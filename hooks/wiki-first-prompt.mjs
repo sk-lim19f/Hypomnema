@@ -43,7 +43,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    const hasSnapshot  = marker.hotPath && existsSync(marker.hotPath);
+    const hasSnapshot  = marker.hasSnapshot ?? (marker.hotPath && existsSync(marker.hotPath));
     const snapshotNote = hasSnapshot ? '' : ' (no snapshot yet — first session)';
 
     console.log(JSON.stringify(
