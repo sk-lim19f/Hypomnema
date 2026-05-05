@@ -175,9 +175,8 @@ function checkBrokenLinks(wikiDir) {
     const content = readFileSync(file, 'utf-8');
     const links = [...content.matchAll(/\[\[([^\]|#\n]+?)(?:[|#][^\]]*?)?\]\]/g)].map(m => m[1].trim());
     for (const link of links) {
-      // skip object-path references (e.g. [[hooks.SessionStart]]) and single-word placeholders
+      // skip object-path references (e.g. [[hooks.SessionStart]])
       if (link.includes('.') && !link.endsWith('.md')) continue;
-      if (/^[a-z_-]+$/.test(link) && link.length <= 10) continue;
       const slug = link.replace(/\.md$/, '');
       if (!slugSet.has(slug) && !slugSet.has(slug.toLowerCase())) {
         broken.push({ file: relative(wikiDir, file), link });
@@ -210,11 +209,13 @@ function buildSlugSet(files, wikiDir) {
   const set = new Set();
   for (const f of files) {
     const rel = relative(wikiDir, f).replace(/\.md$/, '');
-    set.add(rel);
-    set.add(rel.toLowerCase());
-    const base = rel.split('/').pop();
-    set.add(base);
-    set.add(base.toLowerCase());
+    // add all path suffixes: pages/learnings/foo → also learnings/foo, foo
+    const parts = rel.split('/');
+    for (let i = 0; i < parts.length; i++) {
+      const suffix = parts.slice(i).join('/');
+      set.add(suffix);
+      set.add(suffix.toLowerCase());
+    }
   }
   return set;
 }
@@ -233,25 +234,27 @@ function checkVerifyBy(wikiDir) {
     const type = fm.type || '';
     if (!['adr', 'page', 'learning'].includes(type)) continue;
 
+    // verify_by = natural-language question; verify_by_date = ISO date deadline
     if (!fm.verify_by) {
       missing.push(relative(wikiDir, file));
-    } else if (fm.verify_by < today) {
-      overdue.push({ file: relative(wikiDir, file), due: fm.verify_by });
+    }
+    if (fm.verify_by_date && /^\d{4}-\d{2}-\d{2}$/.test(fm.verify_by_date) && fm.verify_by_date < today) {
+      overdue.push({ file: relative(wikiDir, file), due: fm.verify_by_date });
     }
   }
 
   if (overdue.length > 0) {
     const sample = overdue.slice(0, 3).map(o => `${o.file} (due ${o.due})`).join(', ');
     const extra  = overdue.length > 3 ? ` (+${overdue.length - 3} more)` : '';
-    warn('verify_by overdue', `${overdue.length} overdue: ${sample}${extra}`);
+    warn('verify_by_date overdue', `${overdue.length} overdue: ${sample}${extra}`);
   } else {
-    pass('verify_by overdue', 'No overdue pages');
+    pass('verify_by_date overdue', 'No overdue pages');
   }
 
   if (missing.length > 0) {
-    warn('verify_by coverage', `${missing.length} pages (adr/page/learning) missing verify_by`);
+    warn('verify_by coverage', `${missing.length} pages (adr/page/learning) missing verify_by question`);
   } else {
-    pass('verify_by coverage', 'All tracked pages have verify_by');
+    pass('verify_by coverage', 'All tracked pages have verify_by question');
   }
 }
 
@@ -263,7 +266,7 @@ function parseFrontmatter(content) {
     const idx = line.indexOf(':');
     if (idx < 0) continue;
     const key = line.slice(0, idx).trim();
-    const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    const val = line.slice(idx + 1).trim().replace(/\s*#.*$/, '').replace(/^["']|["']$/g, '');
     fm[key] = val;
   }
   return fm;

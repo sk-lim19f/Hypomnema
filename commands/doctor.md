@@ -20,15 +20,18 @@ You are running `/hypo:doctor`. Verify the health of the current Hypomnema wiki 
 
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
-If the user passed a wiki directory as an argument to the command, use it. Otherwise let the script resolve it via `HYPO_DIR` / `hypo-config.md` scan / `~/wiki` default.
+If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically: `HYPO_DIR` env → `hypo-config.md` scan → `~/wiki` default.
 
 ---
 
 ## Step 2 — Run the doctor script
 
 ```bash
-node <package-root>/scripts/doctor.mjs [--wiki-dir="<path>"]
+node <package-root>/scripts/doctor.mjs [--wiki-dir="<path>"] [--json]
 ```
+
+- `--wiki-dir=<path>` — override wiki root (takes precedence over `HYPO_DIR` env and auto-scan)
+- `--json` — output results as a JSON array (useful for programmatic use)
 
 ---
 
@@ -46,13 +49,18 @@ Then show the summary line: `Result: N passed, N warnings, N failed`
 ## Step 4 — Recommend fixes
 
 For any `✗` failures:
-- Suggest running `/hypo:init` to repair missing directories, files, or hook registrations.
+- Missing wiki root or required directories/files → run `/hypo:init`.
+- 0 hook files installed → run `/hypo:init`.
+- 0 hook registrations in settings.json → run `/hypo:init`.
 
 For `⚠` warnings:
-- Missing `hypo-config.md`: run `/hypo:init` — it creates the config marker.
-- Missing git remote: `git remote add origin <url>` in the wiki directory.
-- Broken links: list the affected files and ask if the user wants to fix them now.
-- Overdue `verify_by`: offer to open the affected pages for review.
-- Missing `verify_by`: suggest adding a `verify_by` field to the listed pages.
+- Missing `hypo-config.md` → run `/hypo:init` — it creates the config marker.
+- Missing baseline files (`index.md`, `hot.md`, etc.) → run `/hypo:init`.
+- Partial hook files (some missing) → run `/hypo:init` to install missing hooks.
+- Partial settings.json registrations → run `/hypo:init` to merge missing entries.
+- Missing git remote → `git -C <wiki-dir> remote add origin <url>`.
+- Broken `[[links]]` → list the affected files and ask if the user wants to fix them now.
+- Overdue `verify_by_date` → offer to open the affected pages for review.
+- Missing `verify_by` question → suggest adding a `verify_by` field to the listed pages.
 
 If all checks passed, tell the user the wiki is healthy and ready to use.
