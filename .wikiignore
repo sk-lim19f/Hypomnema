@@ -1,0 +1,24 @@
+# .wikiignore — privacy & secret file patterns
+# Files matching these patterns are blocked by pre-commit and lint.mjs (sources/ check).
+# Syntax: one glob pattern per line. Lines starting with # are comments.
+# Patterns match against the file basename. Trailing / matches directories.
+
+# Credentials & secrets
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*credentials*
+*secret*
+*token*
+*password*
+*passwd*
+
+# Build artifacts & dependencies
+node_modules/
+dist/
+build/
+.cache/
