@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+/**
+ * wiki-session-start.mjs — SessionStart hook
+ *
+ * On session start:
+ *   HIT  → cwd matches a project's working_dir → inject that project's hot.md
+ *   MISS → inject global hot.md pointer only (no fan-out to all projects)
+ */
+
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { homedir, tmpdir } from 'os';
+import { join } from 'path';
+import { WIKI_DIR, buildOutput } from './wiki-shared.mjs';
+
+const MARKER_FILE  = join(tmpdir(), 'hypo-session-marker.json');
+const PROJECTS_DIR = join(WIKI_DIR, 'projects');
+const GLOBAL_HOT   = join(WIKI_DIR, 'hot.md');
+const MAX_CHARS    = 3000;
+
+function parseFrontmatterField(content, key) {
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return null;
+  const line = match[1].split('\n').find(l => l.startsWith(`${key}:`));
+  if (!line) return null;
+  return line.slice(key.length + 1).trim().replace(/^['"]|['"]$/g, '');
+}
+
+function findProjectHot(cwd) {
+  if (!existsSync(PROJECTS_DIR)) return null;
+  for (const proj of readdirSync(PROJECTS_DIR)) {
+    const projDir  = join(PROJECTS_DIR, proj);
+    if (!statSync(projDir).isDirectory()) continue;
+    const indexPath = join(projDir, 'index.md');
+    if (!existsSync(indexPath)) continue;
+    const content    = readFileSync(indexPath, 'utf-8');
+    const workingDir = parseFrontmatterField(content, 'working_dir');
+    if (!workingDir) continue;
+    const resolved = workingDir.startsWith('~/')
+      ? join(homedir(), workingDir.slice(2))
+      : workingDir;
+    if (cwd === resolved || cwd.startsWith(resolved + '/')) {
+      const hotPath = join(projDir, 'hot.md');
+      return { proj, hotPath: existsSync(hotPath) ? hotPath : null };
+    }
+  }
+  return null;
+}
+
+function extractSection(content, heading) {
+  const re = new RegExp(`## ${heading}\\n([\\s\\S]*?)(?=\\n## |$)`);
+  const m = content.match(re);
+  return m ? m[1].trim() : null;
+}
+
+function printTerminalSummary(proj, content) {
+  const next = extractSection(content, '다음 이어받기') ?? extractSection(content, 'Next Up');
+  const prev = extractSection(content, '직전 세션 \\([^)]+\\)')
+    ?? extractSection(content, '직전 세션.*')
+    ?? extractSection(content, 'Last Session.*');
+  const lines = ['', `\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${proj}\x1b[0m`];
+  if (prev) lines.push(`  prev: ${prev.split('\n')[0].replace(/^\*\*|\*\*$/g, '')}`);
+  if (next) {
+    lines.push('  next:');
+    next.split('\n').slice(0, 5).forEach(l => lines.push(`    ${l}`));
+  }
+  lines.push('');
+  process.stderr.write(lines.join('\n'));
+}
+
+let raw = '';
+process.stdin.setEncoding('utf-8');
+process.stdin.on('data', chunk => raw += chunk);
+process.stdin.on('end', () => {
+  try {
+    let data = {};
+    try { data = JSON.parse(raw); } catch {}
+
+    const cwd = data.cwd || data.directory || process.cwd();
+    const hit = findProjectHot(cwd);
+
+    if (hit) {
+      if (hit.hotPath) {
+        const content = readFileSync(hit.hotPath, 'utf-8').slice(0, MAX_CHARS);
+        printTerminalSummary(hit.proj, content);
+        writeFileSync(MARKER_FILE, JSON.stringify({ proj: hit.proj, hotPath: hit.hotPath, ts: Date.now() }));
+        console.log(JSON.stringify(
+          buildOutput(`[WIKI HOT CACHE: project=${hit.proj}]\n\n${content}`, { continue: true, suppressOutput: true })
+        ));
+      } else {
+        process.stderr.write(`\n\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${hit.proj}\x1b[0m (no snapshot yet)\n\n`);
+        writeFileSync(MARKER_FILE, JSON.stringify({ proj: hit.proj, hotPath: null, ts: Date.now() }));
+        console.log(JSON.stringify(
+          buildOutput(`[WIKI HOT CACHE: project=${hit.proj}, no snapshot yet]`, { continue: true, suppressOutput: true })
+        ));
+      }
+      return;
+    }
+
+    if (!existsSync(GLOBAL_HOT)) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    const globalContent = readFileSync(GLOBAL_HOT, 'utf-8').slice(0, MAX_CHARS);
+    console.log(JSON.stringify(
+      buildOutput(`[WIKI HOT CACHE: global — no project matched cwd=${cwd}]\n\n${globalContent}`, { continue: true, suppressOutput: true })
+    ));
+
+  } catch {
+    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+  }
+});
