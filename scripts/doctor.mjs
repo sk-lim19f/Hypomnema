@@ -135,7 +135,7 @@ function checkSettingsJson() {
     for (const file of files) {
       total++;
       const cmd = `node ${hooksDir.replace(HOME, '$HOME')}/${file}`;
-      const found = (settings.hooks?.[event] || [])
+      const found = (Array.isArray(settings.hooks?.[event]) ? settings.hooks[event] : [])
         .flatMap(g => g.hooks || [])
         .some(h => h.command === cmd);
       if (found) registered++;

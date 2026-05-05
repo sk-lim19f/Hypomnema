@@ -19,4 +19,4 @@ tags: [wiki, operations]
 
 1. Check this file for the relevant project hot.md link
 2. Read `projects/<name>/hot.md`
-3. Check `projects/<name>/session-log.md` recent entries if needed
+3. Check `projects/<name>/session-log/YYYY-MM.md` recent entries if needed

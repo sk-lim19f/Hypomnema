@@ -152,13 +152,16 @@ function installHooks(targetDir, dryRun) {
 function mergeSettingsJson(settingsPath, hooksDir, dryRun) {
   let settings = {};
   if (existsSync(settingsPath)) {
-    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')); } catch {}
+    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')); } catch {
+      log('errors', `settings.json is not valid JSON — fix or back it up before re-running: ${settingsPath}`);
+      return;
+    }
   }
   if (!settings.hooks) settings.hooks = {};
 
   let changed = false;
   for (const [event, files] of Object.entries(HOOK_MAP)) {
-    if (!settings.hooks[event]) settings.hooks[event] = [];
+    if (!Array.isArray(settings.hooks[event])) settings.hooks[event] = [];
     for (const file of files) {
       const cmd = `node ${hooksDir.replace(HOME, '$HOME')}/${file}`;
       const already = settings.hooks[event]
@@ -186,7 +189,13 @@ function git(wikiDir, args, opts = {}) {
 function gitSetup(wikiDir, remote, dryRun) {
   const isGit = existsSync(join(wikiDir, '.git'));
   if (!isGit) {
-    if (!dryRun) spawnSync('git', ['init', wikiDir], { stdio: 'ignore' });
+    if (!dryRun) {
+      const r = spawnSync('git', ['init', wikiDir], { stdio: 'ignore' });
+      if (r.error || r.status !== 0) {
+        log('errors', `git init failed in ${wikiDir}`);
+        return;
+      }
+    }
     log('created', join(wikiDir, '.git'));
   }
   if (remote) {

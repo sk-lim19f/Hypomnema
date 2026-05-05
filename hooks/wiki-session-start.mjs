@@ -12,7 +12,6 @@ import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { WIKI_DIR, buildOutput } from './wiki-shared.mjs';
 
-const MARKER_FILE  = join(tmpdir(), 'hypo-session-marker.json');
 const PROJECTS_DIR = join(WIKI_DIR, 'projects');
 const GLOBAL_HOT   = join(WIKI_DIR, 'hot.md');
 const MAX_CHARS    = 3000;
@@ -76,6 +75,8 @@ process.stdin.on('end', () => {
     try { data = JSON.parse(raw); } catch {}
 
     const cwd = data.cwd || data.directory || process.cwd();
+    const sessionId = data.session_id || 'default';
+    const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);
     const hit = findProjectHot(cwd);
 
     if (hit) {
