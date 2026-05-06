@@ -159,7 +159,7 @@ process.stdin.on('end', () => {
     }
 
     const overflow = matched.length > MAX_HITS
-      ? `\n(+${matched.length - MAX_HITS} more matches — use wiki_query for full results)` : '';
+      ? `\n(+${matched.length - MAX_HITS} more matches — search wiki index for more)` : '';
 
     console.log(JSON.stringify(
       buildOutput(
