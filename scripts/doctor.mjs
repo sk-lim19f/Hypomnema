@@ -73,7 +73,7 @@ function checkWikiRoot(wikiDir) {
 }
 
 function checkDirectories(wikiDir) {
-  const required = ['pages', 'projects', 'sources', 'decisions', 'learnings'];
+  const required = ['pages', 'projects', 'sources'];
   for (const d of required) {
     if (existsSync(join(wikiDir, d))) {
       pass(`Directory: ${d}/`);

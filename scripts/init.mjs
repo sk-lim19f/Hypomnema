@@ -68,7 +68,7 @@ function log(action, path) { results[action].push(path); }
 
 // ── directory structure ──────────────────────────────────────────────────────
 
-const WIKI_DIRS = ['pages', 'projects', 'sources', 'decisions', 'learnings'];
+const WIKI_DIRS = ['pages', 'projects', 'sources'];
 
 function ensureDir(dir, dryRun) {
   if (existsSync(dir)) return;
