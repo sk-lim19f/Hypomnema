@@ -55,6 +55,8 @@ const HOOK_MAP = {
   FileChanged:      ['wiki-file-watch.mjs'],
 };
 
+const SHARED_FILES = ['wiki-shared.mjs'];
+
 // ── checks ───────────────────────────────────────────────────────────────────
 
 function checkWikiRoot(wikiDir) {
@@ -96,7 +98,7 @@ function checkFiles(wikiDir) {
 
 function checkHooks() {
   const claudeHooks = join(HOME, '.claude', 'hooks');
-  const allFiles = Object.values(HOOK_MAP).flat();
+  const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
 
   let missing = 0;
   for (const file of allFiles) {

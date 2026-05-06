@@ -88,6 +88,9 @@ const HOOK_MAP = {
   FileChanged:      ['wiki-file-watch.mjs'],
 };
 
+// Shared utility files deployed alongside hooks but not bound to a specific event.
+const SHARED_FILES = ['wiki-shared.mjs'];
+
 // ── checks ───────────────────────────────────────────────────────────────────
 
 function checkSchemaVersion(wikiDir) {
@@ -114,25 +117,24 @@ function checkHookFiles() {
   const claudeHooks = join(HOME, '.claude', 'hooks');
   const results = [];
 
-  for (const files of Object.values(HOOK_MAP)) {
-    for (const file of files) {
-      const installedPath = join(claudeHooks, file);
-      const srcPath       = join(HOOKS_SRC, file);
+  const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
+  for (const file of allFiles) {
+    const installedPath = join(claudeHooks, file);
+    const srcPath       = join(HOOKS_SRC, file);
 
-      if (!existsSync(installedPath)) {
-        results.push({ file, status: 'missing', installedPath, srcPath });
-      } else if (!existsSync(srcPath)) {
-        results.push({ file, status: 'src-missing', installedPath, srcPath });
-      } else {
-        const installedContent = readFileSync(installedPath, 'utf-8');
-        const srcContent       = readFileSync(srcPath, 'utf-8');
-        results.push({
-          file,
-          status: installedContent === srcContent ? 'up-to-date' : 'stale',
-          installedPath,
-          srcPath,
-        });
-      }
+    if (!existsSync(installedPath)) {
+      results.push({ file, status: 'missing', installedPath, srcPath });
+    } else if (!existsSync(srcPath)) {
+      results.push({ file, status: 'src-missing', installedPath, srcPath });
+    } else {
+      const installedContent = readFileSync(installedPath, 'utf-8');
+      const srcContent       = readFileSync(srcPath, 'utf-8');
+      results.push({
+        file,
+        status: installedContent === srcContent ? 'up-to-date' : 'stale',
+        installedPath,
+        srcPath,
+      });
     }
   }
 
