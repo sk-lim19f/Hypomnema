@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -153,16 +153,19 @@ test('--dry-run reports created dirs without writing them', () => {
   });
 });
 
-test('--privacy=shared includes extra ignore note in output', () => {
+test('--privacy=shared writes shared-mode content to .wikiignore', () => {
   withTmpDir(dir => {
+    const wikiDir = join(dir, 'wiki');
     const r = run('init.mjs', [
-      `--wiki-dir=${dir}/wiki`,
+      `--wiki-dir=${wikiDir}`,
       '--privacy=shared',
-      '--dry-run',
       '--no-hooks',
       '--no-git-init',
     ]);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const wikiignore = readFileSync(join(wikiDir, '.wikiignore'), 'utf-8');
+    assert.ok(wikiignore.includes('*personal*'), '.wikiignore missing shared-mode pattern');
+    assert.ok(wikiignore.includes('journal/'), '.wikiignore missing journal/ exclusion');
   });
 });
 
