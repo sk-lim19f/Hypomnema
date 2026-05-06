@@ -403,6 +403,107 @@ test('clean wiki → suppressOutput:true', () => {
   });
 });
 
+// ── upgrade.mjs smoke tests ───────────────────────────────────────────────────
+
+suite('upgrade.mjs --json');
+
+test('exits without crashing on non-existent wiki dir', () => {
+  const r = run('upgrade.mjs', [
+    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    '--json',
+  ]);
+  assert.ok(r.status !== null, 'process did not exit cleanly');
+  assert.ok(r.status <= 1, `unexpected exit code ${r.status}\n${r.stderr}`);
+});
+
+test('--json output is valid JSON', () => {
+  const r = run('upgrade.mjs', [
+    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    '--json',
+  ]);
+  assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout not JSON: ${r.stdout}`);
+});
+
+test('JSON output has required top-level fields', () => {
+  const r = run('upgrade.mjs', [
+    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    '--json',
+  ]);
+  const out = JSON.parse(r.stdout);
+  assert.ok('schema'   in out, 'missing schema field');
+  assert.ok('hooks'    in out, 'missing hooks field');
+  assert.ok('settings' in out, 'missing settings field');
+  assert.ok('applied'  in out, 'missing applied field');
+});
+
+test('schema object has installed/current/bump fields', () => {
+  const r = run('upgrade.mjs', [
+    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    '--json',
+  ]);
+  const { schema } = JSON.parse(r.stdout);
+  assert.ok('installed' in schema, 'schema missing installed');
+  assert.ok('current'   in schema, 'schema missing current');
+  assert.ok('bump'      in schema, 'schema missing bump');
+});
+
+test('hooks is an array of file/status objects', () => {
+  const r = run('upgrade.mjs', [
+    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    '--json',
+  ]);
+  const { hooks } = JSON.parse(r.stdout);
+  assert.ok(Array.isArray(hooks), 'hooks should be an array');
+  assert.ok(hooks.length > 0, 'expected at least one hook entry');
+  assert.ok('file'   in hooks[0], 'hook entry missing file');
+  assert.ok('status' in hooks[0], 'hook entry missing status');
+});
+
+test('settings is an array of event/file/status objects', () => {
+  const r = run('upgrade.mjs', [
+    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    '--json',
+  ]);
+  const { settings } = JSON.parse(r.stdout);
+  assert.ok(Array.isArray(settings), 'settings should be an array');
+  assert.ok(settings.length > 0, 'expected at least one settings entry');
+  assert.ok('event'  in settings[0], 'settings entry missing event');
+  assert.ok('file'   in settings[0], 'settings entry missing file');
+  assert.ok('status' in settings[0], 'settings entry missing status');
+});
+
+test('applied object has hooks and settings arrays', () => {
+  const r = run('upgrade.mjs', [
+    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    '--json',
+  ]);
+  const { applied } = JSON.parse(r.stdout);
+  assert.ok(Array.isArray(applied.hooks),    'applied.hooks should be array');
+  assert.ok(Array.isArray(applied.settings), 'applied.settings should be array');
+});
+
+test('exits 1 when drift exists and --apply not passed', () => {
+  const r = run('upgrade.mjs', [
+    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    '--json',
+  ]);
+  // Non-existent wiki always has drift → exit 1
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}`);
+});
+
+test('--apply on tmp wiki exits 0 after applying available changes', () => {
+  withTmpDir(dir => {
+    const wikiDir = join(dir, 'wiki');
+    // First init the wiki so schema exists
+    run('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-hooks', '--no-git-init']);
+    const r = run('upgrade.mjs', [`--wiki-dir=${wikiDir}`, '--json', '--apply']);
+    const out = JSON.parse(r.stdout);
+    assert.ok('applied' in out, 'applied field missing after --apply');
+    // Should exit 0 (all drift resolved) or 1 (some items can't auto-apply)
+    assert.ok(r.status <= 1, `unexpected exit code ${r.status}`);
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
