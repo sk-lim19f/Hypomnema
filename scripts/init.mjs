@@ -23,6 +23,7 @@ import { join, basename } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { expandHome, resolveWikiRoot } from './lib/wiki-root.mjs';
 
 const HOME     = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -34,7 +35,7 @@ const TEMPLATES  = join(PKG_ROOT, 'templates');
 
 function parseArgs(argv) {
   const args = {
-    wikiDir:   join(HOME, 'wiki'),
+    wikiDir:   resolveWikiRoot(),
     privacy:   'personal',
     hooks:     true,
     codex:     false,
@@ -52,12 +53,6 @@ function parseArgs(argv) {
     else if (arg === '--dry-run')         args.dryRun    = true;
   }
   return args;
-}
-
-function expandHome(p) {
-  if (p === '~') return HOME;
-  if (p.startsWith('~/') || p.startsWith('~\\')) return join(HOME, p.slice(2));
-  return p;
 }
 
 // ── result tracking ──────────────────────────────────────────────────────────
