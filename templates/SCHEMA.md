@@ -35,6 +35,8 @@ Read this before any wiki operation (ingest / query / lint).
 | `project-index` | `projects/*/index.md` | Project overview + progress checklist | mutable |
 | `open-questions` | `pages/open-questions.md` | Unresolved question queue | append+resolve |
 | `schema` | `SCHEMA.md` (this file) | Type system + vocabulary standard | versioned |
+| `log` | `log.md` | Append-only activity log (ingest, session, note entries) | append-only |
+| `config` | `hypo-config.md` | Wiki root marker + user settings | mutable |
 
 **Notes**:
 - `append-only`: never delete/modify existing entries. Corrections go as new entries (`[supersedes: YYYY-MM-DD]`).
@@ -87,8 +89,8 @@ source: <slug or URL>
 
 Use lowercase, hyphenated tags. Keep the vocabulary small and consistent.
 
-**Domain tags**: `ai`, `dev`, `ops`, `security`, `data`, `design`, `management`  
-**Status tags**: `draft`, `stable`, `deprecated`, `needs-review`  
+**Domain tags**: `ai`, `dev`, `ops`, `security`, `data`, `design`, `management`
+**Status tags**: `draft`, `stable`, `deprecated`, `needs-review`
 **Meta tags**: `wiki`, `index`, `operations`, `guide`, `schema`
 
 ---

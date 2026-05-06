@@ -84,7 +84,7 @@ function checkDirectories(wikiDir) {
 }
 
 function checkFiles(wikiDir) {
-  const required = ['index.md', 'hot.md', 'log.md', '.wikiignore'];
+  const required = ['index.md', 'hot.md', 'log.md', '.wikiignore', 'SCHEMA.md', 'wiki-guide.md'];
   for (const f of required) {
     if (existsSync(join(wikiDir, f))) {
       pass(`File: ${f}`);

@@ -32,17 +32,11 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 ├── SCHEMA.md           ← type system reference
 ├── wiki-guide.md       ← this file
 ├── .wikiignore         ← privacy/exclusion patterns
-├── pages/              ← permanent knowledge pages
-│   ├── learnings/
-│   ├── playbooks/
-│   ├── tool-evaluations/
-│   ├── prompt-patterns/
-│   ├── feedback/
-│   ├── syntheses/
-│   ├── tips/
-│   ├── people/
-│   ├── orgs/
-│   └── open-questions.md
+├── pages/              ← permanent knowledge pages (subdirs added on demand)
+│   ├── learnings/      (optional)
+│   ├── playbooks/      (optional)
+│   ├── feedback/       (optional)
+│   └── open-questions.md  (optional)
 ├── projects/           ← project work artifacts
 │   └── <name>/
 │       ├── index.md          ← overview (working_dir: field)
@@ -52,9 +46,8 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 │       ├── session-log/      ← monthly narrative logs
 │       └── decisions/        ← ADRs (0001-*.md …)
 ├── sources/            ← raw ingested sources (never edit)
-├── journal/            ← weekly/monthly journals
-│   └── weekly/
-└── decisions/          ← cross-project ADRs
+├── decisions/          ← cross-project ADRs
+└── learnings/          ← extracted lessons and patterns
 ```
 
 **Rule**: never edit `sources/`. All knowledge creation goes in `pages/` and `projects/`.
