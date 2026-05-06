@@ -219,9 +219,11 @@ ensureDir(args.wikiDir, args.dryRun);
 for (const d of WIKI_DIRS) ensureDir(join(args.wikiDir, d), args.dryRun);
 
 // 2. template files
-copyTemplate('index.md', join(args.wikiDir, 'index.md'), args.dryRun);
-copyTemplate('hot.md',   join(args.wikiDir, 'hot.md'),   args.dryRun);
-copyTemplate('log.md',   join(args.wikiDir, 'log.md'),   args.dryRun);
+copyTemplate('index.md',     join(args.wikiDir, 'index.md'),     args.dryRun);
+copyTemplate('hot.md',       join(args.wikiDir, 'hot.md'),       args.dryRun);
+copyTemplate('log.md',       join(args.wikiDir, 'log.md'),       args.dryRun);
+copyTemplate('SCHEMA.md',    join(args.wikiDir, 'SCHEMA.md'),    args.dryRun);
+copyTemplate('wiki-guide.md',join(args.wikiDir, 'wiki-guide.md'),args.dryRun);
 
 // 3. hypo-config.md + .wikiignore
 writeHypoConfig(args.wikiDir, args.privacy, args.dryRun);
