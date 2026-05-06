@@ -76,20 +76,13 @@ function bumpType(installed, current) {
   return 'none';
 }
 
-// ── hook map (must match init.mjs) ───────────────────────────────────────────
+// ── hook map (loaded from hooks/hooks.json — single source of truth) ─────────
 
-const HOOK_MAP = {
-  SessionStart:     ['wiki-session-start.mjs'],
-  UserPromptSubmit: ['wiki-first-prompt.mjs', 'wiki-lookup.mjs', 'wiki-compact-guard.mjs'],
-  PreCompact:       ['personal-wiki-check.mjs'],
-  PostToolUse:      ['wiki-auto-stage.mjs'],
-  Stop:             ['wiki-hot-rebuild.mjs', 'wiki-auto-commit.mjs'],
-  CwdChanged:       ['wiki-cwd-change.mjs'],
-  FileChanged:      ['wiki-file-watch.mjs'],
-};
-
-// Shared utility files deployed alongside hooks but not bound to a specific event.
-const SHARED_FILES = ['wiki-shared.mjs'];
+const _hookConfig = JSON.parse(
+  readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8')
+);
+const HOOK_MAP    = _hookConfig.hooks;
+const SHARED_FILES = _hookConfig.shared;
 
 // ── checks ───────────────────────────────────────────────────────────────────
 

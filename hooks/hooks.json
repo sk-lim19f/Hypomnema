@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "SessionStart":     ["wiki-session-start.mjs"],
+    "UserPromptSubmit": ["wiki-first-prompt.mjs", "wiki-lookup.mjs", "wiki-compact-guard.mjs"],
+    "PreCompact":       ["personal-wiki-check.mjs"],
+    "PostToolUse":      ["wiki-auto-stage.mjs"],
+    "Stop":             ["wiki-hot-rebuild.mjs", "wiki-auto-commit.mjs"],
+    "CwdChanged":       ["wiki-cwd-change.mjs"],
+    "FileChanged":      ["wiki-file-watch.mjs"]
+  },
+  "shared": ["wiki-shared.mjs"]
+}

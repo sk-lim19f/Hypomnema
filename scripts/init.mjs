@@ -122,15 +122,9 @@ function writeWikiignore(wikiDir, privacy, dryRun) {
 
 // ── hook installation ────────────────────────────────────────────────────────
 
-const HOOK_MAP = {
-  SessionStart:     ['wiki-session-start.mjs'],
-  UserPromptSubmit: ['wiki-first-prompt.mjs', 'wiki-lookup.mjs', 'wiki-compact-guard.mjs'],
-  PreCompact:       ['personal-wiki-check.mjs'],
-  PostToolUse:      ['wiki-auto-stage.mjs'],
-  Stop:             ['wiki-hot-rebuild.mjs', 'wiki-auto-commit.mjs'],
-  CwdChanged:       ['wiki-cwd-change.mjs'],
-  FileChanged:      ['wiki-file-watch.mjs'],
-};
+const { hooks: HOOK_MAP } = JSON.parse(
+  readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8')
+);
 
 function installHooks(targetDir, dryRun) {
   if (!existsSync(HOOKS_SRC)) { log('errors', `hooks source missing: ${HOOKS_SRC}`); return; }
