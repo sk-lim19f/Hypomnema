@@ -1,0 +1,18 @@
+# Runtime state — never commit
+.omc/
+.claude/
+
+# Node
+node_modules/
+dist/
+build/
+
+# OS
+.DS_Store
+*.swp
+
+# Secrets
+.env*
+*.pem
+*credentials*
+*secret*

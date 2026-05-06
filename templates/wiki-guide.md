@@ -45,9 +45,7 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 │       ├── session-state.md  ← next-session handoff
 │       ├── session-log/      ← monthly narrative logs
 │       └── decisions/        ← ADRs (0001-*.md …)
-├── sources/            ← raw ingested sources (never edit)
-├── decisions/          ← cross-project ADRs
-└── learnings/          ← extracted lessons and patterns
+└── sources/            ← raw ingested sources (never edit)
 ```
 
 **Rule**: never edit `sources/`. All knowledge creation goes in `pages/` and `projects/`.

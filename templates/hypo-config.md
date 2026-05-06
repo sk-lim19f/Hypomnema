@@ -37,7 +37,5 @@ HYPO_SKIP_GATE=1
 │       ├── index.md    ← project overview (working_dir: field)
 │       ├── hot.md      ← project-scoped session snapshot
 │       └── session-log/    ← monthly logs (YYYY-MM.md)
-├── sources/            ← raw ingested sources (read-only)
-├── decisions/          ← architecture decision records (ADRs)
-└── learnings/          ← extracted lessons and patterns
+└── sources/            ← raw ingested sources (read-only)
 ```

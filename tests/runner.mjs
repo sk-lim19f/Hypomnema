@@ -178,7 +178,7 @@ test('actual run creates expected directories', () => {
       '--no-git-init',
     ]);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    for (const sub of ['pages', 'projects', 'sources', 'decisions', 'learnings']) {
+    for (const sub of ['pages', 'projects', 'sources']) {
       assert.ok(existsSync(join(wikiDir, sub)), `missing: ${sub}/`);
     }
   });
