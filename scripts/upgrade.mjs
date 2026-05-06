@@ -78,11 +78,15 @@ function bumpType(installed, current) {
 
 // ── hook map (loaded from hooks/hooks.json — single source of truth) ─────────
 
-const _hookConfig = JSON.parse(
-  readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8')
-);
-const HOOK_MAP    = _hookConfig.hooks;
-const SHARED_FILES = _hookConfig.shared;
+let _hookConfig;
+try {
+  _hookConfig = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
+} catch {
+  console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
+  process.exit(1);
+}
+const HOOK_MAP     = _hookConfig.hooks   ?? {};
+const SHARED_FILES = _hookConfig.shared  ?? [];
 
 // ── checks ───────────────────────────────────────────────────────────────────
 

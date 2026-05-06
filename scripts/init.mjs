@@ -122,9 +122,14 @@ function writeWikiignore(wikiDir, privacy, dryRun) {
 
 // ── hook installation ────────────────────────────────────────────────────────
 
-const { hooks: HOOK_MAP } = JSON.parse(
-  readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8')
-);
+let _hooksJson;
+try {
+  _hooksJson = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
+} catch {
+  console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
+  process.exit(1);
+}
+const HOOK_MAP = _hooksJson.hooks ?? {};
 
 function installHooks(targetDir, dryRun) {
   if (!existsSync(HOOKS_SRC)) { log('errors', `hooks source missing: ${HOOKS_SRC}`); return; }
