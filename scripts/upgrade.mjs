@@ -67,8 +67,12 @@ function parseVersion(str) {
 
 function bumpType(installed, current) {
   if (!installed || !current) return 'unknown';
-  if (installed.major !== current.major) return 'major';
-  if (installed.minor !== current.minor) return 'minor';
+  if (installed.major !== current.major) {
+    return installed.major > current.major ? 'ahead' : 'major';
+  }
+  if (installed.minor !== current.minor) {
+    return installed.minor > current.minor ? 'ahead' : 'minor';
+  }
   return 'none';
 }
 
@@ -225,7 +229,8 @@ Review the SCHEMA diff and update your wiki pages accordingly.
 
 ## Action items
 
-- [ ] Review the updated \`SCHEMA.md\` — run \`/hypo:upgrade --apply\` to install it
+- [ ] Compare your \`SCHEMA.md\` (v${fromVersion}) with the package template (v${toVersion}) and update manually
+- [ ] Run \`/hypo:upgrade --apply\` to install updated hook files and settings.json entries
 - [ ] Check all \`adr\` and \`learning\` pages for new required frontmatter fields
 - [ ] Run \`/hypo:doctor\` after applying updates to verify installation health
 
@@ -246,14 +251,17 @@ const schema   = checkSchemaVersion(args.wikiDir);
 const hooks    = checkHookFiles();
 const settings = checkSettingsJson();
 
-const staleHooks      = hooks.filter(h => h.status === 'stale' || h.status === 'missing');
+const staleHooks      = hooks.filter(h => h.status === 'stale' || h.status === 'missing' || h.status === 'src-missing');
 const missingSettings = settings.filter(s => s.status === 'missing');
+const invalidSettings = settings.some(s => s.status === 'invalid-json');
+const schemaDrift     = schema.bump !== 'none' && schema.bump !== 'unknown' && schema.bump !== 'ahead';
 
 let migrationPath   = null;
 let appliedHooks    = [];
 let appliedSettings = [];
 
-// Generate migration report for major bumps (always, not just on --apply)
+// Generate migration report for major bumps (always, not just on --apply).
+// This creates a new file — it does not overwrite SCHEMA.md.
 if (schema.bump === 'major' && schema.installed && schema.current && existsSync(args.wikiDir)) {
   migrationPath = writeMigrationReport(args.wikiDir, schema.installed, schema.current);
 }
@@ -265,6 +273,8 @@ if (args.apply) {
 
 // ── output ───────────────────────────────────────────────────────────────────
 
+const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings;
+
 if (args.json) {
   console.log(JSON.stringify({
     schema,
@@ -273,7 +283,7 @@ if (args.json) {
     applied: { hooks: appliedHooks, settings: appliedSettings },
     migrationReport: migrationPath,
   }, null, 2));
-  process.exit(staleHooks.length + missingSettings.length > 0 && !args.apply ? 1 : 0);
+  process.exit(hasDrift && !args.apply ? 1 : 0);
 }
 
 // Human-readable report
@@ -284,21 +294,24 @@ if (schema.bump === 'none') {
   lines.push(`✓ SCHEMA version    ${schema.installed} (up to date)`);
 } else if (schema.bump === 'unknown') {
   lines.push(`⚠ SCHEMA version    installed=${schema.installed ?? 'not found'}, package=${schema.current ?? 'not found'} (cannot compare)`);
+} else if (schema.bump === 'ahead') {
+  lines.push(`⚠ SCHEMA version    ${schema.installed} (installed is ahead of package ${schema.current})`);
 } else if (schema.bump === 'major') {
-  lines.push(`✗ SCHEMA version    ${schema.installed} → ${schema.current}  [MAJOR — migration required]`);
+  lines.push(`✗ SCHEMA version    ${schema.installed} → ${schema.current}  [MAJOR — review MIGRATION report, update manually]`);
 } else {
-  lines.push(`⚠ SCHEMA version    ${schema.installed} → ${schema.current}  [minor update available]`);
+  lines.push(`⚠ SCHEMA version    ${schema.installed} → ${schema.current}  [minor update — review and update SCHEMA.md manually]`);
 }
 
 // Hook files
-const upToDate  = hooks.filter(h => h.status === 'up-to-date').length;
+const upToDate   = hooks.filter(h => h.status === 'up-to-date').length;
 const staleCount = hooks.filter(h => h.status === 'stale').length;
 const missCount  = hooks.filter(h => h.status === 'missing').length;
+const srcMiss    = hooks.filter(h => h.status === 'src-missing').length;
 
-if (staleCount === 0 && missCount === 0) {
+if (staleCount === 0 && missCount === 0 && srcMiss === 0) {
   lines.push(`✓ Hook files        ${upToDate}/${hooks.length} up to date`);
 } else {
-  lines.push(`⚠ Hook files        ${upToDate} up to date, ${staleCount} stale, ${missCount} missing:`);
+  lines.push(`⚠ Hook files        ${upToDate} up to date, ${staleCount} stale, ${missCount} missing, ${srcMiss} src-missing:`);
   for (const h of hooks) {
     if (h.status === 'up-to-date') {
       lines.push(`    ✓ ${h.file}`);
@@ -306,15 +319,17 @@ if (staleCount === 0 && missCount === 0) {
       lines.push(`    ⚠ ${h.file}  [stale — package has newer version]`);
     } else if (h.status === 'missing') {
       lines.push(`    ✗ ${h.file}  [not found in ~/.claude/hooks/]`);
+    } else if (h.status === 'src-missing') {
+      lines.push(`    ⚠ ${h.file}  [installed but missing from package — may be orphaned]`);
     }
   }
 }
 
 // settings.json
-const regCount  = settings.filter(s => s.status === 'registered').length;
-const missReg   = settings.filter(s => s.status === 'missing').length;
+const regCount = settings.filter(s => s.status === 'registered').length;
+const missReg  = settings.filter(s => s.status === 'missing').length;
 
-if (settings.some(s => s.status === 'invalid-json')) {
+if (invalidSettings) {
   lines.push(`✗ settings.json     invalid JSON — fix or back it up before re-running`);
 } else if (missReg === 0) {
   lines.push(`✓ settings.json     ${regCount}/${settings.length} hook registrations present`);
@@ -329,7 +344,7 @@ if (settings.some(s => s.status === 'invalid-json')) {
 if (migrationPath) {
   lines.push('');
   lines.push(`📋 Migration report: ${migrationPath}`);
-  lines.push(`   Review before applying — major schema changes may require page updates.`);
+  lines.push(`   Review and update SCHEMA.md manually — auto-overwrite is intentionally disabled.`);
 }
 
 // Applied actions
@@ -347,7 +362,7 @@ if (appliedHooks.length > 0 || appliedSettings.length > 0) {
 
 // Summary
 lines.push('');
-const totalDrift = staleHooks.length + missingSettings.length + (schema.bump !== 'none' && schema.bump !== 'unknown' ? 1 : 0);
+const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0);
 if (totalDrift === 0) {
   lines.push('Result: wiki is up to date');
 } else if (args.apply) {
@@ -359,5 +374,4 @@ if (totalDrift === 0) {
 
 console.log(lines.join('\n'));
 
-const needsAction = (staleHooks.length > 0 || missingSettings.length > 0 || schema.bump === 'major') && !args.apply;
-process.exit(needsAction ? 1 : 0);
+process.exit(hasDrift && !args.apply ? 1 : 0);

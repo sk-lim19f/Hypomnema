@@ -20,13 +20,15 @@ If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherw
 
 ---
 
-## Step 2 — Run upgrade check (dry-run)
+## Step 2 — Run upgrade check
 
 ```bash
 node <package-root>/scripts/upgrade.mjs [--wiki-dir="<path>"]
 ```
 
 Show the output verbatim.
+
+> **Note**: If a major SCHEMA bump is detected, this step generates a `MIGRATION-vX.Y.md` file in the wiki root. This is a new informational file — no existing files are overwritten.
 
 ---
 
@@ -45,7 +47,8 @@ For a **major SCHEMA bump**: point the user to the generated `MIGRATION-vX.Y.md`
 If there is anything to update, ask the user:
 
 > Updates found: [list what needs updating].
-> Apply now? Hook files will be overwritten and settings.json will be merged. (y/N)
+> Apply now? Hook files will be overwritten and settings.json will be merged.
+> Note: SCHEMA.md is never auto-overwritten — update it manually after reviewing the diff. (y/N)
 
 - If **yes** → run with `--apply`:
   ```bash
