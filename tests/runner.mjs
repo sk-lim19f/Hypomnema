@@ -218,6 +218,191 @@ test('JSON output is an array of check objects', () => {
   assert.ok('label' in out[0], 'expected label field');
 });
 
+// ── hook contract tests ───────────────────────────────────────────────────────
+
+const HOOKS = join(REPO, 'hooks');
+
+const { isCompactCommand, isGateSkipped, buildOutput } = await import(
+  join(HOOKS, 'wiki-shared.mjs')
+);
+
+function runHook(hookFile, stdinData, extraEnv = {}) {
+  return spawnSync(process.execPath, [join(HOOKS, hookFile)], {
+    input: typeof stdinData === 'string' ? stdinData : JSON.stringify(stdinData),
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '/tmp/nonexistent-hypo-99999', ...extraEnv },
+  });
+}
+
+function withCleanWiki(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    writeFileSync(join(dir, 'log.md'), `## [${today}] session | test-project\n`);
+    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\nupdated: today\n---\n# Hot\n');
+    spawnSync('git', ['init'], { cwd: dir, encoding: 'utf-8' });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+    spawnSync('git', ['add', '-A'], { cwd: dir, encoding: 'utf-8' });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, encoding: 'utf-8' });
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+suite('isCompactCommand()');
+
+test('/compact → true', () => {
+  assert.equal(isCompactCommand('/compact'), true);
+});
+
+test('/compact with trailing args → true', () => {
+  assert.equal(isCompactCommand('/compact --all'), true);
+});
+
+test('non-compact prompt → false', () => {
+  assert.equal(isCompactCommand('hello'), false);
+  assert.equal(isCompactCommand('/other'), false);
+});
+
+suite('isGateSkipped()');
+
+test('HYPO_SKIP_GATE=1 → true', () => {
+  const orig = process.env.HYPO_SKIP_GATE;
+  process.env.HYPO_SKIP_GATE = '1';
+  try { assert.equal(isGateSkipped(), true); }
+  finally { orig === undefined ? delete process.env.HYPO_SKIP_GATE : (process.env.HYPO_SKIP_GATE = orig); }
+});
+
+test('no env var → false', () => {
+  const o1 = process.env.HYPO_SKIP_GATE;
+  const o2 = process.env.OMC_SKIP_WIKI_GATE;
+  delete process.env.HYPO_SKIP_GATE;
+  delete process.env.OMC_SKIP_WIKI_GATE;
+  try { assert.equal(isGateSkipped(), false); }
+  finally {
+    if (o1 !== undefined) process.env.HYPO_SKIP_GATE = o1;
+    if (o2 !== undefined) process.env.OMC_SKIP_WIKI_GATE = o2;
+  }
+});
+
+suite('buildOutput()');
+
+test('wraps context in additionalContext field', () => {
+  const out = buildOutput('test context');
+  assert.equal(out.additionalContext, 'test context');
+});
+
+test('merges extra fields alongside additionalContext', () => {
+  const out = buildOutput('ctx', { continue: true });
+  assert.equal(out.continue, true);
+  assert.equal(out.additionalContext, 'ctx');
+});
+
+suite('wiki-compact-guard.mjs — contract');
+
+test('invalid JSON input → fail-open {continue:true}', () => {
+  const r = runHook('wiki-compact-guard.mjs', 'not-json');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+});
+
+test('non-compact prompt → pass-through', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: 'hello world' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+});
+
+test('HYPO_SKIP_GATE=1 + /compact → pass-through', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' }, { HYPO_SKIP_GATE: '1' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+});
+
+test('/compact with incomplete wiki → additionalContext, not systemMessage', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const out = JSON.parse(r.stdout);
+  assert.ok('additionalContext' in out, 'missing additionalContext field');
+  assert.ok(!('systemMessage' in out), 'must not use deprecated systemMessage field');
+});
+
+test('/compact with incomplete wiki → continue:true (soft nudge, not block)', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+});
+
+test('/compact with incomplete wiki → additionalContext contains WIKI_AUTOCLOSE', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const out = JSON.parse(r.stdout);
+  assert.ok(out.additionalContext.includes('WIKI_AUTOCLOSE'), 'missing WIKI_AUTOCLOSE marker');
+});
+
+test('/compact with clean wiki → pass-through', () => {
+  withCleanWiki(dir => {
+    const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true);
+    assert.equal(out.suppressOutput, true);
+  });
+});
+
+test('output is always valid JSON regardless of prompt', () => {
+  for (const prompt of ['/compact', 'hello', '']) {
+    const r = runHook('wiki-compact-guard.mjs', { prompt });
+    assert.doesNotThrow(() => JSON.parse(r.stdout), `invalid JSON for prompt="${prompt}"`);
+  }
+});
+
+suite('personal-wiki-check.mjs — contract');
+
+test('output is always valid JSON', () => {
+  const r = runHook('personal-wiki-check.mjs', '');
+  assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout: ${r.stdout}`);
+});
+
+test('no wiki dir → block decision', () => {
+  const r = runHook('personal-wiki-check.mjs', '');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.decision, 'block');
+  assert.equal(out.continue, false);
+});
+
+test('block response includes stopReason string', () => {
+  const r = runHook('personal-wiki-check.mjs', '');
+  const out = JSON.parse(r.stdout);
+  assert.ok(typeof out.stopReason === 'string' && out.stopReason.length > 0);
+});
+
+test('block reason contains WIKI CHECK marker', () => {
+  const r = runHook('personal-wiki-check.mjs', '');
+  const out = JSON.parse(r.stdout);
+  assert.ok(out.reason.includes('WIKI CHECK'), 'missing WIKI CHECK marker in reason');
+});
+
+test('HYPO_SKIP_GATE=1 → continue:true + systemMessage (PreCompact has no additionalContext)', () => {
+  const r = runHook('personal-wiki-check.mjs', '', { HYPO_SKIP_GATE: '1' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  // PreCompact hook does not support additionalContext per Claude Code docs — systemMessage is the correct universal field.
+  assert.ok('systemMessage' in out, 'missing systemMessage field');
+  assert.ok(!('additionalContext' in out), 'PreCompact must not use unsupported additionalContext field');
+});
+
+test('clean wiki → suppressOutput:true', () => {
+  withCleanWiki(dir => {
+    const r = runHook('personal-wiki-check.mjs', '', { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.suppressOutput, true);
+    assert.equal(out.continue, true);
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

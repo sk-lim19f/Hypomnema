@@ -42,7 +42,7 @@ try {
   lintBlockers = parsed.blockers || [];
   lintW8 = (parsed.warnings || []).filter(w => w.id === 'W8');
 } catch {
-  // lint unavailable — skip
+  // Fail-open: lint script missing or broken must not block compaction.
 }
 const lintOk           = lintBlockers.length === 0;
 const designHistoryOk  = lintW8.length === 0;
@@ -57,6 +57,7 @@ if (hasSession && gitStatus.clean && hotStatus.clean && lintOk && designHistoryO
       !hotStatus.clean     ? hotStatus.reason         : '',
       !designHistoryOk     ? `design-history stale (${lintW8.length})` : '',
     ].filter(Boolean).join(', ');
+    // PreCompact does not support additionalContext — use systemMessage (universal field).
     console.log(JSON.stringify({
       continue: true,
       systemMessage: `[WIKI CHECK] gate bypassed via HYPO_SKIP_GATE=1 (incomplete: ${skipped}).`,
