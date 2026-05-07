@@ -1,0 +1,18 @@
+# .wikiignore — patterns excluded from Hypomnema hooks
+# One glob per line. Lines starting with # are comments.
+# Matched files are not read by hooks or included in index lookups.
+# Syntax follows .gitignore glob rules.
+
+# Large binaries
+*.pdf
+*.zip
+*.tar.gz
+
+# Credentials and secrets
+*.pem
+*.key
+*.env
+
+# Draft / scratch (uncomment to hide from hooks)
+# drafts/
+# scratch/
