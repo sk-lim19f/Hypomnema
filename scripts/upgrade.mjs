@@ -245,6 +245,19 @@ Add migration-specific notes here after reviewing the SCHEMA diff.
   return dest;
 }
 
+function checkPkgJson() {
+  const path = join(HOME, '.claude', 'hypo-pkg.json');
+  if (!existsSync(path)) return { status: 'missing', path };
+  try {
+    const v = JSON.parse(readFileSync(path, 'utf-8')).pkgRoot;
+    if (typeof v !== 'string' || !v) return { status: 'missing', path };
+    if (v !== PKG_ROOT) return { status: 'stale', path, installed: v, current: PKG_ROOT };
+    return { status: 'up-to-date', path };
+  } catch {
+    return { status: 'missing', path };
+  }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -252,15 +265,18 @@ const args = parseArgs(process.argv);
 const schema   = checkSchemaVersion(args.wikiDir);
 const hooks    = checkHookFiles();
 const settings = checkSettingsJson();
+const pkgJson  = checkPkgJson();
 
 const staleHooks      = hooks.filter(h => h.status === 'stale' || h.status === 'missing' || h.status === 'src-missing');
 const missingSettings = settings.filter(s => s.status === 'missing');
 const invalidSettings = settings.some(s => s.status === 'invalid-json');
 const schemaDrift     = schema.bump !== 'none' && schema.bump !== 'unknown' && schema.bump !== 'ahead';
+const pkgJsonDrift    = pkgJson.status !== 'up-to-date';
 
-let migrationPath   = null;
-let appliedHooks    = [];
-let appliedSettings = [];
+let migrationPath    = null;
+let appliedHooks     = [];
+let appliedSettings  = [];
+let appliedPkgJson   = false;
 
 if (args.apply) {
   if (schema.bump === 'major' && schema.installed && schema.current && existsSync(args.wikiDir)) {
@@ -268,18 +284,22 @@ if (args.apply) {
   }
   appliedHooks    = applyHookFiles(hooks);
   appliedSettings = applySettingsJson(settings);
+  const pkgJsonPath = join(HOME, '.claude', 'hypo-pkg.json');
+  writeFileSync(pkgJsonPath, JSON.stringify({ pkgRoot: PKG_ROOT }, null, 2) + '\n');
+  appliedPkgJson = true;
 }
 
 // ── output ───────────────────────────────────────────────────────────────────
 
-const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings;
+const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings || pkgJsonDrift;
 
 if (args.json) {
   console.log(JSON.stringify({
     schema,
     hooks,
     settings,
-    applied: { hooks: appliedHooks, settings: appliedSettings },
+    pkgJson,
+    applied: { hooks: appliedHooks, settings: appliedSettings, pkgJson: appliedPkgJson },
     migrationReport: migrationPath,
   }, null, 2));
   process.exit(hasDrift && !args.apply ? 1 : 0);
@@ -339,6 +359,15 @@ if (invalidSettings) {
   }
 }
 
+// Package metadata
+if (pkgJson.status === 'up-to-date') {
+  lines.push(`✓ Package metadata  hypo-pkg.json up to date`);
+} else if (pkgJson.status === 'stale') {
+  lines.push(`⚠ Package metadata  hypo-pkg.json stale (${pkgJson.installed} → ${pkgJson.current}) — run --apply to update`);
+} else {
+  lines.push(`✗ Package metadata  hypo-pkg.json missing — run --apply to install`);
+}
+
 // Migration report notice
 if (migrationPath) {
   lines.push('');
@@ -347,7 +376,7 @@ if (migrationPath) {
 }
 
 // Applied actions
-if (appliedHooks.length > 0 || appliedSettings.length > 0) {
+if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson) {
   lines.push('');
   if (appliedHooks.length > 0) {
     lines.push(`✓ Updated hook files (${appliedHooks.length}):`);
@@ -357,15 +386,18 @@ if (appliedHooks.length > 0 || appliedSettings.length > 0) {
     lines.push(`✓ Merged settings.json entries (${appliedSettings.length}):`);
     for (const e of appliedSettings) lines.push(`    → ${e}`);
   }
+  if (appliedPkgJson) {
+    lines.push(`✓ Written package metadata: ~/.claude/hypo-pkg.json`);
+  }
 }
 
 // Summary
 lines.push('');
-const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0);
+const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0) + (pkgJsonDrift ? 1 : 0);
 if (totalDrift === 0) {
   lines.push('Result: wiki is up to date');
 } else if (args.apply) {
-  const total = appliedHooks.length + appliedSettings.length;
+  const total = appliedHooks.length + appliedSettings.length + (appliedPkgJson ? 1 : 0);
   lines.push(`Result: ${total} update(s) applied. Run /hypo:doctor to verify.`);
 } else {
   lines.push(`Result: ${totalDrift} item(s) need updating — run with --apply to install`);

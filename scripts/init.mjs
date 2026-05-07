@@ -207,6 +207,15 @@ echo "[post-commit] hooks/ changed — syncing to ~/.claude/hooks/ ..."
 node "$REPO_ROOT/scripts/upgrade.mjs" --apply
 `;
 
+function writePkgJson(dryRun) {
+  const dest = join(HOME, '.claude', 'hypo-pkg.json');
+  if (!dryRun) {
+    mkdirSync(join(HOME, '.claude'), { recursive: true });
+    writeFileSync(dest, JSON.stringify({ pkgRoot: PKG_ROOT }, null, 2) + '\n');
+    log('created', dest);
+  }
+}
+
 function installPkgGitHook(dryRun) {
   const gitDir = join(PKG_ROOT, '.git');
   if (!existsSync(gitDir)) return;
@@ -278,6 +287,7 @@ if (args.hooks) {
   const claudeHooks = join(HOME, '.claude', 'hooks');
   installHooks(claudeHooks, args.dryRun);
   mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun, HOOK_MAP);
+  writePkgJson(args.dryRun);
 }
 
 // 5. codex hooks (optional)

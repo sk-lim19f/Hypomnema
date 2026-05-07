@@ -15,6 +15,7 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import {
   WIKI_DIR,
+  PKG_ROOT,
   lastSubstantialOpIsSession,
   wikiIsClean,
   hotMdIsClean,
@@ -29,7 +30,7 @@ const gitStatus  = wikiIsClean();
 const hotStatus  = hotMdIsClean();
 
 // Lint blocker check (non-fatal if lint script missing)
-const lintPath = join(WIKI_DIR, 'scripts', 'lint.mjs');
+const lintPath = join(PKG_ROOT ?? WIKI_DIR, 'scripts', 'lint.mjs');
 let lintBlockers = [];
 let lintW8 = [];
 try {
