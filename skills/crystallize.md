@@ -7,7 +7,7 @@ You are running `/hypo:crystallize`. Find pages that are ready to be consolidate
 ## What this does
 
 - Finds tag groups with ≥ N pages sharing the same tag (synthesis candidates)
-- Lists orphan pages (no inbound `[[wikilinks]]`)
+- Lists orphan pages (no outbound `[[wikilinks]]`)
 - Lists draft / stub pages that could be fleshed out
 - After the script runs, you help the user pick what to crystallize and do it
 

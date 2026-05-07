@@ -9,7 +9,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 
 const HOME = homedir();
 
@@ -72,10 +72,11 @@ export function lastSubstantialOpIsSession() {
 
 export function wikiIsClean() {
   try {
-    const porcelain = execSync(`git -C "${WIKI_DIR}" status --porcelain`, { encoding: 'utf-8' }).trim();
-    if (porcelain !== '') return { clean: false, reason: `uncommitted changes in ${WIKI_DIR}` };
-    const ahead = execSync(`git -C "${WIKI_DIR}" status --branch --porcelain`, { encoding: 'utf-8' });
-    if (/\[ahead \d+\]/.test(ahead)) return { clean: false, reason: `unpushed commits in ${WIKI_DIR}` };
+    const porcelain = spawnSync('git', ['-C', WIKI_DIR, 'status', '--porcelain'], { encoding: 'utf-8' });
+    if (porcelain.status !== 0) return { clean: false, reason: `git check failed in ${WIKI_DIR}` };
+    if (porcelain.stdout.trim() !== '') return { clean: false, reason: `uncommitted changes in ${WIKI_DIR}` };
+    const ahead = spawnSync('git', ['-C', WIKI_DIR, 'status', '--branch', '--porcelain'], { encoding: 'utf-8' });
+    if (/\[ahead \d+\]/.test(ahead.stdout || '')) return { clean: false, reason: `unpushed commits in ${WIKI_DIR}` };
     return { clean: true };
   } catch {
     return { clean: false, reason: `git check failed in ${WIKI_DIR}` };

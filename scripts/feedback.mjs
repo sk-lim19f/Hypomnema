@@ -18,7 +18,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
@@ -114,6 +114,11 @@ if (args.list) {
 
 if (!args.topic) {
   console.error('Error: --topic=<slug> is required (or use --list)');
+  process.exit(1);
+}
+
+if (!/^[a-z0-9][a-z0-9._-]*$/i.test(args.topic)) {
+  console.error('Error: --topic must be a simple slug (letters, digits, hyphen, dot, underscore)');
   process.exit(1);
 }
 

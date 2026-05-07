@@ -54,7 +54,7 @@ For the chosen source, read its content and create `pages/<slug>.md` with the fo
 ---
 title: <descriptive title>
 type: source-summary
-source: sources/<filename>
+source: <filename>
 tags: [<relevant tags>]
 updated: <today YYYY-MM-DD>
 evidence_strength: direct   # or inferred

@@ -8,11 +8,18 @@
 import { spawnSync } from 'child_process';
 import { WIKI_DIR } from './wiki-shared.mjs';
 
-const input = JSON.parse(await new Promise(r => {
-  let d = '';
-  process.stdin.on('data', c => d += c);
-  process.stdin.on('end', () => r(d));
-}));
+let input = {};
+try {
+  const raw = await new Promise(r => {
+    let d = '';
+    process.stdin.on('data', c => d += c);
+    process.stdin.on('end', () => r(d));
+  });
+  input = JSON.parse(raw);
+} catch {
+  console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+  process.exit(0);
+}
 
 const filePath = input.tool_input?.file_path ?? '';
 
