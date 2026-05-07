@@ -16,6 +16,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, extname } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -31,13 +32,14 @@ function parseArgs(argv) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectMdFiles(dir, acc = []) {
+function collectMdFiles(dir, acc = [], wikiDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
+    if (wikiDir && isIgnored(full, wikiDir, ignorePatterns)) continue;
     const st = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc);
+    if (st.isDirectory()) collectMdFiles(full, acc, wikiDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
@@ -75,10 +77,11 @@ function getLastActivity(wikiDir) {
 
 const args = parseArgs(process.argv);
 
-const pageFiles = collectMdFiles(join(args.wikiDir, 'pages'));
+const ignorePatterns = loadWikiIgnore(args.wikiDir);
+const pageFiles = collectMdFiles(join(args.wikiDir, 'pages'), [], args.wikiDir, ignorePatterns);
 const projects  = listDirs(join(args.wikiDir, 'projects'));
 const sources   = existsSync(join(args.wikiDir, 'sources'))
-  ? readdirSync(join(args.wikiDir, 'sources')).filter(e => !e.startsWith('.'))
+  ? readdirSync(join(args.wikiDir, 'sources')).filter(e => !e.startsWith('.') && !isIgnored(join(args.wikiDir, 'sources', e), args.wikiDir, ignorePatterns))
   : [];
 
 const typeCounts = {};

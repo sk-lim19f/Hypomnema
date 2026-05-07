@@ -20,6 +20,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { parseFrontmatter } from './lib/frontmatter.mjs';
 
 const HOME       = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -38,22 +39,6 @@ function parseArgs(argv) {
   }
   if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
   return args;
-}
-
-// ── frontmatter parser ───────────────────────────────────────────────────────
-
-function parseFrontmatter(content) {
-  const m = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!m) return {};
-  const fm = {};
-  for (const line of m[1].split('\n')) {
-    const idx = line.indexOf(':');
-    if (idx < 0) continue;
-    const key = line.slice(0, idx).trim();
-    const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
-    fm[key] = val;
-  }
-  return fm;
 }
 
 // ── version helpers ──────────────────────────────────────────────────────────
@@ -113,10 +98,10 @@ function checkSchemaVersion(wikiDir) {
   const wikiPath = join(wikiDir, 'SCHEMA.md');
 
   const pkgVersion  = existsSync(pkgPath)
-    ? parseVersion(parseFrontmatter(readFileSync(pkgPath, 'utf-8')).version)
+    ? parseVersion((parseFrontmatter(readFileSync(pkgPath, 'utf-8')) ?? {}).version)
     : null;
   const wikiVersion = existsSync(wikiPath)
-    ? parseVersion(parseFrontmatter(readFileSync(wikiPath, 'utf-8')).version)
+    ? parseVersion((parseFrontmatter(readFileSync(wikiPath, 'utf-8')) ?? {}).version)
     : null;
 
   return {

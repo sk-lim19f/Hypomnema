@@ -17,6 +17,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
@@ -33,13 +34,14 @@ function parseArgs(argv) {
 
 // ── page collector ────────────────────────────────────────────────────────────
 
-function collectPages(dir, root, pages = []) {
+function collectPages(dir, root, pages = [], ignorePatterns = []) {
   if (!existsSync(dir)) return pages;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
+    if (isIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) {
-      collectPages(full, root, pages);
+      collectPages(full, root, pages, ignorePatterns);
     } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
       const slug = relative(root, full).replace(/\.md$/, '').replace(/\\/g, '/');
       pages.push({ path: full, slug, bare: basename(full, '.md') });
@@ -97,6 +99,11 @@ function buildGraph(pages, slugIndex) {
   return { edges, inDegree, outDegree };
 }
 
+// ── label escapers ────────────────────────────────────────────────────────────
+
+function escapeMermaid(s) { return s.replace(/"/g, '#quot;'); }
+function escapeDot(s)     { return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"'); }
+
 // ── formatters ────────────────────────────────────────────────────────────────
 
 function formatJson(pages, graph, minEdges) {
@@ -133,7 +140,7 @@ function formatMermaid(pages, graph, minEdges) {
     if (activeNodes.has(from) && activeNodes.has(to)) {
       const f = from.replace(/[^a-zA-Z0-9_]/g, '_');
       const t = to.replace(/[^a-zA-Z0-9_]/g, '_');
-      lines.push(`  ${f}["${from}"] --> ${t}["${to}"]`);
+      lines.push(`  ${f}["${escapeMermaid(from)}"] --> ${t}["${escapeMermaid(to)}"]`);
     }
   }
   return lines.join('\n');
@@ -152,7 +159,7 @@ function formatDot(pages, graph, minEdges) {
   const lines = ['digraph wiki {', '  rankdir=LR;'];
   for (const { from, to } of graph.edges) {
     if (activeNodes.has(from) && activeNodes.has(to)) {
-      lines.push(`  "${from}" -> "${to}";`);
+      lines.push(`  "${escapeDot(from)}" -> "${escapeDot(to)}";`);
     }
   }
   lines.push('}');
@@ -163,8 +170,9 @@ function formatDot(pages, graph, minEdges) {
 
 const args = parseArgs(process.argv);
 
+const ignorePatterns = loadWikiIgnore(args.wikiDir);
 const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-const pages    = scanDirs.flatMap(d => collectPages(d, args.wikiDir));
+const pages    = scanDirs.flatMap(d => collectPages(d, args.wikiDir, [], ignorePatterns));
 const slugIndex = buildSlugIndex(pages);
 const graph    = buildGraph(pages, slugIndex);
 

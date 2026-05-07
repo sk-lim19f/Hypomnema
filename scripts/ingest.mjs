@@ -17,6 +17,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, extname, basename } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -32,13 +33,14 @@ function parseArgs(argv) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectMdFiles(dir, acc = []) {
+function collectMdFiles(dir, acc = [], wikiDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
+    if (wikiDir && isIgnored(full, wikiDir, ignorePatterns)) continue;
     const st = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc);
+    if (st.isDirectory()) collectMdFiles(full, acc, wikiDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
@@ -60,13 +62,14 @@ function parseFrontmatter(content) {
 
 const args = parseArgs(process.argv);
 
+const ignorePatterns = loadWikiIgnore(args.wikiDir);
 const sourcesDir = join(args.wikiDir, 'sources');
 const allSources = existsSync(sourcesDir)
-  ? readdirSync(sourcesDir).filter(e => !e.startsWith('.') && !statSync(join(sourcesDir, e)).isDirectory())
+  ? readdirSync(sourcesDir).filter(e => !e.startsWith('.') && !statSync(join(sourcesDir, e)).isDirectory() && !isIgnored(join(sourcesDir, e), args.wikiDir, ignorePatterns))
   : [];
 
 // collect all source: references in wiki pages
-const pageFiles = collectMdFiles(join(args.wikiDir, 'pages'));
+const pageFiles = collectMdFiles(join(args.wikiDir, 'pages'), [], args.wikiDir, ignorePatterns);
 const referencedSources = new Set();
 
 for (const f of pageFiles) {

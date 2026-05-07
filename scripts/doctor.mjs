@@ -18,6 +18,8 @@ import { homedir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
+import { parseFrontmatter } from './lib/frontmatter.mjs';
 
 const HOME     = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -184,8 +186,8 @@ function checkGit(wikiDir) {
   }
 }
 
-function checkBrokenLinks(wikiDir) {
-  const mdFiles = collectMdFiles(wikiDir);
+function checkBrokenLinks(wikiDir, ignorePatterns = []) {
+  const mdFiles = collectMdFiles(wikiDir, [], wikiDir, ignorePatterns);
   const slugSet = buildSlugSet(mdFiles, wikiDir);
   const broken = [];
 
@@ -211,13 +213,14 @@ function checkBrokenLinks(wikiDir) {
   }
 }
 
-function collectMdFiles(dir, acc = []) {
+function collectMdFiles(dir, acc = [], wikiDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
+    if (wikiDir && isIgnored(full, wikiDir, ignorePatterns)) continue;
     const st   = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc);
+    if (st.isDirectory()) collectMdFiles(full, acc, wikiDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
@@ -238,9 +241,9 @@ function buildSlugSet(files, wikiDir) {
   return set;
 }
 
-function checkVerifyBy(wikiDir) {
+function checkVerifyBy(wikiDir, ignorePatterns = []) {
   const today    = new Date().toISOString().slice(0, 10);
-  const mdFiles  = collectMdFiles(wikiDir);
+  const mdFiles  = collectMdFiles(wikiDir, [], wikiDir, ignorePatterns);
   const overdue  = [];
   const missing  = [];
 
@@ -276,30 +279,17 @@ function checkVerifyBy(wikiDir) {
   }
 }
 
-function parseFrontmatter(content) {
-  const m = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!m) return null;
-  const fm = {};
-  for (const line of m[1].split('\n')) {
-    const idx = line.indexOf(':');
-    if (idx < 0) continue;
-    const key = line.slice(0, idx).trim();
-    const val = line.slice(idx + 1).trim().replace(/\s*#.*$/, '').replace(/^["']|["']$/g, '');
-    fm[key] = val;
-  }
-  return fm;
-}
-
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
 
+const ignorePatterns = loadWikiIgnore(args.wikiDir);
 const rootOk = checkWikiRoot(args.wikiDir);
 if (rootOk) {
   checkDirectories(args.wikiDir);
   checkFiles(args.wikiDir);
-  checkBrokenLinks(args.wikiDir);
-  checkVerifyBy(args.wikiDir);
+  checkBrokenLinks(args.wikiDir, ignorePatterns);
+  checkVerifyBy(args.wikiDir, ignorePatterns);
 }
 checkHooks();
 checkSettingsJson();
