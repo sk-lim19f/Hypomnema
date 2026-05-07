@@ -7,14 +7,15 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-const HOME     = homedir();
-const REPO     = join(fileURLToPath(new URL('.', import.meta.url)), '..');
-const SCRIPTS  = join(REPO, 'scripts');
+const HOME           = homedir();
+const REPO           = join(fileURLToPath(new URL('.', import.meta.url)), '..');
+const SCRIPTS        = join(REPO, 'scripts');
+const NONEXISTENT_WIKI = join(tmpdir(), `hypo-no-wiki-${process.pid}`);
 
 // ── minimal test harness ─────────────────────────────────────────────────────
 
@@ -64,6 +65,18 @@ function withTmpDir(fn) {
   try { fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
+function withTmpHome(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-home-'));
+  try { fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+function runWithHome(script, args = [], home) {
+  return spawnSync(process.execPath, [join(SCRIPTS, script), ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '', HOME: home },
+  });
+}
+
 // ── lib/wiki-root.mjs ────────────────────────────────────────────────────────
 
 const { expandHome, resolveWikiRoot } = await import(`${SCRIPTS}/lib/wiki-root.mjs`);
@@ -110,16 +123,20 @@ test('falls back to ~/wiki when no env or marker found', () => {
 });
 
 test('finds wiki by hypo-config.md marker', () => {
-  withTmpDir(dir => {
-    writeFileSync(join(dir, 'hypo-config.md'), '# config');
-    const orig = process.env.HYPO_DIR;
-    delete process.env.HYPO_DIR;
-    // We can't easily override the candidate list, so just verify the function
-    // returns a string without throwing
+  const orig = process.env.HYPO_DIR;
+  delete process.env.HYPO_DIR;
+  try {
     const result = resolveWikiRoot();
-    assert.ok(typeof result === 'string');
+    assert.ok(typeof result === 'string' && result.length > 0, 'should return non-empty string');
+    assert.ok(result.startsWith('/'), 'should return an absolute path');
+    // Either the returned path has hypo-config.md (marker scan worked), or it is the ~/wiki default
+    const isDefault = result === join(HOME, 'wiki');
+    const hasMarker = existsSync(join(result, 'hypo-config.md'));
+    assert.ok(isDefault || hasMarker,
+      `resolveWikiRoot returned "${result}" which is neither the default nor has hypo-config.md`);
+  } finally {
     if (orig !== undefined) process.env.HYPO_DIR = orig;
-  });
+  }
 });
 
 // ── init.mjs smoke tests ─────────────────────────────────────────────────────
@@ -184,13 +201,22 @@ test('actual run creates expected directories', () => {
   });
 });
 
+test('--no-hooks succeeds without touching hook config', () => {
+  withTmpDir(dir => {
+    const wikiDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `--no-hooks should exit 0: ${r.stderr}`);
+    assert.ok(existsSync(join(wikiDir, 'index.md')), 'wiki files should still be created');
+  });
+});
+
 // ── doctor.mjs smoke tests ───────────────────────────────────────────────────
 
 suite('doctor.mjs --json');
 
 test('exits without crashing on non-existent wiki dir', () => {
   const r = run('doctor.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   // doctor may exit 1 (failures found) but should not crash (exit 2+)
@@ -200,7 +226,7 @@ test('exits without crashing on non-existent wiki dir', () => {
 
 test('--json output is valid JSON', () => {
   const r = run('doctor.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout not JSON: ${r.stdout}`);
@@ -208,7 +234,7 @@ test('--json output is valid JSON', () => {
 
 test('JSON output is an array of check objects', () => {
   const r = run('doctor.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const out = JSON.parse(r.stdout);
@@ -409,7 +435,7 @@ suite('upgrade.mjs --json');
 
 test('exits without crashing on non-existent wiki dir', () => {
   const r = run('upgrade.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   assert.ok(r.status !== null, 'process did not exit cleanly');
@@ -418,7 +444,7 @@ test('exits without crashing on non-existent wiki dir', () => {
 
 test('--json output is valid JSON', () => {
   const r = run('upgrade.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout not JSON: ${r.stdout}`);
@@ -426,7 +452,7 @@ test('--json output is valid JSON', () => {
 
 test('JSON output has required top-level fields', () => {
   const r = run('upgrade.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const out = JSON.parse(r.stdout);
@@ -438,7 +464,7 @@ test('JSON output has required top-level fields', () => {
 
 test('schema object has installed/current/bump fields', () => {
   const r = run('upgrade.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { schema } = JSON.parse(r.stdout);
@@ -449,7 +475,7 @@ test('schema object has installed/current/bump fields', () => {
 
 test('hooks is an array of file/status objects', () => {
   const r = run('upgrade.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { hooks } = JSON.parse(r.stdout);
@@ -461,7 +487,7 @@ test('hooks is an array of file/status objects', () => {
 
 test('settings is an array of event/file/status objects', () => {
   const r = run('upgrade.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { settings } = JSON.parse(r.stdout);
@@ -474,7 +500,7 @@ test('settings is an array of event/file/status objects', () => {
 
 test('applied object has hooks and settings arrays', () => {
   const r = run('upgrade.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { applied } = JSON.parse(r.stdout);
@@ -484,7 +510,7 @@ test('applied object has hooks and settings arrays', () => {
 
 test('schema.installed is null and bump is "unknown" for non-existent wiki', () => {
   const r = run('upgrade.mjs', [
-    '--wiki-dir=/tmp/nonexistent-hypo-wiki-99999',
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { schema } = JSON.parse(r.stdout);
@@ -496,16 +522,69 @@ test('schema.installed is null and bump is "unknown" for non-existent wiki', () 
 });
 
 test('--apply on tmp wiki exits 0 after applying available changes', () => {
-  withTmpDir(dir => {
-    const wikiDir = join(dir, 'wiki');
-    // First init the wiki so schema exists
-    run('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-hooks', '--no-git-init']);
-    const r = run('upgrade.mjs', [`--wiki-dir=${wikiDir}`, '--json', '--apply']);
-    const out = JSON.parse(r.stdout);
-    assert.ok('applied' in out, 'applied field missing after --apply');
-    // Should exit 0 (all drift resolved) or 1 (some items can't auto-apply)
-    assert.ok(r.status <= 1, `unexpected exit code ${r.status}`);
+  withTmpHome(home => {
+    withTmpDir(dir => {
+      const wikiDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const r = runWithHome('upgrade.mjs', [`--wiki-dir=${wikiDir}`, '--json', '--apply'], home);
+      assert.equal(r.signal, null, `process killed with signal: ${r.signal}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok('applied' in out, 'applied field missing after --apply');
+      assert.ok(Array.isArray(out.applied.hooks), 'applied.hooks should be an array');
+      assert.ok(Array.isArray(out.applied.settings), 'applied.settings should be an array');
+      assert.equal(r.status, 0, `expected exit 0 after --apply: ${r.stderr}`);
+    });
   });
+});
+
+// ── lint.mjs --fix tests ─────────────────────────────────────────────────────
+
+suite('lint.mjs --fix');
+
+function lintFix(content) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-'));
+  const pagesDir = join(dir, 'pages');
+  mkdirSync(pagesDir);
+  writeFileSync(join(pagesDir, 'test.md'), content);
+  const r = run('lint.mjs', [`--wiki-dir=${dir}`, '--fix', '--json']);
+  const fixed = readFileSync(join(pagesDir, 'test.md'), 'utf-8');
+  rmSync(dir, { recursive: true, force: true });
+  return { r, fixed };
+}
+
+test('--fix inserts updated into LF frontmatter', () => {
+  const { fixed } = lintFix('---\ntitle: T\ntype: concept\n---\nbody\n');
+  const fm = fixed.slice(0, fixed.indexOf('\n---\n') + 5);
+  assert.ok(fm.includes('updated:'), 'updated not inserted into frontmatter');
+  assert.ok(!fixed.slice(fixed.indexOf('\n---\n') + 5).includes('updated:'), 'updated inserted outside frontmatter');
+});
+
+test('--fix inserts updated into CRLF frontmatter', () => {
+  const { fixed } = lintFix('---\r\ntitle: T\r\ntype: concept\r\n---\r\nbody\r\n');
+  assert.ok(fixed.includes('updated:'), 'updated not inserted');
+  const fmEnd = fixed.indexOf('\r\n---\r\n');
+  assert.ok(fixed.indexOf('updated:') < fmEnd, 'updated inserted outside frontmatter');
+});
+
+test('--fix handles mixed line endings (LF frontmatter + CRLF body)', () => {
+  const { fixed } = lintFix('---\ntitle: T\ntype: concept\n---\r\nbody\r\n');
+  const fmEnd = fixed.indexOf('\n---\r\n');
+  assert.ok(fmEnd > 0, 'frontmatter closing not found');
+  const updatedPos = fixed.indexOf('updated:');
+  assert.ok(updatedPos > 0 && updatedPos < fmEnd, `updated at ${updatedPos}, fm closes at ${fmEnd}`);
+});
+
+test('--fix skips file with no frontmatter', () => {
+  const { fixed } = lintFix('# No frontmatter here\nbody\n');
+  assert.ok(!fixed.includes('updated:'), 'should not insert updated into file without frontmatter');
+});
+
+test('--json output omits internal path field', () => {
+  const { r } = lintFix('---\ntitle: T\ntype: concept\n---\nbody\n');
+  const out = JSON.parse(r.stdout);
+  const allIssues = [...(out.errors || []), ...(out.warns || [])];
+  assert.ok(allIssues.every(i => !('path' in i)), 'path field leaked into JSON output');
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
