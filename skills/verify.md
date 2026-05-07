@@ -7,7 +7,7 @@ You are running `/hypo:verify`. Check all wiki pages for `verify_by` and `verify
 ## What this does
 
 - Scans all pages for `verify_by` (a question to re-check) and `verify_by_date` (deadline)
-- Groups results: **overdue**, **due soon** (within 30 days), and **ok**
+- Groups results: **overdue**, **due soon** (within 14 days), and **ok**
 - After the script runs, you help the user review and update each overdue page
 
 ---
@@ -40,7 +40,7 @@ Show the output verbatim.
 ## Step 3 — Interpret results
 
 - **overdue** — `verify_by_date` is in the past; the page needs immediate review
-- **due soon** — `verify_by_date` is within 30 days; worth reviewing this session
+- **due soon** — `verify_by_date` is within 14 days; worth reviewing this session
 - **ok** — no verify fields, or deadline is far enough out
 
 A page with `verify_by` but no `verify_by_date` is treated as **due soon** (undated verification intent).
