@@ -86,6 +86,14 @@ See [docs/PRIVACY.md](docs/PRIVACY.md) for the full privacy guide, including wha
 
 ---
 
+## Docs
+
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — internals, component map, data flows
+- [CONTRIBUTING.md](docs/CONTRIBUTING.md) — development setup, conventions, PR process
+- [PRIVACY.md](docs/PRIVACY.md) — privacy modes, `.wikiignore`, data handling
+
+---
+
 ## License
 
 MIT
