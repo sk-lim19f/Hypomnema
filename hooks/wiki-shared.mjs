@@ -45,6 +45,14 @@ export const LOG_PATH   = join(WIKI_DIR, 'log.md');
 export const HOT_PATH   = join(WIKI_DIR, 'hot.md');
 export const GUIDE_PATH = join(WIKI_DIR, 'wiki-guide.md');
 
+// Package root: written by init/upgrade to ~/.claude/hypo-pkg.json
+function resolvePkgRoot() {
+  const p = join(HOME, '.claude', 'hypo-pkg.json');
+  if (!existsSync(p)) return null;
+  try { const v = JSON.parse(readFileSync(p, 'utf-8')).pkgRoot; return typeof v === 'string' && v ? v : null; } catch { return null; }
+}
+export const PKG_ROOT = resolvePkgRoot();
+
 // Optional H2 allowlist for hot.md validation.
 // Set HYPO_ALLOWED_HOT_H2=comma,separated,headings to enable.
 const _allowedH2Env = process.env.HYPO_ALLOWED_HOT_H2;
