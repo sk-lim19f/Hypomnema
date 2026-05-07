@@ -194,6 +194,32 @@ function mergeSettingsJson(settingsPath, hooksDir, dryRun, hookMap) {
   }
 }
 
+// ── pkg git hook ────────────────────────────────────────────────────────────
+
+const PKG_GIT_HOOK_CONTENT = `#!/bin/sh
+# Auto-sync hooks/ to ~/.claude/hooks/ when hook files change.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+changed=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '^hooks/')
+if [ -z "$changed" ]; then
+  exit 0
+fi
+echo "[post-commit] hooks/ changed — syncing to ~/.claude/hooks/ ..."
+node "$REPO_ROOT/scripts/upgrade.mjs" --apply
+`;
+
+function installPkgGitHook(dryRun) {
+  const gitDir = join(PKG_ROOT, '.git');
+  if (!existsSync(gitDir)) return;
+  const hooksDir = join(gitDir, 'hooks');
+  const hookPath = join(hooksDir, 'post-commit');
+  if (existsSync(hookPath)) { log('skipped', hookPath); return; }
+  if (!dryRun) {
+    mkdirSync(hooksDir, { recursive: true });
+    writeFileSync(hookPath, PKG_GIT_HOOK_CONTENT, { mode: 0o755 });
+  }
+  log('created', hookPath);
+}
+
 // ── git setup ────────────────────────────────────────────────────────────────
 
 function git(wikiDir, args, opts = {}) {
@@ -264,6 +290,11 @@ if (args.codex) {
 // 6. git setup
 if (args.gitInit) {
   gitSetup(args.wikiDir, args.gitRemote, args.dryRun);
+}
+
+// 7. pkg repo git hook (auto-sync hooks/ → ~/.claude/hooks/ on commit)
+if (args.hooks) {
+  installPkgGitHook(args.dryRun);
 }
 
 // ── report ───────────────────────────────────────────────────────────────────
