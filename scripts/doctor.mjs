@@ -52,8 +52,26 @@ try {
   console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
   process.exit(1);
 }
-const HOOK_MAP     = _hookConfig.hooks   ?? {};
-const SHARED_FILES = _hookConfig.shared  ?? [];
+if (!_hookConfig || typeof _hookConfig !== 'object' || Array.isArray(_hookConfig)) {
+  console.error('Error: hooks/hooks.json must be a JSON object');
+  process.exit(1);
+}
+if (!_hookConfig.hooks || typeof _hookConfig.hooks !== 'object' || Array.isArray(_hookConfig.hooks)) {
+  console.error('Error: hooks/hooks.json must contain a "hooks" object');
+  process.exit(1);
+}
+for (const [event, files] of Object.entries(_hookConfig.hooks)) {
+  if (!Array.isArray(files) || !files.every(f => typeof f === 'string' && f.length > 0)) {
+    console.error(`Error: hooks/hooks.json "hooks.${event}" must be an array of non-empty strings`);
+    process.exit(1);
+  }
+}
+if (_hookConfig.shared !== undefined && (!Array.isArray(_hookConfig.shared) || !_hookConfig.shared.every(f => typeof f === 'string' && f.length > 0))) {
+  console.error('Error: hooks/hooks.json "shared" must be an array of non-empty strings');
+  process.exit(1);
+}
+const HOOK_MAP     = _hookConfig.hooks;
+const SHARED_FILES = _hookConfig.shared ?? [];
 
 // ── checks ───────────────────────────────────────────────────────────────────
 

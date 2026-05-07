@@ -9,7 +9,7 @@
  *   node scripts/init.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>    Wiki root directory (default: ~/wiki)
+ *   --wiki-dir=<path>    Wiki root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/wiki)
  *   --privacy=<mode>     personal | shared | public  (default: personal)
  *   --no-hooks           Skip hook installation
  *   --codex              Also install Codex hooks (~/.codex/hooks/)
@@ -122,14 +122,34 @@ function writeWikiignore(wikiDir, privacy, dryRun) {
 
 // ── hook installation ────────────────────────────────────────────────────────
 
-let _hooksJson;
-try {
-  _hooksJson = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
-} catch {
-  console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
-  process.exit(1);
+function loadHookMap() {
+  let cfg;
+  try {
+    cfg = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
+  } catch {
+    console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
+    process.exit(1);
+  }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    console.error('Error: hooks/hooks.json must be a JSON object');
+    process.exit(1);
+  }
+  if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
+    console.error('Error: hooks/hooks.json must contain a "hooks" object');
+    process.exit(1);
+  }
+  for (const [event, files] of Object.entries(cfg.hooks)) {
+    if (!Array.isArray(files) || !files.every(f => typeof f === 'string' && f.length > 0)) {
+      console.error(`Error: hooks/hooks.json "hooks.${event}" must be an array of non-empty strings`);
+      process.exit(1);
+    }
+  }
+  if (cfg.shared !== undefined && (!Array.isArray(cfg.shared) || !cfg.shared.every(f => typeof f === 'string' && f.length > 0))) {
+    console.error('Error: hooks/hooks.json "shared" must be an array of non-empty strings');
+    process.exit(1);
+  }
+  return cfg.hooks;
 }
-const HOOK_MAP = _hooksJson.hooks ?? {};
 
 function installHooks(targetDir, dryRun) {
   if (!existsSync(HOOKS_SRC)) { log('errors', `hooks source missing: ${HOOKS_SRC}`); return; }
@@ -143,7 +163,7 @@ function installHooks(targetDir, dryRun) {
   }
 }
 
-function mergeSettingsJson(settingsPath, hooksDir, dryRun) {
+function mergeSettingsJson(settingsPath, hooksDir, dryRun, hookMap) {
   let settings = {};
   if (existsSync(settingsPath)) {
     try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')); } catch {
@@ -154,7 +174,7 @@ function mergeSettingsJson(settingsPath, hooksDir, dryRun) {
   if (!settings.hooks) settings.hooks = {};
 
   let changed = false;
-  for (const [event, files] of Object.entries(HOOK_MAP)) {
+  for (const [event, files] of Object.entries(hookMap)) {
     if (!Array.isArray(settings.hooks[event])) settings.hooks[event] = [];
     for (const file of files) {
       const cmd = `node ${hooksDir.replace(HOME, '$HOME')}/${file}`;
@@ -208,6 +228,9 @@ function gitSetup(wikiDir, remote, dryRun) {
 
 const args = parseArgs(process.argv);
 
+// Validate hooks.json before any file writes so a bad package leaves no partial state
+const HOOK_MAP = (args.hooks || args.codex) ? loadHookMap() : null;
+
 // 1. wiki directory structure
 ensureDir(args.wikiDir, args.dryRun);
 for (const d of WIKI_DIRS) ensureDir(join(args.wikiDir, d), args.dryRun);
@@ -224,17 +247,18 @@ writeHypoConfig(args.wikiDir, args.privacy, args.dryRun);
 writeWikiignore(args.wikiDir, args.privacy, args.dryRun);
 
 // 4. hooks
+
 if (args.hooks) {
   const claudeHooks = join(HOME, '.claude', 'hooks');
   installHooks(claudeHooks, args.dryRun);
-  mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun);
+  mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun, HOOK_MAP);
 }
 
 // 5. codex hooks (optional)
 if (args.codex) {
   const codexHooks = join(HOME, '.codex', 'hooks');
   installHooks(codexHooks, args.dryRun);
-  mergeSettingsJson(join(HOME, '.codex', 'settings.json'), codexHooks, args.dryRun);
+  mergeSettingsJson(join(HOME, '.codex', 'settings.json'), codexHooks, args.dryRun, HOOK_MAP);
 }
 
 // 6. git setup
