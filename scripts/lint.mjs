@@ -16,6 +16,7 @@
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/wiki-shared.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -97,6 +98,23 @@ function issue(severity, rel, msg, fullPath = null) {
   issues.push({ severity, file: rel, message: msg, path: fullPath });
 }
 
+function hasHeading(content, heading) {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^##\\s+${escaped}\\s*$`, 'm').test(content);
+}
+
+function lintSessionStateHeadings(content, rel) {
+  if (!rel.match(/^projects\/[^/]+\/session-state\.md$/)) return;
+
+  if (!SESSION_STATE_NEXT_HEADINGS.some(heading => hasHeading(content, heading))) {
+    issue(
+      'error',
+      rel,
+      `Missing required session-state heading: one of ${SESSION_STATE_NEXT_HEADINGS.map(h => `## ${h}`).join(', ')}`
+    );
+  }
+}
+
 function lintPage({ path, rel }, slugMap) {
   let content;
   try { content = readFileSync(path, 'utf-8'); } catch { return; }
@@ -123,6 +141,8 @@ function lintPage({ path, rel }, slugMap) {
   if (!fm.updated) {
     issue('warn', rel, 'Missing frontmatter field: updated', path);
   }
+
+  lintSessionStateHeadings(content, rel);
 
   for (const link of extractWikilinks(content)) {
     if (!slugMap.has(link) && !slugMap.has(link.replace(/\//g, path.sep))) {

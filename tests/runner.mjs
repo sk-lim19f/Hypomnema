@@ -587,6 +587,34 @@ test('--json output omits internal path field', () => {
   assert.ok(allIssues.every(i => !('path' in i)), 'path field leaked into JSON output');
 });
 
+suite('lint.mjs session-state schema');
+
+function lintSessionState(content) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-state-'));
+  const projectDir = join(dir, 'projects', 'proj');
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, 'session-state.md'), content);
+  const r = run('lint.mjs', [`--wiki-dir=${dir}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  rmSync(dir, { recursive: true, force: true });
+  return { r, out };
+}
+
+test('accepts 다음 작업 as a session-state next heading alias', () => {
+  const { r, out } = lintSessionState('---\ntitle: Session State\ntype: session-state\nupdated: 2026-05-07\n---\n# Session State\n\n## 다음 작업\n\n- Continue\n');
+  assert.equal(r.status, 0, `stderr: ${r.stderr}\nstdout: ${r.stdout}`);
+  assert.deepEqual(out.errors, []);
+});
+
+test('errors when project session-state lacks a next heading', () => {
+  const { r, out } = lintSessionState('---\ntitle: Session State\ntype: session-state\nupdated: 2026-05-07\n---\n# Session State\n\n## Background\n\n- Missing next section\n');
+  assert.equal(r.status, 1, `expected lint error\nstdout: ${r.stdout}`);
+  assert.ok(out.errors.some(i =>
+    i.file === 'projects/proj/session-state.md'
+    && i.message.includes('Missing required session-state heading')
+  ), `missing session-state heading error: ${r.stdout}`);
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

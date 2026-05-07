@@ -10,7 +10,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
-import { WIKI_DIR, buildOutput } from './wiki-shared.mjs';
+import { WIKI_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS } from './wiki-shared.mjs';
 
 const PROJECTS_DIR = join(WIKI_DIR, 'projects');
 const GLOBAL_HOT   = join(WIKI_DIR, 'hot.md');
@@ -52,17 +52,21 @@ function findProjectFiles(cwd) {
 }
 
 function extractSection(content, heading) {
-  const re = new RegExp(`## ${heading}\\n([\\s\\S]*?)(?=\\n## |$)`);
-  const m = content.match(re);
-  return m ? m[1].trim() : null;
+  const headings = Array.isArray(heading) ? heading : [heading];
+  for (const h of headings) {
+    const re = new RegExp(`## ${h}\\r?\\n([\\s\\S]*?)(?=\\r?\\n## |$)`);
+    const m = content.match(re);
+    if (m) return m[1].trim();
+  }
+  return null;
 }
 
 function printTerminalSummary(proj, hotContent, stateContent) {
   const nextFromState = stateContent
-    ? (extractSection(stateContent, '다음 이어받기') ?? extractSection(stateContent, 'Next Up'))
+    ? extractSection(stateContent, SESSION_STATE_NEXT_HEADINGS)
     : null;
   const next = nextFromState
-    ?? (extractSection(hotContent ?? '', '다음 이어받기') ?? extractSection(hotContent ?? '', 'Next Up'));
+    ?? extractSection(hotContent ?? '', SESSION_STATE_NEXT_HEADINGS);
   const prev = hotContent
     ? (extractSection(hotContent, '직전 세션 \\([^)]+\\)')
         ?? extractSection(hotContent, '직전 세션.*')
