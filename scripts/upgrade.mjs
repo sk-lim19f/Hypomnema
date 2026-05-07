@@ -277,13 +277,10 @@ let migrationPath   = null;
 let appliedHooks    = [];
 let appliedSettings = [];
 
-// Generate migration report for major bumps (always, not just on --apply).
-// This creates a new file — it does not overwrite SCHEMA.md.
-if (schema.bump === 'major' && schema.installed && schema.current && existsSync(args.wikiDir)) {
-  migrationPath = writeMigrationReport(args.wikiDir, schema.installed, schema.current);
-}
-
 if (args.apply) {
+  if (schema.bump === 'major' && schema.installed && schema.current && existsSync(args.wikiDir)) {
+    migrationPath = writeMigrationReport(args.wikiDir, schema.installed, schema.current);
+  }
   appliedHooks    = applyHookFiles(hooks);
   appliedSettings = applySettingsJson(settings);
 }

@@ -60,10 +60,12 @@ function parseFrontmatter(content) {
   return fm;
 }
 
+function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
 function scoreAndExcerpt(content, terms) {
   const lower = content.toLowerCase();
   let score = 0;
-  for (const t of terms) score += (lower.match(new RegExp(t, 'g')) || []).length;
+  for (const t of terms) score += (lower.match(new RegExp(escapeRegex(t), 'g')) || []).length;
 
   // find first matching line for excerpt
   const lines = content.split('\n');
