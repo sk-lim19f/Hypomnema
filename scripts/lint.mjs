@@ -13,7 +13,7 @@
  *   --fix               Auto-add missing `updated` field (safe repairs only)
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
 
@@ -93,8 +93,8 @@ const VALID_TYPES = [
 
 const issues = [];
 
-function issue(severity, rel, msg) {
-  issues.push({ severity, file: rel, message: msg });
+function issue(severity, rel, msg, fullPath = null) {
+  issues.push({ severity, file: rel, message: msg, path: fullPath });
 }
 
 function lintPage({ path, rel }, slugMap) {
@@ -121,7 +121,7 @@ function lintPage({ path, rel }, slugMap) {
   }
 
   if (!fm.updated) {
-    issue('warn', rel, 'Missing frontmatter field: updated');
+    issue('warn', rel, 'Missing frontmatter field: updated', path);
   }
 
   for (const link of extractWikilinks(content)) {
@@ -141,11 +141,37 @@ const slugMap = buildSlugMap(pages);
 
 for (const page of pages) lintPage(page, slugMap);
 
+if (args.fix) {
+  const today = new Date().toISOString().slice(0, 10);
+  const fixed = new Set();
+  for (const iss of issues) {
+    if (iss.severity === 'warn' && iss.message === 'Missing frontmatter field: updated' && iss.path) {
+      const content = readFileSync(iss.path, 'utf-8');
+      const fmMatch = /^---\r?\n[\s\S]*?\r?\n---/.exec(content);
+      if (fmMatch) {
+        const lineEnding = fmMatch[0].includes('\r\n') ? '\r\n' : '\n';
+        const closingTag = `${lineEnding}---`;
+        const insertAt = fmMatch.index + fmMatch[0].lastIndexOf(closingTag);
+        if (insertAt < 0) continue;
+        const fixedContent = content.slice(0, insertAt) + `${lineEnding}updated: ${today}` + content.slice(insertAt);
+        writeFileSync(iss.path, fixedContent);
+        fixed.add(iss.path);
+      }
+    }
+  }
+  if (fixed.size > 0) {
+    issues.splice(0, issues.length, ...issues.filter(
+      i => !(i.severity === 'warn' && i.message === 'Missing frontmatter field: updated' && fixed.has(i.path))
+    ));
+  }
+}
+
 const errors = issues.filter(i => i.severity === 'error');
 const warns  = issues.filter(i => i.severity === 'warn');
 
 if (args.json) {
-  console.log(JSON.stringify({ ok: errors.length === 0, errors, warns, total: issues.length }, null, 2));
+  const toOut = ({ severity, file, message }) => ({ severity, file, message });
+  console.log(JSON.stringify({ ok: errors.length === 0, errors: errors.map(toOut), warns: warns.map(toOut), total: issues.length }, null, 2));
 } else {
   if (issues.length === 0) {
     console.log('✓ No lint issues found');
