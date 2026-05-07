@@ -129,6 +129,11 @@ export function readChecklist(today) {
   }
 }
 
+// ── session-state schema ───────────────────────────────────────────────────
+
+/** Accepted heading aliases for the "next task" section in session-state.md. */
+export const SESSION_STATE_NEXT_HEADINGS = ['다음 이어받기', '다음 작업', 'Next Up', 'Next'];
+
 // ── misc helpers ───────────────────────────────────────────────────────────
 
 /** Returns true if the prompt is a /compact command invocation. */

@@ -55,7 +55,7 @@ process.stdin.on('end', () => {
 
     console.log(JSON.stringify({
       continue: true,
-      systemMessage: [
+      additionalContext: [
         `[WIKI_AUTOCLOSE] /compact detected — session close incomplete (${reasons.join(', ')}).`,
         `Do NOT wait for user input. Run wiki session close NOW, then retry /compact.`,
         ``,
@@ -65,6 +65,7 @@ process.stdin.on('end', () => {
       ].join('\n'),
     }));
   } catch {
+    // Fail-open: any parse/runtime error must not block the user's prompt.
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   }
 });

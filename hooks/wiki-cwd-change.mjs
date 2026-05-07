@@ -52,8 +52,8 @@ process.stdin.on('end', () => {
     let data = {};
     try { data = JSON.parse(raw); } catch {}
 
-    const newCwd = data.new_directory || data.cwd || process.cwd();
-    const oldCwd = data.old_directory || data.previous_cwd || '';
+    const newCwd = data.new_cwd || data.new_directory || data.cwd || process.cwd();
+    const oldCwd = data.old_cwd || data.old_directory || data.previous_cwd || '';
 
     // Skip re-injection if still in the same project
     const oldHit = oldCwd ? findProjectHot(oldCwd) : null;

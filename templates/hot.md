@@ -7,8 +7,8 @@ tags: [wiki, operations]
 
 # Hot Cache
 
-> Read at session start → navigate to the relevant project hot.md.
-> Update at session close: project hot.md + this file's "Active Projects" table.
+> Read at session start → navigate to the relevant project session-state.md and hot.md.
+> Update at session close: project session-state.md, project hot.md, and this file's "Active Projects" table.
 
 ## Active Projects
 
@@ -17,6 +17,6 @@ tags: [wiki, operations]
 
 ## Session Start Checklist
 
-1. Check this file for the relevant project hot.md link
-2. Read `projects/<name>/hot.md`
-3. Check `projects/<name>/session-log.md` recent entries if needed
+1. Check this file for the relevant project link
+2. Read `projects/<name>/session-state.md` for next tasks if it exists
+3. Read `projects/<name>/hot.md` for project background

@@ -1,0 +1,15 @@
+{
+  "name": "hypomnema",
+  "version": "0.1.0",
+  "description": "LLM-native personal wiki system for Claude Code",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node tests/runner.mjs",
+    "lint": "node scripts/lint.mjs",
+    "graph": "node scripts/graph.mjs"
+  }
+}

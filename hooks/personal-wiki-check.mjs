@@ -42,7 +42,7 @@ try {
   lintBlockers = parsed.blockers || [];
   lintW8 = (parsed.warnings || []).filter(w => w.id === 'W8');
 } catch {
-  // lint unavailable — skip
+  // Fail-open: lint script missing or broken must not block compaction.
 }
 const lintOk           = lintBlockers.length === 0;
 const designHistoryOk  = lintW8.length === 0;
@@ -57,6 +57,7 @@ if (hasSession && gitStatus.clean && hotStatus.clean && lintOk && designHistoryO
       !hotStatus.clean     ? hotStatus.reason         : '',
       !designHistoryOk     ? `design-history stale (${lintW8.length})` : '',
     ].filter(Boolean).join(', ');
+    // PreCompact does not support additionalContext — use systemMessage (universal field).
     console.log(JSON.stringify({
       continue: true,
       systemMessage: `[WIKI CHECK] gate bypassed via HYPO_SKIP_GATE=1 (incomplete: ${skipped}).`,
@@ -78,7 +79,7 @@ if (hasSession && gitStatus.clean && hotStatus.clean && lintOk && designHistoryO
       `  [ ] 3. Ingest    — if new external knowledge, save to sources/ and ingest`,
       `  [ ] 4. Pages     — extract new concepts/patterns to pages/`,
       `  [ ] 5. Synthesis — if 3+ cross-page analysis results, save to pages/syntheses/`,
-      `  [ ] 6. session-log — append to projects/<name>/session-log.md`,
+      `  [ ] 6. session-log — append to projects/<name>/session-log/YYYY-MM.md`,
       `  [ ] 7. index.md  — update Projects section if needed`,
       `  [ ] 8. log.md    — append ## [${today}] session | <project-name>`,
       `  [ ] 9. hot.md    — update projects/<name>/hot.md (no exceptions)`,

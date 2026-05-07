@@ -3,19 +3,19 @@
  * wiki-session-start.mjs — SessionStart hook
  *
  * On session start:
- *   HIT  → cwd matches a project's working_dir → inject that project's hot.md
+ *   HIT  → cwd matches a project's working_dir → inject hot.md (2000 chars) + session-state.md (1000 chars)
  *   MISS → inject global hot.md pointer only (no fan-out to all projects)
  */
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
-import { WIKI_DIR, buildOutput } from './wiki-shared.mjs';
+import { WIKI_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS } from './wiki-shared.mjs';
 
-const MARKER_FILE  = join(tmpdir(), 'hypo-session-marker.json');
 const PROJECTS_DIR = join(WIKI_DIR, 'projects');
 const GLOBAL_HOT   = join(WIKI_DIR, 'hot.md');
-const MAX_CHARS    = 3000;
+const HOT_CHARS    = 2000;
+const STATE_CHARS  = 1000;
 
 function parseFrontmatterField(content, key) {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
@@ -25,7 +25,7 @@ function parseFrontmatterField(content, key) {
   return line.slice(key.length + 1).trim().replace(/^['"]|['"]$/g, '');
 }
 
-function findProjectHot(cwd) {
+function findProjectFiles(cwd) {
   if (!existsSync(PROJECTS_DIR)) return null;
   for (const proj of readdirSync(PROJECTS_DIR)) {
     const projDir  = join(PROJECTS_DIR, proj);
@@ -39,24 +39,39 @@ function findProjectHot(cwd) {
       ? join(homedir(), workingDir.slice(2))
       : workingDir;
     if (cwd === resolved || cwd.startsWith(resolved + '/')) {
-      const hotPath = join(projDir, 'hot.md');
-      return { proj, hotPath: existsSync(hotPath) ? hotPath : null };
+      const hotPath   = join(projDir, 'hot.md');
+      const statePath = join(projDir, 'session-state.md');
+      return {
+        proj,
+        hotPath:   existsSync(hotPath)   ? hotPath   : null,
+        statePath: existsSync(statePath) ? statePath : null,
+      };
     }
   }
   return null;
 }
 
 function extractSection(content, heading) {
-  const re = new RegExp(`## ${heading}\\n([\\s\\S]*?)(?=\\n## |$)`);
-  const m = content.match(re);
-  return m ? m[1].trim() : null;
+  const headings = Array.isArray(heading) ? heading : [heading];
+  for (const h of headings) {
+    const re = new RegExp(`## ${h}\\r?\\n([\\s\\S]*?)(?=\\r?\\n## |$)`);
+    const m = content.match(re);
+    if (m) return m[1].trim();
+  }
+  return null;
 }
 
-function printTerminalSummary(proj, content) {
-  const next = extractSection(content, '다음 이어받기') ?? extractSection(content, 'Next Up');
-  const prev = extractSection(content, '직전 세션 \\([^)]+\\)')
-    ?? extractSection(content, '직전 세션.*')
-    ?? extractSection(content, 'Last Session.*');
+function printTerminalSummary(proj, hotContent, stateContent) {
+  const nextFromState = stateContent
+    ? extractSection(stateContent, SESSION_STATE_NEXT_HEADINGS)
+    : null;
+  const next = nextFromState
+    ?? extractSection(hotContent ?? '', SESSION_STATE_NEXT_HEADINGS);
+  const prev = hotContent
+    ? (extractSection(hotContent, '직전 세션 \\([^)]+\\)')
+        ?? extractSection(hotContent, '직전 세션.*')
+        ?? extractSection(hotContent, 'Last Session.*'))
+    : null;
   const lines = ['', `\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${proj}\x1b[0m`];
   if (prev) lines.push(`  prev: ${prev.split('\n')[0].replace(/^\*\*|\*\*$/g, '')}`);
   if (next) {
@@ -76,15 +91,22 @@ process.stdin.on('end', () => {
     try { data = JSON.parse(raw); } catch {}
 
     const cwd = data.cwd || data.directory || process.cwd();
-    const hit = findProjectHot(cwd);
+    const sessionId = data.session_id || 'default';
+    const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);
+    const hit = findProjectFiles(cwd);
 
     if (hit) {
-      if (hit.hotPath) {
-        const content = readFileSync(hit.hotPath, 'utf-8').slice(0, MAX_CHARS);
-        printTerminalSummary(hit.proj, content);
-        writeFileSync(MARKER_FILE, JSON.stringify({ proj: hit.proj, hotPath: hit.hotPath, ts: Date.now() }));
+      const hotContent   = hit.hotPath   ? readFileSync(hit.hotPath,   'utf-8').slice(0, HOT_CHARS)   : null;
+      const stateContent = hit.statePath ? readFileSync(hit.statePath, 'utf-8').slice(0, STATE_CHARS) : null;
+
+      if (hotContent || stateContent) {
+        printTerminalSummary(hit.proj, hotContent, stateContent);
+        writeFileSync(MARKER_FILE, JSON.stringify({ proj: hit.proj, hotPath: hit.hotPath, statePath: hit.statePath, hasSnapshot: true, ts: Date.now() }));
+        const parts = [];
+        if (hotContent)   parts.push(`[HOT]\n${hotContent}`);
+        if (stateContent) parts.push(`[SESSION STATE — 다음 작업]\n${stateContent}`);
         console.log(JSON.stringify(
-          buildOutput(`[WIKI HOT CACHE: project=${hit.proj}]\n\n${content}`, { continue: true, suppressOutput: true })
+          buildOutput(`[WIKI HOT CACHE: project=${hit.proj}]\n\n${parts.join('\n\n')}`, { continue: true, suppressOutput: true })
         ));
       } else {
         process.stderr.write(`\n\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${hit.proj}\x1b[0m (no snapshot yet)\n\n`);
@@ -101,7 +123,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    const globalContent = readFileSync(GLOBAL_HOT, 'utf-8').slice(0, MAX_CHARS);
+    const globalContent = readFileSync(GLOBAL_HOT, 'utf-8').slice(0, HOT_CHARS);
     console.log(JSON.stringify(
       buildOutput(`[WIKI HOT CACHE: global — no project matched cwd=${cwd}]\n\n${globalContent}`, { continue: true, suppressOutput: true })
     ));

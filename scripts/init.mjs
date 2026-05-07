@@ -9,7 +9,7 @@
  *   node scripts/init.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>    Wiki root directory (default: ~/wiki)
+ *   --wiki-dir=<path>    Wiki root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/wiki)
  *   --privacy=<mode>     personal | shared | public  (default: personal)
  *   --no-hooks           Skip hook installation
  *   --codex              Also install Codex hooks (~/.codex/hooks/)
@@ -23,6 +23,7 @@ import { join, basename } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { expandHome, resolveWikiRoot } from './lib/wiki-root.mjs';
 
 const HOME     = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -34,7 +35,7 @@ const TEMPLATES  = join(PKG_ROOT, 'templates');
 
 function parseArgs(argv) {
   const args = {
-    wikiDir:   join(HOME, 'wiki'),
+    wikiDir:   resolveWikiRoot(),
     privacy:   'personal',
     hooks:     true,
     codex:     false,
@@ -54,12 +55,6 @@ function parseArgs(argv) {
   return args;
 }
 
-function expandHome(p) {
-  if (p === '~') return HOME;
-  if (p.startsWith('~/') || p.startsWith('~\\')) return join(HOME, p.slice(2));
-  return p;
-}
-
 // ── result tracking ──────────────────────────────────────────────────────────
 
 const results = { created: [], skipped: [], merged: [], errors: [] };
@@ -68,7 +63,7 @@ function log(action, path) { results[action].push(path); }
 
 // ── directory structure ──────────────────────────────────────────────────────
 
-const WIKI_DIRS = ['pages', 'projects', 'sources', 'decisions', 'learnings'];
+const WIKI_DIRS = ['pages', 'projects', 'sources'];
 
 function ensureDir(dir, dryRun) {
   if (existsSync(dir)) return;
@@ -127,15 +122,34 @@ function writeWikiignore(wikiDir, privacy, dryRun) {
 
 // ── hook installation ────────────────────────────────────────────────────────
 
-const HOOK_MAP = {
-  SessionStart:     ['wiki-session-start.mjs'],
-  UserPromptSubmit: ['wiki-first-prompt.mjs', 'wiki-lookup.mjs', 'wiki-compact-guard.mjs'],
-  PreCompact:       ['personal-wiki-check.mjs'],
-  PostToolUse:      ['wiki-auto-stage.mjs'],
-  Stop:             ['wiki-hot-rebuild.mjs', 'wiki-auto-commit.mjs'],
-  CwdChanged:       ['wiki-cwd-change.mjs'],
-  FileChanged:      ['wiki-file-watch.mjs'],
-};
+function loadHookMap() {
+  let cfg;
+  try {
+    cfg = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
+  } catch {
+    console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
+    process.exit(1);
+  }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    console.error('Error: hooks/hooks.json must be a JSON object');
+    process.exit(1);
+  }
+  if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
+    console.error('Error: hooks/hooks.json must contain a "hooks" object');
+    process.exit(1);
+  }
+  for (const [event, files] of Object.entries(cfg.hooks)) {
+    if (!Array.isArray(files) || !files.every(f => typeof f === 'string' && f.length > 0)) {
+      console.error(`Error: hooks/hooks.json "hooks.${event}" must be an array of non-empty strings`);
+      process.exit(1);
+    }
+  }
+  if (cfg.shared !== undefined && (!Array.isArray(cfg.shared) || !cfg.shared.every(f => typeof f === 'string' && f.length > 0))) {
+    console.error('Error: hooks/hooks.json "shared" must be an array of non-empty strings');
+    process.exit(1);
+  }
+  return cfg.hooks;
+}
 
 function installHooks(targetDir, dryRun) {
   if (!existsSync(HOOKS_SRC)) { log('errors', `hooks source missing: ${HOOKS_SRC}`); return; }
@@ -149,16 +163,19 @@ function installHooks(targetDir, dryRun) {
   }
 }
 
-function mergeSettingsJson(settingsPath, hooksDir, dryRun) {
+function mergeSettingsJson(settingsPath, hooksDir, dryRun, hookMap) {
   let settings = {};
   if (existsSync(settingsPath)) {
-    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')); } catch {}
+    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')); } catch {
+      log('errors', `settings.json is not valid JSON — fix or back it up before re-running: ${settingsPath}`);
+      return;
+    }
   }
   if (!settings.hooks) settings.hooks = {};
 
   let changed = false;
-  for (const [event, files] of Object.entries(HOOK_MAP)) {
-    if (!settings.hooks[event]) settings.hooks[event] = [];
+  for (const [event, files] of Object.entries(hookMap)) {
+    if (!Array.isArray(settings.hooks[event])) settings.hooks[event] = [];
     for (const file of files) {
       const cmd = `node ${hooksDir.replace(HOME, '$HOME')}/${file}`;
       const already = settings.hooks[event]
@@ -177,6 +194,32 @@ function mergeSettingsJson(settingsPath, hooksDir, dryRun) {
   }
 }
 
+// ── pkg git hook ────────────────────────────────────────────────────────────
+
+const PKG_GIT_HOOK_CONTENT = `#!/bin/sh
+# Auto-sync hooks/ to ~/.claude/hooks/ when hook files change.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+changed=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '^hooks/')
+if [ -z "$changed" ]; then
+  exit 0
+fi
+echo "[post-commit] hooks/ changed — syncing to ~/.claude/hooks/ ..."
+node "$REPO_ROOT/scripts/upgrade.mjs" --apply
+`;
+
+function installPkgGitHook(dryRun) {
+  const gitDir = join(PKG_ROOT, '.git');
+  if (!existsSync(gitDir)) return;
+  const hooksDir = join(gitDir, 'hooks');
+  const hookPath = join(hooksDir, 'post-commit');
+  if (existsSync(hookPath)) { log('skipped', hookPath); return; }
+  if (!dryRun) {
+    mkdirSync(hooksDir, { recursive: true });
+    writeFileSync(hookPath, PKG_GIT_HOOK_CONTENT, { mode: 0o755 });
+  }
+  log('created', hookPath);
+}
+
 // ── git setup ────────────────────────────────────────────────────────────────
 
 function git(wikiDir, args, opts = {}) {
@@ -186,7 +229,13 @@ function git(wikiDir, args, opts = {}) {
 function gitSetup(wikiDir, remote, dryRun) {
   const isGit = existsSync(join(wikiDir, '.git'));
   if (!isGit) {
-    if (!dryRun) spawnSync('git', ['init', wikiDir], { stdio: 'ignore' });
+    if (!dryRun) {
+      const r = spawnSync('git', ['init', wikiDir], { stdio: 'ignore' });
+      if (r.error || r.status !== 0) {
+        log('errors', `git init failed in ${wikiDir}`);
+        return;
+      }
+    }
     log('created', join(wikiDir, '.git'));
   }
   if (remote) {
@@ -205,36 +254,47 @@ function gitSetup(wikiDir, remote, dryRun) {
 
 const args = parseArgs(process.argv);
 
+// Validate hooks.json before any file writes so a bad package leaves no partial state
+const HOOK_MAP = (args.hooks || args.codex) ? loadHookMap() : null;
+
 // 1. wiki directory structure
 ensureDir(args.wikiDir, args.dryRun);
 for (const d of WIKI_DIRS) ensureDir(join(args.wikiDir, d), args.dryRun);
 
 // 2. template files
-copyTemplate('index.md', join(args.wikiDir, 'index.md'), args.dryRun);
-copyTemplate('hot.md',   join(args.wikiDir, 'hot.md'),   args.dryRun);
-copyTemplate('log.md',   join(args.wikiDir, 'log.md'),   args.dryRun);
+copyTemplate('index.md',     join(args.wikiDir, 'index.md'),     args.dryRun);
+copyTemplate('hot.md',       join(args.wikiDir, 'hot.md'),       args.dryRun);
+copyTemplate('log.md',       join(args.wikiDir, 'log.md'),       args.dryRun);
+copyTemplate('SCHEMA.md',    join(args.wikiDir, 'SCHEMA.md'),    args.dryRun);
+copyTemplate('wiki-guide.md',join(args.wikiDir, 'wiki-guide.md'),args.dryRun);
 
 // 3. hypo-config.md + .wikiignore
 writeHypoConfig(args.wikiDir, args.privacy, args.dryRun);
 writeWikiignore(args.wikiDir, args.privacy, args.dryRun);
 
 // 4. hooks
+
 if (args.hooks) {
   const claudeHooks = join(HOME, '.claude', 'hooks');
   installHooks(claudeHooks, args.dryRun);
-  mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun);
+  mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun, HOOK_MAP);
 }
 
 // 5. codex hooks (optional)
 if (args.codex) {
   const codexHooks = join(HOME, '.codex', 'hooks');
   installHooks(codexHooks, args.dryRun);
-  mergeSettingsJson(join(HOME, '.codex', 'settings.json'), codexHooks, args.dryRun);
+  mergeSettingsJson(join(HOME, '.codex', 'settings.json'), codexHooks, args.dryRun, HOOK_MAP);
 }
 
 // 6. git setup
 if (args.gitInit) {
   gitSetup(args.wikiDir, args.gitRemote, args.dryRun);
+}
+
+// 7. pkg repo git hook (auto-sync hooks/ → ~/.claude/hooks/ on commit)
+if (args.hooks) {
+  installPkgGitHook(args.dryRun);
 }
 
 // ── report ───────────────────────────────────────────────────────────────────

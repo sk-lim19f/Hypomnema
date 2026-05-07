@@ -16,14 +16,18 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { buildOutput } from './wiki-shared.mjs';
 
-const MARKER_FILE = join(tmpdir(), 'hypo-session-marker.json');
-const MARKER_TTL  = 10 * 60 * 1000; // 10 min
+const MARKER_TTL = 10 * 60 * 1000; // 10 min
 
 let raw = '';
 process.stdin.setEncoding('utf-8');
 process.stdin.on('data', chunk => raw += chunk);
 process.stdin.on('end', () => {
   try {
+    let data = {};
+    try { data = JSON.parse(raw); } catch {}
+    const sessionId = data.session_id || 'default';
+    const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);
+
     if (!existsSync(MARKER_FILE)) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
@@ -39,7 +43,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    const hasSnapshot  = marker.hotPath && existsSync(marker.hotPath);
+    const hasSnapshot  = marker.hasSnapshot ?? (marker.hotPath && existsSync(marker.hotPath));
     const snapshotNote = hasSnapshot ? '' : ' (no snapshot yet — first session)';
 
     console.log(JSON.stringify(

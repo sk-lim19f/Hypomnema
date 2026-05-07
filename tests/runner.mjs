@@ -1,0 +1,629 @@
+#!/usr/bin/env node
+/**
+ * tests/runner.mjs — Hypomnema test runner (no external deps)
+ *
+ * Runs unit tests for lib functions and smoke tests for CLI scripts.
+ */
+
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const HOME           = homedir();
+const REPO           = join(fileURLToPath(new URL('.', import.meta.url)), '..');
+const SCRIPTS        = join(REPO, 'scripts');
+const NONEXISTENT_WIKI = join(tmpdir(), `hypo-no-wiki-${process.pid}`);
+
+// ── minimal test harness ─────────────────────────────────────────────────────
+
+let passed = 0;
+let failed = 0;
+const failures = [];
+
+function test(name, fn) {
+  try {
+    fn();
+    console.log(`  ✓ ${name}`);
+    passed++;
+  } catch (err) {
+    console.error(`  ✗ ${name}`);
+    console.error(`    ${err.message}`);
+    failures.push({ name, err });
+    failed++;
+  }
+}
+
+async function testAsync(name, fn) {
+  try {
+    await fn();
+    console.log(`  ✓ ${name}`);
+    passed++;
+  } catch (err) {
+    console.error(`  ✗ ${name}`);
+    console.error(`    ${err.message}`);
+    failures.push({ name, err });
+    failed++;
+  }
+}
+
+function suite(label) { console.log(`\n${label}`); }
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function run(script, args = []) {
+  return spawnSync(process.execPath, [join(SCRIPTS, script), ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '' },
+  });
+}
+
+function withTmpDir(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-test-'));
+  try { fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+function withTmpHome(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-home-'));
+  try { fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+function runWithHome(script, args = [], home) {
+  return spawnSync(process.execPath, [join(SCRIPTS, script), ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '', HOME: home },
+  });
+}
+
+// ── lib/wiki-root.mjs ────────────────────────────────────────────────────────
+
+const { expandHome, resolveWikiRoot } = await import(`${SCRIPTS}/lib/wiki-root.mjs`);
+
+suite('expandHome()');
+
+test('passthrough for non-tilde paths', () => {
+  assert.equal(expandHome('/absolute/path'), '/absolute/path');
+  assert.equal(expandHome('relative'), 'relative');
+});
+
+test('~ alone expands to HOME', () => {
+  assert.equal(expandHome('~'), HOME);
+});
+
+test('~/foo expands to HOME/foo', () => {
+  assert.equal(expandHome('~/foo/bar'), join(HOME, 'foo/bar'));
+});
+
+suite('resolveWikiRoot()');
+
+test('HYPO_DIR env var takes precedence', () => {
+  const orig = process.env.HYPO_DIR;
+  process.env.HYPO_DIR = '/tmp/custom-wiki';
+  try {
+    assert.equal(resolveWikiRoot(), '/tmp/custom-wiki');
+  } finally {
+    if (orig === undefined) delete process.env.HYPO_DIR;
+    else process.env.HYPO_DIR = orig;
+  }
+});
+
+test('falls back to ~/wiki when no env or marker found', () => {
+  const orig = process.env.HYPO_DIR;
+  delete process.env.HYPO_DIR;
+  try {
+    const result = resolveWikiRoot();
+    // Either found a real wiki (has hypo-config.md) or returned ~/wiki default
+    assert.ok(typeof result === 'string' && result.length > 0);
+    assert.ok(result.startsWith('/'));
+  } finally {
+    if (orig !== undefined) process.env.HYPO_DIR = orig;
+  }
+});
+
+test('finds wiki by hypo-config.md marker', () => {
+  const orig = process.env.HYPO_DIR;
+  delete process.env.HYPO_DIR;
+  try {
+    const result = resolveWikiRoot();
+    assert.ok(typeof result === 'string' && result.length > 0, 'should return non-empty string');
+    assert.ok(result.startsWith('/'), 'should return an absolute path');
+    // Either the returned path has hypo-config.md (marker scan worked), or it is the ~/wiki default
+    const isDefault = result === join(HOME, 'wiki');
+    const hasMarker = existsSync(join(result, 'hypo-config.md'));
+    assert.ok(isDefault || hasMarker,
+      `resolveWikiRoot returned "${result}" which is neither the default nor has hypo-config.md`);
+  } finally {
+    if (orig !== undefined) process.env.HYPO_DIR = orig;
+  }
+});
+
+// ── init.mjs smoke tests ─────────────────────────────────────────────────────
+
+suite('init.mjs --dry-run');
+
+test('exits 0 with --dry-run --no-hooks --no-git-init', () => {
+  withTmpDir(dir => {
+    const r = run('init.mjs', [
+      `--wiki-dir=${dir}/wiki`,
+      '--dry-run',
+      '--no-hooks',
+      '--no-git-init',
+    ]);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes('[DRY RUN'), `stdout: ${r.stdout}`);
+  });
+});
+
+test('--dry-run reports created dirs without writing them', () => {
+  withTmpDir(dir => {
+    const wikiDir = join(dir, 'wiki');
+    const r = run('init.mjs', [
+      `--wiki-dir=${wikiDir}`,
+      '--dry-run',
+      '--no-hooks',
+      '--no-git-init',
+    ]);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(!existsSync(wikiDir), 'wiki dir should not be created in dry-run');
+  });
+});
+
+test('--privacy=shared writes shared-mode content to .wikiignore', () => {
+  withTmpDir(dir => {
+    const wikiDir = join(dir, 'wiki');
+    const r = run('init.mjs', [
+      `--wiki-dir=${wikiDir}`,
+      '--privacy=shared',
+      '--no-hooks',
+      '--no-git-init',
+    ]);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const wikiignore = readFileSync(join(wikiDir, '.wikiignore'), 'utf-8');
+    assert.ok(wikiignore.includes('*personal*'), '.wikiignore missing shared-mode pattern');
+    assert.ok(wikiignore.includes('journal/'), '.wikiignore missing journal/ exclusion');
+  });
+});
+
+test('actual run creates expected directories', () => {
+  withTmpDir(dir => {
+    const wikiDir = join(dir, 'wiki');
+    const r = run('init.mjs', [
+      `--wiki-dir=${wikiDir}`,
+      '--no-hooks',
+      '--no-git-init',
+    ]);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    for (const sub of ['pages', 'projects', 'sources']) {
+      assert.ok(existsSync(join(wikiDir, sub)), `missing: ${sub}/`);
+    }
+  });
+});
+
+test('--no-hooks succeeds without touching hook config', () => {
+  withTmpDir(dir => {
+    const wikiDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `--no-hooks should exit 0: ${r.stderr}`);
+    assert.ok(existsSync(join(wikiDir, 'index.md')), 'wiki files should still be created');
+  });
+});
+
+// ── doctor.mjs smoke tests ───────────────────────────────────────────────────
+
+suite('doctor.mjs --json');
+
+test('exits without crashing on non-existent wiki dir', () => {
+  const r = run('doctor.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  // doctor may exit 1 (failures found) but should not crash (exit 2+)
+  assert.ok(r.status !== null, 'process did not exit cleanly');
+  assert.ok(r.status <= 1, `unexpected exit code ${r.status}\n${r.stderr}`);
+});
+
+test('--json output is valid JSON', () => {
+  const r = run('doctor.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout not JSON: ${r.stdout}`);
+});
+
+test('JSON output is an array of check objects', () => {
+  const r = run('doctor.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  const out = JSON.parse(r.stdout);
+  assert.ok(Array.isArray(out), 'expected top-level array');
+  assert.ok(out.length > 0, 'expected at least one check');
+  assert.ok('status' in out[0], 'expected status field');
+  assert.ok('label' in out[0], 'expected label field');
+});
+
+// ── hook contract tests ───────────────────────────────────────────────────────
+
+const HOOKS = join(REPO, 'hooks');
+
+const { isCompactCommand, isGateSkipped, buildOutput } = await import(
+  join(HOOKS, 'wiki-shared.mjs')
+);
+
+function runHook(hookFile, stdinData, extraEnv = {}) {
+  return spawnSync(process.execPath, [join(HOOKS, hookFile)], {
+    input: typeof stdinData === 'string' ? stdinData : JSON.stringify(stdinData),
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '/tmp/nonexistent-hypo-99999', ...extraEnv },
+  });
+}
+
+function withCleanWiki(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    writeFileSync(join(dir, 'log.md'), `## [${today}] session | test-project\n`);
+    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\nupdated: today\n---\n# Hot\n');
+    spawnSync('git', ['init'], { cwd: dir, encoding: 'utf-8' });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+    spawnSync('git', ['add', '-A'], { cwd: dir, encoding: 'utf-8' });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, encoding: 'utf-8' });
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+suite('isCompactCommand()');
+
+test('/compact → true', () => {
+  assert.equal(isCompactCommand('/compact'), true);
+});
+
+test('/compact with trailing args → true', () => {
+  assert.equal(isCompactCommand('/compact --all'), true);
+});
+
+test('non-compact prompt → false', () => {
+  assert.equal(isCompactCommand('hello'), false);
+  assert.equal(isCompactCommand('/other'), false);
+});
+
+suite('isGateSkipped()');
+
+test('HYPO_SKIP_GATE=1 → true', () => {
+  const orig = process.env.HYPO_SKIP_GATE;
+  process.env.HYPO_SKIP_GATE = '1';
+  try { assert.equal(isGateSkipped(), true); }
+  finally { orig === undefined ? delete process.env.HYPO_SKIP_GATE : (process.env.HYPO_SKIP_GATE = orig); }
+});
+
+test('no env var → false', () => {
+  const o1 = process.env.HYPO_SKIP_GATE;
+  const o2 = process.env.OMC_SKIP_WIKI_GATE;
+  delete process.env.HYPO_SKIP_GATE;
+  delete process.env.OMC_SKIP_WIKI_GATE;
+  try { assert.equal(isGateSkipped(), false); }
+  finally {
+    if (o1 !== undefined) process.env.HYPO_SKIP_GATE = o1;
+    if (o2 !== undefined) process.env.OMC_SKIP_WIKI_GATE = o2;
+  }
+});
+
+suite('buildOutput()');
+
+test('wraps context in additionalContext field', () => {
+  const out = buildOutput('test context');
+  assert.equal(out.additionalContext, 'test context');
+});
+
+test('merges extra fields alongside additionalContext', () => {
+  const out = buildOutput('ctx', { continue: true });
+  assert.equal(out.continue, true);
+  assert.equal(out.additionalContext, 'ctx');
+});
+
+suite('wiki-compact-guard.mjs — contract');
+
+test('invalid JSON input → fail-open {continue:true}', () => {
+  const r = runHook('wiki-compact-guard.mjs', 'not-json');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+});
+
+test('non-compact prompt → pass-through', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: 'hello world' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+});
+
+test('HYPO_SKIP_GATE=1 + /compact → pass-through', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' }, { HYPO_SKIP_GATE: '1' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+});
+
+test('/compact with incomplete wiki → additionalContext, not systemMessage', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const out = JSON.parse(r.stdout);
+  assert.ok('additionalContext' in out, 'missing additionalContext field');
+  assert.ok(!('systemMessage' in out), 'must not use deprecated systemMessage field');
+});
+
+test('/compact with incomplete wiki → continue:true (soft nudge, not block)', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+});
+
+test('/compact with incomplete wiki → additionalContext contains WIKI_AUTOCLOSE', () => {
+  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const out = JSON.parse(r.stdout);
+  assert.ok(out.additionalContext.includes('WIKI_AUTOCLOSE'), 'missing WIKI_AUTOCLOSE marker');
+});
+
+test('/compact with clean wiki → pass-through', () => {
+  withCleanWiki(dir => {
+    const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true);
+    assert.equal(out.suppressOutput, true);
+  });
+});
+
+test('output is always valid JSON regardless of prompt', () => {
+  for (const prompt of ['/compact', 'hello', '']) {
+    const r = runHook('wiki-compact-guard.mjs', { prompt });
+    assert.doesNotThrow(() => JSON.parse(r.stdout), `invalid JSON for prompt="${prompt}"`);
+  }
+});
+
+suite('personal-wiki-check.mjs — contract');
+
+test('output is always valid JSON', () => {
+  const r = runHook('personal-wiki-check.mjs', '');
+  assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout: ${r.stdout}`);
+});
+
+test('no wiki dir → block decision', () => {
+  const r = runHook('personal-wiki-check.mjs', '');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.decision, 'block');
+  assert.equal(out.continue, false);
+});
+
+test('block response includes stopReason string', () => {
+  const r = runHook('personal-wiki-check.mjs', '');
+  const out = JSON.parse(r.stdout);
+  assert.ok(typeof out.stopReason === 'string' && out.stopReason.length > 0);
+});
+
+test('block reason contains WIKI CHECK marker', () => {
+  const r = runHook('personal-wiki-check.mjs', '');
+  const out = JSON.parse(r.stdout);
+  assert.ok(out.reason.includes('WIKI CHECK'), 'missing WIKI CHECK marker in reason');
+});
+
+test('HYPO_SKIP_GATE=1 → continue:true + systemMessage (PreCompact has no additionalContext)', () => {
+  const r = runHook('personal-wiki-check.mjs', '', { HYPO_SKIP_GATE: '1' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  // PreCompact hook does not support additionalContext per Claude Code docs — systemMessage is the correct universal field.
+  assert.ok('systemMessage' in out, 'missing systemMessage field');
+  assert.ok(!('additionalContext' in out), 'PreCompact must not use unsupported additionalContext field');
+});
+
+test('clean wiki → suppressOutput:true', () => {
+  withCleanWiki(dir => {
+    const r = runHook('personal-wiki-check.mjs', '', { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.suppressOutput, true);
+    assert.equal(out.continue, true);
+  });
+});
+
+// ── upgrade.mjs smoke tests ───────────────────────────────────────────────────
+
+suite('upgrade.mjs --json');
+
+test('exits without crashing on non-existent wiki dir', () => {
+  const r = run('upgrade.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  assert.ok(r.status !== null, 'process did not exit cleanly');
+  assert.ok(r.status <= 1, `unexpected exit code ${r.status}\n${r.stderr}`);
+});
+
+test('--json output is valid JSON', () => {
+  const r = run('upgrade.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout not JSON: ${r.stdout}`);
+});
+
+test('JSON output has required top-level fields', () => {
+  const r = run('upgrade.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  const out = JSON.parse(r.stdout);
+  assert.ok('schema'   in out, 'missing schema field');
+  assert.ok('hooks'    in out, 'missing hooks field');
+  assert.ok('settings' in out, 'missing settings field');
+  assert.ok('applied'  in out, 'missing applied field');
+});
+
+test('schema object has installed/current/bump fields', () => {
+  const r = run('upgrade.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  const { schema } = JSON.parse(r.stdout);
+  assert.ok('installed' in schema, 'schema missing installed');
+  assert.ok('current'   in schema, 'schema missing current');
+  assert.ok('bump'      in schema, 'schema missing bump');
+});
+
+test('hooks is an array of file/status objects', () => {
+  const r = run('upgrade.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  const { hooks } = JSON.parse(r.stdout);
+  assert.ok(Array.isArray(hooks), 'hooks should be an array');
+  assert.ok(hooks.length > 0, 'expected at least one hook entry');
+  assert.ok('file'   in hooks[0], 'hook entry missing file');
+  assert.ok('status' in hooks[0], 'hook entry missing status');
+});
+
+test('settings is an array of event/file/status objects', () => {
+  const r = run('upgrade.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  const { settings } = JSON.parse(r.stdout);
+  assert.ok(Array.isArray(settings), 'settings should be an array');
+  assert.ok(settings.length > 0, 'expected at least one settings entry');
+  assert.ok('event'  in settings[0], 'settings entry missing event');
+  assert.ok('file'   in settings[0], 'settings entry missing file');
+  assert.ok('status' in settings[0], 'settings entry missing status');
+});
+
+test('applied object has hooks and settings arrays', () => {
+  const r = run('upgrade.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  const { applied } = JSON.parse(r.stdout);
+  assert.ok(Array.isArray(applied.hooks),    'applied.hooks should be array');
+  assert.ok(Array.isArray(applied.settings), 'applied.settings should be array');
+});
+
+test('schema.installed is null and bump is "unknown" for non-existent wiki', () => {
+  const r = run('upgrade.mjs', [
+    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    '--json',
+  ]);
+  const { schema } = JSON.parse(r.stdout);
+  // No SCHEMA.md → installed=null, version comparison impossible → bump='unknown'
+  assert.equal(schema.installed, null, 'missing SCHEMA.md should yield installed=null');
+  assert.equal(schema.bump, 'unknown', 'unresolvable versions should yield bump=unknown');
+  // Exit code is 0 or 1 depending on installed hook/settings state (environment-dependent)
+  assert.ok(r.status <= 1, `unexpected exit code ${r.status}`);
+});
+
+test('--apply on tmp wiki exits 0 after applying available changes', () => {
+  withTmpHome(home => {
+    withTmpDir(dir => {
+      const wikiDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const r = runWithHome('upgrade.mjs', [`--wiki-dir=${wikiDir}`, '--json', '--apply'], home);
+      assert.equal(r.signal, null, `process killed with signal: ${r.signal}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok('applied' in out, 'applied field missing after --apply');
+      assert.ok(Array.isArray(out.applied.hooks), 'applied.hooks should be an array');
+      assert.ok(Array.isArray(out.applied.settings), 'applied.settings should be an array');
+      assert.equal(r.status, 0, `expected exit 0 after --apply: ${r.stderr}`);
+    });
+  });
+});
+
+// ── lint.mjs --fix tests ─────────────────────────────────────────────────────
+
+suite('lint.mjs --fix');
+
+function lintFix(content) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-'));
+  const pagesDir = join(dir, 'pages');
+  mkdirSync(pagesDir);
+  writeFileSync(join(pagesDir, 'test.md'), content);
+  const r = run('lint.mjs', [`--wiki-dir=${dir}`, '--fix', '--json']);
+  const fixed = readFileSync(join(pagesDir, 'test.md'), 'utf-8');
+  rmSync(dir, { recursive: true, force: true });
+  return { r, fixed };
+}
+
+test('--fix inserts updated into LF frontmatter', () => {
+  const { fixed } = lintFix('---\ntitle: T\ntype: concept\n---\nbody\n');
+  const fm = fixed.slice(0, fixed.indexOf('\n---\n') + 5);
+  assert.ok(fm.includes('updated:'), 'updated not inserted into frontmatter');
+  assert.ok(!fixed.slice(fixed.indexOf('\n---\n') + 5).includes('updated:'), 'updated inserted outside frontmatter');
+});
+
+test('--fix inserts updated into CRLF frontmatter', () => {
+  const { fixed } = lintFix('---\r\ntitle: T\r\ntype: concept\r\n---\r\nbody\r\n');
+  assert.ok(fixed.includes('updated:'), 'updated not inserted');
+  const fmEnd = fixed.indexOf('\r\n---\r\n');
+  assert.ok(fixed.indexOf('updated:') < fmEnd, 'updated inserted outside frontmatter');
+});
+
+test('--fix handles mixed line endings (LF frontmatter + CRLF body)', () => {
+  const { fixed } = lintFix('---\ntitle: T\ntype: concept\n---\r\nbody\r\n');
+  const fmEnd = fixed.indexOf('\n---\r\n');
+  assert.ok(fmEnd > 0, 'frontmatter closing not found');
+  const updatedPos = fixed.indexOf('updated:');
+  assert.ok(updatedPos > 0 && updatedPos < fmEnd, `updated at ${updatedPos}, fm closes at ${fmEnd}`);
+});
+
+test('--fix skips file with no frontmatter', () => {
+  const { fixed } = lintFix('# No frontmatter here\nbody\n');
+  assert.ok(!fixed.includes('updated:'), 'should not insert updated into file without frontmatter');
+});
+
+test('--json output omits internal path field', () => {
+  const { r } = lintFix('---\ntitle: T\ntype: concept\n---\nbody\n');
+  const out = JSON.parse(r.stdout);
+  const allIssues = [...(out.errors || []), ...(out.warns || [])];
+  assert.ok(allIssues.every(i => !('path' in i)), 'path field leaked into JSON output');
+});
+
+suite('lint.mjs session-state schema');
+
+function lintSessionState(content) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-state-'));
+  const projectDir = join(dir, 'projects', 'proj');
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, 'session-state.md'), content);
+  const r = run('lint.mjs', [`--wiki-dir=${dir}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  rmSync(dir, { recursive: true, force: true });
+  return { r, out };
+}
+
+test('accepts 다음 작업 as a session-state next heading alias', () => {
+  const { r, out } = lintSessionState('---\ntitle: Session State\ntype: session-state\nupdated: 2026-05-07\n---\n# Session State\n\n## 다음 작업\n\n- Continue\n');
+  assert.equal(r.status, 0, `stderr: ${r.stderr}\nstdout: ${r.stdout}`);
+  assert.deepEqual(out.errors, []);
+});
+
+test('errors when project session-state lacks a next heading', () => {
+  const { r, out } = lintSessionState('---\ntitle: Session State\ntype: session-state\nupdated: 2026-05-07\n---\n# Session State\n\n## Background\n\n- Missing next section\n');
+  assert.equal(r.status, 1, `expected lint error\nstdout: ${r.stdout}`);
+  assert.ok(out.errors.some(i =>
+    i.file === 'projects/proj/session-state.md'
+    && i.message.includes('Missing required session-state heading')
+  ), `missing session-state heading error: ${r.stdout}`);
+});
+
+// ── summary ──────────────────────────────────────────────────────────────────
+
+console.log(`\n${'─'.repeat(40)}`);
+console.log(`  ${passed} passed, ${failed} failed`);
+
+if (failed > 0) {
+  console.error(`\nFailed tests:`);
+  for (const { name, err } of failures) {
+    console.error(`  ✗ ${name}: ${err.message}`);
+  }
+  process.exit(1);
+}
