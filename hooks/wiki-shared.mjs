@@ -7,7 +7,7 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { join, relative, basename } from 'path';
 import { homedir } from 'os';
 import { spawnSync } from 'child_process';
 
@@ -148,4 +148,56 @@ export function isCompactCommand(prompt) {
  */
 export function buildOutput(context, extra = {}) {
   return { ...extra, additionalContext: context };
+}
+
+// ── .wikiignore support ────────────────────────────────────────────────────
+// Inlined here so deployed hooks (~/.claude/hooks/) don't need scripts/lib/.
+
+function _globToRegex(glob) {
+  return new RegExp('^' +
+    glob
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/\*\*/g, '\x00')
+      .replace(/\*/g, '[^/]*')
+      .replace(/\?/g, '[^/]')
+      .replace(/\x00/g, '.*')
+  + '$');
+}
+
+export function loadWikiIgnore(wikiDir) {
+  const ignorePath = join(wikiDir, '.wikiignore');
+  if (!existsSync(ignorePath)) return [];
+  return readFileSync(ignorePath, 'utf-8')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'));
+}
+
+export function isIgnored(filePath, wikiDir, patterns) {
+  const rel = relative(wikiDir, filePath).replace(/\\/g, '/');
+  const base = basename(filePath);
+  for (const pattern of patterns) {
+    const isDir = pattern.endsWith('/');
+    if (isDir) {
+      const dir = pattern.slice(0, -1);
+      const isAnchored = dir.includes('/');
+      if (isAnchored) {
+        const re = _globToRegex(dir);
+        const parts = rel.split('/');
+        for (let i = dir.split('/').length; i <= parts.length; i++) {
+          if (re.test(parts.slice(0, i).join('/'))) return true;
+        }
+      } else {
+        const re = _globToRegex(dir);
+        for (const part of rel.split('/')) {
+          if (re.test(part)) return true;
+        }
+      }
+      continue;
+    }
+    const hasSlash = pattern.includes('/');
+    const target = hasSlash ? rel : base;
+    if (_globToRegex(pattern).test(target)) return true;
+  }
+  return false;
 }

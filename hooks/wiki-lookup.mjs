@@ -12,6 +12,7 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join, basename } from 'path';
 import { WIKI_DIR, buildOutput } from './wiki-shared.mjs';
+import { loadWikiIgnore, isIgnored } from './wiki-shared.mjs';
 
 const INDEX_PATH = join(WIKI_DIR, 'index.md');
 const MAX_HITS   = 3;
@@ -19,12 +20,13 @@ const MAX_CHARS  = 2000;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function buildPageMap(dir, root = dir, map = {}) {
+function buildPageMap(dir, root = dir, map = {}, ignorePatterns = [], wikiDir = root) {
   if (!existsSync(dir)) return map;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
+    if (isIgnored(full, wikiDir, ignorePatterns)) continue;
     if (statSync(full).isDirectory()) {
-      buildPageMap(full, root, map);
+      buildPageMap(full, root, map, ignorePatterns, wikiDir);
     } else if (entry.endsWith('.md')) {
       const rel = full.slice(root.length + 1).replace(/\.md$/, '');
       map[rel] = full;
@@ -135,9 +137,10 @@ process.stdin.on('end', () => {
       return;
     }
 
+    const ignorePatterns = loadWikiIgnore(WIKI_DIR);
     const pageMap = {
-      ...buildPageMap(join(WIKI_DIR, 'pages')),
-      ...buildPageMap(join(WIKI_DIR, 'projects')),
+      ...buildPageMap(join(WIKI_DIR, 'pages'), join(WIKI_DIR, 'pages'), {}, ignorePatterns),
+      ...buildPageMap(join(WIKI_DIR, 'projects'), join(WIKI_DIR, 'projects'), {}, ignorePatterns),
     };
 
     const injected = [];

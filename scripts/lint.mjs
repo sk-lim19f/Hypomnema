@@ -17,6 +17,7 @@ import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from '
 import { join, relative, extname, basename } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
 import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/wiki-shared.mjs';
+import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -47,13 +48,14 @@ function parseFrontmatter(content) {
 
 // ── page collector ────────────────────────────────────────────────────────────
 
-function collectPages(dir, root, pages = []) {
+function collectPages(dir, root, pages = [], ignorePatterns = []) {
   if (!existsSync(dir)) return pages;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
+    if (isIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) {
-      collectPages(full, root, pages);
+      collectPages(full, root, pages, ignorePatterns);
     } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
       pages.push({ path: full, rel: relative(root, full) });
     }
@@ -155,8 +157,9 @@ function lintPage({ path, rel }, slugMap) {
 
 const args = parseArgs(process.argv);
 
+const ignorePatterns = loadWikiIgnore(args.wikiDir);
 const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-const pages = scanDirs.flatMap(d => collectPages(d, args.wikiDir));
+const pages = scanDirs.flatMap(d => collectPages(d, args.wikiDir, [], ignorePatterns));
 const slugMap = buildSlugMap(pages);
 
 for (const page of pages) lintPage(page, slugMap);

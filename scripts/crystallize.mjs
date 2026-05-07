@@ -18,6 +18,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -34,13 +35,14 @@ function parseArgs(argv) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectPages(dir, root, acc = []) {
+function collectPages(dir, root, acc = [], ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
+    if (isIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
-    if (st.isDirectory()) collectPages(full, root, acc);
+    if (st.isDirectory()) collectPages(full, root, acc, ignorePatterns);
     else if (extname(entry) === '.md') {
       acc.push({ path: full, rel: relative(root, full) });
     }
@@ -74,8 +76,9 @@ function extractWikilinks(content) {
 
 const args = parseArgs(process.argv);
 
+const ignorePatterns = loadWikiIgnore(args.wikiDir);
 const pagesDir = join(args.wikiDir, 'pages');
-const pages = collectPages(pagesDir, args.wikiDir);
+const pages = collectPages(pagesDir, args.wikiDir, [], ignorePatterns);
 
 const tagGroups  = {};  // tag → [{ slug, title }]
 const unlinked   = [];  // pages with no outbound wikilinks

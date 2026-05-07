@@ -18,6 +18,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
 import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -34,13 +35,14 @@ function parseArgs(argv) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectMdFiles(dir, acc = []) {
+function collectMdFiles(dir, acc = [], wikiDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
+    if (wikiDir && isIgnored(full, wikiDir, ignorePatterns)) continue;
     const st = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc);
+    if (st.isDirectory()) collectMdFiles(full, acc, wikiDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
@@ -69,8 +71,9 @@ let files;
 if (args.file) {
   files = [args.file];
 } else {
+  const ignorePatterns = loadWikiIgnore(args.wikiDir);
   const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-  files = scanDirs.flatMap(d => collectMdFiles(d));
+  files = scanDirs.flatMap(d => collectMdFiles(d, [], args.wikiDir, ignorePatterns));
 }
 
 const overdue  = [];
