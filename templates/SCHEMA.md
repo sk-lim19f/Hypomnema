@@ -81,6 +81,8 @@ confidence: high | medium | low | speculative
 evidence_strength: direct | inferred | hearsay
 scope: always | project | session
 source: <slug or URL>
+verify_by: <question to re-check at next review>
+verify_by_date: YYYY-MM-DD
 ```
 
 ---

@@ -96,28 +96,27 @@ function stripSettingsJson(settingsPath, hooksDir, hookMap, apply) {
   for (const [event, groups] of Object.entries(settings.hooks)) {
     if (!Array.isArray(groups)) continue;
 
-    const filtered = groups.filter(group => {
-      if (!Array.isArray(group.hooks)) return true;
-      // Check if every hook in this group is a Hypomnema-managed command
-      const allHypo = group.hooks.every(h => {
-        if (h.type !== 'command' || typeof h.command !== 'string') return false;
-        const hookFiles = hookMap[event] ?? [];
-        return hookFiles.some(file => {
-          const cmd = `node ${hooksDir.replace(HOME, '$HOME')}/${file}`;
-          return h.command === cmd;
-        });
-      });
-      if (allHypo) {
-        for (const h of group.hooks) stripped.push(`${event}: ${h.command}`);
-        return false; // remove this group
-      }
-      return true; // keep non-Hypomnema groups
+    const managed = (hookMap[event] ?? []);
+    const isHypoHook = h =>
+      h.type === 'command' &&
+      typeof h.command === 'string' &&
+      managed.some(file => h.command === `node ${hooksDir.replace(HOME, '$HOME')}/${file}`);
+
+    const filtered = groups.flatMap(group => {
+      if (!Array.isArray(group.hooks)) return [group];
+
+      const hypoHooks = group.hooks.filter(h => isHypoHook(h));
+      const userHooks = group.hooks.filter(h => !isHypoHook(h));
+
+      for (const h of hypoHooks) stripped.push(`${event}: ${h.command}`);
+
+      if (hypoHooks.length === 0) return [group];   // no Hypomnema hooks → keep as-is
+      changed = true;
+      if (userHooks.length === 0) return [];          // all Hypomnema → remove group
+      return [{ ...group, hooks: userHooks }];        // mixed → keep only user hooks
     });
 
-    if (filtered.length !== groups.length) {
-      settings.hooks[event] = filtered;
-      changed = true;
-    }
+    settings.hooks[event] = filtered;
   }
 
   if (changed && apply) {
