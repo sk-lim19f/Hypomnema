@@ -6,7 +6,7 @@ You are running `/hypo:lint`. Validate all wiki pages for frontmatter correctnes
 
 ## What this checks
 
-- Every `.md` file under `pages/` and `projects/` must have `---` frontmatter
+- Every `.md` file under `pages/` and `projects/` should have `---` frontmatter (missing frontmatter is a warning, not an error)
 - Required fields: `title`, `type`
 - `type` must be one of the recognised values (concept, source-summary, learning, adr, …)
 - `updated` field should be present
@@ -42,7 +42,7 @@ Show the output verbatim.
 - `✗ <file>: <message>` — error (missing required field or malformed frontmatter); must be fixed
 - `⚠ <file>: <message>` — warning (unknown type, missing `updated`, broken link); worth fixing
 
-A non-zero exit code means at least one error was found.
+A non-zero exit code means at least one **error** was found (warnings alone do not produce a non-zero exit code).
 
 ---
 
@@ -50,6 +50,6 @@ A non-zero exit code means at least one error was found.
 
 For **broken wikilinks**: list the affected files and ask if the user wants help correcting the links now.
 
-For **missing `updated`**: suggest running with `--fix` to auto-repair.
+For **missing `updated`**: suggest running with `--fix` to auto-add `updated: <today>` to each affected page's frontmatter. Note: `--fix` only repairs files that already have a valid, closed frontmatter block — files with no frontmatter or malformed frontmatter are skipped.
 
 For **missing required fields** (`title`, `type`): open the affected files and help the user fill them in.
