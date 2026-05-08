@@ -12,6 +12,8 @@ Hooks use it to locate the wiki root automatically — do not delete or move it.
 
 ## Settings
 
+privacy: personal
+
 To override the wiki root path, set the `HYPO_DIR` environment variable
 instead of editing this file.
 
