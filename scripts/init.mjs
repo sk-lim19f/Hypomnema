@@ -280,9 +280,11 @@ function firstCommit(wikiDir, remote, dryRun) {
     const commitR = git(wikiDir, ['commit', '-m', `chore: init wiki (${today})`]);
     if (commitR.status !== 0) { log('errors', 'first commit failed'); return; }
     if (remote) {
+      const actualOrigin = git(wikiDir, ['remote', 'get-url', 'origin']);
+      const pushTarget = actualOrigin.status === 0 ? actualOrigin.stdout.trim() : remote;
       const pushR = git(wikiDir, ['push', '-u', 'origin', 'HEAD']);
       if (pushR.status !== 0) log('errors', `git push failed: ${(pushR.stderr || '').trim()}`);
-      else log('merged', `pushed to ${remote}`);
+      else log('merged', `pushed to ${pushTarget}`);
     }
   }
   log('created', `first commit (${today})`);
