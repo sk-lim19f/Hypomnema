@@ -1,0 +1,62 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  verify-pages:
+    name: Verify pages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Init wiki
+        run: |
+          node scripts/init.mjs \
+            --wiki-dir=/tmp/wiki-nightly \
+            --no-hooks --no-git-init
+      - name: Seed verify fixture
+        run: |
+          printf '%s\n' \
+            '---' \
+            'title: Verify Fixture' \
+            'type: concept' \
+            'updated: 2026-01-01' \
+            'verify_by: Is this fixture still accurate?' \
+            'verify_by_date: 2026-01-01' \
+            '---' \
+            '# Verify Fixture' \
+            'A synthetic fixture used by nightly verify-pages CI.' \
+            > /tmp/wiki-nightly/pages/verify-fixture.md
+      - name: Verify all pages
+        run: |
+          node scripts/verify.mjs \
+            --wiki-dir=/tmp/wiki-nightly \
+            --json
+
+  llm-lint:
+    name: LLM lint (Haiku)
+    runs-on: ubuntu-latest
+    if: ${{ vars.ENABLE_LLM_LINT == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Init wiki
+        run: |
+          node scripts/init.mjs \
+            --wiki-dir=/tmp/wiki-llm-lint \
+            --no-hooks --no-git-init
+      - name: Run LLM lint (Haiku)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          node scripts/lint-llm.mjs \
+            --wiki-dir=/tmp/wiki-llm-lint \
+            --model=haiku \
+            --json
