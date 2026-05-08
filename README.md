@@ -1,3 +1,7 @@
+English | [한국어](README.ko.md)
+
+---
+
 # Hypomnema
 
 LLM-native personal wiki system for Claude Code.
