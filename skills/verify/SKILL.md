@@ -43,7 +43,7 @@ Show the output verbatim.
 - **due soon** — `verify_by_date` is within 14 days; worth reviewing this session
 - **ok** — no verify fields, or deadline is far enough out
 
-A page with `verify_by` but no `verify_by_date` is treated as **due soon** (undated verification intent).
+A page with `verify_by` but no `verify_by_date` is treated as **ok** (no deadline set — add `verify_by_date` to schedule a review).
 
 ---
 
@@ -71,11 +71,22 @@ After each review, apply the updated `last_reviewed` and `verify_by_date` fields
 
 For each page reviewed as **no** or **partially** (content found stale or incorrect):
 
-1. Open `<wiki-root>/pages/open-questions.md` (create with a `# Open Questions` heading if absent).
+1. Open `<wiki-root>/pages/open-questions.md`. If absent, create it with this frontmatter:
+
+```
+---
+title: Open Questions
+type: open-questions
+updated: <today YYYY-MM-DD>
+---
+
+# Open Questions
+```
+
 2. Append an entry:
 
 ```
-- [ ] Re-verify [[<page-title>]]: <verify_by question>  (surfaced: <today YYYY-MM-DD>)
+- [ ] Re-verify [[<page-slug>|<page-title>]]: <verify_by question>  (surfaced: <today YYYY-MM-DD>)
 ```
 
 3. Save the file. Do not remove or reorder existing entries.
