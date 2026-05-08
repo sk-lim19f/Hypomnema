@@ -63,7 +63,7 @@ function log(action, path) { results[action].push(path); }
 
 // ── directory structure ──────────────────────────────────────────────────────
 
-const WIKI_DIRS = ['pages', 'projects', 'sources'];
+const WIKI_DIRS = ['pages', 'projects', 'sources', 'journal/daily', 'journal/weekly', 'journal/monthly'];
 
 function ensureDir(dir, dryRun) {
   if (existsSync(dir)) return;
@@ -266,6 +266,28 @@ function gitSetup(wikiDir, remote, dryRun) {
   }
 }
 
+// ── first commit + push ──────────────────────────────────────────────────────
+
+function firstCommit(wikiDir, remote, dryRun) {
+  const logR = git(wikiDir, ['log', '--oneline', '-1']);
+  if (logR.status === 0 && logR.stdout.trim()) {
+    log('skipped', 'first commit (repo already has commits)');
+    return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  if (!dryRun) {
+    git(wikiDir, ['add', '-A'], { stdio: 'ignore' });
+    const commitR = git(wikiDir, ['commit', '-m', `chore: init wiki (${today})`]);
+    if (commitR.status !== 0) { log('errors', 'first commit failed'); return; }
+    if (remote) {
+      const pushR = git(wikiDir, ['push', '-u', 'origin', 'HEAD']);
+      if (pushR.status !== 0) log('errors', `git push failed: ${(pushR.stderr || '').trim()}`);
+      else log('merged', `pushed to ${remote}`);
+    }
+  }
+  log('created', `first commit (${today})`);
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -278,11 +300,26 @@ ensureDir(args.wikiDir, args.dryRun);
 for (const d of WIKI_DIRS) ensureDir(join(args.wikiDir, d), args.dryRun);
 
 // 2. template files
-copyTemplate('index.md',     join(args.wikiDir, 'index.md'),     args.dryRun);
-copyTemplate('hot.md',       join(args.wikiDir, 'hot.md'),       args.dryRun);
-copyTemplate('log.md',       join(args.wikiDir, 'log.md'),       args.dryRun);
-copyTemplate('SCHEMA.md',    join(args.wikiDir, 'SCHEMA.md'),    args.dryRun);
-copyTemplate('wiki-guide.md',join(args.wikiDir, 'wiki-guide.md'),args.dryRun);
+copyTemplate('index.md',          join(args.wikiDir, 'index.md'),          args.dryRun);
+copyTemplate('hot.md',            join(args.wikiDir, 'hot.md'),            args.dryRun);
+copyTemplate('log.md',            join(args.wikiDir, 'log.md'),            args.dryRun);
+copyTemplate('SCHEMA.md',         join(args.wikiDir, 'SCHEMA.md'),         args.dryRun);
+copyTemplate('wiki-guide.md',     join(args.wikiDir, 'wiki-guide.md'),     args.dryRun);
+copyTemplate('Home.md',           join(args.wikiDir, 'Home.md'),           args.dryRun);
+copyTemplate('Overview.md',       join(args.wikiDir, 'Overview.md'),       args.dryRun);
+copyTemplate('hypo-help.md',      join(args.wikiDir, 'hypo-help.md'),      args.dryRun);
+copyTemplate('wiki-automation.md',join(args.wikiDir, 'wiki-automation.md'),args.dryRun);
+copyTemplate('session-state.md',  join(args.wikiDir, 'session-state.md'),  args.dryRun);
+copyTemplate(join('pages', '_index.md'), join(args.wikiDir, 'pages', '_index.md'), args.dryRun);
+
+// projects/_template structure
+ensureDir(join(args.wikiDir, 'projects', '_template'), args.dryRun);
+ensureDir(join(args.wikiDir, 'projects', '_template', 'decisions'), args.dryRun);
+ensureDir(join(args.wikiDir, 'projects', '_template', 'session-log'), args.dryRun);
+copyTemplate(join('projects', '_template', 'hot.md'),          join(args.wikiDir, 'projects', '_template', 'hot.md'),          args.dryRun);
+copyTemplate(join('projects', '_template', 'index.md'),        join(args.wikiDir, 'projects', '_template', 'index.md'),        args.dryRun);
+copyTemplate(join('projects', '_template', 'prd.md'),          join(args.wikiDir, 'projects', '_template', 'prd.md'),          args.dryRun);
+copyTemplate(join('projects', '_template', 'session-state.md'),join(args.wikiDir, 'projects', '_template', 'session-state.md'),args.dryRun);
 
 // 3. hypo-config.md + .wikiignore
 writeHypoConfig(args.wikiDir, args.privacy, args.dryRun);
@@ -312,6 +349,11 @@ if (args.gitInit) {
 // 7. pkg repo git hook (auto-sync hooks/ → ~/.claude/hooks/ on commit)
 if (args.hooks) {
   installPkgGitHook(args.dryRun);
+}
+
+// 8. first commit + push
+if (args.gitInit) {
+  firstCommit(args.wikiDir, args.gitRemote, args.dryRun);
 }
 
 // ── report ───────────────────────────────────────────────────────────────────
