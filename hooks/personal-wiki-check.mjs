@@ -8,7 +8,7 @@
  *   - hot.md has forbidden structure
  *   - lint blockers exist
  *
- * Bypass: set HYPO_SKIP_GATE=1 (also accepts OMC_SKIP_WIKI_GATE=1 for backwards compat).
+ * Bypass: set HYPO_SKIP_GATE=1.
  */
 
 import { spawnSync } from 'child_process';

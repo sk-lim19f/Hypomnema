@@ -64,7 +64,7 @@ export const ALLOWED_HOT_H2 = _allowedH2Env
 
 /** Returns true if the wiki gate should be bypassed. */
 export function isGateSkipped() {
-  return process.env.HYPO_SKIP_GATE === '1' || process.env.OMC_SKIP_WIKI_GATE === '1';
+  return process.env.HYPO_SKIP_GATE === '1';
 }
 
 // ── state checkers ─────────────────────────────────────────────────────────

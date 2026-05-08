@@ -304,13 +304,10 @@ test('HYPO_SKIP_GATE=1 → true', () => {
 
 test('no env var → false', () => {
   const o1 = process.env.HYPO_SKIP_GATE;
-  const o2 = process.env.OMC_SKIP_WIKI_GATE;
   delete process.env.HYPO_SKIP_GATE;
-  delete process.env.OMC_SKIP_WIKI_GATE;
   try { assert.equal(isGateSkipped(), false); }
   finally {
     if (o1 !== undefined) process.env.HYPO_SKIP_GATE = o1;
-    if (o2 !== undefined) process.env.OMC_SKIP_WIKI_GATE = o2;
   }
 });
 
