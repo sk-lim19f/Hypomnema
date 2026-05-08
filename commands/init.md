@@ -79,9 +79,9 @@ Add `--dry-run` first to preview the changes, then run without it.
 ## Step 3 — Report results
 
 Show the script output to the user:
-- ✓ Created files/dirs
+- ✓ Created files/dirs (includes journal/, projects/_template/, first commit)
 - ⊘ Skipped (already existed — no overwrites)
-- ↪ Merged into settings.json
+- ↪ Merged into settings.json / pushed to remote
 - ✗ Errors (if any)
 
 ---
