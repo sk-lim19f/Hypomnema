@@ -158,8 +158,8 @@ jobs:
             if (d.continue !== true) { console.error('expected continue:true'); process.exit(1); }
           "
 
-  omc-absent:
-    name: OMC-absent (Node ${{ matrix.node-version }})
+  hypo-absent:
+    name: Hypo-absent (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -169,10 +169,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      - name: Run tests without OMC env vars
+      - name: Run tests without hypo env vars
         env:
           HYPO_SKIP_GATE: ""
-          OMC_SKIP_WIKI_GATE: ""
-          OMC_SKIP_HOOKS: ""
           HYPO_DIR: ""
         run: npm test

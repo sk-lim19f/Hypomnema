@@ -94,7 +94,7 @@ When adding a feature, add a corresponding test in `tests/runner.mjs`. For hook 
 - Commit messages: imperative, lowercase subject line, ≤ 72 characters.
   - Good: `fix: resolve wiki root when HYPO_DIR contains ~`
   - Bad: `Fixed the bug with the wiki root path resolution issue`
-- For non-trivial changes, get a second review (e.g. via `omc-teams:2 codex`) before merging.
+- For non-trivial changes, get a second review before merging.
 
 ---
 
