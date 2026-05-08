@@ -128,9 +128,10 @@ process.stdin.on('end', () => {
     if (matched.length === 0) {
       const topic   = keywords.slice(0, 5).join(', ');
       const closest = bm25Score(keywords, entries).slice(0, 3).map(e => `[[${e.slug}]]`).join(', ');
+      const hint    = closest ? ` Closest: ${closest}` : '';
       console.log(JSON.stringify(
         buildOutput(
-          `[WIKI LOOKUP: miss] "${topic}" — no match. Closest: ${closest || 'none'}`,
+          `[WIKI LOOKUP: miss] "${topic}" — 관련 페이지 없음. 리서치 후 /hypo:ingest 로 저장을 권장합니다.${hint}`,
           { continue: true, suppressOutput: true }
         )
       ));

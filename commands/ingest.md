@@ -50,8 +50,10 @@ Do **not** modify or summarize in the sources file — save it as-is.
 Read and synthesize the source:
 
 1. **Check index.md** — does a page on this topic already exist?
-   - If yes: update the existing page (merge new information, mark `updated:` today)
-   - If no: create a new page in `pages/` with `type: source-summary` and `source: <slug>`
+   - **If yes**: read the existing page and check its `verify_by` date (if present).
+     - If `verify_by` is in the past (legacy): **preserve** the existing content as-is, append new findings under a `## Update YYYY-MM-DD` section, and set `updated:` to today. Do not overwrite or rewrite the original body.
+     - If `verify_by` is still valid or absent: merge new information into the existing page and mark `updated:` today.
+   - **If no**: create a new page in `pages/` with `type: source-summary` and `source: <slug>`
 
 2. **Frontmatter** for new pages:
    ```yaml
