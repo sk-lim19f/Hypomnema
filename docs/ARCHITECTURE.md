@@ -14,13 +14,13 @@ Hypomnema is an LLM-native personal wiki that runs as a Claude Code extension. I
 
 ```
 hypomnema/
-├── commands/          ← slash command definitions (.md prompt + entry in skills/)
+├── commands/          ← slash command definitions (.md prompts)
 ├── hooks/             ← lifecycle hooks deployed to ~/.claude/hooks/
 │   ├── wiki-shared.mjs   ← shared utilities (inlined at deploy; no external imports)
 │   └── hooks.json        ← hook-to-event registry
 ├── scripts/           ← command implementations called by slash commands
 │   └── lib/           ← shared helpers (frontmatter, wiki-root, wiki-ignore)
-├── skills/            ← Agent skill definitions for /hypo:* commands
+├── skills/            ← Agent Skills (skills/<name>/SKILL.md) for /hypo:* commands
 ├── templates/         ← baseline wiki files copied on init
 ├── tests/
 │   └── runner.mjs     ← no-dependency test runner

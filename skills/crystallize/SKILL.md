@@ -15,7 +15,7 @@ You are running `/hypo:crystallize`. Find pages that are ready to be consolidate
 
 ## Step 1 — Locate package root
 
-Locate the Hypomnema package root (the directory containing this file's parent `skills/`).
+Locate the Hypomnema package root (the directory two levels above this file (`skills/<name>/SKILL.md` → package root)).
 
 If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/wiki`.
 
