@@ -20,7 +20,7 @@ hypomnema/
 │   └── hooks.json        ← hook-to-event registry
 ├── scripts/           ← command implementations called by slash commands
 │   └── lib/           ← shared helpers (frontmatter, wiki-root, wiki-ignore)
-├── skills/            ← OMC skill wrappers for /hypo:* commands
+├── skills/            ← Agent skill definitions for /hypo:* commands
 ├── templates/         ← baseline wiki files copied on init
 ├── tests/
 │   └── runner.mjs     ← no-dependency test runner
