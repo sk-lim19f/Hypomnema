@@ -64,3 +64,18 @@ For each overdue page, in priority order:
 ## Step 5 — Update frontmatter
 
 After each review, apply the updated `last_reviewed` and `verify_by_date` fields to the page frontmatter. Do not change any other fields unless the user approves.
+
+---
+
+## Step 6 — Append stale items to open-questions.md
+
+For each page reviewed as **no** or **partially** (content found stale or incorrect):
+
+1. Open `<wiki-root>/pages/open-questions.md` (create with a `# Open Questions` heading if absent).
+2. Append an entry:
+
+```
+- [ ] Re-verify [[<page-title>]]: <verify_by question>  (surfaced: <today YYYY-MM-DD>)
+```
+
+3. Save the file. Do not remove or reorder existing entries.

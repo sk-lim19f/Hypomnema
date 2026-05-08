@@ -160,4 +160,13 @@ const summary = [
 
 console.log(`Result: ${summary || 'nothing to verify'}`);
 
+// Emit signal lines for overdue/upcoming pages so /hypo:verify skill can drive review
+const needsReview = [...overdue, ...upcoming].filter(p => p.verify_by);
+if (needsReview.length > 0) {
+  console.log('');
+  for (const p of needsReview) {
+    console.log(`[HYPO VERIFY QUESTION: ${p.verify_by} (file: ${p.file})]`);
+  }
+}
+
 if (overdue.length > 0) process.exit(1);
