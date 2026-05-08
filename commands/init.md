@@ -29,6 +29,19 @@ Ask the following questions **one at a time**. Use the default if the user press
    - `public`   — maximum redaction (blocks `journal/`, personal identifiers)
    Default: `personal`
 
+   After the user selects a privacy mode, display this notice before continuing:
+
+   > **Privacy boundary:** Wiki files are stored **locally** on your machine. However, when
+   > Claude reads wiki pages via hooks or commands, that content is sent to Anthropic's API
+   > as part of the conversation context.
+   >
+   > - `personal` — no extra restrictions; all pages may reach Claude context.
+   > - `shared` — blocks `*personal*`, `*private*`, `journal/` from hook injection.
+   > - `public` — adds `sources/` and `drafts/` on top of `shared` rules (maximum redaction).
+   >
+   > To exclude specific content from Claude's context, add paths to `.wikiignore` after init.
+   > Full details: `docs/PRIVACY.md`
+
 3. **Install hooks**
    > "Install Claude Code hooks for automatic context injection? [yes]"
    Default: yes
