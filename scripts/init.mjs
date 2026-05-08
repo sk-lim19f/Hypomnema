@@ -104,10 +104,16 @@ function writeHypoConfig(wikiDir, privacy, dryRun) {
 // ── .wikiignore ──────────────────────────────────────────────────────────────
 
 const SHARED_EXTRA = `
-# Shared / public mode: also block personal identifiers
+# shared/public mode: block personal identifiers
 *personal*
 *private*
 journal/
+`;
+
+const PUBLIC_EXTRA = `
+# public mode: maximum redaction — also block raw sources and drafts
+sources/
+drafts/
 `;
 
 function writeWikiignore(wikiDir, privacy, dryRun) {
@@ -116,6 +122,7 @@ function writeWikiignore(wikiDir, privacy, dryRun) {
   const src  = join(TEMPLATES, '.wikiignore');
   let content = existsSync(src) ? readFileSync(src, 'utf-8') : '';
   if (privacy === 'shared' || privacy === 'public') content += SHARED_EXTRA;
+  if (privacy === 'public') content += PUBLIC_EXTRA;
   if (!dryRun) writeFileSync(dest, content);
   log('created', dest);
 }
