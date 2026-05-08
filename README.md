@@ -40,7 +40,7 @@ Four things that set it apart:
 1. **Synthesis over storage.** Claude reads each source and synthesizes it into a structured page — not a copy-paste dump. You get a knowledge base you can reason over, not a pile of bookmarks.
 2. **Compounding pages.** When a new source overlaps an existing page, Claude updates that page. The wiki gets denser and more connected over time rather than just bigger.
 3. **Zero-friction hooks.** Session start, session close, auto-staging, and auto-commit happen automatically through Claude Code lifecycle hooks. You never context-switch to manage the wiki.
-4. **Native to your workflow.** No separate app, no export/import, no sync service. Hypomnema runs inside the Claude Code session you already have open.
+4. **Native to your workflow.** No separate app, no export/import, no third-party sync service. Hypomnema runs inside the Claude Code session you already have open.
 
 ---
 
@@ -130,7 +130,7 @@ You put a project down for three weeks. At the next session start, the hook read
 
 ## Privacy
 
-All wiki data is stored locally. No content is sent to external services by Hypomnema itself.
+Wiki data is stored as local files. If you configure a Git remote, the Stop hook automatically commits and pushes your wiki — no third-party sync service is involved. Commands that use the Claude API (such as `/hypo:verify` and `/hypo:lint --llm`) send page content to Anthropic for evaluation; all other hooks operate entirely offline.
 
 Three privacy modes are available: `personal` (default), `shared`, and `public`. A `.wikiignore` file controls which files hooks scan and include in context.
 
