@@ -32,7 +32,11 @@ import {
 const CRITICAL_FILE = join(homedir(), '.claude', 'state', 'wiki-context-critical.json');
 const WARNING_FILE  = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
-/** Parse JSONL transcript and return concatenated text of user-role messages only. */
+/** Parse JSONL transcript and return concatenated text of user-role messages only.
+ *
+ * Claude Code transcript format: each line is `{ type: "user", message: { role: "user", content: ... } }`.
+ * Older shape (`{ role, content }` at top level) is also accepted for forward compatibility.
+ */
 function extractUserMessages(transcriptPath) {
   try {
     const lines = readFileSync(transcriptPath, 'utf-8').split('\n');
@@ -40,10 +44,11 @@ function extractUserMessages(transcriptPath) {
     return tail.map(line => {
       try {
         const obj = JSON.parse(line);
-        if (obj.role !== 'user') return '';
-        return typeof obj.content === 'string'
-          ? obj.content
-          : JSON.stringify(obj.content);
+        const msg = obj.message ?? obj;
+        const role = msg.role ?? obj.role ?? obj.type;
+        if (role !== 'user') return '';
+        const content = msg.content ?? obj.content;
+        return typeof content === 'string' ? content : JSON.stringify(content);
       } catch { return ''; }
     }).join('\n');
   } catch { return ''; }
