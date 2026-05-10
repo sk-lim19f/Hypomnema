@@ -57,7 +57,7 @@ journal/
 sources/*.pdf
 ```
 
-See [[docs/PRIVACY]] for full privacy documentation.
+See [docs/PRIVACY.md](https://github.com/sk-lim19f/Hypomnema/blob/main/docs/PRIVACY.md) for full privacy documentation.
 
 ---
 

@@ -232,11 +232,14 @@ function checkBrokenLinks(hypoDir, ignorePatterns = []) {
   const broken = [];
 
   for (const file of mdFiles) {
-    const content = readFileSync(file, 'utf-8');
+    const raw = readFileSync(file, 'utf-8');
+    const content = raw.replace(/<!--[\s\S]*?-->/g, '').replace(/`[^`\n]+`/g, '');
     const links = [...content.matchAll(/\[\[([^\]|#\n]+?)(?:[|#][^\]]*?)?\]\]/g)].map(m => m[1].trim());
     for (const link of links) {
       // skip object-path references (e.g. [[hooks.SessionStart]])
       if (link.includes('.') && !link.endsWith('.md')) continue;
+      // skip template placeholders (e.g. [[projects/<project-name>/prd]])
+      if (link.includes('<') || link.includes('>')) continue;
       const slug = link.replace(/\.md$/, '');
       if (!slugSet.has(slug) && !slugSet.has(slug.toLowerCase())) {
         broken.push({ file: relative(hypoDir, file), link });
