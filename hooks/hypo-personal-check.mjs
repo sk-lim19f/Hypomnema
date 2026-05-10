@@ -30,6 +30,7 @@ import {
 } from './hypo-shared.mjs';
 
 const CRITICAL_FILE = join(homedir(), '.claude', 'state', 'wiki-context-critical.json');
+const WARNING_FILE  = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
 /** Parse JSONL transcript and return concatenated text of user-role messages only. */
 function extractUserMessages(transcriptPath) {
@@ -64,6 +65,24 @@ process.stdin.on('end', () => {
     console.log(JSON.stringify({
       continue: true,
       systemMessage: '[WIKI CHECK] gate auto-bypassed (context ≥90% critical). Session close pending next session.',
+    }));
+    return;
+  }
+
+  // ── Block 1.5: context warning (≥70%) — request session-compact before compact ──
+  if (existsSync(WARNING_FILE)) {
+    try { unlinkSync(WARNING_FILE); } catch {}
+    console.log(JSON.stringify({
+      decision: 'block',
+      reason: [
+        `[WIKI CHECK — BLOCKING] Context ≥70%: run /session-compact before compacting.`,
+        `STOP. Do NOT compact yet.`,
+        `1. If Skill tool is available: call it with skill="session-compact" immediately.`,
+        `2. If Skill tool is unavailable: perform the full session-close checklist from hypo-guide.md.`,
+        `After session close completes, compact will proceed normally.`,
+        ``,
+        `To skip: set HYPO_SKIP_GATE=1`,
+      ].join('\n'),
     }));
     return;
   }
