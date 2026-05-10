@@ -38,9 +38,17 @@ function resolveActiveProject(hypoDir) {
   if (!existsSync(hotPath)) return null;
 
   const content = readFileSync(hotPath, 'utf-8');
-  // look for table rows with project links: | [name](projects/name/...) | ...
-  const tableRow = content.match(/\|\s*\[([^\]]+)\]\(projects\/([^/)]+)/);
-  if (tableRow) return tableRow[2];
+  // Canonical hot.md uses wikilinks: | name | date | [[projects/slug/hot]] |
+  // Pick the most recent row by the date column when present.
+  const wikiRows = [...content.matchAll(/\|\s*([^|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2})?\s*\|\s*\[\[projects\/([^\]/]+)\/[^\]]+\]\]/g)]
+    .map(m => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
+  if (wikiRows.length > 0) {
+    wikiRows.sort((a, b) => b.date.localeCompare(a.date));
+    return wikiRows[0].slug;
+  }
+  // Legacy markdown-link rows: | [name](projects/name/...) | ...
+  const mdRow = content.match(/\|\s*\[([^\]]+)\]\(projects\/([^/)]+)/);
+  if (mdRow) return mdRow[2];
 
   // fallback: most recently modified project with a session-state.md
   const projectsDir = join(hypoDir, 'projects');
