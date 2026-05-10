@@ -37,14 +37,16 @@ const TEMPLATES  = join(PKG_ROOT, 'templates');
 
 function parseArgs(argv) {
   const args = {
-    hypoDir:    resolveHypoRoot(),
-    privacy:    'personal',
-    hooks:      true,
-    codex:      false,
-    gitRemote:  null,
-    gitInit:    true,
-    dryRun:     false,
-    fromRemote: null,
+    hypoDir:     resolveHypoRoot(),
+    privacy:     'personal',
+    hooks:       true,
+    codex:       false,
+    gitRemote:   null,
+    gitInit:     true,
+    dryRun:      false,
+    fromRemote:  null,
+    shellSetup:  true,
+    shellConfig: null,
   };
   for (const arg of argv.slice(2)) {
     if (arg === '--help' || arg === '-h') {
@@ -58,22 +60,26 @@ Options:
   --git-remote=<url>     Git remote URL
   --no-git-init          Skip git initialization
   --from-remote=<url>    Clone existing Hypomnema wiki from remote and install hooks
+  --no-shell             Skip shell function setup (~/.zshrc / ~/.bashrc)
+  --shell-config=<path>  Shell config file path (default: auto-detect)
   --dry-run              Show what would be done without making changes
   --help, -h             Show this help message`);
       process.exit(0);
     }
-    else if (arg.startsWith('--hypo-dir='))     args.hypoDir    = expandHome(arg.slice(11));
-    else if (arg.startsWith('--privacy='))       args.privacy    = arg.slice(10);
-    else if (arg === '--no-hooks')               args.hooks      = false;
-    else if (arg === '--codex')                  args.codex      = true;
-    else if (arg.startsWith('--git-remote='))    args.gitRemote  = arg.slice(13);
-    else if (arg === '--no-git-init')            args.gitInit    = false;
+    else if (arg.startsWith('--hypo-dir='))      args.hypoDir    = expandHome(arg.slice(11));
+    else if (arg.startsWith('--privacy='))        args.privacy    = arg.slice(10);
+    else if (arg === '--no-hooks')                args.hooks      = false;
+    else if (arg === '--codex')                   args.codex      = true;
+    else if (arg.startsWith('--git-remote='))     args.gitRemote  = arg.slice(13);
+    else if (arg === '--no-git-init')             args.gitInit    = false;
     else if (arg.startsWith('--from-remote=')) {
       const url = arg.slice(14).trim();
       if (!url) { console.error('Error: --from-remote requires a non-empty URL'); process.exit(1); }
       args.fromRemote = url;
     }
-    else if (arg === '--dry-run')                args.dryRun     = true;
+    else if (arg === '--dry-run')                 args.dryRun     = true;
+    else if (arg === '--no-shell')                args.shellSetup = false;
+    else if (arg.startsWith('--shell-config='))   args.shellConfig = expandHome(arg.slice(14));
   }
   return args;
 }
@@ -298,6 +304,62 @@ function installPkgGitHook(dryRun) {
   log('created', hookPath);
 }
 
+// ── shell function setup ─────────────────────────────────────────────────────
+
+const SHELL_MARKER_START = '# hypo-managed:shell-setup:start';
+const SHELL_MARKER_END   = '# hypo-managed:shell-setup:end';
+
+function shellFunctionBlock() {
+  return `${SHELL_MARKER_START}
+function claude() {
+  echo "{\\"cwd\\":\\"$(pwd)\\"}" | node "$HOME/.claude/hooks/hypo-session-start.mjs" > /dev/null 2>&1
+  command claude "$@"
+}
+${SHELL_MARKER_END}`;
+}
+
+function detectShellConfig(customPath) {
+  if (customPath) return customPath;
+  const shell = process.env.SHELL || '';
+  if (shell.includes('zsh'))  return join(HOME, '.zshrc');
+  if (shell.includes('bash')) return join(HOME, '.bashrc');
+  // fallback: prefer .zshrc if it exists, else .bashrc
+  const zshrc = join(HOME, '.zshrc');
+  return existsSync(zshrc) ? zshrc : join(HOME, '.bashrc');
+}
+
+function installShellFunction(shellConfigPath, dryRun) {
+  const block = shellFunctionBlock();
+
+  if (!existsSync(shellConfigPath)) {
+    if (!dryRun) writeFileSync(shellConfigPath, block + '\n');
+    log('created', `${shellConfigPath} (shell function)`);
+    return;
+  }
+
+  const content = readFileSync(shellConfigPath, 'utf-8');
+  const startIdx = content.indexOf(SHELL_MARKER_START);
+  const endIdx   = content.indexOf(SHELL_MARKER_END);
+
+  if (startIdx !== -1 && endIdx !== -1) {
+    // Block exists — check if already up to date
+    const existing = content.slice(startIdx, endIdx + SHELL_MARKER_END.length);
+    if (existing === block) { log('skipped', `${shellConfigPath} (shell function up to date)`); return; }
+    // Replace stale block
+    const updated = content.slice(0, startIdx) + block + content.slice(endIdx + SHELL_MARKER_END.length);
+    if (!dryRun) writeFileSync(shellConfigPath, updated);
+    log('merged', `${shellConfigPath} (shell function updated)`);
+    return;
+  }
+
+  // No block — remove any legacy wiki-session-start function first, then append
+  const legacyPattern = /\n?# Wiki session context[^\n]*\nfunction claude\(\) \{[\s\S]+?\n\}\n?/g;
+  const cleaned = content.replace(legacyPattern, '\n');
+  const appended = cleaned.trimEnd() + '\n\n' + block + '\n';
+  if (!dryRun) writeFileSync(shellConfigPath, appended);
+  log('created', `${shellConfigPath} (shell function)`);
+}
+
 // ── from-remote clone ────────────────────────────────────────────────────────
 
 function readPrivacyFromConfig(hypoDir) {
@@ -443,24 +505,30 @@ if (args.hooks) {
   writePkgJson(args.dryRun);
 }
 
-// 5. codex hooks (optional)
+// 5. shell function (claude wrapper)
+if (args.shellSetup) {
+  const shellConfigPath = detectShellConfig(args.shellConfig);
+  installShellFunction(shellConfigPath, args.dryRun);
+}
+
+// 6. codex hooks (optional)
 if (args.codex) {
   const codexHooks = join(HOME, '.codex', 'hooks');
   installHooks(codexHooks, args.dryRun);
   mergeSettingsJson(join(HOME, '.codex', 'settings.json'), codexHooks, args.dryRun, HOOK_MAP);
 }
 
-// 6. git setup (skip when cloned from remote — already has .git + remote)
+// 7. git setup (skip when cloned from remote — already has .git + remote)
 if (args.gitInit && !args.fromRemote) {
   gitSetup(args.hypoDir, args.gitRemote, args.dryRun);
 }
 
-// 7. pkg repo git hook (auto-sync hooks/ → ~/.claude/hooks/ on commit)
+// 8. pkg repo git hook (auto-sync hooks/ → ~/.claude/hooks/ on commit)
 if (args.hooks) {
   installPkgGitHook(args.dryRun);
 }
 
-// 8. first commit + push (skip when cloned from remote — already has commits)
+// 9. first commit + push (skip when cloned from remote — already has commits)
 if (args.gitInit && !args.fromRemote) {
   firstCommit(args.hypoDir, args.gitRemote, args.dryRun);
 }
