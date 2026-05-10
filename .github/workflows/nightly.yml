@@ -10,7 +10,6 @@ jobs:
     # Checks verify_by / verify_by_date frontmatter fields only.
     # Does NOT detect semantic staleness, broken external links, or
     # pages that lack verify_by entirely (verify.mjs flags those separately).
-    # For content-quality checks, see the llm-lint job below.
     name: Verify pages
     runs-on: ubuntu-latest
     steps:
@@ -40,27 +39,4 @@ jobs:
         run: |
           node scripts/verify.mjs \
             --wiki-dir=/tmp/wiki-nightly \
-            --json
-
-  llm-lint:
-    name: LLM lint (Haiku)
-    runs-on: ubuntu-latest
-    if: ${{ vars.ENABLE_LLM_LINT == 'true' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Init wiki
-        run: |
-          node scripts/init.mjs \
-            --wiki-dir=/tmp/wiki-llm-lint \
-            --no-hooks --no-git-init
-      - name: Run LLM lint (Haiku)
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          node scripts/lint-llm.mjs \
-            --wiki-dir=/tmp/wiki-llm-lint \
-            --model=haiku \
             --json

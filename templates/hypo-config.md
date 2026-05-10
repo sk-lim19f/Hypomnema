@@ -12,8 +12,6 @@ Hooks use it to locate the wiki root automatically — do not delete or move it.
 
 ## Settings
 
-privacy: personal
-
 To override the wiki root path, set the `HYPO_DIR` environment variable
 instead of editing this file.
 
@@ -32,7 +30,7 @@ HYPO_SKIP_GATE=1
 ├── log.md              ← chronological activity log
 ├── hypo-guide.md       ← operations guide
 ├── SCHEMA.md           ← type system reference
-├── .hypoignore         ← privacy/secret file patterns
+├── .hypoignore         ← glob patterns excluded from hooks
 ├── pages/              ← permanent knowledge pages
 ├── projects/           ← project work artifacts
 │   └── <name>/

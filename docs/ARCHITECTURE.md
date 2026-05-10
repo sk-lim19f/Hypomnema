@@ -24,7 +24,7 @@ hypomnema/
 ├── templates/         ← baseline wiki files copied on init
 ├── tests/
 │   └── runner.mjs     ← no-dependency test runner
-└── docs/              ← PRIVACY.md, ARCHITECTURE.md, CONTRIBUTING.md
+└── docs/              ← ARCHITECTURE.md, CONTRIBUTING.md
 ```
 
 ---
@@ -133,7 +133,7 @@ Helpers used by command scripts (not deployed to hooks):
 ## Init and upgrade flow
 
 1. **Init** (`/hypo:init`):
-   - Wizard collects wiki path, privacy mode, hook preferences
+   - Wizard collects wiki path and hook preferences
    - Creates vault directory structure
    - Copies `templates/` files
    - Deploys hooks to `~/.claude/hooks/` (and optionally `~/.codex/hooks/`)
@@ -169,9 +169,9 @@ user question
 
 ---
 
-## Privacy
+## Exclusion patterns
 
-`.hypoignore` controls which files hooks include in context. Three built-in modes (`personal`, `shared`, `public`) set default patterns at init time. See [PRIVACY.md](PRIVACY.md).
+`.hypoignore` controls which files hooks include in context. The default patterns exclude common large binaries (`*.pdf`, `*.zip`) and credential extensions (`*.pem`, `*.env`). Edit this file directly in your wiki root to add additional exclusions.
 
 ---
 

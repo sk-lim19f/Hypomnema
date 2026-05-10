@@ -17,7 +17,6 @@
 - `hypo-config.md` 존재 (root marker)
 - `index.md`, `hot.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md` 존재
 - `.hypoignore` 존재
-- `privacy: personal` (기본값) 포함됨
 - 이미 존재하는 파일은 덮어쓰지 않음 (idempotent)
 
 ### TC-01-2. journal 디렉토리 및 추가 템플릿 생성 [AUTO]
@@ -30,29 +29,7 @@
 - `pages/_index.md` 존재
 - `projects/_template/` 구조 존재
 
-### TC-01-3. Privacy 모드별 `.hypoignore` 차등 적용 [AUTO]
-
-| 모드 | `*personal*` | `journal/` | `sources/` | `drafts/` |
-|---|---|---|---|---|
-| `personal` | ✗ | ✗ | ✗ | ✗ |
-| `shared` | ✓ | ✓ | ✗ | ✗ |
-| `public` | ✓ | ✓ | ✓ | ✓ |
-
-**When**: 각 모드로 init 실행  
-**Then**: `.hypoignore`에 해당 패턴 포함/미포함 확인
-
-### TC-01-4. Privacy boundary 안내 출력 [MANUAL]
-
-**Given**: `/hypo:init` Claude 커맨드 실행  
-**When**: privacy mode 선택 단계  
-**Then**: 다음 내용의 안내문이 출력됨:
-```
-Privacy boundary: Wiki files are stored locally on your machine.
-However, when Claude reads wiki pages via hooks or commands,
-that content is sent to Anthropic's API as part of the conversation context.
-```
-
-### TC-01-5. Git remote 설정 + first commit + push [AUTO]
+### TC-01-3. Git remote 설정 + first commit + push [AUTO]
 
 **Given**: git remote URL 입력  
 **When**: `node scripts/init.mjs --hypo-dir=/tmp/wiki-git --git-remote=<url>`  
@@ -272,24 +249,6 @@ that content is sent to Anthropic's API as part of the conversation context.
 
 ---
 
-## TC-08. `/hypo:lint-llm` — L2 의미론적 검사 (nightly)
-
-### TC-08-1. Haiku 판정 실행 [AUTO]
-
-**Given**: `ANTHROPIC_API_KEY` 설정됨  
-**When**: `node scripts/lint-llm.mjs --hypo-dir=<path> --json`  
-**Then**:
-- `ok: true`
-- `results` 배열에 페이지별 판정 결과 포함
-- `note: "LLM evaluation pass not yet implemented"` 메시지 없음 (스텁 제거됨)
-
-### TC-08-2. API key 없을 때 graceful [AUTO]
-
-**When**: API key 미설정  
-**Then**: `{"ok": false, "error": "lint-llm requires ANTHROPIC_API_KEY ..."}` 출력, exit 1
-
----
-
 ## TC-09. `/hypo:doctor` — 설치 상태 점검
 
 ### TC-09-1. 정상 설치 상태 [MANUAL]
@@ -501,11 +460,6 @@ env -i HOME=$HOME PATH=$PATH \
 
 **When**: nightly 실행 (또는 `workflow_dispatch`)  
 **Then**: `verify-pages` job 실행됨, `ANTHROPIC_API_KEY` 없으면 skip (graceful)
-
-### TC-16-3. nightly llm-lint [AUTO]
-
-**Given**: `ENABLE_LLM_LINT=true`, `ANTHROPIC_API_KEY` 설정  
-**Then**: `llm-lint` job 실행, `ok: true` 반환
 
 ---
 

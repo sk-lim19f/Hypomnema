@@ -96,7 +96,7 @@ You put a project down for three weeks. At the next session start, the hook read
 
 **Do not store here:**
 - Raw source material — that goes in `sources/` automatically, unedited
-- Credentials, tokens, or secrets — use `.wikiignore` to exclude sensitive paths
+- Credentials, tokens, or secrets — use `.hypoignore` to exclude sensitive paths
 - Transient task lists for the current session — use the task list in the conversation
 - Code patterns derivable from the repo itself — `git log` and `grep` are already authoritative
 - Information that has a canonical owner elsewhere (Jira tickets, Confluence pages, API docs) — ingest a *synthesis*, not a mirror
@@ -133,21 +133,11 @@ You put a project down for three weeks. At the next session start, the hook read
 ├── log.md              ← append-only activity log
 ├── SCHEMA.md           ← type system reference
 ├── hypo-guide.md       ← operations guide
-├── .wikiignore         ← privacy/exclusion patterns
+├── .hypoignore         ← glob patterns excluded from hooks
 ├── pages/              ← permanent knowledge pages
 ├── projects/           ← project artifacts and session logs
 └── sources/            ← raw ingested sources (never edit)
 ```
-
----
-
-## Privacy
-
-Wiki data is stored as local files. If you configure a Git remote, the Stop hook automatically commits and pushes your wiki — no third-party sync service is involved. Commands that use the Claude API (such as `/hypo:verify` and `/hypo:lint --llm`) send page content to Anthropic for evaluation; all other hooks operate entirely offline.
-
-Three privacy modes are available: `personal` (default), `shared`, and `public`. A `.wikiignore` file controls which files hooks scan and include in context.
-
-See [docs/PRIVACY.md](docs/PRIVACY.md) for the full privacy guide, including what each hook reads, how to exclude sensitive content, and how to delete your wiki completely.
 
 ---
 
@@ -162,7 +152,6 @@ See [docs/PRIVACY.md](docs/PRIVACY.md) for the full privacy guide, including wha
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — internals, component map, data flows
 - [CONTRIBUTING.md](docs/CONTRIBUTING.md) — development setup, conventions, PR process
-- [PRIVACY.md](docs/PRIVACY.md) — privacy modes, `.wikiignore`, data handling
 
 ---
 

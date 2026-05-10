@@ -170,22 +170,6 @@ test('--dry-run reports created dirs without writing them', () => {
   });
 });
 
-test('--privacy=shared writes shared-mode content to .hypoignore', () => {
-  withTmpDir(dir => {
-    const hypoDir = join(dir, 'wiki');
-    const r = run('init.mjs', [
-      `--hypo-dir=${hypoDir}`,
-      '--privacy=shared',
-      '--no-hooks',
-      '--no-git-init',
-    ]);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const hypoignore = readFileSync(join(hypoDir, '.hypoignore'), 'utf-8');
-    assert.ok(hypoignore.includes('*personal*'), '.hypoignore missing shared-mode pattern');
-    assert.ok(hypoignore.includes('journal/'), '.hypoignore missing journal/ exclusion');
-  });
-});
-
 test('actual run creates expected directories', () => {
   withTmpDir(dir => {
     const hypoDir = join(dir, 'wiki');

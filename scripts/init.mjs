@@ -10,7 +10,6 @@
  *
  * Options:
  *   --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
- *   --privacy=<mode>       personal | shared | public  (default: personal)
  *   --no-hooks             Skip hook installation
  *   --codex                Also install Codex hooks (~/.codex/hooks/)
  *   --git-remote=<url>     Git remote URL
@@ -38,7 +37,6 @@ const TEMPLATES  = join(PKG_ROOT, 'templates');
 function parseArgs(argv) {
   const args = {
     hypoDir:     resolveHypoRoot(),
-    privacy:     'personal',
     hooks:       true,
     codex:       false,
     gitRemote:   null,
@@ -54,7 +52,6 @@ function parseArgs(argv) {
 
 Options:
   --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
-  --privacy=<mode>       personal | shared | public  (default: personal)
   --no-hooks             Skip hook installation
   --codex                Also install Codex hooks (~/.codex/hooks/)
   --git-remote=<url>     Git remote URL
@@ -67,7 +64,6 @@ Options:
       process.exit(0);
     }
     else if (arg.startsWith('--hypo-dir='))      args.hypoDir    = expandHome(arg.slice(11));
-    else if (arg.startsWith('--privacy='))        args.privacy    = arg.slice(10);
     else if (arg === '--no-hooks')                args.hooks      = false;
     else if (arg === '--codex')                   args.codex      = true;
     else if (arg.startsWith('--git-remote='))     args.gitRemote  = arg.slice(13);
@@ -117,41 +113,24 @@ function copyTemplate(srcName, destPath, dryRun, transform) {
 
 // ── hypo-config.md ───────────────────────────────────────────────────────────
 
-function writeHypoConfig(hypoDir, privacy, dryRun) {
+function writeHypoConfig(hypoDir, dryRun) {
   const dest = join(hypoDir, 'hypo-config.md');
   if (existsSync(dest)) { log('skipped', dest); return; }
   const today = new Date().toISOString().slice(0, 10);
   const src   = join(TEMPLATES, 'hypo-config.md');
   const base  = existsSync(src) ? readFileSync(src, 'utf-8') : '';
-  const content = base
-    .replace(/YYYY-MM-DD/g, today)
-    .replace(/^privacy: personal$/m, `privacy: ${privacy}`);
+  const content = base.replace(/YYYY-MM-DD/g, today);
   if (!dryRun) writeFileSync(dest, content);
   log('created', dest);
 }
 
 // ── .hypoignore ──────────────────────────────────────────────────────────────
 
-const SHARED_EXTRA = `
-# shared/public mode: block personal identifiers
-*personal*
-*private*
-journal/
-`;
-
-const PUBLIC_EXTRA = `
-# public mode: maximum redaction — also block raw sources and drafts
-sources/
-drafts/
-`;
-
-function writeWikiignore(hypoDir, privacy, dryRun) {
+function writeWikiignore(hypoDir, dryRun) {
   const dest = join(hypoDir, '.hypoignore');
   if (existsSync(dest)) { log('skipped', dest); return; }
   const src  = join(TEMPLATES, '.hypoignore');
-  let content = existsSync(src) ? readFileSync(src, 'utf-8') : '';
-  if (privacy === 'shared' || privacy === 'public') content += SHARED_EXTRA;
-  if (privacy === 'public') content += PUBLIC_EXTRA;
+  const content = existsSync(src) ? readFileSync(src, 'utf-8') : '';
   if (!dryRun) writeFileSync(dest, content);
   log('created', dest);
 }
@@ -362,15 +341,6 @@ function installShellFunction(shellConfigPath, dryRun) {
 
 // ── from-remote clone ────────────────────────────────────────────────────────
 
-function readPrivacyFromConfig(hypoDir) {
-  const cfgPath = join(hypoDir, 'hypo-config.md');
-  if (!existsSync(cfgPath)) return 'personal';
-  try {
-    const m = readFileSync(cfgPath, 'utf-8').match(/^privacy:\s*(\S+)/m);
-    return m ? m[1] : 'personal';
-  } catch { return 'personal'; }
-}
-
 function cloneFromRemote(url, hypoDir, dryRun) {
   if (existsSync(hypoDir)) {
     log('errors', `--from-remote: target directory already exists: ${hypoDir}. Remove it or choose a different --hypo-dir.`);
@@ -461,8 +431,6 @@ if (args.fromRemote) {
     console.error(results.errors.join('\n'));
     process.exit(1);
   }
-  // Read privacy from the cloned hypo-config.md (override CLI default)
-  if (!args.dryRun) args.privacy = readPrivacyFromConfig(args.hypoDir);
 } else {
   // ── normal path: create structure + templates ───────────────────────────────
   // 1. wiki directory structure
@@ -492,8 +460,8 @@ if (args.fromRemote) {
   copyTemplate(join('projects', '_template', 'session-state.md'),join(args.hypoDir, 'projects', '_template', 'session-state.md'),args.dryRun);
 
   // 3. hypo-config.md + .hypoignore
-  writeHypoConfig(args.hypoDir, args.privacy, args.dryRun);
-  writeWikiignore(args.hypoDir, args.privacy, args.dryRun);
+  writeHypoConfig(args.hypoDir, args.dryRun);
+  writeWikiignore(args.hypoDir, args.dryRun);
 }
 
 // 4. hooks

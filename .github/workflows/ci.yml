@@ -83,35 +83,6 @@ jobs:
             if (!Array.isArray(d.applied.settings)) { console.error('applied.settings not array'); process.exit(1); }
           "
 
-  privacy:
-    name: Privacy mode (${{ matrix.mode }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        mode: [personal, shared, public]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Init with privacy=${{ matrix.mode }}
-        run: |
-          node scripts/init.mjs \
-            --hypo-dir=/tmp/wiki-${{ matrix.mode }} \
-            --privacy=${{ matrix.mode }} \
-            --no-hooks --no-git-init
-          grep -q "privacy: ${{ matrix.mode }}" /tmp/wiki-${{ matrix.mode }}/hypo-config.md
-      - name: Verify shared/public extra hypoignore rules
-        if: matrix.mode != 'personal'
-        run: |
-          grep -q '\*personal\*' /tmp/wiki-${{ matrix.mode }}/.hypoignore
-          grep -q 'journal/'     /tmp/wiki-${{ matrix.mode }}/.hypoignore
-      - name: Verify public-only extra hypoignore rules
-        if: matrix.mode == 'public'
-        run: |
-          grep -q 'sources/' /tmp/wiki-${{ matrix.mode }}/.hypoignore
-          grep -q 'drafts/'  /tmp/wiki-${{ matrix.mode }}/.hypoignore
-
   replay:
     name: Hook replay
     runs-on: ubuntu-latest
