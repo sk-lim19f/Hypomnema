@@ -44,7 +44,21 @@ function parseArgs(argv) {
     dryRun:    false,
   };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--hypo-dir='))   args.hypoDir   = expandHome(arg.slice(11));
+    if (arg === '--help' || arg === '-h') {
+      console.log(`Usage: node scripts/init.mjs [options]
+
+Options:
+  --hypo-dir=<path>    Hypomnema root directory (default: ~/hypomnema)
+  --privacy=<mode>     personal | shared | public  (default: personal)
+  --no-hooks           Skip hook installation
+  --codex              Also install Codex hooks (~/.codex/hooks/)
+  --git-remote=<url>   Git remote URL
+  --no-git-init        Skip git initialization
+  --dry-run            Show what would be done without making changes
+  --help, -h           Show this help message`);
+      process.exit(0);
+    }
+    else if (arg.startsWith('--hypo-dir='))   args.hypoDir   = expandHome(arg.slice(11));
     else if (arg.startsWith('--privacy=')) args.privacy  = arg.slice(10);
     else if (arg === '--no-hooks')        args.hooks     = false;
     else if (arg === '--codex')           args.codex     = true;

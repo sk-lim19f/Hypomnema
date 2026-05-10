@@ -89,6 +89,8 @@ function bm25Score(queryTerms, entries, k1 = 1.5, b = 0.75) {
 function parseIndexEntries(indexContent) {
   const entries = [];
   for (const line of indexContent.split('\n')) {
+    if (line.trimStart().startsWith('<!--')) continue;
+    if (line.trimStart().startsWith('>')) continue;
     const m = line.match(/\[\[([^\]]+)\]\]\s*[—\-]+\s*(.+)/);
     if (!m) continue;
     const raw  = m[1].trim();
