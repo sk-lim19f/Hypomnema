@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-cwd-change.mjs — CwdChanged hook
+ * hypo-cwd-change.mjs — CwdChanged hook
  *
  * When the working directory changes mid-session, re-inject the matching
  * project hot.md. Skips if still within the same project subtree.
@@ -16,7 +16,7 @@ const GLOBAL_HOT   = join(HYPO_DIR, 'hot.md');
 const MAX_CHARS    = 3000;
 
 function parseFrontmatterField(content, key) {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return null;
   const line = match[1].split('\n').find(l => l.startsWith(`${key}:`));
   if (!line) return null;

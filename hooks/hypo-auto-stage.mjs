@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-auto-stage.mjs — PostToolUse hook
+ * hypo-auto-stage.mjs — PostToolUse hook
  *
  * When a file inside the wiki directory is written, stage it automatically.
  */
