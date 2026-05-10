@@ -6,8 +6,8 @@ You are running `/hypo:init`. Set up a new personal wiki powered by Hypomnema.
 
 ## What this does
 
-- Creates the wiki directory structure (`pages/`, `projects/`, `sources/`, etc.)
-- Copies baseline template files (`index.md`, `hot.md`, `log.md`, `hypo-config.md`, `SCHEMA.md`, `wiki-guide.md`)
+- Creates the Hypomnema directory structure (`pages/`, `projects/`, `sources/`, etc.)
+- Copies baseline template files (`index.md`, `hot.md`, `log.md`, `hypo-config.md`, `SCHEMA.md`, `hypo-guide.md`)
 - Installs Claude Code hooks for automatic context injection
 - Merges hook entries into `~/.claude/settings.json` (idempotent)
 - Optionally sets up git with a remote
@@ -19,8 +19,8 @@ You are running `/hypo:init`. Set up a new personal wiki powered by Hypomnema.
 Ask the following questions **one at a time**. Use the default if the user presses Enter.
 
 1. **Wiki directory**
-   > "Where should your wiki live? [~/wiki]"
-   Default: `~/wiki`
+   > "Where should your wiki live? [~/hypomnema]"
+   Default: `~/hypomnema`
 
 2. **Privacy mode**
    > "Privacy mode? (personal / shared / public) [personal]"
@@ -39,7 +39,7 @@ Ask the following questions **one at a time**. Use the default if the user press
    > - `shared` — blocks `*personal*`, `*private*`, `journal/` from hook injection.
    > - `public` — adds `sources/` and `drafts/` on top of `shared` rules (maximum redaction).
    >
-   > To exclude specific content from Claude's context, add paths to `.wikiignore` after init.
+   > To exclude specific content from Claude's context, add paths to `.hypoignore` after init.
    > Full details: `docs/PRIVACY.md`
 
 3. **Install hooks**
@@ -64,7 +64,7 @@ Then run:
 
 ```bash
 node <package-root>/scripts/init.mjs \
-  --wiki-dir="<wiki-dir>" \
+  --hypo-dir="<hypo-dir>" \
   --privacy=<privacy> \
   [--no-hooks] \
   [--codex] \
@@ -92,6 +92,6 @@ After a successful init, tell the user:
 
 1. **Restart Claude Code** (or reload the window) so the new hooks take effect.
 2. Run `/hypo:doctor` to verify the installation.
-3. Open `<wiki-dir>/wiki-guide.md` to read the operations guide.
+3. Open `<hypo-dir>/hypo-guide.md` to read the operations guide.
 
 If hooks were installed: note that `~/.claude/settings.json` was updated and a restart is required.

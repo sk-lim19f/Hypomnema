@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-shared.mjs — shared utilities for Hypomnema hooks
+ * hypo-shared.mjs — shared utilities for Hypomnema hooks
  *
  * Imported by personal-wiki-check.mjs, wiki-compact-guard.mjs, and others.
  * Hooks are deployed to ~/.claude/hooks/ — no external imports allowed.
@@ -22,28 +22,30 @@ function expandHome(p) {
 }
 
 /**
- * Resolve wiki root: HYPO_DIR env → hypo-config.md scan → ~/wiki default.
+ * Resolve Hypomnema root: HYPO_DIR env → hypo-config.md scan → ~/hypomnema default.
  * @returns {string}
  */
-function resolveWikiRoot() {
+function resolveHypoRoot() {
   if (process.env.HYPO_DIR) return expandHome(process.env.HYPO_DIR);
 
   const candidates = [
+    join(HOME, 'hypomnema'),
     join(HOME, 'wiki'),
     join(HOME, 'notes'),
     join(HOME, 'knowledge'),
+    join(HOME, 'Documents', 'hypomnema'),
     join(HOME, 'Documents', 'wiki'),
   ];
   for (const c of candidates) {
     if (existsSync(join(c, 'hypo-config.md'))) return c;
   }
-  return join(HOME, 'wiki');
+  return join(HOME, 'hypomnema');
 }
 
-export const WIKI_DIR   = resolveWikiRoot();
-export const LOG_PATH   = join(WIKI_DIR, 'log.md');
-export const HOT_PATH   = join(WIKI_DIR, 'hot.md');
-export const GUIDE_PATH = join(WIKI_DIR, 'wiki-guide.md');
+export const HYPO_DIR   = resolveHypoRoot();
+export const LOG_PATH   = join(HYPO_DIR, 'log.md');
+export const HOT_PATH   = join(HYPO_DIR, 'hot.md');
+export const GUIDE_PATH = join(HYPO_DIR, 'hypo-guide.md');
 
 // Package root: written by init/upgrade to ~/.claude/hypo-pkg.json
 function resolvePkgRoot() {
@@ -78,16 +80,16 @@ export function lastSubstantialOpIsSession() {
   return /^## \[\d{4}-\d{2}-\d{2}\] session/.test(substantial[substantial.length - 1]);
 }
 
-export function wikiIsClean() {
+export function hypoIsClean() {
   try {
-    const porcelain = spawnSync('git', ['-C', WIKI_DIR, 'status', '--porcelain'], { encoding: 'utf-8' });
-    if (porcelain.status !== 0) return { clean: false, reason: `git check failed in ${WIKI_DIR}` };
-    if (porcelain.stdout.trim() !== '') return { clean: false, reason: `uncommitted changes in ${WIKI_DIR}` };
-    const ahead = spawnSync('git', ['-C', WIKI_DIR, 'status', '--branch', '--porcelain'], { encoding: 'utf-8' });
-    if (/\[ahead \d+\]/.test(ahead.stdout || '')) return { clean: false, reason: `unpushed commits in ${WIKI_DIR}` };
+    const porcelain = spawnSync('git', ['-C', HYPO_DIR, 'status', '--porcelain'], { encoding: 'utf-8' });
+    if (porcelain.status !== 0) return { clean: false, reason: `git check failed in ${HYPO_DIR}` };
+    if (porcelain.stdout.trim() !== '') return { clean: false, reason: `uncommitted changes in ${HYPO_DIR}` };
+    const ahead = spawnSync('git', ['-C', HYPO_DIR, 'status', '--branch', '--porcelain'], { encoding: 'utf-8' });
+    if (/\[ahead \d+\]/.test(ahead.stdout || '')) return { clean: false, reason: `unpushed commits in ${HYPO_DIR}` };
     return { clean: true };
   } catch {
-    return { clean: false, reason: `git check failed in ${WIKI_DIR}` };
+    return { clean: false, reason: `git check failed in ${HYPO_DIR}` };
   }
 }
 
@@ -115,7 +117,7 @@ export function hotMdIsClean() {
 // ── session-close checklist ────────────────────────────────────────────────
 
 /**
- * Read the session-close checklist from wiki-guide.md.
+ * Read the session-close checklist from hypo-guide.md.
  * Falls back to null if the guide is unavailable or the section can't be parsed.
  */
 export function readChecklist(today) {
@@ -158,7 +160,7 @@ export function buildOutput(context, extra = {}) {
   return { ...extra, additionalContext: context };
 }
 
-// ── .wikiignore support ────────────────────────────────────────────────────
+// ── .hypoignore support ────────────────────────────────────────────────────
 // Inlined here so deployed hooks (~/.claude/hooks/) don't need scripts/lib/.
 
 function _globToRegex(glob) {
@@ -172,8 +174,8 @@ function _globToRegex(glob) {
   + '$');
 }
 
-export function loadWikiIgnore(wikiDir) {
-  const ignorePath = join(wikiDir, '.wikiignore');
+export function loadHypoIgnore(hypoDir) {
+  const ignorePath = join(hypoDir, '.hypoignore');
   if (!existsSync(ignorePath)) return [];
   return readFileSync(ignorePath, 'utf-8')
     .split('\n')
@@ -181,8 +183,8 @@ export function loadWikiIgnore(wikiDir) {
     .filter(l => l && !l.startsWith('#'));
 }
 
-export function isIgnored(filePath, wikiDir, patterns) {
-  const rel = relative(wikiDir, filePath).replace(/\\/g, '/');
+export function isIgnored(filePath, hypoDir, patterns) {
+  const rel = relative(hypoDir, filePath).replace(/\\/g, '/');
   const base = basename(filePath);
   for (const pattern of patterns) {
     const isDir = pattern.endsWith('/');

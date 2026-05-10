@@ -12,12 +12,12 @@
 
 import {
   lastSubstantialOpIsSession,
-  wikiIsClean,
+  hypoIsClean,
   hotMdIsClean,
   readChecklist,
   isCompactCommand,
   isGateSkipped,
-} from './wiki-shared.mjs';
+} from './hypo-shared.mjs';
 
 let input = '';
 process.stdin.setEncoding('utf-8');
@@ -33,7 +33,7 @@ process.stdin.on('end', () => {
     }
 
     const hasSession = lastSubstantialOpIsSession();
-    const gitStatus  = wikiIsClean();
+    const gitStatus  = hypoIsClean();
     const hotStatus  = hotMdIsClean();
 
     if (hasSession && gitStatus.clean && hotStatus.clean) {
@@ -51,7 +51,7 @@ process.stdin.on('end', () => {
     const checklist = readChecklist(today);
     const body      = checklist
       ? `Checklist:\n${checklist}`
-      : 'See wiki-guide.md for the session-close checklist.';
+      : 'See hypo-guide.md for the session-close checklist.';
 
     console.log(JSON.stringify({
       continue: true,

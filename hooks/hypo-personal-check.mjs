@@ -14,29 +14,29 @@
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import {
-  WIKI_DIR,
+  HYPO_DIR,
   PKG_ROOT,
   lastSubstantialOpIsSession,
-  wikiIsClean,
+  hypoIsClean,
   hotMdIsClean,
   readChecklist,
   isGateSkipped,
-} from './wiki-shared.mjs';
+} from './hypo-shared.mjs';
 
 const today = new Date().toISOString().slice(0, 10);
 
 const hasSession = lastSubstantialOpIsSession();
-const gitStatus  = wikiIsClean();
+const gitStatus  = hypoIsClean();
 const hotStatus  = hotMdIsClean();
 
 // Lint blocker check (non-fatal if lint script missing)
-const lintPath = join(PKG_ROOT ?? WIKI_DIR, 'scripts', 'lint.mjs');
+const lintPath = join(PKG_ROOT ?? HYPO_DIR, 'scripts', 'lint.mjs');
 let lintBlockers = [];
 let lintW8 = [];
 try {
   const r = spawnSync('node', [lintPath, '--json'], {
     encoding: 'utf-8',
-    cwd: WIKI_DIR,
+    cwd: HYPO_DIR,
     timeout: 30000,
   });
   const parsed = JSON.parse(r.stdout || '{}');
@@ -74,7 +74,7 @@ if (hasSession && gitStatus.clean && hotStatus.clean && lintOk && designHistoryO
 
     const checklist     = readChecklist(today);
     const checklistText = checklist ?? [
-      `  [ ] 0. Read SCHEMA.md + wiki-guide.md (required before wiki work)`,
+      `  [ ] 0. Read SCHEMA.md + hypo-guide.md (required before wiki work)`,
       `  [ ] 1. PRD       — create projects/<name>/prd.md if missing`,
       `  [ ] 2. ADR       — decide yes/no on 5 types; if all N, note "no ADR — reason: <why>"`,
       `  [ ] 3. Ingest    — if new external knowledge, save to sources/ and ingest`,

@@ -16,7 +16,7 @@ You are running `/hypo:graph`. Generate a link dependency graph from wiki pages.
 
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
-If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag.
+If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag.
 
 ---
 
@@ -24,7 +24,7 @@ If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherw
 
 ```bash
 node <package-root>/scripts/graph.mjs \
-  [--wiki-dir="<path>"] \
+  [--hypo-dir="<path>"] \
   [--format=json|mermaid|dot] \
   [--min-edges=<n>]
 ```

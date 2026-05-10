@@ -49,10 +49,10 @@ If the user says stop, end here. Otherwise continue to Step 4.
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
 ```bash
-node <package-root>/scripts/crystallize.mjs [--wiki-dir="<path>"] [--min-group=2]
+node <package-root>/scripts/crystallize.mjs [--hypo-dir="<path>"] [--min-group=2]
 ```
 
-Show the output to the user. If no candidates are found, tell them the wiki looks well-connected and no crystallization is needed.
+Show the output to the user. If no candidates are found, tell them Hypomnema looks well-connected and no crystallization is needed.
 
 ---
 

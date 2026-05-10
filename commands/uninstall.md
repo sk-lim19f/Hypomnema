@@ -48,5 +48,5 @@ If the user also wants Codex hooks removed, append `--codex`.
 
 ## Notes
 
-- Wiki content (`~/wiki/`) is never touched — only hook files and settings.json entries
+- Wiki content (`~/hypomnema/`) is never touched — only hook files and settings.json entries
 - To reinstall, run `/hypo:init`

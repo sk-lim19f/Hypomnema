@@ -9,26 +9,26 @@
  *   node scripts/graph.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --format=<fmt>      Output format: json | mermaid | dot  (default: json)
  *   --min-edges=<n>     Only include nodes with at least N edges (default: 0)
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
-import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, format: 'json', minEdges: 0 };
+  const args = { hypoDir: null, format: 'json', minEdges: 0 };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir='))  args.wikiDir  = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir='))  args.hypoDir  = expandHome(arg.slice(11));
     else if (arg.startsWith('--format='))   args.format   = arg.slice(9);
     else if (arg.startsWith('--min-edges=')) args.minEdges = parseInt(arg.slice(12), 10) || 0;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -170,9 +170,9 @@ function formatDot(pages, graph, minEdges) {
 
 const args = parseArgs(process.argv);
 
-const ignorePatterns = loadWikiIgnore(args.wikiDir);
-const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-const pages    = scanDirs.flatMap(d => collectPages(d, args.wikiDir, [], ignorePatterns));
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
+const pages    = scanDirs.flatMap(d => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugIndex = buildSlugIndex(pages);
 const graph    = buildGraph(pages, slugIndex);
 

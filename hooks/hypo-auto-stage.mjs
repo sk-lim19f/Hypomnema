@@ -6,7 +6,7 @@
  */
 
 import { spawnSync } from 'child_process';
-import { WIKI_DIR } from './wiki-shared.mjs';
+import { HYPO_DIR } from './hypo-shared.mjs';
 
 let input = {};
 try {
@@ -23,8 +23,8 @@ try {
 
 const filePath = input.tool_input?.file_path ?? '';
 
-if (filePath.startsWith(WIKI_DIR + '/') || filePath === WIKI_DIR) {
-  spawnSync('git', ['-C', WIKI_DIR, 'add', filePath], { stdio: 'ignore' });
+if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
+  spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' });
 }
 
 console.log(JSON.stringify({ continue: true, suppressOutput: true }));

@@ -8,27 +8,27 @@
  *   node scripts/lint.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --json              Output results as JSON
  *   --fix               Auto-add missing `updated` field (safe repairs only)
  */
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
-import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/wiki-shared.mjs';
-import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, json: false, fix: false };
+  const args = { hypoDir: null, json: false, fix: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json')         args.json = true;
     else if (arg === '--fix')          args.fix  = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -157,9 +157,9 @@ function lintPage({ path, rel }, slugMap) {
 
 const args = parseArgs(process.argv);
 
-const ignorePatterns = loadWikiIgnore(args.wikiDir);
-const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-const pages = scanDirs.flatMap(d => collectPages(d, args.wikiDir, [], ignorePatterns));
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
+const pages = scanDirs.flatMap(d => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugMap = buildSlugMap(pages);
 
 for (const page of pages) lintPage(page, slugMap);

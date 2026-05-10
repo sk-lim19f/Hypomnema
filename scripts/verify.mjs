@@ -10,39 +10,39 @@
  *   node scripts/verify.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --file=<path>       Check a single file only
  *   --json              Output as JSON
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
-import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, file: null, json: false };
+  const args = { hypoDir: null, file: null, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--file='))    args.file   = expandHome(arg.slice(7));
     else if (arg === '--json')             args.json   = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectMdFiles(dir, acc = [], wikiDir = '', ignorePatterns = []) {
+function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
-    if (wikiDir && isIgnored(full, wikiDir, ignorePatterns)) continue;
+    if (hypoDir && isIgnored(full, hypoDir, ignorePatterns)) continue;
     const st = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc, wikiDir, ignorePatterns);
+    if (st.isDirectory()) collectMdFiles(full, acc, hypoDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
@@ -71,9 +71,9 @@ let files;
 if (args.file) {
   files = [args.file];
 } else {
-  const ignorePatterns = loadWikiIgnore(args.wikiDir);
-  const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-  files = scanDirs.flatMap(d => collectMdFiles(d, [], args.wikiDir, ignorePatterns));
+  const ignorePatterns = loadHypoIgnore(args.hypoDir);
+  const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
+  files = scanDirs.flatMap(d => collectMdFiles(d, [], args.hypoDir, ignorePatterns));
 }
 
 const overdue  = [];
@@ -90,7 +90,7 @@ for (const file of files) {
   const type = fm.type || '';
   if (!VERIFIED_TYPES.has(type)) continue;
 
-  const rel = args.wikiDir ? relative(args.wikiDir, file) : file;
+  const rel = args.hypoDir ? relative(args.hypoDir, file) : file;
   const entry = {
     file: rel,
     title: fm.title || rel,

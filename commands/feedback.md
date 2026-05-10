@@ -27,7 +27,7 @@ If the user did not provide them, ask:
 To check for an existing topic, locate the Hypomnema package root and run:
 
 ```bash
-node <package-root>/scripts/feedback.mjs --list [--wiki-dir="<path>"]
+node <package-root>/scripts/feedback.mjs --list [--hypo-dir="<path>"]
 ```
 
 If a matching topic exists, confirm with the user whether to append to it or create a new one.
@@ -52,7 +52,7 @@ Then run:
 node <package-root>/scripts/feedback.mjs \
   --topic="<slug>" \
   --entry="<formatted entry text>" \
-  [--wiki-dir="<path>"] \
+  [--hypo-dir="<path>"] \
   [--dry-run]
 ```
 

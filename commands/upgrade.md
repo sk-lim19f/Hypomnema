@@ -6,7 +6,7 @@ You are running `/hypo:upgrade`. Check if the installed Hypomnema wiki is out of
 
 ## What this checks
 
-- **SCHEMA version**: compares `~/wiki/SCHEMA.md` version against the package's current version
+- **SCHEMA version**: compares `~/hypomnema/SCHEMA.md` version against the package's current version
 - **Hook files**: checks if any hooks in `~/.claude/hooks/` are stale or missing
 - **settings.json**: checks if all hook registrations are present in `~/.claude/settings.json`
 
@@ -16,19 +16,19 @@ You are running `/hypo:upgrade`. Check if the installed Hypomnema wiki is out of
 
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
-If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag.
+If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag.
 
 ---
 
 ## Step 2 — Run upgrade check
 
 ```bash
-node <package-root>/scripts/upgrade.mjs [--wiki-dir="<path>"]
+node <package-root>/scripts/upgrade.mjs [--hypo-dir="<path>"]
 ```
 
 Show the output verbatim.
 
-> **Note**: If a major SCHEMA bump is detected, this step generates a `MIGRATION-vX.Y.md` file in the wiki root. This is a new informational file — no existing files are overwritten.
+> **Note**: If a major SCHEMA bump is detected, this step generates a `MIGRATION-vX.Y.md` file in the Hypomnema root. This is a new informational file — no existing files are overwritten.
 
 ---
 
@@ -38,7 +38,7 @@ Show the output verbatim.
 - `⚠` — minor update available (stale hook or missing settings entry)
 - `✗` — major version bump or missing hook files (action required)
 
-For a **major SCHEMA bump**: point the user to the generated `MIGRATION-vX.Y.md` file in their wiki root and ask them to review it before applying.
+For a **major SCHEMA bump**: point the user to the generated `MIGRATION-vX.Y.md` file in their Hypomnema root and ask them to review it before applying.
 
 ---
 
@@ -52,7 +52,7 @@ If there is anything to update, ask the user:
 
 - If **yes** → run with `--apply`:
   ```bash
-  node <package-root>/scripts/upgrade.mjs [--wiki-dir="<path>"] --apply
+  node <package-root>/scripts/upgrade.mjs [--hypo-dir="<path>"] --apply
   ```
 - If **no** → tell the user they can apply later by running `/hypo:upgrade` again.
 

@@ -10,26 +10,26 @@
  *   node scripts/crystallize.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --min-group=<n>     Min pages per tag group to report (default: 2)
  *   --json              Output as JSON
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
-import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, minGroup: 2, json: false };
+  const args = { hypoDir: null, minGroup: 2, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir='))    args.wikiDir  = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir='))    args.hypoDir  = expandHome(arg.slice(11));
     else if (arg.startsWith('--min-group=')) args.minGroup = parseInt(arg.slice(12), 10) || 2;
     else if (arg === '--json')             args.json     = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -76,9 +76,9 @@ function extractWikilinks(content) {
 
 const args = parseArgs(process.argv);
 
-const ignorePatterns = loadWikiIgnore(args.wikiDir);
-const pagesDir = join(args.wikiDir, 'pages');
-const pages = collectPages(pagesDir, args.wikiDir, [], ignorePatterns);
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const pagesDir = join(args.hypoDir, 'pages');
+const pages = collectPages(pagesDir, args.hypoDir, [], ignorePatterns);
 
 const tagGroups  = {};  // tag → [{ slug, title }]
 const unlinked   = [];  // pages with no outbound wikilinks
@@ -149,5 +149,5 @@ if (drafts.length > 0) {
 }
 
 if (!found) {
-  console.log('✓ No crystallization candidates found — wiki looks well-connected.');
+  console.log('✓ No crystallization candidates found — Hypomnema looks well-connected.');
 }

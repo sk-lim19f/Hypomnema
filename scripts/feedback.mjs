@@ -10,7 +10,7 @@
  *   node scripts/feedback.mjs --topic=<slug> --entry=<text> [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --topic=<slug>      Feedback topic slug (e.g. "response-length", "code-style")
  *   --entry=<text>      Feedback entry text (one-line rule or short paragraph)
  *   --dry-run           Preview without writing
@@ -19,27 +19,27 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
 import { join, resolve, sep } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, topic: null, entry: null, dryRun: false, list: false };
+  const args = { hypoDir: null, topic: null, entry: null, dryRun: false, list: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--topic='))   args.topic  = arg.slice(8);
     else if (arg.startsWith('--entry='))   args.entry  = arg.slice(8);
     else if (arg === '--dry-run')          args.dryRun = true;
     else if (arg === '--list')             args.list   = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
 // ── list mode ────────────────────────────────────────────────────────────────
 
-function listTopics(wikiDir) {
-  const feedbackDir = join(wikiDir, 'pages', 'feedback');
+function listTopics(hypoDir) {
+  const feedbackDir = join(hypoDir, 'pages', 'feedback');
   if (!existsSync(feedbackDir)) {
     console.log('No feedback pages found.');
     return;
@@ -55,8 +55,8 @@ function listTopics(wikiDir) {
 
 // ── write feedback entry ──────────────────────────────────────────────────────
 
-function writeFeedback(wikiDir, topic, entry, dryRun) {
-  const feedbackDir = join(wikiDir, 'pages', 'feedback');
+function writeFeedback(hypoDir, topic, entry, dryRun) {
+  const feedbackDir = join(hypoDir, 'pages', 'feedback');
   const filePath    = join(feedbackDir, `${topic}.md`);
   const today       = new Date().toISOString().slice(0, 10);
 
@@ -94,7 +94,7 @@ ${entry}
   console.log(`✓ Written: ${filePath}`);
 
   // append to log.md
-  const logPath = join(wikiDir, 'log.md');
+  const logPath = join(hypoDir, 'log.md');
   const logEntry = `\n- ${today} feedback: [[pages/feedback/${topic}]] — ${entry.split('\n')[0].slice(0, 80)}\n`;
   if (existsSync(logPath)) {
     const log = readFileSync(logPath, 'utf-8');
@@ -108,7 +108,7 @@ ${entry}
 const args = parseArgs(process.argv);
 
 if (args.list) {
-  listTopics(args.wikiDir);
+  listTopics(args.hypoDir);
   process.exit(0);
 }
 
@@ -127,4 +127,4 @@ if (!args.entry) {
   process.exit(1);
 }
 
-writeFeedback(args.wikiDir, args.topic, args.entry, args.dryRun);
+writeFeedback(args.hypoDir, args.topic, args.entry, args.dryRun);

@@ -11,15 +11,15 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from '
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
-import { WIKI_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS } from './wiki-shared.mjs';
+import { HYPO_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS } from './hypo-shared.mjs';
 
-const PROJECTS_DIR = join(WIKI_DIR, 'projects');
+const PROJECTS_DIR = join(HYPO_DIR, 'projects');
 
 function gitPull(dir) {
   if (!existsSync(join(dir, '.git'))) return;
   spawnSync('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], { stdio: 'pipe', timeout: 10000 });
 }
-const GLOBAL_HOT   = join(WIKI_DIR, 'hot.md');
+const GLOBAL_HOT   = join(HYPO_DIR, 'hot.md');
 const HOT_CHARS    = 2000;
 const STATE_CHARS  = 2000;
 
@@ -96,7 +96,7 @@ process.stdin.on('end', () => {
     let data = {};
     try { data = JSON.parse(raw); } catch {}
 
-    gitPull(WIKI_DIR);
+    gitPull(HYPO_DIR);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);

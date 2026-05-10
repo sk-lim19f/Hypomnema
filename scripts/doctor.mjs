@@ -8,7 +8,7 @@
  *   node scripts/doctor.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>    Wiki root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/wiki)
+ *   --hypo-dir=<path>    Hypomnema root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/hypomnema)
  *   --json               Output results as JSON
  */
 
@@ -17,8 +17,8 @@ import { join, relative, extname } from 'path';
 import { homedir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
-import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 
 const HOME     = homedir();
@@ -28,12 +28,12 @@ const PKG_ROOT   = join(SCRIPT_DIR, '..');
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, json: false };
+  const args = { hypoDir: null, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json')         args.json = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -117,14 +117,14 @@ const SHARED_FILES = _hookConfig.shared ?? [];
 
 // ── checks ───────────────────────────────────────────────────────────────────
 
-function checkWikiRoot(wikiDir) {
-  if (!existsSync(wikiDir)) {
-    fail('Wiki root exists', wikiDir);
+function checkHypoRoot(hypoDir) {
+  if (!existsSync(hypoDir)) {
+    fail('Wiki root exists', hypoDir);
     return false;
   }
-  pass('Wiki root exists', wikiDir);
+  pass('Wiki root exists', hypoDir);
 
-  if (existsSync(join(wikiDir, 'hypo-config.md'))) {
+  if (existsSync(join(hypoDir, 'hypo-config.md'))) {
     pass('hypo-config.md marker');
   } else {
     warn('hypo-config.md marker', 'Missing — wiki root resolution may fall back to default');
@@ -132,10 +132,10 @@ function checkWikiRoot(wikiDir) {
   return true;
 }
 
-function checkDirectories(wikiDir) {
+function checkDirectories(hypoDir) {
   const required = ['pages', 'projects', 'sources'];
   for (const d of required) {
-    if (existsSync(join(wikiDir, d))) {
+    if (existsSync(join(hypoDir, d))) {
       pass(`Directory: ${d}/`);
     } else {
       fail(`Directory: ${d}/`, `Run /hypo:init to create missing directories`);
@@ -143,10 +143,10 @@ function checkDirectories(wikiDir) {
   }
 }
 
-function checkFiles(wikiDir) {
-  const required = ['index.md', 'hot.md', 'log.md', '.wikiignore', 'SCHEMA.md', 'wiki-guide.md'];
+function checkFiles(hypoDir) {
+  const required = ['index.md', 'hot.md', 'log.md', '.hypoignore', 'SCHEMA.md', 'hypo-guide.md'];
   for (const f of required) {
-    if (existsSync(join(wikiDir, f))) {
+    if (existsSync(join(hypoDir, f))) {
       pass(`File: ${f}`);
     } else {
       warn(`File: ${f}`, 'Expected baseline file is missing');
@@ -211,14 +211,14 @@ function checkSettingsJson() {
   }
 }
 
-function checkGit(wikiDir) {
-  if (!existsSync(join(wikiDir, '.git'))) {
+function checkGit(hypoDir) {
+  if (!existsSync(join(hypoDir, '.git'))) {
     warn('Git repository', 'Not a git repo — run /hypo:init with git-remote option for sync/backup');
     return;
   }
   pass('Git repository');
 
-  const remote = spawnSync('git', ['-C', wikiDir, 'remote', 'get-url', 'origin'], { encoding: 'utf-8' });
+  const remote = spawnSync('git', ['-C', hypoDir, 'remote', 'get-url', 'origin'], { encoding: 'utf-8' });
   if (remote.status === 0 && remote.stdout.trim()) {
     pass('Git remote origin', remote.stdout.trim());
   } else {
@@ -226,9 +226,9 @@ function checkGit(wikiDir) {
   }
 }
 
-function checkBrokenLinks(wikiDir, ignorePatterns = []) {
-  const mdFiles = collectMdFiles(wikiDir, [], wikiDir, ignorePatterns);
-  const slugSet = buildSlugSet(mdFiles, wikiDir);
+function checkBrokenLinks(hypoDir, ignorePatterns = []) {
+  const mdFiles = collectMdFiles(hypoDir, [], hypoDir, ignorePatterns);
+  const slugSet = buildSlugSet(mdFiles, hypoDir);
   const broken = [];
 
   for (const file of mdFiles) {
@@ -239,7 +239,7 @@ function checkBrokenLinks(wikiDir, ignorePatterns = []) {
       if (link.includes('.') && !link.endsWith('.md')) continue;
       const slug = link.replace(/\.md$/, '');
       if (!slugSet.has(slug) && !slugSet.has(slug.toLowerCase())) {
-        broken.push({ file: relative(wikiDir, file), link });
+        broken.push({ file: relative(hypoDir, file), link });
       }
     }
   }
@@ -253,23 +253,23 @@ function checkBrokenLinks(wikiDir, ignorePatterns = []) {
   }
 }
 
-function collectMdFiles(dir, acc = [], wikiDir = '', ignorePatterns = []) {
+function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
-    if (wikiDir && isIgnored(full, wikiDir, ignorePatterns)) continue;
+    if (hypoDir && isIgnored(full, hypoDir, ignorePatterns)) continue;
     const st   = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc, wikiDir, ignorePatterns);
+    if (st.isDirectory()) collectMdFiles(full, acc, hypoDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
 }
 
-function buildSlugSet(files, wikiDir) {
+function buildSlugSet(files, hypoDir) {
   const set = new Set();
   for (const f of files) {
-    const rel = relative(wikiDir, f).replace(/\.md$/, '');
+    const rel = relative(hypoDir, f).replace(/\.md$/, '');
     // add all path suffixes: pages/learnings/foo → also learnings/foo, foo
     const parts = rel.split('/');
     for (let i = 0; i < parts.length; i++) {
@@ -281,9 +281,9 @@ function buildSlugSet(files, wikiDir) {
   return set;
 }
 
-function checkVerifyBy(wikiDir, ignorePatterns = []) {
+function checkVerifyBy(hypoDir, ignorePatterns = []) {
   const today    = new Date().toISOString().slice(0, 10);
-  const mdFiles  = collectMdFiles(wikiDir, [], wikiDir, ignorePatterns);
+  const mdFiles  = collectMdFiles(hypoDir, [], hypoDir, ignorePatterns);
   const overdue  = [];
   const missing  = [];
 
@@ -297,10 +297,10 @@ function checkVerifyBy(wikiDir, ignorePatterns = []) {
 
     // verify_by = natural-language question; verify_by_date = ISO date deadline
     if (!fm.verify_by) {
-      missing.push(relative(wikiDir, file));
+      missing.push(relative(hypoDir, file));
     }
     if (fm.verify_by_date && /^\d{4}-\d{2}-\d{2}$/.test(fm.verify_by_date) && fm.verify_by_date < today) {
-      overdue.push({ file: relative(wikiDir, file), due: fm.verify_by_date });
+      overdue.push({ file: relative(hypoDir, file), due: fm.verify_by_date });
     }
   }
 
@@ -323,17 +323,17 @@ function checkVerifyBy(wikiDir, ignorePatterns = []) {
 
 const args = parseArgs(process.argv);
 
-const ignorePatterns = loadWikiIgnore(args.wikiDir);
-const rootOk = checkWikiRoot(args.wikiDir);
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const rootOk = checkHypoRoot(args.hypoDir);
 if (rootOk) {
-  checkDirectories(args.wikiDir);
-  checkFiles(args.wikiDir);
-  checkBrokenLinks(args.wikiDir, ignorePatterns);
-  checkVerifyBy(args.wikiDir, ignorePatterns);
+  checkDirectories(args.hypoDir);
+  checkFiles(args.hypoDir);
+  checkBrokenLinks(args.hypoDir, ignorePatterns);
+  checkVerifyBy(args.hypoDir, ignorePatterns);
 }
 checkHooks();
 checkSettingsJson();
-checkGit(args.wikiDir);
+checkGit(args.hypoDir);
 
 // ── report ───────────────────────────────────────────────────────────────────
 
