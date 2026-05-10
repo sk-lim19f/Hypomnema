@@ -3,7 +3,7 @@
  * wiki-session-start.mjs — SessionStart hook
  *
  * On session start:
- *   HIT  → cwd matches a project's working_dir → inject hot.md (2000 chars) + session-state.md (1000 chars)
+ *   HIT  → cwd matches a project's working_dir → inject hot.md (2000 chars) + session-state.md (2000 chars)
  *   MISS → inject global hot.md pointer only (no fan-out to all projects)
  */
 
@@ -15,7 +15,7 @@ import { WIKI_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS } from './wiki-share
 const PROJECTS_DIR = join(WIKI_DIR, 'projects');
 const GLOBAL_HOT   = join(WIKI_DIR, 'hot.md');
 const HOT_CHARS    = 2000;
-const STATE_CHARS  = 1000;
+const STATE_CHARS  = 2000;
 
 function parseFrontmatterField(content, key) {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
@@ -76,7 +76,7 @@ function printTerminalSummary(proj, hotContent, stateContent) {
   if (prev) lines.push(`  prev: ${prev.split('\n')[0].replace(/^\*\*|\*\*$/g, '')}`);
   if (next) {
     lines.push('  next:');
-    next.split('\n').slice(0, 5).forEach(l => lines.push(`    ${l}`));
+    next.split('\n').slice(0, 20).forEach(l => lines.push(`    ${l}`));
   }
   lines.push('');
   process.stderr.write(lines.join('\n'));
