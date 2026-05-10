@@ -535,6 +535,31 @@ test('--apply on tmp wiki exits 0 after applying available changes', () => {
   });
 });
 
+test('--apply generates migration report for major SCHEMA bump', () => {
+  withTmpHome(home => {
+    withTmpDir(dir => {
+      const wikiDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // Patch SCHEMA.md to an older major version to simulate a major bump
+      const schemaPath = join(wikiDir, 'SCHEMA.md');
+      const schema = readFileSync(schemaPath, 'utf-8');
+      writeFileSync(schemaPath, schema.replace(/^version: .+$/m, 'version: 0.9'));
+
+      const r = runWithHome('upgrade.mjs', [`--wiki-dir=${wikiDir}`, '--json', '--apply'], home);
+      assert.equal(r.signal, null, `process killed with signal: ${r.signal}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(out.migrationReport !== null, 'migrationReport should be set for major bump');
+      assert.ok(typeof out.migrationReport === 'string', 'migrationReport should be a path string');
+      assert.ok(existsSync(out.migrationReport), `migration report file not found: ${out.migrationReport}`);
+      const content = readFileSync(out.migrationReport, 'utf-8');
+      assert.ok(content.includes('0.9'), 'migration report should reference old version');
+      assert.ok(content.includes('1.0'), 'migration report should reference new version');
+    });
+  });
+});
+
 // ── lint.mjs --fix tests ─────────────────────────────────────────────────────
 
 suite('lint.mjs --fix');
