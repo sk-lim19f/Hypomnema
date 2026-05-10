@@ -40,7 +40,7 @@ Quick reference for all `/hypo:*` commands.
 |---------|-------------|
 | `/hypo:crystallize` | Find synthesis candidates — tag clusters, unlinked pages, drafts |
 | `/hypo:verify` | Review overdue verify_by deadlines |
-| `/hypo:lint` | Validate frontmatter and [[wikilinks]] |
+| `/hypo:lint` | Validate frontmatter and `[[wikilinks]]` |
 | `/hypo:graph` | Generate link graph (json / mermaid / dot) |
 
 ---

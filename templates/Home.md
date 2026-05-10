@@ -17,7 +17,7 @@ tags: [wiki, home]
 - [[hot]] — active projects and last session context
 - [[log]] — chronological activity log
 - [[SCHEMA]] — type system reference
-- [[wiki-guide]] — operations guide
+- [[hypo-guide]] — operations guide
 
 ---
 
