@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-first-prompt.mjs — UserPromptSubmit hook
+ * hypo-first-prompt.mjs — UserPromptSubmit hook
  *
  * Consumes the marker written by wiki-session-start.mjs.
  * On the FIRST user prompt of a new session, injects a lightweight decision

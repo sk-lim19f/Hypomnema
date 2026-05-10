@@ -104,25 +104,36 @@ process.stdin.on('end', () => {
   const gitStatus  = hypoIsClean();
   const hotStatus  = hotMdIsClean();
 
-  const lintPath = join(PKG_ROOT ?? HYPO_DIR, 'scripts', 'lint.mjs');
+  const lintPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'lint.mjs') : null;
   let lintBlockers = [];
   let lintW8 = [];
-  try {
-    const r = spawnSync('node', [lintPath, '--json'], {
-      encoding: 'utf-8',
-      cwd: HYPO_DIR,
-      timeout: 30000,
-    });
-    const parsed = JSON.parse(r.stdout || '{}');
-    lintBlockers = parsed.errors || [];
-    lintW8 = (parsed.warns || []).filter(w => w.id === 'W8');
-  } catch { /* fail-open */ }
+  let lintSkipped = false;
+  if (!lintPath || !existsSync(lintPath)) {
+    lintSkipped = true;
+  } else {
+    try {
+      const r = spawnSync('node', [lintPath, '--json'], {
+        encoding: 'utf-8',
+        cwd: HYPO_DIR,
+        timeout: 30000,
+      });
+      const parsed = JSON.parse(r.stdout || '{}');
+      lintBlockers = parsed.errors || [];
+      lintW8 = (parsed.warns || []).filter(w => w.id === 'W8');
+    } catch { /* fail-open */ }
+  }
 
   const lintOk          = lintBlockers.length === 0;
   const designHistoryOk = lintW8.length === 0;
 
   if (hasSession && gitStatus.clean && hotStatus.clean && lintOk && designHistoryOk) {
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    const msg = lintSkipped
+      ? '[WIKI CHECK] OK (lint skipped — run `hypomnema init` to enable lint gate).'
+      : undefined;
+    console.log(JSON.stringify(msg
+      ? { continue: true, systemMessage: msg }
+      : { continue: true, suppressOutput: true }
+    ));
     return;
   }
 
@@ -133,6 +144,7 @@ process.stdin.on('end', () => {
       !gitStatus.clean ? gitStatus.reason                           : '',
       !hotStatus.clean ? hotStatus.reason                           : '',
       !designHistoryOk ? `design-history stale (${lintW8.length})` : '',
+      lintSkipped      ? 'lint skipped (hypo-pkg.json missing)'     : '',
     ].filter(Boolean).join(', ');
     console.log(JSON.stringify({
       continue: true,
@@ -148,6 +160,7 @@ process.stdin.on('end', () => {
     !hotStatus.clean ? hotStatus.reason                                                              : '',
     !lintOk          ? `lint blockers: ${lintBlockers.map(b => b.id).join(', ')}`                   : '',
     !designHistoryOk ? `design-history stale: ${lintW8.map(w => w.file.split('/')[1]).join(', ')}` : '',
+    lintSkipped      ? 'lint skipped (run `hypomnema init` to enable lint gate)'                    : '',
   ].filter(Boolean);
 
   const checklist     = readChecklist(today);

@@ -24,7 +24,7 @@ const HOT_CHARS    = 2000;
 const STATE_CHARS  = 2000;
 
 function parseFrontmatterField(content, key) {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return null;
   const line = match[1].split('\n').find(l => l.startsWith(`${key}:`));
   if (!line) return null;

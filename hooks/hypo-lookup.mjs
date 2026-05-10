@@ -140,8 +140,8 @@ process.stdin.on('end', () => {
 
     const ignorePatterns = loadHypoIgnore(HYPO_DIR);
     const pageMap = {
-      ...buildPageMap(join(HYPO_DIR, 'pages'), join(HYPO_DIR, 'pages'), {}, ignorePatterns),
-      ...buildPageMap(join(HYPO_DIR, 'projects'), join(HYPO_DIR, 'projects'), {}, ignorePatterns),
+      ...buildPageMap(join(HYPO_DIR, 'pages'), join(HYPO_DIR, 'pages'), {}, ignorePatterns, HYPO_DIR),
+      ...buildPageMap(join(HYPO_DIR, 'projects'), join(HYPO_DIR, 'projects'), {}, ignorePatterns, HYPO_DIR),
     };
 
     const injected = [];

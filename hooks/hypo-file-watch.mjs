@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-file-watch.mjs — FileChanged hook
+ * hypo-file-watch.mjs — FileChanged hook
  *
  * When a hot.md inside the wiki is modified externally (e.g. by a remote
  * agent or another Claude Code session), re-inject its contents.
