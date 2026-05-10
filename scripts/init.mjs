@@ -9,13 +9,15 @@
  *   node scripts/init.mjs [options]
  *
  * Options:
- *   --hypo-dir=<path>    Hypomnema root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/hypomnema)
- *   --privacy=<mode>     personal | shared | public  (default: personal)
- *   --no-hooks           Skip hook installation
- *   --codex              Also install Codex hooks (~/.codex/hooks/)
- *   --git-remote=<url>   Git remote URL
- *   --no-git-init        Skip git initialization
- *   --dry-run            Show what would be done without making changes
+ *   --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
+ *   --privacy=<mode>       personal | shared | public  (default: personal)
+ *   --no-hooks             Skip hook installation
+ *   --codex                Also install Codex hooks (~/.codex/hooks/)
+ *   --git-remote=<url>     Git remote URL
+ *   --no-git-init          Skip git initialization
+ *   --from-remote=<url>    Clone existing Hypomnema wiki from remote and install hooks
+ *   --dry-run              Show what would be done without making changes
+ *   --help, -h             Show this help message
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync } from 'fs';
@@ -66,7 +68,11 @@ Options:
     else if (arg === '--codex')                  args.codex      = true;
     else if (arg.startsWith('--git-remote='))    args.gitRemote  = arg.slice(13);
     else if (arg === '--no-git-init')            args.gitInit    = false;
-    else if (arg.startsWith('--from-remote='))   args.fromRemote = arg.slice(14);
+    else if (arg.startsWith('--from-remote=')) {
+      const url = arg.slice(14).trim();
+      if (!url) { console.error('Error: --from-remote requires a non-empty URL'); process.exit(1); }
+      args.fromRemote = url;
+    }
     else if (arg === '--dry-run')                args.dryRun     = true;
   }
   return args;
@@ -313,6 +319,11 @@ function cloneFromRemote(url, hypoDir, dryRun) {
     const r = spawnSync('git', ['clone', url, hypoDir], { stdio: 'inherit' });
     if (r.error || r.status !== 0) {
       log('errors', `git clone failed: ${url}`);
+      return false;
+    }
+    if (!existsSync(join(hypoDir, 'hypo-config.md'))) {
+      spawnSync('rm', ['-rf', hypoDir]);
+      log('errors', `--from-remote: cloned repo is not a Hypomnema wiki (hypo-config.md missing). Removed ${hypoDir}.`);
       return false;
     }
   }
