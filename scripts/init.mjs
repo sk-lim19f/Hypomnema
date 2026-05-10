@@ -79,7 +79,7 @@ Options:
     }
     else if (arg === '--dry-run')                 args.dryRun     = true;
     else if (arg === '--no-shell')                args.shellSetup = false;
-    else if (arg.startsWith('--shell-config='))   args.shellConfig = expandHome(arg.slice(14));
+    else if (arg.startsWith('--shell-config='))   args.shellConfig = expandHome(arg.slice(15));
   }
   return args;
 }

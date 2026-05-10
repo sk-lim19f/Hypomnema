@@ -15,7 +15,6 @@
     "templates/",
     "docs/",
     ".claude-plugin/",
-    ".wikiignore",
     "README.md"
   ],
   "keywords": ["wiki", "llm", "claude", "claude-code", "personal-wiki", "knowledge-management"],

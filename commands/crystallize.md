@@ -21,10 +21,10 @@ Work through each item in order. For an explicit session-close invocation, proce
 
 1. **session-state.md** — update `projects/<name>/session-state.md` with the next tasks list for the upcoming session (what to tackle first next time).
 2. **hot.md (project)** — update `projects/<name>/hot.md` with a session snapshot: what changed and decisions made. Keep under 500 words. Do not put next-step tasks here; those belong in session-state.md.
-3. **hot.md (root)** — update `<wiki-root>/hot.md` active-projects pointer table: set the `Last Session` date for this project to today.
+3. **hot.md (root)** — update `<hypo-root>/hot.md` active-projects pointer table: set the `Last Session` date for this project to today.
 4. **session-log** — append a session entry to `projects/<name>/session-log/YYYY-MM.md` (create the file if it does not exist for this month).
 5. **open-questions** — only if `pages/open-questions.md` exists and questions were raised or resolved this session: move resolved ones out; add newly raised ones. Skip if unchanged.
-6. **log.md** — append a `session` entry to `<wiki-root>/log.md`.
+6. **log.md** — append a `session` entry to `<hypo-root>/log.md`.
 
 ---
 

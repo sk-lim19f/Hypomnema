@@ -128,7 +128,7 @@ for (const filePath of pages) {
 const summary = {
   ok: errors === 0,
   model: modelId,
-  wiki_dir: args.hypoDir,
+  hypo_dir: args.hypoDir,
   page_count: pages.length,
   error_count: errors,
   results,

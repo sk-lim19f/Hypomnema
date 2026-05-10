@@ -24,14 +24,14 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 ## 2. Directory Layout
 
 ```
-<wiki-root>/
+<hypo-root>/
 ├── hypo-config.md      ← root marker (do not delete)
 ├── index.md            ← searchable page catalog
 ├── hot.md              ← active-project pointer table
 ├── log.md              ← append-only activity log
 ├── SCHEMA.md           ← type system reference
 ├── hypo-guide.md       ← this file
-├── .wikiignore         ← privacy/exclusion patterns
+├── .hypoignore         ← privacy/exclusion patterns
 ├── pages/              ← permanent knowledge pages (subdirs added on demand)
 │   ├── learnings/      (optional)
 │   ├── playbooks/      (optional)

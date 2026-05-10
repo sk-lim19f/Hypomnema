@@ -49,5 +49,5 @@ Quick reference for all `/hypo:*` commands.
 
 - **Session start**: `hot.md` → `session-state.md` → begin work
 - **Session end**: run `/session-compact` (if available) or update session-state.md manually
-- **Privacy**: edit `.wikiignore` to exclude sensitive paths from hooks
+- **Privacy**: edit `.hypoignore` to exclude sensitive paths from hooks
 - **Verify schedule**: add `verify_by:` and `verify_by_date:` to pages you want to review periodically
