@@ -145,17 +145,56 @@ function loadHookMap() {
     console.error('Error: hooks/hooks.json must contain a "hooks" object');
     process.exit(1);
   }
-  for (const [event, files] of Object.entries(cfg.hooks)) {
-    if (!Array.isArray(files) || !files.every(f => typeof f === 'string' && f.length > 0)) {
-      console.error(`Error: hooks/hooks.json "hooks.${event}" must be an array of non-empty strings`);
+  function _extractCommandFileName(command) {
+    if (typeof command !== 'string') return null;
+    const matches = [...command.matchAll(/(?:^|[\/\\])([^\/\\\s"'`]+\.mjs)(?=$|[\s"'`])/g)];
+    if (matches.length > 0) return matches[matches.length - 1][1];
+    const bare = command.match(/(?:^|\s)([^\/\\\s"'`]+\.mjs)(?=$|[\s"'`])/);
+    return bare ? bare[1] : null;
+  }
+
+  function _isHookFileName(file) {
+    return typeof file === 'string' && /^[^/\\\s]+\.mjs$/.test(file.trim());
+  }
+
+  function _isHookGroup(group) {
+    return group &&
+      typeof group === 'object' &&
+      !Array.isArray(group) &&
+      Array.isArray(group.hooks) &&
+      group.hooks.length > 0 &&
+      group.hooks.every(hook =>
+        hook &&
+        typeof hook === 'object' &&
+        !Array.isArray(hook) &&
+        hook.type === 'command' &&
+        _extractCommandFileName(hook.command)
+      );
+  }
+
+  // Extract .mjs file names from both old format (string[]) and new format (hook-group object[])
+  function _extractFileNames(groups) {
+    return groups.flatMap(group => {
+      if (typeof group === 'string') return [group.trim()];
+      return group.hooks.map(hook => _extractCommandFileName(hook.command));
+    });
+  }
+
+  for (const [event, groups] of Object.entries(cfg.hooks)) {
+    const valid = Array.isArray(groups) &&
+      groups.length > 0 &&
+      groups.every(group => _isHookFileName(group) || _isHookGroup(group)) &&
+      _extractFileNames(groups).length > 0;
+    if (!valid) {
+      console.error(`Error: hooks/hooks.json "hooks.${event}" must be a non-empty array of .mjs file names or Claude hook groups`);
       process.exit(1);
     }
   }
-  if (cfg.shared !== undefined && (!Array.isArray(cfg.shared) || !cfg.shared.every(f => typeof f === 'string' && f.length > 0))) {
-    console.error('Error: hooks/hooks.json "shared" must be an array of non-empty strings');
+  if (cfg.shared !== undefined && (!Array.isArray(cfg.shared) || !cfg.shared.every(f => _isHookFileName(f)))) {
+    console.error('Error: hooks/hooks.json "shared" must be an array of .mjs file names');
     process.exit(1);
   }
-  return cfg.hooks;
+  return Object.fromEntries(Object.entries(cfg.hooks).map(([event, groups]) => [event, _extractFileNames(groups)]));
 }
 
 function installHooks(targetDir, dryRun) {
