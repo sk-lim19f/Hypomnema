@@ -158,6 +158,25 @@ jobs:
             if (d.continue !== true) { console.error('expected continue:true'); process.exit(1); }
           "
 
+  uninstall-smoke:
+    name: Uninstall smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Dry-run reports DRY RUN
+        run: |
+          out=$(node scripts/uninstall.mjs \
+            --hooks-dir=/tmp/no-hooks-$RANDOM)
+          echo "$out" | grep -q '\[DRY RUN'
+      - name: Apply mode exits 0 when nothing is installed
+        run: |
+          node scripts/uninstall.mjs \
+            --apply \
+            --hooks-dir=/tmp/no-hooks-$RANDOM
+
   hypo-absent:
     name: Hypo-absent (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest

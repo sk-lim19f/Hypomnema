@@ -26,6 +26,19 @@ Claude Code에서 실행:
 
 ---
 
+## Git 동기화
+
+`/hypo:init` 실행 후 위키 디렉터리는 이미 로컬 git 저장소입니다. 여러 기기에서 동기화하려면 remote를 추가하고 push하세요:
+
+```bash
+git -C ~/wiki remote add origin <저장소-URL>
+git -C ~/wiki push -u origin HEAD
+```
+
+이후 Stop 훅이 매 세션 종료 시 자동으로 commit 및 push합니다 — 별도 동기화 작업이 필요 없습니다.
+
+---
+
 ## Hypomnema를 선택하는 이유
 
 | | Hypomnema | Obsidian / Notion | RAG / 벡터 검색 |

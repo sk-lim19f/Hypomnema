@@ -26,6 +26,19 @@ This sets up your wiki directory, installs hooks, and merges them into `~/.claud
 
 ---
 
+## Git sync
+
+After `/hypo:init`, your wiki directory is already a local git repository. To sync it across machines, add a remote and push:
+
+```bash
+git -C ~/wiki remote add origin <your-repo-url>
+git -C ~/wiki push -u origin HEAD
+```
+
+The Stop hook then auto-commits and pushes your wiki at the end of every session — no manual sync needed.
+
+---
+
 ## Why Hypomnema
 
 | | Hypomnema | Plain Obsidian / Notion | RAG / vector search |
