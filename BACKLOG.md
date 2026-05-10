@@ -9,7 +9,7 @@ updated: 2026-05-08
 # Hypomnema 기획/구현 갭 분석 & 작업 백로그
 
 > **기준 문서**: `~/hypomnema/projects/llm-wiki-oss/oss-plan.md`, `prd.md`, `index.md`  
-> **분석 대상**: `/Users/blair/Workspace/wiki` (OSS 레포)  
+> **분석 대상**: `/Users/blair/Workspace/hypomnema` (OSS 레포)  
 > **검증**: Claude + 교차 검증  
 > **`npm test` 결과**: 51/51 PASS | `claude plugin validate .`: **10개 스키마 오류** (P0 블로커)
 
