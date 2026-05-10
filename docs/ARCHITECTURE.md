@@ -85,7 +85,7 @@ Core helpers used across hooks and scripts:
 |--------|---------|
 | `WIKI_DIR` | Resolved wiki root path |
 | `PKG_ROOT` | Package install path, read from `~/.claude/hypo-pkg.json` |
-| `resolveWikiRoot()` | `HYPO_DIR` env → `hypo-config.md` scan → `~/wiki` fallback |
+| `resolveWikiRoot()` | `HYPO_DIR` env → `hypo-config.md` scan → `~/hypomnema` fallback |
 | `loadWikiIgnore()` | Parses `.wikiignore` into pattern list |
 | `isIgnored()` | Tests a file path against `.wikiignore` patterns |
 | `wikiIsClean()` | Checks git status + unpushed commits |
@@ -116,7 +116,7 @@ Helpers used by command scripts (not deployed to hooks):
 ├── hot.md              ← active project pointers
 ├── log.md              ← append-only activity log
 ├── SCHEMA.md           ← type system reference
-├── wiki-guide.md       ← operations guide
+├── hypo-guide.md       ← operations guide
 ├── .wikiignore         ← privacy/exclusion patterns
 ├── pages/              ← permanent knowledge pages
 ├── projects/           ← per-project session artifacts

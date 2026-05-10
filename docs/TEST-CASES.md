@@ -15,7 +15,7 @@
 **Then**:
 - `pages/`, `projects/`, `sources/` 디렉토리 존재
 - `hypo-config.md` 존재 (root marker)
-- `index.md`, `hot.md`, `log.md`, `SCHEMA.md`, `wiki-guide.md` 존재
+- `index.md`, `hot.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md` 존재
 - `.wikiignore` 존재
 - `privacy: personal` (기본값) 포함됨
 - 이미 존재하는 파일은 덮어쓰지 않음 (idempotent)

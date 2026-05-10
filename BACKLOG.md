@@ -8,7 +8,7 @@ updated: 2026-05-08
 
 # Hypomnema 기획/구현 갭 분석 & 작업 백로그
 
-> **기준 문서**: `~/wiki/projects/llm-wiki-oss/oss-plan.md`, `prd.md`, `index.md`  
+> **기준 문서**: `~/hypomnema/projects/llm-wiki-oss/oss-plan.md`, `prd.md`, `index.md`  
 > **분석 대상**: `/Users/blair/Workspace/wiki` (OSS 레포)  
 > **검증**: Claude + 교차 검증  
 > **`npm test` 결과**: 51/51 PASS | `claude plugin validate .`: **10개 스키마 오류** (P0 블로커)
@@ -282,7 +282,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 | `즉시 할 일`: git init, 레포 구조 | `[ ]` | 완료됨 |
 
 **필요 작업**:
-- `~/wiki/projects/llm-wiki-oss/index.md` 해당 항목들 검토 후 `[x]`로 업데이트
+- `~/hypomnema/projects/llm-wiki-oss/index.md` 해당 항목들 검토 후 `[x]`로 업데이트
 
 ---
 
@@ -298,7 +298,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 | P0-4 | `docs/CONTRIBUTING.md` "omc-teams:2 codex" 제거 (B-3) | `docs/CONTRIBUTING.md` |
 | P0-5 | README "로컬 저장" vs "Git-synced" 일관 수정 (C-1) | `README.md`, `README.ko.md` |
 | P0-6 | `plugin.json` author 정보 교체 (C-3) | `.claude-plugin/plugin.json` |
-| P0-7 | `index.md` 체크리스트 staleness 정리 (E-1) | `~/wiki/projects/llm-wiki-oss/index.md` |
+| P0-7 | `index.md` 체크리스트 staleness 정리 (E-1) | `~/hypomnema/projects/llm-wiki-oss/index.md` |
 | P0-8 | License 결정 (신규) | `LICENSE`, `package.json` |
 
 ### P1 — 기획 핵심 기능 갭

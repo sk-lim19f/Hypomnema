@@ -114,7 +114,7 @@ test('falls back to ~/hypomnema when no env or marker found', () => {
   delete process.env.HYPO_DIR;
   try {
     const result = resolveHypoRoot();
-    // Either found a real wiki (has hypo-config.md) or returned ~/wiki default
+    // Either found a real wiki (has hypo-config.md) or returned ~/hypomnema default
     assert.ok(typeof result === 'string' && result.length > 0);
     assert.ok(result.startsWith('/'));
   } finally {
@@ -129,7 +129,7 @@ test('finds wiki by hypo-config.md marker', () => {
     const result = resolveHypoRoot();
     assert.ok(typeof result === 'string' && result.length > 0, 'should return non-empty string');
     assert.ok(result.startsWith('/'), 'should return an absolute path');
-    // Either the returned path has hypo-config.md (marker scan worked), or it is the ~/wiki default
+    // Either the returned path has hypo-config.md (marker scan worked), or it is the ~/hypomnema default
     const isDefault = result === join(HOME, 'hypomnema');
     const hasMarker = existsSync(join(result, 'hypo-config.md'));
     assert.ok(isDefault || hasMarker,

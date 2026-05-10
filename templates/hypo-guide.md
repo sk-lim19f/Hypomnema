@@ -9,7 +9,7 @@ tags: [wiki, guide, operations]
 
 How to run this wiki. For the type system, see [[SCHEMA]].
 
-> **Before any wiki task**: read `SCHEMA.md` → `wiki-guide.md` on the first wiki operation of a session. Reuse for subsequent operations. Re-read after `/compact`, context resume, or if unsure.
+> **Before any wiki task**: read `SCHEMA.md` → `hypo-guide.md` on the first wiki operation of a session. Reuse for subsequent operations. Re-read after `/compact`, context resume, or if unsure.
 
 ---
 
@@ -30,7 +30,7 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 ├── hot.md              ← active-project pointer table
 ├── log.md              ← append-only activity log
 ├── SCHEMA.md           ← type system reference
-├── wiki-guide.md       ← this file
+├── hypo-guide.md       ← this file
 ├── .wikiignore         ← privacy/exclusion patterns
 ├── pages/              ← permanent knowledge pages (subdirs added on demand)
 │   ├── learnings/      (optional)

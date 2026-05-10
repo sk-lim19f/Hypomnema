@@ -30,7 +30,7 @@ HYPO_SKIP_GATE=1
 ├── index.md            ← searchable page index
 ├── hot.md              ← active-project pointer table
 ├── log.md              ← chronological activity log
-├── wiki-guide.md       ← operations guide
+├── hypo-guide.md       ← operations guide
 ├── SCHEMA.md           ← type system reference
 ├── .wikiignore         ← privacy/secret file patterns
 ├── pages/              ← permanent knowledge pages

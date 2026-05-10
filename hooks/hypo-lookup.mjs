@@ -4,7 +4,7 @@
  *
  * On every user prompt:
  *   1. Extract keywords from the prompt
- *   2. BM25-score against ~/wiki/index.md entries
+ *   2. BM25-score against ~/hypomnema/index.md entries
  *   HIT  → read matched pages, inject as additionalContext
  *   MISS → inject top-3 closest slugs as a research signal
  */

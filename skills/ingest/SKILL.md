@@ -16,7 +16,7 @@ You are running `/hypo:ingest`. Add a new source document to `sources/` and crea
 
 Locate the Hypomnema package root (the directory two levels above this file (`skills/<name>/SKILL.md` → package root)).
 
-If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/wiki`.
+If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
 
 ---
 

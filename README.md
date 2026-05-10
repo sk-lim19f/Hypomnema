@@ -31,8 +31,8 @@ This sets up your wiki directory, installs hooks, and merges them into `~/.claud
 After `/hypo:init`, your wiki directory is already a local git repository. To sync it across machines, add a remote and push:
 
 ```bash
-git -C ~/wiki remote add origin <your-repo-url>
-git -C ~/wiki push -u origin HEAD
+git -C ~/hypomnema remote add origin <your-repo-url>
+git -C ~/hypomnema push -u origin HEAD
 ```
 
 The Stop hook then auto-commits and pushes your wiki at the end of every session — no manual sync needed.
@@ -132,7 +132,7 @@ You put a project down for three weeks. At the next session start, the hook read
 ├── hot.md              ← active project pointers
 ├── log.md              ← append-only activity log
 ├── SCHEMA.md           ← type system reference
-├── wiki-guide.md       ← operations guide
+├── hypo-guide.md       ← operations guide
 ├── .wikiignore         ← privacy/exclusion patterns
 ├── pages/              ← permanent knowledge pages
 ├── projects/           ← project artifacts and session logs
