@@ -1,30 +1,31 @@
 #!/usr/bin/env node
 /**
- * wiki-lookup.mjs — UserPromptSubmit hook
+ * hypo-lookup.mjs — UserPromptSubmit hook
  *
  * On every user prompt:
  *   1. Extract keywords from the prompt
- *   2. BM25-score against ~/wiki/index.md entries
+ *   2. BM25-score against ~/hypomnema/index.md entries
  *   HIT  → read matched pages, inject as additionalContext
  *   MISS → inject top-3 closest slugs as a research signal
  */
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join, basename } from 'path';
-import { WIKI_DIR, buildOutput } from './wiki-shared.mjs';
+import { HYPO_DIR, buildOutput, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
 
-const INDEX_PATH = join(WIKI_DIR, 'index.md');
+const INDEX_PATH = join(HYPO_DIR, 'index.md');
 const MAX_HITS   = 3;
 const MAX_CHARS  = 2000;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function buildPageMap(dir, root = dir, map = {}) {
+function buildPageMap(dir, root = dir, map = {}, ignorePatterns = [], hypoDir = root) {
   if (!existsSync(dir)) return map;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
+    if (isIgnored(full, hypoDir, ignorePatterns)) continue;
     if (statSync(full).isDirectory()) {
-      buildPageMap(full, root, map);
+      buildPageMap(full, root, map, ignorePatterns, hypoDir);
     } else if (entry.endsWith('.md')) {
       const rel = full.slice(root.length + 1).replace(/\.md$/, '');
       map[rel] = full;
@@ -87,6 +88,8 @@ function bm25Score(queryTerms, entries, k1 = 1.5, b = 0.75) {
 function parseIndexEntries(indexContent) {
   const entries = [];
   for (const line of indexContent.split('\n')) {
+    if (line.trimStart().startsWith('<!--')) continue;
+    if (line.trimStart().startsWith('>')) continue;
     const m = line.match(/\[\[([^\]]+)\]\]\s*[—\-]+\s*(.+)/);
     if (!m) continue;
     const raw  = m[1].trim();
@@ -135,9 +138,10 @@ process.stdin.on('end', () => {
       return;
     }
 
+    const ignorePatterns = loadHypoIgnore(HYPO_DIR);
     const pageMap = {
-      ...buildPageMap(join(WIKI_DIR, 'pages')),
-      ...buildPageMap(join(WIKI_DIR, 'projects')),
+      ...buildPageMap(join(HYPO_DIR, 'pages'), join(HYPO_DIR, 'pages'), {}, ignorePatterns, HYPO_DIR),
+      ...buildPageMap(join(HYPO_DIR, 'projects'), join(HYPO_DIR, 'projects'), {}, ignorePatterns, HYPO_DIR),
     };
 
     const injected = [];

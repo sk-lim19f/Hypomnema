@@ -17,7 +17,7 @@ You are running `/hypo:resume`. Load the session state for an active project and
 If the user named a project in the command invocation, use that. Otherwise, locate the Hypomnema package root and run:
 
 ```bash
-node <package-root>/scripts/resume.mjs [--wiki-dir="<path>"] [--project=<name>]
+node <package-root>/scripts/resume.mjs [--hypo-dir="<path>"] [--project=<name>]
 ```
 
 The script will resolve the most recently active project from `hot.md` if `--project` is omitted.

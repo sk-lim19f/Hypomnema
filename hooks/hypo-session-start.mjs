@@ -1,24 +1,30 @@
 #!/usr/bin/env node
 /**
- * wiki-session-start.mjs — SessionStart hook
+ * hypo-session-start.mjs — SessionStart hook
  *
  * On session start:
- *   HIT  → cwd matches a project's working_dir → inject hot.md (2000 chars) + session-state.md (1000 chars)
+ *   HIT  → cwd matches a project's working_dir → inject hot.md (2000 chars) + session-state.md (2000 chars)
  *   MISS → inject global hot.md pointer only (no fan-out to all projects)
  */
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
-import { WIKI_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS } from './wiki-shared.mjs';
+import { spawnSync } from 'child_process';
+import { HYPO_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS } from './hypo-shared.mjs';
 
-const PROJECTS_DIR = join(WIKI_DIR, 'projects');
-const GLOBAL_HOT   = join(WIKI_DIR, 'hot.md');
+const PROJECTS_DIR = join(HYPO_DIR, 'projects');
+
+function gitPull(dir) {
+  if (!existsSync(join(dir, '.git'))) return;
+  spawnSync('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], { stdio: 'pipe', timeout: 10000 });
+}
+const GLOBAL_HOT   = join(HYPO_DIR, 'hot.md');
 const HOT_CHARS    = 2000;
-const STATE_CHARS  = 1000;
+const STATE_CHARS  = 2000;
 
 function parseFrontmatterField(content, key) {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return null;
   const line = match[1].split('\n').find(l => l.startsWith(`${key}:`));
   if (!line) return null;
@@ -76,7 +82,7 @@ function printTerminalSummary(proj, hotContent, stateContent) {
   if (prev) lines.push(`  prev: ${prev.split('\n')[0].replace(/^\*\*|\*\*$/g, '')}`);
   if (next) {
     lines.push('  next:');
-    next.split('\n').slice(0, 5).forEach(l => lines.push(`    ${l}`));
+    next.split('\n').slice(0, 20).forEach(l => lines.push(`    ${l}`));
   }
   lines.push('');
   process.stderr.write(lines.join('\n'));
@@ -90,6 +96,7 @@ process.stdin.on('end', () => {
     let data = {};
     try { data = JSON.parse(raw); } catch {}
 
+    gitPull(HYPO_DIR);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);

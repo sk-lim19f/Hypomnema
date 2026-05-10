@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Run tests
+        run: npm test
+
+  lint-runner:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run lint
+        run: npm run lint
+
+  init-snapshot:
+    name: Init snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Dry-run reports DRY RUN without writing files
+        run: |
+          out=$(node scripts/init.mjs \
+            --hypo-dir=/tmp/wiki-dry \
+            --dry-run --no-hooks --no-git-init)
+          echo "$out" | grep -q '\[DRY RUN'
+          test ! -d /tmp/wiki-dry
+      - name: Actual init creates expected structure
+        run: |
+          node scripts/init.mjs \
+            --hypo-dir=/tmp/wiki-init \
+            --no-hooks --no-git-init
+          test -d /tmp/wiki-init/pages
+          test -d /tmp/wiki-init/projects
+          test -d /tmp/wiki-init/sources
+          test -f /tmp/wiki-init/hypo-config.md
+          test -f /tmp/wiki-init/index.md
+
+  upgrade-snapshot:
+    name: Upgrade snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Init then upgrade — JSON output has required fields
+        run: |
+          node scripts/init.mjs \
+            --hypo-dir=/tmp/wiki-upgrade \
+            --no-git-init
+          node scripts/upgrade.mjs \
+            --hypo-dir=/tmp/wiki-upgrade \
+            --json > /tmp/upgrade-out.json
+          node -e "
+            const d = JSON.parse(require('fs').readFileSync('/tmp/upgrade-out.json', 'utf-8'));
+            for (const k of ['schema', 'hooks', 'settings', 'applied']) {
+              if (!(k in d)) { console.error('missing field: ' + k); process.exit(1); }
+            }
+            if (!Array.isArray(d.applied.hooks))    { console.error('applied.hooks not array'); process.exit(1); }
+            if (!Array.isArray(d.applied.settings)) { console.error('applied.settings not array'); process.exit(1); }
+          "
+
+  replay:
+    name: Hook replay
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: compact-guard — non-compact prompt passes through
+        run: |
+          echo '{"prompt":"hello"}' \
+            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/hypo-compact-guard.mjs \
+            > /tmp/cg-pass.json
+          node -e "
+            const d = JSON.parse(require('fs').readFileSync('/tmp/cg-pass.json', 'utf-8'));
+            if (d.continue !== true) { console.error('expected continue:true'); process.exit(1); }
+          "
+      - name: compact-guard — /compact with no wiki produces additionalContext
+        run: |
+          echo '{"prompt":"/compact"}' \
+            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/hypo-compact-guard.mjs \
+            > /tmp/cg-compact.json
+          node -e "
+            const d = JSON.parse(require('fs').readFileSync('/tmp/cg-compact.json', 'utf-8'));
+            if (!('additionalContext' in d)) { console.error('missing additionalContext'); process.exit(1); }
+            if (d.continue !== true)         { console.error('expected continue:true');    process.exit(1); }
+          "
+      - name: personal-check — no wiki returns block decision
+        run: |
+          echo '{}' \
+            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/hypo-personal-check.mjs \
+            > /tmp/pwc-block.json
+          node -e "
+            const d = JSON.parse(require('fs').readFileSync('/tmp/pwc-block.json', 'utf-8'));
+            if (d.decision !== 'block') { console.error('expected decision:block'); process.exit(1); }
+          "
+      - name: personal-check — HYPO_SKIP_GATE=1 passes through
+        run: |
+          echo '{}' \
+            | HYPO_DIR=/tmp/no-wiki-$RANDOM HYPO_SKIP_GATE=1 node hooks/hypo-personal-check.mjs \
+            > /tmp/pwc-skip.json
+          node -e "
+            const d = JSON.parse(require('fs').readFileSync('/tmp/pwc-skip.json', 'utf-8'));
+            if (d.continue !== true) { console.error('expected continue:true'); process.exit(1); }
+          "
+
+  uninstall-smoke:
+    name: Uninstall smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Dry-run reports DRY RUN
+        run: |
+          out=$(node scripts/uninstall.mjs \
+            --hooks-dir=/tmp/no-hooks-$RANDOM)
+          echo "$out" | grep -q '\[DRY RUN'
+      - name: Apply mode exits 0 when nothing is installed
+        run: |
+          node scripts/uninstall.mjs \
+            --apply \
+            --hooks-dir=/tmp/no-hooks-$RANDOM
+
+  hypo-absent:
+    name: Hypo-absent (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Run tests without hypo env vars
+        env:
+          HYPO_SKIP_GATE: ""
+          HYPO_DIR: ""
+        run: npm test

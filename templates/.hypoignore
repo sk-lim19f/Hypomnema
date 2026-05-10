@@ -1,4 +1,4 @@
-# .wikiignore — patterns excluded from Hypomnema hooks
+# .hypoignore — patterns excluded from Hypomnema hooks
 # One glob per line. Lines starting with # are comments.
 # Matched files are not read by hooks or included in index lookups.
 # Syntax follows .gitignore glob rules.

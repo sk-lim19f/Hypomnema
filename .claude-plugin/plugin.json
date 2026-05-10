@@ -1,10 +1,10 @@
 {
   "name": "hypomnema",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "LLM-native personal wiki system — session-aware knowledge base for Claude Code",
   "author": {
-    "name": "Linus",
-    "email": "linus@cre8orclub.com"
+    "name": "sk-lim19f",
+    "email": "limsangkyu0219@gmail.com"
   },
   "commands": "./commands/",
   "skills": "./skills/"

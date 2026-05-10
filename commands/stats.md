@@ -17,14 +17,14 @@ You are running `/hypo:stats`. Display a summary of wiki health and activity.
 
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
-If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag.
+If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag.
 
 ---
 
 ## Step 2 — Run the stats script
 
 ```bash
-node <package-root>/scripts/stats.mjs [--wiki-dir="<path>"] [--json]
+node <package-root>/scripts/stats.mjs [--hypo-dir="<path>"] [--json]
 ```
 
 ---

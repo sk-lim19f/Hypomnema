@@ -8,7 +8,7 @@
  *   node scripts/doctor.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>    Wiki root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/wiki)
+ *   --hypo-dir=<path>    Hypomnema root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/hypomnema)
  *   --json               Output results as JSON
  */
 
@@ -17,7 +17,9 @@ import { join, relative, extname } from 'path';
 import { homedir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
+import { parseFrontmatter } from './lib/frontmatter.mjs';
 
 const HOME     = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -26,12 +28,12 @@ const PKG_ROOT   = join(SCRIPT_DIR, '..');
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, json: false };
+  const args = { hypoDir: null, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json')         args.json = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -60,29 +62,69 @@ if (!_hookConfig.hooks || typeof _hookConfig.hooks !== 'object' || Array.isArray
   console.error('Error: hooks/hooks.json must contain a "hooks" object');
   process.exit(1);
 }
-for (const [event, files] of Object.entries(_hookConfig.hooks)) {
-  if (!Array.isArray(files) || !files.every(f => typeof f === 'string' && f.length > 0)) {
-    console.error(`Error: hooks/hooks.json "hooks.${event}" must be an array of non-empty strings`);
+function _extractCommandFileName(command) {
+  if (typeof command !== 'string') return null;
+  const matches = [...command.matchAll(/(?:^|[\/\\])([^\/\\\s"'`]+\.mjs)(?=$|[\s"'`])/g)];
+  if (matches.length > 0) return matches[matches.length - 1][1];
+  const bare = command.match(/(?:^|\s)([^\/\\\s"'`]+\.mjs)(?=$|[\s"'`])/);
+  return bare ? bare[1] : null;
+}
+
+function _isHookFileName(file) {
+  return typeof file === 'string' && /^[^/\\\s]+\.mjs$/.test(file.trim());
+}
+
+function _isHookGroup(group) {
+  return group &&
+    typeof group === 'object' &&
+    !Array.isArray(group) &&
+    Array.isArray(group.hooks) &&
+    group.hooks.length > 0 &&
+    group.hooks.every(hook =>
+      hook &&
+      typeof hook === 'object' &&
+      !Array.isArray(hook) &&
+      hook.type === 'command' &&
+      _extractCommandFileName(hook.command)
+    );
+}
+
+// Extract .mjs file names from both old format (string[]) and new format (hook-group object[])
+function _extractFileNames(groups) {
+  return groups.flatMap(group => {
+    if (typeof group === 'string') return [group.trim()];
+    return group.hooks.map(hook => _extractCommandFileName(hook.command));
+  });
+}
+
+for (const [event, groups] of Object.entries(_hookConfig.hooks)) {
+  const valid = Array.isArray(groups) &&
+    groups.length > 0 &&
+    groups.every(group => _isHookFileName(group) || _isHookGroup(group)) &&
+    _extractFileNames(groups).length > 0;
+  if (!valid) {
+    console.error(`Error: hooks/hooks.json "hooks.${event}" must be a non-empty array of .mjs file names or Claude hook groups`);
     process.exit(1);
   }
 }
-if (_hookConfig.shared !== undefined && (!Array.isArray(_hookConfig.shared) || !_hookConfig.shared.every(f => typeof f === 'string' && f.length > 0))) {
-  console.error('Error: hooks/hooks.json "shared" must be an array of non-empty strings');
+if (_hookConfig.shared !== undefined && (!Array.isArray(_hookConfig.shared) || !_hookConfig.shared.every(f => _isHookFileName(f)))) {
+  console.error('Error: hooks/hooks.json "shared" must be an array of .mjs file names');
   process.exit(1);
 }
-const HOOK_MAP     = _hookConfig.hooks;
+
+const HOOK_MAP     = Object.fromEntries(Object.entries(_hookConfig.hooks).map(([e, gs]) => [e, _extractFileNames(gs)]));
 const SHARED_FILES = _hookConfig.shared ?? [];
 
 // ── checks ───────────────────────────────────────────────────────────────────
 
-function checkWikiRoot(wikiDir) {
-  if (!existsSync(wikiDir)) {
-    fail('Wiki root exists', wikiDir);
+function checkHypoRoot(hypoDir) {
+  if (!existsSync(hypoDir)) {
+    fail('Wiki root exists', hypoDir);
     return false;
   }
-  pass('Wiki root exists', wikiDir);
+  pass('Wiki root exists', hypoDir);
 
-  if (existsSync(join(wikiDir, 'hypo-config.md'))) {
+  if (existsSync(join(hypoDir, 'hypo-config.md'))) {
     pass('hypo-config.md marker');
   } else {
     warn('hypo-config.md marker', 'Missing — wiki root resolution may fall back to default');
@@ -90,10 +132,10 @@ function checkWikiRoot(wikiDir) {
   return true;
 }
 
-function checkDirectories(wikiDir) {
+function checkDirectories(hypoDir) {
   const required = ['pages', 'projects', 'sources'];
   for (const d of required) {
-    if (existsSync(join(wikiDir, d))) {
+    if (existsSync(join(hypoDir, d))) {
       pass(`Directory: ${d}/`);
     } else {
       fail(`Directory: ${d}/`, `Run /hypo:init to create missing directories`);
@@ -101,10 +143,10 @@ function checkDirectories(wikiDir) {
   }
 }
 
-function checkFiles(wikiDir) {
-  const required = ['index.md', 'hot.md', 'log.md', '.wikiignore', 'SCHEMA.md', 'wiki-guide.md'];
+function checkFiles(hypoDir) {
+  const required = ['index.md', 'hot.md', 'log.md', '.hypoignore', 'SCHEMA.md', 'hypo-guide.md'];
   for (const f of required) {
-    if (existsSync(join(wikiDir, f))) {
+    if (existsSync(join(hypoDir, f))) {
       pass(`File: ${f}`);
     } else {
       warn(`File: ${f}`, 'Expected baseline file is missing');
@@ -169,14 +211,14 @@ function checkSettingsJson() {
   }
 }
 
-function checkGit(wikiDir) {
-  if (!existsSync(join(wikiDir, '.git'))) {
+function checkGit(hypoDir) {
+  if (!existsSync(join(hypoDir, '.git'))) {
     warn('Git repository', 'Not a git repo — run /hypo:init with git-remote option for sync/backup');
     return;
   }
   pass('Git repository');
 
-  const remote = spawnSync('git', ['-C', wikiDir, 'remote', 'get-url', 'origin'], { encoding: 'utf-8' });
+  const remote = spawnSync('git', ['-C', hypoDir, 'remote', 'get-url', 'origin'], { encoding: 'utf-8' });
   if (remote.status === 0 && remote.stdout.trim()) {
     pass('Git remote origin', remote.stdout.trim());
   } else {
@@ -184,20 +226,23 @@ function checkGit(wikiDir) {
   }
 }
 
-function checkBrokenLinks(wikiDir) {
-  const mdFiles = collectMdFiles(wikiDir);
-  const slugSet = buildSlugSet(mdFiles, wikiDir);
+function checkBrokenLinks(hypoDir, ignorePatterns = []) {
+  const mdFiles = collectMdFiles(hypoDir, [], hypoDir, ignorePatterns);
+  const slugSet = buildSlugSet(mdFiles, hypoDir);
   const broken = [];
 
   for (const file of mdFiles) {
-    const content = readFileSync(file, 'utf-8');
+    const raw = readFileSync(file, 'utf-8');
+    const content = raw.replace(/<!--[\s\S]*?-->/g, '').replace(/`[^`\n]+`/g, '');
     const links = [...content.matchAll(/\[\[([^\]|#\n]+?)(?:[|#][^\]]*?)?\]\]/g)].map(m => m[1].trim());
     for (const link of links) {
       // skip object-path references (e.g. [[hooks.SessionStart]])
       if (link.includes('.') && !link.endsWith('.md')) continue;
+      // skip template placeholders (e.g. [[projects/<project-name>/prd]])
+      if (link.includes('<') || link.includes('>')) continue;
       const slug = link.replace(/\.md$/, '');
       if (!slugSet.has(slug) && !slugSet.has(slug.toLowerCase())) {
-        broken.push({ file: relative(wikiDir, file), link });
+        broken.push({ file: relative(hypoDir, file), link });
       }
     }
   }
@@ -211,22 +256,23 @@ function checkBrokenLinks(wikiDir) {
   }
 }
 
-function collectMdFiles(dir, acc = []) {
+function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
+    if (hypoDir && isIgnored(full, hypoDir, ignorePatterns)) continue;
     const st   = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc);
+    if (st.isDirectory()) collectMdFiles(full, acc, hypoDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
 }
 
-function buildSlugSet(files, wikiDir) {
+function buildSlugSet(files, hypoDir) {
   const set = new Set();
   for (const f of files) {
-    const rel = relative(wikiDir, f).replace(/\.md$/, '');
+    const rel = relative(hypoDir, f).replace(/\.md$/, '');
     // add all path suffixes: pages/learnings/foo → also learnings/foo, foo
     const parts = rel.split('/');
     for (let i = 0; i < parts.length; i++) {
@@ -238,9 +284,9 @@ function buildSlugSet(files, wikiDir) {
   return set;
 }
 
-function checkVerifyBy(wikiDir) {
+function checkVerifyBy(hypoDir, ignorePatterns = []) {
   const today    = new Date().toISOString().slice(0, 10);
-  const mdFiles  = collectMdFiles(wikiDir);
+  const mdFiles  = collectMdFiles(hypoDir, [], hypoDir, ignorePatterns);
   const overdue  = [];
   const missing  = [];
 
@@ -254,10 +300,10 @@ function checkVerifyBy(wikiDir) {
 
     // verify_by = natural-language question; verify_by_date = ISO date deadline
     if (!fm.verify_by) {
-      missing.push(relative(wikiDir, file));
+      missing.push(relative(hypoDir, file));
     }
     if (fm.verify_by_date && /^\d{4}-\d{2}-\d{2}$/.test(fm.verify_by_date) && fm.verify_by_date < today) {
-      overdue.push({ file: relative(wikiDir, file), due: fm.verify_by_date });
+      overdue.push({ file: relative(hypoDir, file), due: fm.verify_by_date });
     }
   }
 
@@ -276,34 +322,21 @@ function checkVerifyBy(wikiDir) {
   }
 }
 
-function parseFrontmatter(content) {
-  const m = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!m) return null;
-  const fm = {};
-  for (const line of m[1].split('\n')) {
-    const idx = line.indexOf(':');
-    if (idx < 0) continue;
-    const key = line.slice(0, idx).trim();
-    const val = line.slice(idx + 1).trim().replace(/\s*#.*$/, '').replace(/^["']|["']$/g, '');
-    fm[key] = val;
-  }
-  return fm;
-}
-
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
 
-const rootOk = checkWikiRoot(args.wikiDir);
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const rootOk = checkHypoRoot(args.hypoDir);
 if (rootOk) {
-  checkDirectories(args.wikiDir);
-  checkFiles(args.wikiDir);
-  checkBrokenLinks(args.wikiDir);
-  checkVerifyBy(args.wikiDir);
+  checkDirectories(args.hypoDir);
+  checkFiles(args.hypoDir);
+  checkBrokenLinks(args.hypoDir, ignorePatterns);
+  checkVerifyBy(args.hypoDir, ignorePatterns);
 }
 checkHooks();
 checkSettingsJson();
-checkGit(args.wikiDir);
+checkGit(args.hypoDir);
 
 // ── report ───────────────────────────────────────────────────────────────────
 

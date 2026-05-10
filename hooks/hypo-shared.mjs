@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * wiki-shared.mjs — shared utilities for Hypomnema hooks
+ * hypo-shared.mjs — shared utilities for Hypomnema hooks
  *
  * Imported by personal-wiki-check.mjs, wiki-compact-guard.mjs, and others.
  * Hooks are deployed to ~/.claude/hooks/ — no external imports allowed.
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { join, relative, basename } from 'path';
 import { homedir } from 'os';
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 
 const HOME = homedir();
 
@@ -22,28 +22,38 @@ function expandHome(p) {
 }
 
 /**
- * Resolve wiki root: HYPO_DIR env → hypo-config.md scan → ~/wiki default.
+ * Resolve Hypomnema root: HYPO_DIR env → hypo-config.md scan → ~/hypomnema default.
  * @returns {string}
  */
-function resolveWikiRoot() {
+function resolveHypoRoot() {
   if (process.env.HYPO_DIR) return expandHome(process.env.HYPO_DIR);
 
   const candidates = [
+    join(HOME, 'hypomnema'),
     join(HOME, 'wiki'),
     join(HOME, 'notes'),
     join(HOME, 'knowledge'),
+    join(HOME, 'Documents', 'hypomnema'),
     join(HOME, 'Documents', 'wiki'),
   ];
   for (const c of candidates) {
     if (existsSync(join(c, 'hypo-config.md'))) return c;
   }
-  return join(HOME, 'wiki');
+  return join(HOME, 'hypomnema');
 }
 
-export const WIKI_DIR   = resolveWikiRoot();
-export const LOG_PATH   = join(WIKI_DIR, 'log.md');
-export const HOT_PATH   = join(WIKI_DIR, 'hot.md');
-export const GUIDE_PATH = join(WIKI_DIR, 'wiki-guide.md');
+export const HYPO_DIR   = resolveHypoRoot();
+export const LOG_PATH   = join(HYPO_DIR, 'log.md');
+export const HOT_PATH   = join(HYPO_DIR, 'hot.md');
+export const GUIDE_PATH = join(HYPO_DIR, 'hypo-guide.md');
+
+// Package root: written by init/upgrade to ~/.claude/hypo-pkg.json
+function resolvePkgRoot() {
+  const p = join(HOME, '.claude', 'hypo-pkg.json');
+  if (!existsSync(p)) return null;
+  try { const v = JSON.parse(readFileSync(p, 'utf-8')).pkgRoot; return typeof v === 'string' && v ? v : null; } catch { return null; }
+}
+export const PKG_ROOT = resolvePkgRoot();
 
 // Optional H2 allowlist for hot.md validation.
 // Set HYPO_ALLOWED_HOT_H2=comma,separated,headings to enable.
@@ -56,7 +66,7 @@ export const ALLOWED_HOT_H2 = _allowedH2Env
 
 /** Returns true if the wiki gate should be bypassed. */
 export function isGateSkipped() {
-  return process.env.HYPO_SKIP_GATE === '1' || process.env.OMC_SKIP_WIKI_GATE === '1';
+  return process.env.HYPO_SKIP_GATE === '1';
 }
 
 // ── state checkers ─────────────────────────────────────────────────────────
@@ -70,15 +80,16 @@ export function lastSubstantialOpIsSession() {
   return /^## \[\d{4}-\d{2}-\d{2}\] session/.test(substantial[substantial.length - 1]);
 }
 
-export function wikiIsClean() {
+export function hypoIsClean() {
   try {
-    const porcelain = execSync(`git -C "${WIKI_DIR}" status --porcelain`, { encoding: 'utf-8' }).trim();
-    if (porcelain !== '') return { clean: false, reason: `uncommitted changes in ${WIKI_DIR}` };
-    const ahead = execSync(`git -C "${WIKI_DIR}" status --branch --porcelain`, { encoding: 'utf-8' });
-    if (/\[ahead \d+\]/.test(ahead)) return { clean: false, reason: `unpushed commits in ${WIKI_DIR}` };
+    const porcelain = spawnSync('git', ['-C', HYPO_DIR, 'status', '--porcelain'], { encoding: 'utf-8' });
+    if (porcelain.status !== 0) return { clean: false, reason: `git check failed in ${HYPO_DIR}` };
+    if (porcelain.stdout.trim() !== '') return { clean: false, reason: `uncommitted changes in ${HYPO_DIR}` };
+    const ahead = spawnSync('git', ['-C', HYPO_DIR, 'status', '--branch', '--porcelain'], { encoding: 'utf-8' });
+    if (/\[ahead \d+\]/.test(ahead.stdout || '')) return { clean: false, reason: `unpushed commits in ${HYPO_DIR}` };
     return { clean: true };
   } catch {
-    return { clean: false, reason: `git check failed in ${WIKI_DIR}` };
+    return { clean: false, reason: `git check failed in ${HYPO_DIR}` };
   }
 }
 
@@ -106,7 +117,7 @@ export function hotMdIsClean() {
 // ── session-close checklist ────────────────────────────────────────────────
 
 /**
- * Read the session-close checklist from wiki-guide.md.
+ * Read the session-close checklist from hypo-guide.md.
  * Falls back to null if the guide is unavailable or the section can't be parsed.
  */
 export function readChecklist(today) {
@@ -147,4 +158,56 @@ export function isCompactCommand(prompt) {
  */
 export function buildOutput(context, extra = {}) {
   return { ...extra, additionalContext: context };
+}
+
+// ── .hypoignore support ────────────────────────────────────────────────────
+// Inlined here so deployed hooks (~/.claude/hooks/) don't need scripts/lib/.
+
+function _globToRegex(glob) {
+  return new RegExp('^' +
+    glob
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/\*\*/g, '\x00')
+      .replace(/\*/g, '[^/]*')
+      .replace(/\?/g, '[^/]')
+      .replace(/\x00/g, '.*')
+  + '$');
+}
+
+export function loadHypoIgnore(hypoDir) {
+  const ignorePath = join(hypoDir, '.hypoignore');
+  if (!existsSync(ignorePath)) return [];
+  return readFileSync(ignorePath, 'utf-8')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'));
+}
+
+export function isIgnored(filePath, hypoDir, patterns) {
+  const rel = relative(hypoDir, filePath).replace(/\\/g, '/');
+  const base = basename(filePath);
+  for (const pattern of patterns) {
+    const isDir = pattern.endsWith('/');
+    if (isDir) {
+      const dir = pattern.slice(0, -1);
+      const isAnchored = dir.includes('/');
+      if (isAnchored) {
+        const re = _globToRegex(dir);
+        const parts = rel.split('/');
+        for (let i = dir.split('/').length; i <= parts.length; i++) {
+          if (re.test(parts.slice(0, i).join('/'))) return true;
+        }
+      } else {
+        const re = _globToRegex(dir);
+        for (const part of rel.split('/')) {
+          if (re.test(part)) return true;
+        }
+      }
+      continue;
+    }
+    const hasSlash = pattern.includes('/');
+    const target = hasSlash ? rel : base;
+    if (_globToRegex(pattern).test(target)) return true;
+  }
+  return false;
 }

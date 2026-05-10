@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-first-prompt.mjs — UserPromptSubmit hook
+ * hypo-first-prompt.mjs — UserPromptSubmit hook
  *
  * Consumes the marker written by wiki-session-start.mjs.
  * On the FIRST user prompt of a new session, injects a lightweight decision
@@ -14,7 +14,7 @@
 import { readFileSync, unlinkSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { buildOutput } from './wiki-shared.mjs';
+import { buildOutput } from './hypo-shared.mjs';
 
 const MARKER_TTL = 10 * 60 * 1000; // 10 min
 

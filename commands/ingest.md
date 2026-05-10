@@ -30,7 +30,7 @@ If a URL is provided, fetch the content. If a file path is provided, read it.
 Locate the Hypomnema package root. Run the ingest helper to surface existing orphaned sources:
 
 ```bash
-node <package-root>/scripts/ingest.mjs [--wiki-dir="<path>"]
+node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"]
 ```
 
 If there are orphaned sources already in `sources/`, ask: "There are N unprocessed sources — do you want to ingest one of those instead?"

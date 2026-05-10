@@ -10,7 +10,7 @@
  *   node scripts/query.mjs --q="<search terms>" [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --q=<query>         Search query (required)
  *   --limit=<n>         Max results (default: 10)
  *   --json              Output as JSON
@@ -18,31 +18,33 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, query: null, limit: 10, json: false };
+  const args = { hypoDir: null, query: null, limit: 10, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--q='))     args.query  = arg.slice(4);
     else if (arg.startsWith('--limit=')) args.limit  = parseInt(arg.slice(8), 10) || 10;
     else if (arg === '--json')           args.json   = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectMdFiles(dir, root, acc = []) {
+function collectMdFiles(dir, root, acc = [], ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
+    if (isIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, root, acc);
+    if (st.isDirectory()) collectMdFiles(full, root, acc, ignorePatterns);
     else if (extname(entry) === '.md') acc.push({ path: full, rel: relative(root, full) });
   }
   return acc;
@@ -60,10 +62,12 @@ function parseFrontmatter(content) {
   return fm;
 }
 
+function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
 function scoreAndExcerpt(content, terms) {
   const lower = content.toLowerCase();
   let score = 0;
-  for (const t of terms) score += (lower.match(new RegExp(t, 'g')) || []).length;
+  for (const t of terms) score += (lower.match(new RegExp(escapeRegex(t), 'g')) || []).length;
 
   // find first matching line for excerpt
   const lines = content.split('\n');
@@ -87,8 +91,9 @@ if (!args.query) {
 }
 
 const terms = args.query.toLowerCase().split(/\s+/).filter(Boolean);
-const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-const files = scanDirs.flatMap(d => collectMdFiles(d, args.wikiDir));
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
+const files = scanDirs.flatMap(d => collectMdFiles(d, args.hypoDir, [], ignorePatterns));
 
 const results = [];
 

@@ -1,7 +1,7 @@
 ---
 title: Hypomnema Config
 type: config
-version: "0.1.0"
+version: "1.0.0"
 created: YYYY-MM-DD
 ---
 
@@ -23,14 +23,14 @@ HYPO_SKIP_GATE=1
 ## Layout
 
 ```
-<wiki-root>/
+<hypo-root>/
 ├── hypo-config.md      ← you are here (root marker)
 ├── index.md            ← searchable page index
 ├── hot.md              ← active-project pointer table
 ├── log.md              ← chronological activity log
-├── wiki-guide.md       ← operations guide
+├── hypo-guide.md       ← operations guide
 ├── SCHEMA.md           ← type system reference
-├── .wikiignore         ← privacy/secret file patterns
+├── .hypoignore         ← glob patterns excluded from hooks
 ├── pages/              ← permanent knowledge pages
 ├── projects/           ← project work artifacts
 │   └── <name>/

@@ -8,26 +8,27 @@
  *   node scripts/lint.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --json              Output results as JSON
  *   --fix               Auto-add missing `updated` field (safe repairs only)
  */
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
-import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/wiki-shared.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, json: false, fix: false };
+  const args = { hypoDir: null, json: false, fix: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json')         args.json = true;
     else if (arg === '--fix')          args.fix  = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -47,13 +48,14 @@ function parseFrontmatter(content) {
 
 // ── page collector ────────────────────────────────────────────────────────────
 
-function collectPages(dir, root, pages = []) {
+function collectPages(dir, root, pages = [], ignorePatterns = []) {
   if (!existsSync(dir)) return pages;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
+    if (isIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) {
-      collectPages(full, root, pages);
+      collectPages(full, root, pages, ignorePatterns);
     } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
       pages.push({ path: full, rel: relative(root, full) });
     }
@@ -145,7 +147,7 @@ function lintPage({ path, rel }, slugMap) {
   lintSessionStateHeadings(content, rel);
 
   for (const link of extractWikilinks(content)) {
-    if (!slugMap.has(link) && !slugMap.has(link.replace(/\//g, path.sep))) {
+    if (!slugMap.has(link)) {
       issue('warn', rel, `Broken wikilink: [[${link}]]`);
     }
   }
@@ -155,8 +157,9 @@ function lintPage({ path, rel }, slugMap) {
 
 const args = parseArgs(process.argv);
 
-const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-const pages = scanDirs.flatMap(d => collectPages(d, args.wikiDir));
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
+const pages = scanDirs.flatMap(d => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugMap = buildSlugMap(pages);
 
 for (const page of pages) lintPage(page, slugMap);

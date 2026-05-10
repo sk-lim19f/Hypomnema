@@ -1,0 +1,6 @@
+.omc/
+skills/.omc/
+.git/
+tests/
+*.test.mjs
+.DS_Store

@@ -9,37 +9,39 @@
  *   node scripts/graph.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --format=<fmt>      Output format: json | mermaid | dot  (default: json)
  *   --min-edges=<n>     Only include nodes with at least N edges (default: 0)
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, format: 'json', minEdges: 0 };
+  const args = { hypoDir: null, format: 'json', minEdges: 0 };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir='))  args.wikiDir  = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir='))  args.hypoDir  = expandHome(arg.slice(11));
     else if (arg.startsWith('--format='))   args.format   = arg.slice(9);
     else if (arg.startsWith('--min-edges=')) args.minEdges = parseInt(arg.slice(12), 10) || 0;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
 // ── page collector ────────────────────────────────────────────────────────────
 
-function collectPages(dir, root, pages = []) {
+function collectPages(dir, root, pages = [], ignorePatterns = []) {
   if (!existsSync(dir)) return pages;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
+    if (isIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) {
-      collectPages(full, root, pages);
+      collectPages(full, root, pages, ignorePatterns);
     } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
       const slug = relative(root, full).replace(/\.md$/, '').replace(/\\/g, '/');
       pages.push({ path: full, slug, bare: basename(full, '.md') });
@@ -97,6 +99,11 @@ function buildGraph(pages, slugIndex) {
   return { edges, inDegree, outDegree };
 }
 
+// ── label escapers ────────────────────────────────────────────────────────────
+
+function escapeMermaid(s) { return s.replace(/"/g, '#quot;'); }
+function escapeDot(s)     { return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"'); }
+
 // ── formatters ────────────────────────────────────────────────────────────────
 
 function formatJson(pages, graph, minEdges) {
@@ -133,7 +140,7 @@ function formatMermaid(pages, graph, minEdges) {
     if (activeNodes.has(from) && activeNodes.has(to)) {
       const f = from.replace(/[^a-zA-Z0-9_]/g, '_');
       const t = to.replace(/[^a-zA-Z0-9_]/g, '_');
-      lines.push(`  ${f}["${from}"] --> ${t}["${to}"]`);
+      lines.push(`  ${f}["${escapeMermaid(from)}"] --> ${t}["${escapeMermaid(to)}"]`);
     }
   }
   return lines.join('\n');
@@ -152,7 +159,7 @@ function formatDot(pages, graph, minEdges) {
   const lines = ['digraph wiki {', '  rankdir=LR;'];
   for (const { from, to } of graph.edges) {
     if (activeNodes.has(from) && activeNodes.has(to)) {
-      lines.push(`  "${from}" -> "${to}";`);
+      lines.push(`  "${escapeDot(from)}" -> "${escapeDot(to)}";`);
     }
   }
   lines.push('}');
@@ -163,8 +170,9 @@ function formatDot(pages, graph, minEdges) {
 
 const args = parseArgs(process.argv);
 
-const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-const pages    = scanDirs.flatMap(d => collectPages(d, args.wikiDir));
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
+const pages    = scanDirs.flatMap(d => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugIndex = buildSlugIndex(pages);
 const graph    = buildGraph(pages, slugIndex);
 

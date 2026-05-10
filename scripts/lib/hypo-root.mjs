@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * wiki-root.mjs — resolve the Hypomnema wiki root directory
+ * hypo-root.mjs — resolve the Hypomnema root directory
  *
  * Resolution order:
  *   1. HYPO_DIR environment variable
  *   2. Scan common locations for hypo-config.md marker
- *   3. Default: ~/wiki
+ *   3. Default: ~/hypomnema
  */
 
 import { existsSync } from 'fs';
@@ -26,19 +26,21 @@ export function expandHome(p) {
 }
 
 /**
- * Resolve the wiki root directory.
- * Checks HYPO_DIR env → hypo-config.md scan → ~/wiki default.
- * @returns {string} absolute path to wiki root
+ * Resolve the Hypomnema root directory.
+ * Checks HYPO_DIR env → hypo-config.md scan → ~/hypomnema default.
+ * @returns {string} absolute path to Hypomnema root
  */
-export function resolveWikiRoot() {
+export function resolveHypoRoot() {
   if (process.env.HYPO_DIR) {
     return expandHome(process.env.HYPO_DIR);
   }
 
   const candidates = [
+    join(HOME, 'hypomnema'),
     join(HOME, 'wiki'),
     join(HOME, 'notes'),
     join(HOME, 'knowledge'),
+    join(HOME, 'Documents', 'hypomnema'),
     join(HOME, 'Documents', 'wiki'),
     join(HOME, 'Documents', 'notes'),
   ];
@@ -47,5 +49,5 @@ export function resolveWikiRoot() {
     if (existsSync(join(c, 'hypo-config.md'))) return c;
   }
 
-  return join(HOME, 'wiki');
+  return join(HOME, 'hypomnema');
 }

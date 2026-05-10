@@ -1,12 +1,109 @@
 {
   "hooks": {
-    "SessionStart":     ["wiki-session-start.mjs"],
-    "UserPromptSubmit": ["wiki-first-prompt.mjs", "wiki-lookup.mjs", "wiki-compact-guard.mjs"],
-    "PreCompact":       ["personal-wiki-check.mjs"],
-    "PostToolUse":      ["wiki-auto-stage.mjs"],
-    "Stop":             ["wiki-hot-rebuild.mjs", "wiki-auto-commit.mjs"],
-    "CwdChanged":       ["wiki-cwd-change.mjs"],
-    "FileChanged":      ["wiki-file-watch.mjs"]
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-session-start.mjs",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-first-prompt.mjs",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-lookup.mjs",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-compact-guard.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-personal-check.mjs",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-auto-stage.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-hot-rebuild.mjs",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-auto-commit.mjs",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-cwd-change.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "FileChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-file-watch.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
   },
-  "shared": ["wiki-shared.mjs"]
+  "shared": ["hypo-shared.mjs"]
 }

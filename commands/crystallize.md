@@ -1,30 +1,62 @@
 ---
-description: Crystallize draft notes and related pages into stable wiki knowledge
+description: Crystallize draft notes into stable knowledge — also the session-close alias
 ---
 
-You are running `/hypo:crystallize`. Identify and consolidate draft or scattered knowledge into stable, well-linked pages.
+You are running `/hypo:crystallize`. This command serves two purposes:
 
-## What this does
-
-- Scans `pages/` for draft pages, unlinked pages, and tag clusters
-- Synthesizes related pages into a `synthesis` page (or upgrades a draft to stable)
-- Adds cross-links between related pages
+1. **Session close** — if invoked at the end of a session, run the session-close checklist first
+2. **Knowledge synthesis** — consolidate draft or scattered wiki pages into stable, well-linked pages
 
 ---
 
-## Step 1 — Surface candidates
+## Step 1 — Detect context
+
+If the user invoked `/hypo:crystallize` to close a session (phrases like "세션 종료", "오늘 작업 마무리", "session close", or "wrap up"), run Steps 2–3 (session-close checklist) **before** the synthesis scan. Otherwise skip to Step 4.
+
+---
+
+## Step 2 — Session-close checklist
+
+Work through each item in order. For an explicit session-close invocation, proceed automatically without asking for confirmation on each item.
+
+1. **session-state.md** — update `projects/<name>/session-state.md` with the next tasks list for the upcoming session (what to tackle first next time).
+2. **hot.md (project)** — update `projects/<name>/hot.md` with a session snapshot: what changed and decisions made. Keep under 500 words. Do not put next-step tasks here; those belong in session-state.md.
+3. **hot.md (root)** — update `<hypo-root>/hot.md` active-projects pointer table: set the `Last Session` date for this project to today.
+4. **session-log** — append a session entry to `projects/<name>/session-log/YYYY-MM.md` (create the file if it does not exist for this month).
+5. **open-questions** — only if `pages/open-questions.md` exists and questions were raised or resolved this session: move resolved ones out; add newly raised ones. Skip if unchanged.
+6. **log.md** — append a `session` entry to `<hypo-root>/log.md`.
+
+---
+
+## Step 3 — Session-close confirmation
+
+After completing the checklist, report:
+
+- ✓ session-state.md updated
+- ✓ hot.md (project + root) updated
+- ✓ session-log entry appended
+- ✓ open-questions updated (or skipped if unchanged)
+- ✓ log.md updated
+
+Then ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+
+If the user says stop, end here. Otherwise continue to Step 4.
+
+---
+
+## Step 4 — Surface synthesis candidates
 
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
 ```bash
-node <package-root>/scripts/crystallize.mjs [--wiki-dir="<path>"] [--min-group=2]
+node <package-root>/scripts/crystallize.mjs [--hypo-dir="<path>"] [--min-group=2]
 ```
 
-Show the output to the user. If no candidates are found, tell them the wiki looks well-connected and no crystallization is needed.
+Show the output to the user. If no candidates are found, tell them Hypomnema looks well-connected and no crystallization is needed.
 
 ---
 
-## Step 2 — Choose what to crystallize
+## Step 5 — Choose what to crystallize
 
 If candidates exist, ask:
 
@@ -35,7 +67,7 @@ If candidates exist, ask:
 
 ---
 
-## Step 3a — Tag cluster synthesis
+## Step 5a — Tag cluster synthesis
 
 For a tag cluster:
 
@@ -57,7 +89,7 @@ For a tag cluster:
 
 ---
 
-## Step 3b — Draft upgrade
+## Step 5b — Draft upgrade
 
 For a draft page:
 
@@ -68,7 +100,7 @@ For a draft page:
 
 ---
 
-## Step 3c — Cross-link unlinked pages
+## Step 5c — Cross-link unlinked pages
 
 For unlinked pages:
 
@@ -79,6 +111,6 @@ For unlinked pages:
 
 ---
 
-## Step 4 — Report
+## Step 6 — Report
 
 Show what was created or modified, and offer to run `/hypo:lint` to verify all new links resolve.

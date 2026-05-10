@@ -77,9 +77,9 @@ function runWithHome(script, args = [], home) {
   });
 }
 
-// ── lib/wiki-root.mjs ────────────────────────────────────────────────────────
+// ── lib/hypo-root.mjs ────────────────────────────────────────────────────────
 
-const { expandHome, resolveWikiRoot } = await import(`${SCRIPTS}/lib/wiki-root.mjs`);
+const { expandHome, resolveHypoRoot } = await import(`${SCRIPTS}/lib/hypo-root.mjs`);
 
 suite('expandHome()');
 
@@ -96,25 +96,25 @@ test('~/foo expands to HOME/foo', () => {
   assert.equal(expandHome('~/foo/bar'), join(HOME, 'foo/bar'));
 });
 
-suite('resolveWikiRoot()');
+suite('resolveHypoRoot()');
 
 test('HYPO_DIR env var takes precedence', () => {
   const orig = process.env.HYPO_DIR;
   process.env.HYPO_DIR = '/tmp/custom-wiki';
   try {
-    assert.equal(resolveWikiRoot(), '/tmp/custom-wiki');
+    assert.equal(resolveHypoRoot(), '/tmp/custom-wiki');
   } finally {
     if (orig === undefined) delete process.env.HYPO_DIR;
     else process.env.HYPO_DIR = orig;
   }
 });
 
-test('falls back to ~/wiki when no env or marker found', () => {
+test('falls back to ~/hypomnema when no env or marker found', () => {
   const orig = process.env.HYPO_DIR;
   delete process.env.HYPO_DIR;
   try {
-    const result = resolveWikiRoot();
-    // Either found a real wiki (has hypo-config.md) or returned ~/wiki default
+    const result = resolveHypoRoot();
+    // Either found a real wiki (has hypo-config.md) or returned ~/hypomnema default
     assert.ok(typeof result === 'string' && result.length > 0);
     assert.ok(result.startsWith('/'));
   } finally {
@@ -126,14 +126,14 @@ test('finds wiki by hypo-config.md marker', () => {
   const orig = process.env.HYPO_DIR;
   delete process.env.HYPO_DIR;
   try {
-    const result = resolveWikiRoot();
+    const result = resolveHypoRoot();
     assert.ok(typeof result === 'string' && result.length > 0, 'should return non-empty string');
     assert.ok(result.startsWith('/'), 'should return an absolute path');
-    // Either the returned path has hypo-config.md (marker scan worked), or it is the ~/wiki default
-    const isDefault = result === join(HOME, 'wiki');
+    // Either the returned path has hypo-config.md (marker scan worked), or it is the ~/hypomnema default
+    const isDefault = result === join(HOME, 'hypomnema');
     const hasMarker = existsSync(join(result, 'hypo-config.md'));
     assert.ok(isDefault || hasMarker,
-      `resolveWikiRoot returned "${result}" which is neither the default nor has hypo-config.md`);
+      `resolveHypoRoot returned "${result}" which is neither the default nor has hypo-config.md`);
   } finally {
     if (orig !== undefined) process.env.HYPO_DIR = orig;
   }
@@ -146,7 +146,7 @@ suite('init.mjs --dry-run');
 test('exits 0 with --dry-run --no-hooks --no-git-init', () => {
   withTmpDir(dir => {
     const r = run('init.mjs', [
-      `--wiki-dir=${dir}/wiki`,
+      `--hypo-dir=${dir}/wiki`,
       '--dry-run',
       '--no-hooks',
       '--no-git-init',
@@ -158,55 +158,39 @@ test('exits 0 with --dry-run --no-hooks --no-git-init', () => {
 
 test('--dry-run reports created dirs without writing them', () => {
   withTmpDir(dir => {
-    const wikiDir = join(dir, 'wiki');
+    const hypoDir = join(dir, 'wiki');
     const r = run('init.mjs', [
-      `--wiki-dir=${wikiDir}`,
+      `--hypo-dir=${hypoDir}`,
       '--dry-run',
       '--no-hooks',
       '--no-git-init',
     ]);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    assert.ok(!existsSync(wikiDir), 'wiki dir should not be created in dry-run');
-  });
-});
-
-test('--privacy=shared writes shared-mode content to .wikiignore', () => {
-  withTmpDir(dir => {
-    const wikiDir = join(dir, 'wiki');
-    const r = run('init.mjs', [
-      `--wiki-dir=${wikiDir}`,
-      '--privacy=shared',
-      '--no-hooks',
-      '--no-git-init',
-    ]);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const wikiignore = readFileSync(join(wikiDir, '.wikiignore'), 'utf-8');
-    assert.ok(wikiignore.includes('*personal*'), '.wikiignore missing shared-mode pattern');
-    assert.ok(wikiignore.includes('journal/'), '.wikiignore missing journal/ exclusion');
+    assert.ok(!existsSync(hypoDir), 'wiki dir should not be created in dry-run');
   });
 });
 
 test('actual run creates expected directories', () => {
   withTmpDir(dir => {
-    const wikiDir = join(dir, 'wiki');
+    const hypoDir = join(dir, 'wiki');
     const r = run('init.mjs', [
-      `--wiki-dir=${wikiDir}`,
+      `--hypo-dir=${hypoDir}`,
       '--no-hooks',
       '--no-git-init',
     ]);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     for (const sub of ['pages', 'projects', 'sources']) {
-      assert.ok(existsSync(join(wikiDir, sub)), `missing: ${sub}/`);
+      assert.ok(existsSync(join(hypoDir, sub)), `missing: ${sub}/`);
     }
   });
 });
 
 test('--no-hooks succeeds without touching hook config', () => {
   withTmpDir(dir => {
-    const wikiDir = join(dir, 'wiki');
-    const r = run('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-hooks', '--no-git-init']);
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
     assert.equal(r.status, 0, `--no-hooks should exit 0: ${r.stderr}`);
-    assert.ok(existsSync(join(wikiDir, 'index.md')), 'wiki files should still be created');
+    assert.ok(existsSync(join(hypoDir, 'index.md')), 'wiki files should still be created');
   });
 });
 
@@ -216,7 +200,7 @@ suite('doctor.mjs --json');
 
 test('exits without crashing on non-existent wiki dir', () => {
   const r = run('doctor.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   // doctor may exit 1 (failures found) but should not crash (exit 2+)
@@ -226,7 +210,7 @@ test('exits without crashing on non-existent wiki dir', () => {
 
 test('--json output is valid JSON', () => {
   const r = run('doctor.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout not JSON: ${r.stdout}`);
@@ -234,7 +218,7 @@ test('--json output is valid JSON', () => {
 
 test('JSON output is an array of check objects', () => {
   const r = run('doctor.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const out = JSON.parse(r.stdout);
@@ -249,7 +233,7 @@ test('JSON output is an array of check objects', () => {
 const HOOKS = join(REPO, 'hooks');
 
 const { isCompactCommand, isGateSkipped, buildOutput } = await import(
-  join(HOOKS, 'wiki-shared.mjs')
+  join(HOOKS, 'hypo-shared.mjs')
 );
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -304,13 +288,10 @@ test('HYPO_SKIP_GATE=1 → true', () => {
 
 test('no env var → false', () => {
   const o1 = process.env.HYPO_SKIP_GATE;
-  const o2 = process.env.OMC_SKIP_WIKI_GATE;
   delete process.env.HYPO_SKIP_GATE;
-  delete process.env.OMC_SKIP_WIKI_GATE;
   try { assert.equal(isGateSkipped(), false); }
   finally {
     if (o1 !== undefined) process.env.HYPO_SKIP_GATE = o1;
-    if (o2 !== undefined) process.env.OMC_SKIP_WIKI_GATE = o2;
   }
 });
 
@@ -327,51 +308,51 @@ test('merges extra fields alongside additionalContext', () => {
   assert.equal(out.additionalContext, 'ctx');
 });
 
-suite('wiki-compact-guard.mjs — contract');
+suite('hypo-compact-guard.mjs — contract');
 
 test('invalid JSON input → fail-open {continue:true}', () => {
-  const r = runHook('wiki-compact-guard.mjs', 'not-json');
+  const r = runHook('hypo-compact-guard.mjs', 'not-json');
   const out = JSON.parse(r.stdout);
   assert.equal(out.continue, true);
   assert.equal(out.suppressOutput, true);
 });
 
 test('non-compact prompt → pass-through', () => {
-  const r = runHook('wiki-compact-guard.mjs', { prompt: 'hello world' });
+  const r = runHook('hypo-compact-guard.mjs', { prompt: 'hello world' });
   const out = JSON.parse(r.stdout);
   assert.equal(out.continue, true);
   assert.equal(out.suppressOutput, true);
 });
 
 test('HYPO_SKIP_GATE=1 + /compact → pass-through', () => {
-  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' }, { HYPO_SKIP_GATE: '1' });
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' }, { HYPO_SKIP_GATE: '1' });
   const out = JSON.parse(r.stdout);
   assert.equal(out.continue, true);
   assert.equal(out.suppressOutput, true);
 });
 
 test('/compact with incomplete wiki → additionalContext, not systemMessage', () => {
-  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' });
   const out = JSON.parse(r.stdout);
   assert.ok('additionalContext' in out, 'missing additionalContext field');
   assert.ok(!('systemMessage' in out), 'must not use deprecated systemMessage field');
 });
 
 test('/compact with incomplete wiki → continue:true (soft nudge, not block)', () => {
-  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' });
   const out = JSON.parse(r.stdout);
   assert.equal(out.continue, true);
 });
 
 test('/compact with incomplete wiki → additionalContext contains WIKI_AUTOCLOSE', () => {
-  const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' });
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' });
   const out = JSON.parse(r.stdout);
   assert.ok(out.additionalContext.includes('WIKI_AUTOCLOSE'), 'missing WIKI_AUTOCLOSE marker');
 });
 
 test('/compact with clean wiki → pass-through', () => {
   withCleanWiki(dir => {
-    const r = runHook('wiki-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
+    const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
     const out = JSON.parse(r.stdout);
     assert.equal(out.continue, true);
     assert.equal(out.suppressOutput, true);
@@ -380,39 +361,39 @@ test('/compact with clean wiki → pass-through', () => {
 
 test('output is always valid JSON regardless of prompt', () => {
   for (const prompt of ['/compact', 'hello', '']) {
-    const r = runHook('wiki-compact-guard.mjs', { prompt });
+    const r = runHook('hypo-compact-guard.mjs', { prompt });
     assert.doesNotThrow(() => JSON.parse(r.stdout), `invalid JSON for prompt="${prompt}"`);
   }
 });
 
-suite('personal-wiki-check.mjs — contract');
+suite('hypo-personal-check.mjs — contract');
 
 test('output is always valid JSON', () => {
-  const r = runHook('personal-wiki-check.mjs', '');
+  const r = runHook('hypo-personal-check.mjs', '');
   assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout: ${r.stdout}`);
 });
 
 test('no wiki dir → block decision', () => {
-  const r = runHook('personal-wiki-check.mjs', '');
+  const r = runHook('hypo-personal-check.mjs', '');
   const out = JSON.parse(r.stdout);
   assert.equal(out.decision, 'block');
   assert.equal(out.continue, false);
 });
 
 test('block response includes stopReason string', () => {
-  const r = runHook('personal-wiki-check.mjs', '');
+  const r = runHook('hypo-personal-check.mjs', '');
   const out = JSON.parse(r.stdout);
   assert.ok(typeof out.stopReason === 'string' && out.stopReason.length > 0);
 });
 
 test('block reason contains WIKI CHECK marker', () => {
-  const r = runHook('personal-wiki-check.mjs', '');
+  const r = runHook('hypo-personal-check.mjs', '');
   const out = JSON.parse(r.stdout);
   assert.ok(out.reason.includes('WIKI CHECK'), 'missing WIKI CHECK marker in reason');
 });
 
 test('HYPO_SKIP_GATE=1 → continue:true + systemMessage (PreCompact has no additionalContext)', () => {
-  const r = runHook('personal-wiki-check.mjs', '', { HYPO_SKIP_GATE: '1' });
+  const r = runHook('hypo-personal-check.mjs', '', { HYPO_SKIP_GATE: '1' });
   const out = JSON.parse(r.stdout);
   assert.equal(out.continue, true);
   // PreCompact hook does not support additionalContext per Claude Code docs — systemMessage is the correct universal field.
@@ -422,7 +403,7 @@ test('HYPO_SKIP_GATE=1 → continue:true + systemMessage (PreCompact has no addi
 
 test('clean wiki → suppressOutput:true', () => {
   withCleanWiki(dir => {
-    const r = runHook('personal-wiki-check.mjs', '', { HYPO_DIR: dir });
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
     const out = JSON.parse(r.stdout);
     assert.equal(out.suppressOutput, true);
     assert.equal(out.continue, true);
@@ -435,7 +416,7 @@ suite('upgrade.mjs --json');
 
 test('exits without crashing on non-existent wiki dir', () => {
   const r = run('upgrade.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   assert.ok(r.status !== null, 'process did not exit cleanly');
@@ -444,7 +425,7 @@ test('exits without crashing on non-existent wiki dir', () => {
 
 test('--json output is valid JSON', () => {
   const r = run('upgrade.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout not JSON: ${r.stdout}`);
@@ -452,7 +433,7 @@ test('--json output is valid JSON', () => {
 
 test('JSON output has required top-level fields', () => {
   const r = run('upgrade.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const out = JSON.parse(r.stdout);
@@ -464,7 +445,7 @@ test('JSON output has required top-level fields', () => {
 
 test('schema object has installed/current/bump fields', () => {
   const r = run('upgrade.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { schema } = JSON.parse(r.stdout);
@@ -475,7 +456,7 @@ test('schema object has installed/current/bump fields', () => {
 
 test('hooks is an array of file/status objects', () => {
   const r = run('upgrade.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { hooks } = JSON.parse(r.stdout);
@@ -487,7 +468,7 @@ test('hooks is an array of file/status objects', () => {
 
 test('settings is an array of event/file/status objects', () => {
   const r = run('upgrade.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { settings } = JSON.parse(r.stdout);
@@ -500,7 +481,7 @@ test('settings is an array of event/file/status objects', () => {
 
 test('applied object has hooks and settings arrays', () => {
   const r = run('upgrade.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { applied } = JSON.parse(r.stdout);
@@ -510,7 +491,7 @@ test('applied object has hooks and settings arrays', () => {
 
 test('schema.installed is null and bump is "unknown" for non-existent wiki', () => {
   const r = run('upgrade.mjs', [
-    `--wiki-dir=${NONEXISTENT_WIKI}`,
+    `--hypo-dir=${NONEXISTENT_WIKI}`,
     '--json',
   ]);
   const { schema } = JSON.parse(r.stdout);
@@ -524,16 +505,41 @@ test('schema.installed is null and bump is "unknown" for non-existent wiki', () 
 test('--apply on tmp wiki exits 0 after applying available changes', () => {
   withTmpHome(home => {
     withTmpDir(dir => {
-      const wikiDir = join(dir, 'wiki');
-      const initR = runWithHome('init.mjs', [`--wiki-dir=${wikiDir}`, '--no-git-init'], home);
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
       assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
-      const r = runWithHome('upgrade.mjs', [`--wiki-dir=${wikiDir}`, '--json', '--apply'], home);
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
       assert.equal(r.signal, null, `process killed with signal: ${r.signal}`);
       const out = JSON.parse(r.stdout);
       assert.ok('applied' in out, 'applied field missing after --apply');
       assert.ok(Array.isArray(out.applied.hooks), 'applied.hooks should be an array');
       assert.ok(Array.isArray(out.applied.settings), 'applied.settings should be an array');
       assert.equal(r.status, 0, `expected exit 0 after --apply: ${r.stderr}`);
+    });
+  });
+});
+
+test('--apply generates migration report for major SCHEMA bump', () => {
+  withTmpHome(home => {
+    withTmpDir(dir => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // Patch SCHEMA.md to an older major version to simulate a major bump
+      const schemaPath = join(hypoDir, 'SCHEMA.md');
+      const schema = readFileSync(schemaPath, 'utf-8');
+      writeFileSync(schemaPath, schema.replace(/^version: .+$/m, 'version: 0.9'));
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.signal, null, `process killed with signal: ${r.signal}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(out.migrationReport !== null, 'migrationReport should be set for major bump');
+      assert.ok(typeof out.migrationReport === 'string', 'migrationReport should be a path string');
+      assert.ok(existsSync(out.migrationReport), `migration report file not found: ${out.migrationReport}`);
+      const content = readFileSync(out.migrationReport, 'utf-8');
+      assert.ok(content.includes('0.9'), 'migration report should reference old version');
+      assert.ok(content.includes('1.0'), 'migration report should reference new version');
     });
   });
 });
@@ -547,7 +553,7 @@ function lintFix(content) {
   const pagesDir = join(dir, 'pages');
   mkdirSync(pagesDir);
   writeFileSync(join(pagesDir, 'test.md'), content);
-  const r = run('lint.mjs', [`--wiki-dir=${dir}`, '--fix', '--json']);
+  const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--fix', '--json']);
   const fixed = readFileSync(join(pagesDir, 'test.md'), 'utf-8');
   rmSync(dir, { recursive: true, force: true });
   return { r, fixed };
@@ -594,7 +600,7 @@ function lintSessionState(content) {
   const projectDir = join(dir, 'projects', 'proj');
   mkdirSync(projectDir, { recursive: true });
   writeFileSync(join(projectDir, 'session-state.md'), content);
-  const r = run('lint.mjs', [`--wiki-dir=${dir}`, '--json']);
+  const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
   const out = JSON.parse(r.stdout);
   rmSync(dir, { recursive: true, force: true });
   return { r, out };

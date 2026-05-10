@@ -10,37 +10,39 @@
  *   node scripts/verify.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --file=<path>       Check a single file only
  *   --json              Output as JSON
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, file: null, json: false };
+  const args = { hypoDir: null, file: null, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--file='))    args.file   = expandHome(arg.slice(7));
     else if (arg === '--json')             args.json   = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectMdFiles(dir, acc = []) {
+function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
+    if (hypoDir && isIgnored(full, hypoDir, ignorePatterns)) continue;
     const st = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc);
+    if (st.isDirectory()) collectMdFiles(full, acc, hypoDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
@@ -69,8 +71,9 @@ let files;
 if (args.file) {
   files = [args.file];
 } else {
-  const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-  files = scanDirs.flatMap(d => collectMdFiles(d));
+  const ignorePatterns = loadHypoIgnore(args.hypoDir);
+  const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
+  files = scanDirs.flatMap(d => collectMdFiles(d, [], args.hypoDir, ignorePatterns));
 }
 
 const overdue  = [];
@@ -87,7 +90,7 @@ for (const file of files) {
   const type = fm.type || '';
   if (!VERIFIED_TYPES.has(type)) continue;
 
-  const rel = args.wikiDir ? relative(args.wikiDir, file) : file;
+  const rel = args.hypoDir ? relative(args.hypoDir, file) : file;
   const entry = {
     file: rel,
     title: fm.title || rel,
@@ -156,5 +159,14 @@ const summary = [
 ].filter(Boolean).join(', ');
 
 console.log(`Result: ${summary || 'nothing to verify'}`);
+
+// Emit signal lines for overdue/upcoming pages so /hypo:verify skill can drive review
+const needsReview = [...overdue, ...upcoming].filter(p => p.verify_by);
+if (needsReview.length > 0) {
+  console.log('');
+  for (const p of needsReview) {
+    console.log(`[HYPO VERIFY QUESTION: ${p.verify_by} (file: ${p.file})]`);
+  }
+}
 
 if (overdue.length > 0) process.exit(1);
