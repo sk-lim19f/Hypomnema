@@ -11,26 +11,26 @@
 ### TC-01-1. 빈 디렉토리 0-config 설치 [AUTO]
 
 **Given**: 빈 디렉토리 `/tmp/wiki-test-01`  
-**When**: `node scripts/init.mjs --wiki-dir=/tmp/wiki-test-01 --no-hooks --no-git-init`  
+**When**: `node scripts/init.mjs --hypo-dir=/tmp/wiki-test-01 --no-hooks --no-git-init`  
 **Then**:
 - `pages/`, `projects/`, `sources/` 디렉토리 존재
 - `hypo-config.md` 존재 (root marker)
 - `index.md`, `hot.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md` 존재
-- `.wikiignore` 존재
+- `.hypoignore` 존재
 - `privacy: personal` (기본값) 포함됨
 - 이미 존재하는 파일은 덮어쓰지 않음 (idempotent)
 
 ### TC-01-2. journal 디렉토리 및 추가 템플릿 생성 [AUTO]
 
 **Given**: 빈 디렉토리  
-**When**: `node scripts/init.mjs --wiki-dir=/tmp/wiki-test-01b --no-hooks --no-git-init`  
+**When**: `node scripts/init.mjs --hypo-dir=/tmp/wiki-test-01b --no-hooks --no-git-init`  
 **Then**:
 - `journal/daily/`, `journal/weekly/`, `journal/monthly/` 존재
-- `Home.md`, `Overview.md`, `wiki-automation.md`, `hypo-help.md` 복사됨
+- `Home.md`, `Overview.md`, `hypo-automation.md`, `hypo-help.md` 복사됨
 - `pages/_index.md` 존재
 - `projects/_template/` 구조 존재
 
-### TC-01-3. Privacy 모드별 `.wikiignore` 차등 적용 [AUTO]
+### TC-01-3. Privacy 모드별 `.hypoignore` 차등 적용 [AUTO]
 
 | 모드 | `*personal*` | `journal/` | `sources/` | `drafts/` |
 |---|---|---|---|---|
@@ -39,7 +39,7 @@
 | `public` | ✓ | ✓ | ✓ | ✓ |
 
 **When**: 각 모드로 init 실행  
-**Then**: `.wikiignore`에 해당 패턴 포함/미포함 확인
+**Then**: `.hypoignore`에 해당 패턴 포함/미포함 확인
 
 ### TC-01-4. Privacy boundary 안내 출력 [MANUAL]
 
@@ -55,7 +55,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 ### TC-01-5. Git remote 설정 + first commit + push [AUTO]
 
 **Given**: git remote URL 입력  
-**When**: `node scripts/init.mjs --wiki-dir=/tmp/wiki-git --git-remote=<url>`  
+**When**: `node scripts/init.mjs --hypo-dir=/tmp/wiki-git --git-remote=<url>`  
 **Then**:
 - `.git/` 존재
 - `git remote get-url origin` = 입력한 URL
@@ -64,7 +64,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 
 ### TC-01-6. Dry-run 모드 [AUTO]
 
-**When**: `node scripts/init.mjs --wiki-dir=/tmp/wiki-dry --dry-run --no-hooks --no-git-init`  
+**When**: `node scripts/init.mjs --hypo-dir=/tmp/wiki-dry --dry-run --no-hooks --no-git-init`  
 **Then**:
 - 출력에 `[DRY RUN — no changes made]` 포함
 - `/tmp/wiki-dry` 디렉토리 미생성
@@ -153,12 +153,12 @@ that content is sent to Anthropic's API as part of the conversation context.
 
 ---
 
-## TC-04. wiki-lookup 훅 — 위키 검색 자동 주입
+## TC-04. hypo-lookup 훅 — 위키 검색 자동 주입
 
 ### TC-04-1. BM25 hit — 관련 페이지 주입 [AUTO]
 
 **Given**: `pages/kubernetes-networking.md` 존재  
-**When**: `echo '{"prompt":"kubernetes pod CIDR 할당"}' | node hooks/wiki-lookup.mjs`  
+**When**: `echo '{"prompt":"kubernetes pod CIDR 할당"}' | node hooks/hypo-lookup.mjs`  
 **Then**:
 - 출력에 `[WIKI LOOKUP: 1 page(s) matched]` 포함
 - 페이지 내용(최대 2000자) 주입됨
@@ -167,7 +167,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 ### TC-04-2. BM25 miss — 리서치 권유 메시지 [AUTO]
 
 **Given**: 위키에 관련 페이지 없음  
-**When**: `echo '{"prompt":"zk-SNARKs 영지식 증명"}' | node hooks/wiki-lookup.mjs`  
+**When**: `echo '{"prompt":"zk-SNARKs 영지식 증명"}' | node hooks/hypo-lookup.mjs`  
 **Then**:
 - 출력에 `[WIKI LOOKUP: miss]` 포함
 - "리서치 후 /hypo:ingest 로 저장을 권장합니다" 메시지 포함
@@ -180,15 +180,15 @@ that content is sent to Anthropic's API as part of the conversation context.
 **When**: 해당 주제 프롬프트  
 **Then**: 주입된 내용에 `⚠ 이 페이지는 verify_by_date가 만료됐습니다` 경고 포함
 
-### TC-04-4. `.wikiignore` 패턴 파일 제외 [AUTO]
+### TC-04-4. `.hypoignore` 패턴 파일 제외 [AUTO]
 
-**Given**: `.wikiignore`에 `*private*` 패턴 존재, `pages/my-private-notes.md` 존재  
+**Given**: `.hypoignore`에 `*private*` 패턴 존재, `pages/my-private-notes.md` 존재  
 **When**: 관련 키워드 프롬프트  
 **Then**: 해당 페이지 주입 안됨
 
 ### TC-04-5. 빈 프롬프트 / 키워드 없음 [AUTO]
 
-**When**: `echo '{"prompt":""}' | node hooks/wiki-lookup.mjs`  
+**When**: `echo '{"prompt":""}' | node hooks/hypo-lookup.mjs`  
 **Then**: `{"continue": true, "suppressOutput": true}` (오류 없이 통과)
 
 ---
@@ -223,13 +223,13 @@ that content is sent to Anthropic's API as part of the conversation context.
 ### TC-06-1. 만료 페이지 감지 [AUTO]
 
 **Given**: `verify_by_date: 2026-01-01`이 포함된 페이지  
-**When**: `node scripts/verify.mjs --wiki-dir=<path> --due`  
+**When**: `node scripts/verify.mjs --hypo-dir=<path> --due`  
 **Then**: 해당 페이지가 만료 목록에 포함됨
 
 ### TC-06-2. Claude API 의미론적 판정 [MANUAL]
 
 **Given**: `ANTHROPIC_API_KEY` 설정됨, `verify_by: "이 내용은 아직 유효한가?"` 포함 페이지  
-**When**: `node scripts/verify.mjs --wiki-dir=<path> --model=haiku`  
+**When**: `node scripts/verify.mjs --hypo-dir=<path> --model=haiku`  
 **Then**:
 - Claude Haiku 호출로 YES/NO 판정
 - NO 판정 시 `pages/open-questions.md`에 해당 항목 append
@@ -255,9 +255,9 @@ that content is sent to Anthropic's API as part of the conversation context.
 **When**: `node scripts/lint.mjs`  
 **Then**: `B1` blocker 항목에 해당 파일 표시, exit code 1
 
-### TC-07-3. `.wikiignore` 패턴 파일에 민감 정보 → B5 blocker [AUTO]
+### TC-07-3. `.hypoignore` 패턴 파일에 민감 정보 → B5 blocker [AUTO]
 
-**Given**: `sources/credentials.pem` 존재 (`.wikiignore`에 `*.pem` 패턴)  
+**Given**: `sources/credentials.pem` 존재 (`.hypoignore`에 `*.pem` 패턴)  
 **Then**: B5 blocker 발생
 
 ### TC-07-4. Warning 항목 (non-blocking) [AUTO]
@@ -277,7 +277,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 ### TC-08-1. Haiku 판정 실행 [AUTO]
 
 **Given**: `ANTHROPIC_API_KEY` 설정됨  
-**When**: `node scripts/lint-llm.mjs --wiki-dir=<path> --json`  
+**When**: `node scripts/lint-llm.mjs --hypo-dir=<path> --json`  
 **Then**:
 - `ok: true`
 - `results` 배열에 페이지별 판정 결과 포함
@@ -314,7 +314,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 
 ### TC-10-1. JSON 출력 필수 필드 [AUTO]
 
-**When**: `node scripts/upgrade.mjs --wiki-dir=<path> --json`  
+**When**: `node scripts/upgrade.mjs --hypo-dir=<path> --json`  
 **Then**: 출력 JSON에 `schema`, `hooks`, `settings`, `applied` 필드 존재  
 `applied.hooks`와 `applied.settings`가 배열
 
@@ -339,7 +339,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 **Then**:
 - hypo 훅 3개 제거됨
 - 비-hypo 훅 2개 보존됨
-- `~/.claude/hooks/wiki-*.mjs` 파일 삭제됨
+- `~/.claude/hooks/hypo-*.mjs` 파일 삭제됨
 
 ### TC-11-2. Dry-run 기본값 [AUTO]
 
@@ -352,8 +352,8 @@ that content is sent to Anthropic's API as part of the conversation context.
 
 ### TC-12-1. SessionStart — git pull [AUTO]
 
-**Given**: 원격 레포에 새 커밋 존재, wiki-session-start.mjs 실행  
-**When**: `echo '{"cwd":"/some/project"}' | node hooks/wiki-session-start.mjs`  
+**Given**: 원격 레포에 새 커밋 존재, hypo-session-start.mjs 실행  
+**When**: `echo '{"cwd":"/some/project"}' | node hooks/hypo-session-start.mjs`  
 **Then**:
 - `git pull` 실행됨
 - pull 결과(`pulled N commits` 또는 `up to date`)가 additionalContext에 포함됨
@@ -366,7 +366,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 ### TC-12-3. Stop 훅 — 자동 commit + push [AUTO]
 
 **Given**: 위키 파일 수정됨, remote 존재  
-**When**: `node hooks/wiki-auto-commit.mjs`  
+**When**: `node hooks/hypo-auto-commit.mjs`  
 **Then**:
 - `git add -A` → `git commit` → `git pull --no-rebase` → `git push` 순서
 - commit 메시지: `auto: YYYY-MM-DD wiki update`
@@ -385,7 +385,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 ### TC-13-1. SessionStart — 프로젝트 hit (hot.md + session-state.md 주입) [AUTO]
 
 **Given**: `projects/my-project/index.md`에 `working_dir: /path/to/project`  
-**When**: `echo '{"cwd":"/path/to/project"}' | node hooks/wiki-session-start.mjs`  
+**When**: `echo '{"cwd":"/path/to/project"}' | node hooks/hypo-session-start.mjs`  
 **Then**:
 - 출력에 `[WIKI HOT CACHE: project=my-project]` 포함
 - hot.md 내용 (최대 2000자) 주입됨
@@ -395,30 +395,30 @@ that content is sent to Anthropic's API as part of the conversation context.
 ### TC-13-2. SessionStart — 프로젝트 miss (global hot.md 주입) [AUTO]
 
 **Given**: cwd가 어떤 project의 working_dir도 아닌 경우  
-**When**: `echo '{"cwd":"/unrelated/path"}' | node hooks/wiki-session-start.mjs`  
+**When**: `echo '{"cwd":"/unrelated/path"}' | node hooks/hypo-session-start.mjs`  
 **Then**: `[WIKI HOT CACHE: global — no project matched cwd=...]` 포함
 
-### TC-13-3. wiki-compact-guard — /compact 차단 [AUTO]
+### TC-13-3. hypo-compact-guard — /compact 차단 [AUTO]
 
-**When**: `echo '{"prompt":"/compact"}' | HYPO_DIR=/tmp/no-wiki node hooks/wiki-compact-guard.mjs`  
+**When**: `echo '{"prompt":"/compact"}' | HYPO_DIR=/tmp/no-wiki node hooks/hypo-compact-guard.mjs`  
 **Then**: `additionalContext`에 세션 close 체크리스트 안내 포함, `continue: true`
 
-### TC-13-4. wiki-compact-guard — 일반 프롬프트 통과 [AUTO]
+### TC-13-4. hypo-compact-guard — 일반 프롬프트 통과 [AUTO]
 
-**When**: `echo '{"prompt":"hello world"}' | node hooks/wiki-compact-guard.mjs`  
+**When**: `echo '{"prompt":"hello world"}' | node hooks/hypo-compact-guard.mjs`  
 **Then**: `{"continue": true, "suppressOutput": true}` (차단 없음)
 
-### TC-13-5. personal-wiki-check — HYPO_SKIP_GATE=1 통과 [AUTO]
+### TC-13-5. hypo-personal-check — HYPO_SKIP_GATE=1 통과 [AUTO]
 
-**When**: `echo '{}' | HYPO_SKIP_GATE=1 node hooks/personal-wiki-check.mjs`  
+**When**: `echo '{}' | HYPO_SKIP_GATE=1 node hooks/hypo-personal-check.mjs`  
 **Then**: `{"continue": true, "suppressOutput": true}`
 
-### TC-13-6. personal-wiki-check — 위키 없을 때 block [AUTO]
+### TC-13-6. hypo-personal-check — 위키 없을 때 block [AUTO]
 
-**When**: `echo '{}' | HYPO_DIR=/tmp/no-wiki-xxx node hooks/personal-wiki-check.mjs`  
+**When**: `echo '{}' | HYPO_DIR=/tmp/no-wiki-xxx node hooks/hypo-personal-check.mjs`  
 **Then**: `{"decision": "block", ...}` (compact 차단)
 
-### TC-13-7. wiki-auto-stage — 위키 파일 수정 후 자동 스테이징 [AUTO]
+### TC-13-7. hypo-auto-stage — 위키 파일 수정 후 자동 스테이징 [AUTO]
 
 **Given**: `pages/test.md` 수정  
 **When**: PostToolUse 훅 실행  
@@ -427,7 +427,7 @@ that content is sent to Anthropic's API as part of the conversation context.
 ### TC-13-8. CwdChanged — 다른 프로젝트 전환 시 context 재주입 [AUTO]
 
 **Given**: project-A → project-B로 cwd 변경  
-**When**: `echo '{"cwd":"/path/to/project-b"}' | node hooks/wiki-cwd-change.mjs`  
+**When**: `echo '{"cwd":"/path/to/project-b"}' | node hooks/hypo-cwd-change.mjs`  
 **Then**: project-B의 hot.md 주입됨, project-A context 미포함
 
 ### TC-13-9. 동일 프로젝트 subdirectory 이동 시 false re-injection 방지 [AUTO]
@@ -463,20 +463,20 @@ env -i HOME=$HOME PATH=$PATH \
 
 ## TC-15. Privacy 보호
 
-### TC-15-1. `.wikiignore` 패턴 파일이 hook context에 포함되지 않음 [AUTO]
+### TC-15-1. `.hypoignore` 패턴 파일이 hook context에 포함되지 않음 [AUTO]
 
-**Given**: `pages/my-private-notes.md`, `.wikiignore`에 `*private*`  
-**When**: wiki-lookup.mjs, wiki-session-start.mjs 실행  
+**Given**: `pages/my-private-notes.md`, `.hypoignore`에 `*private*`  
+**When**: hypo-lookup.mjs, hypo-session-start.mjs 실행  
 **Then**: `my-private-notes.md` 내용이 additionalContext에 없음
 
-### TC-15-2. `.wikiignore` 패턴 파일이 lint.mjs에서 스킵됨 [AUTO]
+### TC-15-2. `.hypoignore` 패턴 파일이 lint.mjs에서 스킵됨 [AUTO]
 
 **When**: `node scripts/lint.mjs`  
-**Then**: `.wikiignore` 매칭 파일은 lint 대상에서 제외됨
+**Then**: `.hypoignore` 매칭 파일은 lint 대상에서 제외됨
 
 ### TC-15-3. sources/에 민감 파일 → B5 blocker [AUTO]
 
-**Given**: `sources/aws-credentials.pem` (`.wikiignore`에 `*.pem`)  
+**Given**: `sources/aws-credentials.pem` (`.hypoignore`에 `*.pem`)  
 **When**: `node scripts/lint.mjs`  
 **Then**: B5 blocker 발생, exit 1
 
@@ -560,7 +560,7 @@ env -i HOME=$HOME PATH=$PATH \
 
 ### TC-19-2. `/hypo:graph` — JSON 생성 [AUTO]
 
-**When**: `node scripts/graph.mjs --wiki-dir=<path>`  
+**When**: `node scripts/graph.mjs --hypo-dir=<path>`  
 **Then**: `graph.json` 생성, `nodes`/`edges` 배열 포함
 
 ---

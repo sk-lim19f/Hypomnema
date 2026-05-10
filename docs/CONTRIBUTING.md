@@ -28,9 +28,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a full breakdown. The short version:
 |-----------|---------------|
 | `commands/` | Prompt definitions for `/hypo:*` slash commands |
 | `scripts/` | Node.js implementations called by commands |
-| `scripts/lib/` | Shared helpers for scripts (frontmatter, wiki-root, wikiignore) |
+| `scripts/lib/` | Shared helpers for scripts (frontmatter, hypo-root, hypo-ignore) |
 | `hooks/` | Claude Code lifecycle hooks + `hooks.json` registry |
-| `hooks/wiki-shared.mjs` | Shared hook utilities — see deployment constraint below |
+| `hooks/hypo-shared.mjs` | Shared hook utilities — see deployment constraint below |
 | `templates/` | Baseline files copied into new wiki vaults on init |
 | `tests/runner.mjs` | Test suite |
 | `docs/` | Documentation |
@@ -39,7 +39,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a full breakdown. The short version:
 
 ## Hook deployment constraint
 
-Hooks are deployed to `~/.claude/hooks/` and **run in isolation** — they cannot import from relative paths. All shared logic lives in `hooks/wiki-shared.mjs`, which is copied alongside each hook at deploy time. If you add a utility that hooks need, add it to `wiki-shared.mjs`. Do not create additional shared files that hooks import.
+Hooks are deployed to `~/.claude/hooks/` and **run in isolation** — they cannot import from relative paths. All shared logic lives in `hooks/hypo-shared.mjs`, which is copied alongside each hook at deploy time. If you add a utility that hooks need, add it to `hypo-shared.mjs`. Do not create additional shared files that hooks import.
 
 Scripts in `scripts/` are not subject to this constraint and can import from `scripts/lib/`.
 
@@ -58,10 +58,10 @@ Scripts in `scripts/` are not subject to this constraint and can import from `sc
 
 1. Edit the hook file in `hooks/`.
 2. If it's a new hook, add it to `hooks/hooks.json` under the correct event key.
-3. If the hook needs shared utilities, add them to `hooks/wiki-shared.mjs`.
+3. If the hook needs shared utilities, add them to `hooks/hypo-shared.mjs`.
 4. Test by running `npm test` and manually running `/hypo:upgrade` in a Claude Code session.
 
-### Modifying `wiki-shared.mjs`
+### Modifying `hypo-shared.mjs`
 
 This file is deployed verbatim to `~/.claude/hooks/`. Keep it self-contained:
 - Only Node.js built-ins (`fs`, `path`, `os`, `child_process`)
@@ -102,7 +102,7 @@ When adding a feature, add a corresponding test in `tests/runner.mjs`. For hook 
 
 1. Run `npm test` and `npm run lint` — both must pass.
 2. If you changed a hook, manually test the affected lifecycle event in Claude Code.
-3. If you changed `wiki-shared.mjs`, verify the deployed copy works after `/hypo:upgrade`.
+3. If you changed `hypo-shared.mjs`, verify the deployed copy works after `/hypo:upgrade`.
 4. Open the PR against `main`. Include what was changed and why, plus any manual verification steps.
 
 ---

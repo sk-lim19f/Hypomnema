@@ -25,14 +25,14 @@ HYPO_SKIP_GATE=1
 ## Layout
 
 ```
-<wiki-root>/
+<hypo-root>/
 ├── hypo-config.md      ← you are here (root marker)
 ├── index.md            ← searchable page index
 ├── hot.md              ← active-project pointer table
 ├── log.md              ← chronological activity log
 ├── hypo-guide.md       ← operations guide
 ├── SCHEMA.md           ← type system reference
-├── .wikiignore         ← privacy/secret file patterns
+├── .hypoignore         ← privacy/secret file patterns
 ├── pages/              ← permanent knowledge pages
 ├── projects/           ← project work artifacts
 │   └── <name>/
