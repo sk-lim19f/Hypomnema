@@ -4,6 +4,10 @@ description: Initialize a new Hypomnema wiki
 
 You are running `/hypo:init`. Set up a new personal wiki powered by Hypomnema.
 
+**If the user passes a remote URL** (e.g. `/hypo:init --from-remote git@github.com:user/wiki.git`), skip the wizard and go directly to [Step 2a — From Remote](#step-2a).
+
+---
+
 ## What this does
 
 - Creates the Hypomnema directory structure (`pages/`, `projects/`, `sources/`, etc.)
@@ -57,7 +61,26 @@ Ask the following questions **one at a time**. Use the default if the user press
 
 ---
 
-## Step 2 — Run the init script
+## Step 2a — From Remote (skip wizard) {#step-2a}
+
+If the user provided `--from-remote <url>`, run:
+
+```bash
+node <package-root>/scripts/init.mjs \
+  --from-remote="<url>" \
+  --hypo-dir="<hypo-dir>" \
+  [--no-hooks] \
+  [--codex]
+```
+
+- `--hypo-dir` defaults to `~/hypomnema` if not specified.
+- The script clones the remote, validates that `hypo-config.md` exists, installs hooks, and merges `~/.claude/settings.json`.
+- If the cloned repo is not a Hypomnema wiki (no `hypo-config.md`), the clone is removed and the command exits with an error.
+- Skip to **Step 3** after running.
+
+---
+
+## Step 2 — Run the init script (new wiki)
 
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 Then run:

@@ -9,13 +9,15 @@
  *   node scripts/init.mjs [options]
  *
  * Options:
- *   --hypo-dir=<path>    Hypomnema root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/hypomnema)
- *   --privacy=<mode>     personal | shared | public  (default: personal)
- *   --no-hooks           Skip hook installation
- *   --codex              Also install Codex hooks (~/.codex/hooks/)
- *   --git-remote=<url>   Git remote URL
- *   --no-git-init        Skip git initialization
- *   --dry-run            Show what would be done without making changes
+ *   --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
+ *   --privacy=<mode>       personal | shared | public  (default: personal)
+ *   --no-hooks             Skip hook installation
+ *   --codex                Also install Codex hooks (~/.codex/hooks/)
+ *   --git-remote=<url>     Git remote URL
+ *   --no-git-init          Skip git initialization
+ *   --from-remote=<url>    Clone existing Hypomnema wiki from remote and install hooks
+ *   --dry-run              Show what would be done without making changes
+ *   --help, -h             Show this help message
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync } from 'fs';
@@ -35,36 +37,43 @@ const TEMPLATES  = join(PKG_ROOT, 'templates');
 
 function parseArgs(argv) {
   const args = {
-    hypoDir:   resolveHypoRoot(),
-    privacy:   'personal',
-    hooks:     true,
-    codex:     false,
-    gitRemote: null,
-    gitInit:   true,
-    dryRun:    false,
+    hypoDir:    resolveHypoRoot(),
+    privacy:    'personal',
+    hooks:      true,
+    codex:      false,
+    gitRemote:  null,
+    gitInit:    true,
+    dryRun:     false,
+    fromRemote: null,
   };
   for (const arg of argv.slice(2)) {
     if (arg === '--help' || arg === '-h') {
       console.log(`Usage: node scripts/init.mjs [options]
 
 Options:
-  --hypo-dir=<path>    Hypomnema root directory (default: ~/hypomnema)
-  --privacy=<mode>     personal | shared | public  (default: personal)
-  --no-hooks           Skip hook installation
-  --codex              Also install Codex hooks (~/.codex/hooks/)
-  --git-remote=<url>   Git remote URL
-  --no-git-init        Skip git initialization
-  --dry-run            Show what would be done without making changes
-  --help, -h           Show this help message`);
+  --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
+  --privacy=<mode>       personal | shared | public  (default: personal)
+  --no-hooks             Skip hook installation
+  --codex                Also install Codex hooks (~/.codex/hooks/)
+  --git-remote=<url>     Git remote URL
+  --no-git-init          Skip git initialization
+  --from-remote=<url>    Clone existing Hypomnema wiki from remote and install hooks
+  --dry-run              Show what would be done without making changes
+  --help, -h             Show this help message`);
       process.exit(0);
     }
-    else if (arg.startsWith('--hypo-dir='))   args.hypoDir   = expandHome(arg.slice(11));
-    else if (arg.startsWith('--privacy=')) args.privacy  = arg.slice(10);
-    else if (arg === '--no-hooks')        args.hooks     = false;
-    else if (arg === '--codex')           args.codex     = true;
-    else if (arg.startsWith('--git-remote=')) args.gitRemote = arg.slice(13);
-    else if (arg === '--no-git-init')     args.gitInit   = false;
-    else if (arg === '--dry-run')         args.dryRun    = true;
+    else if (arg.startsWith('--hypo-dir='))     args.hypoDir    = expandHome(arg.slice(11));
+    else if (arg.startsWith('--privacy='))       args.privacy    = arg.slice(10);
+    else if (arg === '--no-hooks')               args.hooks      = false;
+    else if (arg === '--codex')                  args.codex      = true;
+    else if (arg.startsWith('--git-remote='))    args.gitRemote  = arg.slice(13);
+    else if (arg === '--no-git-init')            args.gitInit    = false;
+    else if (arg.startsWith('--from-remote=')) {
+      const url = arg.slice(14).trim();
+      if (!url) { console.error('Error: --from-remote requires a non-empty URL'); process.exit(1); }
+      args.fromRemote = url;
+    }
+    else if (arg === '--dry-run')                args.dryRun     = true;
   }
   return args;
 }
@@ -289,6 +298,39 @@ function installPkgGitHook(dryRun) {
   log('created', hookPath);
 }
 
+// ── from-remote clone ────────────────────────────────────────────────────────
+
+function readPrivacyFromConfig(hypoDir) {
+  const cfgPath = join(hypoDir, 'hypo-config.md');
+  if (!existsSync(cfgPath)) return 'personal';
+  try {
+    const m = readFileSync(cfgPath, 'utf-8').match(/^privacy:\s*(\S+)/m);
+    return m ? m[1] : 'personal';
+  } catch { return 'personal'; }
+}
+
+function cloneFromRemote(url, hypoDir, dryRun) {
+  if (existsSync(hypoDir)) {
+    log('errors', `--from-remote: target directory already exists: ${hypoDir}. Remove it or choose a different --hypo-dir.`);
+    return false;
+  }
+  console.log(`Cloning ${url} → ${hypoDir} ...`);
+  if (!dryRun) {
+    const r = spawnSync('git', ['clone', url, hypoDir], { stdio: 'inherit' });
+    if (r.error || r.status !== 0) {
+      log('errors', `git clone failed: ${url}`);
+      return false;
+    }
+    if (!existsSync(join(hypoDir, 'hypo-config.md'))) {
+      spawnSync('rm', ['-rf', hypoDir]);
+      log('errors', `--from-remote: cloned repo is not a Hypomnema wiki (hypo-config.md missing). Removed ${hypoDir}.`);
+      return false;
+    }
+  }
+  log('created', hypoDir);
+  return true;
+}
+
 // ── git setup ────────────────────────────────────────────────────────────────
 
 function git(hypoDir, args, opts = {}) {
@@ -350,35 +392,47 @@ const args = parseArgs(process.argv);
 // Validate hooks.json before any file writes so a bad package leaves no partial state
 const HOOK_MAP = (args.hooks || args.codex) ? loadHookMap() : null;
 
-// 1. wiki directory structure
-ensureDir(args.hypoDir, args.dryRun);
-for (const d of HYPO_DIRS) ensureDir(join(args.hypoDir, d), args.dryRun);
+if (args.fromRemote) {
+  // ── from-remote path: clone → read config → install hooks ──────────────────
+  const cloned = cloneFromRemote(args.fromRemote, args.hypoDir, args.dryRun);
+  if (!cloned) {
+    console.error(results.errors.join('\n'));
+    process.exit(1);
+  }
+  // Read privacy from the cloned hypo-config.md (override CLI default)
+  if (!args.dryRun) args.privacy = readPrivacyFromConfig(args.hypoDir);
+} else {
+  // ── normal path: create structure + templates ───────────────────────────────
+  // 1. wiki directory structure
+  ensureDir(args.hypoDir, args.dryRun);
+  for (const d of HYPO_DIRS) ensureDir(join(args.hypoDir, d), args.dryRun);
 
-// 2. template files
-copyTemplate('index.md',          join(args.hypoDir, 'index.md'),          args.dryRun);
-copyTemplate('hot.md',            join(args.hypoDir, 'hot.md'),            args.dryRun);
-copyTemplate('log.md',            join(args.hypoDir, 'log.md'),            args.dryRun);
-copyTemplate('SCHEMA.md',         join(args.hypoDir, 'SCHEMA.md'),         args.dryRun);
-copyTemplate('hypo-guide.md',     join(args.hypoDir, 'hypo-guide.md'),     args.dryRun);
-copyTemplate('Home.md',           join(args.hypoDir, 'Home.md'),           args.dryRun);
-copyTemplate('Overview.md',       join(args.hypoDir, 'Overview.md'),       args.dryRun);
-copyTemplate('hypo-help.md',      join(args.hypoDir, 'hypo-help.md'),      args.dryRun);
-copyTemplate('hypo-automation.md',join(args.hypoDir, 'hypo-automation.md'),args.dryRun);
-copyTemplate('session-state.md',  join(args.hypoDir, 'session-state.md'),  args.dryRun);
-copyTemplate(join('pages', '_index.md'), join(args.hypoDir, 'pages', '_index.md'), args.dryRun);
+  // 2. template files
+  copyTemplate('index.md',          join(args.hypoDir, 'index.md'),          args.dryRun);
+  copyTemplate('hot.md',            join(args.hypoDir, 'hot.md'),            args.dryRun);
+  copyTemplate('log.md',            join(args.hypoDir, 'log.md'),            args.dryRun);
+  copyTemplate('SCHEMA.md',         join(args.hypoDir, 'SCHEMA.md'),         args.dryRun);
+  copyTemplate('hypo-guide.md',     join(args.hypoDir, 'hypo-guide.md'),     args.dryRun);
+  copyTemplate('Home.md',           join(args.hypoDir, 'Home.md'),           args.dryRun);
+  copyTemplate('Overview.md',       join(args.hypoDir, 'Overview.md'),       args.dryRun);
+  copyTemplate('hypo-help.md',      join(args.hypoDir, 'hypo-help.md'),      args.dryRun);
+  copyTemplate('hypo-automation.md',join(args.hypoDir, 'hypo-automation.md'),args.dryRun);
+  copyTemplate('session-state.md',  join(args.hypoDir, 'session-state.md'),  args.dryRun);
+  copyTemplate(join('pages', '_index.md'), join(args.hypoDir, 'pages', '_index.md'), args.dryRun);
 
-// projects/_template structure
-ensureDir(join(args.hypoDir, 'projects', '_template'), args.dryRun);
-ensureDir(join(args.hypoDir, 'projects', '_template', 'decisions'), args.dryRun);
-ensureDir(join(args.hypoDir, 'projects', '_template', 'session-log'), args.dryRun);
-copyTemplate(join('projects', '_template', 'hot.md'),          join(args.hypoDir, 'projects', '_template', 'hot.md'),          args.dryRun);
-copyTemplate(join('projects', '_template', 'index.md'),        join(args.hypoDir, 'projects', '_template', 'index.md'),        args.dryRun);
-copyTemplate(join('projects', '_template', 'prd.md'),          join(args.hypoDir, 'projects', '_template', 'prd.md'),          args.dryRun);
-copyTemplate(join('projects', '_template', 'session-state.md'),join(args.hypoDir, 'projects', '_template', 'session-state.md'),args.dryRun);
+  // projects/_template structure
+  ensureDir(join(args.hypoDir, 'projects', '_template'), args.dryRun);
+  ensureDir(join(args.hypoDir, 'projects', '_template', 'decisions'), args.dryRun);
+  ensureDir(join(args.hypoDir, 'projects', '_template', 'session-log'), args.dryRun);
+  copyTemplate(join('projects', '_template', 'hot.md'),          join(args.hypoDir, 'projects', '_template', 'hot.md'),          args.dryRun);
+  copyTemplate(join('projects', '_template', 'index.md'),        join(args.hypoDir, 'projects', '_template', 'index.md'),        args.dryRun);
+  copyTemplate(join('projects', '_template', 'prd.md'),          join(args.hypoDir, 'projects', '_template', 'prd.md'),          args.dryRun);
+  copyTemplate(join('projects', '_template', 'session-state.md'),join(args.hypoDir, 'projects', '_template', 'session-state.md'),args.dryRun);
 
-// 3. hypo-config.md + .hypoignore
-writeHypoConfig(args.hypoDir, args.privacy, args.dryRun);
-writeWikiignore(args.hypoDir, args.privacy, args.dryRun);
+  // 3. hypo-config.md + .hypoignore
+  writeHypoConfig(args.hypoDir, args.privacy, args.dryRun);
+  writeWikiignore(args.hypoDir, args.privacy, args.dryRun);
+}
 
 // 4. hooks
 
@@ -396,8 +450,8 @@ if (args.codex) {
   mergeSettingsJson(join(HOME, '.codex', 'settings.json'), codexHooks, args.dryRun, HOOK_MAP);
 }
 
-// 6. git setup
-if (args.gitInit) {
+// 6. git setup (skip when cloned from remote — already has .git + remote)
+if (args.gitInit && !args.fromRemote) {
   gitSetup(args.hypoDir, args.gitRemote, args.dryRun);
 }
 
@@ -406,8 +460,8 @@ if (args.hooks) {
   installPkgGitHook(args.dryRun);
 }
 
-// 8. first commit + push
-if (args.gitInit) {
+// 8. first commit + push (skip when cloned from remote — already has commits)
+if (args.gitInit && !args.fromRemote) {
   firstCommit(args.hypoDir, args.gitRemote, args.dryRun);
 }
 
