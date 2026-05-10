@@ -51,13 +51,32 @@ function loadHookFiles() {
   }
 
   const hookFiles = new Set();
-  for (const files of Object.values(cfg.hooks)) {
-    for (const f of files) hookFiles.add(f);
+  const normalizedHookMap = {};
+
+  for (const [event, groups] of Object.entries(cfg.hooks)) {
+    const filenames = [];
+    for (const entry of groups) {
+      if (typeof entry === 'string') {
+        // legacy flat format: entry is a filename
+        hookFiles.add(entry);
+        filenames.push(entry);
+      } else if (entry && Array.isArray(entry.hooks)) {
+        // current group format: extract filename from command string
+        for (const h of entry.hooks) {
+          if (h.type === 'command' && typeof h.command === 'string') {
+            const m = h.command.match(/\/hooks\/([^/\s]+\.mjs)$/);
+            if (m) { hookFiles.add(m[1]); filenames.push(m[1]); }
+          }
+        }
+      }
+    }
+    normalizedHookMap[event] = filenames;
   }
+
   if (Array.isArray(cfg.shared)) {
     for (const f of cfg.shared) hookFiles.add(f);
   }
-  return { hookMap: cfg.hooks, hookFiles };
+  return { hookMap: normalizedHookMap, hookFiles };
 }
 
 // ── hook file removal ────────────────────────────────────────────────────────

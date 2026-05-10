@@ -7,6 +7,10 @@ on:
 
 jobs:
   verify-pages:
+    # Checks verify_by / verify_by_date frontmatter fields only.
+    # Does NOT detect semantic staleness, broken external links, or
+    # pages that lack verify_by entirely (verify.mjs flags those separately).
+    # For content-quality checks, see the llm-lint job below.
     name: Verify pages
     runs-on: ubuntu-latest
     steps:
