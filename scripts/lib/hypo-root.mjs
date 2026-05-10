@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * hypo-root.mjs — resolve the Hypomnema wiki root directory
+ * hypo-root.mjs — resolve the Hypomnema root directory
  *
  * Resolution order:
  *   1. HYPO_DIR environment variable
  *   2. Scan common locations for hypo-config.md marker
- *   3. Default: ~/wiki
+ *   3. Default: ~/hypomnema
  */
 
 import { existsSync } from 'fs';

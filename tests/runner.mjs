@@ -109,7 +109,7 @@ test('HYPO_DIR env var takes precedence', () => {
   }
 });
 
-test('falls back to ~/wiki when no env or marker found', () => {
+test('falls back to ~/hypomnema when no env or marker found', () => {
   const orig = process.env.HYPO_DIR;
   delete process.env.HYPO_DIR;
   try {
