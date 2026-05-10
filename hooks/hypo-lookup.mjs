@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-lookup.mjs — UserPromptSubmit hook
+ * hypo-lookup.mjs — UserPromptSubmit hook
  *
  * On every user prompt:
  *   1. Extract keywords from the prompt
@@ -11,8 +11,7 @@
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join, basename } from 'path';
-import { HYPO_DIR, buildOutput } from './hypo-shared.mjs';
-import { loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
+import { HYPO_DIR, buildOutput, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
 
 const INDEX_PATH = join(HYPO_DIR, 'index.md');
 const MAX_HITS   = 3;

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * personal-wiki-check.mjs — PreCompact hook
+ * hypo-personal-check.mjs — PreCompact hook
  *
  * Hard gate before /compact. Blocks if:
  *   - last substantial wiki op is not a session close
@@ -114,8 +114,8 @@ process.stdin.on('end', () => {
       timeout: 30000,
     });
     const parsed = JSON.parse(r.stdout || '{}');
-    lintBlockers = parsed.blockers || [];
-    lintW8 = (parsed.warnings || []).filter(w => w.id === 'W8');
+    lintBlockers = parsed.errors || [];
+    lintW8 = (parsed.warns || []).filter(w => w.id === 'W8');
   } catch { /* fail-open */ }
 
   const lintOk          = lintBlockers.length === 0;

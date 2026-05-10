@@ -43,14 +43,14 @@ jobs:
       - name: Dry-run reports DRY RUN without writing files
         run: |
           out=$(node scripts/init.mjs \
-            --wiki-dir=/tmp/wiki-dry \
+            --hypo-dir=/tmp/wiki-dry \
             --dry-run --no-hooks --no-git-init)
           echo "$out" | grep -q '\[DRY RUN'
           test ! -d /tmp/wiki-dry
       - name: Actual init creates expected structure
         run: |
           node scripts/init.mjs \
-            --wiki-dir=/tmp/wiki-init \
+            --hypo-dir=/tmp/wiki-init \
             --no-hooks --no-git-init
           test -d /tmp/wiki-init/pages
           test -d /tmp/wiki-init/projects
@@ -69,10 +69,10 @@ jobs:
       - name: Init then upgrade — JSON output has required fields
         run: |
           node scripts/init.mjs \
-            --wiki-dir=/tmp/wiki-upgrade \
+            --hypo-dir=/tmp/wiki-upgrade \
             --no-git-init
           node scripts/upgrade.mjs \
-            --wiki-dir=/tmp/wiki-upgrade \
+            --hypo-dir=/tmp/wiki-upgrade \
             --json > /tmp/upgrade-out.json
           node -e "
             const d = JSON.parse(require('fs').readFileSync('/tmp/upgrade-out.json', 'utf-8'));
@@ -97,20 +97,20 @@ jobs:
       - name: Init with privacy=${{ matrix.mode }}
         run: |
           node scripts/init.mjs \
-            --wiki-dir=/tmp/wiki-${{ matrix.mode }} \
+            --hypo-dir=/tmp/wiki-${{ matrix.mode }} \
             --privacy=${{ matrix.mode }} \
             --no-hooks --no-git-init
           grep -q "privacy: ${{ matrix.mode }}" /tmp/wiki-${{ matrix.mode }}/hypo-config.md
-      - name: Verify shared/public extra wikiignore rules
+      - name: Verify shared/public extra hypoignore rules
         if: matrix.mode != 'personal'
         run: |
-          grep -q '\*personal\*' /tmp/wiki-${{ matrix.mode }}/.wikiignore
-          grep -q 'journal/'     /tmp/wiki-${{ matrix.mode }}/.wikiignore
-      - name: Verify public-only extra wikiignore rules
+          grep -q '\*personal\*' /tmp/wiki-${{ matrix.mode }}/.hypoignore
+          grep -q 'journal/'     /tmp/wiki-${{ matrix.mode }}/.hypoignore
+      - name: Verify public-only extra hypoignore rules
         if: matrix.mode == 'public'
         run: |
-          grep -q 'sources/' /tmp/wiki-${{ matrix.mode }}/.wikiignore
-          grep -q 'drafts/'  /tmp/wiki-${{ matrix.mode }}/.wikiignore
+          grep -q 'sources/' /tmp/wiki-${{ matrix.mode }}/.hypoignore
+          grep -q 'drafts/'  /tmp/wiki-${{ matrix.mode }}/.hypoignore
 
   replay:
     name: Hook replay
@@ -123,7 +123,7 @@ jobs:
       - name: compact-guard — non-compact prompt passes through
         run: |
           echo '{"prompt":"hello"}' \
-            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/wiki-compact-guard.mjs \
+            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/hypo-compact-guard.mjs \
             > /tmp/cg-pass.json
           node -e "
             const d = JSON.parse(require('fs').readFileSync('/tmp/cg-pass.json', 'utf-8'));
@@ -132,26 +132,26 @@ jobs:
       - name: compact-guard — /compact with no wiki produces additionalContext
         run: |
           echo '{"prompt":"/compact"}' \
-            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/wiki-compact-guard.mjs \
+            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/hypo-compact-guard.mjs \
             > /tmp/cg-compact.json
           node -e "
             const d = JSON.parse(require('fs').readFileSync('/tmp/cg-compact.json', 'utf-8'));
             if (!('additionalContext' in d)) { console.error('missing additionalContext'); process.exit(1); }
             if (d.continue !== true)         { console.error('expected continue:true');    process.exit(1); }
           "
-      - name: personal-wiki-check — no wiki returns block decision
+      - name: personal-check — no wiki returns block decision
         run: |
           echo '{}' \
-            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/personal-wiki-check.mjs \
+            | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/hypo-personal-check.mjs \
             > /tmp/pwc-block.json
           node -e "
             const d = JSON.parse(require('fs').readFileSync('/tmp/pwc-block.json', 'utf-8'));
             if (d.decision !== 'block') { console.error('expected decision:block'); process.exit(1); }
           "
-      - name: personal-wiki-check — HYPO_SKIP_GATE=1 passes through
+      - name: personal-check — HYPO_SKIP_GATE=1 passes through
         run: |
           echo '{}' \
-            | HYPO_DIR=/tmp/no-wiki-$RANDOM HYPO_SKIP_GATE=1 node hooks/personal-wiki-check.mjs \
+            | HYPO_DIR=/tmp/no-wiki-$RANDOM HYPO_SKIP_GATE=1 node hooks/hypo-personal-check.mjs \
             > /tmp/pwc-skip.json
           node -e "
             const d = JSON.parse(require('fs').readFileSync('/tmp/pwc-skip.json', 'utf-8'));

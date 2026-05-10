@@ -147,7 +147,7 @@ function lintPage({ path, rel }, slugMap) {
   lintSessionStateHeadings(content, rel);
 
   for (const link of extractWikilinks(content)) {
-    if (!slugMap.has(link) && !slugMap.has(link.replace(/\//g, path.sep))) {
+    if (!slugMap.has(link)) {
       issue('warn', rel, `Broken wikilink: [[${link}]]`);
     }
   }

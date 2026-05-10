@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-hot-rebuild.mjs — Stop hook
+ * hypo-hot-rebuild.mjs — Stop hook
  *
  * Rebuilds root hot.md in canonical format on every session end.
  * Preserves the project pointer table rows while refreshing dates

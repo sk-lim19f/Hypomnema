@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-compact-guard.mjs — UserPromptSubmit hook
+ * hypo-compact-guard.mjs — UserPromptSubmit hook
  *
  * Scope: detects "/compact" typed in chat only.
  * The CLI built-in /compact does NOT fire UserPromptSubmit — use personal-wiki-check.mjs
