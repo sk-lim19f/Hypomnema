@@ -1,4 +1,5 @@
 .omc/
+skills/.omc/
 .git/
 tests/
 *.test.mjs
