@@ -132,13 +132,7 @@ process.stdin.on('end', () => {
   const designHistoryOk = lintW8.length === 0;
 
   if (hasSession && gitStatus.clean && hotStatus.clean && lintOk && designHistoryOk) {
-    const msg = lintSkipped
-      ? '[WIKI CHECK] OK (lint skipped — run `hypomnema init` to enable lint gate).'
-      : undefined;
-    console.log(JSON.stringify(msg
-      ? { continue: true, systemMessage: msg }
-      : { continue: true, suppressOutput: true }
-    ));
+    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
     return;
   }
 
