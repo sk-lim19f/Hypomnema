@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-auto-commit.mjs — Stop hook
+ * hypo-auto-commit.mjs — Stop hook
  *
  * At session end: stage all changes, commit if any, then pull+push to sync remote.
  */

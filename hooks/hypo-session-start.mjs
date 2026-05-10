@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * wiki-session-start.mjs — SessionStart hook
+ * hypo-session-start.mjs — SessionStart hook
  *
  * On session start:
  *   HIT  → cwd matches a project's working_dir → inject hot.md (2000 chars) + session-state.md (2000 chars)
