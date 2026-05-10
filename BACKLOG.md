@@ -4,14 +4,13 @@ type: backlog
 status: active
 created: 2026-05-08
 updated: 2026-05-08
-reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 ---
 
 # Hypomnema 기획/구현 갭 분석 & 작업 백로그
 
 > **기준 문서**: `~/wiki/projects/llm-wiki-oss/oss-plan.md`, `prd.md`, `index.md`  
 > **분석 대상**: `/Users/blair/Workspace/wiki` (OSS 레포)  
-> **검증**: Claude 초안 → Codex worker-1 (섹션 A·B) + worker-2 (섹션 C·D, 파일 직접 확인) → Claude 교차 검증  
+> **검증**: Claude + 교차 검증  
 > **`npm test` 결과**: 51/51 PASS | `claude plugin validate .`: **10개 스키마 오류** (P0 블로커)
 
 ---
@@ -47,7 +46,7 @@ reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 
 **기획**: `index.md` 9-6에서 `/hypo:crystallize` = "session close 체크리스트 alias"로 명시  
 **실제**: `commands/crystallize.md`는 "초안·분산 페이지를 stable 지식으로 합성"하는 전혀 다른 도구. `skills/crystallize.md`에 "session end" 트리거 시 체크리스트 언급이 있으나 slash command가 구현하지 않음  
-**Worker-1 보정**: 기획 문서는 `/hypo:crystallize` 또는 `/hypo:close`를 session-close alias로 명시. 새 이름 결정 전 **설계 Q-F 먼저 결정** 필요
+기획 문서는 `/hypo:crystallize` 또는 `/hypo:close`를 session-close alias로 명시. 새 이름 결정 전 **설계 Q-F 먼저 결정** 필요
 
 **필요 작업**:
 - 설계 Q-F 결정 (아래 §5 참고): 커맨드 이름 및 책임 범위 확정
@@ -59,7 +58,7 @@ reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 #### A-2. Ingest 워크플로 자동화 없음 🔴
 
 **기획**: `사용자 요청 → 위키 검색 → miss면 LLM 리서치 → ingest → 결과/의사결정 이유 정리 / hit면 최신성 확인 → 레거시면 append/update`  
-**실제** (worker-2 파일 직접 확인):
+**실제**:
 - `wiki-lookup.mjs` miss: `[WIKI LOOKUP: miss] ... Closest: [[slug]]` 신호만 출력 종료
 - `wiki-lookup.mjs` hit: 페이지 주입만, 최신성 확인 없음
 - `commands/ingest.md`: `updated:` 날짜 업데이트는 있으나 `verify_by_date`/레거시 보존 절차 없음
@@ -74,7 +73,7 @@ reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 #### A-3. `lint-llm.mjs` 스텁 미구현 🟡
 
 **기획**: L2 의미론적 LLM 검사 — 페이지별 Haiku 판정, nightly CI 실행  
-**실제** (worker-2 확인): `scripts/lint-llm.mjs`에 `TODO: implement per-page LLM evaluation pass` + `"LLM evaluation pass not yet implemented"` 메시지만 있음
+**실제**: `scripts/lint-llm.mjs`에 `TODO: implement per-page LLM evaluation pass` + `"LLM evaluation pass not yet implemented"` 메시지만 있음
 
 **필요 작업**:
 - `scripts/lint-llm.mjs`: Anthropic SDK로 페이지별 Haiku 호출 구현  
@@ -86,8 +85,8 @@ reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 #### A-4. SessionStart에 `git pull` 없음 🟡
 
 **기획**: "매일 00시 또는 최초 실행 시 자동 pull"  
-**실제** (worker-2 확인): `wiki-session-start.mjs`는 hot.md/session-state.md 주입만. `git pull`은 Stop 훅(wiki-auto-commit)에서만  
-**Worker-1 우선순위 조정**: oss-plan 우선순위 표에서 auto-pull은 P2 — P1에서 **P2로 조정**
+**실제**: `wiki-session-start.mjs`는 hot.md/session-state.md 주입만. `git pull`은 Stop 훅(wiki-auto-commit)에서만  
+우선순위 조정: oss-plan 우선순위 표에서 auto-pull은 P2 — P1에서 **P2로 조정**
 
 **필요 작업**:
 - `wiki-session-start.mjs`에 세션 시작 시 `git pull --no-rebase -q` 추가  
@@ -98,7 +97,7 @@ reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 #### A-5. `init` 완료 시 first commit + push 없음 🟡
 
 **기획** (oss-plan.md 시나리오 A): `✓ Git initialized, remote added, first commit pushed`  
-**실제** (worker-2 확인): `scripts/init.mjs`의 `gitSetup()`은 `git init` + `git remote add`만. first commit/push 없음  
+**실제**: `scripts/init.mjs`의 `gitSetup()`은 `git init` + `git remote add`만. first commit/push 없음  
 
 **필요 작업**:
 - git remote가 있을 때 `git add -A` → `git commit -m "init: hypomnema wiki"` → `git push -u origin main` 추가
@@ -109,8 +108,8 @@ reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 #### A-6. `commands/lint.md` 없음 🟡 → **P1로 승격**
 
 **기획**: `docs/ARCHITECTURE.md` Commands 목록에 `lint` 명시. README에서 `/hypo:lint` 광고  
-**실제** (worker-2 확인): `commands/lint.md` 없음. `skills/lint.md` + `scripts/lint.mjs`는 존재  
-**Worker-2 우선순위 조정**: README가 `/hypo:lint`를 사용자 공개 기능으로 광고 → P2에서 **P1로 승격**
+**실제**: `commands/lint.md` 없음. `skills/lint.md` + `scripts/lint.mjs`는 존재  
+우선순위 조정: README가 `/hypo:lint`를 사용자 공개 기능으로 광고 → P2에서 **P1로 승격**
 
 **필요 작업**:
 - `commands/lint.md` 신설 — `scripts/lint.mjs` 호출 절차 기술
@@ -120,7 +119,7 @@ reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 #### A-7. `/hypo:verify`가 static — Claude API 연동 없음 🟡 *(신규)*
 
 **기획** (oss-plan.md): `verify-pages.mjs` → Claude Haiku `YES/NO` 판정 + `open-questions.md` append  
-**실제** (worker-2 직접 확인): `scripts/verify.mjs`는 정적 메타데이터/날짜 검사만. Anthropic API 호출 없음
+**실제**: `scripts/verify.mjs`는 정적 메타데이터/날짜 검사만. Anthropic API 호출 없음
 
 **필요 작업**:
 - `scripts/verify.mjs`: Claude API(Haiku) 호출로 `verify_by` 질문에 YES/NO 판정 구현
@@ -132,7 +131,7 @@ reviewers: worker-1 (Codex), worker-2 (Codex), Claude cross-verify
 #### A-8. `init.mjs`에서 생성하는 baseline 파일/디렉토리 불완전 🟡 *(신규)*
 
 **기획** (oss-plan.md + index.md 9-9): `templates/`의 파일들이 `init` 시 복사되어야 함  
-**실제** (worker-2 확인): `init.mjs`는 `pages/`, `projects/`, `sources/` 디렉토리 3개 + 5개 루트 파일만 생성. 다음이 누락됨:
+**실제**: `init.mjs`는 `pages/`, `projects/`, `sources/` 디렉토리 3개 + 5개 루트 파일만 생성. 다음이 누락됨:
 - `journal/daily/`, `journal/weekly/`, `journal/monthly/` 디렉토리
 - `templates/Home.md`, `Overview.md`, `wiki-automation.md`, `hypo-help.md` 복사 미구현
 - `templates/pages/_index.md`, `templates/projects/_template/` 구조 복사 미구현
@@ -155,7 +154,7 @@ Phase 2 DoD 조건: **`grep 'OMC|oh-my-claude' 0건`** — 현재 미달성
 | `hooks/personal-wiki-check.mjs` | line 11 (주석) | `OMC_SKIP_WIKI_GATE=1 for backwards compat` |
 | `tests/runner.mjs` | lines 307, 309, 313 | `OMC_SKIP_WIKI_GATE` 환경변수 조작 |
 
-**Worker-2 추가 (B-4 참고)**: `ci.yml` omc-absent job에도 `OMC_SKIP_WIKI_GATE: ""` 환경변수 잔존
+추가: `ci.yml` omc-absent job에도 `OMC_SKIP_WIKI_GATE: ""` 환경변수 잔존
 
 **필요 작업**:
 - `wiki-shared.mjs`: backwards compat 코드 및 `OMC_SKIP_WIKI_GATE` 참조 완전 제거
@@ -192,7 +191,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 
 **`README.ko.md` Privacy 섹션**: `"모든 위키 데이터는 로컬에 저장됩니다"` + `"외부 서비스로 콘텐츠를 전송하지 않습니다"`  
 **실제**: `wiki-auto-commit.mjs`(Stop 훅)가 자동 commit + pull + push. README는 "no sync service"라고 명시  
-**Worker-2 확인**: `README.md`/`README.ko.md` 모두 동일한 충돌 문구 존재
+확인: `README.md`/`README.ko.md` 모두 동일한 충돌 문구 존재
 
 **필요 작업**:
 - Privacy 섹션: "로컬 저장" → "로컬 파일 + 선택적 Git remote 동기화"로 변경
@@ -212,7 +211,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 
 **현재**: `"name": "Linus"`, `"email": "linus@cre8orclub.com"`  
 **package.json은 이미** `sk-lim19f/Hypomnema` URL로 되어 있음  
-**Worker-2**: package.json의 repository/homepage/bugs는 이미 올바름. plugin.json만 수정 필요
+확인: package.json의 repository/homepage/bugs는 이미 올바름. plugin.json만 수정 필요
 
 **필요 작업**: `.claude-plugin/plugin.json` author 정보를 실제 정보로 교체
 
@@ -221,7 +220,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 #### C-4. `plugin.json` hooks 스키마 오류 (10개) 🔴 *(설명 수정)*
 
 **초안 설명**: "hooks 필드 누락"  
-**Worker-2 직접 실행** (`claude plugin validate .`): **10개 스키마 오류** 발생  
+`claude plugin validate .` 직접 실행: **10개 스키마 오류** 발생  
 실제 문제: `hooks/hooks.json`의 모든 이벤트가 raw string 배열 (`["wiki-session-start.mjs"]`)로 되어 있음. 플러그인 hooks는 `hooks` 배열을 포함한 객체 형식 + `${CLAUDE_PLUGIN_ROOT}` 경로 규칙 필요
 
 **필요 작업**:
@@ -235,7 +234,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 
 **기획** (`oss-plan.md` §529-546, `index.md` 9-8): "What goes / does not go in your wiki" 섹션 필요  
 **현재**: `README.ko.md`에 "위키에 저장할 것 / 저장하지 말 것" 섹션 있음 (line 75-89)  
-**Worker-1 지적**: 섹션 자체는 있으나 index.md 9-8 체크리스트 항목이 아직 `[ ]` — 검토 후 완료 처리 필요
+참고: 섹션 자체는 있으나 index.md 9-8 체크리스트 항목이 아직 `[ ]` — 검토 후 완료 처리 필요
 
 **필요 작업**:
 - README의 해당 섹션 내용이 oss-plan.md §529-546 요구사항을 충족하는지 검토
@@ -261,7 +260,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 #### D-2. nightly verify-pages가 실제로 Claude API를 호출하지 않음 🟡 *(설명 수정)*
 
 **초안 설명**: "ANTHROPIC_API_KEY 없으면 실패"  
-**Worker-2 직접 확인**: `scripts/verify.mjs`는 Anthropic 호출 자체 없음 (정적 날짜/메타데이터 검사만)  
+직접 확인: `scripts/verify.mjs`는 Anthropic 호출 자체 없음 (정적 날짜/메타데이터 검사만)  
 실제 문제: A-7과 연결 — semantic 판정이 미구현이므로 nightly job 자체가 의도한 기능을 하지 않음
 
 **필요 작업**:
@@ -274,7 +273,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 
 #### E-1. `index.md` 완료됐지만 `[ ]`로 표시된 항목 🔴 → **P0로 승격**
 
-**Worker-1 지적**: privacy onboarding은 단순 체크리스트 정리가 아니라 실제 릴리스 블로커
+참고: privacy onboarding은 단순 체크리스트 정리가 아니라 실제 릴리스 블로커
 
 | 항목 | index.md 상태 | 실제 구현 상태 |
 |---|---|---|
@@ -344,7 +343,7 @@ line 97: get a second review (e.g. via omc-teams:2 codex) before merging
 
 ## 5. 미결 설계 질문 (작업 전 결정 필요)
 
-> Worker-1·2 교차 검증 결과 원래 4개에서 11개로 확장됨
+> 원래 4개에서 11개로 확장됨
 
 | Q | 질문 | 관련 작업 |
 |---|---|---|
