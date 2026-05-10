@@ -27,7 +27,7 @@ Run full-text search:
 ```bash
 node <package-root>/scripts/query.mjs \
   --q="<query terms>" \
-  [--wiki-dir="<path>"] \
+  [--hypo-dir="<path>"] \
   [--limit=10]
 ```
 
@@ -44,7 +44,7 @@ Read `index.md` first to understand the page catalog, then read the top-scoring 
 Write a clear, concise answer that:
 - Cites source pages as `[[slug]]` links
 - Notes confidence level if any source is speculative
-- Flags if no relevant pages were found ("The wiki does not currently have a page on this topic.")
+- Flags if no relevant pages were found ("Hypomnema does not currently have a page on this topic.")
 
 If the query surfaces a gap, offer to create a new page or run `/hypo:ingest` on a relevant source.
 

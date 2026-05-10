@@ -10,37 +10,37 @@
  *   node scripts/ingest.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --json              Output as JSON
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, extname, basename } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
-import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, json: false };
+  const args = { hypoDir: null, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json')         args.json = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectMdFiles(dir, acc = [], wikiDir = '', ignorePatterns = []) {
+function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return acc;
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
-    if (wikiDir && isIgnored(full, wikiDir, ignorePatterns)) continue;
+    if (hypoDir && isIgnored(full, hypoDir, ignorePatterns)) continue;
     const st = statSync(full);
-    if (st.isDirectory()) collectMdFiles(full, acc, wikiDir, ignorePatterns);
+    if (st.isDirectory()) collectMdFiles(full, acc, hypoDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);
   }
   return acc;
@@ -62,14 +62,14 @@ function parseFrontmatter(content) {
 
 const args = parseArgs(process.argv);
 
-const ignorePatterns = loadWikiIgnore(args.wikiDir);
-const sourcesDir = join(args.wikiDir, 'sources');
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const sourcesDir = join(args.hypoDir, 'sources');
 const allSources = existsSync(sourcesDir)
-  ? readdirSync(sourcesDir).filter(e => !e.startsWith('.') && !statSync(join(sourcesDir, e)).isDirectory() && !isIgnored(join(sourcesDir, e), args.wikiDir, ignorePatterns))
+  ? readdirSync(sourcesDir).filter(e => !e.startsWith('.') && !statSync(join(sourcesDir, e)).isDirectory() && !isIgnored(join(sourcesDir, e), args.hypoDir, ignorePatterns))
   : [];
 
 // collect all source: references in wiki pages
-const pageFiles = collectMdFiles(join(args.wikiDir, 'pages'), [], args.wikiDir, ignorePatterns);
+const pageFiles = collectMdFiles(join(args.hypoDir, 'pages'), [], args.hypoDir, ignorePatterns);
 const referencedSources = new Set();
 
 for (const f of pageFiles) {

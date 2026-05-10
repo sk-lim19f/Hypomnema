@@ -10,7 +10,7 @@
  *   node scripts/query.mjs --q="<search terms>" [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root (default: resolved via HYPO_DIR / hypo-config.md / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --q=<query>         Search query (required)
  *   --limit=<n>         Max results (default: 10)
  *   --json              Output as JSON
@@ -18,20 +18,20 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
-import { loadWikiIgnore, isIgnored } from './lib/wiki-ignore.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, query: null, limit: 10, json: false };
+  const args = { hypoDir: null, query: null, limit: 10, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--q='))     args.query  = arg.slice(4);
     else if (arg.startsWith('--limit=')) args.limit  = parseInt(arg.slice(8), 10) || 10;
     else if (arg === '--json')           args.json   = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -91,9 +91,9 @@ if (!args.query) {
 }
 
 const terms = args.query.toLowerCase().split(/\s+/).filter(Boolean);
-const ignorePatterns = loadWikiIgnore(args.wikiDir);
-const scanDirs = ['pages', 'projects'].map(d => join(args.wikiDir, d));
-const files = scanDirs.flatMap(d => collectMdFiles(d, args.wikiDir, [], ignorePatterns));
+const ignorePatterns = loadHypoIgnore(args.hypoDir);
+const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
+const files = scanDirs.flatMap(d => collectMdFiles(d, args.hypoDir, [], ignorePatterns));
 
 const results = [];
 

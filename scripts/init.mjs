@@ -9,7 +9,7 @@
  *   node scripts/init.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>    Wiki root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/wiki)
+ *   --hypo-dir=<path>    Hypomnema root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/hypomnema)
  *   --privacy=<mode>     personal | shared | public  (default: personal)
  *   --no-hooks           Skip hook installation
  *   --codex              Also install Codex hooks (~/.codex/hooks/)
@@ -23,7 +23,7 @@ import { join, basename } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { expandHome, resolveWikiRoot } from './lib/wiki-root.mjs';
+import { expandHome, resolveHypoRoot } from './lib/hypo-root.mjs';
 
 const HOME     = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -35,7 +35,7 @@ const TEMPLATES  = join(PKG_ROOT, 'templates');
 
 function parseArgs(argv) {
   const args = {
-    wikiDir:   resolveWikiRoot(),
+    hypoDir:   resolveHypoRoot(),
     privacy:   'personal',
     hooks:     true,
     codex:     false,
@@ -44,7 +44,7 @@ function parseArgs(argv) {
     dryRun:    false,
   };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir='))   args.wikiDir   = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir='))   args.hypoDir   = expandHome(arg.slice(11));
     else if (arg.startsWith('--privacy=')) args.privacy  = arg.slice(10);
     else if (arg === '--no-hooks')        args.hooks     = false;
     else if (arg === '--codex')           args.codex     = true;
@@ -63,7 +63,7 @@ function log(action, path) { results[action].push(path); }
 
 // ── directory structure ──────────────────────────────────────────────────────
 
-const WIKI_DIRS = ['pages', 'projects', 'sources', 'journal/daily', 'journal/weekly', 'journal/monthly'];
+const HYPO_DIRS = ['pages', 'projects', 'sources', 'journal/daily', 'journal/weekly', 'journal/monthly'];
 
 function ensureDir(dir, dryRun) {
   if (existsSync(dir)) return;
@@ -88,8 +88,8 @@ function copyTemplate(srcName, destPath, dryRun, transform) {
 
 // ── hypo-config.md ───────────────────────────────────────────────────────────
 
-function writeHypoConfig(wikiDir, privacy, dryRun) {
-  const dest = join(wikiDir, 'hypo-config.md');
+function writeHypoConfig(hypoDir, privacy, dryRun) {
+  const dest = join(hypoDir, 'hypo-config.md');
   if (existsSync(dest)) { log('skipped', dest); return; }
   const today = new Date().toISOString().slice(0, 10);
   const src   = join(TEMPLATES, 'hypo-config.md');
@@ -101,7 +101,7 @@ function writeHypoConfig(wikiDir, privacy, dryRun) {
   log('created', dest);
 }
 
-// ── .wikiignore ──────────────────────────────────────────────────────────────
+// ── .hypoignore ──────────────────────────────────────────────────────────────
 
 const SHARED_EXTRA = `
 # shared/public mode: block personal identifiers
@@ -116,10 +116,10 @@ sources/
 drafts/
 `;
 
-function writeWikiignore(wikiDir, privacy, dryRun) {
-  const dest = join(wikiDir, '.wikiignore');
+function writeWikiignore(hypoDir, privacy, dryRun) {
+  const dest = join(hypoDir, '.hypoignore');
   if (existsSync(dest)) { log('skipped', dest); return; }
-  const src  = join(TEMPLATES, '.wikiignore');
+  const src  = join(TEMPLATES, '.hypoignore');
   let content = existsSync(src) ? readFileSync(src, 'utf-8') : '';
   if (privacy === 'shared' || privacy === 'public') content += SHARED_EXTRA;
   if (privacy === 'public') content += PUBLIC_EXTRA;
@@ -277,29 +277,29 @@ function installPkgGitHook(dryRun) {
 
 // ── git setup ────────────────────────────────────────────────────────────────
 
-function git(wikiDir, args, opts = {}) {
-  return spawnSync('git', ['-C', wikiDir, ...args], { encoding: 'utf-8', ...opts });
+function git(hypoDir, args, opts = {}) {
+  return spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', ...opts });
 }
 
-function gitSetup(wikiDir, remote, dryRun) {
-  const isGit = existsSync(join(wikiDir, '.git'));
+function gitSetup(hypoDir, remote, dryRun) {
+  const isGit = existsSync(join(hypoDir, '.git'));
   if (!isGit) {
     if (!dryRun) {
-      const r = spawnSync('git', ['init', wikiDir], { stdio: 'ignore' });
+      const r = spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
       if (r.error || r.status !== 0) {
-        log('errors', `git init failed in ${wikiDir}`);
+        log('errors', `git init failed in ${hypoDir}`);
         return;
       }
     }
-    log('created', join(wikiDir, '.git'));
+    log('created', join(hypoDir, '.git'));
   }
   if (remote) {
-    const existing = git(wikiDir, ['remote', 'get-url', 'origin']);
+    const existing = git(hypoDir, ['remote', 'get-url', 'origin']);
     if (existing.status === 0) {
       const url = existing.stdout.trim();
       if (url !== remote) log('skipped', `remote origin already set to ${url}`);
     } else {
-      if (!dryRun) git(wikiDir, ['remote', 'add', 'origin', remote], { stdio: 'ignore' });
+      if (!dryRun) git(hypoDir, ['remote', 'add', 'origin', remote], { stdio: 'ignore' });
       log('merged', `git remote origin → ${remote}`);
     }
   }
@@ -307,21 +307,21 @@ function gitSetup(wikiDir, remote, dryRun) {
 
 // ── first commit + push ──────────────────────────────────────────────────────
 
-function firstCommit(wikiDir, remote, dryRun) {
-  const logR = git(wikiDir, ['log', '--oneline', '-1']);
+function firstCommit(hypoDir, remote, dryRun) {
+  const logR = git(hypoDir, ['log', '--oneline', '-1']);
   if (logR.status === 0 && logR.stdout.trim()) {
     log('skipped', 'first commit (repo already has commits)');
     return;
   }
   const today = new Date().toISOString().slice(0, 10);
   if (!dryRun) {
-    git(wikiDir, ['add', '-A'], { stdio: 'ignore' });
-    const commitR = git(wikiDir, ['commit', '-m', `chore: init wiki (${today})`]);
+    git(hypoDir, ['add', '-A'], { stdio: 'ignore' });
+    const commitR = git(hypoDir, ['commit', '-m', `chore: init hypomnema (${today})`]);
     if (commitR.status !== 0) { log('errors', 'first commit failed'); return; }
     if (remote) {
-      const actualOrigin = git(wikiDir, ['remote', 'get-url', 'origin']);
+      const actualOrigin = git(hypoDir, ['remote', 'get-url', 'origin']);
       const pushTarget = actualOrigin.status === 0 ? actualOrigin.stdout.trim() : remote;
-      const pushR = git(wikiDir, ['push', '-u', 'origin', 'HEAD']);
+      const pushR = git(hypoDir, ['push', '-u', 'origin', 'HEAD']);
       if (pushR.status !== 0) log('errors', `git push failed: ${(pushR.stderr || '').trim()}`);
       else log('merged', `pushed to ${pushTarget}`);
     }
@@ -337,34 +337,34 @@ const args = parseArgs(process.argv);
 const HOOK_MAP = (args.hooks || args.codex) ? loadHookMap() : null;
 
 // 1. wiki directory structure
-ensureDir(args.wikiDir, args.dryRun);
-for (const d of WIKI_DIRS) ensureDir(join(args.wikiDir, d), args.dryRun);
+ensureDir(args.hypoDir, args.dryRun);
+for (const d of HYPO_DIRS) ensureDir(join(args.hypoDir, d), args.dryRun);
 
 // 2. template files
-copyTemplate('index.md',          join(args.wikiDir, 'index.md'),          args.dryRun);
-copyTemplate('hot.md',            join(args.wikiDir, 'hot.md'),            args.dryRun);
-copyTemplate('log.md',            join(args.wikiDir, 'log.md'),            args.dryRun);
-copyTemplate('SCHEMA.md',         join(args.wikiDir, 'SCHEMA.md'),         args.dryRun);
-copyTemplate('wiki-guide.md',     join(args.wikiDir, 'wiki-guide.md'),     args.dryRun);
-copyTemplate('Home.md',           join(args.wikiDir, 'Home.md'),           args.dryRun);
-copyTemplate('Overview.md',       join(args.wikiDir, 'Overview.md'),       args.dryRun);
-copyTemplate('hypo-help.md',      join(args.wikiDir, 'hypo-help.md'),      args.dryRun);
-copyTemplate('wiki-automation.md',join(args.wikiDir, 'wiki-automation.md'),args.dryRun);
-copyTemplate('session-state.md',  join(args.wikiDir, 'session-state.md'),  args.dryRun);
-copyTemplate(join('pages', '_index.md'), join(args.wikiDir, 'pages', '_index.md'), args.dryRun);
+copyTemplate('index.md',          join(args.hypoDir, 'index.md'),          args.dryRun);
+copyTemplate('hot.md',            join(args.hypoDir, 'hot.md'),            args.dryRun);
+copyTemplate('log.md',            join(args.hypoDir, 'log.md'),            args.dryRun);
+copyTemplate('SCHEMA.md',         join(args.hypoDir, 'SCHEMA.md'),         args.dryRun);
+copyTemplate('hypo-guide.md',     join(args.hypoDir, 'hypo-guide.md'),     args.dryRun);
+copyTemplate('Home.md',           join(args.hypoDir, 'Home.md'),           args.dryRun);
+copyTemplate('Overview.md',       join(args.hypoDir, 'Overview.md'),       args.dryRun);
+copyTemplate('hypo-help.md',      join(args.hypoDir, 'hypo-help.md'),      args.dryRun);
+copyTemplate('hypo-automation.md',join(args.hypoDir, 'hypo-automation.md'),args.dryRun);
+copyTemplate('session-state.md',  join(args.hypoDir, 'session-state.md'),  args.dryRun);
+copyTemplate(join('pages', '_index.md'), join(args.hypoDir, 'pages', '_index.md'), args.dryRun);
 
 // projects/_template structure
-ensureDir(join(args.wikiDir, 'projects', '_template'), args.dryRun);
-ensureDir(join(args.wikiDir, 'projects', '_template', 'decisions'), args.dryRun);
-ensureDir(join(args.wikiDir, 'projects', '_template', 'session-log'), args.dryRun);
-copyTemplate(join('projects', '_template', 'hot.md'),          join(args.wikiDir, 'projects', '_template', 'hot.md'),          args.dryRun);
-copyTemplate(join('projects', '_template', 'index.md'),        join(args.wikiDir, 'projects', '_template', 'index.md'),        args.dryRun);
-copyTemplate(join('projects', '_template', 'prd.md'),          join(args.wikiDir, 'projects', '_template', 'prd.md'),          args.dryRun);
-copyTemplate(join('projects', '_template', 'session-state.md'),join(args.wikiDir, 'projects', '_template', 'session-state.md'),args.dryRun);
+ensureDir(join(args.hypoDir, 'projects', '_template'), args.dryRun);
+ensureDir(join(args.hypoDir, 'projects', '_template', 'decisions'), args.dryRun);
+ensureDir(join(args.hypoDir, 'projects', '_template', 'session-log'), args.dryRun);
+copyTemplate(join('projects', '_template', 'hot.md'),          join(args.hypoDir, 'projects', '_template', 'hot.md'),          args.dryRun);
+copyTemplate(join('projects', '_template', 'index.md'),        join(args.hypoDir, 'projects', '_template', 'index.md'),        args.dryRun);
+copyTemplate(join('projects', '_template', 'prd.md'),          join(args.hypoDir, 'projects', '_template', 'prd.md'),          args.dryRun);
+copyTemplate(join('projects', '_template', 'session-state.md'),join(args.hypoDir, 'projects', '_template', 'session-state.md'),args.dryRun);
 
-// 3. hypo-config.md + .wikiignore
-writeHypoConfig(args.wikiDir, args.privacy, args.dryRun);
-writeWikiignore(args.wikiDir, args.privacy, args.dryRun);
+// 3. hypo-config.md + .hypoignore
+writeHypoConfig(args.hypoDir, args.privacy, args.dryRun);
+writeWikiignore(args.hypoDir, args.privacy, args.dryRun);
 
 // 4. hooks
 
@@ -384,7 +384,7 @@ if (args.codex) {
 
 // 6. git setup
 if (args.gitInit) {
-  gitSetup(args.wikiDir, args.gitRemote, args.dryRun);
+  gitSetup(args.hypoDir, args.gitRemote, args.dryRun);
 }
 
 // 7. pkg repo git hook (auto-sync hooks/ → ~/.claude/hooks/ on commit)
@@ -394,7 +394,7 @@ if (args.hooks) {
 
 // 8. first commit + push
 if (args.gitInit) {
-  firstCommit(args.wikiDir, args.gitRemote, args.dryRun);
+  firstCommit(args.hypoDir, args.gitRemote, args.dryRun);
 }
 
 // ── report ───────────────────────────────────────────────────────────────────

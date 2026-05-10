@@ -6,14 +6,14 @@
  * the Anthropic API. Intended for nightly CI runs.
  *
  * Usage:
- *   node scripts/lint-llm.mjs --wiki-dir=<path> [--model=haiku] [--json]
+ *   node scripts/lint-llm.mjs --hypo-dir=<path> [--model=haiku] [--json]
  *
  * Requires: ANTHROPIC_API_KEY environment variable
  */
 
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import { join, extname } from 'path';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 
 const MODEL_ALIASES = {
   haiku:  'claude-haiku-4-5-20251001',
@@ -35,13 +35,13 @@ PAGE:
 ${content}`;
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, model: 'haiku', json: false };
+  const args = { hypoDir: null, model: 'haiku', json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir='))  args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir='))  args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--model=')) args.model   = arg.slice(8);
     else if (arg === '--json')           args.json    = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -102,7 +102,7 @@ if (!apiKey) {
 }
 
 const modelId = MODEL_ALIASES[args.model] ?? args.model;
-const pages = collectMdFiles(join(args.wikiDir, 'pages'));
+const pages = collectMdFiles(join(args.hypoDir, 'pages'));
 
 if (!args.json) console.log(`Evaluating ${pages.length} pages with ${modelId}…`);
 
@@ -128,7 +128,7 @@ for (const filePath of pages) {
 const summary = {
   ok: errors === 0,
   model: modelId,
-  wiki_dir: args.wikiDir,
+  wiki_dir: args.hypoDir,
   page_count: pages.length,
   error_count: errors,
   results,

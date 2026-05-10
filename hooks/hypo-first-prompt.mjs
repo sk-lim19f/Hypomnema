@@ -14,7 +14,7 @@
 import { readFileSync, unlinkSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { buildOutput } from './wiki-shared.mjs';
+import { buildOutput } from './hypo-shared.mjs';
 
 const MARKER_TTL = 10 * 60 * 1000; // 10 min
 

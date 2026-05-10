@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from 'fs';
 import { join, relative, basename } from 'path';
 
-export function loadWikiIgnore(wikiDir) {
-  const ignorePath = join(wikiDir, '.wikiignore');
+export function loadHypoIgnore(hypoDir) {
+  const ignorePath = join(hypoDir, '.hypoignore');
   if (!existsSync(ignorePath)) return [];
   return readFileSync(ignorePath, 'utf-8')
     .split('\n')
@@ -21,8 +21,8 @@ function globToRegex(glob) {
   + '$');
 }
 
-export function isIgnored(filePath, wikiDir, patterns) {
-  const rel = relative(wikiDir, filePath).replace(/\\/g, '/');
+export function isIgnored(filePath, hypoDir, patterns) {
+  const rel = relative(hypoDir, filePath).replace(/\\/g, '/');
   const base = basename(filePath);
 
   for (const pattern of patterns) {

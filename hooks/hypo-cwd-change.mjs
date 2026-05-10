@@ -9,10 +9,10 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { WIKI_DIR, buildOutput } from './wiki-shared.mjs';
+import { HYPO_DIR, buildOutput } from './hypo-shared.mjs';
 
-const PROJECTS_DIR = join(WIKI_DIR, 'projects');
-const GLOBAL_HOT   = join(WIKI_DIR, 'hot.md');
+const PROJECTS_DIR = join(HYPO_DIR, 'projects');
+const GLOBAL_HOT   = join(HYPO_DIR, 'hot.md');
 const MAX_CHARS    = 3000;
 
 function parseFrontmatterField(content, key) {

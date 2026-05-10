@@ -12,9 +12,9 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { WIKI_DIR } from './wiki-shared.mjs';
+import { HYPO_DIR } from './hypo-shared.mjs';
 
-const HOT_PATH = join(WIKI_DIR, 'hot.md');
+const HOT_PATH = join(HYPO_DIR, 'hot.md');
 
 function parseFrontmatter(content) {
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -28,7 +28,7 @@ function parseFrontmatter(content) {
 }
 
 function getProjectDate(slug) {
-  const hotPath = join(WIKI_DIR, 'projects', slug, 'hot.md');
+  const hotPath = join(HYPO_DIR, 'projects', slug, 'hot.md');
   if (!existsSync(hotPath)) return null;
   try {
     return parseFrontmatter(readFileSync(hotPath, 'utf-8')).updated || null;

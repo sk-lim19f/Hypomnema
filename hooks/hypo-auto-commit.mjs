@@ -6,10 +6,10 @@
  */
 
 import { spawnSync } from 'child_process';
-import { WIKI_DIR } from './wiki-shared.mjs';
+import { HYPO_DIR } from './hypo-shared.mjs';
 
 function git(...args) {
-  return spawnSync('git', ['-C', WIKI_DIR, ...args], { encoding: 'utf-8', timeout: 30000 });
+  return spawnSync('git', ['-C', HYPO_DIR, ...args], { encoding: 'utf-8', timeout: 30000 });
 }
 
 function hasRemote() {

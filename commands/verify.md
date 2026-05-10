@@ -16,7 +16,7 @@ You are running `/hypo:verify`. Audit wiki pages for overdue or missing `verify_
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
 ```bash
-node <package-root>/scripts/verify.mjs [--wiki-dir="<path>"] [--file=<path>]
+node <package-root>/scripts/verify.mjs [--hypo-dir="<path>"] [--file=<path>]
 ```
 
 Options:

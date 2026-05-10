@@ -10,7 +10,7 @@
  *   node scripts/upgrade.mjs [options]
  *
  * Options:
- *   --wiki-dir=<path>   Wiki root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/wiki)
+ *   --hypo-dir=<path>   Hypomnema root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/hypomnema)
  *   --apply             Apply hook file updates and settings.json merges
  *   --json              Output results as JSON
  */
@@ -19,7 +19,7 @@ import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync } from
 import { join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { resolveWikiRoot, expandHome } from './lib/wiki-root.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 
 const HOME       = homedir();
@@ -31,13 +31,13 @@ const TEMPLATES  = join(PKG_ROOT, 'templates');
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { wikiDir: null, apply: false, json: false };
+  const args = { hypoDir: null, apply: false, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--wiki-dir=')) args.wikiDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--apply')        args.apply = true;
     else if (arg === '--json')         args.json  = true;
   }
-  if (!args.wikiDir) args.wikiDir = resolveWikiRoot();
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
 
@@ -133,22 +133,22 @@ const SHARED_FILES = _hookConfig.shared ?? [];
 
 // ── checks ───────────────────────────────────────────────────────────────────
 
-function checkSchemaVersion(wikiDir) {
+function checkSchemaVersion(hypoDir) {
   const pkgPath  = join(TEMPLATES, 'SCHEMA.md');
-  const wikiPath = join(wikiDir, 'SCHEMA.md');
+  const hypoPath = join(hypoDir, 'SCHEMA.md');
 
   const pkgVersion  = existsSync(pkgPath)
     ? parseVersion((parseFrontmatter(readFileSync(pkgPath, 'utf-8')) ?? {}).version)
     : null;
-  const wikiVersion = existsSync(wikiPath)
-    ? parseVersion((parseFrontmatter(readFileSync(wikiPath, 'utf-8')) ?? {}).version)
+  const hypoVersion = existsSync(hypoPath)
+    ? parseVersion((parseFrontmatter(readFileSync(hypoPath, 'utf-8')) ?? {}).version)
     : null;
 
   return {
-    installed: wikiVersion?.raw ?? null,
+    installed: hypoVersion?.raw ?? null,
     current:   pkgVersion?.raw  ?? null,
-    bump:      bumpType(wikiVersion, pkgVersion),
-    wikiPath,
+    bump:      bumpType(hypoVersion, pkgVersion),
+    hypoPath,
     pkgPath,
   };
 }
@@ -245,10 +245,82 @@ function applySettingsJson(settingsResults) {
   return applied;
 }
 
-function writeMigrationReport(wikiDir, fromVersion, toVersion) {
+// Rename map: old wiki-*.mjs → new hypo-*.mjs
+const HOOK_RENAMES = {
+  'wiki-session-start.mjs':  'hypo-session-start.mjs',
+  'wiki-first-prompt.mjs':   'hypo-first-prompt.mjs',
+  'wiki-lookup.mjs':         'hypo-lookup.mjs',
+  'wiki-compact-guard.mjs':  'hypo-compact-guard.mjs',
+  'wiki-auto-stage.mjs':     'hypo-auto-stage.mjs',
+  'wiki-hot-rebuild.mjs':    'hypo-hot-rebuild.mjs',
+  'wiki-auto-commit.mjs':    'hypo-auto-commit.mjs',
+  'wiki-cwd-change.mjs':     'hypo-cwd-change.mjs',
+  'wiki-file-watch.mjs':     'hypo-file-watch.mjs',
+  'wiki-shared.mjs':         'hypo-shared.mjs',
+  'personal-wiki-check.mjs': 'hypo-personal-check.mjs',
+};
+
+function checkOldHookNames() {
+  const settingsPath = join(HOME, '.claude', 'settings.json');
+  if (!existsSync(settingsPath)) return [];
+  let settings;
+  try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')); } catch { return []; }
+
+  const found = [];
+  for (const [event, groups] of Object.entries(settings.hooks || {})) {
+    for (const group of (Array.isArray(groups) ? groups : [])) {
+      for (const hook of (group.hooks || [])) {
+        const cmd = hook.command || '';
+        for (const oldName of Object.keys(HOOK_RENAMES)) {
+          if (cmd.includes(oldName)) found.push({ event, oldName, cmd });
+        }
+      }
+    }
+  }
+  return found;
+}
+
+function applyHookNameMigration(oldRefs) {
+  const settingsPath = join(HOME, '.claude', 'settings.json');
+  const hooksDir     = join(HOME, '.claude', 'hooks');
+  if (!existsSync(settingsPath)) return [];
+
+  let settings;
+  try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')); } catch { return []; }
+
+  const applied = [];
+  for (const [event, groups] of Object.entries(settings.hooks || {})) {
+    for (const group of (Array.isArray(groups) ? groups : [])) {
+      for (const hook of (group.hooks || [])) {
+        for (const [oldName, newName] of Object.entries(HOOK_RENAMES)) {
+          if ((hook.command || '').includes(oldName)) {
+            hook.command = hook.command.replace(oldName, newName);
+            applied.push(`${event}: ${oldName} → ${newName}`);
+          }
+        }
+      }
+    }
+  }
+
+  if (applied.length > 0) {
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    // Copy renamed hook files to ~/.claude/hooks/
+    for (const [oldName, newName] of Object.entries(HOOK_RENAMES)) {
+      const oldPath = join(hooksDir, oldName);
+      const newPath = join(hooksDir, newName);
+      const srcPath = join(HOOKS_SRC, newName);
+      if (existsSync(oldPath) && !existsSync(newPath) && existsSync(srcPath)) {
+        copyFileSync(srcPath, newPath);
+      }
+    }
+  }
+  return applied;
+}
+
+function writeMigrationReport(hypoDir, fromVersion, toVersion) {
   const today    = new Date().toISOString().slice(0, 10);
   const filename = `MIGRATION-v${toVersion}.md`;
-  const dest     = join(wikiDir, filename);
+  const dest     = join(hypoDir, filename);
 
   // Don't overwrite an existing report
   if (existsSync(dest)) return dest;
@@ -257,7 +329,7 @@ function writeMigrationReport(wikiDir, fromVersion, toVersion) {
 title: Migration Report — v${fromVersion} → v${toVersion}
 type: reference
 updated: ${today}
-tags: [wiki, migration, schema]
+tags: [hypomnema, migration, schema]
 ---
 
 # Migration Report: v${fromVersion} → v${toVersion}
@@ -302,10 +374,11 @@ function checkPkgJson() {
 
 const args = parseArgs(process.argv);
 
-const schema   = checkSchemaVersion(args.wikiDir);
+const schema   = checkSchemaVersion(args.hypoDir);
 const hooks    = checkHookFiles();
 const settings = checkSettingsJson();
 const pkgJson  = checkPkgJson();
+const oldHookRefs = checkOldHookNames();
 
 const staleHooks      = hooks.filter(h => h.status === 'stale' || h.status === 'missing' || h.status === 'src-missing');
 const missingSettings = settings.filter(s => s.status === 'missing');
@@ -313,14 +386,18 @@ const invalidSettings = settings.some(s => s.status === 'invalid-json');
 const schemaDrift     = schema.bump !== 'none' && schema.bump !== 'unknown' && schema.bump !== 'ahead';
 const pkgJsonDrift    = pkgJson.status !== 'up-to-date';
 
-let migrationPath    = null;
-let appliedHooks     = [];
-let appliedSettings  = [];
-let appliedPkgJson   = false;
+let migrationPath        = null;
+let appliedHooks         = [];
+let appliedSettings      = [];
+let appliedPkgJson       = false;
+let appliedHookNameRenames = [];
 
 if (args.apply) {
-  if (schema.bump === 'major' && schema.installed && schema.current && existsSync(args.wikiDir)) {
-    migrationPath = writeMigrationReport(args.wikiDir, schema.installed, schema.current);
+  if (oldHookRefs.length > 0) {
+    appliedHookNameRenames = applyHookNameMigration(oldHookRefs);
+  }
+  if (schema.bump === 'major' && schema.installed && schema.current && existsSync(args.hypoDir)) {
+    migrationPath = writeMigrationReport(args.hypoDir, schema.installed, schema.current);
   }
   appliedHooks    = applyHookFiles(hooks);
   appliedSettings = applySettingsJson(settings);
@@ -331,7 +408,7 @@ if (args.apply) {
 
 // ── output ───────────────────────────────────────────────────────────────────
 
-const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings || pkgJsonDrift;
+const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings || pkgJsonDrift || oldHookRefs.length > 0;
 
 if (args.json) {
   console.log(JSON.stringify({
@@ -339,7 +416,8 @@ if (args.json) {
     hooks,
     settings,
     pkgJson,
-    applied: { hooks: appliedHooks, settings: appliedSettings, pkgJson: appliedPkgJson },
+    oldHookRefs,
+    applied: { hooks: appliedHooks, settings: appliedSettings, pkgJson: appliedPkgJson, hookNameRenames: appliedHookNameRenames },
     migrationReport: migrationPath,
   }, null, 2));
   process.exit(hasDrift && !args.apply ? 1 : 0);
@@ -408,6 +486,14 @@ if (pkgJson.status === 'up-to-date') {
   lines.push(`✗ Package metadata  hypo-pkg.json missing — run --apply to install`);
 }
 
+// Old hook names (wiki-*.mjs → hypo-*.mjs rename migration)
+if (oldHookRefs.length > 0) {
+  lines.push(`⚠ Hook name migration  ${oldHookRefs.length} old wiki-*.mjs reference(s) in settings.json — run --apply to rename:`);
+  for (const r of oldHookRefs) lines.push(`    ${r.event}: ${r.oldName} → ${HOOK_RENAMES[r.oldName]}`);
+} else {
+  lines.push(`✓ Hook names        All hook references use current hypo-*.mjs names`);
+}
+
 // Migration report notice
 if (migrationPath) {
   lines.push('');
@@ -416,8 +502,12 @@ if (migrationPath) {
 }
 
 // Applied actions
-if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson) {
+if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson || appliedHookNameRenames.length > 0) {
   lines.push('');
+  if (appliedHookNameRenames.length > 0) {
+    lines.push(`✓ Renamed legacy hook references (${appliedHookNameRenames.length}):`);
+    for (const r of appliedHookNameRenames) lines.push(`    → ${r}`);
+  }
   if (appliedHooks.length > 0) {
     lines.push(`✓ Updated hook files (${appliedHooks.length}):`);
     for (const f of appliedHooks) lines.push(`    → ${f}`);
@@ -433,11 +523,11 @@ if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson) {
 
 // Summary
 lines.push('');
-const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0) + (pkgJsonDrift ? 1 : 0);
+const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0) + (pkgJsonDrift ? 1 : 0) + oldHookRefs.length;
 if (totalDrift === 0) {
-  lines.push('Result: wiki is up to date');
+  lines.push('Result: Hypomnema is up to date');
 } else if (args.apply) {
-  const total = appliedHooks.length + appliedSettings.length + (appliedPkgJson ? 1 : 0);
+  const total = appliedHooks.length + appliedSettings.length + (appliedPkgJson ? 1 : 0) + appliedHookNameRenames.length;
   lines.push(`Result: ${total} update(s) applied. Run /hypo:doctor to verify.`);
 } else {
   lines.push(`Result: ${totalDrift} item(s) need updating — run with --apply to install`);

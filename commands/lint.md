@@ -18,14 +18,14 @@ You are running `/hypo:lint`. Validate all wiki pages for frontmatter correctnes
 
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
-If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/wiki`.
+If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag and the script resolves the Hypomnema root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
 
 ---
 
 ## Step 2 — Run lint
 
 ```bash
-node <package-root>/scripts/lint.mjs [--wiki-dir="<path>"] [--json] [--fix]
+node <package-root>/scripts/lint.mjs [--hypo-dir="<path>"] [--json] [--fix]
 ```
 
 Options:
@@ -38,7 +38,7 @@ Show the output verbatim.
 
 ## Step 3 — Interpret results
 
-- `✓ No lint issues found` — wiki is clean
+- `✓ No lint issues found` — Hypomnema is clean
 - `✗ <file>: <message>` — error (missing required field or malformed frontmatter); must be fixed
 - `⚠ <file>: <message>` — warning (unknown type, missing `updated`, broken link); worth fixing
 
