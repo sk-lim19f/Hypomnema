@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420" role="img" aria-label="Hypomnema — dev.to cover">
+  <title>Hypomnema — dev.to cover</title>
+
+  <defs>
+    <radialGradient id="parchment2" cx="35%" cy="40%" r="80%">
+      <stop offset="0%"  stop-color="#FFFBEB"/>
+      <stop offset="70%" stop-color="#FEF3C7"/>
+      <stop offset="100%" stop-color="#FDE68A"/>
+    </radialGradient>
+  </defs>
+  <rect width="1000" height="420" fill="url(#parchment2)"/>
+
+  <!-- Subtle manuscript rules -->
+  <g stroke="#92400E" stroke-opacity="0.06" stroke-width="1">
+    <line x1="0" y1="120" x2="1000" y2="120"/>
+    <line x1="0" y1="180" x2="1000" y2="180"/>
+    <line x1="0" y1="240" x2="1000" y2="240"/>
+    <line x1="0" y1="300" x2="1000" y2="300"/>
+  </g>
+
+  <!-- Logo mark left -->
+  <g transform="translate(64 84) scale(0.4882)">
+    <g fill="#171717">
+      <rect x="104" y="112" width="56" height="288"/>
+      <rect x="84"  y="104" width="96" height="16"/>
+      <rect x="80"  y="100" width="104" height="6"/>
+      <rect x="84"  y="392" width="96" height="16"/>
+      <rect x="80"  y="406" width="104" height="6"/>
+      <rect x="352" y="112" width="56" height="288"/>
+      <rect x="332" y="104" width="96" height="16"/>
+      <rect x="328" y="100" width="104" height="6"/>
+      <rect x="332" y="392" width="96" height="16"/>
+      <rect x="328" y="406" width="104" height="6"/>
+    </g>
+    <g transform="translate(160 208)">
+      <ellipse cx="96" cy="80" rx="130" ry="16" fill="#F59E0B" fill-opacity="0.22"/>
+      <path d="M 4 26 L 96 12 L 96 86 L 4 96 Z"   fill="#F59E0B" stroke="#171717" stroke-width="4" stroke-linejoin="round"/>
+      <path d="M 188 26 L 96 12 L 96 86 L 188 96 Z" fill="#F59E0B" stroke="#171717" stroke-width="4" stroke-linejoin="round"/>
+      <line x1="96" y1="12" x2="96" y2="86" stroke="#171717" stroke-width="4" stroke-linecap="round"/>
+      <g stroke="#171717" stroke-opacity="0.55" stroke-width="2.5" stroke-linecap="round">
+        <line x1="22"  y1="42" x2="84"  y2="32"/>
+        <line x1="22"  y1="56" x2="84"  y2="46"/>
+        <line x1="22"  y1="70" x2="68"  y2="62"/>
+        <line x1="108" y1="32" x2="170" y2="42"/>
+        <line x1="108" y1="46" x2="170" y2="56"/>
+        <line x1="108" y1="62" x2="156" y2="70"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- Text right -->
+  <g font-family="Georgia, 'Times New Roman', 'Noto Serif KR', serif" fill="#171717">
+    <text x="340" y="195" font-size="72" font-weight="700" letter-spacing="-1.2">Hypomnema</text>
+    <text x="342" y="232" font-size="20" font-weight="400" fill-opacity="0.78">
+      LLM-native personal wiki for Claude Code
+    </text>
+
+    <text x="342" y="296" font-size="22" font-weight="600" font-style="italic">
+      Don&#39;t take notes. Let Claude synthesize them.
+    </text>
+    <rect x="342" y="306" width="416" height="3" fill="#F59E0B"/>
+
+    <g transform="translate(342 332)">
+      <rect width="280" height="36" rx="6" fill="#171717"/>
+      <text x="16" y="24" font-size="16" font-weight="500" fill="#FFFBEB" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace">
+        npm install -g hypomnema
+      </text>
+    </g>
+  </g>
+</svg>

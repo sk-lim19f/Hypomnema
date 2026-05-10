@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="160" viewBox="0 0 720 160" role="img" aria-label="Hypomnema wordmark">
+  <title>Hypomnema — LLM-native personal wiki</title>
+
+  <!-- Mark: scaled-down H + book -->
+  <g transform="translate(20 20) scale(0.234375)">
+    <!-- (matches main logo geometry, 512→120 effective) -->
+    <rect width="512" height="512" rx="96" fill="#FFFBEB"/>
+
+    <!-- pillars -->
+    <g fill="#171717">
+      <rect x="104" y="112" width="56" height="288"/>
+      <rect x="84"  y="104" width="96" height="16"/>
+      <rect x="80"  y="100" width="104" height="6"/>
+      <rect x="84"  y="392" width="96" height="16"/>
+      <rect x="80"  y="406" width="104" height="6"/>
+      <rect x="352" y="112" width="56" height="288"/>
+      <rect x="332" y="104" width="96" height="16"/>
+      <rect x="328" y="100" width="104" height="6"/>
+      <rect x="332" y="392" width="96" height="16"/>
+      <rect x="328" y="406" width="104" height="6"/>
+    </g>
+
+    <!-- book -->
+    <g transform="translate(160 208)">
+      <ellipse cx="96" cy="80" rx="120" ry="14" fill="#F59E0B" fill-opacity="0.18"/>
+      <path d="M 4 26 L 96 12 L 96 86 L 4 96 Z"   fill="#F59E0B" stroke="#171717" stroke-width="4" stroke-linejoin="round"/>
+      <path d="M 188 26 L 96 12 L 96 86 L 188 96 Z" fill="#F59E0B" stroke="#171717" stroke-width="4" stroke-linejoin="round"/>
+      <line x1="96" y1="12" x2="96" y2="86" stroke="#171717" stroke-width="4" stroke-linecap="round"/>
+      <g stroke="#171717" stroke-opacity="0.55" stroke-width="2.5" stroke-linecap="round">
+        <line x1="22"  y1="42" x2="84"  y2="32"/>
+        <line x1="22"  y1="56" x2="84"  y2="46"/>
+        <line x1="22"  y1="70" x2="68"  y2="62"/>
+        <line x1="108" y1="32" x2="170" y2="42"/>
+        <line x1="108" y1="46" x2="170" y2="56"/>
+        <line x1="108" y1="62" x2="156" y2="70"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- Wordmark text -->
+  <g font-family="Georgia, 'Times New Roman', 'Noto Serif KR', serif" fill="#171717">
+    <text x="172" y="92" font-size="64" font-weight="700" letter-spacing="-1">Hypomnema</text>
+    <text x="174" y="124" font-size="20" font-weight="400" fill-opacity="0.7" letter-spacing="0.5">
+      LLM-native personal wiki for Claude Code
+    </text>
+  </g>
+</svg>

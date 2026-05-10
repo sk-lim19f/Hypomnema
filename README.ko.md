@@ -1,5 +1,9 @@
 [English](README.md) | 한국어
 
+<p align="center">
+  <img src="docs/assets/logo/wordmark.svg" alt="Hypomnema" width="520">
+</p>
+
 # Hypomnema
 
 [![npm version](https://img.shields.io/npm/v/hypomnema?color=cb3837)](https://www.npmjs.com/package/hypomnema)

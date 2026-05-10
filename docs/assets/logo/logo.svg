@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Hypomnema logo">
+  <title>Hypomnema</title>
+  <desc>Greek capital H as classical pillars, with an open Memex book as the crossbar.</desc>
+
+  <!-- Parchment background -->
+  <rect width="512" height="512" rx="96" fill="#FFFBEB"/>
+
+  <!-- Subtle inner border -->
+  <rect x="16" y="16" width="480" height="480" rx="80" fill="none" stroke="#171717" stroke-opacity="0.08" stroke-width="2"/>
+
+  <!-- Left pillar (Greek H, classical serif) -->
+  <g fill="#171717">
+    <!-- shaft -->
+    <rect x="104" y="112" width="56" height="288"/>
+    <!-- top serif -->
+    <rect x="84" y="104" width="96" height="16"/>
+    <rect x="80" y="100" width="104" height="6"/>
+    <!-- bottom serif -->
+    <rect x="84" y="392" width="96" height="16"/>
+    <rect x="80" y="406" width="104" height="6"/>
+  </g>
+
+  <!-- Right pillar -->
+  <g fill="#171717">
+    <rect x="352" y="112" width="56" height="288"/>
+    <rect x="332" y="104" width="96" height="16"/>
+    <rect x="328" y="100" width="104" height="6"/>
+    <rect x="332" y="392" width="96" height="16"/>
+    <rect x="328" y="406" width="104" height="6"/>
+  </g>
+
+  <!-- Open Memex book as crossbar -->
+  <g transform="translate(160 208)">
+    <!-- Soft amber glow under book (knowledge halo) -->
+    <ellipse cx="96" cy="80" rx="120" ry="14" fill="#F59E0B" fill-opacity="0.18"/>
+
+    <!-- Left page -->
+    <path d="M 4 26 L 96 12 L 96 86 L 4 96 Z"
+          fill="#F59E0B" stroke="#171717" stroke-width="4" stroke-linejoin="round"/>
+    <!-- Right page -->
+    <path d="M 188 26 L 96 12 L 96 86 L 188 96 Z"
+          fill="#F59E0B" stroke="#171717" stroke-width="4" stroke-linejoin="round"/>
+    <!-- Center spine -->
+    <line x1="96" y1="12" x2="96" y2="86" stroke="#171717" stroke-width="4" stroke-linecap="round"/>
+
+    <!-- Manuscript lines, left page -->
+    <g stroke="#171717" stroke-opacity="0.55" stroke-width="2.5" stroke-linecap="round">
+      <line x1="22" y1="42" x2="84" y2="32"/>
+      <line x1="22" y1="56" x2="84" y2="46"/>
+      <line x1="22" y1="70" x2="68"  y2="62"/>
+    </g>
+
+    <!-- Manuscript lines, right page -->
+    <g stroke="#171717" stroke-opacity="0.55" stroke-width="2.5" stroke-linecap="round">
+      <line x1="108" y1="32" x2="170" y2="42"/>
+      <line x1="108" y1="46" x2="170" y2="56"/>
+      <line x1="108" y1="62" x2="156" y2="70"/>
+    </g>
+  </g>
+</svg>
