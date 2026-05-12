@@ -30,7 +30,7 @@ jobs:
             'type: concept' \
             'updated: 2026-01-01' \
             'verify_by: Is this fixture still accurate?' \
-            'verify_by_date: 2026-01-01' \
+            'verify_by_date: 2099-12-31' \
             '---' \
             '# Verify Fixture' \
             'A synthetic fixture used by nightly verify-pages CI.' \
