@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-marketplace.json",
+  "name": "hypomnema",
+  "description": "LLM-native personal wiki system for Claude Code — session-aware knowledge base with hooks, slash commands, and a synthesis pipeline.",
+  "owner": {
+    "name": "sk-lim19f",
+    "email": "limsangkyu0219@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "hypomnema",
+      "source": "./",
+      "description": "LLM-native personal wiki — session-aware knowledge base for Claude Code",
+      "version": "1.0.0",
+      "homepage": "https://github.com/sk-lim19f/Hypomnema"
+    }
+  ]
+}

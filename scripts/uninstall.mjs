@@ -14,22 +14,67 @@
  *   --hooks-dir=<path>   Override Claude hooks directory (default: ~/.claude/hooks)
  */
 
-import { existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, rmSync, rmdirSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
+import { readPkgJson as readPkgJsonSafe, sha256, isRegularFile, readFileIfRegular } from './lib/pkg-json.mjs';
 
 const HOME       = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const PKG_ROOT   = join(SCRIPT_DIR, '..');
 
+function removeCommands(apply, force) {
+  const targetDir = join(HOME, '.claude', 'commands', 'hypo');
+  const pkgPath   = join(HOME, '.claude', 'hypo-pkg.json');
+  if (!existsSync(targetDir)) return { removed: [], skippedUserModified: [], skippedNonRegular: [] };
+
+  const recorded = readPkgJsonSafe(pkgPath).commands || {};
+  const removed = [];
+  const skippedUserModified = [];
+  const skippedNonRegular = [];
+
+  for (const file of readdirSync(targetDir)) {
+    if (!file.endsWith('.md')) continue;
+    const fullPath = join(targetDir, file);
+    const recordedSHA = recorded[file];
+    if (!recordedSHA) continue; // wasn't installed by us — leave alone
+
+    if (!isRegularFile(fullPath)) {
+      // Refuse to follow symlinks during destructive ops.
+      skippedNonRegular.push(fullPath);
+      continue;
+    }
+    const buf = readFileIfRegular(fullPath);
+    const sha = buf ? sha256(buf) : null;
+
+    if (sha === recordedSHA || force) {
+      if (apply) rmSync(fullPath);
+      removed.push(fullPath);
+    } else {
+      // User-modified tracked command — preserve unless --force.
+      skippedUserModified.push(fullPath);
+    }
+  }
+
+  // Remove the hypo/ dir only if it ends up empty.
+  if (apply && existsSync(targetDir)) {
+    try {
+      const remaining = readdirSync(targetDir);
+      if (remaining.length === 0) rmdirSync(targetDir);
+    } catch {}
+  }
+  return { removed, skippedUserModified, skippedNonRegular };
+}
+
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { apply: false, codex: false, hooksDir: null };
+  const args = { apply: false, codex: false, hooksDir: null, forceCommands: false };
   for (const arg of argv.slice(2)) {
     if (arg === '--apply')                 args.apply    = true;
     else if (arg === '--codex')            args.codex    = true;
+    else if (arg === '--force-commands')   args.forceCommands = true;
     else if (arg.startsWith('--hooks-dir=')) args.hooksDir = arg.slice(12);
   }
   return args;
@@ -157,6 +202,16 @@ const claudeSettings  = join(HOME, '.claude', 'settings.json');
 
 const hookResult     = removeHookFiles(claudeHooksDir, hookFiles, args.apply);
 const settingsResult = stripSettingsJson(claudeSettings, claudeHooksDir, hookMap, args.apply);
+const commandResult  = removeCommands(args.apply, args.forceCommands);
+
+// pkg.json metadata file removal — only when no user-modified commands remain on disk.
+const pkgJsonPath = join(HOME, '.claude', 'hypo-pkg.json');
+let pkgJsonRemoved = null;
+const keepPkgJson = commandResult.skippedUserModified.length > 0 || commandResult.skippedNonRegular.length > 0;
+if (existsSync(pkgJsonPath) && !keepPkgJson) {
+  if (args.apply) rmSync(pkgJsonPath);
+  pkgJsonRemoved = pkgJsonPath;
+}
 
 let codexHookResult     = { removed: [], missing: [] };
 let codexSettingsResult = { stripped: [] };
@@ -177,11 +232,16 @@ const allRemoved = [...hookResult.removed, ...codexHookResult.removed];
 const allStripped = [...settingsResult.stripped, ...codexSettingsResult.stripped];
 
 if (allRemoved.length)  lines.push(`✓ Hook files ${dryRun ? 'to remove' : 'removed'} (${allRemoved.length}):\n${allRemoved.map(p => `  ${p}`).join('\n')}`);
+if (commandResult.removed.length) lines.push(`✓ Slash commands ${dryRun ? 'to remove' : 'removed'} (${commandResult.removed.length}):\n${commandResult.removed.map(p => `  ${p}`).join('\n')}`);
+if (commandResult.skippedUserModified.length) lines.push(`⊘ Slash commands preserved (user-modified, ${commandResult.skippedUserModified.length}) — pass --force-commands to remove anyway:\n${commandResult.skippedUserModified.map(p => `  ${p}`).join('\n')}`);
+if (commandResult.skippedNonRegular.length) lines.push(`⊘ Slash commands skipped (non-regular file, ${commandResult.skippedNonRegular.length}) — refusing to follow symlinks:\n${commandResult.skippedNonRegular.map(p => `  ${p}`).join('\n')}`);
 if (allStripped.length) lines.push(`✓ settings.json entries ${dryRun ? 'to remove' : 'removed'} (${allStripped.length}):\n${allStripped.map(p => `  ${p}`).join('\n')}`);
+if (pkgJsonRemoved)     lines.push(`✓ Package metadata ${dryRun ? 'to remove' : 'removed'}: ${pkgJsonRemoved}`);
+if (keepPkgJson && !pkgJsonRemoved && existsSync(pkgJsonPath)) lines.push(`⊘ Package metadata preserved (${pkgJsonPath}) — user-modified or non-regular commands still tracked`);
 if (hookResult.missing.length) lines.push(`⊘ Already absent (${hookResult.missing.length}):\n${hookResult.missing.map(p => `  ${p}`).join('\n')}`);
 if (settingsResult.error) lines.push(`⚠ ${settingsResult.error}`);
 
-if (!allRemoved.length && !allStripped.length && !hookResult.missing.length) {
+if (!allRemoved.length && !allStripped.length && !hookResult.missing.length && !commandResult.removed.length && !pkgJsonRemoved && !commandResult.skippedUserModified.length) {
   lines.push('Nothing to uninstall — Hypomnema does not appear to be installed.');
 }
 

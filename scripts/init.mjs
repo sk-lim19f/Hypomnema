@@ -11,6 +11,8 @@
  * Options:
  *   --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
  *   --no-hooks             Skip hook installation
+ *   --no-commands          Skip slash command installation to ~/.claude/commands/hypo/
+ *   --force-commands       Overwrite user-modified slash command files (creates .bak)
  *   --codex                Also install Codex hooks (~/.codex/hooks/)
  *   --git-remote=<url>     Git remote URL
  *   --no-git-init          Skip git initialization
@@ -19,18 +21,27 @@
  *   --help, -h             Show this help message
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync, renameSync, unlinkSync } from 'fs';
 import { join, basename } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
 import { expandHome, resolveHypoRoot } from './lib/hypo-root.mjs';
+import { readPkgJson as readPkgJsonSafe, writePkgJsonAtomic, sha256 as sha256Buf, isRegularFile, readFileIfRegular } from './lib/pkg-json.mjs';
 
-const HOME     = homedir();
+const HOME       = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const PKG_ROOT   = join(SCRIPT_DIR, '..');
-const HOOKS_SRC  = join(PKG_ROOT, 'hooks');
-const TEMPLATES  = join(PKG_ROOT, 'templates');
+const HOOKS_SRC    = join(PKG_ROOT, 'hooks');
+const COMMANDS_SRC = join(PKG_ROOT, 'commands');
+const TEMPLATES    = join(PKG_ROOT, 'templates');
+const PKG_VERSION  = (() => {
+  try { return JSON.parse(readFileSync(join(PKG_ROOT, 'package.json'), 'utf-8')).version; }
+  catch { return null; }
+})();
+
+function sha256(buf) { return sha256Buf(buf); }
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -38,6 +49,8 @@ function parseArgs(argv) {
   const args = {
     hypoDir:     resolveHypoRoot(),
     hooks:       true,
+    commands:    true,
+    forceCommands: false,
     codex:       false,
     gitRemote:   null,
     gitInit:     true,
@@ -53,6 +66,8 @@ function parseArgs(argv) {
 Options:
   --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
   --no-hooks             Skip hook installation
+  --no-commands          Skip slash command installation to ~/.claude/commands/hypo/
+  --force-commands       Overwrite user-modified slash command files (creates .bak)
   --codex                Also install Codex hooks (~/.codex/hooks/)
   --git-remote=<url>     Git remote URL
   --no-git-init          Skip git initialization
@@ -65,6 +80,8 @@ Options:
     }
     else if (arg.startsWith('--hypo-dir='))      args.hypoDir    = expandHome(arg.slice(11));
     else if (arg === '--no-hooks')                args.hooks      = false;
+    else if (arg === '--no-commands')             args.commands   = false;
+    else if (arg === '--force-commands')          args.forceCommands = true;
     else if (arg === '--codex')                   args.codex      = true;
     else if (arg.startsWith('--git-remote='))     args.gitRemote  = arg.slice(13);
     else if (arg === '--no-git-init')             args.gitInit    = false;
@@ -261,13 +278,129 @@ echo "[post-commit] hooks/ changed — syncing to ~/.claude/hooks/ ..."
 node "$REPO_ROOT/scripts/upgrade.mjs" --apply
 `;
 
-function writePkgJson(dryRun) {
-  const dest = join(HOME, '.claude', 'hypo-pkg.json');
+function pkgJsonPath() { return join(HOME, '.claude', 'hypo-pkg.json'); }
+
+function writePkgJson(dryRun, extraFields = {}) {
+  const dest     = pkgJsonPath();
+  const existing = readPkgJsonSafe(dest);
+  const merged   = {
+    ...existing,
+    pkgRoot:       PKG_ROOT,
+    pkgVersion:    PKG_VERSION,
+    schemaVersion: '1.0',
+    ...extraFields,
+  };
   if (!dryRun) {
-    mkdirSync(join(HOME, '.claude'), { recursive: true });
-    writeFileSync(dest, JSON.stringify({ pkgRoot: PKG_ROOT }, null, 2) + '\n');
+    writePkgJsonAtomic(dest, merged);
     log('created', dest);
   }
+  return merged;
+}
+
+// ── slash command installation ───────────────────────────────────────────────
+//
+// Sync `commands/*.md` to `~/.claude/commands/hypo/<name>.md` with 3-way SHA tracking.
+// Decision matrix (per file):
+//   on-disk SHA == recorded SHA && on-disk SHA == packaged SHA  → no-op (up to date)
+//   on-disk SHA == recorded SHA && on-disk SHA != packaged SHA  → overwrite (user untouched)
+//   on-disk SHA != recorded SHA                                 → skip + warn (user modified)
+//     (force=true overrides, writing <name>.md.bak first)
+//   file missing                                                → install fresh
+// Recorded SHAs are kept in ~/.claude/hypo-pkg.json under `commands: { "<name>.md": "<sha>" }`.
+
+function installCommands(targetDir, dryRun, force) {
+  if (!existsSync(COMMANDS_SRC)) { log('errors', `commands source missing: ${COMMANDS_SRC}`); return null; }
+  if (!dryRun) mkdirSync(targetDir, { recursive: true });
+
+  const prevPkg  = readPkgJsonSafe(pkgJsonPath());
+  const prevSHAs = (prevPkg.commands && typeof prevPkg.commands === 'object') ? prevPkg.commands : {};
+  const newSHAs  = {};
+
+  function writeFresh(dest, srcContent) {
+    if (dryRun) return;
+    const tmp = `${dest}.tmp.${process.pid}.${Date.now()}`;
+    writeFileSync(tmp, srcContent);
+    try { renameSync(tmp, dest); }
+    catch (err) { try { unlinkSync(tmp); } catch {} throw err; }
+  }
+
+  for (const file of readdirSync(COMMANDS_SRC)) {
+    if (!file.endsWith('.md')) continue;
+    const srcPath    = join(COMMANDS_SRC, file);
+    const dest       = join(targetDir, file);
+    const srcContent = readFileSync(srcPath);
+    const srcSHA     = sha256(srcContent);
+
+    // Fresh install
+    if (!existsSync(dest)) {
+      writeFresh(dest, srcContent);
+      newSHAs[file] = srcSHA;
+      log('created', dest);
+      continue;
+    }
+
+    // Refuse to operate on non-regular files (symlinks, sockets, etc.)
+    if (!isRegularFile(dest)) {
+      log('skipped', `${dest} (not a regular file — refusing to overwrite)`);
+      // Do NOT record ownership for paths we didn't write
+      if (prevSHAs[file]) newSHAs[file] = prevSHAs[file];
+      continue;
+    }
+
+    const onDiskContent = readFileIfRegular(dest);
+    if (onDiskContent === null) {
+      log('skipped', `${dest} (could not read — refusing to overwrite)`);
+      if (prevSHAs[file]) newSHAs[file] = prevSHAs[file];
+      continue;
+    }
+    const onDiskSHA = sha256(onDiskContent);
+    const recordedSHA = prevSHAs[file];
+
+    if (onDiskSHA === srcSHA) {
+      newSHAs[file] = srcSHA;
+      log('skipped', `${dest} (up to date)`);
+      continue;
+    }
+
+    if (recordedSHA && onDiskSHA === recordedSHA) {
+      // Compare-and-swap: re-verify just before write.
+      if (!dryRun) {
+        const verifyContent = readFileIfRegular(dest);
+        const verifySHA = verifyContent ? sha256(verifyContent) : null;
+        if (verifySHA !== recordedSHA) {
+          log('skipped', `${dest} (changed since check — skipping for safety)`);
+          newSHAs[file] = recordedSHA;
+          continue;
+        }
+        writeFresh(dest, srcContent);
+      }
+      newSHAs[file] = srcSHA;
+      log('merged', `${dest} (updated to package version)`);
+      continue;
+    }
+
+    // User-modified path
+    if (force) {
+      if (!dryRun) {
+        writeFresh(dest + '.bak', onDiskContent);
+        writeFresh(dest, srcContent);
+      }
+      newSHAs[file] = srcSHA;
+      log('merged', `${dest} (force-overwritten, backup at ${file}.bak)`);
+      continue;
+    }
+
+    // Preserve user changes. Only claim ownership if we already had a recorded
+    // SHA for this file — never invent ownership for files we didn't install.
+    if (recordedSHA) {
+      newSHAs[file] = recordedSHA;
+      log('skipped', `${dest} (user-modified — re-run with --force-commands to overwrite)`);
+    } else {
+      log('skipped', `${dest} (file exists but Hypomnema does not own it — re-run with --force-commands to take ownership)`);
+    }
+  }
+
+  return newSHAs;
 }
 
 function installPkgGitHook(dryRun) {
@@ -466,11 +599,20 @@ if (args.fromRemote) {
 
 // 4. hooks
 
+let commandSHAs = null;
+if (args.commands) {
+  const claudeCommands = join(HOME, '.claude', 'commands', 'hypo');
+  commandSHAs = installCommands(claudeCommands, args.dryRun, args.forceCommands);
+}
+
 if (args.hooks) {
   const claudeHooks = join(HOME, '.claude', 'hooks');
   installHooks(claudeHooks, args.dryRun);
   mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun, HOOK_MAP);
-  writePkgJson(args.dryRun);
+}
+
+if (args.hooks || args.commands) {
+  writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {});
 }
 
 // 5. shell function (claude wrapper)

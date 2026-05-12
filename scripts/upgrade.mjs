@@ -15,27 +15,34 @@
  *   --json              Output results as JSON
  */
 
-import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
+import { readPkgJson as readPkgJsonSafe, writePkgJsonAtomic, sha256 as sha256Buf, isRegularFile, readFileIfRegular } from './lib/pkg-json.mjs';
 
-const HOME       = homedir();
-const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
-const PKG_ROOT   = join(SCRIPT_DIR, '..');
-const HOOKS_SRC  = join(PKG_ROOT, 'hooks');
-const TEMPLATES  = join(PKG_ROOT, 'templates');
+const HOME         = homedir();
+const SCRIPT_DIR   = fileURLToPath(new URL('.', import.meta.url));
+const PKG_ROOT     = join(SCRIPT_DIR, '..');
+const HOOKS_SRC    = join(PKG_ROOT, 'hooks');
+const COMMANDS_SRC = join(PKG_ROOT, 'commands');
+const TEMPLATES    = join(PKG_ROOT, 'templates');
+
+function sha256(buf) { return sha256Buf(buf); }
+function pkgJsonPath() { return join(HOME, '.claude', 'hypo-pkg.json'); }
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, apply: false, json: false };
+  const args = { hypoDir: null, apply: false, json: false, forceCommands: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg === '--apply')        args.apply = true;
-    else if (arg === '--json')         args.json  = true;
+    else if (arg === '--apply')              args.apply = true;
+    else if (arg === '--force-commands')     args.forceCommands = true;
+    else if (arg === '--json')               args.json  = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -370,6 +377,159 @@ function checkPkgJson() {
   }
 }
 
+// ── slash command sync (mirrors init.mjs:installCommands logic) ─────────────
+
+function readPkgRecordedCommands() {
+  const pkg = readPkgJsonSafe(pkgJsonPath());
+  return (pkg && pkg.commands && typeof pkg.commands === 'object') ? pkg.commands : {};
+}
+
+function checkCommands() {
+  const targetDir = join(HOME, '.claude', 'commands', 'hypo');
+  const results = [];
+  if (!existsSync(COMMANDS_SRC)) return results;
+
+  const recorded = readPkgRecordedCommands();
+  const packagedFiles = new Set();
+
+  for (const file of readdirSync(COMMANDS_SRC)) {
+    if (!file.endsWith('.md')) continue;
+    packagedFiles.add(file);
+    const srcPath = join(COMMANDS_SRC, file);
+    const dest    = join(targetDir, file);
+    const srcSHA  = sha256(readFileSync(srcPath));
+
+    if (!existsSync(dest)) {
+      results.push({ file, status: 'missing', srcPath, dest, srcSHA });
+      continue;
+    }
+    if (!isRegularFile(dest)) {
+      results.push({ file, status: 'non-regular', srcPath, dest, srcSHA });
+      continue;
+    }
+    const onDiskBuf = readFileIfRegular(dest);
+    if (onDiskBuf === null) {
+      results.push({ file, status: 'unreadable', srcPath, dest, srcSHA });
+      continue;
+    }
+    const onDiskSHA = sha256(onDiskBuf);
+    if (onDiskSHA === srcSHA) {
+      results.push({ file, status: 'up-to-date', srcPath, dest, srcSHA });
+      continue;
+    }
+    const recordedSHA = recorded[file];
+    if (recordedSHA && onDiskSHA === recordedSHA) {
+      results.push({ file, status: 'stale', srcPath, dest, srcSHA, recordedSHA });
+    } else {
+      results.push({ file, status: 'user-modified', srcPath, dest, srcSHA, onDiskSHA });
+    }
+  }
+
+  // Reconcile orphaned recorded entries (packages removed a command we previously installed)
+  for (const file of Object.keys(recorded)) {
+    if (packagedFiles.has(file)) continue;
+    const dest = join(targetDir, file);
+    results.push({ file, status: 'orphaned', dest, recordedSHA: recorded[file] });
+  }
+  return results;
+}
+
+function writeFreshAtomic(dest, content) {
+  const tmp = `${dest}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmp, content);
+  try { renameSync(tmp, dest); }
+  catch (err) { try { unlinkSync(tmp); } catch {} throw err; }
+}
+
+function applyCommands(commandResults, force) {
+  const targetDir = join(HOME, '.claude', 'commands', 'hypo');
+  mkdirSync(targetDir, { recursive: true });
+
+  const applied = [];
+  const newSHAs = {};
+
+  for (const c of commandResults) {
+    if (c.status === 'up-to-date') {
+      newSHAs[c.file] = c.srcSHA;
+      continue;
+    }
+    if (c.status === 'missing') {
+      writeFreshAtomic(c.dest, readFileSync(c.srcPath));
+      newSHAs[c.file] = c.srcSHA;
+      applied.push(c.file);
+      continue;
+    }
+    if (c.status === 'stale') {
+      // Compare-and-swap: re-verify just before write to avoid TOCTOU.
+      const verifyBuf = readFileIfRegular(c.dest);
+      const verifySHA = verifyBuf ? sha256(verifyBuf) : null;
+      if (verifySHA !== c.recordedSHA) {
+        // Something changed between check and apply — keep recorded SHA, skip.
+        newSHAs[c.file] = c.recordedSHA;
+        applied.push(`${c.file} (skipped — changed since check)`);
+        continue;
+      }
+      writeFreshAtomic(c.dest, readFileSync(c.srcPath));
+      newSHAs[c.file] = c.srcSHA;
+      applied.push(c.file);
+      continue;
+    }
+    if (c.status === 'user-modified') {
+      if (force) {
+        const buf = readFileIfRegular(c.dest);
+        if (buf) writeFreshAtomic(c.dest + '.bak', buf);
+        writeFreshAtomic(c.dest, readFileSync(c.srcPath));
+        newSHAs[c.file] = c.srcSHA;
+        applied.push(`${c.file} (force-overwritten, backup at ${c.file}.bak)`);
+      } else {
+        // Preserve user changes — only claim ownership if we already had it.
+        // (user-modified is only reported when on-disk SHA != src SHA; the
+        //  pre-existing ownership comes from the recorded map.)
+        const recorded = readPkgRecordedCommands();
+        if (recorded[c.file]) newSHAs[c.file] = recorded[c.file];
+      }
+      continue;
+    }
+    if (c.status === 'non-regular' || c.status === 'unreadable') {
+      // Refuse silently — keep prior recorded SHA if any.
+      const recorded = readPkgRecordedCommands();
+      if (recorded[c.file]) newSHAs[c.file] = recorded[c.file];
+      continue;
+    }
+    if (c.status === 'orphaned') {
+      // Package no longer ships this command. Drop from recorded map; only
+      // delete on-disk file if it still matches our recorded SHA (unmodified).
+      if (existsSync(c.dest) && isRegularFile(c.dest)) {
+        const buf = readFileIfRegular(c.dest);
+        const sha = buf ? sha256(buf) : null;
+        if (sha === c.recordedSHA) {
+          unlinkSync(c.dest);
+          applied.push(`${c.file} (orphaned — removed)`);
+        } else {
+          // Leave user-modified orphaned file alone.
+          applied.push(`${c.file} (orphaned — user-modified, kept on disk)`);
+        }
+      }
+      // Either way, drop the recorded entry.
+      continue;
+    }
+  }
+
+  // Persist atomically — single write per upgrade run.
+  const path = pkgJsonPath();
+  const existing = readPkgJsonSafe(path);
+  let pkgVersion = null;
+  try { pkgVersion = JSON.parse(readFileSync(join(PKG_ROOT, 'package.json'), 'utf-8')).version; } catch {}
+  writePkgJsonAtomic(path, {
+    ...existing,
+    pkgRoot:       PKG_ROOT,
+    pkgVersion,
+    schemaVersion: '1.0',
+    commands:      newSHAs,
+  });
+  return applied;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -378,6 +538,7 @@ const schema   = checkSchemaVersion(args.hypoDir);
 const hooks    = checkHookFiles();
 const settings = checkSettingsJson();
 const pkgJson  = checkPkgJson();
+const commands = checkCommands();
 const oldHookRefs = checkOldHookNames();
 
 const staleHooks      = hooks.filter(h => h.status === 'stale' || h.status === 'missing' || h.status === 'src-missing');
@@ -385,12 +546,17 @@ const missingSettings = settings.filter(s => s.status === 'missing');
 const invalidSettings = settings.some(s => s.status === 'invalid-json');
 const schemaDrift     = schema.bump !== 'none' && schema.bump !== 'unknown' && schema.bump !== 'ahead';
 const pkgJsonDrift    = pkgJson.status !== 'up-to-date';
+const staleCommands        = commands.filter(c => c.status === 'stale' || c.status === 'missing');
+const userModifiedCommands = commands.filter(c => c.status === 'user-modified');
+const orphanedCommands     = commands.filter(c => c.status === 'orphaned');
+const nonRegularCommands   = commands.filter(c => c.status === 'non-regular' || c.status === 'unreadable');
 
 let migrationPath        = null;
 let appliedHooks         = [];
 let appliedSettings      = [];
 let appliedPkgJson       = false;
 let appliedHookNameRenames = [];
+let appliedCommands      = [];
 
 if (args.apply) {
   if (oldHookRefs.length > 0) {
@@ -401,14 +567,14 @@ if (args.apply) {
   }
   appliedHooks    = applyHookFiles(hooks);
   appliedSettings = applySettingsJson(settings);
-  const pkgJsonPath = join(HOME, '.claude', 'hypo-pkg.json');
-  writeFileSync(pkgJsonPath, JSON.stringify({ pkgRoot: PKG_ROOT }, null, 2) + '\n');
+  // applyCommands handles the single atomic hypo-pkg.json write (pkgRoot, version, schema, commands map)
+  appliedCommands = applyCommands(commands, args.forceCommands);
   appliedPkgJson = true;
 }
 
 // ── output ───────────────────────────────────────────────────────────────────
 
-const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings || pkgJsonDrift || oldHookRefs.length > 0;
+const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings || pkgJsonDrift || oldHookRefs.length > 0 || staleCommands.length > 0 || userModifiedCommands.length > 0 || orphanedCommands.length > 0 || nonRegularCommands.length > 0;
 
 if (args.json) {
   console.log(JSON.stringify({
@@ -416,8 +582,9 @@ if (args.json) {
     hooks,
     settings,
     pkgJson,
+    commands,
     oldHookRefs,
-    applied: { hooks: appliedHooks, settings: appliedSettings, pkgJson: appliedPkgJson, hookNameRenames: appliedHookNameRenames },
+    applied: { hooks: appliedHooks, settings: appliedSettings, pkgJson: appliedPkgJson, hookNameRenames: appliedHookNameRenames, commands: appliedCommands },
     migrationReport: migrationPath,
   }, null, 2));
   process.exit(hasDrift && !args.apply ? 1 : 0);
@@ -486,6 +653,30 @@ if (pkgJson.status === 'up-to-date') {
   lines.push(`✗ Package metadata  hypo-pkg.json missing — run --apply to install`);
 }
 
+// Slash commands
+const cmdUpToDate    = commands.filter(c => c.status === 'up-to-date').length;
+const cmdStaleCount  = commands.filter(c => c.status === 'stale').length;
+const cmdMissCount   = commands.filter(c => c.status === 'missing').length;
+const cmdUserCount   = userModifiedCommands.length;
+const cmdOrphanCount = orphanedCommands.length;
+const cmdNonRegCount = nonRegularCommands.length;
+if (commands.length === 0) {
+  lines.push(`⚠ Slash commands    package commands/ is empty`);
+} else if (cmdStaleCount === 0 && cmdMissCount === 0 && cmdUserCount === 0 && cmdOrphanCount === 0 && cmdNonRegCount === 0) {
+  lines.push(`✓ Slash commands    ${cmdUpToDate}/${commands.length} up to date in ~/.claude/commands/hypo/`);
+} else {
+  lines.push(`⚠ Slash commands    ${cmdUpToDate} up to date, ${cmdStaleCount} stale, ${cmdMissCount} missing, ${cmdUserCount} user-modified, ${cmdOrphanCount} orphaned, ${cmdNonRegCount} non-regular:`);
+  for (const c of commands) {
+    if (c.status === 'up-to-date')         lines.push(`    ✓ ${c.file}`);
+    else if (c.status === 'stale')         lines.push(`    ⚠ ${c.file}  [stale — package has newer version]`);
+    else if (c.status === 'missing')       lines.push(`    ✗ ${c.file}  [not installed]`);
+    else if (c.status === 'user-modified') lines.push(`    ⚠ ${c.file}  [user-modified — use --apply --force-commands to overwrite]`);
+    else if (c.status === 'orphaned')      lines.push(`    ⊘ ${c.file}  [orphaned — no longer shipped by package; --apply will reconcile]`);
+    else if (c.status === 'non-regular')   lines.push(`    ✗ ${c.file}  [not a regular file (symlink?) — refusing to touch]`);
+    else if (c.status === 'unreadable')    lines.push(`    ✗ ${c.file}  [unreadable — refusing to touch]`);
+  }
+}
+
 // Old hook names (wiki-*.mjs → hypo-*.mjs rename migration)
 if (oldHookRefs.length > 0) {
   lines.push(`⚠ Hook name migration  ${oldHookRefs.length} old wiki-*.mjs reference(s) in settings.json — run --apply to rename:`);
@@ -502,7 +693,7 @@ if (migrationPath) {
 }
 
 // Applied actions
-if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson || appliedHookNameRenames.length > 0) {
+if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson || appliedHookNameRenames.length > 0 || appliedCommands.length > 0) {
   lines.push('');
   if (appliedHookNameRenames.length > 0) {
     lines.push(`✓ Renamed legacy hook references (${appliedHookNameRenames.length}):`);
@@ -511,6 +702,10 @@ if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson || a
   if (appliedHooks.length > 0) {
     lines.push(`✓ Updated hook files (${appliedHooks.length}):`);
     for (const f of appliedHooks) lines.push(`    → ${f}`);
+  }
+  if (appliedCommands.length > 0) {
+    lines.push(`✓ Updated slash commands (${appliedCommands.length}):`);
+    for (const f of appliedCommands) lines.push(`    → ${f}`);
   }
   if (appliedSettings.length > 0) {
     lines.push(`✓ Merged settings.json entries (${appliedSettings.length}):`);
@@ -523,7 +718,7 @@ if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson || a
 
 // Summary
 lines.push('');
-const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0) + (pkgJsonDrift ? 1 : 0) + oldHookRefs.length;
+const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0) + (pkgJsonDrift ? 1 : 0) + oldHookRefs.length + staleCommands.length + userModifiedCommands.length + orphanedCommands.length + nonRegularCommands.length;
 if (totalDrift === 0) {
   lines.push('Result: Hypomnema is up to date');
 } else if (args.apply) {
