@@ -25,28 +25,34 @@ _Don't take notes. Let Claude synthesize them._
 
 ## Quick Start
 
-**Step 1: Install**
+Hypomnema ships **two install paths**. Pick one — both end up with the same wiki, hooks, and `/hypo:*` slash commands.
 
-```bash
-npm install -g hypomnema
-# or run once without installing
-npx hypomnema
-```
+### Path A — Claude Code plugin (recommended)
 
-**Step 2: Initialize inside Claude Code**
+Inside Claude Code:
 
 ```
+/plugin marketplace add sk-lim19f/Hypomnema
+/plugin install hypomnema@hypomnema
 /hypo:init
 ```
 
-That single command:
+The plugin install registers `/hypo:*` commands from the package's `commands/` directory; `/hypo:init` then scaffolds the wiki and merges hooks into `~/.claude/settings.json`.
 
-- creates the wiki at `~/hypomnema/` (or any path you choose),
-- scaffolds `pages/`, `projects/`, `sources/`, `journal/{daily,weekly,monthly}/` plus root markers,
-- installs 10 lifecycle hooks and merges them into `~/.claude/settings.json`,
-- initializes a local git repository, makes the first commit, and pushes if a remote is configured.
+### Path B — npm CLI
 
-**Step 3: Use it like a wiki**
+In your shell:
+
+```bash
+npm install -g hypomnema
+hypomnema
+```
+
+`hypomnema` (or `hypomnema --help` for flags) scaffolds the wiki, installs hooks, **and** copies the slash command files to `~/.claude/commands/hypo/` so `/hypo:*` works inside Claude Code afterwards. Subsequent `hypomnema upgrade` runs use per-file SHA tracking to avoid clobbering anything you have hand-edited.
+
+> Either path: restart Claude Code (or open a new session) after the first run so the new hooks and slash commands are picked up.
+
+### Step 2: use it
 
 ```
 /hypo:ingest https://example.com/some-article-or-paper.pdf
@@ -54,7 +60,7 @@ That single command:
 /hypo:feedback "always include test commands when explaining a fix"
 ```
 
-That's it. Hooks handle the rest — auto-staging, auto-commit/push, session-state injection, lookup signals.
+Hooks handle the rest — auto-staging, auto-commit/push, session-state injection, lookup signals.
 
 > **Sync across machines:** the wiki is already a git repo. Add a remote, push once, and the `Stop` hook will keep every machine in sync afterwards.
 
@@ -169,7 +175,7 @@ Eight commands cover the full capture → retrieval → consolidation cycle.
 
 | Command | What it does | When to reach for it |
 |---|---|---|
-| `/hypo:ingest` | Saves the raw source under `sources/`, synthesizes a structured page under `pages/` | Anytime you read something worth keeping |
+| `/hypo:ingest` | Saves the raw source under `sources/`; Claude synthesizes a structured page under `pages/`. The shell helper (`scripts/ingest.mjs`) is read-only — it only *lists* pending sources so you know what still needs ingesting | Anytime you read something worth keeping |
 | `/hypo:query` | BM25 retrieval + LLM synthesis with `[[wikilink]]` citations | When you need an answer grounded in your own notes |
 | `/hypo:crystallize` | Synthesizes drafts and runs the 11-step session-close checklist | End of a non-trivial session |
 | `/hypo:resume` | Loads the most recent session state for an active project | Coming back to a paused project |
@@ -276,15 +282,25 @@ You put a project down for three weeks. At the next session start, `hypo-session
 
 ## Configuration
 
-The wiki path is resolved in this order:
+The wiki path is resolved in this order (see `scripts/lib/hypo-root.mjs`):
 
-1. `HYPO_DIR` environment variable (explicit override)
-2. `hypo-config.md` scan — current dir up to `$HOME`
-3. Default: `~/hypomnema`
+| Priority | Source |
+|---|---|
+| 1 | `--hypo-dir=<path>` CLI flag (per-script override; only honored by scripts that accept it) |
+| 2 | `HYPO_DIR` environment variable |
+| 3 | `hypo-config.md` marker discovered in a fixed list of home-relative candidates (`~/hypomnema`, `~/wiki`, `~/notes`, `~/knowledge`, `~/Documents/{hypomnema,wiki,notes}`) |
+| 4 | Default: `~/hypomnema` |
 
 Place a `hypo-config.md` at the wiki root to make it portable across machines without setting environment variables.
 
 `.hypoignore` controls which paths the hooks ignore (default: `*.pdf`, `*.zip`, `*.pem`, `*.env`, …). Edit it directly — there is no privacy mode flag; one file, one source of truth.
+
+### Where do `/hypo:*` commands live?
+
+| Install path | Slash commands served from |
+|---|---|
+| Plugin (Path A) | Claude Code's plugin cache; updated via `/plugin update` |
+| npm CLI (Path B) | `~/.claude/commands/hypo/`; updated via `hypomnema upgrade --apply` with per-file SHA tracking. Pass `--force-commands` to overwrite hand-edits (creates `.bak`). |
 
 ---
 
