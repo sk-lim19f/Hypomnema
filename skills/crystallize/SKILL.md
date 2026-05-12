@@ -83,3 +83,7 @@ evidence_strength: inferred
 
 3. Cross-link all source pages back to the synthesis with `[[wikilink]]`.
 4. Add the synthesis to `index.md` under `## Pages — Syntheses`.
+
+---
+
+> **Citation convention.** When you reference a wiki page in your response, link it as `[[page-slug]]`. The observability audit counts citations toward the autonomy score — see [[pages/observability/_index]] (run `/hypo:audit` to inspect).

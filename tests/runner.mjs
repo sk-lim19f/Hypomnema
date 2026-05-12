@@ -621,6 +621,50 @@ test('errors when project session-state lacks a next heading', () => {
   ), `missing session-state heading error: ${r.stdout}`);
 });
 
+// ── weekly-report.mjs (Lane E) ───────────────────────────────────────────────
+
+suite('weekly-report.mjs');
+
+test('--write produces pages/observability/<YYYY-WW>.md with autonomy score', () => {
+  withTmpDir(dir => {
+    const cacheDir = join(dir, '.cache', 'sessions');
+    mkdirSync(cacheDir, { recursive: true });
+    const transcriptPath = join(cacheDir, 'w.jsonl');
+    writeFileSync(transcriptPath, JSON.stringify({ type: 'tool_use', name: 'Grep' }) + '\n');
+    writeFileSync(
+      join(cacheDir, 'index.jsonl'),
+      JSON.stringify({
+        session_id: 'w1',
+        transcript_path: transcriptPath,
+        recorded_at: '2026-05-06T12:00:00Z',
+        cwd: dir,
+      }) + '\n',
+    );
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--write']);
+    assert.equal(r.status, 0, `weekly-report failed: ${r.stderr}\nstdout: ${r.stdout}`);
+
+    const reportPath = join(dir, 'pages', 'observability', '2026-19.md');
+    assert.ok(existsSync(reportPath), `report file not written: ${reportPath}`);
+    const content = readFileSync(reportPath, 'utf-8');
+    assert.ok(content.includes('Autonomy score'), 'report missing autonomy score header');
+    assert.ok(content.includes('| w1 |'), 'report should list session w1');
+    assert.ok(/^---\n[\s\S]*?\n---\n/.test(content), 'report missing frontmatter');
+  });
+});
+
+test('--json on empty wiki returns valid report payload', () => {
+  withTmpDir(dir => {
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--json']);
+    assert.equal(r.status, 0, `weekly-report --json failed: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.week, '2026-19');
+    assert.equal(out.count, 0);
+    assert.equal(typeof out.score, 'number');
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

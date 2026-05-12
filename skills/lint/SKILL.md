@@ -53,3 +53,7 @@ For **broken wikilinks**: list the affected files and ask if the user wants help
 For **missing `updated`**: suggest running with `--fix` to auto-add `updated: <today>` to each affected page's frontmatter. Note: `--fix` only repairs files that already have a valid, closed frontmatter block — files with no frontmatter or malformed frontmatter are skipped.
 
 For **missing required fields** (`title`, `type`): open the affected files and help the user fill them in.
+
+---
+
+> **Citation convention.** When you reference a wiki page in your response, link it as `[[page-slug]]`. The observability audit counts citations toward the autonomy score — see [[pages/observability/_index]] (run `/hypo:audit` to inspect).
