@@ -13,6 +13,9 @@
 *.key
 *.env
 
+# Hypomnema runtime cache (session growth metrics, future index.jsonl, etc.)
+.cache/
+
 # Draft / scratch (uncomment to hide from hooks)
 # drafts/
 # scratch/
