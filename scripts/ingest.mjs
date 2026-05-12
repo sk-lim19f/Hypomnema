@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 /**
- * Hypomnema ingest helper script
+ * Hypomnema ingest *listing* helper
  *
- * Lists files in sources/ that have no corresponding source-summary page,
- * and reports pages that reference missing source files.
- * Used by /hypo:ingest to surface what needs ingestion before Claude synthesizes.
+ * This script does NOT synthesize wiki pages — that step is LLM-driven by
+ * `/hypo:ingest` inside Claude Code. The CLI helper only inspects the wiki
+ * filesystem and reports:
+ *   - files under `sources/` that have no matching `source-summary` page
+ *   - pages whose `source:` frontmatter points at a missing `sources/` file
+ *
+ * Calling it from the shell will never modify the wiki; it is read-only.
  *
  * Usage:
  *   node scripts/ingest.mjs [options]
@@ -108,6 +112,7 @@ if (args.json) {
     missingSource,
   }, null, 2));
 } else {
+  console.log('[hypomnema] Listing pending ingest targets — synthesis is performed by /hypo:ingest inside Claude Code.');
   console.log(`Sources: ${allSources.length} total`);
 
   if (orphaned.length === 0) {
