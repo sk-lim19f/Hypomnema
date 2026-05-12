@@ -40,3 +40,33 @@ jobs:
           node scripts/verify.mjs \
             --hypo-dir=/tmp/wiki-nightly \
             --json
+
+  audit-smoke:
+    # Lane E smoke check: session-audit + weekly-report must run end-to-end on
+    # an empty wiki without crashing. Real data is dogfooded locally; CI just
+    # guards against syntax/import regressions.
+    name: Audit smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Init wiki
+        run: |
+          node scripts/init.mjs \
+            --hypo-dir=/tmp/wiki-audit \
+            --no-hooks --no-git-init
+      - name: session-audit smoke (empty index → fallback)
+        run: |
+          node scripts/session-audit.mjs \
+            --hypo-dir=/tmp/wiki-audit \
+            --json > /tmp/audit.json
+          test -s /tmp/audit.json
+          node -e "const o=require('/tmp/audit.json'); if(!Array.isArray(o.results))process.exit(1);"
+      - name: weekly-report smoke (--write to empty wiki)
+        run: |
+          node scripts/weekly-report.mjs \
+            --hypo-dir=/tmp/wiki-audit \
+            --week=2026-19 --write
+          test -f /tmp/wiki-audit/pages/observability/2026-19.md

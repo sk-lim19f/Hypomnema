@@ -732,6 +732,186 @@ test('session-start emits no growth line when cache absent', () => {
   });
 });
 
+// ── weekly-report.mjs (Lane E) ───────────────────────────────────────────────
+
+suite('weekly-report.mjs');
+
+test('--write produces pages/observability/<YYYY-WW>.md with autonomy score', () => {
+  withTmpDir(dir => {
+    const cacheDir = join(dir, '.cache', 'sessions');
+    mkdirSync(cacheDir, { recursive: true });
+    const transcriptPath = join(cacheDir, 'w.jsonl');
+    writeFileSync(transcriptPath, JSON.stringify({ type: 'tool_use', name: 'Grep' }) + '\n');
+    writeFileSync(
+      join(cacheDir, 'index.jsonl'),
+      JSON.stringify({
+        session_id: 'w1',
+        transcript_path: transcriptPath,
+        recorded_at: '2026-05-06T12:00:00Z',
+        cwd: dir,
+      }) + '\n',
+    );
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--write']);
+    assert.equal(r.status, 0, `weekly-report failed: ${r.stderr}\nstdout: ${r.stdout}`);
+
+    const reportPath = join(dir, 'pages', 'observability', '2026-19.md');
+    assert.ok(existsSync(reportPath), `report file not written: ${reportPath}`);
+    const content = readFileSync(reportPath, 'utf-8');
+    assert.ok(content.includes('Autonomy score'), 'report missing autonomy score header');
+    assert.ok(content.includes('| w1 |'), 'report should list session w1');
+    assert.ok(/^---\n[\s\S]*?\n---\n/.test(content), 'report missing frontmatter');
+  });
+});
+
+test('--json returns valid report payload (week with no matching sessions)', () => {
+  withTmpDir(dir => {
+    // Seed an index entry far in the past so the fallback (~/.claude/projects)
+    // path is bypassed by the primary index check, and then ask for a
+    // present-day week where nothing in the index will match.
+    const cacheDir = join(dir, '.cache', 'sessions');
+    mkdirSync(cacheDir, { recursive: true });
+    const transcriptPath = join(cacheDir, 'old.jsonl');
+    writeFileSync(transcriptPath, '');
+    writeFileSync(
+      join(cacheDir, 'index.jsonl'),
+      JSON.stringify({
+        session_id: 'old-1',
+        transcript_path: transcriptPath,
+        recorded_at: '1970-01-05T00:00:00Z',
+        cwd: dir,
+      }) + '\n',
+    );
+
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2099-50', '--json']);
+    assert.equal(r.status, 0, `weekly-report --json failed: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.week, '2099-50');
+    assert.equal(out.count, 0, `expected 0 sessions in 2099-50, got ${out.count}`);
+    assert.equal(typeof out.score, 'number');
+  });
+});
+
+// ── session-audit.mjs fixtures ───────────────────────────────────────────────
+
+suite('session-audit.mjs (transcript dual-source — ADR 0019)');
+
+function setupAuditFixture(hypoDir, { transcriptLines, recordedAtIso }) {
+  const cacheDir      = join(hypoDir, '.cache', 'sessions');
+  mkdirSync(cacheDir, { recursive: true });
+  const transcriptPath = join(cacheDir, 'fixture-transcript.jsonl');
+  writeFileSync(
+    transcriptPath,
+    transcriptLines.map(l => JSON.stringify(l)).join('\n') + '\n',
+  );
+  const indexEntry = {
+    session_id: 'fixture-session',
+    transcript_path: transcriptPath,
+    recorded_at: recordedAtIso,
+    cwd: hypoDir,
+  };
+  writeFileSync(join(cacheDir, 'index.jsonl'), JSON.stringify(indexEntry) + '\n');
+}
+
+function runAudit(hypoDir) {
+  const r = run('session-audit.mjs', [`--hypo-dir=${hypoDir}`, '--json']);
+  assert.equal(r.status, 0, `audit failed: ${r.stderr}\nstdout: ${r.stdout}`);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.results.length, 1, `expected exactly one session, got ${out.results.length}`);
+  return out.results[0];
+}
+
+const RECENT = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); // 1 day ago
+const STALE  = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString(); // 60 days ago
+
+test('fixture: normal — exactly one search, no urls, no ingest', () => {
+  withTmpDir(dir => {
+    setupAuditFixture(dir, {
+      recordedAtIso: RECENT,
+      transcriptLines: [
+        { type: 'tool_use', name: 'Grep', input: { pattern: 'foo' } },
+        { type: 'text', role: 'assistant', content: 'looked it up.' },
+      ],
+    });
+    const r = runAudit(dir);
+    assert.equal(r.classification, 'normal');
+    assert.equal(r.metrics.search_count, 1);
+    assert.equal(r.metrics.ingest_count, 0);
+    assert.equal(r.metrics.urls, 0);
+  });
+});
+
+test('fixture: search-0 — zero search or query in session', () => {
+  withTmpDir(dir => {
+    setupAuditFixture(dir, {
+      recordedAtIso: RECENT,
+      transcriptLines: [
+        { type: 'text', role: 'user', content: 'hi' },
+        { type: 'text', role: 'assistant', content: 'hello' },
+      ],
+    });
+    const r = runAudit(dir);
+    assert.equal(r.classification, 'search-0');
+    assert.equal(r.metrics.search_count, 0);
+  });
+});
+
+test('fixture: search-many — five or more searches → search-many', () => {
+  withTmpDir(dir => {
+    const lines = [];
+    for (let i = 0; i < 6; i++) {
+      lines.push({ type: 'tool_use', name: 'Grep', input: { pattern: `q${i}` } });
+    }
+    setupAuditFixture(dir, { recordedAtIso: RECENT, transcriptLines: lines });
+    const r = runAudit(dir);
+    assert.equal(r.classification, 'search-many');
+    assert.ok(r.metrics.search_count >= 5, `expected ≥5 searches, got ${r.metrics.search_count}`);
+  });
+});
+
+test('fixture: ingest-missed — multiple urls in transcript but no ingest call', () => {
+  withTmpDir(dir => {
+    setupAuditFixture(dir, {
+      recordedAtIso: RECENT,
+      transcriptLines: [
+        { type: 'text', role: 'user', content: 'check https://example.com/a and https://example.com/b' },
+        { type: 'text', role: 'assistant', content: 'done' },
+      ],
+    });
+    const r = runAudit(dir);
+    assert.equal(r.classification, 'ingest-missed');
+    assert.ok(r.metrics.urls >= 2);
+    assert.equal(r.metrics.ingest_count, 0);
+  });
+});
+
+test('fixture: staleness-skip — session older than --max-age-days is staleness-skip', () => {
+  withTmpDir(dir => {
+    setupAuditFixture(dir, {
+      recordedAtIso: STALE,
+      transcriptLines: [
+        { type: 'tool_use', name: 'Grep', input: { pattern: 'old' } },
+      ],
+    });
+    const r = runAudit(dir);
+    assert.equal(r.classification, 'staleness-skip');
+    assert.ok(r.age_days > 30, `expected age > 30 days, got ${r.age_days}`);
+  });
+});
+
+test('fallback: empty index falls back to ~/.claude/projects scan path', () => {
+  withTmpDir(dir => {
+    // Index path is absent → loader uses fallback. We can't easily seed
+    // ~/.claude/projects from a tmp HOME without running the script with
+    // HOME override, so this test asserts the loader's graceful empty path.
+    const r = run('session-audit.mjs', [`--hypo-dir=${dir}`, '--json']);
+    assert.equal(r.status, 0, `audit failed on empty index: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(Array.isArray(out.results), 'results should be an array even with no index');
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

@@ -56,3 +56,7 @@ Read the top matching pages (up to 5) and produce a synthesized response:
 3. **Gaps** — if the wiki lacks coverage on the topic, note what is missing and suggest an ingest target.
 
 If zero results are returned, say so and offer to broaden the search or suggest using `/hypo:ingest` to add relevant sources.
+
+---
+
+> **Citation convention.** When you reference a wiki page in your response, link it as `[[page-slug]]`. The observability audit counts citations toward the autonomy score — see [[pages/observability/_index]] (run `/hypo:audit` to inspect).

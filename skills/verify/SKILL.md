@@ -90,3 +90,7 @@ updated: <today YYYY-MM-DD>
 ```
 
 3. Save the file. Do not remove or reorder existing entries.
+
+---
+
+> **Citation convention.** When you reference a wiki page in your response, link it as `[[page-slug]]`. The observability audit counts citations toward the autonomy score — see [[pages/observability/_index]] (run `/hypo:audit` to inspect).

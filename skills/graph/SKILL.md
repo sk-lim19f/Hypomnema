@@ -52,3 +52,7 @@ node <package-root>/scripts/graph.mjs \
 - **dot**: wrap the output in a fenced code block tagged `dot` and suggest the user pipe it to `dot -Tsvg -o graph.svg`.
 
 If the graph has 0 edges, note that no `[[wikilinks]]` were found between pages.
+
+---
+
+> **Citation convention.** When you reference a wiki page in your response, link it as `[[page-slug]]`. The observability audit counts citations toward the autonomy score — see [[pages/observability/_index]] (run `/hypo:audit` to inspect).
