@@ -76,9 +76,29 @@ function buildSlugMap(pages) {
 
 // ── wikilink extractor ────────────────────────────────────────────────────────
 
+// Strip regions where wikilinks are not real references:
+//   - fenced code blocks (``` or ~~~ anchored to line start; markdown allows
+//     up to 3 spaces of indent and pairs the same fence character)
+//   - inline code spans (``...`` then `...`, so double-tick spans aren't split)
+//   - HTML comments (<!-- ... -->)
+// Replacement preserves newline positions so future line-aware checks still
+// line up. Fences are anchored to line starts because the previous version
+// matched any two backtick triples in prose, which could silently hide real
+// wikilinks between them.
+function stripNonWikilinkRegions(content) {
+  let out = content;
+  out = out.replace(/^[ \t]{0,3}```[\s\S]*?^[ \t]{0,3}```/gm, m => m.replace(/[^\n]/g, ' '));
+  out = out.replace(/^[ \t]{0,3}~~~[\s\S]*?^[ \t]{0,3}~~~/gm, m => m.replace(/[^\n]/g, ' '));
+  out = out.replace(/<!--[\s\S]*?-->/g, m => m.replace(/[^\n]/g, ' '));
+  out = out.replace(/``[^`\n]*``/g, m => ' '.repeat(m.length));
+  out = out.replace(/`[^`\n]*`/g, m => ' '.repeat(m.length));
+  return out;
+}
+
 function extractWikilinks(content) {
+  const stripped = stripNonWikilinkRegions(content);
   const links = [];
-  for (const m of content.matchAll(/\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]/g)) {
+  for (const m of stripped.matchAll(/\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]/g)) {
     links.push(m[1].trim());
   }
   return links;

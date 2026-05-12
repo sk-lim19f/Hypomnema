@@ -35,5 +35,8 @@ tags: [project]
 
 ## Links
 
+<!-- Replace `<project-name>` with the project slug and uncomment.
 - [[projects/<project-name>/prd|PRD]]
 - [[projects/<project-name>/hot|Hot Cache]]
+-->
+
