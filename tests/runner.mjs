@@ -519,6 +519,48 @@ test('--apply on tmp wiki exits 0 after applying available changes', () => {
   });
 });
 
+test('--apply .hypoignore migration appends .cache/ and is idempotent', () => {
+  withTmpHome(home => {
+    withTmpDir(dir => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // Simulate a pre-existing user .hypoignore from an older Hypomnema version
+      // (no `.cache/` entry). Strip any matching line that may be present from
+      // the freshly-scaffolded file.
+      const hypoignorePath = join(hypoDir, '.hypoignore');
+      const original = readFileSync(hypoignorePath, 'utf-8')
+        .split('\n')
+        .filter(line => line.trim() !== '.cache/')
+        .join('\n');
+      writeFileSync(hypoignorePath, original);
+
+      // First --apply: should append .cache/
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r1.status, 0, `first --apply failed: ${r1.stderr}`);
+      const out1 = JSON.parse(r1.stdout);
+      assert.deepEqual(out1.applied.hypoignore, ['.cache/'], 'expected .cache/ to be appended on first run');
+      const afterFirst = readFileSync(hypoignorePath, 'utf-8');
+      assert.ok(afterFirst.includes('.cache/'), '.cache/ missing from .hypoignore after first --apply');
+      assert.equal(
+        (afterFirst.match(/^\.cache\/$/gm) || []).length,
+        1,
+        '.cache/ should appear exactly once after first --apply',
+      );
+
+      // Second --apply: should be a no-op (idempotency)
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second --apply failed: ${r2.stderr}`);
+      const out2 = JSON.parse(r2.stdout);
+      assert.deepEqual(out2.applied.hypoignore, [], 'second --apply should not append anything');
+      assert.equal(out2.hypoignore.status, 'up-to-date', 'hypoignore status should be up-to-date on second run');
+      const afterSecond = readFileSync(hypoignorePath, 'utf-8');
+      assert.equal(afterSecond, afterFirst, '.hypoignore content drifted across idempotent --apply');
+    });
+  });
+});
+
 test('--apply generates migration report for major SCHEMA bump', () => {
   withTmpHome(home => {
     withTmpDir(dir => {

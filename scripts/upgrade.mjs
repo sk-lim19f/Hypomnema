@@ -324,6 +324,45 @@ function applyHookNameMigration(oldRefs) {
   return applied;
 }
 
+// ── .hypoignore migration — ensure required runtime patterns are present ─────
+//
+// Idempotent: only appends entries that are absent. Re-running --apply on an
+// already-migrated .hypoignore is a no-op.
+
+const HYPOIGNORE_REQUIRED_ENTRIES = [
+  {
+    pattern: '.cache/',
+    comment: '# Hypomnema runtime cache (session growth metrics, future index.jsonl, etc.)',
+  },
+];
+
+function checkHypoignore(hypoDir) {
+  const path = join(hypoDir, '.hypoignore');
+  if (!existsSync(path)) return { status: 'no-file', missing: [], path };
+  const content = readFileSync(path, 'utf-8');
+  const entries = new Set(
+    content
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith('#'))
+  );
+  const missing = HYPOIGNORE_REQUIRED_ENTRIES.filter(e => !entries.has(e.pattern));
+  return { status: missing.length === 0 ? 'up-to-date' : 'needs-migration', missing, path };
+}
+
+function applyHypoignoreMigration(result) {
+  if (result.status !== 'needs-migration') return [];
+  let content = readFileSync(result.path, 'utf-8');
+  if (!content.endsWith('\n')) content += '\n';
+  const appended = [];
+  for (const entry of result.missing) {
+    content += `\n${entry.comment}\n${entry.pattern}\n`;
+    appended.push(entry.pattern);
+  }
+  writeFileSync(result.path, content);
+  return appended;
+}
+
 function writeMigrationReport(hypoDir, fromVersion, toVersion) {
   const today    = new Date().toISOString().slice(0, 10);
   const filename = `MIGRATION-v${toVersion}.md`;
@@ -540,6 +579,7 @@ const settings = checkSettingsJson();
 const pkgJson  = checkPkgJson();
 const commands = checkCommands();
 const oldHookRefs = checkOldHookNames();
+const hypoignore = checkHypoignore(args.hypoDir);
 
 const staleHooks      = hooks.filter(h => h.status === 'stale' || h.status === 'missing' || h.status === 'src-missing');
 const missingSettings = settings.filter(s => s.status === 'missing');
@@ -557,6 +597,7 @@ let appliedSettings      = [];
 let appliedPkgJson       = false;
 let appliedHookNameRenames = [];
 let appliedCommands      = [];
+let appliedHypoignore    = [];
 
 if (args.apply) {
   if (oldHookRefs.length > 0) {
@@ -570,11 +611,12 @@ if (args.apply) {
   // applyCommands handles the single atomic hypo-pkg.json write (pkgRoot, version, schema, commands map)
   appliedCommands = applyCommands(commands, args.forceCommands);
   appliedPkgJson = true;
+  appliedHypoignore = applyHypoignoreMigration(hypoignore);
 }
 
 // ── output ───────────────────────────────────────────────────────────────────
 
-const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings || pkgJsonDrift || oldHookRefs.length > 0 || staleCommands.length > 0 || userModifiedCommands.length > 0 || orphanedCommands.length > 0 || nonRegularCommands.length > 0;
+const hasDrift = staleHooks.length > 0 || missingSettings.length > 0 || schemaDrift || invalidSettings || pkgJsonDrift || oldHookRefs.length > 0 || staleCommands.length > 0 || userModifiedCommands.length > 0 || orphanedCommands.length > 0 || nonRegularCommands.length > 0 || hypoignore.status === 'needs-migration';
 
 if (args.json) {
   console.log(JSON.stringify({
@@ -584,7 +626,8 @@ if (args.json) {
     pkgJson,
     commands,
     oldHookRefs,
-    applied: { hooks: appliedHooks, settings: appliedSettings, pkgJson: appliedPkgJson, hookNameRenames: appliedHookNameRenames, commands: appliedCommands },
+    hypoignore,
+    applied: { hooks: appliedHooks, settings: appliedSettings, pkgJson: appliedPkgJson, hookNameRenames: appliedHookNameRenames, commands: appliedCommands, hypoignore: appliedHypoignore },
     migrationReport: migrationPath,
   }, null, 2));
   process.exit(hasDrift && !args.apply ? 1 : 0);
@@ -685,6 +728,16 @@ if (oldHookRefs.length > 0) {
   lines.push(`✓ Hook names        All hook references use current hypo-*.mjs names`);
 }
 
+// .hypoignore migration (ensure required runtime patterns are present)
+if (hypoignore.status === 'no-file') {
+  lines.push(`⚠ .hypoignore       not found at ${hypoignore.path} (init.mjs scaffolds this)`);
+} else if (hypoignore.status === 'up-to-date') {
+  lines.push(`✓ .hypoignore       required entries present`);
+} else {
+  lines.push(`⚠ .hypoignore       ${hypoignore.missing.length} missing entry(s) — run --apply to append:`);
+  for (const e of hypoignore.missing) lines.push(`    + ${e.pattern}`);
+}
+
 // Migration report notice
 if (migrationPath) {
   lines.push('');
@@ -693,7 +746,7 @@ if (migrationPath) {
 }
 
 // Applied actions
-if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson || appliedHookNameRenames.length > 0 || appliedCommands.length > 0) {
+if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson || appliedHookNameRenames.length > 0 || appliedCommands.length > 0 || appliedHypoignore.length > 0) {
   lines.push('');
   if (appliedHookNameRenames.length > 0) {
     lines.push(`✓ Renamed legacy hook references (${appliedHookNameRenames.length}):`);
@@ -714,15 +767,19 @@ if (appliedHooks.length > 0 || appliedSettings.length > 0 || appliedPkgJson || a
   if (appliedPkgJson) {
     lines.push(`✓ Written package metadata: ~/.claude/hypo-pkg.json`);
   }
+  if (appliedHypoignore.length > 0) {
+    lines.push(`✓ Appended .hypoignore entries (${appliedHypoignore.length}):`);
+    for (const e of appliedHypoignore) lines.push(`    → ${e}`);
+  }
 }
 
 // Summary
 lines.push('');
-const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0) + (pkgJsonDrift ? 1 : 0) + oldHookRefs.length + staleCommands.length + userModifiedCommands.length + orphanedCommands.length + nonRegularCommands.length;
+const totalDrift = staleHooks.length + missingSettings.length + (schemaDrift ? 1 : 0) + (invalidSettings ? 1 : 0) + (pkgJsonDrift ? 1 : 0) + oldHookRefs.length + staleCommands.length + userModifiedCommands.length + orphanedCommands.length + nonRegularCommands.length + (hypoignore.status === 'needs-migration' ? hypoignore.missing.length : 0);
 if (totalDrift === 0) {
   lines.push('Result: Hypomnema is up to date');
 } else if (args.apply) {
-  const total = appliedHooks.length + appliedSettings.length + (appliedPkgJson ? 1 : 0) + appliedHookNameRenames.length;
+  const total = appliedHooks.length + appliedSettings.length + (appliedPkgJson ? 1 : 0) + appliedHookNameRenames.length + appliedHypoignore.length;
   lines.push(`Result: ${total} update(s) applied. Run /hypo:doctor to verify.`);
 } else {
   lines.push(`Result: ${totalDrift} item(s) need updating — run with --apply to install`);
