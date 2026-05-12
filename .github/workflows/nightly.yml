@@ -20,7 +20,7 @@ jobs:
       - name: Init wiki
         run: |
           node scripts/init.mjs \
-            --wiki-dir=/tmp/wiki-nightly \
+            --hypo-dir=/tmp/wiki-nightly \
             --no-hooks --no-git-init
       - name: Seed verify fixture
         run: |
@@ -38,5 +38,5 @@ jobs:
       - name: Verify all pages
         run: |
           node scripts/verify.mjs \
-            --wiki-dir=/tmp/wiki-nightly \
+            --hypo-dir=/tmp/wiki-nightly \
             --json
