@@ -25,6 +25,10 @@ const targets = [
     pattern: /("version"\s*:\s*")([^"]+)(")/,
   },
   {
+    path: '.claude-plugin/marketplace.json',
+    pattern: /("version"\s*:\s*")([^"]+)(")/,
+  },
+  {
     path: 'templates/hypo-config.md',
     pattern: /(^version:\s*")([^"]+)(")/m,
   },
