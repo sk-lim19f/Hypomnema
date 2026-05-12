@@ -10,11 +10,12 @@
  * This script manages: frontmatter, H2 structure, date fields.
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { HYPO_DIR } from './hypo-shared.mjs';
+import { HYPO_DIR, computeSessionGrowth, formatGrowthMetrics } from './hypo-shared.mjs';
 
-const HOT_PATH = join(HYPO_DIR, 'hot.md');
+const HOT_PATH         = join(HYPO_DIR, 'hot.md');
+const GROWTH_CACHE     = join(HYPO_DIR, '.cache', 'last-session-growth.json');
 
 function parseFrontmatter(content) {
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -88,8 +89,18 @@ ${tableRows}
   if (canonical !== current) writeFileSync(HOT_PATH, canonical);
 }
 
-try {
-  rebuild();
-} catch {}
+function emitGrowth() {
+  if (!existsSync(HYPO_DIR)) return;
+  const stats = computeSessionGrowth(HYPO_DIR);
+  const line  = formatGrowthMetrics('stop', stats);
+  if (line) process.stderr.write(`${line}\n`);
+  try {
+    mkdirSync(join(HYPO_DIR, '.cache'), { recursive: true });
+    writeFileSync(GROWTH_CACHE, JSON.stringify({ ...stats, ts: Date.now() }));
+  } catch {}
+}
+
+try { rebuild();     } catch {}
+try { emitGrowth();  } catch {}
 
 try { console.log(JSON.stringify({ continue: true, suppressOutput: true })); } catch {}

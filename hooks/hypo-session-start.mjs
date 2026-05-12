@@ -11,9 +11,20 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from '
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
-import { HYPO_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS } from './hypo-shared.mjs';
+import { HYPO_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS, formatGrowthMetrics } from './hypo-shared.mjs';
 
-const PROJECTS_DIR = join(HYPO_DIR, 'projects');
+const PROJECTS_DIR  = join(HYPO_DIR, 'projects');
+const GROWTH_CACHE  = join(HYPO_DIR, '.cache', 'last-session-growth.json');
+
+function readLastGrowthLine() {
+  if (!existsSync(GROWTH_CACHE)) return '';
+  try {
+    const stats = JSON.parse(readFileSync(GROWTH_CACHE, 'utf-8'));
+    return formatGrowthMetrics('start', stats);
+  } catch {
+    return '';
+  }
+}
 
 function gitPull(dir) {
   if (!existsSync(join(dir, '.git'))) return;
@@ -97,6 +108,9 @@ process.stdin.on('end', () => {
     try { data = JSON.parse(raw); } catch {}
 
     gitPull(HYPO_DIR);
+    const growthLine = readLastGrowthLine();
+    const growthPrefix = growthLine ? `${growthLine}\n\n` : '';
+    if (growthLine) process.stderr.write(`\n\x1b[36m${growthLine}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);
@@ -113,26 +127,30 @@ process.stdin.on('end', () => {
         if (hotContent)   parts.push(`[HOT]\n${hotContent}`);
         if (stateContent) parts.push(`[SESSION STATE — 다음 작업]\n${stateContent}`);
         console.log(JSON.stringify(
-          buildOutput(`[WIKI HOT CACHE: project=${hit.proj}]\n\n${parts.join('\n\n')}`, { continue: true, suppressOutput: true })
+          buildOutput(`${growthPrefix}[WIKI HOT CACHE: project=${hit.proj}]\n\n${parts.join('\n\n')}`, { continue: true, suppressOutput: true })
         ));
       } else {
         process.stderr.write(`\n\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${hit.proj}\x1b[0m (no snapshot yet)\n\n`);
         writeFileSync(MARKER_FILE, JSON.stringify({ proj: hit.proj, hotPath: null, ts: Date.now() }));
         console.log(JSON.stringify(
-          buildOutput(`[WIKI HOT CACHE: project=${hit.proj}, no snapshot yet]`, { continue: true, suppressOutput: true })
+          buildOutput(`${growthPrefix}[WIKI HOT CACHE: project=${hit.proj}, no snapshot yet]`, { continue: true, suppressOutput: true })
         ));
       }
       return;
     }
 
     if (!existsSync(GLOBAL_HOT)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      if (growthLine) {
+        console.log(JSON.stringify(buildOutput(growthLine, { continue: true, suppressOutput: true })));
+      } else {
+        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      }
       return;
     }
 
     const globalContent = readFileSync(GLOBAL_HOT, 'utf-8').slice(0, HOT_CHARS);
     console.log(JSON.stringify(
-      buildOutput(`[WIKI HOT CACHE: global — no project matched cwd=${cwd}]\n\n${globalContent}`, { continue: true, suppressOutput: true })
+      buildOutput(`${growthPrefix}[WIKI HOT CACHE: global — no project matched cwd=${cwd}]\n\n${globalContent}`, { continue: true, suppressOutput: true })
     ));
 
   } catch {
