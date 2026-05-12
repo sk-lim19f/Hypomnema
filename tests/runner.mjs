@@ -621,6 +621,117 @@ test('errors when project session-state lacks a next heading', () => {
   ), `missing session-state heading error: ${r.stdout}`);
 });
 
+// ── Lane B: formatGrowthMetrics + growth echo regressions ─────────────────
+
+const { formatGrowthMetrics, computeSessionGrowth } = await import(
+  join(HOOKS, 'hypo-shared.mjs')
+);
+
+suite('formatGrowthMetrics()');
+
+test('stop mode happy path', () => {
+  const out = formatGrowthMetrics('stop', { addedPages: 2, updatedPages: 3, newWikilinks: 5 });
+  assert.equal(out, '[hypo] +2 pages, ~3 updated, 5 wikilinks');
+});
+
+test('start mode happy path', () => {
+  const out = formatGrowthMetrics('start', { addedPages: 1, updatedPages: 0, newWikilinks: 2 });
+  assert.ok(out.startsWith('[hypo] 직전 세션: +1 pages, ~0 updated, 2 wikilinks'));
+  assert.ok(out.includes('이어서 볼까요'));
+});
+
+test('stop mode edge: all zeros → empty string', () => {
+  assert.equal(formatGrowthMetrics('stop', { addedPages: 0, updatedPages: 0, newWikilinks: 0 }), '');
+  assert.equal(formatGrowthMetrics('stop', {}), '');
+  assert.equal(formatGrowthMetrics('stop', null), '');
+});
+
+test('start mode edge: unknown mode or missing fields', () => {
+  assert.equal(formatGrowthMetrics('weird', { addedPages: 1 }), '');
+  const out = formatGrowthMetrics('start', { addedPages: 1 });
+  assert.ok(out.includes('+1 pages, ~0 updated, 0 wikilinks'));
+});
+
+suite('hypo-hot-rebuild.mjs — growth echo regression');
+
+function withGrowthWiki(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-growth-'));
+  try {
+    spawnSync('git', ['init', '-q'], { cwd: dir });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    writeFileSync(join(dir, 'hot.md'),
+      '---\ntitle: Hot\nupdated: today\n---\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n');
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function runStop(hookFile, dir) {
+  return spawnSync(process.execPath, [join(HOOKS, hookFile)], {
+    input: '{}',
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: dir },
+  });
+}
+
+test('hot-rebuild writes growth cache when wiki has changes', () => {
+  withGrowthWiki(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'new.md'), '---\ntitle: New\n---\nrefs [[other]] and [[third]]\n');
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stderr.includes('[hypo] +1 pages'), `expected growth line in stderr: ${r.stderr}`);
+    const cache = JSON.parse(readFileSync(join(dir, '.cache', 'last-session-growth.json'), 'utf-8'));
+    assert.equal(cache.addedPages, 1);
+    assert.ok(cache.newWikilinks >= 2);
+  });
+});
+
+test('hot-rebuild emits no growth line when wiki is clean', () => {
+  withGrowthWiki(dir => {
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(!r.stderr.includes('[hypo] +'), `unexpected growth line: ${r.stderr}`);
+  });
+});
+
+suite('hypo-session-start.mjs — growth echo regression');
+
+function runStart(dir, cwd) {
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+    input: JSON.stringify({ cwd: cwd || dir, session_id: 'test-growth' }),
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: dir },
+  });
+}
+
+test('session-start injects growth line when cache exists', () => {
+  withGrowthWiki(dir => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'last-session-growth.json'),
+      JSON.stringify({ addedPages: 4, updatedPages: 2, newWikilinks: 7, ts: Date.now() }));
+    const r = runStart(dir);
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext || '';
+    assert.ok(ctx.includes('직전 세션: +4 pages, ~2 updated, 7 wikilinks'),
+      `growth prefix missing in additionalContext: ${ctx}`);
+  });
+});
+
+test('session-start emits no growth line when cache absent', () => {
+  withGrowthWiki(dir => {
+    const r = runStart(dir);
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext || '';
+    assert.ok(!ctx.includes('직전 세션'), `unexpected growth line: ${ctx}`);
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

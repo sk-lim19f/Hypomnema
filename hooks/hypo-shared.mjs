@@ -160,6 +160,86 @@ export function buildOutput(context, extra = {}) {
   return { ...extra, additionalContext: context };
 }
 
+// ── growth metrics (F2 + E4) ───────────────────────────────────────────────
+// Single formatter used by Stop (hot-rebuild) and SessionStart hooks so the
+// "[hypo] +N pages, ~M updated, K wikilinks" line stays consistent at both
+// ends of a session. See ADR-0018 / Lane B.
+
+/**
+ * Format a growth-metrics one-liner. Returns '' when all counts are 0 so
+ * callers can no-op silently.
+ *
+ * @param {'stop'|'start'} mode
+ * @param {{addedPages?:number, updatedPages?:number, newWikilinks?:number}} stats
+ * @returns {string}
+ */
+export function formatGrowthMetrics(mode, stats) {
+  const a = Number(stats?.addedPages)   || 0;
+  const u = Number(stats?.updatedPages) || 0;
+  const w = Number(stats?.newWikilinks) || 0;
+  if (a === 0 && u === 0 && w === 0) return '';
+  const body = `+${a} pages, ~${u} updated, ${w} wikilinks`;
+  if (mode === 'stop')  return `[hypo] ${body}`;
+  if (mode === 'start') return `[hypo] 직전 세션: ${body}. 이어서 볼까요?`;
+  return '';
+}
+
+/**
+ * Compute session growth by inspecting the wiki repo's working tree against
+ * HEAD. Counts every modified/added/untracked markdown file under `pages/`
+ * or `projects/` and totals net-new `[[wikilink]]` occurrences in the diff.
+ *
+ * @param {string} hypoDir
+ * @returns {{addedPages:number, updatedPages:number, newWikilinks:number}}
+ */
+export function computeSessionGrowth(hypoDir) {
+  const empty = { addedPages: 0, updatedPages: 0, newWikilinks: 0 };
+  if (!existsSync(join(hypoDir, '.git'))) return empty;
+  try {
+    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain'], { encoding: 'utf-8', timeout: 5000 });
+    if (porcelain.status !== 0) return empty;
+    let addedPages = 0, updatedPages = 0;
+    for (const line of (porcelain.stdout || '').split('\n')) {
+      if (!line || line.startsWith('??')) continue;
+      const xy   = line.slice(0, 2);
+      const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
+      if (!file.endsWith('.md')) continue;
+      if (xy.includes('A')) addedPages++;
+      else if (xy.includes('M') || xy.includes('R')) updatedPages++;
+    }
+    const untracked = spawnSync('git', ['-C', hypoDir, 'ls-files', '--others', '--exclude-standard'], { encoding: 'utf-8', timeout: 5000 });
+    if (untracked.status === 0) {
+      for (const f of (untracked.stdout || '').split('\n')) {
+        if (f && f.endsWith('.md')) addedPages++;
+      }
+    }
+    const diff = spawnSync('git', ['-C', hypoDir, 'diff', 'HEAD', '--unified=0'], { encoding: 'utf-8', timeout: 10000 });
+    let plus = 0, minus = 0;
+    if (diff.status === 0) {
+      for (const line of (diff.stdout || '').split('\n')) {
+        if (line.startsWith('+++') || line.startsWith('---')) continue;
+        const matches = line.match(/\[\[[^\]\n]+\]\]/g);
+        if (!matches) continue;
+        if (line.startsWith('+')) plus  += matches.length;
+        else if (line.startsWith('-')) minus += matches.length;
+      }
+    }
+    if (untracked.status === 0) {
+      for (const f of (untracked.stdout || '').split('\n')) {
+        if (!f || !f.endsWith('.md')) continue;
+        try {
+          const body = readFileSync(join(hypoDir, f), 'utf-8');
+          const matches = body.match(/\[\[[^\]\n]+\]\]/g);
+          if (matches) plus += matches.length;
+        } catch {}
+      }
+    }
+    return { addedPages, updatedPages, newWikilinks: Math.max(0, plus - minus) };
+  } catch {
+    return empty;
+  }
+}
+
 // ── .hypoignore support ────────────────────────────────────────────────────
 // Inlined here so deployed hooks (~/.claude/hooks/) don't need scripts/lib/.
 
