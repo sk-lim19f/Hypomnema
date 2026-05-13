@@ -1045,6 +1045,64 @@ test('fallback: empty index falls back to ~/.claude/projects scan path', () => {
   });
 });
 
+test('fixture: nested tool_use in message.content[] is counted (real transcript shape)', () => {
+  withTmpDir(dir => {
+    setupAuditFixture(dir, {
+      recordedAtIso: RECENT,
+      transcriptLines: [
+        // Real Claude Code transcript shape: tool_use lives inside
+        // message.content[], top-level has no type/name field.
+        { parentUuid: 'a', message: { role: 'assistant', content: [
+          { type: 'tool_use', id: 't1', name: 'Grep', input: { pattern: 'x' } },
+        ] } },
+        { parentUuid: 'b', message: { role: 'assistant', content: [
+          { type: 'tool_use', id: 't2', name: 'WebFetch', input: { url: 'https://example.com' } },
+        ] } },
+      ],
+    });
+    const r = runAudit(dir);
+    assert.equal(r.metrics.search_count, 2,
+      `expected search_count=2 for two nested tool_use blocks, got ${r.metrics.search_count}`);
+  });
+});
+
+suite('weekly-report.mjs — --week validation');
+
+test('--week=invalid exits non-zero with a clear error', () => {
+  withTmpDir(dir => {
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=not-a-week', '--json']);
+    assert.notEqual(r.status, 0, 'should reject malformed --week');
+    assert.ok(r.stderr.includes('invalid --week'), `stderr should explain: ${r.stderr}`);
+  });
+});
+
+suite('hypo-shared.computeSessionGrowth — pages/projects scope');
+
+test('growth ignores root README.md / hot.md (out of pages/projects scope)', () => {
+  withGrowthWiki(dir => {
+    // Touch a top-level scaffolding file. Should NOT count as page growth.
+    writeFileSync(join(dir, 'README.md'), '# readme\n');
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0);
+    assert.ok(!r.stderr.includes('[hypo] +'),
+      `unexpected growth line for root README: ${r.stderr}`);
+  });
+});
+
+test('growth ignores wikilinks introduced outside pages/projects', () => {
+  withGrowthWiki(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'real.md'), '# real\n[[other]]\n');
+    // A non-Markdown file with a wikilink-shaped string must not be counted.
+    writeFileSync(join(dir, 'script.js'), '// see [[noise]] but not a wiki link\n');
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0);
+    const cache = JSON.parse(readFileSync(join(dir, '.cache', 'last-session-growth.json'), 'utf-8'));
+    assert.equal(cache.addedPages, 1, 'only the pages/real.md should count');
+    assert.equal(cache.newWikilinks, 1, 'wikilink-shaped string in script.js must be ignored');
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

@@ -125,17 +125,40 @@ function countUrls(text) {
   return matches ? matches.length : 0;
 }
 
+// Walk a transcript line for `tool_use` blocks at the top level AND nested
+// inside `message.content[]`. Real Claude Code transcripts put tool calls in
+// the nested form (`{ type:"assistant", message:{ content:[{type:"tool_use",
+// name:"Bash"}] } }`); legacy fixtures use the top-level form. Both must work.
+function extractToolNames(entry) {
+  const names = [];
+  if (!entry || typeof entry !== 'object') return names;
+  if (entry.type === 'tool_use') {
+    const n = entry.name || entry.tool_name;
+    if (n) names.push(n);
+  } else if (entry.tool_name || entry.name) {
+    names.push(entry.tool_name || entry.name);
+  }
+  const content = entry.message?.content ?? (Array.isArray(entry.content) ? entry.content : null);
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === 'object' && block.type === 'tool_use') {
+        const n = block.name || block.tool_name;
+        if (n) names.push(n);
+      }
+    }
+  }
+  return names;
+}
+
 export function computeMetrics(transcriptLines) {
   const metrics = { search_count: 0, ingest_count: 0, feedback_count: 0, urls: 0, messages: 0 };
   for (const line of transcriptLines) {
     metrics.messages++;
-    // Tool-use entries are scored solely via their tool name — skip the text
-    // path below so a single transcript record can't double-count search.
-    const isToolUse = line.type === 'tool_use' || line.tool_name || line.name;
-    if (isToolUse) {
-      const name = line.name || line.tool_name;
-      if (name && SEARCH_TOOLS.has(name)) metrics.search_count++;
-      continue;
+    // Count tool_use blocks (top-level OR nested under message.content[]).
+    // Text scan is independent — tool_use blocks carry `input`, not `.text`,
+    // so extractText() won't double-count them.
+    for (const name of extractToolNames(line)) {
+      if (SEARCH_TOOLS.has(name)) metrics.search_count++;
     }
     const text = extractText(line);
     if (!text) continue;

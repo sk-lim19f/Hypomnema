@@ -150,6 +150,10 @@ function isMain() {
 
 if (isMain()) {
   const args = parseArgs(process.argv);
+  if (args.week && !parseWeekArg(args.week)) {
+    console.error(`Error: invalid --week value "${args.week}" (expected YYYY-WW)`);
+    process.exit(2);
+  }
   const report = buildReport(args.hypoDir, { week: args.week, limit: args.limit });
 
   if (args.json) {
