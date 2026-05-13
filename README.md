@@ -10,7 +10,7 @@ English | [한국어](README.ko.md)
 [![npm downloads](https://img.shields.io/npm/dm/hypomnema?color=blue)](https://www.npmjs.com/package/hypomnema)
 [![Node.js](https://img.shields.io/node/v/hypomnema?color=43853d&logo=node.js&logoColor=white)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-51%2F51-brightgreen)](tests/runner.mjs)
+[![CI](https://github.com/sk-lim19f/Hypomnema/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sk-lim19f/Hypomnema/actions/workflows/ci.yml)
 [![GitHub stars](https://img.shields.io/github/stars/sk-lim19f/Hypomnema?style=flat&color=yellow)](https://github.com/sk-lim19f/Hypomnema/stargazers)
 
 **LLM-native personal wiki for Claude Code. Knowledge that compounds.**
@@ -320,7 +320,7 @@ No external services. No API keys. No vector databases.
 
 ## Status
 
-- **Tests:** 51 / 51 passing — see `tests/runner.mjs`
+- **Tests:** see `npm test` — exact totals shift as lanes ship, so the runner is the source of truth
 - **CI:** 7 independent jobs (test matrix, lint, init/upgrade snapshots, replay, hypo-absent, uninstall-smoke)
 - **Release:** `npm publish --provenance` on `v*` tag push
 
