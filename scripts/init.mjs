@@ -33,6 +33,11 @@ import { readPkgJson as readPkgJsonSafe, writePkgJsonAtomic, sha256 as sha256Buf
 const HOME       = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const PKG_ROOT   = join(SCRIPT_DIR, '..');
+
+// Shown after every fatal package-integrity error. These conditions mean the
+// shipped hooks/hooks.json is missing or malformed — never a user mistake —
+// so the only useful next step is a re-install of the package.
+const PKG_INTEGRITY_HINT = '→ This indicates a corrupt or incomplete install. Re-install with `npm install -g hypomnema` (or re-install the Claude Code plugin).';
 const HOOKS_SRC    = join(PKG_ROOT, 'hooks');
 const COMMANDS_SRC = join(PKG_ROOT, 'commands');
 const TEMPLATES    = join(PKG_ROOT, 'templates');
@@ -160,14 +165,17 @@ function loadHookMap() {
     cfg = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
   } catch {
     console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
     console.error('Error: hooks/hooks.json must be a JSON object');
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
     console.error('Error: hooks/hooks.json must contain a "hooks" object');
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   function _extractCommandFileName(command) {
@@ -212,11 +220,13 @@ function loadHookMap() {
       _extractFileNames(groups).length > 0;
     if (!valid) {
       console.error(`Error: hooks/hooks.json "hooks.${event}" must be a non-empty array of .mjs file names or Claude hook groups`);
+      console.error(PKG_INTEGRITY_HINT);
       process.exit(1);
     }
   }
   if (cfg.shared !== undefined && (!Array.isArray(cfg.shared) || !cfg.shared.every(f => _isHookFileName(f)))) {
     console.error('Error: hooks/hooks.json "shared" must be an array of .mjs file names');
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   return Object.fromEntries(Object.entries(cfg.hooks).map(([event, groups]) => [event, _extractFileNames(groups)]));
