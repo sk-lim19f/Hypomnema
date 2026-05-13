@@ -196,43 +196,47 @@ export function computeSessionGrowth(hypoDir) {
   const empty = { addedPages: 0, updatedPages: 0, newWikilinks: 0 };
   if (!existsSync(join(hypoDir, '.git'))) return empty;
   try {
-    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain'], { encoding: 'utf-8', timeout: 5000 });
+    // Single `git status --porcelain` enumerates tracked + untracked. On a
+    // clean tree (no .md changes at all) we return early and skip the much
+    // more expensive `git diff HEAD --unified=0` — Stop hook P95 win.
+    // `-uall` expands untracked directories so a brand-new `pages/new.md`
+    // isn't hidden behind a single `?? pages/` line.
+    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall'], { encoding: 'utf-8', timeout: 5000 });
     if (porcelain.status !== 0) return empty;
     let addedPages = 0, updatedPages = 0;
+    let hasTrackedMdChange = false;
+    const untrackedMd = [];
     for (const line of (porcelain.stdout || '').split('\n')) {
-      if (!line || line.startsWith('??')) continue;
+      if (!line) continue;
       const xy   = line.slice(0, 2);
       const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
       if (!file.endsWith('.md')) continue;
+      if (xy === '??') { untrackedMd.push(file); addedPages++; continue; }
+      hasTrackedMdChange = true;
       if (xy.includes('A')) addedPages++;
       else if (xy.includes('M') || xy.includes('R')) updatedPages++;
     }
-    const untracked = spawnSync('git', ['-C', hypoDir, 'ls-files', '--others', '--exclude-standard'], { encoding: 'utf-8', timeout: 5000 });
-    if (untracked.status === 0) {
-      for (const f of (untracked.stdout || '').split('\n')) {
-        if (f && f.endsWith('.md')) addedPages++;
-      }
-    }
-    const diff = spawnSync('git', ['-C', hypoDir, 'diff', 'HEAD', '--unified=0'], { encoding: 'utf-8', timeout: 10000 });
+    if (!hasTrackedMdChange && untrackedMd.length === 0) return empty;
+
     let plus = 0, minus = 0;
-    if (diff.status === 0) {
-      for (const line of (diff.stdout || '').split('\n')) {
-        if (line.startsWith('+++') || line.startsWith('---')) continue;
-        const matches = line.match(/\[\[[^\]\n]+\]\]/g);
-        if (!matches) continue;
-        if (line.startsWith('+')) plus  += matches.length;
-        else if (line.startsWith('-')) minus += matches.length;
+    if (hasTrackedMdChange) {
+      const diff = spawnSync('git', ['-C', hypoDir, 'diff', 'HEAD', '--unified=0'], { encoding: 'utf-8', timeout: 10000 });
+      if (diff.status === 0) {
+        for (const line of (diff.stdout || '').split('\n')) {
+          if (line.startsWith('+++') || line.startsWith('---')) continue;
+          const matches = line.match(/\[\[[^\]\n]+\]\]/g);
+          if (!matches) continue;
+          if (line.startsWith('+')) plus  += matches.length;
+          else if (line.startsWith('-')) minus += matches.length;
+        }
       }
     }
-    if (untracked.status === 0) {
-      for (const f of (untracked.stdout || '').split('\n')) {
-        if (!f || !f.endsWith('.md')) continue;
-        try {
-          const body = readFileSync(join(hypoDir, f), 'utf-8');
-          const matches = body.match(/\[\[[^\]\n]+\]\]/g);
-          if (matches) plus += matches.length;
-        } catch {}
-      }
+    for (const f of untrackedMd) {
+      try {
+        const body = readFileSync(join(hypoDir, f), 'utf-8');
+        const matches = body.match(/\[\[[^\]\n]+\]\]/g);
+        if (matches) plus += matches.length;
+      } catch {}
     }
     return { addedPages, updatedPages, newWikilinks: Math.max(0, plus - minus) };
   } catch {

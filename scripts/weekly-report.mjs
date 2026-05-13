@@ -83,12 +83,14 @@ function autonomyScore(results) {
     den += 1; // at minimum, expect *some* wiki engagement per real session
     num += Math.min(m.search_count, 3) + m.ingest_count * 3 + m.feedback_count * 2;
     if (m.urls > 0) {
-      den += Math.min(m.urls, 5) * 2; // each URL is a missed-ingest opportunity weight 2
-      num += m.ingest_count * 0; // ingest already counted above
+      // Each URL is a missed-ingest opportunity (weight 2). Numerator is *not*
+      // boosted here — `ingest_count` is already credited above; what URLs do
+      // is raise the bar for what "fully autonomous" looks like.
+      den += Math.min(m.urls, 5) * 2;
     }
   }
   if (den === 0) return 0;
-  return Math.round((num / den) * 100);
+  return Math.min(100, Math.max(0, Math.round((num / den) * 100)));
 }
 
 export function buildReport(hypoDir, { week, limit = 200, now = Date.now() } = {}) {
