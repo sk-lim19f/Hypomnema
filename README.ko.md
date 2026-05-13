@@ -10,7 +10,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/hypomnema?color=blue)](https://www.npmjs.com/package/hypomnema)
 [![Node.js](https://img.shields.io/node/v/hypomnema?color=43853d&logo=node.js&logoColor=white)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-51%2F51-brightgreen)](tests/runner.mjs)
+[![CI](https://github.com/sk-lim19f/Hypomnema/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sk-lim19f/Hypomnema/actions/workflows/ci.yml)
 [![GitHub stars](https://img.shields.io/github/stars/sk-lim19f/Hypomnema?style=flat&color=yellow)](https://github.com/sk-lim19f/Hypomnema/stargazers)
 
 **Claude Code를 위한 LLM 네이티브 개인 위키. 복리로 성장하는 지식.**
@@ -320,7 +320,7 @@ Claude가 잘못하거나 정확히 맞았을 때마다 `/hypo:feedback`을 실�
 
 ## 상태
 
-- **테스트:** 51 / 51 통과 — `tests/runner.mjs`
+- **테스트:** `npm test` 참조 — lane이 ship될 때마다 카운트가 변하므로 러너가 단일 진실 공급원
 - **CI:** 7개 독립 job (test matrix, lint, init/upgrade snapshots, replay, hypo-absent, uninstall-smoke)
 - **릴리스:** `v*` 태그 push 시 `npm publish --provenance` 자동 실행
 
