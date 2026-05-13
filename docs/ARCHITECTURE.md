@@ -53,7 +53,7 @@ hypomnema/
 │   ├── Home.md, Overview.md, hypo-automation.md, hypo-help.md
 │   ├── pages/_index.md
 │   └── projects/_template/
-├── tests/runner.mjs          ← no-dependency test runner (51 tests)
+├── tests/runner.mjs          ← no-dependency test runner
 ├── docs/                     ← ARCHITECTURE.md, CONTRIBUTING.md
 ├── .claude-plugin/plugin.json← plugin manifest
 └── package.json              ← npm metadata, no runtime deps
@@ -100,7 +100,7 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | `UserPromptSubmit` | `hypo-first-prompt.mjs` → `hypo-lookup.mjs` → `hypo-compact-guard.mjs` |
 | `PreCompact` | `hypo-personal-check.mjs` |
 | `PostToolUse` (Write/Edit) | `hypo-auto-stage.mjs` |
-| `Stop` | `hypo-hot-rebuild.mjs` → `hypo-auto-commit.mjs` |
+| `Stop` | `hypo-hot-rebuild.mjs` → `hypo-session-record.mjs` → `hypo-auto-commit.mjs` |
 | `CwdChanged` | `hypo-cwd-change.mjs` |
 | `FileChanged` | `hypo-file-watch.mjs` |
 
@@ -113,9 +113,10 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each, with verify-by-date warnings). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
 | `hypo-compact-guard` | Detect `/compact` invocations → enforce session-close checklist before allowing compact |
 | `hypo-personal-check` | PreCompact validation: lint blockers, uncommitted changes, missing session-log entries → block compact |
-| `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (filtered by `.hypoignore`) |
-| `hypo-hot-rebuild` | At session stop, regenerate root `hot.md` from recent activity |
-| `hypo-auto-commit` | At session stop, commit staged changes + `git pull --rebase` + `git push` (silent fail on missing remote) |
+| `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`) |
+| `hypo-hot-rebuild` | At session stop, regenerate root `hot.md` from recent activity; emit growth metrics + cache for next SessionStart |
+| `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
+| `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote) |
 | `hypo-cwd-change` | When working directory changes, re-resolve the active project and inject its `hot.md` |
 | `hypo-file-watch` | Notify on external wiki edits so the in-session view stays consistent |
 
@@ -289,8 +290,9 @@ SessionStart
   │     └─► hypo-cwd-change.mjs (re-inject project hot.md)
   │
   └─► Stop
-        ├─► hypo-hot-rebuild.mjs (regenerate root hot.md)
-        └─► hypo-auto-commit.mjs (commit + pull --rebase + push)
+        ├─► hypo-hot-rebuild.mjs (regenerate root hot.md + growth cache)
+        ├─► hypo-session-record.mjs (append .cache/sessions/index.jsonl)
+        └─► hypo-auto-commit.mjs (.hypoignore-filtered stage + commit + pull + push)
 ```
 
 ---
@@ -401,9 +403,9 @@ Default patterns: `*.pdf`, `*.zip`, `*.pem`, `*.env`, `*.key`, `*.crt`, `*creden
 | `upgrade.mjs` regression | ~10 (includes migration fixture) |
 | `lint.mjs` (fix / json / session-state) | ~10 |
 | Misc (`expandHome`, `resolveHypoRoot`, …) | ~remainder |
-| **Total** | **51 / 51 PASS** |
+| **Total** | Run `npm test` for the live count |
 
-Run with `npm test`. The runner uses only Node.js built-ins; tests create scoped temp dirs and clean up after themselves.
+Run with `npm test`. The runner uses only Node.js built-ins; tests create scoped temp dirs and clean up after themselves. The count above is a layout sketch — exact totals shift as lanes ship, so `npm test` is the source of truth.
 
 ---
 
