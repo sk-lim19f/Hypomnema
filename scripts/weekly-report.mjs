@@ -1,0 +1,177 @@
+#!/usr/bin/env node
+/**
+ * weekly-report.mjs — Weekly observability report (Lane E)
+ *
+ * Aggregates session-audit results into a Markdown report under
+ * `<hypo-dir>/pages/observability/<YYYY-WW>.md`.
+ *
+ * The autonomy score is heuristic on purpose — see
+ * pages/observability/_index.md for the definition and the 4-week
+ * baseline plan before we revisit LLM-judge classification.
+ *
+ * Usage:
+ *   node scripts/weekly-report.mjs [--hypo-dir=<path>] [--week=YYYY-WW]
+ *                                  [--limit N] [--write] [--json]
+ */
+
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadSessionEntries, auditEntries } from './session-audit.mjs';
+
+function parseArgs(argv) {
+  const args = { hypoDir: null, week: null, limit: 200, write: false, json: false, fallbackAll: false };
+  for (const arg of argv.slice(2)) {
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
+    else if (arg.startsWith('--week='))   args.week    = arg.slice(7);
+    else if (arg.startsWith('--limit='))  args.limit   = parseInt(arg.slice(8), 10) || 200;
+    else if (arg === '--write')           args.write   = true;
+    else if (arg === '--json')            args.json    = true;
+    else if (arg === '--fallback-all-projects') args.fallbackAll = true;
+  }
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
+  return args;
+}
+
+function isoWeek(date) {
+  // ISO-8601 week: Thursday in current week decides the year.
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const week = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return `${d.getUTCFullYear()}-${String(week).padStart(2, '0')}`;
+}
+
+function parseWeekArg(spec) {
+  // Accepts YYYY-WW. Returns the Monday of that ISO week.
+  const m = String(spec).match(/^(\d{4})-(\d{2})$/);
+  if (!m) return null;
+  const year = parseInt(m[1], 10);
+  const week = parseInt(m[2], 10);
+  // Find Jan 4 — always in week 1 — and offset to the Monday of `week`.
+  const jan4    = new Date(Date.UTC(year, 0, 4));
+  const jan4Dow = jan4.getUTCDay() || 7;
+  const week1Mon = new Date(jan4);
+  week1Mon.setUTCDate(jan4.getUTCDate() - (jan4Dow - 1));
+  const weekStart = new Date(week1Mon);
+  weekStart.setUTCDate(week1Mon.getUTCDate() + (week - 1) * 7);
+  return weekStart;
+}
+
+function filterToWeek(results, weekLabel) {
+  return results.filter(r => {
+    if (!r.recorded_at) return false;
+    return isoWeek(new Date(r.recorded_at)) === weekLabel;
+  });
+}
+
+function tally(results) {
+  const out = { 'normal': 0, 'search-0': 0, 'search-many': 0, 'ingest-missed': 0, 'staleness-skip': 0 };
+  for (const r of results) out[r.classification] = (out[r.classification] || 0) + 1;
+  return out;
+}
+
+function autonomyScore(results) {
+  // Heuristic v0 (see pages/observability/_index.md §3 for the formal sketch).
+  // Numerator   = weighted "wiki was actually used" signals.
+  // Denominator = same signals expected (1 per non-stale session, plus URL→ingest opportunities).
+  let num = 0;
+  let den = 0;
+  for (const r of results) {
+    if (r.classification === 'staleness-skip') continue;
+    const m = r.metrics;
+    den += 1; // at minimum, expect *some* wiki engagement per real session
+    num += Math.min(m.search_count, 3) + m.ingest_count * 3 + m.feedback_count * 2;
+    if (m.urls > 0) {
+      // Each URL is a missed-ingest opportunity (weight 2). Numerator is *not*
+      // boosted here — `ingest_count` is already credited above; what URLs do
+      // is raise the bar for what "fully autonomous" looks like.
+      den += Math.min(m.urls, 5) * 2;
+    }
+  }
+  if (den === 0) return 0;
+  return Math.min(100, Math.max(0, Math.round((num / den) * 100)));
+}
+
+export function buildReport(hypoDir, { week, limit = 200, now = Date.now(), fallbackAll = false } = {}) {
+  const entries = loadSessionEntries(hypoDir, { fallbackAll });
+  const audited = auditEntries(entries, { limit, maxAgeDays: 365, now });
+  const weekLabel = week || isoWeek(new Date(now));
+  const weekResults = filterToWeek(audited, weekLabel);
+  const counts = tally(weekResults);
+  const score  = autonomyScore(weekResults);
+  return { week: weekLabel, count: weekResults.length, counts, score, results: weekResults };
+}
+
+function renderMarkdown(report) {
+  const { week, count, counts, score, results } = report;
+  const today = new Date().toISOString().slice(0, 10);
+  const lines = [];
+  lines.push('---');
+  lines.push(`title: Observability — Week ${week}`);
+  lines.push('tags: [observability, autonomy, weekly]');
+  lines.push('type: weekly-journal');
+  lines.push(`updated: ${today}`);
+  lines.push('---');
+  lines.push('');
+  lines.push(`# Observability — Week ${week}`);
+  lines.push('');
+  lines.push(`> Generated by \`scripts/weekly-report.mjs\`. Heuristic definition: [[pages/observability/_index]].`);
+  lines.push('');
+  lines.push(`## Autonomy score (heuristic v0): **${score}%**`);
+  lines.push('');
+  lines.push(`Sessions audited: ${count}`);
+  lines.push('');
+  lines.push('| Classification | Count |');
+  lines.push('|---|---|');
+  for (const k of ['normal', 'search-0', 'search-many', 'ingest-missed', 'staleness-skip']) {
+    lines.push(`| ${k} | ${counts[k] || 0} |`);
+  }
+  lines.push('');
+  if (results.length === 0) {
+    lines.push('_No sessions recorded in this week. If this is unexpected, check `hooks/hypo-session-record.mjs` and `.cache/sessions/index.jsonl`._');
+  } else {
+    lines.push('## Sessions');
+    lines.push('');
+    lines.push('| Session | Class | search | ingest | urls | recorded |');
+    lines.push('|---|---|---|---|---|---|');
+    for (const r of results) {
+      const m = r.metrics;
+      lines.push(`| ${r.session_id} | ${r.classification} | ${m.search_count} | ${m.ingest_count} | ${m.urls} | ${r.recorded_at || '—'} |`);
+    }
+  }
+  return lines.join('\n') + '\n';
+}
+
+function isMain() {
+  try { return import.meta.url === `file://${process.argv[1]}`; }
+  catch { return false; }
+}
+
+if (isMain()) {
+  const args = parseArgs(process.argv);
+  if (args.week && !parseWeekArg(args.week)) {
+    console.error(`Error: invalid --week value "${args.week}" (expected YYYY-WW)`);
+    process.exit(2);
+  }
+  const report = buildReport(args.hypoDir, { week: args.week, limit: args.limit, fallbackAll: args.fallbackAll });
+
+  if (args.json) {
+    console.log(JSON.stringify(report, null, 2));
+    process.exit(0);
+  }
+
+  const md = renderMarkdown(report);
+
+  if (args.write) {
+    const dir  = join(args.hypoDir, 'pages', 'observability');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `${report.week}.md`);
+    writeFileSync(path, md);
+    console.log(`✓ Wrote ${path}`);
+    console.log(`  Autonomy score: ${report.score}%  (sessions: ${report.count})`);
+  } else {
+    process.stdout.write(md);
+  }
+}

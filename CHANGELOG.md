@@ -5,6 +5,100 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-05-13
+
+Minor release. The headline is **observability**: the v1 → v2 thesis is
+that Claude eventually reads, writes, and synthesizes the wiki without
+being asked, but v1.0.1 was still trigger-driven. v1.1.0 doesn't claim
+the autonomy gap is closed — instead it ships the **measurement** that
+makes the auto-vs-manual ratio visible per session and per week, plus
+the privacy gate that lets that measurement run without leaking
+transcript content into the wiki.
+
+Alongside that, this release cleans up a v1.0.x install-flow surprise:
+`hypomnema upgrade --apply` is no longer a no-op (see Fixed).
+
+### Upgrading from 1.0.1
+
+```bash
+npm install -g hypomnema@1.1.0       # or: npm update -g hypomnema
+hypomnema upgrade --apply            # now actually runs upgrade.mjs
+```
+
+Plugin users: re-run `/plugin install hypomnema@hypomnema` (or restart
+Claude Code) so the new slash commands and hooks get registered.
+
+### Added
+
+- **Observability pipeline.** `/hypo:audit` (`scripts/session-audit.mjs`)
+  classifies every Claude session against the lookup → ingest → query →
+  session-close pipeline and prints a per-session report.
+  `scripts/weekly-report.mjs` aggregates the same signal into a weekly
+  observability page. `SKILL.md` files now carry citation footers that
+  the audit uses to verify wiki uptake. Nightly CI (`nightly.yml`)
+  keeps the pipeline honest.
+- **Session growth metrics.** Hooks surface per-session growth at
+  session boundaries — pages touched, wikilinks added, session-close
+  rate — scoped to `pages/` + `projects/` so unrelated repo activity
+  doesn't pollute the score.
+- **Privacy gate via `.hypoignore`.** The auto-commit and auto-stage
+  hooks now honor `.hypoignore`; transcript classification cannot leak
+  transcript text, URLs, tool input, or secret commands into the
+  weekly report. Locked by a contract test in `tests/runner.mjs`.
+- **`hypomnema <upgrade|doctor|uninstall>` subcommands.** Previously
+  the bin entry silently dropped the positional verb and ran `init`;
+  the documented forms had been advertised but never wired up.
+  `hypomnema --help` now lists each command.
+- **Community templates.**
+  `.github/ISSUE_TEMPLATE/{bug_report.md,feature_request.md,config.yml}`,
+  `.github/PULL_REQUEST_TEMPLATE.md`, and root `SECURITY.md` — the
+  last with a scoped threat model (wiki vault + `~/.claude/`
+  namespace) and a private-reporting channel.
+
+### Fixed
+
+- **`hypomnema upgrade --apply` actually upgrades.** The bin pointed at
+  `scripts/init.mjs`, which silently ignored the positional verb and
+  ran the init flow instead. Users got an init-shaped output and
+  assumed the documented upgrade had run. It hadn't. Same story for
+  `hypomnema doctor` and `hypomnema uninstall`. All four are now
+  dispatched correctly from a tiny subcommand router at the top of
+  `init.mjs`; bare `hypomnema` still equals `hypomnema init` for the
+  documented Path-B onboarding command.
+- **Audit correctness.** Counts nested `tool_use` entries (matches real
+  transcript shape), scopes session growth to `pages/` + `projects/`
+  (ignores root `README.md` / `hot.md`), validates `--week=<ISO>` with
+  a clear error on malformed input, and defaults the fallback session
+  scan to the wiki's encoded cwd. Opt-in to a full scan via
+  `--fallback-all-projects`.
+- **Package-integrity errors point at a next step.** Low-level errors
+  thrown when `hooks/hooks.json` is missing or malformed
+  (`Error: hooks/hooks.json must be a JSON object`, etc.) previously
+  exited with no remediation. They now follow up with:
+  *→ This indicates a corrupt or incomplete install. Re-install with
+  `npm install -g hypomnema` (or re-install the Claude Code plugin).*
+- **`.hypoignore` migration.** `hypomnema upgrade` appends `.cache/` to
+  existing `.hypoignore` idempotently — no duplication if you run
+  `upgrade --apply` twice.
+
+### Documentation
+
+- README honesty pass. v1.0.1's trigger model is documented explicitly
+  (most behavior fires on `/hypo:*` commands, not autonomously). v1.1
+  is framed as the *first step* on the v2 autonomous ramp: ship the
+  observability score so the gap is visible to the user before the
+  autonomy work lands. No "fully autonomous" claims in v1.1.
+- README badges and Status section drop the hard-coded "51/51 tests"
+  figure. The static shields.io badge is replaced with a live GitHub
+  Actions CI status badge; the body line points readers at `npm test`.
+  ARCHITECTURE.md and CONTRIBUTING.md follow the same pattern, so the
+  count no longer rots every time a lane ships.
+- ARCHITECTURE.md syncs the `Stop` hook order with `hypo-session-record`
+  and updates the auto-stage / auto-commit rows to reflect
+  `.hypoignore` filtering.
+
+[1.1.0]: https://github.com/sk-lim19f/Hypomnema/releases/tag/v1.1.0
+
 ## [1.0.1] - 2026-05-12
 
 Hotfix release. v1.0.0 quickstart told users to run `npm install -g hypomnema`

@@ -53,7 +53,7 @@ hypomnema/
 │   ├── Home.md, Overview.md, hypo-automation.md, hypo-help.md
 │   ├── pages/_index.md
 │   └── projects/_template/
-├── tests/runner.mjs          ← no-dependency test runner (51 tests)
+├── tests/runner.mjs          ← no-dependency test runner
 ├── docs/                     ← ARCHITECTURE.md, CONTRIBUTING.md
 ├── .claude-plugin/plugin.json← plugin manifest
 └── package.json              ← npm metadata, no runtime deps
@@ -100,7 +100,7 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | `UserPromptSubmit` | `hypo-first-prompt.mjs` → `hypo-lookup.mjs` → `hypo-compact-guard.mjs` |
 | `PreCompact` | `hypo-personal-check.mjs` |
 | `PostToolUse` (Write/Edit) | `hypo-auto-stage.mjs` |
-| `Stop` | `hypo-hot-rebuild.mjs` → `hypo-auto-commit.mjs` |
+| `Stop` | `hypo-hot-rebuild.mjs` → `hypo-session-record.mjs` → `hypo-auto-commit.mjs` |
 | `CwdChanged` | `hypo-cwd-change.mjs` |
 | `FileChanged` | `hypo-file-watch.mjs` |
 
@@ -113,9 +113,10 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each, with verify-by-date warnings). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
 | `hypo-compact-guard` | Detect `/compact` invocations → enforce session-close checklist before allowing compact |
 | `hypo-personal-check` | PreCompact validation: lint blockers, uncommitted changes, missing session-log entries → block compact |
-| `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (filtered by `.hypoignore`) |
-| `hypo-hot-rebuild` | At session stop, regenerate root `hot.md` from recent activity |
-| `hypo-auto-commit` | At session stop, commit staged changes + `git pull --rebase` + `git push` (silent fail on missing remote) |
+| `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`) |
+| `hypo-hot-rebuild` | At session stop, regenerate root `hot.md` from recent activity; emit growth metrics + cache for next SessionStart |
+| `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
+| `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote) |
 | `hypo-cwd-change` | When working directory changes, re-resolve the active project and inject its `hot.md` |
 | `hypo-file-watch` | Notify on external wiki edits so the in-session view stays consistent |
 
@@ -289,8 +290,9 @@ SessionStart
   │     └─► hypo-cwd-change.mjs (re-inject project hot.md)
   │
   └─► Stop
-        ├─► hypo-hot-rebuild.mjs (regenerate root hot.md)
-        └─► hypo-auto-commit.mjs (commit + pull --rebase + push)
+        ├─► hypo-hot-rebuild.mjs (regenerate root hot.md + growth cache)
+        ├─► hypo-session-record.mjs (append .cache/sessions/index.jsonl)
+        └─► hypo-auto-commit.mjs (.hypoignore-filtered stage + commit + pull + push)
 ```
 
 ---
@@ -304,6 +306,78 @@ Corrections flow through three stages:
 3. **Promote** — when a feedback page accumulates `confidence: high`, `evidence_strength: direct`, and ≥3 "forgotten and re-explained" events, it is hand-promoted into `CLAUDE.md`'s `<learned_behaviors>` block — making it a permanent rule for Claude on every machine that pulls the wiki.
 
 Promotion is intentionally manual to keep `<learned_behaviors>` curated. The pipeline definition is captured in the wiki at `.omc/wiki/wiki-promotion-pipeline.md` (personal system; not part of the OSS package).
+
+---
+
+## Observability (v1.1)
+
+v1.1 ships an **observability wedge** — the wiki measures whether it's actually being used per session, rather than claiming autonomy it can't yet deliver.
+
+### Data flow
+
+```
+Stop hook (hypo-session-record.mjs)
+    │  appends one JSONL entry per session
+    ▼
+<hypo-root>/.cache/sessions/index.jsonl   ← primary source
+    │
+    ▼
+scripts/session-audit.mjs                  ← per-session metrics + classification
+    │
+    ▼
+scripts/weekly-report.mjs                  ← aggregated weekly autonomy score
+    │
+    ▼
+pages/observability/<YYYY-WW>.md           ← committed report (heuristic v0)
+```
+
+### Transcript dual-source (ADR 0019)
+
+`session-audit.mjs` reads transcripts from two locations, in priority order:
+
+1. **Primary:** `<hypo-root>/.cache/sessions/index.jsonl` — written by the Stop hook `hypo-session-record.mjs`. Each line: `{ session_id, transcript_path, recorded_at, cwd }`.
+2. **Fallback:** `~/.claude/projects/<encoded>/*.jsonl` — scanned when the index is missing or empty (legacy / freshly-installed wikis).
+
+### Classification
+
+| Class | Rule |
+|---|---|
+| `staleness-skip` | `recorded_at` older than `--max-age-days` (default 30) |
+| `ingest-missed` | `urls >= 2` and `ingest_count == 0` |
+| `search-many`   | `search_count >= 5` (heavy retrieval; suggests missing synthesis) |
+| `search-0`      | `search_count == 0` |
+| `normal`        | otherwise |
+
+Counted tool names: `Grep`, `WebSearch`, `WebFetch`. Counted slash commands: `/hypo:query`, `/hypo:ingest`, `/hypo:feedback`. A single transcript record contributes to exactly one of (tool-use search OR text-based command search) — `computeMetrics` short-circuits after a tool-use match to prevent double counting.
+
+### Autonomy score (heuristic v0)
+
+`weekly-report.mjs` aggregates the week's results into a 0–100 score. The score is **clamped to `[0, 100]`** and skips `staleness-skip` sessions. Formula sketch (see `pages/observability/_index.md` for the formal definition):
+
+```
+numerator   = Σ min(search,3) + ingest*3 + feedback*2
+denominator = Σ 1   + (urls > 0 ? min(urls,5)*2 : 0)
+score       = clamp(round(num/den * 100), 0, 100)
+```
+
+The score is a **proxy, not ground truth**. The four-week baseline plan (capture v0 numbers, then revisit with LLM-judge classification before v2) is recorded in the same `_index.md`.
+
+### Privacy
+
+The observability pipeline reads but never republishes raw transcripts. Weekly reports only emit `session_id` plus aggregate counts — no transcript content, no URLs, no tool inputs. Transcripts themselves live under `~/.claude/projects/` or `.cache/sessions/` which `.hypoignore` already excludes from any sync.
+
+### Growth metrics (Lane B)
+
+A separate, lightweight counter — distinct from the audit pipeline — runs at every Stop / SessionStart pair:
+
+- **Stop** (`hypo-hot-rebuild.mjs`) computes `{ addedPages, updatedPages, newWikilinks }` by reading `git status --porcelain` plus a conditional `git diff HEAD --unified=0`, writes the result to `<hypo-root>/.cache/last-session-growth.json`, and echoes one line to stderr.
+- **SessionStart** (`hypo-session-start.mjs`) reads the cache and surfaces the same line in both stderr (cyan) and the LLM's `additionalContext` so user and model see the same "직전 세션" prefix.
+
+If `git status` shows no `.md` changes, the diff step is skipped — Stop hook fast path.
+
+### Citation convention
+
+The six writer-side skills (`crystallize`, `query`, `ingest`, `verify`, `graph`, `lint`) carry an identical footer instructing Claude to cite wiki pages inline as `[[page-slug]]`. The audit script counts these citations as a "wiki was actually consulted" signal in future iterations.
 
 ---
 
@@ -329,9 +403,9 @@ Default patterns: `*.pdf`, `*.zip`, `*.pem`, `*.env`, `*.key`, `*.crt`, `*creden
 | `upgrade.mjs` regression | ~10 (includes migration fixture) |
 | `lint.mjs` (fix / json / session-state) | ~10 |
 | Misc (`expandHome`, `resolveHypoRoot`, …) | ~remainder |
-| **Total** | **51 / 51 PASS** |
+| **Total** | Run `npm test` for the live count |
 
-Run with `npm test`. The runner uses only Node.js built-ins; tests create scoped temp dirs and clean up after themselves.
+Run with `npm test`. The runner uses only Node.js built-ins; tests create scoped temp dirs and clean up after themselves. The count above is a layout sketch — exact totals shift as lanes ship, so `npm test` is the source of truth.
 
 ---
 

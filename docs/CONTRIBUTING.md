@@ -22,7 +22,7 @@ No build step. The package is plain ESM with **zero npm runtime dependencies**.
 git clone https://github.com/sk-lim19f/Hypomnema.git
 cd Hypomnema
 npm install   # installs dev tooling only — runtime deps are zero
-npm test      # 51/51 should pass
+npm test      # all tests should pass — exact count shifts as lanes ship
 npm run lint  # frontmatter + wikilink validation
 ```
 

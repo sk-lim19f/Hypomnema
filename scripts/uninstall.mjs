@@ -24,6 +24,11 @@ const HOME       = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const PKG_ROOT   = join(SCRIPT_DIR, '..');
 
+// Shown after every fatal package-integrity error. These conditions mean the
+// shipped hooks/hooks.json is missing or malformed — never a user mistake —
+// so the only useful next step is a re-install of the package.
+const PKG_INTEGRITY_HINT = '→ This indicates a corrupt or incomplete install. Re-install with `npm install -g hypomnema` (or re-install the Claude Code plugin).';
+
 function removeCommands(apply, force) {
   const targetDir = join(HOME, '.claude', 'commands', 'hypo');
   const pkgPath   = join(HOME, '.claude', 'hypo-pkg.json');
@@ -88,10 +93,12 @@ function loadHookFiles() {
     cfg = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
   } catch {
     console.error('Error: cannot read hooks/hooks.json');
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   if (!cfg?.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
     console.error('Error: hooks/hooks.json must contain a "hooks" object');
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
 

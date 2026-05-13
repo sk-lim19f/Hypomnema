@@ -6,7 +6,8 @@
  */
 
 import { spawnSync } from 'child_process';
-import { HYPO_DIR } from './hypo-shared.mjs';
+import { HYPO_DIR, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
+import { join } from 'path';
 
 function git(...args) {
   return spawnSync('git', ['-C', HYPO_DIR, ...args], { encoding: 'utf-8', timeout: 30000 });
@@ -17,7 +18,19 @@ function hasRemote() {
   return (r.stdout || '').trim().length > 0;
 }
 
-git('add', '-A');
+// `.hypoignore` is the project privacy boundary. `git add -A` ignores it, so
+// enumerate changed paths, drop ignored ones, then stage explicitly.
+const ignorePatterns = loadHypoIgnore(HYPO_DIR);
+const porcelain = git('status', '--porcelain', '-uall');
+const paths = [];
+for (const line of (porcelain.stdout || '').split('\n')) {
+  if (!line) continue;
+  const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
+  if (!file) continue;
+  if (ignorePatterns.length > 0 && isIgnored(join(HYPO_DIR, file), HYPO_DIR, ignorePatterns)) continue;
+  paths.push(file);
+}
+if (paths.length > 0) git('add', '--', ...paths);
 const staged = git('diff', '--cached', '--name-only').stdout?.trim() || '';
 if (staged) {
   const today = new Date().toISOString().slice(0, 10);

@@ -160,6 +160,102 @@ export function buildOutput(context, extra = {}) {
   return { ...extra, additionalContext: context };
 }
 
+// ── growth metrics (F2 + E4) ───────────────────────────────────────────────
+// Single formatter used by Stop (hot-rebuild) and SessionStart hooks so the
+// "[hypo] +N pages, ~M updated, K wikilinks" line stays consistent at both
+// ends of a session. See ADR-0018 / Lane B.
+
+/**
+ * Format a growth-metrics one-liner. Returns '' when all counts are 0 so
+ * callers can no-op silently.
+ *
+ * @param {'stop'|'start'} mode
+ * @param {{addedPages?:number, updatedPages?:number, newWikilinks?:number}} stats
+ * @returns {string}
+ */
+export function formatGrowthMetrics(mode, stats) {
+  const a = Number(stats?.addedPages)   || 0;
+  const u = Number(stats?.updatedPages) || 0;
+  const w = Number(stats?.newWikilinks) || 0;
+  if (a === 0 && u === 0 && w === 0) return '';
+  const body = `+${a} pages, ~${u} updated, ${w} wikilinks`;
+  if (mode === 'stop')  return `[hypo] ${body}`;
+  if (mode === 'start') return `[hypo] 직전 세션: ${body}. 이어서 볼까요?`;
+  return '';
+}
+
+/**
+ * Compute session growth by inspecting the wiki repo's working tree against
+ * HEAD. Counts every modified/added/untracked markdown file under `pages/`
+ * or `projects/` and totals net-new `[[wikilink]]` occurrences in the diff.
+ *
+ * @param {string} hypoDir
+ * @returns {{addedPages:number, updatedPages:number, newWikilinks:number}}
+ */
+export function computeSessionGrowth(hypoDir) {
+  const empty = { addedPages: 0, updatedPages: 0, newWikilinks: 0 };
+  if (!existsSync(join(hypoDir, '.git'))) return empty;
+  try {
+    // Single `git status --porcelain` enumerates tracked + untracked. On a
+    // clean tree (no .md changes at all) we return early and skip the much
+    // more expensive `git diff HEAD --unified=0` — Stop hook P95 win.
+    // `-uall` expands untracked directories so a brand-new `pages/new.md`
+    // isn't hidden behind a single `?? pages/` line.
+    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall'], { encoding: 'utf-8', timeout: 5000 });
+    if (porcelain.status !== 0) return empty;
+    let addedPages = 0, updatedPages = 0;
+    let hasTrackedMdChange = false;
+    const untrackedMd = [];
+    // Growth metrics describe wiki page activity, so restrict to the two
+    // page-bearing trees. Top-level files like README.md or root hot.md are
+    // intentionally excluded — they're scaffolding, not page growth.
+    const inPagesScope = (file) =>
+      file.endsWith('.md') && (file.startsWith('pages/') || file.startsWith('projects/'));
+    for (const line of (porcelain.stdout || '').split('\n')) {
+      if (!line) continue;
+      const xy   = line.slice(0, 2);
+      const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
+      if (!inPagesScope(file)) continue;
+      if (xy === '??') { untrackedMd.push(file); addedPages++; continue; }
+      hasTrackedMdChange = true;
+      if (xy.includes('A')) addedPages++;
+      else if (xy.includes('M') || xy.includes('R')) updatedPages++;
+    }
+    if (!hasTrackedMdChange && untrackedMd.length === 0) return empty;
+
+    let plus = 0, minus = 0;
+    if (hasTrackedMdChange) {
+      // pathspec keeps non-Markdown / out-of-scope diffs from polluting the
+      // wikilink count. Without it, a `[[…]]` string in a script.js diff was
+      // being credited as a new wikilink.
+      const diff = spawnSync(
+        'git',
+        ['-C', hypoDir, 'diff', 'HEAD', '--unified=0', '--', 'pages/', 'projects/'],
+        { encoding: 'utf-8', timeout: 10000 }
+      );
+      if (diff.status === 0) {
+        for (const line of (diff.stdout || '').split('\n')) {
+          if (line.startsWith('+++') || line.startsWith('---')) continue;
+          const matches = line.match(/\[\[[^\]\n]+\]\]/g);
+          if (!matches) continue;
+          if (line.startsWith('+')) plus  += matches.length;
+          else if (line.startsWith('-')) minus += matches.length;
+        }
+      }
+    }
+    for (const f of untrackedMd) {
+      try {
+        const body = readFileSync(join(hypoDir, f), 'utf-8');
+        const matches = body.match(/\[\[[^\]\n]+\]\]/g);
+        if (matches) plus += matches.length;
+      } catch {}
+    }
+    return { addedPages, updatedPages, newWikilinks: Math.max(0, plus - minus) };
+  } catch {
+    return empty;
+  }
+}
+
 // ── .hypoignore support ────────────────────────────────────────────────────
 // Inlined here so deployed hooks (~/.claude/hooks/) don't need scripts/lib/.
 

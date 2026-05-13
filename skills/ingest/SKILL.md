@@ -81,3 +81,7 @@ Append an ingest entry to `<wiki-root>/log.md`:
 - summary: pages/<slug>.md
 - tags: <tags>
 ```
+
+---
+
+> **Citation convention.** When you reference a wiki page in your response, link it as `[[page-slug]]`. The observability audit counts citations toward the autonomy score — see [[pages/observability/_index]] (run `/hypo:audit` to inspect).

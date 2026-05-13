@@ -10,16 +10,18 @@ English | [한국어](README.ko.md)
 [![npm downloads](https://img.shields.io/npm/dm/hypomnema?color=blue)](https://www.npmjs.com/package/hypomnema)
 [![Node.js](https://img.shields.io/node/v/hypomnema?color=43853d&logo=node.js&logoColor=white)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-51%2F51-brightgreen)](tests/runner.mjs)
+[![CI](https://github.com/sk-lim19f/Hypomnema/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sk-lim19f/Hypomnema/actions/workflows/ci.yml)
 [![GitHub stars](https://img.shields.io/github/stars/sk-lim19f/Hypomnema?style=flat&color=yellow)](https://github.com/sk-lim19f/Hypomnema/stargazers)
 
 **LLM-native personal wiki for Claude Code. Knowledge that compounds.**
 
-_Don't take notes. Let Claude synthesize them._
+_Make Claude take notes — and measure whether it actually does._
 
 [Quick Start](#quick-start) • [How It Compares](#how-it-compares) • [Design Decisions](#design-decisions) • [Features](#features) • [Architecture](docs/ARCHITECTURE.md) • [Contributing](docs/CONTRIBUTING.md)
 
 > Inspired by Andrej Karpathy's "LLM-native wiki" sketch and shaped by ten months of personal use, Hypomnema ships the full lifecycle — capture, synthesis, retrieval, session-resume — as Claude Code commands and lifecycle hooks.
+
+> **Current state vs. v2 vision.** v1.0.1 (today) is honest about its trigger model: most wiki behavior — ingest, query, session-close — fires on **explicit `/hypo:*` commands**, with a handful of hooks providing auto-staging, session-state injection, and lookup signals. The v2 thesis is *fully autonomous* — Claude reading, writing, and synthesizing the wiki without being asked. **v1.1.0** is the first step on that ramp: instead of claiming auto-behavior, it ships an **observability score** that measures how often the wiki is actually used per session (ingest count, query count, session-close rate, citation rate) so you can see the auto-vs-manual ratio with your own eyes before the v2 work lands.
 
 ---
 
@@ -105,6 +107,7 @@ Hypomnema          ───►  synthesis · markdown · git · hooks · local
 | **Format** | Plain markdown + frontmatter | Markdown | Proprietary | Vector store | Proprietary | HTML |
 | **Backend** | Local file + git | Local file | SaaS | Service / DB | SaaS | Service |
 | **Behavior tuning** | `/hypo:feedback` → permanent rules | None | None | None | Sometimes | None |
+| **Auto-behavior** | Explicit `/hypo:*` triggers today; **v1.1 ships an observability score**, v2 target = fully autonomous | None | None | None | Black box | None |
 | **Setup cost** | One command | One install | Sign-up | Pipeline build | Sign-up | Repo connect |
 | **Lock-in** | Zero (markdown + git) | Low | High | Medium | High | Medium |
 
@@ -295,6 +298,8 @@ Place a `hypo-config.md` at the wiki root to make it portable across machines wi
 
 `.hypoignore` controls which paths the hooks ignore (default: `*.pdf`, `*.zip`, `*.pem`, `*.env`, …). Edit it directly — there is no privacy mode flag; one file, one source of truth.
 
+> **Scope of git sync.** Hypomnema git-syncs only the `~/hypomnema/` wiki itself. Your Claude Code configuration (`~/.claude/`) is intentionally **not** managed by Hypomnema — for cross-machine sync of agents, skills, and settings, the recommended pattern is a separate dotfiles manager such as [chezmoi](https://www.chezmoi.io/).
+
 ### Where do `/hypo:*` commands live?
 
 | Install path | Slash commands served from |
@@ -315,7 +320,7 @@ No external services. No API keys. No vector databases.
 
 ## Status
 
-- **Tests:** 51 / 51 passing — see `tests/runner.mjs`
+- **Tests:** see `npm test` — exact totals shift as lanes ship, so the runner is the source of truth
 - **CI:** 7 independent jobs (test matrix, lint, init/upgrade snapshots, replay, hypo-absent, uninstall-smoke)
 - **Release:** `npm publish --provenance` on `v*` tag push
 

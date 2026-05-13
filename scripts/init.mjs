@@ -33,6 +33,11 @@ import { readPkgJson as readPkgJsonSafe, writePkgJsonAtomic, sha256 as sha256Buf
 const HOME       = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const PKG_ROOT   = join(SCRIPT_DIR, '..');
+
+// Shown after every fatal package-integrity error. These conditions mean the
+// shipped hooks/hooks.json is missing or malformed — never a user mistake —
+// so the only useful next step is a re-install of the package.
+const PKG_INTEGRITY_HINT = '→ This indicates a corrupt or incomplete install. Re-install with `npm install -g hypomnema` (or re-install the Claude Code plugin).';
 const HOOKS_SRC    = join(PKG_ROOT, 'hooks');
 const COMMANDS_SRC = join(PKG_ROOT, 'commands');
 const TEMPLATES    = join(PKG_ROOT, 'templates');
@@ -42,6 +47,27 @@ const PKG_VERSION  = (() => {
 })();
 
 function sha256(buf) { return sha256Buf(buf); }
+
+// ── subcommand dispatch ──────────────────────────────────────────────────────
+// Route `hypomnema <verb> [flags]` to the matching script. README, CHANGELOG,
+// and the upgrade-flow docs all document `hypomnema upgrade --apply`,
+// `hypomnema upgrade --check`, `hypomnema doctor`, and `hypomnema uninstall`,
+// but without this dispatcher the positional verb was silently dropped and
+// init.mjs ran instead — so users got an init-shaped output and assumed the
+// command "worked" while the documented behavior never happened.
+//
+// `hypomnema` with no verb (or with only flags like `--hypo-dir=…` / `--help`)
+// keeps running init for backwards compatibility — that's the documented
+// Path-B onboarding command. An explicit `hypomnema init` is accepted too,
+// and is stripped before flag parsing so the rest of this file is unchanged.
+const KNOWN_SUBCOMMANDS = new Set(['init', 'upgrade', 'doctor', 'uninstall']);
+const _verb = process.argv[2];
+if (_verb && KNOWN_SUBCOMMANDS.has(_verb) && _verb !== 'init') {
+  const _target = join(SCRIPT_DIR, `${_verb}.mjs`);
+  const _r = spawnSync(process.execPath, [_target, ...process.argv.slice(3)], { stdio: 'inherit' });
+  process.exit(_r.status ?? 1);
+}
+if (_verb === 'init') process.argv.splice(2, 1);
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -61,9 +87,18 @@ function parseArgs(argv) {
   };
   for (const arg of argv.slice(2)) {
     if (arg === '--help' || arg === '-h') {
-      console.log(`Usage: node scripts/init.mjs [options]
+      console.log(`Usage: hypomnema [<command>] [options]
 
-Options:
+Commands:
+  init        (default)   Scaffold a wiki, install hooks, merge settings.json
+  upgrade                 Reconcile hooks / settings.json / slash commands against the
+                          installed package (use --check for dry-run, --apply to commit)
+  doctor                  Health check: directories, files, hooks, settings.json, git
+  uninstall               Remove hooks and registrations (dry-run by default; pass --apply)
+
+  Running \`hypomnema\` with no command is equivalent to \`hypomnema init\`.
+
+Init options:
   --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
   --no-hooks             Skip hook installation
   --no-commands          Skip slash command installation to ~/.claude/commands/hypo/
@@ -75,7 +110,10 @@ Options:
   --no-shell             Skip shell function setup (~/.zshrc / ~/.bashrc)
   --shell-config=<path>  Shell config file path (default: auto-detect)
   --dry-run              Show what would be done without making changes
-  --help, -h             Show this help message`);
+  --help, -h             Show this help message
+
+Subcommand-specific flags (upgrade/doctor/uninstall) live in the
+docstring at the top of scripts/<command>.mjs.`);
       process.exit(0);
     }
     else if (arg.startsWith('--hypo-dir='))      args.hypoDir    = expandHome(arg.slice(11));
@@ -160,14 +198,17 @@ function loadHookMap() {
     cfg = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
   } catch {
     console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
     console.error('Error: hooks/hooks.json must be a JSON object');
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
     console.error('Error: hooks/hooks.json must contain a "hooks" object');
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   function _extractCommandFileName(command) {
@@ -212,11 +253,13 @@ function loadHookMap() {
       _extractFileNames(groups).length > 0;
     if (!valid) {
       console.error(`Error: hooks/hooks.json "hooks.${event}" must be a non-empty array of .mjs file names or Claude hook groups`);
+      console.error(PKG_INTEGRITY_HINT);
       process.exit(1);
     }
   }
   if (cfg.shared !== undefined && (!Array.isArray(cfg.shared) || !cfg.shared.every(f => _isHookFileName(f)))) {
     console.error('Error: hooks/hooks.json "shared" must be an array of .mjs file names');
+    console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
   return Object.fromEntries(Object.entries(cfg.hooks).map(([event, groups]) => [event, _extractFileNames(groups)]));
