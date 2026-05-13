@@ -1105,6 +1105,43 @@ test('fallback scope: --fallback-all-projects opts in to full scan', () => {
   });
 });
 
+suite('weekly-report.mjs — privacy contract');
+
+test('weekly report does not leak transcript text, URLs, or tool inputs', () => {
+  withTmpDir(dir => {
+    const cacheDir = join(dir, '.cache', 'sessions');
+    mkdirSync(cacheDir, { recursive: true });
+    const SECRET_URL    = 'https://internal.example.com/super-secret-path';
+    const SECRET_TEXT   = 'PRIVATE_TRANSCRIPT_BODY_DO_NOT_LEAK';
+    const SECRET_INPUT  = 'SECRET_TOOL_INPUT_DO_NOT_LEAK';
+    const SECRET_CMD    = 'rm -rf /private/path/that/must/not/leak';
+    const transcriptPath = join(cacheDir, 'leaky.jsonl');
+    writeFileSync(transcriptPath, [
+      JSON.stringify({ type: 'text', role: 'assistant', content: `${SECRET_TEXT} ${SECRET_URL}` }),
+      JSON.stringify({ message: { content: [
+        { type: 'tool_use', name: 'Bash', input: { command: SECRET_CMD, description: SECRET_INPUT } },
+      ] } }),
+    ].join('\n') + '\n');
+    writeFileSync(join(cacheDir, 'index.jsonl'),
+      JSON.stringify({
+        session_id: 'leaky-session',
+        transcript_path: transcriptPath,
+        recorded_at: '2026-05-06T12:00:00Z',
+        cwd: dir,
+      }) + '\n');
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--write']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const reportPath = join(dir, 'pages', 'observability', '2026-19.md');
+    const report = readFileSync(reportPath, 'utf-8');
+    for (const secret of [SECRET_URL, SECRET_TEXT, SECRET_INPUT, SECRET_CMD]) {
+      assert.ok(!report.includes(secret),
+        `weekly report leaked "${secret}" — privacy contract broken`);
+    }
+    // session_id and aggregate counts are the only per-session signal allowed.
+    assert.ok(report.includes('leaky-session'), 'session_id should be present');
+  });
+});
+
 suite('weekly-report.mjs — --week validation');
 
 test('--week=invalid exits non-zero with a clear error', () => {
