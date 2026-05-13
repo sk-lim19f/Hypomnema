@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/sk-lim19f/Hypomnema/discussions
+    about: Use GitHub Discussions for usage questions, design conversations, or anything that isn't a concrete bug or feature.
