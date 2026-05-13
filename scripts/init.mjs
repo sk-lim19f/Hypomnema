@@ -43,6 +43,27 @@ const PKG_VERSION  = (() => {
 
 function sha256(buf) { return sha256Buf(buf); }
 
+// ── subcommand dispatch ──────────────────────────────────────────────────────
+// Route `hypomnema <verb> [flags]` to the matching script. README, CHANGELOG,
+// and the upgrade-flow docs all document `hypomnema upgrade --apply`,
+// `hypomnema upgrade --check`, `hypomnema doctor`, and `hypomnema uninstall`,
+// but without this dispatcher the positional verb was silently dropped and
+// init.mjs ran instead — so users got an init-shaped output and assumed the
+// command "worked" while the documented behavior never happened.
+//
+// `hypomnema` with no verb (or with only flags like `--hypo-dir=…` / `--help`)
+// keeps running init for backwards compatibility — that's the documented
+// Path-B onboarding command. An explicit `hypomnema init` is accepted too,
+// and is stripped before flag parsing so the rest of this file is unchanged.
+const KNOWN_SUBCOMMANDS = new Set(['init', 'upgrade', 'doctor', 'uninstall']);
+const _verb = process.argv[2];
+if (_verb && KNOWN_SUBCOMMANDS.has(_verb) && _verb !== 'init') {
+  const _target = join(SCRIPT_DIR, `${_verb}.mjs`);
+  const _r = spawnSync(process.execPath, [_target, ...process.argv.slice(3)], { stdio: 'inherit' });
+  process.exit(_r.status ?? 1);
+}
+if (_verb === 'init') process.argv.splice(2, 1);
+
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -61,9 +82,18 @@ function parseArgs(argv) {
   };
   for (const arg of argv.slice(2)) {
     if (arg === '--help' || arg === '-h') {
-      console.log(`Usage: node scripts/init.mjs [options]
+      console.log(`Usage: hypomnema [<command>] [options]
 
-Options:
+Commands:
+  init        (default)   Scaffold a wiki, install hooks, merge settings.json
+  upgrade                 Reconcile hooks / settings.json / slash commands against the
+                          installed package (use --check for dry-run, --apply to commit)
+  doctor                  Health check: directories, files, hooks, settings.json, git
+  uninstall               Remove hooks and registrations (dry-run by default; pass --apply)
+
+  Running \`hypomnema\` with no command is equivalent to \`hypomnema init\`.
+
+Init options:
   --hypo-dir=<path>      Hypomnema root directory (default: resolves via HYPO_DIR env / hypo-config.md scan / ~/hypomnema)
   --no-hooks             Skip hook installation
   --no-commands          Skip slash command installation to ~/.claude/commands/hypo/
@@ -75,7 +105,10 @@ Options:
   --no-shell             Skip shell function setup (~/.zshrc / ~/.bashrc)
   --shell-config=<path>  Shell config file path (default: auto-detect)
   --dry-run              Show what would be done without making changes
-  --help, -h             Show this help message`);
+  --help, -h             Show this help message
+
+Subcommand-specific flags (upgrade/doctor/uninstall) live in the
+docstring at the top of scripts/<command>.mjs.`);
       process.exit(0);
     }
     else if (arg.startsWith('--hypo-dir='))      args.hypoDir    = expandHome(arg.slice(11));
