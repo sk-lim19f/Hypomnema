@@ -206,11 +206,16 @@ export function computeSessionGrowth(hypoDir) {
     let addedPages = 0, updatedPages = 0;
     let hasTrackedMdChange = false;
     const untrackedMd = [];
+    // Growth metrics describe wiki page activity, so restrict to the two
+    // page-bearing trees. Top-level files like README.md or root hot.md are
+    // intentionally excluded — they're scaffolding, not page growth.
+    const inPagesScope = (file) =>
+      file.endsWith('.md') && (file.startsWith('pages/') || file.startsWith('projects/'));
     for (const line of (porcelain.stdout || '').split('\n')) {
       if (!line) continue;
       const xy   = line.slice(0, 2);
       const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
-      if (!file.endsWith('.md')) continue;
+      if (!inPagesScope(file)) continue;
       if (xy === '??') { untrackedMd.push(file); addedPages++; continue; }
       hasTrackedMdChange = true;
       if (xy.includes('A')) addedPages++;
@@ -220,7 +225,14 @@ export function computeSessionGrowth(hypoDir) {
 
     let plus = 0, minus = 0;
     if (hasTrackedMdChange) {
-      const diff = spawnSync('git', ['-C', hypoDir, 'diff', 'HEAD', '--unified=0'], { encoding: 'utf-8', timeout: 10000 });
+      // pathspec keeps non-Markdown / out-of-scope diffs from polluting the
+      // wikilink count. Without it, a `[[…]]` string in a script.js diff was
+      // being credited as a new wikilink.
+      const diff = spawnSync(
+        'git',
+        ['-C', hypoDir, 'diff', 'HEAD', '--unified=0', '--', 'pages/', 'projects/'],
+        { encoding: 'utf-8', timeout: 10000 }
+      );
       if (diff.status === 0) {
         for (const line of (diff.stdout || '').split('\n')) {
           if (line.startsWith('+++') || line.startsWith('---')) continue;
