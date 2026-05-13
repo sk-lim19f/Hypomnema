@@ -1066,6 +1066,45 @@ test('fixture: nested tool_use in message.content[] is counted (real transcript 
   });
 });
 
+suite('session-audit.mjs — fallback scope');
+
+test('fallback scope: unrelated ~/.claude/projects subdirs are skipped by default', () => {
+  withTmpDir(dir => {
+    withTmpHome(home => {
+      // Seed two unrelated encoded project dirs — neither matches `dir`.
+      const unrelated1 = join(home, '.claude', 'projects', '-other-project-a');
+      const unrelated2 = join(home, '.claude', 'projects', '-other-project-b');
+      mkdirSync(unrelated1, { recursive: true });
+      mkdirSync(unrelated2, { recursive: true });
+      writeFileSync(join(unrelated1, 'sess-x.jsonl'),
+        JSON.stringify({ type: 'tool_use', name: 'Grep' }) + '\n');
+      writeFileSync(join(unrelated2, 'sess-y.jsonl'),
+        JSON.stringify({ type: 'tool_use', name: 'WebFetch' }) + '\n');
+      const r = runWithHome('session-audit.mjs', [`--hypo-dir=${dir}`, '--json'], home);
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.count, 0,
+        `default fallback must skip unrelated dirs, got ${out.count} sessions`);
+    });
+  });
+});
+
+test('fallback scope: --fallback-all-projects opts in to full scan', () => {
+  withTmpDir(dir => {
+    withTmpHome(home => {
+      const other = join(home, '.claude', 'projects', '-some-other');
+      mkdirSync(other, { recursive: true });
+      writeFileSync(join(other, 'sess-z.jsonl'),
+        JSON.stringify({ type: 'tool_use', name: 'Grep' }) + '\n');
+      const r = runWithHome('session-audit.mjs',
+        [`--hypo-dir=${dir}`, '--fallback-all-projects', '--json'], home);
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(out.count >= 1, `expected ≥1 session with --fallback-all-projects, got ${out.count}`);
+    });
+  });
+});
+
 suite('weekly-report.mjs — --week validation');
 
 test('--week=invalid exits non-zero with a clear error', () => {

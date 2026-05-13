@@ -32,12 +32,13 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 const HOME = homedir();
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, limit: 50, maxAgeDays: 30, json: false };
+  const args = { hypoDir: null, limit: 50, maxAgeDays: 30, json: false, fallbackAll: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir='))      args.hypoDir     = expandHome(arg.slice(11));
     else if (arg.startsWith('--limit='))    args.limit       = parseInt(arg.slice(8), 10) || 50;
     else if (arg.startsWith('--max-age-days=')) args.maxAgeDays = parseInt(arg.slice(15), 10) || 30;
     else if (arg === '--json')              args.json        = true;
+    else if (arg === '--fallback-all-projects') args.fallbackAll = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -63,12 +64,30 @@ function readIndexEntries(hypoDir) {
   return [...bySession.values()];
 }
 
-function scanFallback(claudeProjectsDir = join(HOME, '.claude', 'projects')) {
+// Claude Code encodes a working directory by replacing path separators with
+// hyphens, so `/Users/foo/wiki` becomes `-Users-foo-wiki`. We use this to
+// limit the fallback scan to the directory matching the wiki under audit
+// rather than every project on the machine.
+function encodeCwdForClaude(cwd) {
+  return String(cwd).replace(/\//g, '-');
+}
+
+function scanFallback(claudeProjectsDir, { scopeDir = null, all = false } = {}) {
   if (!existsSync(claudeProjectsDir)) return [];
+  const subdirs = readdirSync(claudeProjectsDir)
+    .filter(d => statSync(join(claudeProjectsDir, d)).isDirectory());
+  let targets;
+  if (all) {
+    targets = subdirs;
+  } else if (scopeDir) {
+    const encoded = encodeCwdForClaude(scopeDir);
+    targets = subdirs.filter(d => d === encoded);
+  } else {
+    targets = [];
+  }
   const entries = [];
-  for (const dir of readdirSync(claudeProjectsDir)) {
+  for (const dir of targets) {
     const full = join(claudeProjectsDir, dir);
-    if (!statSync(full).isDirectory()) continue;
     for (const file of readdirSync(full)) {
       if (!file.endsWith('.jsonl')) continue;
       const transcriptPath = join(full, file);
@@ -87,7 +106,13 @@ export function loadSessionEntries(hypoDir, opts = {}) {
   const primary = readIndexEntries(hypoDir);
   if (primary.length > 0) return primary.map(e => ({ ...e, source: e.source || 'index' }));
   const fallbackDir = opts.fallbackDir ?? join(HOME, '.claude', 'projects');
-  return scanFallback(fallbackDir);
+  // By default we restrict fallback to transcripts whose Claude-encoded path
+  // matches `scopeDir` (the wiki root). This keeps an empty wiki's report
+  // from harvesting unrelated `~/.claude/projects/*` sessions.
+  return scanFallback(fallbackDir, {
+    scopeDir: opts.scopeDir ?? hypoDir,
+    all: !!opts.fallbackAll,
+  });
 }
 
 // ── transcript parsing & metrics ─────────────────────────────────────────────
@@ -213,7 +238,7 @@ function isMain() {
 
 if (isMain()) {
   const args    = parseArgs(process.argv);
-  const entries = loadSessionEntries(args.hypoDir);
+  const entries = loadSessionEntries(args.hypoDir, { fallbackAll: args.fallbackAll });
   const results = auditEntries(entries, { maxAgeDays: args.maxAgeDays, limit: args.limit });
 
   if (args.json) {

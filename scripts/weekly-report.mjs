@@ -20,13 +20,14 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadSessionEntries, auditEntries } from './session-audit.mjs';
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, week: null, limit: 200, write: false, json: false };
+  const args = { hypoDir: null, week: null, limit: 200, write: false, json: false, fallbackAll: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--week='))   args.week    = arg.slice(7);
     else if (arg.startsWith('--limit='))  args.limit   = parseInt(arg.slice(8), 10) || 200;
     else if (arg === '--write')           args.write   = true;
     else if (arg === '--json')            args.json    = true;
+    else if (arg === '--fallback-all-projects') args.fallbackAll = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -93,8 +94,8 @@ function autonomyScore(results) {
   return Math.min(100, Math.max(0, Math.round((num / den) * 100)));
 }
 
-export function buildReport(hypoDir, { week, limit = 200, now = Date.now() } = {}) {
-  const entries = loadSessionEntries(hypoDir);
+export function buildReport(hypoDir, { week, limit = 200, now = Date.now(), fallbackAll = false } = {}) {
+  const entries = loadSessionEntries(hypoDir, { fallbackAll });
   const audited = auditEntries(entries, { limit, maxAgeDays: 365, now });
   const weekLabel = week || isoWeek(new Date(now));
   const weekResults = filterToWeek(audited, weekLabel);
@@ -154,7 +155,7 @@ if (isMain()) {
     console.error(`Error: invalid --week value "${args.week}" (expected YYYY-WW)`);
     process.exit(2);
   }
-  const report = buildReport(args.hypoDir, { week: args.week, limit: args.limit });
+  const report = buildReport(args.hypoDir, { week: args.week, limit: args.limit, fallbackAll: args.fallbackAll });
 
   if (args.json) {
     console.log(JSON.stringify(report, null, 2));
