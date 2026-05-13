@@ -742,6 +742,40 @@ test('hot-rebuild emits no growth line when wiki is clean', () => {
   });
 });
 
+suite('hypo-auto-commit.mjs / hypo-auto-stage.mjs — .hypoignore honor');
+
+test('auto-commit skips .hypoignore-listed .cache paths', () => {
+  withGrowthWiki(dir => {
+    writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+    mkdirSync(join(dir, '.cache', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'sessions', 'index.jsonl'), '{"session_id":"x"}\n');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'note.md'), '# note\n');
+    const r = runStop('hypo-auto-commit.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', '.cache'], { encoding: 'utf-8' }).stdout;
+    assert.equal(tracked.trim(), '', `expected .cache to be excluded, got: ${tracked}`);
+    const trackedPages = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], { encoding: 'utf-8' }).stdout;
+    assert.ok(trackedPages.includes('pages/note.md'), 'pages/ should still be committed');
+  });
+});
+
+test('auto-stage skips .hypoignore-listed file_path', () => {
+  withGrowthWiki(dir => {
+    writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'a.json'), '{}\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+      input: JSON.stringify({ tool_input: { file_path: join(dir, '.cache', 'a.json') } }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0);
+    const staged = spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], { encoding: 'utf-8' }).stdout;
+    assert.equal(staged.trim(), '', `unexpected staged: ${staged}`);
+  });
+});
+
 suite('hypo-session-start.mjs — growth echo regression');
 
 function runStart(dir, cwd) {

@@ -6,7 +6,7 @@
  */
 
 import { spawnSync } from 'child_process';
-import { HYPO_DIR } from './hypo-shared.mjs';
+import { HYPO_DIR, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
 
 let input = {};
 try {
@@ -24,7 +24,10 @@ try {
 const filePath = input.tool_input?.file_path ?? '';
 
 if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
-  spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' });
+  const patterns = loadHypoIgnore(HYPO_DIR);
+  if (patterns.length === 0 || !isIgnored(filePath, HYPO_DIR, patterns)) {
+    spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' });
+  }
 }
 
 console.log(JSON.stringify({ continue: true, suppressOutput: true }));
