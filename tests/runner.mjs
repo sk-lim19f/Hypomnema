@@ -807,6 +807,63 @@ test('--write produces pages/observability/<YYYY-WW>.md with autonomy score', ()
   });
 });
 
+test('autonomy score: clamped to 100 with ingest-heavy session', () => {
+  withTmpDir(dir => {
+    const cacheDir = join(dir, '.cache', 'sessions');
+    mkdirSync(cacheDir, { recursive: true });
+    // Single session w/ ingest commands and no URL penalty — numerator should
+    // exceed denominator so the clamp kicks in.
+    const transcriptPath = join(cacheDir, 'heavy.jsonl');
+    const lines = [];
+    for (let i = 0; i < 5; i++) {
+      lines.push({ type: 'text', role: 'assistant', content: '/hypo:ingest source-' + i });
+    }
+    writeFileSync(transcriptPath, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+    writeFileSync(
+      join(cacheDir, 'index.jsonl'),
+      JSON.stringify({
+        session_id: 'heavy',
+        transcript_path: transcriptPath,
+        recorded_at: '2026-05-06T12:00:00Z',
+        cwd: dir,
+      }) + '\n',
+    );
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--json']);
+    assert.equal(r.status, 0, `weekly-report --json failed: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(out.score <= 100, `score must be clamped to 100, got ${out.score}`);
+    assert.ok(out.score >= 0, `score must be ≥0, got ${out.score}`);
+    assert.equal(out.count, 1);
+  });
+});
+
+test('autonomy score: 0 when only staleness-skip sessions are in the week', () => {
+  withTmpDir(dir => {
+    const cacheDir = join(dir, '.cache', 'sessions');
+    mkdirSync(cacheDir, { recursive: true });
+    const transcriptPath = join(cacheDir, 'old.jsonl');
+    writeFileSync(transcriptPath, JSON.stringify({ type: 'tool_use', name: 'Grep' }) + '\n');
+    writeFileSync(
+      join(cacheDir, 'index.jsonl'),
+      JSON.stringify({
+        session_id: 'old',
+        transcript_path: transcriptPath,
+        // Way in the past, but we ask for that exact week so the session
+        // matches the filter; the audit's maxAgeDays=365 from buildReport
+        // will mark it staleness-skip, which autonomyScore must ignore.
+        recorded_at: '2020-01-06T12:00:00Z',
+        cwd: dir,
+      }) + '\n',
+    );
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2020-02', '--json']);
+    assert.equal(r.status, 0, `weekly-report --json failed: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    // The session matched the week but should be staleness-skipped, so the
+    // score numerator/denominator both stay 0 → score is 0.
+    assert.equal(out.score, 0, `expected 0 score for staleness-only week, got ${out.score}`);
+  });
+});
+
 test('--json returns valid report payload (week with no matching sessions)', () => {
   withTmpDir(dir => {
     // Seed an index entry far in the past so the fallback (~/.claude/projects)

@@ -109,6 +109,10 @@ process.stdin.on('end', () => {
 
     gitPull(HYPO_DIR);
     const growthLine = readLastGrowthLine();
+    // Intentional dual emit: stderr (cyan) is the human-visible nudge in the
+    // terminal; growthPrefix injects the same plain-text line into the LLM's
+    // additionalContext so model and user start the session looking at the
+    // same state. ANSI escapes are kept out of additionalContext on purpose.
     const growthPrefix = growthLine ? `${growthLine}\n\n` : '';
     if (growthLine) process.stderr.write(`\n\x1b[36m${growthLine}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();

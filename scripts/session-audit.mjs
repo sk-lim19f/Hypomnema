@@ -129,9 +129,13 @@ export function computeMetrics(transcriptLines) {
   const metrics = { search_count: 0, ingest_count: 0, feedback_count: 0, urls: 0, messages: 0 };
   for (const line of transcriptLines) {
     metrics.messages++;
-    if (line.type === 'tool_use' || line.tool_name || line.name) {
+    // Tool-use entries are scored solely via their tool name — skip the text
+    // path below so a single transcript record can't double-count search.
+    const isToolUse = line.type === 'tool_use' || line.tool_name || line.name;
+    if (isToolUse) {
       const name = line.name || line.tool_name;
       if (name && SEARCH_TOOLS.has(name)) metrics.search_count++;
+      continue;
     }
     const text = extractText(line);
     if (!text) continue;
