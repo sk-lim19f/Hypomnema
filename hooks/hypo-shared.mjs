@@ -6,9 +6,9 @@
  * Hooks are deployed to ~/.claude/hooks/ — no external imports allowed.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, mkdirSync, rmSync } from 'fs';
 import { join, relative, basename } from 'path';
-import { homedir } from 'os';
+import { homedir, hostname } from 'os';
 import { spawnSync } from 'child_process';
 
 const HOME = homedir();
@@ -112,6 +112,71 @@ export function hotMdIsClean() {
   }
 
   return reasons.length === 0 ? { clean: true } : { clean: false, reason: reasons.join(' / ') };
+}
+
+// ── sync-state (fix #9/#10/#11) ────────────────────────────────────────────
+// `.cache/sync-state.json` is JSONL: one {timestamp, op, error, host} entry per
+// line. hypo-auto-commit (#9) appends on pull/push failure; hypo-session-start
+// (#10) surfaces open entries and clears them once sync is healthy again;
+// doctor (#11) warns while entries remain. Keep the schema defined here only.
+
+/** @returns {string} path to the sync-state JSONL file for a wiki root. */
+function syncStatePath(hypoDir) {
+  return join(hypoDir, '.cache', 'sync-state.json');
+}
+
+/**
+ * Append a sync failure entry. Best-effort — never throws, since a failed
+ * failure-log must not break the Stop hook that calls it.
+ *
+ * @param {string} hypoDir
+ * @param {'pull'|'push'} op
+ * @param {string} error  raw stderr/stdout; first non-empty line is kept
+ */
+export function appendSyncFailure(hypoDir, op, error) {
+  try {
+    const cacheDir = join(hypoDir, '.cache');
+    if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
+    const firstLine = String(error || '')
+      .split('\n').map(l => l.trim()).find(Boolean) || 'unknown error';
+    const entry = {
+      timestamp: new Date().toISOString(),
+      op,
+      error: firstLine.slice(0, 200),
+      host: hostname(),
+    };
+    appendFileSync(syncStatePath(hypoDir), JSON.stringify(entry) + '\n');
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * Read sync-state entries.
+ * @param {string} hypoDir
+ * @returns {{entries: object[], parseError: boolean}}
+ */
+export function readSyncState(hypoDir) {
+  const path = syncStatePath(hypoDir);
+  if (!existsSync(path)) return { entries: [], parseError: false };
+  try {
+    const entries = readFileSync(path, 'utf-8')
+      .split('\n')
+      .filter(l => l.trim())
+      .map(l => JSON.parse(l));
+    return { entries, parseError: false };
+  } catch {
+    return { entries: [], parseError: true };
+  }
+}
+
+/** Remove the sync-state file. Called once sync is healthy again. Best-effort. */
+export function clearSyncState(hypoDir) {
+  try {
+    rmSync(syncStatePath(hypoDir), { force: true });
+  } catch {
+    // best-effort
+  }
 }
 
 // ── session-close checklist ────────────────────────────────────────────────

@@ -11,7 +11,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from '
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
-import { HYPO_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS, formatGrowthMetrics } from './hypo-shared.mjs';
+import { HYPO_DIR, buildOutput, SESSION_STATE_NEXT_HEADINGS, formatGrowthMetrics, readSyncState, clearSyncState } from './hypo-shared.mjs';
 
 const PROJECTS_DIR  = join(HYPO_DIR, 'projects');
 const GROWTH_CACHE  = join(HYPO_DIR, '.cache', 'last-session-growth.json');
@@ -26,9 +26,44 @@ function readLastGrowthLine() {
   }
 }
 
+/** Pull the wiki repo. Returns true only when the pull actually succeeded. */
 function gitPull(dir) {
-  if (!existsSync(join(dir, '.git'))) return;
-  spawnSync('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], { stdio: 'pipe', timeout: 10000 });
+  if (!existsSync(join(dir, '.git'))) return false;
+  const r = spawnSync('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], { stdio: 'pipe', timeout: 10000 });
+  return r.status === 0;
+}
+
+/**
+ * fix #10: surface unresolved sync failures recorded by a prior session's
+ * Stop hook (#9). The entry is cleared only once this session's pull has
+ * succeeded AND there is no unpushed commit left behind by a failed push
+ * (`[ahead N]`).
+ *
+ * Resolution deliberately checks only the ahead-of-remote state, not the full
+ * working tree: uncommitted/untracked files are not a sync failure, and a
+ * fresh `hypo init` wiki does not git-ignore `.cache/`, so a broader cleanliness
+ * check would see the sync-state file itself and never clear.
+ *
+ * @returns {string} a `[WIKI: last sync failed: ...]` line, or '' when clear.
+ */
+function syncStateNotice(pullOk) {
+  const { entries, parseError } = readSyncState(HYPO_DIR);
+  // A corrupt JSONL file is still an "open" failure — surface it (doctor warns
+  // too) but never clear it, so the unreadable record survives for inspection.
+  if (parseError) return '[WIKI: last sync failed: sync-state.json unreadable — inspect manually]';
+  if (entries.length === 0) return '';
+  let resolved = false;
+  if (pullOk) {
+    const r = spawnSync('git', ['-C', HYPO_DIR, 'status', '--branch', '--porcelain'],
+      { encoding: 'utf-8', timeout: 10000 });
+    resolved = r.status === 0 && !/\[ahead \d+\]/.test(r.stdout || '');
+  }
+  if (resolved) {
+    clearSyncState(HYPO_DIR);
+    return '';
+  }
+  const last = entries[entries.length - 1];
+  return `[WIKI: last sync failed: ${last.op || '?'} — ${last.error || 'unknown'}]`;
 }
 const GLOBAL_HOT   = join(HYPO_DIR, 'hot.md');
 const HOT_CHARS    = 2000;
@@ -107,13 +142,16 @@ process.stdin.on('end', () => {
     let data = {};
     try { data = JSON.parse(raw); } catch {}
 
-    gitPull(HYPO_DIR);
+    const pullOk = gitPull(HYPO_DIR);
+    const syncLine = syncStateNotice(pullOk);
     const growthLine = readLastGrowthLine();
-    // Intentional dual emit: stderr (cyan) is the human-visible nudge in the
-    // terminal; growthPrefix injects the same plain-text line into the LLM's
-    // additionalContext so model and user start the session looking at the
-    // same state. ANSI escapes are kept out of additionalContext on purpose.
-    const growthPrefix = growthLine ? `${growthLine}\n\n` : '';
+    // Intentional dual emit: stderr (yellow/cyan) is the human-visible nudge in
+    // the terminal; noticePrefix injects the same plain-text lines into the
+    // LLM's additionalContext so model and user start the session looking at
+    // the same state. ANSI escapes are kept out of additionalContext on purpose.
+    const notices = [syncLine, growthLine].filter(Boolean);
+    const noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
+    if (syncLine)   process.stderr.write(`\n\x1b[33m${syncLine}\x1b[0m\n`);
     if (growthLine) process.stderr.write(`\n\x1b[36m${growthLine}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
@@ -131,21 +169,22 @@ process.stdin.on('end', () => {
         if (hotContent)   parts.push(`[HOT]\n${hotContent}`);
         if (stateContent) parts.push(`[SESSION STATE — 다음 작업]\n${stateContent}`);
         console.log(JSON.stringify(
-          buildOutput(`${growthPrefix}[WIKI HOT CACHE: project=${hit.proj}]\n\n${parts.join('\n\n')}`, { continue: true, suppressOutput: true })
+          buildOutput(`${noticePrefix}[WIKI HOT CACHE: project=${hit.proj}]\n\n${parts.join('\n\n')}`, { continue: true, suppressOutput: true })
         ));
       } else {
         process.stderr.write(`\n\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${hit.proj}\x1b[0m (no snapshot yet)\n\n`);
         writeFileSync(MARKER_FILE, JSON.stringify({ proj: hit.proj, hotPath: null, ts: Date.now() }));
         console.log(JSON.stringify(
-          buildOutput(`${growthPrefix}[WIKI HOT CACHE: project=${hit.proj}, no snapshot yet]`, { continue: true, suppressOutput: true })
+          buildOutput(`${noticePrefix}[WIKI HOT CACHE: project=${hit.proj}, no snapshot yet]`, { continue: true, suppressOutput: true })
         ));
       }
       return;
     }
 
     if (!existsSync(GLOBAL_HOT)) {
-      if (growthLine) {
-        console.log(JSON.stringify(buildOutput(growthLine, { continue: true, suppressOutput: true })));
+      const notice = notices.join('\n\n');
+      if (notice) {
+        console.log(JSON.stringify(buildOutput(notice, { continue: true, suppressOutput: true })));
       } else {
         console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       }
@@ -154,7 +193,7 @@ process.stdin.on('end', () => {
 
     const globalContent = readFileSync(GLOBAL_HOT, 'utf-8').slice(0, HOT_CHARS);
     console.log(JSON.stringify(
-      buildOutput(`${growthPrefix}[WIKI HOT CACHE: global — no project matched cwd=${cwd}]\n\n${globalContent}`, { continue: true, suppressOutput: true })
+      buildOutput(`${noticePrefix}[WIKI HOT CACHE: global — no project matched cwd=${cwd}]\n\n${globalContent}`, { continue: true, suppressOutput: true })
     ));
 
   } catch {
