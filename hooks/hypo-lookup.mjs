@@ -89,7 +89,6 @@ function typePrior(slug) {
   if (/\/decisions\/|^decisions\//.test(slug)) return 1.5;
   if (/\bprd\b|spec-v/.test(slug))             return 1.3;
   if (/\/session-log\/|\/session-log$/.test(slug)) return 1.2;
-  if (/^sources\//.test(slug))                  return 1.2;
   return 1.0;
 }
 

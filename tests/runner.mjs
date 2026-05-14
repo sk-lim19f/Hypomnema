@@ -1202,6 +1202,27 @@ test('output is always valid JSON', () => {
   assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout: ${r.stdout}`);
 });
 
+test('PRD entry ranked above plain entry with same keyword', () => {
+  withTmpDir(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'prd-search.md'), '# PRD\n');
+    writeFileSync(join(dir, 'pages', 'search-notes.md'), '# Notes\n');
+    const indexContent = [
+      '# Index',
+      '- [[prd-search]] — search feature product requirements',
+      '- [[search-notes]] — search feature general notes',
+    ].join('\n');
+    writeFileSync(join(dir, 'index.md'), indexContent);
+    const r = runHook('hypo-lookup.mjs', { prompt: 'search feature' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext ?? '';
+    const prdPos   = ctx.indexOf('prd-search');
+    const plainPos = ctx.indexOf('search-notes');
+    assert.ok(prdPos !== -1, 'PRD entry should appear in context');
+    assert.ok(prdPos < plainPos || plainPos === -1, 'PRD should rank before plain entry');
+  });
+});
+
 test('ADR entry ranked above plain entry with same keyword', () => {
   withTmpDir(dir => {
     // pageMap searches pages/ and projects/ subdirs; put both files there
