@@ -33,10 +33,11 @@ const PKG_INTEGRITY_HINT = '→ This indicates a corrupt or incomplete install. 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, json: false };
+  const args = { hypoDir: null, json: false, codex: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json')         args.json = true;
+    else if (arg === '--codex')        args.codex = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -126,6 +127,38 @@ const HOOK_MAP     = Object.fromEntries(Object.entries(_hookConfig.hooks).map(([
 const SHARED_FILES = _hookConfig.shared ?? [];
 
 // ── checks ───────────────────────────────────────────────────────────────────
+
+function checkExternalDeps() {
+  const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
+  if (nodeMajor >= 18) {
+    pass('Node.js ≥ 18', `v${process.versions.node}`);
+  } else {
+    fail('Node.js ≥ 18', `v${process.versions.node} — upgrade to Node.js 18+`);
+  }
+
+  const npm = spawnSync('npm', ['--version'], { encoding: 'utf-8' });
+  if (npm.status === 0) {
+    pass('npm', `v${npm.stdout.trim()}`);
+  } else {
+    fail('npm', 'Not found — install npm');
+  }
+
+  const git = spawnSync('git', ['--version'], { encoding: 'utf-8' });
+  if (git.status === 0) {
+    pass('git', git.stdout.trim().replace('git version ', 'v'));
+  } else {
+    fail('git', 'Not found — install git');
+  }
+
+  const shell = process.env.SHELL || '';
+  if (shell.endsWith('zsh') || shell.endsWith('bash')) {
+    pass('Shell (zsh/bash)', shell);
+  } else if (!shell) {
+    warn('Shell (zsh/bash)', '$SHELL not set');
+  } else {
+    warn('Shell (zsh/bash)', `${shell} — zsh or bash recommended`);
+  }
+}
 
 function checkHypoRoot(hypoDir) {
   if (!existsSync(hypoDir)) {
@@ -218,6 +251,50 @@ function checkSettingsJson() {
     warn('settings.json hook registrations', `${registered}/${total} registered — run /hypo:init to merge missing entries`);
   } else {
     fail('settings.json hook registrations', `0/${total} registered — run /hypo:init`);
+  }
+
+  // fix #7: stale hypo-* entries (uninstall remnants)
+  const expectedCmds = new Set(
+    Object.entries(HOOK_MAP).flatMap(([, files]) =>
+      files.map(f => `node ${hooksDir.replace(HOME, '$HOME')}/${f}`)
+    )
+  );
+  const stale = [];
+  for (const [, groups] of Object.entries(settings.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    for (const g of groups) {
+      if (!g || typeof g !== 'object') continue;
+      for (const h of (g.hooks || [])) {
+        if (typeof h.command === 'string' && /hypo-[^/]+\.mjs/.test(h.command) && !expectedCmds.has(h.command)) {
+          stale.push(h.command);
+        }
+      }
+    }
+  }
+  if (stale.length > 0) {
+    warn('settings.json stale hypo-* entries', `${stale.length} unrecognised hypo-* command(s) — run /hypo:uninstall then /hypo:init: ${stale.slice(0, 3).join(', ')}`);
+  } else {
+    pass('settings.json stale hypo-* entries', 'None');
+  }
+
+  // fix #7: duplicate hypo-* entries per event
+  const dupes = [];
+  for (const [event, groups] of Object.entries(settings.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    const seen = new Set();
+    for (const g of groups) {
+      if (!g || typeof g !== 'object') continue;
+      for (const h of (g.hooks || [])) {
+        if (typeof h.command !== 'string' || !/hypo-[^/]+\.mjs/.test(h.command)) continue;
+        if (seen.has(h.command)) dupes.push(`${event}:${h.command}`);
+        else seen.add(h.command);
+      }
+    }
+  }
+  if (dupes.length > 0) {
+    warn('settings.json duplicate hypo-* entries', `${dupes.length} duplicate(s) — run /hypo:init to repair: ${dupes.slice(0, 2).join(', ')}`);
+  } else {
+    pass('settings.json duplicate hypo-* entries', 'None');
   }
 }
 
@@ -332,10 +409,91 @@ function checkVerifyBy(hypoDir, ignorePatterns = []) {
   }
 }
 
+function checkSyncState(hypoDir) {
+  // "open" = file exists with ≥1 entries; session-start (fix #10) clears after user resolves
+  const syncStatePath = join(hypoDir, '.cache', 'sync-state.json');
+  if (!existsSync(syncStatePath)) {
+    pass('Sync state', 'No unresolved sync failures');
+    return;
+  }
+
+  let entries;
+  try {
+    const lines = readFileSync(syncStatePath, 'utf-8').split('\n').filter(l => l.trim());
+    entries = lines.map(l => JSON.parse(l));
+  } catch {
+    warn('Sync state', 'Cannot parse .cache/sync-state.json — inspect manually');
+    return;
+  }
+
+  if (entries.length === 0) {
+    pass('Sync state', 'No unresolved sync failures');
+  } else {
+    const last = entries[entries.length - 1];
+    warn('Sync state', `${entries.length} unresolved failure(s) — last: ${last.op || '?'} at ${last.timestamp || '?'}. Inspect .cache/sync-state.json or push/pull manually to clear.`);
+  }
+}
+
+function checkCodexPaths() {
+  const codexHooks = join(HOME, '.codex', 'hooks');
+  const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
+
+  let missing = 0;
+  for (const file of allFiles) {
+    if (!existsSync(join(codexHooks, file))) missing++;
+  }
+
+  if (missing === 0) {
+    pass('Codex hook files installed', codexHooks);
+  } else if (missing < allFiles.length) {
+    warn('Codex hook files installed', `${missing}/${allFiles.length} missing in ${codexHooks} — run /hypo:init --codex`);
+  } else {
+    fail('Codex hook files installed', `No hook files found in ${codexHooks} — run /hypo:init --codex`);
+  }
+
+  const settingsPath = join(HOME, '.codex', 'settings.json');
+  if (!existsSync(settingsPath)) {
+    warn('Codex settings.json hook registrations', 'settings.json not found — run /hypo:init --codex');
+    return;
+  }
+
+  let settings;
+  try {
+    settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+  } catch {
+    fail('Codex settings.json hook registrations', 'settings.json is not valid JSON');
+    return;
+  }
+
+  const hooksDir = codexHooks;
+  let registered = 0;
+  let total = 0;
+
+  for (const [event, files] of Object.entries(HOOK_MAP)) {
+    for (const file of files) {
+      total++;
+      const cmd = `node ${hooksDir.replace(HOME, '$HOME')}/${file}`;
+      const found = (Array.isArray(settings.hooks?.[event]) ? settings.hooks[event] : [])
+        .flatMap(g => g.hooks || [])
+        .some(h => h.command === cmd);
+      if (found) registered++;
+    }
+  }
+
+  if (registered === total) {
+    pass('Codex settings.json hook registrations', `${registered}/${total} registered`);
+  } else if (registered > 0) {
+    warn('Codex settings.json hook registrations', `${registered}/${total} registered — run /hypo:init --codex`);
+  } else {
+    fail('Codex settings.json hook registrations', `0/${total} registered — run /hypo:init --codex`);
+  }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
 
+checkExternalDeps();
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const rootOk = checkHypoRoot(args.hypoDir);
 if (rootOk) {
@@ -346,6 +504,8 @@ if (rootOk) {
 }
 checkHooks();
 checkSettingsJson();
+if (args.codex) checkCodexPaths();
+if (rootOk) checkSyncState(args.hypoDir);
 checkGit(args.hypoDir);
 
 // ── report ───────────────────────────────────────────────────────────────────

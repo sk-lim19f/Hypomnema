@@ -228,6 +228,160 @@ test('JSON output is an array of check objects', () => {
   assert.ok('label' in out[0], 'expected label field');
 });
 
+// fix #6: doctor-checks-node-git-shell-npm
+suite('doctor.mjs — fix #6: external deps');
+
+test('doctor-checks-node-git-shell-npm: Node.js check passes (running on ≥18)', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const nodeCheck = out.find(c => c.label === 'Node.js ≥ 18');
+  assert.ok(nodeCheck, 'Node.js ≥ 18 check not found');
+  assert.equal(nodeCheck.status, 'pass', `expected pass, got ${nodeCheck.status}: ${nodeCheck.detail}`);
+});
+
+test('doctor-checks-node-git-shell-npm: git check present', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const gitCheck = out.find(c => c.label === 'git');
+  assert.ok(gitCheck, 'git check not found');
+  assert.ok(['pass', 'fail'].includes(gitCheck.status), `unexpected status: ${gitCheck.status}`);
+});
+
+test('doctor-checks-node-git-shell-npm: npm check present', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const npmCheck = out.find(c => c.label === 'npm');
+  assert.ok(npmCheck, 'npm check not found');
+  assert.ok(['pass', 'fail'].includes(npmCheck.status), `unexpected status: ${npmCheck.status}`);
+});
+
+test('doctor-checks-node-git-shell-npm: shell check present', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const shellCheck = out.find(c => c.label === 'Shell (zsh/bash)');
+  assert.ok(shellCheck, 'Shell check not found');
+  assert.ok(['pass', 'warn', 'fail'].includes(shellCheck.status), `unexpected status: ${shellCheck.status}`);
+});
+
+// fix #7: doctor-settings-integrity
+suite('doctor.mjs — fix #7: settings integrity');
+
+test('doctor-settings-integrity: no stale entries → pass', () => {
+  withTmpHome(home => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ hooks: {} }));
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const staleCheck = out.find(c => c.label === 'settings.json stale hypo-* entries');
+    assert.ok(staleCheck, 'stale check not found');
+    assert.equal(staleCheck.status, 'pass', `expected pass: ${staleCheck.detail}`);
+  });
+});
+
+test('doctor-settings-integrity: stale hypo-* entry → warn', () => {
+  withTmpHome(home => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    const staleSetting = {
+      hooks: {
+        PostToolUse: [{
+          hooks: [{ type: 'command', command: `node $HOME/.claude/hooks/hypo-old-removed.mjs` }],
+        }],
+      },
+    };
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(staleSetting));
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const staleCheck = out.find(c => c.label === 'settings.json stale hypo-* entries');
+    assert.ok(staleCheck, 'stale check not found');
+    assert.equal(staleCheck.status, 'warn', `expected warn: ${staleCheck.detail}`);
+  });
+});
+
+test('doctor-settings-integrity: duplicate hypo-* entry → warn', () => {
+  withTmpHome(home => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    const dupeSetting = {
+      hooks: {
+        Stop: [
+          { hooks: [{ type: 'command', command: `node $HOME/.claude/hooks/hypo-auto-commit.mjs` }] },
+          { hooks: [{ type: 'command', command: `node $HOME/.claude/hooks/hypo-auto-commit.mjs` }] },
+        ],
+      },
+    };
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(dupeSetting));
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const dupeCheck = out.find(c => c.label === 'settings.json duplicate hypo-* entries');
+    assert.ok(dupeCheck, 'duplicate check not found');
+    assert.equal(dupeCheck.status, 'warn', `expected warn: ${dupeCheck.detail}`);
+  });
+});
+
+// fix #11: doctor-sync-state-warn
+suite('doctor.mjs — fix #11: sync-state warn');
+
+test('doctor-sync-state-warn: no .cache/sync-state.json → pass', () => {
+  withTmpDir(dir => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find(c => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+  });
+});
+
+test('doctor-sync-state-warn: open sync-state.json entries → warn', () => {
+  withTmpDir(dir => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({ timestamp: '2026-05-14T00:00:00Z', op: 'push', error: 'network timeout', host: 'test' }) + '\n'
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find(c => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+  });
+});
+
+// fix #8: doctor-codex-paths
+suite('doctor.mjs — fix #8: codex paths');
+
+test('doctor-codex-paths: no codex checks without --codex flag', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const codexChecks = out.filter(c => c.label.includes('Codex'));
+  assert.equal(codexChecks.length, 0, 'expected no Codex checks without --codex flag');
+});
+
+test('doctor-codex-paths: --codex flag triggers codex hook file check', () => {
+  withTmpHome(home => {
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--codex', '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const hookCheck = out.find(c => c.label === 'Codex hook files installed');
+    assert.ok(hookCheck, 'Codex hook files check not found');
+    assert.equal(hookCheck.status, 'fail', `expected fail when ~/.codex/hooks is empty: ${hookCheck.detail}`);
+  });
+});
+
+test('doctor-codex-paths: --codex flag triggers codex settings.json check', () => {
+  withTmpHome(home => {
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--codex', '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const settingsCheck = out.find(c => c.label === 'Codex settings.json hook registrations');
+    assert.ok(settingsCheck, 'Codex settings.json check not found');
+  });
+});
+
 // ── hook contract tests ───────────────────────────────────────────────────────
 
 const HOOKS = join(REPO, 'hooks');
