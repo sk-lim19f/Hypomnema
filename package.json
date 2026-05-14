@@ -32,6 +32,8 @@
   "scripts": {
     "test": "node tests/runner.mjs",
     "lint": "node scripts/lint.mjs",
-    "graph": "node scripts/graph.mjs"
+    "graph": "node scripts/graph.mjs",
+    "smoke-pack": "node scripts/smoke-pack.mjs",
+    "prepublishOnly": "npm test && npm run lint && npm run smoke-pack"
   }
 }
