@@ -85,6 +85,13 @@ function bm25Score(queryTerms, entries, k1 = 1.5, b = 0.75) {
   }).sort((a, c) => c.score - a.score);
 }
 
+function typePrior(slug) {
+  if (/\/decisions\/|^decisions\//.test(slug)) return 1.5;
+  if (/\bprd\b|spec-v/.test(slug))             return 1.3;
+  if (/\/session-log\/|\/session-log$/.test(slug)) return 1.2;
+  return 1.0;
+}
+
 function parseIndexEntries(indexContent) {
   const entries = [];
   for (const line of indexContent.split('\n')) {
@@ -122,13 +129,19 @@ process.stdin.on('end', () => {
     }
 
     const entries  = parseIndexEntries(readFileSync(INDEX_PATH, 'utf-8'));
-    const scored   = bm25Score(keywords, entries).filter(e => e.score > 0);
+    const scored   = bm25Score(keywords, entries)
+      .map(e => ({ ...e, score: e.score * typePrior(e.slug) }))
+      .sort((a, c) => c.score - a.score)
+      .filter(e => e.score > 0);
     const topScore = scored[0]?.score ?? 0;
     const matched  = scored.filter(e => e.score >= topScore * 0.5);
 
     if (matched.length === 0) {
       const topic   = keywords.slice(0, 5).join(', ');
-      const closest = bm25Score(keywords, entries).slice(0, 3).map(e => `[[${e.slug}]]`).join(', ');
+      const closest = bm25Score(keywords, entries)
+        .map(e => ({ ...e, score: e.score * typePrior(e.slug) }))
+        .sort((a, c) => c.score - a.score)
+        .slice(0, 3).map(e => `[[${e.slug}]]`).join(', ');
       console.log(JSON.stringify(
         buildOutput(
           `[WIKI LOOKUP: miss] "${topic}" — no match. Closest: ${closest || 'none'}`,

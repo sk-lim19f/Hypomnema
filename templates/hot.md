@@ -14,6 +14,8 @@ tags: [wiki, operations]
 
 | Project | Last Session | Hot Cache |
 |---|---|---|
+<!-- Row format: | Project Name | YYYY-MM-DD | [[projects/slug/hot]] | -->
+<!-- col2 date is rebuilt from projects/<slug>/hot.md frontmatter on each session close -->
 
 ## Session Start Checklist
 

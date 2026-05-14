@@ -912,6 +912,77 @@ test('hot-rebuild emits no growth line when wiki is clean', () => {
   });
 });
 
+suite('hypo-hot-rebuild.mjs — parsePointerRows row format');
+
+test('valid wikilink row is preserved in rebuilt hot.md', () => {
+  withTmpDir(dir => {
+    const hotContent = [
+      '---',
+      'title: Hot Cache — Pointer',
+      'type: reference',
+      'updated: 2026-01-01',
+      'tags: [wiki, operations]',
+      '---',
+      '',
+      '# Hot Cache',
+      '',
+      '> Read at session start',
+      '',
+      '## Active Projects',
+      '',
+      '| Project | Last Session | Hot Cache |',
+      '|---|---|---|',
+      '| my-project | 2026-01-01 | [[projects/my-project/hot]] |',
+      '',
+      '## Session Start Checklist',
+      '',
+      '1. Check this file',
+    ].join('\n');
+    writeFileSync(join(dir, 'hot.md'), hotContent);
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const result = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(result.includes('[[projects/my-project/hot]]'), 'valid wikilink row must be preserved');
+  });
+});
+
+test('markdown link row is silently excluded when mixed with a valid wikilink row', () => {
+  withTmpDir(dir => {
+    // mixed table: one valid wikilink row + one markdown link row
+    const hotContent = [
+      '---',
+      'title: Hot Cache — Pointer',
+      'type: reference',
+      'updated: 2026-01-01',
+      'tags: [wiki, operations]',
+      '---',
+      '',
+      '# Hot Cache',
+      '',
+      '> Read at session start',
+      '',
+      '## Active Projects',
+      '',
+      '| Project | Last Session | Hot Cache |',
+      '|---|---|---|',
+      '| valid-project | 2026-01-01 | [[projects/valid-project/hot]] |',
+      '| bad-project | 2026-01-01 | [projects/bad-project/hot](projects/bad-project/hot.md) |',
+      '',
+      '## Session Start Checklist',
+      '',
+      '1. Check this file',
+    ].join('\n');
+    writeFileSync(join(dir, 'hot.md'), hotContent);
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const result = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(result.includes('[[projects/valid-project/hot]]'), 'valid wikilink row must be preserved');
+    assert.ok(!result.includes('bad-project'), 'markdown link row must be excluded from rebuilt output');
+  });
+});
+
 suite('hypo-auto-commit.mjs / hypo-auto-stage.mjs — .hypoignore honor');
 
 test('auto-commit skips .hypoignore-listed .cache paths', () => {
@@ -1346,6 +1417,90 @@ test('growth ignores wikilinks introduced outside pages/projects', () => {
     const cache = JSON.parse(readFileSync(join(dir, '.cache', 'last-session-growth.json'), 'utf-8'));
     assert.equal(cache.addedPages, 1, 'only the pages/real.md should count');
     assert.equal(cache.newWikilinks, 1, 'wikilink-shaped string in script.js must be ignored');
+  });
+});
+
+suite('hypo-lookup.mjs — type-prior boost');
+
+test('output is always valid JSON', () => {
+  const r = runHook('hypo-lookup.mjs', { prompt: 'hello world' });
+  assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout: ${r.stdout}`);
+});
+
+test('PRD entry ranked above plain entry with same keyword', () => {
+  withTmpDir(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'prd-search.md'), '# PRD\n');
+    writeFileSync(join(dir, 'pages', 'search-notes.md'), '# Notes\n');
+    const indexContent = [
+      '# Index',
+      '- [[prd-search]] — search feature product requirements',
+      '- [[search-notes]] — search feature general notes',
+    ].join('\n');
+    writeFileSync(join(dir, 'index.md'), indexContent);
+    const r = runHook('hypo-lookup.mjs', { prompt: 'search feature' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext ?? '';
+    const prdPos   = ctx.indexOf('prd-search');
+    const plainPos = ctx.indexOf('search-notes');
+    assert.ok(prdPos !== -1, 'PRD entry should appear in context');
+    assert.ok(prdPos < plainPos || plainPos === -1, 'PRD should rank before plain entry');
+  });
+});
+
+test('ADR entry ranked above plain entry with same keyword', () => {
+  withTmpDir(dir => {
+    // pageMap searches pages/ and projects/ subdirs; put both files there
+    mkdirSync(join(dir, 'pages', 'decisions'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'decisions', '0001-use-bm25.md'), '# ADR\n');
+    writeFileSync(join(dir, 'pages', 'bm25-notes.md'), '# BM25 Notes\n');
+    const indexContent = [
+      '# Index',
+      '- [[decisions/0001-use-bm25]] — bm25 scoring decision adr',
+      '- [[bm25-notes]] — bm25 scoring general notes',
+    ].join('\n');
+    writeFileSync(join(dir, 'index.md'), indexContent);
+    const r = runHook('hypo-lookup.mjs', { prompt: 'bm25 scoring' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext ?? '';
+    const adrPos   = ctx.indexOf('decisions/0001-use-bm25');
+    const plainPos = ctx.indexOf('bm25-notes');
+    assert.ok(adrPos !== -1, 'ADR entry should appear in context');
+    assert.ok(adrPos < plainPos || plainPos === -1, 'ADR should rank before plain entry');
+  });
+});
+
+// ── query.mjs smoke tests ────────────────────────────────────────────────────
+
+suite('query.mjs — no-results ingest prompt');
+
+test('no results: shows ingest suggestion', () => {
+  withTmpDir(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const r = run('query.mjs', [`--hypo-dir=${dir}`, '--q=xyzzy-nonexistent-term']);
+    assert.equal(r.status, 0, `should exit 0: ${r.stderr}`);
+    assert.ok(r.stdout.includes('/hypo:ingest'), `expected ingest prompt in stdout: ${r.stdout}`);
+  });
+});
+
+test('no results: ingest prompt absent in --json mode', () => {
+  withTmpDir(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const r = run('query.mjs', [`--hypo-dir=${dir}`, '--q=xyzzy-nonexistent-term', '--json']);
+    assert.equal(r.status, 0, `should exit 0: ${r.stderr}`);
+    const parsed = JSON.parse(r.stdout);
+    assert.ok(Array.isArray(parsed), 'JSON output should be an array');
+    assert.equal(parsed.length, 0, 'should be empty array');
+  });
+});
+
+test('with results: ingest prompt not shown', () => {
+  withTmpDir(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'test-page.md'), '---\ntitle: test\ntype: note\n---\nfoo bar baz content here\n');
+    const r = run('query.mjs', [`--hypo-dir=${dir}`, '--q=foo']);
+    assert.equal(r.status, 0, `should exit 0: ${r.stderr}`);
+    assert.ok(!r.stdout.includes('/hypo:ingest'), `ingest prompt should not appear when results exist: ${r.stdout}`);
   });
 });
 
