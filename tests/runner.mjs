@@ -228,6 +228,41 @@ test('JSON output is an array of check objects', () => {
   assert.ok('label' in out[0], 'expected label field');
 });
 
+// fix #6: doctor-checks-node-git-shell-npm
+suite('doctor.mjs — fix #6: external deps');
+
+test('doctor-checks-node-git-shell-npm: Node.js check passes (running on ≥18)', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const nodeCheck = out.find(c => c.label === 'Node.js ≥ 18');
+  assert.ok(nodeCheck, 'Node.js ≥ 18 check not found');
+  assert.equal(nodeCheck.status, 'pass', `expected pass, got ${nodeCheck.status}: ${nodeCheck.detail}`);
+});
+
+test('doctor-checks-node-git-shell-npm: git check present', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const gitCheck = out.find(c => c.label === 'git');
+  assert.ok(gitCheck, 'git check not found');
+  assert.ok(['pass', 'fail'].includes(gitCheck.status), `unexpected status: ${gitCheck.status}`);
+});
+
+test('doctor-checks-node-git-shell-npm: npm check present', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const npmCheck = out.find(c => c.label === 'npm');
+  assert.ok(npmCheck, 'npm check not found');
+  assert.ok(['pass', 'fail'].includes(npmCheck.status), `unexpected status: ${npmCheck.status}`);
+});
+
+test('doctor-checks-node-git-shell-npm: shell check present', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const shellCheck = out.find(c => c.label === 'Shell (zsh/bash)');
+  assert.ok(shellCheck, 'Shell check not found');
+  assert.ok(['pass', 'warn', 'fail'].includes(shellCheck.status), `unexpected status: ${shellCheck.status}`);
+});
+
 // ── hook contract tests ───────────────────────────────────────────────────────
 
 const HOOKS = join(REPO, 'hooks');

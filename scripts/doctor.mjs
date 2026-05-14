@@ -33,10 +33,11 @@ const PKG_INTEGRITY_HINT = '→ This indicates a corrupt or incomplete install. 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, json: false };
+  const args = { hypoDir: null, json: false, codex: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json')         args.json = true;
+    else if (arg === '--codex')        args.codex = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -126,6 +127,38 @@ const HOOK_MAP     = Object.fromEntries(Object.entries(_hookConfig.hooks).map(([
 const SHARED_FILES = _hookConfig.shared ?? [];
 
 // ── checks ───────────────────────────────────────────────────────────────────
+
+function checkExternalDeps() {
+  const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
+  if (nodeMajor >= 18) {
+    pass('Node.js ≥ 18', `v${process.versions.node}`);
+  } else {
+    fail('Node.js ≥ 18', `v${process.versions.node} — upgrade to Node.js 18+`);
+  }
+
+  const npm = spawnSync('npm', ['--version'], { encoding: 'utf-8' });
+  if (npm.status === 0) {
+    pass('npm', `v${npm.stdout.trim()}`);
+  } else {
+    fail('npm', 'Not found — install npm');
+  }
+
+  const git = spawnSync('git', ['--version'], { encoding: 'utf-8' });
+  if (git.status === 0) {
+    pass('git', git.stdout.trim().replace('git version ', 'v'));
+  } else {
+    fail('git', 'Not found — install git');
+  }
+
+  const shell = process.env.SHELL || '';
+  if (shell.endsWith('zsh') || shell.endsWith('bash')) {
+    pass('Shell (zsh/bash)', shell);
+  } else if (!shell) {
+    warn('Shell (zsh/bash)', '$SHELL not set');
+  } else {
+    warn('Shell (zsh/bash)', `${shell} — zsh or bash recommended`);
+  }
+}
 
 function checkHypoRoot(hypoDir) {
   if (!existsSync(hypoDir)) {
@@ -336,6 +369,7 @@ function checkVerifyBy(hypoDir, ignorePatterns = []) {
 
 const args = parseArgs(process.argv);
 
+checkExternalDeps();
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const rootOk = checkHypoRoot(args.hypoDir);
 if (rootOk) {
