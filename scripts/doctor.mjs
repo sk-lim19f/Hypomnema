@@ -252,6 +252,48 @@ function checkSettingsJson() {
   } else {
     fail('settings.json hook registrations', `0/${total} registered — run /hypo:init`);
   }
+
+  // fix #7: stale hypo-* entries (uninstall remnants)
+  const expectedCmds = new Set(
+    Object.entries(HOOK_MAP).flatMap(([, files]) =>
+      files.map(f => `node ${hooksDir.replace(HOME, '$HOME')}/${f}`)
+    )
+  );
+  const stale = [];
+  for (const [, groups] of Object.entries(settings.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    for (const g of groups) {
+      for (const h of (g.hooks || [])) {
+        if (typeof h.command === 'string' && /hypo-[^/]+\.mjs/.test(h.command) && !expectedCmds.has(h.command)) {
+          stale.push(h.command);
+        }
+      }
+    }
+  }
+  if (stale.length > 0) {
+    warn('settings.json stale hypo-* entries', `${stale.length} unrecognised hypo-* command(s) — run /hypo:uninstall then /hypo:init: ${stale.slice(0, 3).join(', ')}`);
+  } else {
+    pass('settings.json stale hypo-* entries', 'None');
+  }
+
+  // fix #7: duplicate hypo-* entries per event
+  const dupes = [];
+  for (const [event, groups] of Object.entries(settings.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    const seen = new Set();
+    for (const g of groups) {
+      for (const h of (g.hooks || [])) {
+        if (typeof h.command !== 'string' || !/hypo-[^/]+\.mjs/.test(h.command)) continue;
+        if (seen.has(h.command)) dupes.push(`${event}:${h.command}`);
+        else seen.add(h.command);
+      }
+    }
+  }
+  if (dupes.length > 0) {
+    warn('settings.json duplicate hypo-* entries', `${dupes.length} duplicate(s) — run /hypo:init to repair: ${dupes.slice(0, 2).join(', ')}`);
+  } else {
+    pass('settings.json duplicate hypo-* entries', 'None');
+  }
 }
 
 function checkGit(hypoDir) {

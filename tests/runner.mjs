@@ -263,6 +263,60 @@ test('doctor-checks-node-git-shell-npm: shell check present', () => {
   assert.ok(['pass', 'warn', 'fail'].includes(shellCheck.status), `unexpected status: ${shellCheck.status}`);
 });
 
+// fix #7: doctor-settings-integrity
+suite('doctor.mjs — fix #7: settings integrity');
+
+test('doctor-settings-integrity: no stale entries → pass', () => {
+  withTmpHome(home => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ hooks: {} }));
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const staleCheck = out.find(c => c.label === 'settings.json stale hypo-* entries');
+    assert.ok(staleCheck, 'stale check not found');
+    assert.equal(staleCheck.status, 'pass', `expected pass: ${staleCheck.detail}`);
+  });
+});
+
+test('doctor-settings-integrity: stale hypo-* entry → warn', () => {
+  withTmpHome(home => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    const staleSetting = {
+      hooks: {
+        PostToolUse: [{
+          hooks: [{ type: 'command', command: `node $HOME/.claude/hooks/hypo-old-removed.mjs` }],
+        }],
+      },
+    };
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(staleSetting));
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const staleCheck = out.find(c => c.label === 'settings.json stale hypo-* entries');
+    assert.ok(staleCheck, 'stale check not found');
+    assert.equal(staleCheck.status, 'warn', `expected warn: ${staleCheck.detail}`);
+  });
+});
+
+test('doctor-settings-integrity: duplicate hypo-* entry → warn', () => {
+  withTmpHome(home => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    const dupeSetting = {
+      hooks: {
+        Stop: [
+          { hooks: [{ type: 'command', command: `node $HOME/.claude/hooks/hypo-auto-commit.mjs` }] },
+          { hooks: [{ type: 'command', command: `node $HOME/.claude/hooks/hypo-auto-commit.mjs` }] },
+        ],
+      },
+    };
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(dupeSetting));
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const dupeCheck = out.find(c => c.label === 'settings.json duplicate hypo-* entries');
+    assert.ok(dupeCheck, 'duplicate check not found');
+    assert.equal(dupeCheck.status, 'warn', `expected warn: ${dupeCheck.detail}`);
+  });
+});
+
 // ── hook contract tests ───────────────────────────────────────────────────────
 
 const HOOKS = join(REPO, 'hooks');
