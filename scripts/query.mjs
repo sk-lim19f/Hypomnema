@@ -114,6 +114,7 @@ if (args.json) {
 } else {
   if (top.length === 0) {
     console.log(`No results for: ${args.query}`);
+    console.log(`→ 관련 페이지가 없습니다. 새 지식이 있다면 /hypo:ingest 로 추가해 보세요.`);
   } else {
     console.log(`Found ${results.length} result(s) for "${args.query}" (showing ${top.length}):\n`);
     for (const r of top) {

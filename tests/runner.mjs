@@ -1316,6 +1316,40 @@ test('ADR entry ranked above plain entry with same keyword', () => {
   });
 });
 
+// ── query.mjs smoke tests ────────────────────────────────────────────────────
+
+suite('query.mjs — no-results ingest prompt');
+
+test('no results: shows ingest suggestion', () => {
+  withTmpDir(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const r = run('query.mjs', [`--hypo-dir=${dir}`, '--q=xyzzy-nonexistent-term']);
+    assert.equal(r.status, 0, `should exit 0: ${r.stderr}`);
+    assert.ok(r.stdout.includes('/hypo:ingest'), `expected ingest prompt in stdout: ${r.stdout}`);
+  });
+});
+
+test('no results: ingest prompt absent in --json mode', () => {
+  withTmpDir(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const r = run('query.mjs', [`--hypo-dir=${dir}`, '--q=xyzzy-nonexistent-term', '--json']);
+    assert.equal(r.status, 0, `should exit 0: ${r.stderr}`);
+    const parsed = JSON.parse(r.stdout);
+    assert.ok(Array.isArray(parsed), 'JSON output should be an array');
+    assert.equal(parsed.length, 0, 'should be empty array');
+  });
+});
+
+test('with results: ingest prompt not shown', () => {
+  withTmpDir(dir => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'test-page.md'), '---\ntitle: test\ntype: note\n---\nfoo bar baz content here\n');
+    const r = run('query.mjs', [`--hypo-dir=${dir}`, '--q=foo']);
+    assert.equal(r.status, 0, `should exit 0: ${r.stderr}`);
+    assert.ok(!r.stdout.includes('/hypo:ingest'), `ingest prompt should not appear when results exist: ${r.stdout}`);
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
