@@ -20,6 +20,7 @@ import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
+import { readSyncState } from '../hooks/hypo-shared.mjs';
 
 const HOME     = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -410,18 +411,11 @@ function checkVerifyBy(hypoDir, ignorePatterns = []) {
 }
 
 function checkSyncState(hypoDir) {
-  // "open" = file exists with ≥1 entries; session-start (fix #10) clears after user resolves
-  const syncStatePath = join(hypoDir, '.cache', 'sync-state.json');
-  if (!existsSync(syncStatePath)) {
-    pass('Sync state', 'No unresolved sync failures');
-    return;
-  }
+  // "open" = file exists with ≥1 entries; session-start (fix #10) clears once
+  // sync is healthy again. Schema + parsing live in hooks/hypo-shared.mjs.
+  const { entries, parseError } = readSyncState(hypoDir);
 
-  let entries;
-  try {
-    const lines = readFileSync(syncStatePath, 'utf-8').split('\n').filter(l => l.trim());
-    entries = lines.map(l => JSON.parse(l));
-  } catch {
+  if (parseError) {
     warn('Sync state', 'Cannot parse .cache/sync-state.json — inspect manually');
     return;
   }
