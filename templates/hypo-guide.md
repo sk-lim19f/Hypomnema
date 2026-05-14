@@ -65,6 +65,8 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 
 Trigger: explicit close mention, `/compact` request, or context limit approaching.
 
+**Auto-trigger rule**: when the user sends a natural-language close signal — "세션 마무리하자", "오늘 여기까지", "이만 종료", "wrap up", "signing off", or equivalent — run the session close checklist immediately without waiting for an explicit `/compact` or `/hypo:crystallize`. If the intent is ambiguous, confirm with a single question before proceeding.
+
 1. Update `projects/<name>/session-state.md` (next tasks, overwrite)
 2. Update `projects/<name>/hot.md` (what was done, ≤500 words, overwrite)
 3. Append to `projects/<name>/session-log/YYYY-MM.md` (narrative entry, append-only)
