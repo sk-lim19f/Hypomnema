@@ -74,6 +74,8 @@ Skip session close for: single bug fix, single-file edit, Q&A only.
 
 ### Ingest (external source → wiki)
 
+**Auto-trigger rule**: after any `WebFetch` / `WebSearch` that yields new knowledge relevant to the current task, run `/hypo:ingest` immediately — do not wait for the user to ask.
+
 1. Save raw source to `sources/<slug>.<ext>` (never edit after)
 2. Read and synthesize
 3. Update or create pages in `pages/` with frontmatter `source: <slug>`
@@ -85,6 +87,7 @@ Skip session close for: single bug fix, single-file edit, Q&A only.
 1. Read `index.md` first
 2. Cross-reference related pages
 3. Synthesize answer — cite `[[page-slug]]` links
+4. **On miss**: research externally (`WebFetch` / `WebSearch`), then auto-ingest — omitting `/hypo:ingest` after external research is a defect
 
 ---
 

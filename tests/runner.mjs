@@ -1195,6 +1195,35 @@ test('growth ignores wikilinks introduced outside pages/projects', () => {
   });
 });
 
+suite('hypo-lookup.mjs — type-prior boost');
+
+test('output is always valid JSON', () => {
+  const r = runHook('hypo-lookup.mjs', { prompt: 'hello world' });
+  assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout: ${r.stdout}`);
+});
+
+test('ADR entry ranked above plain entry with same keyword', () => {
+  withTmpDir(dir => {
+    // pageMap searches pages/ and projects/ subdirs; put both files there
+    mkdirSync(join(dir, 'pages', 'decisions'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'decisions', '0001-use-bm25.md'), '# ADR\n');
+    writeFileSync(join(dir, 'pages', 'bm25-notes.md'), '# BM25 Notes\n');
+    const indexContent = [
+      '# Index',
+      '- [[decisions/0001-use-bm25]] — bm25 scoring decision adr',
+      '- [[bm25-notes]] — bm25 scoring general notes',
+    ].join('\n');
+    writeFileSync(join(dir, 'index.md'), indexContent);
+    const r = runHook('hypo-lookup.mjs', { prompt: 'bm25 scoring' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext ?? '';
+    const adrPos   = ctx.indexOf('decisions/0001-use-bm25');
+    const plainPos = ctx.indexOf('bm25-notes');
+    assert.ok(adrPos !== -1, 'ADR entry should appear in context');
+    assert.ok(adrPos < plainPos || plainPos === -1, 'ADR should rank before plain entry');
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

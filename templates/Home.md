@@ -19,6 +19,8 @@ tags: [wiki, home]
 - [[SCHEMA]] — type system reference
 - [[hypo-guide]] — operations guide
 
+> **Auto-ingest rule**: after any `WebFetch` / `WebSearch` that yields relevant knowledge, run `/hypo:ingest` immediately without waiting for an explicit request.
+
 ---
 
 ## Active Projects
