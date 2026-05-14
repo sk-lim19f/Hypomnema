@@ -263,6 +263,7 @@ function checkSettingsJson() {
   for (const [, groups] of Object.entries(settings.hooks || {})) {
     if (!Array.isArray(groups)) continue;
     for (const g of groups) {
+      if (!g || typeof g !== 'object') continue;
       for (const h of (g.hooks || [])) {
         if (typeof h.command === 'string' && /hypo-[^/]+\.mjs/.test(h.command) && !expectedCmds.has(h.command)) {
           stale.push(h.command);
@@ -282,6 +283,7 @@ function checkSettingsJson() {
     if (!Array.isArray(groups)) continue;
     const seen = new Set();
     for (const g of groups) {
+      if (!g || typeof g !== 'object') continue;
       for (const h of (g.hooks || [])) {
         if (typeof h.command !== 'string' || !/hypo-[^/]+\.mjs/.test(h.command)) continue;
         if (seen.has(h.command)) dupes.push(`${event}:${h.command}`);
@@ -428,7 +430,7 @@ function checkSyncState(hypoDir) {
     pass('Sync state', 'No unresolved sync failures');
   } else {
     const last = entries[entries.length - 1];
-    warn('Sync state', `${entries.length} unresolved failure(s) — last: ${last.op || '?'} at ${last.timestamp || '?'}. Run /hypo:resume to review.`);
+    warn('Sync state', `${entries.length} unresolved failure(s) — last: ${last.op || '?'} at ${last.timestamp || '?'}. Inspect .cache/sync-state.json or push/pull manually to clear.`);
   }
 }
 
