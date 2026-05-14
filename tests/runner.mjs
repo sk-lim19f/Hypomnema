@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -1091,6 +1091,70 @@ test('auto-stage skips .hypoignore-listed file_path', () => {
     assert.equal(r.status, 0);
     const staged = spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], { encoding: 'utf-8' }).stdout;
     assert.equal(staged.trim(), '', `unexpected staged: ${staged}`);
+  });
+});
+
+suite('ingest.mjs — .hypoignore privacy guard (#14)');
+
+test('ingest-rejects-hypoignore: --check=.env refuses (spec §8.10 verification #2)', () => {
+  withTmpDir(dir => {
+    writeFileSync(join(dir, '.hypoignore'), '# Secrets\n.env*\n*secret*\n');
+    const r = run('ingest.mjs', [`--hypo-dir=${dir}`, '--check=.env']);
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status} (stderr: ${r.stderr})`);
+    assert.ok(/Refused/.test(r.stderr), `expected refusal message, got: ${r.stderr}`);
+    assert.ok(/\.env\*/.test(r.stderr), `expected matched pattern in message, got: ${r.stderr}`);
+  });
+});
+
+test('ingest-rejects-hypoignore: --check=sources/<slug> refuses renamed secret (rename-bypass)', () => {
+  withTmpDir(dir => {
+    // A user could rename `.env` to an innocuous slug; the destination path
+    // sources/<slug>.<ext> must still be blocked by a content-pattern match.
+    writeFileSync(join(dir, '.hypoignore'), '# Secrets\n.env*\n*secret*\n');
+    const r = run('ingest.mjs', [`--hypo-dir=${dir}`, '--check=sources/my-secrets.md']);
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status} (stderr: ${r.stderr})`);
+    assert.ok(/Refused/.test(r.stderr), `expected refusal message, got: ${r.stderr}`);
+  });
+});
+
+test('ingest-rejects-hypoignore: --check on a non-ignored path exits 0 silently', () => {
+  withTmpDir(dir => {
+    writeFileSync(join(dir, '.hypoignore'), '# Secrets\n.env*\n*secret*\n');
+    const r = run('ingest.mjs', [`--hypo-dir=${dir}`, '--check=sources/openai-swarm-paper.md']);
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status} (stderr: ${r.stderr})`);
+    assert.equal(r.stdout.trim(), '', `expected no stdout, got: ${r.stdout}`);
+    assert.equal(r.stderr.trim(), '', `expected no stderr, got: ${r.stderr}`);
+  });
+});
+
+test('ingest-rejects-hypoignore: --check with no .hypoignore file exits 0', () => {
+  withTmpDir(dir => {
+    const r = run('ingest.mjs', [`--hypo-dir=${dir}`, '--check=.env']);
+    assert.equal(r.status, 0, `expected exit 0 with no .hypoignore, got ${r.status} (stderr: ${r.stderr})`);
+  });
+});
+
+test('ingest-rejects-hypoignore: symlink with innocuous name pointing at ignored target is refused', () => {
+  withTmpDir(dir => {
+    // A symlink `innocent-note.md` → `.env` would otherwise pass the lexical
+    // check (its own basename is not ignored) and let `/hypo:ingest` read the
+    // secret it points at. The guard follows the symlink via realpath.
+    writeFileSync(join(dir, '.hypoignore'), '# Secrets\n.env*\n*secret*\n');
+    writeFileSync(join(dir, '.env'), 'API_KEY=xxx\n');
+    symlinkSync(join(dir, '.env'), join(dir, 'innocent-note.md'));
+    const r = run('ingest.mjs', [`--hypo-dir=${dir}`, '--check=innocent-note.md']);
+    assert.equal(r.status, 1, `expected exit 1 (symlink bypass), got ${r.status} (stderr: ${r.stderr})`);
+    assert.ok(/Refused/.test(r.stderr), `expected refusal message, got: ${r.stderr}`);
+  });
+});
+
+test('ingest-rejects-hypoignore: ../ traversal is still caught by basename patterns', () => {
+  withTmpDir(dir => {
+    // `join(hypoDir, '../foo/.env')` resolves outside the wiki; anchored
+    // patterns no longer apply, but basename patterns (`.env*`) still must.
+    writeFileSync(join(dir, '.hypoignore'), '# Secrets\n.env*\n*secret*\n');
+    const r = run('ingest.mjs', [`--hypo-dir=${dir}`, '--check=../foo/.env']);
+    assert.equal(r.status, 1, `expected exit 1 (basename match through traversal), got ${r.status} (stderr: ${r.stderr})`);
   });
 });
 

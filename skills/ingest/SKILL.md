@@ -16,14 +16,14 @@ You are running `/hypo:ingest`. Add a new source document to `sources/` and crea
 
 Locate the Hypomnema package root (the directory two levels above this file (`skills/<name>/SKILL.md` → package root)).
 
-If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
+If the user specified a wiki directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
 
 ---
 
 ## Step 2 — Run ingest status check
 
 ```bash
-node <package-root>/scripts/ingest.mjs [--wiki-dir="<path>"] [--json]
+node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] [--json]
 ```
 
 Options:
@@ -33,7 +33,27 @@ Show the output verbatim.
 
 ---
 
-## Step 3 — Handle the source file
+## Step 3 — Privacy guard (`.hypoignore`)
+
+Before touching any source content, refuse to ingest secrets (`.env`, SSH keys, credentials). Run the guard for **both** the input path and the destination path:
+
+1. **If the user provided a file path**, check it (use an absolute path):
+
+   ```bash
+   node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] --check="<absolute-input-path>"
+   ```
+
+2. **Always** check the destination `sources/<slug>.<ext>`:
+
+   ```bash
+   node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] --check="sources/<slug>.<ext>"
+   ```
+
+If either command exits non-zero, **stop**: surface the `Refused: ...` message to the user and do not download, read, or save the source. The slug check matters because a user could rename a `.env` to an innocuous slug — the destination must still be blocked.
+
+---
+
+## Step 4 — Handle the source file
 
 **If the user provided a file or URL to ingest:**
 
@@ -46,7 +66,7 @@ List un-ingested sources from the script output and ask which one to process now
 
 ---
 
-## Step 4 — Synthesize a source-summary page
+## Step 5 — Synthesize a source-summary page
 
 For the chosen source, read its content and create `pages/<slug>.md` with the following frontmatter:
 
@@ -70,7 +90,7 @@ Cross-reference existing pages with `[[wikilink]]` syntax where relevant.
 
 ---
 
-## Step 5 — Update log.md
+## Step 6 — Update log.md
 
 Append an ingest entry to `<wiki-root>/log.md`:
 
