@@ -6,7 +6,7 @@
  */
 
 import { spawnSync } from 'child_process';
-import { HYPO_DIR, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
+import { HYPO_DIR, loadHypoIgnore, isIgnored, appendSyncFailure } from './hypo-shared.mjs';
 import { join } from 'path';
 
 function git(...args) {
@@ -42,8 +42,13 @@ if (staged) {
 }
 
 if (hasRemote()) {
-  git('pull', '--no-rebase', '-q');
-  git('push');
+  // fix #9: pull/push failures must not stop the session, but they can no
+  // longer be swallowed silently — record each to .cache/sync-state.json so
+  // session-start (#10) and doctor (#11) can surface them next session.
+  const pull = git('pull', '--no-rebase', '-q');
+  if (pull.status !== 0) appendSyncFailure(HYPO_DIR, 'pull', pull.stderr || pull.stdout);
+  const push = git('push');
+  if (push.status !== 0) appendSyncFailure(HYPO_DIR, 'push', push.stderr || push.stdout);
 }
 
 console.log(JSON.stringify({ continue: true, suppressOutput: true }));
