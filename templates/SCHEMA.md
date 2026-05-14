@@ -61,6 +61,17 @@ Files responsible for session continuity — separate from the type taxonomy abo
 - Session start: root `hot.md` → project `hot.md` → `session-state.md`
 - Session close: update project `hot.md` (what was done) + `session-state.md` (what to do next) + root `hot.md`
 
+**Pointer table row format** (`hypo-hot-rebuild.mjs` parses this with a fixed regex — any deviation causes silent row drop):
+
+```
+| <Project Name> | YYYY-MM-DD | [[projects/<slug>/hot]] |
+```
+
+Column semantics:
+- col 1 (name): preserved as-is from the existing row
+- col 2 (date): **ignored on read** — rebuilt from `projects/<slug>/hot.md` frontmatter `updated:` (falls back to today if the file is absent)
+- col 3 (wikilink): must be exactly `[[projects/<slug>/hot]]` — no trailing path, no markdown link `[text](url)`
+
 ---
 
 ## 3. Required Frontmatter Fields

@@ -758,6 +758,74 @@ test('hot-rebuild emits no growth line when wiki is clean', () => {
   });
 });
 
+suite('hypo-hot-rebuild.mjs — parsePointerRows row format');
+
+test('valid wikilink row is preserved in rebuilt hot.md', () => {
+  withTmpDir(dir => {
+    const hotContent = [
+      '---',
+      'title: Hot Cache — Pointer',
+      'type: reference',
+      'updated: 2026-01-01',
+      'tags: [wiki, operations]',
+      '---',
+      '',
+      '# Hot Cache',
+      '',
+      '> Read at session start',
+      '',
+      '## Active Projects',
+      '',
+      '| Project | Last Session | Hot Cache |',
+      '|---|---|---|',
+      '| my-project | 2026-01-01 | [[projects/my-project/hot]] |',
+      '',
+      '## Session Start Checklist',
+      '',
+      '1. Check this file',
+    ].join('\n');
+    writeFileSync(join(dir, 'hot.md'), hotContent);
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const result = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(result.includes('[[projects/my-project/hot]]'), 'valid wikilink row must be preserved');
+  });
+});
+
+test('markdown link row is silently dropped (not valid pointer format)', () => {
+  withTmpDir(dir => {
+    const hotContent = [
+      '---',
+      'title: Hot Cache — Pointer',
+      'type: reference',
+      'updated: 2026-01-01',
+      'tags: [wiki, operations]',
+      '---',
+      '',
+      '# Hot Cache',
+      '',
+      '## Active Projects',
+      '',
+      '| Project | Last Session | Hot Cache |',
+      '|---|---|---|',
+      '| my-project | 2026-01-01 | [projects/my-project/hot](projects/my-project/hot.md) |',
+      '',
+      '## Session Start Checklist',
+      '',
+      '1. Check this file',
+    ].join('\n');
+    writeFileSync(join(dir, 'hot.md'), hotContent);
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    const before = hotContent;
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    // rebuild returns early when no rows parsed — file unchanged
+    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.equal(after, before, 'markdown link row must not be parsed; file must remain unchanged');
+  });
+});
+
 suite('hypo-auto-commit.mjs / hypo-auto-stage.mjs — .hypoignore honor');
 
 test('auto-commit skips .hypoignore-listed .cache paths', () => {
