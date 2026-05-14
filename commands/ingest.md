@@ -21,13 +21,33 @@ Ask the user:
 2. **Slug**: "What slug should this source have? (e.g. `openai-swarm-paper`, `team-retro-2026-04`)"
    - Default: derive from title or filename
 
-If a URL is provided, fetch the content. If a file path is provided, read it.
+Do **not** fetch the URL or read the file yet — the privacy guard in Step 2 must run first.
 
 ---
 
-## Step 2 — Check for orphaned sources
+## Step 2 — Privacy guard (`.hypoignore`)
 
-Locate the Hypomnema package root. Run the ingest helper to surface existing orphaned sources:
+Refuse to ingest secrets (`.env`, SSH keys, credentials) before they ever reach `sources/`. Locate the Hypomnema package root and run the guard for **both** the input path and the destination path:
+
+1. **If the source is a file path**, check it (use an absolute path):
+
+   ```bash
+   node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] --check="<absolute-input-path>"
+   ```
+
+2. **Always** check the destination `sources/<slug>.<ext>`:
+
+   ```bash
+   node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] --check="sources/<slug>.<ext>"
+   ```
+
+If either command exits non-zero, **stop**: surface the `Refused: ...` message to the user and do not fetch, read, or save the source. The slug check matters because a user could rename a `.env` to an innocuous slug — the destination must still be blocked.
+
+---
+
+## Step 3 — Check for orphaned sources
+
+Run the ingest helper to surface existing orphaned sources:
 
 ```bash
 node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"]
@@ -35,9 +55,11 @@ node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"]
 
 If there are orphaned sources already in `sources/`, ask: "There are N unprocessed sources — do you want to ingest one of those instead?"
 
+Once the guard has passed: if a URL is provided, fetch the content; if a file path is provided, read it.
+
 ---
 
-## Step 3 — Save raw source
+## Step 4 — Save raw source
 
 Save the raw content to `sources/<slug>.<ext>` (use `.md` for text, `.txt` for plain text, `.pdf` or original extension for documents).
 
@@ -45,7 +67,7 @@ Do **not** modify or summarize in the sources file — save it as-is.
 
 ---
 
-## Step 4 — Synthesize
+## Step 5 — Synthesize
 
 Read and synthesize the source:
 
@@ -70,14 +92,14 @@ Read and synthesize the source:
 
 ---
 
-## Step 5 — Update index.md and log.md
+## Step 6 — Update index.md and log.md
 
 - Append a line to `index.md`: `- [[pages/<slug>]] — <one-line description>`
 - Append to `log.md`: `- YYYY-MM-DD ingest: [[pages/<slug>]] from sources/<slug>.<ext>`
 
 ---
 
-## Step 6 — Report
+## Step 7 — Report
 
 Show:
 - ✓ Saved source: `sources/<slug>.<ext>`

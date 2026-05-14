@@ -16,23 +16,50 @@
  * Options:
  *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --json              Output as JSON
+ *   --check=<path>      Privacy guard: exit 1 if <path> matches a `.hypoignore`
+ *                       pattern, exit 0 silently otherwise. Used by `/hypo:ingest`
+ *                       to refuse ingesting secrets before they reach `sources/`.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
-import { join, extname, basename } from 'path';
+import { existsSync, readFileSync, readdirSync, statSync, realpathSync } from 'fs';
+import { join, extname, basename, isAbsolute } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, json: false };
+  const args = { hypoDir: null, json: false, check: null };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json')         args.json = true;
+    else if (arg.startsWith('--check=')) args.check = expandHome(arg.slice(8));
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
+}
+
+// Find the first `.hypoignore` pattern that matches `target`, or null.
+// `target` is resolved relative to `hypoDir` when not already absolute, so
+// both wiki-relative destinations (`sources/<slug>.md`) and user-supplied
+// input paths land inside the wiki tree for anchored-pattern matching.
+//
+// A symlink with an innocuous name (`note.md` → `.env`) must still be
+// refused, so an existing target is also checked by its realpath. realpath
+// throws ENOENT for a not-yet-created destination — fall back to the lexical
+// path in that case. Both the lexical and resolved paths are tested, for
+// defense-in-depth when only one of them matches a pattern.
+function matchingIgnorePattern(target, hypoDir, patterns) {
+  const lexical = isAbsolute(target) ? target : join(hypoDir, target);
+  let resolved = lexical;
+  try { resolved = realpathSync(lexical); } catch { /* not on disk — lexical only */ }
+  const candidates = resolved === lexical ? [lexical] : [lexical, resolved];
+  for (const pattern of patterns) {
+    for (const candidate of candidates) {
+      if (isIgnored(candidate, hypoDir, [pattern])) return pattern;
+    }
+  }
+  return null;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -67,6 +94,20 @@ function parseFrontmatter(content) {
 const args = parseArgs(process.argv);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
+
+// ── --check guard ────────────────────────────────────────────────────────────
+// Privacy boundary (spec §6.8 / §8.10): refuse to ingest a path that matches
+// `.hypoignore` before it ever reaches `sources/`. Separate from the
+// listing-mode filter below — this is the explicit-reject path.
+if (args.check) {
+  const matched = matchingIgnorePattern(args.check, args.hypoDir, ignorePatterns);
+  if (matched) {
+    console.error(`Refused: '${args.check}' matches .hypoignore pattern '${matched}' — not ingesting.`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
 const sourcesDir = join(args.hypoDir, 'sources');
 const allSources = existsSync(sourcesDir)
   ? readdirSync(sourcesDir).filter(e => !e.startsWith('.') && !statSync(join(sourcesDir, e)).isDirectory() && !isIgnored(join(sourcesDir, e), args.hypoDir, ignorePatterns))
