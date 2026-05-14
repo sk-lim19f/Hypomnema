@@ -179,9 +179,25 @@ test('actual run creates expected directories', () => {
       '--no-git-init',
     ]);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    for (const sub of ['pages', 'projects', 'sources']) {
+    for (const sub of ['pages', 'projects', 'sources', 'pages/observability']) {
       assert.ok(existsSync(join(hypoDir, sub)), `missing: ${sub}/`);
     }
+  });
+});
+
+test('init creates pages/observability/_index.md stub', () => {
+  withTmpDir(dir => {
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [
+      `--hypo-dir=${hypoDir}`,
+      '--no-hooks',
+      '--no-git-init',
+    ]);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const stubPath = join(hypoDir, 'pages', 'observability', '_index.md');
+    assert.ok(existsSync(stubPath), 'pages/observability/_index.md should be created');
+    const content = readFileSync(stubPath, 'utf8');
+    assert.ok(content.includes('autonomy score'), '_index.md should contain autonomy score section');
   });
 });
 

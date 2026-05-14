@@ -143,7 +143,7 @@ function log(action, path) { results[action].push(path); }
 
 // ── directory structure ──────────────────────────────────────────────────────
 
-const HYPO_DIRS = ['pages', 'projects', 'sources', 'journal/daily', 'journal/weekly', 'journal/monthly'];
+const HYPO_DIRS = ['pages', 'projects', 'sources', 'journal/daily', 'journal/weekly', 'journal/monthly', 'pages/observability'];
 
 function ensureDir(dir, dryRun) {
   if (existsSync(dir)) return;
@@ -625,6 +625,7 @@ if (args.fromRemote) {
   copyTemplate('hypo-automation.md',join(args.hypoDir, 'hypo-automation.md'),args.dryRun);
   copyTemplate('session-state.md',  join(args.hypoDir, 'session-state.md'),  args.dryRun);
   copyTemplate(join('pages', '_index.md'), join(args.hypoDir, 'pages', '_index.md'), args.dryRun);
+  copyTemplate(join('pages', 'observability', '_index.md'), join(args.hypoDir, 'pages', 'observability', '_index.md'), args.dryRun);
 
   // projects/_template structure
   ensureDir(join(args.hypoDir, 'projects', '_template'), args.dryRun);
