@@ -317,6 +317,35 @@ test('doctor-settings-integrity: duplicate hypo-* entry → warn', () => {
   });
 });
 
+// fix #8: doctor-codex-paths
+suite('doctor.mjs — fix #8: codex paths');
+
+test('doctor-codex-paths: no codex checks without --codex flag', () => {
+  const r = run('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  const codexChecks = out.filter(c => c.label.includes('Codex'));
+  assert.equal(codexChecks.length, 0, 'expected no Codex checks without --codex flag');
+});
+
+test('doctor-codex-paths: --codex flag triggers codex hook file check', () => {
+  withTmpHome(home => {
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--codex', '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const hookCheck = out.find(c => c.label === 'Codex hook files installed');
+    assert.ok(hookCheck, 'Codex hook files check not found');
+    assert.equal(hookCheck.status, 'fail', `expected fail when ~/.codex/hooks is empty: ${hookCheck.detail}`);
+  });
+});
+
+test('doctor-codex-paths: --codex flag triggers codex settings.json check', () => {
+  withTmpHome(home => {
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--codex', '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const settingsCheck = out.find(c => c.label === 'Codex settings.json hook registrations');
+    assert.ok(settingsCheck, 'Codex settings.json check not found');
+  });
+});
+
 // ── hook contract tests ───────────────────────────────────────────────────────
 
 const HOOKS = join(REPO, 'hooks');

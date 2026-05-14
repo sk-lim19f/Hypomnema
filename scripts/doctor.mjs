@@ -407,6 +407,61 @@ function checkVerifyBy(hypoDir, ignorePatterns = []) {
   }
 }
 
+function checkCodexPaths() {
+  const codexHooks = join(HOME, '.codex', 'hooks');
+  const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
+
+  let missing = 0;
+  for (const file of allFiles) {
+    if (!existsSync(join(codexHooks, file))) missing++;
+  }
+
+  if (missing === 0) {
+    pass('Codex hook files installed', codexHooks);
+  } else if (missing < allFiles.length) {
+    warn('Codex hook files installed', `${missing}/${allFiles.length} missing in ${codexHooks} — run /hypo:init --codex`);
+  } else {
+    fail('Codex hook files installed', `No hook files found in ${codexHooks} — run /hypo:init --codex`);
+  }
+
+  const settingsPath = join(HOME, '.codex', 'settings.json');
+  if (!existsSync(settingsPath)) {
+    warn('Codex settings.json hook registrations', 'settings.json not found — run /hypo:init --codex');
+    return;
+  }
+
+  let settings;
+  try {
+    settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+  } catch {
+    fail('Codex settings.json hook registrations', 'settings.json is not valid JSON');
+    return;
+  }
+
+  const hooksDir = codexHooks;
+  let registered = 0;
+  let total = 0;
+
+  for (const [event, files] of Object.entries(HOOK_MAP)) {
+    for (const file of files) {
+      total++;
+      const cmd = `node ${hooksDir.replace(HOME, '$HOME')}/${file}`;
+      const found = (Array.isArray(settings.hooks?.[event]) ? settings.hooks[event] : [])
+        .flatMap(g => g.hooks || [])
+        .some(h => h.command === cmd);
+      if (found) registered++;
+    }
+  }
+
+  if (registered === total) {
+    pass('Codex settings.json hook registrations', `${registered}/${total} registered`);
+  } else if (registered > 0) {
+    warn('Codex settings.json hook registrations', `${registered}/${total} registered — run /hypo:init --codex`);
+  } else {
+    fail('Codex settings.json hook registrations', `0/${total} registered — run /hypo:init --codex`);
+  }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -422,6 +477,7 @@ if (rootOk) {
 }
 checkHooks();
 checkSettingsJson();
+if (args.codex) checkCodexPaths();
 checkGit(args.hypoDir);
 
 // ── report ───────────────────────────────────────────────────────────────────
