@@ -317,6 +317,42 @@ test('doctor-settings-integrity: duplicate hypo-* entry → warn', () => {
   });
 });
 
+// fix #11: doctor-sync-state-warn
+suite('doctor.mjs — fix #11: sync-state warn');
+
+test('doctor-sync-state-warn: no .cache/sync-state.json → pass', () => {
+  withTmpDir(dir => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find(c => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+  });
+});
+
+test('doctor-sync-state-warn: open sync-state.json entries → warn', () => {
+  withTmpDir(dir => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({ timestamp: '2026-05-14T00:00:00Z', op: 'push', error: 'network timeout', host: 'test' }) + '\n'
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find(c => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+  });
+});
+
 // fix #8: doctor-codex-paths
 suite('doctor.mjs — fix #8: codex paths');
 

@@ -407,6 +407,31 @@ function checkVerifyBy(hypoDir, ignorePatterns = []) {
   }
 }
 
+function checkSyncState(hypoDir) {
+  // "open" = file exists with ≥1 entries; session-start (fix #10) clears after user resolves
+  const syncStatePath = join(hypoDir, '.cache', 'sync-state.json');
+  if (!existsSync(syncStatePath)) {
+    pass('Sync state', 'No unresolved sync failures');
+    return;
+  }
+
+  let entries;
+  try {
+    const lines = readFileSync(syncStatePath, 'utf-8').split('\n').filter(l => l.trim());
+    entries = lines.map(l => JSON.parse(l));
+  } catch {
+    warn('Sync state', 'Cannot parse .cache/sync-state.json — inspect manually');
+    return;
+  }
+
+  if (entries.length === 0) {
+    pass('Sync state', 'No unresolved sync failures');
+  } else {
+    const last = entries[entries.length - 1];
+    warn('Sync state', `${entries.length} unresolved failure(s) — last: ${last.op || '?'} at ${last.timestamp || '?'}. Run /hypo:resume to review.`);
+  }
+}
+
 function checkCodexPaths() {
   const codexHooks = join(HOME, '.codex', 'hooks');
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
@@ -478,6 +503,7 @@ if (rootOk) {
 checkHooks();
 checkSettingsJson();
 if (args.codex) checkCodexPaths();
+if (rootOk) checkSyncState(args.hypoDir);
 checkGit(args.hypoDir);
 
 // ── report ───────────────────────────────────────────────────────────────────
