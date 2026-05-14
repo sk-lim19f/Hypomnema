@@ -27,6 +27,7 @@ import {
   hotMdIsClean,
   readChecklist,
   isGateSkipped,
+  isClosePattern,
 } from './hypo-shared.mjs';
 
 const CRITICAL_FILE = join(homedir(), '.claude', 'state', 'wiki-context-critical.json');
@@ -92,14 +93,16 @@ process.stdin.on('end', () => {
     return;
   }
 
-  // ── Bypass 2: env var ──
-  if (!isGateSkipped() && transcriptPath && existsSync(transcriptPath)) {
-    // Only scan user-role messages to avoid matching the block reason text
-    // which itself contains "Bypass with HYPO_SKIP_GATE=1"
+  // ── Transcript scan (Bypass 2 + #20 close-intent detection) ──
+  let hasCloseIntent = false;
+  if (transcriptPath && existsSync(transcriptPath)) {
     const userText = extractUserMessages(transcriptPath);
-    if (/HYPO_SKIP_GATE=1/.test(userText)) {
+    // Bypass 2: user-role "HYPO_SKIP_GATE=1" (scan before gate so bypass takes effect)
+    if (!isGateSkipped() && /HYPO_SKIP_GATE=1/.test(userText)) {
       process.env.HYPO_SKIP_GATE = '1';
     }
+    // #20: natural-language close-intent detection (informational — enriches block message)
+    hasCloseIntent = isClosePattern(userText);
   }
 
   // ── Heavy checks ──
@@ -179,10 +182,14 @@ process.stdin.on('end', () => {
     `  [ ] 12. git commit & push`,
   ].join('\n');
 
+  const closeIntentNote = hasCloseIntent
+    ? `[Close intent detected in recent messages — completing session close first.]\n`
+    : '';
+
   console.log(JSON.stringify({
     decision: 'block',
     reason: [
-      `[WIKI CHECK — BLOCKING] Session close incomplete. (${reasons.join(', ')})`,
+      `${closeIntentNote}[WIKI CHECK — BLOCKING] Session close incomplete. (${reasons.join(', ')})`,
       `Run the checklist below in order, then retry /compact:`,
       ``,
       checklistText,

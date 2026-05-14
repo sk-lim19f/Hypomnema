@@ -153,6 +153,41 @@ export function isCompactCommand(prompt) {
 }
 
 /**
+ * Returns true if the text contains a natural-language session-close signal.
+ * Scans Korean and English close patterns. Designed for transcript user-message
+ * text — favours low false-positive rate over recall.
+ *
+ * Examples that match: "세션 마무리하자", "오늘 여기까지", "wrap up", "signing off".
+ * Examples that do NOT match: "이 함수 마무리하자", "wrap up this PR".
+ */
+export function isClosePattern(text) {
+  if (!text || typeof text !== 'string') return false;
+  const krPatterns = [
+    /세션\s*(끝|종료|마무리)/,
+    /오늘\s*은?\s*(여기|작업|세션).*(끝|마치|마무리|종료)/,
+    // 여기까지: requires no continuation action word (e.g. 여기까지 구현해줘 is not a close signal)
+    /여기(서)?까지(?!\s*(?:구현|작성|완성|수정|변경|추가|삭제|테스트|확인|검토|해줘|해야|하고|하면))/,
+    /이만\s*(마치|끝|종료|마무리)/,
+    // 작업 종료/마무리: requires verb ending, not noun modifier (e.g. 작업 종료 조건을 is not a close signal)
+    /작업\s*(?:마무리|종료)\s*(?:하자|할게|하겠|했어|임)/,
+    /오늘은?\s*여기/,
+    /그만\s*(하자|할게|하겠|합시다)/,
+    /슬슬\s*(마무리|종료)/,
+    /오늘은?\s*이만/,
+  ];
+  const enPatterns = [
+    // wrap up: requires session-level context or sentence-end, not code-level objects
+    /wrap(?:ping)?\s+up(?!\s+(?:this|the)\s+(?:pr|issue|bug|task|function|component|module|feature|code|test)\b)/i,
+    /done\s+for\s+(?:today|now|the\s+day)/i,
+    /that'?s?\s+(?:all|it)\s+for\s+(?:today|now|the\s+day)/i,
+    /signing\s+off/i,
+    /end(?:ing)?\s+(?:the|this)\s+(?:session|work|day)/i,
+    /close\s+(?:the|this)\s+session/i,
+  ];
+  return [...krPatterns, ...enPatterns].some(re => re.test(text));
+}
+
+/**
  * Build hook output for Claude Code (additionalContext channel).
  * Codex hooks write systemMessage directly in their own files.
  */

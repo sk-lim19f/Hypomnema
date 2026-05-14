@@ -248,7 +248,7 @@ test('JSON output is an array of check objects', () => {
 
 const HOOKS = join(REPO, 'hooks');
 
-const { isCompactCommand, isGateSkipped, buildOutput } = await import(
+const { isCompactCommand, isGateSkipped, buildOutput, isClosePattern } = await import(
   join(HOOKS, 'hypo-shared.mjs')
 );
 
@@ -291,6 +291,60 @@ test('/compact with trailing args → true', () => {
 test('non-compact prompt → false', () => {
   assert.equal(isCompactCommand('hello'), false);
   assert.equal(isCompactCommand('/other'), false);
+});
+
+suite('isClosePattern()');
+
+test('한국어 세션 마무리 패턴 → true', () => {
+  assert.equal(isClosePattern('세션 마무리하자'), true);
+  assert.equal(isClosePattern('세션 종료할게'), true);
+  assert.equal(isClosePattern('세션 끝'), true);
+});
+
+test('한국어 여기까지/이만 패턴 → true', () => {
+  assert.equal(isClosePattern('오늘 여기까지'), true);
+  assert.equal(isClosePattern('오늘은 여기'), true);
+  assert.equal(isClosePattern('여기까지'), true);
+  assert.equal(isClosePattern('이만 마치자'), true);
+  assert.equal(isClosePattern('이만 종료'), true);
+});
+
+test('한국어 작업/그만/슬슬/이만 패턴 → true', () => {
+  assert.equal(isClosePattern('오늘 작업 마무리하자'), true);
+  assert.equal(isClosePattern('작업 마무리 할게'), true);
+  assert.equal(isClosePattern('작업 종료 하자'), true);
+  assert.equal(isClosePattern('그만 하자'), true);
+  assert.equal(isClosePattern('그만 할게'), true);
+  assert.equal(isClosePattern('슬슬 마무리하자'), true);
+  assert.equal(isClosePattern('오늘은 이만'), true);
+});
+
+test('영어 close 패턴 → true', () => {
+  assert.equal(isClosePattern('wrap up'), true);
+  assert.equal(isClosePattern('wrapping up'), true);
+  assert.equal(isClosePattern('done for today'), true);
+  assert.equal(isClosePattern("that's all for today"), true);
+  assert.equal(isClosePattern('signing off'), true);
+  assert.equal(isClosePattern('ending the session'), true);
+  assert.equal(isClosePattern('close the session'), true);
+});
+
+test('일반 작업 문장 → false (false-positive 방지)', () => {
+  assert.equal(isClosePattern('이 함수 마무리하자'), false);
+  assert.equal(isClosePattern('버그 종료하자'), false);
+  assert.equal(isClosePattern('코드 정리'), false);
+  assert.equal(isClosePattern('다음 작업 시작하자'), false);
+  assert.equal(isClosePattern('여기까지 구현하고 테스트해줘'), false);   // Codex P2
+  assert.equal(isClosePattern('작업 종료 조건을 바꿔줘'), false);         // Codex P2
+  assert.equal(isClosePattern('wrap up this PR'), false);               // Codex P2
+  assert.equal(isClosePattern('wrap up this feature'), false);          // Codex P2
+  assert.equal(isClosePattern(''), false);
+  assert.equal(isClosePattern(null), false);
+});
+
+test('혼합 텍스트(트랜스크립트)에서도 패턴 감지', () => {
+  const transcript = '이 PR 리뷰 마저 봐줘\n오늘은 여기까지 하자\n내일 다시 볼게';
+  assert.equal(isClosePattern(transcript), true);
 });
 
 suite('isGateSkipped()');
@@ -380,6 +434,29 @@ test('output is always valid JSON regardless of prompt', () => {
     const r = runHook('hypo-compact-guard.mjs', { prompt });
     assert.doesNotThrow(() => JSON.parse(r.stdout), `invalid JSON for prompt="${prompt}"`);
   }
+});
+
+suite('hypo-personal-check.mjs — close-intent enrichment (#20)');
+
+test('close intent in transcript → block message includes close-intent note', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-close-'));
+  try {
+    const transcript = join(dir, 'transcript.jsonl');
+    writeFileSync(transcript, JSON.stringify({ message: { role: 'user', content: '세션 마무리하자' } }) + '\n');
+    const r = runHook('hypo-personal-check.mjs', { transcript_path: transcript });
+    const out = JSON.parse(r.stdout);
+    assert.ok(out.decision === 'block', 'should still block when session close is incomplete');
+    assert.ok(out.reason.includes('Close intent'), 'block reason should mention close intent detection');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('no close intent → block message does NOT include close-intent note', () => {
+  const r = runHook('hypo-personal-check.mjs', {});
+  const out = JSON.parse(r.stdout);
+  assert.ok(out.decision === 'block');
+  assert.ok(!out.reason.includes('Close intent'), 'block reason should not mention close intent when absent');
 });
 
 suite('hypo-personal-check.mjs — contract');
