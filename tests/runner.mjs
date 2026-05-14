@@ -1126,6 +1126,110 @@ test('session-start emits no growth line when cache absent', () => {
   });
 });
 
+// ── sync-state replay (fix #9/#10) ───────────────────────────────────────────
+
+// A wiki repo wired to a working bare remote and pushed in sync — the baseline
+// for exercising session-start's clear/preserve logic.
+function withSyncedWiki(fn) {
+  const base   = mkdtempSync(join(tmpdir(), 'hypo-sync-'));
+  const dir    = join(base, 'wiki');
+  const remote = join(base, 'remote.git');
+  try {
+    spawnSync('git', ['init', '--bare', '-q', remote]);
+    spawnSync('git', ['init', '-q', dir]);
+    spawnSync('git', ['-C', dir, 'config', 'user.email', 'test@test.com']);
+    spawnSync('git', ['-C', dir, 'config', 'user.name', 'Test']);
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    writeFileSync(join(dir, 'hot.md'),
+      '---\ntitle: Hot\nupdated: today\n---\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'init']);
+    spawnSync('git', ['-C', dir, 'remote', 'add', 'origin', remote]);
+    spawnSync('git', ['-C', dir, 'push', '-q', '-u', 'origin', 'HEAD']);
+    fn(dir);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+function readSyncEntries(dir) {
+  return readFileSync(join(dir, '.cache', 'sync-state.json'), 'utf-8')
+    .split('\n').filter(Boolean).map(l => JSON.parse(l));
+}
+
+suite('hypo-auto-commit.mjs / hypo-session-start.mjs — sync-state replay');
+
+test('replay-auto-commit-writes-sync-state: pull/push failure appends entries', () => {
+  withGrowthWiki(dir => {
+    // a remote that does not exist → both pull and push fail
+    spawnSync('git', ['-C', dir, 'remote', 'add', 'origin', join(dir, 'no-such-remote.git')]);
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'note.md'), '# note\n');
+    const r = runStop('hypo-auto-commit.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(existsSync(join(dir, '.cache', 'sync-state.json')),
+      'sync-state.json must be created on sync failure');
+    const entries = readSyncEntries(dir);
+    assert.ok(entries.length >= 1, `expected ≥1 failure entry, got ${entries.length}`);
+    assert.ok(entries.every(e => e.op === 'pull' || e.op === 'push'),
+      `unexpected op: ${JSON.stringify(entries)}`);
+    assert.ok(entries.every(e => e.timestamp && e.host && e.error),
+      `entries must carry timestamp/host/error: ${JSON.stringify(entries)}`);
+  });
+});
+
+test('replay-session-start-exposes-sync-state: open entry surfaces in additionalContext', () => {
+  withGrowthWiki(dir => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({ timestamp: '2026-05-14T00:00:00Z', op: 'push', error: 'network timeout', host: 'test' }) + '\n');
+    const r = runStart(dir);
+    const ctx = (JSON.parse(r.stdout).additionalContext) || '';
+    assert.ok(ctx.includes('last sync failed'), `sync notice missing: ${ctx}`);
+    assert.ok(ctx.includes('network timeout'), `error detail missing: ${ctx}`);
+  });
+});
+
+test('replay-session-start-clears-resolved-sync-state: healthy repo clears the entry', () => {
+  withSyncedWiki(dir => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const p = join(dir, '.cache', 'sync-state.json');
+    writeFileSync(p, JSON.stringify({ timestamp: '2026-05-14T00:00:00Z', op: 'pull', error: 'network timeout', host: 'test' }) + '\n');
+    const r = runStart(dir);
+    const ctx = (JSON.parse(r.stdout).additionalContext) || '';
+    assert.ok(!ctx.includes('last sync failed'), `resolved sync should not surface: ${ctx}`);
+    assert.ok(!existsSync(p), 'sync-state.json must be cleared once sync is healthy');
+  });
+});
+
+test('replay-session-start-surfaces-unreadable-sync-state: corrupt JSONL is not silently hidden', () => {
+  withGrowthWiki(dir => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const p = join(dir, '.cache', 'sync-state.json');
+    writeFileSync(p, JSON.stringify({ timestamp: '2026-05-14T00:00:00Z', op: 'push', error: 'x', host: 'test' }) + '\nnot-json\n');
+    const r = runStart(dir);
+    const ctx = (JSON.parse(r.stdout).additionalContext) || '';
+    assert.ok(ctx.includes('last sync failed'), `corrupt sync-state must still surface: ${ctx}`);
+    assert.ok(existsSync(p), 'unreadable sync-state.json must be preserved for inspection');
+  });
+});
+
+test('replay-session-start-preserves-sync-state-when-ahead: unpushed commit keeps the entry', () => {
+  withSyncedWiki(dir => {
+    // simulate a prior failed push: a local commit not on the remote
+    writeFileSync(join(dir, 'unpushed.md'), '# unpushed\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'unpushed work']);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const p = join(dir, '.cache', 'sync-state.json');
+    writeFileSync(p, JSON.stringify({ timestamp: '2026-05-14T00:00:00Z', op: 'push', error: 'connection refused', host: 'test' }) + '\n');
+    const r = runStart(dir);
+    const ctx = (JSON.parse(r.stdout).additionalContext) || '';
+    assert.ok(ctx.includes('last sync failed'), `unresolved push failure must stay surfaced: ${ctx}`);
+    assert.ok(existsSync(p), 'sync-state.json must not be cleared while local is ahead of remote');
+  });
+});
+
 // ── weekly-report.mjs (Lane E) ───────────────────────────────────────────────
 
 suite('weekly-report.mjs');
