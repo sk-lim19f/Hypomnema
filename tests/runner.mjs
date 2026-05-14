@@ -793,8 +793,9 @@ test('valid wikilink row is preserved in rebuilt hot.md', () => {
   });
 });
 
-test('markdown link row is silently dropped (not valid pointer format)', () => {
+test('markdown link row is silently excluded when mixed with a valid wikilink row', () => {
   withTmpDir(dir => {
+    // mixed table: one valid wikilink row + one markdown link row
     const hotContent = [
       '---',
       'title: Hot Cache — Pointer',
@@ -805,11 +806,14 @@ test('markdown link row is silently dropped (not valid pointer format)', () => {
       '',
       '# Hot Cache',
       '',
+      '> Read at session start',
+      '',
       '## Active Projects',
       '',
       '| Project | Last Session | Hot Cache |',
       '|---|---|---|',
-      '| my-project | 2026-01-01 | [projects/my-project/hot](projects/my-project/hot.md) |',
+      '| valid-project | 2026-01-01 | [[projects/valid-project/hot]] |',
+      '| bad-project | 2026-01-01 | [projects/bad-project/hot](projects/bad-project/hot.md) |',
       '',
       '## Session Start Checklist',
       '',
@@ -817,12 +821,11 @@ test('markdown link row is silently dropped (not valid pointer format)', () => {
     ].join('\n');
     writeFileSync(join(dir, 'hot.md'), hotContent);
     writeFileSync(join(dir, 'hypo-config.md'), '# config');
-    const before = hotContent;
     const r = runStop('hypo-hot-rebuild.mjs', dir);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    // rebuild returns early when no rows parsed — file unchanged
-    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.equal(after, before, 'markdown link row must not be parsed; file must remain unchanged');
+    const result = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(result.includes('[[projects/valid-project/hot]]'), 'valid wikilink row must be preserved');
+    assert.ok(!result.includes('bad-project'), 'markdown link row must be excluded from rebuilt output');
   });
 });
 
