@@ -49,7 +49,17 @@ If `/hypo:crystallize` was invoked as a session-close action, run through this c
 5. **open-questions** — only if `pages/open-questions.md` exists and questions were raised or resolved this session: move resolved ones out; add newly raised ones. Skip if unchanged.
 6. **log.md** — append a `session` entry to `<wiki-root>/log.md`.
 
-After completing the checklist, report each item with ✓ and ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+After completing the checklist, verify it before reporting:
+
+```bash
+node <package-root>/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
+```
+
+This runs the same strict check as the PreCompact hard gate (fix #17). Fix any
+file reported `missing` or `stale` and re-run until it passes — otherwise
+`/compact` will be blocked.
+
+Once it passes, report each item with ✓ and ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
 
 ---
 

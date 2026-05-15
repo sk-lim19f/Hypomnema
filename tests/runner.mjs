@@ -467,22 +467,50 @@ function runHook(hookFile, stdinData, extraEnv = {}) {
   });
 }
 
-function withCleanWiki(fn) {
+// Build a fully session-closed wiki tree: root hot.md + log.md plus the 4
+// project memory files (session-state, project hot.md, session-log) all
+// carrying today's date. Mirrors the strict 11-step close (fix #17).
+function buildCleanWikiTree(dir, today) {
+  const ym = today.slice(0, 7);
+  const projDir = join(dir, 'projects', 'test-project');
+  mkdirSync(join(projDir, 'session-log'), { recursive: true });
+  writeFileSync(join(dir, 'hypo-config.md'), '# config');
+  writeFileSync(join(dir, 'log.md'), `## [${today}] session | test-project\n`);
+  writeFileSync(join(dir, 'hot.md'),
+    `---\ntitle: Hot\nupdated: ${today}\n---\n# Hot\n\n## Active Projects\n\n` +
+    `| Project | Last Session | Hot Cache |\n|---|---|---|\n` +
+    `| test-project | ${today} | [[projects/test-project/hot]] |\n`);
+  writeFileSync(join(projDir, 'session-state.md'),
+    `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- next\n`);
+  writeFileSync(join(projDir, 'hot.md'),
+    `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot\n`);
+  writeFileSync(join(projDir, 'session-log', `${ym}.md`),
+    `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] test session\n`);
+}
+
+// Build a clean wiki tree, optionally mutate it before the initial commit,
+// then run `fn(dir, today)`. `mutate` runs pre-commit so tests can make a
+// file stale without leaving the git tree dirty (which would block on a
+// different reason).
+function withWiki(mutate, fn) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
   try {
     const today = new Date().toISOString().slice(0, 10);
-    writeFileSync(join(dir, 'hypo-config.md'), '# config');
-    writeFileSync(join(dir, 'log.md'), `## [${today}] session | test-project\n`);
-    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\nupdated: today\n---\n# Hot\n');
+    buildCleanWikiTree(dir, today);
+    if (mutate) mutate(dir, today);
     spawnSync('git', ['init'], { cwd: dir, encoding: 'utf-8' });
     spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
     spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
     spawnSync('git', ['add', '-A'], { cwd: dir, encoding: 'utf-8' });
     spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, encoding: 'utf-8' });
-    fn(dir);
+    fn(dir, today);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+function withCleanWiki(fn) {
+  withWiki(null, dir => fn(dir));
 }
 
 suite('isCompactCommand()');
@@ -707,6 +735,146 @@ test('clean wiki → suppressOutput:true', () => {
     const out = JSON.parse(r.stdout);
     assert.equal(out.suppressOutput, true);
     assert.equal(out.continue, true);
+  });
+});
+
+suite('hypo-personal-check.mjs — strict 11-step session close (#17)');
+
+test('all 6 memory files fresh → suppressOutput:true', () => {
+  withWiki(null, dir => {
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `expected pass, got: ${r.stdout}`);
+    assert.equal(out.suppressOutput, true);
+  });
+});
+
+test('project hot.md not updated today → block, reason names the file', () => {
+  withWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'test-project', 'hot.md'),
+      '---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n');
+  }, dir => {
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `expected block, got: ${r.stdout}`);
+    assert.ok(out.reason.includes('projects/test-project/hot.md'),
+      `block reason should name the stale file: ${out.reason}`);
+  });
+});
+
+test('session-log missing a today-dated heading → block', () => {
+  withWiki((dir, today) => {
+    const ym = today.slice(0, 7);
+    writeFileSync(join(dir, 'projects', 'test-project', 'session-log', `${ym}.md`),
+      '---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n');
+  }, dir => {
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `expected block, got: ${r.stdout}`);
+    assert.ok(out.reason.includes('session-log'),
+      `block reason should name the session-log file: ${out.reason}`);
+  });
+});
+
+test('open-questions.md absent/stale → still passes (conditional, not gated)', () => {
+  withWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'open-questions.md'),
+      '---\ntitle: Open Questions\ntype: open-questions\nupdated: 2020-01-01\n---\n\n# Open Questions\n');
+  }, dir => {
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `open-questions is conditional — should not gate: ${r.stdout}`);
+  });
+});
+
+test('log.md missing a today-dated session entry → block', () => {
+  withWiki((dir) => {
+    // log.md exists but its session entry is stale-dated.
+    writeFileSync(join(dir, 'log.md'), '## [2020-01-01] session | test-project — old\n');
+  }, dir => {
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `expected block, got: ${r.stdout}`);
+    assert.ok(out.reason.includes('log.md'), `block reason should name log.md: ${out.reason}`);
+  });
+});
+
+test('log.md session entry for a different project → block', () => {
+  withWiki((dir, today) => {
+    // A fresh session entry, but for some other project — must not satisfy
+    // the gate for the resolved project (test-project).
+    writeFileSync(join(dir, 'log.md'), `## [${today}] session | other-project — done\n`);
+  }, dir => {
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `cross-project log entry must not pass: ${r.stdout}`);
+    assert.ok(out.reason.includes('log.md'), `block reason should name log.md: ${out.reason}`);
+  });
+});
+
+test('HYPO_SKIP_GATE=1 bypasses an incomplete session close', () => {
+  withWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'test-project', 'session-state.md'),
+      '---\ntitle: session-state\ntype: session-state\nupdated: 2020-01-01\n---\n\n## 다음 작업\n\n- next\n');
+  }, dir => {
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HYPO_SKIP_GATE: '1' });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `HYPO_SKIP_GATE should bypass: ${r.stdout}`);
+    assert.ok(out.systemMessage.includes('memory files not updated'),
+      `bypass message should still surface the incomplete files: ${out.systemMessage}`);
+  });
+});
+
+suite('crystallize.mjs --check-session-close (#17)');
+
+test('clean session close → exit 0 + ok:true', () => {
+  withWiki(null, dir => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.equal(out.project, 'test-project');
+  });
+});
+
+test('stale memory file → exit 1 + ok:false + names the file', () => {
+  withWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'test-project', 'session-state.md'),
+      '---\ntitle: session-state\ntype: session-state\nupdated: 2020-01-01\n---\n\n## 다음 작업\n\n- next\n');
+  }, dir => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(out.stale.includes('projects/test-project/session-state.md'),
+      `stale list should name the file: ${JSON.stringify(out.stale)}`);
+  });
+});
+
+test('--check-session-close reads log.md from --hypo-dir, not the ambient wiki', () => {
+  withWiki((dir) => {
+    // log.md whose last substantial op is an ingest, not a session close.
+    writeFileSync(join(dir, 'log.md'), '## [2020-01-01] ingest | some-source\n');
+  }, dir => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(out.stale.includes('log.md'),
+      `log.md check must target --hypo-dir and flag it stale: ${r.stdout}`);
+  });
+});
+
+test('missing log.md → exit 1 + log.md in missing list', () => {
+  withWiki((dir) => {
+    rmSync(join(dir, 'log.md'));
+  }, dir => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(out.missing.includes('log.md'), `missing list should name log.md: ${r.stdout}`);
   });
 });
 

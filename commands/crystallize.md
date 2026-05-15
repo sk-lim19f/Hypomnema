@@ -30,7 +30,17 @@ Work through each item in order. For an explicit session-close invocation, proce
 
 ## Step 3 — Session-close confirmation
 
-After completing the checklist, report:
+After completing the checklist, verify it with the script before reporting:
+
+```bash
+node <package-root>/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
+```
+
+This is the same strict check the PreCompact hard gate runs (fix #17). If it
+reports any file as `missing` or `stale`, fix that file and re-run before
+continuing — otherwise `/compact` will be blocked.
+
+Once the check passes, report:
 
 - ✓ session-state.md updated
 - ✓ hot.md (project + root) updated

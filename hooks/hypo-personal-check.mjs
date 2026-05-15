@@ -3,7 +3,8 @@
  * hypo-personal-check.mjs — PreCompact hook
  *
  * Hard gate before /compact. Blocks if:
- *   - last substantial wiki op is not a session close
+ *   - the session-close memory files were not updated this session (fix #17:
+ *     session-state.md, project hot.md, root hot.md, session-log, log.md)
  *   - wiki git repo has uncommitted/unpushed changes
  *   - hot.md has forbidden structure
  *   - lint blockers exist
@@ -22,9 +23,9 @@ import { homedir } from 'os';
 import {
   HYPO_DIR,
   PKG_ROOT,
-  lastSubstantialOpIsSession,
   hypoIsClean,
   hotMdIsClean,
+  sessionCloseFileStatus,
   readChecklist,
   isGateSkipped,
   isClosePattern,
@@ -108,9 +109,18 @@ process.stdin.on('end', () => {
   // ── Heavy checks ──
   const today = new Date().toISOString().slice(0, 10);
 
-  const hasSession = lastSubstantialOpIsSession();
   const gitStatus  = hypoIsClean();
   const hotStatus  = hotMdIsClean();
+  // fix #17: strict 11-step session-close — the 6 memory files must be updated.
+  // closeFiles covers files #1-4 + log.md (#6); open-questions.md (#5) is
+  // conditional and not gated.
+  const closeFiles = sessionCloseFileStatus(HYPO_DIR);
+  const closeFilesReason = closeFiles.ok ? '' : `memory files not updated this session: ${
+    [
+      ...closeFiles.missing.map(f => `${f} (missing)`),
+      ...closeFiles.stale.map(f => `${f} (stale)`),
+    ].join(', ')
+  }`;
 
   const lintPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'lint.mjs') : null;
   let lintBlockers = [];
@@ -134,7 +144,7 @@ process.stdin.on('end', () => {
   const lintOk          = lintBlockers.length === 0;
   const designHistoryOk = lintW8.length === 0;
 
-  if (hasSession && gitStatus.clean && hotStatus.clean && lintOk && designHistoryOk) {
+  if (gitStatus.clean && hotStatus.clean && lintOk && designHistoryOk && closeFiles.ok) {
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
     return;
   }
@@ -142,9 +152,9 @@ process.stdin.on('end', () => {
   // ── Bypass 3: HYPO_SKIP_GATE ──
   if (isGateSkipped()) {
     const skipped = [
-      !hasSession      ? 'session log missing'                      : '',
       !gitStatus.clean ? gitStatus.reason                           : '',
       !hotStatus.clean ? hotStatus.reason                           : '',
+      !closeFiles.ok   ? closeFilesReason                           : '',
       !designHistoryOk ? `design-history stale (${lintW8.length})` : '',
       lintSkipped      ? 'lint skipped (hypo-pkg.json missing)'     : '',
     ].filter(Boolean).join(', ');
@@ -157,9 +167,9 @@ process.stdin.on('end', () => {
 
   // ── Block ──
   const reasons = [
-    !hasSession      ? 'session log entry missing'                                                   : '',
     !gitStatus.clean ? gitStatus.reason                                                              : '',
     !hotStatus.clean ? hotStatus.reason                                                              : '',
+    !closeFiles.ok   ? closeFilesReason                                                              : '',
     !lintOk          ? `lint blockers: ${lintBlockers.map(b => b.id).join(', ')}`                   : '',
     !designHistoryOk ? `design-history stale: ${lintW8.map(w => w.file.split('/')[1]).join(', ')}` : '',
     lintSkipped      ? 'lint skipped (run `hypomnema init` to enable lint gate)'                    : '',
