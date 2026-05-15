@@ -210,6 +210,59 @@ test('--no-hooks succeeds without touching hook config', () => {
   });
 });
 
+test('init creates .gitignore with .cache/ entry', () => {
+  withTmpDir(dir => {
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const gitignorePath = join(hypoDir, '.gitignore');
+    assert.ok(existsSync(gitignorePath), '.gitignore should be created');
+    const content = readFileSync(gitignorePath, 'utf8');
+    assert.ok(content.includes('.cache/'), '.gitignore should exclude .cache/');
+  });
+});
+
+test('init installs .git/hooks/pre-commit with hypo marker', () => {
+  withTmpDir(dir => {
+    const hypoDir = join(dir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const hookPath = join(hypoDir, '.git', 'hooks', 'pre-commit');
+    assert.ok(existsSync(hookPath), '.git/hooks/pre-commit should be created');
+    const content = readFileSync(hookPath, 'utf8');
+    assert.ok(content.includes('# hypo-managed:pre-commit:start'), 'hook should contain hypo marker');
+    assert.ok(content.includes('hypo-pre-commit.mjs'), 'hook should reference worker script');
+  });
+});
+
+test('pre-commit hook blocks staged .env file via git commit', () => {
+  withTmpDir(dir => {
+    const hypoDir = join(dir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'config', 'user.email', 'test@hypo.test'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'config', 'user.name', 'Hypo Test'], { stdio: 'ignore' });
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `init failed: ${r.stderr}`);
+
+    // Make an initial commit so the repo is non-empty
+    spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+
+    // Stage a file matching .env* pattern
+    writeFileSync(join(hypoDir, '.env.local'), 'SECRET=abc\n');
+    spawnSync('git', ['-C', hypoDir, 'add', '.env.local'], { stdio: 'ignore' });
+
+    // git commit must be blocked by the pre-commit hook
+    const commitR = spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'should be blocked'], { encoding: 'utf-8' });
+    assert.notEqual(commitR.status, 0, 'git commit should fail when .env.local is staged');
+    assert.ok(
+      (commitR.stdout + commitR.stderr).includes('.env.local'),
+      `expected .env.local in git output: ${commitR.stdout}${commitR.stderr}`
+    );
+  });
+});
+
 // ── doctor.mjs smoke tests ───────────────────────────────────────────────────
 
 suite('doctor.mjs --json');

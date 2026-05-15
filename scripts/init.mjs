@@ -21,7 +21,7 @@
  *   --help, -h             Show this help message
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync, renameSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, copyFileSync, readdirSync, renameSync, unlinkSync } from 'fs';
 import { join, basename } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
@@ -186,6 +186,18 @@ function writeWikiignore(hypoDir, dryRun) {
   if (existsSync(dest)) { log('skipped', dest); return; }
   const src  = join(TEMPLATES, '.hypoignore');
   const content = existsSync(src) ? readFileSync(src, 'utf-8') : '';
+  if (!dryRun) writeFileSync(dest, content);
+  log('created', dest);
+}
+
+// ── .gitignore ───────────────────────────────────────────────────────────────
+
+function writeGitignore(hypoDir, dryRun) {
+  const dest = join(hypoDir, '.gitignore');
+  if (existsSync(dest)) { log('skipped', dest); return; }
+  // Template is named without leading dot to survive npm pack (which strips .gitignore)
+  const src  = join(TEMPLATES, 'gitignore');
+  const content = existsSync(src) ? readFileSync(src, 'utf-8') : '.cache/\n';
   if (!dryRun) writeFileSync(dest, content);
   log('created', dest);
 }
@@ -459,6 +471,50 @@ function installPkgGitHook(dryRun) {
   log('created', hookPath);
 }
 
+// ── wiki pre-commit hook ─────────────────────────────────────────────────────
+
+const WIKI_PRE_COMMIT_MARKER_START = '# hypo-managed:pre-commit:start';
+const WIKI_PRE_COMMIT_MARKER_END   = '# hypo-managed:pre-commit:end';
+
+function wikiPreCommitContent() {
+  const worker = join(PKG_ROOT, 'hooks', 'hypo-pre-commit.mjs');
+  // Single-quote escaping prevents shell expansion of special chars (e.g. $HOME, backticks) in path
+  const escaped = worker.replace(/'/g, "'\\''");
+  return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\nnode '${escaped}'\nexit $?\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+}
+
+function installWikiPreCommitHook(hypoDir, dryRun, force) {
+  const gitDir = join(hypoDir, '.git');
+  if (!existsSync(gitDir)) return; // no git repo — silently skip
+  const hooksDir = join(gitDir, 'hooks');
+  const hookPath = join(hooksDir, 'pre-commit');
+  const newContent = wikiPreCommitContent();
+
+  if (existsSync(hookPath)) {
+    const existing = readFileSync(hookPath, 'utf-8');
+    if (existing.includes(WIKI_PRE_COMMIT_MARKER_START)) {
+      if (existing === newContent) { log('skipped', `${hookPath} (pre-commit up to date)`); return; }
+      if (!dryRun) { writeFileSync(hookPath, newContent); chmodSync(hookPath, 0o755); }
+      log('merged', `${hookPath} (pre-commit updated)`);
+    } else if (force) {
+      if (!dryRun) {
+        writeFileSync(hookPath + '.bak', existing);
+        writeFileSync(hookPath, newContent);
+        chmodSync(hookPath, 0o755);
+      }
+      log('merged', `${hookPath} (force-overwritten, backup at pre-commit.bak)`);
+    } else {
+      log('skipped', `${hookPath} (user pre-commit exists — re-run with --force-commands to install)`);
+    }
+    return;
+  }
+  if (!dryRun) {
+    mkdirSync(hooksDir, { recursive: true });
+    writeFileSync(hookPath, newContent, { mode: 0o755 });
+  }
+  log('created', hookPath);
+}
+
 // ── shell function setup ─────────────────────────────────────────────────────
 
 const SHELL_MARKER_START = '# hypo-managed:shell-setup:start';
@@ -636,9 +692,10 @@ if (args.fromRemote) {
   copyTemplate(join('projects', '_template', 'prd.md'),          join(args.hypoDir, 'projects', '_template', 'prd.md'),          args.dryRun);
   copyTemplate(join('projects', '_template', 'session-state.md'),join(args.hypoDir, 'projects', '_template', 'session-state.md'),args.dryRun);
 
-  // 3. hypo-config.md + .hypoignore
+  // 3. hypo-config.md + .hypoignore + .gitignore
   writeHypoConfig(args.hypoDir, args.dryRun);
   writeWikiignore(args.hypoDir, args.dryRun);
+  writeGitignore(args.hypoDir, args.dryRun);
 }
 
 // 4. hooks
@@ -681,6 +738,9 @@ if (args.gitInit && !args.fromRemote) {
 if (args.hooks) {
   installPkgGitHook(args.dryRun);
 }
+
+// 8b. wiki pre-commit hook (.hypoignore last-line-of-defence guard — §6.8 fix #24)
+installWikiPreCommitHook(args.hypoDir, args.dryRun, args.forceCommands);
 
 // 9. first commit + push (skip when cloned from remote — already has commits)
 if (args.gitInit && !args.fromRemote) {
