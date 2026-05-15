@@ -8,10 +8,24 @@
 *.zip
 *.tar.gz
 
-# Credentials and secrets
+# Credentials and secrets (§6.8 baseline)
 *.pem
 *.key
-*.env
+.env*
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*credentials*
+*secret*
+*token*
+*password*
+*passwd*
+
+# Build artifacts
+node_modules/
+dist/
+build/
 
 # Hypomnema runtime cache (session growth metrics, future index.jsonl, etc.)
 .cache/
