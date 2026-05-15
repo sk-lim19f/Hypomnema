@@ -12,7 +12,7 @@
  * Options:
  *   --hypo-dir=<path>        Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --min-group=<n>          Min pages per tag group to report (default: 2)
- *   --check-session-close    Verify the strict 11-step session-close memory files (fix #17)
+ *   --check-session-close    Verify the strict session-close memory files — 5 mandatory + open-questions conditional (fix #17)
  *   --json                   Output as JSON
  */
 

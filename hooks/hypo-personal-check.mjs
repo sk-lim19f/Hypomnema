@@ -111,9 +111,10 @@ process.stdin.on('end', () => {
 
   const gitStatus  = hypoIsClean();
   const hotStatus  = hotMdIsClean();
-  // fix #17: strict 11-step session-close — the 6 memory files must be updated.
-  // closeFiles covers files #1-4 + log.md (#6); open-questions.md (#5) is
-  // conditional and not gated.
+  // fix #17: strict session-close (steps 1~6 of the 11-step crystallize
+  // checklist). closeFiles gates the 5 mandatory files (steps 1-4 + log.md);
+  // open-questions.md (step 5) is conditional ("변경 시") and intentionally
+  // ungated — see hypo-shared.mjs sessionCloseFileStatus and spec §5.2.7.
   const closeFiles = sessionCloseFileStatus(HYPO_DIR);
   const closeFilesReason = closeFiles.ok ? '' : `memory files not updated this session: ${
     [

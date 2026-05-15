@@ -180,7 +180,7 @@ Eight commands cover the full capture → retrieval → consolidation cycle.
 |---|---|---|
 | `/hypo:ingest` | Saves the raw source under `sources/`; Claude synthesizes a structured page under `pages/`. The shell helper (`scripts/ingest.mjs`) is read-only — it only *lists* pending sources so you know what still needs ingesting | Anytime you read something worth keeping |
 | `/hypo:query` | BM25 retrieval + LLM synthesis with `[[wikilink]]` citations | When you need an answer grounded in your own notes |
-| `/hypo:crystallize` | Synthesizes drafts and runs the 11-step session-close checklist | End of a non-trivial session |
+| `/hypo:crystallize` | Runs the session-close checklist (steps 1~6) and, on request, synthesizes drafts (steps 7~11) | End of a non-trivial session |
 | `/hypo:resume` | Loads the most recent session state for an active project | Coming back to a paused project |
 | `/hypo:feedback` | Records an AI behavior correction; eligible for promotion to permanent rules | Right when Claude does something wrong (or exactly right) |
 | `/hypo:verify` | Audits pages with `verify_by` frontmatter | When time-bound knowledge might have aged out |

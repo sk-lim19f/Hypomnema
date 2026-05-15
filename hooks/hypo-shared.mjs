@@ -114,11 +114,15 @@ export function hotMdIsClean() {
   return reasons.length === 0 ? { clean: true } : { clean: false, reason: reasons.join(' / ') };
 }
 
-// ── strict 11-step session-close verification (fix #17) ────────────────────
-// spec §5.2.7 / §8.3: a session close must touch 6 memory files. The hard gate
-// (sessionCloseFileStatus) confirms 5 of them — session-state.md, project
-// hot.md, root hot.md, session-log/YYYY-MM.md, and log.md. open-questions.md
-// (file #5) is conditional ("변경 시") and intentionally not gated.
+// ── strict session-close verification (fix #17) ────────────────────────────
+// spec §5.2.7 / §8.3 (updated 2026-05-15): session-close = steps 1~6 of the
+// 11-step crystallize checklist (synthesis is steps 7~11). The hard gate
+// (sessionCloseFileStatus) confirms the 5 mandatory files — session-state.md,
+// project hot.md, root hot.md, session-log/YYYY-MM.md, and log.md.
+// pages/open-questions.md (step 5) is conditional ("변경 시") — it is a
+// cross-project queue, so a session that raises no questions should not be
+// forced to touch it. Gating it would produce false-blocks; spec §5.2.7
+// records this as the intended policy.
 //
 // Known limitation: freshness is date-based per spec §8.3 ("timestamp가 같음"),
 // so a second session on the same day that skips updating a file still passes
