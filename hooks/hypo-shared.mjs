@@ -114,6 +114,137 @@ export function hotMdIsClean() {
   return reasons.length === 0 ? { clean: true } : { clean: false, reason: reasons.join(' / ') };
 }
 
+// ── strict 11-step session-close verification (fix #17) ────────────────────
+// spec §5.2.7 / §8.3: a session close must touch 6 memory files. The hard gate
+// (sessionCloseFileStatus) confirms 5 of them — session-state.md, project
+// hot.md, root hot.md, session-log/YYYY-MM.md, and log.md. open-questions.md
+// (file #5) is conditional ("변경 시") and intentionally not gated.
+//
+// Known limitation: freshness is date-based per spec §8.3 ("timestamp가 같음"),
+// so a second session on the same day that skips updating a file still passes
+// if an earlier close that day already stamped it. freshDates() accepting both
+// local and UTC dates widens that window by up to one UTC offset. A per-session
+// boundary is out of scope for fix #17.
+
+/** Parse the frontmatter `updated:` field. Returns the trimmed value or null. */
+function frontmatterUpdated(content) {
+  const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return null;
+  const u = m[1].match(/^updated:\s*(.+)$/m);
+  return u ? u[1].trim().replace(/^["']|["']$/g, '') : null;
+}
+
+/** Escape a string for safe literal use inside a RegExp. */
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Date strings that count as "today" for freshness checks. Both the local and
+ * UTC dates are accepted: Claude writes file dates in the user's local zone,
+ * while hypo-hot-rebuild stamps root hot.md with the UTC date. Accepting both
+ * removes the ~timezone-offset window where a correctly closed session would
+ * otherwise false-block.
+ * @returns {string[]} 1-2 ISO dates (YYYY-MM-DD), most-relevant first.
+ */
+export function freshDates() {
+  const d = new Date();
+  const local = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const utc = d.toISOString().slice(0, 10);
+  return local === utc ? [local] : [local, utc];
+}
+
+/**
+ * Resolve the most-recently-active project slug from root hot.md.
+ * Mirrors scripts/resume.mjs resolveActiveProject — kept in sync by hand.
+ * @param {string} hypoDir
+ * @returns {string|null}
+ */
+export function resolveActiveProject(hypoDir) {
+  const hotPath = join(hypoDir, 'hot.md');
+  if (!existsSync(hotPath)) return null;
+  let content;
+  try { content = readFileSync(hotPath, 'utf-8'); } catch { return null; }
+  // Canonical hot.md uses wikilinks: | name | date | [[projects/slug/hot]] |
+  const wikiRows = [...content.matchAll(/\|\s*([^|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2})?\s*\|\s*\[\[projects\/([^\]/]+)\/[^\]]+\]\]/g)]
+    .map(m => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
+  if (wikiRows.length > 0) {
+    wikiRows.sort((a, b) => b.date.localeCompare(a.date));
+    return wikiRows[0].slug;
+  }
+  // Legacy markdown-link rows: | [name](projects/name/...) | ...
+  const mdRow = content.match(/\|\s*\[([^\]]+)\]\(projects\/([^/)]+)/);
+  if (mdRow) return mdRow[2];
+  return null;
+}
+
+/**
+ * Strict session-close verification (fix #17, spec §5.2.7 / §8.3).
+ * Confirms the memory files a session close must touch were updated today:
+ *   - projects/<project>/session-state.md       — frontmatter `updated:` is today
+ *   - projects/<project>/hot.md                 — frontmatter `updated:` is today
+ *   - hot.md (root)                             — frontmatter `updated:` is today
+ *   - projects/<project>/session-log/YYYY-MM.md — has a `## [today]` heading
+ *   - log.md                                    — has a `## [today] session | <project>` entry
+ * The log.md check is project-scoped so a session close left incomplete for
+ * project A can't be masked by a fresh close of project B (and vice versa).
+ * open-questions.md (file #5) is conditional and not gated.
+ *
+ * @param {string} hypoDir
+ * @returns {{ok: boolean, project: string|null, dates: string[], stale: string[], missing: string[]}}
+ */
+export function sessionCloseFileStatus(hypoDir) {
+  const dates = freshDates();
+  const project = resolveActiveProject(hypoDir);
+  if (!project) {
+    return { ok: false, project: null, dates, stale: [], missing: ['hot.md (no active project in pointer table)'] };
+  }
+
+  const stale = [];    // exists but not updated this session
+  const missing = [];  // file does not exist
+  const dateAlt = dates.join('|');
+
+  const checkUpdated = (relPath) => {
+    const full = join(hypoDir, relPath);
+    if (!existsSync(full)) { missing.push(relPath); return; }
+    let content;
+    try { content = readFileSync(full, 'utf-8'); } catch { missing.push(relPath); return; }
+    if (!dates.includes(frontmatterUpdated(content))) stale.push(relPath);
+  };
+
+  checkUpdated(join('projects', project, 'session-state.md'));
+  checkUpdated(join('projects', project, 'hot.md'));
+  checkUpdated('hot.md');
+
+  // session-log: monthly append-only file — must carry a today-dated heading.
+  // Reported under the local date's month (dates[0]) when no match is found.
+  let sessionLogOk = false;
+  for (const date of dates) {
+    const full = join(hypoDir, 'projects', project, 'session-log', `${date.slice(0, 7)}.md`);
+    if (!existsSync(full)) continue;
+    let content = '';
+    try { content = readFileSync(full, 'utf-8'); } catch { continue; }
+    if (new RegExp('^#{1,6} \\[' + date + '\\]', 'm').test(content)) { sessionLogOk = true; break; }
+  }
+  if (!sessionLogOk) {
+    const logRel = join('projects', project, 'session-log', `${dates[0].slice(0, 7)}.md`);
+    (existsSync(join(hypoDir, logRel)) ? stale : missing).push(logRel);
+  }
+
+  // log.md: must carry a today-dated `session` entry for the resolved project.
+  const logFull = join(hypoDir, 'log.md');
+  if (!existsSync(logFull)) {
+    missing.push('log.md');
+  } else {
+    let content = '';
+    try { content = readFileSync(logFull, 'utf-8'); } catch { missing.push('log.md'); }
+    const re = new RegExp('^## \\[(' + dateAlt + ')\\] session \\| ' + escapeRegExp(project) + '\\b', 'm');
+    if (content && !re.test(content)) stale.push('log.md');
+  }
+
+  return { ok: stale.length === 0 && missing.length === 0, project, dates, stale, missing };
+}
+
 // ── sync-state (fix #9/#10/#11) ────────────────────────────────────────────
 // `.cache/sync-state.json` is JSONL: one {timestamp, op, error, host} entry per
 // line. hypo-auto-commit (#9) appends on pull/push failure; hypo-session-start

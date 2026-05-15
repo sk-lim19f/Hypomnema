@@ -10,27 +10,73 @@
  *   node scripts/crystallize.mjs [options]
  *
  * Options:
- *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
- *   --min-group=<n>     Min pages per tag group to report (default: 2)
- *   --json              Output as JSON
+ *   --hypo-dir=<path>        Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
+ *   --min-group=<n>          Min pages per tag group to report (default: 2)
+ *   --check-session-close    Verify the strict 11-step session-close memory files (fix #17)
+ *   --json                   Output as JSON
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
+import { sessionCloseFileStatus } from '../hooks/hypo-shared.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, minGroup: 2, json: false };
+  const args = { hypoDir: null, minGroup: 2, json: false, checkSessionClose: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir='))    args.hypoDir  = expandHome(arg.slice(11));
     else if (arg.startsWith('--min-group=')) args.minGroup = parseInt(arg.slice(12), 10) || 2;
+    else if (arg === '--check-session-close') args.checkSessionClose = true;
     else if (arg === '--json')             args.json     = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
+}
+
+// ── session-close check (fix #17, spec §5.2.7 / §8.3) ────────────────────────
+// Mirrors the hard gate in hypo-personal-check.mjs so the /hypo:crystallize
+// flow can self-verify before /compact triggers PreCompact.
+
+function runSessionCloseCheck(args) {
+  const status = sessionCloseFileStatus(args.hypoDir);
+
+  if (args.json) {
+    console.log(JSON.stringify({
+      ok: status.ok,
+      project: status.project,
+      dates: status.dates,
+      stale: status.stale,
+      missing: status.missing,
+    }, null, 2));
+    process.exit(status.ok ? 0 : 1);
+  }
+
+  const proj = status.project || '(unresolved)';
+  console.log(`Session-close check (project: ${proj}, date: ${status.dates.join(' / ')}):\n`);
+
+  const required = status.project ? [
+    `projects/${status.project}/session-state.md`,
+    `projects/${status.project}/hot.md`,
+    'hot.md',
+    `projects/${status.project}/session-log/${status.dates[0].slice(0, 7)}.md`,
+    'log.md',
+  ] : [];
+  for (const f of required) {
+    const bad = status.missing.includes(f) ? 'missing' : status.stale.includes(f) ? 'stale' : '';
+    console.log(`  ${bad ? '✗' : '✓'} ${f}${bad ? ` — ${bad}` : ''}`);
+  }
+  // Surface anything not covered by the canonical list (e.g. unresolved project).
+  for (const f of [...status.missing, ...status.stale]) {
+    if (!required.includes(f)) console.log(`  ✗ ${f}`);
+  }
+  console.log('');
+  console.log(status.ok
+    ? '✓ All required memory files updated this session. (open-questions.md: conditional, not checked)'
+    : '✗ Session close incomplete — update the files marked above, then retry.');
+  process.exit(status.ok ? 0 : 1);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -75,6 +121,10 @@ function extractWikilinks(content) {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
+
+if (args.checkSessionClose) {
+  runSessionCloseCheck(args);   // exits
+}
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const pagesDir = join(args.hypoDir, 'pages');
