@@ -312,6 +312,18 @@ function checkGit(hypoDir) {
   } else {
     warn('Git remote origin', 'No remote configured — wiki will not sync/backup automatically');
   }
+
+  const preCommitPath = join(hypoDir, '.git', 'hooks', 'pre-commit');
+  if (existsSync(preCommitPath)) {
+    const content = readFileSync(preCommitPath, 'utf-8');
+    if (content.includes('# hypo-managed:pre-commit:start')) {
+      pass('.git/hooks/pre-commit', 'Hypomnema .hypoignore guard installed');
+    } else {
+      warn('.git/hooks/pre-commit', 'Exists but not managed by Hypomnema — manual git add can bypass .hypoignore');
+    }
+  } else {
+    warn('.git/hooks/pre-commit', 'Not installed — run /hypo:init to install .hypoignore guard (fix #24)');
+  }
 }
 
 function checkBrokenLinks(hypoDir, ignorePatterns = []) {
