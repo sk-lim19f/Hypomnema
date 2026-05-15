@@ -879,6 +879,230 @@ test('missing log.md → exit 1 + log.md in missing list', () => {
   });
 });
 
+// ── fix #38: --apply-session-close --payload <json> ───────────────────────────
+// Idempotent payload-driven entrypoint that writes the 5 mandatory memory files
+// (+ optional open-questions) and finishes with the strict gate. ADR 0029 Phase A.
+
+suite('crystallize.mjs --apply-session-close (#38)');
+
+// Helper: build a payload that re-asserts today's already-clean state on a wiki
+// produced by buildCleanWikiTree(). Used to test idempotency without changing
+// any fixture content.
+function payloadForCleanWiki(dir, today) {
+  const ym = today.slice(0, 7);
+  return {
+    project: 'test-project',
+    date: today,
+    sessionState: { content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8') },
+    projectHot:   { content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'),           'utf-8') },
+    rootHot:      { content: readFileSync(join(dir, 'hot.md'),                                       'utf-8') },
+    sessionLog:   { entry:   `## [${today}] re-applied session\n` },
+    log:          { entry:   `## [${today}] session | test-project — re-applied\n` },
+  };
+}
+
+function runApply(dir, payload) {
+  const payloadPath = join(dir, '.payload.json');
+  writeFileSync(payloadPath, JSON.stringify(payload));
+  return run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', `--payload=${payloadPath}`, '--json']);
+}
+
+test('clean-wiki payload → ok:true, new entries appended (apply dedup is exact-entry, not date-based)', () => {
+  withWiki(null, (dir, today) => {
+    // payloadForCleanWiki uses NEW entry text ("re-applied"), not the fixture's
+    // existing "test session" entry. Apply must append the new entries — using
+    // the freshness gate as a dedup signal would silently drop a legitimate
+    // same-day second close (codex review of fix #38, Worker 1 finding 2).
+    const r = runApply(dir, payloadForCleanWiki(dir, today));
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    const appliedSlots = out.applied.join(' ');
+    assert.ok(/sessionLog/.test(appliedSlots), `sessionLog should be appended (new entry): ${JSON.stringify(out)}`);
+    assert.ok(/log \(log\.md\)/.test(appliedSlots), `log.md should be appended (new entry): ${JSON.stringify(out)}`);
+  });
+});
+
+test('idempotent: re-running same payload produces no new bytes (file mtimes unchanged)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const r1 = runApply(dir, payload);
+    assert.equal(r1.status, 0, `first apply failed: ${r1.stdout}\n${r1.stderr}`);
+    const sl = join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`);
+    const sizeBefore = readFileSync(sl, 'utf-8').length;
+    const logBefore  = readFileSync(join(dir, 'log.md'), 'utf-8').length;
+
+    const r2 = runApply(dir, payload);
+    assert.equal(r2.status, 0, `second apply failed: ${r2.stdout}\n${r2.stderr}`);
+    const sizeAfter = readFileSync(sl, 'utf-8').length;
+    const logAfter  = readFileSync(join(dir, 'log.md'), 'utf-8').length;
+    assert.equal(sizeAfter, sizeBefore, 'session-log must not grow on re-apply (idempotent append)');
+    assert.equal(logAfter,  logBefore,  'log.md must not grow on re-apply (idempotent append)');
+  });
+});
+
+test('--hypo-dir isolation: overwrite fields land in the supplied dir', () => {
+  // run() forces HYPO_DIR='' in env, so any write that lands inside `dir` is
+  // proof --hypo-dir was honored. Use an overwrite field (sessionState) with a
+  // unique sentinel — append fields are per-day deduped so they're a poor
+  // isolation probe.
+  withWiki(null, (dir, today) => {
+    const sentinel = `<!-- isolation-probe-${Date.now()} -->`;
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionState = {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
+    };
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    assert.ok(onDisk.includes(sentinel), 'sentinel must land in --hypo-dir, proving isolation');
+  });
+});
+
+test('open-questions absent in payload → still passes (conditional, ungated)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    delete payload.openQuestions;  // explicitly omit
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, 'open-questions is conditional — apply must succeed without it');
+    assert.ok(!out.applied.some(a => /openQuestions/.test(a)), 'openQuestions slot should not appear when omitted');
+  });
+});
+
+test('open-questions stale on disk → still passes (apply does not gate it)', () => {
+  withWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'open-questions.md'),
+      '---\ntitle: Open Questions\ntype: open-questions\nupdated: 2020-01-01\n---\n\n# Open Questions\n');
+  }, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    delete payload.openQuestions;
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 0, `stale open-questions must not gate: ${r.stdout}`);
+  });
+});
+
+test('payload with stale `updated:` → exit 1, no auto-fix (advisor rule)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    // Inject a stale-dated session-state. Helper must NOT silently rewrite it.
+    payload.sessionState = {
+      content: '---\ntitle: session-state\ntype: session-state\nupdated: 2020-01-01\n---\n\n## 다음 작업\n\n- next\n',
+    };
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `stale payload must fail final gate, got status=${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(out.verification.stale.includes('projects/test-project/session-state.md'),
+      `stale field should be flagged: ${JSON.stringify(out.verification)}`);
+  });
+});
+
+test('missing payload → exit 1 with clear error', () => {
+  withWiki(null, (dir) => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    assert.equal(r.status, 1);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(/payload is required/.test(out.error), `error should mention payload: ${out.error}`);
+  });
+});
+
+test('same-day second close: distinct entries are both appended (W1 regression)', () => {
+  // Sub-session within the same day must produce a second log entry, not be
+  // silently deduped because today's heading already exists. This was the
+  // major flaw codex review surfaced — apply dedup vs freshness gate.
+  withWiki(null, (dir, today) => {
+    const p1 = payloadForCleanWiki(dir, today);
+    p1.sessionLog.entry = `## [${today}] morning sub-session\n\nbody A\n`;
+    p1.log.entry        = `## [${today}] session | test-project — morning\n`;
+    const r1 = runApply(dir, p1);
+    assert.equal(r1.status, 0, `first apply failed: ${r1.stdout}\n${r1.stderr}`);
+
+    const p2 = payloadForCleanWiki(dir, today);
+    p2.sessionLog.entry = `## [${today}] afternoon sub-session\n\nbody B\n`;
+    p2.log.entry        = `## [${today}] session | test-project — afternoon\n`;
+    const r2 = runApply(dir, p2);
+    assert.equal(r2.status, 0, `second apply failed: ${r2.stdout}\n${r2.stderr}`);
+
+    const sl  = readFileSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`), 'utf-8');
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.ok(sl.includes('morning sub-session'),   `session-log should keep morning entry: ${sl}`);
+    assert.ok(sl.includes('afternoon sub-session'), `session-log should append afternoon entry: ${sl}`);
+    assert.ok(log.includes('— morning'),   `log.md should keep morning entry: ${log}`);
+    assert.ok(log.includes('— afternoon'), `log.md should append afternoon entry: ${log}`);
+  });
+});
+
+test('payload schema: missing mandatory field → exit 1 with named field (W1 fail-loud)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    delete payload.projectHot;  // drop a mandatory slot
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `missing mandatory must fail, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(/projectHot/.test(JSON.stringify(out.details || out.error)),
+      `error must name the missing field: ${r.stdout}`);
+  });
+});
+
+test('payload schema: invalid date format → exit 1', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.date = '2026/05/15';
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1);
+    const out = JSON.parse(r.stdout);
+    assert.ok(/YYYY-MM-DD/.test(JSON.stringify(out.details || out.error)),
+      `error must mention date format: ${r.stdout}`);
+  });
+});
+
+test('hasLogEntry: project "foo" must NOT match "foo-bar" (W2 boundary regression)', () => {
+  // Pre-existing bug in sessionCloseFileStatus that the helper extraction
+  // inherited. \b after "foo" matches before "-" (non-word char), so the
+  // bounded regex must use (?=\\s|$) instead.
+  withWiki((dir, today) => {
+    // Replace root hot.md to declare project "foo" as the active project,
+    // and seed log.md with a session entry for "foo-bar" only.
+    writeFileSync(join(dir, 'hot.md'),
+      `---\ntitle: Hot\nupdated: ${today}\n---\n# Hot\n\n## Active Projects\n\n` +
+      `| Project | Last Session | Hot Cache |\n|---|---|---|\n` +
+      `| foo | ${today} | [[projects/foo/hot]] |\n`);
+    mkdirSync(join(dir, 'projects', 'foo', 'session-log'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'foo', 'session-state.md'),
+      `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- next\n`);
+    writeFileSync(join(dir, 'projects', 'foo', 'hot.md'),
+      `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot\n`);
+    writeFileSync(join(dir, 'projects', 'foo', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] foo session\n`);
+    // log.md only carries an entry for the LOOK-ALIKE project name.
+    writeFileSync(join(dir, 'log.md'), `## [${today}] session | foo-bar — should not satisfy "foo" gate\n`);
+  }, dir => {
+    // Plain --check-session-close must reject "foo" because no foo entry exists.
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
+    assert.equal(r.status, 1, `foo must not match foo-bar in log.md, got status=${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(out.stale.includes('log.md') || out.missing.includes('log.md'),
+      `log.md must be flagged stale/missing for foo: ${JSON.stringify(out)}`);
+  });
+});
+
+test('payload via stdin (`--payload=-`) works the same as a file', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const r = spawnSync(process.execPath,
+      [join(REPO, 'scripts', 'crystallize.mjs'), `--hypo-dir=${dir}`, '--apply-session-close', '--payload=-', '--json'],
+      { input: JSON.stringify(payload), encoding: 'utf-8' });
+    assert.equal(r.status, 0, `stdin apply failed: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+  });
+});
+
 // ── upgrade.mjs smoke tests ───────────────────────────────────────────────────
 
 suite('upgrade.mjs --json');

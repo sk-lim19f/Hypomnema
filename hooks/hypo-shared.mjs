@@ -144,6 +144,35 @@ function escapeRegExp(s) {
 }
 
 /**
+ * True if `content` carries an ATX heading dated `date` (YYYY-MM-DD), e.g.
+ *   `## [2026-05-15] something`. Matches H1-H6.
+ * Shared by sessionCloseFileStatus() and the crystallize apply helper so both
+ * use the same definition of "session-log already updated for today".
+ */
+export function hasSessionLogHeading(content, date) {
+  return new RegExp('^#{1,6} \\[' + escapeRegExp(date) + '\\]', 'm').test(content || '');
+}
+
+/**
+ * True if `content` carries a today-dated `## [date] session | <project>` entry
+ * in log.md.
+ *
+ * Bounded with an explicit `(?=\s|$)` lookahead, NOT `\b`: a regex word boundary
+ * matches between word and non-word chars, so `\b` after "foo" still matches in
+ * "foo-bar" (hyphen is non-word). The canonical log format always separates the
+ * project slug from anything that follows by whitespace or end-of-line, so the
+ * lookahead correctly rejects "session | foo-bar" when looking for "foo".
+ * (Reported by codex review of fix #38 — was a pre-existing bug in
+ * sessionCloseFileStatus that the helper extraction inherited.)
+ */
+export function hasLogEntry(content, date, project) {
+  return new RegExp(
+    '^## \\[' + escapeRegExp(date) + '\\] session \\| ' + escapeRegExp(project) + '(?=\\s|$)',
+    'm',
+  ).test(content || '');
+}
+
+/**
  * Date strings that count as "today" for freshness checks. Both the local and
  * UTC dates are accepted: Claude writes file dates in the user's local zone,
  * while hypo-hot-rebuild stamps root hot.md with the UTC date. Accepting both
@@ -206,7 +235,6 @@ export function sessionCloseFileStatus(hypoDir) {
 
   const stale = [];    // exists but not updated this session
   const missing = [];  // file does not exist
-  const dateAlt = dates.join('|');
 
   const checkUpdated = (relPath) => {
     const full = join(hypoDir, relPath);
@@ -228,7 +256,7 @@ export function sessionCloseFileStatus(hypoDir) {
     if (!existsSync(full)) continue;
     let content = '';
     try { content = readFileSync(full, 'utf-8'); } catch { continue; }
-    if (new RegExp('^#{1,6} \\[' + date + '\\]', 'm').test(content)) { sessionLogOk = true; break; }
+    if (hasSessionLogHeading(content, date)) { sessionLogOk = true; break; }
   }
   if (!sessionLogOk) {
     const logRel = join('projects', project, 'session-log', `${dates[0].slice(0, 7)}.md`);
@@ -242,8 +270,8 @@ export function sessionCloseFileStatus(hypoDir) {
   } else {
     let content = '';
     try { content = readFileSync(logFull, 'utf-8'); } catch { missing.push('log.md'); }
-    const re = new RegExp('^## \\[(' + dateAlt + ')\\] session \\| ' + escapeRegExp(project) + '\\b', 'm');
-    if (content && !re.test(content)) stale.push('log.md');
+    const logFresh = content && dates.some(d => hasLogEntry(content, d, project));
+    if (content && !logFresh) stale.push('log.md');
   }
 
   return { ok: stale.length === 0 && missing.length === 0, project, dates, stale, missing };

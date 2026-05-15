@@ -13,11 +13,31 @@
  *   --hypo-dir=<path>        Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --min-group=<n>          Min pages per tag group to report (default: 2)
  *   --check-session-close    Verify the strict session-close memory files — 5 mandatory + open-questions conditional (fix #17)
+ *   --apply-session-close    Apply a JSON payload that updates the 5 mandatory memory files
+ *                            (+ optional open-questions). Idempotent — re-running with the same
+ *                            payload is a no-op. Always finishes with the strict gate check.
+ *   --payload=<path|->       Required with --apply-session-close. Path to JSON file or `-` for stdin.
  *   --json                   Output as JSON
+ *
+ * Payload schema (fix #38):
+ *   {
+ *     "project":      "<slug>",                       // optional — defaults to resolveActiveProject()
+ *     "date":         "YYYY-MM-DD",                   // optional — defaults to today (local)
+ *     "sessionState": { "content": "<full file>" },   // overwrite (idempotent: identical bytes → skip)
+ *     "projectHot":   { "content": "<full file>" },   // overwrite
+ *     "rootHot":      { "content": "<full file>" },   // overwrite
+ *     "sessionLog":   { "entry":   "## [date] ..." }, // append, skip if heading already present
+ *     "log":          { "entry":   "## [date] session | <project> ..." }, // append, skip if entry present
+ *     "openQuestions":{ "content": "<full file>" }    // optional overwrite
+ *   }
+ *
+ * The helper does NOT auto-fix `updated:` frontmatter. If a payload field carries a
+ * stale date, the final sessionCloseFileStatus check fails with a clear error so the
+ * caller fixes the payload and retries. Silent rewrites would mask payload bugs.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
-import { join, relative, extname } from 'path';
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { join, relative, extname, dirname } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import { sessionCloseFileStatus } from '../hooks/hypo-shared.mjs';
@@ -25,11 +45,16 @@ import { sessionCloseFileStatus } from '../hooks/hypo-shared.mjs';
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, minGroup: 2, json: false, checkSessionClose: false };
+  const args = {
+    hypoDir: null, minGroup: 2, json: false,
+    checkSessionClose: false, applySessionClose: false, payload: null,
+  };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir='))    args.hypoDir  = expandHome(arg.slice(11));
     else if (arg.startsWith('--min-group=')) args.minGroup = parseInt(arg.slice(12), 10) || 2;
     else if (arg === '--check-session-close') args.checkSessionClose = true;
+    else if (arg === '--apply-session-close') args.applySessionClose = true;
+    else if (arg.startsWith('--payload=')) args.payload = arg.slice(10);
     else if (arg === '--json')             args.json     = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
@@ -79,6 +104,217 @@ function runSessionCloseCheck(args) {
   process.exit(status.ok ? 0 : 1);
 }
 
+// ── session-close apply (fix #38) ────────────────────────────────────────────
+// Idempotent payload-driven application of the 5 mandatory session-close memory
+// files (+ optional open-questions). Used by the LLM session-close flow as the
+// canonical entrypoint instead of issuing 5+ Write tool calls by hand.
+//
+// Idempotency:
+//   • full-content fields (sessionState/projectHot/rootHot/openQuestions): write
+//     only when on-disk bytes differ — re-running with same payload is a no-op.
+//   • append fields (sessionLog/log): skip when the dated heading/entry is
+//     already present (regex shared with sessionCloseFileStatus via hypo-shared).
+//
+// Validation: never auto-fixes the payload. The final sessionCloseFileStatus
+// check fails fast on stale `updated:` or missing entries so the caller fixes
+// the payload and retries — silent rewrites would hide payload bugs (advisor #3).
+
+function readPayload(source) {
+  if (!source) throw new Error('--payload is required with --apply-session-close (path or `-` for stdin)');
+  let raw;
+  if (source === '-') {
+    // Synchronous stdin read; payloads are tiny (a few hundred KB at most).
+    raw = readFileSync(0, 'utf-8');
+  } else {
+    const path = expandHome(source);
+    if (!existsSync(path)) throw new Error(`payload file not found: ${path}`);
+    raw = readFileSync(path, 'utf-8');
+  }
+  try { return JSON.parse(raw); }
+  catch (e) { throw new Error(`payload is not valid JSON: ${e.message}`); }
+}
+
+/** Atomic write via tmp+rename. `<path>.<pid>.<rand>.tmp` so concurrent helpers
+ * don't fight over the same shared `<path>.tmp` slot. */
+function atomicWrite(path, content) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  writeFileSync(tmp, content);
+  renameSync(tmp, path);
+}
+
+/** Atomic write that skips when on-disk bytes already match `content`. */
+function writeIfChanged(path, content) {
+  if (existsSync(path)) {
+    try {
+      if (readFileSync(path, 'utf-8') === content) return false;  // idempotent skip
+    } catch { /* fall through to overwrite */ }
+  }
+  atomicWrite(path, content);
+  return true;
+}
+
+/**
+ * Append `entry` to `path` only if `alreadyPresent(content)` is false.
+ * Atomic: rebuilds the full file content and writes via atomicWrite — a crash
+ * mid-append cannot leave log.md or session-log/YYYY-MM.md half-written, which
+ * matters for these append-only history files (codex review of fix #38).
+ */
+function appendIfAbsent(path, entry, alreadyPresent) {
+  let content = '';
+  if (existsSync(path)) {
+    try { content = readFileSync(path, 'utf-8'); } catch { content = ''; }
+  }
+  if (alreadyPresent(content)) return false;
+  // Ensure single blank line between existing tail and new entry, no trailing dup.
+  const sep = content === '' ? '' : (content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n');
+  const next = entry.endsWith('\n') ? entry : entry + '\n';
+  atomicWrite(path, content + sep + next);
+  return true;
+}
+
+function todayLocal() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Spec §5.2.7 / §8.3 + ADR 0029: 5 mandatory + 1 conditional. The payload
+// shape MUST mirror that contract — missing a mandatory field is a payload
+// bug, not a no-op. Caller is the LLM session-close flow, which composes the
+// payload deliberately; partial payloads must fail loudly so caller fixes them
+// rather than silently relying on yesterday's freshness state. (Codex review
+// of fix #38 — Worker 1 finding 1.)
+const REQUIRED_PAYLOAD_FIELDS = [
+  ['sessionState',  'content'],
+  ['projectHot',    'content'],
+  ['rootHot',       'content'],
+  ['sessionLog',    'entry'],
+  ['log',           'entry'],
+];
+
+function validatePayloadShape(payload) {
+  const errs = [];
+  if (!payload || typeof payload !== 'object') {
+    errs.push('payload must be a JSON object');
+    return errs;
+  }
+  for (const [field, key] of REQUIRED_PAYLOAD_FIELDS) {
+    const slot = payload[field];
+    if (!slot || typeof slot !== 'object') {
+      errs.push(`payload.${field} is required (object with .${key})`);
+      continue;
+    }
+    if (typeof slot[key] !== 'string') {
+      errs.push(`payload.${field}.${key} must be a string`);
+    }
+  }
+  if (payload.openQuestions !== undefined) {
+    if (!payload.openQuestions || typeof payload.openQuestions !== 'object'
+        || typeof payload.openQuestions.content !== 'string') {
+      errs.push('payload.openQuestions, when present, must be { content: string }');
+    }
+  }
+  if (payload.date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(payload.date))) {
+    errs.push('payload.date, when present, must be YYYY-MM-DD');
+  }
+  return errs;
+}
+
+function applySessionClose(args) {
+  let payload;
+  try { payload = readPayload(args.payload); }
+  catch (e) {
+    const out = { ok: false, error: e.message };
+    console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${e.message}`);
+    process.exit(1);
+  }
+
+  const schemaErrs = validatePayloadShape(payload);
+  if (schemaErrs.length > 0) {
+    const out = { ok: false, error: 'payload schema invalid', details: schemaErrs };
+    console.log(args.json
+      ? JSON.stringify(out, null, 2)
+      : `✗ payload schema invalid:\n  ${schemaErrs.join('\n  ')}`);
+    process.exit(1);
+  }
+
+  // Resolve project: explicit payload.project wins; else fall back to active project.
+  // Done via sessionCloseFileStatus to keep one source of truth (and so a
+  // missing pointer table surfaces the same error shape as --check-session-close).
+  const probe = sessionCloseFileStatus(args.hypoDir);
+  const project = payload.project || probe.project;
+  if (!project) {
+    const msg = 'no project resolved (payload.project missing and root hot.md has no active-project row)';
+    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+    process.exit(1);
+  }
+  const date = payload.date || todayLocal();
+  const ym   = date.slice(0, 7);
+
+  const applied = [];
+  const skipped = [];
+
+  const overwrite = (key, relPath, field) => {
+    if (!field || typeof field.content !== 'string') return;  // optional / absent
+    const wrote = writeIfChanged(join(args.hypoDir, relPath), field.content);
+    (wrote ? applied : skipped).push(`${key} (${relPath})`);
+  };
+
+  overwrite('sessionState', join('projects', project, 'session-state.md'), payload.sessionState);
+  overwrite('projectHot',   join('projects', project, 'hot.md'),           payload.projectHot);
+  overwrite('rootHot',      'hot.md',                                       payload.rootHot);
+  overwrite('openQuestions', join('pages', 'open-questions.md'),            payload.openQuestions);
+
+  // Append idempotency: dedup by exact-entry presence, not by "any heading
+  // dated today". The freshness gate (sessionCloseFileStatus) is what answers
+  // "was this file touched today?"; that's a different concern and must not
+  // be reused for apply-time dedup, or a legitimate same-day second close gets
+  // silently dropped (Codex review of fix #38 — Worker 1 finding 2).
+  const entryAlreadyPresent = entry => content =>
+    content.includes(entry.endsWith('\n') ? entry.replace(/\n+$/, '') : entry);
+
+  {
+    const rel = join('projects', project, 'session-log', `${ym}.md`);
+    const wrote = appendIfAbsent(
+      join(args.hypoDir, rel),
+      payload.sessionLog.entry,
+      entryAlreadyPresent(payload.sessionLog.entry),
+    );
+    (wrote ? applied : skipped).push(`sessionLog (${rel})`);
+  }
+
+  {
+    const wrote = appendIfAbsent(
+      join(args.hypoDir, 'log.md'),
+      payload.log.entry,
+      entryAlreadyPresent(payload.log.entry),
+    );
+    (wrote ? applied : skipped).push('log (log.md)');
+  }
+
+  const verification = sessionCloseFileStatus(args.hypoDir);
+  const result = { ok: verification.ok, project, date, applied, skipped, verification };
+
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`Session-close apply (project: ${project}, date: ${date}):`);
+    for (const a of applied) console.log(`  ✓ wrote ${a}`);
+    for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
+    if (verification.ok) {
+      console.log('\n✓ session-close verified — all 5 mandatory files fresh.');
+    } else {
+      const bad = [
+        ...verification.missing.map(f => `${f} (missing)`),
+        ...verification.stale.map(f => `${f} (stale)`),
+      ].join(', ');
+      console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
+      console.log('  Fix the payload (likely an `updated:` field) and retry.');
+    }
+  }
+  process.exit(verification.ok ? 0 : 1);
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function collectPages(dir, root, acc = [], ignorePatterns = []) {
@@ -121,6 +357,10 @@ function extractWikilinks(content) {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
+
+if (args.applySessionClose) {
+  applySessionClose(args);   // exits
+}
 
 if (args.checkSessionClose) {
   runSessionCloseCheck(args);   // exits
