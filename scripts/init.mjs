@@ -190,6 +190,17 @@ function writeWikiignore(hypoDir, dryRun) {
   log('created', dest);
 }
 
+// ── .gitignore ───────────────────────────────────────────────────────────────
+
+function writeGitignore(hypoDir, dryRun) {
+  const dest = join(hypoDir, '.gitignore');
+  if (existsSync(dest)) { log('skipped', dest); return; }
+  const src  = join(TEMPLATES, '.gitignore');
+  const content = existsSync(src) ? readFileSync(src, 'utf-8') : '.cache/\n';
+  if (!dryRun) writeFileSync(dest, content);
+  log('created', dest);
+}
+
 // ── hook installation ────────────────────────────────────────────────────────
 
 function loadHookMap() {
@@ -636,9 +647,10 @@ if (args.fromRemote) {
   copyTemplate(join('projects', '_template', 'prd.md'),          join(args.hypoDir, 'projects', '_template', 'prd.md'),          args.dryRun);
   copyTemplate(join('projects', '_template', 'session-state.md'),join(args.hypoDir, 'projects', '_template', 'session-state.md'),args.dryRun);
 
-  // 3. hypo-config.md + .hypoignore
+  // 3. hypo-config.md + .hypoignore + .gitignore
   writeHypoConfig(args.hypoDir, args.dryRun);
   writeWikiignore(args.hypoDir, args.dryRun);
+  writeGitignore(args.hypoDir, args.dryRun);
 }
 
 // 4. hooks
