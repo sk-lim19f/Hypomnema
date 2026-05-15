@@ -1,15 +1,18 @@
 ---
-description: Surface synthesis candidates and consolidate scattered wiki knowledge into stable pages
+description: Close a session (steps 1~6) and, on request, consolidate scattered wiki knowledge into stable pages (steps 7~11)
 ---
 
-You are running `/hypo:crystallize`. Find pages that are ready to be consolidated into stable, cross-linked knowledge — then guide the synthesis.
+You are running `/hypo:crystallize`. The command serves two modes (spec §5.2.7 / §8.3):
+
+1. **Session close (steps 1~6)** — gate the 5 mandatory memory files plus open-questions (conditional) so `/compact` can pass.
+2. **Synthesis (steps 7~11)** — surface tag clusters, orphan pages, and drafts that are ready to consolidate.
+
+When invoked at the end of a session (or with phrases like "세션 종료", "wrap up"), run the session-close checklist first. The synthesis scan only runs after close is confirmed and the user agrees.
 
 ## What this does
 
-- Finds tag groups with ≥ N pages sharing the same tag (synthesis candidates)
-- Lists orphan pages (no outbound `[[wikilinks]]`)
-- Lists draft / stub pages that could be fleshed out
-- After the script runs, you help the user pick what to crystallize and do it
+- **Close mode**: walks the 6-step checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) and verifies via `crystallize.mjs --check-session-close` — same gate the PreCompact hook runs.
+- **Synthesis mode**: finds tag clusters (≥ N pages), orphan pages (no outbound `[[wikilinks]]`), and draft / stub pages, then guides consolidation into `pages/syntheses/<topic>.md` with back-links and `index.md` updates.
 
 ---
 

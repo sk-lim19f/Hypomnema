@@ -469,7 +469,8 @@ function runHook(hookFile, stdinData, extraEnv = {}) {
 
 // Build a fully session-closed wiki tree: root hot.md + log.md plus the 4
 // project memory files (session-state, project hot.md, session-log) all
-// carrying today's date. Mirrors the strict 11-step close (fix #17).
+// carrying today's date. Mirrors the strict session-close gate (5 mandatory
+// files; open-questions.md stays conditional per fix #17 / spec §5.2.7).
 function buildCleanWikiTree(dir, today) {
   const ym = today.slice(0, 7);
   const projDir = join(dir, 'projects', 'test-project');
@@ -738,9 +739,9 @@ test('clean wiki → suppressOutput:true', () => {
   });
 });
 
-suite('hypo-personal-check.mjs — strict 11-step session close (#17)');
+suite('hypo-personal-check.mjs — strict session-close gate (#17)');
 
-test('all 6 memory files fresh → suppressOutput:true', () => {
+test('5 mandatory memory files fresh → suppressOutput:true', () => {
   withWiki(null, dir => {
     const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
     const out = JSON.parse(r.stdout);

@@ -38,7 +38,7 @@ Quick reference for all `/hypo:*` commands.
 
 | Command | Description |
 |---------|-------------|
-| `/hypo:crystallize` | Find synthesis candidates — tag clusters, unlinked pages, drafts |
+| `/hypo:crystallize` | Close a session (steps 1~6 hard gate) and, on request, surface synthesis candidates (steps 7~11) — tag clusters, unlinked pages, drafts |
 | `/hypo:verify` | Review overdue verify_by deadlines |
 | `/hypo:lint` | Validate frontmatter and `[[wikilinks]]` |
 | `/hypo:graph` | Generate link graph (json / mermaid / dot) |
