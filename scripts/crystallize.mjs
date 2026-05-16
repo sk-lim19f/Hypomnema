@@ -16,7 +16,17 @@
  *   --apply-session-close    Apply a JSON payload that updates the 5 mandatory memory files
  *                            (+ optional open-questions). Idempotent — re-running with the same
  *                            payload is a no-op. Always finishes with the strict gate check.
- *   --payload=<path|->       Required with --apply-session-close. Path to JSON file or `-` for stdin.
+ *
+ *                            Without --payload, runs as a cheap "already complete?" probe:
+ *                            if the strict gate is ok, exits 0 with alreadyComplete:true;
+ *                            otherwise exits 1 with "payload is required". Fix #39 (option D):
+ *                            payload presence = explicit close intent → always full apply
+ *                            (fix #38's per-entry idempotency keeps re-apply cheap).
+ *   --payload=<path|->       Path to JSON payload (file or `-` for stdin). Required for any
+ *                            apply work; omit only for the probe path above.
+ *   --force                  Bypass the no-payload probe early-exit. Payload is still required
+ *                            for any apply work — --force only opts out of the alreadyComplete
+ *                            shortcut. Reserved for explicit diagnostics / scripted recovery.
  *   --json                   Output as JSON
  *
  * Payload schema (fix #38):
@@ -47,7 +57,7 @@ import { sessionCloseFileStatus } from '../hooks/hypo-shared.mjs';
 function parseArgs(argv) {
   const args = {
     hypoDir: null, minGroup: 2, json: false,
-    checkSessionClose: false, applySessionClose: false, payload: null,
+    checkSessionClose: false, applySessionClose: false, payload: null, force: false,
   };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir='))    args.hypoDir  = expandHome(arg.slice(11));
@@ -55,6 +65,7 @@ function parseArgs(argv) {
     else if (arg === '--check-session-close') args.checkSessionClose = true;
     else if (arg === '--apply-session-close') args.applySessionClose = true;
     else if (arg.startsWith('--payload=')) args.payload = arg.slice(10);
+    else if (arg === '--force')            args.force    = true;
     else if (arg === '--json')             args.json     = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
@@ -221,6 +232,37 @@ function validatePayloadShape(payload) {
 }
 
 function applySessionClose(args) {
+  // Fix #39 (option D): early-exit fires only when NO payload was supplied.
+  // Rationale: payload presence is explicit close intent and must always run
+  // the full apply path — fix #38's per-entry idempotency (writeIfChanged +
+  // exact-entry append dedup) keeps re-apply cheap without short-circuiting,
+  // and avoids silent-success when a same-day second close brings new bytes.
+  // Payload-less invocation is treated as a cheap "already complete?" probe.
+  // --force opts out of that probe shortcut only — payload remains required
+  // for any actual apply work (readPayload below surfaces "payload is
+  // required" the same way it always has).
+  if (!args.force && !args.payload) {
+    const probe = sessionCloseFileStatus(args.hypoDir);
+    if (probe.ok) {
+      const result = {
+        ok: true,
+        alreadyComplete: true,
+        project: probe.project,
+        date: probe.dates[0],
+        message: '오늘 이미 close 완료로 보임 (probe 모드 — payload 미지정).',
+      };
+      if (args.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`✓ ${result.message}`);
+        console.log(`  project: ${result.project} / date: ${result.date}`);
+      }
+      process.exit(0);
+    }
+    // gate not ok → fall through to readPayload, which surfaces
+    // "payload is required" with the same error shape as before.
+  }
+
   let payload;
   try { payload = readPayload(args.payload); }
   catch (e) {
