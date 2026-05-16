@@ -1,0 +1,20 @@
+node_modules/
+.git/
+.omc/
+.claude/
+
+# Templates are copied verbatim to user wikis — preserve as-is
+templates/
+
+# Long-form docs and prose — avoid prettier mangling line breaks
+README.md
+README.ko.md
+CHANGELOG.md
+SECURITY.md
+LICENSE
+docs/
+.github/
+
+# Skills/commands may contain prompt text with intentional formatting
+skills/
+commands/
