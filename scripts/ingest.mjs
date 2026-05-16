@@ -32,7 +32,7 @@ function parseArgs(argv) {
   const args = { hypoDir: null, json: false, check: null };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg === '--json')         args.json = true;
+    else if (arg === '--json') args.json = true;
     else if (arg.startsWith('--check=')) args.check = expandHome(arg.slice(8));
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
@@ -52,7 +52,11 @@ function parseArgs(argv) {
 function matchingIgnorePattern(target, hypoDir, patterns) {
   const lexical = isAbsolute(target) ? target : join(hypoDir, target);
   let resolved = lexical;
-  try { resolved = realpathSync(lexical); } catch { /* not on disk — lexical only */ }
+  try {
+    resolved = realpathSync(lexical);
+  } catch {
+    /* not on disk — lexical only */
+  }
   const candidates = resolved === lexical ? [lexical] : [lexical, resolved];
   for (const pattern of patterns) {
     for (const candidate of candidates) {
@@ -84,7 +88,10 @@ function parseFrontmatter(content) {
   for (const line of m[1].split('\n')) {
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    fm[line.slice(0, idx).trim()] = line
+      .slice(idx + 1)
+      .trim()
+      .replace(/^["']|["']$/g, '');
   }
   return fm;
 }
@@ -102,7 +109,9 @@ const ignorePatterns = loadHypoIgnore(args.hypoDir);
 if (args.check) {
   const matched = matchingIgnorePattern(args.check, args.hypoDir, ignorePatterns);
   if (matched) {
-    console.error(`Refused: '${args.check}' matches .hypoignore pattern '${matched}' — not ingesting.`);
+    console.error(
+      `Refused: '${args.check}' matches .hypoignore pattern '${matched}' — not ingesting.`,
+    );
     process.exit(1);
   }
   process.exit(0);
@@ -110,7 +119,12 @@ if (args.check) {
 
 const sourcesDir = join(args.hypoDir, 'sources');
 const allSources = existsSync(sourcesDir)
-  ? readdirSync(sourcesDir).filter(e => !e.startsWith('.') && !statSync(join(sourcesDir, e)).isDirectory() && !isIgnored(join(sourcesDir, e), args.hypoDir, ignorePatterns))
+  ? readdirSync(sourcesDir).filter(
+      (e) =>
+        !e.startsWith('.') &&
+        !statSync(join(sourcesDir, e)).isDirectory() &&
+        !isIgnored(join(sourcesDir, e), args.hypoDir, ignorePatterns),
+    )
   : [];
 
 // collect all source: references in wiki pages
@@ -119,7 +133,11 @@ const referencedSources = new Set();
 
 for (const f of pageFiles) {
   let content;
-  try { content = readFileSync(f, 'utf-8'); } catch { continue; }
+  try {
+    content = readFileSync(f, 'utf-8');
+  } catch {
+    continue;
+  }
   const fm = parseFrontmatter(content);
   if (fm.source && !fm.source.startsWith('session:')) {
     referencedSources.add(fm.source);
@@ -127,7 +145,7 @@ for (const f of pageFiles) {
 }
 
 // sources with no summary page
-const orphaned = allSources.filter(s => {
+const orphaned = allSources.filter((s) => {
   const slug = basename(s, extname(s));
   return !referencedSources.has(s) && !referencedSources.has(slug);
 });
@@ -136,24 +154,38 @@ const orphaned = allSources.filter(s => {
 const missingSource = [];
 for (const f of pageFiles) {
   let content;
-  try { content = readFileSync(f, 'utf-8'); } catch { continue; }
+  try {
+    content = readFileSync(f, 'utf-8');
+  } catch {
+    continue;
+  }
   const fm = parseFrontmatter(content);
   if (!fm.source || fm.source.startsWith('session:')) continue;
   const sourceFile = join(sourcesDir, fm.source);
-  const sourceFileWithExt = allSources.find(s => s === fm.source || basename(s, extname(s)) === fm.source);
+  const sourceFileWithExt = allSources.find(
+    (s) => s === fm.source || basename(s, extname(s)) === fm.source,
+  );
   if (!sourceFileWithExt && !existsSync(sourceFile)) {
     missingSource.push({ page: f, source: fm.source });
   }
 }
 
 if (args.json) {
-  console.log(JSON.stringify({
-    totalSources: allSources.length,
-    orphaned,
-    missingSource,
-  }, null, 2));
+  console.log(
+    JSON.stringify(
+      {
+        totalSources: allSources.length,
+        orphaned,
+        missingSource,
+      },
+      null,
+      2,
+    ),
+  );
 } else {
-  console.log('[hypomnema] Listing pending ingest targets — synthesis is performed by /hypo:ingest inside Claude Code.');
+  console.log(
+    '[hypomnema] Listing pending ingest targets — synthesis is performed by /hypo:ingest inside Claude Code.',
+  );
   console.log(`Sources: ${allSources.length} total`);
 
   if (orphaned.length === 0) {

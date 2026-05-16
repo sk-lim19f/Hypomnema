@@ -27,7 +27,8 @@ for (const line of (porcelain.stdout || '').split('\n')) {
   if (!line) continue;
   const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
   if (!file) continue;
-  if (ignorePatterns.length > 0 && isIgnored(join(HYPO_DIR, file), HYPO_DIR, ignorePatterns)) continue;
+  if (ignorePatterns.length > 0 && isIgnored(join(HYPO_DIR, file), HYPO_DIR, ignorePatterns))
+    continue;
   paths.push(file);
 }
 if (paths.length > 0) git('add', '--', ...paths);

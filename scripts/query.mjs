@@ -27,9 +27,9 @@ function parseArgs(argv) {
   const args = { hypoDir: null, query: null, limit: 10, json: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg.startsWith('--q='))     args.query  = arg.slice(4);
-    else if (arg.startsWith('--limit=')) args.limit  = parseInt(arg.slice(8), 10) || 10;
-    else if (arg === '--json')           args.json   = true;
+    else if (arg.startsWith('--q=')) args.query = arg.slice(4);
+    else if (arg.startsWith('--limit=')) args.limit = parseInt(arg.slice(8), 10) || 10;
+    else if (arg === '--json') args.json = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -57,12 +57,17 @@ function parseFrontmatter(content) {
   for (const line of m[1].split('\n')) {
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    fm[line.slice(0, idx).trim()] = line
+      .slice(idx + 1)
+      .trim()
+      .replace(/^["']|["']$/g, '');
   }
   return fm;
 }
 
-function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 function scoreAndExcerpt(content, terms) {
   const lower = content.toLowerCase();
@@ -73,7 +78,7 @@ function scoreAndExcerpt(content, terms) {
   const lines = content.split('\n');
   let excerpt = '';
   for (const line of lines) {
-    if (terms.some(t => line.toLowerCase().includes(t))) {
+    if (terms.some((t) => line.toLowerCase().includes(t))) {
       excerpt = line.trim().slice(0, 120);
       break;
     }
@@ -92,18 +97,28 @@ if (!args.query) {
 
 const terms = args.query.toLowerCase().split(/\s+/).filter(Boolean);
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
-const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
-const files = scanDirs.flatMap(d => collectMdFiles(d, args.hypoDir, [], ignorePatterns));
+const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
+const files = scanDirs.flatMap((d) => collectMdFiles(d, args.hypoDir, [], ignorePatterns));
 
 const results = [];
 
 for (const { path, rel } of files) {
   let content;
-  try { content = readFileSync(path, 'utf-8'); } catch { continue; }
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch {
+    continue;
+  }
   const { score, excerpt } = scoreAndExcerpt(content, terms);
   if (score === 0) continue;
   const fm = parseFrontmatter(content);
-  results.push({ slug: rel.replace(/\.md$/, ''), title: fm.title || rel, type: fm.type || '', score, excerpt });
+  results.push({
+    slug: rel.replace(/\.md$/, ''),
+    title: fm.title || rel,
+    type: fm.type || '',
+    score,
+    excerpt,
+  });
 }
 
 results.sort((a, b) => b.score - a.score);

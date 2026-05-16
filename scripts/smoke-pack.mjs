@@ -16,7 +16,15 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  renameSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -37,7 +45,9 @@ function run(cmd, args, opts = {}) {
   return res;
 }
 
-function step(msg) { console.log(`\n▸ ${msg}`); }
+function step(msg) {
+  console.log(`\n▸ ${msg}`);
+}
 
 const work = mkdtempSync(join(tmpdir(), 'hypo-smoke-'));
 const sandboxHome = join(work, 'home');
@@ -54,11 +64,14 @@ try {
 
   step(`install into ${installRoot}`);
   run('mkdir', ['-p', installRoot]);
-  writeFileSync(join(installRoot, 'package.json'), JSON.stringify({
-    name: 'hypo-smoke-host',
-    version: '0.0.0',
-    private: true,
-  }) + '\n');
+  writeFileSync(
+    join(installRoot, 'package.json'),
+    JSON.stringify({
+      name: 'hypo-smoke-host',
+      version: '0.0.0',
+      private: true,
+    }) + '\n',
+  );
   run('npm', ['install', '--no-audit', '--no-fund', '--silent', tarball], { cwd: installRoot });
 
   // Move tarball into the work dir so it's not left in the repo.
@@ -77,15 +90,19 @@ try {
 
   step('hypomnema init --dry-run (installed)');
   const dryEnv = { ...process.env, HOME: sandboxHome, HYPO_DIR: wikiDir };
-  const dry = run(cliBin, [
-    'init',
-    '--dry-run',
-    `--hypo-dir=${wikiDir}`,
-    '--no-hooks',
-    '--no-commands',
-    '--no-git-init',
-    '--no-shell',
-  ], { env: dryEnv });
+  const dry = run(
+    cliBin,
+    [
+      'init',
+      '--dry-run',
+      `--hypo-dir=${wikiDir}`,
+      '--no-hooks',
+      '--no-commands',
+      '--no-git-init',
+      '--no-shell',
+    ],
+    { env: dryEnv },
+  );
   if (!/dry[\s-]?run/i.test(dry.stdout + dry.stderr)) {
     console.log(dry.stdout);
     throw new Error('init --dry-run did not announce dry-run mode');

@@ -10,7 +10,15 @@
  *   that as a refusal to operate on the destination.
  */
 
-import { existsSync, readFileSync, writeFileSync, renameSync, lstatSync, mkdirSync, unlinkSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  lstatSync,
+  mkdirSync,
+  unlinkSync,
+} from 'fs';
 import { join, dirname } from 'path';
 import { createHash } from 'crypto';
 
@@ -20,12 +28,20 @@ export function sha256(buf) {
 
 export function isRegularFile(path) {
   if (!existsSync(path)) return false;
-  try { return lstatSync(path).isFile(); } catch { return false; }
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
 export function readFileIfRegular(path) {
   if (!isRegularFile(path)) return null;
-  try { return readFileSync(path); } catch { return null; }
+  try {
+    return readFileSync(path);
+  } catch {
+    return null;
+  }
 }
 
 export function readPkgJson(pkgJsonPath) {
@@ -36,7 +52,7 @@ export function readPkgJson(pkgJsonPath) {
   } catch (err) {
     // Preserve corrupt file as <name>.corrupt-<ts>.json so the user can recover.
     try {
-      const ts  = new Date().toISOString().replace(/[:.]/g, '-');
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
       const bak = `${pkgJsonPath}.corrupt-${ts}.json`;
       renameSync(pkgJsonPath, bak);
       console.error(`[hypomnema] WARN: ${pkgJsonPath} was not valid JSON. Preserved as ${bak}.`);
@@ -53,7 +69,9 @@ export function writePkgJsonAtomic(pkgJsonPath, data) {
   try {
     renameSync(tmp, pkgJsonPath);
   } catch (err) {
-    try { unlinkSync(tmp); } catch {}
+    try {
+      unlinkSync(tmp);
+    } catch {}
     throw err;
   }
 }

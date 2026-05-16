@@ -21,10 +21,12 @@ import {
 
 let input = '';
 process.stdin.setEncoding('utf-8');
-process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+});
 process.stdin.on('end', () => {
   try {
-    const data   = JSON.parse(input);
+    const data = JSON.parse(input);
     const prompt = (data.prompt || '').trim();
 
     if (!isCompactCommand(prompt) || isGateSkipped()) {
@@ -33,8 +35,8 @@ process.stdin.on('end', () => {
     }
 
     const hasSession = lastSubstantialOpIsSession();
-    const gitStatus  = hypoIsClean();
-    const hotStatus  = hotMdIsClean();
+    const gitStatus = hypoIsClean();
+    const hotStatus = hotMdIsClean();
 
     if (hasSession && gitStatus.clean && hotStatus.clean) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
@@ -42,28 +44,30 @@ process.stdin.on('end', () => {
     }
 
     const reasons = [
-      !hasSession      ? 'session log entry missing' : '',
+      !hasSession ? 'session log entry missing' : '',
       !gitStatus.clean ? gitStatus.reason : '',
       !hotStatus.clean ? hotStatus.reason : '',
     ].filter(Boolean);
 
-    const today     = new Date().toISOString().slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
     const checklist = readChecklist(today);
-    const body      = checklist
+    const body = checklist
       ? `Checklist:\n${checklist}`
       : 'See hypo-guide.md for the session-close checklist.';
 
-    console.log(JSON.stringify({
-      continue: true,
-      additionalContext: [
-        `[WIKI_AUTOCLOSE] /compact detected — session close incomplete (${reasons.join(', ')}).`,
-        `Do NOT wait for user input. Run wiki session close NOW, then retry /compact.`,
-        ``,
-        body,
-        ``,
-        `To bypass: set HYPO_SKIP_GATE=1`,
-      ].join('\n'),
-    }));
+    console.log(
+      JSON.stringify({
+        continue: true,
+        additionalContext: [
+          `[WIKI_AUTOCLOSE] /compact detected — session close incomplete (${reasons.join(', ')}).`,
+          `Do NOT wait for user input. Run wiki session close NOW, then retry /compact.`,
+          ``,
+          body,
+          ``,
+          `To bypass: set HYPO_SKIP_GATE=1`,
+        ].join('\n'),
+      }),
+    );
   } catch {
     // Fail-open: any parse/runtime error must not block the user's prompt.
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));

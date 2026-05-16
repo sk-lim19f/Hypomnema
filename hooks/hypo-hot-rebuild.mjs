@@ -14,8 +14,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { HYPO_DIR, computeSessionGrowth, formatGrowthMetrics } from './hypo-shared.mjs';
 
-const HOT_PATH         = join(HYPO_DIR, 'hot.md');
-const GROWTH_CACHE     = join(HYPO_DIR, '.cache', 'last-session-growth.json');
+const HOT_PATH = join(HYPO_DIR, 'hot.md');
+const GROWTH_CACHE = join(HYPO_DIR, '.cache', 'last-session-growth.json');
 
 function parseFrontmatter(content) {
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -56,10 +56,12 @@ function rebuild() {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  const tableRows = rows.map(({ name, slug }) => {
-    const date = getProjectDate(slug) || today;
-    return `| ${name} | ${date} | [[projects/${slug}/hot]] |`;
-  }).join('\n');
+  const tableRows = rows
+    .map(({ name, slug }) => {
+      const date = getProjectDate(slug) || today;
+      return `| ${name} | ${date} | [[projects/${slug}/hot]] |`;
+    })
+    .join('\n');
 
   const canonical = `---
 title: Hot Cache — Pointer
@@ -92,7 +94,7 @@ ${tableRows}
 function emitGrowth() {
   if (!existsSync(HYPO_DIR)) return;
   const stats = computeSessionGrowth(HYPO_DIR);
-  const line  = formatGrowthMetrics('stop', stats);
+  const line = formatGrowthMetrics('stop', stats);
   if (line) process.stderr.write(`${line}\n`);
   try {
     mkdirSync(join(HYPO_DIR, '.cache'), { recursive: true });
@@ -100,7 +102,13 @@ function emitGrowth() {
   } catch {}
 }
 
-try { rebuild();     } catch {}
-try { emitGrowth();  } catch {}
+try {
+  rebuild();
+} catch {}
+try {
+  emitGrowth();
+} catch {}
 
-try { console.log(JSON.stringify({ continue: true, suppressOutput: true })); } catch {}
+try {
+  console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+} catch {}

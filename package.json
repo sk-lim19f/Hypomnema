@@ -17,7 +17,14 @@
     ".claude-plugin/",
     "README.md"
   ],
-  "keywords": ["wiki", "llm", "claude", "claude-code", "personal-wiki", "knowledge-management"],
+  "keywords": [
+    "wiki",
+    "llm",
+    "claude",
+    "claude-code",
+    "personal-wiki",
+    "knowledge-management"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/sk-lim19f/Hypomnema.git"
@@ -34,6 +41,11 @@
     "lint": "node scripts/lint.mjs",
     "graph": "node scripts/graph.mjs",
     "smoke-pack": "node scripts/smoke-pack.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "prepublishOnly": "npm test && npm run lint && npm run smoke-pack"
+  },
+  "devDependencies": {
+    "prettier": "^3.8.3"
   }
 }

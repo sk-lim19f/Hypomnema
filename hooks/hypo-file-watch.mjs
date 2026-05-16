@@ -14,11 +14,13 @@ const MAX_CHARS = 2000;
 
 let raw = '';
 process.stdin.setEncoding('utf-8');
-process.stdin.on('data', chunk => raw += chunk);
+process.stdin.on('data', (chunk) => (raw += chunk));
 process.stdin.on('end', () => {
   try {
     let data = {};
-    try { data = JSON.parse(raw); } catch {}
+    try {
+      data = JSON.parse(raw);
+    } catch {}
 
     const filePath = data.file_path || data.path || '';
 
@@ -35,12 +37,13 @@ process.stdin.on('end', () => {
     const content = readFileSync(filePath, 'utf-8').slice(0, MAX_CHARS);
     const relPath = filePath.replace(HYPO_DIR + '/', '');
 
-    console.log(JSON.stringify({
-      continue: true,
-      suppressOutput: true,
-      additionalContext: `[WIKI FILE UPDATED: ${relPath}]\n\n${content}`,
-    }));
-
+    console.log(
+      JSON.stringify({
+        continue: true,
+        suppressOutput: true,
+        additionalContext: `[WIKI FILE UPDATED: ${relPath}]\n\n${content}`,
+      }),
+    );
   } catch {
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   }

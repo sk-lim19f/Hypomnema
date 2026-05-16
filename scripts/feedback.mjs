@@ -27,10 +27,10 @@ function parseArgs(argv) {
   const args = { hypoDir: null, topic: null, entry: null, dryRun: false, list: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg.startsWith('--topic='))   args.topic  = arg.slice(8);
-    else if (arg.startsWith('--entry='))   args.entry  = arg.slice(8);
-    else if (arg === '--dry-run')          args.dryRun = true;
-    else if (arg === '--list')             args.list   = true;
+    else if (arg.startsWith('--topic=')) args.topic = arg.slice(8);
+    else if (arg.startsWith('--entry=')) args.entry = arg.slice(8);
+    else if (arg === '--dry-run') args.dryRun = true;
+    else if (arg === '--list') args.list = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -44,7 +44,7 @@ function listTopics(hypoDir) {
     console.log('No feedback pages found.');
     return;
   }
-  const files = readdirSync(feedbackDir).filter(f => f.endsWith('.md'));
+  const files = readdirSync(feedbackDir).filter((f) => f.endsWith('.md'));
   if (files.length === 0) {
     console.log('No feedback pages found.');
     return;
@@ -57,8 +57,8 @@ function listTopics(hypoDir) {
 
 function writeFeedback(hypoDir, topic, entry, dryRun) {
   const feedbackDir = join(hypoDir, 'pages', 'feedback');
-  const filePath    = join(feedbackDir, `${topic}.md`);
-  const today       = new Date().toISOString().slice(0, 10);
+  const filePath = join(feedbackDir, `${topic}.md`);
+  const today = new Date().toISOString().slice(0, 10);
 
   let content;
 

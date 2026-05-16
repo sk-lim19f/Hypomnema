@@ -42,16 +42,21 @@ function resolveHypoRoot() {
   return join(HOME, 'hypomnema');
 }
 
-export const HYPO_DIR   = resolveHypoRoot();
-export const LOG_PATH   = join(HYPO_DIR, 'log.md');
-export const HOT_PATH   = join(HYPO_DIR, 'hot.md');
+export const HYPO_DIR = resolveHypoRoot();
+export const LOG_PATH = join(HYPO_DIR, 'log.md');
+export const HOT_PATH = join(HYPO_DIR, 'hot.md');
 export const GUIDE_PATH = join(HYPO_DIR, 'hypo-guide.md');
 
 // Package root: written by init/upgrade to ~/.claude/hypo-pkg.json
 function resolvePkgRoot() {
   const p = join(HOME, '.claude', 'hypo-pkg.json');
   if (!existsSync(p)) return null;
-  try { const v = JSON.parse(readFileSync(p, 'utf-8')).pkgRoot; return typeof v === 'string' && v ? v : null; } catch { return null; }
+  try {
+    const v = JSON.parse(readFileSync(p, 'utf-8')).pkgRoot;
+    return typeof v === 'string' && v ? v : null;
+  } catch {
+    return null;
+  }
 }
 export const PKG_ROOT = resolvePkgRoot();
 
@@ -59,7 +64,7 @@ export const PKG_ROOT = resolvePkgRoot();
 // Set HYPO_ALLOWED_HOT_H2=comma,separated,headings to enable.
 const _allowedH2Env = process.env.HYPO_ALLOWED_HOT_H2;
 export const ALLOWED_HOT_H2 = _allowedH2Env
-  ? new Set(_allowedH2Env.split(',').map(s => s.trim()))
+  ? new Set(_allowedH2Env.split(',').map((s) => s.trim()))
   : null;
 
 // ── skip-gate helper ───────────────────────────────────────────────────────
@@ -74,19 +79,26 @@ export function isGateSkipped() {
 export function lastSubstantialOpIsSession() {
   if (!existsSync(LOG_PATH)) return true;
   const log = readFileSync(LOG_PATH, 'utf-8');
-  const substantial = log.split('\n')
-    .filter(l => /^## \[\d{4}-\d{2}-\d{2}\] (session|ingest)/.test(l));
+  const substantial = log
+    .split('\n')
+    .filter((l) => /^## \[\d{4}-\d{2}-\d{2}\] (session|ingest)/.test(l));
   if (substantial.length === 0) return true;
   return /^## \[\d{4}-\d{2}-\d{2}\] session/.test(substantial[substantial.length - 1]);
 }
 
 export function hypoIsClean() {
   try {
-    const porcelain = spawnSync('git', ['-C', HYPO_DIR, 'status', '--porcelain'], { encoding: 'utf-8' });
+    const porcelain = spawnSync('git', ['-C', HYPO_DIR, 'status', '--porcelain'], {
+      encoding: 'utf-8',
+    });
     if (porcelain.status !== 0) return { clean: false, reason: `git check failed in ${HYPO_DIR}` };
-    if (porcelain.stdout.trim() !== '') return { clean: false, reason: `uncommitted changes in ${HYPO_DIR}` };
-    const ahead = spawnSync('git', ['-C', HYPO_DIR, 'status', '--branch', '--porcelain'], { encoding: 'utf-8' });
-    if (/\[ahead \d+\]/.test(ahead.stdout || '')) return { clean: false, reason: `unpushed commits in ${HYPO_DIR}` };
+    if (porcelain.stdout.trim() !== '')
+      return { clean: false, reason: `uncommitted changes in ${HYPO_DIR}` };
+    const ahead = spawnSync('git', ['-C', HYPO_DIR, 'status', '--branch', '--porcelain'], {
+      encoding: 'utf-8',
+    });
+    if (/\[ahead \d+\]/.test(ahead.stdout || ''))
+      return { clean: false, reason: `unpushed commits in ${HYPO_DIR}` };
     return { clean: true };
   } catch {
     return { clean: false, reason: `git check failed in ${HYPO_DIR}` };
@@ -100,8 +112,8 @@ export function hotMdIsClean() {
 
   // Optional: check H2 allowlist if HYPO_ALLOWED_HOT_H2 is set
   if (ALLOWED_HOT_H2) {
-    const h2s = [...content.matchAll(/^## (.+)$/gm)].map(m => m[1].trim());
-    const extra = h2s.filter(h => !ALLOWED_HOT_H2.has(h));
+    const h2s = [...content.matchAll(/^## (.+)$/gm)].map((m) => m[1].trim());
+    const extra = h2s.filter((h) => !ALLOWED_HOT_H2.has(h));
     if (extra.length > 0) reasons.push(`hot.md has unexpected H2 sections: ${extra.join(', ')}`);
   }
 
@@ -197,10 +209,17 @@ export function resolveActiveProject(hypoDir) {
   const hotPath = join(hypoDir, 'hot.md');
   if (!existsSync(hotPath)) return null;
   let content;
-  try { content = readFileSync(hotPath, 'utf-8'); } catch { return null; }
+  try {
+    content = readFileSync(hotPath, 'utf-8');
+  } catch {
+    return null;
+  }
   // Canonical hot.md uses wikilinks: | name | date | [[projects/slug/hot]] |
-  const wikiRows = [...content.matchAll(/\|\s*([^|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2})?\s*\|\s*\[\[projects\/([^\]/]+)\/[^\]]+\]\]/g)]
-    .map(m => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
+  const wikiRows = [
+    ...content.matchAll(
+      /\|\s*([^|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2})?\s*\|\s*\[\[projects\/([^\]/]+)\/[^\]]+\]\]/g,
+    ),
+  ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
     wikiRows.sort((a, b) => b.date.localeCompare(a.date));
     return wikiRows[0].slug;
@@ -230,17 +249,31 @@ export function sessionCloseFileStatus(hypoDir) {
   const dates = freshDates();
   const project = resolveActiveProject(hypoDir);
   if (!project) {
-    return { ok: false, project: null, dates, stale: [], missing: ['hot.md (no active project in pointer table)'] };
+    return {
+      ok: false,
+      project: null,
+      dates,
+      stale: [],
+      missing: ['hot.md (no active project in pointer table)'],
+    };
   }
 
-  const stale = [];    // exists but not updated this session
-  const missing = [];  // file does not exist
+  const stale = []; // exists but not updated this session
+  const missing = []; // file does not exist
 
   const checkUpdated = (relPath) => {
     const full = join(hypoDir, relPath);
-    if (!existsSync(full)) { missing.push(relPath); return; }
+    if (!existsSync(full)) {
+      missing.push(relPath);
+      return;
+    }
     let content;
-    try { content = readFileSync(full, 'utf-8'); } catch { missing.push(relPath); return; }
+    try {
+      content = readFileSync(full, 'utf-8');
+    } catch {
+      missing.push(relPath);
+      return;
+    }
     if (!dates.includes(frontmatterUpdated(content))) stale.push(relPath);
   };
 
@@ -255,8 +288,15 @@ export function sessionCloseFileStatus(hypoDir) {
     const full = join(hypoDir, 'projects', project, 'session-log', `${date.slice(0, 7)}.md`);
     if (!existsSync(full)) continue;
     let content = '';
-    try { content = readFileSync(full, 'utf-8'); } catch { continue; }
-    if (hasSessionLogHeading(content, date)) { sessionLogOk = true; break; }
+    try {
+      content = readFileSync(full, 'utf-8');
+    } catch {
+      continue;
+    }
+    if (hasSessionLogHeading(content, date)) {
+      sessionLogOk = true;
+      break;
+    }
   }
   if (!sessionLogOk) {
     const logRel = join('projects', project, 'session-log', `${dates[0].slice(0, 7)}.md`);
@@ -269,8 +309,12 @@ export function sessionCloseFileStatus(hypoDir) {
     missing.push('log.md');
   } else {
     let content = '';
-    try { content = readFileSync(logFull, 'utf-8'); } catch { missing.push('log.md'); }
-    const logFresh = content && dates.some(d => hasLogEntry(content, d, project));
+    try {
+      content = readFileSync(logFull, 'utf-8');
+    } catch {
+      missing.push('log.md');
+    }
+    const logFresh = content && dates.some((d) => hasLogEntry(content, d, project));
     if (content && !logFresh) stale.push('log.md');
   }
 
@@ -300,8 +344,11 @@ export function appendSyncFailure(hypoDir, op, error) {
   try {
     const cacheDir = join(hypoDir, '.cache');
     if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
-    const firstLine = String(error || '')
-      .split('\n').map(l => l.trim()).find(Boolean) || 'unknown error';
+    const firstLine =
+      String(error || '')
+        .split('\n')
+        .map((l) => l.trim())
+        .find(Boolean) || 'unknown error';
     const entry = {
       timestamp: new Date().toISOString(),
       op,
@@ -325,8 +372,8 @@ export function readSyncState(hypoDir) {
   try {
     const entries = readFileSync(path, 'utf-8')
       .split('\n')
-      .filter(l => l.trim())
-      .map(l => JSON.parse(l));
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l));
     return { entries, parseError: false };
   } catch {
     return { entries: [], parseError: true };
@@ -412,7 +459,7 @@ export function isClosePattern(text) {
     /end(?:ing)?\s+(?:the|this)\s+(?:session|work|day)/i,
     /close\s+(?:the|this)\s+session/i,
   ];
-  return [...krPatterns, ...enPatterns].some(re => re.test(text));
+  return [...krPatterns, ...enPatterns].some((re) => re.test(text));
 }
 
 /**
@@ -437,12 +484,12 @@ export function buildOutput(context, extra = {}) {
  * @returns {string}
  */
 export function formatGrowthMetrics(mode, stats) {
-  const a = Number(stats?.addedPages)   || 0;
+  const a = Number(stats?.addedPages) || 0;
   const u = Number(stats?.updatedPages) || 0;
   const w = Number(stats?.newWikilinks) || 0;
   if (a === 0 && u === 0 && w === 0) return '';
   const body = `+${a} pages, ~${u} updated, ${w} wikilinks`;
-  if (mode === 'stop')  return `[hypo] ${body}`;
+  if (mode === 'stop') return `[hypo] ${body}`;
   if (mode === 'start') return `[hypo] 직전 세션: ${body}. 이어서 볼까요?`;
   return '';
 }
@@ -464,9 +511,13 @@ export function computeSessionGrowth(hypoDir) {
     // more expensive `git diff HEAD --unified=0` — Stop hook P95 win.
     // `-uall` expands untracked directories so a brand-new `pages/new.md`
     // isn't hidden behind a single `?? pages/` line.
-    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall'], { encoding: 'utf-8', timeout: 5000 });
+    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall'], {
+      encoding: 'utf-8',
+      timeout: 5000,
+    });
     if (porcelain.status !== 0) return empty;
-    let addedPages = 0, updatedPages = 0;
+    let addedPages = 0,
+      updatedPages = 0;
     let hasTrackedMdChange = false;
     const untrackedMd = [];
     // Growth metrics describe wiki page activity, so restrict to the two
@@ -476,17 +527,22 @@ export function computeSessionGrowth(hypoDir) {
       file.endsWith('.md') && (file.startsWith('pages/') || file.startsWith('projects/'));
     for (const line of (porcelain.stdout || '').split('\n')) {
       if (!line) continue;
-      const xy   = line.slice(0, 2);
+      const xy = line.slice(0, 2);
       const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
       if (!inPagesScope(file)) continue;
-      if (xy === '??') { untrackedMd.push(file); addedPages++; continue; }
+      if (xy === '??') {
+        untrackedMd.push(file);
+        addedPages++;
+        continue;
+      }
       hasTrackedMdChange = true;
       if (xy.includes('A')) addedPages++;
       else if (xy.includes('M') || xy.includes('R')) updatedPages++;
     }
     if (!hasTrackedMdChange && untrackedMd.length === 0) return empty;
 
-    let plus = 0, minus = 0;
+    let plus = 0,
+      minus = 0;
     if (hasTrackedMdChange) {
       // pathspec keeps non-Markdown / out-of-scope diffs from polluting the
       // wikilink count. Without it, a `[[…]]` string in a script.js diff was
@@ -494,14 +550,14 @@ export function computeSessionGrowth(hypoDir) {
       const diff = spawnSync(
         'git',
         ['-C', hypoDir, 'diff', 'HEAD', '--unified=0', '--', 'pages/', 'projects/'],
-        { encoding: 'utf-8', timeout: 10000 }
+        { encoding: 'utf-8', timeout: 10000 },
       );
       if (diff.status === 0) {
         for (const line of (diff.stdout || '').split('\n')) {
           if (line.startsWith('+++') || line.startsWith('---')) continue;
           const matches = line.match(/\[\[[^\]\n]+\]\]/g);
           if (!matches) continue;
-          if (line.startsWith('+')) plus  += matches.length;
+          if (line.startsWith('+')) plus += matches.length;
           else if (line.startsWith('-')) minus += matches.length;
         }
       }
@@ -523,14 +579,16 @@ export function computeSessionGrowth(hypoDir) {
 // Inlined here so deployed hooks (~/.claude/hooks/) don't need scripts/lib/.
 
 function _globToRegex(glob) {
-  return new RegExp('^' +
-    glob
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*\*/g, '\x00')
-      .replace(/\*/g, '[^/]*')
-      .replace(/\?/g, '[^/]')
-      .replace(/\x00/g, '.*')
-  + '$');
+  return new RegExp(
+    '^' +
+      glob
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*\*/g, '\x00')
+        .replace(/\*/g, '[^/]*')
+        .replace(/\?/g, '[^/]')
+        .replace(/\x00/g, '.*') +
+      '$',
+  );
 }
 
 export function loadHypoIgnore(hypoDir) {
@@ -538,8 +596,8 @@ export function loadHypoIgnore(hypoDir) {
   if (!existsSync(ignorePath)) return [];
   return readFileSync(ignorePath, 'utf-8')
     .split('\n')
-    .map(l => l.trim())
-    .filter(l => l && !l.startsWith('#'));
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
 }
 
 export function isIgnored(filePath, hypoDir, patterns) {

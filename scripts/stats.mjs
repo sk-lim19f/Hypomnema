@@ -24,7 +24,7 @@ function parseArgs(argv) {
   const args = { hypoDir: null, json: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg === '--json')         args.json = true;
+    else if (arg === '--json') args.json = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -52,14 +52,17 @@ function parseFrontmatter(content) {
   for (const line of m[1].split('\n')) {
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    fm[line.slice(0, idx).trim()] = line
+      .slice(idx + 1)
+      .trim()
+      .replace(/^["']|["']$/g, '');
   }
   return fm;
 }
 
 function listDirs(dir) {
   if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter(e => {
+  return readdirSync(dir).filter((e) => {
     if (e.startsWith('.')) return false;
     return statSync(join(dir, e)).isDirectory();
   });
@@ -69,7 +72,7 @@ function getLastActivity(hypoDir) {
   const logPath = join(hypoDir, 'log.md');
   if (!existsSync(logPath)) return null;
   const content = readFileSync(logPath, 'utf-8');
-  const dates = [...content.matchAll(/\b(\d{4}-\d{2}-\d{2})\b/g)].map(m => m[1]);
+  const dates = [...content.matchAll(/\b(\d{4}-\d{2}-\d{2})\b/g)].map((m) => m[1]);
   return dates.length ? dates[dates.length - 1] : null;
 }
 
@@ -79,9 +82,13 @@ const args = parseArgs(process.argv);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const pageFiles = collectMdFiles(join(args.hypoDir, 'pages'), [], args.hypoDir, ignorePatterns);
-const projects  = listDirs(join(args.hypoDir, 'projects'));
-const sources   = existsSync(join(args.hypoDir, 'sources'))
-  ? readdirSync(join(args.hypoDir, 'sources')).filter(e => !e.startsWith('.') && !isIgnored(join(args.hypoDir, 'sources', e), args.hypoDir, ignorePatterns))
+const projects = listDirs(join(args.hypoDir, 'projects'));
+const sources = existsSync(join(args.hypoDir, 'sources'))
+  ? readdirSync(join(args.hypoDir, 'sources')).filter(
+      (e) =>
+        !e.startsWith('.') &&
+        !isIgnored(join(args.hypoDir, 'sources', e), args.hypoDir, ignorePatterns),
+    )
   : [];
 
 const typeCounts = {};
@@ -89,9 +96,16 @@ let missingFrontmatter = 0;
 
 for (const f of pageFiles) {
   let content;
-  try { content = readFileSync(f, 'utf-8'); } catch { continue; }
+  try {
+    content = readFileSync(f, 'utf-8');
+  } catch {
+    continue;
+  }
   const fm = parseFrontmatter(content);
-  if (!fm) { missingFrontmatter++; continue; }
+  if (!fm) {
+    missingFrontmatter++;
+    continue;
+  }
   const t = fm.type || 'unknown';
   typeCounts[t] = (typeCounts[t] || 0) + 1;
 }
@@ -100,7 +114,7 @@ let adrCount = 0;
 for (const p of projects) {
   const decisionsDir = join(args.hypoDir, 'projects', p, 'decisions');
   if (existsSync(decisionsDir)) {
-    adrCount += readdirSync(decisionsDir).filter(f => f.endsWith('.md')).length;
+    adrCount += readdirSync(decisionsDir).filter((f) => f.endsWith('.md')).length;
   }
 }
 

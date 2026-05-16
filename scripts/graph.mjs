@@ -24,8 +24,8 @@ import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 function parseArgs(argv) {
   const args = { hypoDir: null, format: 'json', minEdges: 0 };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--hypo-dir='))  args.hypoDir  = expandHome(arg.slice(11));
-    else if (arg.startsWith('--format='))   args.format   = arg.slice(9);
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
+    else if (arg.startsWith('--format=')) args.format = arg.slice(9);
     else if (arg.startsWith('--min-edges=')) args.minEdges = parseInt(arg.slice(12), 10) || 0;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
@@ -75,7 +75,7 @@ function extractWikilinks(content) {
 
 function buildGraph(pages, slugIndex) {
   const edges = [];
-  const inDegree  = new Map();
+  const inDegree = new Map();
   const outDegree = new Map();
 
   for (const p of pages) {
@@ -85,7 +85,11 @@ function buildGraph(pages, slugIndex) {
 
   for (const p of pages) {
     let content;
-    try { content = readFileSync(p.path, 'utf-8'); } catch { continue; }
+    try {
+      content = readFileSync(p.path, 'utf-8');
+    } catch {
+      continue;
+    }
     for (const link of extractWikilinks(content)) {
       const target = slugIndex.get(link);
       if (target && target !== p.slug) {
@@ -101,24 +105,28 @@ function buildGraph(pages, slugIndex) {
 
 // ── label escapers ────────────────────────────────────────────────────────────
 
-function escapeMermaid(s) { return s.replace(/"/g, '#quot;'); }
-function escapeDot(s)     { return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"'); }
+function escapeMermaid(s) {
+  return s.replace(/"/g, '#quot;');
+}
+function escapeDot(s) {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
 
 // ── formatters ────────────────────────────────────────────────────────────────
 
 function formatJson(pages, graph, minEdges) {
   const nodes = pages
-    .map(p => ({
+    .map((p) => ({
       slug: p.slug,
       in: graph.inDegree.get(p.slug) || 0,
       out: graph.outDegree.get(p.slug) || 0,
     }))
-    .filter(n => minEdges === 0 || n.in + n.out >= minEdges)
-    .sort((a, b) => (b.in + b.out) - (a.in + a.out));
+    .filter((n) => minEdges === 0 || n.in + n.out >= minEdges)
+    .sort((a, b) => b.in + b.out - (a.in + a.out));
 
-  const edges = graph.edges.filter(e => {
-    const fn = nodes.find(n => n.slug === e.from);
-    const tn = nodes.find(n => n.slug === e.to);
+  const edges = graph.edges.filter((e) => {
+    const fn = nodes.find((n) => n.slug === e.from);
+    const tn = nodes.find((n) => n.slug === e.to);
     return fn && tn;
   });
 
@@ -128,11 +136,11 @@ function formatJson(pages, graph, minEdges) {
 function formatMermaid(pages, graph, minEdges) {
   const activeNodes = new Set(
     pages
-      .filter(p => {
+      .filter((p) => {
         const total = (graph.inDegree.get(p.slug) || 0) + (graph.outDegree.get(p.slug) || 0);
         return total >= minEdges;
       })
-      .map(p => p.slug)
+      .map((p) => p.slug),
   );
 
   const lines = ['graph TD'];
@@ -149,11 +157,11 @@ function formatMermaid(pages, graph, minEdges) {
 function formatDot(pages, graph, minEdges) {
   const activeNodes = new Set(
     pages
-      .filter(p => {
+      .filter((p) => {
         const total = (graph.inDegree.get(p.slug) || 0) + (graph.outDegree.get(p.slug) || 0);
         return total >= minEdges;
       })
-      .map(p => p.slug)
+      .map((p) => p.slug),
   );
 
   const lines = ['digraph wiki {', '  rankdir=LR;'];
@@ -171,13 +179,18 @@ function formatDot(pages, graph, minEdges) {
 const args = parseArgs(process.argv);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
-const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
-const pages    = scanDirs.flatMap(d => collectPages(d, args.hypoDir, [], ignorePatterns));
+const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
+const pages = scanDirs.flatMap((d) => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugIndex = buildSlugIndex(pages);
-const graph    = buildGraph(pages, slugIndex);
+const graph = buildGraph(pages, slugIndex);
 
 switch (args.format) {
-  case 'mermaid': console.log(formatMermaid(pages, graph, args.minEdges)); break;
-  case 'dot':     console.log(formatDot(pages, graph, args.minEdges)); break;
-  default:        console.log(formatJson(pages, graph, args.minEdges));
+  case 'mermaid':
+    console.log(formatMermaid(pages, graph, args.minEdges));
+    break;
+  case 'dot':
+    console.log(formatDot(pages, graph, args.minEdges));
+    break;
+  default:
+    console.log(formatJson(pages, graph, args.minEdges));
 }

@@ -1,0 +1,5 @@
+# Commits listed here are skipped by `git blame` (use `--ignore-revs-file=.git-blame-ignore-revs`).
+# GitHub honors this file automatically when present at the repo root.
+
+# style: apply Prettier formatting to scripts/, hooks/, tests/ (2026-05-16)
+4dac33c

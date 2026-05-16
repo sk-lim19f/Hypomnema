@@ -23,9 +23,9 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 function parseArgs(argv) {
   const args = { hypoDir: null, project: null, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--hypo-dir='))  args.hypoDir = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--project=')) args.project = arg.slice(10);
-    else if (arg === '--json')           args.json    = true;
+    else if (arg === '--json') args.json = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -40,8 +40,11 @@ function resolveActiveProject(hypoDir) {
   const content = readFileSync(hotPath, 'utf-8');
   // Canonical hot.md uses wikilinks: | name | date | [[projects/slug/hot]] |
   // Pick the most recent row by the date column when present.
-  const wikiRows = [...content.matchAll(/\|\s*([^|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2})?\s*\|\s*\[\[projects\/([^\]/]+)\/[^\]]+\]\]/g)]
-    .map(m => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
+  const wikiRows = [
+    ...content.matchAll(
+      /\|\s*([^|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2})?\s*\|\s*\[\[projects\/([^\]/]+)\/[^\]]+\]\]/g,
+    ),
+  ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
     wikiRows.sort((a, b) => b.date.localeCompare(a.date));
     return wikiRows[0].slug;
@@ -60,7 +63,10 @@ function resolveActiveProject(hypoDir) {
     const ssPath = join(projectsDir, p, 'session-state.md');
     if (!existsSync(ssPath)) continue;
     const mtime = statSync(ssPath).mtimeMs;
-    if (mtime > latestMtime) { latestMtime = mtime; latest = p; }
+    if (mtime > latestMtime) {
+      latestMtime = mtime;
+      latest = p;
+    }
   }
   return latest;
 }
