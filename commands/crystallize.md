@@ -4,57 +4,114 @@ description: Crystallize draft notes into stable knowledge — also the session-
 
 You are running `/hypo:crystallize`. This command serves two purposes:
 
-1. **Session close** — if invoked at the end of a session, run the session-close checklist first
+1. **Session close** — if invoked at the end of a session, run the session-close mechanical-apply path
 2. **Knowledge synthesis** — consolidate draft or scattered wiki pages into stable, well-linked pages
 
 ---
 
 ## Step 1 — Detect context
 
-If the user invoked `/hypo:crystallize` to close a session (phrases like "세션 종료", "오늘 작업 마무리", "session close", or "wrap up"), run Steps 2–3 (session-close checklist) **before** the synthesis scan. Otherwise skip to Step 4.
+If the user invoked `/hypo:crystallize` to close a session (phrases like "세션 종료", "오늘 작업 마무리", "session close", or "wrap up"), run Steps 2–4 (session-close mechanical apply + recovery) **before** the synthesis scan. Otherwise skip to Step 5.
 
 ---
 
-## Step 2 — Session-close checklist
+## Step 2 — Compose the session-close payload
 
-Work through each item in order. For an explicit session-close invocation, proceed automatically without asking for confirmation on each item.
+The session-close path is **payload-driven** (fix #38). Instead of writing the 5 mandatory files one-by-one, you compose a single JSON payload that describes the full session-close state, then hand it to `crystallize.mjs --apply-session-close`, which performs idempotent atomic writes and gates the result with lint.
 
-1. **session-state.md** — update `projects/<name>/session-state.md` with the next tasks list for the upcoming session (what to tackle first next time).
-2. **hot.md (project)** — update `projects/<name>/hot.md` with a session snapshot: what changed and decisions made. Keep under 500 words. Do not put next-step tasks here; those belong in session-state.md.
-3. **hot.md (root)** — update `<hypo-root>/hot.md` active-projects pointer table: set the `Last Session` date for this project to today.
-4. **session-log** — append a session entry to `projects/<name>/session-log/YYYY-MM.md` (create the file if it does not exist for this month).
-5. **open-questions** — only if `pages/open-questions.md` exists and questions were raised or resolved this session: move resolved ones out; add newly raised ones. Skip if unchanged.
-6. **log.md** — append a `session` entry to `<hypo-root>/log.md`.
+Payload shape (5 required + 1 conditional, per Spec §5.2.7 / §8.3 + ADR 0029):
 
----
-
-## Step 3 — Session-close confirmation
-
-After completing the checklist, verify it with the script before reporting:
-
-```bash
-node <package-root>/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
+```json
+{
+  "project": "<project-name>",
+  "date": "YYYY-MM-DD",
+  "sessionState": { "content": "<full body of projects/<name>/session-state.md>" },
+  "projectHot": { "content": "<full body of projects/<name>/hot.md>" },
+  "rootHot": { "content": "<full body of <hypo-root>/hot.md>" },
+  "sessionLog": { "entry": "<entry to append to projects/<name>/session-log/YYYY-MM.md>" },
+  "log": { "entry": "<entry to append to <hypo-root>/log.md>" },
+  "openQuestions": { "content": "<full body of pages/open-questions.md>" }
+}
 ```
 
-This is the same strict check the PreCompact hard gate runs (fix #17). If it
-reports any file as `missing` or `stale`, fix that file and re-run before
-continuing — otherwise `/compact` will be blocked.
+> **Important:** the JSON above is a literal template — do not add `//` or `#` comments when materializing it. `readPayload()` runs `JSON.parse`, which rejects comments and would fail the apply before any write.
 
-Once the check passes, report:
+Field rules:
 
-- ✓ session-state.md updated
-- ✓ hot.md (project + root) updated
+- `project` — optional. Falls back to the active project from root `hot.md` pointer table.
+- `date` — optional. Defaults to today (local). Must be `YYYY-MM-DD` if supplied.
+- `openQuestions` — optional. Include only when `pages/open-questions.md` exists and changed this session.
+- All other top-level fields are required.
+
+Notes:
+
+- `sessionState` / `projectHot` / `rootHot` / `openQuestions` are **overwrite** (full-file content). `sessionLog` / `log` are **append** (entry-level idempotency — exact-entry dedup, safe to re-run).
+- Frontmatter `updated:` is NOT auto-fixed. If your payload's `updated:` is stale, the post-apply verification gate will fail with `stage='post-apply-verification'` and you must fix the payload and retry.
+- Write the payload to a temp path, e.g. `/tmp/hypo-session-close-<YYYY-MM-DD>.json`.
+
+Content guidance for each slot:
+
+1. **sessionState** — next tasks list for the upcoming session (what to tackle first next time).
+2. **projectHot** — session snapshot under 500 words: what changed and decisions made. Do **not** put next-step tasks here; those belong in `sessionState`.
+3. **rootHot** — active-projects pointer table with this project's `Last Session` date set to today.
+4. **sessionLog** — one session entry to append to `projects/<name>/session-log/YYYY-MM.md`.
+5. **log** — one `session` entry to append to `<hypo-root>/log.md`.
+6. **openQuestions** (conditional) — only if `pages/open-questions.md` exists and questions were raised or resolved this session.
+
+---
+
+## Step 3 — Apply the payload
+
+```bash
+node <package-root>/scripts/crystallize.mjs \
+  --apply-session-close \
+  --payload=/tmp/hypo-session-close-<YYYY-MM-DD>.json \
+  --hypo-dir="<path>" \
+  --json
+```
+
+**Behavior (fix #39 option D + fix #40 lint gates):**
+
+| Invocation | Behavior |
+|---|---|
+| `--apply-session-close` (no `--payload`) | **Probe mode** — exits 0 with "오늘 이미 close 완료로 보임" if all 5 files are fresh today; exits 1 with "payload is required" otherwise. Cheap "already complete?" check. |
+| `--apply-session-close --payload=<path>` | **Always-apply** — payload presence = explicit close intent. Per-field idempotent writes (no-op when bytes match), then strict verification + lint gate. Safe to re-run. |
+| `--apply-session-close --force` | Skips the probe early-exit. `--payload` still required for any actual apply work. |
+
+**Two lint gates run automatically (fix #40):**
+
+1. **Preflight** — `lint.mjs --json` runs **before** any payload bytes are written. Errors in files this payload will overwrite (sessionState / projectHot / rootHot / openQuestions) are filtered (they're about to be replaced anyway). Errors in any other file → exit 1 with `stage='preflight-lint'`, no apply occurs.
+2. **Post-apply** — lint re-runs after the writes. Catches payloads that introduce a broken wikilink or malformed body. Surfaces as `stage='post-apply-lint'` (or `'post-apply-verification+lint'` if the freshness gate also fails).
+
+---
+
+## Step 4 — Stage-based recovery
+
+The result JSON includes a `stage` field when `ok: false`. Branch on it:
+
+| `stage` | What broke | How to recover |
+|---|---|---|
+| `preflight-lint` | A non-payload file in the wiki has a blocking lint error. | Fix the lint error in that file (separate from session-close), then re-run. No payload bytes were written. |
+| `post-apply-verification` | A mandatory file's `updated:` frontmatter is stale (≠ today) after apply. | Edit the payload's stale `content` (or supply correct `date`), then re-run. Writes are idempotent — re-applying a corrected payload is safe. |
+| `post-apply-lint` | The payload itself introduced a lint blocker (broken wikilink, bad frontmatter). | Fix the offending content in the payload, then re-run. |
+| `post-apply-verification+lint` | Both above. | Fix both; re-run. |
+
+Once `ok: true`, report:
+
+- ✓ session-state.md applied
+- ✓ hot.md (project + root) applied
 - ✓ session-log entry appended
-- ✓ open-questions updated (or skipped if unchanged)
-- ✓ log.md updated
+- ✓ open-questions applied (or skipped if unchanged)
+- ✓ log.md entry appended
+- ✓ post-apply lint clean
 
 Then ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
 
-If the user says stop, end here. Otherwise continue to Step 4.
+If the user says stop, end here. Otherwise continue to Step 5.
 
 ---
 
-## Step 4 — Surface synthesis candidates
+## Step 5 — Surface synthesis candidates
 
 Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
 
@@ -66,7 +123,7 @@ Show the output to the user. If no candidates are found, tell them Hypomnema loo
 
 ---
 
-## Step 5 — Choose what to crystallize
+## Step 6 — Choose what to crystallize
 
 If candidates exist, ask:
 
@@ -77,7 +134,7 @@ If candidates exist, ask:
 
 ---
 
-## Step 5a — Tag cluster synthesis
+## Step 6a — Tag cluster synthesis
 
 For a tag cluster:
 
@@ -99,7 +156,7 @@ For a tag cluster:
 
 ---
 
-## Step 5b — Draft upgrade
+## Step 6b — Draft upgrade
 
 For a draft page:
 
@@ -110,7 +167,7 @@ For a draft page:
 
 ---
 
-## Step 5c — Cross-link unlinked pages
+## Step 6c — Cross-link unlinked pages
 
 For unlinked pages:
 
@@ -121,6 +178,18 @@ For unlinked pages:
 
 ---
 
-## Step 6 — Report
+## Step 7 — Report
 
 Show what was created or modified, and offer to run `/hypo:lint` to verify all new links resolve.
+
+---
+
+## Appendix — Legacy `--check-session-close`
+
+`--check-session-close` (read-only strict gate, same check PreCompact runs) is still supported as a probe-only verification. Use it when you only want to verify that today's session-close is complete without applying anything:
+
+```bash
+node <package-root>/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
+```
+
+It reports any file as `missing` or `stale`. For an actual close, prefer `--apply-session-close --payload=<path>` (Step 3) — it bundles freshness + lint into one gate and is the documented dogfood path. (`parseArgs` only accepts the `--payload=<path>` spelling; a space-separated `--payload <path>` is silently ignored and triggers "payload is required".)
