@@ -44,6 +44,18 @@
  * The helper does NOT auto-fix `updated:` frontmatter. If a payload field carries a
  * stale date, the final sessionCloseFileStatus check fails with a clear error so the
  * caller fixes the payload and retries. Silent rewrites would mask payload bugs.
+ *
+ * Lint gates (fix #40):
+ *   • Preflight — runs `lint.mjs --json` BEFORE any payload byte is written.
+ *     Errors in files this payload will OVERWRITE (sessionState/projectHot/
+ *     rootHot/openQuestions) are filtered out — they're about to be replaced,
+ *     and not filtering them dead-locks the documented "fix payload and retry"
+ *     recovery after a post-apply-lint failure (codex P2). Errors in any other
+ *     file → exit 1 with stage='preflight-lint', no apply occurs. PreCompact's
+ *     hypo-personal-check is still the final enforcement.
+ *   • Post-apply — runs after the writes. Surfaces as stage='post-apply-lint'
+ *     (or 'post-apply-verification+lint' if freshness also fails). Catches
+ *     payloads that introduce a broken wikilink / malformed body.
  */
 
 import {
@@ -56,9 +68,36 @@ import {
   renameSync,
 } from 'fs';
 import { join, relative, extname, dirname } from 'path';
+import { spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import { sessionCloseFileStatus } from '../hooks/hypo-shared.mjs';
+
+const LINT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'lint.mjs');
+
+// Spawn lint.mjs --json against `hypoDir` and return parsed result.
+// We shell out instead of refactoring lint.mjs into a library because lint.mjs
+// keeps issues in module scope (scripts/lint.mjs:139,250) — a programmatic
+// extraction is its own chore. spawnSync is the minimum-invasive path for #40.
+// Throws only on JSON parse failure (lint crashed mid-run); a lint that exits 1
+// with valid JSON is a normal "errors present" signal, not a crash.
+// maxBuffer raised to 64 MiB: warn-only output on a large wiki can otherwise
+// trip Node's 1 MiB default, truncate stdout, and turn a clean wiki into a
+// JSON.parse crash (codex P3 — fix #40 follow-up).
+function runLint(hypoDir) {
+  const r = spawnSync(process.execPath, [LINT_SCRIPT, `--hypo-dir=${hypoDir}`, '--json'], {
+    encoding: 'utf-8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  try {
+    return JSON.parse(r.stdout);
+  } catch {
+    throw new Error(
+      `lint helper produced unparseable output (exit=${r.status}):\n${r.stdout}\n${r.stderr}`,
+    );
+  }
+}
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -323,6 +362,9 @@ function applySessionClose(args) {
   // Resolve project: explicit payload.project wins; else fall back to active project.
   // Done via sessionCloseFileStatus to keep one source of truth (and so a
   // missing pointer table surfaces the same error shape as --check-session-close).
+  // Resolved BEFORE preflight because preflight needs overwrite-target paths
+  // (which require the project slug) to filter out errors in files this apply
+  // is about to replace — see the filter rationale below.
   const probe = sessionCloseFileStatus(args.hypoDir);
   const project = payload.project || probe.project;
   if (!project) {
@@ -333,6 +375,51 @@ function applySessionClose(args) {
   }
   const date = payload.date || todayLocal();
   const ym = date.slice(0, 7);
+
+  // Fix #40 preflight: lint the wiki BEFORE writing any payload bytes. If lint
+  // has blockers (errors) in files this apply WON'T overwrite, the wiki is in
+  // a degraded state and apply would mask the root cause — abort fail-fast.
+  //
+  // Overwrite-target filter (codex P2 follow-up): errors in files we're about
+  // to fully replace are IGNORED at preflight. Otherwise a bad payload
+  // (post-apply-lint fail) would leave the broken file on disk and the very
+  // next retry — even with a corrected payload — gets dead-locked here. The
+  // post-apply lint is the authoritative check on payload content.
+  //
+  // Append targets (session-log, log.md) are NOT filtered: appending can't
+  // repair existing corruption, so a corrupt session-log must still block.
+  // Warns are informational (not gated) in either pass.
+  const overwriteTargets = new Set();
+  if (payload.sessionState) overwriteTargets.add(join('projects', project, 'session-state.md'));
+  if (payload.projectHot) overwriteTargets.add(join('projects', project, 'hot.md'));
+  if (payload.rootHot) overwriteTargets.add('hot.md');
+  if (payload.openQuestions) overwriteTargets.add(join('pages', 'open-questions.md'));
+
+  let preflightLint;
+  try {
+    preflightLint = runLint(args.hypoDir);
+  } catch (e) {
+    const out = { ok: false, stage: 'preflight-lint', error: e.message };
+    console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${e.message}`);
+    process.exit(1);
+  }
+  const blockingErrors = preflightLint.errors.filter((e) => !overwriteTargets.has(e.file));
+  if (blockingErrors.length > 0) {
+    const out = {
+      ok: false,
+      stage: 'preflight-lint',
+      error: 'lint preflight failed — apply aborted (no payload bytes written)',
+      lint: { ...preflightLint, blockingErrors },
+    };
+    if (args.json) {
+      console.log(JSON.stringify(out, null, 2));
+    } else {
+      console.log('✗ lint preflight failed — apply aborted (no payload bytes written):');
+      for (const e of blockingErrors) console.log(`  ✗ ${e.file}: ${e.message}`);
+      console.log('  Fix the wiki (run `node scripts/lint.mjs`) and retry.');
+    }
+    process.exit(1);
+  }
 
   const applied = [];
   const skipped = [];
@@ -376,7 +463,40 @@ function applySessionClose(args) {
   }
 
   const verification = sessionCloseFileStatus(args.hypoDir);
-  const result = { ok: verification.ok, project, date, applied, skipped, verification };
+
+  // Fix #40 post-apply lint: payload may have introduced a broken wikilink or
+  // a malformed session-state body. Surface as a distinct `stage` so caller can
+  // tell "lint broke" apart from "frontmatter stale". This runs even if the
+  // freshness gate also failed — both failure modes are useful to the caller.
+  let postApplyLint;
+  try {
+    postApplyLint = runLint(args.hypoDir);
+  } catch (e) {
+    postApplyLint = {
+      ok: false,
+      errors: [{ file: '(lint crash)', message: e.message }],
+      warns: [],
+    };
+  }
+
+  const ok = verification.ok && postApplyLint.ok;
+  const stage = ok
+    ? null
+    : !verification.ok && !postApplyLint.ok
+      ? 'post-apply-verification+lint'
+      : !verification.ok
+        ? 'post-apply-verification'
+        : 'post-apply-lint';
+  const result = {
+    ok,
+    stage,
+    project,
+    date,
+    applied,
+    skipped,
+    verification,
+    lint: { preflight: preflightLint, postApply: postApplyLint },
+  };
 
   if (args.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -384,18 +504,25 @@ function applySessionClose(args) {
     console.log(`Session-close apply (project: ${project}, date: ${date}):`);
     for (const a of applied) console.log(`  ✓ wrote ${a}`);
     for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
-    if (verification.ok) {
-      console.log('\n✓ session-close verified — all 5 mandatory files fresh.');
+    if (ok) {
+      console.log('\n✓ session-close verified — all 5 mandatory files fresh, lint clean.');
     } else {
-      const bad = [
-        ...verification.missing.map((f) => `${f} (missing)`),
-        ...verification.stale.map((f) => `${f} (stale)`),
-      ].join(', ');
-      console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
-      console.log('  Fix the payload (likely an `updated:` field) and retry.');
+      if (!verification.ok) {
+        const bad = [
+          ...verification.missing.map((f) => `${f} (missing)`),
+          ...verification.stale.map((f) => `${f} (stale)`),
+        ].join(', ');
+        console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
+        console.log('  Fix the payload (likely an `updated:` field) and retry.');
+      }
+      if (!postApplyLint.ok) {
+        console.log('\n✗ post-apply lint failed:');
+        for (const e of postApplyLint.errors) console.log(`  ✗ ${e.file}: ${e.message}`);
+        console.log('  Payload introduced a lint blocker — fix the payload content and retry.');
+      }
     }
   }
-  process.exit(verification.ok ? 0 : 1);
+  process.exit(ok ? 0 : 1);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
