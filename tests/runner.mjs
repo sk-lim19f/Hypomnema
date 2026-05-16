@@ -1392,6 +1392,101 @@ test('payload via stdin (`--payload=-`) works the same as a file', () => {
   });
 });
 
+// ── fix #40: helper lint preflight + post-apply check ───────────────────────
+
+test('preflight (#40): pre-existing lint blocker → exit 1 stage=preflight-lint, payload NOT applied', () => {
+  // Inject a malformed-frontmatter page (unclosed ---) under projects/. lint.mjs
+  // raises an 'error' for that, which must abort apply before any byte is
+  // written. Verify by checking session-state.md still carries the fixture's
+  // original "- next" body (payload sentinel did not land).
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'broken.md'),
+        '---\ntitle: broken\ntype: concept\n\nbody (frontmatter never closes)\n',
+      );
+    },
+    (dir, today) => {
+      const sentinel = `<!-- preflight-sentinel-${Date.now()} -->`;
+      const payload = payloadForCleanWiki(dir, today);
+      payload.sessionState = {
+        content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
+      };
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 1, `preflight must abort, got ${r.status}\n${r.stdout}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false);
+      assert.equal(out.stage, 'preflight-lint', `stage should be preflight-lint: ${r.stdout}`);
+      const onDisk = readFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
+        'utf-8',
+      );
+      assert.ok(
+        !onDisk.includes(sentinel),
+        'preflight failure must NOT have written payload sentinel',
+      );
+    },
+  );
+});
+
+test('post-apply (#40): payload introduces lint blocker → exit 1 stage=post-apply-lint, bytes written', () => {
+  // Payload writes a session-state body that omits the required "## 다음 작업"
+  // heading — lint raises an error, but freshness gate still passes (updated:
+  // today). Apply DID write (sentinel present on disk), but final result is
+  // ok:false with stage=post-apply-lint so caller distinguishes "wiki was
+  // damaged" from "frontmatter stale".
+  withWiki(null, (dir, today) => {
+    const sentinel = `<!-- post-apply-sentinel-${Date.now()} -->`;
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionState = {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## random heading without required label\n\n- next\n`,
+    };
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `post-apply lint must fail, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.stage, 'post-apply-lint', `stage should be post-apply-lint: ${r.stdout}`);
+    assert.equal(out.verification.ok, true, 'freshness gate should still pass');
+    const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    assert.ok(onDisk.includes(sentinel), 'post-apply path must have written the payload sentinel');
+  });
+});
+
+test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry → succeeds (no dead-lock)', () => {
+  // Codex review of fix #40 caught a dead-lock: a payload that fails
+  // post-apply-lint leaves the broken file on disk, and the retry hits
+  // preflight on that same broken file → "fix payload and retry" is
+  // impossible. Preflight must filter errors in files this apply will
+  // overwrite. Lock the documented recovery path.
+  withWiki(null, (dir, today) => {
+    // 1. Apply a bad payload (session-state missing required heading)
+    const bad = payloadForCleanWiki(dir, today);
+    bad.sessionState = {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## wrong heading\n\n- next\n`,
+    };
+    const r1 = runApply(dir, bad);
+    assert.equal(r1.status, 1, `bad payload must fail: ${r1.stdout}`);
+    assert.equal(JSON.parse(r1.stdout).stage, 'post-apply-lint');
+
+    // 2. Retry with corrected payload — must succeed (was dead-locked before fix)
+    const good = payloadForCleanWiki(dir, today);
+    good.sessionState = {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- fixed\n`,
+    };
+    good.sessionLog.entry = `## [${today}] retry after fix\n`;
+    good.log.entry = `## [${today}] session | test-project — retry\n`;
+    const r2 = runApply(dir, good);
+    assert.equal(
+      r2.status,
+      0,
+      `retry must succeed (P2 dead-lock regression), got ${r2.status}\n${r2.stdout}`,
+    );
+    const out = JSON.parse(r2.stdout);
+    assert.equal(out.ok, true);
+    assert.equal(out.lint.postApply.ok, true, 'post-apply lint should now pass');
+  });
+});
+
 // ── upgrade.mjs smoke tests ───────────────────────────────────────────────────
 
 suite('upgrade.mjs --json');
