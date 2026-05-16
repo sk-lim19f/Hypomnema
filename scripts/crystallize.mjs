@@ -46,7 +46,15 @@
  * caller fixes the payload and retries. Silent rewrites would mask payload bugs.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+  mkdirSync,
+  renameSync,
+} from 'fs';
 import { join, relative, extname, dirname } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
@@ -56,17 +64,22 @@ import { sessionCloseFileStatus } from '../hooks/hypo-shared.mjs';
 
 function parseArgs(argv) {
   const args = {
-    hypoDir: null, minGroup: 2, json: false,
-    checkSessionClose: false, applySessionClose: false, payload: null, force: false,
+    hypoDir: null,
+    minGroup: 2,
+    json: false,
+    checkSessionClose: false,
+    applySessionClose: false,
+    payload: null,
+    force: false,
   };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--hypo-dir='))    args.hypoDir  = expandHome(arg.slice(11));
+    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--min-group=')) args.minGroup = parseInt(arg.slice(12), 10) || 2;
     else if (arg === '--check-session-close') args.checkSessionClose = true;
     else if (arg === '--apply-session-close') args.applySessionClose = true;
     else if (arg.startsWith('--payload=')) args.payload = arg.slice(10);
-    else if (arg === '--force')            args.force    = true;
-    else if (arg === '--json')             args.json     = true;
+    else if (arg === '--force') args.force = true;
+    else if (arg === '--json') args.json = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -80,26 +93,34 @@ function runSessionCloseCheck(args) {
   const status = sessionCloseFileStatus(args.hypoDir);
 
   if (args.json) {
-    console.log(JSON.stringify({
-      ok: status.ok,
-      project: status.project,
-      dates: status.dates,
-      stale: status.stale,
-      missing: status.missing,
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          ok: status.ok,
+          project: status.project,
+          dates: status.dates,
+          stale: status.stale,
+          missing: status.missing,
+        },
+        null,
+        2,
+      ),
+    );
     process.exit(status.ok ? 0 : 1);
   }
 
   const proj = status.project || '(unresolved)';
   console.log(`Session-close check (project: ${proj}, date: ${status.dates.join(' / ')}):\n`);
 
-  const required = status.project ? [
-    `projects/${status.project}/session-state.md`,
-    `projects/${status.project}/hot.md`,
-    'hot.md',
-    `projects/${status.project}/session-log/${status.dates[0].slice(0, 7)}.md`,
-    'log.md',
-  ] : [];
+  const required = status.project
+    ? [
+        `projects/${status.project}/session-state.md`,
+        `projects/${status.project}/hot.md`,
+        'hot.md',
+        `projects/${status.project}/session-log/${status.dates[0].slice(0, 7)}.md`,
+        'log.md',
+      ]
+    : [];
   for (const f of required) {
     const bad = status.missing.includes(f) ? 'missing' : status.stale.includes(f) ? 'stale' : '';
     console.log(`  ${bad ? '✗' : '✓'} ${f}${bad ? ` — ${bad}` : ''}`);
@@ -109,9 +130,11 @@ function runSessionCloseCheck(args) {
     if (!required.includes(f)) console.log(`  ✗ ${f}`);
   }
   console.log('');
-  console.log(status.ok
-    ? '✓ All required memory files updated this session. (open-questions.md: conditional, not checked)'
-    : '✗ Session close incomplete — update the files marked above, then retry.');
+  console.log(
+    status.ok
+      ? '✓ All required memory files updated this session. (open-questions.md: conditional, not checked)'
+      : '✗ Session close incomplete — update the files marked above, then retry.',
+  );
   process.exit(status.ok ? 0 : 1);
 }
 
@@ -131,7 +154,8 @@ function runSessionCloseCheck(args) {
 // the payload and retries — silent rewrites would hide payload bugs (advisor #3).
 
 function readPayload(source) {
-  if (!source) throw new Error('--payload is required with --apply-session-close (path or `-` for stdin)');
+  if (!source)
+    throw new Error('--payload is required with --apply-session-close (path or `-` for stdin)');
   let raw;
   if (source === '-') {
     // Synchronous stdin read; payloads are tiny (a few hundred KB at most).
@@ -141,8 +165,11 @@ function readPayload(source) {
     if (!existsSync(path)) throw new Error(`payload file not found: ${path}`);
     raw = readFileSync(path, 'utf-8');
   }
-  try { return JSON.parse(raw); }
-  catch (e) { throw new Error(`payload is not valid JSON: ${e.message}`); }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`payload is not valid JSON: ${e.message}`);
+  }
 }
 
 /** Atomic write via tmp+rename. `<path>.<pid>.<rand>.tmp` so concurrent helpers
@@ -158,8 +185,10 @@ function atomicWrite(path, content) {
 function writeIfChanged(path, content) {
   if (existsSync(path)) {
     try {
-      if (readFileSync(path, 'utf-8') === content) return false;  // idempotent skip
-    } catch { /* fall through to overwrite */ }
+      if (readFileSync(path, 'utf-8') === content) return false; // idempotent skip
+    } catch {
+      /* fall through to overwrite */
+    }
   }
   atomicWrite(path, content);
   return true;
@@ -174,11 +203,16 @@ function writeIfChanged(path, content) {
 function appendIfAbsent(path, entry, alreadyPresent) {
   let content = '';
   if (existsSync(path)) {
-    try { content = readFileSync(path, 'utf-8'); } catch { content = ''; }
+    try {
+      content = readFileSync(path, 'utf-8');
+    } catch {
+      content = '';
+    }
   }
   if (alreadyPresent(content)) return false;
   // Ensure single blank line between existing tail and new entry, no trailing dup.
-  const sep = content === '' ? '' : (content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n');
+  const sep =
+    content === '' ? '' : content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
   const next = entry.endsWith('\n') ? entry : entry + '\n';
   atomicWrite(path, content + sep + next);
   return true;
@@ -196,11 +230,11 @@ function todayLocal() {
 // rather than silently relying on yesterday's freshness state. (Codex review
 // of fix #38 — Worker 1 finding 1.)
 const REQUIRED_PAYLOAD_FIELDS = [
-  ['sessionState',  'content'],
-  ['projectHot',    'content'],
-  ['rootHot',       'content'],
-  ['sessionLog',    'entry'],
-  ['log',           'entry'],
+  ['sessionState', 'content'],
+  ['projectHot', 'content'],
+  ['rootHot', 'content'],
+  ['sessionLog', 'entry'],
+  ['log', 'entry'],
 ];
 
 function validatePayloadShape(payload) {
@@ -220,8 +254,11 @@ function validatePayloadShape(payload) {
     }
   }
   if (payload.openQuestions !== undefined) {
-    if (!payload.openQuestions || typeof payload.openQuestions !== 'object'
-        || typeof payload.openQuestions.content !== 'string') {
+    if (
+      !payload.openQuestions ||
+      typeof payload.openQuestions !== 'object' ||
+      typeof payload.openQuestions.content !== 'string'
+    ) {
       errs.push('payload.openQuestions, when present, must be { content: string }');
     }
   }
@@ -264,8 +301,9 @@ function applySessionClose(args) {
   }
 
   let payload;
-  try { payload = readPayload(args.payload); }
-  catch (e) {
+  try {
+    payload = readPayload(args.payload);
+  } catch (e) {
     const out = { ok: false, error: e.message };
     console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${e.message}`);
     process.exit(1);
@@ -274,9 +312,11 @@ function applySessionClose(args) {
   const schemaErrs = validatePayloadShape(payload);
   if (schemaErrs.length > 0) {
     const out = { ok: false, error: 'payload schema invalid', details: schemaErrs };
-    console.log(args.json
-      ? JSON.stringify(out, null, 2)
-      : `✗ payload schema invalid:\n  ${schemaErrs.join('\n  ')}`);
+    console.log(
+      args.json
+        ? JSON.stringify(out, null, 2)
+        : `✗ payload schema invalid:\n  ${schemaErrs.join('\n  ')}`,
+    );
     process.exit(1);
   }
 
@@ -286,33 +326,34 @@ function applySessionClose(args) {
   const probe = sessionCloseFileStatus(args.hypoDir);
   const project = payload.project || probe.project;
   if (!project) {
-    const msg = 'no project resolved (payload.project missing and root hot.md has no active-project row)';
+    const msg =
+      'no project resolved (payload.project missing and root hot.md has no active-project row)';
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
   const date = payload.date || todayLocal();
-  const ym   = date.slice(0, 7);
+  const ym = date.slice(0, 7);
 
   const applied = [];
   const skipped = [];
 
   const overwrite = (key, relPath, field) => {
-    if (!field || typeof field.content !== 'string') return;  // optional / absent
+    if (!field || typeof field.content !== 'string') return; // optional / absent
     const wrote = writeIfChanged(join(args.hypoDir, relPath), field.content);
     (wrote ? applied : skipped).push(`${key} (${relPath})`);
   };
 
   overwrite('sessionState', join('projects', project, 'session-state.md'), payload.sessionState);
-  overwrite('projectHot',   join('projects', project, 'hot.md'),           payload.projectHot);
-  overwrite('rootHot',      'hot.md',                                       payload.rootHot);
-  overwrite('openQuestions', join('pages', 'open-questions.md'),            payload.openQuestions);
+  overwrite('projectHot', join('projects', project, 'hot.md'), payload.projectHot);
+  overwrite('rootHot', 'hot.md', payload.rootHot);
+  overwrite('openQuestions', join('pages', 'open-questions.md'), payload.openQuestions);
 
   // Append idempotency: dedup by exact-entry presence, not by "any heading
   // dated today". The freshness gate (sessionCloseFileStatus) is what answers
   // "was this file touched today?"; that's a different concern and must not
   // be reused for apply-time dedup, or a legitimate same-day second close gets
   // silently dropped (Codex review of fix #38 — Worker 1 finding 2).
-  const entryAlreadyPresent = entry => content =>
+  const entryAlreadyPresent = (entry) => (content) =>
     content.includes(entry.endsWith('\n') ? entry.replace(/\n+$/, '') : entry);
 
   {
@@ -347,8 +388,8 @@ function applySessionClose(args) {
       console.log('\n✓ session-close verified — all 5 mandatory files fresh.');
     } else {
       const bad = [
-        ...verification.missing.map(f => `${f} (missing)`),
-        ...verification.stale.map(f => `${f} (stale)`),
+        ...verification.missing.map((f) => `${f} (missing)`),
+        ...verification.stale.map((f) => `${f} (stale)`),
       ].join(', ');
       console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
       console.log('  Fix the payload (likely an `updated:` field) and retry.');
@@ -381,7 +422,10 @@ function parseFrontmatter(content) {
   for (const line of m[1].split('\n')) {
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    fm[line.slice(0, idx).trim()] = line
+      .slice(idx + 1)
+      .trim()
+      .replace(/^["']|["']$/g, '');
   }
   return fm;
 }
@@ -389,11 +433,14 @@ function parseFrontmatter(content) {
 function parseTags(fm) {
   if (!fm.tags) return [];
   const raw = fm.tags.trim().replace(/^\[|\]$/g, '');
-  return raw.split(',').map(t => t.trim()).filter(Boolean);
+  return raw
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
 }
 
 function extractWikilinks(content) {
-  return [...content.matchAll(/\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]/g)].map(m => m[1].trim());
+  return [...content.matchAll(/\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]/g)].map((m) => m[1].trim());
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -401,30 +448,34 @@ function extractWikilinks(content) {
 const args = parseArgs(process.argv);
 
 if (args.applySessionClose) {
-  applySessionClose(args);   // exits
+  applySessionClose(args); // exits
 }
 
 if (args.checkSessionClose) {
-  runSessionCloseCheck(args);   // exits
+  runSessionCloseCheck(args); // exits
 }
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const pagesDir = join(args.hypoDir, 'pages');
 const pages = collectPages(pagesDir, args.hypoDir, [], ignorePatterns);
 
-const tagGroups  = {};  // tag → [{ slug, title }]
-const unlinked   = [];  // pages with no outbound wikilinks
-const drafts     = [];  // pages tagged draft
+const tagGroups = {}; // tag → [{ slug, title }]
+const unlinked = []; // pages with no outbound wikilinks
+const drafts = []; // pages tagged draft
 
 for (const { path, rel } of pages) {
   let content;
-  try { content = readFileSync(path, 'utf-8'); } catch { continue; }
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch {
+    continue;
+  }
   const fm = parseFrontmatter(content);
   if (!fm) continue;
 
-  const slug  = rel.replace(/\.md$/, '');
+  const slug = rel.replace(/\.md$/, '');
   const title = fm.title || slug;
-  const tags  = parseTags(fm);
+  const tags = parseTags(fm);
 
   // tag groups
   for (const tag of tags) {
@@ -438,7 +489,7 @@ for (const { path, rel } of pages) {
   }
 
   // unlinked (no outbound wikilinks in body)
-  const body  = content.replace(/^---[\s\S]*?---/, '');
+  const body = content.replace(/^---[\s\S]*?---/, '');
   const links = extractWikilinks(body);
   if (links.length === 0) unlinked.push({ slug, title });
 }

@@ -5,7 +5,11 @@ export function parseFrontmatter(content) {
   for (const line of m[1].split(/\r?\n/)) {
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line.slice(idx + 1).trim().replace(/\s*#.*$/, '').replace(/^["']|["']$/g, '');
+    fm[line.slice(0, idx).trim()] = line
+      .slice(idx + 1)
+      .trim()
+      .replace(/\s*#.*$/, '')
+      .replace(/^["']|["']$/g, '');
   }
   return fm;
 }

@@ -22,14 +22,16 @@ function emitContinue() {
 
 let raw = '';
 process.stdin.setEncoding('utf-8');
-process.stdin.on('data', chunk => raw += chunk);
+process.stdin.on('data', (chunk) => (raw += chunk));
 process.stdin.on('end', () => {
   try {
     let payload = {};
-    try { payload = JSON.parse(raw) || {}; } catch {}
+    try {
+      payload = JSON.parse(raw) || {};
+    } catch {}
 
     const transcriptPath = payload.transcript_path || payload.transcriptPath || null;
-    const sessionId      = payload.session_id || payload.sessionId || null;
+    const sessionId = payload.session_id || payload.sessionId || null;
     if (!transcriptPath || !sessionId) {
       // Older Claude Code (no transcript_path) — fallback path in
       // scripts/session-audit.mjs handles this case.
@@ -37,7 +39,10 @@ process.stdin.on('end', () => {
       return;
     }
 
-    if (!existsSync(HYPO_DIR)) { emitContinue(); return; }
+    if (!existsSync(HYPO_DIR)) {
+      emitContinue();
+      return;
+    }
     mkdirSync(dirname(INDEX_PATH), { recursive: true });
 
     const entry = {

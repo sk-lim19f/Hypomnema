@@ -25,8 +25,8 @@ function parseArgs(argv) {
   const args = { hypoDir: null, json: false, fix: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg === '--json')         args.json = true;
-    else if (arg === '--fix')          args.fix  = true;
+    else if (arg === '--json') args.json = true;
+    else if (arg === '--fix') args.fix = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -41,7 +41,10 @@ function parseFrontmatter(content) {
   for (const line of m[1].split('\n')) {
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    fm[line.slice(0, idx).trim()] = line
+      .slice(idx + 1)
+      .trim()
+      .replace(/^["']|["']$/g, '');
   }
   return fm;
 }
@@ -87,11 +90,11 @@ function buildSlugMap(pages) {
 // wikilinks between them.
 function stripNonWikilinkRegions(content) {
   let out = content;
-  out = out.replace(/^[ \t]{0,3}```[\s\S]*?^[ \t]{0,3}```/gm, m => m.replace(/[^\n]/g, ' '));
-  out = out.replace(/^[ \t]{0,3}~~~[\s\S]*?^[ \t]{0,3}~~~/gm, m => m.replace(/[^\n]/g, ' '));
-  out = out.replace(/<!--[\s\S]*?-->/g, m => m.replace(/[^\n]/g, ' '));
-  out = out.replace(/``[^`\n]*``/g, m => ' '.repeat(m.length));
-  out = out.replace(/`[^`\n]*`/g, m => ' '.repeat(m.length));
+  out = out.replace(/^[ \t]{0,3}```[\s\S]*?^[ \t]{0,3}```/gm, (m) => m.replace(/[^\n]/g, ' '));
+  out = out.replace(/^[ \t]{0,3}~~~[\s\S]*?^[ \t]{0,3}~~~/gm, (m) => m.replace(/[^\n]/g, ' '));
+  out = out.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '));
+  out = out.replace(/``[^`\n]*``/g, (m) => ' '.repeat(m.length));
+  out = out.replace(/`[^`\n]*`/g, (m) => ' '.repeat(m.length));
   return out;
 }
 
@@ -108,10 +111,27 @@ function extractWikilinks(content) {
 
 const REQUIRED_FIELDS = ['title', 'type'];
 const VALID_TYPES = [
-  'concept', 'source-summary', 'entity', 'tool-eval', 'prompt-pattern',
-  'playbook', 'learning', 'tip', 'feedback', 'reference', 'synthesis',
-  'weekly-journal', 'prd', 'adr', 'session-log', 'session-state',
-  'project-index', 'postmortem', 'open-questions', 'schema', 'source',
+  'concept',
+  'source-summary',
+  'entity',
+  'tool-eval',
+  'prompt-pattern',
+  'playbook',
+  'learning',
+  'tip',
+  'feedback',
+  'reference',
+  'synthesis',
+  'weekly-journal',
+  'prd',
+  'adr',
+  'session-log',
+  'session-state',
+  'project-index',
+  'postmortem',
+  'open-questions',
+  'schema',
+  'source',
 ];
 
 const issues = [];
@@ -128,18 +148,22 @@ function hasHeading(content, heading) {
 function lintSessionStateHeadings(content, rel) {
   if (!rel.match(/^projects\/[^/]+\/session-state\.md$/)) return;
 
-  if (!SESSION_STATE_NEXT_HEADINGS.some(heading => hasHeading(content, heading))) {
+  if (!SESSION_STATE_NEXT_HEADINGS.some((heading) => hasHeading(content, heading))) {
     issue(
       'error',
       rel,
-      `Missing required session-state heading: one of ${SESSION_STATE_NEXT_HEADINGS.map(h => `## ${h}`).join(', ')}`
+      `Missing required session-state heading: one of ${SESSION_STATE_NEXT_HEADINGS.map((h) => `## ${h}`).join(', ')}`,
     );
   }
 }
 
 function lintPage({ path, rel }, slugMap) {
   let content;
-  try { content = readFileSync(path, 'utf-8'); } catch { return; }
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch {
+    return;
+  }
 
   if (!content.match(/^---\r?\n/)) {
     issue('warn', rel, 'No frontmatter found');
@@ -178,8 +202,8 @@ function lintPage({ path, rel }, slugMap) {
 const args = parseArgs(process.argv);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
-const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
-const pages = scanDirs.flatMap(d => collectPages(d, args.hypoDir, [], ignorePatterns));
+const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
+const pages = scanDirs.flatMap((d) => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugMap = buildSlugMap(pages);
 
 for (const page of pages) lintPage(page, slugMap);
@@ -188,7 +212,11 @@ if (args.fix) {
   const today = new Date().toISOString().slice(0, 10);
   const fixed = new Set();
   for (const iss of issues) {
-    if (iss.severity === 'warn' && iss.message === 'Missing frontmatter field: updated' && iss.path) {
+    if (
+      iss.severity === 'warn' &&
+      iss.message === 'Missing frontmatter field: updated' &&
+      iss.path
+    ) {
       const content = readFileSync(iss.path, 'utf-8');
       const fmMatch = /^---\r?\n[\s\S]*?\r?\n---/.exec(content);
       if (fmMatch) {
@@ -196,25 +224,46 @@ if (args.fix) {
         const closingTag = `${lineEnding}---`;
         const insertAt = fmMatch.index + fmMatch[0].lastIndexOf(closingTag);
         if (insertAt < 0) continue;
-        const fixedContent = content.slice(0, insertAt) + `${lineEnding}updated: ${today}` + content.slice(insertAt);
+        const fixedContent =
+          content.slice(0, insertAt) + `${lineEnding}updated: ${today}` + content.slice(insertAt);
         writeFileSync(iss.path, fixedContent);
         fixed.add(iss.path);
       }
     }
   }
   if (fixed.size > 0) {
-    issues.splice(0, issues.length, ...issues.filter(
-      i => !(i.severity === 'warn' && i.message === 'Missing frontmatter field: updated' && fixed.has(i.path))
-    ));
+    issues.splice(
+      0,
+      issues.length,
+      ...issues.filter(
+        (i) =>
+          !(
+            i.severity === 'warn' &&
+            i.message === 'Missing frontmatter field: updated' &&
+            fixed.has(i.path)
+          ),
+      ),
+    );
   }
 }
 
-const errors = issues.filter(i => i.severity === 'error');
-const warns  = issues.filter(i => i.severity === 'warn');
+const errors = issues.filter((i) => i.severity === 'error');
+const warns = issues.filter((i) => i.severity === 'warn');
 
 if (args.json) {
   const toOut = ({ severity, file, message }) => ({ severity, file, message });
-  console.log(JSON.stringify({ ok: errors.length === 0, errors: errors.map(toOut), warns: warns.map(toOut), total: issues.length }, null, 2));
+  console.log(
+    JSON.stringify(
+      {
+        ok: errors.length === 0,
+        errors: errors.map(toOut),
+        warns: warns.map(toOut),
+        total: issues.length,
+      },
+      null,
+      2,
+    ),
+  );
 } else {
   if (issues.length === 0) {
     console.log('✓ No lint issues found');

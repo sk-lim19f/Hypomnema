@@ -26,8 +26,8 @@ function parseArgs(argv) {
   const args = { hypoDir: null, file: null, json: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg.startsWith('--file='))    args.file   = expandHome(arg.slice(7));
-    else if (arg === '--json')             args.json   = true;
+    else if (arg.startsWith('--file=')) args.file = expandHome(arg.slice(7));
+    else if (arg === '--json') args.json = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -55,7 +55,11 @@ function parseFrontmatter(content) {
   for (const line of m[1].split('\n')) {
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line.slice(idx + 1).trim().replace(/\s*#.*$/, '').replace(/^["']|["']$/g, '');
+    fm[line.slice(0, idx).trim()] = line
+      .slice(idx + 1)
+      .trim()
+      .replace(/\s*#.*$/, '')
+      .replace(/^["']|["']$/g, '');
   }
   return fm;
 }
@@ -72,18 +76,22 @@ if (args.file) {
   files = [args.file];
 } else {
   const ignorePatterns = loadHypoIgnore(args.hypoDir);
-  const scanDirs = ['pages', 'projects'].map(d => join(args.hypoDir, d));
-  files = scanDirs.flatMap(d => collectMdFiles(d, [], args.hypoDir, ignorePatterns));
+  const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
+  files = scanDirs.flatMap((d) => collectMdFiles(d, [], args.hypoDir, ignorePatterns));
 }
 
-const overdue  = [];
+const overdue = [];
 const upcoming = [];
-const missing  = [];
-const ok       = [];
+const missing = [];
+const ok = [];
 
 for (const file of files) {
   let content;
-  try { content = readFileSync(file, 'utf-8'); } catch { continue; }
+  try {
+    content = readFileSync(file, 'utf-8');
+  } catch {
+    continue;
+  }
   const fm = parseFrontmatter(content);
   if (!fm) continue;
 
@@ -152,16 +160,18 @@ if (ok.length > 0 && overdue.length === 0 && upcoming.length === 0) {
 }
 
 const summary = [
-  overdue.length  ? `${overdue.length} overdue`  : '',
+  overdue.length ? `${overdue.length} overdue` : '',
   upcoming.length ? `${upcoming.length} due soon` : '',
-  missing.length  ? `${missing.length} missing verify_by` : '',
-  ok.length       ? `${ok.length} ok` : '',
-].filter(Boolean).join(', ');
+  missing.length ? `${missing.length} missing verify_by` : '',
+  ok.length ? `${ok.length} ok` : '',
+]
+  .filter(Boolean)
+  .join(', ');
 
 console.log(`Result: ${summary || 'nothing to verify'}`);
 
 // Emit signal lines for overdue/upcoming pages so /hypo:verify skill can drive review
-const needsReview = [...overdue, ...upcoming].filter(p => p.verify_by);
+const needsReview = [...overdue, ...upcoming].filter((p) => p.verify_by);
 if (needsReview.length > 0) {
   console.log('');
   for (const p of needsReview) {

@@ -18,22 +18,29 @@ if (gitRoot.status !== 0) process.exit(0);
 const hypoDir = gitRoot.stdout.replace(/\r?\n$/, '');
 
 // Get staged files (NUL-separated for safe handling of special chars)
-const staged = spawnSync('git', ['diff', '--cached', '--name-only', '-z'], { encoding: 'utf-8', cwd: hypoDir });
+const staged = spawnSync('git', ['diff', '--cached', '--name-only', '-z'], {
+  encoding: 'utf-8',
+  cwd: hypoDir,
+});
 if (staged.status !== 0 || !staged.stdout) process.exit(0);
 
-const files = staged.stdout.split('\0').filter(Boolean).map(f => join(hypoDir, f));
+const files = staged.stdout
+  .split('\0')
+  .filter(Boolean)
+  .map((f) => join(hypoDir, f));
 const patterns = loadHypoIgnore(hypoDir);
 
 if (patterns.length === 0) process.exit(0);
 
-const blocked = files.filter(f => isIgnored(f, hypoDir, patterns));
+const blocked = files.filter((f) => isIgnored(f, hypoDir, patterns));
 if (blocked.length === 0) process.exit(0);
 
-const rel = blocked.map(f => f.slice(hypoDir.length + 1));
+const rel = blocked.map((f) => f.slice(hypoDir.length + 1));
 process.stderr.write(
   `[hypo] Commit blocked — staged files match .hypoignore patterns:\n` +
-  rel.map(f => `  ${f}`).join('\n') + '\n' +
-  `\nUnstage with: git restore --staged <file>\n` +
-  `Override (at your own risk): git commit --no-verify\n`
+    rel.map((f) => `  ${f}`).join('\n') +
+    '\n' +
+    `\nUnstage with: git restore --staged <file>\n` +
+    `Override (at your own risk): git commit --no-verify\n`,
 );
 process.exit(1);

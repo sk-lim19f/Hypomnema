@@ -10,9 +10,9 @@ import { HYPO_DIR, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
 
 let input = {};
 try {
-  const raw = await new Promise(r => {
+  const raw = await new Promise((r) => {
     let d = '';
-    process.stdin.on('data', c => d += c);
+    process.stdin.on('data', (c) => (d += c));
     process.stdin.on('end', () => r(d));
   });
   input = JSON.parse(raw);

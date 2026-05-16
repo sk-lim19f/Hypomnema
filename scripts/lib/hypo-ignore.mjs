@@ -6,19 +6,21 @@ export function loadHypoIgnore(hypoDir) {
   if (!existsSync(ignorePath)) return [];
   return readFileSync(ignorePath, 'utf-8')
     .split('\n')
-    .map(l => l.trim())
-    .filter(l => l && !l.startsWith('#'));
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
 }
 
 function globToRegex(glob) {
-  return new RegExp('^' +
-    glob
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*\*/g, '\x00')   // placeholder before single-* replacement
-      .replace(/\*/g, '[^/]*')
-      .replace(/\?/g, '[^/]')
-      .replace(/\x00/g, '.*')     // restore ** → .*
-  + '$');
+  return new RegExp(
+    '^' +
+      glob
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*\*/g, '\x00') // placeholder before single-* replacement
+        .replace(/\*/g, '[^/]*')
+        .replace(/\?/g, '[^/]')
+        .replace(/\x00/g, '.*') + // restore ** → .*
+      '$',
+  );
 }
 
 export function isIgnored(filePath, hypoDir, patterns) {
