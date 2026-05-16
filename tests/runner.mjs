@@ -901,10 +901,15 @@ function payloadForCleanWiki(dir, today) {
   };
 }
 
-function runApply(dir, payload) {
+function runApply(dir, payload, { force = false } = {}) {
+  // Fix #39 (option D): payload presence = explicit close intent → always runs
+  // full apply. --force only matters for the no-payload probe path, so tests
+  // that supply a payload do NOT need --force.
   const payloadPath = join(dir, '.payload.json');
   writeFileSync(payloadPath, JSON.stringify(payload));
-  return run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', `--payload=${payloadPath}`, '--json']);
+  const flags = [`--hypo-dir=${dir}`, '--apply-session-close', `--payload=${payloadPath}`, '--json'];
+  if (force) flags.push('--force');
+  return run('crystallize.mjs', flags);
 }
 
 test('clean-wiki payload → ok:true, new entries appended (apply dedup is exact-entry, not date-based)', () => {
@@ -1001,9 +1006,17 @@ test('payload with stale `updated:` → exit 1, no auto-fix (advisor rule)', () 
 });
 
 test('missing payload → exit 1 with clear error', () => {
-  withWiki(null, (dir) => {
+  // With fix #39 (option D) the probe early-exit only fires on a clean wiki.
+  // Mark hot.md stale so the gate fails → no early-exit → payload-required
+  // error is reachable as the original test intends.
+  withWiki((dir) => {
+    writeFileSync(join(dir, 'hot.md'),
+      '---\ntitle: Hot\nupdated: 2020-01-01\n---\n# Hot\n\n## Active Projects\n\n' +
+      '| Project | Last Session | Hot Cache |\n|---|---|---|\n' +
+      '| test-project | 2020-01-01 | [[projects/test-project/hot]] |\n');
+  }, (dir) => {
     const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
-    assert.equal(r.status, 1);
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.ok(/payload is required/.test(out.error), `error should mention payload: ${out.error}`);
@@ -1088,6 +1101,70 @@ test('hasLogEntry: project "foo" must NOT match "foo-bar" (W2 boundary regressio
     const out = JSON.parse(r.stdout);
     assert.ok(out.stale.includes('log.md') || out.missing.includes('log.md'),
       `log.md must be flagged stale/missing for foo: ${JSON.stringify(out)}`);
+  });
+});
+
+// ── fix #39: probe early-exit (option D) ─────────────────────────────────────
+
+test('probe (#39): no payload + gate ok → exit 0 with alreadyComplete', () => {
+  // buildCleanWikiTree() leaves the wiki in a passing-gate state for `today`.
+  // With no --payload, the helper runs as a cheap "already complete?" probe:
+  // gate ok → exit 0 alreadyComplete:true, no payload required.
+  withWiki(null, (dir, today) => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    assert.equal(r.status, 0, `probe must succeed, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.equal(out.alreadyComplete, true, `alreadyComplete flag must be set: ${r.stdout}`);
+    assert.equal(out.date, today);
+  });
+});
+
+test('apply (#39): payload supplied + gate ok → still full apply (W1-2 guard, no --force)', () => {
+  // Option D core invariant: payload presence = explicit close intent.
+  // Same-day second close with a NEW sessionLog entry must land WITHOUT
+  // requiring --force. fix #38's exact-entry dedup is the only safety net,
+  // and a probe-style short-circuit here would re-introduce W1-2 silent drop.
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog.entry = `## [${today}] 2nd close\n\nnew body\n`;
+    payload.log.entry        = `## [${today}] session | test-project — 2nd\n`;
+    const r = runApply(dir, payload);   // no --force
+    assert.equal(r.status, 0, `payload apply failed: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.ok(!out.alreadyComplete, 'payload path must run full apply, not probe');
+    const sl = readFileSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`), 'utf-8');
+    assert.ok(sl.includes('2nd close'), `2nd-close entry must land on disk: ${sl}`);
+  });
+});
+
+test('probe (#39): --force without --payload → payload-required (force does NOT bypass payload gate)', () => {
+  // Lock the documented contract: --force only bypasses the alreadyComplete
+  // probe shortcut. Payload is always required for apply work. (Codex W1
+  // single-worker review — missing edge-case lock.)
+  withWiki(null, (dir) => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--force', '--json']);
+    assert.equal(r.status, 1, `--force alone must error, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(/payload is required/.test(out.error), `must surface payload-required: ${out.error}`);
+  });
+});
+
+test('probe (#39): gate NOT ok + no payload → falls through to payload-required (no skip)', () => {
+  // Stale gate must NOT trigger the alreadyComplete probe — fallthrough
+  // surfaces the "payload is required" error so the caller knows to supply
+  // close content.
+  withWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'test-project', 'hot.md'),
+      `---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n`);
+  }, (dir) => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    assert.equal(r.status, 1, `stale gate + no payload must error, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(/payload is required/.test(out.error), `must surface payload-required: ${out.error}`);
   });
 });
 
