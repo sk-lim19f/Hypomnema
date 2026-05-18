@@ -28,9 +28,9 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
   ```bash
   node <package-root>/scripts/session-audit.mjs [--hypo-dir="<path>"] [--limit=20]
   ```
-- **Weekly report (when the user asks for "weekly", "score", or names a week)** — write the report to `pages/observability/<YYYY-WW>.md`:
+- **Weekly report (when the user asks for "weekly", "score", or names a week)** — write the report to `journal/weekly/<YYYY-Www>.md` (spec §6.4 SoT):
   ```bash
-  node <package-root>/scripts/weekly-report.mjs [--hypo-dir="<path>"] [--week=YYYY-WW] --write
+  node <package-root>/scripts/weekly-report.mjs [--hypo-dir="<path>"] [--week=YYYY-Www] --write
   ```
 - **JSON for tooling** — append `--json` to either script.
 

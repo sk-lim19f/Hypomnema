@@ -328,7 +328,7 @@ scripts/session-audit.mjs                  ← per-session metrics + classificat
 scripts/weekly-report.mjs                  ← aggregated weekly autonomy score
     │
     ▼
-pages/observability/<YYYY-WW>.md           ← committed report (heuristic v0)
+journal/weekly/<YYYY-Www>.md               ← committed report (heuristic v0, spec §6.4 SoT)
 ```
 
 ### Transcript dual-source (ADR 0019)

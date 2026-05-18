@@ -1836,6 +1836,20 @@ test('all type-conditional fields present → green', () => {
   assert.equal(r.status, 0, `expected green, got ${r.status}`);
 });
 
+test('weekly-journal under journal/weekly missing week → error (scanDirs covers journal/)', () => {
+  const { r, out } = lintWithSchema(
+    'journal/weekly/2026-W19.md',
+    '---\ntitle: T\ntype: weekly-journal\nupdated: 2026-05-18\ntags: [wiki]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1, `expected error, got ${r.status}: ${r.stdout}`);
+  assert.ok(
+    out.errors.some((e) =>
+      e.message.includes('Missing required field for type "weekly-journal": week'),
+    ),
+    `weekly-journal week error missing: ${r.stdout}`,
+  );
+});
+
 suite('lint.mjs tag vocabulary + forbidden patterns');
 
 test('PascalCase tag → error', () => {
@@ -2534,7 +2548,7 @@ test('replay-session-start-preserves-sync-state-when-ahead: unpushed commit keep
 
 suite('weekly-report.mjs');
 
-test('--write produces pages/observability/<YYYY-WW>.md with autonomy score', () => {
+test('--write produces journal/weekly/<YYYY-Www>.md with autonomy score', () => {
   withTmpDir((dir) => {
     const cacheDir = join(dir, '.cache', 'sessions');
     mkdirSync(cacheDir, { recursive: true });
@@ -2551,10 +2565,10 @@ test('--write produces pages/observability/<YYYY-WW>.md with autonomy score', ()
     );
     mkdirSync(join(dir, 'pages'), { recursive: true });
 
-    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--write']);
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-W19', '--write']);
     assert.equal(r.status, 0, `weekly-report failed: ${r.stderr}\nstdout: ${r.stdout}`);
 
-    const reportPath = join(dir, 'pages', 'observability', '2026-19.md');
+    const reportPath = join(dir, 'journal', 'weekly', '2026-W19.md');
     assert.ok(existsSync(reportPath), `report file not written: ${reportPath}`);
     const content = readFileSync(reportPath, 'utf-8');
     assert.ok(content.includes('Autonomy score'), 'report missing autonomy score header');
@@ -2584,7 +2598,7 @@ test('autonomy score: clamped to 100 with ingest-heavy session', () => {
         cwd: dir,
       }) + '\n',
     );
-    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--json']);
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-W19', '--json']);
     assert.equal(r.status, 0, `weekly-report --json failed: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.ok(out.score <= 100, `score must be clamped to 100, got ${out.score}`);
@@ -2611,7 +2625,7 @@ test('autonomy score: 0 when only staleness-skip sessions are in the week', () =
         cwd: dir,
       }) + '\n',
     );
-    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2020-02', '--json']);
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2020-W02', '--json']);
     assert.equal(r.status, 0, `weekly-report --json failed: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     // The session matched the week but should be staleness-skipped, so the
@@ -2639,11 +2653,11 @@ test('--json returns valid report payload (week with no matching sessions)', () 
       }) + '\n',
     );
 
-    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2099-50', '--json']);
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2099-W50', '--json']);
     assert.equal(r.status, 0, `weekly-report --json failed: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
-    assert.equal(out.week, '2099-50');
-    assert.equal(out.count, 0, `expected 0 sessions in 2099-50, got ${out.count}`);
+    assert.equal(out.week, '2099-W50');
+    assert.equal(out.count, 0, `expected 0 sessions in 2099-W50, got ${out.count}`);
     assert.equal(typeof out.score, 'number');
   });
 });
@@ -2900,9 +2914,9 @@ test('weekly report does not leak transcript text, URLs, or tool inputs', () => 
         cwd: dir,
       }) + '\n',
     );
-    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--write']);
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-W19', '--write']);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const reportPath = join(dir, 'pages', 'observability', '2026-19.md');
+    const reportPath = join(dir, 'journal', 'weekly', '2026-W19.md');
     const report = readFileSync(reportPath, 'utf-8');
     for (const secret of [SECRET_URL, SECRET_TEXT, SECRET_INPUT, SECRET_CMD]) {
       assert.ok(
@@ -2922,6 +2936,28 @@ test('--week=invalid exits non-zero with a clear error', () => {
     const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=not-a-week', '--json']);
     assert.notEqual(r.status, 0, 'should reject malformed --week');
     assert.ok(r.stderr.includes('invalid --week'), `stderr should explain: ${r.stderr}`);
+  });
+});
+
+test('--week rejects out-of-range ISO weeks (W00, W54, W53 in 52-week year)', () => {
+  withTmpDir((dir) => {
+    // 2025 is a 52-week ISO year (Jan 1 = Wed, non-leap) — W53 is invalid.
+    for (const bad of ['2025-W00', '2025-W54', '2025-W53']) {
+      const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, `--week=${bad}`, '--json']);
+      assert.notEqual(r.status, 0, `should reject ${bad}, got status ${r.status}`);
+      assert.ok(
+        r.stderr.includes('invalid --week'),
+        `stderr should explain for ${bad}: ${r.stderr}`,
+      );
+    }
+  });
+});
+
+test('--week=YYYY-WW (legacy, no W prefix) is rejected', () => {
+  withTmpDir((dir) => {
+    const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-19', '--json']);
+    assert.notEqual(r.status, 0, 'legacy YYYY-WW must be rejected');
+    assert.ok(r.stderr.includes('invalid --week'), `stderr: ${r.stderr}`);
   });
 });
 
