@@ -71,6 +71,8 @@ function writeFeedback(hypoDir, topic, entry, dryRun) {
 title: "Feedback: ${topic}"
 type: feedback
 updated: ${today}
+source: session:${today}
+corrected_at: ${today}
 tags: [feedback]
 ---
 

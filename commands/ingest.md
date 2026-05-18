@@ -73,7 +73,7 @@ Read and synthesize the source:
 
 1. **Check index.md** — does a page on this topic already exist?
    - If yes: update the existing page (merge new information, mark `updated:` today)
-   - If no: create a new page in `pages/` with `type: source-summary` and `source: <slug>`
+   - If no: create a new page in `pages/` with `type: source-summary` and `sources: [<slug>]`
 
 2. **Frontmatter** for new pages:
    ```yaml
@@ -82,7 +82,7 @@ Read and synthesize the source:
    type: source-summary
    updated: YYYY-MM-DD
    tags: [<relevant tags>]
-   source: <slug>
+   sources: [<slug>]
    confidence: high | medium | low
    evidence_strength: direct
    ---
