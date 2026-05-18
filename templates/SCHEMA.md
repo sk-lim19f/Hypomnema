@@ -100,11 +100,25 @@ verify_by_date: YYYY-MM-DD
 
 ## 4. Tag Vocabulary
 
-Use lowercase, hyphenated tags. Keep the vocabulary small and consistent.
+Use lowercase, hyphenated tags. Vocabulary is locked — `lint` blocks unknown tags
+and forbidden patterns (PascalCase, plurals, whitespace, generic words).
+Extend this list (and `~/hypomnema/SCHEMA.md`) before introducing a new tag.
 
-**Domain tags**: `ai`, `dev`, `ops`, `security`, `data`, `design`, `management`
-**Status tags**: `draft`, `stable`, `deprecated`, `needs-review`
-**Meta tags**: `wiki`, `index`, `operations`, `guide`, `schema`
+**Meta**: `wiki`, `index`, `pages`, `home`, `overview`, `guide`, `operations`, `schema`, `reference`, `hypo`, `commands`, `hot-cache`
+**Workflow**: `automation`, `hooks`, `observability`, `autonomy`, `wiki-health`
+**Project**: `project`, `prd`, `adr`, `session-state`
+**Domain**: `ai`, `dev`, `ops`, `security`, `data`, `design`, `management`
+**Status**: `active`, `completed`, `archived`, `draft`, `stable`, `deprecated`, `needs-review`, `proposed`, `superseded`
+**Content classification**: `learning`, `tip`, `feedback`, `gotcha`, `concept`, `pattern`
+
+### Forbidden patterns
+
+| Pattern | Reason | Use instead |
+|---------|--------|-------------|
+| PascalCase (`Jenkins`, `Claude`) | Inconsistent casing | `jenkins`, `claude-code` |
+| Plurals (`learnings`, `tips`) | Singular form is canonical | `learning`, `tip` |
+| Generic (`general`, `misc`, `other`, `todo`) | No search value | Specific domain tag |
+| Whitespace (`llm wiki`) | Parse breakage | `llm-wiki` |
 
 ---
 

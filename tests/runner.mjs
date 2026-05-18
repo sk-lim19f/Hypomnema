@@ -1836,6 +1836,71 @@ test('all type-conditional fields present → green', () => {
   assert.equal(r.status, 0, `expected green, got ${r.status}`);
 });
 
+suite('lint.mjs tag vocabulary + forbidden patterns');
+
+test('PascalCase tag → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [Jenkins]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Forbidden tag pattern (PascalCase)')),
+    `expected PascalCase error: ${r.stdout}`,
+  );
+});
+
+test('plural tag (learnings) → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [learnings]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1);
+  assert.ok(out.errors.some((e) => e.message.includes('Forbidden tag pattern (plural)')));
+});
+
+test('generic tag (todo) → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [todo]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1);
+  assert.ok(out.errors.some((e) => e.message.includes('Forbidden tag pattern (generic)')));
+});
+
+test('unknown tag (not in vocab) → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [zzz-unknown]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Unknown tag: "zzz-unknown"')),
+    `expected unknown tag error: ${r.stdout}`,
+  );
+});
+
+test('valid tag in vocab → green', () => {
+  const { r } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [wiki, concept]\n---\nbody\n',
+  );
+  assert.equal(r.status, 0, `expected green, got ${r.status}`);
+});
+
+test('vocab check skipped when SCHEMA.md absent (back-compat)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-novocab-'));
+  const pageDir = join(dir, 'pages');
+  mkdirSync(pageDir, { recursive: true });
+  writeFileSync(
+    join(pageDir, 'x.md'),
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [Jenkins]\n---\nbody\n',
+  );
+  const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
+  rmSync(dir, { recursive: true, force: true });
+  assert.equal(r.status, 0, `expected green when SCHEMA.md missing, got ${r.status}: ${r.stdout}`);
+});
+
 // ── Lane B: formatGrowthMetrics + growth echo regressions ─────────────────
 
 const { formatGrowthMetrics, computeSessionGrowth } = await import(join(HOOKS, 'hypo-shared.mjs'));

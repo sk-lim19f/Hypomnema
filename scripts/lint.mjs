@@ -18,6 +18,7 @@ import { join, relative, extname, basename } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
+import { parseSchemaVocab, checkForbidden } from './lib/schema-vocab.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -47,6 +48,23 @@ function parseFrontmatter(content) {
       .replace(/^["']|["']$/g, '');
   }
   return fm;
+}
+
+function parseTagsField(rawValue) {
+  if (rawValue == null) return null;
+  const trimmed = String(rawValue).trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    return trimmed
+      .slice(1, -1)
+      .split(',')
+      .map((t) => t.trim().replace(/^["']|["']$/g, ''))
+      .filter(Boolean);
+  }
+  return trimmed
+    .split(',')
+    .map((t) => t.trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
 }
 
 // type-conditional required fields (spec §6.3, SCHEMA.md §2)
@@ -177,7 +195,7 @@ function lintSessionStateHeadings(content, rel) {
   }
 }
 
-function lintPage({ path, rel }, slugMap) {
+function lintPage({ path, rel }, slugMap, tagVocab) {
   let content;
   try {
     content = readFileSync(path, 'utf-8');
@@ -230,6 +248,21 @@ function lintPage({ path, rel }, slugMap) {
     }
   }
 
+  // tag vocabulary + forbidden patterns (fix #36)
+  const tags = parseTagsField(fm.tags);
+  if (tags && tagVocab && tagVocab.size > 0) {
+    for (const tag of tags) {
+      const forbidden = checkForbidden(tag);
+      if (forbidden) {
+        issue('error', rel, `Forbidden tag pattern (${forbidden}): "${tag}"`);
+        continue;
+      }
+      if (!tagVocab.has(tag)) {
+        issue('error', rel, `Unknown tag: "${tag}" (not in SCHEMA.md Tag Vocabulary)`);
+      }
+    }
+  }
+
   lintSessionStateHeadings(content, rel);
 
   for (const link of extractWikilinks(content)) {
@@ -247,8 +280,9 @@ const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
 const pages = scanDirs.flatMap((d) => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugMap = buildSlugMap(pages);
+const tagVocab = parseSchemaVocab(args.hypoDir);
 
-for (const page of pages) lintPage(page, slugMap);
+for (const page of pages) lintPage(page, slugMap, tagVocab);
 
 if (args.fix) {
   const today = new Date().toISOString().slice(0, 10);
