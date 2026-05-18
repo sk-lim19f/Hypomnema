@@ -196,7 +196,7 @@ Eight commands cover the full capture → retrieval → consolidation cycle.
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT inject / MISS → closest-slug signal |
 | `hypo-compact-guard.mjs` | `UserPromptSubmit` | Detect `/compact` → enforce session-close checklist |
 | `hypo-cwd-change.mjs` | `CwdChanged` | Inject the matching project's `hot.md` |
-| `hypo-file-watch.mjs` | `FileChanged` | Notify on wiki-file changes |
+| `hypo-file-watch.mjs` | `FileChanged` | Notify on wiki-file changes (honors `.hypoignore` — matched paths are never re-emitted into LLM context) |
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit)` | Auto-stage wiki-file edits |
 | `hypo-auto-commit.mjs` | `Stop` | Auto commit + pull + push |
 | `hypo-hot-rebuild.mjs` | `Stop` | Rebuild `hot.md` |
@@ -297,6 +297,8 @@ The wiki path is resolved in this order (see `scripts/lib/hypo-root.mjs`):
 Place a `hypo-config.md` at the wiki root to make it portable across machines without setting environment variables.
 
 `.hypoignore` controls which paths the hooks ignore (default: `*.pdf`, `*.zip`, `*.pem`, `*.env`, …). Edit it directly — there is no privacy mode flag; one file, one source of truth.
+
+> **Provider transmission disclaimer.** Hypomnema hooks emit wiki content into Claude Code's `additionalContext`, which is transmitted to the Claude model provider as part of the prompt. `.hypoignore` is enforced at every content-injection hook (`hypo-file-watch`, `hypo-session-start`, `hypo-cwd-change`, `hypo-lookup`) and at `ingest`, but any file *not* matched by `.hypoignore` is fair game for transmission. (`hypo-auto-stage` and `hypo-auto-commit` are git-staging hooks, not injection points, and also honor `.hypoignore` for their staging decisions.) Keep secrets out of the wiki, and review `.hypoignore` patterns before storing anything sensitive under `HYPO_DIR`.
 
 > **Scope of git sync.** Hypomnema git-syncs only the `~/hypomnema/` wiki itself. Your Claude Code configuration (`~/.claude/`) is intentionally **not** managed by Hypomnema — for cross-machine sync of agents, skills, and settings, the recommended pattern is a separate dotfiles manager such as [chezmoi](https://www.chezmoi.io/).
 

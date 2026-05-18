@@ -9,11 +9,19 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { HYPO_DIR, buildOutput } from './hypo-shared.mjs';
+import { HYPO_DIR, buildOutput, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
 const GLOBAL_HOT = join(HYPO_DIR, 'hot.md');
 const MAX_CHARS = 3000;
+
+// Privacy guard (fix #48, Stage 1): a .hypoignore-matched hot.md must not be
+// re-emitted into additionalContext on cwd change.
+function readIfNotIgnored(path, patterns) {
+  if (!path) return null;
+  if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return null;
+  return readFileSync(path, 'utf-8').slice(0, MAX_CHARS);
+}
 
 function parseFrontmatterField(content, key) {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -69,10 +77,11 @@ process.stdin.on('end', () => {
       return;
     }
 
+    const ignorePatterns = loadHypoIgnore(HYPO_DIR);
+
     if (newHit) {
-      const content = newHit.hotPath
-        ? readFileSync(newHit.hotPath, 'utf-8').slice(0, MAX_CHARS)
-        : '(no hot.md yet — will be created at session close)';
+      const fromFile = readIfNotIgnored(newHit.hotPath, ignorePatterns);
+      const content = fromFile ?? '(no hot.md yet — will be created at session close)';
       console.log(
         JSON.stringify(
           buildOutput(`[WIKI: cwd changed → project=${newHit.proj}]\n\n${content}`, {
@@ -89,7 +98,11 @@ process.stdin.on('end', () => {
       return;
     }
 
-    const globalContent = readFileSync(GLOBAL_HOT, 'utf-8').slice(0, MAX_CHARS);
+    const globalContent = readIfNotIgnored(GLOBAL_HOT, ignorePatterns);
+    if (!globalContent) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
     console.log(
       JSON.stringify(
         buildOutput(

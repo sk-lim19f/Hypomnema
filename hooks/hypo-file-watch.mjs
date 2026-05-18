@@ -8,7 +8,7 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { HYPO_DIR } from './hypo-shared.mjs';
+import { HYPO_DIR, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
 
 const MAX_CHARS = 2000;
 
@@ -25,6 +25,15 @@ process.stdin.on('end', () => {
     const filePath = data.file_path || data.path || '';
 
     if (!filePath.startsWith(HYPO_DIR + '/') && filePath !== HYPO_DIR) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    // Privacy guard (fix #48, Stage 1 Truth Reconciliation): refuse to inject
+    // .hypoignore-matched paths. Without this, `.env*` or other secrets under
+    // HYPO_DIR are re-emitted as additionalContext to the Claude provider.
+    const patterns = loadHypoIgnore(HYPO_DIR);
+    if (patterns.length > 0 && isIgnored(filePath, HYPO_DIR, patterns)) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
