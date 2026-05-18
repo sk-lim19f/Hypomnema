@@ -277,7 +277,7 @@ function lintPage({ path, rel }, slugMap, tagVocab) {
 const args = parseArgs(process.argv);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
-const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
+const scanDirs = ['pages', 'projects', 'journal'].map((d) => join(args.hypoDir, d));
 const pages = scanDirs.flatMap((d) => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugMap = buildSlugMap(pages);
 const tagVocab = parseSchemaVocab(args.hypoDir);

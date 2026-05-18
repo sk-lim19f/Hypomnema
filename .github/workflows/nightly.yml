@@ -68,5 +68,5 @@ jobs:
         run: |
           node scripts/weekly-report.mjs \
             --hypo-dir=/tmp/wiki-audit \
-            --week=2026-19 --write
-          test -f /tmp/wiki-audit/pages/observability/2026-19.md
+            --week=2026-W19 --write
+          test -f /tmp/wiki-audit/journal/weekly/2026-W19.md

@@ -3,14 +3,14 @@
  * weekly-report.mjs — Weekly observability report (Lane E)
  *
  * Aggregates session-audit results into a Markdown report under
- * `<hypo-dir>/pages/observability/<YYYY-WW>.md`.
+ * `<hypo-dir>/journal/weekly/<YYYY-Www>.md` (spec §6.4 SoT).
  *
  * The autonomy score is heuristic on purpose — see
  * pages/observability/_index.md for the definition and the 4-week
  * baseline plan before we revisit LLM-judge classification.
  *
  * Usage:
- *   node scripts/weekly-report.mjs [--hypo-dir=<path>] [--week=YYYY-WW]
+ *   node scripts/weekly-report.mjs [--hypo-dir=<path>] [--week=YYYY-Www]
  *                                  [--limit N] [--write] [--json]
  */
 
@@ -47,22 +47,25 @@ function isoWeek(date) {
   d.setUTCDate(d.getUTCDate() + 4 - dayNum);
   const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
   const week = Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
-  return `${d.getUTCFullYear()}-${String(week).padStart(2, '0')}`;
+  return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
 }
 
 function parseWeekArg(spec) {
-  // Accepts YYYY-WW. Returns the Monday of that ISO week.
-  const m = String(spec).match(/^(\d{4})-(\d{2})$/);
+  // Accepts YYYY-Www (ISO 8601). Returns the Monday of that ISO week, or
+  // null if the week number does not exist in that year (round-trips via
+  // isoWeek to reject W00, W54, and W53 in non-53-week years).
+  const m = String(spec).match(/^(\d{4})-W(\d{2})$/);
   if (!m) return null;
   const year = parseInt(m[1], 10);
   const week = parseInt(m[2], 10);
-  // Find Jan 4 — always in week 1 — and offset to the Monday of `week`.
+  if (week < 1 || week > 53) return null;
   const jan4 = new Date(Date.UTC(year, 0, 4));
   const jan4Dow = jan4.getUTCDay() || 7;
   const week1Mon = new Date(jan4);
   week1Mon.setUTCDate(jan4.getUTCDate() - (jan4Dow - 1));
   const weekStart = new Date(week1Mon);
   weekStart.setUTCDate(week1Mon.getUTCDate() + (week - 1) * 7);
+  if (isoWeek(weekStart) !== spec) return null;
   return weekStart;
 }
 
@@ -179,7 +182,7 @@ function isMain() {
 if (isMain()) {
   const args = parseArgs(process.argv);
   if (args.week && !parseWeekArg(args.week)) {
-    console.error(`Error: invalid --week value "${args.week}" (expected YYYY-WW)`);
+    console.error(`Error: invalid --week value "${args.week}" (expected YYYY-Www)`);
     process.exit(2);
   }
   const report = buildReport(args.hypoDir, {
@@ -196,7 +199,7 @@ if (isMain()) {
   const md = renderMarkdown(report);
 
   if (args.write) {
-    const dir = join(args.hypoDir, 'pages', 'observability');
+    const dir = join(args.hypoDir, 'journal', 'weekly');
     mkdirSync(dir, { recursive: true });
     const path = join(dir, `${report.week}.md`);
     writeFileSync(path, md);

@@ -26,7 +26,7 @@ scripts/session-audit.mjs   ← per-session metrics + classification
 scripts/weekly-report.mjs   ← weekly autonomy score
     │
     ▼
-pages/observability/<YYYY-WW>.md
+journal/weekly/<YYYY-Www>.md   (spec §6.4 SoT)
 ```
 
 ---
@@ -68,7 +68,7 @@ Capture v0 scores for 4 weeks before introducing LLM-judge classification or cha
 
 | Week | Score | Notes |
 |---|---|---|
-| <!-- YYYY-WW --> | <!-- % --> | <!-- first run --> |
+| <!-- YYYY-Www --> | <!-- % --> | <!-- first run --> |
 
 ---
 
