@@ -49,6 +49,26 @@ function parseFrontmatter(content) {
   return fm;
 }
 
+// type-conditional required fields (spec §6.3, SCHEMA.md §2)
+const TYPE_CONDITIONAL_FIELDS = {
+  prd: ['status', 'started'],
+  adr: ['source', 'status', 'date'],
+  'project-index': ['working_dir', 'status', 'started'],
+  'tool-eval': ['status'],
+  postmortem: ['outcome'],
+  learning: ['source'],
+  feedback: ['source'],
+  'prompt-pattern': ['source'],
+  'source-summary': ['sources'],
+  'weekly-journal': ['week'],
+};
+
+const TYPE_ENUM_FIELDS = {
+  prd: { status: ['draft', 'active', 'completed', 'cancelled', 'archived'] },
+  adr: { status: ['proposed', 'accepted', 'deprecated', 'superseded'] },
+  'tool-eval': { status: ['adopted', 'evaluating', 'rejected'] },
+};
+
 // ── page collector ────────────────────────────────────────────────────────────
 
 function collectPages(dir, root, pages = [], ignorePatterns = []) {
@@ -186,6 +206,28 @@ function lintPage({ path, rel }, slugMap) {
 
   if (!fm.updated) {
     issue('warn', rel, 'Missing frontmatter field: updated', path);
+  }
+
+  // type-conditional required fields (fix #15)
+  if (fm.type && TYPE_CONDITIONAL_FIELDS[fm.type]) {
+    for (const field of TYPE_CONDITIONAL_FIELDS[fm.type]) {
+      if (!fm[field]) {
+        issue('error', rel, `Missing required field for type "${fm.type}": ${field}`);
+      }
+    }
+  }
+
+  // type-specific enum validation
+  if (fm.type && TYPE_ENUM_FIELDS[fm.type]) {
+    for (const [field, allowed] of Object.entries(TYPE_ENUM_FIELDS[fm.type])) {
+      if (fm[field] && !allowed.includes(fm[field])) {
+        issue(
+          'error',
+          rel,
+          `Invalid value for ${field} on type "${fm.type}": "${fm[field]}" (allowed: ${allowed.join(', ')})`,
+        );
+      }
+    }
   }
 
   lintSessionStateHeadings(content, rel);

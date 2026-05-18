@@ -16,7 +16,7 @@ import {
   existsSync,
   symlinkSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -1749,6 +1749,91 @@ test('errors when project session-state lacks a next heading', () => {
     ),
     `missing session-state heading error: ${r.stdout}`,
   );
+});
+
+// ── lint.mjs type-conditional + tag vocab tests (fix #15 + #36) ─────────────
+
+suite('lint.mjs type-conditional required fields');
+
+const VOCAB_SCHEMA =
+  '---\ntitle: SCHEMA\ntype: schema\n---\n# Schema\n\n## 4. Tag Vocabulary\n\n`wiki` `project` `prd` `adr` `concept` `learning` `feedback`\n\n## 5. Next\n';
+
+function lintWithSchema(pageRel, content, schemaContent = VOCAB_SCHEMA) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-cond-'));
+  writeFileSync(join(dir, 'SCHEMA.md'), schemaContent);
+  const fullPath = join(dir, pageRel);
+  mkdirSync(dirname(fullPath), { recursive: true });
+  writeFileSync(fullPath, content);
+  const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  rmSync(dir, { recursive: true, force: true });
+  return { r, out };
+}
+
+test('prd missing started → error', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/prd.md',
+    '---\ntitle: T\ntype: prd\nstatus: active\nupdated: 2026-05-18\ntags: [prd]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1, `expected error, got ${r.status}: ${r.stdout}`);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Missing required field for type "prd": started')),
+    `started error missing: ${r.stdout}`,
+  );
+});
+
+test('adr missing source → error', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/decisions/0001-x.md',
+    '---\ntitle: T\ntype: adr\nstatus: accepted\ndate: 2026-05-18\nupdated: 2026-05-18\ntags: [adr]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Missing required field for type "adr": source')),
+  );
+});
+
+test('project-index missing working_dir → error', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/index.md',
+    '---\ntitle: T\ntype: project-index\nstatus: active\nstarted: 2026-05-18\nupdated: 2026-05-18\ntags: [project]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) =>
+      e.message.includes('Missing required field for type "project-index": working_dir'),
+    ),
+  );
+});
+
+test('postmortem missing outcome → error', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/postmortems/2026-05-18-x.md',
+    '---\ntitle: T\ntype: postmortem\nupdated: 2026-05-18\ntags: [project]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) =>
+      e.message.includes('Missing required field for type "postmortem": outcome'),
+    ),
+  );
+});
+
+test('prd with invalid status enum → error', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/prd.md',
+    '---\ntitle: T\ntype: prd\nstatus: in-progress\nstarted: 2026-05-18\nupdated: 2026-05-18\ntags: [prd]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1);
+  assert.ok(out.errors.some((e) => e.message.includes('Invalid value for status on type "prd"')));
+});
+
+test('all type-conditional fields present → green', () => {
+  const { r } = lintWithSchema(
+    'projects/p/prd.md',
+    '---\ntitle: T\ntype: prd\nstatus: active\nstarted: 2026-05-18\nupdated: 2026-05-18\ntags: [prd]\n---\nbody\n',
+  );
+  assert.equal(r.status, 0, `expected green, got ${r.status}`);
 });
 
 // ── Lane B: formatGrowthMetrics + growth echo regressions ─────────────────
