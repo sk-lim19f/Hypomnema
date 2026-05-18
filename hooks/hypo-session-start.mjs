@@ -18,7 +18,19 @@ import {
   formatGrowthMetrics,
   readSyncState,
   clearSyncState,
+  loadHypoIgnore,
+  isIgnored,
 } from './hypo-shared.mjs';
+
+// Privacy guard (fix #48, Stage 1): refuse to read+inject .hypoignore-matched
+// wiki files into additionalContext. Without this, a user who lists
+// `projects/private/hot.md` in .hypoignore would still see SECRET emit because
+// session-start reads hot/state paths directly.
+function readIfNotIgnored(path, maxChars, patterns) {
+  if (!path) return null;
+  if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return null;
+  return readFileSync(path, 'utf-8').slice(0, maxChars);
+}
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
 const GROWTH_CACHE = join(HYPO_DIR, '.cache', 'last-session-growth.json');
@@ -177,13 +189,11 @@ process.stdin.on('end', () => {
     const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);
     const hit = findProjectFiles(cwd);
 
+    const ignorePatterns = loadHypoIgnore(HYPO_DIR);
+
     if (hit) {
-      const hotContent = hit.hotPath
-        ? readFileSync(hit.hotPath, 'utf-8').slice(0, HOT_CHARS)
-        : null;
-      const stateContent = hit.statePath
-        ? readFileSync(hit.statePath, 'utf-8').slice(0, STATE_CHARS)
-        : null;
+      const hotContent = readIfNotIgnored(hit.hotPath, HOT_CHARS, ignorePatterns);
+      const stateContent = readIfNotIgnored(hit.statePath, STATE_CHARS, ignorePatterns);
 
       if (hotContent || stateContent) {
         printTerminalSummary(hit.proj, hotContent, stateContent);
@@ -238,7 +248,11 @@ process.stdin.on('end', () => {
       return;
     }
 
-    const globalContent = readFileSync(GLOBAL_HOT, 'utf-8').slice(0, HOT_CHARS);
+    const globalContent = readIfNotIgnored(GLOBAL_HOT, HOT_CHARS, ignorePatterns);
+    if (!globalContent) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
     console.log(
       JSON.stringify(
         buildOutput(

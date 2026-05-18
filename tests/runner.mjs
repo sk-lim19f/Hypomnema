@@ -1958,6 +1958,147 @@ test('auto-stage skips .hypoignore-listed file_path', () => {
   });
 });
 
+suite('hypo-file-watch.mjs — .hypoignore privacy guard (fix #48)');
+
+test('file-watch refuses to inject .hypoignore-matched file (e.g. .env)', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), '# Secrets\n.env*\n*secret*\n');
+    const secretPath = join(dir, '.env');
+    writeFileSync(secretPath, 'OPENAI_API_KEY=sk-leakedvalue\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
+      input: JSON.stringify({ file_path: secretPath }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true);
+    assert.equal(
+      out.additionalContext,
+      undefined,
+      `.hypoignore-matched secret leaked into additionalContext: ${out.additionalContext}`,
+    );
+    assert.ok(!/sk-leakedvalue/.test(r.stdout), `secret value leaked in stdout: ${r.stdout}`);
+  });
+});
+
+test('file-watch still injects non-ignored wiki file (e.g. hot.md)', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), '.env*\n');
+    const hotPath = join(dir, 'hot.md');
+    writeFileSync(hotPath, '# hot\n\nactive project state\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
+      input: JSON.stringify({ file_path: hotPath }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      out.additionalContext && /active project state/.test(out.additionalContext),
+      `expected hot.md injection, got: ${out.additionalContext}`,
+    );
+  });
+});
+
+suite('hypo-session-start.mjs / hypo-cwd-change.mjs — .hypoignore injection guard (fix #48)');
+
+function withPrivateProject(fn) {
+  withGrowthWiki((dir) => {
+    const work = mkdtempSync(join(tmpdir(), 'hypo-priv-work-'));
+    const projDir = join(dir, 'projects', 'private');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      `---\ntitle: private\ntype: project-index\nupdated: 2026-05-18\nworking_dir: "${work}"\n---\n# Private\n`,
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\nSECRET_HOT_VALUE\n');
+    writeFileSync(join(projDir, 'session-state.md'), '# state\nSECRET_STATE_VALUE\n');
+    try {
+      fn(dir, work);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+}
+
+test('session-start refuses to inject .hypoignore-matched project hot/state', () => {
+  withPrivateProject((dir, work) => {
+    writeFileSync(
+      join(dir, '.hypoignore'),
+      'projects/private/hot.md\nprojects/private/session-state.md\n',
+    );
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: work, session_id: 'test-fix48-ss' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !/SECRET_HOT_VALUE|SECRET_STATE_VALUE/.test(r.stdout),
+      `secret leaked through session-start: ${r.stdout}`,
+    );
+  });
+});
+
+test('session-start still injects non-ignored project hot/state', () => {
+  withPrivateProject((dir, work) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: work, session_id: 'test-fix48-ss-ok' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0);
+    assert.ok(
+      /SECRET_HOT_VALUE/.test(r.stdout) && /SECRET_STATE_VALUE/.test(r.stdout),
+      `expected legitimate hot/state injection, got: ${r.stdout}`,
+    );
+  });
+});
+
+test('cwd-change refuses to inject .hypoignore-matched project hot.md', () => {
+  withPrivateProject((dir, work) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/private/hot.md\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+      input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(!/SECRET_HOT_VALUE/.test(r.stdout), `secret leaked through cwd-change: ${r.stdout}`);
+  });
+});
+
+test('cwd-change refuses to inject .hypoignore-matched global hot.md', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), 'hot.md\n');
+    writeFileSync(join(dir, 'hot.md'), '# global\nSECRET_GLOBAL_VALUE\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+      input: JSON.stringify({ new_cwd: '/tmp/nowhere-no-project', old_cwd: '/tmp/other' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !/SECRET_GLOBAL_VALUE/.test(r.stdout),
+      `global secret leaked through cwd-change: ${r.stdout}`,
+    );
+  });
+});
+
+test('file-watch ignores file outside HYPO_DIR even without .hypoignore', () => {
+  withGrowthWiki((dir) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
+      input: JSON.stringify({ file_path: '/etc/passwd' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.additionalContext, undefined);
+  });
+});
+
 suite('ingest.mjs — .hypoignore privacy guard (#14)');
 
 test('ingest-rejects-hypoignore: --check=.env refuses (spec §8.10 verification #2)', () => {
