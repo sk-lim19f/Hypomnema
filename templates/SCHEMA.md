@@ -105,7 +105,7 @@ and forbidden patterns (PascalCase, plurals, whitespace, generic words).
 Extend this list (and `~/hypomnema/SCHEMA.md`) before introducing a new tag.
 
 **Meta**: `wiki`, `index`, `pages`, `home`, `overview`, `guide`, `operations`, `schema`, `reference`, `hypo`, `commands`, `hot-cache`
-**Workflow**: `automation`, `hooks`, `observability`, `autonomy`, `wiki-health`
+**Workflow**: `automation`, `hooks`, `observability`, `autonomy`, `wiki-health`, `weekly`
 **Project**: `project`, `prd`, `adr`, `session-state`
 **Domain**: `ai`, `dev`, `ops`, `security`, `data`, `design`, `management`
 **Status**: `active`, `completed`, `archived`, `draft`, `stable`, `deprecated`, `needs-review`, `proposed`, `superseded`

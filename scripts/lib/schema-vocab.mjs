@@ -3,7 +3,8 @@ import { join } from 'path';
 
 const VOCAB_HEADER_RE = /^##\s+(?:\d+\.\s+)?Tag\s+(?:Vocabulary|Taxonomy)\s*$/m;
 const NEXT_H2_RE = /^##\s+/m;
-const BACKTICK_TOKEN_RE = /`([^`\n]+)`/g;
+const CATEGORY_PREFIX_RE = /^\s*\*\*[^*]+\*\*:\s*/;
+const BACKTICK_TOKEN_RE = /`([^`]+)`/g;
 
 const FORBIDDEN_PATTERNS = [
   { name: 'PascalCase', test: (t) => /[A-Z]/.test(t) },
@@ -25,6 +26,24 @@ export function checkForbidden(tag) {
   return null;
 }
 
+// Extract only backtick tokens from canonical vocabulary lines.
+// A vocabulary line is one whose non-backtick residue (after stripping an
+// optional `**Category**:` prefix) contains only separators (whitespace, commas).
+// This excludes prose like "...`lint` blocks unknown tags..." and table rows
+// in the Forbidden patterns section that mention example tokens.
+function vocabLineTokens(rawLine) {
+  const line = rawLine.replace(CATEGORY_PREFIX_RE, '').trim();
+  if (!line) return [];
+  const residue = line.replace(/`[^`]+`/g, '').trim();
+  if (!/^[\s,]*$/.test(residue)) return [];
+  const tokens = [];
+  for (const m of line.matchAll(BACKTICK_TOKEN_RE)) {
+    const t = m[1].trim();
+    if (t && !t.includes(' ')) tokens.push(t);
+  }
+  return tokens;
+}
+
 export function parseSchemaVocab(hypoDir) {
   const path = join(hypoDir, 'SCHEMA.md');
   if (!existsSync(path)) return new Set();
@@ -39,11 +58,8 @@ export function parseSchemaVocab(hypoDir) {
   const section = nextH2 ? rest.slice(0, nextH2.index) : rest;
 
   const vocab = new Set();
-  for (const m of section.matchAll(BACKTICK_TOKEN_RE)) {
-    const token = m[1].trim();
-    if (!token) continue;
-    if (token.includes(' ')) continue;
-    vocab.add(token);
+  for (const rawLine of section.split('\n')) {
+    for (const token of vocabLineTokens(rawLine)) vocab.add(token);
   }
   return vocab;
 }

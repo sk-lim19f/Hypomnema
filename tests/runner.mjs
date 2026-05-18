@@ -1888,6 +1888,31 @@ test('valid tag in vocab → green', () => {
   assert.equal(r.status, 0, `expected green, got ${r.status}`);
 });
 
+test('vocab parser excludes prose backticks and Forbidden table examples', () => {
+  // Codex P3: prior parser accepted every backtick in the section, so `lint`
+  // appearing in explanatory prose and `Jenkins` in the Forbidden table row
+  // were silently added to the vocabulary.
+  const schema =
+    '---\ntitle: SCHEMA\ntype: schema\n---\n# Schema\n\n## 4. Tag Vocabulary\n\n' +
+    'Use lowercase, hyphenated tags. `lint` blocks unknown tags.\n\n' +
+    '**Meta**: `wiki`, `concept`\n\n' +
+    '### Forbidden patterns\n\n' +
+    '| Pattern | Reason | Use instead |\n' +
+    '|---------|--------|-------------|\n' +
+    '| PascalCase (`Jenkins`) | Inconsistent | `jenkins` |\n\n' +
+    '## 5. Next\n';
+  const { r, out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [lint]\n---\nbody\n',
+    schema,
+  );
+  assert.equal(r.status, 1, `expected error for prose-only tag, got ${r.status}`);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Unknown tag: "lint"')),
+    `parser leaked prose token "lint" into vocab: ${r.stdout}`,
+  );
+});
+
 test('vocab check skipped when SCHEMA.md absent (back-compat)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-novocab-'));
   const pageDir = join(dir, 'pages');

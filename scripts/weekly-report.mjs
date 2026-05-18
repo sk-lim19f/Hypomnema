@@ -128,6 +128,8 @@ function renderMarkdown(report) {
   lines.push(`title: Observability — Week ${week}`);
   lines.push('tags: [observability, autonomy, weekly]');
   lines.push('type: weekly-journal');
+  lines.push(`week: ${week}`);
+  lines.push(`generated_by: manual`);
   lines.push(`updated: ${today}`);
   lines.push('---');
   lines.push('');
