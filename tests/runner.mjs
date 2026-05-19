@@ -573,9 +573,14 @@ test('doctor-codex-paths: --codex flag triggers codex settings.json check', () =
 
 const HOOKS = join(REPO, 'hooks');
 
-const { isCompactCommand, isGateSkipped, buildOutput, isClosePattern } = await import(
-  join(HOOKS, 'hypo-shared.mjs')
-);
+const {
+  isCompactCommand,
+  isClearCommand,
+  isCompactOrClearCommand,
+  isGateSkipped,
+  buildOutput,
+  isClosePattern,
+} = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
   return spawnSync(process.execPath, [join(HOOKS, hookFile)], {
@@ -653,6 +658,36 @@ test('/compact with trailing args → true', () => {
 test('non-compact prompt → false', () => {
   assert.equal(isCompactCommand('hello'), false);
   assert.equal(isCompactCommand('/other'), false);
+});
+
+suite('isClearCommand() (fix #25)');
+
+test('/clear → true', () => {
+  assert.equal(isClearCommand('/clear'), true);
+});
+
+test('/clear with trailing args → true', () => {
+  assert.equal(isClearCommand('/clear --all'), true);
+});
+
+test('non-clear prompt → false', () => {
+  assert.equal(isClearCommand('hello'), false);
+  assert.equal(isClearCommand('/clearfoo'), false);
+  assert.equal(isClearCommand('/compact'), false);
+});
+
+suite('isCompactOrClearCommand() (fix #25)');
+
+test('/compact → true', () => {
+  assert.equal(isCompactOrClearCommand('/compact'), true);
+});
+
+test('/clear → true', () => {
+  assert.equal(isCompactOrClearCommand('/clear'), true);
+});
+
+test('other prompt → false', () => {
+  assert.equal(isCompactOrClearCommand('hello'), false);
 });
 
 suite('isClosePattern()');
@@ -800,6 +835,47 @@ test('output is always valid JSON regardless of prompt', () => {
     const r = runHook('hypo-compact-guard.mjs', { prompt });
     assert.doesNotThrow(() => JSON.parse(r.stdout), `invalid JSON for prompt="${prompt}"`);
   }
+});
+
+// ── replay-compact-guard-detects-slash-clear (fix #25, ADR 0022 Layer 2) ──
+
+test('replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE', () => {
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear' });
+  const out = JSON.parse(r.stdout);
+  assert.ok('additionalContext' in out, 'missing additionalContext field on /clear');
+  assert.equal(out.continue, true);
+  assert.ok(out.additionalContext.includes('WIKI_AUTOCLOSE'), 'missing WIKI_AUTOCLOSE marker');
+  assert.ok(out.additionalContext.includes('/clear'), 'message must reference /clear');
+});
+
+test('/clear with trailing args → still detected', () => {
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear something' });
+  const out = JSON.parse(r.stdout);
+  assert.ok('additionalContext' in out);
+  assert.ok(out.additionalContext.includes('/clear'));
+});
+
+test('HYPO_SKIP_GATE=1 + /clear → pass-through', () => {
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear' }, { HYPO_SKIP_GATE: '1' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+});
+
+test('/clear with clean wiki → pass-through', () => {
+  withCleanWiki((dir) => {
+    const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true);
+    assert.equal(out.suppressOutput, true);
+  });
+});
+
+test('/clearfoo (no word boundary) → pass-through (not /clear)', () => {
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/clearfoo' });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
 });
 
 suite('hypo-personal-check.mjs — close-intent enrichment (#20)');

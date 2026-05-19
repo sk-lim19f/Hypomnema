@@ -427,6 +427,16 @@ export function isCompactCommand(prompt) {
   return prompt === '/compact' || /^\/compact(\s|$)/.test(prompt);
 }
 
+/** Returns true if the prompt is a /clear command invocation. */
+export function isClearCommand(prompt) {
+  return prompt === '/clear' || /^\/clear(\s|$)/.test(prompt);
+}
+
+/** Returns true if the prompt is either /compact or /clear (ADR 0022 Layer 2, fix #25). */
+export function isCompactOrClearCommand(prompt) {
+  return isCompactCommand(prompt) || isClearCommand(prompt);
+}
+
 /**
  * Returns true if the text contains a natural-language session-close signal.
  * Scans Korean and English close patterns. Designed for transcript user-message

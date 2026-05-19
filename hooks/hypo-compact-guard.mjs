@@ -2,12 +2,13 @@
 /**
  * hypo-compact-guard.mjs — UserPromptSubmit hook
  *
- * Scope: detects "/compact" typed in chat only.
+ * Scope: detects "/compact" or "/clear" typed in chat only (ADR 0022 Layer 2, fix #25).
  * The CLI built-in /compact does NOT fire UserPromptSubmit — use personal-wiki-check.mjs
- * (PreCompact hook) as the hard gate for that path.
+ * (PreCompact hook) as the hard gate for that path. /clear has no PreCompact event, so
+ * this hook is the only chat-side gate that can prompt session-close before context wipe.
  *
  * Behavior: if session close is incomplete → instruct Claude to run session close
- * immediately before /compact.
+ * immediately before /compact or /clear.
  */
 
 import {
@@ -15,7 +16,8 @@ import {
   hypoIsClean,
   hotMdIsClean,
   readChecklist,
-  isCompactCommand,
+  isClearCommand,
+  isCompactOrClearCommand,
   isGateSkipped,
 } from './hypo-shared.mjs';
 
@@ -29,10 +31,12 @@ process.stdin.on('end', () => {
     const data = JSON.parse(input);
     const prompt = (data.prompt || '').trim();
 
-    if (!isCompactCommand(prompt) || isGateSkipped()) {
+    if (!isCompactOrClearCommand(prompt) || isGateSkipped()) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
+
+    const detected = isClearCommand(prompt) ? '/clear' : '/compact';
 
     const hasSession = lastSubstantialOpIsSession();
     const gitStatus = hypoIsClean();
@@ -59,8 +63,8 @@ process.stdin.on('end', () => {
       JSON.stringify({
         continue: true,
         additionalContext: [
-          `[WIKI_AUTOCLOSE] /compact detected — session close incomplete (${reasons.join(', ')}).`,
-          `Do NOT wait for user input. Run wiki session close NOW, then retry /compact.`,
+          `[WIKI_AUTOCLOSE] ${detected} detected — session close incomplete (${reasons.join(', ')}).`,
+          `Do NOT wait for user input. Run wiki session close NOW, then retry ${detected}.`,
           ``,
           body,
           ``,
