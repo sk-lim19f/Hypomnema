@@ -6,7 +6,7 @@
  * Hooks are deployed to ~/.claude/hooks/ — no external imports allowed.
  */
 
-import { readFileSync, existsSync, appendFileSync, mkdirSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, rmSync } from 'fs';
 import { join, relative, basename } from 'path';
 import { homedir, hostname } from 'os';
 import { spawnSync } from 'child_process';
@@ -384,6 +384,91 @@ export function readSyncState(hypoDir) {
 export function clearSyncState(hypoDir) {
   try {
     rmSync(syncStatePath(hypoDir), { force: true });
+  } catch {
+    // best-effort
+  }
+}
+
+// ── clear-marker (fix #25 PR-A2, ADR 0022 amendment 2026-05-14) ────────────
+// `/clear` cannot be blocked (no UserPromptSubmit fire). The only intervention
+// point is the SessionEnd(reason='clear') → SessionStart(source='clear') pair:
+// SessionEnd writes `.cache/clear-marker.json` with the dying session's id +
+// transcript path; SessionStart on `source=clear` reads, injects a recovery
+// nudge into additionalContext, and unlinks (one-shot). A 7-day stale guard
+// prevents an orphaned marker (SessionEnd fired but new session never began)
+// from polluting an unrelated later session.
+
+const CLEAR_MARKER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** @returns {string} path to the clear-marker file for a wiki root. */
+function clearMarkerPath(hypoDir) {
+  return join(hypoDir, '.cache', 'clear-marker.json');
+}
+
+/**
+ * Persist the dying session's identity so the next SessionStart(source=clear)
+ * can issue a recovery nudge. Single-file by design (see ADR 0022 amendment):
+ * /clear is a single-client UX action, multi-marker disambiguation buys no
+ * safety and breaks the 1-of-1 read-and-unlink contract.
+ *
+ * Best-effort: a failure here only loses the recovery nudge, never the user's
+ * `/clear` itself.
+ *
+ * @param {string} hypoDir
+ * @param {{prev_session_id: string, prev_transcript_path: string, prev_cwd?: string}} info
+ */
+export function writeClearMarker(hypoDir, info) {
+  try {
+    const cacheDir = join(hypoDir, '.cache');
+    if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
+    const payload = {
+      prev_session_id: info.prev_session_id || null,
+      prev_transcript_path: info.prev_transcript_path || null,
+      prev_cwd: info.prev_cwd || null,
+      ts: new Date().toISOString(),
+    };
+    writeFileSync(clearMarkerPath(hypoDir), JSON.stringify(payload) + '\n');
+  } catch (err) {
+    process.stderr.write(`[hypo] clear-marker write failed: ${err?.message || err}\n`);
+  }
+}
+
+/**
+ * Read the clear-marker if present and not stale (>7 days). Returns null when
+ * absent, unreadable, or expired. Stale markers are unlinked here so a single
+ * SessionStart cleans them up — no separate cron needed.
+ *
+ * @param {string} hypoDir
+ * @returns {object|null}
+ */
+export function readClearMarker(hypoDir) {
+  const path = clearMarkerPath(hypoDir);
+  if (!existsSync(path)) return null;
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf-8'));
+    const ts = Date.parse(data?.ts || '');
+    if (!Number.isFinite(ts) || Date.now() - ts > CLEAR_MARKER_STALE_MS) {
+      rmSync(path, { force: true });
+      return null;
+    }
+    return data;
+  } catch (err) {
+    // Corrupt marker: emit a debug line AND unlink so the next SessionStart
+    // does not log the same parse error forever (self-cleanup invariant).
+    process.stderr.write(`[hypo] clear-marker read failed: ${err?.message || err}\n`);
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // best-effort
+    }
+    return null;
+  }
+}
+
+/** Delete the clear-marker. One-shot contract — caller is SessionStart. */
+export function clearClearMarker(hypoDir) {
+  try {
+    rmSync(clearMarkerPath(hypoDir), { force: true });
   } catch {
     // best-effort
   }
