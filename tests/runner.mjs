@@ -15,6 +15,7 @@ import {
   readFileSync,
   existsSync,
   symlinkSync,
+  statSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -24,6 +25,16 @@ const HOME = homedir();
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const SCRIPTS = join(REPO, 'scripts');
 const NONEXISTENT_WIKI = join(tmpdir(), `hypo-no-wiki-${process.pid}`);
+
+// Session-wide tmp HOME: every child process launched via run() inherits this
+// HOME so scripts like init.mjs cannot write to the real ~/.claude/. Tests that
+// need a specific HOME use runWithHome() to override.
+const SESSION_TMP_HOME = mkdtempSync(join(tmpdir(), 'hypo-session-home-'));
+process.on('exit', () => {
+  try {
+    rmSync(SESSION_TMP_HOME, { recursive: true, force: true });
+  } catch {}
+});
 
 // ── minimal test harness ─────────────────────────────────────────────────────
 
@@ -66,7 +77,7 @@ function suite(label) {
 function run(script, args = []) {
   return spawnSync(process.execPath, [join(SCRIPTS, script), ...args], {
     encoding: 'utf-8',
-    env: { ...process.env, HYPO_DIR: '' },
+    env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
   });
 }
 
@@ -281,6 +292,70 @@ test('pre-commit hook blocks staged .env file via git commit', () => {
     assert.ok(
       (commitR.stdout + commitR.stderr).includes('.env.local'),
       `expected .env.local in git output: ${commitR.stdout}${commitR.stderr}`,
+    );
+  });
+});
+
+// ── test-hermeticity guard (Stage 2 #3) ──────────────────────────────────────
+// Regression guard: tests must never write to the real ~/.claude/. Snapshot
+// the real-HOME paths init.mjs would touch, invoke init.mjs via the default
+// run() helper, and assert nothing under real HOME changed. If a future test
+// accidentally uses runWithHome(home=homedir()) or a script gains a new
+// HOME-derived write path not covered by SESSION_TMP_HOME, this test fails.
+
+suite('test hermeticity — run() must not touch real HOME');
+
+test('init.mjs invoked via run() does not write to real ~/.claude/', () => {
+  const realPaths = [
+    join(HOME, '.claude', 'commands', 'hypo'),
+    join(HOME, '.claude', 'hypo-pkg.json'),
+    join(HOME, '.claude', 'settings.json'),
+    join(HOME, '.claude', 'hooks'),
+  ];
+  const snapshot = realPaths.map((p) => {
+    if (!existsSync(p)) return { p, exists: false };
+    const s = statSync(p);
+    return { p, exists: true, mtimeMs: s.mtimeMs, size: s.size, ino: s.ino };
+  });
+
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init']);
+    assert.equal(r.status, 0, `init failed: ${r.stderr}`);
+  });
+
+  for (const before of snapshot) {
+    const nowExists = existsSync(before.p);
+    assert.equal(
+      nowExists,
+      before.exists,
+      `real HOME path existence changed: ${before.p} (was ${before.exists}, now ${nowExists})`,
+    );
+    if (before.exists) {
+      const s = statSync(before.p);
+      assert.equal(s.mtimeMs, before.mtimeMs, `real HOME path mutated (mtime): ${before.p}`);
+      assert.equal(s.ino, before.ino, `real HOME path replaced (inode): ${before.p}`);
+    }
+  }
+});
+
+test('run() exports a HOME under tmpdir() that differs from real homedir()', () => {
+  // Spawn a tiny probe script via run() and assert the child sees the injected
+  // HOME, not the real one. This exercises run()'s env wiring directly instead
+  // of only asserting the SESSION_TMP_HOME constant.
+  withTmpDir((dir) => {
+    const probe = join(dir, 'probe.mjs');
+    writeFileSync(probe, "process.stdout.write(process.env.HOME ?? '')\n");
+    const r = spawnSync(process.execPath, [probe], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(r.status, 0, `probe failed: ${r.stderr}`);
+    assert.equal(r.stdout, SESSION_TMP_HOME, 'child must see SESSION_TMP_HOME');
+    assert.notEqual(r.stdout, HOME, 'child must not see real homedir()');
+    assert.ok(
+      r.stdout.startsWith(tmpdir()),
+      `child HOME must live under tmpdir(), got ${r.stdout}`,
     );
   });
 });
