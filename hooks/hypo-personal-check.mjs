@@ -9,11 +9,14 @@
  *   - hot.md has forbidden structure
  *   - lint blockers exist
  *
- * Bypass options (checked in order, short-circuits before heavy checks):
- *   1. wiki-context-critical.json exists (context ≥ 90% — hard limit imminent)
- *   2. HYPO_SKIP_GATE=1 env var
- *   3. HYPO_SKIP_GATE=1 in a recent *user-role* transcript message
+ * Bypass options (checked in order, per ADR 0022 / spec §7.5):
+ *   1. HYPO_SKIP_GATE=1 env var
+ *   2. HYPO_SKIP_GATE=1 in a recent *user-role* transcript message
  *      (assistant/tool output is excluded to prevent self-triggering from block reason text)
+ *
+ * NOTE: capacity bypass (wiki-context-critical.json ≥90%) was REMOVED by fix #26
+ * (ADR 0022 amendment 2026-05-13). Spec §7.5: even at full context, minimal
+ * session-close is mandatory — auto-bypass on capacity caused silent state loss.
  */
 
 import { spawnSync } from 'child_process';
@@ -31,7 +34,6 @@ import {
   isClosePattern,
 } from './hypo-shared.mjs';
 
-const CRITICAL_FILE = join(homedir(), '.claude', 'state', 'wiki-context-critical.json');
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
 /** Parse JSONL transcript and return concatenated text of user-role messages only.
@@ -74,20 +76,9 @@ process.stdin.on('end', () => {
     /* fail-open */
   }
 
-  // ── Bypass 1: context critical (≥90%) — short-circuit BEFORE all checks ──
-  if (existsSync(CRITICAL_FILE)) {
-    try {
-      unlinkSync(CRITICAL_FILE);
-    } catch {}
-    console.log(
-      JSON.stringify({
-        continue: true,
-        systemMessage:
-          '[WIKI CHECK] gate auto-bypassed (context ≥90% critical). Session close pending next session.',
-      }),
-    );
-    return;
-  }
+  // ── Capacity bypass (≥90%) REMOVED — fix #26, ADR 0022 amendment 2026-05-13.
+  //    Even at full context, minimal session-close is mandatory (spec §7.5).
+  //    Bypass paths are now only: HYPO_SKIP_GATE env / HYPO_SKIP_GATE in transcript.
 
   // ── Block 1.5: context warning (≥70%) — request session-compact before compact ──
   if (existsSync(WARNING_FILE)) {

@@ -16,6 +16,7 @@ import {
   existsSync,
   symlinkSync,
   statSync,
+  unlinkSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -578,10 +579,19 @@ const { isCompactCommand, isGateSkipped, buildOutput, isClosePattern } = await i
 );
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
+  // Hermeticity invariant (mirrors run() helper, PR #30 / stage-2-#3): child hook
+  // must NOT see the developer's real $HOME. Default HOME to SESSION_TMP_HOME so
+  // any hook that reads ~/.claude/state/, ~/.claude/, or homedir() lands in the
+  // tmp scratch dir. extraEnv may still override HOME explicitly.
   return spawnSync(process.execPath, [join(HOOKS, hookFile)], {
     input: typeof stdinData === 'string' ? stdinData : JSON.stringify(stdinData),
     encoding: 'utf-8',
-    env: { ...process.env, HYPO_DIR: '/tmp/nonexistent-hypo-99999', ...extraEnv },
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: '/tmp/nonexistent-hypo-99999',
+      ...extraEnv,
+    },
   });
 }
 
@@ -1001,6 +1011,65 @@ test('HYPO_SKIP_GATE=1 bypasses an incomplete session close', () => {
         out.systemMessage.includes('memory files not updated'),
         `bypass message should still surface the incomplete files: ${out.systemMessage}`,
       );
+    },
+  );
+});
+
+// ── replay-personal-check-bypass-order (fix #26, ADR 0022 amendment 2026-05-13) ──
+// Capacity bypass (wiki-context-critical.json ≥90%) was removed. Spec §7.5:
+// the only bypass paths are HYPO_SKIP_GATE env / transcript user-role message.
+
+test('replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (fix #26 negative control)', () => {
+  withWiki(
+    (dir) => {
+      // Make session-close stale so the gate would normally block.
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
+        '---\ntitle: session-state\ntype: session-state\nupdated: 2020-01-01\n---\n\n## 다음 작업\n\n- next\n',
+      );
+    },
+    (dir) => {
+      // Write the (now-defunct) capacity marker into the session-scoped tmp HOME,
+      // and force the child hook to see THAT HOME — never the developer's real
+      // ~/.claude/state/. This mirrors the test-hermeticity invariant established
+      // by PR #30 (stage-2-#3): every hook test must scope HOME to SESSION_TMP_HOME.
+      const stateDir = join(SESSION_TMP_HOME, '.claude', 'state');
+      mkdirSync(stateDir, { recursive: true });
+      const criticalPath = join(stateDir, 'wiki-context-critical.json');
+      writeFileSync(criticalPath, JSON.stringify({ percent: 95 }));
+
+      try {
+        const r = runHook('hypo-personal-check.mjs', '', {
+          HYPO_DIR: dir,
+          HOME: SESSION_TMP_HOME,
+        });
+        const out = JSON.parse(r.stdout);
+
+        // Pre-fix: would have continue:true + "gate auto-bypassed (context ≥90% critical)".
+        // Post-fix: capacity flag is ignored → normal block path runs.
+        assert.equal(
+          out.decision,
+          'block',
+          `CRITICAL_FILE must NOT bypass — gate should still block: ${r.stdout}`,
+        );
+        assert.ok(
+          !(out.systemMessage || '').includes('context ≥90% critical'),
+          'capacity-bypass message must no longer appear',
+        );
+
+        // Negative control: the file MUST remain — fix #26 removed the unlink path too.
+        // If it's gone, the old bypass code is still wired somewhere.
+        assert.ok(
+          existsSync(criticalPath),
+          'wiki-context-critical.json should not be consumed (bypass path removed)',
+        );
+      } finally {
+        if (existsSync(criticalPath)) {
+          try {
+            unlinkSync(criticalPath);
+          } catch {}
+        }
+      }
     },
   );
 });
