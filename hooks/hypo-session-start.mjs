@@ -18,6 +18,8 @@ import {
   formatGrowthMetrics,
   readSyncState,
   clearSyncState,
+  readClearMarker,
+  clearClearMarker,
   loadHypoIgnore,
   isIgnored,
 } from './hypo-shared.mjs';
@@ -43,6 +45,32 @@ function readLastGrowthLine() {
   } catch {
     return '';
   }
+}
+
+/**
+ * fix #25 PR-A2 (ADR 0022 amendment 2026-05-14): if the prior session ended
+ * via `/clear`, hypo-session-end stashed its identity in `.cache/clear-marker.json`.
+ * Read it (with 7-day stale guard), unlink it (one-shot), and return a
+ * `[WIKI_AUTOCLOSE]` recovery line for additionalContext + stderr.
+ *
+ * @param {string|undefined} source SessionStart payload `source` field
+ * @returns {string} recovery line, or '' when no recovery is needed
+ */
+function buildClearRecoveryLine(source) {
+  if (source !== 'clear') return '';
+  const marker = readClearMarker(HYPO_DIR);
+  if (!marker) return '';
+  clearClearMarker(HYPO_DIR);
+  const prevId = marker.prev_session_id || 'unknown';
+  const prevTr = marker.prev_transcript_path || null;
+  const prevCwd = marker.prev_cwd || null;
+  const trLine = prevTr ? `\n  prev_transcript: ${prevTr}` : '';
+  const cwdLine = prevCwd ? `\n  prev_cwd: ${prevCwd}` : '';
+  return (
+    `[WIKI_AUTOCLOSE] 이전 세션(${prevId})이 /clear로 강제 종료됨.${trLine}${cwdLine}\n` +
+    `  session-close가 미완료라면 지금 즉시 실행할 것 ` +
+    `(hot.md + session-state.md + log.md 최소 갱신).`
+  );
 }
 
 /** Pull the wiki repo. Returns true only when the pull actually succeeded. */
@@ -176,14 +204,21 @@ process.stdin.on('end', () => {
     const pullOk = gitPull(HYPO_DIR);
     const syncLine = syncStateNotice(pullOk);
     const growthLine = readLastGrowthLine();
+    // fix #25 PR-A2 (ADR 0022 amendment): on source='clear', surface the dying
+    // session's identity that hypo-session-end stashed so Claude can recover
+    // session-close work that /clear skipped. One-shot: marker is unlinked
+    // immediately after read.
+    const clearRecoveryLine = buildClearRecoveryLine(data.source);
     // Intentional dual emit: stderr (yellow/cyan) is the human-visible nudge in
     // the terminal; noticePrefix injects the same plain-text lines into the
     // LLM's additionalContext so model and user start the session looking at
     // the same state. ANSI escapes are kept out of additionalContext on purpose.
-    const notices = [syncLine, growthLine].filter(Boolean);
+    const notices = [syncLine, growthLine, clearRecoveryLine].filter(Boolean);
     const noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
     if (syncLine) process.stderr.write(`\n\x1b[33m${syncLine}\x1b[0m\n`);
     if (growthLine) process.stderr.write(`\n\x1b[36m${growthLine}\x1b[0m\n`);
+    if (clearRecoveryLine)
+      process.stderr.write(`\n\x1b[33m${clearRecoveryLine.split('\n')[0]}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);

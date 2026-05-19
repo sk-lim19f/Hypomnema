@@ -2764,6 +2764,190 @@ test('replay-session-start-preserves-sync-state-when-ahead: unpushed commit keep
   });
 });
 
+// ── hypo-session-end / clear-marker (fix #25 PR-A2, ADR 0022 amendment) ────
+
+suite('hypo-session-end.mjs / hypo-session-start.mjs — clear-marker replay');
+
+function runSessionEnd(dir, payload) {
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-session-end.mjs')], {
+    input: JSON.stringify(payload),
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+  });
+}
+
+function runStartWithSource(dir, source) {
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+    input: JSON.stringify({ cwd: dir, session_id: 'new-session', source }),
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+  });
+}
+
+function readMarker(dir) {
+  const p = join(dir, '.cache', 'clear-marker.json');
+  if (!existsSync(p)) return null;
+  return JSON.parse(readFileSync(p, 'utf-8'));
+}
+
+test('replay-session-end-writes-clear-marker-on-clear: reason=clear stashes session identity', () => {
+  withGrowthWiki((dir) => {
+    const r = runSessionEnd(dir, {
+      reason: 'clear',
+      session_id: 'dying-session',
+      transcript_path: '/tmp/transcript-xyz.jsonl',
+      cwd: '/Users/x/Workspace/foo',
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const marker = readMarker(dir);
+    assert.ok(marker, 'clear-marker.json must be written');
+    assert.equal(marker.prev_session_id, 'dying-session');
+    assert.equal(marker.prev_transcript_path, '/tmp/transcript-xyz.jsonl');
+    assert.equal(marker.prev_cwd, '/Users/x/Workspace/foo');
+    assert.ok(marker.ts, 'ts must be present');
+  });
+});
+
+test('replay-session-end-skips-marker-on-non-clear-reason: prompt_input_exit is a deliberate exit', () => {
+  withGrowthWiki((dir) => {
+    const r = runSessionEnd(dir, {
+      reason: 'prompt_input_exit',
+      session_id: 'normal-exit',
+      transcript_path: '/tmp/t.jsonl',
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(readMarker(dir), null, 'non-clear reason must not write marker');
+  });
+});
+
+test('replay-session-end-skips-marker-on-logout: any non-clear reason is skipped', () => {
+  withGrowthWiki((dir) => {
+    runSessionEnd(dir, { reason: 'logout', session_id: 's', transcript_path: '/t' });
+    assert.equal(readMarker(dir), null);
+  });
+});
+
+test('replay-session-start-injects-clear-recovery-on-source-clear: marker drives [WIKI_AUTOCLOSE]', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'clear-marker.json'),
+      JSON.stringify({
+        prev_session_id: 'dying-session-42',
+        prev_transcript_path: '/tmp/transcript-42.jsonl',
+        prev_cwd: '/Users/x/repo',
+        ts: new Date().toISOString(),
+      }) + '\n',
+    );
+    const r = runStartWithSource(dir, 'clear');
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(ctx.includes('[WIKI_AUTOCLOSE]'), `recovery line missing: ${ctx}`);
+    assert.ok(ctx.includes('dying-session-42'), `prev_session_id missing: ${ctx}`);
+    assert.ok(ctx.includes('/tmp/transcript-42.jsonl'), `prev_transcript_path missing: ${ctx}`);
+    assert.ok(ctx.includes('/Users/x/repo'), `prev_cwd missing from recovery line: ${ctx}`);
+  });
+});
+
+test('replay-session-end-emits-suppressed-continue: stdout JSON is well-formed', () => {
+  withGrowthWiki((dir) => {
+    const r = runSessionEnd(dir, {
+      reason: 'clear',
+      session_id: 's',
+      transcript_path: '/t',
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, 'must emit continue:true');
+    assert.equal(out.suppressOutput, true, 'must emit suppressOutput:true');
+  });
+});
+
+test('replay-session-end-graceful-when-hypo-dir-missing: no marker created in nonexistent wiki', () => {
+  const ghostDir = join(tmpdir(), `hypo-ghost-${process.pid}-${Date.now()}`);
+  const r = runSessionEnd(ghostDir, { reason: 'clear', session_id: 's', transcript_path: '/t' });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  assert.ok(!existsSync(ghostDir), 'hook must not create the wiki tree it is missing');
+});
+
+test('replay-session-start-removes-corrupt-marker: invalid JSON triggers self-cleanup', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const p = join(dir, '.cache', 'clear-marker.json');
+    writeFileSync(p, '{not valid json');
+    const r = runStartWithSource(dir, 'clear');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `corrupt marker must not fire: ${ctx}`);
+    assert.ok(!existsSync(p), 'corrupt marker must be unlinked on read failure');
+  });
+});
+
+test('replay-session-start-removes-marker-after-read: one-shot contract', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const p = join(dir, '.cache', 'clear-marker.json');
+    writeFileSync(
+      p,
+      JSON.stringify({
+        prev_session_id: 's',
+        prev_transcript_path: '/t',
+        prev_cwd: '/c',
+        ts: new Date().toISOString(),
+      }) + '\n',
+    );
+    runStartWithSource(dir, 'clear');
+    assert.ok(!existsSync(p), 'marker must be unlinked after read (one-shot)');
+  });
+});
+
+test('replay-session-start-graceful-when-source-clear-but-no-marker: missing marker is silent', () => {
+  withGrowthWiki((dir) => {
+    const r = runStartWithSource(dir, 'clear');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `recovery line should not fire: ${ctx}`);
+  });
+});
+
+test('replay-session-start-ignores-clear-marker-on-source-startup: marker only consumed on source=clear', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const p = join(dir, '.cache', 'clear-marker.json');
+    writeFileSync(
+      p,
+      JSON.stringify({
+        prev_session_id: 's',
+        prev_transcript_path: '/t',
+        ts: new Date().toISOString(),
+      }) + '\n',
+    );
+    const r = runStartWithSource(dir, 'startup');
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `marker must not fire on source=startup: ${ctx}`);
+    assert.ok(existsSync(p), 'marker must be preserved when source !== clear');
+  });
+});
+
+test('replay-session-start-drops-stale-clear-marker: >7 day marker is discarded', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const p = join(dir, '.cache', 'clear-marker.json');
+    const stale = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    writeFileSync(
+      p,
+      JSON.stringify({
+        prev_session_id: 's',
+        prev_transcript_path: '/t',
+        ts: stale,
+      }) + '\n',
+    );
+    const r = runStartWithSource(dir, 'clear');
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `stale marker must not fire: ${ctx}`);
+    assert.ok(!existsSync(p), 'stale marker must be cleaned up');
+  });
+});
+
 // ── weekly-report.mjs (Lane E) ───────────────────────────────────────────────
 
 suite('weekly-report.mjs');
