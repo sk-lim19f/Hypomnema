@@ -75,7 +75,18 @@ const TYPE_CONDITIONAL_FIELDS = {
   'tool-eval': ['status'],
   postmortem: ['outcome'],
   learning: ['source'],
-  feedback: ['source'],
+  // feedback: ADR 0031 / fix #37 — projection SoT requires full classification
+  feedback: [
+    'status',
+    'scope',
+    'tier',
+    'targets',
+    'sensitivity',
+    'priority',
+    'memory_summary',
+    'reason',
+    'source',
+  ],
   'prompt-pattern': ['source'],
   'source-summary': ['sources'],
   'weekly-journal': ['week'],
@@ -85,6 +96,13 @@ const TYPE_ENUM_FIELDS = {
   prd: { status: ['draft', 'active', 'completed', 'cancelled', 'archived'] },
   adr: { status: ['proposed', 'accepted', 'deprecated', 'superseded'] },
   'tool-eval': { status: ['adopted', 'evaluating', 'rejected'] },
+  // feedback: ADR 0031 / fix #37 — sensitivity:private is forbidden (wiki is a
+  // git-pushed public surface)
+  feedback: {
+    status: ['active', 'superseded', 'archived'],
+    tier: ['L1', 'L2'],
+    sensitivity: ['public', 'sanitized'],
+  },
 };
 
 // ── page collector ────────────────────────────────────────────────────────────
@@ -244,6 +262,26 @@ function lintPage({ path, rel }, slugMap, tagVocab) {
           rel,
           `Invalid value for ${field} on type "${fm.type}": "${fm[field]}" (allowed: ${allowed.join(', ')})`,
         );
+      }
+    }
+  }
+
+  // feedback: scope vocabulary + conditional claude-learned fields (ADR 0031 / fix #37)
+  if (fm.type === 'feedback') {
+    const scope = fm.scope || '';
+    if (scope && scope !== 'global' && !/^project:[a-z0-9][a-z0-9-]*$/.test(scope)) {
+      issue('error', rel, `Invalid feedback scope: "${scope}" (allowed: global | project:<slug>)`);
+    }
+    const fbTargets = parseTagsField(fm.targets) || [];
+    if (fbTargets.includes('claude-learned')) {
+      for (const field of ['global_summary', 'promote_to_global']) {
+        if (!fm[field]) {
+          issue(
+            'error',
+            rel,
+            `Missing required field for feedback with targets:claude-learned: ${field}`,
+          );
+        }
       }
     }
   }

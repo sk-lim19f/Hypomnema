@@ -96,6 +96,31 @@ verify_by: <question to re-check at next review>
 verify_by_date: YYYY-MM-DD
 ```
 
+### 3.1. `feedback` type — projection fields (ADR 0031)
+
+Feedback pages are the single source of truth for behavior corrections;
+`hypomnema feedback-sync` projects them one-way into Claude Code's `MEMORY.md`
+and `~/.claude/CLAUDE.md` `<learned_behaviors>`. They require:
+
+```yaml
+status: active | superseded | archived
+scope: global | project:<slug>           # global → eligible for CLAUDE.md projection
+tier: L1 | L2                            # L1 required for CLAUDE.md <learned_behaviors>
+targets: [project-memory, claude-learned] # which projection surfaces to derive
+sensitivity: public | sanitized          # `private` forbidden (wiki is git-pushed)
+priority: 1-5                            # over-cap sort key (higher first)
+memory_summary: <one line for the MEMORY.md index>
+reason: <why this rule is needed>
+source: session:YYYY-MM-DD | commit:<hash> | pr:<n> | https://...
+
+# conditional — required when `targets` includes `claude-learned`:
+global_summary: <one line for the <learned_behaviors> entry>
+promote_to_global: true                  # explicit opt-in to global projection
+```
+
+Edit the feedback page only — never hand-edit the generated
+`<!-- HYPO:FEEDBACK-SYNC:START … -->` managed blocks (sync detects tampering as a conflict).
+
 ---
 
 ## 4. Tag Vocabulary

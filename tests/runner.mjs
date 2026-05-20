@@ -2070,6 +2070,124 @@ test('weekly-journal under journal/weekly missing week → error (scanDirs cover
   );
 });
 
+// feedback type — ADR 0031 / fix #37 conditional schema (#8)
+const FB_FM_OK =
+  '---\ntitle: T\ntype: feedback\nstatus: active\nscope: global\ntier: L1\n' +
+  'targets: [project-memory, claude-learned]\nsensitivity: public\npriority: 3\n' +
+  'memory_summary: m\nglobal_summary: g\npromote_to_global: true\nreason: r\n' +
+  'source: session:2026-05-20\nupdated: 2026-05-20\ntags: [feedback]\n---\nbody\n';
+
+test('feedback fully populated → no error', () => {
+  const { r } = lintWithSchema('pages/feedback/ok.md', FB_FM_OK);
+  assert.equal(r.status, 0, `expected clean, got ${r.status}: ${r.stdout}`);
+});
+
+test('feedback missing tier → error', () => {
+  const { r, out } = lintWithSchema('pages/feedback/x.md', FB_FM_OK.replace('tier: L1\n', ''));
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Missing required field for type "feedback": tier')),
+    `tier error missing: ${r.stdout}`,
+  );
+});
+
+test('feedback sensitivity:private → error (forbidden vocabulary)', () => {
+  const { r, out } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('sensitivity: public', 'sensitivity: private'),
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Invalid value for sensitivity')),
+    `private sensitivity must error: ${r.stdout}`,
+  );
+});
+
+test('feedback claude-learned target without global_summary → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('global_summary: g\n', ''),
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('targets:claude-learned: global_summary')),
+    `conditional global_summary error missing: ${r.stdout}`,
+  );
+});
+
+test('feedback project-memory-only target does NOT require global_summary', () => {
+  const { r } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('targets: [project-memory, claude-learned]', 'targets: [project-memory]')
+      .replace('global_summary: g\n', '')
+      .replace('promote_to_global: true\n', '')
+      .replace('scope: global', 'scope: project:hypomnema')
+      .replace('tier: L1', 'tier: L2'),
+  );
+  assert.equal(r.status, 0, `project-memory-only feedback should be clean: ${r.stdout}`);
+});
+
+test('feedback invalid scope → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('scope: global', 'scope: team'),
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Invalid feedback scope')),
+    `invalid scope must error: ${r.stdout}`,
+  );
+});
+
+test('feedback status:superseded + sensitivity:sanitized → no error (allowed enums)', () => {
+  const { r } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('status: active', 'status: superseded').replace(
+      'sensitivity: public',
+      'sensitivity: sanitized',
+    ),
+  );
+  assert.equal(r.status, 0, `superseded+sanitized must be clean: ${r.stdout}`);
+});
+
+test('feedback invalid tier → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('tier: L1', 'tier: L3'),
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Invalid value for tier')),
+    `invalid tier must error: ${r.stdout}`,
+  );
+});
+
+test('feedback claude-learned target without promote_to_global → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('promote_to_global: true\n', ''),
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('targets:claude-learned: promote_to_global')),
+    `conditional promote_to_global error missing: ${r.stdout}`,
+  );
+});
+
+test('feedback missing targets → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('targets: [project-memory, claude-learned]\n', ''),
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) =>
+      e.message.includes('Missing required field for type "feedback": targets'),
+    ),
+    `missing targets error: ${r.stdout}`,
+  );
+});
+
 suite('lint.mjs tag vocabulary + forbidden patterns');
 
 test('PascalCase tag → error', () => {
