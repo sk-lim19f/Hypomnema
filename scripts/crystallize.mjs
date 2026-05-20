@@ -72,7 +72,12 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
-import { sessionCloseFileStatus } from '../hooks/hypo-shared.mjs';
+import {
+  sessionCloseFileStatus,
+  writeSessionClosedMarker,
+  sessionClosedMarkerPath,
+  hypoIsClean,
+} from '../hooks/hypo-shared.mjs';
 
 const LINT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'lint.mjs');
 
@@ -108,6 +113,8 @@ function parseArgs(argv) {
     json: false,
     checkSessionClose: false,
     applySessionClose: false,
+    markSessionClosed: false,
+    sessionId: null,
     payload: null,
     force: false,
   };
@@ -116,6 +123,8 @@ function parseArgs(argv) {
     else if (arg.startsWith('--min-group=')) args.minGroup = parseInt(arg.slice(12), 10) || 2;
     else if (arg === '--check-session-close') args.checkSessionClose = true;
     else if (arg === '--apply-session-close') args.applySessionClose = true;
+    else if (arg === '--mark-session-closed') args.markSessionClosed = true;
+    else if (arg.startsWith('--session-id=')) args.sessionId = arg.slice(13);
     else if (arg.startsWith('--payload=')) args.payload = arg.slice(10);
     else if (arg === '--force') args.force = true;
     else if (arg === '--json') args.json = true;
@@ -307,6 +316,71 @@ function validatePayloadShape(payload) {
   return errs;
 }
 
+// ── session-close marker (fix #27 PR-C, ADR 0022 amendment 2026-05-19) ──────
+// Standalone marker writer. Used when the LLM closes the session via direct
+// Write tool calls (not --apply-session-close). Hook `hypo-auto-minimal-
+// crystallize` is the only Reader; writer authority is intentionally split
+// between this CLI and the auto-write at the tail of applySessionClose.
+//
+// Contract: marker is only written when sessionCloseFileStatus(hypoDir).ok.
+// A failed check exits 1 with no marker — the next Stop hook will re-block.
+
+function runMarkSessionClosed(args) {
+  if (!args.sessionId) {
+    const msg = '--session-id=<id> is required with --mark-session-closed';
+    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+    process.exit(1);
+  }
+  // ADR 0022 amendment 2026-05-19 Q2: marker write authority requires BOTH
+  // sessionCloseFileStatus.ok AND hypoIsClean.clean — git dirty would let a
+  // Stop hook pass while wiki changes are still uncommitted (auto-commit may
+  // have failed in this run). Codex Worker-1 BLOCKER (pre-commit review).
+  const status = sessionCloseFileStatus(args.hypoDir);
+  const git = hypoIsClean(args.hypoDir);
+  if (!status.ok || !git.clean) {
+    const result = {
+      ok: false,
+      session_id: args.sessionId,
+      project: status.project,
+      missing: status.missing,
+      stale: status.stale,
+      git_reason: git.clean ? null : git.reason,
+      error: 'session-close gate not satisfied — marker not written',
+    };
+    if (args.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(`✗ session-close gate not satisfied — marker not written (project: ${status.project || '(unresolved)'}):`);
+      for (const f of status.missing) console.log(`  ✗ ${f} (missing)`);
+      for (const f of status.stale) console.log(`  ✗ ${f} (stale)`);
+      if (!git.clean) console.log(`  ✗ git: ${git.reason}`);
+    }
+    process.exit(1);
+  }
+  writeSessionClosedMarker(args.hypoDir, args.sessionId, { project: status.project });
+  // Marker writer swallows IO errors (best-effort, see hypo-shared.mjs). Verify
+  // the file actually landed before claiming success — otherwise CLI exits 0
+  // while next Stop re-blocks, hiding a permission/disk problem.
+  // Codex Worker-2 CONCERN (pre-commit review).
+  if (!existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
+    const err = 'marker file did not land after write (likely .cache permission/disk issue)';
+    console.log(args.json ? JSON.stringify({ ok: false, session_id: args.sessionId, error: err }, null, 2) : `✗ ${err}`);
+    process.exit(1);
+  }
+  const result = {
+    ok: true,
+    session_id: args.sessionId,
+    project: status.project,
+    date: status.dates[0],
+  };
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`✓ session-closed marker written (session_id: ${args.sessionId}, project: ${status.project}).`);
+  }
+  process.exit(0);
+}
+
 function applySessionClose(args) {
   // Fix #39 (option D): early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
@@ -480,6 +554,23 @@ function applySessionClose(args) {
   }
 
   const ok = verification.ok && postApplyLint.ok;
+
+  // fix #27 PR-C (ADR 0022 amendment 2026-05-19): auto-write the per-session
+  // closed marker on a verified close. Hook authority is read-only; this is
+  // one of the two writer paths (the other is --mark-session-closed standalone).
+  // Marker requires BOTH file/lint gate (already in `ok`) AND clean git tree —
+  // ADR Q2 explicit. Auto-commit may have failed silently in the Stop chain;
+  // a dirty git would otherwise let the marker pass for an unrecorded close.
+  if (ok && args.sessionId) {
+    const git = hypoIsClean(args.hypoDir);
+    if (git.clean) {
+      writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
+    }
+    // git not clean → silent skip: caller's `result.ok` already reflects the
+    // file/lint state; surfacing a "marker skipped" warning here would
+    // confuse the close-applied success path. Next Stop re-blocks until
+    // git is clean (auto-commit retries on subsequent runs).
+  }
   const stage = ok
     ? null
     : !verification.ok && !postApplyLint.ok
@@ -573,6 +664,10 @@ function extractWikilinks(content) {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
+
+if (args.markSessionClosed) {
+  runMarkSessionClosed(args); // exits
+}
 
 if (args.applySessionClose) {
   applySessionClose(args); // exits
