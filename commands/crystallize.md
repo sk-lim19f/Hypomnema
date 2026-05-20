@@ -66,9 +66,19 @@ Content guidance for each slot:
 node <package-root>/scripts/crystallize.mjs \
   --apply-session-close \
   --payload=/tmp/hypo-session-close-<YYYY-MM-DD>.json \
+  --session-id=<current-session-id> \
   --hypo-dir="<path>" \
   --json
 ```
+
+**`--session-id` (fix #27 PR-C):** pass the current session's id whenever you
+know it — most importantly when this close was triggered by a `[WIKI_AUTOCLOSE]`
+Stop-hook block (the block reason prints the exact `--session-id` to use). On a
+verified close (`ok: true` + clean git tree), it writes the per-session marker
+`HYPO_DIR/.cache/session-closed-<id>.marker`. That marker is what tells the
+Stop-chain Layer 3 hook (`hypo-auto-minimal-crystallize`) the session is closed,
+so it stops re-prompting. Omit it only when running crystallize purely for
+synthesis (no session-close intent) — the marker is then simply not written.
 
 **Behavior (fix #39 option D + fix #40 lint gates):**
 
@@ -76,6 +86,7 @@ node <package-root>/scripts/crystallize.mjs \
 |---|---|
 | `--apply-session-close` (no `--payload`) | **Probe mode** — exits 0 with "오늘 이미 close 완료로 보임" if all 5 files are fresh today; exits 1 with "payload is required" otherwise. Cheap "already complete?" check. |
 | `--apply-session-close --payload=<path>` | **Always-apply** — payload presence = explicit close intent. Per-field idempotent writes (no-op when bytes match), then strict verification + lint gate. Safe to re-run. |
+| `--apply-session-close --payload=<path> --session-id=<id>` | Same as above, **plus** writes the per-session closed marker on success (clean git required). The Stop-chain Layer 3 path. |
 | `--apply-session-close --force` | Skips the probe early-exit. `--payload` still required for any actual apply work. |
 
 **Two lint gates run automatically (fix #40):**

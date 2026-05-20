@@ -86,22 +86,22 @@ export function lastSubstantialOpIsSession() {
   return /^## \[\d{4}-\d{2}-\d{2}\] session/.test(substantial[substantial.length - 1]);
 }
 
-export function hypoIsClean() {
+export function hypoIsClean(dir = HYPO_DIR) {
   try {
-    const porcelain = spawnSync('git', ['-C', HYPO_DIR, 'status', '--porcelain'], {
+    const porcelain = spawnSync('git', ['-C', dir, 'status', '--porcelain'], {
       encoding: 'utf-8',
     });
-    if (porcelain.status !== 0) return { clean: false, reason: `git check failed in ${HYPO_DIR}` };
+    if (porcelain.status !== 0) return { clean: false, reason: `git check failed in ${dir}` };
     if (porcelain.stdout.trim() !== '')
-      return { clean: false, reason: `uncommitted changes in ${HYPO_DIR}` };
-    const ahead = spawnSync('git', ['-C', HYPO_DIR, 'status', '--branch', '--porcelain'], {
+      return { clean: false, reason: `uncommitted changes in ${dir}` };
+    const ahead = spawnSync('git', ['-C', dir, 'status', '--branch', '--porcelain'], {
       encoding: 'utf-8',
     });
     if (/\[ahead \d+\]/.test(ahead.stdout || ''))
-      return { clean: false, reason: `unpushed commits in ${HYPO_DIR}` };
+      return { clean: false, reason: `unpushed commits in ${dir}` };
     return { clean: true };
   } catch {
-    return { clean: false, reason: `git check failed in ${HYPO_DIR}` };
+    return { clean: false, reason: `git check failed in ${dir}` };
   }
 }
 
@@ -474,6 +474,177 @@ export function clearClearMarker(hypoDir) {
   }
 }
 
+// ── session-closed marker (fix #27 PR-C, ADR 0022 amendment 2026-05-19) ────
+// Per-session marker proving session-close completed. Stop hook
+// (`hypo-auto-minimal-crystallize`) reads it; `scripts/crystallize.mjs` writes
+// it after a verified close. Per-session (not per-day) precision resolves the
+// codex BLOCKER from 2026-05-14: log.md date-level check false-passes when a
+// later session reuses an earlier session's entry on the same day.
+//
+// Writer authority lives in crystallize, NOT this hook: the hook only checks
+// presence. See ADR 0022 amendment 2026-05-19 Q2 for the split rationale.
+
+const SESSION_CLOSED_MARKER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Sanitize session_id for filesystem use — Claude session_ids are UUIDs but
+ *  defend against accidental path traversal regardless. */
+function sanitizeSessionId(sessionId) {
+  return String(sessionId).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128);
+}
+
+/** @returns {string} path to the session-closed marker for a given session_id. */
+export function sessionClosedMarkerPath(hypoDir, sessionId) {
+  return join(hypoDir, '.cache', `session-closed-${sanitizeSessionId(sessionId)}.marker`);
+}
+
+/**
+ * Persist a per-session close proof. Caller MUST verify
+ * `sessionCloseFileStatus(hypoDir).ok` before invoking — this helper does NOT
+ * re-check; that's the writer's contract (crystallize.mjs).
+ *
+ * Best-effort: stderr debug line on failure, no exception propagation.
+ *
+ * @param {string} hypoDir
+ * @param {string} sessionId
+ * @param {{project?: string, transcript_path?: string}} info
+ */
+export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
+  if (!sessionId) return;
+  try {
+    const cacheDir = join(hypoDir, '.cache');
+    if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
+    const payload = {
+      session_id: sessionId,
+      project: info.project || null,
+      transcript_path: info.transcript_path || null,
+      closed_at: new Date().toISOString(),
+      verification: 'session-close-file-status:ok',
+    };
+    writeFileSync(sessionClosedMarkerPath(hypoDir, sessionId), JSON.stringify(payload) + '\n');
+  } catch (err) {
+    process.stderr.write(`[hypo] session-closed marker write failed: ${err?.message || err}\n`);
+  }
+}
+
+/**
+ * Read the session-closed marker for `sessionId` if present and not stale
+ * (>7 days). Returns null when absent, unreadable, or expired. Stale/corrupt
+ * markers are unlinked here so a single Stop hook call cleans them up — no
+ * separate sweeper needed (mirrors clear-marker self-cleanup invariant).
+ *
+ * @param {string} hypoDir
+ * @param {string} sessionId
+ * @returns {object|null}
+ */
+export function readSessionClosedMarker(hypoDir, sessionId) {
+  if (!sessionId) return null;
+  const path = sessionClosedMarkerPath(hypoDir, sessionId);
+  if (!existsSync(path)) return null;
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf-8'));
+    const ts = Date.parse(data?.closed_at || '');
+    if (!Number.isFinite(ts) || Date.now() - ts > SESSION_CLOSED_MARKER_STALE_MS) {
+      rmSync(path, { force: true });
+      return null;
+    }
+    return data;
+  } catch (err) {
+    process.stderr.write(`[hypo] session-closed marker read failed: ${err?.message || err}\n`);
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // best-effort
+    }
+    return null;
+  }
+}
+
+/** Delete a session-closed marker. Test/maintenance helper. */
+export function clearSessionClosedMarker(hypoDir, sessionId) {
+  if (!sessionId) return;
+  try {
+    rmSync(sessionClosedMarkerPath(hypoDir, sessionId), { force: true });
+  } catch {
+    // best-effort
+  }
+}
+
+// ── transcript activity heuristic (fix #27 PR-C, ADR 0022 amendment 2026-05-19) ──
+// Substantial-session gate for the Stop hook: a session that performed at least
+// one mutation tool call (Edit / Write / MultiEdit / NotebookEdit) is "worth"
+// blocking on for session-close. Pure Q&A / read-only sessions skip the block.
+//
+// Bash is intentionally excluded — running tests would otherwise trigger
+// block. Future fix may broaden to read-heavy sessions (Grep ≥ N).
+
+const MUTATING_TOOL_NAMES = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+/** Mirror of `scripts/session-audit.mjs` extractToolNames: handles both top-level
+ *  `tool_use` entries (legacy fixtures) and nested `message.content[].tool_use`
+ *  blocks (real Claude Code transcripts). */
+function extractTranscriptToolNames(entry) {
+  const names = [];
+  if (!entry || typeof entry !== 'object') return names;
+  if (entry.type === 'tool_use') {
+    const n = entry.name || entry.tool_name;
+    if (n) names.push(n);
+  } else if (entry.tool_name || entry.name) {
+    if (entry.type === undefined || entry.type === 'tool_use') {
+      const n = entry.tool_name || entry.name;
+      if (n) names.push(n);
+    }
+  }
+  const content = entry.message?.content ?? (Array.isArray(entry.content) ? entry.content : null);
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === 'object' && block.type === 'tool_use') {
+        const n = block.name || block.tool_name;
+        if (n) names.push(n);
+      }
+    }
+  }
+  return names;
+}
+
+/**
+ * True if the JSONL transcript at `transcriptPath` contains ≥1 mutation
+ * tool_use (Edit/Write/MultiEdit/NotebookEdit).
+ *
+ * Granularity:
+ *   • Whole-file unreadable / missing path → returns false (fail-open).
+ *   • Per-line malformed JSON → that line is skipped, scan continues. Real
+ *     transcripts occasionally carry truncated lines; one bad line must not
+ *     hide a clearly-mutating session that follows. (Codex Worker-2 CONCERN
+ *     resolved 2026-05-19: line-level skip is the intended contract.)
+ *
+ * @param {string|null|undefined} transcriptPath
+ * @returns {boolean}
+ */
+export function hasMutatingTranscriptActivity(transcriptPath) {
+  if (!transcriptPath || typeof transcriptPath !== 'string') return false;
+  if (!existsSync(transcriptPath)) return false;
+  let raw;
+  try {
+    raw = readFileSync(transcriptPath, 'utf-8');
+  } catch {
+    return false;
+  }
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    for (const name of extractTranscriptToolNames(entry)) {
+      if (MUTATING_TOOL_NAMES.has(name)) return true;
+    }
+  }
+  return false;
+}
+
 // ── session-close checklist ────────────────────────────────────────────────
 
 /**
@@ -520,6 +691,41 @@ export function isClearCommand(prompt) {
 /** Returns true if the prompt is either /compact or /clear (ADR 0022 Layer 2, fix #25). */
 export function isCompactOrClearCommand(prompt) {
   return isCompactCommand(prompt) || isClearCommand(prompt);
+}
+
+/**
+ * Extract recent user-role message text from a JSONL transcript (last `tailN`
+ * lines). Promoted from hypo-personal-check.mjs (fix #27 PR-C) so both the
+ * PreCompact gate and the Stop-chain Layer 3 hook share one close-intent
+ * signal source. Claude Code transcript format: each line is
+ * `{ type:"user", message:{ role:"user", content: ... } }`; the older
+ * top-level `{ role, content }` shape is also accepted.
+ *
+ * @param {string} transcriptPath
+ * @param {number} tailN  how many trailing lines to scan (default 30)
+ * @returns {string} newline-joined user text, or '' on any failure (fail-open)
+ */
+export function extractUserMessages(transcriptPath, tailN = 30) {
+  try {
+    const lines = readFileSync(transcriptPath, 'utf-8').split('\n');
+    const tail = lines.slice(-tailN);
+    return tail
+      .map((line) => {
+        try {
+          const obj = JSON.parse(line);
+          const msg = obj.message ?? obj;
+          const role = msg.role ?? obj.role ?? obj.type;
+          if (role !== 'user') return '';
+          const content = msg.content ?? obj.content;
+          return typeof content === 'string' ? content : JSON.stringify(content);
+        } catch {
+          return '';
+        }
+      })
+      .join('\n');
+  } catch {
+    return '';
+  }
 }
 
 /**
