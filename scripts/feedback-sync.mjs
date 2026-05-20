@@ -20,9 +20,17 @@
  *   node scripts/feedback-sync.mjs [--check|--write|--bootstrap|--import-target-change --from=<memory|claude>]
  *     --hypo-dir=<path>      Hypomnema root (default: HYPO_DIR / hypo-config.md / ~/hypomnema)
  *     --claude-home=<path>   Claude Code home (default: ~/.claude)
- *     --project-id=<id>      Override derived project-id (§5)
+ *     --project-id=<id>      Override derived project-id (§5; always wins, no prompt)
+ *     --no-input             Never prompt; treat unresolved project-id non-interactively
  *     --strict               Promote warnings to failures (PreCompact gate)
  *     --json                 Machine-readable output
+ *
+ * Project-id fallback (§5 step 4): when the derived project-id directory does not
+ * exist AND stdin is an interactive TTY AND --no-input is not set, prompt the user
+ * to confirm the derived id, enter a different one, or skip MEMORY projection.
+ * Non-interactive runs (hooks, CI, pipes — no TTY) NEVER prompt: they keep the
+ * existing behavior (warn + skip MEMORY, exit 0). feedback-sync runs inside the
+ * PreCompact hook non-interactively and must never block waiting on input.
  *
  * Exit codes:
  *   0  clean / write succeeded
@@ -49,6 +57,8 @@ function parseArgs(argv) {
     hypoDir: null,
     claudeHome: null,
     projectId: null,
+    noInput: false,
+    skipMemory: false,
     strict: false,
     json: false,
     cwd: process.cwd(),
@@ -64,6 +74,7 @@ function parseArgs(argv) {
     else if (arg.startsWith('--project-id=')) args.projectId = arg.slice(13);
     else if (arg.startsWith('--cwd='))
       args.cwd = expandHome(arg.slice(6)); // test hook
+    else if (arg === '--no-input') args.noInput = true;
     else if (arg === '--strict') args.strict = true;
     else if (arg === '--json') args.json = true;
   }
@@ -424,9 +435,63 @@ function deriveProjectId(args) {
   return { id, derived: true, exists: existsSync(dir) };
 }
 
+// Default interactive prompt (readline over stdin → stderr, so stdout stays clean
+// for --json). Returns one of: { action: 'confirm' } | { action: 'id', id }
+// | { action: 'skip' }. Isolated so resolveProjectId() can be unit-tested with a
+// fake prompt and so the only thing that can touch stdin is gated behind isTTY.
+async function defaultPrompt({ derivedId, claudeHome }) {
+  const rl = (await import('node:readline/promises')).createInterface({
+    input: process.stdin,
+    output: process.stderr,
+  });
+  try {
+    process.stderr.write(
+      `[feedback-sync] project-id "${derivedId}" has no directory under ${claudeHome}/projects.\n` +
+        '  [Enter] confirm and use it (memory dir will be created on --write)\n' +
+        '  type an id to use a different project-id\n' +
+        '  type "skip" to skip MEMORY projection\n',
+    );
+    const answer = (await rl.question('project-id> ')).trim();
+    if (!answer) return { action: 'confirm' };
+    if (answer.toLowerCase() === 'skip') return { action: 'skip' };
+    return { action: 'id', id: answer };
+  } finally {
+    rl.close();
+  }
+}
+
+// Interactive layer on top of the pure deriveProjectId(). Resolves to
+// { id, derived, exists, skipMemory }. Only prompts when the derived dir is
+// missing AND stdin is a TTY AND --no-input is unset. Non-TTY / --no-input /
+// explicit --project-id paths NEVER call prompt → cannot hang (hook/CI safe).
+// `prompt` is injectable for testing; defaults to readline.
+async function resolveProjectId(args, { prompt = defaultPrompt, isTTY } = {}) {
+  const pid = deriveProjectId(args);
+  // explicit --project-id, or derived dir exists → use as-is (no prompt).
+  if (!pid.derived || pid.exists) return { ...pid, skipMemory: false };
+
+  const interactive = (isTTY ?? Boolean(process.stdin.isTTY)) && !args.noInput;
+  if (!interactive) {
+    // hook / CI / pipe / --no-input: keep current behavior — skip MEMORY, no hang.
+    return { ...pid, skipMemory: true };
+  }
+
+  const choice = await prompt({ derivedId: pid.id, claudeHome: args.claudeHome });
+  if (choice.action === 'skip') return { ...pid, skipMemory: true };
+  if (choice.action === 'id') {
+    const id = choice.id;
+    const exists = existsSync(join(args.claudeHome, 'projects', id));
+    // user-entered id is accepted even if missing (they may be creating it);
+    // the MEMORY dir is created on --write.
+    return { id, derived: false, exists, skipMemory: false };
+  }
+  // confirm: accept the derived id despite the missing dir.
+  return { ...pid, skipMemory: false };
+}
+
 // ── modes ─────────────────────────────────────────────────────────────────────
 
-function run(args) {
+function run(args, resolvedPid = null) {
   if (!existsSync(args.hypoDir)) {
     return { code: 1, error: `wiki not found: ${args.hypoDir}` };
   }
@@ -438,20 +503,34 @@ function run(args) {
   }
 
   const pages = loadFeedbackPages(args.hypoDir);
-  const pid = deriveProjectId(args);
+  // pid may be pre-resolved by the interactive layer in main(); fall back to the
+  // pure derivation for direct callers / tests. `skipMemory` carries the §5 step 4
+  // decision (non-interactive unresolved, or user chose "skip").
+  let pid;
+  if (resolvedPid) {
+    pid = resolvedPid;
+  } else {
+    // direct/sync caller (tests, machine path): no prompting possible here, so
+    // mirror the original non-interactive rule — skip MEMORY when the derived
+    // dir is missing (contract §5 step 4 non-interactive branch).
+    const d = deriveProjectId(args);
+    pid = { ...d, skipMemory: d.derived && !d.exists };
+  }
+  if (args.skipMemory) pid.skipMemory = true;
 
   const targets = [];
-  // MEMORY target only when its project dir is resolvable (contract §5 step 4:
-  // unknown project-id in non-interactive mode → skip, do not hard-fail).
-  if (pid.exists || !pid.derived) {
+  // MEMORY target only when not skipped (contract §5 step 4: unknown project-id
+  // in non-interactive mode, or user-declined → skip, do not hard-fail).
+  if (!pid.skipMemory) {
     targets.push(memoryTarget(args, pid.id));
   }
   targets.push(claudeTarget(args));
 
   const report = { mode: args.mode, projectId: pid.id, projectIdResolved: pid.exists, targets: {} };
+  if (pid.skipMemory) report.skipMemory = true;
   let code = 0;
   const warnings = [];
-  if (pid.derived && !pid.exists) {
+  if (pid.skipMemory) {
     warnings.push(
       `project-id "${pid.id}" dir not found under ${args.claudeHome}/projects — MEMORY projection skipped (pass --project-id to override)`,
     );
@@ -509,9 +588,16 @@ function run(args) {
 
 // ── main ───────────────────────────────────────────────────────────────────────
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv);
-  const out = run(args);
+  // Resolve project-id before run() so the (possibly interactive) prompt happens
+  // exactly once. resolveProjectId only touches stdin when stdin.isTTY is truthy
+  // and --no-input is unset → hooks/CI/pipes never block here.
+  let resolvedPid = null;
+  if (existsSync(args.hypoDir) && args.mode !== 'bootstrap' && args.mode !== 'import') {
+    resolvedPid = await resolveProjectId(args);
+  }
+  const out = run(args, resolvedPid);
 
   if (args.json) {
     console.log(JSON.stringify(out.error ? { error: out.error } : out.report, null, 2));
@@ -547,4 +633,16 @@ function main() {
   process.exit(out.code);
 }
 
-main();
+function isMain() {
+  try {
+    return import.meta.url === `file://${process.argv[1]}`;
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) {
+  main();
+}
+
+export { parseArgs, deriveProjectId, resolveProjectId, run };

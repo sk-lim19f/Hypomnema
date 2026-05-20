@@ -21,6 +21,9 @@ import {
 import { join, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+// static import (no top-level await) — feedback-sync.mjs guards main() behind an
+// entry check, so importing it for unit tests does not run the CLI.
+import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync.mjs';
 
 const HOME = homedir();
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
@@ -4496,6 +4499,151 @@ test('tampered managed block (conflict) → fail Feedback projection integrity',
     );
     assert.equal(r.status, 1, 'doctor exits 1 when any check fails');
   });
+});
+
+// ── feedback-sync.mjs — project-id fallback (fix #37 #10) ─────────────────────
+
+suite('feedback-sync.mjs — project-id fallback (fix #37 #10)');
+
+// Non-TTY / hook / CI path: derived dir missing → skip MEMORY, exit 0, NO prompt,
+// NO hang. The child has no controlling TTY under spawnSync, so this IS the
+// non-interactive proof. --no-input makes it explicit + belt-and-suspenders.
+test('feedback-sync-no-input-non-tty: derived-missing project-id skips MEMORY, exit 0, no hang', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome }) => {
+    const r = run('feedback-sync.mjs', [
+      '--check',
+      '--no-input',
+      '--json',
+      `--hypo-dir=${wiki}`,
+      `--claude-home=${claudeHome}`,
+      `--cwd=${join(tmpdir(), 'no-such-cwd-xyz')}`,
+    ]);
+    // spawnSync returns (no timeout), proving the non-TTY path never blocks.
+    assert.equal(r.signal, null, 'process must exit on its own (no hang/kill)');
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.projectIdResolved, false);
+    assert.equal(rep.skipMemory, true, 'skipMemory flag surfaced in report');
+    assert.equal(rep.targets.memory, undefined, 'MEMORY skipped on unresolved project-id');
+    assert.ok('claude' in rep.targets, 'claude target still evaluated');
+  });
+});
+
+// Explicit --project-id always wins, no prompt, MEMORY present even on TTY-less run.
+test('feedback-sync-explicit-project-id-wins: MEMORY target present, no prompt path', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb }) => {
+    const r = runFb(['--check', '--json']); // withFeedbackEnv passes a valid --project-id
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.projectIdResolved, true);
+    assert.equal(rep.skipMemory, undefined, 'no skip for explicit project-id');
+    assert.ok('memory' in rep.targets, 'MEMORY target present for explicit project-id');
+  });
+});
+
+// Injected-prompt unit tests: drive resolveProjectId() directly with isTTY:true
+// and a fake prompt, exercising the interactive branches without a real TTY.
+await testAsync(
+  'resolveProjectId: explicit --project-id resolves without calling prompt',
+  async () => {
+    let called = false;
+    const r = await fbResolveProjectId(
+      { projectId: 'explicit-id', claudeHome: '/no/such', cwd: '/x', noInput: false },
+      {
+        isTTY: true,
+        prompt: () => {
+          called = true;
+          return { action: 'confirm' };
+        },
+      },
+    );
+    assert.equal(r.id, 'explicit-id');
+    assert.equal(r.skipMemory, false);
+    assert.equal(called, false, 'explicit project-id must not prompt');
+  },
+);
+
+await testAsync('resolveProjectId: derived dir exists resolves without prompting', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-rpid-'));
+  try {
+    const claudeHome = join(base, 'claude');
+    const id = '-x'; // matches cwd "/x" → "/x".replace(/[/.]/g,'-') === "-x"
+    mkdirSync(join(claudeHome, 'projects', id), { recursive: true });
+    const r = await fbResolveProjectId(
+      { projectId: null, claudeHome, cwd: '/x', noInput: false },
+      {
+        isTTY: true,
+        prompt: () => {
+          throw new Error('prompt must not be called when derived dir exists');
+        },
+      },
+    );
+    assert.equal(r.id, id);
+    assert.equal(r.exists, true);
+    assert.equal(r.skipMemory, false);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+await testAsync(
+  'resolveProjectId: prompt "confirm" accepts derived id, MEMORY not skipped',
+  async () => {
+    const r = await fbResolveProjectId(
+      { projectId: null, claudeHome: '/no/such', cwd: '/some/path', noInput: false },
+      { isTTY: true, prompt: () => ({ action: 'confirm' }) },
+    );
+    assert.equal(r.id, '-some-path');
+    assert.equal(r.skipMemory, false, 'confirm includes MEMORY despite missing dir');
+  },
+);
+
+await testAsync('resolveProjectId: prompt "id" returns chosen id, MEMORY not skipped', async () => {
+  const r = await fbResolveProjectId(
+    { projectId: null, claudeHome: '/no/such', cwd: '/some/path', noInput: false },
+    { isTTY: true, prompt: () => ({ action: 'id', id: 'chosen-id' }) },
+  );
+  assert.equal(r.id, 'chosen-id');
+  assert.equal(r.derived, false, 'user-entered id is treated as explicit');
+  assert.equal(r.skipMemory, false, 'chosen id still projects MEMORY (created on --write)');
+});
+
+await testAsync('resolveProjectId: prompt "skip" sets skipMemory', async () => {
+  const r = await fbResolveProjectId(
+    { projectId: null, claudeHome: '/no/such', cwd: '/some/path', noInput: false },
+    { isTTY: true, prompt: () => ({ action: 'skip' }) },
+  );
+  assert.equal(r.skipMemory, true);
+});
+
+await testAsync('resolveProjectId: --no-input never prompts even with isTTY true', async () => {
+  let called = false;
+  const r = await fbResolveProjectId(
+    { projectId: null, claudeHome: '/no/such', cwd: '/some/path', noInput: true },
+    {
+      isTTY: true,
+      prompt: () => {
+        called = true;
+        return { action: 'confirm' };
+      },
+    },
+  );
+  assert.equal(called, false, '--no-input must short-circuit before prompting');
+  assert.equal(r.skipMemory, true);
+});
+
+await testAsync('resolveProjectId: non-TTY never prompts (hook/CI safety)', async () => {
+  let called = false;
+  const r = await fbResolveProjectId(
+    { projectId: null, claudeHome: '/no/such', cwd: '/some/path', noInput: false },
+    {
+      isTTY: false,
+      prompt: () => {
+        called = true;
+        return { action: 'confirm' };
+      },
+    },
+  );
+  assert.equal(called, false, 'non-TTY must never call prompt');
+  assert.equal(r.skipMemory, true);
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
