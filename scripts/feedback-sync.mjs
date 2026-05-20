@@ -1,0 +1,550 @@
+#!/usr/bin/env node
+/**
+ * feedback-sync.mjs — project wiki feedback as SoT, external memory as projection (ADR 0031, fix #37)
+ *
+ * Wiki `pages/feedback/<slug>.md` is the single source of truth for
+ * learning/correction knowledge. Two Claude Code memory surfaces are derived
+ * (one-way) from it:
+ *   - Project memory:  <claude-home>/projects/<project-id>/memory/feedback_<slug>.md
+ *                      + MEMORY.md index (managed region)
+ *   - Global learned:  <claude-home>/CLAUDE.md  <learned_behaviors> managed region
+ *
+ * Phase A scope (this file): --check / --write engine + per-slug managed blocks
+ * + sha256 idempotency + conflict (exit 3) + over-cap (exit 2). Bootstrap and
+ * import are later phases (stubbed here).
+ *
+ * Contract: projects/hypomnema/fix-37-contract.md (per-slug managed block model,
+ * sha256 over normalized inner content, sort key, exit matrix, project-id rule).
+ *
+ * Usage:
+ *   node scripts/feedback-sync.mjs [--check|--write|--bootstrap|--import-target-change --from=<memory|claude>]
+ *     --hypo-dir=<path>      Hypomnema root (default: HYPO_DIR / hypo-config.md / ~/hypomnema)
+ *     --claude-home=<path>   Claude Code home (default: ~/.claude)
+ *     --project-id=<id>      Override derived project-id (§5)
+ *     --strict               Promote warnings to failures (PreCompact gate)
+ *     --json                 Machine-readable output
+ *
+ * Exit codes:
+ *   0  clean / write succeeded
+ *   1  drift detected (--check) OR generic error (usage / wiki not found)
+ *   2  over-cap (CLAUDE 10 entries / MEMORY 200 index lines) — human decision required
+ *   3  conflict (managed block hash mismatch = manual edit) — no auto-merge
+ */
+
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, rmSync } from 'node:fs';
+import { join, basename } from 'node:path';
+import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { parseFrontmatter } from './lib/frontmatter.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+
+const HOME = homedir();
+
+// ── arg parsing ────────────────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const args = {
+    mode: 'check', // check | write | bootstrap | import
+    from: null,
+    hypoDir: null,
+    claudeHome: null,
+    projectId: null,
+    strict: false,
+    json: false,
+    cwd: process.cwd(),
+  };
+  for (const arg of argv.slice(2)) {
+    if (arg === '--check') args.mode = 'check';
+    else if (arg === '--write') args.mode = 'write';
+    else if (arg === '--bootstrap') args.mode = 'bootstrap';
+    else if (arg === '--import-target-change') args.mode = 'import';
+    else if (arg.startsWith('--from=')) args.from = arg.slice(7);
+    else if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
+    else if (arg.startsWith('--claude-home=')) args.claudeHome = expandHome(arg.slice(14));
+    else if (arg.startsWith('--project-id=')) args.projectId = arg.slice(13);
+    else if (arg.startsWith('--cwd='))
+      args.cwd = expandHome(arg.slice(6)); // test hook
+    else if (arg === '--strict') args.strict = true;
+    else if (arg === '--json') args.json = true;
+  }
+  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
+  if (!args.claudeHome) args.claudeHome = join(HOME, '.claude');
+  return args;
+}
+
+// ── frontmatter helpers ──────────────────────────────────────────────────────
+
+// parseFrontmatter() flattens list values to their raw "[a, b]" string; split
+// them back into arrays here (same shape lint.mjs uses for tags).
+function parseListField(raw) {
+  if (!raw) return [];
+  const trimmed = String(raw)
+    .trim()
+    .replace(/^\[|\]$/g, '');
+  return trimmed
+    .split(',')
+    .map((t) => t.trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
+}
+
+function loadFeedbackPages(hypoDir) {
+  const dir = join(hypoDir, 'pages', 'feedback');
+  if (!existsSync(dir)) return [];
+  const pages = [];
+  for (const entry of readdirSync(dir)) {
+    if (!entry.endsWith('.md') || entry.startsWith('.') || entry.startsWith('_')) continue;
+    const path = join(dir, entry);
+    const content = readFileSync(path, 'utf-8');
+    const fm = parseFrontmatter(content) || {};
+    pages.push({
+      slug: basename(entry, '.md'),
+      fm,
+      targets: parseListField(fm.targets),
+      content,
+      path,
+    });
+  }
+  return pages;
+}
+
+// ── managed block primitives (contract §1/§2) ────────────────────────────────
+
+const MARK_START = (slug, hash) =>
+  `<!-- HYPO:FEEDBACK-SYNC:START source=${slug} sha256=${hash} -->`;
+const MARK_END = '<!-- HYPO:FEEDBACK-SYNC:END -->';
+const MARK_ANCHOR = '<!-- HYPO:FEEDBACK-SYNC:ANCHOR -->';
+// provenance header stamped on generated full-copy side-files so staleSideFiles
+// only ever deletes files this tool wrote (never a user's hand-written memory)
+const SIDE_MARKER = (slug) => `<!-- HYPO:FEEDBACK-SYNC source=${slug} -->`;
+const SIDE_MARKER_PREFIX = '<!-- HYPO:FEEDBACK-SYNC source=';
+const BLOCK_RE =
+  /<!-- HYPO:FEEDBACK-SYNC:START source=(\S+) sha256=([0-9a-f]{64}) -->\r?\n([\s\S]*?)\r?\n<!-- HYPO:FEEDBACK-SYNC:END -->/g;
+// line-anchored so marker-looking text inside prose/code does not false-count
+const START_RE = /^[ \t]*<!-- HYPO:FEEDBACK-SYNC:START\b/gm;
+const END_RE = /^[ \t]*<!-- HYPO:FEEDBACK-SYNC:END -->[ \t]*$/gm;
+
+// Count raw START/END markers; if they outnumber fully-matched blocks, a marker
+// is malformed/unpaired (truncated, tampered hash, stray) → refuse (conflict).
+function countMarkers(content) {
+  return {
+    starts: (content.match(START_RE) || []).length,
+    ends: (content.match(END_RE) || []).length,
+  };
+}
+
+// sha256 over the normalized inner content (contract §2): inner lines joined by
+// \n, leading/trailing blank lines stripped, no trailing newline.
+function normalizeInner(text) {
+  const lines = String(text).replace(/\r\n/g, '\n').split('\n');
+  while (lines.length && lines[0].trim() === '') lines.shift();
+  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+  return lines.join('\n');
+}
+
+function hashInner(text) {
+  return createHash('sha256').update(normalizeInner(text), 'utf-8').digest('hex');
+}
+
+function renderBlock(slug, inner) {
+  const norm = normalizeInner(inner);
+  return `${MARK_START(slug, hashInner(norm))}\n${norm}\n${MARK_END}`;
+}
+
+// Find existing managed blocks with their positions. Returns
+// { blocks: [{slug, declaredHash, inner, actualHash, start, end}], firstStart, lastEnd }.
+function findBlocks(content) {
+  const blocks = [];
+  let m;
+  BLOCK_RE.lastIndex = 0;
+  while ((m = BLOCK_RE.exec(content)) !== null) {
+    blocks.push({
+      slug: m[1],
+      declaredHash: m[2],
+      inner: m[3],
+      actualHash: hashInner(m[3]),
+      start: m.index,
+      end: m.index + m[0].length,
+    });
+  }
+  const firstStart = blocks.length ? blocks[0].start : -1;
+  const lastEnd = blocks.length ? blocks[blocks.length - 1].end : -1;
+  return { blocks, firstStart, lastEnd };
+}
+
+// Detect hand-added lines *between* managed blocks. Contract §1 requires manual
+// entries to live outside the contiguous managed span; lines inside it would be
+// silently dropped on rewrite, so we refuse (treated as conflict, exit 3).
+function regionHasIntruders(content) {
+  const { blocks, firstStart, lastEnd } = findBlocks(content);
+  if (blocks.length < 1) return false;
+  const span = content.slice(firstStart, lastEnd).replace(BLOCK_RE, '');
+  return span.trim().length > 0;
+}
+
+// ── projection targets (descriptor abstraction — ADR 0032 reuse) ──────────────
+
+const PUBLIC_SENSITIVITY = new Set(['public', 'sanitized']);
+
+function memoryTarget(args, projectId) {
+  const root = join(args.claudeHome, 'projects', projectId, 'memory');
+  return {
+    name: 'memory',
+    file: join(root, 'MEMORY.md'),
+    dir: root,
+    cap: 200,
+    capKind: 'lines',
+    filter: (p) =>
+      p.fm.status === 'active' &&
+      (p.fm.scope === 'global' || (p.fm.scope || '').startsWith('project:')) &&
+      p.targets.includes('project-memory') &&
+      PUBLIC_SENSITIVITY.has(p.fm.sensitivity),
+    render: (p) =>
+      `- [${p.fm.title || p.slug}](feedback_${p.slug}.md) — ${p.fm.memory_summary || ''}`.trim(),
+    // full-copy individual files owned entirely by sync (contract §7); the
+    // provenance header marks them as tool-generated for safe staleness removal
+    sideFiles: (p) => [
+      {
+        path: join(root, `feedback_${p.slug}.md`),
+        content: `${SIDE_MARKER(p.slug)}\n${p.content}`,
+      },
+    ],
+  };
+}
+
+function claudeTarget(args) {
+  return {
+    name: 'claude',
+    file: join(args.claudeHome, 'CLAUDE.md'),
+    cap: 10,
+    capKind: 'entries',
+    container: 'learned_behaviors', // managed region must live inside <learned_behaviors>
+    filter: (p) =>
+      p.fm.status === 'active' &&
+      p.fm.scope === 'global' && // scope:project:* auto-rejected (contract §6)
+      p.fm.tier === 'L1' &&
+      p.targets.includes('claude-learned') &&
+      String(p.fm.promote_to_global) === 'true' &&
+      PUBLIC_SENSITIVITY.has(p.fm.sensitivity),
+    render: (p) => {
+      const date = (p.fm.updated || p.fm.date || '').slice(0, 10);
+      const datePart = date ? `[${date}] ` : '';
+      return `- ${datePart}${p.fm.global_summary || ''} — 근거: [[${p.slug}]]`;
+    },
+    sideFiles: () => [],
+  };
+}
+
+// ── sort key (contract §3): (priority desc, date desc, slug asc) ──────────────
+
+function sortKey(a, b) {
+  const pa = Number(a.fm.priority) || 3;
+  const pb = Number(b.fm.priority) || 3;
+  if (pa !== pb) return pb - pa;
+  const da = (a.fm.updated || a.fm.date || '1970-01-01').slice(0, 10);
+  const db = (b.fm.updated || b.fm.date || '1970-01-01').slice(0, 10);
+  if (da !== db) return da < db ? 1 : -1;
+  return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
+}
+
+// Build the desired ordered block list for a target.
+function computeDesired(pages, target) {
+  return pages
+    .filter(target.filter)
+    .sort(sortKey)
+    .map((p) => {
+      const inner = target.render(p);
+      return { slug: p.slug, inner: normalizeInner(inner), hash: hashInner(inner), page: p };
+    });
+}
+
+// ── region insertion (contract §1) ───────────────────────────────────────────
+
+function buildRegion(desired) {
+  return desired.map((d) => renderBlock(d.slug, d.inner)).join('\n');
+}
+
+// Compute the next file content for a target. Returns { content } on success or
+// { error } when the region cannot be placed (e.g. missing container). Pure — no
+// disk writes — so run() can preflight every target before any write (atomicity).
+function buildNextContent(content, region, target) {
+  const { firstStart, lastEnd } = findBlocks(content);
+  if (firstStart >= 0) {
+    // replace the contiguous managed span (region may be '' to clear it)
+    return { content: content.slice(0, firstStart) + region + content.slice(lastEnd) };
+  }
+  // no existing blocks
+  if (region === '') return { content }; // nothing to place → no-op (idempotent)
+  if (target.container === 'learned_behaviors') {
+    const open = content.indexOf('<learned_behaviors>');
+    const close = content.indexOf('</learned_behaviors>');
+    if (open < 0 || close < 0 || close < open) {
+      return { error: `<learned_behaviors> container not found in ${target.file}` };
+    }
+    // an anchor is honored ONLY when it sits inside the container span
+    const anchorIdx = content.indexOf(MARK_ANCHOR);
+    if (anchorIdx > open && anchorIdx < close) {
+      return {
+        content:
+          content.slice(0, anchorIdx) + region + content.slice(anchorIdx + MARK_ANCHOR.length),
+      };
+    }
+    return { content: content.slice(0, close) + region + '\n' + content.slice(close) };
+  }
+  // memory index: anchor (anywhere) or append
+  const anchorIdx = content.indexOf(MARK_ANCHOR);
+  if (anchorIdx >= 0) {
+    return {
+      content: content.slice(0, anchorIdx) + region + content.slice(anchorIdx + MARK_ANCHOR.length),
+    };
+  }
+  const sep = content.endsWith('\n') ? '' : '\n';
+  return { content: content + sep + region + '\n' };
+}
+
+// sync-owned full-copy files (feedback_<slug>.md) no longer backed by an active
+// candidate → must be removed so deletions/demotions propagate (MEDIUM-1).
+function staleSideFiles(target, desired) {
+  if (!target.dir || !existsSync(target.dir)) return [];
+  const keep = new Set(desired.map((d) => `feedback_${d.slug}.md`));
+  return readdirSync(target.dir)
+    .filter((f) => /^feedback_.+\.md$/.test(f) && !keep.has(f))
+    .map((f) => join(target.dir, f))
+    .filter((p) => {
+      // only delete files THIS tool generated (provenance header on line 1) —
+      // never a user's hand-written feedback_*.md memory file
+      try {
+        return readFileSync(p, 'utf-8').startsWith(SIDE_MARKER_PREFIX);
+      } catch {
+        return false;
+      }
+    });
+}
+
+// ── per-target evaluation (preflight: validates + computes the write plan) ─────
+
+function evaluateTarget(pages, target) {
+  const desired = computeDesired(pages, target);
+  const fileExists = existsSync(target.file);
+  const content = fileExists ? readFileSync(target.file, 'utf-8') : '';
+  const { blocks } = findBlocks(content);
+  const { starts, ends } = countMarkers(content);
+
+  // conflict: on-disk block whose inner content no longer matches its marker
+  const conflicts = blocks.filter((b) => b.actualHash !== b.declaredHash).map((b) => b.slug);
+  // unpaired: a raw START/END marker that BLOCK_RE could not pair (malformed/tampered)
+  const unpaired = starts !== blocks.length || ends !== blocks.length;
+  // intruder: hand-added lines inside the managed span (would be dropped on rewrite)
+  const intruder = regionHasIntruders(content);
+  // out-of-container: an existing managed block sitting outside <learned_behaviors>
+  // (drifted/hand-moved) — replacing it in place would leave it outside the
+  // required region, so refuse and require import.
+  let outOfContainer = false;
+  if (target.container === 'learned_behaviors' && blocks.length) {
+    const open = content.indexOf('<learned_behaviors>');
+    const close = content.indexOf('</learned_behaviors>');
+    outOfContainer = open < 0 || close < 0 || blocks.some((b) => b.start < open || b.end > close);
+  }
+
+  const region = buildRegion(desired);
+  let overCap = false;
+  if (target.capKind === 'entries') overCap = desired.length > target.cap;
+  // count index content lines only — the START/END marker wrappers are sync
+  // bookkeeping, not part of the "200 index lines" budget (codex HIGH).
+  else if (target.capKind === 'lines')
+    overCap = desired.reduce((n, d) => n + d.inner.split('\n').length, 0) > target.cap;
+
+  // build the next content (validation happens here, before any write)
+  let nextContent = null;
+  let buildError = null;
+  if (!fileExists && target.container) {
+    buildError = `target file missing: ${target.file}`;
+  } else {
+    const r = buildNextContent(fileExists ? content : '', region, target);
+    if (r.error) buildError = r.error;
+    else nextContent = r.content;
+  }
+
+  // side-files: writes (current candidates) + deletes (stale sync-owned copies)
+  const sideWrites = [];
+  for (const d of desired) {
+    for (const sf of target.sideFiles(d.page)) sideWrites.push(sf);
+  }
+  const sideDeletes = staleSideFiles(target, desired);
+
+  // dirty: main content would change OR any side-file would change/be removed
+  let dirty = nextContent !== null && nextContent !== (fileExists ? content : '');
+  if (sideDeletes.length) dirty = true;
+  for (const sf of sideWrites) {
+    const cur = existsSync(sf.path) ? readFileSync(sf.path, 'utf-8') : null;
+    if (cur !== sf.content) dirty = true;
+  }
+
+  return {
+    desired,
+    conflicts,
+    unpaired,
+    intruder,
+    outOfContainer,
+    overCap,
+    dirty,
+    content,
+    fileExists,
+    nextContent,
+    buildError,
+    sideWrites,
+    sideDeletes,
+  };
+}
+
+// Pure writer: applies a fully-validated plan. No validation here.
+function applyTarget(target, res) {
+  if (target.dir) mkdirSync(target.dir, { recursive: true });
+  for (const sf of res.sideWrites) {
+    mkdirSync(join(sf.path, '..'), { recursive: true });
+    writeFileSync(sf.path, sf.content);
+  }
+  for (const p of res.sideDeletes) {
+    try {
+      rmSync(p);
+    } catch {
+      /* best-effort */
+    }
+  }
+  if (res.nextContent !== null && res.nextContent !== (res.fileExists ? res.content : '')) {
+    writeFileSync(target.file, res.nextContent);
+  }
+}
+
+// ── project-id derivation (contract §5, OQ-31.3) ──────────────────────────────
+
+function deriveProjectId(args) {
+  if (args.projectId) return { id: args.projectId, derived: false, exists: true };
+  const id = args.cwd.replace(/[/.]/g, '-');
+  const dir = join(args.claudeHome, 'projects', id);
+  return { id, derived: true, exists: existsSync(dir) };
+}
+
+// ── modes ─────────────────────────────────────────────────────────────────────
+
+function run(args) {
+  if (!existsSync(args.hypoDir)) {
+    return { code: 1, error: `wiki not found: ${args.hypoDir}` };
+  }
+  if (args.mode === 'bootstrap' || args.mode === 'import') {
+    return {
+      code: 1,
+      error: `mode --${args.mode === 'import' ? 'import-target-change' : 'bootstrap'} not implemented in Phase A`,
+    };
+  }
+
+  const pages = loadFeedbackPages(args.hypoDir);
+  const pid = deriveProjectId(args);
+
+  const targets = [];
+  // MEMORY target only when its project dir is resolvable (contract §5 step 4:
+  // unknown project-id in non-interactive mode → skip, do not hard-fail).
+  if (pid.exists || !pid.derived) {
+    targets.push(memoryTarget(args, pid.id));
+  }
+  targets.push(claudeTarget(args));
+
+  const report = { mode: args.mode, projectId: pid.id, projectIdResolved: pid.exists, targets: {} };
+  let code = 0;
+  const warnings = [];
+  if (pid.derived && !pid.exists) {
+    warnings.push(
+      `project-id "${pid.id}" dir not found under ${args.claudeHome}/projects — MEMORY projection skipped (pass --project-id to override)`,
+    );
+  }
+  // surface pages excluded purely for sensitivity (private is forbidden — ADR
+  // 0031 §7; lint #8 blocks it at the SoT, this is a pre-#8 debugging aid)
+  for (const p of pages) {
+    if (p.fm.sensitivity && !PUBLIC_SENSITIVITY.has(p.fm.sensitivity)) {
+      warnings.push(
+        `page "${p.slug}" excluded: sensitivity="${p.fm.sensitivity}" (only public|sanitized)`,
+      );
+    }
+  }
+
+  // pass 1: preflight every target before touching disk — validates the write
+  // plan (container/anchor, markers) and computes next content. A conflict /
+  // over-cap / build error in ANY target blocks writes to ALL (atomicity — ADR
+  // 0031 Decision §6 "no auto-merge"; avoids a partial write where one target
+  // lands and another refuses).
+  const evals = targets.map((target) => ({ target, res: evaluateTarget(pages, target) }));
+  for (const { target, res } of evals) {
+    report.targets[target.name] = {
+      candidates: res.desired.length,
+      conflicts: res.conflicts,
+      unpaired: res.unpaired,
+      intruder: res.intruder,
+      outOfContainer: res.outOfContainer,
+      overCap: res.overCap,
+      dirty: res.dirty,
+      ...(res.buildError ? { buildError: res.buildError } : {}),
+    };
+    if (res.conflicts.length || res.intruder || res.unpaired || res.outOfContainer)
+      code = Math.max(code, 3);
+    else if (res.overCap) code = Math.max(code, 2);
+    else if (res.buildError) code = Math.max(code, 1);
+    else if (res.dirty && args.mode === 'check') code = Math.max(code, 1);
+  }
+
+  // strict promotes warnings to a failure; compute it BEFORE the write gate so a
+  // --write --strict refuses rather than writing then exiting non-zero (codex LOW).
+  const strictFail = args.strict && warnings.length > 0;
+
+  // pass 2: write only when nothing blocks (code === 0 ⇒ no conflict, over-cap,
+  // build error, or check-mode drift) and no strict failure. Skip clean targets
+  // so writes stay byte-idempotent.
+  if (args.mode === 'write' && code === 0 && !strictFail) {
+    for (const { target, res } of evals) {
+      if (res.dirty) applyTarget(target, res);
+    }
+  }
+
+  if (strictFail) code = Math.max(code, 1);
+  return { code, report, warnings };
+}
+
+// ── main ───────────────────────────────────────────────────────────────────────
+
+function main() {
+  const args = parseArgs(process.argv);
+  const out = run(args);
+
+  if (args.json) {
+    console.log(JSON.stringify(out.error ? { error: out.error } : out.report, null, 2));
+  } else if (out.error) {
+    console.error(`[feedback-sync] ${out.error}`);
+  } else {
+    for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
+    for (const [name, t] of Object.entries(out.report.targets)) {
+      if (t.conflicts.length || t.intruder || t.unpaired || t.outOfContainer) {
+        const why = t.conflicts.length
+          ? `block(s) manually edited: ${t.conflicts.join(', ')}`
+          : t.unpaired
+            ? 'malformed/unpaired HYPO:FEEDBACK-SYNC marker'
+            : t.outOfContainer
+              ? 'managed block sits outside <learned_behaviors>'
+              : 'managed region has unrecognized lines (move them outside the HYPO blocks)';
+        console.error(
+          `[feedback-sync] CONFLICT: ${name} ${why}\n` +
+            `  Run \`hypomnema feedback-sync --import-target-change --from=${name}\` to import.`,
+        );
+      } else if (t.buildError) console.error(`[feedback-sync] ERROR: ${name} ${t.buildError}`);
+      else if (t.overCap)
+        console.error(
+          `[feedback-sync] OVER-CAP: ${name} has ${t.candidates} candidates (cap ${name === 'claude' ? '10 entries' : '200 lines'}) — demote/archive required.`,
+        );
+      else if (t.dirty && args.mode === 'check')
+        console.error(`[feedback-sync] drift: ${name} projection is stale (run --write).`);
+    }
+    if (out.code === 0 && args.mode === 'write')
+      console.error('[feedback-sync] projections written.');
+  }
+
+  process.exit(out.code);
+}
+
+main();

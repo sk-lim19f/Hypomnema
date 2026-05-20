@@ -3558,8 +3558,14 @@ test('replay-auto-minimal-crystallize-on-incomplete-close: mutating + no marker 
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block', `must block, got: ${JSON.stringify(out)}`);
-    assert.ok(/WIKI_AUTOCLOSE/.test(out.reason), `reason must mention WIKI_AUTOCLOSE: ${out.reason}`);
-    assert.ok(/\/hypo:crystallize/.test(out.reason), 'reason must point at /hypo:crystallize skill');
+    assert.ok(
+      /WIKI_AUTOCLOSE/.test(out.reason),
+      `reason must mention WIKI_AUTOCLOSE: ${out.reason}`,
+    );
+    assert.ok(
+      /\/hypo:crystallize/.test(out.reason),
+      'reason must point at /hypo:crystallize skill',
+    );
     assert.ok(out.reason.includes('s-substantial'), 'reason must embed the session_id to use');
   });
 });
@@ -3765,7 +3771,10 @@ test('--mark-session-closed with failing gate → exit 1, no marker', () => {
     assert.equal(r.status, 1);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
-    assert.ok(!existsSync(join(dir, '.cache', 'session-closed-s-failgate.marker')), 'marker must not be written on failed gate');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-failgate.marker')),
+      'marker must not be written on failed gate',
+    );
   });
 });
 
@@ -3787,7 +3796,10 @@ test('--mark-session-closed with ok gate but dirty git → exit 1, no marker (AD
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.ok(out.git_reason, `dirty-git result must carry git_reason: ${JSON.stringify(out)}`);
-    assert.ok(!existsSync(join(dir, '.cache', 'session-closed-s-dirty.marker')), 'marker must not land on dirty git');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-dirty.marker')),
+      'marker must not land on dirty git',
+    );
   });
 });
 
@@ -3857,6 +3869,408 @@ test('--apply-session-close --session-id leaves payload uncommitted → marker N
       'apply leaves payload writes uncommitted → ADR Q2 git-clean gate skips marker until auto-commit lands',
     );
   });
+});
+
+// ── feedback-sync.mjs (ADR 0031, fix #37 Phase A) ─────────────────────────────
+
+function fbPage(fields) {
+  const fm = Object.entries(fields)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join('\n');
+  return `---\n${fm}\n---\nbody\n`;
+}
+
+// Build a wiki + claude-home pair, seed feedback pages, run feedback-sync.
+// `pages` is { slug: fieldsObject }. Returns { dir, claudeHome, projectId, runFb(args) }.
+function withFeedbackEnv(pages, fn, { claudeMd, memoryMd } = {}) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-fb-'));
+  const wiki = join(base, 'wiki');
+  const claudeHome = join(base, 'claude');
+  const projectId = 'proj';
+  const memDir = join(claudeHome, 'projects', projectId, 'memory');
+  try {
+    mkdirSync(join(wiki, 'pages', 'feedback'), { recursive: true });
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(wiki, 'hypo-config.md'), '# config');
+    for (const [slug, fields] of Object.entries(pages)) {
+      writeFileSync(join(wiki, 'pages', 'feedback', `${slug}.md`), fbPage(fields));
+    }
+    writeFileSync(
+      join(claudeHome, 'CLAUDE.md'),
+      claudeMd ?? '# Global\n<learned_behaviors>\n- manual entry\n</learned_behaviors>\n',
+    );
+    writeFileSync(join(memDir, 'MEMORY.md'), memoryMd ?? '# Memory Index\n');
+    const runFb = (args) =>
+      run('feedback-sync.mjs', [
+        ...args,
+        `--hypo-dir=${wiki}`,
+        `--claude-home=${claudeHome}`,
+        `--project-id=${projectId}`,
+      ]);
+    fn({ base, wiki, claudeHome, projectId, memDir, runFb });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+const FB_GLOBAL_L1 = {
+  title: 'Rule A',
+  type: 'feedback',
+  status: 'active',
+  scope: 'global',
+  tier: 'L1',
+  targets: '[project-memory, claude-learned]',
+  sensitivity: 'public',
+  priority: 5,
+  memory_summary: 'do A',
+  global_summary: 'always do A',
+  promote_to_global: true,
+  reason: 'because A',
+  source: 'session:2026-05-20',
+  updated: '2026-05-20',
+};
+
+const FB_PROJECT_L2 = {
+  title: 'Rule B',
+  type: 'feedback',
+  status: 'active',
+  scope: 'project:hypomnema',
+  tier: 'L2',
+  targets: '[project-memory]',
+  sensitivity: 'public',
+  priority: 2,
+  memory_summary: 'do B',
+  reason: 'because B',
+  source: 'session:2026-05-19',
+  updated: '2026-05-19',
+};
+
+suite('feedback-sync.mjs — ADR 0031 / fix #37 Phase A');
+
+test('feedback-sync-check-detects-drift: fresh projection targets are dirty → exit 1', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb }) => {
+    const r = runFb(['--check', '--json']);
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}: ${r.stderr}`);
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.targets.claude.dirty, true);
+    assert.equal(rep.targets.memory.dirty, true);
+  });
+});
+
+test('feedback-sync-write-idempotent: second --write is byte-identical + post-check clean', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, 'rule-b': FB_PROJECT_L2 },
+    ({ claudeHome, memDir, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const claude1 = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      const mem1 = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      assert.ok(claude1.includes('- manual entry'), 'manual entry must survive');
+      assert.ok(claude1.includes('HYPO:FEEDBACK-SYNC:START source=rule-a'));
+      assert.equal(runFb(['--write']).status, 0);
+      assert.equal(
+        readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8'),
+        claude1,
+        'CLAUDE.md not byte-identical',
+      );
+      assert.equal(
+        readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'),
+        mem1,
+        'MEMORY.md not byte-identical',
+      );
+      assert.equal(runFb(['--check']).status, 0, 'post-write check must be clean');
+    },
+  );
+});
+
+test('feedback-sync-conflict-fails-without-merge: hand-edited block → exit 3, no overwrite', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runFb }) => {
+    runFb(['--write']);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED'));
+    assert.equal(runFb(['--check']).status, 3, 'check must report conflict');
+    assert.equal(runFb(['--write']).status, 3, 'write must refuse');
+    assert.ok(
+      readFileSync(p, 'utf-8').includes('HAND EDITED'),
+      'conflict block must not be auto-merged',
+    );
+  });
+});
+
+test('feedback-sync-scope-project-rejected-from-claude: project scope only reaches memory', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ runFb }) => {
+    const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+    assert.equal(rep.targets.claude.candidates, 0, 'scope:project:* must be rejected from CLAUDE');
+    assert.equal(rep.targets.memory.candidates, 1, 'project scope still projects to memory');
+  });
+});
+
+test('feedback-sync-over-cap-exits-2: >10 CLAUDE candidates → exit 2', () => {
+  const pages = {};
+  for (let i = 1; i <= 11; i++) {
+    pages[`cap-${i}`] = {
+      ...FB_GLOBAL_L1,
+      title: `Cap ${i}`,
+      global_summary: `g${i}`,
+      memory_summary: `m${i}`,
+    };
+  }
+  withFeedbackEnv(pages, ({ runFb }) => {
+    const r = runFb(['--check', '--json']);
+    assert.equal(r.status, 2, `expected exit 2, got ${r.status}: ${r.stderr}`);
+    assert.equal(JSON.parse(r.stdout).targets.claude.overCap, true);
+  });
+});
+
+test('feedback-sync-write-atomic-on-conflict: stale target not written when another conflicts', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, memDir, runFb }) => {
+    runFb(['--write']); // both projections clean now
+    const memBefore = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+    // make MEMORY genuinely stale (memory_summary change only affects MEMORY render)
+    const pagePath = join(wiki, 'pages', 'feedback', 'rule-a.md');
+    writeFileSync(
+      pagePath,
+      readFileSync(pagePath, 'utf-8').replace('memory_summary: do A', 'memory_summary: do A v2'),
+    );
+    // create a CLAUDE conflict by hand-editing its managed block
+    const cp = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(cp, readFileSync(cp, 'utf-8').replace('always do A', 'HAND EDITED'));
+    const r = runFb(['--write']);
+    assert.equal(r.status, 3, `expected conflict exit 3, got ${r.status}: ${r.stderr}`);
+    assert.equal(
+      readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'),
+      memBefore,
+      'stale MEMORY must NOT be written when CLAUDE conflicts (atomicity)',
+    );
+  });
+});
+
+test('feedback-sync-intruder-in-region-refuses: hand line between blocks → exit 3, preserved', () => {
+  withFeedbackEnv(
+    {
+      'rule-a': FB_GLOBAL_L1,
+      'cap-x': { ...FB_GLOBAL_L1, title: 'X', global_summary: 'gx', memory_summary: 'mx' },
+    },
+    ({ claudeHome, runFb }) => {
+      runFb(['--write']);
+      const cp = join(claudeHome, 'CLAUDE.md');
+      // inject a manual line between the two managed END/START boundaries
+      const content = readFileSync(cp, 'utf-8').replace(
+        '<!-- HYPO:FEEDBACK-SYNC:END -->\n<!-- HYPO:FEEDBACK-SYNC:START',
+        '<!-- HYPO:FEEDBACK-SYNC:END -->\n- intruder line\n<!-- HYPO:FEEDBACK-SYNC:START',
+      );
+      writeFileSync(cp, content);
+      assert.equal(runFb(['--check']).status, 3, 'intruder must be flagged');
+      assert.equal(runFb(['--write']).status, 3, 'write must refuse with intruder present');
+      assert.ok(
+        readFileSync(cp, 'utf-8').includes('- intruder line'),
+        'intruder must be preserved',
+      );
+    },
+  );
+});
+
+test('feedback-sync-project-id-unknown-skips-memory: derived dir missing → no hard fail', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome }) => {
+    const r = run('feedback-sync.mjs', [
+      '--check',
+      '--json',
+      `--hypo-dir=${wiki}`,
+      `--claude-home=${claudeHome}`,
+      `--cwd=${join(tmpdir(), 'no-such-cwd-xyz')}`,
+    ]);
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.projectIdResolved, false);
+    assert.equal(rep.targets.memory, undefined, 'memory target skipped when project-id unresolved');
+    assert.ok('claude' in rep.targets, 'claude target still evaluated');
+  });
+});
+
+// ── codex review fixes (HIGH-1..4 / MEDIUM-1) ─────────────────────────────────
+
+test('feedback-sync-crlf-block-idempotent: CRLF managed block is recognized, no duplicate region', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runFb }) => {
+    runFb(['--write']);
+    const cp = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(cp, readFileSync(cp, 'utf-8').replace(/\n/g, '\r\n')); // simulate CRLF editor
+    // must NOT treat CRLF block as "no blocks" and append a second region
+    assert.equal(runFb(['--write']).status, 0);
+    const after = readFileSync(cp, 'utf-8');
+    const starts = (after.match(/HYPO:FEEDBACK-SYNC:START/g) || []).length;
+    assert.equal(starts, 1, `CRLF block duplicated: ${starts} START markers`);
+  });
+});
+
+test('feedback-sync-unpaired-marker-refuses: stray START marker → exit 3', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runFb }) => {
+    runFb(['--write']);
+    const cp = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(
+      cp,
+      readFileSync(cp, 'utf-8') +
+        '\n<!-- HYPO:FEEDBACK-SYNC:START source=ghost sha256=deadbeef -->\n',
+    );
+    assert.equal(runFb(['--check']).status, 3, 'unpaired START must be flagged');
+    assert.equal(runFb(['--write']).status, 3, 'write must refuse with unpaired marker');
+  });
+});
+
+test('feedback-sync-anchor-outside-container-ignored: region stays inside <learned_behaviors>', () => {
+  // anchor placed OUTSIDE the container — must NOT be used as insertion point
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const c = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      const open = c.indexOf('<learned_behaviors>');
+      const close = c.indexOf('</learned_behaviors>');
+      const block = c.indexOf('HYPO:FEEDBACK-SYNC:START');
+      assert.ok(block > open && block < close, 'managed block must land inside the container');
+      assert.ok(c.indexOf('ANCHOR') < open, 'out-of-container anchor must remain untouched');
+    },
+    {
+      claudeMd:
+        '# Global\n<!-- HYPO:FEEDBACK-SYNC:ANCHOR -->\n<learned_behaviors>\n- manual entry\n</learned_behaviors>\n',
+    },
+  );
+});
+
+test('feedback-sync-missing-container-no-partial-write: MEMORY untouched when CLAUDE has no container', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, memDir, runFb }) => {
+      const memBefore = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      const sideBefore = existsSync(join(memDir, 'feedback_rule-a.md'));
+      const r = runFb(['--write']);
+      assert.notEqual(r.status, 0, 'write must fail when CLAUDE lacks <learned_behaviors>');
+      assert.equal(
+        readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'),
+        memBefore,
+        'MEMORY index must NOT be written (atomic preflight)',
+      );
+      assert.equal(
+        existsSync(join(memDir, 'feedback_rule-a.md')),
+        sideBefore,
+        'MEMORY side-file must NOT be written',
+      );
+    },
+    { claudeMd: '# Global\n(no learned_behaviors block here)\n' },
+  );
+});
+
+test('feedback-sync-zero-candidate-idempotent: no candidates → --write does not grow the file', () => {
+  // a page that matches NO target (status archived) → zero candidates
+  withFeedbackEnv(
+    { 'rule-x': { ...FB_GLOBAL_L1, status: 'archived' } },
+    ({ claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const c1 = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      assert.equal(runFb(['--write']).status, 0);
+      const c2 = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      assert.equal(c1, c2, 'zero-candidate --write must be byte-identical (no appended newline)');
+      assert.ok(!c1.includes('HYPO:FEEDBACK-SYNC'), 'no managed block when no candidates');
+    },
+  );
+});
+
+test('feedback-sync-stale-side-file-removed: demoting a page deletes its feedback_<slug>.md copy', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, memDir, runFb }) => {
+    runFb(['--write']);
+    assert.ok(existsSync(join(memDir, 'feedback_rule-a.md')), 'side-file created on first write');
+    // demote: flip status to archived so the page is no longer a candidate
+    const pagePath = join(wiki, 'pages', 'feedback', 'rule-a.md');
+    writeFileSync(
+      pagePath,
+      readFileSync(pagePath, 'utf-8').replace('status: active', 'status: archived'),
+    );
+    assert.equal(runFb(['--write']).status, 0);
+    assert.ok(
+      !existsSync(join(memDir, 'feedback_rule-a.md')),
+      'stale side-file must be removed when page is demoted',
+    );
+  });
+});
+
+// ── second-pass review fixes (HIGH cap / HIGH provenance / MEDIUM container / LOW) ──
+
+test('feedback-sync-stale-skips-non-sync-file: hand-written feedback_*.md is NOT deleted', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ memDir, runFb }) => {
+    // a user's own memory file with the same naming pattern but no provenance header
+    const manual = join(memDir, 'feedback_my_manual_note.md');
+    writeFileSync(manual, '# my own note, not from sync\n');
+    assert.equal(runFb(['--write']).status, 0);
+    assert.ok(existsSync(manual), 'non-sync (no provenance header) file must be preserved');
+    // and the generated one carries the provenance header
+    assert.ok(
+      readFileSync(join(memDir, 'feedback_rule-a.md'), 'utf-8').startsWith(
+        '<!-- HYPO:FEEDBACK-SYNC source=',
+      ),
+      'generated side-file must carry provenance header',
+    );
+  });
+});
+
+test('feedback-sync-memory-cap-counts-index-lines-only: 100 one-line entries not over-cap', () => {
+  const pages = {};
+  for (let i = 1; i <= 100; i++) {
+    // project-scoped → MEMORY only (not CLAUDE), one-line index entry each
+    pages[`m-${i}`] = { ...FB_PROJECT_L2, title: `M ${i}`, memory_summary: `s${i}` };
+  }
+  withFeedbackEnv(pages, ({ runFb }) => {
+    const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+    assert.equal(rep.targets.memory.candidates, 100);
+    assert.equal(
+      rep.targets.memory.overCap,
+      false,
+      '100 one-line index entries (< 200) must not over-cap (markers excluded)',
+    );
+  });
+});
+
+test('feedback-sync-block-outside-container-refuses: managed block outside <learned_behaviors> → exit 3', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runFb }) => {
+      assert.equal(runFb(['--check']).status, 3, 'block outside container must be flagged');
+      assert.equal(runFb(['--write']).status, 3, 'write must refuse');
+    },
+    {
+      // a managed block sitting BEFORE the container (drifted/hand-moved)
+      claudeMd:
+        '# Global\n<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=' +
+        '0'.repeat(64) +
+        ' -->\n- stray\n<!-- HYPO:FEEDBACK-SYNC:END -->\n<learned_behaviors>\n- manual\n</learned_behaviors>\n',
+    },
+  );
+});
+
+test('feedback-sync-marker-in-prose-not-counted: mid-line marker text does not trip unpaired', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runFb }) => {
+      // a clean write must still succeed; the prose mention must not be seen as a marker
+      assert.equal(runFb(['--write']).status, 0, 'mid-line marker-looking text must be ignored');
+    },
+    {
+      claudeMd:
+        '# Global\nExample doc: <!-- HYPO:FEEDBACK-SYNC:START source=x --> appears mid-line here.\n<learned_behaviors>\n- manual\n</learned_behaviors>\n',
+    },
+  );
+});
+
+test('feedback-sync-write-strict-refuses-before-write: strict warning blocks the write', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, priv: { ...FB_PROJECT_L2, sensitivity: 'private' } },
+    ({ claudeHome, runFb }) => {
+      const before = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      const r = runFb(['--write', '--strict']);
+      assert.notEqual(r.status, 0, 'strict warning (private page) must fail');
+      assert.equal(
+        readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8'),
+        before,
+        'strict --write must NOT write before failing',
+      );
+    },
+  );
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
