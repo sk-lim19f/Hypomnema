@@ -4391,6 +4391,113 @@ test('feedback-sync-write-strict-refuses-before-write: strict warning blocks the
   );
 });
 
+// ── doctor.mjs — feedback projection (fix #37 #9) ────────────────────────────
+
+// Build a wiki + claude-home with feedback pages, then run doctor wired to the
+// same --claude-home/--project-id used by feedback-sync. Returns the parsed
+// `Feedback projection` check entries (doctor's other checks fire on the
+// synthetic wiki, so assert on the entry, not the process exit code).
+function withDoctorFeedbackEnv(pages, fn, { claudeMd, memoryMd } = {}) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-doc-fb-'));
+  const wiki = join(base, 'wiki');
+  const claudeHome = join(base, 'claude');
+  const projectId = 'proj';
+  const memDir = join(claudeHome, 'projects', projectId, 'memory');
+  try {
+    mkdirSync(join(wiki, 'pages', 'feedback'), { recursive: true });
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(wiki, 'hypo-config.md'), '# config');
+    for (const [slug, fields] of Object.entries(pages)) {
+      writeFileSync(join(wiki, 'pages', 'feedback', `${slug}.md`), fbPage(fields));
+    }
+    writeFileSync(
+      join(claudeHome, 'CLAUDE.md'),
+      claudeMd ?? '# Global\n<learned_behaviors>\n- manual entry\n</learned_behaviors>\n',
+    );
+    writeFileSync(join(memDir, 'MEMORY.md'), memoryMd ?? '# Memory Index\n');
+    const runFb = (args) =>
+      run('feedback-sync.mjs', [
+        ...args,
+        `--hypo-dir=${wiki}`,
+        `--claude-home=${claudeHome}`,
+        `--project-id=${projectId}`,
+      ]);
+    const runDoctor = () => {
+      const r = run('doctor.mjs', [
+        `--hypo-dir=${wiki}`,
+        `--claude-home=${claudeHome}`,
+        `--project-id=${projectId}`,
+        '--json',
+      ]);
+      const checks = JSON.parse(r.stdout);
+      return {
+        r,
+        checks,
+        fb: checks.filter((c) => c.label.startsWith('Feedback projection')),
+      };
+    };
+    fn({ base, wiki, claudeHome, projectId, memDir, runFb, runDoctor });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+suite('doctor.mjs — feedback projection (fix #37 #9)');
+
+test('clean (post --write) projection → pass, no fail entry', () => {
+  withDoctorFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb, runDoctor }) => {
+    assert.equal(runFb(['--write']).status, 0, 'seed write must succeed');
+    const { fb } = runDoctor();
+    assert.ok(fb.length >= 1, 'expected a Feedback projection check entry');
+    assert.ok(
+      fb.every((c) => c.status !== 'fail'),
+      `clean projection must not fail: ${JSON.stringify(fb)}`,
+    );
+    assert.ok(
+      fb.some((c) => c.status === 'pass' && c.label === 'Feedback projection'),
+      `clean projection should pass: ${JSON.stringify(fb)}`,
+    );
+  });
+});
+
+test('no feedback pages → pass with "no projection candidates"', () => {
+  withDoctorFeedbackEnv({}, ({ runDoctor }) => {
+    const { fb } = runDoctor();
+    assert.ok(
+      fb.some((c) => c.status === 'pass' && c.detail.includes('no projection candidates')),
+      `expected no-candidates pass: ${JSON.stringify(fb)}`,
+    );
+  });
+});
+
+test('drifted projection (never written) → warn, never fail', () => {
+  withDoctorFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runDoctor }) => {
+    const { fb } = runDoctor();
+    assert.ok(
+      fb.every((c) => c.status !== 'fail'),
+      `drift must be warn not fail: ${JSON.stringify(fb)}`,
+    );
+    assert.ok(
+      fb.some((c) => c.status === 'warn' && c.detail.includes('feedback-sync --write')),
+      `expected stale-projection warn: ${JSON.stringify(fb)}`,
+    );
+  });
+});
+
+test('tampered managed block (conflict) → fail Feedback projection integrity', () => {
+  withDoctorFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb, claudeHome, runDoctor }) => {
+    runFb(['--write']);
+    const cp = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(cp, readFileSync(cp, 'utf-8').replace('always do A', 'HAND EDITED'));
+    const { r, fb } = runDoctor();
+    assert.ok(
+      fb.some((c) => c.status === 'fail' && c.label === 'Feedback projection integrity'),
+      `conflict must fail: ${JSON.stringify(fb)}`,
+    );
+    assert.equal(r.status, 1, 'doctor exits 1 when any check fails');
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
