@@ -67,6 +67,15 @@ Trigger: explicit close mention, `/compact` request, or context limit approachin
 
 **Auto-trigger rule**: when the user sends a natural-language close signal — "세션 마무리하자", "오늘 여기까지", "이만 종료", "wrap up", "signing off", or equivalent — run the session close checklist immediately without waiting for an explicit `/compact` or `/hypo:crystallize`. If the intent is ambiguous, confirm with a single question before proceeding.
 
+**Proactive close offer** (ADR 0022 Layer 1): even when the user gives no close signal, offer to wrap up once a task is truly done — don't make them remember to. Fire `AskUserQuestion` **at the end of the assistant turn in which you report a task complete or verified**, when both hold:
+
+1. The session did substantial work — file mutations or multi-step changes, not Q&A only.
+2. The current user request did not already include a next task or tell you not to close.
+
+Do **not** treat these as completion: plan approvals, clarification answers, permission grants, progress updates, partial findings, or mid-task checkpoints. A "좋아요" / "감사합니다" / "ok" following any of those is *not* a close signal — only offer after a genuine final completion/verification report.
+
+Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까요?"* with options **[세션 마무리 / 계속 작업]**. On **세션 마무리** → run the session close checklist (or invoke `/hypo:crystallize`). On **계속 작업** → continue and do not re-ask until the next task completes. Ask at most once per completed task; never loop. (Decline simply ends the turn — Layer 3's Stop-chain only blocks on an explicit close signal, so no repeated prompts occur.)
+
 1. Update `projects/<name>/session-state.md` (next tasks, overwrite)
 2. Update `projects/<name>/hot.md` (what was done, ≤500 words, overwrite)
 3. Append to `projects/<name>/session-log/YYYY-MM.md` (narrative entry, append-only)
