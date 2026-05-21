@@ -4067,6 +4067,71 @@ const FB_PROJECT_L2 = {
   updated: '2026-05-19',
 };
 
+// ── hypo-personal-check.mjs — feedback projection gate (fix #37 Phase C) ──────
+// The PreCompact gate runs `feedback-sync --check --strict`; projection drift
+// must surface as a block, but only when PKG_ROOT resolves (a custom HOME with
+// hypo-pkg.json). The single-blocking-gate invariant (spec §7.5) means this is
+// integrated into hypo-personal-check, not a separate hook.
+suite('hypo-personal-check.mjs — feedback projection gate (fix #37 Phase C)');
+
+test('feedback projection drift → block names feedback projection', () => {
+  withWiki(
+    (dir) => {
+      // A global-L1 page is a CLAUDE projection candidate; the controlled
+      // CLAUDE.md below has an empty <learned_behaviors> with no managed region
+      // yet, so `--check` sees the projection as stale → exit 1.
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      // Custom HOME so the hook's PKG_ROOT resolves (enabling the feedback
+      // check) and the projection target is a controlled empty CLAUDE.md.
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-home-'));
+      try {
+        mkdirSync(join(home, '.claude'), { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        writeFileSync(
+          join(home, '.claude', 'CLAUDE.md'),
+          '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+        );
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const out = JSON.parse(r.stdout);
+        assert.equal(out.decision, 'block', `expected block, got: ${r.stdout}`);
+        assert.ok(
+          out.reason.includes('feedback projection'),
+          `block reason should name feedback projection: ${out.reason}`,
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('feedback gate: memory clean + missing CLAUDE.md → fail-open (no false block)', () => {
+  // Regression (codex review): the prior `every(buildError)` predicate blocked
+  // when the memory target was clean but the claude target only had a buildError
+  // (e.g. ~/.claude/CLAUDE.md never created). With no feedback pages the memory
+  // target has 0 candidates (clean) and the missing CLAUDE.md is benign — the
+  // gate must fail-open, not report drift.
+  withWiki(null, (dir) => {
+    const home = mkdtempSync(join(tmpdir(), 'hypo-fbgate-home-'));
+    try {
+      const derivedId = process.cwd().replace(/[/.]/g, '-');
+      const memDir = join(home, '.claude', 'projects', derivedId, 'memory');
+      mkdirSync(memDir, { recursive: true });
+      writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+      writeFileSync(join(memDir, 'MEMORY.md'), '# Memory Index\n');
+      // intentionally NO CLAUDE.md → claude target buildError
+      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.continue, true, `missing CLAUDE.md must not block: ${r.stdout}`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 suite('feedback-sync.mjs — ADR 0031 / fix #37 Phase A');
 
 test('feedback-sync-check-detects-drift: fresh projection targets are dirty → exit 1', () => {
