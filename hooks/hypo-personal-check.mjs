@@ -120,8 +120,9 @@ process.stdin.on('end', () => {
       const parsed = JSON.parse(r.stdout || '{}');
       lintBlockers = parsed.errors || [];
       lintW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
-    } catch {
+    } catch (err) {
       /* fail-open */
+      process.stderr.write(`[hypo-personal-check] error: ${err?.message ?? String(err)}\n`);
     }
   }
 
@@ -195,8 +196,9 @@ process.stdin.on('end', () => {
               : 'feedback projection drift — run `hypomnema feedback-sync --write`';
         }
       }
-    } catch {
+    } catch (err) {
       feedbackSkipped = true;
+      process.stderr.write(`[hypo-personal-check] error: ${err?.message ?? String(err)}\n`);
     }
   }
 

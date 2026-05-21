@@ -59,8 +59,7 @@ function emitBlock(sessionId) {
   // alias; passing --session-id there writes the per-session marker that clears
   // this block. CLI fallback + bypass live in commands/crystallize.md, not here
   // — keep the Stop reason terse so the actionable instruction stands out.
-  const reason =
-    `[WIKI_AUTOCLOSE] session-close 미완료 — /hypo:crystallize 실행으로 마무리 (session_id=${sessionId}).`;
+  const reason = `[WIKI_AUTOCLOSE] session-close 미완료 — /hypo:crystallize 실행으로 마무리 (session_id=${sessionId}).`;
   console.log(
     JSON.stringify({
       decision: 'block',
@@ -78,9 +77,12 @@ process.stdin.on('end', () => {
     let payload = {};
     try {
       payload = JSON.parse(raw) || {};
-    } catch {
+    } catch (err) {
       // Any malformed payload is fail-open — we never want a parse error to
       // strand Claude in a blocked Stop with no recovery context.
+      process.stderr.write(
+        `[hypo-auto-minimal-crystallize] error: ${err?.message ?? String(err)}\n`,
+      );
       emitContinue();
       return;
     }
@@ -102,10 +104,8 @@ process.stdin.on('end', () => {
       return;
     }
 
-    const sessionId =
-      payload.session_id || payload.sessionId || null;
-    const transcriptPath =
-      payload.transcript_path || payload.transcriptPath || null;
+    const sessionId = payload.session_id || payload.sessionId || null;
+    const transcriptPath = payload.transcript_path || payload.transcriptPath || null;
 
     // 3. substantial-session gate. Read-only / Q&A sessions skip the block.
     if (!hasMutatingTranscriptActivity(transcriptPath)) {
@@ -137,8 +137,9 @@ process.stdin.on('end', () => {
     }
 
     emitBlock(sessionId);
-  } catch {
+  } catch (err) {
     // Fail-open on any unexpected error.
+    process.stderr.write(`[hypo-auto-minimal-crystallize] error: ${err?.message ?? String(err)}\n`);
     emitContinue();
   }
 });

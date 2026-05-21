@@ -5621,6 +5621,66 @@ test('mergeLatest: refreshes latest but preserves notifiedFor', () => {
   }
 });
 
+// ── #12: unified hook stderr log format ────────────────────────────────────────
+// spec §7.5: every lifecycle hook's fail-open path must emit `[hypo-<name>] error:
+// <message>` to stderr (debugging, user-visible) while still returning the
+// fail-open output. <name> = hook filename minus `.mjs` (proven by the
+// wiki-cwd-change → hypo-cwd-change normalization).
+suite('hooks-stderr-log-format — unified [hypo-<name>] error: logging (#12)');
+
+const STDERR_LOG_HOOKS = [
+  'hypo-session-start',
+  'hypo-session-end',
+  'hypo-session-record',
+  'hypo-hot-rebuild',
+  'hypo-cwd-change',
+  'hypo-first-prompt',
+  'hypo-compact-guard',
+  'hypo-file-watch',
+  'hypo-lookup',
+  'hypo-personal-check',
+  'hypo-auto-minimal-crystallize',
+  'hypo-auto-stage',
+];
+
+for (const name of STDERR_LOG_HOOKS) {
+  test(`hooks-stderr-log-format: ${name}.mjs carries the unified [${name}] error: tag`, () => {
+    const src = readFileSync(join(HOOKS, `${name}.mjs`), 'utf-8');
+    // Unified tag present in a stderr write.
+    assert.ok(
+      new RegExp(`process\\.stderr\\.write\\(\`\\[${name}\\] error: `).test(src),
+      `${name}.mjs must log to stderr with the unified [${name}] error: format`,
+    );
+    // Hardened err access — bare `${err.message}` throws if a non-Error (null/
+    // undefined) is ever thrown, which would break the fail-open invariant.
+    assert.ok(
+      !/\$\{err\.message\}/.test(src),
+      `${name}.mjs must use \`err?.message ?? String(err)\`, not bare err.message`,
+    );
+    // No legacy [wiki-*] tag must survive the normalization (scoped to stderr
+    // writes so legitimate [WIKI ...] injection markers never false-fail).
+    assert.ok(
+      !/process\.stderr\.write\(`\[wiki-/.test(src),
+      `${name}.mjs must not retain a legacy [wiki-*] stderr tag`,
+    );
+  });
+}
+
+test('hooks-stderr-log-format: forced catch emits [hypo-compact-guard] error: + preserves fail-open', () => {
+  const r = runHook('hypo-compact-guard.mjs', 'not-json');
+  assert.match(r.stderr, /^\[hypo-compact-guard\] error: /m);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true); // fail-open invariant intact
+});
+
+test('hooks-stderr-log-format: forced catch emits [hypo-auto-stage] error: + preserves fail-open', () => {
+  const r = runHook('hypo-auto-stage.mjs', 'not-json');
+  assert.match(r.stderr, /^\[hypo-auto-stage\] error: /m);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(r.status, 0);
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

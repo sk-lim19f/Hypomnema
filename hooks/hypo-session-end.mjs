@@ -50,8 +50,9 @@ process.stdin.on('end', () => {
       prev_transcript_path: payload.transcript_path || payload.transcriptPath || null,
       prev_cwd: payload.cwd || null,
     });
-  } catch {
+  } catch (err) {
     // Best-effort: a marker failure must not break /clear itself.
+    process.stderr.write(`[hypo-session-end] error: ${err?.message ?? String(err)}\n`);
   }
   emitContinue();
 });

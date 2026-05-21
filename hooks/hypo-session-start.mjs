@@ -379,7 +379,8 @@ process.stdin.on('end', () => {
         ),
       ),
     );
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[hypo-session-start] error: ${err?.message ?? String(err)}\n`);
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   }
 });
