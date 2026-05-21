@@ -8,10 +8,21 @@
 
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, rmSync } from 'fs';
 import { join, relative, basename } from 'path';
-import { homedir, hostname } from 'os';
+import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 
 const HOME = homedir();
+
+// ── session marker path ─────────────────────────────────────────────────────
+// hypo-session-start / hypo-cwd-change WRITE this marker; hypo-first-prompt
+// READS + unlinks it. The session_id comes from the Claude Code runtime (a
+// UUID), but we sanitize defensively so a malformed id with path separators or
+// `..` can never escape tmpdir or collide on an empty value (codex review
+// 2026-05-21, fix #3/#13). Non-alphanumeric chars collapse to `_`.
+export function sessionMarkerPath(sessionId) {
+  const safe = String(sessionId || 'default').replace(/[^A-Za-z0-9._-]/g, '_') || 'default';
+  return join(tmpdir(), `hypo-session-marker-${safe}.json`);
+}
 
 // ── wiki root resolution ────────────────────────────────────────────────────
 
@@ -489,7 +500,9 @@ const SESSION_CLOSED_MARKER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 /** Sanitize session_id for filesystem use — Claude session_ids are UUIDs but
  *  defend against accidental path traversal regardless. */
 function sanitizeSessionId(sessionId) {
-  return String(sessionId).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128);
+  return String(sessionId)
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .slice(0, 128);
 }
 
 /** @returns {string} path to the session-closed marker for a given session_id. */
