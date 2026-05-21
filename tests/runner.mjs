@@ -4801,6 +4801,199 @@ test('doctor-derived-missing-project-id: unresolved warn, not a misleading stale
   });
 });
 
+// ── feedback.mjs — /hypo:feedback page writer (fix #37 Phase C) ───────────────
+// feedback.mjs must emit lint #8-complete frontmatter so the page is a valid
+// projection SoT, and must reject incomplete classification rather than write a
+// page lint would later block. --no-sync keeps these tests from touching
+// ~/.claude (the projection post-step is exercised manually / in feedback-sync).
+suite('feedback.mjs — /hypo:feedback page writer (fix #37 Phase C)');
+
+function withFeedbackWriterWiki(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-fbw-'));
+  try {
+    mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('feedback.mjs create: full classification → page written + lint-clean', () => {
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', [
+      '--topic=test-rule',
+      '--entry=항상 X를 한다.',
+      '--scope=global',
+      '--tier=L1',
+      '--targets=project-memory,claude-learned',
+      '--priority=4',
+      '--memory-summary=X를 항상 수행',
+      '--global-summary=항상 X 수행',
+      '--promote-to-global',
+      '--reason=Y 실수 방지',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+    ]);
+    assert.equal(r.status, 0, `feedback create failed: ${r.stderr}`);
+    const page = readFileSync(join(dir, 'pages', 'feedback', 'test-rule.md'), 'utf-8');
+    for (const f of [
+      'type: feedback',
+      'status: active',
+      'scope: global',
+      'tier: L1',
+      'targets: [project-memory, claude-learned]',
+      'sensitivity: public',
+      'priority: 4',
+      'memory_summary:',
+      'global_summary:',
+      'promote_to_global: true',
+      'reason:',
+      'source:',
+    ]) {
+      assert.ok(page.includes(f), `frontmatter missing "${f}":\n${page}`);
+    }
+    // lint #8 must accept the generated page (zero errors)
+    const lint = run('lint.mjs', ['--json', `--hypo-dir=${dir}`]);
+    const report = JSON.parse(lint.stdout);
+    assert.equal(report.errors.length, 0, `lint errors on generated page: ${lint.stdout}`);
+  });
+});
+
+test('feedback.mjs create: projection post-step targets --claude-home (no ~/.claude touch)', () => {
+  withFeedbackWriterWiki((dir) => {
+    // Isolated projection target: --claude-home keeps the post-step out of the
+    // real ~/.claude. Proves the auto `feedback-sync --write` runs and projects.
+    const cHome = mkdtempSync(join(tmpdir(), 'hypo-fbw-claude-'));
+    try {
+      mkdirSync(join(cHome, 'projects', 'pid', 'memory'), { recursive: true });
+      writeFileSync(
+        join(cHome, 'CLAUDE.md'),
+        '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+      );
+      writeFileSync(join(cHome, 'projects', 'pid', 'memory', 'MEMORY.md'), '# Memory Index\n');
+      const r = run('feedback.mjs', [
+        '--topic=proj-rule',
+        '--entry=항상 P를 한다.',
+        '--scope=global',
+        '--tier=L1',
+        '--targets=project-memory,claude-learned',
+        '--priority=5',
+        '--memory-summary=P 수행',
+        '--global-summary=항상 P',
+        '--promote-to-global',
+        '--reason=Q 방지',
+        `--claude-home=${cHome}`,
+        '--project-id=pid',
+        `--hypo-dir=${dir}`,
+      ]);
+      assert.equal(r.status, 0, `feedback create+sync failed: ${r.stderr}`);
+      const claudeMd = readFileSync(join(cHome, 'CLAUDE.md'), 'utf-8');
+      assert.ok(
+        claudeMd.includes('HYPO:FEEDBACK-SYNC:START source=proj-rule'),
+        `projection should write a managed block:\n${claudeMd}`,
+      );
+    } finally {
+      rmSync(cHome, { recursive: true, force: true });
+    }
+  });
+});
+
+test('feedback.mjs create: missing --memory-summary → exit 1, no page', () => {
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', [
+      '--topic=incomplete',
+      '--entry=무언가',
+      '--scope=global',
+      '--tier=L2',
+      '--targets=project-memory',
+      '--reason=이유',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+    ]);
+    assert.equal(r.status, 1, 'incomplete classification must fail');
+    assert.ok(/memory-summary/.test(r.stderr), `error should name the missing field: ${r.stderr}`);
+    assert.ok(
+      !existsSync(join(dir, 'pages', 'feedback', 'incomplete.md')),
+      'no page should be written on validation failure',
+    );
+  });
+});
+
+test('feedback.mjs create: claude-learned with project scope → exit 1 (ADR 0031 §6)', () => {
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', [
+      '--topic=mis-scoped',
+      '--entry=무언가',
+      '--scope=project:foo',
+      '--tier=L1',
+      '--targets=project-memory,claude-learned',
+      '--priority=3',
+      '--memory-summary=요약',
+      '--global-summary=전역요약',
+      '--promote-to-global',
+      '--reason=이유',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+    ]);
+    assert.equal(r.status, 1, 'claude-learned requires scope=global');
+    assert.ok(/scope=global/.test(r.stderr), `error should explain the §6 filter: ${r.stderr}`);
+  });
+});
+
+test('feedback.mjs create: newline in a scalar cannot inject a frontmatter key', () => {
+  // Regression (codex review): raw interpolation let a value with an embedded
+  // newline forge a frontmatter key (e.g. reason="legit\nstatus: archived").
+  // oneLine() collapses whitespace so the injected text stays on the value line.
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', [
+      '--topic=inject',
+      '--entry=rule body',
+      '--scope=global',
+      '--tier=L2',
+      '--targets=project-memory',
+      '--priority=3',
+      '--memory-summary=ok',
+      '--reason=legit\nstatus: archived',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+    ]);
+    assert.equal(r.status, 0, `create failed: ${r.stderr}`);
+    const page = readFileSync(join(dir, 'pages', 'feedback', 'inject.md'), 'utf-8');
+    const fm = page.split('---')[1];
+    assert.ok(/^status: active$/m.test(fm), 'real status must stay active');
+    assert.ok(!/^status: archived$/m.test(fm), 'injected key must NOT appear as its own line');
+    assert.ok(/^reason: legit status: archived$/m.test(fm), 'newline collapsed into the value');
+  });
+});
+
+test('feedback.mjs append: bumpUpdated leaves a body "updated:" line untouched', () => {
+  // Regression (codex review): a multiline replace would rewrite a body line
+  // starting with "updated:". bumpUpdated must only touch the frontmatter fence.
+  withFeedbackWriterWiki((dir) => {
+    const p = join(dir, 'pages', 'feedback', 'existing.md');
+    writeFileSync(
+      p,
+      '---\ntitle: x\ntype: feedback\nupdated: 2020-01-01\n---\n\n# x\n\nupdated: 2019-12-31 (body line)\n',
+    );
+    const r = run('feedback.mjs', [
+      '--topic=existing',
+      '--entry=new dated entry',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+    ]);
+    assert.equal(r.status, 0, `append failed: ${r.stderr}`);
+    const out = readFileSync(p, 'utf-8');
+    assert.ok(out.includes('updated: 2019-12-31 (body line)'), 'body updated: line preserved');
+    const today = new Date().toISOString().slice(0, 10);
+    const fm = out.split('\n---')[0];
+    assert.ok(
+      new RegExp(`^updated: ${today}$`, 'm').test(fm),
+      'frontmatter updated bumped to today',
+    );
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

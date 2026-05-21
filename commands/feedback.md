@@ -2,23 +2,34 @@
 description: Record an AI behavior correction or preference into the wiki
 ---
 
-You are running `/hypo:feedback`. Capture a behavior correction or preference into `pages/feedback/` for future sessions.
+You are running `/hypo:feedback`. Capture a behavior correction or preference into `pages/feedback/` — the **single source of truth** for learned behaviors (ADR 0031 / fix #37).
 
 ## What this does
 
-- Creates or updates `pages/feedback/<topic>.md` with a dated entry
+- Creates or updates `pages/feedback/<topic>.md` with a dated entry and full classification frontmatter
 - Appends a reference to `log.md`
-- Ensures the feedback is findable in future sessions
+- **Automatically refreshes the projection** into `MEMORY.md` and the user's CLAUDE.md `<learned_behaviors>` via `feedback-sync --write`
+
+> ⚠️ Do **not** hand-edit MEMORY.md or CLAUDE.md `<learned_behaviors>` for feedback. Those are one-way projections derived from the wiki page. Edit the wiki page; the projection follows.
 
 ---
 
 ## Step 1 — Gather feedback details
 
-If the user did not provide them, ask:
+If the user did not provide them, ask. The classification fields are required so the page can project correctly:
 
-1. **Topic** (slug): "What topic does this feedback apply to? (e.g. `response-length`, `commit-style`, `code-comments`)"
-2. **Rule**: "State the rule or correction in one or two sentences."
-3. **Why** (optional): "What was the reason or incident that prompted this?"
+1. **Topic** (slug): "What topic does this feedback apply to? (e.g. `response-length`, `commit-style`)"
+2. **Rule** (entry): "State the rule or correction in one or two sentences."
+3. **Reason**: "What incident or reasoning prompted this?"
+4. **Scope**: "Does this apply globally (all projects) or to this project only?" → `global` | `project:<slug>`
+5. **Tier**: "Is this a hard rule (L1) or a softer preference (L2)?" → `L1` | `L2`
+6. **Targets**: "Where should this project?" → `project-memory` (MEMORY.md) and/or `claude-learned` (global CLAUDE.md). Default `project-memory`.
+7. **Priority** (1–5, higher sorts first; default 3).
+8. **Sensitivity**: `public` (default) or `sanitized` (redacted secrets/paths). `private` is not allowed — the wiki is git-pushed.
+
+If **claude-learned** is among the targets, the page must be `scope: global` + `tier: L1`, and you must also collect:
+- **Global summary**: a one-line summary for the CLAUDE.md learned-behaviors entry.
+- Confirm **promote to global** (the page is only projected to CLAUDE.md when promoted).
 
 ---
 
@@ -30,38 +41,39 @@ To check for an existing topic, locate the Hypomnema package root and run:
 node <package-root>/scripts/feedback.mjs --list [--hypo-dir="<path>"]
 ```
 
-If a matching topic exists, confirm with the user whether to append to it or create a new one.
+If a matching topic exists, appending adds a dated entry and bumps `updated:` (classification frontmatter is preserved).
 
 ---
 
-## Step 3 — Write the feedback entry
+## Step 3 — Write the feedback page
 
-Compose the entry text. Format:
-
-```
-**Rule**: <one-line rule>
-
-**Why**: <reason or incident>
-
-**How to apply**: <when this kicks in>
-```
-
-Then run:
+Run with `--dry-run` first to preview the generated page, then without it to write. Pass every collected field:
 
 ```bash
 node <package-root>/scripts/feedback.mjs \
   --topic="<slug>" \
-  --entry="<formatted entry text>" \
+  --entry="<one-line rule>" \
+  --scope="global|project:<slug>" \
+  --tier="L1|L2" \
+  --targets="project-memory[,claude-learned]" \
+  --priority=<1-5> \
+  --sensitivity="public|sanitized" \
+  --memory-summary="<one-line MEMORY.md summary>" \
+  --reason="<why this rule exists>" \
+  [--global-summary="<one-line CLAUDE.md summary>" --promote-to-global] \
+  [--source="session:<date>"] \
   [--hypo-dir="<path>"] \
   [--dry-run]
 ```
 
-Run with `--dry-run` first to preview, then without it to write.
+When `--targets` includes `claude-learned`, `--global-summary` and `--promote-to-global` are required (and `--scope=global --tier=L1`).
+
+On a real (non-dry-run) write, the script automatically runs `feedback-sync --write` to refresh MEMORY.md / CLAUDE.md. If that post-step reports drift it prints a one-line warning — the page is still saved; reconcile with `hypomnema feedback-sync --check`.
 
 ---
 
-## Step 4 — Confirm and cross-reference
+## Step 4 — Confirm
 
-After writing:
-- Tell the user: "Saved to `pages/feedback/<topic>.md`."
-- If this feedback should also update the project's `session-state.md` or the user's CLAUDE.md `<learned_behaviors>`, ask: "Should I also add this to your CLAUDE.md learned behaviors?"
+After writing, tell the user:
+- "Saved to `pages/feedback/<topic>.md` and refreshed the MEMORY/CLAUDE projection."
+- If the projection post-step warned (over-cap, conflict, unresolved project-id), surface that and suggest `hypomnema feedback-sync --check`.
