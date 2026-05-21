@@ -44,7 +44,9 @@ function parseArgs(argv) {
     else if (arg.startsWith('--project-id=')) args.projectId = arg.slice(13);
   }
   if (!args.claudeHome) args.claudeHome = join(HOME, '.claude');
-  if (!args.projectId) args.projectId = process.cwd().replace(/[/.]/g, '-');
+  // projectId intentionally left null when not user-supplied — let feedback-sync
+  // derive it and exercise its own "derived dir missing → skip MEMORY" path so
+  // doctor reports "unresolved/skipped" rather than a misleading stale warning.
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
@@ -587,18 +589,18 @@ function checkCodexPaths() {
 // run `feedback-sync --write` yet is normal and must not block doctor.
 function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
   const cliPath = join(PKG_ROOT, 'scripts', 'feedback-sync.mjs');
-  const r = spawnSync(
-    process.execPath,
-    [
-      cliPath,
-      '--check',
-      '--json',
-      `--hypo-dir=${hypoDir}`,
-      `--claude-home=${claudeHome}`,
-      `--project-id=${projectId}`,
-    ],
-    { encoding: 'utf-8' },
-  );
+  const cliArgs = [
+    cliPath,
+    '--check',
+    '--json',
+    '--no-input', // never let the child block on a TTY prompt under doctor
+    `--hypo-dir=${hypoDir}`,
+    `--claude-home=${claudeHome}`,
+  ];
+  // forward --project-id ONLY when the user supplied one; otherwise let
+  // feedback-sync derive it and run its derived-missing → skip-MEMORY path
+  if (projectId) cliArgs.push(`--project-id=${projectId}`);
+  const r = spawnSync(process.execPath, cliArgs, { encoding: 'utf-8' });
 
   // feedback-sync exits non-zero on drift/over-cap/conflict — that is expected
   // and still prints a JSON report on stdout. Only treat a missing process or

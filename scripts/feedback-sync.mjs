@@ -39,10 +39,19 @@
  *   3  conflict (managed block hash mismatch = manual edit) — no auto-merge
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  mkdirSync,
+  rmSync,
+  realpathSync,
+} from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 
@@ -635,7 +644,12 @@ async function main() {
 
 function isMain() {
   try {
-    return import.meta.url === `file://${process.argv[1]}`;
+    // normalize via realpathSync + pathToFileURL so paths with spaces /
+    // URL-significant chars / symlinks compare correctly. Node resolves
+    // import.meta.url through realpath, so argv[1] must be realpath'd too
+    // (e.g. macOS /tmp → /private/tmp); a raw `file://${argv[1]}` silently no-ops.
+    if (!process.argv[1]) return false;
+    return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
   } catch {
     return false;
   }

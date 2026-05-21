@@ -17,6 +17,7 @@ import {
   symlinkSync,
   statSync,
   unlinkSync,
+  cpSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -4509,7 +4510,9 @@ suite('feedback-sync.mjs — project-id fallback (fix #37 #10)');
 // NO hang. The child has no controlling TTY under spawnSync, so this IS the
 // non-interactive proof. --no-input makes it explicit + belt-and-suspenders.
 test('feedback-sync-no-input-non-tty: derived-missing project-id skips MEMORY, exit 0, no hang', () => {
-  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome }) => {
+  // MEMORY-only fixture (project-scoped, no CLAUDE candidate) so the clean run
+  // genuinely exits 0 — proving the non-TTY skip path AND a clean exit code.
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, claudeHome }) => {
     const r = run('feedback-sync.mjs', [
       '--check',
       '--no-input',
@@ -4520,6 +4523,7 @@ test('feedback-sync-no-input-non-tty: derived-missing project-id skips MEMORY, e
     ]);
     // spawnSync returns (no timeout), proving the non-TTY path never blocks.
     assert.equal(r.signal, null, 'process must exit on its own (no hang/kill)');
+    assert.equal(r.status, 0, `clean MEMORY-only run must exit 0: ${r.stderr}`);
     const rep = JSON.parse(r.stdout);
     assert.equal(rep.projectIdResolved, false);
     assert.equal(rep.skipMemory, true, 'skipMemory flag surfaced in report');
@@ -4644,6 +4648,70 @@ await testAsync('resolveProjectId: non-TTY never prompts (hook/CI safety)', asyn
   );
   assert.equal(called, false, 'non-TTY must never call prompt');
   assert.equal(r.skipMemory, true);
+});
+
+// ── integration-review fixes (entry guard, doctor project-id) ────────────────
+
+suite('feedback-sync.mjs / doctor.mjs — integration review fixes (fix #37)');
+
+test('feedback-sync-entry-guard-tolerates-space-in-path: CLI runs, not a silent no-op', () => {
+  // a path with a space: raw `file://${argv[1]}` mismatches the percent-encoded
+  // import.meta.url, so the pre-fix entry guard skipped main() and exited 0 silently.
+  const base = mkdtempSync(join(tmpdir(), 'hypo fb space-'));
+  try {
+    cpSync(SCRIPTS, join(base, 'scripts'), { recursive: true }); // incl. lib/ for relative imports
+    const wiki = join(base, 'wiki');
+    mkdirSync(join(wiki, 'pages', 'feedback'), { recursive: true });
+    writeFileSync(join(wiki, 'hypo-config.md'), '# config');
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(base, 'scripts', 'feedback-sync.mjs'),
+        '--check',
+        '--json',
+        '--no-input',
+        `--hypo-dir=${wiki}`,
+        `--claude-home=${join(base, 'claude')}`,
+        `--cwd=${join(tmpdir(), 'no-such-cwd')}`,
+      ],
+      { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+    );
+    assert.ok(
+      r.stdout.trim().length > 0,
+      `CLI must produce output even from a spaced path (entry guard): ${JSON.stringify({ status: r.status, stdout: r.stdout, stderr: r.stderr })}`,
+    );
+    const rep = JSON.parse(r.stdout);
+    assert.ok('claude' in rep.targets, 'a real report must be produced');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('doctor-derived-missing-project-id: unresolved warn, not a misleading stale warn', () => {
+  withDoctorFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, claudeHome }) => {
+    // run doctor from a cwd whose derived project dir does not exist, WITHOUT
+    // --project-id — doctor must forward neither, letting feedback-sync skip MEMORY.
+    const noCwd = mkdtempSync(join(tmpdir(), 'hypo-doc-nocwd-'));
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'doctor.mjs'), `--hypo-dir=${wiki}`, `--claude-home=${claudeHome}`, '--json'],
+      {
+        encoding: 'utf-8',
+        cwd: noCwd,
+        env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+      },
+    );
+    rmSync(noCwd, { recursive: true, force: true });
+    const fb = JSON.parse(r.stdout).filter((c) => c.label.startsWith('Feedback projection'));
+    assert.ok(
+      fb.some((c) => c.status === 'warn' && /unresolved|skipped/i.test(c.detail || '')),
+      `expected unresolved/skipped warn: ${JSON.stringify(fb)}`,
+    );
+    assert.ok(
+      !fb.some((c) => /feedback-sync --write/.test(c.detail || '')),
+      `must NOT emit a stale-projection warn when project-id is unresolved: ${JSON.stringify(fb)}`,
+    );
+  });
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
