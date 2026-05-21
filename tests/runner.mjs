@@ -2160,6 +2160,99 @@ test('vocab check skipped when SCHEMA.md absent (back-compat)', () => {
   assert.equal(r.status, 0, `expected green when SCHEMA.md missing, got ${r.status}: ${r.stdout}`);
 });
 
+// ── lint.mjs pages/ directory whitelist (B6 — SCHEMA dir typo guard) ─────────
+
+suite('lint.mjs pages/ directory whitelist');
+
+const DIR_SCHEMA = [
+  '---',
+  'title: SCHEMA',
+  'type: schema',
+  '---',
+  '# Schema',
+  '',
+  '## 1. Page Type Taxonomy',
+  '',
+  '| type | directory | desc |',
+  '|------|-----------|------|',
+  '| `learning` | `pages/learnings/` | gotchas |',
+  '| `feedback` | `pages/feedback/` | corrections |',
+  '',
+  '## 4. Tag Vocabulary',
+  '',
+  '`wiki` `concept`',
+  '',
+  '## 5. Next',
+  '',
+].join('\n');
+
+// type: concept has no conditional-required fields and no tags → isolates B6 as
+// the only possible error, since the check keys off the path, not frontmatter.
+const PLAIN_PAGE = '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\n---\nbody\n';
+
+test('typo directory (pages/learning/) → error', () => {
+  const { r, out } = lintWithSchema('pages/learning/x.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 1, `expected error, got ${r.status}: ${r.stdout}`);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Undefined pages/ directory: "pages/learning/"')),
+    `expected undefined-dir error: ${r.stdout}`,
+  );
+});
+
+test('canonical directory (pages/learnings/) → green', () => {
+  const { r } = lintWithSchema('pages/learnings/x.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 0, `expected green, got ${r.status}: ${r.stdout}`);
+});
+
+test('root-level pages/ file (no subdir) → green', () => {
+  const { r } = lintWithSchema('pages/x.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 0, `expected green, got ${r.status}: ${r.stdout}`);
+});
+
+test('dir check skipped when Page Type Taxonomy table absent (back-compat)', () => {
+  // VOCAB_SCHEMA has no "## 1. Page Type Taxonomy" table → whitelist empty → skip.
+  const { r } = lintWithSchema('pages/learning/x.md', PLAIN_PAGE);
+  assert.equal(r.status, 0, `expected green when table absent, got ${r.status}: ${r.stdout}`);
+});
+
+test('_index.md in an undefined dir → green (scaffold exemption)', () => {
+  // pages/observability/ ships via init but is a topical grouping, not a page
+  // *type*, so it is absent from the taxonomy table. Its _index.md scaffold must
+  // not trip the guard.
+  const { r } = lintWithSchema('pages/observability/_index.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 0, `expected green for _index scaffold, got ${r.status}: ${r.stdout}`);
+});
+
+test('content file in an undefined dir still errors despite the _index exemption', () => {
+  // The exemption must not blunt the guard: a real content page (no `_` prefix)
+  // in a typo dir is still the original bug we are catching.
+  const { r, out } = lintWithSchema('pages/learning/real-content.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 1, `expected error, got ${r.status}: ${r.stdout}`);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Undefined pages/ directory: "pages/learning/"')),
+    `expected undefined-dir error: ${r.stdout}`,
+  );
+});
+
+test('fresh init wiki passes lint (regression: observability scaffold vs B6)', () => {
+  // Worker-1 caught that B6 would fail a freshly initialized wiki because
+  // init.mjs scaffolds pages/observability/_index.md, a dir absent from the
+  // taxonomy table. Drive the real init.mjs + lint.mjs, not a fixture.
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-init-lint-'));
+  const initR = run('init.mjs', [`--hypo-dir=${dir}`, '--no-hooks', '--no-git-init']);
+  assert.equal(initR.status, 0, `init failed: ${initR.stderr || initR.stdout}`);
+  const lintR = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
+  const out = JSON.parse(lintR.stdout);
+  rmSync(dir, { recursive: true, force: true });
+  const dirErrors = out.errors.filter((e) => /Undefined pages\/ directory/.test(e.message));
+  assert.equal(dirErrors.length, 0, `B6 fired on fresh init wiki: ${JSON.stringify(dirErrors)}`);
+  assert.equal(
+    lintR.status,
+    0,
+    `fresh init wiki should lint green, got ${lintR.status}: ${lintR.stdout}`,
+  );
+});
+
 // ── Lane B: formatGrowthMetrics + growth echo regressions ─────────────────
 
 const { formatGrowthMetrics, computeSessionGrowth } = await import(join(HOOKS, 'hypo-shared.mjs'));
@@ -3558,8 +3651,14 @@ test('replay-auto-minimal-crystallize-on-incomplete-close: mutating + no marker 
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block', `must block, got: ${JSON.stringify(out)}`);
-    assert.ok(/WIKI_AUTOCLOSE/.test(out.reason), `reason must mention WIKI_AUTOCLOSE: ${out.reason}`);
-    assert.ok(/\/hypo:crystallize/.test(out.reason), 'reason must point at /hypo:crystallize skill');
+    assert.ok(
+      /WIKI_AUTOCLOSE/.test(out.reason),
+      `reason must mention WIKI_AUTOCLOSE: ${out.reason}`,
+    );
+    assert.ok(
+      /\/hypo:crystallize/.test(out.reason),
+      'reason must point at /hypo:crystallize skill',
+    );
     assert.ok(out.reason.includes('s-substantial'), 'reason must embed the session_id to use');
   });
 });
@@ -3765,7 +3864,10 @@ test('--mark-session-closed with failing gate → exit 1, no marker', () => {
     assert.equal(r.status, 1);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
-    assert.ok(!existsSync(join(dir, '.cache', 'session-closed-s-failgate.marker')), 'marker must not be written on failed gate');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-failgate.marker')),
+      'marker must not be written on failed gate',
+    );
   });
 });
 
@@ -3787,7 +3889,10 @@ test('--mark-session-closed with ok gate but dirty git → exit 1, no marker (AD
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.ok(out.git_reason, `dirty-git result must carry git_reason: ${JSON.stringify(out)}`);
-    assert.ok(!existsSync(join(dir, '.cache', 'session-closed-s-dirty.marker')), 'marker must not land on dirty git');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-dirty.marker')),
+      'marker must not land on dirty git',
+    );
   });
 });
 

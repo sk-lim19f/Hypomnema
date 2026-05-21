@@ -18,7 +18,7 @@ import { join, relative, extname, basename } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
-import { parseSchemaVocab, checkForbidden } from './lib/schema-vocab.mjs';
+import { parseSchemaVocab, checkForbidden, parseSchemaPageDirs } from './lib/schema-vocab.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -195,7 +195,28 @@ function lintSessionStateHeadings(content, rel) {
   }
 }
 
-function lintPage({ path, rel }, slugMap, tagVocab) {
+function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
+  // Directory whitelist: a content page under pages/<subdir>/ must live in a
+  // SCHEMA-defined directory. Catches typo'd dirs (e.g. pages/learning/ vs the
+  // canonical pages/learnings/) regardless of frontmatter, since a directory
+  // absent from SCHEMA breaks wikilink resolution and crystallize routing.
+  // `_`-prefixed files (e.g. pages/observability/_index.md) are scaffold/section
+  // markers, not content — exempt them so packaged scaffold dirs that aren't a
+  // page *type* (e.g. observability, a topical grouping of reference pages) don't
+  // trip the guard. A real typo dir is created with content, not just an index.
+  // Skipped entirely when pageDirs is empty (SCHEMA.md or the table absent) for
+  // back-compat with minimal wikis — mirrors the tag-vocab check.
+  if (pageDirs && pageDirs.size > 0 && !basename(rel).startsWith('_')) {
+    const segs = rel.replace(/\\/g, '/').split('/');
+    if (segs[0] === 'pages' && segs.length > 2 && !pageDirs.has(segs[1])) {
+      issue(
+        'error',
+        rel,
+        `Undefined pages/ directory: "pages/${segs[1]}/" not in SCHEMA.md (likely a typo — defined: ${[...pageDirs].sort().join(', ')})`,
+      );
+    }
+  }
+
   let content;
   try {
     content = readFileSync(path, 'utf-8');
@@ -281,8 +302,9 @@ const scanDirs = ['pages', 'projects', 'journal'].map((d) => join(args.hypoDir, 
 const pages = scanDirs.flatMap((d) => collectPages(d, args.hypoDir, [], ignorePatterns));
 const slugMap = buildSlugMap(pages);
 const tagVocab = parseSchemaVocab(args.hypoDir);
+const pageDirs = parseSchemaPageDirs(args.hypoDir);
 
-for (const page of pages) lintPage(page, slugMap, tagVocab);
+for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs);
 
 if (args.fix) {
   const today = new Date().toISOString().slice(0, 10);
