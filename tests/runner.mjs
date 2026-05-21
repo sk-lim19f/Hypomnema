@@ -4532,6 +4532,28 @@ test('feedback-sync-no-input-non-tty: derived-missing project-id skips MEMORY, e
   });
 });
 
+// --strict must NOT escalate the skip-MEMORY warning. A fresh / external user
+// whose ~/.claude/projects/<id>/memory does not exist yet runs the PreCompact
+// gate (#3: `--check --strict`); contract §5 step 4 promises this never hard-
+// fails. skipMemory is an environmental state, not actionable drift.
+test('feedback-sync-strict-does-not-escalate-skip-memory: derived-missing + --strict → exit 0', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, claudeHome }) => {
+    const r = run('feedback-sync.mjs', [
+      '--check',
+      '--strict',
+      '--no-input',
+      '--json',
+      `--hypo-dir=${wiki}`,
+      `--claude-home=${claudeHome}`,
+      `--cwd=${join(tmpdir(), 'no-such-cwd-xyz')}`,
+    ]);
+    assert.equal(r.signal, null, 'process must exit on its own (no hang)');
+    assert.equal(r.status, 0, `skip-MEMORY warning must not be escalated by --strict: ${r.stderr}`);
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.skipMemory, true, 'skipMemory still surfaced in report');
+  });
+});
+
 // Explicit --project-id always wins, no prompt, MEMORY present even on TTY-less run.
 test('feedback-sync-explicit-project-id-wins: MEMORY target present, no prompt path', () => {
   withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb }) => {

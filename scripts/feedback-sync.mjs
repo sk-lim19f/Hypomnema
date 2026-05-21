@@ -538,19 +538,27 @@ function run(args, resolvedPid = null) {
   const report = { mode: args.mode, projectId: pid.id, projectIdResolved: pid.exists, targets: {} };
   if (pid.skipMemory) report.skipMemory = true;
   let code = 0;
+  // `warnings`: everything surfaced to the human (stderr / JSON report).
+  // `strictWarnings`: the subset `--strict` escalates to a non-zero exit.
+  // These are NOT the same set. The skip-MEMORY warning is an *environmental*
+  // state (a fresh / external user has no ~/.claude/projects/<id>/memory yet),
+  // not actionable drift — contract §5 step 4 promises this never hard-fails,
+  // so it must stay OUT of strictWarnings or the PreCompact gate (#3, which
+  // runs `--check --strict`) would block every first-run user. A private-
+  // sensitivity page IS a real SoT violation (ADR 0031 §7; lint #8 blocks it
+  // at the source) so it stays strict-escalatable as defense-in-depth.
   const warnings = [];
+  const strictWarnings = [];
   if (pid.skipMemory) {
     warnings.push(
       `project-id "${pid.id}" dir not found under ${args.claudeHome}/projects — MEMORY projection skipped (pass --project-id to override)`,
     );
   }
-  // surface pages excluded purely for sensitivity (private is forbidden — ADR
-  // 0031 §7; lint #8 blocks it at the SoT, this is a pre-#8 debugging aid)
   for (const p of pages) {
     if (p.fm.sensitivity && !PUBLIC_SENSITIVITY.has(p.fm.sensitivity)) {
-      warnings.push(
-        `page "${p.slug}" excluded: sensitivity="${p.fm.sensitivity}" (only public|sanitized)`,
-      );
+      const w = `page "${p.slug}" excluded: sensitivity="${p.fm.sensitivity}" (only public|sanitized)`;
+      warnings.push(w);
+      strictWarnings.push(w);
     }
   }
 
@@ -580,7 +588,7 @@ function run(args, resolvedPid = null) {
 
   // strict promotes warnings to a failure; compute it BEFORE the write gate so a
   // --write --strict refuses rather than writing then exiting non-zero (codex LOW).
-  const strictFail = args.strict && warnings.length > 0;
+  const strictFail = args.strict && strictWarnings.length > 0;
 
   // pass 2: write only when nothing blocks (code === 0 ⇒ no conflict, over-cap,
   // build error, or check-mode drift) and no strict failure. Skip clean targets
