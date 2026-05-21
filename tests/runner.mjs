@@ -13,6 +13,7 @@ import {
   rmSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
   symlinkSync,
   statSync,
@@ -4627,6 +4628,245 @@ test('feedback-sync-explicit-project-id-wins: MEMORY target present, no prompt p
     assert.equal(rep.projectIdResolved, true);
     assert.equal(rep.skipMemory, undefined, 'no skip for explicit project-id');
     assert.ok('memory' in rep.targets, 'MEMORY target present for explicit project-id');
+  });
+});
+
+// ── feedback-sync.mjs — bootstrap + import (fix #37 Phase D) ──────────────────
+
+suite('feedback-sync.mjs — bootstrap + import (fix #37 Phase D)');
+
+test('feedback-sync-bootstrap-creates-drafts: legacy surfaces → _drafts scaffolds, idempotent', () => {
+  const claudeMd =
+    '# Global\n<learned_behaviors>\n' +
+    '- [2026-05-20] always run the formatter before commit — 이유: consistency\n' +
+    '- [2026-05-19] push after every wiki commit — 이유: hook only pushes staged\n' +
+    '</learned_behaviors>\n';
+  const memoryMd =
+    '# Memory Index\n' +
+    '- [Teams usage](feedback_omc_teams_usage.md) — heavy tasks use teams\n' +
+    '- [Plain note](some_other_note.md) — not a feedback projection (skipped)\n';
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, runFb }) => {
+      const r = runFb(['--bootstrap', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      const rep = JSON.parse(r.stdout);
+      // 2 learned_behaviors + 1 feedback_* memory entry = 3; non-feedback_ entry ignored
+      assert.equal(rep.created.length, 3, `expected 3 drafts, got ${rep.created.length}`);
+      const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+      const files = readdirSync(draftsDir);
+      assert.ok(
+        files.some((f) => f.startsWith('legacy-claude-20260520-')),
+        'claude draft slug',
+      );
+      assert.ok(files.includes('omc-teams-usage.md'), 'memory slug: feedback_ stripped, _→-');
+      assert.ok(!files.some((f) => f.includes('some-other-note')), 'non-feedback_ entry skipped');
+      const draft = readFileSync(join(draftsDir, 'omc-teams-usage.md'), 'utf-8');
+      assert.ok(draft.startsWith('<!-- HYPO:FEEDBACK-SYNC:DRAFT'), 'provenance marker present');
+      assert.ok(/^type: feedback$/m.test(draft) && /^scope:/m.test(draft), 'frontmatter scaffold');
+      // idempotent: second run creates nothing, all skipped as draft-exists
+      const r2 = JSON.parse(runFb(['--bootstrap', '--json']).stdout);
+      assert.equal(r2.created.length, 0, 'second bootstrap creates nothing');
+      assert.ok(
+        r2.skipped.length >= 3 && r2.skipped.every((s) => s.reason === 'draft-exists'),
+        'all skipped as draft-exists',
+      );
+    },
+    { claudeMd, memoryMd },
+  );
+});
+
+test('feedback-sync-bootstrap-dry-run-writes-nothing: --dry-run reports but creates no files', () => {
+  const claudeMd =
+    '# Global\n<learned_behaviors>\n- [2026-05-20] a rule — 이유: x\n</learned_behaviors>\n';
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, runFb }) => {
+      const rep = JSON.parse(runFb(['--bootstrap', '--dry-run', '--json']).stdout);
+      assert.equal(rep.dryRun, true);
+      assert.ok(rep.created.length >= 1, 'dry-run still reports planned drafts');
+      assert.ok(!existsSync(join(wiki, 'pages', 'feedback', '_drafts')), 'no _drafts dir written');
+    },
+    { claudeMd },
+  );
+});
+
+test('feedback-sync-import-target-change: hand-edited block → draft, SoT page untouched', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    runFb(['--write']); // project rule-a into CLAUDE.md
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED externally'));
+    assert.equal(runFb(['--check']).status, 3, 'precondition: conflict detected');
+    const r = runFb(['--import-target-change', '--from=claude', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.imported.length, 1);
+    assert.equal(rep.imported[0].slug, 'rule-a');
+    const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+    const f = readdirSync(draftsDir).find((x) => x.startsWith('rule-a.import-'));
+    assert.ok(f, 'import draft created with import-<date> suffix');
+    assert.ok(
+      readFileSync(join(draftsDir, f), 'utf-8').includes('HAND EDITED externally'),
+      'draft captures the hand-edited content',
+    );
+    assert.ok(
+      !readFileSync(join(wiki, 'pages', 'feedback', 'rule-a.md'), 'utf-8').includes('HAND EDITED'),
+      'pages/feedback/rule-a.md (SoT) must not be modified',
+    );
+  });
+});
+
+test('feedback-sync-import-no-conflict-noop: clean target imports nothing, exit 0', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb }) => {
+    runFb(['--write']);
+    const r = runFb(['--import-target-change', '--from=claude', '--json']);
+    assert.equal(r.status, 0);
+    assert.equal(JSON.parse(r.stdout).imported.length, 0, 'no conflict → nothing imported');
+  });
+});
+
+test('feedback-sync-import-bad-from-errors: missing/invalid --from → exit 1', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb }) => {
+    assert.equal(runFb(['--import-target-change']).status, 1, 'missing --from rejected');
+    assert.equal(
+      runFb(['--import-target-change', '--from=bogus']).status,
+      1,
+      'invalid --from rejected',
+    );
+  });
+});
+
+test('feedback-sync-bootstrap-traversal-slug-stays-in-drafts: MEMORY ../ neutralized, pure-dots rejected', () => {
+  // codex BLOCKER regression: a crafted `feedback_../escaped.md` must NOT escape
+  // _drafts into pages/feedback/. basename() collapses traversal to the final
+  // segment; a slug that reduces to nothing (`..`) is rejected as unsafe-slug.
+  const memoryMd =
+    '# Memory Index\n' +
+    '- [Evil](feedback_../escaped.md) — traversal collapses to basename\n' +
+    '- [Dots](feedback_...md) — reduces to nothing, rejected\n';
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, runFb }) => {
+      const rep = JSON.parse(runFb(['--bootstrap', '--json']).stdout);
+      assert.ok(
+        !existsSync(join(wiki, 'pages', 'feedback', 'escaped.md')),
+        'must not escape into pages/feedback/',
+      );
+      assert.ok(
+        existsSync(join(wiki, 'pages', 'feedback', '_drafts', 'escaped.md')),
+        'traversal neutralized to a draft under _drafts',
+      );
+      assert.ok(
+        rep.skipped.some((s) => s.reason === 'unsafe-slug'),
+        'pure-dots slug rejected as unsafe-slug',
+      );
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-bootstrap-skips-managed-memory-block: projected MEMORY entries not re-drafted', () => {
+  // codex IMPORTANT regression: parseMemoryIndex must scrub HYPO:FEEDBACK-SYNC
+  // managed regions (parity with parseLearnedBehaviors) so already-projected
+  // index lines are not resurrected as legacy drafts.
+  const memoryMd =
+    '# Memory Index\n' +
+    `<!-- HYPO:FEEDBACK-SYNC:START source=managed-x sha256=${'a'.repeat(64)} -->\n` +
+    '- [Managed X](feedback_managed_x.md) — already projected\n' +
+    '<!-- HYPO:FEEDBACK-SYNC:END -->\n' +
+    '- [Loose Y](feedback_loose_y.md) — legacy hand entry\n';
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, runFb }) => {
+      runFb(['--bootstrap']);
+      const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+      const drafts = existsSync(draftsDir) ? readdirSync(draftsDir) : [];
+      assert.ok(drafts.includes('loose-y.md'), 'loose legacy MEMORY entry is drafted');
+      assert.ok(!drafts.includes('managed-x.md'), 'managed-block entry must NOT be re-drafted');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-import-traversal-source-stays-in-drafts: tampered source= neutralized', () => {
+  // codex BLOCKER regression: a tampered `source=../escaped` managed marker must
+  // not let --import write outside _drafts.
+  const claudeMd =
+    '# Global\n<learned_behaviors>\n' +
+    `<!-- HYPO:FEEDBACK-SYNC:START source=../escaped sha256=${'0'.repeat(64)} -->\n` +
+    'tampered inner content\n' +
+    '<!-- HYPO:FEEDBACK-SYNC:END -->\n' +
+    '</learned_behaviors>\n';
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, runFb }) => {
+      const r = runFb(['--import-target-change', '--from=claude', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(
+        !readdirSync(join(wiki, 'pages', 'feedback')).some((f) => f.includes('escaped')),
+        'nothing named escaped at pages/feedback top level',
+      );
+      assert.ok(
+        readdirSync(join(wiki, 'pages', 'feedback', '_drafts')).some((f) =>
+          f.startsWith('escaped.import-claude-'),
+        ),
+        'tampered source neutralized into _drafts',
+      );
+    },
+    { claudeMd },
+  );
+});
+
+test('feedback-sync-import-no-clobber: re-import same day preserves the prior draft', () => {
+  // codex IMPORTANT regression: a same-day re-import (or human-edited draft) must
+  // not be overwritten — the writer picks a collision-free numbered name.
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    runFb(['--write']);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED'));
+    runFb(['--import-target-change', '--from=claude']);
+    const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+    const first = readdirSync(draftsDir).find((x) => x.startsWith('rule-a.import-claude-'));
+    writeFileSync(join(draftsDir, first), 'HUMAN RECONCILED');
+    runFb(['--import-target-change', '--from=claude']); // second import, same day
+    assert.equal(
+      readFileSync(join(draftsDir, first), 'utf-8'),
+      'HUMAN RECONCILED',
+      'prior (human-edited) draft must be preserved',
+    );
+    assert.equal(
+      readdirSync(draftsDir).filter((x) => x.startsWith('rule-a.import-claude-')).length,
+      2,
+      'second import created a new numbered draft, not a clobber',
+    );
+  });
+});
+
+test('feedback-sync-existing-9-pages-pass-new-schema: schema-complete pages lint green + parse', () => {
+  // 9 schema-complete feedback pages (mirroring the canonical frontmatter the
+  // real wiki ships) must pass the new feedback conditional-required lint AND be
+  // parsed by feedback-sync without error. Hermetic — no dependency on ~/hypomnema
+  // (§8.13 verification #4 dogfooding, expressed as a hermetic regression guard).
+  const pages = {};
+  for (let i = 1; i <= 7; i++)
+    pages[`global-${i}`] = {
+      ...FB_GLOBAL_L1,
+      title: `Global ${i}`,
+      global_summary: `g${i}`,
+      memory_summary: `m${i}`,
+    };
+  for (let i = 1; i <= 2; i++)
+    pages[`proj-${i}`] = { ...FB_PROJECT_L2, title: `Proj ${i}`, memory_summary: `pm${i}` };
+  withFeedbackEnv(pages, ({ wiki, runFb }) => {
+    const lint = run('lint.mjs', [`--hypo-dir=${wiki}`]);
+    assert.equal(
+      lint.status,
+      0,
+      `lint must pass schema-complete feedback pages:\n${lint.stdout}${lint.stderr}`,
+    );
+    const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+    assert.equal(rep.targets.claude.candidates, 7, 'L1 global pages reach CLAUDE');
+    assert.equal(rep.targets.memory.candidates, 9, 'all 9 reach MEMORY');
   });
 });
 

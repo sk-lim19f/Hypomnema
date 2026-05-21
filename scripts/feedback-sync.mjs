@@ -9,9 +9,10 @@
  *                      + MEMORY.md index (managed region)
  *   - Global learned:  <claude-home>/CLAUDE.md  <learned_behaviors> managed region
  *
- * Phase A scope (this file): --check / --write engine + per-slug managed blocks
- * + sha256 idempotency + conflict (exit 3) + over-cap (exit 2). Bootstrap and
- * import are later phases (stubbed here).
+ * --check / --write engine: per-slug managed blocks + sha256 idempotency +
+ * conflict (exit 3) + over-cap (exit 2) [Phase A]. --bootstrap / --import-target-
+ * change: reverse one-time helpers that scaffold pages/feedback/_drafts/ for human
+ * review — never write pages/feedback/<slug>.md directly [Phase D].
  *
  * Contract: projects/hypomnema/fix-37-contract.md (per-slug managed block model,
  * sha256 over normalized inner content, sort key, exit matrix, project-id rule).
@@ -24,6 +25,7 @@
  *     --no-input             Never prompt; treat unresolved project-id non-interactively
  *     --strict               Promote warnings to failures (PreCompact gate)
  *     --json                 Machine-readable output
+ *     --dry-run              (bootstrap/import) report planned drafts, write nothing
  *
  * Project-id fallback (§5 step 4): when the derived project-id directory does not
  * exist AND stdin is an interactive TTY AND --no-input is not set, prompt the user
@@ -48,7 +50,7 @@ import {
   rmSync,
   realpathSync,
 } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
@@ -70,6 +72,7 @@ function parseArgs(argv) {
     skipMemory: false,
     strict: false,
     json: false,
+    dryRun: false,
     cwd: process.cwd(),
   };
   for (const arg of argv.slice(2)) {
@@ -86,6 +89,7 @@ function parseArgs(argv) {
     else if (arg === '--no-input') args.noInput = true;
     else if (arg === '--strict') args.strict = true;
     else if (arg === '--json') args.json = true;
+    else if (arg === '--dry-run') args.dryRun = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   if (!args.claudeHome) args.claudeHome = join(HOME, '.claude');
@@ -498,18 +502,296 @@ async function resolveProjectId(args, { prompt = defaultPrompt, isTTY } = {}) {
   return { ...pid, skipMemory: false };
 }
 
+// ── bootstrap + import (contract §11, fix #37 Phase D) ────────────────────────
+//
+// Both modes are *reverse* one-time helpers that scaffold wiki DRAFTS under
+// pages/feedback/_drafts/ — they NEVER write pages/feedback/<slug>.md directly
+// (the single-direction invariant, ADR 0031 §6). A human reviews each draft,
+// fills the decision fields (scope/tier/targets/promote_to_global), and moves
+// it into pages/feedback/. _drafts/ is excluded from sync candidates
+// (loadFeedbackPages) and from lint (collectPages skips `_`-dirs), so an
+// incomplete scaffold never trips required-field errors or projection.
+
+// Provenance header so re-running bootstrap/import is recognisable and humans
+// see at a glance the file is a generated scaffold awaiting review.
+const DRAFT_MARKER = (origin) => `<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=${origin} -->`;
+
+// Slug from free text: keep unicode letters/digits (Korean rules stay readable),
+// collapse every other run to a single dash, length-cap for filesystem sanity.
+function kebabSlug(text, max = 48) {
+  const s = String(text)
+    .replace(/\*\*/g, '') // markdown bold
+    .replace(/`[^`]*`/g, ' ') // inline code spans
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '');
+  return s.slice(0, max).replace(/-+$/g, '') || 'entry';
+}
+
+// Reduce an externally-sourced slug (MEMORY index name, managed-block `source=`)
+// to a single safe path segment. basename() collapses any `../` traversal to the
+// final component, then we strip everything but unicode word chars / . _ - and
+// leading dots. Returns null when nothing safe remains → caller skips it. Without
+// this a crafted `source=../evil` / `feedback_../evil.md` would let --bootstrap /
+// --import write outside _drafts (e.g. into pages/feedback/), breaking the
+// one-way invariant (codex BLOCKER, fix #37 Phase D review).
+function safeDraftSlug(raw) {
+  const seg = basename(String(raw).replace(/\\/g, '/'));
+  const cleaned = seg
+    .replace(/[^\p{L}\p{N}._-]+/gu, '-')
+    .replace(/^[.-]+/, '')
+    .replace(/-+$/g, '');
+  return cleaned && cleaned !== '.' && cleaned !== '..' ? cleaned : null;
+}
+
+// Defense-in-depth: refuse to write a draft whose resolved path escapes _drafts.
+function assertUnderDrafts(draftsDir, target) {
+  const root = resolve(draftsDir) + sep;
+  if (!resolve(target).startsWith(root)) {
+    throw new Error(`refusing to write outside _drafts: ${target}`);
+  }
+}
+
+// One-line summary from a rule body: drop markdown noise, cap length.
+function oneLineSummary(text, max = 100) {
+  const s = String(text).replace(/\*\*/g, '').replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
+  return s.length > max ? s.slice(0, max - 1).trimEnd() + '…' : s;
+}
+
+// Parse <learned_behaviors> hand-written lines into {date, rule}. Lines INSIDE a
+// HYPO:FEEDBACK-SYNC managed block are skipped — those already have a wiki SoT
+// and are not legacy entries to migrate.
+function parseLearnedBehaviors(content) {
+  const open = content.indexOf('<learned_behaviors>');
+  const close = content.indexOf('</learned_behaviors>');
+  if (open < 0 || close < 0 || close < open) return [];
+  const inner = content.slice(open + '<learned_behaviors>'.length, close);
+  const scrubbed = inner.replace(BLOCK_RE, ''); // blank out already-projected blocks
+  const out = [];
+  for (const line of scrubbed.split('\n')) {
+    const m = line.match(/^- \[(\d{4}-\d{2}-\d{2})\]\s+(.*\S)\s*$/);
+    if (m) out.push({ date: m[1], rule: m[2].trim() });
+  }
+  return out;
+}
+
+// Parse MEMORY.md index for sync-shaped feedback entries:
+//   `- [Title](feedback_<name>.md) — summary`
+// Non-`feedback_*` index lines are out of scope (not feedback projections).
+function parseMemoryIndex(content) {
+  const out = [];
+  // scrub already-projected managed blocks first (parity with parseLearnedBehaviors):
+  // index lines inside a HYPO:FEEDBACK-SYNC block already have a wiki SoT and must
+  // not be re-drafted as legacy entries (codex IMPORTANT, fix #37 Phase D review).
+  const scrubbed = content.replace(BLOCK_RE, '');
+  const re = /^- \[([^\]]*)\]\(feedback_([^)]+?)\.md\)\s*(?:—\s*(.*\S))?\s*$/gm;
+  let m;
+  while ((m = re.exec(scrubbed)) !== null) {
+    out.push({ title: m[1].trim(), name: m[2].trim(), summary: (m[3] || '').trim() });
+  }
+  return out;
+}
+
+// Frontmatter skeleton for a bootstrap draft. Decision fields the human must set
+// are left as `TODO` (the file is excluded from lint, so this never errors).
+function bootstrapDraftContent({ title, summary, body, date, origin }) {
+  const lines = [
+    DRAFT_MARKER(origin),
+    '---',
+    `title: ${title}`,
+    'type: feedback',
+    'status: draft',
+    'scope: TODO              # global | project:<slug>',
+    'tier: TODO               # L1 (CLAUDE.md <learned_behaviors> candidate) | L2',
+    'targets: [project-memory]   # + claude-learned for a global L1 rule',
+    'sensitivity: public      # public | sanitized (private is forbidden)',
+    'priority: 3              # 1-5, higher wins over-cap',
+    `memory_summary: ${summary}`,
+    `global_summary: ${summary}`,
+    'promote_to_global: false # set true to project into <learned_behaviors>',
+    'reason: TODO',
+    `source: ${date ? `session:${date}` : 'TODO'}`,
+  ];
+  if (date) lines.push(`created: ${date}`, `updated: ${date}`);
+  lines.push(`bootstrap_origin: ${origin}`, '---', '', `# ${title}`, '', body, '');
+  return lines.join('\n');
+}
+
+// Frontmatter skeleton for an import draft: captures the on-disk (hand-edited)
+// managed block content as the body so the human can reconcile it into the SoT.
+function importDraftContent({ slug, inner, from }) {
+  return [
+    DRAFT_MARKER(`import-${from}`),
+    '---',
+    `title: imported ${slug}`,
+    'type: feedback',
+    'status: draft',
+    'scope: TODO',
+    'tier: TODO',
+    'targets: [project-memory]',
+    'sensitivity: public',
+    'priority: 3',
+    `memory_summary: ${oneLineSummary(inner)}`,
+    `global_summary: ${oneLineSummary(inner)}`,
+    'promote_to_global: false',
+    `reason: imported from ${from} <learned_behaviors>/MEMORY managed block (hand-edited)`,
+    'source: TODO',
+    `imported_from: ${from}`,
+    '---',
+    '',
+    `# imported ${slug}`,
+    '',
+    '> The managed block below was edited outside the wiki. Reconcile it into',
+    `> pages/feedback/${slug}.md (the SoT), then re-run feedback-sync --write.`,
+    '',
+    inner,
+    '',
+  ].join('\n');
+}
+
+function existingPageSlugs(hypoDir) {
+  const dir = join(hypoDir, 'pages', 'feedback');
+  if (!existsSync(dir)) return new Set();
+  return new Set(
+    readdirSync(dir)
+      .filter((f) => f.endsWith('.md') && !f.startsWith('.') && !f.startsWith('_'))
+      .map((f) => basename(f, '.md')),
+  );
+}
+
+// --bootstrap: read the two legacy projection surfaces (CLAUDE.md
+// <learned_behaviors> + MEMORY.md feedback_* index) and scaffold drafts.
+function runBootstrap(args) {
+  const draftsDir = join(args.hypoDir, 'pages', 'feedback', '_drafts');
+  const existing = existingPageSlugs(args.hypoDir);
+  const report = { mode: 'bootstrap', dryRun: args.dryRun, created: [], skipped: [] };
+  const warnings = [];
+  const candidates = [];
+
+  const claudeFile = join(args.claudeHome, 'CLAUDE.md');
+  if (existsSync(claudeFile)) {
+    for (const lb of parseLearnedBehaviors(readFileSync(claudeFile, 'utf-8'))) {
+      const slug = `legacy-claude-${lb.date.replace(/-/g, '')}-${kebabSlug(lb.rule)}`;
+      candidates.push({
+        slug,
+        origin: 'claude-learned',
+        title: oneLineSummary(lb.rule, 60),
+        summary: oneLineSummary(lb.rule),
+        body: lb.rule,
+        date: lb.date,
+      });
+    }
+  } else {
+    warnings.push(`CLAUDE.md not found at ${claudeFile} — learned_behaviors source skipped`);
+  }
+
+  const pid = deriveProjectId(args);
+  const memFile = join(args.claudeHome, 'projects', pid.id, 'memory', 'MEMORY.md');
+  if (existsSync(memFile)) {
+    for (const e of parseMemoryIndex(readFileSync(memFile, 'utf-8'))) {
+      const slug = safeDraftSlug(e.name.replace(/_/g, '-'));
+      if (!slug) {
+        report.skipped.push({ slug: e.name, reason: 'unsafe-slug' });
+        continue;
+      }
+      candidates.push({
+        slug,
+        origin: 'memory-index',
+        title: e.title || slug,
+        summary: e.summary,
+        body: e.summary || e.title || slug,
+        date: '',
+      });
+    }
+  } else {
+    warnings.push(
+      `MEMORY.md not found for project-id "${pid.id}" at ${memFile} — memory source skipped`,
+    );
+  }
+
+  const seen = new Set();
+  for (const c of candidates) {
+    if (seen.has(c.slug)) {
+      report.skipped.push({ slug: c.slug, reason: 'duplicate-in-batch' });
+      continue;
+    }
+    seen.add(c.slug);
+    if (existing.has(c.slug)) {
+      report.skipped.push({ slug: c.slug, reason: 'page-exists' });
+      continue;
+    }
+    const draftPath = join(draftsDir, `${c.slug}.md`);
+    if (existsSync(draftPath)) {
+      report.skipped.push({ slug: c.slug, reason: 'draft-exists' });
+      continue;
+    }
+    assertUnderDrafts(draftsDir, draftPath);
+    report.created.push({ slug: c.slug, origin: c.origin, path: draftPath });
+    if (!args.dryRun) {
+      mkdirSync(draftsDir, { recursive: true });
+      writeFileSync(draftPath, bootstrapDraftContent(c));
+    }
+  }
+  return { code: 0, report, warnings };
+}
+
+// --import-target-change --from=<memory|claude>: capture hand-edited (conflict)
+// managed blocks back into drafts so the human can reconcile them into the SoT.
+function runImport(args) {
+  if (args.from !== 'memory' && args.from !== 'claude') {
+    return { code: 1, error: '--import-target-change requires --from=memory|claude' };
+  }
+  const file =
+    args.from === 'claude'
+      ? join(args.claudeHome, 'CLAUDE.md')
+      : join(args.claudeHome, 'projects', deriveProjectId(args).id, 'memory', 'MEMORY.md');
+  if (!existsSync(file)) return { code: 1, error: `target file not found: ${file}` };
+
+  const { blocks } = findBlocks(readFileSync(file, 'utf-8'));
+  const conflicts = blocks.filter((b) => b.actualHash !== b.declaredHash);
+  const report = { mode: 'import', from: args.from, dryRun: args.dryRun, imported: [] };
+  const warnings = [];
+  if (!conflicts.length) {
+    warnings.push(`no hand-edited (conflicting) managed blocks in ${file} — nothing to import`);
+    return { code: 0, report, warnings };
+  }
+  const draftsDir = join(args.hypoDir, 'pages', 'feedback', '_drafts');
+  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  report.skipped = [];
+  for (const b of conflicts) {
+    // sanitize the marker-supplied slug (a tampered `source=../x` must not escape
+    // _drafts — codex BLOCKER), then pick a collision-free name so a re-run / a
+    // same-day import from both targets never clobbers a prior draft (or human
+    // edits to it — codex IMPORTANT). `from` is in the name to disambiguate
+    // memory vs claude imports of the same slug.
+    const slug = safeDraftSlug(b.slug);
+    if (!slug) {
+      report.skipped.push({ slug: b.slug, reason: 'unsafe-slug' });
+      continue;
+    }
+    let draftPath = join(draftsDir, `${slug}.import-${args.from}-${stamp}.md`);
+    for (let n = 2; existsSync(draftPath); n++) {
+      draftPath = join(draftsDir, `${slug}.import-${args.from}-${stamp}-${n}.md`);
+    }
+    assertUnderDrafts(draftsDir, draftPath);
+    report.imported.push({ slug, path: draftPath });
+    if (!args.dryRun) {
+      mkdirSync(draftsDir, { recursive: true });
+      writeFileSync(draftPath, importDraftContent({ slug, inner: b.inner, from: args.from }));
+    }
+  }
+  return { code: 0, report, warnings };
+}
+
 // ── modes ─────────────────────────────────────────────────────────────────────
 
 function run(args, resolvedPid = null) {
   if (!existsSync(args.hypoDir)) {
     return { code: 1, error: `wiki not found: ${args.hypoDir}` };
   }
-  if (args.mode === 'bootstrap' || args.mode === 'import') {
-    return {
-      code: 1,
-      error: `mode --${args.mode === 'import' ? 'import-target-change' : 'bootstrap'} not implemented in Phase A`,
-    };
-  }
+  if (args.mode === 'bootstrap') return runBootstrap(args);
+  if (args.mode === 'import') return runImport(args);
 
   const pages = loadFeedbackPages(args.hypoDir);
   // pid may be pre-resolved by the interactive layer in main(); fall back to the
@@ -620,6 +902,28 @@ async function main() {
     console.log(JSON.stringify(out.error ? { error: out.error } : out.report, null, 2));
   } else if (out.error) {
     console.error(`[feedback-sync] ${out.error}`);
+  } else if (out.report.mode === 'bootstrap') {
+    for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
+    const verb = out.report.dryRun ? 'would create' : 'created';
+    for (const c of out.report.created)
+      console.error(
+        `[feedback-sync] ${verb} draft: pages/feedback/_drafts/${c.slug}.md (${c.origin})`,
+      );
+    for (const s of out.report.skipped)
+      console.error(`[feedback-sync] skipped ${s.slug}: ${s.reason}`);
+    console.error(
+      `[feedback-sync] bootstrap: ${out.report.created.length} ${verb}, ${out.report.skipped.length} skipped. ` +
+        `Fill scope/tier/targets/promote_to_global and move into pages/feedback/.`,
+    );
+  } else if (out.report.mode === 'import') {
+    for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
+    const verb = out.report.dryRun ? 'would import' : 'imported';
+    for (const i of out.report.imported)
+      console.error(`[feedback-sync] ${verb} ${i.slug} → ${i.path}`);
+    if (out.report.imported.length)
+      console.error(
+        `[feedback-sync] import: ${out.report.imported.length} draft(s). Reconcile into the SoT page, then feedback-sync --write.`,
+      );
   } else {
     for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
     for (const [name, t] of Object.entries(out.report.targets)) {
