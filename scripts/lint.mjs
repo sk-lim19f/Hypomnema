@@ -114,6 +114,11 @@ function collectPages(dir, root, pages = [], ignorePatterns = []) {
     if (isIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) {
+      // `_`-prefixed dirs (e.g. pages/feedback/_drafts) hold scaffolds / scratch
+      // not yet promoted to content — skip so incomplete frontmatter never errors
+      // (mirrors loadFeedbackPages in feedback-sync.mjs). `_`-prefixed *files*
+      // (e.g. _index.md) are still linted.
+      if (entry.startsWith('_')) continue;
       collectPages(full, root, pages, ignorePatterns);
     } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
       pages.push({ path: full, rel: relative(root, full) });
