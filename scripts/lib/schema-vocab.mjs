@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const VOCAB_HEADER_RE = /^##\s+(?:\d+\.\s+)?Tag\s+(?:Vocabulary|Taxonomy)\s*$/m;
+const TYPE_TAXONOMY_HEADER_RE = /^##\s+(?:\d+\.\s+)?Page\s+Type\s+Taxonomy\s*$/m;
+const PAGE_DIR_TOKEN_RE = /`pages\/([a-z0-9-]+)\//g;
 const NEXT_H2_RE = /^##\s+/m;
 const CATEGORY_PREFIX_RE = /^\s*\*\*[^*]+\*\*:\s*/;
 const BACKTICK_TOKEN_RE = /`([^`]+)`/g;
@@ -62,4 +64,33 @@ export function parseSchemaVocab(hypoDir) {
     for (const token of vocabLineTokens(rawLine)) vocab.add(token);
   }
   return vocab;
+}
+
+// Derive the set of valid immediate subdirectories under pages/ from the
+// SCHEMA "Page Type Taxonomy" table (e.g. learnings, feedback, people). Single
+// source of truth — adding a type+dir row to SCHEMA automatically widens the
+// whitelist. Returns an empty Set when SCHEMA.md or the table is absent, which
+// callers treat as "skip the check" for back-compat with minimal wikis.
+export function parseSchemaPageDirs(hypoDir) {
+  const path = join(hypoDir, 'SCHEMA.md');
+  if (!existsSync(path)) return new Set();
+  const content = readFileSync(path, 'utf-8');
+
+  const headerMatch = TYPE_TAXONOMY_HEADER_RE.exec(content);
+  if (!headerMatch) return new Set();
+
+  const sectionStart = headerMatch.index + headerMatch[0].length;
+  const rest = content.slice(sectionStart);
+  const nextH2 = NEXT_H2_RE.exec(rest);
+  const section = nextH2 ? rest.slice(0, nextH2.index) : rest;
+
+  // Only scan table rows (lines starting with `|`) so a backticked path that
+  // appears in surrounding prose (e.g. an example of a *wrong* dir) can never
+  // leak into the whitelist.
+  const dirs = new Set();
+  for (const rawLine of section.split('\n')) {
+    if (!rawLine.trimStart().startsWith('|')) continue;
+    for (const m of rawLine.matchAll(PAGE_DIR_TOKEN_RE)) dirs.add(m[1]);
+  }
+  return dirs;
 }
