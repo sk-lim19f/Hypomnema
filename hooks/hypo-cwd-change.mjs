@@ -114,7 +114,9 @@ process.stdin.on('end', () => {
             }),
           );
         } catch (err) {
-          process.stderr.write(`[wiki-cwd-change] marker write failed: ${err.message}\n`);
+          process.stderr.write(
+            `[hypo-cwd-change] marker write failed: ${err?.message ?? String(err)}\n`,
+          );
         }
       }
       console.log(
@@ -147,7 +149,7 @@ process.stdin.on('end', () => {
       ),
     );
   } catch (err) {
-    process.stderr.write(`[wiki-cwd-change] error: ${err.message}\n`);
+    process.stderr.write(`[hypo-cwd-change] error: ${err?.message ?? String(err)}\n`);
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   }
 });

@@ -72,8 +72,9 @@ process.stdin.on('end', () => {
         ].join('\n'),
       }),
     );
-  } catch {
+  } catch (err) {
     // Fail-open: any parse/runtime error must not block the user's prompt.
+    process.stderr.write(`[hypo-compact-guard] error: ${err?.message ?? String(err)}\n`);
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   }
 });

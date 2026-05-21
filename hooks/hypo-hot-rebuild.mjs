@@ -104,10 +104,14 @@ function emitGrowth() {
 
 try {
   rebuild();
-} catch {}
+} catch (err) {
+  process.stderr.write(`[hypo-hot-rebuild] error: ${err?.message ?? String(err)}\n`);
+}
 try {
   emitGrowth();
-} catch {}
+} catch (err) {
+  process.stderr.write(`[hypo-hot-rebuild] error: ${err?.message ?? String(err)}\n`);
+}
 
 try {
   console.log(JSON.stringify({ continue: true, suppressOutput: true }));

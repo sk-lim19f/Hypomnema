@@ -16,7 +16,8 @@ try {
     process.stdin.on('end', () => r(d));
   });
   input = JSON.parse(raw);
-} catch {
+} catch (err) {
+  process.stderr.write(`[hypo-auto-stage] error: ${err?.message ?? String(err)}\n`);
   console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   process.exit(0);
 }

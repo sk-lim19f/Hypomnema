@@ -277,7 +277,8 @@ process.stdin.on('end', () => {
         ),
       ),
     );
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[hypo-lookup] error: ${err?.message ?? String(err)}\n`);
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   }
 });

@@ -53,7 +53,8 @@ process.stdin.on('end', () => {
         additionalContext: `[WIKI FILE UPDATED: ${relPath}]\n\n${content}`,
       }),
     );
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[hypo-file-watch] error: ${err?.message ?? String(err)}\n`);
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   }
 });

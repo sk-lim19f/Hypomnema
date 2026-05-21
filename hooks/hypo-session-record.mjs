@@ -52,8 +52,9 @@ process.stdin.on('end', () => {
       cwd: payload.cwd || process.cwd(),
     };
     appendFileSync(INDEX_PATH, JSON.stringify(entry) + '\n');
-  } catch {
+  } catch (err) {
     // Audit is best-effort observability — never let it block session close.
+    process.stderr.write(`[hypo-session-record] error: ${err?.message ?? String(err)}\n`);
   }
   emitContinue();
 });
