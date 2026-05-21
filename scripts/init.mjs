@@ -82,7 +82,7 @@ function sha256(buf) {
 // keeps running init for backwards compatibility — that's the documented
 // Path-B onboarding command. An explicit `hypomnema init` is accepted too,
 // and is stripped before flag parsing so the rest of this file is unchanged.
-const KNOWN_SUBCOMMANDS = new Set(['init', 'upgrade', 'doctor', 'uninstall']);
+const KNOWN_SUBCOMMANDS = new Set(['init', 'upgrade', 'doctor', 'uninstall', 'feedback-sync']);
 const _verb = process.argv[2];
 if (_verb && KNOWN_SUBCOMMANDS.has(_verb) && _verb !== 'init') {
   const _target = join(SCRIPT_DIR, `${_verb}.mjs`);
@@ -117,6 +117,8 @@ Commands:
                           installed package (use --check for dry-run, --apply to commit)
   doctor                  Health check: directories, files, hooks, settings.json, git
   uninstall               Remove hooks and registrations (dry-run by default; pass --apply)
+  feedback-sync           Project feedback (SoT) → MEMORY.md / CLAUDE.md learned-behaviors
+                          projection (--check default, --write to apply; ADR 0031)
 
   Running \`hypomnema\` with no command is equivalent to \`hypomnema init\`.
 

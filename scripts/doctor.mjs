@@ -35,12 +35,18 @@ const PKG_INTEGRITY_HINT =
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, json: false, codex: false };
+  const args = { hypoDir: null, json: false, codex: false, claudeHome: null, projectId: null };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json') args.json = true;
     else if (arg === '--codex') args.codex = true;
+    else if (arg.startsWith('--claude-home=')) args.claudeHome = expandHome(arg.slice(14));
+    else if (arg.startsWith('--project-id=')) args.projectId = arg.slice(13);
   }
+  if (!args.claudeHome) args.claudeHome = join(HOME, '.claude');
+  // projectId intentionally left null when not user-supplied — let feedback-sync
+  // derive it and exercise its own "derived dir missing → skip MEMORY" path so
+  // doctor reports "unresolved/skipped" rather than a misleading stale warning.
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
@@ -574,6 +580,95 @@ function checkCodexPaths() {
   }
 }
 
+// ── feedback projection (fix #37 #9 — ADR 0031) ──────────────────────────────
+
+// Spawn feedback-sync.mjs --check --json and map its drift report onto doctor's
+// pass/warn/fail. Integrity violations (exit-3 class: conflict / unpaired marker
+// / intruder line / block out of container) are FAIL. Plain drift, build errors,
+// over-cap, and an unresolved project-id are WARN — a fresh system that has not
+// run `feedback-sync --write` yet is normal and must not block doctor.
+function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
+  const cliPath = join(PKG_ROOT, 'scripts', 'feedback-sync.mjs');
+  const cliArgs = [
+    cliPath,
+    '--check',
+    '--json',
+    '--no-input', // never let the child block on a TTY prompt under doctor
+    `--hypo-dir=${hypoDir}`,
+    `--claude-home=${claudeHome}`,
+  ];
+  // forward --project-id ONLY when the user supplied one; otherwise let
+  // feedback-sync derive it and run its derived-missing → skip-MEMORY path
+  if (projectId) cliArgs.push(`--project-id=${projectId}`);
+  const r = spawnSync(process.execPath, cliArgs, { encoding: 'utf-8' });
+
+  // feedback-sync exits non-zero on drift/over-cap/conflict — that is expected
+  // and still prints a JSON report on stdout. Only treat a missing process or
+  // unparseable stdout as a doctor-level problem (warn, never crash).
+  if (r.error || r.status === null) {
+    warn(
+      'Feedback projection',
+      `feedback-sync could not run: ${r.error?.message || 'no exit code'}`,
+    );
+    return;
+  }
+  let report;
+  try {
+    report = JSON.parse(r.stdout);
+  } catch {
+    warn('Feedback projection', 'feedback-sync produced no JSON report — inspect manually');
+    return;
+  }
+  if (report.error) {
+    warn('Feedback projection', report.error);
+    return;
+  }
+
+  const targets = Object.entries(report.targets || {});
+
+  // 1) integrity violations → FAIL
+  const broken = targets.find(
+    ([, t]) => (t.conflicts && t.conflicts.length) || t.unpaired || t.intruder || t.outOfContainer,
+  );
+  if (broken) {
+    const [name, t] = broken;
+    const reason =
+      t.conflicts && t.conflicts.length
+        ? `conflict (${t.conflicts.join(', ')})`
+        : t.unpaired
+          ? 'unpaired managed marker'
+          : t.intruder
+            ? 'hand-edited line inside managed region'
+            : 'managed block outside its container';
+    fail(
+      'Feedback projection integrity',
+      `${name}: ${reason} — run \`hypomnema feedback-sync --import-target-change\` to reconcile`,
+    );
+  } else {
+    // 2) build error → WARN
+    const buildErr = targets.find(([, t]) => t.buildError);
+    if (buildErr) {
+      warn('Feedback projection', buildErr[1].buildError);
+    } else if (targets.find(([, t]) => t.overCap)) {
+      warn('Feedback projection', 'projection over cap — demote/archive feedback pages');
+    } else if (targets.find(([, t]) => t.dirty)) {
+      warn('Feedback projection', 'projections stale — run `hypomnema feedback-sync --write`');
+    } else {
+      const candidates = targets.reduce((n, [, t]) => n + (t.candidates || 0), 0);
+      if (candidates > 0) pass('Feedback projection', 'in sync');
+      else pass('Feedback projection', 'no projection candidates');
+    }
+  }
+
+  // 3) unresolved project-id is a separate, non-fatal concern (MEMORY skipped)
+  if (report.projectIdResolved === false) {
+    warn(
+      'Feedback projection',
+      `project-id ${report.projectId} unresolved — MEMORY projection skipped; pass --project-id`,
+    );
+  }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -591,6 +686,7 @@ checkHooks();
 checkSettingsJson();
 if (args.codex) checkCodexPaths();
 if (rootOk) checkSyncState(args.hypoDir);
+if (rootOk) checkFeedbackProjection(args.hypoDir, args.claudeHome, args.projectId);
 checkGit(args.hypoDir);
 
 // ── report ───────────────────────────────────────────────────────────────────

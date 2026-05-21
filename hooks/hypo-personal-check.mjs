@@ -128,7 +128,86 @@ process.stdin.on('end', () => {
   const lintOk = lintBlockers.length === 0;
   const designHistoryOk = lintW8.length === 0;
 
-  if (gitStatus.clean && hotStatus.clean && lintOk && designHistoryOk && closeFiles.ok) {
+  // ── fix #37 Phase C: feedback projection drift (ADR 0031) ──
+  // Single blocking gate invariant (spec §7.5): integrate into THIS hook, never
+  // add a separate PreCompact hook. `feedback-sync --check --strict` reports
+  // projection drift (wiki feedback SoT vs MEMORY / CLAUDE.md learned-behaviors
+  // projection). `--no-input` keeps this non-TTY hook from ever blocking on a
+  // prompt, and the engine's skip-MEMORY warning is *soft* (never escalated by
+  // --strict) so a fresh / external user whose ~/.claude/projects/<id> dir does
+  // not exist yet is never gated (contract §5 step 4). Fail-open on any spawn
+  // error, exactly like the lint check above.
+  const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
+  let feedbackOk = true;
+  let feedbackReason = '';
+  let feedbackSkipped = false;
+  if (!feedbackPath || !existsSync(feedbackPath)) {
+    feedbackSkipped = true;
+  } else {
+    try {
+      const r = spawnSync(
+        process.execPath,
+        [
+          feedbackPath,
+          '--check',
+          '--strict',
+          '--no-input',
+          '--json',
+          `--hypo-dir=${HYPO_DIR}`,
+          `--claude-home=${join(homedir(), '.claude')}`,
+        ],
+        { encoding: 'utf-8', timeout: 30000 },
+      );
+      if (r.error || r.status === null) {
+        feedbackSkipped = true; // spawn failure → fail-open (never block on tooling)
+      } else if (r.status !== 0) {
+        // exit≠0 alone is ambiguous. A *missing* target file (e.g. a system
+        // whose ~/.claude/CLAUDE.md was never created) reports buildError +
+        // exit 1, which is benign — there is nothing to gate. Decide from the
+        // JSON report's per-target state instead of the raw exit code: block
+        // ONLY when some target has a genuine, actionable issue (drift,
+        // conflict, over-cap, or a malformed managed region). buildError is
+        // never actionable here, so any mix that lacks a real issue fails open
+        // — including memory:clean + claude:buildError (codex review: the prior
+        // `every(buildError)` predicate wrongly blocked that case). Mirrors
+        // doctor's buildError→warn (non-fatal) handling.
+        let report = null;
+        try {
+          report = JSON.parse(r.stdout || '');
+        } catch {
+          /* unparseable → fail-open below */
+        }
+        const targets = report ? Object.values(report.targets || {}) : [];
+        const conflicted = targets.some(
+          (t) =>
+            t.intruder || t.unpaired || t.outOfContainer || (t.conflicts && t.conflicts.length),
+        );
+        const overCap = targets.some((t) => t.overCap);
+        const drifted = targets.some((t) => t.dirty);
+        if (!report || !(conflicted || overCap || drifted)) {
+          feedbackSkipped = true; // missing target / pure warning / unparseable → fail-open
+        } else {
+          feedbackOk = false;
+          feedbackReason = conflicted
+            ? 'feedback projection conflict (manual edit) — run `hypomnema feedback-sync --import-target-change --from=<memory|claude>`'
+            : overCap
+              ? 'feedback projection over cap — demote/archive feedback pages'
+              : 'feedback projection drift — run `hypomnema feedback-sync --write`';
+        }
+      }
+    } catch {
+      feedbackSkipped = true;
+    }
+  }
+
+  if (
+    gitStatus.clean &&
+    hotStatus.clean &&
+    lintOk &&
+    designHistoryOk &&
+    closeFiles.ok &&
+    feedbackOk
+  ) {
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
     return;
   }
@@ -140,7 +219,9 @@ process.stdin.on('end', () => {
       !hotStatus.clean ? hotStatus.reason : '',
       !closeFiles.ok ? closeFilesReason : '',
       !designHistoryOk ? `design-history stale (${lintW8.length})` : '',
+      !feedbackOk ? feedbackReason : '',
       lintSkipped ? 'lint skipped (hypo-pkg.json missing)' : '',
+      feedbackSkipped ? 'feedback-sync skipped (hypo-pkg.json missing)' : '',
     ]
       .filter(Boolean)
       .join(', ');
@@ -162,6 +243,7 @@ process.stdin.on('end', () => {
     !designHistoryOk
       ? `design-history stale: ${lintW8.map((w) => w.file.split('/')[1]).join(', ')}`
       : '',
+    !feedbackOk ? feedbackReason : '',
     lintSkipped ? 'lint skipped (run `hypomnema init` to enable lint gate)' : '',
   ].filter(Boolean);
 

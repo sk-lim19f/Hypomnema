@@ -124,6 +124,85 @@ try {
     }
   }
 
+  step('hypomnema feedback-sync (installed) — check/write idempotency + bootstrap');
+  // Seed a fixture wiki + claude-home and exercise the feedback-sync surface
+  // through the installed CLI (proves the subcommand is routed + shipped and the
+  // Phase D bootstrap helper runs end-to-end). --check exits 1 on a fresh
+  // (un-written) projection, so use spawnSync (run() throws on non-zero).
+  const fbWiki = join(work, 'fb-wiki');
+  const fbHome = join(work, 'fb-home');
+  const fbProject = 'smoke';
+  run('mkdir', ['-p', join(fbWiki, 'pages', 'feedback')]);
+  run('mkdir', ['-p', join(fbHome, 'projects', fbProject, 'memory')]);
+  writeFileSync(
+    join(fbWiki, 'hypo-config.md'),
+    '---\ntitle: config\ntype: reference\n---\n# config\n',
+  );
+  writeFileSync(
+    join(fbWiki, 'pages', 'feedback', 'smoke-rule.md'),
+    [
+      '---',
+      'title: Smoke Rule',
+      'type: feedback',
+      'status: active',
+      'scope: global',
+      'tier: L1',
+      'targets: [project-memory, claude-learned]',
+      'sensitivity: public',
+      'priority: 4',
+      'memory_summary: smoke rule for the packed CLI',
+      'global_summary: always smoke-test the packed CLI',
+      'promote_to_global: true',
+      'reason: catch packaging regressions',
+      'source: session:2026-05-21',
+      'updated: 2026-05-21',
+      '---',
+      'body',
+      '',
+    ].join('\n'),
+  );
+  writeFileSync(
+    join(fbHome, 'CLAUDE.md'),
+    '# Global\n<learned_behaviors>\n- [2026-05-20] legacy hand rule — 이유: bootstrap source\n</learned_behaviors>\n',
+  );
+  writeFileSync(join(fbHome, 'projects', fbProject, 'memory', 'MEMORY.md'), '# Memory Index\n');
+
+  const fbArgs = [`--hypo-dir=${fbWiki}`, `--claude-home=${fbHome}`, `--project-id=${fbProject}`];
+  const fbRun = (extra) =>
+    spawnSync(cliBin, ['feedback-sync', ...extra, ...fbArgs], { encoding: 'utf-8' });
+
+  const fbCheck1 = fbRun(['--check']);
+  if (fbCheck1.status !== 1) {
+    throw new Error(
+      `feedback-sync --check on fresh projection expected exit 1, got ${fbCheck1.status}`,
+    );
+  }
+  const fbWrite = fbRun(['--write']);
+  if (fbWrite.status !== 0) {
+    throw new Error(
+      `feedback-sync --write expected exit 0, got ${fbWrite.status}: ${fbWrite.stderr}`,
+    );
+  }
+  if (
+    !readFileSync(join(fbHome, 'CLAUDE.md'), 'utf-8').includes(
+      'HYPO:FEEDBACK-SYNC:START source=smoke-rule',
+    )
+  ) {
+    throw new Error('feedback-sync --write did not project the managed block into CLAUDE.md');
+  }
+  const fbCheck2 = fbRun(['--check']);
+  if (fbCheck2.status !== 0) {
+    throw new Error(
+      `feedback-sync --check after --write expected clean exit 0, got ${fbCheck2.status}`,
+    );
+  }
+  const fbBootstrap = fbRun(['--bootstrap', '--dry-run']);
+  if (fbBootstrap.status !== 0 || !/would create draft/.test(fbBootstrap.stderr)) {
+    throw new Error(
+      `feedback-sync --bootstrap --dry-run did not announce drafts (exit ${fbBootstrap.status})`,
+    );
+  }
+
   console.log('\n✓ smoke-pack passed');
   cleanupOk = true;
 } catch (err) {
