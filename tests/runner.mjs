@@ -2283,6 +2283,99 @@ test('vocab check skipped when SCHEMA.md absent (back-compat)', () => {
   assert.equal(r.status, 0, `expected green when SCHEMA.md missing, got ${r.status}: ${r.stdout}`);
 });
 
+// ── lint.mjs pages/ directory whitelist (B6 — SCHEMA dir typo guard) ─────────
+
+suite('lint.mjs pages/ directory whitelist');
+
+const DIR_SCHEMA = [
+  '---',
+  'title: SCHEMA',
+  'type: schema',
+  '---',
+  '# Schema',
+  '',
+  '## 1. Page Type Taxonomy',
+  '',
+  '| type | directory | desc |',
+  '|------|-----------|------|',
+  '| `learning` | `pages/learnings/` | gotchas |',
+  '| `feedback` | `pages/feedback/` | corrections |',
+  '',
+  '## 4. Tag Vocabulary',
+  '',
+  '`wiki` `concept`',
+  '',
+  '## 5. Next',
+  '',
+].join('\n');
+
+// type: concept has no conditional-required fields and no tags → isolates B6 as
+// the only possible error, since the check keys off the path, not frontmatter.
+const PLAIN_PAGE = '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\n---\nbody\n';
+
+test('typo directory (pages/learning/) → error', () => {
+  const { r, out } = lintWithSchema('pages/learning/x.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 1, `expected error, got ${r.status}: ${r.stdout}`);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Undefined pages/ directory: "pages/learning/"')),
+    `expected undefined-dir error: ${r.stdout}`,
+  );
+});
+
+test('canonical directory (pages/learnings/) → green', () => {
+  const { r } = lintWithSchema('pages/learnings/x.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 0, `expected green, got ${r.status}: ${r.stdout}`);
+});
+
+test('root-level pages/ file (no subdir) → green', () => {
+  const { r } = lintWithSchema('pages/x.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 0, `expected green, got ${r.status}: ${r.stdout}`);
+});
+
+test('dir check skipped when Page Type Taxonomy table absent (back-compat)', () => {
+  // VOCAB_SCHEMA has no "## 1. Page Type Taxonomy" table → whitelist empty → skip.
+  const { r } = lintWithSchema('pages/learning/x.md', PLAIN_PAGE);
+  assert.equal(r.status, 0, `expected green when table absent, got ${r.status}: ${r.stdout}`);
+});
+
+test('_index.md in an undefined dir → green (scaffold exemption)', () => {
+  // pages/observability/ ships via init but is a topical grouping, not a page
+  // *type*, so it is absent from the taxonomy table. Its _index.md scaffold must
+  // not trip the guard.
+  const { r } = lintWithSchema('pages/observability/_index.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 0, `expected green for _index scaffold, got ${r.status}: ${r.stdout}`);
+});
+
+test('content file in an undefined dir still errors despite the _index exemption', () => {
+  // The exemption must not blunt the guard: a real content page (no `_` prefix)
+  // in a typo dir is still the original bug we are catching.
+  const { r, out } = lintWithSchema('pages/learning/real-content.md', PLAIN_PAGE, DIR_SCHEMA);
+  assert.equal(r.status, 1, `expected error, got ${r.status}: ${r.stdout}`);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Undefined pages/ directory: "pages/learning/"')),
+    `expected undefined-dir error: ${r.stdout}`,
+  );
+});
+
+test('fresh init wiki passes lint (regression: observability scaffold vs B6)', () => {
+  // Worker-1 caught that B6 would fail a freshly initialized wiki because
+  // init.mjs scaffolds pages/observability/_index.md, a dir absent from the
+  // taxonomy table. Drive the real init.mjs + lint.mjs, not a fixture.
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-init-lint-'));
+  const initR = run('init.mjs', [`--hypo-dir=${dir}`, '--no-hooks', '--no-git-init']);
+  assert.equal(initR.status, 0, `init failed: ${initR.stderr || initR.stdout}`);
+  const lintR = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
+  const out = JSON.parse(lintR.stdout);
+  rmSync(dir, { recursive: true, force: true });
+  const dirErrors = out.errors.filter((e) => /Undefined pages\/ directory/.test(e.message));
+  assert.equal(dirErrors.length, 0, `B6 fired on fresh init wiki: ${JSON.stringify(dirErrors)}`);
+  assert.equal(
+    lintR.status,
+    0,
+    `fresh init wiki should lint green, got ${lintR.status}: ${lintR.stdout}`,
+  );
+});
+
 // ── Lane B: formatGrowthMetrics + growth echo regressions ─────────────────
 
 const { formatGrowthMetrics, computeSessionGrowth } = await import(join(HOOKS, 'hypo-shared.mjs'));
@@ -5232,6 +5325,150 @@ test('feedback.mjs append: bumpUpdated leaves a body "updated:" line untouched',
       'frontmatter updated bumped to today',
     );
   });
+});
+
+// ── version-check (update notifier) ──────────────────────────────────────────
+
+const vc = await import(`${REPO}/hooks/version-check.mjs`);
+
+test('compareSemver: basic ordering', () => {
+  assert.equal(vc.compareSemver('1.0.0', '1.0.1'), -1);
+  assert.equal(vc.compareSemver('1.2.0', '1.1.9'), 1);
+  assert.equal(vc.compareSemver('2.0.0', '2.0.0'), 0);
+  assert.equal(vc.compareSemver('v1.1.0', '1.1.0'), 0); // tolerate leading v
+});
+
+test('compareSemver: release outranks prerelease, build metadata ignored', () => {
+  assert.equal(vc.compareSemver('1.2.3-rc.1', '1.2.3'), -1);
+  assert.equal(vc.compareSemver('1.2.3', '1.2.3-rc.1'), 1);
+  assert.equal(vc.compareSemver('1.2.3+build9', '1.2.3'), 0);
+});
+
+test('compareSemver: invalid input returns null', () => {
+  assert.equal(vc.compareSemver('not-a-version', '1.0.0'), null);
+  assert.equal(vc.compareSemver('1.0.0', ''), null);
+  assert.equal(vc.compareSemver('1.0', '1.0.0'), null);
+});
+
+test('detectChannel: npm / plugin / unknown', () => {
+  assert.equal(vc.detectChannel('/usr/local/lib/node_modules/hypomnema'), 'npm');
+  assert.equal(vc.detectChannel('/Users/x/.claude/plugins/cache/hypomnema'), 'plugin');
+  assert.equal(vc.detectChannel('/Users/x/Workspace/hypomnema'), 'unknown');
+  assert.equal(vc.detectChannel(''), 'unknown');
+  assert.equal(vc.detectChannel(undefined), 'unknown');
+});
+
+test('detectChannel: plugin path containing node_modules still resolves to plugin', () => {
+  assert.equal(
+    vc.detectChannel('/Users/x/.claude/plugins/cache/hypomnema/node_modules/foo'),
+    'plugin',
+  );
+});
+
+test('buildUpdateLine: channel-specific update command', () => {
+  assert.match(vc.buildUpdateLine('npm', '1.0.0', '1.1.0'), /npm install -g hypomnema/);
+  assert.match(
+    vc.buildUpdateLine('plugin', '1.0.0', '1.1.0'),
+    /plugin marketplace update hypomnema/,
+  );
+  assert.match(vc.buildUpdateLine('plugin', '1.0.0', '1.1.0'), /reload-plugins/);
+  assert.match(vc.buildUpdateLine('unknown', '1.0.0', '1.1.0'), /1\.0\.0 → 1\.1\.0/);
+});
+
+test('cacheIsFresh: fresh / stale / future / missing', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(vc.cacheIsFresh({ checkedAt: now - 1000 }, now), true);
+  assert.equal(vc.cacheIsFresh({ checkedAt: now - vc.TTL_MS - 1 }, now), false);
+  assert.equal(vc.cacheIsFresh({ checkedAt: now + 5 * 60_000 }, now), false); // future skew
+  assert.equal(vc.cacheIsFresh(null, now), false);
+  assert.equal(vc.cacheIsFresh({}, now), false);
+});
+
+test('computeNotice: shows when latest is newer', () => {
+  const cache = { latest: { npm: '1.2.0' }, notifiedFor: {} };
+  const n = vc.computeNotice(cache, 'npm', '1.1.0');
+  assert.ok(n);
+  assert.equal(n.latest, '1.2.0');
+  assert.match(n.line, /npm install -g hypomnema/);
+});
+
+test('computeNotice: skips when current >= latest (incl. local dev)', () => {
+  assert.equal(vc.computeNotice({ latest: { npm: '1.2.0' } }, 'npm', '1.2.0'), null);
+  assert.equal(vc.computeNotice({ latest: { npm: '1.2.0' } }, 'npm', '1.3.0'), null);
+});
+
+test('computeNotice: skips when already notified for this version', () => {
+  const cache = { latest: { npm: '1.2.0' }, notifiedFor: { npm: '1.2.0' } };
+  assert.equal(vc.computeNotice(cache, 'npm', '1.1.0'), null);
+});
+
+test('computeNotice: unknown channel / missing latest / invalid version → null', () => {
+  assert.equal(vc.computeNotice({ latest: { npm: '1.2.0' } }, 'unknown', '1.1.0'), null);
+  assert.equal(vc.computeNotice({ latest: {} }, 'npm', '1.1.0'), null);
+  assert.equal(vc.computeNotice(null, 'npm', '1.1.0'), null);
+  assert.equal(vc.computeNotice({ latest: { npm: 'garbage' } }, 'npm', '1.1.0'), null);
+});
+
+test('computeNotice: per-channel state is independent (channel switch)', () => {
+  // npm already notified at 1.2.0, but plugin at 1.2.0 has NOT been notified.
+  const cache = {
+    latest: { npm: '1.2.0', plugin: '1.2.0' },
+    notifiedFor: { npm: '1.2.0' },
+  };
+  assert.equal(vc.computeNotice(cache, 'npm', '1.1.0'), null); // suppressed
+  assert.ok(vc.computeNotice(cache, 'plugin', '1.1.0')); // still shows
+});
+
+test('isOptedOut: respects HYPO_NO_UPDATE_CHECK / NO_UPDATE_NOTIFIER / CI', () => {
+  assert.equal(vc.isOptedOut({}), false);
+  assert.equal(vc.isOptedOut({ HYPO_NO_UPDATE_CHECK: '1' }), true);
+  assert.equal(vc.isOptedOut({ NO_UPDATE_NOTIFIER: '1' }), true);
+  assert.equal(vc.isOptedOut({ CI: 'true' }), true);
+});
+
+test('cache I/O: atomic write/read round-trip + corrupt file → null', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-vc-'));
+  const path = join(dir, 'version-check.json');
+  try {
+    assert.equal(vc.readCache(path), null); // missing
+    vc.writeCacheAtomic(path, { checkedAt: 42, latest: { npm: '1.0.0' } });
+    assert.equal(vc.readCache(path).checkedAt, 42);
+    writeFileSync(path, '{not json');
+    assert.equal(vc.readCache(path), null); // corrupt
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('markNotified: sets channel mark without erasing other fields', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-vc-'));
+  const path = join(dir, 'version-check.json');
+  try {
+    vc.writeCacheAtomic(path, { checkedAt: 1, latest: { npm: '1.2.0', plugin: '1.1.0' } });
+    vc.markNotified(path, 'npm', '1.2.0');
+    const c = vc.readCache(path);
+    assert.equal(c.notifiedFor.npm, '1.2.0');
+    assert.equal(c.latest.npm, '1.2.0'); // preserved
+    assert.equal(c.latest.plugin, '1.1.0'); // preserved
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('mergeLatest: refreshes latest but preserves notifiedFor', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-vc-'));
+  const path = join(dir, 'version-check.json');
+  try {
+    vc.writeCacheAtomic(path, { latest: { npm: '1.0.0' }, notifiedFor: { npm: '1.0.0' } });
+    vc.mergeLatest(path, { npm: '1.3.0', plugin: '1.3.0' }, 999);
+    const c = vc.readCache(path);
+    assert.equal(c.checkedAt, 999);
+    assert.equal(c.latest.npm, '1.3.0');
+    assert.equal(c.latest.plugin, '1.3.0');
+    assert.equal(c.notifiedFor.npm, '1.0.0'); // NOT erased by the fetch worker
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
