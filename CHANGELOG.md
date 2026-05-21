@@ -5,6 +5,21 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Update notifier.** The SessionStart hook now shows an "Update available!"
+  banner when a newer Hypomnema version has been published, detecting both
+  distribution channels (npm package and Claude Code plugin) and printing the
+  channel-appropriate update command (`npm install -g hypomnema`, or
+  `/plugin marketplace update hypomnema` + `/reload-plugins`). The check never
+  blocks session start: the hook reads a 24-hour cache only, and a detached
+  worker refreshes it out-of-band, so a newer version surfaces from the next
+  session. Per-channel notification state prevents the same banner from
+  repeating, and `current >= latest` (local dev) is silently skipped. Opt out
+  with `HYPO_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER`, or `CI`.
+
 ## [1.1.0] - 2026-05-13
 
 Minor release. The headline is **observability**: the v1 → v2 thesis is

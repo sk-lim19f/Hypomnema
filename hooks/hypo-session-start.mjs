@@ -9,8 +9,9 @@
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { homedir, tmpdir } from 'os';
-import { join } from 'path';
-import { spawnSync } from 'child_process';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { spawnSync, spawn } from 'child_process';
 import {
   HYPO_DIR,
   buildOutput,
@@ -23,6 +24,15 @@ import {
   loadHypoIgnore,
   isIgnored,
 } from './hypo-shared.mjs';
+import {
+  defaultCachePath,
+  detectChannel,
+  readCache,
+  cacheIsFresh,
+  computeNotice,
+  markNotified,
+  isOptedOut,
+} from './version-check.mjs';
 
 // Privacy guard (fix #48, Stage 1): refuse to read+inject .hypoignore-matched
 // wiki files into additionalContext. Without this, a user who lists
@@ -32,6 +42,76 @@ function readIfNotIgnored(path, maxChars, patterns) {
   if (!path) return null;
   if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return null;
   return readFileSync(path, 'utf-8').slice(0, maxChars);
+}
+
+// Directory of the running hook, and the install root one level up
+// (<root>/hooks/...). The root is derived from the RUNNING hook path rather
+// than ~/.claude/hypo-pkg.json so a dual install (npm + plugin) or a stale
+// metadata file can't mislabel the channel (teams review (b), 2026-05-21).
+const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
+const ACTIVE_ROOT = dirname(HOOK_DIR);
+
+function readInstalledVersion(root) {
+  try {
+    return JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Update-notifier (teams-reviewed 2026-05-21). Reads ONLY the cache — never a
+ * synchronous network call. When the cache is stale, fires a detached worker to
+ * refresh it (shown next session). Fully best-effort: any failure returns ''.
+ */
+function buildUpdateNotice() {
+  try {
+    if (isOptedOut()) return '';
+    const cachePath = defaultCachePath();
+
+    let root = ACTIVE_ROOT;
+    let version = readInstalledVersion(root);
+    if (!version) {
+      try {
+        const meta = JSON.parse(readFileSync(join(homedir(), '.claude', 'hypo-pkg.json'), 'utf-8'));
+        root = meta.pkgRoot || root;
+        version = meta.pkgVersion || readInstalledVersion(root);
+      } catch {
+        /* fallback unavailable */
+      }
+    }
+    if (!version) return '';
+
+    const channel = detectChannel(root);
+    const cache = readCache(cachePath);
+
+    if (!cacheIsFresh(cache)) {
+      try {
+        const worker = join(HOOK_DIR, 'version-check-fetch.mjs');
+        if (existsSync(worker)) {
+          const child = spawn(process.execPath, [worker, cachePath], {
+            detached: true,
+            stdio: 'ignore',
+          });
+          // spawn() failures (EAGAIN/EMFILE/ENOENT) surface ASYNChronously on
+          // the child's 'error' event — the try/catch above only catches the
+          // synchronous throw. Without this listener an unhandled 'error' would
+          // crash SessionStart, violating the best-effort contract.
+          child.on('error', () => {});
+          child.unref();
+        }
+      } catch {
+        /* spawn is best-effort */
+      }
+    }
+
+    const notice = computeNotice(cache, channel, version);
+    if (!notice) return '';
+    markNotified(cachePath, channel, notice.latest);
+    return notice.line;
+  } catch {
+    return '';
+  }
 }
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
@@ -209,16 +289,18 @@ process.stdin.on('end', () => {
     // session-close work that /clear skipped. One-shot: marker is unlinked
     // immediately after read.
     const clearRecoveryLine = buildClearRecoveryLine(data.source);
+    const updateLine = buildUpdateNotice();
     // Intentional dual emit: stderr (yellow/cyan) is the human-visible nudge in
     // the terminal; noticePrefix injects the same plain-text lines into the
     // LLM's additionalContext so model and user start the session looking at
     // the same state. ANSI escapes are kept out of additionalContext on purpose.
-    const notices = [syncLine, growthLine, clearRecoveryLine].filter(Boolean);
+    const notices = [syncLine, growthLine, clearRecoveryLine, updateLine].filter(Boolean);
     const noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
     if (syncLine) process.stderr.write(`\n\x1b[33m${syncLine}\x1b[0m\n`);
     if (growthLine) process.stderr.write(`\n\x1b[36m${growthLine}\x1b[0m\n`);
     if (clearRecoveryLine)
       process.stderr.write(`\n\x1b[33m${clearRecoveryLine.split('\n')[0]}\x1b[0m\n`);
+    if (updateLine) process.stderr.write(`\n\x1b[33m${updateLine}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);

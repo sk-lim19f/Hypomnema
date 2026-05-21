@@ -3558,8 +3558,14 @@ test('replay-auto-minimal-crystallize-on-incomplete-close: mutating + no marker 
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block', `must block, got: ${JSON.stringify(out)}`);
-    assert.ok(/WIKI_AUTOCLOSE/.test(out.reason), `reason must mention WIKI_AUTOCLOSE: ${out.reason}`);
-    assert.ok(/\/hypo:crystallize/.test(out.reason), 'reason must point at /hypo:crystallize skill');
+    assert.ok(
+      /WIKI_AUTOCLOSE/.test(out.reason),
+      `reason must mention WIKI_AUTOCLOSE: ${out.reason}`,
+    );
+    assert.ok(
+      /\/hypo:crystallize/.test(out.reason),
+      'reason must point at /hypo:crystallize skill',
+    );
     assert.ok(out.reason.includes('s-substantial'), 'reason must embed the session_id to use');
   });
 });
@@ -3765,7 +3771,10 @@ test('--mark-session-closed with failing gate → exit 1, no marker', () => {
     assert.equal(r.status, 1);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
-    assert.ok(!existsSync(join(dir, '.cache', 'session-closed-s-failgate.marker')), 'marker must not be written on failed gate');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-failgate.marker')),
+      'marker must not be written on failed gate',
+    );
   });
 });
 
@@ -3787,7 +3796,10 @@ test('--mark-session-closed with ok gate but dirty git → exit 1, no marker (AD
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.ok(out.git_reason, `dirty-git result must carry git_reason: ${JSON.stringify(out)}`);
-    assert.ok(!existsSync(join(dir, '.cache', 'session-closed-s-dirty.marker')), 'marker must not land on dirty git');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-dirty.marker')),
+      'marker must not land on dirty git',
+    );
   });
 });
 
@@ -3857,6 +3869,150 @@ test('--apply-session-close --session-id leaves payload uncommitted → marker N
       'apply leaves payload writes uncommitted → ADR Q2 git-clean gate skips marker until auto-commit lands',
     );
   });
+});
+
+// ── version-check (update notifier) ──────────────────────────────────────────
+
+const vc = await import(`${REPO}/hooks/version-check.mjs`);
+
+test('compareSemver: basic ordering', () => {
+  assert.equal(vc.compareSemver('1.0.0', '1.0.1'), -1);
+  assert.equal(vc.compareSemver('1.2.0', '1.1.9'), 1);
+  assert.equal(vc.compareSemver('2.0.0', '2.0.0'), 0);
+  assert.equal(vc.compareSemver('v1.1.0', '1.1.0'), 0); // tolerate leading v
+});
+
+test('compareSemver: release outranks prerelease, build metadata ignored', () => {
+  assert.equal(vc.compareSemver('1.2.3-rc.1', '1.2.3'), -1);
+  assert.equal(vc.compareSemver('1.2.3', '1.2.3-rc.1'), 1);
+  assert.equal(vc.compareSemver('1.2.3+build9', '1.2.3'), 0);
+});
+
+test('compareSemver: invalid input returns null', () => {
+  assert.equal(vc.compareSemver('not-a-version', '1.0.0'), null);
+  assert.equal(vc.compareSemver('1.0.0', ''), null);
+  assert.equal(vc.compareSemver('1.0', '1.0.0'), null);
+});
+
+test('detectChannel: npm / plugin / unknown', () => {
+  assert.equal(vc.detectChannel('/usr/local/lib/node_modules/hypomnema'), 'npm');
+  assert.equal(vc.detectChannel('/Users/x/.claude/plugins/cache/hypomnema'), 'plugin');
+  assert.equal(vc.detectChannel('/Users/x/Workspace/hypomnema'), 'unknown');
+  assert.equal(vc.detectChannel(''), 'unknown');
+  assert.equal(vc.detectChannel(undefined), 'unknown');
+});
+
+test('detectChannel: plugin path containing node_modules still resolves to plugin', () => {
+  assert.equal(
+    vc.detectChannel('/Users/x/.claude/plugins/cache/hypomnema/node_modules/foo'),
+    'plugin',
+  );
+});
+
+test('buildUpdateLine: channel-specific update command', () => {
+  assert.match(vc.buildUpdateLine('npm', '1.0.0', '1.1.0'), /npm install -g hypomnema/);
+  assert.match(
+    vc.buildUpdateLine('plugin', '1.0.0', '1.1.0'),
+    /plugin marketplace update hypomnema/,
+  );
+  assert.match(vc.buildUpdateLine('plugin', '1.0.0', '1.1.0'), /reload-plugins/);
+  assert.match(vc.buildUpdateLine('unknown', '1.0.0', '1.1.0'), /1\.0\.0 → 1\.1\.0/);
+});
+
+test('cacheIsFresh: fresh / stale / future / missing', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(vc.cacheIsFresh({ checkedAt: now - 1000 }, now), true);
+  assert.equal(vc.cacheIsFresh({ checkedAt: now - vc.TTL_MS - 1 }, now), false);
+  assert.equal(vc.cacheIsFresh({ checkedAt: now + 5 * 60_000 }, now), false); // future skew
+  assert.equal(vc.cacheIsFresh(null, now), false);
+  assert.equal(vc.cacheIsFresh({}, now), false);
+});
+
+test('computeNotice: shows when latest is newer', () => {
+  const cache = { latest: { npm: '1.2.0' }, notifiedFor: {} };
+  const n = vc.computeNotice(cache, 'npm', '1.1.0');
+  assert.ok(n);
+  assert.equal(n.latest, '1.2.0');
+  assert.match(n.line, /npm install -g hypomnema/);
+});
+
+test('computeNotice: skips when current >= latest (incl. local dev)', () => {
+  assert.equal(vc.computeNotice({ latest: { npm: '1.2.0' } }, 'npm', '1.2.0'), null);
+  assert.equal(vc.computeNotice({ latest: { npm: '1.2.0' } }, 'npm', '1.3.0'), null);
+});
+
+test('computeNotice: skips when already notified for this version', () => {
+  const cache = { latest: { npm: '1.2.0' }, notifiedFor: { npm: '1.2.0' } };
+  assert.equal(vc.computeNotice(cache, 'npm', '1.1.0'), null);
+});
+
+test('computeNotice: unknown channel / missing latest / invalid version → null', () => {
+  assert.equal(vc.computeNotice({ latest: { npm: '1.2.0' } }, 'unknown', '1.1.0'), null);
+  assert.equal(vc.computeNotice({ latest: {} }, 'npm', '1.1.0'), null);
+  assert.equal(vc.computeNotice(null, 'npm', '1.1.0'), null);
+  assert.equal(vc.computeNotice({ latest: { npm: 'garbage' } }, 'npm', '1.1.0'), null);
+});
+
+test('computeNotice: per-channel state is independent (channel switch)', () => {
+  // npm already notified at 1.2.0, but plugin at 1.2.0 has NOT been notified.
+  const cache = {
+    latest: { npm: '1.2.0', plugin: '1.2.0' },
+    notifiedFor: { npm: '1.2.0' },
+  };
+  assert.equal(vc.computeNotice(cache, 'npm', '1.1.0'), null); // suppressed
+  assert.ok(vc.computeNotice(cache, 'plugin', '1.1.0')); // still shows
+});
+
+test('isOptedOut: respects HYPO_NO_UPDATE_CHECK / NO_UPDATE_NOTIFIER / CI', () => {
+  assert.equal(vc.isOptedOut({}), false);
+  assert.equal(vc.isOptedOut({ HYPO_NO_UPDATE_CHECK: '1' }), true);
+  assert.equal(vc.isOptedOut({ NO_UPDATE_NOTIFIER: '1' }), true);
+  assert.equal(vc.isOptedOut({ CI: 'true' }), true);
+});
+
+test('cache I/O: atomic write/read round-trip + corrupt file → null', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-vc-'));
+  const path = join(dir, 'version-check.json');
+  try {
+    assert.equal(vc.readCache(path), null); // missing
+    vc.writeCacheAtomic(path, { checkedAt: 42, latest: { npm: '1.0.0' } });
+    assert.equal(vc.readCache(path).checkedAt, 42);
+    writeFileSync(path, '{not json');
+    assert.equal(vc.readCache(path), null); // corrupt
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('markNotified: sets channel mark without erasing other fields', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-vc-'));
+  const path = join(dir, 'version-check.json');
+  try {
+    vc.writeCacheAtomic(path, { checkedAt: 1, latest: { npm: '1.2.0', plugin: '1.1.0' } });
+    vc.markNotified(path, 'npm', '1.2.0');
+    const c = vc.readCache(path);
+    assert.equal(c.notifiedFor.npm, '1.2.0');
+    assert.equal(c.latest.npm, '1.2.0'); // preserved
+    assert.equal(c.latest.plugin, '1.1.0'); // preserved
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('mergeLatest: refreshes latest but preserves notifiedFor', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-vc-'));
+  const path = join(dir, 'version-check.json');
+  try {
+    vc.writeCacheAtomic(path, { latest: { npm: '1.0.0' }, notifiedFor: { npm: '1.0.0' } });
+    vc.mergeLatest(path, { npm: '1.3.0', plugin: '1.3.0' }, 999);
+    const c = vc.readCache(path);
+    assert.equal(c.checkedAt, 999);
+    assert.equal(c.latest.npm, '1.3.0');
+    assert.equal(c.latest.plugin, '1.3.0');
+    assert.equal(c.notifiedFor.npm, '1.0.0'); // NOT erased by the fetch worker
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
