@@ -6,10 +6,16 @@
  * project hot.md. Skips if still within the same project subtree.
  */
 
-import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { HYPO_DIR, buildOutput, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
+import {
+  HYPO_DIR,
+  buildOutput,
+  loadHypoIgnore,
+  isIgnored,
+  sessionMarkerPath,
+} from './hypo-shared.mjs';
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
 const GLOBAL_HOT = join(HYPO_DIR, 'hot.md');
@@ -49,7 +55,13 @@ function findProjectHot(cwd) {
       : workingDir;
     if (cwd === resolved || cwd.startsWith(resolved + '/')) {
       const hotPath = join(projDir, 'hot.md');
-      return { proj, hotPath: existsSync(hotPath) ? hotPath : null, resolved };
+      const statePath = join(projDir, 'session-state.md');
+      return {
+        proj,
+        hotPath: existsSync(hotPath) ? hotPath : null,
+        statePath: existsSync(statePath) ? statePath : null,
+        resolved,
+      };
     }
   }
   return null;
@@ -67,6 +79,7 @@ process.stdin.on('end', () => {
 
     const newCwd = data.new_cwd || data.new_directory || data.cwd || process.cwd();
     const oldCwd = data.old_cwd || data.old_directory || data.previous_cwd || '';
+    const sessionId = data.session_id || 'default';
 
     // Skip re-injection if still in the same project
     const oldHit = oldCwd ? findProjectHot(oldCwd) : null;
@@ -82,6 +95,28 @@ process.stdin.on('end', () => {
     if (newHit) {
       const fromFile = readIfNotIgnored(newHit.hotPath, ignorePatterns);
       const content = fromFile ?? '(no hot.md yet — will be created at session close)';
+      // fix #13: arm the first-prompt marker so the NEXT user prompt re-triggers
+      // hypo-first-prompt, which forces a "Resuming <project>" summary line.
+      // Only arm when real hot content was actually injected — if hot.md is
+      // missing or .hypoignore'd (fromFile null), there is nothing for the LLM
+      // to summarize, so forcing "Resuming" would be empty noise (codex review).
+      if (fromFile) {
+        try {
+          writeFileSync(
+            sessionMarkerPath(sessionId),
+            JSON.stringify({
+              proj: newHit.proj,
+              hotPath: newHit.hotPath,
+              statePath: newHit.statePath,
+              hasSnapshot: true,
+              source: 'cwd-change',
+              ts: Date.now(),
+            }),
+          );
+        } catch (err) {
+          process.stderr.write(`[wiki-cwd-change] marker write failed: ${err.message}\n`);
+        }
+      }
       console.log(
         JSON.stringify(
           buildOutput(`[WIKI: cwd changed → project=${newHit.proj}]\n\n${content}`, {

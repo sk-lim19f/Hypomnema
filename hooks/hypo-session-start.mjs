@@ -8,7 +8,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
-import { homedir, tmpdir } from 'os';
+import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync, spawn } from 'child_process';
@@ -23,6 +23,7 @@ import {
   clearClearMarker,
   loadHypoIgnore,
   isIgnored,
+  sessionMarkerPath,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -303,7 +304,7 @@ process.stdin.on('end', () => {
     if (updateLine) process.stderr.write(`\n\x1b[33m${updateLine}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
-    const MARKER_FILE = join(tmpdir(), `hypo-session-marker-${sessionId}.json`);
+    const MARKER_FILE = sessionMarkerPath(sessionId);
     const hit = findProjectFiles(cwd);
 
     const ignorePatterns = loadHypoIgnore(HYPO_DIR);

@@ -2711,6 +2711,156 @@ test('cwd-change refuses to inject .hypoignore-matched global hot.md', () => {
   });
 });
 
+// ── first-prompt forced resume summary (fix #3) + cwd-change re-trigger (#13) ──
+suite('hypo-first-prompt.mjs — forced resume summary (fix #3 / #13)');
+
+// first-prompt reads its marker from os.tmpdir(), independent of HOME/HYPO_DIR.
+// Tests use a unique session_id so the marker path never collides.
+function markerPath(sessionId) {
+  return join(tmpdir(), `hypo-session-marker-${sessionId}.json`);
+}
+function writeMarker(sessionId, marker) {
+  writeFileSync(markerPath(sessionId), JSON.stringify({ ts: Date.now(), ...marker }));
+}
+function runFirstPrompt(sessionId) {
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-first-prompt.mjs')], {
+    input: JSON.stringify({ session_id: sessionId, prompt: 'unrelated weather question' }),
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '/tmp/nonexistent-hypo-99999' },
+  });
+}
+
+test('replay-first-prompt-forces-summary: fresh marker forces unconditional summary line', () => {
+  const sid = `fp-force-${process.pid}-${Date.now()}`;
+  writeMarker(sid, { proj: 'demo', hotPath: null, hasSnapshot: true });
+  try {
+    const r = runFirstPrompt(sid);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout).additionalContext || '';
+    assert.match(out, /Previously working on demo/, 'must force the resume summary line');
+    assert.match(out, /unconditionally/, 'directive must be unconditional (fix #3)');
+    // The old "answer only if related / no mention" escape must be gone.
+    assert.doesNotMatch(out, /answer only, no mention/, 'old conditional hint must be removed');
+  } finally {
+    if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+  }
+});
+
+test('replay-first-prompt-forces-summary: cwd-change marker says "Resuming"', () => {
+  const sid = `fp-resume-${process.pid}-${Date.now()}`;
+  writeMarker(sid, { proj: 'demo', hotPath: null, hasSnapshot: true, source: 'cwd-change' });
+  try {
+    const r = runFirstPrompt(sid);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout).additionalContext || '';
+    assert.match(out, /Resuming demo/, 'cwd-change source must phrase as Resuming (fix #13)');
+    assert.doesNotMatch(out, /Previously working on/, 'must not use the session-start verb');
+  } finally {
+    if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+  }
+});
+
+test('replay-first-prompt-forces-summary: no marker → silent pass-through', () => {
+  const sid = `fp-none-${process.pid}-${Date.now()}`;
+  const r = runFirstPrompt(sid); // no marker written
+  assert.equal(r.status, 0);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.additionalContext, undefined, 'no marker → no injected directive');
+  assert.equal(out.suppressOutput, true);
+});
+
+test('replay-first-prompt-forces-summary: expired marker (>10min) → no directive, cleaned up', () => {
+  const sid = `fp-exp-${process.pid}-${Date.now()}`;
+  writeFileSync(
+    markerPath(sid),
+    JSON.stringify({ proj: 'demo', hasSnapshot: true, ts: Date.now() - 11 * 60 * 1000 }),
+  );
+  const r = runFirstPrompt(sid);
+  assert.equal(r.status, 0);
+  assert.equal(JSON.parse(r.stdout).additionalContext, undefined, 'expired marker injects nothing');
+  assert.equal(existsSync(markerPath(sid)), false, 'expired marker is unlinked');
+});
+
+test('replay-cwd-change-triggers-first-prompt: entering a project arms the marker', () => {
+  const sid = `cwd-arm-${process.pid}-${Date.now()}`;
+  withPrivateProject((dir, work) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+      input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other-nonproject', session_id: sid }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    try {
+      assert.ok(
+        existsSync(markerPath(sid)),
+        'cwd-change must write a first-prompt marker (fix #13)',
+      );
+      const m = JSON.parse(readFileSync(markerPath(sid), 'utf-8'));
+      assert.equal(m.proj, 'private');
+      assert.equal(m.source, 'cwd-change');
+      // The armed marker drives first-prompt to force a "Resuming" line.
+      const fp = runFirstPrompt(sid);
+      const out = JSON.parse(fp.stdout).additionalContext || '';
+      assert.match(out, /Resuming private/, 'armed marker forces Resuming on next prompt');
+    } finally {
+      if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+    }
+  });
+});
+
+const sharedMod = await import(`${REPO}/hooks/hypo-shared.mjs`);
+
+test('sessionMarkerPath: sanitizes path separators and empty ids (codex fix #3/#13)', () => {
+  const { sessionMarkerPath } = sharedMod;
+  // A crafted id with separators / traversal must collapse to a flat filename
+  // inside tmpdir — never escape it.
+  const evil = sessionMarkerPath('../../etc/passwd');
+  assert.equal(dirname(evil), tmpdir(), 'must stay directly under tmpdir');
+  assert.doesNotMatch(evil, /\/etc\/passwd/, 'separators must not survive');
+  // Empty / missing id falls back to a stable default, never a bare marker name.
+  assert.match(sessionMarkerPath(''), /hypo-session-marker-default\.json$/);
+  assert.match(sessionMarkerPath(undefined), /hypo-session-marker-default\.json$/);
+  // A normal UUID-ish id is preserved verbatim.
+  assert.match(sessionMarkerPath('abc-123_DEF'), /hypo-session-marker-abc-123_DEF\.json$/);
+});
+
+test('replay-cwd-change-triggers-first-prompt: ignored hot.md does NOT arm the marker', () => {
+  const sid = `cwd-ignored-${process.pid}-${Date.now()}`;
+  withPrivateProject((dir, work) => {
+    // hot.md is .hypoignore'd → cwd-change injects a placeholder, so there is
+    // nothing to summarize and the marker must NOT be armed (codex finding #2).
+    writeFileSync(join(dir, '.hypoignore'), 'projects/private/hot.md\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+      input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other-nonproject', session_id: sid }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    if (existsSync(markerPath(sid))) {
+      unlinkSync(markerPath(sid));
+      assert.fail('ignored/absent hot content must not arm a "Resuming" marker');
+    }
+  });
+});
+
+test('replay-cwd-change-triggers-first-prompt: same-project move does NOT arm the marker', () => {
+  const sid = `cwd-same-${process.pid}-${Date.now()}`;
+  withPrivateProject((dir, work) => {
+    const sub = join(work, 'subdir');
+    mkdirSync(sub, { recursive: true });
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+      input: JSON.stringify({ new_cwd: sub, old_cwd: work, session_id: sid }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    if (existsSync(markerPath(sid))) {
+      unlinkSync(markerPath(sid));
+      assert.fail('same-project cwd move must skip and not arm a marker');
+    }
+  });
+});
+
 test('file-watch ignores file outside HYPO_DIR even without .hypoignore', () => {
   withGrowthWiki((dir) => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
