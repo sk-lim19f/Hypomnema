@@ -24,6 +24,9 @@ import {
   loadHypoIgnore,
   isIgnored,
   sessionMarkerPath,
+  shouldSuggestProjectCreation,
+  buildProjectSuggestionLine,
+  recordSuggestionCooldown,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -296,7 +299,7 @@ process.stdin.on('end', () => {
     // LLM's additionalContext so model and user start the session looking at
     // the same state. ANSI escapes are kept out of additionalContext on purpose.
     const notices = [syncLine, growthLine, clearRecoveryLine, updateLine].filter(Boolean);
-    const noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
+    let noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
     if (syncLine) process.stderr.write(`\n\x1b[33m${syncLine}\x1b[0m\n`);
     if (growthLine) process.stderr.write(`\n\x1b[36m${growthLine}\x1b[0m\n`);
     if (clearRecoveryLine)
@@ -356,6 +359,18 @@ process.stdin.on('end', () => {
       return;
     }
 
+    // MISS: cwd matches no project. fix #23 / ADR 0023 — offer to create one
+    // when the ADR trigger conditions hold (git repo + project marker + no
+    // cooldown + not previously declined). The actual scaffold is the LLM's
+    // job on a "Y" reply (scripts/lib/project-create.mjs); the hook only nudges.
+    if (shouldSuggestProjectCreation(cwd, HYPO_DIR)) {
+      const suggestLine = buildProjectSuggestionLine(cwd);
+      notices.push(suggestLine);
+      noticePrefix = `${notices.join('\n\n')}\n\n`;
+      recordSuggestionCooldown(HYPO_DIR, cwd);
+      process.stderr.write(`\n\x1b[33m${suggestLine}\x1b[0m\n`);
+    }
+
     if (!existsSync(GLOBAL_HOT)) {
       const notice = notices.join('\n\n');
       if (notice) {
@@ -368,7 +383,15 @@ process.stdin.on('end', () => {
 
     const globalContent = readIfNotIgnored(GLOBAL_HOT, HOT_CHARS, ignorePatterns);
     if (!globalContent) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      // GLOBAL_HOT exists but is empty or .hypoignore'd — still surface any
+      // pending notices (sync state, growth, AND the auto-project offer), which
+      // would otherwise be silently dropped here (codex review 2026-05-22).
+      const notice = notices.join('\n\n');
+      if (notice) {
+        console.log(JSON.stringify(buildOutput(notice, { continue: true, suppressOutput: true })));
+      } else {
+        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      }
       return;
     }
     console.log(

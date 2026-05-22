@@ -15,6 +15,9 @@ import {
   loadHypoIgnore,
   isIgnored,
   sessionMarkerPath,
+  shouldSuggestProjectCreation,
+  buildProjectSuggestionLine,
+  recordSuggestionCooldown,
 } from './hypo-shared.mjs';
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
@@ -130,20 +133,36 @@ process.stdin.on('end', () => {
       return;
     }
 
-    if (!existsSync(GLOBAL_HOT)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
+    // MISS: cwd matches no project. fix #23 / ADR 0023 — offer to create one
+    // when the trigger conditions hold. Same nudge-only model as session-start.
+    let suggestPrefix = '';
+    if (shouldSuggestProjectCreation(newCwd, HYPO_DIR)) {
+      const suggestLine = buildProjectSuggestionLine(newCwd);
+      suggestPrefix = `${suggestLine}\n\n`;
+      recordSuggestionCooldown(HYPO_DIR, newCwd);
+      process.stderr.write(`\n\x1b[33m${suggestLine}\x1b[0m\n`);
     }
 
-    const globalContent = readIfNotIgnored(GLOBAL_HOT, ignorePatterns);
+    const globalContent = existsSync(GLOBAL_HOT)
+      ? readIfNotIgnored(GLOBAL_HOT, ignorePatterns)
+      : null;
+
     if (!globalContent) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      if (suggestPrefix) {
+        console.log(
+          JSON.stringify(
+            buildOutput(suggestPrefix.trimEnd(), { continue: true, suppressOutput: true }),
+          ),
+        );
+      } else {
+        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      }
       return;
     }
     console.log(
       JSON.stringify(
         buildOutput(
-          `[WIKI: cwd changed → no project match, injecting global hot]\n\n${globalContent}`,
+          `${suggestPrefix}[WIKI: cwd changed → no project match, injecting global hot]\n\n${globalContent}`,
           { continue: true, suppressOutput: true },
         ),
       ),
