@@ -45,6 +45,7 @@ import {
   isRegularFile,
   readFileIfRegular,
 } from './lib/pkg-json.mjs';
+import { syncExtensions } from './lib/extensions.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -861,6 +862,27 @@ if (args.hooks) {
 
 if (args.hooks || args.commands) {
   writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {});
+}
+
+// 4b. user extensions companion sync (ADR 0024, fix #29 + #30). Runs after
+// writePkgJson so the per-target SHA map is merged into the same hypo-pkg.json
+// (preserving the commands map) rather than racing it.
+if (args.hooks) {
+  const extResult = syncExtensions({
+    extDir: join(args.hypoDir, 'extensions'),
+    hypoDir: args.hypoDir,
+    target: 'claude',
+    settingsPath: join(HOME, '.claude', 'settings.json'),
+    pkgPath: pkgJsonPath(),
+    apply: !args.dryRun,
+  });
+  for (const a of extResult.actions) {
+    if (a.action === 'create' || a.action === 'update' || a.action === 'force-update') {
+      log('created', `extension ${a.file} (${a.action})`);
+    }
+  }
+  for (const r of extResult.registered) log('merged', `extension ${r}`);
+  for (const w of extResult.warnings) log('skipped', `extension: ${w}`);
 }
 
 // 5. shell function (claude wrapper)

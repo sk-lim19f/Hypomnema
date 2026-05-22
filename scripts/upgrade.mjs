@@ -38,6 +38,7 @@ import {
   isRegularFile,
   readFileIfRegular,
 } from './lib/pkg-json.mjs';
+import { syncExtensions } from './lib/extensions.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -648,6 +649,20 @@ const commands = checkCommands();
 const oldHookRefs = checkOldHookNames();
 const hypoignore = checkHypoignore(args.hypoDir);
 
+// Extensions companion (ADR 0024, fix #29 + #30). Read-only check; the apply
+// happens below, AFTER applyCommands, so the per-target SHA map merges into the
+// hypo-pkg.json that applyCommands writes (rather than being clobbered by it).
+const extSettingsPath = join(HOME, '.claude', 'settings.json');
+const extDir = join(args.hypoDir, 'extensions');
+const extCheck = syncExtensions({
+  extDir,
+  hypoDir: args.hypoDir,
+  target: 'claude',
+  settingsPath: extSettingsPath,
+  pkgPath: pkgJsonPath(),
+  apply: false,
+});
+
 const staleHooks = hooks.filter(
   (h) => h.status === 'stale' || h.status === 'missing' || h.status === 'src-missing',
 );
@@ -669,6 +684,7 @@ let appliedPkgJson = false;
 let appliedHookNameRenames = [];
 let appliedCommands = [];
 let appliedHypoignore = [];
+let appliedExtensions = null;
 
 if (args.apply) {
   if (oldHookRefs.length > 0) {
@@ -683,9 +699,20 @@ if (args.apply) {
   appliedCommands = applyCommands(commands, args.forceCommands);
   appliedPkgJson = true;
   appliedHypoignore = applyHypoignoreMigration(hypoignore);
+  // After applyCommands wrote hypo-pkg.json — merges extensions.<target> alongside.
+  appliedExtensions = syncExtensions({
+    extDir,
+    hypoDir: args.hypoDir,
+    target: 'claude',
+    settingsPath: extSettingsPath,
+    pkgPath: pkgJsonPath(),
+    apply: true,
+  });
 }
 
 // ── output ───────────────────────────────────────────────────────────────────
+
+const extDrift = extCheck.needsWork;
 
 const hasDrift =
   staleHooks.length > 0 ||
@@ -698,7 +725,8 @@ const hasDrift =
   userModifiedCommands.length > 0 ||
   orphanedCommands.length > 0 ||
   nonRegularCommands.length > 0 ||
-  hypoignore.status === 'needs-migration';
+  hypoignore.status === 'needs-migration' ||
+  extDrift;
 
 if (args.json) {
   console.log(
@@ -711,6 +739,7 @@ if (args.json) {
         commands,
         oldHookRefs,
         hypoignore,
+        extensions: extCheck,
         applied: {
           hooks: appliedHooks,
           settings: appliedSettings,
@@ -718,6 +747,7 @@ if (args.json) {
           hookNameRenames: appliedHookNameRenames,
           commands: appliedCommands,
           hypoignore: appliedHypoignore,
+          extensions: appliedExtensions,
         },
         migrationReport: migrationPath,
       },
@@ -869,6 +899,31 @@ if (hypoignore.status === 'no-file') {
   for (const e of hypoignore.missing) lines.push(`    + ${e.pattern}`);
 }
 
+// Extensions companion (ADR 0024)
+{
+  const pending = extCheck.actions.filter(
+    (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
+  );
+  const extConflicts = extCheck.actions.filter(
+    (a) => a.action === 'skip-user-modified' || a.action === 'skip-conflict',
+  );
+  if (extCheck.actions.length === 0 && extCheck.warnings.length === 0) {
+    lines.push(`✓ Extensions        none found in ${extDir.replace(HOME, '~')}`);
+  } else if (pending.length === 0 && extConflicts.length === 0) {
+    const reg = extCheck.registered.length;
+    lines.push(
+      `✓ Extensions        ${extCheck.actions.length} synced${reg ? `, ${reg} hook(s) registered` : ''}`,
+    );
+  } else {
+    lines.push(
+      `⚠ Extensions        ${pending.length} to sync, ${extConflicts.length} conflict(s):`,
+    );
+    for (const a of pending) lines.push(`    + ${a.file}  [${a.action}]`);
+    for (const a of extConflicts) lines.push(`    ⚠ ${a.file}  [${a.action} — left untouched]`);
+  }
+  for (const w of extCheck.warnings) lines.push(`    ⚠ ${w}`);
+}
+
 // Migration report notice
 if (migrationPath) {
   lines.push('');
@@ -911,6 +966,23 @@ if (
   }
 }
 
+if (appliedExtensions) {
+  const synced = appliedExtensions.actions.filter(
+    (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
+  );
+  if (synced.length > 0 || appliedExtensions.settingsChanged) {
+    lines.push('');
+    if (synced.length > 0) {
+      lines.push(`✓ Synced extensions (${synced.length}):`);
+      for (const a of synced) lines.push(`    → ${a.file} (${a.action})`);
+    }
+    if (appliedExtensions.settingsChanged) {
+      lines.push(`✓ Registered extension hooks (${appliedExtensions.registered.length}):`);
+      for (const r of appliedExtensions.registered) lines.push(`    → ${r}`);
+    }
+  }
+}
+
 // Summary
 lines.push('');
 const totalDrift =
@@ -924,16 +996,25 @@ const totalDrift =
   userModifiedCommands.length +
   orphanedCommands.length +
   nonRegularCommands.length +
-  (hypoignore.status === 'needs-migration' ? hypoignore.missing.length : 0);
+  (hypoignore.status === 'needs-migration' ? hypoignore.missing.length : 0) +
+  extCheck.actions.filter(
+    (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
+  ).length;
 if (totalDrift === 0) {
   lines.push('Result: Hypomnema is up to date');
 } else if (args.apply) {
+  const appliedExtCount = appliedExtensions
+    ? appliedExtensions.actions.filter(
+        (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
+      ).length + (appliedExtensions.settingsChanged ? 1 : 0)
+    : 0;
   const total =
     appliedHooks.length +
     appliedSettings.length +
     (appliedPkgJson ? 1 : 0) +
     appliedHookNameRenames.length +
-    appliedHypoignore.length;
+    appliedHypoignore.length +
+    appliedExtCount;
   lines.push(`Result: ${total} update(s) applied. Run /hypo:doctor to verify.`);
 } else {
   lines.push(`Result: ${totalDrift} item(s) need updating — run with --apply to install`);
