@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Auto-project creation on cwd match (ADR 0023).** When you start a session
+  (or change directory) inside a git repository that carries a project marker
+  (`package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `pom.xml`,
+  `build.gradle`, `composer.json`, `Gemfile`) but matches no existing wiki
+  project's `working_dir`, the SessionStart/CwdChanged hook now offers to create
+  one. The offer is a nudge only; on "Y" Claude runs the new internal scaffold
+  helper (`scripts/lib/project-create.mjs`) which materializes the project from
+  `templates/projects/_template/` with token substitution, adds the root
+  `hot.md` pointer row, and logs the creation. On "N" the cwd is recorded under
+  `skips[]` in `.cache/project-suggestions.json` and never offered again (a
+  5-minute per-cwd cooldown also suppresses repeats within a session). Temp and
+  marker-less directories never trigger the offer. `hypomnema doctor` validates
+  the skip-persistence file's schema. The deprecated `hypomnema project new`
+  subcommand is not introduced (ADR 0023). Also strengthens the templated
+  Session Start guidance: the first response must lead with a resume summary.
 - **Update notifier.** The SessionStart hook now shows an "Update available!"
   banner when a newer Hypomnema version has been published, detecting both
   distribution channels (npm package and Claude Code plugin) and printing the
