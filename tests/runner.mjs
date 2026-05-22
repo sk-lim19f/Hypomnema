@@ -256,6 +256,23 @@ test('init creates .gitignore with .cache/ entry', () => {
   });
 });
 
+// init-creates-extensions-baseline (§8.12, ADR 0024 fix #28)
+test('init-creates-extensions-baseline', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    for (const t of ['hooks', 'commands', 'skills', 'agents']) {
+      const extDir = join(hypoDir, 'extensions', t);
+      assert.ok(existsSync(extDir), `extensions/${t}/ should be created`);
+      assert.ok(
+        existsSync(join(extDir, '.gitkeep')),
+        `extensions/${t}/.gitkeep should be created (git-trackable empty dir)`,
+      );
+    }
+  });
+});
+
 test('init installs .git/hooks/pre-commit with hypo marker', () => {
   withTmpDir((dir) => {
     const hypoDir = join(dir, 'wiki');
@@ -391,6 +408,29 @@ test('JSON output is an array of check objects', () => {
   assert.ok(out.length > 0, 'expected at least one check');
   assert.ok('status' in out[0], 'expected status field');
   assert.ok('label' in out[0], 'expected label field');
+});
+
+// fix #28: doctor gates on extensions baseline existence (ADR 0024)
+test('doctor flags missing extensions baseline dir as failure', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+    // freshly-inited wiki: extensions baseline present → doctor check passes
+    let r = run('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json']);
+    let checks = JSON.parse(r.stdout);
+    const extCheck = checks.find((c) => c.label === 'Directory: extensions/hooks/');
+    assert.ok(extCheck, 'doctor should report a Directory: extensions/hooks/ check');
+    assert.equal(extCheck.status, 'pass', 'extensions/hooks/ should pass on a fresh wiki');
+
+    // remove one baseline dir → doctor must fail that check
+    rmSync(join(hypoDir, 'extensions', 'hooks'), { recursive: true, force: true });
+    r = run('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json']);
+    checks = JSON.parse(r.stdout);
+    const missing = checks.find((c) => c.label === 'Directory: extensions/hooks/');
+    assert.equal(missing.status, 'fail', 'missing extensions/hooks/ should fail doctor');
+  });
 });
 
 // fix #6: doctor-checks-node-git-shell-npm

@@ -205,7 +205,17 @@ function checkHypoRoot(hypoDir) {
 }
 
 function checkDirectories(hypoDir) {
-  const required = ['pages', 'projects', 'sources'];
+  const required = [
+    'pages',
+    'projects',
+    'sources',
+    // Extensions baseline (ADR 0024, fix #28). Existence only — SHA / settings /
+    // manifest integrity is E5 (#33).
+    'extensions/hooks',
+    'extensions/commands',
+    'extensions/skills',
+    'extensions/agents',
+  ];
   for (const d of required) {
     if (existsSync(join(hypoDir, d))) {
       pass(`Directory: ${d}/`);
