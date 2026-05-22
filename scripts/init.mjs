@@ -13,7 +13,7 @@
  *   --no-hooks             Skip hook installation
  *   --no-commands          Skip slash command installation to ~/.claude/commands/hypo/
  *   --force-commands       Overwrite user-modified slash command files (creates .bak)
- *   --codex                Also install Codex hooks (~/.codex/hooks/)
+ *   --codex                Also install Codex hooks + extensions (~/.codex/{hooks,commands}/)
  *   --git-remote=<url>     Git remote URL
  *   --no-git-init          Skip git initialization
  *   --from-remote=<url>    Clone existing Hypomnema wiki from remote and install hooks
@@ -130,7 +130,7 @@ Init options:
   --no-commands          Skip slash command installation to ~/.claude/commands/hypo/
   --force-commands       Overwrite user-modified slash command files (creates .bak)
   --force-extensions     Overwrite user-modified / conflicting extension copies (creates .bak)
-  --codex                Also install Codex hooks (~/.codex/hooks/)
+  --codex                Also install Codex hooks + extensions (~/.codex/{hooks,commands}/)
   --git-remote=<url>     Git remote URL
   --no-git-init          Skip git initialization
   --from-remote=<url>    Clone existing Hypomnema wiki from remote and install hooks
@@ -912,6 +912,37 @@ if (args.codex) {
   const codexHooks = join(HOME, '.codex', 'hooks');
   installHooks(codexHooks, args.dryRun);
   mergeSettingsJson(join(HOME, '.codex', 'settings.json'), codexHooks, args.dryRun, HOOK_MAP);
+
+  // 6b. user extensions companion → codex (E4, #32). Mirrors the claude sync above
+  // for the codex target: hooks + commands only (skills/agents are skipped with a
+  // notice). The per-target SHA map merges into the same ~/.claude/hypo-pkg.json
+  // under extensions.codex, alongside extensions.claude written in step 4b.
+  const extCodex = syncExtensions({
+    extDir: join(args.hypoDir, 'extensions'),
+    hypoDir: args.hypoDir,
+    target: 'codex',
+    settingsPath: join(HOME, '.codex', 'settings.json'),
+    pkgPath: pkgJsonPath(),
+    apply: !args.dryRun,
+    force: args.forceExtensions,
+  });
+  for (const a of extCodex.actions) {
+    if (a.action === 'create' || a.action === 'update' || a.action === 'force-update') {
+      log('created', `codex extension ${a.file} (${a.action})`);
+    }
+  }
+  for (const r of extCodex.registered) log('merged', `codex extension ${r}`);
+  for (const w of extCodex.warnings) log('skipped', `codex extension: ${w}`);
+  if (extCodex.conflicts.length > 0) {
+    log('errors', '[WIKI: existing file conflicts. Backup and retry, or use --force-extensions]');
+    for (const c of extCodex.conflicts) log('errors', `codex extension ${c.file} (${c.action})`);
+  }
+  for (const d of extCodex.drifts) {
+    log(
+      'skipped',
+      `[WIKI: extension ${d.name} drift detected. Use --force-extensions to overwrite.]`,
+    );
+  }
 }
 
 // 7. git setup (skip when cloned from remote — already has .git + remote)

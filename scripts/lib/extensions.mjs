@@ -353,6 +353,18 @@ export function syncExtensions({
   const discovered = discoverExtensions(extDir, patterns, hypoDir);
   result.warnings.push(...discovered.warnings);
 
+  // E4 (#32): Codex supports hooks + commands only. If the user authored
+  // skills/agents extensions, surface a one-time notice that they are skipped
+  // for this target rather than silently dropping them (plan §2 E4).
+  if (target === 'codex') {
+    const skipped = discovered.skills.length + discovered.agents.length;
+    if (skipped > 0) {
+      result.warnings.push(
+        `${skipped} skill/agent extension(s) skipped for Codex — only hooks + commands are supported`,
+      );
+    }
+  }
+
   const recorded = readExtensionPkgStateNoMutate(pkgPath, target);
   const newSHAs = {};
   // Preserve recorded SHAs for types this target does not cover (e.g. codex skips

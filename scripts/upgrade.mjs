@@ -14,6 +14,7 @@
  *   --apply             Apply hook file updates and settings.json merges
  *   --force-commands    Overwrite user-modified slash command files (creates .bak)
  *   --force-extensions  Overwrite user-modified / conflicting extension copies (creates .bak)
+ *   --codex             Also sync extensions into ~/.codex/{hooks,commands} + settings.json
  *   --json              Output results as JSON
  */
 
@@ -71,12 +72,14 @@ function parseArgs(argv) {
     json: false,
     forceCommands: false,
     forceExtensions: false,
+    codex: false,
   };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--apply') args.apply = true;
     else if (arg === '--force-commands') args.forceCommands = true;
     else if (arg === '--force-extensions') args.forceExtensions = true;
+    else if (arg === '--codex') args.codex = true;
     else if (arg === '--json') args.json = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
@@ -673,6 +676,22 @@ const extCheck = syncExtensions({
   force: args.forceExtensions,
 });
 
+// E4 (#32): --codex mirrors the extensions sync into ~/.codex (hooks + commands
+// only; skills/agents skipped with a notice). The per-target SHA map lives in the
+// same ~/.claude/hypo-pkg.json under extensions.codex, so pkgPath is unchanged.
+const extCodexSettingsPath = join(HOME, '.codex', 'settings.json');
+const extCheckCodex = args.codex
+  ? syncExtensions({
+      extDir,
+      hypoDir: args.hypoDir,
+      target: 'codex',
+      settingsPath: extCodexSettingsPath,
+      pkgPath: pkgJsonPath(),
+      apply: false,
+      force: args.forceExtensions,
+    })
+  : null;
+
 const staleHooks = hooks.filter(
   (h) => h.status === 'stale' || h.status === 'missing' || h.status === 'src-missing',
 );
@@ -695,6 +714,7 @@ let appliedHookNameRenames = [];
 let appliedCommands = [];
 let appliedHypoignore = [];
 let appliedExtensions = null;
+let appliedExtensionsCodex = null;
 
 if (args.apply) {
   if (oldHookRefs.length > 0) {
@@ -719,11 +739,25 @@ if (args.apply) {
     apply: true,
     force: args.forceExtensions,
   });
+  // E4 (#32): codex apply runs AFTER the claude apply so it reads the freshly
+  // written hypo-pkg.json and merges extensions.codex alongside extensions.claude
+  // (the per-target spread in syncExtensions preserves the other target's map).
+  if (args.codex) {
+    appliedExtensionsCodex = syncExtensions({
+      extDir,
+      hypoDir: args.hypoDir,
+      target: 'codex',
+      settingsPath: extCodexSettingsPath,
+      pkgPath: pkgJsonPath(),
+      apply: true,
+      force: args.forceExtensions,
+    });
+  }
 }
 
 // ── output ───────────────────────────────────────────────────────────────────
 
-const extDrift = extCheck.needsWork;
+const extDrift = extCheck.needsWork || (extCheckCodex?.needsWork ?? false);
 
 const hasDrift =
   staleHooks.length > 0 ||
@@ -751,6 +785,7 @@ if (args.json) {
         oldHookRefs,
         hypoignore,
         extensions: extCheck,
+        extensionsCodex: extCheckCodex,
         applied: {
           hooks: appliedHooks,
           settings: appliedSettings,
@@ -759,6 +794,7 @@ if (args.json) {
           commands: appliedCommands,
           hypoignore: appliedHypoignore,
           extensions: appliedExtensions,
+          extensionsCodex: appliedExtensionsCodex,
         },
         migrationReport: migrationPath,
       },
@@ -766,7 +802,13 @@ if (args.json) {
       2,
     ),
   );
-  process.exit((hasDrift && !args.apply) || extCheck.conflicts.length > 0 ? 1 : 0);
+  process.exit(
+    (hasDrift && !args.apply) ||
+      extCheck.conflicts.length > 0 ||
+      (extCheckCodex?.conflicts.length ?? 0) > 0
+      ? 1
+      : 0,
+  );
 }
 
 // Human-readable report
@@ -910,41 +952,45 @@ if (hypoignore.status === 'no-file') {
   for (const e of hypoignore.missing) lines.push(`    + ${e.pattern}`);
 }
 
-// Extensions companion (ADR 0024; conflict/drift gating E3, #31)
-{
-  const pending = extCheck.actions.filter(
+// Extensions companion (ADR 0024; conflict/drift gating E3, #31). Shared by the
+// claude target and, under --codex, the codex target (E4, #32) — the label keeps
+// the two blocks distinguishable in the report.
+function pushExtSummary(check, label) {
+  // Pad to fit the longest label ("Extensions (codex)" = 18) plus a separating
+  // space so the count never glues onto the label.
+  const col = `Extensions${label}`.padEnd(20);
+  const pending = check.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
   );
-  const nConflicts = extCheck.conflicts.length;
-  const nDrifts = extCheck.drifts.length;
-  if (extCheck.actions.length === 0 && extCheck.warnings.length === 0) {
-    lines.push(`✓ Extensions        none found in ${extDir.replace(HOME, '~')}`);
+  const nConflicts = check.conflicts.length;
+  const nDrifts = check.drifts.length;
+  if (check.actions.length === 0 && check.warnings.length === 0) {
+    lines.push(`✓ ${col}none found in ${extDir.replace(HOME, '~')}`);
   } else if (pending.length === 0 && nConflicts === 0 && nDrifts === 0) {
-    const reg = extCheck.registered.length;
-    lines.push(
-      `✓ Extensions        ${extCheck.actions.length} synced${reg ? `, ${reg} hook(s) registered` : ''}`,
-    );
+    const reg = check.registered.length;
+    lines.push(`✓ ${col}${check.actions.length} synced${reg ? `, ${reg} hook(s) registered` : ''}`);
   } else {
     lines.push(
-      `⚠ Extensions        ${pending.length} to sync, ${nConflicts} conflict(s), ${nDrifts} drift(s):`,
+      `⚠ ${col}${pending.length} to sync, ${nConflicts} conflict(s), ${nDrifts} drift(s):`,
     );
     for (const a of pending) lines.push(`    + ${a.file}  [${a.action}]`);
-    for (const c of extCheck.conflicts)
-      lines.push(`    ✗ ${c.file}  [${c.action} — left untouched]`);
-    for (const d of extCheck.drifts) lines.push(`    ⚠ ${d.file}  [drift — left untouched]`);
+    for (const c of check.conflicts) lines.push(`    ✗ ${c.file}  [${c.action} — left untouched]`);
+    for (const d of check.drifts) lines.push(`    ⚠ ${d.file}  [drift — left untouched]`);
   }
   // E3 (#31): a hard conflict blocks install (exit 1, even under --apply); drift is
   // resolvable advisory. Emit the spec'd WIKI messages so the user knows the recovery.
   if (nConflicts > 0) {
     lines.push('  [WIKI: existing file conflicts. Backup and retry, or use --force-extensions]');
   }
-  for (const d of extCheck.drifts) {
+  for (const d of check.drifts) {
     lines.push(
       `  [WIKI: extension ${d.name} drift detected. Use --force-extensions to overwrite.]`,
     );
   }
-  for (const w of extCheck.warnings) lines.push(`    ⚠ ${w}`);
+  for (const w of check.warnings) lines.push(`    ⚠ ${w}`);
 }
+pushExtSummary(extCheck, '');
+if (extCheckCodex) pushExtSummary(extCheckCodex, ' (codex)');
 
 // Migration report notice
 if (migrationPath) {
@@ -988,22 +1034,25 @@ if (
   }
 }
 
-if (appliedExtensions) {
-  const synced = appliedExtensions.actions.filter(
+function pushAppliedExt(applied, label) {
+  if (!applied) return;
+  const synced = applied.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
   );
-  if (synced.length > 0 || appliedExtensions.settingsChanged) {
+  if (synced.length > 0 || applied.settingsChanged) {
     lines.push('');
     if (synced.length > 0) {
-      lines.push(`✓ Synced extensions (${synced.length}):`);
+      lines.push(`✓ Synced extensions${label} (${synced.length}):`);
       for (const a of synced) lines.push(`    → ${a.file} (${a.action})`);
     }
-    if (appliedExtensions.settingsChanged) {
-      lines.push(`✓ Registered extension hooks (${appliedExtensions.registered.length}):`);
-      for (const r of appliedExtensions.registered) lines.push(`    → ${r}`);
+    if (applied.settingsChanged) {
+      lines.push(`✓ Registered extension hooks${label} (${applied.registered.length}):`);
+      for (const r of applied.registered) lines.push(`    → ${r}`);
     }
   }
 }
+pushAppliedExt(appliedExtensions, '');
+pushAppliedExt(appliedExtensionsCodex, ' (codex)');
 
 // Summary
 lines.push('');
@@ -1025,15 +1074,26 @@ const totalDrift =
   // E3 (#31): unresolved drift/conflict is pending work too — without these the
   // summary printed "up to date" while the exit code was 1 (codex review).
   extCheck.conflicts.length +
-  extCheck.drifts.length;
+  extCheck.drifts.length +
+  // E4 (#32): codex-target pending work counts identically (same message/exit
+  // consistency the E3 review caught — a codex conflict must not read "up to date").
+  (extCheckCodex
+    ? extCheckCodex.actions.filter(
+        (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
+      ).length +
+      extCheckCodex.conflicts.length +
+      extCheckCodex.drifts.length
+    : 0);
 if (totalDrift === 0) {
   lines.push('Result: Hypomnema is up to date');
 } else if (args.apply) {
-  const appliedExtCount = appliedExtensions
-    ? appliedExtensions.actions.filter(
-        (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
-      ).length + (appliedExtensions.settingsChanged ? 1 : 0)
-    : 0;
+  const countApplied = (r) =>
+    r
+      ? r.actions.filter(
+          (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
+        ).length + (r.settingsChanged ? 1 : 0)
+      : 0;
+  const appliedExtCount = countApplied(appliedExtensions) + countApplied(appliedExtensionsCodex);
   const total =
     appliedHooks.length +
     appliedSettings.length +
@@ -1051,5 +1111,5 @@ console.log(lines.join('\n'));
 // E3 (#31): a hard extension conflict blocks even under --apply (unlike ordinary
 // drift, which only fails check mode). --force-extensions clears the resolvable
 // cases; an unfollowable symlink/non-regular dest still counts and stays exit 1.
-const extBlocked = extCheck.conflicts.length > 0;
+const extBlocked = extCheck.conflicts.length > 0 || (extCheckCodex?.conflicts.length ?? 0) > 0;
 process.exit((hasDrift && !args.apply) || extBlocked ? 1 : 0);

@@ -2507,6 +2507,267 @@ test('extensions: .hypoignore-matched manifest is not copied or recorded', () =>
   });
 });
 
+// §8.12 (5) --codex mirrors the extensions sync into ~/.codex (hooks + commands
+// only; skills/agents skipped with a notice). Covers BOTH entry points (upgrade
+// here, init below) — the E3 review showed a shared sync fn can still leak
+// per-entry-point wiring bugs.
+test('extensions-codex-sync', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // A hook (registrable), a command, and a skill (Codex-unsupported → skip).
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cdxwatch.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 8000,
+      });
+      writeExt(hypoDir, 'commands', 'hypo-ext-cdxcmd.md', '# codex command\n');
+      writeExt(hypoDir, 'skills', 'hypo-ext-cdxskill.md', '# claude-only skill\n');
+
+      // (sanity) a plain --apply must NEVER touch ~/.codex.
+      const rNoCdx = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(rNoCdx.status, 0, `claude-only apply failed: ${rNoCdx.stderr}`);
+      assert.ok(
+        !existsSync(join(home, '.codex', 'hooks', 'hypo-ext-cdxwatch.mjs')),
+        'without --codex nothing must be written into ~/.codex',
+      );
+
+      // ── entry point 1: upgrade --codex --apply ──
+      const rUp = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply', '--codex'],
+        home,
+      );
+      assert.equal(rUp.status, 0, `upgrade --codex failed: ${rUp.stderr}`);
+      const up = JSON.parse(rUp.stdout);
+
+      const cdxHooks = join(home, '.codex', 'hooks');
+      const cdxCmds = join(home, '.codex', 'commands');
+      assert.ok(
+        existsSync(join(cdxHooks, 'hypo-ext-cdxwatch.mjs')),
+        'hook not hard-copied to ~/.codex/hooks',
+      );
+      assert.ok(
+        existsSync(join(cdxHooks, 'hypo-ext-cdxwatch.manifest.json')),
+        'manifest not hard-copied to ~/.codex/hooks',
+      );
+      assert.ok(
+        existsSync(join(cdxCmds, 'hypo-ext-cdxcmd.md')),
+        'command not hard-copied to ~/.codex/commands',
+      );
+      assert.ok(
+        !existsSync(join(home, '.codex', 'skills', 'hypo-ext-cdxskill.md')),
+        'skill extension must be skipped for the codex target',
+      );
+
+      // ~/.codex/settings.json entry uses a command WE constructed, pointing at ~/.codex.
+      const cdxSettings = JSON.parse(readFileSync(join(home, '.codex', 'settings.json'), 'utf-8'));
+      const grp = (cdxSettings.hooks?.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-cdxwatch.mjs')),
+      );
+      assert.equal(grp.length, 1, 'exactly one codex PostToolUse entry expected');
+      assert.equal(
+        grp[0].hooks[0].command,
+        'node $HOME/.codex/hooks/hypo-ext-cdxwatch.mjs',
+        'codex command must point at ~/.codex and be constructed by us',
+      );
+      assert.equal(grp[0].matcher, 'Write', 'codex matcher from manifest not applied');
+
+      // per-target SHA: BOTH claude and codex maps must survive (regression guard).
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions?.claude?.['hooks/hypo-ext-cdxwatch.mjs'],
+        'claude per-target SHA was dropped by the codex sync',
+      );
+      assert.ok(
+        pkg.extensions?.codex?.['hooks/hypo-ext-cdxwatch.mjs'],
+        'codex hook SHA not recorded',
+      );
+      assert.ok(
+        pkg.extensions.codex['commands/hypo-ext-cdxcmd.md'],
+        'codex command SHA not recorded',
+      );
+      assert.ok(
+        !pkg.extensions.codex['skills/hypo-ext-cdxskill.md'],
+        'skipped skill must not be recorded under codex',
+      );
+
+      // skip notice surfaced on the codex result — and NOT on the claude result.
+      assert.ok(
+        up.extensionsCodex.warnings.some((w) => /skipped for Codex/i.test(w)),
+        'a skill/agent skip notice was expected for the codex target',
+      );
+      assert.ok(
+        !up.extensions.warnings.some((w) => /skipped for Codex/i.test(w)),
+        'the claude target must not emit a codex skip notice',
+      );
+
+      // idempotency: a second --codex --apply syncs nothing new.
+      const rUp2 = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply', '--codex'],
+        home,
+      );
+      assert.equal(rUp2.status, 0, `second --codex apply failed: ${rUp2.stderr}`);
+      const up2 = JSON.parse(rUp2.stdout);
+      const synced2 = up2.applied.extensionsCodex.actions.filter((a) =>
+        ['create', 'update', 'force-update'].includes(a.action),
+      );
+      assert.equal(synced2.length, 0, 'second --codex apply should sync nothing (idempotent)');
+    });
+  });
+});
+
+// §8.12 (5) the OTHER entry point: init --codex must run the same codex sync
+// (E3 lesson — wiring bugs surface per entry point even with a shared fn).
+test('extensions-codex-sync: init --codex entry point', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-icdx.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+
+      const r = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--codex'],
+        home,
+      );
+      assert.equal(r.status, 0, `init --codex failed: ${r.stderr}`);
+      assert.ok(
+        existsSync(join(home, '.codex', 'hooks', 'hypo-ext-icdx.mjs')),
+        'init --codex must hard-copy the extension into ~/.codex/hooks',
+      );
+      const cdxSettings = JSON.parse(readFileSync(join(home, '.codex', 'settings.json'), 'utf-8'));
+      assert.ok(
+        JSON.stringify(cdxSettings.hooks || {}).includes('hypo-ext-icdx.mjs'),
+        'init --codex must register the extension in ~/.codex/settings.json',
+      );
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions?.codex?.['hooks/hypo-ext-icdx.mjs'],
+        'init --codex must record the codex per-target SHA',
+      );
+      // init writes the claude target (step 4b) before the codex target (6b) — the
+      // codex write must not clobber the claude per-target SHA map.
+      assert.ok(
+        pkg.extensions?.claude?.['hooks/hypo-ext-icdx.mjs'],
+        'init --codex must preserve the claude per-target SHA',
+      );
+    });
+  });
+});
+
+// §8.12 (5) + (c): a codex hard conflict (foreign file at the ~/.codex target)
+// must block even under --apply (exit 1), leave the file untouched, and never
+// report "up to date" — the message/exit consistency the E3 review enforced.
+test('extensions-codex-sync: hard conflict blocks even under --apply', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cdxconf.mjs', '#!/usr/bin/env node\n// source\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      // Pre-existing UNOWNED file occupying the codex target → hard conflict.
+      const cdxHooks = join(home, '.codex', 'hooks');
+      mkdirSync(cdxHooks, { recursive: true });
+      const target = join(cdxHooks, 'hypo-ext-cdxconf.mjs');
+      writeFileSync(target, '// foreign — not ours\n');
+
+      const r = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply', '--codex'],
+        home,
+      );
+      assert.equal(r.status, 1, 'a codex hard conflict must exit 1 even under --apply');
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        out.extensionsCodex.conflicts.some((c) => c.file === 'hooks/hypo-ext-cdxconf.mjs'),
+        'codex conflict must be reported in extensionsCodex.conflicts',
+      );
+      assert.equal(
+        readFileSync(target, 'utf-8'),
+        '// foreign — not ours\n',
+        'a conflicting codex file must be left untouched',
+      );
+
+      // The human-readable summary must not contradict the exit code (E3 review).
+      const rh = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(rh.status, 1, 'non-JSON codex conflict must also exit 1');
+      // The verdict line must not claim everything is settled (E3 message/exit
+      // consistency) — per-check "up to date" lines are fine, only the Result is.
+      assert.ok(
+        !/Result: Hypomnema is up to date/.test(rh.stdout),
+        'the summary verdict must not read "up to date" while a codex conflict exists',
+      );
+    });
+  });
+});
+
+// §8.12 (5) + 검증 4: --force-extensions resolves a drifted codex copy (backup +
+// overwrite). Both entry points forward the flag; this guards the codex wiring.
+test('extensions-codex-sync: --force-extensions overwrites a drifted codex copy', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cdxforce.mjs', '#!/usr/bin/env node\n// v1\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(r1.status, 0, `initial codex sync failed: ${r1.stderr}`);
+      const installed = join(home, '.codex', 'hooks', 'hypo-ext-cdxforce.mjs');
+
+      // User edits the installed codex copy (drift) and the source advances to v2.
+      writeFileSync(installed, '#!/usr/bin/env node\n// user edit\n');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cdxforce.mjs', '#!/usr/bin/env node\n// v2\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+
+      // Plain --apply must NOT overwrite a drifted (owned-but-edited) codex copy.
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(
+        readFileSync(installed, 'utf-8'),
+        '#!/usr/bin/env node\n// user edit\n',
+        'apply without --force must not overwrite a drifted codex file',
+      );
+
+      // --force-extensions backs up (.bak) and overwrites from source.
+      const r3 = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--codex', '--force-extensions'],
+        home,
+      );
+      assert.equal(r3.status, 0, `--force-extensions codex apply failed: ${r3.stderr}`);
+      assert.equal(
+        readFileSync(installed, 'utf-8'),
+        '#!/usr/bin/env node\n// v2\n',
+        '--force-extensions must overwrite the codex copy with the source',
+      );
+      assert.ok(
+        existsSync(`${installed}.bak`),
+        '--force-extensions must back up the prior codex copy',
+      );
+    });
+  });
+});
+
 // ── lint.mjs --fix tests ─────────────────────────────────────────────────────
 
 suite('lint.mjs --fix');
