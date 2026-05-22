@@ -2,9 +2,9 @@
 title: <project-name> — Index
 type: project-index
 status: active
-started: YYYY-MM-DD
+started: <started>
 updated: YYYY-MM-DD
-working_dir: ~/path/to/project
+working_dir: <working_dir>
 tags: [project]
 ---
 

@@ -2,7 +2,7 @@
 title: <project-name> — PRD
 type: prd
 status: active
-started: YYYY-MM-DD
+started: <started>
 updated: YYYY-MM-DD
 tags: [project, prd]
 ---
