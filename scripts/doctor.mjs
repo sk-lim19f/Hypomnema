@@ -21,6 +21,15 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 import { readSyncState, projectSuggestionsPath } from '../hooks/hypo-shared.mjs';
+import {
+  discoverExtensions,
+  parseManifest,
+  buildExpectedSettingsEntries,
+  readExtensionPkgStateNoMutate,
+  EXT_TYPES,
+  CODEX_TYPES,
+} from './lib/extensions.mjs';
+import { sha256, readFileIfRegular } from './lib/pkg-json.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -647,6 +656,190 @@ function checkCodexPaths() {
   }
 }
 
+// ── extensions integrity (fix #33 — ADR 0024, E5) ───────────────────────────
+
+// Detect drift between the user's `~/hypomnema/extensions/` source, the recorded
+// per-target SHA map (`hypo-pkg.json`), and the installed copies + settings.json
+// entries under `~/.claude` (or `~/.codex` with --codex). Reuses E2's read-only
+// helpers (plan §5 D4) — never re-derives discovery/manifest/SHA logic.
+//
+// Severity taxonomy (plan §5 #4 pins manifest; the rest mirror the slash-command
+// / settings-stale precedent that recoverable drift is a warn, not a ship blocker):
+//   manifest malformed (parse fail / unknown event) → FAIL (won't self-heal; §5 #4)
+//   manifest missing                                → warn (hook just won't register; §5 #4)
+//   installed copy SHA ≠ recorded (user-modified)   → warn (--force-extensions recovers)
+//   recorded entry but copy absent / non-regular    → warn (upgrade --apply recovers)
+//   expected settings entry missing                 → warn (upgrade --apply recovers)
+//   orphan settings entry (source removed)          → warn (uninstall recovers; boost #2)
+// A malformed manifest failing here is what makes the §5.1.3 `fails=0` ship gate
+// actually cover §8.12-7(c) — asserted by the doctor-extensions-integrity test.
+//
+// E5 is doctor SURFACE only. The settings.json mixed-group surgical *write*
+// (preserve sibling-plugin hooks, swap only ours) stays deferred — it is a
+// write-path change to registerSettings (extensions.mjs:488), not a doctor check.
+function checkExtensions(hypoDir, claudeHome, target = 'claude') {
+  const extDir = join(hypoDir, 'extensions');
+  // E1 baseline absent (e.g. --from-remote clone, plan §5 #8) → nothing to check.
+  if (!existsSync(extDir)) return;
+
+  const root = target === 'codex' ? join(HOME, '.codex') : claudeHome;
+  const label = target === 'codex' ? 'Codex extensions integrity' : 'Extensions integrity';
+  // The per-target SHA map lives in ~/.claude/hypo-pkg.json under
+  // `extensions.{claude,codex}` (sync writes both targets into the one file —
+  // upgrade.mjs:681), so the pkg path is always claude regardless of target.
+  const pkgPath = join(claudeHome, 'hypo-pkg.json');
+  const settingsPath = join(root, 'settings.json');
+  const hooksDir = join(root, 'hooks');
+  const types = target === 'codex' ? CODEX_TYPES : EXT_TYPES;
+
+  const patterns = loadHypoIgnore(hypoDir);
+  const discovered = discoverExtensions(extDir, patterns, hypoDir);
+
+  const problems = [];
+
+  // (c) manifest health — hooks only (plan §0 D3: non-hook manifests don't register).
+  for (const ext of discovered.hooks) {
+    if (!ext.manifestPath) {
+      problems.push({
+        severity: 'warn',
+        msg: `${ext.name}.manifest.json missing — hook will not auto-register`,
+      });
+      continue;
+    }
+    const parsed = parseManifest(ext.manifestPath);
+    if (!parsed.ok) {
+      problems.push({ severity: 'fail', msg: `${ext.manifestName} malformed (${parsed.error})` });
+    }
+  }
+
+  // (a) hard-copy SHA: recorded SHA vs the installed copy on disk.
+  const recorded = readExtensionPkgStateNoMutate(pkgPath, target);
+  for (const [key, recSHA] of Object.entries(recorded)) {
+    // Skip keys outside this target's covered types (defensive: a Claude run records
+    // skills/agents that a codex target never installs — don't false-flag them).
+    if (!types.includes(key.split('/')[0])) continue;
+    const destPath = join(root, key);
+    if (!existsSync(destPath)) {
+      problems.push({
+        severity: 'warn',
+        msg: `${key} recorded but not installed — run upgrade --apply`,
+      });
+      continue;
+    }
+    const onDisk = readFileIfRegular(destPath);
+    if (onDisk === null) {
+      problems.push({ severity: 'warn', msg: `${key} is not a regular file — left untouched` });
+      continue;
+    }
+    if (sha256(onDisk) !== recSHA) {
+      problems.push({
+        severity: 'warn',
+        msg: `${key} modified since install (drift) — use --force-extensions`,
+      });
+    }
+  }
+
+  // (b) settings.json entries. Distinguish three states:
+  //   - malformed JSON      → skip (checkSettingsJson / checkCodexPaths already FAILs it;
+  //                            piling on a misleading "not registered" warn helps no one)
+  //   - missing file / no `hooks` object → treat as an EMPTY hooks map, so a synced
+  //     extension whose registration is absent still surfaces as expected-but-missing
+  //     (§8.12-7(b)). A missing file alone with no extensions yields no problem (gate-safe).
+  let settingsParseFailed = false;
+  let hooksObj = {};
+  if (existsSync(settingsPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      if (
+        parsed &&
+        parsed.hooks &&
+        typeof parsed.hooks === 'object' &&
+        !Array.isArray(parsed.hooks)
+      ) {
+        hooksObj = parsed.hooks;
+      }
+    } catch {
+      settingsParseFailed = true;
+    }
+  }
+  if (!settingsParseFailed) {
+    const expected = buildExpectedSettingsEntries(discovered.hooks, hooksDir);
+
+    // (b) for each registrable hook: locate the single-hook group that owns its
+    // command (mirroring registerSettings' isOurGroup, extensions.mjs:512) and
+    // compare against the manifest-derived shape. Two drift kinds, both warn:
+    //   - not registered (no owning group under the right event) → run upgrade --apply
+    //   - registered but matcher/timeout differs from the manifest → run upgrade --apply
+    // The shape-differs branch is the settings-entry mismatch E3 deferred to E5
+    // (extensions.mjs:488); upgrade --apply silently self-heals it, so doctor is
+    // the only surface that reports it.
+    const ownsCommand = (g, command) =>
+      g &&
+      typeof g === 'object' &&
+      Array.isArray(g.hooks) &&
+      g.hooks.length === 1 &&
+      g.hooks[0] &&
+      g.hooks[0].command === command;
+    for (const entry of expected) {
+      const desiredHook = { type: 'command', command: entry.command };
+      if (entry.timeout) desiredHook.timeout = entry.timeout;
+      const desiredGroup = { hooks: [desiredHook] };
+      if (entry.matcher) desiredGroup.matcher = entry.matcher;
+
+      const groups = Array.isArray(hooksObj[entry.event]) ? hooksObj[entry.event] : [];
+      const owning = groups.find((g) => ownsCommand(g, entry.command));
+      if (!owning) {
+        problems.push({
+          severity: 'warn',
+          msg: `${entry.name} not registered under ${entry.event} — run upgrade --apply`,
+        });
+      } else if (JSON.stringify(owning) !== JSON.stringify(desiredGroup)) {
+        problems.push({
+          severity: 'warn',
+          msg: `${entry.name} settings entry differs from manifest (matcher/timeout) — run upgrade --apply`,
+        });
+      }
+    }
+
+    // orphan (boost #2): a hypo-ext-* command in settings with no source extension.
+    // E4 excluded hypo-ext-* from the core stale checker (doctor.mjs:302), so this
+    // is the ONLY place orphaned extension entries are caught.
+    const sourceCmds = new Set(
+      discovered.hooks.map((ext) => `node ${hooksDir.replace(HOME, '$HOME')}/${ext.file}`),
+    );
+    const seen = new Set();
+    for (const groups of Object.values(hooksObj)) {
+      if (!Array.isArray(groups)) continue;
+      for (const g of groups) {
+        if (!g || typeof g !== 'object') continue;
+        for (const h of g.hooks || []) {
+          if (typeof h.command !== 'string') continue;
+          if (!/(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(h.command)) continue;
+          if (sourceCmds.has(h.command) || seen.has(h.command)) continue;
+          seen.add(h.command);
+          problems.push({
+            severity: 'warn',
+            msg: `orphan settings entry (${h.command}) — source extension removed; run uninstall`,
+          });
+        }
+      }
+    }
+  }
+
+  if (problems.length === 0) {
+    pass(label, 'All extensions consistent');
+    return;
+  }
+  const hasFail = problems.some((p) => p.severity === 'fail');
+  const sample = problems
+    .slice(0, 4)
+    .map((p) => p.msg)
+    .join('; ');
+  const extra = problems.length > 4 ? ` (+${problems.length - 4} more)` : '';
+  if (hasFail) fail(label, `${sample}${extra}`);
+  else warn(label, `${sample}${extra}`);
+}
+
 // ── feedback projection (fix #37 #9 — ADR 0031) ──────────────────────────────
 
 // Spawn feedback-sync.mjs --check --json and map its drift report onto doctor's
@@ -752,6 +945,8 @@ if (rootOk) {
 checkHooks();
 checkSettingsJson();
 if (args.codex) checkCodexPaths();
+if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
+if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkFeedbackProjection(args.hypoDir, args.claudeHome, args.projectId);

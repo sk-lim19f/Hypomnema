@@ -2768,6 +2768,202 @@ test('extensions-codex-sync: --force-extensions overwrites a drifted codex copy'
   });
 });
 
+// §8.12 (7) doctor extensions integrity (fix #33, ADR 0024 E5). Detects
+// (a) hard-copy SHA mismatch, (b) settings-entry mismatch + orphan, (c) manifest
+// missing (warn) / malformed (fail). Malformed = FAIL is what makes doctor's
+// `fails=0` ship gate (§5.1.3) actually cover §8.12-7(c).
+test('doctor-extensions-integrity', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const doctorLabel = 'Extensions integrity';
+      const findExt = (out) => out.find((c) => c.label === doctorLabel);
+
+      // Author + sync a healthy hook extension.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-watch.mjs', '#!/usr/bin/env node\n// v1\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+      });
+      const sync = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(sync.status, 0, `sync failed: ${sync.stderr}`);
+
+      // (clean) all consistent → pass.
+      let r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      let ext = findExt(JSON.parse(r.stdout));
+      assert.ok(ext, 'extensions integrity check not found');
+      assert.equal(ext.status, 'pass', `expected pass when consistent: ${ext.detail}`);
+
+      // (a) user edits the installed copy → recorded SHA ≠ on-disk → warn (not fail).
+      const installed = join(home, '.claude', 'hooks', 'hypo-ext-watch.mjs');
+      writeFileSync(installed, '#!/usr/bin/env node\n// hand-edited\n');
+      r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      ext = findExt(JSON.parse(r.stdout));
+      assert.equal(ext.status, 'warn', `SHA drift must warn: ${ext.detail}`);
+      assert.ok(/drift/i.test(ext.detail), `drift detail expected: ${ext.detail}`);
+      assert.notEqual(r.status, 1, 'a recoverable drift must not fail the doctor gate');
+
+      // (b) restore the copy, then strip the settings entry → expected-missing → warn.
+      const resync = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--force-extensions'],
+        home,
+      );
+      assert.equal(resync.status, 0, `resync failed: ${resync.stderr}`);
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      settings.hooks.PostToolUse = (settings.hooks.PostToolUse || []).filter(
+        (g) => !(g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-watch.mjs')),
+      );
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+      r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      ext = findExt(JSON.parse(r.stdout));
+      assert.equal(ext.status, 'warn', `missing settings entry must warn: ${ext.detail}`);
+      assert.ok(/not registered/i.test(ext.detail), `registration detail expected: ${ext.detail}`);
+
+      // (b-orphan) settings entry whose source extension was removed → warn.
+      // E4 excludes hypo-ext-* from the core stale checker, so checkExtensions is
+      // the only place this is caught.
+      withTmpHome((home2) => {
+        const hypoDir2 = join(dir, 'wiki2');
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir2}`, '--no-git-init'], home2);
+        const s2 = {
+          hooks: {
+            Stop: [
+              {
+                hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/hypo-ext-gone.mjs' }],
+              },
+            ],
+          },
+        };
+        writeFileSync(join(home2, '.claude', 'settings.json'), JSON.stringify(s2, null, 2));
+        const ro = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir2}`, '--json'], home2);
+        const eo = findExt(JSON.parse(ro.stdout));
+        assert.equal(eo.status, 'warn', `orphan entry must warn: ${eo.detail}`);
+        assert.ok(/orphan/i.test(eo.detail), `orphan detail expected: ${eo.detail}`);
+      });
+
+      // (c-warn) hook with no manifest → warn ("will not auto-register").
+      withTmpHome((home3) => {
+        const hypoDir3 = join(dir, 'wiki3');
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir3}`, '--no-git-init'], home3);
+        writeExt(hypoDir3, 'hooks', 'hypo-ext-nomani.mjs', '#!/usr/bin/env node\n'); // no manifest
+        runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir3}`, '--apply'], home3);
+        const rm = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir3}`, '--json'], home3);
+        const em = findExt(JSON.parse(rm.stdout));
+        assert.equal(em.status, 'warn', `missing manifest must warn: ${em.detail}`);
+        assert.ok(/missing/i.test(em.detail), `missing-manifest detail expected: ${em.detail}`);
+        assert.notEqual(rm.status, 1, 'a missing manifest must not fail the gate');
+      });
+
+      // (c-fail) malformed manifest → FAIL + non-zero exit (ship gate covers §8.12-7c).
+      withTmpHome((home4) => {
+        const hypoDir4 = join(dir, 'wiki4');
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir4}`, '--no-git-init'], home4);
+        const extHooks = join(hypoDir4, 'extensions', 'hooks');
+        mkdirSync(extHooks, { recursive: true });
+        writeFileSync(join(extHooks, 'hypo-ext-bad.mjs'), '#!/usr/bin/env node\n');
+        // Unknown event → parseManifest !ok → malformed → fail.
+        writeFileSync(
+          join(extHooks, 'hypo-ext-bad.manifest.json'),
+          JSON.stringify({ type: 'hook', event: 'NotARealEvent' }),
+        );
+        const rf = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir4}`, '--json'], home4);
+        const ef = findExt(JSON.parse(rf.stdout));
+        assert.equal(ef.status, 'fail', `malformed manifest must fail: ${ef.detail}`);
+        assert.equal(rf.status, 1, 'malformed manifest must fail the doctor gate (exit 1)');
+      });
+
+      // (b-shape) command registered but matcher/timeout differs from the manifest.
+      // upgrade --apply silently self-heals this (extensions.mjs:544), so doctor is
+      // the only surface that reports it (the mismatch E3 deferred to E5).
+      withTmpHome((home5) => {
+        const hypoDir5 = join(dir, 'wiki5');
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir5}`, '--no-git-init'], home5);
+        writeExt(hypoDir5, 'hooks', 'hypo-ext-shape.mjs', '#!/usr/bin/env node\n', {
+          type: 'hook',
+          event: 'PostToolUse',
+          matcher: 'Write',
+          timeout: 5000,
+        });
+        runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir5}`, '--apply'], home5);
+        // User hand-edits the matcher in settings.json (recorded SHA path untouched).
+        const sp = join(home5, '.claude', 'settings.json');
+        const s = JSON.parse(readFileSync(sp, 'utf-8'));
+        for (const g of s.hooks.PostToolUse) {
+          if ((g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-shape.mjs'))) {
+            g.matcher = 'Edit'; // diverge from manifest's "Write"
+          }
+        }
+        writeFileSync(sp, JSON.stringify(s, null, 2));
+        const r5 = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir5}`, '--json'], home5);
+        const e5 = findExt(JSON.parse(r5.stdout));
+        assert.equal(e5.status, 'warn', `settings shape drift must warn: ${e5.detail}`);
+        assert.ok(/differs from manifest/i.test(e5.detail), `shape-drift detail: ${e5.detail}`);
+      });
+
+      // (b-missing-file) codex 2-worker review: a synced hook whose settings.json was
+      // deleted (or has no hooks object) must still warn "not registered" — a matching
+      // SHA must not mask the absent registration (§8.12-7(b)). Regression for the
+      // pre-fix guard that skipped the entry check unless settings.hooks existed.
+      withTmpHome((home6) => {
+        const hypoDir6 = join(dir, 'wiki6');
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir6}`, '--no-git-init'], home6);
+        writeExt(hypoDir6, 'hooks', 'hypo-ext-noreg.mjs', '#!/usr/bin/env node\n', {
+          type: 'hook',
+          event: 'Stop',
+        });
+        runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir6}`, '--apply'], home6);
+        // Delete settings.json — the installed copy + recorded SHA still match.
+        rmSync(join(home6, '.claude', 'settings.json'), { force: true });
+        const r6 = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir6}`, '--json'], home6);
+        const e6 = findExt(JSON.parse(r6.stdout));
+        assert.equal(e6.status, 'warn', `missing settings.json must still warn: ${e6.detail}`);
+        assert.ok(
+          /not registered/i.test(e6.detail),
+          `not-registered detail expected: ${e6.detail}`,
+        );
+      });
+    });
+  });
+});
+
+// §8.12 (7) codex target: doctor --codex runs the same integrity check against
+// ~/.codex, and skills/agents recorded under claude do not false-flag there.
+test('doctor-extensions-integrity: --codex target', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cdxdoc.mjs', '#!/usr/bin/env node\n// v1\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      const sync = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--codex'],
+        home,
+      );
+      assert.equal(sync.status, 0, `codex sync failed: ${sync.stderr}`);
+
+      // Clean → codex check passes.
+      let r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--codex', '--json'], home);
+      let ext = JSON.parse(r.stdout).find((c) => c.label === 'Codex extensions integrity');
+      assert.ok(ext, 'codex extensions integrity check not found');
+      assert.equal(ext.status, 'pass', `expected codex pass: ${ext.detail}`);
+
+      // Edit the installed codex copy → drift warn on the codex target.
+      writeFileSync(join(home, '.codex', 'hooks', 'hypo-ext-cdxdoc.mjs'), '// edited\n');
+      r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--codex', '--json'], home);
+      ext = JSON.parse(r.stdout).find((c) => c.label === 'Codex extensions integrity');
+      assert.equal(ext.status, 'warn', `codex drift must warn: ${ext.detail}`);
+    });
+  });
+});
+
 // ── lint.mjs --fix tests ─────────────────────────────────────────────────────
 
 suite('lint.mjs --fix');
