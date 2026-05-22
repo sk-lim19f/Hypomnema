@@ -12,6 +12,8 @@
  * Options:
  *   --hypo-dir=<path>   Hypomnema root directory (default: resolved via HYPO_DIR / hypo-config.md scan / ~/hypomnema)
  *   --apply             Apply hook file updates and settings.json merges
+ *   --force-commands    Overwrite user-modified slash command files (creates .bak)
+ *   --force-extensions  Overwrite user-modified / conflicting extension copies (creates .bak)
  *   --json              Output results as JSON
  */
 
@@ -63,11 +65,18 @@ function pkgJsonPath() {
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, apply: false, json: false, forceCommands: false };
+  const args = {
+    hypoDir: null,
+    apply: false,
+    json: false,
+    forceCommands: false,
+    forceExtensions: false,
+  };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--apply') args.apply = true;
     else if (arg === '--force-commands') args.forceCommands = true;
+    else if (arg === '--force-extensions') args.forceExtensions = true;
     else if (arg === '--json') args.json = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
@@ -661,6 +670,7 @@ const extCheck = syncExtensions({
   settingsPath: extSettingsPath,
   pkgPath: pkgJsonPath(),
   apply: false,
+  force: args.forceExtensions,
 });
 
 const staleHooks = hooks.filter(
@@ -707,6 +717,7 @@ if (args.apply) {
     settingsPath: extSettingsPath,
     pkgPath: pkgJsonPath(),
     apply: true,
+    force: args.forceExtensions,
   });
 }
 
@@ -755,7 +766,7 @@ if (args.json) {
       2,
     ),
   );
-  process.exit(hasDrift && !args.apply ? 1 : 0);
+  process.exit((hasDrift && !args.apply) || extCheck.conflicts.length > 0 ? 1 : 0);
 }
 
 // Human-readable report
@@ -899,27 +910,38 @@ if (hypoignore.status === 'no-file') {
   for (const e of hypoignore.missing) lines.push(`    + ${e.pattern}`);
 }
 
-// Extensions companion (ADR 0024)
+// Extensions companion (ADR 0024; conflict/drift gating E3, #31)
 {
   const pending = extCheck.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
   );
-  const extConflicts = extCheck.actions.filter(
-    (a) => a.action === 'skip-user-modified' || a.action === 'skip-conflict',
-  );
+  const nConflicts = extCheck.conflicts.length;
+  const nDrifts = extCheck.drifts.length;
   if (extCheck.actions.length === 0 && extCheck.warnings.length === 0) {
     lines.push(`✓ Extensions        none found in ${extDir.replace(HOME, '~')}`);
-  } else if (pending.length === 0 && extConflicts.length === 0) {
+  } else if (pending.length === 0 && nConflicts === 0 && nDrifts === 0) {
     const reg = extCheck.registered.length;
     lines.push(
       `✓ Extensions        ${extCheck.actions.length} synced${reg ? `, ${reg} hook(s) registered` : ''}`,
     );
   } else {
     lines.push(
-      `⚠ Extensions        ${pending.length} to sync, ${extConflicts.length} conflict(s):`,
+      `⚠ Extensions        ${pending.length} to sync, ${nConflicts} conflict(s), ${nDrifts} drift(s):`,
     );
     for (const a of pending) lines.push(`    + ${a.file}  [${a.action}]`);
-    for (const a of extConflicts) lines.push(`    ⚠ ${a.file}  [${a.action} — left untouched]`);
+    for (const c of extCheck.conflicts)
+      lines.push(`    ✗ ${c.file}  [${c.action} — left untouched]`);
+    for (const d of extCheck.drifts) lines.push(`    ⚠ ${d.file}  [drift — left untouched]`);
+  }
+  // E3 (#31): a hard conflict blocks install (exit 1, even under --apply); drift is
+  // resolvable advisory. Emit the spec'd WIKI messages so the user knows the recovery.
+  if (nConflicts > 0) {
+    lines.push('  [WIKI: existing file conflicts. Backup and retry, or use --force-extensions]');
+  }
+  for (const d of extCheck.drifts) {
+    lines.push(
+      `  [WIKI: extension ${d.name} drift detected. Use --force-extensions to overwrite.]`,
+    );
   }
   for (const w of extCheck.warnings) lines.push(`    ⚠ ${w}`);
 }
@@ -999,7 +1021,11 @@ const totalDrift =
   (hypoignore.status === 'needs-migration' ? hypoignore.missing.length : 0) +
   extCheck.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
-  ).length;
+  ).length +
+  // E3 (#31): unresolved drift/conflict is pending work too — without these the
+  // summary printed "up to date" while the exit code was 1 (codex review).
+  extCheck.conflicts.length +
+  extCheck.drifts.length;
 if (totalDrift === 0) {
   lines.push('Result: Hypomnema is up to date');
 } else if (args.apply) {
@@ -1022,4 +1048,8 @@ if (totalDrift === 0) {
 
 console.log(lines.join('\n'));
 
-process.exit(hasDrift && !args.apply ? 1 : 0);
+// E3 (#31): a hard extension conflict blocks even under --apply (unlike ordinary
+// drift, which only fails check mode). --force-extensions clears the resolvable
+// cases; an unfollowable symlink/non-regular dest still counts and stays exit 1.
+const extBlocked = extCheck.conflicts.length > 0;
+process.exit((hasDrift && !args.apply) || extBlocked ? 1 : 0);

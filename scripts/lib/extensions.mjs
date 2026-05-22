@@ -235,9 +235,10 @@ function writeFreshAtomic(dest, content) {
 /**
  * Decide + (when apply) perform the hard-copy of one file, returning the SHA to
  * record and an action label. Mirrors the slash-command 3-way SHA matrix
- * (init.mjs:installCommands). `force` (E3) backs up + overwrites user-modified
- * files; in E2 it is always false, so user-modified / unowned files are left
- * untouched (E3 adds the conflict exit-code + --force-extensions semantics).
+ * (init.mjs:installCommands). `force` (E3, --force-extensions) backs up (.bak) +
+ * overwrites user-modified / unowned files; without it those are left untouched and
+ * surface as drift/conflict. A symlink/non-regular dest is never followed even under
+ * force (the isRegularFile guard precedes the force branch).
  */
 function copyOne({ srcPath, destPath, key, recordedSHA, apply, force }) {
   const srcContent = readFileSync(srcPath);
@@ -285,6 +286,29 @@ function copyOne({ srcPath, destPath, key, recordedSHA, apply, force }) {
 }
 
 /**
+ * Classify one hard-copy outcome into the sync result (E3, #31). Owned writes mark
+ * pending work; an owned-but-edited file is drift (warn + check-mode work); an
+ * unowned or unsafe-to-overwrite file is a hard conflict (blocks even --apply).
+ */
+function recordCopyOutcome(result, name, key, action, apply) {
+  if (action === 'create' || action === 'update' || action === 'force-update') {
+    result.needsWork = result.needsWork || !apply;
+  } else if (action === 'skip-user-modified') {
+    result.drifts.push({ name, file: key });
+    // Drift is pending work; needsWork drives check-mode exit 1 (not --apply).
+    result.needsWork = true;
+    result.warnings.push(`${key} (drift — user-modified) — left untouched`);
+  } else if (
+    action === 'skip-conflict' ||
+    action === 'skip-non-regular' ||
+    action === 'skip-unreadable'
+  ) {
+    result.conflicts.push({ name, file: key, action });
+    result.warnings.push(`${key} (${action}) — left untouched`);
+  }
+}
+
+/**
  * Sync all discovered extensions for one target ('claude' | 'codex').
  *
  * Ordering (D2): per extension, the manifest is parsed + validated BEFORE any
@@ -310,6 +334,15 @@ export function syncExtensions({
     actions: [],
     registered: [],
     warnings: [],
+    // Hard conflicts (E3, #31): a file we do NOT own — or cannot safely overwrite
+    // (symlink/non-regular/unreadable) — already occupies the target path. These
+    // block install with exit 1 even under --apply; --force-extensions resolves the
+    // owned/unowned-file cases (backup + overwrite) but never follows a symlink.
+    conflicts: [],
+    // Drift (E3, #31): a file we own whose on-disk copy the user has since edited.
+    // Warned + counted as pending work (check-mode exit 1, mirroring slash commands)
+    // but NOT a hard block under --apply. --force-extensions overwrites it.
+    drifts: [],
     settingsChanged: false,
     needsWork: false,
   };
@@ -364,21 +397,13 @@ export function syncExtensions({
       });
       if (fileRes.sha != null) newSHAs[fileKey] = fileRes.sha;
       result.actions.push({ target, file: fileKey, action: fileRes.action });
-      if (
-        fileRes.action === 'create' ||
-        fileRes.action === 'update' ||
-        fileRes.action === 'force-update'
-      ) {
-        result.needsWork = result.needsWork || !apply;
-      } else if (fileRes.action === 'skip-user-modified' || fileRes.action === 'skip-conflict') {
-        result.warnings.push(`${fileKey} (${fileRes.action}) — left untouched`);
-      }
+      recordCopyOutcome(result, ext.name, fileKey, fileRes.action, apply);
 
       // If the main hook file was NOT written/owned by us (a pre-existing
       // unowned file or a user-modified copy), we must not copy its manifest or
       // register a settings entry — that would activate a file we refused to
-      // overwrite. Full conflict semantics (exit 1 + --force-extensions) land in
-      // E3 (#31); E2 just stays safe.
+      // overwrite. The conflict/drift is recorded above; init/upgrade turn a hard
+      // conflict into exit 1 (E3, #31) unless --force-extensions resolves it.
       const ownedMainFile = OWNED_ACTIONS.has(fileRes.action);
 
       // (2b) hard-copy the manifest alongside, when present + valid + owned, so
@@ -401,13 +426,7 @@ export function syncExtensions({
         });
         if (mRes.sha != null) newSHAs[mKey] = mRes.sha;
         result.actions.push({ target, file: mKey, action: mRes.action });
-        if (
-          mRes.action === 'create' ||
-          mRes.action === 'update' ||
-          mRes.action === 'force-update'
-        ) {
-          result.needsWork = result.needsWork || !apply;
-        }
+        recordCopyOutcome(result, ext.name, mKey, mRes.action, apply);
         if (manifestParsed.registrable) expectedHookExts.push(ext);
       }
     }
@@ -453,6 +472,15 @@ export function syncExtensions({
  * patched in place; if the event changed, the stale group is removed and a fresh
  * one added under the new event. A pre-existing multi-hook group containing our
  * command is treated as a manual edit and left alone (drift; E3 handles force).
+ *
+ * E3 scope note (#31): settings.json entry drift is NOT surfaced here. Without a
+ * recorded last-written entry we cannot tell a user edit apart from a manifest
+ * change (the latter must auto-update — see the "manifest change re-registers"
+ * test), so this reconcile silently self-heals a single-hook group back to the
+ * manifest-derived shape. Detecting + reporting settings-entry mismatch is E5's
+ * job (#33, doctor integrity §8.12-7). Mixed-group surgical replacement (preserve
+ * sibling plugins' hooks, swap only ours) is likewise deferred — today a foreign
+ * hook sharing our group is left untouched as drift.
  */
 function registerSettings(settingsPath, expectedEntries, apply) {
   let original = '';
