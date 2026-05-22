@@ -100,6 +100,7 @@ function parseArgs(argv) {
     hooks: true,
     commands: true,
     forceCommands: false,
+    forceExtensions: false,
     codex: false,
     gitRemote: null,
     gitInit: true,
@@ -128,6 +129,7 @@ Init options:
   --no-hooks             Skip hook installation
   --no-commands          Skip slash command installation to ~/.claude/commands/hypo/
   --force-commands       Overwrite user-modified slash command files (creates .bak)
+  --force-extensions     Overwrite user-modified / conflicting extension copies (creates .bak)
   --codex                Also install Codex hooks (~/.codex/hooks/)
   --git-remote=<url>     Git remote URL
   --no-git-init          Skip git initialization
@@ -144,6 +146,7 @@ docstring at the top of scripts/<command>.mjs.`);
     else if (arg === '--no-hooks') args.hooks = false;
     else if (arg === '--no-commands') args.commands = false;
     else if (arg === '--force-commands') args.forceCommands = true;
+    else if (arg === '--force-extensions') args.forceExtensions = true;
     else if (arg === '--codex') args.codex = true;
     else if (arg.startsWith('--git-remote=')) args.gitRemote = arg.slice(13);
     else if (arg === '--no-git-init') args.gitInit = false;
@@ -875,6 +878,7 @@ if (args.hooks) {
     settingsPath: join(HOME, '.claude', 'settings.json'),
     pkgPath: pkgJsonPath(),
     apply: !args.dryRun,
+    force: args.forceExtensions,
   });
   for (const a of extResult.actions) {
     if (a.action === 'create' || a.action === 'update' || a.action === 'force-update') {
@@ -883,6 +887,18 @@ if (args.hooks) {
   }
   for (const r of extResult.registered) log('merged', `extension ${r}`);
   for (const w of extResult.warnings) log('skipped', `extension: ${w}`);
+  // E3 (#31): a hard conflict (unowned/symlinked target) blocks install — surface
+  // the recovery and force a non-zero exit. Drift is advisory (resolvable, no block).
+  if (extResult.conflicts.length > 0) {
+    log('errors', '[WIKI: existing file conflicts. Backup and retry, or use --force-extensions]');
+    for (const c of extResult.conflicts) log('errors', `extension ${c.file} (${c.action})`);
+  }
+  for (const d of extResult.drifts) {
+    log(
+      'skipped',
+      `[WIKI: extension ${d.name} drift detected. Use --force-extensions to overwrite.]`,
+    );
+  }
 }
 
 // 5. shell function (claude wrapper)

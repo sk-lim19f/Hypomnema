@@ -2248,7 +2248,13 @@ test('extensions: conflict on main file blocks manifest copy + registration', ()
       });
 
       const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
-      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      // E3 (#31): a hard conflict blocks install with exit 1 even under --apply.
+      assert.equal(r.status, 1, `conflict must block with exit 1: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        out.extensions.conflicts.some((c) => c.file === 'hooks/hypo-ext-conflict.mjs'),
+        'conflict must be reported in extensions.conflicts',
+      );
 
       // Foreign file left untouched.
       assert.equal(
@@ -2267,6 +2273,148 @@ test('extensions: conflict on main file blocks manifest copy + registration', ()
         !JSON.stringify(settings.hooks || {}).includes('hypo-ext-conflict.mjs'),
         'conflicted extension must NOT be registered in settings.json',
       );
+    });
+  });
+});
+
+// fix #31: the init.mjs conflict path must also block (exit 1) and report the
+// recovery — not throw. (Guards against the errors-bucket name typo.)
+test('extensions: init blocks on a hard conflict (exit 1, no throw)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `first init failed: ${initR.stderr}`);
+
+      // A foreign, unowned file occupies the target; author the extension.
+      const claudeHooks = join(home, '.claude', 'hooks');
+      writeFileSync(join(claudeHooks, 'hypo-ext-foreign.mjs'), '// not ours\n');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-foreign.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+      });
+
+      const r = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(r.status, 1, 'init must exit 1 on a hard extension conflict');
+      const combined = `${r.stdout}\n${r.stderr}`;
+      assert.ok(
+        combined.includes('existing file conflicts'),
+        'init must surface the conflict recovery message',
+      );
+      assert.equal(
+        readFileSync(join(claudeHooks, 'hypo-ext-foreign.mjs'), 'utf-8'),
+        '// not ours\n',
+        'foreign file must remain untouched',
+      );
+    });
+  });
+});
+
+// §8.12 (c) — fix #31: a user-edited owned copy is DRIFT (warn + check-mode exit 1,
+// not a hard --apply block); --force-extensions backs it up (.bak) and overwrites.
+// A foreign symlink at the target is a conflict that --force-extensions never
+// follows (it stays exit 1).
+test('extensions-conflict-detected-blocks-without-force', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const claudeHooks = join(home, '.claude', 'hooks');
+      const installed = join(claudeHooks, 'hypo-ext-drift.mjs');
+
+      // Author + install an extension we own.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-drift.mjs', '#!/usr/bin/env node\n// v1\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+      });
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r1.status, 0, `initial sync failed: ${r1.stderr}`);
+      assert.ok(existsSync(installed), 'extension should be installed');
+
+      // The user edits the installed copy → drift (we own it, recorded SHA ≠ disk).
+      writeFileSync(installed, '#!/usr/bin/env node\n// hand-edited\n');
+
+      // (a) --check (no apply) → exit 1, reported as drift, file untouched.
+      const rc = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      assert.equal(rc.status, 1, 'drift must fail check mode (exit 1)');
+      const checkOut = JSON.parse(rc.stdout);
+      assert.ok(
+        checkOut.extensions.drifts.some((d) => d.file === 'hooks/hypo-ext-drift.mjs'),
+        'drift must be reported in extensions.drifts',
+      );
+      assert.equal(checkOut.extensions.conflicts.length, 0, 'drift is not a hard conflict');
+      assert.equal(
+        readFileSync(installed, 'utf-8'),
+        '#!/usr/bin/env node\n// hand-edited\n',
+        'check mode must not overwrite a drifted file',
+      );
+
+      // Non-JSON summary must stay consistent with the exit code: drift is pending
+      // work, so the summary must NOT claim "up to date" while exiting 1.
+      const rcText = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`], home);
+      assert.equal(rcText.status, 1, 'drift must fail check mode (non-JSON)');
+      assert.ok(
+        !rcText.stdout.includes('Hypomnema is up to date'),
+        'summary must not say "up to date" when drift is pending',
+      );
+      assert.ok(
+        rcText.stdout.includes('drift detected'),
+        'summary must surface the drift recovery message',
+      );
+
+      // (b) --apply WITHOUT force → drift is advisory, NOT a hard block (exit 0),
+      // and the user's edit is preserved (mirrors slash-command drift semantics).
+      const ra = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(ra.status, 0, `drift must not hard-block --apply: ${ra.stderr}`);
+      assert.equal(
+        readFileSync(installed, 'utf-8'),
+        '#!/usr/bin/env node\n// hand-edited\n',
+        'apply without --force-extensions must not overwrite a drifted file',
+      );
+
+      // (c) --apply --force-extensions → backup (.bak) + overwrite from source.
+      const rf = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--force-extensions'],
+        home,
+      );
+      assert.equal(rf.status, 0, `force apply failed: ${rf.stderr}`);
+      assert.equal(
+        readFileSync(installed, 'utf-8'),
+        '#!/usr/bin/env node\n// v1\n',
+        '--force-extensions must overwrite with the source content',
+      );
+      assert.ok(existsSync(`${installed}.bak`), '--force-extensions must back up the prior file');
+      assert.equal(
+        readFileSync(`${installed}.bak`, 'utf-8'),
+        '#!/usr/bin/env node\n// hand-edited\n',
+        'backup must hold the user-edited content',
+      );
+
+      // (d) a symlink at the target is a conflict --force-extensions never follows.
+      const decoy = join(dir, 'decoy.mjs');
+      writeFileSync(decoy, '// decoy\n');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-link.mjs', '#!/usr/bin/env node\n// linked\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      symlinkSync(decoy, join(claudeHooks, 'hypo-ext-link.mjs'));
+      const rl = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply', '--force-extensions'],
+        home,
+      );
+      assert.equal(rl.status, 1, 'a symlink target must stay a conflict even under --force');
+      const linkOut = JSON.parse(rl.stdout);
+      assert.ok(
+        linkOut.extensions.conflicts.some(
+          (c) => c.file === 'hooks/hypo-ext-link.mjs' && c.action === 'skip-non-regular',
+        ),
+        'symlink must be reported as a non-regular conflict',
+      );
+      assert.equal(readFileSync(decoy, 'utf-8'), '// decoy\n', 'symlink target must be untouched');
     });
   });
 });
