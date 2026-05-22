@@ -178,6 +178,12 @@ const HYPO_DIRS = [
   'journal/weekly',
   'journal/monthly',
   'pages/observability',
+  // User extensions companion (ADR 0024, fix #28). init creates the baseline
+  // dirs; #29 (E2) adds the hard-copy / manifest / settings sync into them.
+  'extensions/hooks',
+  'extensions/commands',
+  'extensions/skills',
+  'extensions/agents',
 ];
 
 function ensureDir(dir, dryRun) {
@@ -779,6 +785,16 @@ if (args.fromRemote) {
   // 1. wiki directory structure
   ensureDir(args.hypoDir, args.dryRun);
   for (const d of HYPO_DIRS) ensureDir(join(args.hypoDir, d), args.dryRun);
+
+  // 1b. extensions baseline: drop a .gitkeep into each so the empty dirs are
+  // git-trackable in the user's wiki repo (ADR 0024, fix #28).
+  for (const t of ['hooks', 'commands', 'skills', 'agents']) {
+    copyTemplate(
+      join('extensions', t, '.gitkeep'),
+      join(args.hypoDir, 'extensions', t, '.gitkeep'),
+      args.dryRun,
+    );
+  }
 
   // 2. template files
   copyTemplate('index.md', join(args.hypoDir, 'index.md'), args.dryRun);
