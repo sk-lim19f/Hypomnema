@@ -295,7 +295,11 @@ function checkSettingsJson() {
     fail('settings.json hook registrations', `0/${total} registered — run /hypo:init`);
   }
 
-  // fix #7: stale hypo-* entries (uninstall remnants)
+  // fix #7: stale hypo-* entries (uninstall remnants).
+  // hypo-ext-* commands are user-extension entries (ADR 0024) — not core hooks,
+  // so they are intentionally absent from HOOK_MAP. Excluded here; their
+  // integrity (SHA + manifest + entry match) is checked separately in E5 (#33).
+  const isExtCommand = (cmd) => /(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(cmd);
   const expectedCmds = new Set(
     Object.entries(HOOK_MAP).flatMap(([, files]) =>
       files.map((f) => `node ${hooksDir.replace(HOME, '$HOME')}/${f}`),
@@ -310,6 +314,7 @@ function checkSettingsJson() {
         if (
           typeof h.command === 'string' &&
           /hypo-[^/]+\.mjs/.test(h.command) &&
+          !isExtCommand(h.command) &&
           !expectedCmds.has(h.command)
         ) {
           stale.push(h.command);
@@ -335,6 +340,7 @@ function checkSettingsJson() {
       if (!g || typeof g !== 'object') continue;
       for (const h of g.hooks || []) {
         if (typeof h.command !== 'string' || !/hypo-[^/]+\.mjs/.test(h.command)) continue;
+        if (isExtCommand(h.command)) continue; // ext duplicates are E5's concern (#33)
         if (seen.has(h.command)) dupes.push(`${event}:${h.command}`);
         else seen.add(h.command);
       }
