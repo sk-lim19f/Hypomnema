@@ -2014,6 +2014,351 @@ test('--apply generates migration report for major SCHEMA bump', () => {
   });
 });
 
+// ── extensions companion sync (ADR 0024, fix #29 + #30) ──────────────────────
+
+suite('extensions companion sync (upgrade.mjs, ADR 0024)');
+
+function writeExt(hypoDir, type, name, content, manifest) {
+  const dir = join(hypoDir, 'extensions', type);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), content);
+  if (manifest !== undefined) {
+    const stem = name.replace(/\.[^.]+$/, '');
+    writeFileSync(join(dir, `${stem}.manifest.json`), JSON.stringify(manifest, null, 2));
+  }
+}
+
+// §8.12 (a) new extension → hard copy + manifest parse + settings.json entry +
+// 3-way SHA record; §8.12 (b) re-run is idempotent (no diff, settings stable).
+test('upgrade-extensions-hard-copy-and-manifest-register', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-mywatcher.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write|Edit',
+        timeout: 10000,
+      });
+
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r1.status, 0, `first --apply failed: ${r1.stderr}`);
+      const out1 = JSON.parse(r1.stdout);
+
+      // (a-1) hard copy of the hook AND its manifest into ~/.claude/hooks/
+      const copyDir = join(home, '.claude', 'hooks');
+      assert.ok(
+        existsSync(join(copyDir, 'hypo-ext-mywatcher.mjs')),
+        'extension hook not hard-copied to ~/.claude/hooks/',
+      );
+      assert.ok(
+        existsSync(join(copyDir, 'hypo-ext-mywatcher.manifest.json')),
+        'extension manifest not hard-copied alongside the hook',
+      );
+
+      // (a-2) settings.json registered the hook with a command WE constructed
+      // (never sourced from the manifest), plus matcher + timeout from manifest.
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const groups = (settings.hooks?.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-mywatcher.mjs')),
+      );
+      assert.equal(groups.length, 1, 'exactly one PostToolUse entry expected for the extension');
+      assert.equal(groups[0].matcher, 'Write|Edit', 'matcher from manifest not applied');
+      assert.equal(
+        groups[0].hooks[0].command,
+        'node $HOME/.claude/hooks/hypo-ext-mywatcher.mjs',
+        'command must be constructed by us, not sourced from manifest',
+      );
+      assert.equal(groups[0].hooks[0].timeout, 10000, 'timeout from manifest not applied');
+
+      // (a-3) per-target SHA recorded WITHOUT clobbering the commands map.
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(pkg.commands && Object.keys(pkg.commands).length > 0, 'commands map was dropped');
+      assert.ok(pkg.extensions?.claude, 'extensions.claude per-target map missing');
+      assert.ok(
+        pkg.extensions.claude['hooks/hypo-ext-mywatcher.mjs'],
+        'hook SHA not recorded under extensions.claude',
+      );
+      assert.ok(
+        pkg.extensions.claude['hooks/hypo-ext-mywatcher.manifest.json'],
+        'manifest SHA not recorded under extensions.claude',
+      );
+
+      // (b) idempotency — second --apply syncs nothing and leaves settings stable.
+      const settingsBefore = readFileSync(join(home, '.claude', 'settings.json'), 'utf-8');
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second --apply failed: ${r2.stderr}`);
+      const out2 = JSON.parse(r2.stdout);
+      const synced2 = out2.applied.extensions.actions.filter((a) =>
+        ['create', 'update', 'force-update'].includes(a.action),
+      );
+      assert.equal(synced2.length, 0, 'second --apply should sync nothing (idempotent)');
+      assert.equal(
+        out2.applied.extensions.settingsChanged,
+        false,
+        'second --apply must not rewrite settings.json',
+      );
+      assert.equal(out2.extensions.needsWork, false, 'no drift expected on second check');
+      const settingsAfter = readFileSync(join(home, '.claude', 'settings.json'), 'utf-8');
+      assert.equal(
+        settingsAfter,
+        settingsBefore,
+        'settings.json drifted across idempotent --apply',
+      );
+    });
+  });
+});
+
+// §8.12 (6) .hypoignore-matched files are excluded from discovery/sync.
+test('extensions-respects-hypoignore', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // One synced extension and one that .hypoignore must exclude.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-keep.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      writeExt(hypoDir, 'hooks', 'hypo-ext-skipme.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      const hypoignorePath = join(hypoDir, '.hypoignore');
+      writeFileSync(
+        hypoignorePath,
+        readFileSync(hypoignorePath, 'utf-8') + '\n# test exclusion\n*skipme*\n',
+      );
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+
+      const copyDir = join(home, '.claude', 'hooks');
+      assert.ok(
+        existsSync(join(copyDir, 'hypo-ext-keep.mjs')),
+        'non-ignored extension should be synced',
+      );
+      assert.ok(
+        !existsSync(join(copyDir, 'hypo-ext-skipme.mjs')),
+        '.hypoignore-matched extension must NOT be synced',
+      );
+      assert.ok(
+        !existsSync(join(copyDir, 'hypo-ext-skipme.manifest.json')),
+        '.hypoignore-matched extension manifest must NOT be synced',
+      );
+
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions.claude['hooks/hypo-ext-keep.mjs'],
+        'kept extension SHA should be recorded',
+      );
+      assert.ok(
+        !pkg.extensions.claude['hooks/hypo-ext-skipme.mjs'],
+        'ignored extension SHA must not be recorded',
+      );
+    });
+  });
+});
+
+// D2 ordering: a malformed manifest (unknown event) must skip the extension
+// entirely — no orphaned, unregistered hook copy left behind.
+test('extensions: malformed manifest leaves no orphan hard-copy', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-bad.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'BogusEvent',
+      });
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      assert.ok(
+        !existsSync(join(home, '.claude', 'hooks', 'hypo-ext-bad.mjs')),
+        'malformed-manifest extension must NOT be hard-copied (D2: validate before copy)',
+      );
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const registered = JSON.stringify(settings.hooks || {}).includes('hypo-ext-bad');
+      assert.ok(!registered, 'malformed-manifest extension must NOT be registered');
+    });
+  });
+});
+
+// Security #9: a hostile `command` field in the manifest must be ignored — the
+// settings entry command is always constructed locally.
+test('extensions: manifest command field cannot inject a command path', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-evil.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+        command: 'rm -rf /',
+      });
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const group = (settings.hooks?.Stop || []).find((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-evil.mjs')),
+      );
+      assert.ok(group, 'extension should still be registered');
+      assert.equal(
+        group.hooks[0].command,
+        'node $HOME/.claude/hooks/hypo-ext-evil.mjs',
+        'command must be constructed locally, never sourced from the manifest',
+      );
+      assert.ok(
+        !JSON.stringify(settings).includes('rm -rf'),
+        'manifest command field must never reach settings.json',
+      );
+    });
+  });
+});
+
+// HIGH (codex E2 review): a pre-existing unowned hook copy must NOT be wired up.
+// We refuse to overwrite it, so we must also refuse to copy its manifest or
+// register a settings entry that would activate a file we don't own.
+test('extensions: conflict on main file blocks manifest copy + registration', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // A foreign, unowned file already sits where our extension would land.
+      const claudeHooks = join(home, '.claude', 'hooks');
+      mkdirSync(claudeHooks, { recursive: true });
+      writeFileSync(join(claudeHooks, 'hypo-ext-conflict.mjs'), '// not ours\n');
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-conflict.mjs', '#!/usr/bin/env node\n// ours\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+      });
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+
+      // Foreign file left untouched.
+      assert.equal(
+        readFileSync(join(claudeHooks, 'hypo-ext-conflict.mjs'), 'utf-8'),
+        '// not ours\n',
+        'foreign file must not be overwritten',
+      );
+      // Manifest NOT copied (we do not own the main file).
+      assert.ok(
+        !existsSync(join(claudeHooks, 'hypo-ext-conflict.manifest.json')),
+        'manifest must not be copied for an unowned/conflicted main file',
+      );
+      // NOT registered in settings.json.
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      assert.ok(
+        !JSON.stringify(settings.hooks || {}).includes('hypo-ext-conflict.mjs'),
+        'conflicted extension must NOT be registered in settings.json',
+      );
+    });
+  });
+});
+
+// MEDIUM (codex E2 review, §8.12 b): a manifest matcher/timeout change must be
+// reflected in the existing settings entry; an event change must migrate it
+// (no orphaned entry left in the old event).
+test('extensions: manifest change re-registers settings entry', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const manifestPath = join(hypoDir, 'extensions', 'hooks', 'hypo-ext-edit.manifest.json');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-edit.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 5000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+
+      // Change matcher + timeout → expect the existing entry updated in place.
+      writeFileSync(
+        manifestPath,
+        JSON.stringify({ type: 'hook', event: 'PostToolUse', matcher: 'Edit', timeout: 9000 }),
+      );
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second --apply failed: ${r2.stderr}`);
+      const s2 = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const post = (s2.hooks.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-edit.mjs')),
+      );
+      assert.equal(post.length, 1, 'exactly one entry expected after matcher change');
+      assert.equal(post[0].matcher, 'Edit', 'matcher should be updated');
+      assert.equal(post[0].hooks[0].timeout, 9000, 'timeout should be updated');
+
+      // Change event → migrate (old event entry removed, new event entry added).
+      writeFileSync(manifestPath, JSON.stringify({ type: 'hook', event: 'Stop' }));
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      const s3 = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const stillPost = (s3.hooks.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-edit.mjs')),
+      );
+      const nowStop = (s3.hooks.Stop || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-edit.mjs')),
+      );
+      assert.equal(stillPost.length, 0, 'old-event entry must be removed on event migration');
+      assert.equal(nowStop.length, 1, 'entry must move to the new event');
+    });
+  });
+});
+
+// MEDIUM (codex E2 review): a .hypoignore-matched manifest must be excluded too
+// — the hook then has no manifest (warns, hard-copy proceeds, not registered).
+test('extensions: .hypoignore-matched manifest is not copied or recorded', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-partial.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      const hypoignorePath = join(hypoDir, '.hypoignore');
+      writeFileSync(hypoignorePath, readFileSync(hypoignorePath, 'utf-8') + '\n*.manifest.json\n');
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      const claudeHooks = join(home, '.claude', 'hooks');
+      assert.ok(existsSync(join(claudeHooks, 'hypo-ext-partial.mjs')), 'hook should still copy');
+      assert.ok(
+        !existsSync(join(claudeHooks, 'hypo-ext-partial.manifest.json')),
+        'ignored manifest must not be copied',
+      );
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        !pkg.extensions.claude['hooks/hypo-ext-partial.manifest.json'],
+        'ignored manifest SHA must not be recorded',
+      );
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      assert.ok(
+        !JSON.stringify(settings.hooks || {}).includes('hypo-ext-partial.mjs'),
+        'without a manifest the hook must not auto-register',
+      );
+    });
+  });
+});
+
 // ── lint.mjs --fix tests ─────────────────────────────────────────────────────
 
 suite('lint.mjs --fix');
