@@ -400,6 +400,127 @@ export function clearSyncState(hypoDir) {
   }
 }
 
+// ── auto-project suggestion (fix #23, ADR 0023) ────────────────────────────
+// `.cache/project-suggestions.json` is a single JSON object:
+//   { "skips": [{cwd, declined_at, reason}], "cooldowns": {"<cwd>": "<iso>"} }
+// `skips` is written by the LLM (Layer-1 behavioral rule) when the user answers
+// "N" to an auto-project offer — permanent per-cwd suppression (no TTL).
+// `cooldowns` is written by the hook each time it emits an offer — a 5-minute
+// same-cwd noise guard. The two live in one file so doctor validates a single
+// schema. Both reads/writes are best-effort; a failure only loses the offer,
+// never breaks SessionStart/CwdChanged.
+
+const PROJECT_MARKERS = [
+  'package.json',
+  'Cargo.toml',
+  'go.mod',
+  'pyproject.toml',
+  'pom.xml',
+  'build.gradle',
+  'composer.json',
+  'Gemfile',
+];
+const SUGGESTION_COOLDOWN_MS = 5 * 60 * 1000;
+
+/** @returns {string} path to the project-suggestions file for a wiki root. */
+export function projectSuggestionsPath(hypoDir) {
+  return join(hypoDir, '.cache', 'project-suggestions.json');
+}
+
+/**
+ * Read the project-suggestions store.
+ * @param {string} hypoDir
+ * @returns {{skips: object[], cooldowns: Record<string,string>, parseError: boolean}}
+ */
+export function readProjectSuggestions(hypoDir) {
+  const path = projectSuggestionsPath(hypoDir);
+  if (!existsSync(path)) return { skips: [], cooldowns: {}, parseError: false };
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf-8'));
+    return {
+      skips: Array.isArray(data.skips) ? data.skips : [],
+      cooldowns: data.cooldowns && typeof data.cooldowns === 'object' ? data.cooldowns : {},
+      parseError: false,
+    };
+  } catch {
+    return { skips: [], cooldowns: {}, parseError: true };
+  }
+}
+
+/**
+ * Record that an offer was just emitted for `cwd`, starting the cooldown.
+ * Preserves the existing skips array. Best-effort.
+ */
+export function recordSuggestionCooldown(hypoDir, cwd, now = new Date()) {
+  try {
+    const cacheDir = join(hypoDir, '.cache');
+    if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
+    const { skips, cooldowns } = readProjectSuggestions(hypoDir);
+    cooldowns[cwd] = now.toISOString();
+    writeFileSync(
+      projectSuggestionsPath(hypoDir),
+      JSON.stringify({ skips, cooldowns }, null, 2) + '\n',
+    );
+  } catch {
+    // best-effort
+  }
+}
+
+/** True when `cwd` carries one of the recognized project-root markers. */
+export function cwdHasProjectMarker(cwd) {
+  return PROJECT_MARKERS.some((m) => existsSync(join(cwd, m)));
+}
+
+/**
+ * Decide whether SessionStart/CwdChanged should offer to create a project for
+ * `cwd`. The caller MUST have already confirmed `cwd` matches no project's
+ * `working_dir` (the hook's MISS branch); this evaluates the remaining ADR 0023
+ * trigger conditions: (a) cwd is a git repo, (b) carries a project marker
+ * (`.git` alone is a weak signal — §8.11), (c) not in cooldown, (d) not a cwd
+ * the user previously declined. A corrupt store stays silent (doctor surfaces).
+ *
+ * @param {string} cwd
+ * @param {string} [hypoDir]
+ * @param {number} [now] epoch ms, injectable for tests
+ * @returns {boolean}
+ */
+export function shouldSuggestProjectCreation(cwd, hypoDir = HYPO_DIR, now = Date.now()) {
+  if (!cwd) return false;
+  if (!existsSync(join(cwd, '.git'))) return false;
+  if (!cwdHasProjectMarker(cwd)) return false;
+  const { skips, cooldowns, parseError } = readProjectSuggestions(hypoDir);
+  if (parseError) return false;
+  if (skips.some((s) => s && s.cwd === cwd)) return false;
+  const ts = cooldowns[cwd];
+  if (ts) {
+    const t = Date.parse(ts);
+    if (Number.isFinite(t) && now - t < SUGGESTION_COOLDOWN_MS) return false;
+  }
+  return true;
+}
+
+/**
+ * Build the §8.11 auto-project offer line for a cwd. The display name is the
+ * cwd basename, which is attacker-influenced (a directory name can contain
+ * newlines/control chars on Unix). Strip control characters and length-cap it
+ * so a crafted dir name cannot spoof extra instructions in additionalContext
+ * (codex review 2026-05-22).
+ */
+export function buildProjectSuggestionLine(cwd) {
+  // Replace any control char (code < 0x20 or === 0x7F) with a space so a
+  // crafted dir name cannot inject newlines/instructions into additionalContext
+  // (codex review 2026-05-22). Done by codepoint to keep control bytes out of
+  // this source file.
+  const sanitized = Array.from(basename(cwd))
+    .map((ch) => {
+      const code = ch.codePointAt(0);
+      return code < 0x20 || code === 0x7f ? ' ' : ch;
+    })
+    .join('');
+  const safe = sanitized.slice(0, 80).trim() || 'project';
+  return `[WIKI: cwd '${safe}'에 매칭되는 프로젝트가 없습니다. 자동 생성할까요? (Y/n)]`;
+}
+
 // ── clear-marker (fix #25 PR-A2, ADR 0022 amendment 2026-05-14) ────────────
 // `/clear` cannot be blocked (no UserPromptSubmit fire). The only intervention
 // point is the SessionEnd(reason='clear') → SessionStart(source='clear') pair:

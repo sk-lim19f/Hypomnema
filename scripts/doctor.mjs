@@ -20,7 +20,7 @@ import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
-import { readSyncState } from '../hooks/hypo-shared.mjs';
+import { readSyncState, projectSuggestionsPath } from '../hooks/hypo-shared.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -510,6 +510,57 @@ function checkSyncState(hypoDir) {
   }
 }
 
+function checkProjectSuggestions(hypoDir) {
+  // fix #23 / ADR 0023: the auto-project skip-persistence store. Absent file is
+  // healthy (no offers declined yet). Validate the RAW JSON shape here rather
+  // than via readProjectSuggestions(): that helper deliberately normalizes a
+  // non-array `skips` to [] for fail-open hook reads, which would mask a
+  // malformed file and silently break permanent "N" suppression (codex review
+  // 2026-05-22). Doctor must catch the malformation the helper hides.
+  const path = projectSuggestionsPath(hypoDir);
+  if (!existsSync(path)) {
+    pass('Auto-project suggestions', 'No skip-persistence file (clean)');
+    return;
+  }
+  let data;
+  try {
+    data = JSON.parse(readFileSync(path, 'utf-8'));
+  } catch {
+    warn(
+      'Auto-project suggestions',
+      'Cannot parse .cache/project-suggestions.json — inspect manually',
+    );
+    return;
+  }
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    warn('Auto-project suggestions', 'project-suggestions.json must be a JSON object');
+    return;
+  }
+  if (!Array.isArray(data.skips)) {
+    warn(
+      'Auto-project suggestions',
+      '`skips` must be an array — declined-cwd suppression will not work',
+    );
+    return;
+  }
+  if (
+    data.cooldowns !== undefined &&
+    (typeof data.cooldowns !== 'object' || data.cooldowns === null || Array.isArray(data.cooldowns))
+  ) {
+    warn('Auto-project suggestions', '`cooldowns` must be a plain object');
+    return;
+  }
+  const bad = data.skips.filter((s) => !s || typeof s.cwd !== 'string' || !s.cwd);
+  if (bad.length > 0) {
+    warn(
+      'Auto-project suggestions',
+      `${bad.length} malformed skip entr(ies) missing a string \`cwd\` in .cache/project-suggestions.json`,
+    );
+  } else {
+    pass('Auto-project suggestions', `${data.skips.length} declined cwd(s) recorded`);
+  }
+}
+
 function checkCodexPaths() {
   const codexHooks = join(HOME, '.codex', 'hooks');
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
@@ -686,6 +737,7 @@ checkHooks();
 checkSettingsJson();
 if (args.codex) checkCodexPaths();
 if (rootOk) checkSyncState(args.hypoDir);
+if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkFeedbackProjection(args.hypoDir, args.claudeHome, args.projectId);
 checkGit(args.hypoDir);
 

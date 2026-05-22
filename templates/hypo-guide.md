@@ -59,7 +59,7 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 1. Read root `hot.md` → identify active project
 2. If `cwd` matches `projects/<name>/index.md`'s `working_dir:` field → read `projects/<name>/session-state.md` first
 3. Read `projects/<name>/hot.md` for background context
-4. Offer: "Continuing [X] from last session — shall we pick up?"
+4. **Your first response must lead with the resume**: a one-line summary of last session + the concrete next task(s) from `session-state.md`, then "Continuing [X] — shall we pick up?". Do not wait for the user to ask; this is mandatory whenever a project matched (not a soft offer).
 
 ### Session Close
 
@@ -124,6 +124,32 @@ projects/<name>/
 ```
 
 Add to root `hot.md` active projects table.
+
+#### Auto-project offer (ADR 0023)
+
+When SessionStart / CwdChanged injects a line like
+`[WIKI: cwd '<name>'에 매칭되는 프로젝트가 없습니다. 자동 생성할까요? (Y/n)]`,
+the current working directory is a real project (git repo + a project marker
+like `package.json`) that has no matching wiki project. **Act on it — do not
+ignore it:**
+
+1. Ask the user with `AskUserQuestion` (or a plain Y/n question) whether to
+   create the project.
+2. **On Yes** — run the scaffold helper once (it substitutes tokens, creates
+   the project files, adds the root `hot.md` row, and logs the entry):
+   ```
+   node <pkg-root>/scripts/lib/project-create.mjs --name <slug> --working-dir "$(pwd)"
+   ```
+   Then tell the user: "Created project `<name>` at
+   `~/hypomnema/projects/<name>/`. Edit `index.md` to refine." Do **not** hand-write
+   the five files — the helper keeps substitution and registration consistent.
+3. **On No** — record the refusal so this cwd is never offered again: append an
+   entry to `~/hypomnema/.cache/project-suggestions.json` under `skips`:
+   ```json
+   { "skips": [ { "cwd": "<absolute cwd>", "declined_at": "<ISO date>", "reason": "user_decline" } ] }
+   ```
+   (preserve any existing `skips` / `cooldowns` keys). The hook reads this and
+   stays silent for that cwd permanently.
 
 ### Close a project
 
