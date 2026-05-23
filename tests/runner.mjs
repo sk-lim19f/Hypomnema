@@ -3787,6 +3787,202 @@ test('doctor-extensions-mixed-group-ownership: doctor accepts mixed-group occurr
   });
 });
 
+// fix #47 follow-up (CONCERN 1, doctor canonical-pick mirror):
+// doctor used to `.find(o => o.event === entry.event)` — picks the FIRST
+// traversal-order occurrence under the target event. registerSettings picks
+// the LOWEST-RANK occurrence (across all events). When the target event has
+// a drifted occurrence FIRST and an exact occurrence LATER, pre-fix doctor
+// warned "differs" while upgrade --apply was a no-op for the canonical.
+// Post-fix doctor uses pickCanonicalOccurrence (same helper as the write
+// path) and pass-throughs rank 1/2.
+test('doctor-extensions-canonical-mirror: drifted-first + exact-later does NOT warn `differs` (CONCERN 1)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-canon.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      // Hand-corrupt: under PostToolUse keep the canonical exact-shape group
+      // (rank 1) AND prepend a drifted single-hook group of our command (rank
+      // 3 — wrong timeout). registerSettings picks the later rank-1; doctor
+      // must agree, not warn "differs" on the earlier rank-3.
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const exactGroup = settings.hooks.PostToolUse.find((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-canon.mjs')),
+      );
+      const ourCommand = exactGroup.hooks.find((h) =>
+        (h.command || '').includes('hypo-ext-canon.mjs'),
+      ).command;
+      // Drifted single-hook group FIRST (rank 3 — same matcher, wrong timeout)
+      settings.hooks.PostToolUse = [
+        {
+          matcher: 'Write',
+          hooks: [{ type: 'command', command: ourCommand, timeout: 5000 }],
+        },
+        // Exact canonical group SECOND (rank 1)
+        exactGroup,
+      ];
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      assert.ok(ext, 'extensions integrity check missing');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/hypo-ext-canon settings entry differs/.test(detail),
+        `doctor falsely reported differs against drifted earlier occurrence: ${detail}`,
+      );
+      // It should still surface the duplicate (rank-1 canonical + rank-3 dup
+      // = 2 occurrences) so the user is told to run upgrade --apply.
+      assert.ok(
+        /hypo-ext-canon has 2 occurrences/.test(detail),
+        `doctor must surface duplicate-occurrence cleanup work: ${detail}`,
+      );
+    });
+  });
+});
+
+test('doctor-extensions-canonical-mirror: target-drift beats non-target-exact (rank 3 < rank 6) → warn `differs`', () => {
+  // Cross-event reviewer convergence (codex 2-worker pre-commit): the
+  // rank-3 occurrence under the TARGET event must beat a rank-6 exact-shape
+  // occurrence under a NON-target event, and doctor must surface "differs"
+  // (not "not registered"). Locks the semantics doctor and registerSettings
+  // share.
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-xevent.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const exactGroup = settings.hooks.PostToolUse.find((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-xevent.mjs')),
+      );
+      const ourCommand = exactGroup.hooks.find((h) =>
+        (h.command || '').includes('hypo-ext-xevent.mjs'),
+      ).command;
+
+      // Replace target event with a DRIFTED single-hook (rank 3) and add the
+      // EXACT-shape group under PreToolUse (rank 6 — wrong event). Doctor must
+      // pick rank 3 as canonical and warn "differs", not "not registered".
+      settings.hooks.PostToolUse = [
+        {
+          matcher: 'Write',
+          hooks: [{ type: 'command', command: ourCommand, timeout: 5000 }],
+        },
+      ];
+      settings.hooks.PreToolUse = [exactGroup];
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /hypo-ext-xevent settings entry differs/.test(detail),
+        `doctor must warn "differs" on target-drift even with non-target exact: ${detail}`,
+      );
+      assert.ok(
+        !/hypo-ext-xevent not registered/.test(detail),
+        `doctor must NOT warn "not registered" — target-rank-3 outranks non-target-rank-6: ${detail}`,
+      );
+    });
+  });
+});
+
+test('doctor-extensions-canonical-mirror: rank-1 alone is silent (no false dup warn)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-clean.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/hypo-ext-clean/.test(detail),
+        `clean install must not surface any ext warn: ${detail}`,
+      );
+    });
+  });
+});
+
+// fix #47 follow-up (CONCERN 2, empty matcher normalization):
+// parseManifest accepted `matcher: ""` as valid, but downstream `if
+// (entry.matcher)` silently dropped it from desiredGroup — a semantic
+// collapse where the manifest's expressed-empty matcher was treated as
+// "absent". Fix: normalize `""` → undefined at the boundary (parseManifest)
+// so EVERY consumer (rankOccurrence, registerSettings, doctor) agrees.
+test('parseManifest-empty-matcher: matcher:"" is normalized to undefined (CONCERN 2)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-empty.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PreToolUse',
+        matcher: '',
+      });
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r1.status, 0, `first apply: ${r1.stderr}`);
+
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const ourGroup = (after.hooks.PreToolUse || []).find((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-empty.mjs')),
+      );
+      assert.ok(ourGroup, 'our hook must be registered');
+      assert.ok(
+        !('matcher' in ourGroup),
+        `matcher:"" should be normalized to absent, got: ${JSON.stringify(ourGroup.matcher)}`,
+      );
+
+      // Idempotent: byte-equal on a second --apply
+      const before = readFileSync(settingsPath, 'utf-8');
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second apply: ${r2.stderr}`);
+      assert.equal(readFileSync(settingsPath, 'utf-8'), before, 'second apply byte-equal no-op');
+
+      // doctor must agree — no `differs` warn for the empty-matcher entry
+      const dr = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(dr.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/hypo-ext-empty/.test(detail),
+        `doctor falsely warned on empty-matcher entry: ${detail}`,
+      );
+    });
+  });
+});
+
 // ── extensions companion uninstall (ADR 0024, fix #34) ───────────────────────
 
 suite('extensions companion uninstall (uninstall.mjs, ADR 0024)');
