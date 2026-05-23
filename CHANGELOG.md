@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lint` emits `W8` design-history-stale warning (fix #49).** The PreCompact
+  hook (`hypo-personal-check.mjs`) has filtered `lint --json` warns for
+  `id === 'W8'` since the initial OSS hook drop, but `scripts/lint.mjs` never
+  emitted that id — so `design-history.md` aging next to a fresher
+  `session-log.md` (or `session-log/YYYY-MM.md` directory layout) was silently
+  invisible to the gate. Lint now runs `findDesignHistoryStale()` once per
+  project (outside the page loop), and emits a `W8`-tagged warn per stale
+  project with a POSIX-separated `file` literal (`projects/<name>/design-history.md`)
+  so the consumer's `file.split('/')` contract stays portable. The JSON `warn`
+  shape gains an optional `id` field, omitted for legacy id-less warns.
 - **`hypomnema upgrade --codex` mirrors core hooks (fix #48).** `init --codex`
   has always installed Hypomnema's core hooks into `~/.codex/hooks/` and
   registered them in `~/.codex/settings.json`, but `upgrade` only mirrored

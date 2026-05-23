@@ -120,7 +120,7 @@ If you need to share new logic, prefer extending an existing helper over adding 
 
 ```bash
 npm test       # tests/runner.mjs — unit + smoke + contract tests
-npm run lint   # scripts/lint.mjs — frontmatter + wikilink validation
+npm run lint   # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale vs session-log)
 ```
 
 The test runner uses only Node.js built-ins. Tests create scoped temp directories and clean up after themselves; you can run the suite without any environment setup.
