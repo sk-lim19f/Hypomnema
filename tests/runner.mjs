@@ -2964,6 +2964,451 @@ test('doctor-extensions-integrity: --codex target', () => {
   });
 });
 
+// ── extensions settings.json mixed-group surgical write (fix #47, ADR 0024 amend 2026-05-23) ──
+//
+// registerSettings used to ignore mixed-group occurrences of our command (any
+// group where g.hooks.length > 1) — leaving us either drifted in place or
+// duplicated as a fresh append. fix #47 makes the write-path surgical: locate
+// every occurrence (single + mixed across every event), rank by 8-step
+// priority, pick canonical, drop duplicates, mutate with the lowest-disturbance
+// edit. Foreign hooks and the hosting group's matcher are NEVER modified.
+
+suite('extensions settings.json mixed-group surgical write (lib/extensions.mjs, fix #47)');
+
+// Helper: inject a foreign sibling hook into the matcher group that already
+// owns our hypo-ext-* command. Returns the path so the test can re-read.
+function injectForeignSibling(home, event, ourCmdSubstr, foreignHook) {
+  const settingsPath = join(home, '.claude', 'settings.json');
+  const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+  const groups = settings.hooks[event] || [];
+  const ourGroupIdx = groups.findIndex((g) =>
+    (g.hooks || []).some((h) => (h.command || '').includes(ourCmdSubstr)),
+  );
+  assert.ok(ourGroupIdx !== -1, `our hook not found in ${event} groups`);
+  groups[ourGroupIdx].hooks.push(foreignHook);
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  return settingsPath;
+}
+
+test('extensions-settings-mixed-group: foreign sibling preserved, our hook in-place patched on timeout drift (rank 4)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-mixed.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write|Edit',
+        timeout: 10000,
+      });
+      const r1 = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
+        home,
+      );
+      assert.equal(r1.status, 0, `first apply: ${r1.stderr}`);
+
+      // Inject foreign sibling into our matcher group.
+      const settingsPath = injectForeignSibling(home, 'PostToolUse', 'hypo-ext-mixed.mjs', {
+        type: 'command',
+        command: 'node /other/plugin/hook.mjs',
+        timeout: 5000,
+      });
+
+      // Drift the manifest timeout — same matcher, same event, our hook fields change.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-mixed.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write|Edit',
+        timeout: 20000,
+      });
+      const r2 = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
+        home,
+      );
+      assert.equal(r2.status, 0, `second apply: ${r2.stderr}`);
+
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const groups = after.hooks.PostToolUse || [];
+      const mixed = groups.find((g) => g.hooks.length === 2);
+      assert.ok(mixed, 'mixed group should still exist (foreign + ours)');
+      assert.equal(mixed.matcher, 'Write|Edit', 'group matcher untouched');
+
+      const foreign = mixed.hooks.find((h) => h.command === 'node /other/plugin/hook.mjs');
+      assert.ok(foreign, 'foreign hook preserved');
+      assert.equal(foreign.timeout, 5000, 'foreign timeout never modified');
+
+      const ours = mixed.hooks.find((h) => (h.command || '').includes('hypo-ext-mixed.mjs'));
+      assert.ok(ours, 'our hook still in-place inside mixed group');
+      assert.equal(ours.timeout, 20000, 'our hook timeout patched in-place');
+
+      const ourSingles = groups.filter(
+        (g) =>
+          g.hooks.length === 1 && (g.hooks[0].command || '').includes('hypo-ext-mixed.mjs'),
+      );
+      assert.equal(ourSingles.length, 0, 'no duplicate single-hook group appended');
+    });
+  });
+});
+
+test('extensions-settings-mixed-group: matcher change extracts our hook, foreign keeps original group + matcher (rank 5)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-matcher.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      const settingsPath = injectForeignSibling(home, 'PostToolUse', 'hypo-ext-matcher.mjs', {
+        type: 'command',
+        command: 'node /other/plugin/hook.mjs',
+      });
+
+      // Matcher changes: our hook must extract; foreign stays under 'Write'.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-matcher.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Edit',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const groups = after.hooks.PostToolUse || [];
+
+      const foreignGroup = groups.find(
+        (g) =>
+          g.hooks.length === 1 && g.hooks[0].command === 'node /other/plugin/hook.mjs',
+      );
+      assert.ok(foreignGroup, 'foreign hook left behind in its own single-hook group');
+      assert.equal(
+        foreignGroup.matcher,
+        'Write',
+        'foreign group keeps the ORIGINAL matcher (never edited by us)',
+      );
+
+      const ourGroup = groups.find(
+        (g) =>
+          g.hooks.length === 1 &&
+          (g.hooks[0].command || '').includes('hypo-ext-matcher.mjs'),
+      );
+      assert.ok(ourGroup, 'our hook extracted into new single-hook group');
+      assert.equal(ourGroup.matcher, 'Edit', 'our new group adopts the manifest matcher');
+    });
+  });
+});
+
+test('extensions-settings-mixed-group: event change extracts our hook, foreign keeps original event (rank 7)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-event.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      const settingsPath = injectForeignSibling(home, 'PostToolUse', 'hypo-ext-event.mjs', {
+        type: 'command',
+        command: 'node /other/plugin/hook.mjs',
+      });
+
+      // Event changes from PostToolUse → PreToolUse.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-event.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PreToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const post = after.hooks.PostToolUse || [];
+      const pre = after.hooks.PreToolUse || [];
+
+      const foreignGroup = post.find(
+        (g) =>
+          g.hooks.length === 1 && g.hooks[0].command === 'node /other/plugin/hook.mjs',
+      );
+      assert.ok(
+        foreignGroup,
+        'foreign hook stays under PostToolUse with the original matcher',
+      );
+      assert.equal(foreignGroup.matcher, 'Write');
+
+      const ourGroup = pre.find(
+        (g) =>
+          g.hooks.length === 1 &&
+          (g.hooks[0].command || '').includes('hypo-ext-event.mjs'),
+      );
+      assert.ok(ourGroup, 'our hook moved to PreToolUse single-hook group');
+      assert.equal(ourGroup.matcher, 'Write');
+
+      // Ours must NOT be in PostToolUse anymore.
+      const stillPost = post.find((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-event.mjs')),
+      );
+      assert.equal(stillPost, undefined, 'our hook fully removed from PostToolUse');
+    });
+  });
+});
+
+test('extensions-settings-multi-occurrence-cleanup: duplicate single + mixed converges to one canonical', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-dup.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      // Hand-corrupt settings: keep the canonical single-hook group AND add a
+      // stale mixed-group occurrence under PreToolUse (event drift + foreign).
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      settings.hooks.PreToolUse = settings.hooks.PreToolUse || [];
+      settings.hooks.PreToolUse.push({
+        matcher: 'Edit',
+        hooks: [
+          { type: 'command', command: 'node /other/plugin/hook.mjs' },
+          {
+            type: 'command',
+            command: settings.hooks.PostToolUse[
+              settings.hooks.PostToolUse.findIndex((g) =>
+                (g.hooks || []).some((h) =>
+                  (h.command || '').includes('hypo-ext-dup.mjs'),
+                ),
+              )
+            ].hooks[0].command,
+            timeout: 9999,
+          },
+        ],
+      });
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+      const r = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
+        home,
+      );
+      assert.equal(r.status, 0, `apply failed: ${r.stderr}`);
+
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      // After cleanup: exactly one occurrence of our command, under PostToolUse
+      // (the rank-1 canonical), foreign hook in PreToolUse preserved alone.
+      const allEvents = ['PreToolUse', 'PostToolUse', 'Stop', 'UserPromptSubmit', 'SessionStart'];
+      let ourCount = 0;
+      for (const ev of allEvents) {
+        for (const g of after.hooks[ev] || []) {
+          for (const h of g.hooks || []) {
+            if ((h.command || '').includes('hypo-ext-dup.mjs')) ourCount += 1;
+          }
+        }
+      }
+      assert.equal(ourCount, 1, 'exactly one canonical occurrence after cleanup');
+
+      const foreignSurvived = (after.hooks.PreToolUse || []).some((g) =>
+        (g.hooks || []).some((h) => h.command === 'node /other/plugin/hook.mjs'),
+      );
+      assert.ok(foreignSurvived, 'foreign hook in PreToolUse preserved');
+    });
+  });
+});
+
+test('extensions-settings-mixed-group-idempotent: second --apply over a mixed-group canonical is a byte-equal no-op', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-idem.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      const settingsPath = injectForeignSibling(home, 'PostToolUse', 'hypo-ext-idem.mjs', {
+        type: 'command',
+        command: 'node /other/plugin/hook.mjs',
+      });
+
+      // First apply over the now-mixed group: rank-2 exact (matcher+hook match).
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      const before = readFileSync(settingsPath, 'utf-8');
+
+      const r2 = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
+        home,
+      );
+      assert.equal(r2.status, 0, `idempotent apply: ${r2.stderr}`);
+      const after = readFileSync(settingsPath, 'utf-8');
+      assert.equal(after, before, 'second apply drifted the file (not byte-equal)');
+
+      const out2 = JSON.parse(r2.stdout);
+      assert.equal(
+        out2.applied.extensions.settingsChanged,
+        false,
+        'idempotent apply reports settingsChanged=false',
+      );
+    });
+  });
+});
+
+// BLOCKER #1 regression (pre-commit codex 2-worker convergence 2026-05-23):
+// reference-based locators must survive cleanup-then-mutate even when an
+// earlier same-event group is removed during cleanup. The numeric-index
+// locator used to silently overwrite a foreign-only group at the stale index.
+test('extensions-settings-cleanup-shift: same-event lower-index duplicate removal preserves foreign-only neighbour (BLOCKER #1)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-shift.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      const r1 = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
+        home,
+      );
+      assert.equal(r1.status, 0, `first apply: ${r1.stderr}`);
+
+      // Hand-corrupt: build a settings.json with [corrupt-ours-mixed, canonical-
+      // ours-single-drift, foreign-only-group] in that traversal order. cleanup
+      // will remove [0] (corrupt mixed has ONLY our hook duplicated), causing a
+      // same-event groupIdx shift; with numeric locators the canonical at idx 1
+      // would re-point to the foreign-only group at idx 2 (now idx 1 after shift)
+      // and silently overwrite it.
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const existing = settings.hooks.PostToolUse.find((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-shift.mjs')),
+      );
+      const ourCommand = existing.hooks.find((h) =>
+        (h.command || '').includes('hypo-ext-shift.mjs'),
+      ).command;
+      // Replace PostToolUse with the staged corrupt layout.
+      settings.hooks.PostToolUse = [
+        // [0] corrupt: two of our hook in one group (no foreign).
+        {
+          matcher: 'Edit',
+          hooks: [
+            { type: 'command', command: ourCommand },
+            { type: 'command', command: ourCommand, timeout: 9999 },
+          ],
+        },
+        // [1] canonical ours-single with timeout drift.
+        {
+          matcher: 'Write',
+          hooks: [{ type: 'command', command: ourCommand, timeout: 5000 }],
+        },
+        // [2] foreign-only group — must survive untouched.
+        {
+          matcher: 'Read',
+          hooks: [{ type: 'command', command: 'node /foreign/keep.mjs', timeout: 1234 }],
+        },
+      ];
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+      const r2 = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
+        home,
+      );
+      assert.equal(r2.status, 0, `apply must not crash on cleanup-shift: ${r2.stderr}`);
+
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const post = after.hooks.PostToolUse || [];
+
+      // Foreign-only group survives, exactly as-is (no overwrite).
+      const foreign = post.find(
+        (g) =>
+          g.hooks.length === 1 &&
+          g.hooks[0].command === 'node /foreign/keep.mjs',
+      );
+      assert.ok(foreign, 'foreign-only group must survive cleanup-shift');
+      assert.equal(foreign.matcher, 'Read', 'foreign matcher untouched');
+      assert.equal(foreign.hooks[0].timeout, 1234, 'foreign timeout untouched');
+
+      // Exactly one occurrence of our command remains, with manifest shape.
+      let ourCount = 0;
+      let ourEntry = null;
+      let ourGroup = null;
+      for (const g of post) {
+        for (const h of g.hooks || []) {
+          if (h.command === ourCommand) {
+            ourCount += 1;
+            ourEntry = h;
+            ourGroup = g;
+          }
+        }
+      }
+      assert.equal(ourCount, 1, `expected exactly 1 canonical, got ${ourCount}`);
+      assert.equal(ourEntry.timeout, 10000, 'canonical entry has manifest timeout');
+      assert.equal(ourGroup.matcher, 'Write', 'canonical group has manifest matcher');
+    });
+  });
+});
+
+test('doctor-extensions-mixed-group-ownership: doctor accepts mixed-group occurrence (no false "not registered")', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-doctor.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write',
+        timeout: 10000,
+      });
+      runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+
+      injectForeignSibling(home, 'PostToolUse', 'hypo-ext-doctor.mjs', {
+        type: 'command',
+        command: 'node /other/plugin/hook.mjs',
+      });
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      assert.equal(r.status, 0, `doctor exit: ${r.stderr}`);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      assert.ok(ext, 'extensions integrity check missing');
+      // Doctor must NOT warn `hypo-ext-doctor.mjs not registered` — the
+      // mixed-group occurrence is valid ownership under fix #47.
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/hypo-ext-doctor\.mjs not registered/.test(detail),
+        `doctor falsely reported not-registered: ${detail}`,
+      );
+    });
+  });
+});
+
 // ── extensions companion uninstall (ADR 0024, fix #34) ───────────────────────
 
 suite('extensions companion uninstall (uninstall.mjs, ADR 0024)');
