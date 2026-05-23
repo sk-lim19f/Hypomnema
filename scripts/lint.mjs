@@ -19,6 +19,7 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import { parseSchemaVocab, checkForbidden, parseSchemaPageDirs } from './lib/schema-vocab.mjs';
+import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -197,8 +198,8 @@ const VALID_TYPES = [
 
 const issues = [];
 
-function issue(severity, rel, msg, fullPath = null) {
-  issues.push({ severity, file: rel, message: msg, path: fullPath });
+function issue(severity, rel, msg, fullPath = null, id = null) {
+  issues.push({ severity, file: rel, message: msg, path: fullPath, id });
 }
 
 function hasHeading(content, heading) {
@@ -349,6 +350,21 @@ const pageDirs = parseSchemaPageDirs(args.hypoDir);
 
 for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs);
 
+// W8: design-history.md stale relative to session-log.md. Emitted once per
+// project (not per page) — runs outside the page loop. POSIX-separated path
+// literal (not path.join) so consumers can rely on `file.split('/')` shape
+// regardless of host OS — `hooks/hypo-personal-check.mjs:246` depends on this.
+for (const s of findDesignHistoryStale(args.hypoDir)) {
+  const gap = s.diffDays != null ? ` (${s.diffDays}일 차이)` : '';
+  issue(
+    'warn',
+    `projects/${s.project}/design-history.md`,
+    `design-history stale: session-log 최신=${s.lastSession} > design-history 최신=${s.lastDesignHistory}${gap} — projects/${s.project}/design-history.md에 설계 변경 사항을 append 하세요`,
+    null,
+    'W8',
+  );
+}
+
 if (args.fix) {
   const today = new Date().toISOString().slice(0, 10);
   const fixed = new Set();
@@ -392,7 +408,8 @@ const errors = issues.filter((i) => i.severity === 'error');
 const warns = issues.filter((i) => i.severity === 'warn');
 
 if (args.json) {
-  const toOut = ({ severity, file, message }) => ({ severity, file, message });
+  const toOut = ({ severity, file, message, id }) =>
+    id ? { severity, file, message, id } : { severity, file, message };
   console.log(
     JSON.stringify(
       {
