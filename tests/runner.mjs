@@ -737,6 +737,18 @@ function runHook(hookFile, stdinData, extraEnv = {}) {
   });
 }
 
+// Local-date "today" matching scripts/crystallize.mjs's todayLocal(). The
+// session-close fixture models files Claude writes (session-state, project
+// hot.md, root hot.md, session-log, log.md) — those are user-facing wiki
+// content keyed to the harness's local `currentDate`. Using toISOString()
+// (UTC) here flakes in KST early morning, where the fixture stamps yesterday
+// (UTC) but crystallize returns today (local). See learnings/hook-utc-date-
+// vs-local-file-dates.md and fix #39.
+function todayLocal() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 // Build a fully session-closed wiki tree: root hot.md + log.md plus the 4
 // project memory files (session-state, project hot.md, session-log) all
 // carrying today's date. Mirrors the strict session-close gate (5 mandatory
@@ -774,7 +786,7 @@ function buildCleanWikiTree(dir, today) {
 function withWiki(mutate, fn) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
   try {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayLocal();
     buildCleanWikiTree(dir, today);
     if (mutate) mutate(dir, today);
     spawnSync('git', ['init'], { cwd: dir, encoding: 'utf-8' });
