@@ -14,7 +14,10 @@
  *   --apply             Apply hook file updates and settings.json merges
  *   --force-commands    Overwrite user-modified slash command files (creates .bak)
  *   --force-extensions  Overwrite user-modified / conflicting extension copies (creates .bak)
- *   --codex             Also sync extensions into ~/.codex/{hooks,commands} + settings.json
+ *   --codex             Mirror to ~/.codex/{hooks,commands,settings.json} — core
+ *                       hook drift/apply, settings.json registration, the
+ *                       wiki-*.mjs → hypo-*.mjs rename migration (fix #48), and
+ *                       the user-extensions companion sync (E4 / fix #32).
  *   --json              Output results as JSON
  */
 
@@ -218,13 +221,15 @@ function checkSchemaVersion(hypoDir) {
   };
 }
 
-function checkHookFiles() {
-  const claudeHooks = join(HOME, '.claude', 'hooks');
+// Target-aware: the same core-hook integrity check runs against ~/.claude/hooks/
+// for the default claude target, and against ~/.codex/hooks/ when --codex is set
+// (fix #48, ADR 0024). The function reads only — apply happens in applyHookFiles.
+function checkHookFiles(hooksDir) {
   const results = [];
 
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
   for (const file of allFiles) {
-    const installedPath = join(claudeHooks, file);
+    const installedPath = join(hooksDir, file);
     const srcPath = join(HOOKS_SRC, file);
 
     if (!existsSync(installedPath)) {
@@ -246,9 +251,10 @@ function checkHookFiles() {
   return results;
 }
 
-function checkSettingsJson() {
-  const settingsPath = join(HOME, '.claude', 'settings.json');
-  const hooksDir = join(HOME, '.claude', 'hooks');
+// Same target-aware shape as checkHookFiles — the registered command string is
+// reconstructed from `hooksDir`, so a codex check verifies that ~/.codex/settings.json
+// references ~/.codex/hooks/<file>.mjs (not the claude path).
+function checkSettingsJson(settingsPath, hooksDir) {
   const results = [];
 
   let settings = {};
@@ -275,9 +281,11 @@ function checkSettingsJson() {
 
 // ── apply actions ────────────────────────────────────────────────────────────
 
-function applyHookFiles(hookResults) {
-  const claudeHooks = join(HOME, '.claude', 'hooks');
-  mkdirSync(claudeHooks, { recursive: true });
+// `hooksDir` is the target the stale/missing paths in `hookResults` already point
+// at (the check above embeds the absolute installedPath). The directory is created
+// up front so first-time codex installs (~/.codex/hooks/ absent) succeed.
+function applyHookFiles(hookResults, hooksDir) {
+  mkdirSync(hooksDir, { recursive: true });
 
   const applied = [];
   for (const h of hookResults) {
@@ -289,8 +297,7 @@ function applyHookFiles(hookResults) {
   return applied;
 }
 
-function applySettingsJson(settingsResults) {
-  const settingsPath = join(HOME, '.claude', 'settings.json');
+function applySettingsJson(settingsResults, settingsPath) {
   let settings = {};
   if (existsSync(settingsPath)) {
     try {
@@ -305,6 +312,17 @@ function applySettingsJson(settingsResults) {
   for (const s of settingsResults) {
     if (s.status !== 'missing') continue;
     if (!Array.isArray(settings.hooks[s.event])) settings.hooks[s.event] = [];
+    // fix #48 BLOCKER: re-check the current parsed settings before appending.
+    // applyHookNameMigration may have rewritten a legacy wiki-*.mjs command to
+    // exactly `s.cmd` between checkSettingsJson and now — appending without
+    // this guard creates a duplicate registration (codex 2-worker review
+    // reproduced 11 duplicate hypo-*.mjs entries on a wiki-only legacy settings
+    // file). The precheck list is allowed to be stale; the apply path must
+    // self-heal against the on-disk truth.
+    const alreadyPresent = settings.hooks[s.event]
+      .flatMap((g) => g.hooks || [])
+      .some((h) => h.command === s.cmd);
+    if (alreadyPresent) continue;
     settings.hooks[s.event].push({ hooks: [{ type: 'command', command: s.cmd }] });
     applied.push(`${s.event}: ${s.file}`);
   }
@@ -331,8 +349,9 @@ const HOOK_RENAMES = {
   'personal-wiki-check.mjs': 'hypo-personal-check.mjs',
 };
 
-function checkOldHookNames() {
-  const settingsPath = join(HOME, '.claude', 'settings.json');
+// Same target-aware shape: scans either ~/.claude/settings.json or ~/.codex/settings.json
+// for v1.0/v1.1 `wiki-*.mjs` references that need renaming to `hypo-*.mjs`.
+function checkOldHookNames(settingsPath) {
   if (!existsSync(settingsPath)) return [];
   let settings;
   try {
@@ -355,9 +374,7 @@ function checkOldHookNames() {
   return found;
 }
 
-function applyHookNameMigration(oldRefs) {
-  const settingsPath = join(HOME, '.claude', 'settings.json');
-  const hooksDir = join(HOME, '.claude', 'hooks');
+function applyHookNameMigration(oldRefs, settingsPath, hooksDir) {
   if (!existsSync(settingsPath)) return [];
 
   let settings;
@@ -383,7 +400,8 @@ function applyHookNameMigration(oldRefs) {
 
   if (applied.length > 0) {
     writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
-    // Copy renamed hook files to ~/.claude/hooks/
+    // Copy renamed hook files to the target hooks dir (~/.claude/hooks or
+    // ~/.codex/hooks per the caller — fix #48 mirror).
     for (const [oldName, newName] of Object.entries(HOOK_RENAMES)) {
       const oldPath = join(hooksDir, oldName);
       const newPath = join(hooksDir, newName);
@@ -653,18 +671,32 @@ function applyCommands(commandResults, force) {
 
 const args = parseArgs(process.argv);
 
+// Target paths. Claude is always checked; codex is checked only when --codex is set
+// (fix #48, ADR 0024) so users without codex installed see no false drift.
+const claudeHooksDir = join(HOME, '.claude', 'hooks');
+const claudeSettingsPath = join(HOME, '.claude', 'settings.json');
+const codexHooksDir = join(HOME, '.codex', 'hooks');
+const codexSettingsPath = join(HOME, '.codex', 'settings.json');
+
 const schema = checkSchemaVersion(args.hypoDir);
-const hooks = checkHookFiles();
-const settings = checkSettingsJson();
+const hooks = checkHookFiles(claudeHooksDir);
+const settings = checkSettingsJson(claudeSettingsPath, claudeHooksDir);
 const pkgJson = checkPkgJson();
 const commands = checkCommands();
-const oldHookRefs = checkOldHookNames();
+const oldHookRefs = checkOldHookNames(claudeSettingsPath);
 const hypoignore = checkHypoignore(args.hypoDir);
+
+// fix #48: when --codex is set, mirror the same core-hook checks against ~/.codex/
+// so `hypomnema upgrade --codex` reports drift symmetrically and `--apply --codex`
+// updates both targets in one pass (matching init.mjs behaviour).
+const hooksCodex = args.codex ? checkHookFiles(codexHooksDir) : null;
+const settingsCodex = args.codex ? checkSettingsJson(codexSettingsPath, codexHooksDir) : null;
+const oldHookRefsCodex = args.codex ? checkOldHookNames(codexSettingsPath) : null;
 
 // Extensions companion (ADR 0024, fix #29 + #30). Read-only check; the apply
 // happens below, AFTER applyCommands, so the per-target SHA map merges into the
 // hypo-pkg.json that applyCommands writes (rather than being clobbered by it).
-const extSettingsPath = join(HOME, '.claude', 'settings.json');
+const extSettingsPath = claudeSettingsPath;
 const extDir = join(args.hypoDir, 'extensions');
 const extCheck = syncExtensions({
   extDir,
@@ -679,7 +711,7 @@ const extCheck = syncExtensions({
 // E4 (#32): --codex mirrors the extensions sync into ~/.codex (hooks + commands
 // only; skills/agents skipped with a notice). The per-target SHA map lives in the
 // same ~/.claude/hypo-pkg.json under extensions.codex, so pkgPath is unchanged.
-const extCodexSettingsPath = join(HOME, '.codex', 'settings.json');
+const extCodexSettingsPath = codexSettingsPath;
 const extCheckCodex = args.codex
   ? syncExtensions({
       extDir,
@@ -697,6 +729,17 @@ const staleHooks = hooks.filter(
 );
 const missingSettings = settings.filter((s) => s.status === 'missing');
 const invalidSettings = settings.some((s) => s.status === 'invalid-json');
+const staleHooksCodex = hooksCodex
+  ? hooksCodex.filter(
+      (h) => h.status === 'stale' || h.status === 'missing' || h.status === 'src-missing',
+    )
+  : [];
+const missingSettingsCodex = settingsCodex
+  ? settingsCodex.filter((s) => s.status === 'missing')
+  : [];
+const invalidSettingsCodex = settingsCodex
+  ? settingsCodex.some((s) => s.status === 'invalid-json')
+  : false;
 const schemaDrift = schema.bump !== 'none' && schema.bump !== 'unknown' && schema.bump !== 'ahead';
 const pkgJsonDrift = pkgJson.status !== 'up-to-date';
 const staleCommands = commands.filter((c) => c.status === 'stale' || c.status === 'missing');
@@ -711,6 +754,9 @@ let appliedHooks = [];
 let appliedSettings = [];
 let appliedPkgJson = false;
 let appliedHookNameRenames = [];
+let appliedHooksCodex = [];
+let appliedSettingsCodex = [];
+let appliedHookNameRenamesCodex = [];
 let appliedCommands = [];
 let appliedHypoignore = [];
 let appliedExtensions = null;
@@ -718,17 +764,34 @@ let appliedExtensionsCodex = null;
 
 if (args.apply) {
   if (oldHookRefs.length > 0) {
-    appliedHookNameRenames = applyHookNameMigration(oldHookRefs);
+    appliedHookNameRenames = applyHookNameMigration(
+      oldHookRefs,
+      claudeSettingsPath,
+      claudeHooksDir,
+    );
   }
   if (schema.bump === 'major' && schema.installed && schema.current && existsSync(args.hypoDir)) {
     migrationPath = writeMigrationReport(args.hypoDir, schema.installed, schema.current);
   }
-  appliedHooks = applyHookFiles(hooks);
-  appliedSettings = applySettingsJson(settings);
+  appliedHooks = applyHookFiles(hooks, claudeHooksDir);
+  appliedSettings = applySettingsJson(settings, claudeSettingsPath);
   // applyCommands handles the single atomic hypo-pkg.json write (pkgRoot, version, schema, commands map)
   appliedCommands = applyCommands(commands, args.forceCommands);
   appliedPkgJson = true;
   appliedHypoignore = applyHypoignoreMigration(hypoignore);
+  // fix #48: codex core hooks + settings + wiki-*→hypo-* rename mirror. Same order
+  // as the claude side (rename first so subsequent hook copy can find renamed targets).
+  if (args.codex) {
+    if (oldHookRefsCodex.length > 0) {
+      appliedHookNameRenamesCodex = applyHookNameMigration(
+        oldHookRefsCodex,
+        codexSettingsPath,
+        codexHooksDir,
+      );
+    }
+    appliedHooksCodex = applyHookFiles(hooksCodex, codexHooksDir);
+    appliedSettingsCodex = applySettingsJson(settingsCodex, codexSettingsPath);
+  }
   // After applyCommands wrote hypo-pkg.json — merges extensions.<target> alongside.
   appliedExtensions = syncExtensions({
     extDir,
@@ -759,6 +822,15 @@ if (args.apply) {
 
 const extDrift = extCheck.needsWork || (extCheckCodex?.needsWork ?? false);
 
+// fix #48: codex drift only counts when --codex is set — without the flag the codex
+// target is intentionally unobserved (parity with the existing extensions pattern).
+const codexCoreDrift =
+  args.codex &&
+  (staleHooksCodex.length > 0 ||
+    missingSettingsCodex.length > 0 ||
+    invalidSettingsCodex ||
+    (oldHookRefsCodex?.length ?? 0) > 0);
+
 const hasDrift =
   staleHooks.length > 0 ||
   missingSettings.length > 0 ||
@@ -771,7 +843,8 @@ const hasDrift =
   orphanedCommands.length > 0 ||
   nonRegularCommands.length > 0 ||
   hypoignore.status === 'needs-migration' ||
-  extDrift;
+  extDrift ||
+  codexCoreDrift;
 
 if (args.json) {
   console.log(
@@ -786,6 +859,10 @@ if (args.json) {
         hypoignore,
         extensions: extCheck,
         extensionsCodex: extCheckCodex,
+        // fix #48: codex core mirror (null when --codex absent).
+        hooksCodex,
+        settingsCodex,
+        oldHookRefsCodex,
         applied: {
           hooks: appliedHooks,
           settings: appliedSettings,
@@ -795,6 +872,9 @@ if (args.json) {
           hypoignore: appliedHypoignore,
           extensions: appliedExtensions,
           extensionsCodex: appliedExtensionsCodex,
+          hooksCodex: appliedHooksCodex,
+          settingsCodex: appliedSettingsCodex,
+          hookNameRenamesCodex: appliedHookNameRenamesCodex,
         },
         migrationReport: migrationPath,
       },
@@ -835,47 +915,51 @@ if (schema.bump === 'none') {
   );
 }
 
-// Hook files
-const upToDate = hooks.filter((h) => h.status === 'up-to-date').length;
-const staleCount = hooks.filter((h) => h.status === 'stale').length;
-const missCount = hooks.filter((h) => h.status === 'missing').length;
-const srcMiss = hooks.filter((h) => h.status === 'src-missing').length;
-
-if (staleCount === 0 && missCount === 0 && srcMiss === 0) {
-  lines.push(`✓ Hook files        ${upToDate}/${hooks.length} up to date`);
-} else {
-  lines.push(
-    `⚠ Hook files        ${upToDate} up to date, ${staleCount} stale, ${missCount} missing, ${srcMiss} src-missing:`,
-  );
-  for (const h of hooks) {
-    if (h.status === 'up-to-date') {
-      lines.push(`    ✓ ${h.file}`);
-    } else if (h.status === 'stale') {
-      lines.push(`    ⚠ ${h.file}  [stale — package has newer version]`);
-    } else if (h.status === 'missing') {
-      lines.push(`    ✗ ${h.file}  [not found in ~/.claude/hooks/]`);
-    } else if (h.status === 'src-missing') {
-      lines.push(`    ⚠ ${h.file}  [installed but missing from package — may be orphaned]`);
+// Hook files (target-aware so --codex can mirror the same block; fix #48).
+function pushHookSummary(hookList, label, targetPath) {
+  const colHook = `Hook files${label}`.padEnd(20);
+  const up = hookList.filter((h) => h.status === 'up-to-date').length;
+  const st = hookList.filter((h) => h.status === 'stale').length;
+  const mi = hookList.filter((h) => h.status === 'missing').length;
+  const sm = hookList.filter((h) => h.status === 'src-missing').length;
+  if (st === 0 && mi === 0 && sm === 0) {
+    lines.push(`✓ ${colHook}${up}/${hookList.length} up to date`);
+  } else {
+    lines.push(`⚠ ${colHook}${up} up to date, ${st} stale, ${mi} missing, ${sm} src-missing:`);
+    for (const h of hookList) {
+      if (h.status === 'up-to-date') {
+        lines.push(`    ✓ ${h.file}`);
+      } else if (h.status === 'stale') {
+        lines.push(`    ⚠ ${h.file}  [stale — package has newer version]`);
+      } else if (h.status === 'missing') {
+        lines.push(`    ✗ ${h.file}  [not found in ${targetPath}]`);
+      } else if (h.status === 'src-missing') {
+        lines.push(`    ⚠ ${h.file}  [installed but missing from package — may be orphaned]`);
+      }
     }
   }
 }
+pushHookSummary(hooks, '', '~/.claude/hooks/');
+if (hooksCodex) pushHookSummary(hooksCodex, ' (codex)', '~/.codex/hooks/');
 
-// settings.json
-const regCount = settings.filter((s) => s.status === 'registered').length;
-const missReg = settings.filter((s) => s.status === 'missing').length;
-
-if (invalidSettings) {
-  lines.push(`✗ settings.json     invalid JSON — fix or back it up before re-running`);
-} else if (missReg === 0) {
-  lines.push(`✓ settings.json     ${regCount}/${settings.length} hook registrations present`);
-} else {
-  lines.push(
-    `⚠ settings.json     ${regCount}/${settings.length} registrations present — ${missReg} missing:`,
-  );
-  for (const s of settings) {
-    if (s.status === 'missing') lines.push(`    + ${s.event}: ${s.file}`);
+// settings.json registrations (target-aware mirror; fix #48).
+function pushSettingsSummary(sList, label, invalidFlag) {
+  const colS = `settings.json${label}`.padEnd(20);
+  const reg = sList.filter((s) => s.status === 'registered').length;
+  const mr = sList.filter((s) => s.status === 'missing').length;
+  if (invalidFlag) {
+    lines.push(`✗ ${colS}invalid JSON — fix or back it up before re-running`);
+  } else if (mr === 0) {
+    lines.push(`✓ ${colS}${reg}/${sList.length} hook registrations present`);
+  } else {
+    lines.push(`⚠ ${colS}${reg}/${sList.length} registrations present — ${mr} missing:`);
+    for (const s of sList) {
+      if (s.status === 'missing') lines.push(`    + ${s.event}: ${s.file}`);
+    }
   }
 }
+pushSettingsSummary(settings, '', invalidSettings);
+if (settingsCodex) pushSettingsSummary(settingsCodex, ' (codex)', invalidSettingsCodex);
 
 // Package metadata
 if (pkgJson.status === 'up-to-date') {
@@ -929,16 +1013,21 @@ if (commands.length === 0) {
   }
 }
 
-// Old hook names (wiki-*.mjs → hypo-*.mjs rename migration)
-if (oldHookRefs.length > 0) {
-  lines.push(
-    `⚠ Hook name migration  ${oldHookRefs.length} old wiki-*.mjs reference(s) in settings.json — run --apply to rename:`,
-  );
-  for (const r of oldHookRefs)
-    lines.push(`    ${r.event}: ${r.oldName} → ${HOOK_RENAMES[r.oldName]}`);
-} else {
-  lines.push(`✓ Hook names        All hook references use current hypo-*.mjs names`);
+// Old hook names (wiki-*.mjs → hypo-*.mjs rename migration). Target-aware so
+// fix #48 surfaces codex settings.json that still references the v1.0/v1.1 names.
+function pushHookNameSummary(refs, label) {
+  if (refs.length > 0) {
+    lines.push(
+      `⚠ Hook name migration${label}  ${refs.length} old wiki-*.mjs reference(s) — run --apply to rename:`,
+    );
+    for (const r of refs) lines.push(`    ${r.event}: ${r.oldName} → ${HOOK_RENAMES[r.oldName]}`);
+  } else {
+    const colN = `Hook names${label}`.padEnd(20);
+    lines.push(`✓ ${colN}All hook references use current hypo-*.mjs names`);
+  }
 }
+pushHookNameSummary(oldHookRefs, '');
+if (oldHookRefsCodex) pushHookNameSummary(oldHookRefsCodex, ' (codex)');
 
 // .hypoignore migration (ensure required runtime patterns are present)
 if (hypoignore.status === 'no-file') {
@@ -1006,7 +1095,10 @@ if (
   appliedPkgJson ||
   appliedHookNameRenames.length > 0 ||
   appliedCommands.length > 0 ||
-  appliedHypoignore.length > 0
+  appliedHypoignore.length > 0 ||
+  appliedHooksCodex.length > 0 ||
+  appliedSettingsCodex.length > 0 ||
+  appliedHookNameRenamesCodex.length > 0
 ) {
   lines.push('');
   if (appliedHookNameRenames.length > 0) {
@@ -1031,6 +1123,19 @@ if (
   if (appliedHypoignore.length > 0) {
     lines.push(`✓ Appended .hypoignore entries (${appliedHypoignore.length}):`);
     for (const e of appliedHypoignore) lines.push(`    → ${e}`);
+  }
+  // fix #48: codex-target applied actions (mirrors claude blocks above).
+  if (appliedHookNameRenamesCodex.length > 0) {
+    lines.push(`✓ Renamed legacy hook references (codex) (${appliedHookNameRenamesCodex.length}):`);
+    for (const r of appliedHookNameRenamesCodex) lines.push(`    → ${r}`);
+  }
+  if (appliedHooksCodex.length > 0) {
+    lines.push(`✓ Updated hook files (codex) (${appliedHooksCodex.length}):`);
+    for (const f of appliedHooksCodex) lines.push(`    → ${f}`);
+  }
+  if (appliedSettingsCodex.length > 0) {
+    lines.push(`✓ Merged settings.json entries (codex) (${appliedSettingsCodex.length}):`);
+    for (const e of appliedSettingsCodex) lines.push(`    → ${e}`);
   }
 }
 
@@ -1083,7 +1188,12 @@ const totalDrift =
       ).length +
       extCheckCodex.conflicts.length +
       extCheckCodex.drifts.length
-    : 0);
+    : 0) +
+  // fix #48: codex core mirror counts the same way as the claude side.
+  staleHooksCodex.length +
+  missingSettingsCodex.length +
+  (invalidSettingsCodex ? 1 : 0) +
+  (oldHookRefsCodex?.length ?? 0);
 if (totalDrift === 0) {
   lines.push('Result: Hypomnema is up to date');
 } else if (args.apply) {
@@ -1100,7 +1210,10 @@ if (totalDrift === 0) {
     (appliedPkgJson ? 1 : 0) +
     appliedHookNameRenames.length +
     appliedHypoignore.length +
-    appliedExtCount;
+    appliedExtCount +
+    appliedHooksCodex.length +
+    appliedSettingsCodex.length +
+    appliedHookNameRenamesCodex.length;
   lines.push(`Result: ${total} update(s) applied. Run /hypo:doctor to verify.`);
 } else {
   lines.push(`Result: ${totalDrift} item(s) need updating — run with --apply to install`);

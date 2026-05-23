@@ -2768,6 +2768,409 @@ test('extensions-codex-sync: --force-extensions overwrites a drifted codex copy'
   });
 });
 
+// §5.1.2 fix #48 — `hypomnema upgrade --codex` must mirror the same core-hook
+// drift detection and apply that the claude side already does (init --codex
+// installs core hooks into ~/.codex/hooks + registers them in ~/.codex/settings.json
+// — upgrade had to catch up). Two cases:
+//   (a) init --codex then a stale codex hook → upgrade --apply --codex restores
+//   (b) init (no --codex) then upgrade --apply --codex installs codex from scratch
+// Both also assert that plain --apply (no --codex) never touches ~/.codex.
+test('upgrade-codex-core-hooks-mirror', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      // init --codex so ~/.codex/{hooks,settings.json} already exist.
+      const initR = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--codex'],
+        home,
+      );
+      assert.equal(initR.status, 0, `init --codex failed: ${initR.stderr}`);
+
+      const cdxHooks = join(home, '.codex', 'hooks');
+      const cdxSettings = join(home, '.codex', 'settings.json');
+      const claudeHooks = join(home, '.claude', 'hooks');
+      const cdxHookFile = join(cdxHooks, 'hypo-shared.mjs');
+      const claudeHookFile = join(claudeHooks, 'hypo-shared.mjs');
+
+      // Both targets must have the hook installed by init.
+      assert.ok(existsSync(cdxHookFile), 'init --codex must install core hooks to ~/.codex/hooks');
+      assert.ok(existsSync(claudeHookFile), 'init must install core hooks to ~/.claude/hooks');
+
+      // Mutate the codex copy → introduce stale drift. Same byte change in claude
+      // would be detected too (regression for both sides).
+      writeFileSync(cdxHookFile, '// drifted codex hook\n');
+      writeFileSync(claudeHookFile, '// drifted claude hook\n');
+
+      // ── (1) plain --apply (no --codex) must NEVER touch ~/.codex ─────────────
+      const rNo = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(rNo.status, 0, `claude-only apply failed: ${rNo.stderr}`);
+      assert.equal(
+        readFileSync(cdxHookFile, 'utf-8'),
+        '// drifted codex hook\n',
+        'plain --apply (no --codex) must not update the codex hook',
+      );
+      assert.notEqual(
+        readFileSync(claudeHookFile, 'utf-8'),
+        '// drifted claude hook\n',
+        'plain --apply must update the claude hook (sanity)',
+      );
+
+      // ── (2) upgrade --codex (no --apply) must report codex drift in JSON ────
+      const rCheck = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--codex', '--json'],
+        home,
+      );
+      assert.equal(rCheck.status, 1, 'codex drift must exit 1 in dry-run');
+      const checkJson = JSON.parse(rCheck.stdout);
+      assert.ok(
+        Array.isArray(checkJson.hooksCodex),
+        'JSON output must include hooksCodex when --codex is set',
+      );
+      assert.ok(
+        checkJson.hooksCodex.some((h) => h.file === 'hypo-shared.mjs' && h.status === 'stale'),
+        'codex hook drift must be reported as stale',
+      );
+
+      // ── (3) upgrade --apply --codex restores the codex hook ─────────────────
+      const rApply = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--codex', '--json'],
+        home,
+      );
+      assert.equal(rApply.status, 0, `upgrade --apply --codex failed: ${rApply.stderr}`);
+      const applyJson = JSON.parse(rApply.stdout);
+      assert.ok(
+        applyJson.applied.hooksCodex.includes('hypo-shared.mjs'),
+        'codex hook must appear in applied.hooksCodex',
+      );
+      assert.notEqual(
+        readFileSync(cdxHookFile, 'utf-8'),
+        '// drifted codex hook\n',
+        'codex hook must be restored from the package source',
+      );
+
+      // ── (4) idempotency: a second --apply --codex syncs nothing new ─────────
+      const rAgain = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--codex', '--json'],
+        home,
+      );
+      assert.equal(rAgain.status, 0, `second --apply --codex failed: ${rAgain.stderr}`);
+      const againJson = JSON.parse(rAgain.stdout);
+      assert.equal(
+        againJson.applied.hooksCodex.length,
+        0,
+        'idempotent re-apply must not update any codex hook',
+      );
+      assert.equal(
+        againJson.applied.settingsCodex.length,
+        0,
+        'idempotent re-apply must not register any codex settings entry',
+      );
+    });
+  });
+});
+
+// fix #48 — from-scratch case: `init` was run WITHOUT --codex, so ~/.codex does
+// not yet exist. `upgrade --apply --codex` must create both ~/.codex/hooks/ and
+// register every core hook in ~/.codex/settings.json (mirrors init --codex).
+test('upgrade-codex-core-hooks-from-scratch', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      // Claude-only init: ~/.codex must NOT exist beforehand.
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      assert.ok(
+        !existsSync(join(home, '.codex', 'hooks')),
+        '~/.codex/hooks must not exist before upgrade --codex',
+      );
+
+      // upgrade --codex (no --apply) must surface every codex hook as missing.
+      const rCheck = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--codex', '--json'],
+        home,
+      );
+      assert.equal(rCheck.status, 1, 'missing codex hooks must exit 1 in dry-run');
+      const checkJson = JSON.parse(rCheck.stdout);
+      assert.ok(
+        checkJson.hooksCodex.length > 0 &&
+          checkJson.hooksCodex.every((h) => h.status === 'missing'),
+        'every codex hook must be reported as missing before from-scratch apply',
+      );
+      assert.ok(
+        checkJson.settingsCodex.every((s) => s.status === 'missing'),
+        'every codex settings registration must be reported as missing',
+      );
+
+      // apply: ~/.codex/hooks/ + settings.json get created and registered.
+      const rApply = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--codex', '--json'],
+        home,
+      );
+      assert.equal(rApply.status, 0, `upgrade --apply --codex failed: ${rApply.stderr}`);
+      const applyJson = JSON.parse(rApply.stdout);
+
+      const cdxHooks = join(home, '.codex', 'hooks');
+      assert.ok(existsSync(cdxHooks), '~/.codex/hooks must be created by upgrade --apply --codex');
+      assert.ok(
+        existsSync(join(cdxHooks, 'hypo-shared.mjs')),
+        'core hook must be hard-copied to ~/.codex/hooks',
+      );
+      assert.ok(
+        applyJson.applied.hooksCodex.length > 0,
+        'applied.hooksCodex must list the created hooks',
+      );
+
+      const cdxSettings = JSON.parse(readFileSync(join(home, '.codex', 'settings.json'), 'utf-8'));
+      // The registered command must point at ~/.codex (not ~/.claude) — the
+      // mergeSettingsJson path uses the codex hooksDir.
+      const allCmds = Object.values(cdxSettings.hooks || {})
+        .flatMap((groups) => groups)
+        .flatMap((g) => g.hooks || [])
+        .map((h) => h.command || '');
+      assert.ok(
+        allCmds.some((c) => c.includes('$HOME/.codex/hooks/')),
+        'codex settings entries must point at ~/.codex/hooks/, not ~/.claude/hooks/',
+      );
+      assert.ok(
+        !allCmds.some((c) => c.includes('$HOME/.claude/hooks/')),
+        'codex settings must NOT reference ~/.claude/hooks/',
+      );
+      assert.ok(
+        applyJson.applied.settingsCodex.length > 0,
+        'applied.settingsCodex must list the registered events',
+      );
+    });
+  });
+});
+
+// fix #48 — the wiki-*.mjs → hypo-*.mjs rename migration (§8.6 line 1103) must
+// mirror onto ~/.codex/settings.json too. Simulates a v1.0/v1.1 codex user whose
+// codex settings carries a legacy `wiki-shared.mjs` reference: `upgrade --apply
+// --codex` should rewrite the command and copy the renamed hook into ~/.codex/hooks/.
+test('upgrade-codex-core-hooks-mirror: wiki-*.mjs → hypo-*.mjs rename on codex side', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--codex'],
+        home,
+      );
+      assert.equal(initR.status, 0, `init --codex failed: ${initR.stderr}`);
+
+      // Plant the legacy state: a wiki-shared.mjs file in ~/.codex/hooks/ AND a
+      // settings.json entry that still references it. The fresh init carried the
+      // new hypo-shared.mjs reference — we replace it with the legacy command so
+      // the rename detector has work to do.
+      const cdxHooks = join(home, '.codex', 'hooks');
+      const cdxSettingsPath = join(home, '.codex', 'settings.json');
+      writeFileSync(join(cdxHooks, 'wiki-shared.mjs'), '// legacy v1.1 codex hook\n');
+
+      const cfg = JSON.parse(readFileSync(cdxSettingsPath, 'utf-8'));
+      // Pick an event the legacy hook would actually have appeared in (any one is
+      // fine — the rename scan walks every event).
+      const eventName = Object.keys(cfg.hooks || {})[0] || 'SessionStart';
+      cfg.hooks = cfg.hooks || {};
+      cfg.hooks[eventName] = cfg.hooks[eventName] || [];
+      cfg.hooks[eventName].push({
+        hooks: [{ type: 'command', command: 'node $HOME/.codex/hooks/wiki-shared.mjs' }],
+      });
+      writeFileSync(cdxSettingsPath, JSON.stringify(cfg, null, 2) + '\n');
+
+      // dry-run --codex must surface the codex-side legacy reference.
+      const rCheck = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--codex', '--json'],
+        home,
+      );
+      assert.equal(rCheck.status, 1, 'codex legacy hook ref must exit 1 in dry-run');
+      const checkJson = JSON.parse(rCheck.stdout);
+      assert.ok(
+        Array.isArray(checkJson.oldHookRefsCodex) &&
+          checkJson.oldHookRefsCodex.some((r) => r.oldName === 'wiki-shared.mjs'),
+        'oldHookRefsCodex must include the legacy wiki-shared.mjs reference',
+      );
+
+      // apply: the rename rewrites the command AND the renamed hook file appears
+      // in ~/.codex/hooks/ (mirrors the claude-side behaviour at upgrade.mjs:386-394).
+      const rApply = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--codex', '--json'],
+        home,
+      );
+      assert.equal(rApply.status, 0, `upgrade --apply --codex failed: ${rApply.stderr}`);
+      const applyJson = JSON.parse(rApply.stdout);
+      assert.ok(
+        applyJson.applied.hookNameRenamesCodex.some((r) =>
+          r.includes('wiki-shared.mjs → hypo-shared.mjs'),
+        ),
+        'applied.hookNameRenamesCodex must list the rename',
+      );
+
+      const cfgAfter = JSON.parse(readFileSync(cdxSettingsPath, 'utf-8'));
+      const allCmds = Object.values(cfgAfter.hooks || {})
+        .flatMap((groups) => groups)
+        .flatMap((g) => g.hooks || [])
+        .map((h) => h.command || '');
+      assert.ok(
+        !allCmds.some((c) => c.includes('wiki-shared.mjs')),
+        'no codex settings entry must still reference wiki-shared.mjs after apply',
+      );
+      assert.ok(
+        allCmds.some((c) => c.includes('$HOME/.codex/hooks/hypo-shared.mjs')),
+        'codex settings must now reference $HOME/.codex/hooks/hypo-shared.mjs',
+      );
+      assert.ok(
+        existsSync(join(cdxHooks, 'hypo-shared.mjs')),
+        'renamed hypo-shared.mjs must exist in ~/.codex/hooks',
+      );
+    });
+  });
+});
+
+// fix #48 BLOCKER (codex 2-worker pre-commit review, 2026-05-23): the precheck
+// list from checkSettingsJson can become stale when applyHookNameMigration
+// rewrites a legacy `wiki-*.mjs` command to its modern `hypo-*.mjs` form between
+// the two passes. Without the per-entry re-check that applySettingsJson now
+// performs, the apply pass would append a duplicate hypo-*.mjs entry on top of
+// the just-renamed command. Both workers independently reproduced 11 duplicate
+// registrations on a wiki-only codex settings file — same silent-corruption
+// pattern as fix #47.
+test('upgrade-codex-core-hooks-mirror: legacy wiki-only settings yields no duplicate registrations', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--codex'],
+        home,
+      );
+      assert.equal(initR.status, 0, `init --codex failed: ${initR.stderr}`);
+
+      const cdxSettingsPath = join(home, '.codex', 'settings.json');
+
+      // Force a fully-legacy codex state: rewrite every hypo-*.mjs command in
+      // codex settings to its wiki-*.mjs predecessor. After this step the codex
+      // settings file is in the shape a v1.0/v1.1 user upgrading to v1.2 would
+      // have (no hypo-* references at all).
+      const cfg = JSON.parse(readFileSync(cdxSettingsPath, 'utf-8'));
+      const rewriteMap = {
+        'hypo-session-start.mjs': 'wiki-session-start.mjs',
+        'hypo-first-prompt.mjs': 'wiki-first-prompt.mjs',
+        'hypo-lookup.mjs': 'wiki-lookup.mjs',
+        'hypo-compact-guard.mjs': 'wiki-compact-guard.mjs',
+        'hypo-auto-stage.mjs': 'wiki-auto-stage.mjs',
+        'hypo-hot-rebuild.mjs': 'wiki-hot-rebuild.mjs',
+        'hypo-auto-commit.mjs': 'wiki-auto-commit.mjs',
+        'hypo-cwd-change.mjs': 'wiki-cwd-change.mjs',
+        'hypo-file-watch.mjs': 'wiki-file-watch.mjs',
+        'hypo-personal-check.mjs': 'personal-wiki-check.mjs',
+      };
+      for (const groups of Object.values(cfg.hooks || {})) {
+        for (const g of Array.isArray(groups) ? groups : []) {
+          for (const h of g.hooks || []) {
+            for (const [modern, legacy] of Object.entries(rewriteMap)) {
+              if ((h.command || '').includes(modern)) {
+                h.command = h.command.replace(modern, legacy);
+              }
+            }
+          }
+        }
+      }
+      writeFileSync(cdxSettingsPath, JSON.stringify(cfg, null, 2) + '\n');
+
+      // dry-run --codex must report the legacy refs (the wiki-only state is
+      // genuine drift). checkSettingsJson may also report the modern names as
+      // "missing" — that is exactly the stale-precheck shape that needs to be
+      // self-healed at apply time.
+      const rCheck = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--codex', '--json'],
+        home,
+      );
+      assert.equal(rCheck.status, 1, 'wiki-only codex settings must exit 1 in dry-run');
+      const checkJson = JSON.parse(rCheck.stdout);
+      assert.ok(
+        checkJson.oldHookRefsCodex.length >= Object.keys(rewriteMap).length,
+        'every legacy ref must be detected in oldHookRefsCodex',
+      );
+
+      // apply --codex: the rename rewrites every wiki-* → hypo-*. Without the
+      // BLOCKER fix, applySettingsJson would then append a SECOND hypo-* entry
+      // for every event (its precheck saw "missing"). With the fix it must
+      // self-heal and produce exactly one entry per registration.
+      const rApply = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--codex', '--json'],
+        home,
+      );
+      assert.equal(rApply.status, 0, `upgrade --apply --codex failed: ${rApply.stderr}`);
+
+      const cfgAfter = JSON.parse(readFileSync(cdxSettingsPath, 'utf-8'));
+      const cmdCounts = new Map();
+      for (const groups of Object.values(cfgAfter.hooks || {})) {
+        for (const g of Array.isArray(groups) ? groups : []) {
+          for (const h of g.hooks || []) {
+            const cmd = h.command || '';
+            cmdCounts.set(cmd, (cmdCounts.get(cmd) || 0) + 1);
+          }
+        }
+      }
+      const duplicates = [...cmdCounts.entries()].filter(([, n]) => n > 1);
+      assert.equal(
+        duplicates.length,
+        0,
+        `no codex settings command must appear twice after apply — found duplicates: ${JSON.stringify(duplicates)}`,
+      );
+      // And every modern hook from rewriteMap must appear exactly once.
+      for (const modern of Object.keys(rewriteMap)) {
+        const count = [...cmdCounts.keys()].filter((c) => c.includes(modern)).length;
+        assert.equal(
+          count,
+          1,
+          `${modern} must appear exactly once in codex settings (saw ${count})`,
+        );
+      }
+      // No legacy wiki-*.mjs reference may survive (round-2 worker 1 NIT) — a
+      // mutation that drops one rename step would leave a legacy command in
+      // place AND append the modern one; the duplicate-only check misses that.
+      for (const legacy of Object.values(rewriteMap)) {
+        const lingering = [...cmdCounts.keys()].filter((c) => c.includes(legacy));
+        assert.equal(
+          lingering.length,
+          0,
+          `no legacy ${legacy} reference must survive apply (found: ${JSON.stringify(lingering)})`,
+        );
+      }
+
+      // Idempotency: a second --apply --codex syncs nothing new on top.
+      const rAgain = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--codex', '--json'],
+        home,
+      );
+      assert.equal(rAgain.status, 0, `second --apply --codex failed: ${rAgain.stderr}`);
+      const againJson = JSON.parse(rAgain.stdout);
+      assert.equal(
+        againJson.applied.settingsCodex.length,
+        0,
+        'idempotent re-apply must not add any codex settings entry',
+      );
+      assert.equal(
+        againJson.applied.hookNameRenamesCodex.length,
+        0,
+        'idempotent re-apply must not re-trigger any codex hook rename',
+      );
+    });
+  });
+});
+
 // §8.12 (7) doctor extensions integrity (fix #33, ADR 0024 E5). Detects
 // (a) hard-copy SHA mismatch, (b) settings-entry mismatch + orphan, (c) manifest
 // missing (warn) / malformed (fail). Malformed = FAIL is what makes doctor's
@@ -3003,11 +3406,7 @@ test('extensions-settings-mixed-group: foreign sibling preserved, our hook in-pl
         matcher: 'Write|Edit',
         timeout: 10000,
       });
-      const r1 = runWithHome(
-        'upgrade.mjs',
-        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
-        home,
-      );
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
       assert.equal(r1.status, 0, `first apply: ${r1.stderr}`);
 
       // Inject foreign sibling into our matcher group.
@@ -3024,11 +3423,7 @@ test('extensions-settings-mixed-group: foreign sibling preserved, our hook in-pl
         matcher: 'Write|Edit',
         timeout: 20000,
       });
-      const r2 = runWithHome(
-        'upgrade.mjs',
-        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
-        home,
-      );
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
       assert.equal(r2.status, 0, `second apply: ${r2.stderr}`);
 
       const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
@@ -3046,8 +3441,7 @@ test('extensions-settings-mixed-group: foreign sibling preserved, our hook in-pl
       assert.equal(ours.timeout, 20000, 'our hook timeout patched in-place');
 
       const ourSingles = groups.filter(
-        (g) =>
-          g.hooks.length === 1 && (g.hooks[0].command || '').includes('hypo-ext-mixed.mjs'),
+        (g) => g.hooks.length === 1 && (g.hooks[0].command || '').includes('hypo-ext-mixed.mjs'),
       );
       assert.equal(ourSingles.length, 0, 'no duplicate single-hook group appended');
     });
@@ -3086,8 +3480,7 @@ test('extensions-settings-mixed-group: matcher change extracts our hook, foreign
       const groups = after.hooks.PostToolUse || [];
 
       const foreignGroup = groups.find(
-        (g) =>
-          g.hooks.length === 1 && g.hooks[0].command === 'node /other/plugin/hook.mjs',
+        (g) => g.hooks.length === 1 && g.hooks[0].command === 'node /other/plugin/hook.mjs',
       );
       assert.ok(foreignGroup, 'foreign hook left behind in its own single-hook group');
       assert.equal(
@@ -3097,9 +3490,7 @@ test('extensions-settings-mixed-group: matcher change extracts our hook, foreign
       );
 
       const ourGroup = groups.find(
-        (g) =>
-          g.hooks.length === 1 &&
-          (g.hooks[0].command || '').includes('hypo-ext-matcher.mjs'),
+        (g) => g.hooks.length === 1 && (g.hooks[0].command || '').includes('hypo-ext-matcher.mjs'),
       );
       assert.ok(ourGroup, 'our hook extracted into new single-hook group');
       assert.equal(ourGroup.matcher, 'Edit', 'our new group adopts the manifest matcher');
@@ -3140,19 +3531,13 @@ test('extensions-settings-mixed-group: event change extracts our hook, foreign k
       const pre = after.hooks.PreToolUse || [];
 
       const foreignGroup = post.find(
-        (g) =>
-          g.hooks.length === 1 && g.hooks[0].command === 'node /other/plugin/hook.mjs',
+        (g) => g.hooks.length === 1 && g.hooks[0].command === 'node /other/plugin/hook.mjs',
       );
-      assert.ok(
-        foreignGroup,
-        'foreign hook stays under PostToolUse with the original matcher',
-      );
+      assert.ok(foreignGroup, 'foreign hook stays under PostToolUse with the original matcher');
       assert.equal(foreignGroup.matcher, 'Write');
 
       const ourGroup = pre.find(
-        (g) =>
-          g.hooks.length === 1 &&
-          (g.hooks[0].command || '').includes('hypo-ext-event.mjs'),
+        (g) => g.hooks.length === 1 && (g.hooks[0].command || '').includes('hypo-ext-event.mjs'),
       );
       assert.ok(ourGroup, 'our hook moved to PreToolUse single-hook group');
       assert.equal(ourGroup.matcher, 'Write');
@@ -3191,24 +3576,19 @@ test('extensions-settings-multi-occurrence-cleanup: duplicate single + mixed con
           { type: 'command', command: 'node /other/plugin/hook.mjs' },
           {
             type: 'command',
-            command: settings.hooks.PostToolUse[
-              settings.hooks.PostToolUse.findIndex((g) =>
-                (g.hooks || []).some((h) =>
-                  (h.command || '').includes('hypo-ext-dup.mjs'),
-                ),
-              )
-            ].hooks[0].command,
+            command:
+              settings.hooks.PostToolUse[
+                settings.hooks.PostToolUse.findIndex((g) =>
+                  (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-dup.mjs')),
+                )
+              ].hooks[0].command,
             timeout: 9999,
           },
         ],
       });
       writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
 
-      const r = runWithHome(
-        'upgrade.mjs',
-        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
-        home,
-      );
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
       assert.equal(r.status, 0, `apply failed: ${r.stderr}`);
 
       const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
@@ -3255,11 +3635,7 @@ test('extensions-settings-mixed-group-idempotent: second --apply over a mixed-gr
       runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
       const before = readFileSync(settingsPath, 'utf-8');
 
-      const r2 = runWithHome(
-        'upgrade.mjs',
-        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
-        home,
-      );
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
       assert.equal(r2.status, 0, `idempotent apply: ${r2.stderr}`);
       const after = readFileSync(settingsPath, 'utf-8');
       assert.equal(after, before, 'second apply drifted the file (not byte-equal)');
@@ -3290,11 +3666,7 @@ test('extensions-settings-cleanup-shift: same-event lower-index duplicate remova
         matcher: 'Write',
         timeout: 10000,
       });
-      const r1 = runWithHome(
-        'upgrade.mjs',
-        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
-        home,
-      );
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
       assert.equal(r1.status, 0, `first apply: ${r1.stderr}`);
 
       // Hand-corrupt: build a settings.json with [corrupt-ours-mixed, canonical-
@@ -3334,11 +3706,7 @@ test('extensions-settings-cleanup-shift: same-event lower-index duplicate remova
       ];
       writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
 
-      const r2 = runWithHome(
-        'upgrade.mjs',
-        [`--hypo-dir=${hypoDir}`, '--json', '--apply'],
-        home,
-      );
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
       assert.equal(r2.status, 0, `apply must not crash on cleanup-shift: ${r2.stderr}`);
 
       const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
@@ -3346,9 +3714,7 @@ test('extensions-settings-cleanup-shift: same-event lower-index duplicate remova
 
       // Foreign-only group survives, exactly as-is (no overwrite).
       const foreign = post.find(
-        (g) =>
-          g.hooks.length === 1 &&
-          g.hooks[0].command === 'node /foreign/keep.mjs',
+        (g) => g.hooks.length === 1 && g.hooks[0].command === 'node /foreign/keep.mjs',
       );
       assert.ok(foreign, 'foreign-only group must survive cleanup-shift');
       assert.equal(foreign.matcher, 'Read', 'foreign matcher untouched');
