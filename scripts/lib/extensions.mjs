@@ -477,23 +477,145 @@ export function syncExtensions({
 /**
  * Reconcile the expected ext hook entries into settings.json (§8.12 b).
  *
- * For each entry we locate the single-hook group that owns its command (D1,
- * path-based identity). If it already sits in the right event with the right
- * matcher/timeout, it is left untouched — so a no-op run does not rewrite the
- * file (idempotent). If the manifest changed matcher/timeout, the group is
- * patched in place; if the event changed, the stale group is removed and a fresh
- * one added under the new event. A pre-existing multi-hook group containing our
- * command is treated as a manual edit and left alone (drift; E3 handles force).
+ * For each entry we locate any group whose hooks[] array contains our command
+ * (D1, path-based identity) — single-hook groups owned exclusively by us AND
+ * mixed groups where a sibling plugin's hook shares the matcher. We collect ALL
+ * occurrences, rank them by an 8-step priority, pick one canonical, drop the
+ * rest (cleanup pre-existing duplicates), and mutate the canonical with the
+ * lowest-disturbance edit that lands the manifest-derived shape.
  *
- * E3 scope note (#31): settings.json entry drift is NOT surfaced here. Without a
- * recorded last-written entry we cannot tell a user edit apart from a manifest
- * change (the latter must auto-update — see the "manifest change re-registers"
- * test), so this reconcile silently self-heals a single-hook group back to the
- * manifest-derived shape. Detecting + reporting settings-entry mismatch is E5's
- * job (#33, doctor integrity §8.12-7). Mixed-group surgical replacement (preserve
- * sibling plugins' hooks, swap only ours) is likewise deferred — today a foreign
- * hook sharing our group is left untouched as drift.
+ * Priority (lowest rank wins, ties break by settings traversal order):
+ *   1. target event · single-hook ours · exact desired shape          (no-op)
+ *   2. target event · mixed · matcher matches · our hook exact         (no-op)
+ *   3. target event · single-hook ours · drift                         (group patch)
+ *   4. target event · mixed · matcher matches · our hook drift         (in-place hook patch)
+ *   5. target event · mixed · matcher differs                          (extract + append new)
+ *   6. non-target event · single-hook ours                             (splice + append new)
+ *   7. non-target event · mixed                                        (extract + append new)
+ *   8. no occurrence                                                   (append new)
+ *
+ * Mixed-group invariant (fix #47, ADR 0024 amendment 2026-05-23): foreign hooks
+ * sharing the matcher group are NEVER read, modified, or reordered. The hosting
+ * group's matcher is also left exactly as-is once we extract — even when our
+ * extraction is the reason the group becomes single-foreign. Foreign handler-
+ * level fields (`if`, `args`, `async`, `statusMessage`, …) are not even
+ * inspected (path-identity on `command` is the sole match key). Empty groups
+ * left behind by extraction are removed.
+ *
+ * Our hook entry, however, is canonical-reset on any drift mutation (ranks 3
+ * and 4): the entire prior hook object — including any handler-level fields a
+ * user appended to our hypo-ext-* entry — is replaced by the manifest-derived
+ * `{ type, command, timeout? }` shape. This mirrors the ADR 0024 hard-copy
+ * ownership semantic for hypo-ext-* file copies. Users who want extra handler
+ * fields on a Hypomnema-managed extension must extend the manifest, not edit
+ * settings.json directly (manifest-as-SoT). registerSettings is honest about
+ * this in its rank-3/rank-4 mutation steps below.
+ *
+ * Idempotency: rank-1 and rank-2 are explicit no-ops (output JSON byte-matches
+ * input). Every other rank converges after one pass — a second registerSettings
+ * call sees the just-written single-hook or in-place hook, scores it rank-1 or
+ * rank-2, and writes nothing.
+ *
+ * Doctor mirror (#47 scope): `scripts/doctor.mjs:776-802` previously only
+ * recognised single-hook groups as "owning" our command — it warned `not
+ * registered` for a mixed-group occurrence this function now accepts as
+ * canonical. The doctor side was updated in lock-step using the
+ * `collectOurOccurrences` helper exported below, so write-path acceptance and
+ * read-path recognition stay aligned.
  */
+/**
+ * Find every occurrence of `command` across every matcher group in `hooks`.
+ * Returns an array of locators in settings traversal order — the canonical
+ * tie-breaker when ranking matches in registerSettings.
+ *
+ * Exported (#47 scope) so `scripts/doctor.mjs` can use the same locator and
+ * accept mixed-group ownership instead of warning `not registered`.
+ *
+ * @param {object} hooks - settings.json `hooks` object (event → group[])
+ * @param {string} command - the manifest-derived command string to match
+ * @returns {Array<{event: string, groupIdx: number, hookIdx: number,
+ *                  group: object, hook: object, isMixed: boolean}>}
+ */
+export function collectOurOccurrences(hooks, command) {
+  const out = [];
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return out;
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) continue;
+    groups.forEach((group, groupIdx) => {
+      if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) return;
+      group.hooks.forEach((hook, hookIdx) => {
+        if (hook && hook.command === command) {
+          out.push({
+            event,
+            groupIdx,
+            hookIdx,
+            group,
+            hook,
+            isMixed: group.hooks.length > 1,
+          });
+        }
+      });
+    });
+  }
+  return out;
+}
+
+// Rank an occurrence against the desired entry. Lower = preferred canonical.
+// See registerSettings docstring for the 8-step table (ranks 1-7 here; 8 is
+// "no occurrence found" handled by the caller).
+function rankOccurrence(occ, entry, desiredHook) {
+  const onTarget = occ.event === entry.event;
+  const groupMatcher = occ.group.matcher;
+  const matcherMatches =
+    (groupMatcher === undefined || groupMatcher === null ? undefined : groupMatcher) ===
+    (entry.matcher === undefined || entry.matcher === null ? undefined : entry.matcher);
+  const hookExact = JSON.stringify(occ.hook) === JSON.stringify(desiredHook);
+
+  if (!onTarget) return occ.isMixed ? 7 : 6;
+  if (!occ.isMixed) return hookExact && matcherMatches ? 1 : 3;
+  // mixed on target
+  if (matcherMatches && hookExact) return 2;
+  if (matcherMatches) return 4;
+  return 5;
+}
+
+// Locate a matcher-group object reference inside the settings.hooks tree.
+// Returns null if the object has already been removed.
+//
+// Reference-based locators (instead of recorded {event, groupIdx, hookIdx}
+// numeric paths) are mandatory for cleanup-then-mutate safety: cleanup may
+// splice arrays at lower indices than the canonical, which would invalidate
+// any recorded numeric path. Object identity survives the splice.
+function locateGroup(hooks, groupRef) {
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (!Array.isArray(groups)) continue;
+    const gi = groups.indexOf(groupRef);
+    if (gi !== -1) return { event, groupIdx: gi };
+  }
+  return null;
+}
+
+// Remove a matcher-group from its hosting event. If the event is left with no
+// groups, delete the event key so downstream iteration doesn't see empty arrays.
+function removeGroup(hooks, groupRef) {
+  const loc = locateGroup(hooks, groupRef);
+  if (!loc) return;
+  hooks[loc.event].splice(loc.groupIdx, 1);
+  if (hooks[loc.event].length === 0) delete hooks[loc.event];
+}
+
+// Splice a single hook object out of its matcher-group. If the group becomes
+// empty as a result, also remove the group. Foreign hook entries sharing the
+// group AND the group-level matcher are NEVER read or modified — `indexOf` on
+// the explicit hook reference is the sole locator.
+function removeHook(hooks, groupRef, hookRef) {
+  const hi = groupRef.hooks.indexOf(hookRef);
+  if (hi === -1) return;
+  groupRef.hooks.splice(hi, 1);
+  if (groupRef.hooks.length === 0) removeGroup(hooks, groupRef);
+}
+
 function registerSettings(settingsPath, expectedEntries, apply) {
   let original = '';
   let settings = {};
@@ -509,14 +631,6 @@ function registerSettings(settingsPath, expectedEntries, apply) {
     settings.hooks = {};
   }
 
-  const isOurGroup = (g, command) =>
-    g &&
-    typeof g === 'object' &&
-    Array.isArray(g.hooks) &&
-    g.hooks.length === 1 &&
-    g.hooks[0] &&
-    g.hooks[0].command === command;
-
   const registered = [];
   for (const entry of expectedEntries) {
     registered.push(`${entry.event}: ${entry.name}`);
@@ -526,27 +640,62 @@ function registerSettings(settingsPath, expectedEntries, apply) {
     const desiredGroup = { hooks: [desiredHook] };
     if (entry.matcher) desiredGroup.matcher = entry.matcher;
 
-    // Locate the single-hook group that owns this command, in any event.
-    let foundEvent = null;
-    let foundIdx = -1;
-    for (const [event, groups] of Object.entries(settings.hooks)) {
-      if (!Array.isArray(groups)) continue;
-      const idx = groups.findIndex((g) => isOurGroup(g, entry.command));
-      if (idx !== -1) {
-        foundEvent = event;
-        foundIdx = idx;
-        break;
+    // 1. collect ALL occurrences (single + mixed across all events). Each
+    //    occurrence carries direct references to its container group and hook
+    //    objects — numeric (event, groupIdx, hookIdx) coordinates are recorded
+    //    only for ranking, never used for mutation (BLOCKER #1 fix from #47
+    //    pre-commit review: cleanup may invalidate numeric paths; object
+    //    identity is the only stable locator).
+    const occurrences = collectOurOccurrences(settings.hooks, entry.command);
+
+    // 2. rank + pick canonical (lowest rank; first occurrence in traversal
+    //    order wins on tie because `<` is strict).
+    let canonical = null;
+    let canonicalRank = Infinity;
+    for (const occ of occurrences) {
+      const r = rankOccurrence(occ, entry, desiredHook);
+      if (r < canonicalRank) {
+        canonicalRank = r;
+        canonical = occ;
       }
     }
 
-    if (foundEvent === entry.event) {
-      // Same event — patch in place only if matcher/timeout drifted.
-      if (JSON.stringify(settings.hooks[entry.event][foundIdx]) !== JSON.stringify(desiredGroup)) {
-        settings.hooks[entry.event][foundIdx] = desiredGroup;
-      }
+    // 3. drop non-canonical occurrences (cleanup pre-existing duplicates).
+    //    Removal is by (group ref, hook ref) — index shifts at any depth do
+    //    not corrupt the canonical's hook reference, which we still hold.
+    for (const occ of occurrences) {
+      if (occ === canonical) continue;
+      removeHook(settings.hooks, occ.group, occ.hook);
+    }
+
+    // 4. apply mutation to canonical OR create new. All locators are by
+    //    object identity; numeric indices from step 1 are no longer trusted.
+    if (!canonical) {
+      // rank 8 — no occurrence.
+      if (!Array.isArray(settings.hooks[entry.event])) settings.hooks[entry.event] = [];
+      settings.hooks[entry.event].push(desiredGroup);
+    } else if (canonicalRank === 1 || canonicalRank === 2) {
+      // exact — no-op (idempotent).
+    } else if (canonicalRank === 3) {
+      // target single-hook drift → replace the canonical group object with
+      // the manifest-derived shape. Our hook entry is canonical-reset on this
+      // path (any user-added handler fields are discarded — that mirrors the
+      // ADR 0024 hard-copy ownership semantic for hypo-ext-*).
+      const loc = locateGroup(settings.hooks, canonical.group);
+      if (loc) settings.hooks[loc.event][loc.groupIdx] = desiredGroup;
+    } else if (canonicalRank === 4) {
+      // target mixed, matcher matches, our hook drifted → replace OUR hook
+      // entry (looked up by identity) with the manifest-derived shape.
+      // Foreign hooks and the group-level matcher are untouched; our own
+      // hook is canonical-reset (handler-level user mods on the hypo-ext-*
+      // hook are not preserved — by the same ADR 0024 ownership semantic).
+      const hi = canonical.group.hooks.indexOf(canonical.hook);
+      if (hi !== -1) canonical.group.hooks[hi] = desiredHook;
     } else {
-      // Event migration or first registration.
-      if (foundEvent !== null) settings.hooks[foundEvent].splice(foundIdx, 1);
+      // ranks 5/6/7 — extract our hook from its current group (foreign
+      // siblings + matcher in the source group remain exactly as found) and
+      // append a fresh single-hook group under the target event.
+      removeHook(settings.hooks, canonical.group, canonical.hook);
       if (!Array.isArray(settings.hooks[entry.event])) settings.hooks[entry.event] = [];
       settings.hooks[entry.event].push(desiredGroup);
     }

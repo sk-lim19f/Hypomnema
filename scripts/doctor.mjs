@@ -26,6 +26,7 @@ import {
   parseManifest,
   buildExpectedSettingsEntries,
   readExtensionPkgStateNoMutate,
+  collectOurOccurrences,
   EXT_TYPES,
   CODEX_TYPES,
 } from './lib/extensions.mjs';
@@ -674,9 +675,13 @@ function checkCodexPaths() {
 // A malformed manifest failing here is what makes the §5.1.3 `fails=0` ship gate
 // actually cover §8.12-7(c) — asserted by the doctor-extensions-integrity test.
 //
-// E5 is doctor SURFACE only. The settings.json mixed-group surgical *write*
-// (preserve sibling-plugin hooks, swap only ours) stays deferred — it is a
-// write-path change to registerSettings (extensions.mjs:488), not a doctor check.
+// E5 is doctor SURFACE for extensions integrity. The mixed-group surgical
+// *write* (preserve sibling-plugin hooks, swap only ours) used to be deferred
+// here; fix #47 (ADR 0024 amendment 2026-05-23) lifted that deferral —
+// registerSettings (extensions.mjs:478 docstring) now does occurrence-first +
+// 8-rank canonical write, and the (b) loop below mirrors that read-path via
+// collectOurOccurrences so a valid mixed-group occurrence is no longer warned
+// as `not registered`.
 function checkExtensions(hypoDir, claudeHome, target = 'claude') {
   const extDir = join(hypoDir, 'extensions');
   // E1 baseline absent (e.g. --from-remote clone, plan §5 #8) → nothing to check.
@@ -765,35 +770,41 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
   if (!settingsParseFailed) {
     const expected = buildExpectedSettingsEntries(discovered.hooks, hooksDir);
 
-    // (b) for each registrable hook: locate the single-hook group that owns its
-    // command (mirroring registerSettings' isOurGroup, extensions.mjs:512) and
-    // compare against the manifest-derived shape. Two drift kinds, both warn:
-    //   - not registered (no owning group under the right event) → run upgrade --apply
-    //   - registered but matcher/timeout differs from the manifest → run upgrade --apply
-    // The shape-differs branch is the settings-entry mismatch E3 deferred to E5
-    // (extensions.mjs:488); upgrade --apply silently self-heals it, so doctor is
-    // the only surface that reports it.
-    const ownsCommand = (g, command) =>
-      g &&
-      typeof g === 'object' &&
-      Array.isArray(g.hooks) &&
-      g.hooks.length === 1 &&
-      g.hooks[0] &&
-      g.hooks[0].command === command;
+    // (b) for each registrable hook: locate any occurrence of our command
+    // (single-hook OR mixed group, fix #47) and compare against the manifest-
+    // derived shape. Three outcomes:
+    //   - no occurrence in any event → warn `not registered` (run upgrade --apply)
+    //   - occurrence in wrong event → warn `not registered under <event>` (run upgrade --apply)
+    //   - occurrence in target event but our hook entry or group matcher drifts
+    //     from the manifest → warn `settings entry differs` (run upgrade --apply)
+    // upgrade --apply self-heals all three via registerSettings' 8-priority
+    // canonical pass, so doctor is the only surface that reports it.
+    //
+    // Mixed-group: a foreign sibling sharing our matcher group does NOT itself
+    // count as drift — only our own hook fields ({type, command, timeout?}) and
+    // the group's matcher are compared. Doctor never inspects foreign hook
+    // shape (no peering into `if`/`args`/`async`/`statusMessage` etc.).
     for (const entry of expected) {
       const desiredHook = { type: 'command', command: entry.command };
       if (entry.timeout) desiredHook.timeout = entry.timeout;
-      const desiredGroup = { hooks: [desiredHook] };
-      if (entry.matcher) desiredGroup.matcher = entry.matcher;
+      const desiredMatcher = entry.matcher;
 
-      const groups = Array.isArray(hooksObj[entry.event]) ? hooksObj[entry.event] : [];
-      const owning = groups.find((g) => ownsCommand(g, entry.command));
-      if (!owning) {
+      const occurrences = collectOurOccurrences(hooksObj, entry.command);
+      const targetOccurrence = occurrences.find((o) => o.event === entry.event);
+      if (!targetOccurrence) {
         problems.push({
           severity: 'warn',
           msg: `${entry.name} not registered under ${entry.event} — run upgrade --apply`,
         });
-      } else if (JSON.stringify(owning) !== JSON.stringify(desiredGroup)) {
+        continue;
+      }
+      const groupMatcher = targetOccurrence.group.matcher;
+      const matcherMatches =
+        (groupMatcher === undefined || groupMatcher === null ? undefined : groupMatcher) ===
+        (desiredMatcher === undefined || desiredMatcher === null ? undefined : desiredMatcher);
+      const hookExact =
+        JSON.stringify(targetOccurrence.hook) === JSON.stringify(desiredHook);
+      if (!matcherMatches || !hookExact) {
         problems.push({
           severity: 'warn',
           msg: `${entry.name} settings entry differs from manifest (matcher/timeout) — run upgrade --apply`,
