@@ -8351,6 +8351,186 @@ test('replay-post-tool-use-rejects-non-http-schemes: file:// / ftp:// / data: �
   }
 });
 
+// ── fix #49: lint W8 design-history stale emit ───────────────────────────────
+
+const { findDesignHistoryStale } = await import(`${SCRIPTS}/lib/design-history-stale.mjs`);
+
+function setupDhProject(root, name, { dh, sessionLogMd, sessionLogDir }) {
+  const dir = join(root, 'projects', name);
+  mkdirSync(dir, { recursive: true });
+  if (dh != null) writeFileSync(join(dir, 'design-history.md'), dh);
+  if (sessionLogMd != null) writeFileSync(join(dir, 'session-log.md'), sessionLogMd);
+  if (sessionLogDir) {
+    const slDir = join(dir, 'session-log');
+    mkdirSync(slDir, { recursive: true });
+    for (const [fname, body] of Object.entries(sessionLogDir)) {
+      writeFileSync(join(slDir, fname), body);
+    }
+  }
+}
+
+suite('fix #49: findDesignHistoryStale()');
+
+test('w8-stale: flat session-log.md newer than design-history → stale', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p1', {
+      dh: '---\ntitle: dh\n---\n\n## 2026-05-10\nfoo\n',
+      sessionLogMd: '## [2026-05-20] session\nbar\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].project, 'p1');
+    assert.equal(stale[0].lastSession, '2026-05-20');
+    assert.equal(stale[0].lastDesignHistory, '2026-05-10');
+    assert.equal(stale[0].diffDays, 10);
+  });
+});
+
+test('w8-stale: directory session-log/YYYY-MM.md aggregated across files', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p2', {
+      dh: '## 2026-04-01\nfoo\n',
+      sessionLogDir: {
+        '2026-04.md': '## [2026-04-15] s\n',
+        '2026-05.md': '## [2026-05-22] s\n',
+      },
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-05-22');
+  });
+});
+
+test('w8-clean: session-log older than design-history → no emit', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p3', {
+      dh: '## 2026-05-22\nfoo\n',
+      sessionLogMd: '## [2026-05-10] s\n',
+    });
+    assert.equal(findDesignHistoryStale(root).length, 0);
+  });
+});
+
+test('w8-skip: project without design-history.md is skipped', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p4', { sessionLogMd: '## [2026-05-20] s\n' });
+    assert.equal(findDesignHistoryStale(root).length, 0);
+  });
+});
+
+test('w8-skip: project without any session-log (file or dir) is skipped', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p5', { dh: '## 2026-05-10\nfoo\n' });
+    assert.equal(findDesignHistoryStale(root).length, 0);
+  });
+});
+
+test('w8-edge: design-history body has no date heading → stale, diffDays=null', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p6', {
+      dh: '---\ntitle: dh\nupdated: 2026-05-22\n---\n\nNo date headings here.\n',
+      sessionLogMd: '## [2026-05-20] s\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastDesignHistory, '(없음)');
+    assert.equal(stale[0].diffDays, null);
+  });
+});
+
+test('w8-edge: invalid date headings (## [2026-13-01]) are filtered, no Invalid Date crash', () => {
+  // codex 2-worker pre-commit review CONCERN: `new Date('2026-13-01')` is an
+  // Invalid Date and `toISOString()` on it throws RangeError. Guarantee the
+  // parser silently drops malformed dates instead of crashing all of lint.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p8', {
+      dh: '## 2026-05-10\nfoo\n',
+      sessionLogMd: '## [2026-13-01] bogus\n## [2026-05-20] real\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-05-20');
+  });
+});
+
+test('w8-edge: design-history with only invalid dates → stale with diffDays=null', () => {
+  // Use month-out-of-range (truly Invalid Date in JS); JS auto-normalizes
+  // overflows in the day field (2026-02-30 → 2026-03-02) but ISO 8601 strict
+  // parsing rejects month > 12 with NaN — that is the path findDesignHistoryStale
+  // must filter to avoid poisoning maxDate.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p9', {
+      dh: '## 2026-13-01\ninvalid only\n',
+      sessionLogMd: '## [2026-05-20] s\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastDesignHistory, '(없음)');
+    assert.equal(stale[0].diffDays, null);
+  });
+});
+
+test('w8-edge: frontmatter updated newer than body date → still stale on body comparison', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p7', {
+      dh: '---\nupdated: 2026-05-25\n---\n\n## 2026-05-10\nfoo\n',
+      sessionLogMd: '## [2026-05-20] s\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastDesignHistory, '2026-05-10');
+  });
+});
+
+suite('fix #49: lint.mjs --json W8 wiring');
+
+test('w8-lint-emits-id-and-posix-file-in-json', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-05-10\nfoo\n',
+      sessionLogMd: '## [2026-05-20] s\n',
+    });
+    // pages/ scan dir is required by lint.mjs even if empty
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${root}`, '--json'],
+      {
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+      },
+    );
+    const parsed = JSON.parse(r.stdout);
+    const w8 = (parsed.warns || []).filter((w) => w.id === 'W8');
+    assert.equal(w8.length, 1, `expected one W8 warn, got: ${JSON.stringify(parsed.warns)}`);
+    assert.equal(w8[0].file, 'projects/demo/design-history.md');
+    assert.ok(w8[0].message.includes('design-history stale'));
+    assert.equal(w8[0].id, 'W8');
+  });
+});
+
+test('w8-lint-omits-id-for-other-warns', () => {
+  withTmpDir((root) => {
+    // page with frontmatter missing `updated` field → W warn without id
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(join(root, 'pages', 'a.md'), '---\ntitle: a\ntype: concept\n---\n\nbody\n');
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${root}`, '--json'],
+      {
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+      },
+    );
+    const parsed = JSON.parse(r.stdout);
+    const nonId = (parsed.warns || []).filter((w) => !('id' in w));
+    assert.ok(
+      nonId.length >= 1,
+      `expected non-W8 warns to omit id field: ${JSON.stringify(parsed.warns)}`,
+    );
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
