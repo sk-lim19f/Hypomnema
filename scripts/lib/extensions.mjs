@@ -168,6 +168,17 @@ export function parseManifest(path) {
   if (m.timeout !== undefined && (typeof m.timeout !== 'number' || m.timeout <= 0)) {
     return { ok: false, error: 'timeout must be a positive number' };
   }
+  // Boundary normalization (fix #47 follow-up, CONCERN 2): `matcher: ""` is a
+  // valid string per the type check above, but every downstream call site
+  // disagrees on what it means — `if (entry.matcher)` (line ~641) silently
+  // drops it from desiredGroup, while rankOccurrence's null/undefined→undef
+  // coercion (line ~571) compares "" against undefined as mismatch. Normalize
+  // here so every consumer (rank, registerSettings, doctor) sees a single
+  // representation: empty matcher === absent matcher.
+  if (m.matcher === '') {
+    m = { ...m };
+    delete m.matcher;
+  }
   return { ok: true, manifest: m, registrable: true };
 }
 
@@ -563,7 +574,12 @@ export function collectOurOccurrences(hooks, command) {
 // Rank an occurrence against the desired entry. Lower = preferred canonical.
 // See registerSettings docstring for the 8-step table (ranks 1-7 here; 8 is
 // "no occurrence found" handled by the caller).
-function rankOccurrence(occ, entry, desiredHook) {
+//
+// Exported (fix #47 follow-up) so `scripts/doctor.mjs` can mirror the write-
+// path canonical selection rather than picking the first traversal-order
+// occurrence — otherwise doctor warns "differs" on a drifted earlier match
+// while upgrade --apply silently accepts a rank-1 later one.
+export function rankOccurrence(occ, entry, desiredHook) {
   const onTarget = occ.event === entry.event;
   const groupMatcher = occ.group.matcher;
   const matcherMatches =
@@ -577,6 +593,33 @@ function rankOccurrence(occ, entry, desiredHook) {
   if (matcherMatches && hookExact) return 2;
   if (matcherMatches) return 4;
   return 5;
+}
+
+/**
+ * Pick the canonical occurrence for `entry` from `occurrences`, mirroring the
+ * write-path selection in registerSettings (lowest rank wins; ties break by
+ * settings traversal order — assumes the caller passed `collectOurOccurrences`
+ * output, which traverses events + groups + hooks in JSON key/array order).
+ * Returns `{ occ, rank } | null`.
+ *
+ * Exported so doctor reports drift against the SAME occurrence that
+ * upgrade --apply will treat as canonical — otherwise an earlier drifted
+ * occurrence would be flagged "differs" while a later exact occurrence is the
+ * actual canonical. Note: rank 1/2 means the canonical SHAPE is accepted, but
+ * upgrade --apply may still rewrite settings.json to remove non-canonical
+ * duplicates (doctor also surfaces `occurrences.length > 1` for that reason).
+ */
+export function pickCanonicalOccurrence(occurrences, entry, desiredHook) {
+  let canonical = null;
+  let canonicalRank = Infinity;
+  for (const occ of occurrences) {
+    const r = rankOccurrence(occ, entry, desiredHook);
+    if (r < canonicalRank) {
+      canonicalRank = r;
+      canonical = occ;
+    }
+  }
+  return canonical ? { occ: canonical, rank: canonicalRank } : null;
 }
 
 // Locate a matcher-group object reference inside the settings.hooks tree.
@@ -649,16 +692,11 @@ function registerSettings(settingsPath, expectedEntries, apply) {
     const occurrences = collectOurOccurrences(settings.hooks, entry.command);
 
     // 2. rank + pick canonical (lowest rank; first occurrence in traversal
-    //    order wins on tie because `<` is strict).
-    let canonical = null;
-    let canonicalRank = Infinity;
-    for (const occ of occurrences) {
-      const r = rankOccurrence(occ, entry, desiredHook);
-      if (r < canonicalRank) {
-        canonicalRank = r;
-        canonical = occ;
-      }
-    }
+    //    order wins on tie because `<` is strict). Doctor uses the same
+    //    helper so its drift report matches what --apply will actually do.
+    const picked = pickCanonicalOccurrence(occurrences, entry, desiredHook);
+    const canonical = picked ? picked.occ : null;
+    const canonicalRank = picked ? picked.rank : Infinity;
 
     // 3. drop non-canonical occurrences (cleanup pre-existing duplicates).
     //    Removal is by (group ref, hook ref) — index shifts at any depth do

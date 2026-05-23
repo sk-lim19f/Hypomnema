@@ -27,6 +27,7 @@ import {
   buildExpectedSettingsEntries,
   readExtensionPkgStateNoMutate,
   collectOurOccurrences,
+  pickCanonicalOccurrence,
   EXT_TYPES,
   CODEX_TYPES,
 } from './lib/extensions.mjs';
@@ -770,15 +771,21 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
   if (!settingsParseFailed) {
     const expected = buildExpectedSettingsEntries(discovered.hooks, hooksDir);
 
-    // (b) for each registrable hook: locate any occurrence of our command
-    // (single-hook OR mixed group, fix #47) and compare against the manifest-
-    // derived shape. Three outcomes:
-    //   - no occurrence in any event → warn `not registered` (run upgrade --apply)
-    //   - occurrence in wrong event → warn `not registered under <event>` (run upgrade --apply)
-    //   - occurrence in target event but our hook entry or group matcher drifts
-    //     from the manifest → warn `settings entry differs` (run upgrade --apply)
-    // upgrade --apply self-heals all three via registerSettings' 8-priority
-    // canonical pass, so doctor is the only surface that reports it.
+    // (b) for each registrable hook: locate every occurrence of our command
+    // (single-hook OR mixed group, fix #47) and pick the canonical via the
+    // SAME 8-rank logic registerSettings uses (fix #47 follow-up, CONCERN 1).
+    // Without this mirror, doctor picked the first traversal-order occurrence
+    // under the target event and warned "differs" even when a later
+    // occurrence was the rank-1 canonical that upgrade --apply silently
+    // accepts — a confusing gap between report and action.
+    //
+    // Outcomes:
+    //   - no occurrence in any event       → warn `not registered`
+    //   - canonical on a non-target event  → warn `not registered under <event>`
+    //   - canonical rank 1/2 (exact)       → no drift; pass through
+    //     (ext-command duplicates are surfaced separately below — core
+    //     duplicate-warn at line ~344 excludes hypo-ext-* on purpose)
+    //   - canonical rank 3/4/5 on target   → warn `settings entry differs`
     //
     // Mixed-group: a foreign sibling sharing our matcher group does NOT itself
     // count as drift — only our own hook fields ({type, command, timeout?}) and
@@ -787,27 +794,37 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
     for (const entry of expected) {
       const desiredHook = { type: 'command', command: entry.command };
       if (entry.timeout) desiredHook.timeout = entry.timeout;
-      const desiredMatcher = entry.matcher;
 
       const occurrences = collectOurOccurrences(hooksObj, entry.command);
-      const targetOccurrence = occurrences.find((o) => o.event === entry.event);
-      if (!targetOccurrence) {
+      const picked = pickCanonicalOccurrence(occurrences, entry, desiredHook);
+      if (!picked) {
         problems.push({
           severity: 'warn',
           msg: `${entry.name} not registered under ${entry.event} — run upgrade --apply`,
         });
         continue;
       }
-      const groupMatcher = targetOccurrence.group.matcher;
-      const matcherMatches =
-        (groupMatcher === undefined || groupMatcher === null ? undefined : groupMatcher) ===
-        (desiredMatcher === undefined || desiredMatcher === null ? undefined : desiredMatcher);
-      const hookExact =
-        JSON.stringify(targetOccurrence.hook) === JSON.stringify(desiredHook);
-      if (!matcherMatches || !hookExact) {
+      if (picked.occ.event !== entry.event) {
+        problems.push({
+          severity: 'warn',
+          msg: `${entry.name} not registered under ${entry.event} — run upgrade --apply`,
+        });
+      } else if (picked.rank >= 3) {
+        // ranks 3/4/5 — on target event, but hook or matcher drifted.
         problems.push({
           severity: 'warn',
           msg: `${entry.name} settings entry differs from manifest (matcher/timeout) — run upgrade --apply`,
+        });
+      }
+      // ext-aware duplicate surface: core duplicate-warn at checkSettingsJson
+      // intentionally skips hypo-ext-* (line ~353 isExtCommand guard). With
+      // the canonical-pick above, exact rank-1 duplicates would otherwise be
+      // invisible to doctor until upgrade --apply runs cleanup. Surface them
+      // here so the report still names the work that --apply will do.
+      if (occurrences.length > 1) {
+        problems.push({
+          severity: 'warn',
+          msg: `${entry.name} has ${occurrences.length} occurrences in settings — run upgrade --apply to clean up`,
         });
       }
     }
