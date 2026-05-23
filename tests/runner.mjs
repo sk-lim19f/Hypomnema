@@ -2964,6 +2964,328 @@ test('doctor-extensions-integrity: --codex target', () => {
   });
 });
 
+// ── extensions companion uninstall (ADR 0024, fix #34) ───────────────────────
+
+suite('extensions companion uninstall (uninstall.mjs, ADR 0024)');
+
+// §8.12 (d): uninstall removes hard-copies + manifests + slash-command exts +
+// settings entries, while preserving the wiki source AND any foreign plugin
+// entries in settings.json (§7.3 invariant).
+test('uninstall-removes-extensions-copy-preserves-source', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-mywatcher.mjs', '#!/usr/bin/env node\n// ours\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write|Edit',
+      });
+      writeExt(hypoDir, 'commands', 'hypo-ext-mycmd.md', '# my command\n');
+
+      // Install: hard-copy + manifest + settings entry + pkg SHA.
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `upgrade --apply failed: ${up.stderr}`);
+
+      // Pre-inject a foreign plugin's PostToolUse entry — uninstall MUST preserve it.
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const seedSettings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      seedSettings.hooks ??= {};
+      seedSettings.hooks.PostToolUse ??= [];
+      seedSettings.hooks.PostToolUse.push({
+        hooks: [{ type: 'command', command: 'node /opt/other-plugin/foo.mjs' }],
+      });
+      writeFileSync(settingsPath, JSON.stringify(seedSettings, null, 2) + '\n');
+
+      const hookCopy = join(home, '.claude', 'hooks', 'hypo-ext-mywatcher.mjs');
+      const manifestCopy = join(home, '.claude', 'hooks', 'hypo-ext-mywatcher.manifest.json');
+      const commandCopy = join(home, '.claude', 'commands', 'hypo-ext-mycmd.md');
+      assert.ok(existsSync(hookCopy), 'pre-state: hook copy must exist');
+      assert.ok(existsSync(manifestCopy), 'pre-state: manifest copy must exist');
+      assert.ok(existsSync(commandCopy), 'pre-state: command copy must exist');
+
+      // Uninstall --apply (claude target only).
+      const un = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(un.status, 0, `uninstall failed: ${un.stderr}\n${un.stdout}`);
+
+      // Hard-copies + manifest + slash-command ext are gone.
+      assert.ok(!existsSync(hookCopy), 'hook copy must be removed');
+      assert.ok(!existsSync(manifestCopy), 'manifest copy must be removed');
+      assert.ok(!existsSync(commandCopy), 'command copy must be removed');
+
+      // Wiki source (~/hypomnema/extensions/) is preserved end-to-end.
+      assert.ok(
+        existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-mywatcher.mjs')),
+        'wiki source hook must be preserved',
+      );
+      assert.ok(
+        existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-mywatcher.manifest.json')),
+        'wiki source manifest must be preserved',
+      );
+      assert.ok(
+        existsSync(join(hypoDir, 'extensions', 'commands', 'hypo-ext-mycmd.md')),
+        'wiki source command must be preserved',
+      );
+
+      // settings.json: hypo-ext-* entries stripped; foreign plugin entry preserved.
+      const post = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const flat = JSON.stringify(post.hooks || {});
+      assert.ok(!flat.includes('hypo-ext-mywatcher'), 'hypo-ext settings entry must be stripped');
+      assert.ok(
+        flat.includes('/opt/other-plugin/foo.mjs'),
+        'foreign plugin entry must be preserved (§7.3 invariant)',
+      );
+
+      // pkg.json: per-target ext map either dropped or has no entries for the removed files.
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      if (existsSync(pkgPath)) {
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+        const m = (pkg.extensions && pkg.extensions.claude) || {};
+        assert.ok(
+          !('hooks/hypo-ext-mywatcher.mjs' in m),
+          'hook SHA must be stripped from pkg.extensions.claude',
+        );
+        assert.ok(
+          !('hooks/hypo-ext-mywatcher.manifest.json' in m),
+          'manifest SHA must be stripped from pkg.extensions.claude',
+        );
+        assert.ok(
+          !('commands/hypo-ext-mycmd.md' in m),
+          'command SHA must be stripped from pkg.extensions.claude',
+        );
+      }
+    });
+  });
+});
+
+// Boost #6 (plan §5 PR-E6): pre-E6 the codex uninstall branch only stripped
+// ~/.codex/hooks + settings, leaving ~/.codex/commands/hypo-ext-*.md orphaned.
+// E6 must clean BOTH directories in one --codex pass.
+test('uninstall-extensions-codex-removes-both-hooks-and-commands', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cdxun.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      writeExt(hypoDir, 'commands', 'hypo-ext-cdxuncmd.md', '# codex cmd\n');
+
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(up.status, 0, `upgrade --apply --codex failed: ${up.stderr}`);
+
+      const cdxHook = join(home, '.codex', 'hooks', 'hypo-ext-cdxun.mjs');
+      const cdxCmd = join(home, '.codex', 'commands', 'hypo-ext-cdxuncmd.md');
+      const claudeHook = join(home, '.claude', 'hooks', 'hypo-ext-cdxun.mjs');
+      const claudeCmd = join(home, '.claude', 'commands', 'hypo-ext-cdxuncmd.md');
+      assert.ok(existsSync(cdxHook), 'pre-state: codex hook copy must exist');
+      assert.ok(existsSync(cdxCmd), 'pre-state: codex command copy must exist');
+      assert.ok(existsSync(claudeHook), 'pre-state: claude hook copy must exist');
+      assert.ok(existsSync(claudeCmd), 'pre-state: claude command copy must exist');
+
+      const un = runWithHome('uninstall.mjs', ['--apply', '--codex'], home);
+      assert.equal(un.status, 0, `uninstall failed: ${un.stderr}\n${un.stdout}`);
+
+      // The boost #6 assertion: BOTH codex hooks AND codex commands cleaned.
+      assert.ok(!existsSync(cdxHook), 'codex hook copy must be removed');
+      assert.ok(!existsSync(cdxCmd), 'codex command copy must be removed (boost #6 gap)');
+      assert.ok(!existsSync(claudeHook), 'claude hook copy must be removed');
+      assert.ok(!existsSync(claudeCmd), 'claude command copy must be removed');
+
+      // ~/.codex/settings.json must no longer carry the ext entry.
+      const cdxSettingsPath = join(home, '.codex', 'settings.json');
+      if (existsSync(cdxSettingsPath)) {
+        const cdxSettings = JSON.parse(readFileSync(cdxSettingsPath, 'utf-8'));
+        const flat = JSON.stringify(cdxSettings.hooks || {});
+        assert.ok(!flat.includes('hypo-ext-cdxun'), 'codex settings ext entry must be stripped');
+      }
+
+      // pkg.json: per-target maps for both claude AND codex must be cleared.
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      if (existsSync(pkgPath)) {
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+        const claude = (pkg.extensions && pkg.extensions.claude) || {};
+        const codex = (pkg.extensions && pkg.extensions.codex) || {};
+        assert.ok(!('hooks/hypo-ext-cdxun.mjs' in codex), 'codex hook SHA must be stripped');
+        assert.ok(
+          !('commands/hypo-ext-cdxuncmd.md' in codex),
+          'codex command SHA must be stripped',
+        );
+        assert.ok(!('hooks/hypo-ext-cdxun.mjs' in claude), 'claude hook SHA must be stripped');
+      }
+    });
+  });
+});
+
+// Parity with --force-commands: a user-modified hypo-ext-* file is preserved
+// (with a `skippedUserModified` report) unless --force-extensions is passed.
+// pkg.json keeps the recorded SHA for the preserved file so doctor still has
+// a baseline next run.
+test('uninstall-extensions-preserves-user-modified-without-force', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      writeExt(hypoDir, 'hooks', 'hypo-ext-edited.mjs', '#!/usr/bin/env node\n// v1\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `upgrade failed: ${up.stderr}`);
+
+      // Locally edit the installed copy so the on-disk SHA diverges from the recorded one.
+      const target = join(home, '.claude', 'hooks', 'hypo-ext-edited.mjs');
+      writeFileSync(target, '// user-edited locally — must be preserved\n');
+
+      // No --force-extensions → preserved + report mentions preservation.
+      const un1 = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(un1.status, 0, `uninstall failed: ${un1.stderr}\n${un1.stdout}`);
+      assert.ok(
+        existsSync(target),
+        'user-modified ext file must be preserved without --force-extensions',
+      );
+      assert.ok(
+        un1.stdout.includes('--force-extensions'),
+        `report must mention --force-extensions guidance: ${un1.stdout}`,
+      );
+
+      // pkg.json keeps the SHA for the preserved file (doctor needs a baseline).
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const pkg1 = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      assert.ok(
+        pkg1.extensions?.claude?.['hooks/hypo-ext-edited.mjs'],
+        'pkg SHA must be retained for the preserved file',
+      );
+
+      // With --force-extensions → file removed + pkg entry cleared.
+      const un2 = runWithHome('uninstall.mjs', ['--apply', '--force-extensions'], home);
+      assert.equal(un2.status, 0, `force uninstall failed: ${un2.stderr}\n${un2.stdout}`);
+      assert.ok(!existsSync(target), '--force-extensions must remove the user-modified file');
+      if (existsSync(pkgPath)) {
+        const pkg2 = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+        assert.ok(
+          !pkg2.extensions?.claude?.['hooks/hypo-ext-edited.mjs'],
+          '--force-extensions must clear the pkg SHA after removal',
+        );
+      }
+    });
+  });
+});
+
+// Per-target SHA contract (plan D2b): a Claude-only uninstall MUST NOT wipe
+// ~/.claude/hypo-pkg.json when ~/.codex/hooks/hypo-ext-*.mjs is still in place
+// (its ownership baseline lives in `extensions.codex` and must survive).
+// Regression cited by the codex pre-commit reviewer: without the
+// unprocessed-target guard, a claude-only uninstall would wholesale-rm pkg.json
+// and orphan the Codex copies.
+test('uninstall-extensions-claude-only-preserves-codex-state', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cdxonly.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      writeExt(hypoDir, 'commands', 'hypo-ext-cdxcmd.md', '# codex cmd\n');
+
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(up.status, 0, `upgrade --apply --codex failed: ${up.stderr}`);
+
+      const codexHook = join(home, '.codex', 'hooks', 'hypo-ext-cdxonly.mjs');
+      const codexCmd = join(home, '.codex', 'commands', 'hypo-ext-cdxcmd.md');
+      assert.ok(existsSync(codexHook), 'pre-state: codex hook copy must exist');
+      assert.ok(existsSync(codexCmd), 'pre-state: codex command copy must exist');
+
+      // Claude-only uninstall — MUST leave Codex state intact.
+      const un = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(un.status, 0, `claude-only uninstall failed: ${un.stderr}\n${un.stdout}`);
+
+      // Claude target stripped.
+      assert.ok(
+        !existsSync(join(home, '.claude', 'hooks', 'hypo-ext-cdxonly.mjs')),
+        'claude hook copy must be removed',
+      );
+
+      // Codex hard-copies survive the claude-only uninstall.
+      assert.ok(existsSync(codexHook), 'codex hook copy must survive claude-only uninstall');
+      assert.ok(existsSync(codexCmd), 'codex command copy must survive claude-only uninstall');
+
+      // pkg.json must NOT be wholesale-deleted — codex baseline must remain.
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      assert.ok(
+        existsSync(pkgPath),
+        'pkg.json must be preserved while extensions.codex still tracks live copies',
+      );
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      assert.ok(
+        pkg.extensions?.codex?.['hooks/hypo-ext-cdxonly.mjs'],
+        'codex hook SHA baseline must survive (per-target contract D2b)',
+      );
+      assert.ok(
+        pkg.extensions?.codex?.['commands/hypo-ext-cdxcmd.md'],
+        'codex command SHA baseline must survive',
+      );
+      // Claude target either dropped or cleared.
+      const claudeMap = pkg.extensions?.claude;
+      assert.ok(
+        claudeMap === undefined || Object.keys(claudeMap).length === 0,
+        'claude per-target map must be cleared by the uninstall',
+      );
+    });
+  });
+});
+
+// Plan §5 #6 (boost #6): non-regular destinations (symlink/socket/etc.) are
+// always preserved — `--force-extensions` does NOT follow them. Mirrors the
+// install/upgrade E3 guard so uninstall cannot delete a foreign target via a
+// dangling symlink in ~/.claude/hooks/.
+test('uninstall-extensions-skips-non-regular-symlink', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      writeExt(hypoDir, 'hooks', 'hypo-ext-symwatch.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `upgrade failed: ${up.stderr}`);
+
+      // Replace the regular hard-copy with a symlink to a decoy.
+      const target = join(home, '.claude', 'hooks', 'hypo-ext-symwatch.mjs');
+      const decoy = join(dir, 'decoy.mjs');
+      writeFileSync(decoy, '// decoy — must remain untouched\n');
+      rmSync(target);
+      symlinkSync(decoy, target);
+
+      // Without force → skip + report.
+      const un1 = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(un1.status, 0, `uninstall failed: ${un1.stderr}\n${un1.stdout}`);
+      assert.ok(existsSync(target), 'symlink must not be removed without force');
+      assert.ok(existsSync(decoy), 'decoy target of symlink must remain untouched');
+      assert.ok(
+        un1.stdout.includes('non-regular'),
+        `report must mention non-regular skip: ${un1.stdout}`,
+      );
+
+      // --force-extensions must STILL refuse to follow non-regular destinations.
+      const un2 = runWithHome('uninstall.mjs', ['--apply', '--force-extensions'], home);
+      assert.equal(un2.status, 0, `force uninstall failed: ${un2.stderr}\n${un2.stdout}`);
+      assert.ok(existsSync(target), '--force-extensions must NOT follow symlinks');
+      assert.ok(existsSync(decoy), 'decoy must remain untouched under --force-extensions');
+    });
+  });
+});
+
 // ── lint.mjs --fix tests ─────────────────────────────────────────────────────
 
 suite('lint.mjs --fix');
