@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`hypomnema upgrade --codex` mirrors core hooks (fix #48).** `init --codex`
+  has always installed Hypomnema's core hooks into `~/.codex/hooks/` and
+  registered them in `~/.codex/settings.json`, but `upgrade` only mirrored
+  user extensions — so a v1.1.x → v1.2.0 codex user's core hooks stayed
+  stale until a fresh install. The flag now drives drift detection, hook-file
+  apply, settings.json registration, and the `wiki-*.mjs → hypo-*.mjs` rename
+  migration on both targets in one pass. The human-readable report labels
+  the two blocks ("Hook files (codex)", "settings.json (codex)") and JSON
+  output gains `hooksCodex` / `settingsCodex` / `oldHookRefsCodex` plus
+  matching `applied.*Codex` keys. Without `--codex` nothing under `~/.codex/`
+  is inspected (parity with the existing extensions behaviour).
 - **Auto-project creation on cwd match (ADR 0023).** When you start a session
   (or change directory) inside a git repository that carries a project marker
   (`package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `pom.xml`,
