@@ -7331,6 +7331,7 @@ const STDERR_LOG_HOOKS = [
   'hypo-personal-check',
   'hypo-auto-minimal-crystallize',
   'hypo-auto-stage',
+  'hypo-web-fetch-ingest',
 ];
 
 for (const name of STDERR_LOG_HOOKS) {
@@ -7369,6 +7370,174 @@ test('hooks-stderr-log-format: forced catch emits [hypo-auto-stage] error: + pre
   const out = JSON.parse(r.stdout);
   assert.equal(out.continue, true);
   assert.equal(r.status, 0);
+});
+
+// ── hypo-web-fetch-ingest.mjs — PostToolUse auto-ingest signal (fix #2) ──────
+//
+// Coverage Matrix id (spec §9.1.1): `hook replay (PostToolUse WebFetch)`.
+// PostToolUse uses **nested** hookSpecificOutput.additionalContext (Claude
+// Code docs "Add context for Claude" + 515458f per-event matrix), unlike the
+// UserPromptSubmit hooks that use top-level additionalContext via buildOutput().
+suite('hypo-web-fetch-ingest.mjs — PostToolUse auto-ingest signal (fix #2)');
+
+function runWebFetchHook(payload, env = {}) {
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-web-fetch-ingest.mjs')], {
+    input: typeof payload === 'string' ? payload : JSON.stringify(payload),
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '', ...env },
+  });
+}
+
+test('replay-post-tool-use-web-fetch-injects-nested-additional-context: nudge under hookSpecificOutput', () => {
+  const r = runWebFetchHook({
+    tool_name: 'WebFetch',
+    tool_input: { url: 'https://example.com/article' },
+    tool_response: { ok: true },
+  });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+  // BLOCKER from codex review: PostToolUse requires nested shape, not top-level.
+  assert.equal(
+    out.additionalContext,
+    undefined,
+    'top-level additionalContext is wrong for PostToolUse',
+  );
+  assert.ok(out.hookSpecificOutput, 'missing hookSpecificOutput');
+  assert.equal(out.hookSpecificOutput.hookEventName, 'PostToolUse');
+  assert.match(out.hookSpecificOutput.additionalContext, /WebFetch/);
+  assert.match(out.hookSpecificOutput.additionalContext, /https:\/\/example\.com\/article/);
+  assert.match(out.hookSpecificOutput.additionalContext, /\/hypo:ingest/);
+});
+
+test('replay-post-tool-use-web-search-injects-weak-signal: WebSearch nudge without URL', () => {
+  const r = runWebFetchHook({
+    tool_name: 'WebSearch',
+    tool_input: { query: 'claude code hooks docs' },
+    tool_response: { ok: true },
+  });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  assert.ok(out.hookSpecificOutput, 'expected nested hookSpecificOutput for WebSearch');
+  assert.equal(out.hookSpecificOutput.hookEventName, 'PostToolUse');
+  assert.match(out.hookSpecificOutput.additionalContext, /WebSearch/);
+  // Weak nudge: no specific URL echoed (tool_response shape isn't a stable contract).
+  assert.ok(
+    !/https?:\/\//.test(out.hookSpecificOutput.additionalContext),
+    'weak nudge must not echo URLs from tool_response',
+  );
+});
+
+test('replay-post-tool-use-skips-non-web-tools: Write/Edit/Bash → no signal', () => {
+  for (const tool of ['Write', 'Edit', 'Bash', 'Read']) {
+    const r = runWebFetchHook({ tool_name: tool, tool_input: { file_path: '/tmp/x' } });
+    assert.equal(r.status, 0, `${tool} stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `${tool}: continue must remain true`);
+    assert.equal(out.suppressOutput, true);
+    assert.equal(
+      out.hookSpecificOutput,
+      undefined,
+      `${tool} must not produce hookSpecificOutput (only WebFetch/WebSearch do)`,
+    );
+  }
+});
+
+test('replay-post-tool-use-redacts-url-query-tokens: query/hash stripped before context injection', () => {
+  const r = runWebFetchHook({
+    tool_name: 'WebFetch',
+    tool_input: {
+      url: 'https://api.example.com/v1/users?token=sk-leakedvalue&session=abc#access_token=xyz',
+    },
+  });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  const ctx = out.hookSpecificOutput?.additionalContext ?? '';
+  // origin + pathname only; query/hash MUST be absent.
+  assert.match(ctx, /https:\/\/api\.example\.com\/v1\/users/);
+  assert.ok(!/sk-leakedvalue/.test(ctx), `query token leaked into context: ${ctx}`);
+  assert.ok(!/access_token=xyz/.test(ctx), `hash token leaked into context: ${ctx}`);
+  assert.ok(!/session=abc/.test(ctx), `session param leaked into context: ${ctx}`);
+  // The full raw URL must never appear in stdout either (defense in depth).
+  assert.ok(!/sk-leakedvalue/.test(r.stdout), `stdout leaked secret: ${r.stdout}`);
+});
+
+test('replay-post-tool-use-respects-skip-gate: HYPO_SKIP_GATE=1 → silent pass-through', () => {
+  const r = runWebFetchHook(
+    { tool_name: 'WebFetch', tool_input: { url: 'https://example.com/page' } },
+    { HYPO_SKIP_GATE: '1' },
+  );
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(
+    out.hookSpecificOutput,
+    undefined,
+    'gate-skipped run must not inject any additionalContext',
+  );
+});
+
+// Robustness/edge-case suite (codex pre-commit review 2026-05-23 reinforcement).
+// These cover the failure modes the happy-path tests don't hit: malformed stdin,
+// missing fields, malformed URLs, userinfo leaks, and non-http schemes.
+
+test('replay-post-tool-use-invalid-json-stdin: fail-open, stderr tagged', () => {
+  const r = runWebFetchHook('not-json');
+  assert.equal(r.status, 0, 'malformed stdin must still exit 0');
+  assert.match(r.stderr, /^\[hypo-web-fetch-ingest\] error: /m);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+  assert.equal(out.hookSpecificOutput, undefined, 'no signal on parse error');
+});
+
+test('replay-post-tool-use-web-fetch-missing-url: silent skip (no signal)', () => {
+  const r = runWebFetchHook({ tool_name: 'WebFetch', tool_input: {} });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true);
+  assert.equal(
+    out.hookSpecificOutput,
+    undefined,
+    'missing url must not produce a nudge (nothing meaningful to point at)',
+  );
+});
+
+test('replay-post-tool-use-redacts-userinfo: user:pass@host stripped from origin', () => {
+  const r = runWebFetchHook({
+    tool_name: 'WebFetch',
+    tool_input: { url: 'https://alice:s3cret@internal.example.com/dashboard' },
+  });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  const ctx = out.hookSpecificOutput?.additionalContext ?? '';
+  assert.match(ctx, /https:\/\/internal\.example\.com\/dashboard/);
+  assert.ok(!/alice/.test(ctx), `userinfo leaked into context: ${ctx}`);
+  assert.ok(!/s3cret/.test(ctx), `password leaked into context: ${ctx}`);
+  assert.ok(!/alice|s3cret/.test(r.stdout), `userinfo leaked in stdout: ${r.stdout}`);
+});
+
+test('replay-post-tool-use-rejects-non-http-schemes: file:// / ftp:// / data: → no signal', () => {
+  for (const url of [
+    'file:///Users/secret/data.txt',
+    'ftp://example.com/private.tar.gz',
+    'data:text/plain;base64,aGVsbG8=',
+    'javascript:alert(1)',
+  ]) {
+    const r = runWebFetchHook({ tool_name: 'WebFetch', tool_input: { url } });
+    assert.equal(r.status, 0, `${url} stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.hookSpecificOutput,
+      undefined,
+      `non-http scheme ${url} must be rejected (no transcript echo)`,
+    );
+    assert.ok(
+      !/Users\/secret|private\.tar\.gz|aGVsbG8|alert/.test(r.stdout),
+      `non-http URL contents leaked in stdout: ${r.stdout}`,
+    );
+  }
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
