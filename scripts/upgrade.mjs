@@ -465,7 +465,7 @@ function writeMigrationReport(hypoDir, fromVersion, toVersion) {
 title: Migration Report — v${fromVersion} → v${toVersion}
 type: reference
 updated: ${today}
-tags: [hypomnema, migration, schema]
+tags: [schema]
 ---
 
 # Migration Report: v${fromVersion} → v${toVersion}
@@ -479,10 +479,14 @@ Review the SCHEMA diff and update your wiki pages accordingly.
 
 ## Action items
 
-- [ ] Compare your \`SCHEMA.md\` (v${fromVersion}) with the package template (v${toVersion}) and update manually
-- [ ] Run \`/hypo:upgrade --apply\` to install updated hook files and settings.json entries
-- [ ] Check all \`adr\` and \`learning\` pages for new required frontmatter fields
-- [ ] Run \`/hypo:doctor\` after applying updates to verify installation health
+This report was generated during \`/hypo:upgrade --apply\`. Hook files and settings.json
+entries were applied by that run (or skipped with a warning if the target was malformed —
+see the upgrade output). \`SCHEMA.md\` is intentionally **not** overwritten by upgrade — the
+remaining steps are manual:
+
+- [ ] Compare your \`SCHEMA.md\` (v${fromVersion}) with the package template (v${toVersion}) and merge changes manually
+- [ ] Re-check all \`adr\` and \`learning\` pages for new required frontmatter fields once SCHEMA is updated
+- [ ] Run \`/hypo:doctor\` to verify installation health
 
 ## Notes
 
@@ -907,7 +911,7 @@ if (schema.bump === 'none') {
   );
 } else if (schema.bump === 'major') {
   lines.push(
-    `✗ SCHEMA version    ${schema.installed} → ${schema.current}  [MAJOR — review MIGRATION report, update manually]`,
+    `✗ SCHEMA version    ${schema.installed} → ${schema.current}  [MAJOR — --apply writes MIGRATION report; SCHEMA must be merged manually]`,
   );
 } else {
   lines.push(

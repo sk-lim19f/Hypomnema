@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync.mjs';
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
 import { buildProjectSuggestionLine } from '../hooks/hypo-shared.mjs';
+import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 
 const HOME = homedir();
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
@@ -2022,6 +2023,86 @@ test('--apply generates migration report for major SCHEMA bump', () => {
       const content = readFileSync(out.migrationReport, 'utf-8');
       assert.ok(content.includes('0.9'), 'migration report should reference old version');
       assert.ok(content.includes('1.0'), 'migration report should reference new version');
+    });
+  });
+});
+
+// User's SCHEMA.md must be byte-equal after --apply. SCHEMA is user vocabulary;
+// upgrade emits an informational migration report instead and the user merges
+// manually. Tests this invariant in the presence of an unrecognized user-added
+// vocab block (which would otherwise be the obvious thing to "clean up").
+test('--apply leaves user SCHEMA.md byte-equal', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // Simulate a user who appended a custom Domain tag to their SCHEMA.md.
+      // Option C contract: upgrade must NOT discard or rewrite this edit.
+      const schemaPath = join(hypoDir, 'SCHEMA.md');
+      const customLine = '\n<!-- user-custom: -->\n**UserDomain**: `user-custom-domain`\n';
+      const modified = readFileSync(schemaPath, 'utf-8') + customLine;
+      writeFileSync(schemaPath, modified);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+
+      const after = readFileSync(schemaPath, 'utf-8');
+      assert.equal(after, modified, 'user SCHEMA.md must be byte-equal after --apply (Option C)');
+    });
+  });
+});
+
+// Migration report tags must be a subset of the *installed* wiki's SCHEMA vocab,
+// not the package's current vocab — because upgrade deliberately leaves user
+// SCHEMA.md untouched, so a long-installed wiki keeps its old vocab line.
+// lint.mjs does not scan the hypoDir root where the report is written, so a
+// file-level lint would give false confidence; the assertion is vocab-direct.
+// Backdate the installed Meta vocab line to the oldest shipped set before running.
+test('--apply migration report tags are all in installed SCHEMA vocab', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const schemaPath = join(hypoDir, 'SCHEMA.md');
+      // Patch (a) version to trigger major bump, (b) Meta vocab to the oldest
+      // shipped set — emulates a wiki that was last linted against an older
+      // package vocab and has never had its SCHEMA.md rewritten.
+      writeFileSync(
+        schemaPath,
+        readFileSync(schemaPath, 'utf-8')
+          .replace(/^version: .+$/m, 'version: 0.9')
+          .replace(
+            /^\*\*Meta\*\*:.*$/m,
+            '**Meta**: `wiki`, `index`, `operations`, `guide`, `schema`',
+          ),
+      );
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(out.migrationReport, 'migrationReport should be set on major bump');
+
+      const reportContent = readFileSync(out.migrationReport, 'utf-8');
+      const tagLine = reportContent.match(/^tags:\s*\[(.+?)\]/m);
+      assert.ok(tagLine, 'migration report must have tags: [...] frontmatter');
+      const tags = tagLine[1]
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean);
+      assert.ok(tags.length > 0, 'migration report must declare at least one tag');
+
+      const vocab = parseSchemaVocab(hypoDir);
+      assert.ok(vocab.size > 0, 'installed SCHEMA vocab must be loadable');
+      for (const tag of tags) {
+        assert.ok(
+          vocab.has(tag),
+          `migration report tag "${tag}" not in installed SCHEMA vocab — major-bump upgrade would create a lint-failing page`,
+        );
+      }
     });
   });
 });
