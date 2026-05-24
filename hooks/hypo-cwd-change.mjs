@@ -24,7 +24,7 @@ const PROJECTS_DIR = join(HYPO_DIR, 'projects');
 const GLOBAL_HOT = join(HYPO_DIR, 'hot.md');
 const MAX_CHARS = 3000;
 
-// Privacy guard (fix #48, Stage 1): a .hypoignore-matched hot.md must not be
+// Privacy guard: a .hypoignore-matched hot.md must not be
 // re-emitted into additionalContext on cwd change.
 function readIfNotIgnored(path, patterns) {
   if (!path) return null;

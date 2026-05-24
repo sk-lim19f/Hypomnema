@@ -220,7 +220,7 @@ function checkDirectories(hypoDir) {
     'pages',
     'projects',
     'sources',
-    // Extensions baseline (ADR 0024, fix #28). Existence only — SHA / settings /
+    // Extensions baseline (ADR 0024). Existence only — SHA / settings /
     // manifest integrity is E5 (#33).
     'extensions/hooks',
     'extensions/commands',
@@ -517,7 +517,7 @@ function checkVerifyBy(hypoDir, ignorePatterns = []) {
 }
 
 function checkSyncState(hypoDir) {
-  // "open" = file exists with ≥1 entries; session-start (fix #10) clears once
+  // "open" = file exists with ≥1 entries; session-start clears once
   // sync is healthy again. Schema + parsing live in hooks/hypo-shared.mjs.
   const { entries, parseError } = readSyncState(hypoDir);
 
@@ -658,7 +658,7 @@ function checkCodexPaths() {
   }
 }
 
-// ── extensions integrity (fix #33 — ADR 0024, E5) ───────────────────────────
+// ── extensions integrity (ADR 0024, E5) ───────────────────────────
 
 // Detect drift between the user's `~/hypomnema/extensions/` source, the recorded
 // per-target SHA map (`hypo-pkg.json`), and the installed copies + settings.json
@@ -773,7 +773,7 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
 
     // (b) for each registrable hook: locate every occurrence of our command
     // (single-hook OR mixed group, fix #47) and pick the canonical via the
-    // SAME 8-rank logic registerSettings uses (fix #47 follow-up, CONCERN 1).
+    // SAME 8-rank logic registerSettings uses.
     // Without this mirror, doctor picked the first traversal-order occurrence
     // under the target event and warned "differs" even when a later
     // occurrence was the rank-1 canonical that upgrade --apply silently
@@ -811,14 +811,14 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
         });
       } else if (picked.rank >= 3) {
         // ranks 3/4/5 — on target event, but hook or matcher drifted.
-        // PR #53 follow-up (codex CONCERN): the manifest boundary normalize
+        // The manifest boundary normalize
         // (extensions.mjs:178) collapses `matcher: ""` → absent only on the
         // manifest path. A hand-edited settings.json with `matcher: ""` still
         // mismatches an absent manifest matcher (rankOccurrence treats "" vs
         // undefined as non-equal). Surface the empty-string-vs-absent
         // equivalence ONLY when the hook itself is otherwise exact —
         // otherwise the specific message would hide a co-occurring hook /
-        // timeout drift (PR #54 follow-up, codex W1 CONCERN). The hookExact
+        // timeout drift. The hookExact
         // comparison mirrors rankOccurrence's own canonical check
         // (extensions.mjs ~580) so doctor's report tracks --apply intent.
         const hookExact = JSON.stringify(picked.occ.hook) === JSON.stringify(desiredHook);
@@ -851,7 +851,7 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
     // E4 excluded hypo-ext-* from the core stale checker (doctor.mjs:302), so this
     // is the ONLY place orphaned extension entries are caught.
     //
-    // Two distinct orphan classes (PR #53 follow-up, codex Worker 2 NIT):
+    // Two distinct orphan classes:
     //   - source-removed: settings entry whose source file is gone → uninstall
     //   - unregistrable : source file present but manifest malformed/non-hook,
     //                     so (b) above skipped it and (c) only FAIL/warned the
@@ -866,7 +866,7 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
       const parsed = parseManifest(ext.manifestPath);
       if (!parsed.ok || !parsed.registrable) unregistrableCmds.add(cmdFor(ext));
     }
-    // PR #53/#54 follow-up deferred NIT: a single hypo-ext-* command can appear
+    // A single hypo-ext-* command can appear
     // in multiple groups/events when settings.json was hand-edited or migrated
     // across events. The registrable-entry duplicate surface above
     // (`occurrences.length > 1`) only iterates `expected`, so orphan-class
@@ -919,7 +919,7 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
   else warn(label, `${sample}${extra}`);
 }
 
-// ── feedback projection (fix #37 #9 — ADR 0031) ──────────────────────────────
+// ── feedback projection (ADR 0031) ──────────────────────────────
 
 // Spawn feedback-sync.mjs --check --json and map its drift report onto doctor's
 // pass/warn/fail. Integrity violations (exit-3 class: conflict / unpaired marker

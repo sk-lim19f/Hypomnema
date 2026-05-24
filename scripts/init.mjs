@@ -182,7 +182,7 @@ const HYPO_DIRS = [
   'journal/weekly',
   'journal/monthly',
   'pages/observability',
-  // User extensions companion (ADR 0024, fix #28). init creates the baseline
+  // User extensions companion (ADR 0024). init creates the baseline
   // dirs; #29 (E2) adds the hard-copy / manifest / settings sync into them.
   'extensions/hooks',
   'extensions/commands',
@@ -791,7 +791,7 @@ if (args.fromRemote) {
   for (const d of HYPO_DIRS) ensureDir(join(args.hypoDir, d), args.dryRun);
 
   // 1b. extensions baseline: drop a .gitkeep into each so the empty dirs are
-  // git-trackable in the user's wiki repo (ADR 0024, fix #28).
+  // git-trackable in the user's wiki repo (ADR 0024).
   for (const t of ['hooks', 'commands', 'skills', 'agents']) {
     copyTemplate(
       join('extensions', t, '.gitkeep'),
@@ -867,7 +867,7 @@ if (args.hooks || args.commands) {
   writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {});
 }
 
-// 4b. user extensions companion sync (ADR 0024, fix #29 + #30). Runs after
+// 4b. user extensions companion sync (ADR 0024). Runs after
 // writePkgJson so the per-target SHA map is merged into the same hypo-pkg.json
 // (preserving the commands map) rather than racing it.
 if (args.hooks) {
@@ -955,7 +955,7 @@ if (args.hooks) {
   installPkgGitHook(args.dryRun);
 }
 
-// 8b. wiki pre-commit hook (.hypoignore last-line-of-defence guard — §6.8 fix #24)
+// 8b. wiki pre-commit hook (.hypoignore last-line-of-defence guard — §6.8)
 installWikiPreCommitHook(args.hypoDir, args.dryRun, args.forceCommands);
 
 // 9. first commit + push (skip when cloned from remote — already has commits)

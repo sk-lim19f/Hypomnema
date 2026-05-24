@@ -29,7 +29,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // Privacy guard (fix #48, Stage 1 Truth Reconciliation): refuse to inject
+    // Privacy guard: refuse to inject
     // .hypoignore-matched paths. Without this, `.env*` or other secrets under
     // HYPO_DIR are re-emitted as additionalContext to the Claude provider.
     const patterns = loadHypoIgnore(HYPO_DIR);

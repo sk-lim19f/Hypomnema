@@ -137,7 +137,7 @@ export function hotMdIsClean() {
   return reasons.length === 0 ? { clean: true } : { clean: false, reason: reasons.join(' / ') };
 }
 
-// ── strict session-close verification (fix #17) ────────────────────────────
+// ── strict session-close verification ────────────────────────────
 // spec §5.2.7 / §8.3 (updated 2026-05-15): session-close = steps 1~6 of the
 // 11-step crystallize checklist (synthesis is steps 7~11). The hard gate
 // (sessionCloseFileStatus) confirms the 5 mandatory files — session-state.md,
@@ -332,7 +332,7 @@ export function sessionCloseFileStatus(hypoDir) {
   return { ok: stale.length === 0 && missing.length === 0, project, dates, stale, missing };
 }
 
-// ── sync-state (fix #9/#10/#11) ────────────────────────────────────────────
+// ── sync-state ────────────────────────────────────────────
 // `.cache/sync-state.json` is JSONL: one {timestamp, op, error, host} entry per
 // line. hypo-auto-commit (#9) appends on pull/push failure; hypo-session-start
 // (#10) surfaces open entries and clears them once sync is healthy again;
@@ -400,7 +400,7 @@ export function clearSyncState(hypoDir) {
   }
 }
 
-// ── auto-project suggestion (fix #23, ADR 0023) ────────────────────────────
+// ── auto-project suggestion (ADR 0023) ────────────────────────────
 // `.cache/project-suggestions.json` is a single JSON object:
 //   { "skips": [{cwd, declined_at, reason}], "cooldowns": {"<cwd>": "<iso>"} }
 // `skips` is written by the LLM (Layer-1 behavioral rule) when the user answers
@@ -521,7 +521,7 @@ export function buildProjectSuggestionLine(cwd) {
   return `[WIKI: cwd '${safe}'에 매칭되는 프로젝트가 없습니다. 자동 생성할까요? (Y/n)]`;
 }
 
-// ── clear-marker (fix #25 PR-A2, ADR 0022 amendment 2026-05-14) ────────────
+// ── clear-marker (ADR 0022 amendment 2026-05-14) ────────────
 // `/clear` cannot be blocked (no UserPromptSubmit fire). The only intervention
 // point is the SessionEnd(reason='clear') → SessionStart(source='clear') pair:
 // SessionEnd writes `.cache/clear-marker.json` with the dying session's id +
@@ -606,7 +606,7 @@ export function clearClearMarker(hypoDir) {
   }
 }
 
-// ── session-closed marker (fix #27 PR-C, ADR 0022 amendment 2026-05-19) ────
+// ── session-closed marker (ADR 0022 amendment 2026-05-19) ────
 // Per-session marker proving session-close completed. Stop hook
 // (`hypo-auto-minimal-crystallize`) reads it; `scripts/crystallize.mjs` writes
 // it after a verified close. Per-session (not per-day) precision resolves the
@@ -703,7 +703,7 @@ export function clearSessionClosedMarker(hypoDir, sessionId) {
   }
 }
 
-// ── transcript activity heuristic (fix #27 PR-C, ADR 0022 amendment 2026-05-19) ──
+// ── transcript activity heuristic (ADR 0022 amendment 2026-05-19) ──
 // Substantial-session gate for the Stop hook: a session that performed at least
 // one mutation tool call (Edit / Write / MultiEdit / NotebookEdit) is "worth"
 // blocking on for session-close. Pure Q&A / read-only sessions skip the block.
