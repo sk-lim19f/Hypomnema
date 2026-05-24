@@ -811,10 +811,23 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
         });
       } else if (picked.rank >= 3) {
         // ranks 3/4/5 — on target event, but hook or matcher drifted.
-        problems.push({
-          severity: 'warn',
-          msg: `${entry.name} settings entry differs from manifest (matcher/timeout) — run upgrade --apply`,
-        });
+        // PR #53 follow-up (codex CONCERN): the manifest boundary normalize
+        // (extensions.mjs:178) collapses `matcher: ""` → absent only on the
+        // manifest path. A hand-edited settings.json with `matcher: ""` still
+        // mismatches an absent manifest matcher (rankOccurrence treats "" vs
+        // undefined as non-equal). Surface this specific drift so the user
+        // sees the empty-string-vs-absent equivalence, not the generic blurb.
+        if (picked.occ.group.matcher === '' && entry.matcher === undefined) {
+          problems.push({
+            severity: 'warn',
+            msg: `${entry.name} settings has matcher: "" (equivalent to absent) — run upgrade --apply to normalize`,
+          });
+        } else {
+          problems.push({
+            severity: 'warn',
+            msg: `${entry.name} settings entry differs from manifest (matcher/timeout) — run upgrade --apply`,
+          });
+        }
       }
       // ext-aware duplicate surface: core duplicate-warn at checkSettingsJson
       // intentionally skips hypo-ext-* (line ~353 isExtCommand guard). With
@@ -832,9 +845,22 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
     // orphan (boost #2): a hypo-ext-* command in settings with no source extension.
     // E4 excluded hypo-ext-* from the core stale checker (doctor.mjs:302), so this
     // is the ONLY place orphaned extension entries are caught.
-    const sourceCmds = new Set(
-      discovered.hooks.map((ext) => `node ${hooksDir.replace(HOME, '$HOME')}/${ext.file}`),
-    );
+    //
+    // Two distinct orphan classes (PR #53 follow-up, codex Worker 2 NIT):
+    //   - source-removed: settings entry whose source file is gone → uninstall
+    //   - unregistrable : source file present but manifest malformed/non-hook,
+    //                     so (b) above skipped it and (c) only FAIL/warned the
+    //                     manifest itself, never naming the stale settings entry.
+    //                     Surfaced separately so the user knows the lingering
+    //                     entry needs cleanup independent of the manifest fix.
+    const cmdFor = (ext) => `node ${hooksDir.replace(HOME, '$HOME')}/${ext.file}`;
+    const sourceCmds = new Set(discovered.hooks.map(cmdFor));
+    const unregistrableCmds = new Set();
+    for (const ext of discovered.hooks) {
+      if (!ext.manifestPath) continue; // (c-warn) already names this case
+      const parsed = parseManifest(ext.manifestPath);
+      if (!parsed.ok || !parsed.registrable) unregistrableCmds.add(cmdFor(ext));
+    }
     const seen = new Set();
     for (const groups of Object.values(hooksObj)) {
       if (!Array.isArray(groups)) continue;
@@ -843,7 +869,16 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
         for (const h of g.hooks || []) {
           if (typeof h.command !== 'string') continue;
           if (!/(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(h.command)) continue;
-          if (sourceCmds.has(h.command) || seen.has(h.command)) continue;
+          if (seen.has(h.command)) continue;
+          if (unregistrableCmds.has(h.command)) {
+            seen.add(h.command);
+            problems.push({
+              severity: 'warn',
+              msg: `orphan settings entry (${h.command}) — manifest unregistrable; run uninstall`,
+            });
+            continue;
+          }
+          if (sourceCmds.has(h.command)) continue;
           seen.add(h.command);
           problems.push({
             severity: 'warn',

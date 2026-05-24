@@ -3983,6 +3983,142 @@ test('parseManifest-empty-matcher: matcher:"" is normalized to undefined (CONCER
   });
 });
 
+// PR #53 follow-up (codex Worker 2 NIT, Concern A): doctor must surface a
+// hypo-ext-* settings.json entry whose source file is present but whose
+// manifest is malformed or non-hook (registrable:false). The pre-existing
+// orphan scan only matched source-removed cases — manifest-unregistrable
+// entries lingered silently because:
+//   - (b) `expected` loop skips them (no entry produced)
+//   - (c) manifest-health loop only FAILs/warns the manifest itself
+//   - orphan scan considered the source file presence sufficient
+// Distinct message ("manifest unregistrable") so the user knows it's the
+// manifest, not a missing file, that needs attention.
+test('doctor-extensions: malformed manifest + lingering settings entry → unregistrable orphan warn', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      // Healthy first, then break the manifest after the settings entry exists.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-broken.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      // Now corrupt the manifest — unknown event ⇒ parseManifest !ok ⇒ malformed.
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      writeFileSync(
+        join(extHooks, 'hypo-ext-broken.manifest.json'),
+        JSON.stringify({ type: 'hook', event: 'NotARealEvent' }),
+      );
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /orphan settings entry .*hypo-ext-broken.*manifest unregistrable/i.test(detail),
+        `expected unregistrable-orphan warn naming settings entry: ${detail}`,
+      );
+      assert.ok(
+        !/orphan settings entry .*hypo-ext-broken.*source extension removed/i.test(detail),
+        `must not use source-removed phrasing when source is present: ${detail}`,
+      );
+    });
+  });
+});
+
+test('doctor-extensions: non-hook manifest + lingering settings entry → unregistrable orphan warn', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      // Hand-place source file + non-hook manifest (type:"skill" under hooks/) +
+      // pre-existing settings entry pointing at it. parseManifest returns
+      // ok:true, registrable:false — entry orphaned by manifest change.
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      mkdirSync(extHooks, { recursive: true });
+      writeFileSync(join(extHooks, 'hypo-ext-skillish.mjs'), '#!/usr/bin/env node\n');
+      writeFileSync(
+        join(extHooks, 'hypo-ext-skillish.manifest.json'),
+        JSON.stringify({ type: 'skill' }),
+      );
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const seed = {
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                { type: 'command', command: 'node $HOME/.claude/hooks/hypo-ext-skillish.mjs' },
+              ],
+            },
+          ],
+        },
+      };
+      writeFileSync(settingsPath, JSON.stringify(seed, null, 2) + '\n');
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /orphan settings entry .*hypo-ext-skillish.*manifest unregistrable/i.test(detail),
+        `expected unregistrable-orphan warn (non-hook manifest): ${detail}`,
+      );
+    });
+  });
+});
+
+// PR #53 follow-up (codex CONCERN, Concern B): hand-edited settings.json with
+// `matcher: ""` against a manifest with no matcher. extensions.mjs:178
+// normalizes only the manifest side; the settings side still mismatches at
+// rankOccurrence (rank 3). Pre-fix doctor lumped this into the generic
+// `differs (matcher/timeout)` warn — opaque since "" looks identical to
+// absent in casual reading. Fix: dedicated message naming the empty-string
+// equivalence so the user knows --apply will normalize it.
+test('doctor-extensions: hand-edited matcher:"" surfaces specific normalize-drift message', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      // Manifest has NO matcher.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-emptydrift.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PreToolUse',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      // Hand-edit: set matcher to "" on our group (settings drift only).
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      for (const g of s.hooks.PreToolUse || []) {
+        if ((g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-emptydrift.mjs'))) {
+          g.matcher = '';
+        }
+      }
+      writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /hypo-ext-emptydrift settings has matcher: "" \(equivalent to absent\)/.test(detail),
+        `expected specific empty-matcher normalize msg: ${detail}`,
+      );
+      assert.ok(
+        !/hypo-ext-emptydrift settings entry differs from manifest/.test(detail),
+        `must NOT use the generic differs msg for this case: ${detail}`,
+      );
+    });
+  });
+});
+
 // ── extensions companion uninstall (ADR 0024, fix #34) ───────────────────────
 
 suite('extensions companion uninstall (uninstall.mjs, ADR 0024)');
