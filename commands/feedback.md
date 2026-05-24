@@ -21,7 +21,7 @@ If the user did not provide them, ask. The classification fields are required so
 1. **Topic** (slug): "What topic does this feedback apply to? (e.g. `response-length`, `commit-style`)"
 2. **Rule** (entry): "State the rule or correction in one or two sentences."
 3. **Reason**: "What incident or reasoning prompted this?"
-4. **Scope**: "Does this apply globally (all projects) or to this project only?" → `global` | `project:<slug>`
+4. **Scope**: "Does this apply globally (all projects) or to this project only?" → `global` | `project:<project-id>` (project-id must exact-match the resolved id; see Step 3 note)
 5. **Tier**: "Is this a hard rule (L1) or a softer preference (L2)?" → `L1` | `L2`
 6. **Targets**: "Where should this project?" → `project-memory` (MEMORY.md) and/or `claude-learned` (global CLAUDE.md). Default `project-memory`.
 7. **Priority** (1–5, higher sorts first; default 3).
@@ -53,7 +53,7 @@ Run with `--dry-run` first to preview the generated page, then without it to wri
 node <package-root>/scripts/feedback.mjs \
   --topic="<slug>" \
   --entry="<one-line rule>" \
-  --scope="global|project:<slug>" \
+  --scope="global|project:<project-id>" \
   --tier="L1|L2" \
   --targets="project-memory[,claude-learned]" \
   --priority=<1-5> \
@@ -67,6 +67,8 @@ node <package-root>/scripts/feedback.mjs \
 ```
 
 When `--targets` includes `claude-learned`, `--global-summary` and `--promote-to-global` are required (and `--scope=global --tier=L1`).
+
+> **`scope: project:<project-id>` 주의 (v1.2.0).** `<project-id>`는 `feedback-sync`가 resolve한 project-id와 정확히 일치해야 한다 (default: cwd의 `/`,`.` → `-` 치환; `--project-id=<id>` 로 override). 일치하지 않으면 그 페이지는 해당 project의 MEMORY로 projection되지 **않는다** (silent skip — lint error 아님). 다만 현재 lint scope regex(`^project:[a-z0-9][a-z0-9-]*$`)는 cwd-derived id 형식(`-Users-...`)을 거부하므로, **`project:*` scope를 사용하려면 slug-safe id로 `--project-id=<slug>`를 override해서 wiki 디렉터리도 그 id에 맞추는 운영 패턴이 필요하다**. resolved-id ↔ slug 정합화는 v1.3.0 트랙에서 다룸.
 
 On a real (non-dry-run) write, the script automatically runs `feedback-sync --write` to refresh MEMORY.md / CLAUDE.md. If that post-step reports drift it prints a one-line warning — the page is still saved; reconcile with `hypomnema feedback-sync --check`.
 

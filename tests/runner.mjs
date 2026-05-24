@@ -7395,7 +7395,7 @@ const FB_PROJECT_L2 = {
   title: 'Rule B',
   type: 'feedback',
   status: 'active',
-  scope: 'project:hypomnema',
+  scope: 'project:proj',
   tier: 'L2',
   targets: '[project-memory]',
   sensitivity: 'public',
@@ -7527,6 +7527,53 @@ test('feedback-sync-scope-project-rejected-from-claude: project scope only reach
     const rep = JSON.parse(runFb(['--check', '--json']).stdout);
     assert.equal(rep.targets.claude.candidates, 0, 'scope:project:* must be rejected from CLAUDE');
     assert.equal(rep.targets.memory.candidates, 1, 'project scope still projects to memory');
+  });
+});
+
+// Cross-project pollution guard (ADR 0031 cwd-scoped projection invariant):
+// memoryTarget.filter previously accepted any `scope: project:*` regardless of
+// the resolved project-id, so a `scope: project:other` page was silently
+// projected into `~/.claude/projects/<this-project>/memory/`. The fix tightens
+// the filter to an exact match against the resolved project-id, and renders /
+// sideFiles share the same desired set so MEMORY index + feedback_<slug>.md
+// stay consistent.
+test('feedback-sync-scope-project-mismatch-excluded: other-project scope never reaches this memory', () => {
+  const otherPage = { ...FB_PROJECT_L2, scope: 'project:other', memory_summary: 'do other' };
+  withFeedbackEnv({ 'mine': FB_PROJECT_L2, 'other': otherPage }, ({ memDir, runFb }) => {
+    const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+    assert.equal(
+      rep.targets.memory.candidates,
+      1,
+      `only the matching-project page should project to memory (got ${rep.targets.memory.candidates})`,
+    );
+    const w = runFb(['--write']);
+    assert.equal(w.status, 0, `--write should succeed: ${w.stderr}`);
+    const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+    assert.ok(mem.includes('feedback_mine.md'), 'matching-project page must appear in MEMORY');
+    assert.ok(
+      !mem.includes('feedback_other.md'),
+      `other-project page must not appear in MEMORY: ${mem}`,
+    );
+    assert.ok(
+      existsSync(join(memDir, 'feedback_mine.md')),
+      'matching-project sideFile must be written',
+    );
+    assert.ok(
+      !existsSync(join(memDir, 'feedback_other.md')),
+      'other-project sideFile must NOT be written',
+    );
+  });
+});
+
+test('feedback-sync-scope-global-still-projects-to-memory: global scope is project-agnostic', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ memDir, runFb }) => {
+    const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+    assert.equal(rep.targets.memory.candidates, 1, 'global scope still reaches memory');
+    runFb(['--write']);
+    assert.ok(
+      readFileSync(join(memDir, 'MEMORY.md'), 'utf-8').includes('feedback_rule-a.md'),
+      'global page must appear in MEMORY index',
+    );
   });
 });
 
