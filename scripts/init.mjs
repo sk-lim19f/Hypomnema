@@ -426,7 +426,7 @@ function writePkgJson(dryRun, extraFields = {}) {
     ...existing,
     pkgRoot: PKG_ROOT,
     pkgVersion: PKG_VERSION,
-    schemaVersion: '1.0',
+    schemaVersion: '2.0',
     ...extraFields,
   };
   if (!dryRun) {

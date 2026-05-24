@@ -2022,7 +2022,92 @@ test('--apply generates migration report for major SCHEMA bump', () => {
       );
       const content = readFileSync(out.migrationReport, 'utf-8');
       assert.ok(content.includes('0.9'), 'migration report should reference old version');
-      assert.ok(content.includes('1.0'), 'migration report should reference new version');
+      assert.ok(
+        content.includes('2.0'),
+        'migration report should reference the new (current) version 2.0',
+      );
+    });
+  });
+});
+
+// ADR 0034 — SCHEMA 1.0 → 2.0 specific guidance. The v1 → v2 path triggers a
+// specialized body that names ADR 0031, all 9 hard-required feedback fields,
+// the manual-backfill requirement, and the project-id/slug regex caveat from
+// PR-B. Generic major bumps (covered above) keep their original body.
+test('--apply migration report v1→v2 includes ADR 0031 feedback fields guidance', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // Simulate a wiki that's still on SCHEMA 1.0 (a v1.1.0 hypomnema user).
+      // The package template is now 2.0, so --apply produces MIGRATION-v2.0.md
+      // and the specific body path must fire.
+      const schemaPath = join(hypoDir, 'SCHEMA.md');
+      writeFileSync(
+        schemaPath,
+        readFileSync(schemaPath, 'utf-8').replace(/^version: .+$/m, 'version: 1.0'),
+      );
+      const schemaBefore = readFileSync(schemaPath, 'utf-8');
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(out.migrationReport, 'migrationReport must be set on v1→v2 bump');
+
+      const body = readFileSync(out.migrationReport, 'utf-8');
+      // ADR + 9 hard-required fields must all be named explicitly so a user
+      // running --apply sees exactly what needs backfilling.
+      assert.ok(body.includes('ADR 0031'), 'v1→v2 report must reference ADR 0031');
+      assert.ok(body.includes('ADR 0034'), 'v1→v2 report must reference ADR 0034');
+      for (const field of [
+        'status',
+        'scope',
+        'tier',
+        'targets',
+        'sensitivity',
+        'priority',
+        'memory_summary',
+        'reason',
+        'source',
+      ]) {
+        assert.ok(
+          body.includes(`\`${field}\``),
+          `v1→v2 report must name the new required feedback field \`${field}\``,
+        );
+      }
+      // Manual-backfill / no auto-stub policy must be explicit so users do
+      // not assume upgrade silently filled the fields.
+      assert.ok(
+        /auto-stub|manually backfill|backfill the 9 fields/i.test(body),
+        'v1→v2 report must state the manual-backfill / no auto-stub policy',
+      );
+      // PR-B caveat: lint regex vs. cwd-derived id mismatch must be carried
+      // through to v1.2.0 users so the silent skip is not surprising.
+      assert.ok(
+        body.includes('project-id') && body.includes('cwd-derived'),
+        'v1→v2 report must surface the project-id/slug regex caveat',
+      );
+      // Conditional claude-learned requirements must be named so a user who
+      // backfills only the 9 unconditional fields and then sets
+      // targets: [claude-learned] does not re-fail lint.
+      for (const conditional of ['global_summary', 'promote_to_global']) {
+        assert.ok(
+          body.includes(`\`${conditional}\``),
+          `v1→v2 report must name the conditional claude-learned field \`${conditional}\``,
+        );
+      }
+      assert.ok(
+        /claude-learned/.test(body) && /Re-run.*lint/i.test(body),
+        'v1→v2 report must close with a re-run-lint checklist item',
+      );
+      // Option C: SCHEMA.md byte-equal even when the specific body fires.
+      assert.equal(
+        readFileSync(schemaPath, 'utf-8'),
+        schemaBefore,
+        'SCHEMA.md must be byte-equal after --apply on v1→v2 (Option C)',
+      );
     });
   });
 });
