@@ -4119,6 +4119,59 @@ test('doctor-extensions: hand-edited matcher:"" surfaces specific normalize-drif
   });
 });
 
+// PR #54 follow-up (codex W1 CONCERN): the matcher:"" specific message must
+// only fire when the hook itself is also exact — otherwise a co-occurring
+// timeout (or hook field) drift gets hidden behind the empty-matcher blurb.
+// Fix gates the specific message on hookExact; this test plants matcher:""
+// AND a wrong timeout, then asserts the generic differs message is used
+// (not the normalize-only one), so the user is told about the timeout drift.
+test('doctor-extensions: matcher:"" + wrong timeout falls back to generic differs (hookExact gate)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      // Manifest has NO matcher but DOES have a timeout (5s).
+      writeExt(hypoDir, 'hooks', 'hypo-ext-emptyplustimeout.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PreToolUse',
+        timeout: 5,
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      // Hand-edit settings: matcher:"" AND timeout wrong (99 vs manifest 5).
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      for (const g of s.hooks.PreToolUse || []) {
+        for (const h of g.hooks || []) {
+          if ((h.command || '').includes('hypo-ext-emptyplustimeout.mjs')) {
+            g.matcher = '';
+            h.timeout = 99;
+          }
+        }
+      }
+      writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      // Generic differs message (now widened to matcher/hook/timeout) MUST fire.
+      assert.ok(
+        /hypo-ext-emptyplustimeout settings entry differs from manifest/.test(detail),
+        `expected generic differs msg when hook drifted too: ${detail}`,
+      );
+      // The specific normalize-only message MUST NOT fire — that would hide
+      // the timeout drift from the user.
+      assert.ok(
+        !/hypo-ext-emptyplustimeout settings has matcher: "" \(equivalent to absent\)/.test(detail),
+        `must NOT use normalize-only msg when hook also drifted: ${detail}`,
+      );
+    });
+  });
+});
+
 // ── extensions companion uninstall (ADR 0024, fix #34) ───────────────────────
 
 suite('extensions companion uninstall (uninstall.mjs, ADR 0024)');
