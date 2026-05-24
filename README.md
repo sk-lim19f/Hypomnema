@@ -78,7 +78,7 @@ Hooks handle the rest — auto-staging, auto-commit/push, session-state injectio
 
 ## Why Hypomnema
 
-Personal knowledge tools fall into four buckets, and each one breaks at a different place:
+Personal knowledge tools fall into five buckets, and each one breaks at a different place:
 
 | | Pain | Why it doesn't compound |
 |---|---|---|
