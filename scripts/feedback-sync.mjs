@@ -373,7 +373,7 @@ function evaluateTarget(pages, target) {
   let overCap = false;
   if (target.capKind === 'entries') overCap = desired.length > target.cap;
   // count index content lines only — the START/END marker wrappers are sync
-  // bookkeeping, not part of the "200 index lines" budget (codex HIGH).
+  // bookkeeping, not part of the "200 index lines" budget.
   else if (target.capKind === 'lines')
     overCap = desired.reduce((n, d) => n + d.inner.split('\n').length, 0) > target.cap;
 
@@ -502,7 +502,7 @@ async function resolveProjectId(args, { prompt = defaultPrompt, isTTY } = {}) {
   return { ...pid, skipMemory: false };
 }
 
-// ── bootstrap + import (contract §11, fix #37 Phase D) ────────────────────────
+// ── bootstrap + import (contract §11) ────────────────────────
 //
 // Both modes are *reverse* one-time helpers that scaffold wiki DRAFTS under
 // pages/feedback/_drafts/ — they NEVER write pages/feedback/<slug>.md directly
@@ -535,7 +535,7 @@ function kebabSlug(text, max = 48) {
 // leading dots. Returns null when nothing safe remains → caller skips it. Without
 // this a crafted `source=../evil` / `feedback_../evil.md` would let --bootstrap /
 // --import write outside _drafts (e.g. into pages/feedback/), breaking the
-// one-way invariant (codex BLOCKER, fix #37 Phase D review).
+// one-way invariant.
 function safeDraftSlug(raw) {
   const seg = basename(String(raw).replace(/\\/g, '/'));
   const cleaned = seg
@@ -583,7 +583,7 @@ function parseMemoryIndex(content) {
   const out = [];
   // scrub already-projected managed blocks first (parity with parseLearnedBehaviors):
   // index lines inside a HYPO:FEEDBACK-SYNC block already have a wiki SoT and must
-  // not be re-drafted as legacy entries (codex IMPORTANT, fix #37 Phase D review).
+  // not be re-drafted as legacy entries.
   const scrubbed = content.replace(BLOCK_RE, '');
   const re = /^- \[([^\]]*)\]\(feedback_([^)]+?)\.md\)\s*(?:—\s*(.*\S))?\s*$/gm;
   let m;
@@ -869,7 +869,7 @@ function run(args, resolvedPid = null) {
   }
 
   // strict promotes warnings to a failure; compute it BEFORE the write gate so a
-  // --write --strict refuses rather than writing then exiting non-zero (codex LOW).
+  // --write --strict refuses rather than writing then exiting non-zero.
   const strictFail = args.strict && strictWarnings.length > 0;
 
   // pass 2: write only when nothing blocks (code === 0 ⇒ no conflict, over-cap,

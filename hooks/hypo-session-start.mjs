@@ -38,7 +38,7 @@ import {
   isOptedOut,
 } from './version-check.mjs';
 
-// Privacy guard (fix #48, Stage 1): refuse to read+inject .hypoignore-matched
+// Privacy guard: refuse to read+inject .hypoignore-matched
 // wiki files into additionalContext. Without this, a user who lists
 // `projects/private/hot.md` in .hypoignore would still see SECRET emit because
 // session-start reads hot/state paths directly.

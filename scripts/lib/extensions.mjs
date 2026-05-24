@@ -168,7 +168,7 @@ export function parseManifest(path) {
   if (m.timeout !== undefined && (typeof m.timeout !== 'number' || m.timeout <= 0)) {
     return { ok: false, error: 'timeout must be a positive number' };
   }
-  // Boundary normalization (fix #47 follow-up, CONCERN 2): `matcher: ""` is a
+  // Boundary normalization: `matcher: ""` is a
   // valid string per the type check above, but every downstream call site
   // disagrees on what it means — `if (entry.matcher)` (line ~641) silently
   // drops it from desiredGroup, while rankOccurrence's null/undefined→undef
@@ -527,7 +527,7 @@ export function syncExtensions({
  * call sees the just-written single-hook or in-place hook, scores it rank-1 or
  * rank-2, and writes nothing.
  *
- * Doctor mirror (#47 scope): `scripts/doctor.mjs:776-802` previously only
+ * Doctor mirror: `scripts/doctor.mjs:776-802` previously only
  * recognised single-hook groups as "owning" our command — it warned `not
  * registered` for a mixed-group occurrence this function now accepts as
  * canonical. The doctor side was updated in lock-step using the
@@ -539,7 +539,7 @@ export function syncExtensions({
  * Returns an array of locators in settings traversal order — the canonical
  * tie-breaker when ranking matches in registerSettings.
  *
- * Exported (#47 scope) so `scripts/doctor.mjs` can use the same locator and
+ * Exported so `scripts/doctor.mjs` can use the same locator and
  * accept mixed-group ownership instead of warning `not registered`.
  *
  * @param {object} hooks - settings.json `hooks` object (event → group[])
@@ -575,7 +575,7 @@ export function collectOurOccurrences(hooks, command) {
 // See registerSettings docstring for the 8-step table (ranks 1-7 here; 8 is
 // "no occurrence found" handled by the caller).
 //
-// Exported (fix #47 follow-up) so `scripts/doctor.mjs` can mirror the write-
+// Exported so `scripts/doctor.mjs` can mirror the write-
 // path canonical selection rather than picking the first traversal-order
 // occurrence — otherwise doctor warns "differs" on a drifted earlier match
 // while upgrade --apply silently accepts a rank-1 later one.

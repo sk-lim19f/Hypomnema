@@ -271,7 +271,7 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
     issue('warn', rel, 'Missing frontmatter field: updated', path);
   }
 
-  // type-conditional required fields (fix #15)
+  // type-conditional required fields
   if (fm.type && TYPE_CONDITIONAL_FIELDS[fm.type]) {
     for (const field of TYPE_CONDITIONAL_FIELDS[fm.type]) {
       if (!fm[field]) {
@@ -293,7 +293,7 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
     }
   }
 
-  // feedback: scope vocabulary + conditional claude-learned fields (ADR 0031 / fix #37)
+  // feedback: scope vocabulary + conditional claude-learned fields (ADR 0031)
   if (fm.type === 'feedback') {
     const scope = fm.scope || '';
     if (scope && scope !== 'global' && !/^project:[a-z0-9][a-z0-9-]*$/.test(scope)) {
@@ -313,7 +313,7 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
     }
   }
 
-  // tag vocabulary + forbidden patterns (fix #36)
+  // tag vocabulary + forbidden patterns
   const tags = parseTagsField(fm.tags);
   if (tags && tagVocab && tagVocab.size > 0) {
     for (const tag of tags) {

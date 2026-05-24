@@ -257,7 +257,7 @@ test('init creates .gitignore with .cache/ entry', () => {
   });
 });
 
-// init-creates-extensions-baseline (§8.12, ADR 0024 fix #28)
+// init-creates-extensions-baseline (§8.12, ADR 0024)
 test('init-creates-extensions-baseline', () => {
   withTmpDir((dir) => {
     const hypoDir = join(dir, 'wiki');
@@ -997,7 +997,7 @@ test('output is always valid JSON regardless of prompt', () => {
   }
 });
 
-// ── replay-compact-guard-detects-slash-clear (fix #25, ADR 0022 Layer 2) ──
+// ── replay-compact-guard-detects-slash-clear (ADR 0022 Layer 2) ──
 
 test('replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE', () => {
   const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear' });
@@ -1241,7 +1241,7 @@ test('HYPO_SKIP_GATE=1 bypasses an incomplete session close', () => {
   );
 });
 
-// ── replay-personal-check-bypass-order (fix #26, ADR 0022 amendment 2026-05-13) ──
+// ── replay-personal-check-bypass-order (ADR 0022 amendment 2026-05-13) ──
 // Capacity bypass (wiki-context-critical.json ≥90%) was removed. Spec §7.5:
 // the only bypass paths are HYPO_SKIP_GATE env / transcript user-role message.
 
@@ -2107,7 +2107,7 @@ test('--apply migration report tags are all in installed SCHEMA vocab', () => {
   });
 });
 
-// ── extensions companion sync (ADR 0024, fix #29 + #30) ──────────────────────
+// ── extensions companion sync (ADR 0024) ──────────────────────
 
 suite('extensions companion sync (upgrade.mjs, ADR 0024)');
 
@@ -3264,7 +3264,7 @@ test('upgrade-codex-core-hooks-mirror: legacy wiki-only settings yields no dupli
   });
 });
 
-// §8.12 (7) doctor extensions integrity (fix #33, ADR 0024 E5). Detects
+// §8.12 (7) doctor extensions integrity (ADR 0024 E5). Detects
 // (a) hard-copy SHA mismatch, (b) settings-entry mismatch + orphan, (c) manifest
 // missing (warn) / malformed (fail). Malformed = FAIL is what makes doctor's
 // `fails=0` ship gate (§5.1.3) actually cover §8.12-7(c).
@@ -3460,7 +3460,7 @@ test('doctor-extensions-integrity: --codex target', () => {
   });
 });
 
-// ── extensions settings.json mixed-group surgical write (fix #47, ADR 0024 amend 2026-05-23) ──
+// ── extensions settings.json mixed-group surgical write (ADR 0024 amend 2026-05-23) ──
 //
 // registerSettings used to ignore mixed-group occurrences of our command (any
 // group where g.hooks.length > 1) — leaving us either drifted in place or
@@ -4064,7 +4064,7 @@ test('parseManifest-empty-matcher: matcher:"" is normalized to undefined (CONCER
   });
 });
 
-// PR #53 follow-up (codex Worker 2 NIT, Concern A): doctor must surface a
+// Doctor must surface a
 // hypo-ext-* settings.json entry whose source file is present but whose
 // manifest is malformed or non-hook (registrable:false). The pre-existing
 // orphan scan only matched source-removed cases — manifest-unregistrable
@@ -4153,7 +4153,7 @@ test('doctor-extensions: non-hook manifest + lingering settings entry → unregi
   });
 });
 
-// PR #53/#54 follow-up deferred NIT: orphan duplicate scan. A single
+// Orphan duplicate scan. A single
 // hypo-ext-* command can appear in multiple groups/events when settings.json
 // was hand-edited. Pre-fix the orphan loop deduped by command and emitted a
 // single warn, hiding the duplicate count from the user. The fix counts
@@ -4269,7 +4269,7 @@ test('doctor-extensions: unregistrable orphan with 2 occurrences reports count',
   });
 });
 
-// PR #53 follow-up (codex CONCERN, Concern B): hand-edited settings.json with
+// Hand-edited settings.json with
 // `matcher: ""` against a manifest with no matcher. extensions.mjs:178
 // normalizes only the manifest side; the settings side still mismatches at
 // rankOccurrence (rank 3). Pre-fix doctor lumped this into the generic
@@ -4316,7 +4316,7 @@ test('doctor-extensions: hand-edited matcher:"" surfaces specific normalize-drif
   });
 });
 
-// PR #54 follow-up (codex W1 CONCERN): the matcher:"" specific message must
+// The matcher:"" specific message must
 // only fire when the hook itself is also exact — otherwise a co-occurring
 // timeout (or hook field) drift gets hidden behind the empty-matcher blurb.
 // Fix gates the specific message on hookExact; this test plants matcher:""
@@ -4369,7 +4369,7 @@ test('doctor-extensions: matcher:"" + wrong timeout falls back to generic differ
   });
 });
 
-// ── extensions companion uninstall (ADR 0024, fix #34) ───────────────────────
+// ── extensions companion uninstall (ADR 0024) ───────────────────────
 
 suite('extensions companion uninstall (uninstall.mjs, ADR 0024)');
 
@@ -4785,7 +4785,7 @@ test('errors when project session-state lacks a next heading', () => {
   );
 });
 
-// ── lint.mjs type-conditional + tag vocab tests (fix #15 + #36) ─────────────
+// ── lint.mjs type-conditional + tag vocab tests ─────────────
 
 suite('lint.mjs type-conditional required fields');
 
@@ -5520,7 +5520,7 @@ test('cwd-change refuses to inject .hypoignore-matched global hot.md', () => {
   });
 });
 
-// ── auto-project suggestion (fix #23 / ADR 0023) ──────────────────────────────
+// ── auto-project suggestion (ADR 0023) ──────────────────────────────
 suite('hypo-session-start.mjs / hypo-cwd-change.mjs — auto-project suggestion (fix #23)');
 
 const AP_OFFER_RE = /매칭되는 프로젝트가 없습니다.*자동 생성할까요/;
@@ -5678,7 +5678,7 @@ test('buildProjectSuggestionLine strips control chars from the cwd basename', ()
   assert.ok(line.includes('자동 생성할까요'), 'offer text intact');
 });
 
-// ── project-create helper (fix #23 scaffold) ──────────────────────────────────
+// ── project-create helper ──────────────────────────────────
 suite('scripts/lib/project-create.mjs — atomic project scaffold (fix #23)');
 
 test('substituteTokens replaces all four tokens', () => {
@@ -5806,7 +5806,7 @@ test('createProject rejects path-escape dot names (.., ., ...)', () => {
   });
 });
 
-// ── first-prompt forced resume summary (fix #3) + cwd-change re-trigger (#13) ──
+// ── first-prompt forced resume summary + cwd-change re-trigger (#13) ──
 suite('hypo-first-prompt.mjs — forced resume summary (fix #3 / #13)');
 
 // first-prompt reads its marker from os.tmpdir(), independent of HOME/HYPO_DIR.
@@ -6081,7 +6081,7 @@ test('session-start emits no growth line when cache absent', () => {
   });
 });
 
-// ── sync-state replay (fix #9/#10) ───────────────────────────────────────────
+// ── sync-state replay ───────────────────────────────────────────
 
 // A wiki repo wired to a working bare remote and pushed in sync — the baseline
 // for exercising session-start's clear/preserve logic.
@@ -6225,7 +6225,7 @@ test('replay-session-start-preserves-sync-state-when-ahead: unpushed commit keep
   });
 });
 
-// ── hypo-session-end / clear-marker (fix #25 PR-A2, ADR 0022 amendment) ────
+// ── hypo-session-end / clear-marker (ADR 0022 amendment) ────
 
 suite('hypo-session-end.mjs / hypo-session-start.mjs — clear-marker replay');
 
@@ -6947,7 +6947,7 @@ test('with results: ingest prompt not shown', () => {
   });
 });
 
-// ── hypo-auto-minimal-crystallize.mjs (fix #27 PR-C, ADR 0022 Layer 3) ─────
+// ── hypo-auto-minimal-crystallize.mjs (ADR 0022 Layer 3) ─────
 
 suite('hypo-auto-minimal-crystallize.mjs — Stop chain replay');
 
@@ -7206,7 +7206,7 @@ test('replay-auto-minimal-crystallize-on-incomplete-close: HYPO_SKIP_GATE=1 → 
   });
 });
 
-// ── crystallize.mjs --mark-session-closed (fix #27 PR-C) ───────────────────
+// ── crystallize.mjs --mark-session-closed ───────────────────
 
 suite('crystallize.mjs --mark-session-closed');
 
@@ -7332,7 +7332,7 @@ test('--apply-session-close --session-id leaves payload uncommitted → marker N
   });
 });
 
-// ── feedback-sync.mjs (ADR 0031, fix #37 Phase A) ─────────────────────────────
+// ── feedback-sync.mjs (ADR 0031) ─────────────────────────────
 
 function fbPage(fields) {
   const fm = Object.entries(fields)
@@ -7406,7 +7406,7 @@ const FB_PROJECT_L2 = {
   updated: '2026-05-19',
 };
 
-// ── hypo-personal-check.mjs — feedback projection gate (fix #37 Phase C) ──────
+// ── hypo-personal-check.mjs — feedback projection gate ──────
 // The PreCompact gate runs `feedback-sync --check --strict`; projection drift
 // must surface as a block, but only when PKG_ROOT resolves (a custom HOME with
 // hypo-pkg.json). The single-blocking-gate invariant (spec §7.5) means this is
@@ -7799,7 +7799,7 @@ test('feedback-sync-write-strict-refuses-before-write: strict warning blocks the
   );
 });
 
-// ── doctor.mjs — feedback projection (fix #37 #9) ────────────────────────────
+// ── doctor.mjs — feedback projection ────────────────────────────
 
 // Build a wiki + claude-home with feedback pages, then run doctor wired to the
 // same --claude-home/--project-id used by feedback-sync. Returns the parsed
@@ -7906,7 +7906,7 @@ test('tampered managed block (conflict) → fail Feedback projection integrity',
   });
 });
 
-// ── feedback-sync.mjs — project-id fallback (fix #37 #10) ─────────────────────
+// ── feedback-sync.mjs — project-id fallback ─────────────────────
 
 suite('feedback-sync.mjs — project-id fallback (fix #37 #10)');
 
@@ -7969,7 +7969,7 @@ test('feedback-sync-explicit-project-id-wins: MEMORY target present, no prompt p
   });
 });
 
-// ── feedback-sync.mjs — bootstrap + import (fix #37 Phase D) ──────────────────
+// ── feedback-sync.mjs — bootstrap + import ──────────────────
 
 suite('feedback-sync.mjs — bootstrap + import (fix #37 Phase D)');
 
@@ -8379,7 +8379,7 @@ test('doctor-derived-missing-project-id: unresolved warn, not a misleading stale
   });
 });
 
-// ── feedback.mjs — /hypo:feedback page writer (fix #37 Phase C) ───────────────
+// ── feedback.mjs — /hypo:feedback page writer ───────────────
 // feedback.mjs must emit lint #8-complete frontmatter so the page is a valid
 // projection SoT, and must reject incomplete classification rather than write a
 // page lint would later block. --no-sync keeps these tests from touching
@@ -8777,7 +8777,7 @@ test('hooks-stderr-log-format: forced catch emits [hypo-auto-stage] error: + pre
   assert.equal(r.status, 0);
 });
 
-// ── hypo-web-fetch-ingest.mjs — PostToolUse auto-ingest signal (fix #2) ──────
+// ── hypo-web-fetch-ingest.mjs — PostToolUse auto-ingest signal ──────
 //
 // Coverage Matrix id (spec §9.1.1): `hook replay (PostToolUse WebFetch)`.
 // PostToolUse uses **nested** hookSpecificOutput.additionalContext (Claude

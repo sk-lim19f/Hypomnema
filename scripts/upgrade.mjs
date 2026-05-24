@@ -223,7 +223,7 @@ function checkSchemaVersion(hypoDir) {
 
 // Target-aware: the same core-hook integrity check runs against ~/.claude/hooks/
 // for the default claude target, and against ~/.codex/hooks/ when --codex is set
-// (fix #48, ADR 0024). The function reads only — apply happens in applyHookFiles.
+// (ADR 0024). The function reads only — apply happens in applyHookFiles.
 function checkHookFiles(hooksDir) {
   const results = [];
 
@@ -676,7 +676,7 @@ function applyCommands(commandResults, force) {
 const args = parseArgs(process.argv);
 
 // Target paths. Claude is always checked; codex is checked only when --codex is set
-// (fix #48, ADR 0024) so users without codex installed see no false drift.
+// (ADR 0024) so users without codex installed see no false drift.
 const claudeHooksDir = join(HOME, '.claude', 'hooks');
 const claudeSettingsPath = join(HOME, '.claude', 'settings.json');
 const codexHooksDir = join(HOME, '.codex', 'hooks');
@@ -697,7 +697,7 @@ const hooksCodex = args.codex ? checkHookFiles(codexHooksDir) : null;
 const settingsCodex = args.codex ? checkSettingsJson(codexSettingsPath, codexHooksDir) : null;
 const oldHookRefsCodex = args.codex ? checkOldHookNames(codexSettingsPath) : null;
 
-// Extensions companion (ADR 0024, fix #29 + #30). Read-only check; the apply
+// Extensions companion (ADR 0024). Read-only check; the apply
 // happens below, AFTER applyCommands, so the per-target SHA map merges into the
 // hypo-pkg.json that applyCommands writes (rather than being clobbered by it).
 const extSettingsPath = claudeSettingsPath;

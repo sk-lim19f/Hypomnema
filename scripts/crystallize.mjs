@@ -133,7 +133,7 @@ function parseArgs(argv) {
   return args;
 }
 
-// ── session-close check (fix #17, spec §5.2.7 / §8.3) ────────────────────────
+// ── session-close check (spec §5.2.7 / §8.3) ────────────────────────
 // Mirrors the hard gate in hypo-personal-check.mjs so the /hypo:crystallize
 // flow can self-verify before /compact triggers PreCompact.
 
@@ -186,7 +186,7 @@ function runSessionCloseCheck(args) {
   process.exit(status.ok ? 0 : 1);
 }
 
-// ── session-close apply (fix #38) ────────────────────────────────────────────
+// ── session-close apply ────────────────────────────────────────────
 // Idempotent payload-driven application of the 5 mandatory session-close memory
 // files (+ optional open-questions). Used by the LLM session-close flow as the
 // canonical entrypoint instead of issuing 5+ Write tool calls by hand.
@@ -316,7 +316,7 @@ function validatePayloadShape(payload) {
   return errs;
 }
 
-// ── session-close marker (fix #27 PR-C, ADR 0022 amendment 2026-05-19) ──────
+// ── session-close marker (ADR 0022 amendment 2026-05-19) ──────
 // Standalone marker writer. Used when the LLM closes the session via direct
 // Write tool calls (not --apply-session-close). Hook `hypo-auto-minimal-
 // crystallize` is the only Reader; writer authority is intentionally split

@@ -94,7 +94,7 @@ function removeCommands(apply, force) {
   return { removed, skippedUserModified, skippedNonRegular };
 }
 
-// ── extensions removal (ADR 0024, fix #34) ───────────────────────────────────
+// ── extensions removal (ADR 0024) ───────────────────────────────────
 
 // Strip per-target extension SHA records from ~/.claude/hypo-pkg.json. Surgical:
 // we only touch the entries for keys we actually removed, so a `--force-extensions`
@@ -424,7 +424,7 @@ const hookResult = removeHookFiles(claudeHooksDir, hookFiles, args.apply);
 const settingsResult = stripSettingsJson(claudeSettings, claudeHooksDir, hookMap, args.apply);
 const commandResult = removeCommands(args.apply, args.forceCommands);
 
-// Extensions (ADR 0024, fix #34). Order matters: remove files first, then strip
+// Extensions (ADR 0024). Order matters: remove files first, then strip
 // settings, then surgically clear the per-target SHA map. The SHA strip uses
 // removedKeys so a user-modified file we left in place keeps its recorded SHA
 // (doctor still has a baseline next run). Settings are path-based and run even
