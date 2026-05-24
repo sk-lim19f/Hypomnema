@@ -104,7 +104,12 @@ and `~/.claude/CLAUDE.md` `<learned_behaviors>`. They require:
 
 ```yaml
 status: active | superseded | archived
-scope: global | project:<slug>           # global → eligible for CLAUDE.md projection
+scope: global | project:<project-id>     # global → eligible for CLAUDE.md projection;
+                                         # <project-id> must exact-match the resolved
+                                         # project-id (default: cwd → `/`,`.` replaced
+                                         # with `-`; or pass `--project-id=<id>`).
+                                         # Mismatched scope = page is NOT projected
+                                         # into that project's MEMORY.md.
 tier: L1 | L2                            # L1 required for CLAUDE.md <learned_behaviors>
 targets: [project-memory, claude-learned] # which projection surfaces to derive
 sensitivity: public | sanitized          # `private` forbidden (wiki is git-pushed)

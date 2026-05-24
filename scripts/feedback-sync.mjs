@@ -219,7 +219,7 @@ function memoryTarget(args, projectId) {
     capKind: 'lines',
     filter: (p) =>
       p.fm.status === 'active' &&
-      (p.fm.scope === 'global' || (p.fm.scope || '').startsWith('project:')) &&
+      (p.fm.scope === 'global' || p.fm.scope === `project:${projectId}`) &&
       p.targets.includes('project-memory') &&
       PUBLIC_SENSITIVITY.has(p.fm.sensitivity),
     render: (p) =>
