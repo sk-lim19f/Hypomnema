@@ -130,7 +130,7 @@ Hypomnema          ───►  synthesis · markdown · git · hooks · local
 
 ## Term decoder
 
-Hypomnema borrows vocabulary from a few worlds. These are the recurring terms used in the rest of the README; the link `[def]` style appears on first use elsewhere.
+Hypomnema borrows vocabulary from a few worlds. These are the recurring terms used in the rest of the README — keep this table open in another tab while you skim.
 
 | Term | Meaning in Hypomnema |
 |---|---|
@@ -245,6 +245,8 @@ Eight commands cover the full capture → retrieval → consolidation cycle.
 
 All hooks resolve the wiki root via `HYPO_DIR` env → `hypo-config.md` scan → `~/hypomnema` default, and share `hypo-shared.mjs` (declared via `hooks.json`'s `shared` field).
 
+Additionally, the `SessionStart` hook performs a non-blocking background check against npm and the Claude Code plugin marketplace and prints an "Update available!" banner the next time a newer Hypomnema version has been published. Opt out with `HYPO_NO_UPDATE_CHECK=1`, `NO_UPDATE_NOTIFIER=1`, or by running under `CI=true`.
+
 ### Setup & maintenance
 
 | Command | Purpose |
@@ -348,7 +350,7 @@ Place a `hypo-config.md` at the wiki root to make it portable across machines wi
 
 | Install path | Slash commands served from |
 |---|---|
-| Plugin (Path A) | Claude Code's plugin cache; updated via `/plugin update` |
+| Plugin (Path A) | Claude Code's plugin cache; updated via `/plugin marketplace update hypomnema` then `/reload-plugins` |
 | npm CLI (Path B) | `~/.claude/commands/hypo/`; updated via `hypomnema upgrade --apply` with per-file SHA tracking. Pass `--force-commands` to overwrite hand-edits (creates `.bak`). |
 
 ---
