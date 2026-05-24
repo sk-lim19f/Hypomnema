@@ -27,7 +27,9 @@ _Make Claude take notes — and measure whether it actually does._
 > - **auto-project creation on cwd match** — when you `cd` into a git repo with a project marker (`package.json`, `Cargo.toml`, etc.) and no matching wiki project exists, Hypomnema offers to scaffold one for you (ADR 0023).
 > - **Stop-chain auto-minimal-crystallize + `/clear` recovery** — non-trivial sessions get an automatic "save a minimal session-close note?" prompt; `/clear` after a forgotten close is detected and recovered cleanly (ADR 0022).
 >
-> SCHEMA bumps to 2.0 — the `feedback` page type now requires 9 hard frontmatter fields. `hypomnema upgrade --apply` writes `MIGRATION-v2.0.md` into your wiki root with a step-by-step backfill checklist. Your own `SCHEMA.md` is **never overwritten** by upgrade (we call this Option C); migration is informational, the diff stays in your hands.
+> The schema (`SCHEMA.md`) bumps to 2.0 — the `feedback` page type now requires 9 mandatory frontmatter fields. `hypomnema upgrade --apply` writes `MIGRATION-v2.0.md` into the wiki root with a step-by-step backfill checklist. Your own `SCHEMA.md` is **never overwritten** by upgrade — we call this policy *Option C*: the upgrade only tells you what changed, and you apply the diff yourself.
+
+> **Quick decoder for terms used below.** *frontmatter* = the YAML block at the top of a markdown file; *wikilink* = a `[[page-slug]]` cross-reference; *ADR* = "Architecture Decision Record", a short markdown page that records *why* a design choice was made; *projection* = a one-way derive (`pages/feedback/*.md` → `MEMORY.md` / `<learned_behaviors>`); *hook* = a script that Claude Code runs automatically on lifecycle events; *hot.md* / *session-state.md* = the per-project cache files that hold "what just happened" and "what's next" so a paused project resumes in one read. Full glossary lives under [Term decoder](#term-decoder).
 
 ---
 
@@ -123,6 +125,35 @@ Hypomnema          ───►  synthesis · markdown · git · hooks · local
 - **Compounding density.** A wiki with 100 sources should not have 100 disconnected pages. After three months of real use, page count grows sub-linearly while cross-links grow super-linearly.
 - **Zero context switch.** You're already in Claude Code. The wiki is one slash command away — not another tab, another app, another login.
 - **Future-proof storage.** Plain markdown + git means: you can read it in 20 years, you can grep it offline, you can move providers anytime, and AI assistants you haven't met yet will still understand it.
+
+---
+
+## Term decoder
+
+Hypomnema borrows vocabulary from a few worlds. These are the recurring terms used in the rest of the README; the link `[def]` style appears on first use elsewhere.
+
+| Term | Meaning in Hypomnema |
+|---|---|
+| **frontmatter** | The YAML block at the top of a markdown page — `title`, `type`, `tags`, etc. |
+| **wikilink** | A `[[page-slug]]` cross-reference between pages; resolved at lint time |
+| **ADR** | "Architecture Decision Record" — a short markdown page recording *why* a non-obvious design choice was made |
+| **schema** | The type taxonomy + required-field rules in `SCHEMA.md` — what makes a page valid |
+| **lint** | A read-only validator (`hypomnema lint`) that checks frontmatter, wikilinks, and schema |
+| **projection** | A one-way automatic derivation — `pages/feedback/*.md` → `MEMORY.md` and CLAUDE.md `<learned_behaviors>` |
+| **SoT** ("source of truth") | The single file you edit; projections derive from it, never the other way around |
+| **hook** | A script Claude Code runs automatically on a lifecycle event (e.g. `SessionStart`, `Stop`) |
+| **lifecycle event** | A point Claude Code surfaces to plugins: session opens, prompt submitted, tool used, compact requested, session ends, etc. |
+| **`hot.md`** | Per-project cache: "what just happened" (most recent session highlights) |
+| **`session-state.md`** | Per-project cache: "what's next" (the resume payload for the next session) |
+| **`.hypoignore`** | Glob patterns that exclude paths from every content-injection hook and from `ingest` |
+| **observability score** | A per-session metric (ingest / query / session-close / citation rates) that measures whether the wiki is actually being used |
+| **manifest** | A small JSON the install scripts write to track exactly which files were installed and at what SHA |
+| **`additionalContext`** | The Claude Code hook field that injects extra context into the prompt — what content-injection hooks emit into |
+| **byte-equal** | A file that comes out of `--apply` bit-for-bit identical to before — the strongest "we did not touch this" guarantee |
+| **BM25** | A classic full-text ranking algorithm; powers the `/hypo:query` MISS-resistant lookup |
+| **Option C** | The policy that `hypomnema upgrade --apply` never overwrites your `SCHEMA.md` — it only writes a migration report you apply by hand |
+
+If a term you hit later in the README is missing here, that is a documentation bug — please open an issue.
 
 ---
 
