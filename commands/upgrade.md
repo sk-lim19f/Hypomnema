@@ -28,7 +28,7 @@ node <package-root>/scripts/upgrade.mjs [--hypo-dir="<path>"]
 
 Show the output verbatim.
 
-> **Note**: If a major SCHEMA bump is detected, this step generates a `MIGRATION-vX.Y.md` file in the Hypomnema root. This is a new informational file — no existing files are overwritten.
+> **Note**: A major SCHEMA bump is only **detected** in this step. The informational `MIGRATION-vX.Y.md` file is written later by `--apply` (Step 4) and only on a major bump. `SCHEMA.md` is never auto-overwritten.
 
 ---
 
@@ -38,7 +38,7 @@ Show the output verbatim.
 - `⚠` — minor update available (stale hook or missing settings entry)
 - `✗` — major version bump or missing hook files (action required)
 
-For a **major SCHEMA bump**: point the user to the generated `MIGRATION-vX.Y.md` file in their Hypomnema root and ask them to review it before applying.
+For a **major SCHEMA bump**: warn the user that `--apply` will additionally write a `MIGRATION-vX.Y.md` informational file in their Hypomnema root and that they must manually merge the SCHEMA diff after applying.
 
 ---
 

@@ -129,7 +129,7 @@ Use lowercase, hyphenated tags. Vocabulary is locked — `lint` blocks unknown t
 and forbidden patterns (PascalCase, plurals, whitespace, generic words).
 Extend this list (and `~/hypomnema/SCHEMA.md`) before introducing a new tag.
 
-**Meta**: `wiki`, `index`, `pages`, `home`, `overview`, `guide`, `operations`, `schema`, `reference`, `hypo`, `commands`, `hot-cache`
+**Meta**: `wiki`, `index`, `pages`, `home`, `overview`, `guide`, `operations`, `schema`, `reference`, `hypo`, `commands`, `hot-cache`, `migration`
 **Workflow**: `automation`, `hooks`, `observability`, `autonomy`, `wiki-health`, `weekly`
 **Project**: `project`, `prd`, `adr`, `session-state`
 **Domain**: `ai`, `dev`, `ops`, `security`, `data`, `design`, `management`
