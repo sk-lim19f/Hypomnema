@@ -2,7 +2,7 @@
 title: Wiki Schema
 type: schema
 updated: YYYY-MM-DD
-version: 1.0
+version: 2.0
 ---
 
 # Wiki Schema
