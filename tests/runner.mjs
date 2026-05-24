@@ -4072,6 +4072,122 @@ test('doctor-extensions: non-hook manifest + lingering settings entry → unregi
   });
 });
 
+// PR #53/#54 follow-up deferred NIT: orphan duplicate scan. A single
+// hypo-ext-* command can appear in multiple groups/events when settings.json
+// was hand-edited. Pre-fix the orphan loop deduped by command and emitted a
+// single warn, hiding the duplicate count from the user. The fix counts
+// occurrences and appends `(N occurrences)`.
+test('doctor-extensions: source-removed orphan with 2 occurrences reports count', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      // Healthy install, then delete the source so it becomes an orphan.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-dup.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      // Hand-edit settings.json to also register the same command under Stop —
+      // simulates manual migration leaving a second copy behind.
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      let extHook = null;
+      for (const groups of Object.values(s.hooks || {})) {
+        if (!Array.isArray(groups)) continue;
+        for (const g of groups) {
+          for (const h of g.hooks || []) {
+            if (typeof h.command === 'string' && /hypo-ext-[^/\s]+\.mjs/.test(h.command)) {
+              extHook = h;
+              break;
+            }
+          }
+          if (extHook) break;
+        }
+        if (extHook) break;
+      }
+      assert.ok(extHook, 'ext hook must be registered before duplicating');
+      s.hooks.Stop = [{ hooks: [{ ...extHook }] }];
+      writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
+
+      // Remove BOTH source file AND the extensions/ directory entry so the
+      // command becomes orphan everywhere.
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      rmSync(join(extHooks, 'hypo-ext-dup.mjs'));
+      rmSync(join(extHooks, 'hypo-ext-dup.manifest.json'));
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /orphan settings entry .*hypo-ext-dup.*source extension removed \(2 occurrences\)/i.test(
+          detail,
+        ),
+        `expected source-removed orphan warn with (2 occurrences): ${detail}`,
+      );
+    });
+  });
+});
+
+test('doctor-extensions: unregistrable orphan with 2 occurrences reports count', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-dupbad.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      // Duplicate the settings entry under Stop.
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      let extHook = null;
+      for (const groups of Object.values(s.hooks || {})) {
+        if (!Array.isArray(groups)) continue;
+        for (const g of groups) {
+          for (const h of g.hooks || []) {
+            if (typeof h.command === 'string' && /hypo-ext-[^/\s]+\.mjs/.test(h.command)) {
+              extHook = h;
+              break;
+            }
+          }
+          if (extHook) break;
+        }
+        if (extHook) break;
+      }
+      assert.ok(extHook, 'ext hook must be registered before duplicating');
+      s.hooks.Stop = [{ hooks: [{ ...extHook }] }];
+      writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
+
+      // Corrupt the manifest — source still present but unregistrable.
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      writeFileSync(
+        join(extHooks, 'hypo-ext-dupbad.manifest.json'),
+        JSON.stringify({ type: 'hook', event: 'NotARealEvent' }),
+      );
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /orphan settings entry .*hypo-ext-dupbad.*manifest unregistrable \(2 occurrences\)/i.test(
+          detail,
+        ),
+        `expected unregistrable orphan warn with (2 occurrences): ${detail}`,
+      );
+    });
+  });
+});
+
 // PR #53 follow-up (codex CONCERN, Concern B): hand-edited settings.json with
 // `matcher: ""` against a manifest with no matcher. extensions.mjs:178
 // normalizes only the manifest side; the settings side still mismatches at

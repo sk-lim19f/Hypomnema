@@ -821,13 +821,8 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
         // timeout drift (PR #54 follow-up, codex W1 CONCERN). The hookExact
         // comparison mirrors rankOccurrence's own canonical check
         // (extensions.mjs ~580) so doctor's report tracks --apply intent.
-        const hookExact =
-          JSON.stringify(picked.occ.hook) === JSON.stringify(desiredHook);
-        if (
-          picked.occ.group.matcher === '' &&
-          entry.matcher === undefined &&
-          hookExact
-        ) {
+        const hookExact = JSON.stringify(picked.occ.hook) === JSON.stringify(desiredHook);
+        if (picked.occ.group.matcher === '' && entry.matcher === undefined && hookExact) {
           problems.push({
             severity: 'warn',
             msg: `${entry.name} settings has matcher: "" (equivalent to absent) — run upgrade --apply to normalize`,
@@ -871,31 +866,42 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
       const parsed = parseManifest(ext.manifestPath);
       if (!parsed.ok || !parsed.registrable) unregistrableCmds.add(cmdFor(ext));
     }
-    const seen = new Set();
+    // PR #53/#54 follow-up deferred NIT: a single hypo-ext-* command can appear
+    // in multiple groups/events when settings.json was hand-edited or migrated
+    // across events. The registrable-entry duplicate surface above
+    // (`occurrences.length > 1`) only iterates `expected`, so orphan-class
+    // duplicates were silently de-duped to a single warn. Count occurrences per
+    // orphan command and append `(N occurrences)` when count > 1.
+    //
+    // Order: check `unregistrableCmds` BEFORE `sourceCmds` — a malformed or
+    // non-hook manifest still has the source file present, so the
+    // `sourceCmds.has` check would otherwise misclassify them as non-orphan.
+    const orphanInfo = new Map(); // command → { kind, count }
     for (const groups of Object.values(hooksObj)) {
       if (!Array.isArray(groups)) continue;
       for (const g of groups) {
         if (!g || typeof g !== 'object') continue;
-        for (const h of g.hooks || []) {
+        if (!Array.isArray(g.hooks)) continue;
+        for (const h of g.hooks) {
           if (typeof h.command !== 'string') continue;
           if (!/(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(h.command)) continue;
-          if (seen.has(h.command)) continue;
-          if (unregistrableCmds.has(h.command)) {
-            seen.add(h.command);
-            problems.push({
-              severity: 'warn',
-              msg: `orphan settings entry (${h.command}) — manifest unregistrable; run uninstall`,
-            });
-            continue;
-          }
-          if (sourceCmds.has(h.command)) continue;
-          seen.add(h.command);
-          problems.push({
-            severity: 'warn',
-            msg: `orphan settings entry (${h.command}) — source extension removed; run uninstall`,
-          });
+          let kind = null;
+          if (unregistrableCmds.has(h.command)) kind = 'unregistrable';
+          else if (!sourceCmds.has(h.command)) kind = 'source-removed';
+          else continue;
+          const info = orphanInfo.get(h.command);
+          if (info) info.count += 1;
+          else orphanInfo.set(h.command, { kind, count: 1 });
         }
       }
+    }
+    for (const [cmd, { kind, count }] of orphanInfo) {
+      const suffix = count > 1 ? ` (${count} occurrences)` : '';
+      const msg =
+        kind === 'unregistrable'
+          ? `orphan settings entry (${cmd}) — manifest unregistrable${suffix}; run uninstall`
+          : `orphan settings entry (${cmd}) — source extension removed${suffix}; run uninstall`;
+      problems.push({ severity: 'warn', msg });
     }
   }
 
