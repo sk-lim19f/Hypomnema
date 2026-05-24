@@ -815,9 +815,19 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
         // (extensions.mjs:178) collapses `matcher: ""` → absent only on the
         // manifest path. A hand-edited settings.json with `matcher: ""` still
         // mismatches an absent manifest matcher (rankOccurrence treats "" vs
-        // undefined as non-equal). Surface this specific drift so the user
-        // sees the empty-string-vs-absent equivalence, not the generic blurb.
-        if (picked.occ.group.matcher === '' && entry.matcher === undefined) {
+        // undefined as non-equal). Surface the empty-string-vs-absent
+        // equivalence ONLY when the hook itself is otherwise exact —
+        // otherwise the specific message would hide a co-occurring hook /
+        // timeout drift (PR #54 follow-up, codex W1 CONCERN). The hookExact
+        // comparison mirrors rankOccurrence's own canonical check
+        // (extensions.mjs ~580) so doctor's report tracks --apply intent.
+        const hookExact =
+          JSON.stringify(picked.occ.hook) === JSON.stringify(desiredHook);
+        if (
+          picked.occ.group.matcher === '' &&
+          entry.matcher === undefined &&
+          hookExact
+        ) {
           problems.push({
             severity: 'warn',
             msg: `${entry.name} settings has matcher: "" (equivalent to absent) — run upgrade --apply to normalize`,
@@ -825,7 +835,7 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
         } else {
           problems.push({
             severity: 'warn',
-            msg: `${entry.name} settings entry differs from manifest (matcher/timeout) — run upgrade --apply`,
+            msg: `${entry.name} settings entry differs from manifest (matcher/hook/timeout) — run upgrade --apply`,
           });
         }
       }
