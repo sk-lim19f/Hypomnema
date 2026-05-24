@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-24
+
+### ⚠ Breaking
+
+- **`SCHEMA.md` version 2.0 — `feedback` page type now requires 9 hard fields (ADR 0031 / ADR 0034, PR #60).** Pages of `type: feedback` must declare `status`, `scope`, `tier`, `targets`, `sensitivity`, `priority`, `memory_summary`, `reason`, `source`. When `targets` includes `claude-learned`, the page must additionally be `scope: global` + `tier: L1` and declare `global_summary` + `promote_to_global: true`. `hypomnema upgrade --apply` now writes `MIGRATION-v2.0.md` into the wiki root with a manual-backfill checklist; the upgrade deliberately does NOT auto-stub the fields because wrong defaults for `scope` / `tier` / `targets` / `sensitivity` / `reason` / `source` would silently project wrong behavior. `SCHEMA.md` itself remains user-owned and byte-equal across upgrade (Option C, preserved by PR #57's invariants). The migration report also carries the `project-id` ↔ slug regex caveat from PR #59 — to use `scope: project:*` in v1.2.0 you must `--project-id=<slug>` override.
+
 ### Added
+
+- **`lint` emits `W8` design-history-stale warning (fix #49).** The PreCompact
+  hook (`hypo-personal-check.mjs`) has filtered `lint --json` warns for
+  `id === 'W8'` since the initial OSS hook drop, but `scripts/lint.mjs` never
+  emitted that id — so `design-history.md` aging next to a fresher
+  `session-log.md` (or `session-log/YYYY-MM.md` directory layout) was silently
+  invisible to the gate. Lint now runs `findDesignHistoryStale()` once per
+  project (outside the page loop), and emits a `W8`-tagged warn per stale
+  project with a POSIX-separated `file` literal (`projects/<name>/design-history.md`)
+  so the consumer's `file.split('/')` contract stays portable. The JSON `warn`
+  shape gains an optional `id` field, omitted for legacy id-less warns.
 
 - **`lint` emits `W8` design-history-stale warning (fix #49).** The PreCompact
   hook (`hypo-personal-check.mjs`) has filtered `lint --json` warns for
@@ -55,6 +72,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session. Per-channel notification state prevents the same banner from
   repeating, and `current >= latest` (local dev) is silently skipped. Opt out
   with `HYPO_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER`, or `CI`.
+- **`feedback`-as-source-of-truth + one-way projections to MEMORY / `<learned_behaviors>` (ADR 0031, fix #37, PR #36).** A new `pages/feedback/<slug>.md` page type replaces ad-hoc human-side sync of behavior corrections across three storage surfaces. `hypomnema feedback-sync` derives `~/.claude/projects/<project-id>/memory/MEMORY.md` (200-line cap) and `~/.claude/CLAUDE.md` `<learned_behaviors>` (max 10 entries, strict gate: `scope:global` + `tier:L1` + `targets:claude-learned` + `promote_to_global:true` + `sensitivity ∈ {public, sanitized}`) from the wiki. Managed blocks are marker- and hash-fenced; hand-edits are flagged as `CONFLICT_MANUAL_EDIT`. PreCompact integration runs inside `hypo-personal-check` (single-blocking-gate invariant). `sensitivity: private` is forbidden — the wiki is git-pushed; private data must stay outside the wiki entirely. `/hypo:feedback` slash command writes pages directly; `hypomnema feedback-sync --bootstrap` scaffolds drafts from existing MEMORY/CLAUDE state under `pages/feedback/_drafts/` for human review.
+- **Extensions companion sync (ADR 0024, PRs #42~#47).** A new `extensions/` taxonomy in the wiki (`agents/`, `commands/`, `hooks/`, `skills/`) lets users ship Claude Code / Codex companion files alongside their wiki. `hypomnema init` scaffolds the directory; `hypomnema upgrade` mirrors the inventory into `~/.claude/` and (with `--codex`) `~/.codex/`, detects conflicts (`--force-extensions` to overwrite), and `hypomnema doctor extensions` audits integrity (orphan duplicates, matcher drift, non-registrable orphans). `hypomnema uninstall` cleans up the companion files. PR #49 added settings.json mixed-group surgical write so settings.json edits stay minimal and merge-friendly.
+- **`hypomnema upgrade --codex` mirrors core hooks (fix #48, PR #50).** `init --codex`
+  has always installed Hypomnema's core hooks into `~/.codex/hooks/` and
+  registered them in `~/.codex/settings.json`, but `upgrade` only mirrored
+  user extensions — so a v1.1.x → v1.2.0 codex user's core hooks stayed
+  stale until a fresh install. The flag now drives drift detection, hook-file
+  apply, settings.json registration, and the `wiki-*.mjs → hypo-*.mjs` rename
+  migration on both targets in one pass. The human-readable report labels
+  the two blocks ("Hook files (codex)", "settings.json (codex)") and JSON
+  output gains `hooksCodex` / `settingsCodex` / `oldHookRefsCodex` plus
+  matching `applied.*Codex` keys. Without `--codex` nothing under `~/.codex/`
+  is inspected (parity with the existing extensions behaviour).
+- **`hypomnema upgrade` v1→v2 migration report (ADR 0034, PR #60).** Major SCHEMA bump now writes `MIGRATION-v2.0.md` into the wiki root with v1→v2-specific guidance: ADR 0031 / ADR 0034 references, all 9 unconditional `feedback` fields, the conditional `claude-learned` set, the explicit no-auto-stub policy, the "fix existing pages before `/hypo:feedback` append" warning, the PR #59 `project-id` ↔ slug regex caveat, and a closing re-run-lint checklist. Other major jumps keep the original generic body. PR #57 invariants preserved: `SCHEMA.md` is byte-equal after `--apply` (Option C), report tag stays `[schema]` (the only token historically valid across all shipped Meta vocabularies).
+- **PostToolUse WebFetch / WebSearch auto-ingest signal (fix #2, PR #48).** When Claude resolves a URL via WebFetch or runs WebSearch, the PostToolUse hook injects a nudge in `hookSpecificOutput.additionalContext` so Claude considers running `/hypo:ingest`. URL query/hash tokens and userinfo (`user:pass@host`) are stripped before injection. Non-HTTP schemes (`file://`, `ftp://`, `data:`) and missing URLs are silent skips. Opt out with `HYPO_SKIP_GATE=1`. Fail-open on invalid JSON stdin; stderr carries the unified `[hypo-web-fetch-ingest] error:` tag.
+- **Stop-chain auto-minimal-crystallize (ADR 0022 Layer 3, PR #34).** A session that crossed a "non-trivial" threshold now offers (and on `Y` runs) `/hypo:crystallize --apply-session-close --minimal` automatically from the Stop hook chain. Combined with PR #31~#33 `/clear` detection and SessionEnd marker / SessionStart `source=clear` recovery, the personal-check gate now catches forgotten session closes and reopens cleanly when the user runs `/clear`.
+- **`crystallize --apply-session-close` programmatic entrypoint (PRs #21, #23~#26).** Strict 11-step session-close validation (PreCompact hard gate + crystallize). `--payload <json>` and `--apply-session-close` make the path machine-callable from the Stop hook chain; `--probe` early-exit (option D) keeps no-op closes fast. Lint preflight + post-apply gate ensures the wiki ends up clean.
+- **Auto-project creation on cwd match (ADR 0023, PR #41).** When you start a session
+  (or change directory) inside a git repository that carries a project marker
+  (`package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `pom.xml`,
+  `build.gradle`, `composer.json`, `Gemfile`) but matches no existing wiki
+  project's `working_dir`, the SessionStart/CwdChanged hook now offers to create
+  one. The offer is a nudge only; on "Y" Claude runs the new internal scaffold
+  helper (`scripts/lib/project-create.mjs`) which materializes the project from
+  `templates/projects/_template/` with token substitution, adds the root
+  `hot.md` pointer row, and logs the creation. On "N" the cwd is recorded under
+  `skips[]` in `.cache/project-suggestions.json` and never offered again (a
+  5-minute per-cwd cooldown also suppresses repeats within a session). Temp and
+  marker-less directories never trigger the offer. `hypomnema doctor` validates
+  the skip-persistence file's schema. (Already listed above; this version's PR #41 also strengthens templated Session Start guidance: first response must lead with a resume summary.)
+- **First-prompt resume summary + cwd-change re-trigger (PR #39).** SessionStart's resume nudge now forces the resume summary on the first response, and a cwd change inside the session re-triggers the project match check (so opening a new repo without restarting Claude still picks up the right project).
+- **Unified `[hypo-<name>] error:` stderr log tag across all lifecycle hooks (PR #40).** Every hook (`hypo-cwd-change`, `hypo-first-prompt`, `hypo-compact-guard`, `hypo-file-watch`, `hypo-lookup`, `hypo-personal-check`, `hypo-auto-minimal-crystallize`, `hypo-auto-stage`, `hypo-web-fetch-ingest`) emits its forced-catch path with the same `[hypo-<name>] error: ...` prefix so dogfood log triage is grep-friendly.
+- **`weekly-report` migrates output to `journal/weekly/<YYYY-Www>.md` (PR #29).** Single source of truth per spec §6.4. Old report locations are no longer written.
+- **Lint type-conditional fields + tag vocabulary lock (PRs #28, #38).** Lint now enforces per-type required fields and rejects unknown tags (vocabulary outside SCHEMA `Tag Vocabulary`). PR #38 adds `B6` warn for `pages/` subdirs absent from SCHEMA taxonomy.
+- **`.hypoignore` privacy guards (PRs #19, #20, #27).** `/hypo:ingest` honors `.hypoignore`; `.hypoignore` is kept in sync with `.gitignore`; a pre-commit hook prevents private-marked content from leaking. `.hypoignore` is now enforced on **all** wiki content-injection hooks (#27).
+- **Self-natural-close pattern detection (PR `91e1c91`).** Behavioral rule layer-1 — the personal-check gate now recognizes natural-language close phrases ("이만 마무리", "오늘 여기까지", etc.) and offers the session-close flow.
+- **Prettier setup + format pass (chore commits `dbc228f`, `4dac33c`, `4696abf`).** Repository-wide Prettier config + `npm run format` / `format:check` scripts. `.git-blame-ignore-revs` for the reformat commit so `git blame` stays clean.
+
+### Changed
+
+- **`feedback-sync` MEMORY projection is now strictly cwd-scoped (ADR 0031 §4 amendment, PR #59).** `memoryTarget.filter` previously accepted any `scope: project:*` page regardless of the resolved project-id, so a `scope: project:other` page was silently projected into `~/.claude/projects/<this-project>/memory/`. The filter is now `scope === 'global' || scope === \`project:${projectId}\`` (exact match). `templates/SCHEMA.md` §3.1 and `commands/feedback.md` `--scope` flag clarify that `<project-id>` must exact-match the resolved project-id (default: `cwd → '/'.'.' → '-'`; or `--project-id=<id>` override). Mismatch = silent MEMORY skip (not a lint error). The lint regex `^project:[a-z0-9][a-z0-9-]*$` and the default cwd-derived id are incompatible — to use a `project:*` scope you must `--project-id=<slug>` override. Full resolved-id ↔ wiki-slug reconciliation is deferred to v1.3.0.
+- **`hypomnema upgrade` migration report tag historical regression fix (별도 잔여 #5, PR #57).** `writeMigrationReport()` previously emitted `tags: [hypomnema, migration, schema]`, but the v1.0 / v1.1 historical Meta vocab is `wiki, index, operations, guide, schema` — neither `hypomnema` nor `migration` are present. Because Option C deliberately does NOT touch the user's `SCHEMA.md`, a v1.0 / v1.1 user upgrading would have a lint-failing page created at the wiki root. Tag tightened to `[schema]` (the only token historically valid). Added two regression tests: `--apply leaves user SCHEMA.md byte-equal` (Option C contract) and `--apply migration report tags are all in installed SCHEMA vocab` (vocab-level assertion, with the installed Meta vocab back-dated to the oldest shipped set). Also clarified `upgrade.mjs` dry-run wording and removed the self-referential "Run /hypo:upgrade --apply" action item from the report body.
+
+### Fixed
+
+- **`doctor` orphan duplicate scan + matcher drift surfacing (PRs #53~#56, fix #47 / PR #54 follow-ups).** `doctor extensions` now surfaces non-registrable orphans, gated `matcher:""` specific message on `hookExact`, and reports orphan duplicate counts. `parseManifest` handles empty matcher; the canonical-pick mirror keeps the doctor view aligned with the actual registered hook.
+- **`extensions` settings.json mixed-group surgical write (fix #47, PR #49, ADR 0024 amendment).** Edits to `settings.json` for extensions registration are now surgical inside mixed groups, leaving siblings + matcher in the source group exactly as found.
+- **`crystallize --apply-session-close` lint preflight + post-apply gate (fix #40, PR #25).** Lint runs before AND after the apply to fail loudly on dirty input or post-write drift.
+- **PreCompact `/clear` detection + SessionEnd marker recovery (PRs #31~#33, fix #25/#26 + amendments, ADR 0022).** `compact-guard` detects `/clear` so it does not block; `personal-check` capacity bypass removed (#32); SessionEnd marker + SessionStart `source=clear` recovery makes /clear-then-restart cleanup work end-to-end.
+- **Test hermeticity — child HOME isolation in `tests/runner.mjs` (fix #3, PR #30).** Tests no longer rely on the dev's real `$HOME`; child processes get an isolated home so external writes can't pollute or break the suite.
+- **`withWiki()` fixture date local-time alignment (fix #39, PR #52).** UTC vs local boundary flake removed.
+
+### Maintenance
+
+- **Code comment cleanup Phase 1 (PR #58).** 13 files, comment-only diff (0 non-comment line changes verified by gate). Removed rot-prone references — `(fix #NN)`, `(PR #NN follow-up)`, `(codex BLOCKER/CONCERN/...)`, `v120-*`, `stage-N-#M`, `(#NN scope)` — while preserving ADR / contract / spec / plan / Layer / § anchors. PR descriptions are now the canonical location for fix/PR/issue cross-references; in-code comments stay about the WHY.
+
+### 한글 요약
+
+**Breaking 변경**
+- **SCHEMA 2.0 — `feedback` page 9 hard 필드 + claude-learned conditional 2 필드 강제.** `hypomnema upgrade --apply` 시 `MIGRATION-v2.0.md`가 자동 작성되어 backfill checklist 제공. `SCHEMA.md`는 사용자 소유 (Option C 보존, byte-equal). 자동 stub은 거부 — `scope` / `tier` / `targets` / `sensitivity` / `reason` / `source`는 의미 결정이라 wrong default가 wrong behavior로 이어짐.
+
+**핵심 신규**
+- **`feedback`-as-SoT + 단방향 projection** (ADR 0031): `pages/feedback/<slug>.md`가 행동 교정의 단일 source-of-truth. `hypomnema feedback-sync`로 MEMORY.md (cwd-scoped, 200줄 cap) + CLAUDE.md `<learned_behaviors>` (max 10, 엄격 게이트) 자동 동기.
+- **Extensions companion sync** (ADR 0024): wiki에 `extensions/{agents,commands,hooks,skills}` 동봉. init/upgrade가 `~/.claude/` (+`--codex`로 `~/.codex/`) 미러링, conflict 감지, doctor 무결성 검사.
+- **Auto-project creation on cwd match** (ADR 0023): git project marker 있는 cwd에 wiki project 없으면 SessionStart에서 생성 권유.
+- **Stop-chain auto-minimal-crystallize** + `/clear` 감지 + SessionEnd marker 복구 (ADR 0022): session 종료 누락 → 자동 minimal crystallize 권유 → `/clear` 후 재시작 시 깔끔 복구.
+- **Update notifier**: SessionStart에서 신규 버전 알림 (npm 패키지 / Claude Code plugin 두 채널), opt out: `HYPO_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` / `CI`.
+- **PostToolUse WebFetch / WebSearch auto-ingest 신호**: URL fetch 시 `/hypo:ingest` 권유 nudge 자동 주입 (privacy redaction 포함).
+
+**Changed**
+- **`feedback-sync` MEMORY cross-project pollution fix** (PR #59 / ADR 0031 §4 amendment): `scope: project:*` exact-match 강제.
+- **`hypomnema upgrade` migration report tag historical regression fix** (PR #57): tag `[schema]`로 좁힘 — v1.0/v1.1 historical vocab에 있는 유일 안전 토큰.
+
+**Fixed**
+- doctor orphan duplicate scan + matcher drift (PR #53~#56)
+- extensions settings.json mixed-group surgical write (PR #49)
+- crystallize lint preflight + post-apply gate (PR #25)
+- test hermeticity HOME isolation (PR #30), withWiki fixture date flake (PR #52)
+
+**Maintenance**
+- Code comment rot cleanup Phase 1 — 13 files comment-only diff. `fix #NN` / `PR #NN follow-up` 등 시간에 따라 stale 되는 참조 제거, ADR / contract / spec anchor 보존.
 
 ## [1.1.0] - 2026-05-13
 
