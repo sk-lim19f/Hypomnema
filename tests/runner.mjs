@@ -1169,6 +1169,35 @@ test('session-log missing a today-dated heading → block', () => {
   );
 });
 
+test('lint blockers without id field → reason names files, no empty placeholders', () => {
+  // Regression: line 244 used `b.id` directly, but error-severity lint issues
+  // never carry an id (only W8 warns do). The result was a reason like
+  // `lint blockers: , , , , , , ,` — blocks correctly but tells the user
+  // nothing actionable. Fix: fall back to file path + dedupe.
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(
+        join(dir, 'pages', 'feedback', 'broken.md'),
+        '---\ntitle: broken\ntype: feedback\nstatus: active\nscope: INVALID-SCOPE\nsensitivity: public\nupdated: 2026-05-26\n---\n',
+      );
+    },
+    (dir) => {
+      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.decision, 'block', `expected block: ${r.stdout}`);
+      assert.ok(
+        out.reason.includes('lint blockers: pages/feedback/broken.md'),
+        `lint blockers should name the file, got: ${out.reason}`,
+      );
+      assert.ok(
+        !/lint blockers:\s*,/.test(out.reason),
+        `lint blockers section must not start with empty commas: ${out.reason}`,
+      );
+    },
+  );
+});
+
 test('open-questions.md absent/stale → still passes (conditional, not gated)', () => {
   withWiki(
     (dir) => {
