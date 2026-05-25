@@ -18,6 +18,7 @@ import {
   shouldSuggestProjectCreation,
   buildProjectSuggestionLine,
   recordSuggestionCooldown,
+  sanitizeProjForPrompt,
 } from './hypo-shared.mjs';
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
@@ -124,10 +125,13 @@ process.stdin.on('end', () => {
       }
       console.log(
         JSON.stringify(
-          buildOutput(`[WIKI: cwd changed → project=${newHit.proj}]\n\n${content}`, {
-            continue: true,
-            suppressOutput: true,
-          }),
+          buildOutput(
+            `[WIKI: cwd changed → project=${sanitizeProjForPrompt(newHit.proj)}]\n\n${content}`,
+            {
+              continue: true,
+              suppressOutput: true,
+            },
+          ),
         ),
       );
       return;

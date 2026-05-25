@@ -24,6 +24,28 @@ export function sessionMarkerPath(sessionId) {
   return join(tmpdir(), `hypo-session-marker-${safe}.json`);
 }
 
+// ── project name sanitizer for prompt-facing interpolation ─────────────────
+// marker.proj is read from a wiki directory name (findProjectFiles) and
+// interpolated into LLM-facing additionalContext strings by multiple hooks.
+// A manually-crafted directory name could otherwise close a wrapping tag,
+// smuggle a newline, or inject conflicting instructions. Centralized so the
+// three injection sites stay in lock-step (codex v2 review 2026-05-26 —
+// addresses shared-helper concern across hypo-first-prompt / hypo-session-start
+// / hypo-cwd-change).
+//
+// Strips: angle brackets, control chars (C0 + C1), Unicode line separators
+// (U+2028 / U+2029), then collapses whitespace and caps length.
+export function sanitizeProjForPrompt(raw, fallback = 'unknown') {
+  const cleaned = String(raw || fallback)
+    .replace(/[<>\[\]]/g, '_')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+  return cleaned || fallback;
+}
+
 // ── wiki root resolution ────────────────────────────────────────────────────
 
 function expandHome(p) {

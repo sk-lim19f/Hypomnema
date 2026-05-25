@@ -15,7 +15,7 @@
  */
 
 import { readFileSync, unlinkSync, existsSync } from 'fs';
-import { buildOutput, sessionMarkerPath } from './hypo-shared.mjs';
+import { buildOutput, sessionMarkerPath, sanitizeProjForPrompt } from './hypo-shared.mjs';
 
 const MARKER_TTL = 10 * 60 * 1000; // 10 min
 
@@ -52,16 +52,48 @@ process.stdin.on('end', () => {
     // fix #13: a cwd-change re-trigger says "Resuming"; a fresh session start
     // (default source) says "Previously working on".
     const verb = marker.source === 'cwd-change' ? 'Resuming' : 'Previously working on';
+    // marker.proj originates from a wiki directory name read by findProjectFiles;
+    // sanitize via the shared helper so a hand-crafted project name cannot close
+    // the wrapper tag, smuggle newlines/control chars, or inject conflicting
+    // directives into the resume contract (codex v2 review 2026-05-26).
+    const projSafe = sanitizeProjForPrompt(marker.proj);
+    // When there is no snapshot, the [HOT] / [SESSION STATE] context has nothing
+    // for the model to fill the placeholders with. Provide a concrete fallback
+    // line so the model doesn't leak literal `[one-line summary]` text on a
+    // first-ever session (codex v2 review 2026-05-26).
+    const exampleLine = hasSnapshot
+      ? `${verb} ${projSafe}: [one-line summary]. Continue with [next task]?`
+      : `${verb} ${projSafe}: no prior snapshot yet — first session. What would you like to start with?`;
+    const fillNote = hasSnapshot
+      ? `Replace the bracketed placeholders using the [HOT] / [SESSION STATE] ` +
+        `context already injected this session — do NOT emit the literal brackets.`
+      : `Use the line above verbatim — there is no prior snapshot to summarize.`;
 
     console.log(
       JSON.stringify(
         buildOutput(
-          `[WIKI SESSION START: project=${marker.proj}${snapshotNote}]\n` +
-            `Before addressing the user's message, lead your FIRST reply with exactly one line:\n` +
-            `"${verb} ${marker.proj}: <one-line summary>. Continue with <next task>?"\n` +
-            `Draw <one-line summary> and <next task> from the [HOT] / [SESSION STATE] ` +
-            `context already injected this session. Inject this line unconditionally — ` +
-            `even if the user's first message is unrelated or a simple question — then answer normally.`,
+          `<hypomnema-session-resume>\n` +
+            `[WIKI SESSION START: project=${projSafe}${snapshotNote}]\n` +
+            `\n` +
+            `Lead your FIRST reply this session with exactly one line in this shape:\n` +
+            `\n` +
+            `${exampleLine}\n` +
+            `\n` +
+            `${fillNote}\n` +
+            `\n` +
+            `Emit this line unconditionally on the first prompt, including when the ` +
+            `user's message is:\n` +
+            `  • a simple greeting ("안녕", "hi", "hello")\n` +
+            `  • a trivial question or unrelated topic\n` +
+            `  • a one-word reply\n` +
+            `\n` +
+            `Do not skip it, do not decide it is "not relevant", do not shorten the ` +
+            `reply to omit it. After the line, answer the user's actual message on the ` +
+            `following line(s) as normal.\n` +
+            `\n` +
+            `This is the Hypomnema session-resume contract — the user relies on this ` +
+            `line to confirm which project context is loaded.\n` +
+            `</hypomnema-session-resume>`,
           { continue: true, suppressOutput: true },
         ),
       ),
