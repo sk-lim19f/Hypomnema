@@ -1,6 +1,9 @@
 # Runtime state — never commit
 .omc/
-.claude/
+.claude/*
+# Exception: project-scoped slash commands (dev workflow) are tracked
+!.claude/commands/
+!.claude/commands/*.md
 
 # Node
 node_modules/
