@@ -27,6 +27,7 @@ import {
   shouldSuggestProjectCreation,
   buildProjectSuggestionLine,
   recordSuggestionCooldown,
+  sanitizeProjForPrompt,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -334,7 +335,7 @@ process.stdin.on('end', () => {
         console.log(
           JSON.stringify(
             buildOutput(
-              `${noticePrefix}[WIKI HOT CACHE: project=${hit.proj}]\n\n${parts.join('\n\n')}`,
+              `${noticePrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}]\n\n${parts.join('\n\n')}`,
               { continue: true, suppressOutput: true },
             ),
           ),
@@ -349,10 +350,13 @@ process.stdin.on('end', () => {
         );
         console.log(
           JSON.stringify(
-            buildOutput(`${noticePrefix}[WIKI HOT CACHE: project=${hit.proj}, no snapshot yet]`, {
-              continue: true,
-              suppressOutput: true,
-            }),
+            buildOutput(
+              `${noticePrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}, no snapshot yet]`,
+              {
+                continue: true,
+                suppressOutput: true,
+              },
+            ),
           ),
         );
       }
