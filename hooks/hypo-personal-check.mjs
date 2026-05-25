@@ -241,7 +241,9 @@ process.stdin.on('end', () => {
     !gitStatus.clean ? gitStatus.reason : '',
     !hotStatus.clean ? hotStatus.reason : '',
     !closeFiles.ok ? closeFilesReason : '',
-    !lintOk ? `lint blockers: ${lintBlockers.map((b) => b.id).join(', ')}` : '',
+    !lintOk
+      ? `lint blockers: ${[...new Set(lintBlockers.map((b) => b.id || b.file))].join(', ')}`
+      : '',
     !designHistoryOk
       ? `design-history stale: ${lintW8.map((w) => w.file.split('/')[1]).join(', ')}`
       : '',
