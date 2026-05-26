@@ -15,6 +15,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 fetches full history including annotated tag objects;
+          # the default shallow clone leaves git unable to read the tag body
+          # that `check-bilingual --tag` validates.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -29,6 +34,11 @@ jobs:
             echo "Tag ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
             exit 1
           fi
+
+      - name: Validate bilingual release docs (CHANGELOG + annotated tag)
+        run: |
+          node scripts/check-bilingual.mjs --changelog
+          node scripts/check-bilingual.mjs --tag "${GITHUB_REF_NAME}"
 
       - name: Run tests
         run: npm test

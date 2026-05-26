@@ -52,6 +52,12 @@ for (const { path, pattern } of targets) {
 }
 
 console.log(`\nNext steps:`);
-console.log(`  git add -A && git commit -m "chore(release): v${next}"`);
-console.log(`  git tag v${next}`);
-console.log(`  git push origin <branch> --tags`);
+console.log(`  1. Edit CHANGELOG.md — ensure the "## [${next}]" section has a`);
+console.log(`     "### 한글 요약" sub-section (release.yml check-bilingual gate).`);
+console.log(`  2. node scripts/check-bilingual.mjs --changelog   # local pre-check`);
+console.log(`  3. git add -A && git commit -m "chore(release): v${next}"`);
+console.log(`  4. Create an ANNOTATED tag (lightweight tags are rejected by CI):`);
+console.log(`       git tag -a v${next} -m "<English body>\\n\\n---\\n\\n<한글 요약>"`);
+console.log(`     See docs/CONTRIBUTING.md "Cutting a release" for the full template.`);
+console.log(`  5. node scripts/check-bilingual.mjs --tag v${next}   # local pre-check`);
+console.log(`  6. git push origin <branch> --tags`);
