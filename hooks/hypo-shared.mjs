@@ -243,7 +243,9 @@ export function resolveActiveProject(hypoDir) {
   if (!existsSync(hotPath)) return null;
   let content;
   try {
-    content = readFileSync(hotPath, 'utf-8');
+    // Strip HTML comments before parsing so the canonical-format example row
+    // in templates/hot.md (`<!-- Row format: ... -->`) is not picked up as data.
+    content = readFileSync(hotPath, 'utf-8').replace(/<!--[\s\S]*?-->/g, '');
   } catch {
     return null;
   }

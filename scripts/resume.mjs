@@ -37,7 +37,9 @@ function resolveActiveProject(hypoDir) {
   const hotPath = join(hypoDir, 'hot.md');
   if (!existsSync(hotPath)) return null;
 
-  const content = readFileSync(hotPath, 'utf-8');
+  // Strip HTML comments before parsing so the canonical-format example row
+  // in templates/hot.md (`<!-- Row format: ... -->`) is not picked up as data.
+  const content = readFileSync(hotPath, 'utf-8').replace(/<!--[\s\S]*?-->/g, '');
   // Canonical hot.md uses wikilinks: | name | date | [[projects/slug/hot]] |
   // Pick the most recent row by the date column when present.
   const wikiRows = [
@@ -60,6 +62,8 @@ function resolveActiveProject(hypoDir) {
   let latest = null;
   let latestMtime = 0;
   for (const p of readdirSync(projectsDir)) {
+    // Skip the scaffold project init.mjs writes — it isn't a real active project.
+    if (p === '_template') continue;
     const ssPath = join(projectsDir, p, 'session-state.md');
     if (!existsSync(ssPath)) continue;
     const mtime = statSync(ssPath).mtimeMs;
