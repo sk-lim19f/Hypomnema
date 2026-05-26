@@ -39,6 +39,7 @@
   "scripts": {
     "test": "node tests/runner.mjs",
     "lint": "node scripts/lint.mjs",
+    "fix:verify": "node scripts/fix-status-verify.mjs",
     "graph": "node scripts/graph.mjs",
     "smoke-pack": "node scripts/smoke-pack.mjs",
     "check:bilingual": "node scripts/check-bilingual.mjs --changelog",

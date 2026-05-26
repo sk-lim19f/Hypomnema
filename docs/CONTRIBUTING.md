@@ -119,9 +119,26 @@ If you need to share new logic, prefer extending an existing helper over adding 
 ## Testing
 
 ```bash
-npm test       # tests/runner.mjs — unit + smoke + contract tests
-npm run lint   # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale vs session-log)
+npm test           # tests/runner.mjs — unit + smoke + contract tests
+npm run lint       # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale vs session-log)
+npm run fix:verify # Phase 1 of learned_behavior #6 — verifies fix #N status claims in
+                   # wiki spec-v1.2.md against `// @fix #N: <test-name>` anchors in
+                   # tests/runner.mjs. Maintainer dogfood; needs a local wiki at
+                   # $HYPO_DIR or ~/hypomnema. Does NOT grep ADR core decision lines.
 ```
+
+### `// @fix #N:` anchor convention
+
+When a test verifies behavior tied to a numbered fix in the wiki spec, add an anchor immediately above the `suite(...)` or `test(...)` call:
+
+```js
+// @fix #25: replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE
+test('replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE', () => { ... });
+```
+
+The anchor's body must be the EXACT test name (whole rest of the line; no comma splitting). Multiple anchor lines per fix # accumulate. For fixes whose verification is behavioral / prompt-driven (no automated test by design), use the sentinel `// @fix #N: NO_AUTO_TEST`.
+
+`npm run fix:verify` reads these anchors plus the spec status claims and reports any drift (`NO_ANCHOR`, `MISSING_TEST`, `FAILING_TEST`, `ORPHAN_ANCHOR`). Plain `// fix #N: …` comments without the `@` prefix are treated as prose and ignored by the verifier.
 
 The test runner uses only Node.js built-ins. Tests create scoped temp directories and clean up after themselves; you can run the suite without any environment setup.
 

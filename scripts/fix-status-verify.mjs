@@ -1,0 +1,202 @@
+#!/usr/bin/env node
+/**
+ * fix-status-verify (CLI) — verify fix→test linkage against wiki spec claims.
+ *
+ * Phase 1 (test-green half only). ADR core decision grep is out of scope —
+ * see scripts/lib/fix-status-verify.mjs header.
+ *
+ * Usage:
+ *   node scripts/fix-status-verify.mjs [--hypo-dir <path>]
+ *                                      [--spec <path>]
+ *                                      [--runner <path>]
+ *                                      [--test-command "<cmd>"]
+ *                                      [--json]
+ *
+ * Exit 0 if no error-level findings, 1 otherwise.
+ */
+
+import { readFileSync, existsSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import {
+  parseAnchors,
+  parseStatus,
+  parseRunnerOutput,
+  verifyMatrix,
+} from './lib/fix-status-verify.mjs';
+
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+function parseArgs(argv) {
+  const out = {
+    hypoDir: process.env.HYPO_DIR || join(homedir(), 'hypomnema'),
+    spec: null,
+    runner: join(REPO, 'tests/runner.mjs'),
+    testCommand: 'npm test',
+    json: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--hypo-dir') out.hypoDir = argv[++i];
+    else if (a === '--spec') out.spec = argv[++i];
+    else if (a === '--runner') out.runner = argv[++i];
+    else if (a === '--test-command') out.testCommand = argv[++i];
+    else if (a === '--json') out.json = true;
+    else if (a === '--help' || a === '-h') {
+      printHelp();
+      process.exit(0);
+    } else {
+      console.error(`unknown arg: ${a}`);
+      process.exit(2);
+    }
+  }
+  if (!out.spec) {
+    out.spec = join(out.hypoDir, 'projects/hypomnema/spec-v1.2.md');
+  }
+  return out;
+}
+
+function printHelp() {
+  console.log(
+    [
+      'fix-status-verify — Phase 1 (test-green half) of learned_behavior #6',
+      '',
+      'Options:',
+      '  --hypo-dir <path>        Wiki root (default: $HYPO_DIR or ~/hypomnema)',
+      '  --spec <path>            Override spec-v1.2.md path',
+      '  --runner <path>          Override tests/runner.mjs path',
+      '  --test-command "<cmd>"   Test invocation (default: "npm test")',
+      '  --json                   Emit machine-readable JSON report',
+      '',
+      'Exit 0 if no error findings, 1 otherwise.',
+      '',
+      'NOTE: This tool only verifies that mapped tests exist and pass.',
+      'It does NOT grep ADR core decision lines — see Phase 2 / v1.3.0.',
+    ].join('\n'),
+  );
+}
+
+function runTests(testCommand) {
+  // Parse simple command (no shell metacharacters supported in args; this is
+  // a maintainer tool, not a security boundary).
+  const parts = testCommand.split(/\s+/).filter(Boolean);
+  const [cmd, ...args] = parts;
+  const result = spawnSync(cmd, args, {
+    cwd: REPO,
+    encoding: 'utf-8',
+    env: { ...process.env, FORCE_COLOR: '0' },
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return {
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    exitCode: result.status,
+  };
+}
+
+function formatFinding(f) {
+  const icon = f.level === 'error' ? '✗' : '⚠';
+  return (
+    `  ${icon} [${f.class}] fix #${f.fixNum}` +
+    (f.testName ? ` (${f.testName})` : '') +
+    `: ${f.detail}`
+  );
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+
+  if (!existsSync(opts.spec)) {
+    console.error(`spec not found: ${opts.spec}`);
+    console.error('hint: pass --hypo-dir <path> or set $HYPO_DIR');
+    process.exit(2);
+  }
+  if (!existsSync(opts.runner)) {
+    console.error(`runner not found: ${opts.runner}`);
+    process.exit(2);
+  }
+
+  const specText = readFileSync(opts.spec, 'utf-8');
+  const runnerText = readFileSync(opts.runner, 'utf-8');
+
+  const anchors = parseAnchors(runnerText);
+  const status = parseStatus(specText);
+
+  if (!opts.json) {
+    console.log(`fix-status-verify (Phase 1)`);
+    console.log(`  spec:   ${opts.spec}`);
+    console.log(`  runner: ${opts.runner}`);
+    console.log(`  ${status.size} positive status claim(s), ${anchors.size} anchor(s)`);
+    console.log(`  running: ${opts.testCommand}`);
+  }
+
+  const testRun = runTests(opts.testCommand);
+  const testResults = parseRunnerOutput(testRun.stdout + '\n' + testRun.stderr);
+
+  if (!opts.json) {
+    const passes = [...testResults.values()].filter((v) => v === 'pass').length;
+    const fails = [...testResults.values()].filter((v) => v === 'fail').length;
+    console.log(`  test run: ${passes} pass, ${fails} fail (exit ${testRun.exitCode})`);
+  }
+
+  const matrixResult = verifyMatrix({ anchors, status, testResults });
+  const findings = [...matrixResult.findings];
+
+  // CLI-level error: if the test command itself exited nonzero, the test run
+  // is not green even if the anchored tests happen to all pass in the parsed
+  // output. Surface as a synthetic error finding so `ok` flips false.
+  if (testRun.exitCode !== 0) {
+    findings.push({
+      level: 'error',
+      class: 'TEST_RUN_NONZERO_EXIT',
+      detail: `test command "${opts.testCommand}" exited ${testRun.exitCode}`,
+      exitCode: testRun.exitCode,
+    });
+  }
+  const ok = matrixResult.ok && testRun.exitCode === 0;
+
+  const MANDATORY_NOTE =
+    'test-linkage + green only — ADR core decision grep NOT checked, see Phase 2 / v1.3.0';
+
+  if (opts.json) {
+    console.log(
+      JSON.stringify(
+        {
+          ok,
+          spec: opts.spec,
+          runner: opts.runner,
+          statusClaims: status.size,
+          anchorCount: anchors.size,
+          testsRan: testResults.size,
+          testExitCode: testRun.exitCode,
+          findings,
+          note: MANDATORY_NOTE,
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    const errors = findings.filter((f) => f.level === 'error');
+    const warns = findings.filter((f) => f.level === 'warn');
+    if (errors.length === 0 && warns.length === 0) {
+      console.log(`  ✓ all ${status.size} claimed-merged fix(es) verified`);
+    } else {
+      if (errors.length) {
+        console.log(`\nerrors (${errors.length}):`);
+        for (const f of errors) console.log(formatFinding(f));
+      }
+      if (warns.length) {
+        console.log(`\nwarnings (${warns.length}):`);
+        for (const f of warns) console.log(formatFinding(f));
+      }
+    }
+    console.log(`\n(${MANDATORY_NOTE})`);
+  }
+
+  process.exit(ok ? 0 : 1);
+}
+
+main();

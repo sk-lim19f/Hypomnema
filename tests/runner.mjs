@@ -88,6 +88,14 @@ function suite(label) {
   console.log(`\n${label}`);
 }
 
+// ── fix-status-verify anchors (Phase 1, learned_behavior #6 half) ────────────
+// These declare fixes whose status is claimed positive in wiki spec but have
+// no automated test by design (behavioral rules / prompt-driven). See
+// scripts/lib/fix-status-verify.mjs for the SoT contract.
+//
+// @fix #20: NO_AUTO_TEST
+// @fix #18: NO_AUTO_TEST
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function run(script, args = []) {
@@ -1005,6 +1013,7 @@ test('output is always valid JSON regardless of prompt', () => {
 });
 
 // ── replay-compact-guard-detects-slash-clear (ADR 0022 Layer 2) ──
+// @fix #25: replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE
 
 test('replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE', () => {
   const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear' });
@@ -1125,6 +1134,10 @@ test('clean wiki → suppressOutput:true', () => {
 });
 
 suite('hypo-personal-check.mjs — strict session-close gate (#17)');
+
+// @fix #17: 5 mandatory memory files fresh → suppressOutput:true
+// @fix #17: project hot.md not updated today → block, reason names the file
+// @fix #17: open-questions.md absent/stale → still passes (conditional, not gated)
 
 test('5 mandatory memory files fresh → suppressOutput:true', () => {
   withWiki(null, (dir) => {
@@ -1278,6 +1291,7 @@ test('HYPO_SKIP_GATE=1 bypasses an incomplete session close', () => {
 });
 
 // ── replay-personal-check-bypass-order (ADR 0022 amendment 2026-05-13) ──
+// @fix #26: replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (fix #26 negative control)
 // Capacity bypass (wiki-context-critical.json ≥90%) was removed. Spec §7.5:
 // the only bypass paths are HYPO_SKIP_GATE env / transcript user-role message.
 
@@ -1404,6 +1418,8 @@ test('missing log.md → exit 1 + log.md in missing list', () => {
 });
 
 // ── fix #38: --apply-session-close --payload <json> ───────────────────────────
+// @fix #38: clean-wiki payload → ok:true, new entries appended (apply dedup is exact-entry, not date-based)
+// @fix #38: idempotent: re-running same payload produces no new bytes (file mtimes unchanged)
 // Idempotent payload-driven entrypoint that writes the 5 mandatory memory files
 // (+ optional open-questions) and finishes with the strict gate. ADR 0029 Phase A.
 
@@ -4907,6 +4923,9 @@ test('errors when project session-state lacks a next heading', () => {
 });
 
 // ── lint.mjs type-conditional + tag vocab tests ─────────────
+// @fix #15: all type-conditional fields present → green
+// @fix #36: PascalCase tag → error
+// @fix #36: unknown tag (not in vocab) → error
 
 suite('lint.mjs type-conditional required fields');
 
@@ -7253,6 +7272,8 @@ tags: [wiki, operations]
 });
 
 // ── hypo-auto-minimal-crystallize.mjs (ADR 0022 Layer 3) ─────
+// @fix #27: replay-auto-minimal-crystallize-on-incomplete-close: mutating + no marker + close-intent → block
+// @fix #27: replay-auto-minimal-crystallize-on-incomplete-close: valid marker → continue (even with close-intent)
 
 suite('hypo-auto-minimal-crystallize.mjs — Stop chain replay');
 
@@ -10376,6 +10397,364 @@ test('installer: HYPOMNEMA_HOOK_VERBOSE=1 surfaces skip reason on stderr', () =>
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── scripts/lib/fix-status-verify.mjs ────────────────────────────────────────
+
+const {
+  parseAnchors: fsvParseAnchors,
+  parseStatus: fsvParseStatus,
+  parseRunnerOutput: fsvParseRunnerOutput,
+  verifyMatrix: fsvVerifyMatrix,
+} = await import(`${SCRIPTS}/lib/fix-status-verify.mjs`);
+
+suite('fix-status-verify — parseAnchors');
+
+test('parseAnchors: extracts @fix anchors with full test name (no comma split)', () => {
+  const text = [
+    'some prose',
+    '// @fix #15: all type-conditional fields present → green',
+    'more code',
+    '// @fix #17: project hot.md not updated today → block, reason names the file',
+  ].join('\n');
+  const a = fsvParseAnchors(text);
+  assert.deepEqual(a.get(15), ['all type-conditional fields present → green']);
+  assert.deepEqual(a.get(17), ['project hot.md not updated today → block, reason names the file']);
+});
+
+test('parseAnchors: ignores prose comments missing @ prefix', () => {
+  const text = [
+    '// fix #28: doctor gates on extensions baseline existence',
+    '// @fix #28: real anchor here',
+  ].join('\n');
+  const a = fsvParseAnchors(text);
+  assert.deepEqual(a.get(28), ['real anchor here']);
+});
+
+test('parseAnchors: accumulates multiple anchors per fix #, dedupes', () => {
+  const text = ['// @fix #27: case A', '// @fix #27: case B', '// @fix #27: case A'].join('\n');
+  const a = fsvParseAnchors(text);
+  assert.deepEqual(a.get(27), ['case A', 'case B']);
+});
+
+test('parseAnchors: NO_AUTO_TEST sentinel preserved as-is', () => {
+  const a = fsvParseAnchors('// @fix #20: NO_AUTO_TEST');
+  assert.deepEqual(a.get(20), ['NO_AUTO_TEST']);
+});
+
+suite('fix-status-verify — parseStatus');
+
+test('parseStatus: table-row form | #N | … TRUE_MERGED', () => {
+  const spec = '| #15 | merged | **TRUE_MERGED (PR #28)** — body |';
+  const s = fsvParseStatus(spec);
+  assert.equal(s.get(15), 'TRUE_MERGED');
+});
+
+test('parseStatus: inline prose form "fix #N (resolved)"', () => {
+  const spec = '✅ v1.2.x fix #38 (resolved PR #23): payload entrypoint';
+  const s = fsvParseStatus(spec);
+  assert.equal(s.get(38), 'resolved');
+});
+
+test('parseStatus: STALE_MERGED does NOT match (negative compound)', () => {
+  const spec = '| #25 | merged | **STALE_MERGED** — code grep 0 |';
+  const s = fsvParseStatus(spec);
+  // The cell has "merged" (positive) AND "STALE_MERGED" (negative compound).
+  // proximity scan picks up "merged" first (within 120 chars), so #25 maps to
+  // merged. The negative compound is a substring of STALE_MERGED only — the
+  // word-boundary regex on "merged" matches the plain "merged" cell.
+  assert.equal(s.get(25), 'merged');
+});
+
+test('parseStatus: pure STALE_MERGED line (no positive token) → not detected', () => {
+  const spec = 'fix #99 STALE_MERGED — placeholder';
+  const s = fsvParseStatus(spec);
+  assert.equal(s.has(99), false);
+});
+
+test('parseStatus: proximity rejects far-apart fix # / status pair', () => {
+  // fix #17 resolved early, fix #41 mentioned later w/o status word nearby.
+  const spec =
+    '**✅ fix #17 (resolved PR #21)**: foo. … long body … Phase B(v1.3.0 fix #41~#44) advisory.';
+  const s = fsvParseStatus(spec);
+  assert.equal(s.get(17), 'resolved');
+  assert.equal(s.has(41), false);
+});
+
+test('parseStatus: TRUE_MERGED > resolved > merged priority within line', () => {
+  const spec = '| #26 | merged → **resolved (2026-05-19)** | **TRUE_MERGED later** |';
+  const s = fsvParseStatus(spec);
+  assert.equal(s.get(26), 'TRUE_MERGED');
+});
+
+suite('fix-status-verify — parseRunnerOutput');
+
+test('parseRunnerOutput: ✓ marks pass, ✗ marks fail', () => {
+  const out = [
+    '  ✓ test A passes',
+    '  ✗ test B fails',
+    '    AssertionError: …',
+    '  ✓ test C passes',
+  ].join('\n');
+  const r = fsvParseRunnerOutput(out);
+  assert.equal(r.get('test A passes'), 'pass');
+  assert.equal(r.get('test B fails'), 'fail');
+  assert.equal(r.get('test C passes'), 'pass');
+});
+
+test('parseRunnerOutput: duplicate name with any fail → sticky fail', () => {
+  const out = ['  ✓ shared name', '  ✗ shared name', '  ✓ shared name'].join('\n');
+  const r = fsvParseRunnerOutput(out);
+  assert.equal(r.get('shared name'), 'fail');
+});
+
+suite('fix-status-verify — verifyMatrix');
+
+test('verifyMatrix: NO_ANCHOR error when status claim has no anchor', () => {
+  const anchors = new Map();
+  const status = new Map([[42, 'resolved']]);
+  const testResults = new Map();
+  const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
+  assert.equal(ok, false);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].class, 'NO_ANCHOR');
+  assert.equal(findings[0].fixNum, 42);
+});
+
+test('verifyMatrix: MISSING_TEST when anchor names non-existent test', () => {
+  const anchors = new Map([[42, ['ghost-test']]]);
+  const status = new Map([[42, 'resolved']]);
+  const testResults = new Map([['other-test', 'pass']]);
+  const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
+  assert.equal(ok, false);
+  assert.ok(findings.some((f) => f.class === 'MISSING_TEST' && f.fixNum === 42));
+});
+
+test('verifyMatrix: FAILING_TEST when anchor names a failed test', () => {
+  const anchors = new Map([[42, ['t1']]]);
+  const status = new Map([[42, 'resolved']]);
+  const testResults = new Map([['t1', 'fail']]);
+  const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
+  assert.equal(ok, false);
+  assert.ok(findings.some((f) => f.class === 'FAILING_TEST' && f.fixNum === 42));
+});
+
+test('verifyMatrix: NO_AUTO_TEST sentinel → info finding, not error', () => {
+  const anchors = new Map([[20, ['NO_AUTO_TEST']]]);
+  const status = new Map([[20, 'resolved']]);
+  const testResults = new Map();
+  const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
+  assert.equal(ok, true);
+  assert.ok(findings.some((f) => f.class === 'NO_AUTO_TEST' && f.level === 'info'));
+});
+
+test('verifyMatrix: ORPHAN_ANCHOR is warn-only, does not break ok', () => {
+  const anchors = new Map([[99, ['orphan-test']]]);
+  const status = new Map();
+  const testResults = new Map([['orphan-test', 'pass']]);
+  const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
+  assert.equal(ok, true);
+  assert.ok(findings.some((f) => f.class === 'ORPHAN_ANCHOR' && f.level === 'warn'));
+});
+
+test('verifyMatrix: all-green case → ok:true with no error findings', () => {
+  const anchors = new Map([[15, ['real-test']]]);
+  const status = new Map([[15, 'TRUE_MERGED']]);
+  const testResults = new Map([['real-test', 'pass']]);
+  const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
+  assert.equal(ok, true);
+  assert.equal(findings.filter((f) => f.level === 'error').length, 0);
+});
+
+// ── fix-status-verify CLI integration ────────────────────────────────────────
+
+suite('fix-status-verify — CLI integration');
+
+test('CLI: green fixture → exit 0', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    writeFileSync(specPath, '# spec\n| #100 | merged | **TRUE_MERGED (PR #1)** — body |\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(
+      runnerPath,
+      [
+        '#!/usr/bin/env node',
+        '// @fix #100: green-fixture-test',
+        "console.log('  ✓ green-fixture-test');",
+      ].join('\n'),
+    );
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    assert.match(r.stdout, /verified/);
+    assert.match(r.stdout, /ADR core decision grep NOT checked/);
+  });
+});
+
+test('CLI: missing anchor → exit 1 with NO_ANCHOR finding', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    writeFileSync(specPath, '| #200 | merged | **resolved (PR #1)** — body |\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(runnerPath, '// no anchor for #200\n');
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /NO_ANCHOR/);
+  });
+});
+
+test('CLI: anchor names test that does not run → exit 1 with MISSING_TEST', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    writeFileSync(specPath, 'fix #300 (resolved PR #1): body\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(
+      runnerPath,
+      [
+        '#!/usr/bin/env node',
+        '// @fix #300: ghost-test-name',
+        "console.log('  ✓ different-name');",
+      ].join('\n'),
+    );
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /MISSING_TEST/);
+  });
+});
+
+test('CLI: --json emits machine-readable report with ok flag', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    writeFileSync(specPath, '| #400 | merged | **TRUE_MERGED** — body |\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(
+      runnerPath,
+      ['#!/usr/bin/env node', '// @fix #400: t', "console.log('  ✓ t');"].join('\n'),
+    );
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 0);
+    const j = JSON.parse(r.stdout);
+    assert.equal(j.ok, true);
+    assert.equal(j.statusClaims, 1);
+    assert.equal(j.anchorCount, 1);
+    // Mandatory note string is identical in human and JSON outputs.
+    assert.equal(
+      j.note,
+      'test-linkage + green only — ADR core decision grep NOT checked, see Phase 2 / v1.3.0',
+    );
+  });
+});
+
+test('CLI: anchored test fails → exit 1 with FAILING_TEST', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    writeFileSync(specPath, 'fix #500 (resolved PR #1): body\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(
+      runnerPath,
+      ['#!/usr/bin/env node', '// @fix #500: real-test', "console.log('  ✗ real-test');"].join(
+        '\n',
+      ),
+    );
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /FAILING_TEST/);
+  });
+});
+
+test('CLI: test command exits nonzero → exit 1 with TEST_RUN_NONZERO_EXIT', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    // No status claim, so no anchor-related errors. Only exit-code flip.
+    writeFileSync(specPath, '# empty spec\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(
+      runnerPath,
+      ['#!/usr/bin/env node', "console.log('  ✓ a test passed');", 'process.exit(7);'].join('\n'),
+    );
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 1);
+    const j = JSON.parse(r.stdout);
+    assert.equal(j.ok, false);
+    assert.equal(j.testExitCode, 7);
+    assert.ok(
+      j.findings.some((f) => f.class === 'TEST_RUN_NONZERO_EXIT'),
+      `expected TEST_RUN_NONZERO_EXIT finding: ${JSON.stringify(j.findings)}`,
+    );
+  });
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
