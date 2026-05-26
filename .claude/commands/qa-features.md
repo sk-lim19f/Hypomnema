@@ -88,12 +88,20 @@ If a scenario explicitly tests "real install side effects on the user's machine"
 2. **Preflight** — run the sandbox setup above. Record `QA_SANDBOX`, `HEAD.sha`, `version` in the matrix file frontmatter.
 3. **Route by surface** — apply the capability table. Any row whose surface neither CLI can host gets `manual` and is surfaced to the user.
 4. **Pick worker stack** — `AskUserQuestion`: how many workers, claude/codex mix (suggest a mix covering every surface in the row set).
-5. **Spawn via /teams** — never call `codex` or `claude` CLI directly. Pass `HOME`/`CODEX_HOME`/`HYPO_DIR` via the worker prompt's env preamble. Example:
+5. **Spawn via /teams — one call per agent-type group** — never call `codex` or `claude` CLI directly. Group rows by required agent type (claude vs codex), then make exactly ONE `/teams N:<agent>` call per group so `spawn.sh` applies its right→down topology within the right column (1st worker = right-split of main; 2nd+ = down-splits stacked under the 1st).
+
+   **Anti-pattern**: making three separate `/teams 1:codex` / `/teams 1:claude` / `/teams 1:claude` calls — each call splits the main pane to the right independently, producing N side-by-side right panes instead of the intended right→down stack. The skill output becomes visually unreadable and breaks the user's expectation of teams topology.
+
+   For a typical QA run with both CLIs, you end up with at most **two** spawn calls (one codex team, one claude team). Within each team, decompose row sets across the N workers in the prompt itself (e.g., "Worker 1: rows 1–3. Worker 2: rows 4–6.").
+
+   **`spawn.sh` delivers the same prompt to every worker in the team** (single `prompt.txt` copied into `$TEAM_DIR/`, every worker runs `codex "$(cat …/prompt.txt)"` or equivalent). Workers therefore need an explicit self-identification rule in the prompt body: instruct each worker to read its index from `$TEAMS_WORKER_DIR` (basename ends in `worker-<N>`) and execute only the rows assigned to that `<N>`. Without that rule the row decomposition is unenforced and every worker runs every row.
+
+   Pass `HOME`/`CODEX_HOME`/`HYPO_DIR` via the worker prompt's env preamble. Example for a 5-row codex group + 8-row claude group:
    ```
-   /teams 1:claude "export HOME=/tmp/hypomnema-qa-…/claude-home HYPO_DIR=/tmp/hypomnema-qa-…/vault; run /hypo:init; verify pages/index.md, hot.md exist under $HYPO_DIR. PASS/FAIL with file paths."
-   /teams 2:codex  "export HOME=… CODEX_HOME=… HYPO_DIR=…; node $REPO_ROOT/scripts/lint.mjs against the sandbox vault; assert exit code 0 and report broken-wikilink count vs README claim."
+   /teams 2:codex  "export HOME=… CODEX_HOME=… HYPO_DIR=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='1-3 (CLI subcommands)';; 2) ROWS='4-5 (scripts)';; esac; run only your assigned rows; capture exit code + output + filesystem effect; PASS/FAIL with evidence."
+   /teams 3:claude "export HOME=… HYPO_DIR=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='6-8 (slash A)';; 2) ROWS='9-11 (slash B)';; 3) ROWS='12-13 (hooks+manual)';; esac; run only your assigned rows."
    ```
-6. **One scenario per row** — each row gets its own worker prompt with a single scenario, expected outcome, and evidence requirement (file path / grep / exit code).
+6. **One scenario per row** — each row must be assigned explicitly inside the team prompt (via the `$TEAMS_WORKER_DIR`-based dispatch above) with scenario, expected outcome, and evidence requirement (file path / grep / exit code).
 7. **Collect** — block on Stop-hook markers, read `output.txt` per worker, parse PASS/FAIL, capture evidence excerpts.
 8. **Log** — write the run to `~/hypomnema/projects/hypomnema/qa-runs/<YYYY-MM-DD>.md` with table: row | feature | surface | scenario | worker | verdict | evidence | follow-up.
 9. **Triage** — every FAIL → fix PR (code or docs). Never close a QA run with FAILs unresolved or `manual` rows un-checked.
