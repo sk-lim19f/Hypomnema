@@ -56,6 +56,13 @@ const wikiDir = join(work, 'wiki');
 let cleanupOk = false;
 
 try {
+  // Capture pre-commit hook contents (if any) BEFORE pack so we can prove
+  // `npm pack` didn't mutate it. The `prepare` lifecycle script runs during
+  // `npm pack` and could theoretically touch .git/hooks/pre-commit; the
+  // installer's CI/lifecycle guards must prevent that.
+  const preCommitPath = join(REPO, '.git', 'hooks', 'pre-commit');
+  const preCommitBefore = existsSync(preCommitPath) ? readFileSync(preCommitPath, 'utf-8') : null;
+
   step('npm pack');
   const pack = run('npm', ['pack', '--json'], { cwd: REPO });
   const meta = JSON.parse(pack.stdout)[0];
@@ -200,6 +207,15 @@ try {
   if (fbBootstrap.status !== 0 || !/would create draft/.test(fbBootstrap.stderr)) {
     throw new Error(
       `feedback-sync --bootstrap --dry-run did not announce drafts (exit ${fbBootstrap.status})`,
+    );
+  }
+
+  step('verify pre-commit hook was not mutated by npm pack');
+  const preCommitAfter = existsSync(preCommitPath) ? readFileSync(preCommitPath, 'utf-8') : null;
+  if (preCommitBefore !== preCommitAfter) {
+    throw new Error(
+      'npm pack mutated .git/hooks/pre-commit — the prepare lifecycle ' +
+        'guard (npm_command=pack) is not firing.',
     );
   }
 

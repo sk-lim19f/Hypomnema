@@ -350,7 +350,9 @@ function runMarkSessionClosed(args) {
     if (args.json) {
       console.log(JSON.stringify(result, null, 2));
     } else {
-      console.log(`✗ session-close gate not satisfied — marker not written (project: ${status.project || '(unresolved)'}):`);
+      console.log(
+        `✗ session-close gate not satisfied — marker not written (project: ${status.project || '(unresolved)'}):`,
+      );
       for (const f of status.missing) console.log(`  ✗ ${f} (missing)`);
       for (const f of status.stale) console.log(`  ✗ ${f} (stale)`);
       if (!git.clean) console.log(`  ✗ git: ${git.reason}`);
@@ -364,7 +366,11 @@ function runMarkSessionClosed(args) {
   // Codex Worker-2 CONCERN (pre-commit review).
   if (!existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
     const err = 'marker file did not land after write (likely .cache permission/disk issue)';
-    console.log(args.json ? JSON.stringify({ ok: false, session_id: args.sessionId, error: err }, null, 2) : `✗ ${err}`);
+    console.log(
+      args.json
+        ? JSON.stringify({ ok: false, session_id: args.sessionId, error: err }, null, 2)
+        : `✗ ${err}`,
+    );
     process.exit(1);
   }
   const result = {
@@ -376,7 +382,9 @@ function runMarkSessionClosed(args) {
   if (args.json) {
     console.log(JSON.stringify(result, null, 2));
   } else {
-    console.log(`✓ session-closed marker written (session_id: ${args.sessionId}, project: ${status.project}).`);
+    console.log(
+      `✓ session-closed marker written (session_id: ${args.sessionId}, project: ${status.project}).`,
+    );
   }
   process.exit(0);
 }

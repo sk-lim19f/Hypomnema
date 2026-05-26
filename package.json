@@ -44,6 +44,7 @@
     "check:bilingual": "node scripts/check-bilingual.mjs --changelog",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "prepare": "node scripts/install-git-hooks.mjs",
     "prepublishOnly": "npm test && npm run lint && npm run smoke-pack && npm run check:bilingual"
   },
   "devDependencies": {
