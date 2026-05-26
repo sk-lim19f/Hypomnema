@@ -42,19 +42,23 @@ Use the table in `/qa-features` ("Worker CLI capability split"). Summary:
 
 Build a fresh sandbox; install branch HEAD into it; pass `HOME`/`CODEX_HOME`/`HYPO_DIR` to every worker. See `/qa-features` "Environment isolation" for the script. Record `QA_SANDBOX`, `HEAD.sha`, `version`, plus the **previous tag's commit SHA** (`git describe --tags --abbrev=0` then `git rev-parse`) in matrix frontmatter so regression bisects have a known-good baseline.
 
+**Sandbox-version assertion is mandatory** (same as `/qa-features` preflight step 4): assert the sandbox's `~/.claude/hypo-pkg.json` `pkgVersion` equals the working tree's `HEAD.version` AND `pkgRoot` equals `$REPO_ROOT`. If either disagrees, the install bound to a stale or wrong working tree — ABORT before spawning workers. The first dogfood of `/qa-features` shipped a v1.2.1 backlog of 5 "defects" that were 4 ghosts plus 1 intentional behavior; the suspected root cause was exactly this stale-install class.
+
 ## Execution protocol
 
 1. **Build the matrix** — assemble the cumulative target list above. Each row: claim | source (file:line) | invocation surface | scenario | expected | prior-pass-run (if any).
 2. **Save the matrix** to `~/hypomnema/projects/hypomnema/qa-runs/<YYYY-MM-DD>-pre-ship-v<X.Y.Z>.md` BEFORE running any worker — this is the contract.
 3. **Preflight** — sandbox setup; record version pins in matrix frontmatter.
 4. **Pick worker count/CLI** — `AskUserQuestion`. Pre-ship default: 3–4 workers, mixed claude/codex (regression risk highest under model-cross-check).
-5. **Spawn via /teams — one call per agent-type group** — never direct CLI. Group matrix rows by required agent type (claude vs codex), then make exactly ONE `/teams N:<agent>` call per group so `spawn.sh` applies right→down topology within the right column (1st = right-split of main; 2nd+ = down-splits stacked). Multiple parallel `/teams 1:…` calls produce N side-by-side right panes — DO NOT do that. For a pre-ship run you typically have two spawn calls total (one codex team, one claude team). `spawn.sh` delivers the **same** `prompt.txt` to every worker in a team, so the prompt must include a `$TEAMS_WORKER_DIR`-based self-dispatch (basename ends in `worker-<N>`) — without it every worker runs every row. Each prompt MUST start with `export HOME=… CODEX_HOME=… HYPO_DIR=…` pointing into `$QA_SANDBOX`.
+5. **Spawn via /teams — one call per agent-type group** — never direct CLI. Group matrix rows by required agent type (claude vs codex), then make exactly ONE `/teams N:<agent>` call per group so `spawn.sh` applies right→down topology within the right column (1st = right-split of main; 2nd+ = down-splits stacked). Multiple parallel `/teams 1:…` calls produce N side-by-side right panes — DO NOT do that. For a pre-ship run you typically have two spawn calls total (one codex team, one claude team). `spawn.sh` delivers the **same** `prompt.txt` to every worker in a team, so the prompt must include a `$TEAMS_WORKER_DIR`-based self-dispatch (basename ends in `worker-<N>`) — without it every worker runs every row. Each prompt MUST start with `export HOME=… CODEX_HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…` (HEAD_VERSION/REPO_ROOT are required by `/qa-features` clause C, embedded via step 6a).
    ```
-   /teams 3:codex  "export HOME=… CODEX_HOME=… HYPO_DIR=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='1-7';; 2) ROWS='8-14';; 3) ROWS='15-20';; esac; run only your assigned rows in sandbox, capture output, verify vs 'expected'; PASS/FAIL + evidence."
-   /teams 2:claude "export HOME=… HYPO_DIR=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='21-28 (slash)';; 2) ROWS='29-34 (hooks)';; esac; run only your assigned rows."
+   /teams 3:codex  "export HOME=… CODEX_HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='1-7';; 2) ROWS='8-14';; 3) ROWS='15-20';; esac; run clause-C stale-install check first, then your assigned rows in sandbox; capture output, verify vs 'expected'; PASS/FAIL + evidence."
+   /teams 2:claude "export HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='21-28 (slash)';; 2) ROWS='29-34 (hooks)';; esac; run clause-C check, then your assigned rows."
    ```
 6. **Collect & cross-check** — read every worker's `output.txt`. For PASS, spot-check evidence against the matrix. For FAIL, capture the regression delta (what worked before vs. now).
-7. **Bisect regressions** — for each FAIL with a prior PASS (check prior `qa-runs/*.md`), `git log <prior-sha>..HEAD -- <file>` to narrow, identify the introducing commit, file a fix PR. Do not ship with unresolved regressions.
+6a. **Worker prompt mandatory clauses** — worker prompts MUST embed the three guard clauses defined in `/qa-features` ("Worker prompt template — mandatory clauses"): (A) placeholder substitution rule, (B) doc-vs-code exact-quote rule, (C) stale-install detection rule, and the worker-self-check echo (`guard clauses acknowledged: A/B/C`). Grep each `output.txt` for the literal acknowledgement line before parsing verdicts — absent → that worker's FAILs are VERDICT_UNCLEAR.
+6b. **Orchestrator FAIL re-verification (MANDATORY)** — for every FAIL the workers reported, the orchestrating Claude MUST live-re-run the failing scenario against a **fresh HEAD-version sandbox** (re-execute the preflight, never against the user's real `~/.claude` / `~/.codex` / `~/hypomnema`) before logging it as a real regression. See `/qa-features` step 8 for the four-case breakdown: CLI/script rows run directly from `$REPO_ROOT`; slash/hook/install rows need a second sandbox; intentional-failure rows downgrade to `WORKER_EXPECTATION_MISMATCH`; doc-drift FAILs require verbatim citation verification or downgrade to `WORKER_QUOTE_MISMATCH`. Only confirmed-on-fresh-HEAD FAILs enter the bisect step. Pre-ship cannot afford ghost defects — they delay ship without buying safety.
+7. **Bisect regressions** — for each confirmed FAIL with a prior PASS (check prior `qa-runs/*.md`), `git log <prior-sha>..HEAD -- <file>` to narrow, identify the introducing commit, file a fix PR. Do not ship with unresolved regressions.
 8. **Sign off** — append to the matrix file:
    ```
    ## Sign-off
@@ -88,6 +92,9 @@ Run **both** in a release cycle: `/qa-features` on each PR as it lands, `/qa-bef
 - ❌ Reusing a stale matrix from a prior release — claims drift, rebuild every time.
 - ❌ Shipping with FAILs marked "non-blocking" without an explicit user sign-off override.
 - ❌ Skipping the sandbox preflight — without it, the QA may PASS on stale installed bits and FAIL on real users.
+- ❌ Skipping the sandbox-version assertion in preflight — past dogfood produced ghost-defect backlogs because `npm install` resolved a published version older than HEAD.
+- ❌ Filing a regression PR off a worker FAIL that was never live-re-verified against HEAD (step 6b).
+- ❌ Letting workers substitute `<name>` / `<path>` / `<sha>` from docs as literal CLI args.
 - ❌ Mutating the user's real `~/hypomnema` vault during ingest/crystallize/feedback rows.
 
 ## Output (last line of this command's response)

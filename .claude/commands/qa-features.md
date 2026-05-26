@@ -76,6 +76,27 @@ ln -sfn "$QA_SANDBOX/claude-home/.codex" "$QA_SANDBOX/codex-home"
 # 3. Record the version pin
 git -C "$REPO_ROOT" rev-parse HEAD > "$QA_SANDBOX/HEAD.sha"
 node -e 'console.log(require("'"$REPO_ROOT"'/package.json").version)' > "$QA_SANDBOX/version"
+
+# 4. ASSERT the sandbox actually runs branch HEAD (not a stale registry/global copy).
+# Past dogfood produced ~4/5 false-positive FAILs partly because the install
+# pointed at an older copy of hypomnema instead of the branch's local code.
+# `scripts/init.mjs` writes ~/.claude/hypo-pkg.json with { pkgVersion, pkgRoot }
+# — those two fields ARE the source of truth for "what did this install bind to".
+HYPO_PKG_JSON="$QA_SANDBOX/claude-home/.claude/hypo-pkg.json"
+SANDBOX_VERSION=$(node -p "require('$HYPO_PKG_JSON').pkgVersion" 2>/dev/null || echo MISSING)
+SANDBOX_PKG_ROOT=$(node -p "require('$HYPO_PKG_JSON').pkgRoot" 2>/dev/null || echo MISSING)
+HEAD_VERSION=$(cat "$QA_SANDBOX/version")
+if [ "$SANDBOX_VERSION" != "$HEAD_VERSION" ]; then
+  echo "PREFLIGHT FAIL: sandbox pkgVersion=$SANDBOX_VERSION but HEAD version=$HEAD_VERSION — install bound to a stale copy. ABORT."
+  exit 1
+fi
+if [ "$SANDBOX_PKG_ROOT" != "$REPO_ROOT" ]; then
+  echo "PREFLIGHT FAIL: sandbox pkgRoot=$SANDBOX_PKG_ROOT but expected REPO_ROOT=$REPO_ROOT — install bound to a different working tree. ABORT."
+  exit 1
+fi
+# Optional sha cross-check: pkgRoot's git HEAD must match the recorded sha.
+SANDBOX_HEAD_SHA=$(git -C "$SANDBOX_PKG_ROOT" rev-parse HEAD 2>/dev/null || echo MISSING)
+[ "$SANDBOX_HEAD_SHA" != "$(cat "$QA_SANDBOX/HEAD.sha")" ] && echo "WARN: sandbox pkgRoot HEAD sha differs from recorded HEAD.sha"
 ```
 
 Each worker prompt MUST export `HOME="$QA_SANDBOX/claude-home"` (claude workers) or `CODEX_HOME="$QA_SANDBOX/codex-home"` (codex workers) AND `HYPO_DIR="$QA_SANDBOX/vault"` so installs/hooks land in the sandbox, not the user's real home.
@@ -96,15 +117,66 @@ If a scenario explicitly tests "real install side effects on the user's machine"
 
    **`spawn.sh` delivers the same prompt to every worker in the team** (single `prompt.txt` copied into `$TEAM_DIR/`, every worker runs `codex "$(cat …/prompt.txt)"` or equivalent). Workers therefore need an explicit self-identification rule in the prompt body: instruct each worker to read its index from `$TEAMS_WORKER_DIR` (basename ends in `worker-<N>`) and execute only the rows assigned to that `<N>`. Without that rule the row decomposition is unenforced and every worker runs every row.
 
-   Pass `HOME`/`CODEX_HOME`/`HYPO_DIR` via the worker prompt's env preamble. Example for a 5-row codex group + 8-row claude group:
+   Pass `HOME`/`CODEX_HOME`/`HYPO_DIR`/`HEAD_VERSION`/`REPO_ROOT` via the worker prompt's env preamble (the last two are required by clause C below). Example for a 5-row codex group + 8-row claude group:
    ```
-   /teams 2:codex  "export HOME=… CODEX_HOME=… HYPO_DIR=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='1-3 (CLI subcommands)';; 2) ROWS='4-5 (scripts)';; esac; run only your assigned rows; capture exit code + output + filesystem effect; PASS/FAIL with evidence."
-   /teams 3:claude "export HOME=… HYPO_DIR=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='6-8 (slash A)';; 2) ROWS='9-11 (slash B)';; 3) ROWS='12-13 (hooks+manual)';; esac; run only your assigned rows."
+   /teams 2:codex  "export HOME=… CODEX_HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='1-3 (CLI subcommands)';; 2) ROWS='4-5 (scripts)';; esac; run clause-C stale-install check first, then your assigned rows; capture exit code + output + filesystem effect; PASS/FAIL with evidence."
+   /teams 3:claude "export HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='6-8 (slash A)';; 2) ROWS='9-11 (slash B)';; 3) ROWS='12-13 (hooks+manual)';; esac; run clause-C check, then your assigned rows."
    ```
-6. **One scenario per row** — each row must be assigned explicitly inside the team prompt (via the `$TEAMS_WORKER_DIR`-based dispatch above) with scenario, expected outcome, and evidence requirement (file path / grep / exit code).
+6. **One scenario per row** — each row must be assigned explicitly inside the team prompt (via the `$TEAMS_WORKER_DIR`-based dispatch above) with scenario, expected outcome, and evidence requirement (file path / grep / exit code). Worker prompts MUST also include the **mandatory clauses** below (placeholder rule + exact-quote rule + stale-install rule + ack-echo) — workers without these clauses produced 4/5 false-positive FAILs in the first dogfood run.
 7. **Collect** — block on Stop-hook markers, read `output.txt` per worker, parse PASS/FAIL, capture evidence excerpts.
-8. **Log** — write the run to `~/hypomnema/projects/hypomnema/qa-runs/<YYYY-MM-DD>.md` with table: row | feature | surface | scenario | worker | verdict | evidence | follow-up.
-9. **Triage** — every FAIL → fix PR (code or docs). Never close a QA run with FAILs unresolved or `manual` rows un-checked.
+8. **Orchestrator re-verification (MANDATORY before logging)** — for every FAIL the workers reported, the orchestrating Claude MUST live-re-run the failing scenario against a **fresh HEAD-version sandbox** (created by re-running the preflight against the current working tree, NOT against the user's real `~/.claude` / `~/.codex` / `~/hypomnema`) before recording it as a real defect.
+   - **CLI / script rows** (`hypomnema doctor`, `node scripts/lint.mjs`, etc.) — run directly against the working tree from `$REPO_ROOT`; if the row passes, mark `WORKER_FALSE_POSITIVE`.
+   - **Slash / hook / install rows** (`/hypo:resume`, `hypo-first-prompt`, …) — bind a second sandbox via the same preflight, re-execute the scenario there, compare.
+   - **Intentional-failure rows** — if the matrix `expected` field says the scenario MUST exit non-zero (e.g., `feedback-sync --strict` with no target file), a non-zero result is PASS, not FAIL. Worker FAILs claiming "ungraceful error" against such rows are downgraded to `WORKER_EXPECTATION_MISMATCH`; fix the matrix `expected` field if it was ambiguous.
+   - **Doc-drift FAILs** — re-grep the cited `README.md:L<n>` / `CHANGELOG.md:L<n>` to confirm the worker's quote is verbatim. If the cited line doesn't say what the worker claimed (paraphrase, hallucination), mark `WORKER_QUOTE_MISMATCH`.
+
+   Only confirmed-on-fresh-HEAD FAILs become fix-PR follow-ups. This step is non-negotiable — skipping it produces the dogfood-#1 backlog of ghost defects.
+9. **Log** — write the run to `~/hypomnema/projects/hypomnema/qa-runs/<YYYY-MM-DD>.md` with table: `row | feature | surface | scenario | expected | worker | verdict | evidence | follow-up`. The **`expected`** column is mandatory — record the exact expected outcome (exit 0 / exit non-zero / specific output / filesystem effect). Without it, step 8 cannot classify intentional-failure rows as `WORKER_EXPECTATION_MISMATCH`. Include a separate "False positives caught at orchestrator gate" section listing each downgrade (`WORKER_FALSE_POSITIVE` / `WORKER_EXPECTATION_MISMATCH` / `WORKER_QUOTE_MISMATCH`) with the reason.
+10. **Triage** — every confirmed FAIL → fix PR (code or docs). Never close a QA run with confirmed FAILs unresolved or `manual` rows un-checked.
+
+### Worker prompt template — mandatory clauses
+
+Every worker prompt for this skill MUST embed these three clauses (in addition to env preamble + row dispatch). They are the operational countermeasures against the three false-positive classes observed in dogfood #1:
+
+```
+# (A) Placeholder substitution rule
+Doc syntax like `--project=<name>`, `--hypo-dir=<path>`, `<sha>` uses angle-bracket
+METAVARIABLES — they are NOT literal arguments. Replace `<name>` with a real
+project slug from the sandbox, replace `<path>` with a real path, or omit the
+flag entirely. Never type `--project=name` or `--project=slug` thinking that's
+what the doc said to do.
+
+# (B) Doc-vs-code drift evidence rule
+When claiming a doc-vs-code drift FAIL, quote the EXACT line from README/
+CHANGELOG (`README.md:L<n>` or `README.ko.md:L<n>`) and the EXACT observed
+output. Words like "implies", "suggests", "the doc should mean" are NOT
+evidence — they are hallucination. If you cannot quote the doc line that
+contradicts the observed behavior, downgrade the verdict from FAIL to
+"drift candidate" and move on; do not file it as a defect.
+
+# (C) Stale-install detection rule
+Before running any scenario, confirm the sandbox you were handed actually binds
+to branch HEAD. The preflight wrote $HOME/.claude/hypo-pkg.json with pkgVersion
++ pkgRoot — assert both against HEAD_VERSION and REPO_ROOT (which the env
+preamble below also exports). Use real shell tests (printing == does NOT
+compare):
+  GOT_VER=$(node -p "require(process.env.HOME + '/.claude/hypo-pkg.json').pkgVersion")
+  GOT_ROOT=$(node -p "require(process.env.HOME + '/.claude/hypo-pkg.json').pkgRoot")
+  [ "$GOT_VER" = "$HEAD_VERSION" ] || { echo "STALE_INSTALL_ABORT: pkgVersion=$GOT_VER != $HEAD_VERSION"; exit 1; }
+  [ "$GOT_ROOT" = "$REPO_ROOT"    ] || { echo "STALE_INSTALL_ABORT: pkgRoot=$GOT_ROOT != $REPO_ROOT"; exit 1; }
+If either disagrees → STOP, do not generate FAILs.
+The env preamble (step 5 example above) must therefore export BOTH
+HEAD_VERSION and REPO_ROOT in addition to HOME/CODEX_HOME/HYPO_DIR.
+
+# (Worker self-check echo — MANDATORY)
+Before running any scenario, echo this exact line to stdout so the orchestrator
+can confirm the guard clauses reached you:
+  "guard clauses acknowledged: A/B/C"
+The orchestrator greps output.txt for this line. Absence = the prompt template
+did not reach you and your FAILs will be treated as VERDICT_UNCLEAR.
+```
+
+The orchestrator MUST grep each worker's `output.txt` for the literal `guard clauses acknowledged: A/B/C` line before parsing verdicts. The clauses themselves are in the team's `prompt.txt` (the spawn-time file, not the worker's answer log), so do not grep `output.txt` for the clause body — grep for the acknowledgement echo instead.
 
 ## Evidence requirements (per row)
 
@@ -115,14 +187,20 @@ If a scenario explicitly tests "real install side effects on the user's machine"
 
 A "I ran it and it looked fine" verdict is not evidence. Quote the raw output.
 
+**Doc-drift FAILs require exact citation**: worker may not claim "README implies X" / "README should say Y" — they must paste the literal `README.md:L<n>` line that contradicts the observed output. Orchestrator-side grep verifies the cited line really exists at that location before accepting the FAIL.
+
 ## Anti-patterns
 
 - ❌ Calling `codex` or `claude` CLI directly from this command. Always `/teams`.
 - ❌ Trusting worker self-reported PASS without reading `output.txt`.
+- ❌ Trusting worker self-reported FAIL without orchestrator-side HEAD re-verification (step 8).
+- ❌ Substituting `<name>`, `<path>`, `<sha>` from docs as literal CLI args — these are metavariables, not values.
+- ❌ Filing a fix PR based on a worker FAIL that was never re-checked against HEAD.
 - ❌ Skipping rows because "obvious it works" — that's exactly when regressions hide.
 - ❌ Running QA after merge. Run before, on the feature branch.
 - ❌ Letting QA log live only in chat. Write the `qa-runs/<date>.md` row durably.
 - ❌ Skipping preflight sandbox — workers will silently test a stale globally-installed plugin and the matrix will lie.
+- ❌ Skipping the preflight sandbox-version assertion — past dogfood produced ghost defects because `npm install` resolved a published version older than HEAD.
 - ❌ Running install/hook rows in the user's real `$HOME` / `~/hypomnema` vault. Use `$QA_SANDBOX`.
 
 ## Output (last line of this command's response)
