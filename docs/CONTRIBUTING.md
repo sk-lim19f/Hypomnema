@@ -139,6 +139,34 @@ Some hook behavior is only observable inside a Claude Code session. Document the
 
 ---
 
+## Pre-commit auto-format hook
+
+`npm install` in this checkout installs a git `pre-commit` hook that runs `prettier --write` on staged files only. The hook is **non-blocking**: formatter failures print a notice but the commit still proceeds. The only block is when `git add` itself fails during restage (true index corruption).
+
+**Requirements**: Git ≥ 2.13 (uses `--absolute-git-dir`; `--git-common-dir` is 2.5+).
+
+**Path-locked to your checkout.** The shim embeds the absolute paths of your `HYPOMNEMA_ROOT` and `.git/` directory at install time. If you `mv` the checkout, re-run `npm install` to regenerate the shim — until then it safely no-ops.
+
+**Main worktree only.** `git worktree add` checkouts silently skip — the shared `.git/hooks/pre-commit` can only point at one embedded root at a time. Commit from the main worktree to get auto-format, or accept the no-op in linked worktrees.
+
+**CI is skipped.** `npm ci` runs `prepare`, but the installer detects `CI=true` and exits 0 without touching `.git/hooks/`. CI runs never mutate hooks.
+
+**Symlink-safe.** If `.git/hooks/` is a symlink, or an existing `pre-commit` is a symlink, the installer refuses to write through it.
+
+**Shared `core.hooksPath` safe.** The shim verifies both `--show-toplevel` and `--absolute-git-dir` against the embedded values before executing. Foreign repos that share your global `core.hooksPath` will silently no-op.
+
+**Env-override defense.** The Node side strips every `GIT_*` env from `git rev-parse --local-env-vars` (plus `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_*`) before its own git spawns. Inherited `GIT_INDEX_FILE` is preserved **only** when invoked from the installed shell shim (signalled via a sentinel env var). Direct `node scripts/pre-commit-format.mjs` invocation drops `GIT_INDEX_FILE` and falls back to the default `.git/index`, closing the class of attacks that try to drive the formatter against a crafted alternate index.
+
+**Existing non-marker pre-commit?** If you have your own `pre-commit` hook (no `# hypomnema-pre-commit-marker v1` on line 2), the installer logs a notice and never overwrites it.
+
+**Skip a single commit**: `git commit --no-verify`. AI agents must not use this without explicit user authorization.
+
+**Verbose install logs**: `HYPOMNEMA_HOOK_VERBOSE=1 npm install` prints skip/install reasons to stderr.
+
+**Distinction from `hooks/hypo-pre-commit.mjs`**: that file is the git pre-commit worker template that `scripts/init.mjs` installs into `<wiki>/.git/hooks/pre-commit` when a user runs `hypomnema init` in their own wiki repo. It lives in the *user's wiki* repo, not in this package repo. The two hooks never interact.
+
+---
+
 ## Branch and commit conventions
 
 - One logical change per branch.
