@@ -10203,10 +10203,18 @@ test('shim: foreign hypomnema-named repo via GIT_DIR/GIT_WORK_TREE → does NOT 
 suite('pre-commit-format: installer');
 
 function runInstaller(dir, extraEnv = {}) {
+  // Drop CI/npm lifecycle envs from the parent process so the installer's
+  // skip guards (CI=true, npm_command=pack/publish, prepublishOnly) don't
+  // fire under GitHub Actions (where CI=true is always set). Tests that
+  // exercise those guards override via extraEnv explicitly.
+  const { CI, npm_command, npm_lifecycle_event, ...cleanParent } = process.env;
+  void CI;
+  void npm_command;
+  void npm_lifecycle_event;
   return spawnSync(process.execPath, [join(dir, 'scripts', 'install-git-hooks.mjs')], {
     cwd: dir,
     encoding: 'utf-8',
-    env: { ...process.env, ...extraEnv },
+    env: { ...cleanParent, ...extraEnv },
   });
 }
 
@@ -10318,13 +10326,19 @@ test('installer: linked worktree → skips', () => {
     // so its `import.meta.url` resolves to a valid file inside the worktree.
     mkdirSync(join(wt, 'scripts'), { recursive: true });
     cpSync(INSTALLER_PATH, join(wt, 'scripts', 'install-git-hooks.mjs'));
+    // Drop CI/lifecycle envs so the test exercises the linked-worktree guard,
+    // not the CI=true skip (always present on GitHub Actions).
+    const { CI, npm_command, npm_lifecycle_event, ...cleanParent } = process.env;
+    void CI;
+    void npm_command;
+    void npm_lifecycle_event;
     const r = spawnSync(process.execPath, [join(wt, 'scripts', 'install-git-hooks.mjs')], {
       cwd: wt,
       encoding: 'utf-8',
-      env: { ...process.env, HYPOMNEMA_HOOK_VERBOSE: '1' },
+      env: { ...cleanParent, HYPOMNEMA_HOOK_VERBOSE: '1' },
     });
     assert.equal(r.status, 0);
-    assert.match(r.stderr, /linked worktree|toplevel != expectedRoot|skipping/);
+    assert.match(r.stderr, /linked worktree|toplevel != expectedRoot/);
   } finally {
     if (wt) rmSync(wt, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
