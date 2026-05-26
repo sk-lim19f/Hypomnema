@@ -177,27 +177,57 @@ Hypomnema uses semver. Releases are automated via `release.yml` on `v*` tag push
 
 ### Cutting a release
 
+Every Hypomnema release must carry a Korean summary alongside the English body
+in **both** the CHANGELOG section AND the git tag annotation. The release
+workflow enforces this with `scripts/check-bilingual.mjs`; lightweight tags or
+a missing `### 한글 요약` section will block `npm publish`.
+
 ```bash
-# 1. Bump the version (writes package.json + CHANGELOG.md)
-node scripts/bump-version.mjs <patch|minor|major>
+# 1. Bump the version across package.json, plugin.json, marketplace.json,
+#    and templates/hypo-config.md. Takes a concrete semver (not patch/minor/major).
+node scripts/bump-version.mjs <new-semver>   # e.g. 1.2.2 or 1.3.0-rc.1
 
-# 2. Review the diff and edit CHANGELOG.md if needed
-git diff
+# 2. Edit CHANGELOG.md — the new section MUST include a "### 한글 요약"
+#    sub-section with at least 10 Hangul characters of real summary text.
+$EDITOR CHANGELOG.md
 
-# 3. Commit
+# 3. Verify locally before tagging (same check that runs in CI)
+node scripts/check-bilingual.mjs --changelog
+
+# 4. Commit
 git add package.json CHANGELOG.md
 git commit -m "chore: release v<version>"
 
-# 4. Tag and push
-git tag v<version>
+# 5. Tag with an ANNOTATED tag — never a lightweight tag.
+#    Annotation body shape: English summary, then "---" on its own line,
+#    then a Korean summary block.
+git tag -a v<version> -m "$(cat <<'EOF'
+Hypomnema v<version> — <one-line English summary>
+
+<a few lines of English body — what shipped, links, etc.>
+
+---
+
+Hypomnema v<version> — <한 줄 한글 요약>
+
+<몇 줄의 한글 요약 본문.>
+EOF
+)"
+
+# 6. Verify the tag annotation locally (same check that runs in CI)
+node scripts/check-bilingual.mjs --tag v<version>
+
+# 7. Push
 git push origin main --tags
 ```
 
 The `release.yml` workflow then:
 
 1. Verifies the tag matches `package.json` version.
-2. Runs `npm test` and `npm run lint`.
-3. Publishes to npm with `npm publish --access public --provenance`.
+2. Validates the CHANGELOG section AND the tag annotation are bilingual
+   (`scripts/check-bilingual.mjs`).
+3. Runs `npm test` and `npm run lint`.
+4. Publishes to npm with `npm publish --access public --provenance`.
 
 `NPM_TOKEN` must be set as a repository secret.
 

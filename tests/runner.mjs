@@ -30,6 +30,12 @@ import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
 import { buildProjectSuggestionLine } from '../hooks/hypo-shared.mjs';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
+import {
+  validateChangelog,
+  validateTagBody,
+  countHangul,
+  HANGUL_BODY_THRESHOLD,
+} from '../scripts/lib/check-bilingual.mjs';
 
 const HOME = homedir();
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
@@ -9469,6 +9475,233 @@ test('w8-lint-omits-id-for-other-warns', () => {
       `expected non-W8 warns to omit id field: ${JSON.stringify(parsed.warns)}`,
     );
   });
+});
+
+// ── check-bilingual: release-doc bilingual rule enforcement ─────────────────
+
+suite('check-bilingual — CHANGELOG section validator');
+
+const CHANGELOG_HEADER = `# Changelog
+
+All notable changes to Hypomnema are documented in this file.
+
+## [Unreleased]
+
+`;
+
+function makeChangelogFixture(sections) {
+  return CHANGELOG_HEADER + sections.join('\n');
+}
+
+const KOREAN_FILLER = '이번 릴리스에서는 새로운 기능을 추가했고 몇 가지 버그를 수정했습니다.';
+
+test('check-bilingual: valid section with 한글 요약 sub-section passes', () => {
+  const cl = makeChangelogFixture([
+    `## [1.2.1] - 2026-05-26
+
+### Fixed
+
+- some English fix
+
+### 한글 요약
+
+- ${KOREAN_FILLER}
+
+### Internal
+
+- some English internal note
+`,
+  ]);
+  const r = validateChangelog(cl, '1.2.1');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.ok(r.hangulCount >= HANGUL_BODY_THRESHOLD);
+});
+
+test('check-bilingual: 한글 요약 heading with English-only body fails', () => {
+  const cl = makeChangelogFixture([
+    `## [1.0.0] - 2026-01-01
+
+### 한글 요약
+
+- This body is only English with no Korean characters.
+`,
+  ]);
+  const r = validateChangelog(cl, '1.0.0');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /Hangul chars/);
+});
+
+test('check-bilingual: section without 한글 요약 sub-section fails', () => {
+  const cl = makeChangelogFixture([
+    `## [1.0.0] - 2026-01-01
+
+### Fixed
+
+- some English fix
+`,
+  ]);
+  const r = validateChangelog(cl, '1.0.0');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /missing "### 한글 요약"/);
+});
+
+test('check-bilingual: version not in CHANGELOG fails', () => {
+  const cl = makeChangelogFixture([`## [1.0.0] - 2026-01-01\n\n- stuff\n`]);
+  const r = validateChangelog(cl, '9.9.9');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no "## \[9\.9\.9\]"/);
+});
+
+test('check-bilingual: [Unreleased] does NOT satisfy a version-target lookup', () => {
+  // The fixture's header contains "## [Unreleased]" but the lookup is for 1.2.0
+  // → must fail (no special-casing — codex BLOCKER fix).
+  const cl = makeChangelogFixture([]);
+  const r = validateChangelog(cl, '1.2.0');
+  assert.equal(r.ok, false);
+});
+
+test('check-bilingual: 1.2.1 does not match 1.2.10 (semver escape)', () => {
+  const cl = makeChangelogFixture([
+    `## [1.2.10] - 2026-06-01
+
+### 한글 요약
+
+- ${KOREAN_FILLER}
+`,
+  ]);
+  const r = validateChangelog(cl, '1.2.1');
+  assert.equal(r.ok, false, 'must not match 1.2.10 prefix as 1.2.1');
+});
+
+test('check-bilingual: prerelease (1.2.1-rc.1) is matched literally', () => {
+  const cl = makeChangelogFixture([
+    `## [1.2.1-rc.1] - 2026-05-20
+
+### 한글 요약
+
+- ${KOREAN_FILLER}
+`,
+  ]);
+  const r = validateChangelog(cl, '1.2.1-rc.1');
+  assert.equal(r.ok, true);
+});
+
+test('check-bilingual: duplicate version sections fail', () => {
+  const cl = makeChangelogFixture([
+    `## [1.0.0] - 2026-01-01
+
+### 한글 요약
+
+- ${KOREAN_FILLER}
+
+## [1.0.0] - 2026-01-02
+
+### 한글 요약
+
+- ${KOREAN_FILLER}
+`,
+  ]);
+  const r = validateChangelog(cl, '1.0.0');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /duplicate.*sections/);
+});
+
+test('check-bilingual: Korean block boundary stops at next H3 (Internal section)', () => {
+  // The 한글 요약 body itself has 0 Korean chars (a parser bug would leak Hangul
+  // from the next "### Internal" section back into the "### 한글 요약" body).
+  // The boundary must stop at the next ### to prevent that false pass.
+  const KOREAN_INTERNAL =
+    '내부 변경 사항 한국어 텍스트입니다 더 많은 한글 단어들로 임계값을 넘기게 합니다.';
+  const cl = makeChangelogFixture([
+    `## [1.0.0] - 2026-01-01
+
+### 한글 요약
+
+- only English body here, no Korean at all.
+
+### Internal
+
+- ${KOREAN_INTERNAL}
+`,
+  ]);
+  const r = validateChangelog(cl, '1.0.0');
+  assert.equal(r.ok, false, 'must fail — Korean lives in Internal, not in 한글 요약');
+});
+
+test('check-bilingual: CRLF line endings normalized', () => {
+  const ko = `## [1.0.0] - 2026-01-01\r\n\r\n### 한글 요약\r\n\r\n- ${KOREAN_FILLER}\r\n`;
+  const cl = CHANGELOG_HEADER.replace(/\n/g, '\r\n') + ko;
+  const r = validateChangelog(cl, '1.0.0');
+  assert.equal(r.ok, true);
+});
+
+test('check-bilingual: NFC normalizes decomposed Hangul jamo before counting', () => {
+  // "가나다라마바사아자차" precomposed = 10 syllables. Decomposed = jamo-only.
+  const decomposed = '가나다라마바사아자차'.normalize('NFD');
+  assert.notEqual(decomposed, '가나다라마바사아자차');
+  const cl = makeChangelogFixture([`## [1.0.0] - 2026-01-01\n\n### 한글 요약\n\n${decomposed}\n`]);
+  const r = validateChangelog(cl, '1.0.0');
+  assert.equal(r.ok, true, `decomposed input must NFC-normalize; got: ${JSON.stringify(r)}`);
+});
+
+suite('check-bilingual — git tag annotation body validator');
+
+test('check-bilingual tag: valid body with --- + Korean passes', () => {
+  const body = `Hypomnema v1.0.0 — initial release\n\nEnglish summary body.\n\n---\n\n한국어 요약 본문입니다 여러 단어를 포함한 실제 한글 요약.\n`;
+  const r = validateTagBody(body);
+  assert.equal(r.ok, true);
+});
+
+test('check-bilingual tag: body without --- separator fails', () => {
+  const body = `Hypomnema v1.0.0\n\nEnglish only, no separator, but has 한국어 요약 inline.\n`;
+  const r = validateTagBody(body);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no "---" separator/);
+});
+
+test('check-bilingual tag: --- present but no Korean after fails', () => {
+  const body = `Hypomnema v1.0.0\n\nEnglish body.\n\n---\n\nMore English, no Korean here.\n`;
+  const r = validateTagBody(body);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /Hangul/);
+});
+
+test('check-bilingual tag: only the LAST --- counts (tolerates English markdown HR)', () => {
+  // Earlier --- is a legit horizontal rule inside the English body. The Korean
+  // summary block lives after the SECOND --- only.
+  const body =
+    `Hypomnema v1.0.0\n\n` +
+    `English section A.\n\n---\n\nEnglish section B (still English, after first ---).\n\n` +
+    `---\n\n한국어 요약 본문입니다 충분한 분량의 실제 한글 요약.\n`;
+  const r = validateTagBody(body);
+  assert.equal(r.ok, true);
+});
+
+test('check-bilingual tag: --- present, only Hangul before it (header-only Korean) fails', () => {
+  // Korean lives BEFORE the separator (mis-ordered). After-separator body is
+  // English-only — must fail.
+  const body = `한국어 요약 본문입니다 충분한 분량의 실제 한글 요약.\n\n---\n\nEnglish only after the separator.\n`;
+  const r = validateTagBody(body);
+  assert.equal(r.ok, false);
+});
+
+test('check-bilingual tag: multiple --- + Korean after last passes', () => {
+  const body = `A\n---\nB\n---\nC\n---\n한글 요약 본문 충분한 길이의 실제 한국어 요약입니다.\n`;
+  const r = validateTagBody(body);
+  assert.equal(r.ok, true);
+});
+
+test('check-bilingual tag: short Korean (under threshold) fails', () => {
+  const body = `English body.\n\n---\n\n한글.\n`;
+  const r = validateTagBody(body);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /threshold: 10/);
+});
+
+test('check-bilingual: countHangul ignores non-Hangul Unicode (e.g. CJK, Hiragana)', () => {
+  // 漢字 (CJK Han, not Hangul), ひらがな (Hiragana) — both should be 0.
+  assert.equal(countHangul('漢字 ひらがな English'), 0);
+  assert.equal(countHangul('한글 + 漢字'), 2);
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────

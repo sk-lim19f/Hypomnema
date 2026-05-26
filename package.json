@@ -41,9 +41,10 @@
     "lint": "node scripts/lint.mjs",
     "graph": "node scripts/graph.mjs",
     "smoke-pack": "node scripts/smoke-pack.mjs",
+    "check:bilingual": "node scripts/check-bilingual.mjs --changelog",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepublishOnly": "npm test && npm run lint && npm run smoke-pack"
+    "prepublishOnly": "npm test && npm run lint && npm run smoke-pack && npm run check:bilingual"
   },
   "devDependencies": {
     "prettier": "^3.8.3"
