@@ -1,6 +1,6 @@
 {
   "name": "hypomnema",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "LLM-native personal wiki system — session-aware knowledge base for Claude Code",
   "author": {
     "name": "sk-lim19f",
