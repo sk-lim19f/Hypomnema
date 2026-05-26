@@ -18,6 +18,7 @@ import {
   symlinkSync,
   statSync,
   unlinkSync,
+  utimesSync,
   cpSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -7144,6 +7145,103 @@ test('with results: ingest prompt not shown', () => {
     assert.ok(
       !r.stdout.includes('/hypo:ingest'),
       `ingest prompt should not appear when results exist: ${r.stdout}`,
+    );
+  });
+});
+
+// ── resume.mjs smoke tests ───────────────────────────────────────────────────
+
+suite('resume.mjs — fresh-init + commented-example hot.md');
+
+test('resume on fresh-init vault: graceful "no active project found" — no slug leak', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+    // Sanity: the template comment example IS present in the generated hot.md.
+    const hot = readFileSync(join(hypoDir, 'hot.md'), 'utf-8');
+    assert.ok(/<!--[\s\S]*?Row format[\s\S]*?-->/.test(hot), 'expected comment in hot.md');
+    const r = run('resume.mjs', [`--hypo-dir=${hypoDir}`]);
+    assert.equal(
+      r.status,
+      1,
+      `expected exit 1, got ${r.status}; stdout=${r.stdout} stderr=${r.stderr}`,
+    );
+    assert.ok(
+      r.stderr.includes('no active project found'),
+      `expected matrix message in stderr: ${r.stderr}`,
+    );
+    assert.ok(
+      !r.stdout.includes('slug') && !r.stderr.includes('"slug"'),
+      `slug placeholder must not leak: stdout=${r.stdout} stderr=${r.stderr}`,
+    );
+  });
+});
+
+test('resume picks real project over _template fallback (even when _template is newer)', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+    // Add a real project alongside the scaffold _template, then make
+    // _template's session-state.md NEWER than foo's so mtime alone would pick
+    // _template. The explicit skip in resolveActiveProject must override that.
+    mkdirSync(join(hypoDir, 'projects', 'foo'), { recursive: true });
+    writeFileSync(
+      join(hypoDir, 'projects', 'foo', 'session-state.md'),
+      '---\ntitle: session-state — foo\ntype: session-state\nupdated: 2026-05-26\n---\n\n## 다음 이어받기\n- task A\n',
+    );
+    // Touch _template/session-state.md to be 1 second newer than foo's.
+    const templateSS = join(hypoDir, 'projects', '_template', 'session-state.md');
+    assert.ok(existsSync(templateSS), 'fixture: _template/session-state.md must exist after init');
+    const fooSS = join(hypoDir, 'projects', 'foo', 'session-state.md');
+    const fooMtime = statSync(fooSS).mtimeMs;
+    const newer = new Date(fooMtime + 5000);
+    utimesSync(templateSS, newer, newer);
+    const r = run('resume.mjs', [`--hypo-dir=${hypoDir}`]);
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}; stderr=${r.stderr}`);
+    assert.ok(r.stdout.startsWith('Project: foo'), `expected 'Project: foo', got: ${r.stdout}`);
+  });
+});
+
+test('resume strips legacy [[projects/slug/hot]] HTML-comment example (back-compat with pre-fix vaults)', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+    // Simulate an older installed hot.md that still has the pre-fix wikilink-
+    // shaped comment example (the exact form that produced the original leak).
+    const legacyHot = `---
+title: Hot Cache — Pointer
+type: reference
+updated: 2026-05-26
+tags: [wiki, operations]
+---
+
+# Hot Cache
+
+## Active Projects
+
+| Project | Last Session | Hot Cache |
+|---|---|---|
+<!-- Row format: | Project Name | YYYY-MM-DD | [[projects/slug/hot]] | -->
+`;
+    writeFileSync(join(hypoDir, 'hot.md'), legacyHot);
+    // Also remove _template so the fallback can't mask the parse-result.
+    rmSync(join(hypoDir, 'projects', '_template'), { recursive: true, force: true });
+    const r = run('resume.mjs', [`--hypo-dir=${hypoDir}`]);
+    assert.equal(
+      r.status,
+      1,
+      `expected exit 1, got ${r.status}; stdout=${r.stdout} stderr=${r.stderr}`,
+    );
+    assert.ok(
+      r.stderr.includes('no active project found'),
+      `expected matrix message in stderr: ${r.stderr}`,
+    );
+    assert.ok(
+      !r.stdout.includes('slug') && !r.stderr.includes('"slug"'),
+      `slug placeholder must not leak: stdout=${r.stdout} stderr=${r.stderr}`,
     );
   });
 });
