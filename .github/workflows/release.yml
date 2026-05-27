@@ -14,14 +14,14 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # fetch-depth: 0 fetches full history including annotated tag objects;
           # the default shallow clone leaves git unable to read the tag body
           # that `check-bilingual --tag` validates.
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 18
           registry-url: 'https://registry.npmjs.org'
