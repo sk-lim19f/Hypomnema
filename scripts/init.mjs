@@ -887,7 +887,7 @@ if (args.hooks) {
   }
   for (const r of extResult.registered) log('merged', `extension ${r}`);
   for (const w of extResult.warnings) log('skipped', `extension: ${w}`);
-  // E3 (#31): a hard conflict (unowned/symlinked target) blocks install — surface
+  // E3 (fix #31): a hard conflict (unowned/symlinked target) blocks install — surface
   // the recovery and force a non-zero exit. Drift is advisory (resolvable, no block).
   if (extResult.conflicts.length > 0) {
     log('errors', '[WIKI: existing file conflicts. Backup and retry, or use --force-extensions]');

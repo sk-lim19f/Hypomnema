@@ -784,7 +784,7 @@ const extCheck = syncExtensions({
   force: args.forceExtensions,
 });
 
-// E4 (#32): --codex mirrors the extensions sync into ~/.codex (hooks + commands
+// E4 (fix #32): --codex mirrors the extensions sync into ~/.codex (hooks + commands
 // only; skills/agents skipped with a notice). The per-target SHA map lives in the
 // same ~/.claude/hypo-pkg.json under extensions.codex, so pkgPath is unchanged.
 const extCodexSettingsPath = codexSettingsPath;
@@ -878,7 +878,7 @@ if (args.apply) {
     apply: true,
     force: args.forceExtensions,
   });
-  // E4 (#32): codex apply runs AFTER the claude apply so it reads the freshly
+  // E4 (fix #32): codex apply runs AFTER the claude apply so it reads the freshly
   // written hypo-pkg.json and merges extensions.codex alongside extensions.claude
   // (the per-target spread in syncExtensions preserves the other target's map).
   if (args.codex) {
@@ -1142,7 +1142,7 @@ function pushExtSummary(check, label) {
     for (const c of check.conflicts) lines.push(`    ✗ ${c.file}  [${c.action} — left untouched]`);
     for (const d of check.drifts) lines.push(`    ⚠ ${d.file}  [drift — left untouched]`);
   }
-  // E3 (#31): a hard conflict blocks install (exit 1, even under --apply); drift is
+  // E3 (fix #31): a hard conflict blocks install (exit 1, even under --apply); drift is
   // resolvable advisory. Emit the spec'd WIKI messages so the user knows the recovery.
   if (nConflicts > 0) {
     lines.push('  [WIKI: existing file conflicts. Backup and retry, or use --force-extensions]');
@@ -1252,11 +1252,11 @@ const totalDrift =
   extCheck.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
   ).length +
-  // E3 (#31): unresolved drift/conflict is pending work too — without these the
+  // E3 (fix #31): unresolved drift/conflict is pending work too — without these the
   // summary printed "up to date" while the exit code was 1.
   extCheck.conflicts.length +
   extCheck.drifts.length +
-  // E4 (#32): codex-target pending work counts identically (same message/exit
+  // E4 (fix #32): codex-target pending work counts identically (same message/exit
   // consistency the E3 review caught — a codex conflict must not read "up to date").
   (extCheckCodex
     ? extCheckCodex.actions.filter(
@@ -1297,7 +1297,7 @@ if (totalDrift === 0) {
 
 console.log(lines.join('\n'));
 
-// E3 (#31): a hard extension conflict blocks even under --apply (unlike ordinary
+// E3 (fix #31): a hard extension conflict blocks even under --apply (unlike ordinary
 // drift, which only fails check mode). --force-extensions clears the resolvable
 // cases; an unfollowable symlink/non-regular dest still counts and stays exit 1.
 const extBlocked = extCheck.conflicts.length > 0 || (extCheckCodex?.conflicts.length ?? 0) > 0;
