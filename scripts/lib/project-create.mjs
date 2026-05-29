@@ -64,8 +64,8 @@ export function insertHotRow(content, name, today) {
   if (content.includes(link)) return content; // already present
   const lines = content.split('\n');
   // Scope the search to the "## Active Projects" section so a table appearing
-  // earlier in hot.md can't capture the row (codex review 2026-05-22). Start
-  // looking from the heading; stop at the next H2 so we never cross sections.
+  // earlier in hot.md can't capture the row. Start looking from the heading;
+  // stop at the next H2 so we never cross sections.
   const headingIdx = lines.findIndex((l) => /^##\s+Active Projects\s*$/.test(l));
   if (headingIdx === -1) return null;
   let sepIdx = -1;

@@ -312,7 +312,7 @@ function applySettingsJson(settingsResults, settingsPath) {
   for (const s of settingsResults) {
     if (s.status !== 'missing') continue;
     if (!Array.isArray(settings.hooks[s.event])) settings.hooks[s.event] = [];
-    // fix #48 BLOCKER: re-check the current parsed settings before appending.
+    // re-check the current parsed settings before appending.
     // applyHookNameMigration may have rewritten a legacy wiki-*.mjs command to
     // exactly `s.cmd` between checkSettingsJson and now — appending without
     // this guard creates a duplicate registration (codex 2-worker review
@@ -762,7 +762,7 @@ const commands = checkCommands();
 const oldHookRefs = checkOldHookNames(claudeSettingsPath);
 const hypoignore = checkHypoignore(args.hypoDir);
 
-// fix #48: when --codex is set, mirror the same core-hook checks against ~/.codex/
+// when --codex is set, mirror the same core-hook checks against ~/.codex/
 // so `hypomnema upgrade --codex` reports drift symmetrically and `--apply --codex`
 // updates both targets in one pass (matching init.mjs behaviour).
 const hooksCodex = args.codex ? checkHookFiles(codexHooksDir) : null;
@@ -855,7 +855,7 @@ if (args.apply) {
   appliedCommands = applyCommands(commands, args.forceCommands);
   appliedPkgJson = true;
   appliedHypoignore = applyHypoignoreMigration(hypoignore);
-  // fix #48: codex core hooks + settings + wiki-*→hypo-* rename mirror. Same order
+  // codex core hooks + settings + wiki-*→hypo-* rename mirror. Same order
   // as the claude side (rename first so subsequent hook copy can find renamed targets).
   if (args.codex) {
     if (oldHookRefsCodex.length > 0) {
@@ -898,7 +898,7 @@ if (args.apply) {
 
 const extDrift = extCheck.needsWork || (extCheckCodex?.needsWork ?? false);
 
-// fix #48: codex drift only counts when --codex is set — without the flag the codex
+// codex drift only counts when --codex is set — without the flag the codex
 // target is intentionally unobserved (parity with the existing extensions pattern).
 const codexCoreDrift =
   args.codex &&
@@ -935,7 +935,7 @@ if (args.json) {
         hypoignore,
         extensions: extCheck,
         extensionsCodex: extCheckCodex,
-        // fix #48: codex core mirror (null when --codex absent).
+        // codex core mirror (null when --codex absent).
         hooksCodex,
         settingsCodex,
         oldHookRefsCodex,
@@ -1090,7 +1090,7 @@ if (commands.length === 0) {
 }
 
 // Old hook names (wiki-*.mjs → hypo-*.mjs rename migration). Target-aware so
-// fix #48 surfaces codex settings.json that still references the v1.0/v1.1 names.
+// codex settings.json entries that still reference the v1.0/v1.1 names are surfaced.
 function pushHookNameSummary(refs, label) {
   if (refs.length > 0) {
     lines.push(
@@ -1200,7 +1200,7 @@ if (
     lines.push(`✓ Appended .hypoignore entries (${appliedHypoignore.length}):`);
     for (const e of appliedHypoignore) lines.push(`    → ${e}`);
   }
-  // fix #48: codex-target applied actions (mirrors claude blocks above).
+  // codex-target applied actions (mirrors claude blocks above).
   if (appliedHookNameRenamesCodex.length > 0) {
     lines.push(`✓ Renamed legacy hook references (codex) (${appliedHookNameRenamesCodex.length}):`);
     for (const r of appliedHookNameRenamesCodex) lines.push(`    → ${r}`);
@@ -1253,7 +1253,7 @@ const totalDrift =
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
   ).length +
   // E3 (#31): unresolved drift/conflict is pending work too — without these the
-  // summary printed "up to date" while the exit code was 1 (codex review).
+  // summary printed "up to date" while the exit code was 1.
   extCheck.conflicts.length +
   extCheck.drifts.length +
   // E4 (#32): codex-target pending work counts identically (same message/exit
@@ -1265,7 +1265,7 @@ const totalDrift =
       extCheckCodex.conflicts.length +
       extCheckCodex.drifts.length
     : 0) +
-  // fix #48: codex core mirror counts the same way as the claude side.
+  // codex core mirror counts the same way as the claude side.
   staleHooksCodex.length +
   missingSettingsCodex.length +
   (invalidSettingsCodex ? 1 : 0) +

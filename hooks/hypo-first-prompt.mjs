@@ -49,7 +49,7 @@ process.stdin.on('end', () => {
 
     const hasSnapshot = marker.hasSnapshot ?? (marker.hotPath && existsSync(marker.hotPath));
     const snapshotNote = hasSnapshot ? '' : ' (no snapshot yet — first session)';
-    // fix #13: a cwd-change re-trigger says "Resuming"; a fresh session start
+    // a cwd-change re-trigger says "Resuming"; a fresh session start
     // (default source) says "Previously working on".
     const verb = marker.source === 'cwd-change' ? 'Resuming' : 'Previously working on';
     // marker.proj originates from a wiki directory name read by findProjectFiles;

@@ -99,11 +99,11 @@ process.stdin.on('end', () => {
     if (newHit) {
       const fromFile = readIfNotIgnored(newHit.hotPath, ignorePatterns);
       const content = fromFile ?? '(no hot.md yet — will be created at session close)';
-      // fix #13: arm the first-prompt marker so the NEXT user prompt re-triggers
+      // arm the first-prompt marker so the NEXT user prompt re-triggers
       // hypo-first-prompt, which forces a "Resuming <project>" summary line.
       // Only arm when real hot content was actually injected — if hot.md is
       // missing or .hypoignore'd (fromFile null), there is nothing for the LLM
-      // to summarize, so forcing "Resuming" would be empty noise (codex review).
+      // to summarize, so forcing "Resuming" would be empty noise.
       if (fromFile) {
         try {
           writeFileSync(

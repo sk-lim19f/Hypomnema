@@ -92,7 +92,7 @@ process.stdin.on('end', () => {
 
   const gitStatus = hypoIsClean();
   const hotStatus = hotMdIsClean();
-  // fix #17: strict session-close (steps 1~6 of the 11-step crystallize
+  // strict session-close (steps 1~6 of the 11-step crystallize
   // checklist). closeFiles gates the 5 mandatory files (steps 1-4 + log.md);
   // open-questions.md (step 5) is conditional ("변경 시") and intentionally
   // ungated — see hypo-shared.mjs sessionCloseFileStatus and spec §5.2.7.
@@ -169,8 +169,8 @@ process.stdin.on('end', () => {
         // ONLY when some target has a genuine, actionable issue (drift,
         // conflict, over-cap, or a malformed managed region). buildError is
         // never actionable here, so any mix that lacks a real issue fails open
-        // — including memory:clean + claude:buildError (codex review: the prior
-        // `every(buildError)` predicate wrongly blocked that case). Mirrors
+        // — including memory:clean + claude:buildError, where the prior
+        // `every(buildError)` predicate wrongly blocked that case. Mirrors
         // doctor's buildError→warn (non-fatal) handling.
         let report = null;
         try {
