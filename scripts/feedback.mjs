@@ -222,7 +222,7 @@ function renderPage(args, targets, today) {
 // it the freshest correction, so it should sort first. Rewrite the `updated:`
 // line ONLY inside the leading frontmatter block (between the first pair of
 // `---` fences). A naive multiline replace would also rewrite any body line that
-// happens to start with "updated:" (codex review) — so we scope to the fence.
+// happens to start with "updated:" — so we scope to the fence.
 function bumpUpdated(content, today) {
   const m = content.match(/^---\n([\s\S]*?)\n---/);
   if (!m) return content; // no frontmatter → nothing to bump

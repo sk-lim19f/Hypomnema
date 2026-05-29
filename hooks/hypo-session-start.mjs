@@ -289,7 +289,7 @@ process.stdin.on('end', () => {
     const pullOk = gitPull(HYPO_DIR);
     const syncLine = syncStateNotice(pullOk);
     const growthLine = readLastGrowthLine();
-    // fix #25 PR-A2 (ADR 0022 amendment): on source='clear', surface the dying
+    // ADR 0022 amendment: on source='clear', surface the dying
     // session's identity that hypo-session-end stashed so Claude can recover
     // session-close work that /clear skipped. One-shot: marker is unlinked
     // immediately after read.
@@ -389,7 +389,7 @@ process.stdin.on('end', () => {
     if (!globalContent) {
       // GLOBAL_HOT exists but is empty or .hypoignore'd — still surface any
       // pending notices (sync state, growth, AND the auto-project offer), which
-      // would otherwise be silently dropped here (codex review 2026-05-22).
+      // would otherwise be silently dropped here.
       const notice = notices.join('\n\n');
       if (notice) {
         console.log(JSON.stringify(buildOutput(notice, { continue: true, suppressOutput: true })));

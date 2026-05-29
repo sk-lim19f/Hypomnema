@@ -246,7 +246,7 @@ function writeIfChanged(path, content) {
  * Append `entry` to `path` only if `alreadyPresent(content)` is false.
  * Atomic: rebuilds the full file content and writes via atomicWrite — a crash
  * mid-append cannot leave log.md or session-log/YYYY-MM.md half-written, which
- * matters for these append-only history files (codex review of fix #38).
+ * matters for these append-only history files.
  */
 function appendIfAbsent(path, entry, alreadyPresent) {
   let content = '';
@@ -563,7 +563,7 @@ function applySessionClose(args) {
 
   const ok = verification.ok && postApplyLint.ok;
 
-  // fix #27 PR-C (ADR 0022 amendment 2026-05-19): auto-write the per-session
+  // ADR 0022 amendment 2026-05-19: auto-write the per-session
   // closed marker on a verified close. Hook authority is read-only; this is
   // one of the two writer paths (the other is --mark-session-closed standalone).
   // Marker requires BOTH file/lint gate (already in `ok`) AND clean git tree —

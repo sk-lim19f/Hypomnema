@@ -205,7 +205,7 @@ function regionHasIntruders(content) {
   return span.trim().length > 0;
 }
 
-// ── projection targets (descriptor abstraction — ADR 0032 reuse) ──────────────
+// ── projection targets (descriptor abstraction) ──────────────────────────────
 
 const PUBLIC_SENSITIVITY = new Set(['public', 'sanitized']);
 
@@ -439,7 +439,7 @@ function applyTarget(target, res) {
   }
 }
 
-// ── project-id derivation (contract §5, OQ-31.3) ──────────────────────────────
+// ── project-id derivation ─────────────────────────────────────────────────────
 
 function deriveProjectId(args) {
   if (args.projectId) return { id: args.projectId, derived: false, exists: true };

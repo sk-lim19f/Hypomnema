@@ -306,7 +306,7 @@ function checkSettingsJson() {
     fail('settings.json hook registrations', `0/${total} registered — run /hypo:init`);
   }
 
-  // fix #7: stale hypo-* entries (uninstall remnants).
+  // stale hypo-* entries (uninstall remnants).
   // hypo-ext-* commands are user-extension entries (ADR 0024) — not core hooks,
   // so they are intentionally absent from HOOK_MAP. Excluded here; their
   // integrity (SHA + manifest + entry match) is checked separately in E5 (#33).
@@ -342,7 +342,7 @@ function checkSettingsJson() {
     pass('settings.json stale hypo-* entries', 'None');
   }
 
-  // fix #7: duplicate hypo-* entries per event
+  // duplicate hypo-* entries per event
   const dupes = [];
   for (const [event, groups] of Object.entries(settings.hooks || {})) {
     if (!Array.isArray(groups)) continue;
@@ -538,12 +538,12 @@ function checkSyncState(hypoDir) {
 }
 
 function checkProjectSuggestions(hypoDir) {
-  // fix #23 / ADR 0023: the auto-project skip-persistence store. Absent file is
+  // ADR 0023: the auto-project skip-persistence store. Absent file is
   // healthy (no offers declined yet). Validate the RAW JSON shape here rather
   // than via readProjectSuggestions(): that helper deliberately normalizes a
   // non-array `skips` to [] for fail-open hook reads, which would mask a
-  // malformed file and silently break permanent "N" suppression (codex review
-  // 2026-05-22). Doctor must catch the malformation the helper hides.
+  // malformed file and silently break permanent "N" suppression. Doctor must
+  // catch the malformation the helper hides.
   const path = projectSuggestionsPath(hypoDir);
   if (!existsSync(path)) {
     pass('Auto-project suggestions', 'No skip-persistence file (clean)');

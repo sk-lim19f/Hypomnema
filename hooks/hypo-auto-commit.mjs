@@ -43,9 +43,9 @@ if (staged) {
 }
 
 if (hasRemote()) {
-  // fix #9: pull/push failures must not stop the session, but they can no
-  // longer be swallowed silently — record each to .cache/sync-state.json so
-  // session-start (#10) and doctor (#11) can surface them next session.
+  // pull/push failures must not stop the session, but they can no longer be
+  // swallowed silently — record each to .cache/sync-state.json so session-start
+  // and doctor can surface them next session.
   const pull = git('pull', '--no-rebase', '-q');
   if (pull.status !== 0) appendSyncFailure(HYPO_DIR, 'pull', pull.stderr || pull.stdout);
   const push = git('push');

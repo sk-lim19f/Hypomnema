@@ -17,8 +17,8 @@ const HOME = homedir();
 // hypo-session-start / hypo-cwd-change WRITE this marker; hypo-first-prompt
 // READS + unlinks it. The session_id comes from the Claude Code runtime (a
 // UUID), but we sanitize defensively so a malformed id with path separators or
-// `..` can never escape tmpdir or collide on an empty value (codex review
-// 2026-05-21, fix #3/#13). Non-alphanumeric chars collapse to `_`.
+// `..` can never escape tmpdir or collide on an empty value. Non-alphanumeric
+// chars collapse to `_`.
 export function sessionMarkerPath(sessionId) {
   const safe = String(sessionId || 'default').replace(/[^A-Za-z0-9._-]/g, '_') || 'default';
   return join(tmpdir(), `hypo-session-marker-${safe}.json`);
@@ -207,8 +207,8 @@ export function hasSessionLogHeading(content, date) {
  * "foo-bar" (hyphen is non-word). The canonical log format always separates the
  * project slug from anything that follows by whitespace or end-of-line, so the
  * lookahead correctly rejects "session | foo-bar" when looking for "foo".
- * (Reported by codex review of fix #38 — was a pre-existing bug in
- * sessionCloseFileStatus that the helper extraction inherited.)
+ * (Was a pre-existing bug in sessionCloseFileStatus that the helper extraction
+ * inherited.)
  */
 export function hasLogEntry(content, date, project) {
   return new RegExp(
@@ -527,14 +527,12 @@ export function shouldSuggestProjectCreation(cwd, hypoDir = HYPO_DIR, now = Date
  * Build the §8.11 auto-project offer line for a cwd. The display name is the
  * cwd basename, which is attacker-influenced (a directory name can contain
  * newlines/control chars on Unix). Strip control characters and length-cap it
- * so a crafted dir name cannot spoof extra instructions in additionalContext
- * (codex review 2026-05-22).
+ * so a crafted dir name cannot spoof extra instructions in additionalContext.
  */
 export function buildProjectSuggestionLine(cwd) {
   // Replace any control char (code < 0x20 or === 0x7F) with a space so a
-  // crafted dir name cannot inject newlines/instructions into additionalContext
-  // (codex review 2026-05-22). Done by codepoint to keep control bytes out of
-  // this source file.
+  // crafted dir name cannot inject newlines/instructions into additionalContext.
+  // Done by codepoint to keep control bytes out of this source file.
   const sanitized = Array.from(basename(cwd))
     .map((ch) => {
       const code = ch.codePointAt(0);
