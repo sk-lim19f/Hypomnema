@@ -80,8 +80,8 @@ function pkgRootDir(target) {
 
 /**
  * Discover sync-eligible extensions under `extDir`. Returns a per-type map plus a
- * `warnings` array. Applies the `.hypoignore` filter (#30), the basename
- * whitelist (#9), and pairs each file with its optional `<name>.manifest.json`.
+ * `warnings` array. Applies the `.hypoignore` filter (fix #30), the basename
+ * whitelist (plan §5 #9), and pairs each file with its optional `<name>.manifest.json`.
  * No-ops gracefully when extDir is absent (e.g. --from-remote clones, plan §5 #8).
  */
 export function discoverExtensions(extDir, hypoignorePatterns, hypoDir) {
@@ -364,7 +364,7 @@ export function syncExtensions({
   const discovered = discoverExtensions(extDir, patterns, hypoDir);
   result.warnings.push(...discovered.warnings);
 
-  // E4 (#32): Codex supports hooks + commands only. If the user authored
+  // E4 (fix #32): Codex supports hooks + commands only. If the user authored
   // skills/agents extensions, surface a one-time notice that they are skipped
   // for this target rather than silently dropping them (plan §2 E4).
   if (target === 'codex') {

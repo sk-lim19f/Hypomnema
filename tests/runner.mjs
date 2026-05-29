@@ -2477,7 +2477,7 @@ test('extensions: conflict on main file blocks manifest copy + registration', ()
       });
 
       const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
-      // E3 (#31): a hard conflict blocks install with exit 1 even under --apply.
+      // E3 (fix #31): a hard conflict blocks install with exit 1 even under --apply.
       assert.equal(r.status, 1, `conflict must block with exit 1: ${r.stderr}`);
       const out = JSON.parse(r.stdout);
       assert.ok(
@@ -5023,7 +5023,7 @@ test('weekly-journal under journal/weekly missing week → error (scanDirs cover
   );
 });
 
-// feedback type — ADR 0031 / fix #37 conditional schema (#8)
+// feedback type — ADR 0031 / fix #37 conditional schema
 const FB_FM_OK =
   '---\ntitle: T\ntype: feedback\nstatus: active\nscope: global\ntier: L1\n' +
   'targets: [project-memory, claude-learned]\nsensitivity: public\npriority: 3\n' +
@@ -5945,7 +5945,7 @@ test('createProject rejects path-escape dot names (.., ., ...)', () => {
   });
 });
 
-// ── first-prompt forced resume summary + cwd-change re-trigger (#13) ──
+// ── first-prompt forced resume summary + cwd-change re-trigger (fix #13) ──
 suite('hypo-first-prompt.mjs — forced resume summary (fix #3 / #13)');
 
 // first-prompt reads its marker from os.tmpdir(), independent of HOME/HYPO_DIR.

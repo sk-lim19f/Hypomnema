@@ -170,7 +170,7 @@ function gitPull(dir) {
 
 /**
  * fix #10: surface unresolved sync failures recorded by a prior session's
- * Stop hook (#9). The entry is cleared only once this session's pull has
+ * Stop hook (fix #9). The entry is cleared only once this session's pull has
  * succeeded AND there is no unpushed commit left behind by a failed push
  * (`[ahead N]`).
  *

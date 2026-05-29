@@ -358,9 +358,9 @@ export function sessionCloseFileStatus(hypoDir) {
 
 // ── sync-state ────────────────────────────────────────────
 // `.cache/sync-state.json` is JSONL: one {timestamp, op, error, host} entry per
-// line. hypo-auto-commit (#9) appends on pull/push failure; hypo-session-start
-// (#10) surfaces open entries and clears them once sync is healthy again;
-// doctor (#11) warns while entries remain. Keep the schema defined here only.
+// line. hypo-auto-commit (fix #9) appends on pull/push failure; hypo-session-start
+// (fix #10) surfaces open entries and clears them once sync is healthy again;
+// doctor (fix #11) warns while entries remain. Keep the schema defined here only.
 
 /** @returns {string} path to the sync-state JSONL file for a wiki root. */
 function syncStatePath(hypoDir) {
