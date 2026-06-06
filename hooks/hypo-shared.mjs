@@ -801,6 +801,133 @@ export function hasMutatingTranscriptActivity(transcriptPath) {
   return false;
 }
 
+// ── session-scoped lint classification ──────────────────────────────────────
+// Bug A/B fix: the close gate must judge a session on the files IT touched, not
+// the whole vault. Lint debt from another project/session (often in shared
+// pages/) must not block this session's close/compact. Two scope builders feed
+// one shared classifier: transcript-derived (hooks + standalone marker) and
+// close-file/payload-derived (the documented apply path writes via Bash, so its
+// files never appear as Edit/Write file_paths and must be seeded explicitly).
+
+const MUTATING_FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+/** Pull file_path/notebook_path args from mutating tool_use blocks in one
+ *  transcript entry. Mirrors extractTranscriptToolNames' shape handling
+ *  (top-level tool_use + nested message.content[] blocks). */
+function extractTranscriptToolFilePaths(entry) {
+  const paths = [];
+  if (!entry || typeof entry !== 'object') return paths;
+  const pull = (name, input) => {
+    if (!name || !MUTATING_FILE_TOOLS.has(name) || !input || typeof input !== 'object') return;
+    const fp = input.file_path || input.notebook_path;
+    if (typeof fp === 'string' && fp) paths.push(fp);
+  };
+  if (entry.type === 'tool_use') pull(entry.name || entry.tool_name, entry.input);
+  const content = entry.message?.content ?? (Array.isArray(entry.content) ? entry.content : null);
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === 'object' && block.type === 'tool_use') {
+        pull(block.name || block.tool_name, block.input);
+      }
+    }
+  }
+  return paths;
+}
+
+/** Normalize an absolute path to a repo-relative POSIX path under hypoDir, or
+ *  null if it resolves outside the wiki. */
+function toHypoRel(absPath, hypoDir) {
+  let rel;
+  try {
+    rel = relative(hypoDir, absPath);
+  } catch {
+    return null;
+  }
+  if (!rel || rel.startsWith('..') || rel.startsWith('/')) return null;
+  return rel.split('\\').join('/');
+}
+
+/**
+ * Repo-relative POSIX paths of wiki files this session edited via direct
+ * Edit/Write/MultiEdit/NotebookEdit tool_use. Returns a Set; empty when the
+ * transcript is missing/unreadable (callers decide the fallback). A per-line
+ * JSON parse error skips that line only (transcripts occasionally truncate).
+ */
+export function extractTouchedWikiFiles(transcriptPath, hypoDir) {
+  const out = new Set();
+  if (!transcriptPath || typeof transcriptPath !== 'string' || !existsSync(transcriptPath)) {
+    return out;
+  }
+  let raw;
+  try {
+    raw = readFileSync(transcriptPath, 'utf-8');
+  } catch {
+    return out;
+  }
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let entry;
+    try {
+      entry = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    for (const fp of extractTranscriptToolFilePaths(entry)) {
+      const rel = toHypoRel(fp, hypoDir);
+      if (rel) out.add(rel);
+    }
+  }
+  return out;
+}
+
+/**
+ * The mandatory session-close files (repo-relative POSIX). The documented close
+ * path `crystallize.mjs --apply-session-close` writes these from inside a Bash
+ * call, so they never surface as Edit/Write file_paths — they must seed the
+ * scoped-lint set explicitly or a close-introduced error would escape the gate.
+ * Mirrors the file list in sessionCloseFileStatus.
+ */
+export function closeFileTargets(hypoDir) {
+  const out = new Set(['hot.md', 'log.md']);
+  const project = resolveActiveProject(hypoDir);
+  if (project) {
+    out.add(`projects/${project}/session-state.md`);
+    out.add(`projects/${project}/hot.md`);
+    const month = freshDates()[0].slice(0, 7);
+    out.add(`projects/${project}/session-log/${month}.md`);
+  }
+  return out;
+}
+
+/** Normalize a path's separators to POSIX so scope membership is OS-independent.
+ *  lint.mjs emits `file` via path.relative (back-slashes on Windows) while the
+ *  scope builders produce forward-slash paths — normalize both sides. */
+function posixPath(p) {
+  return (p || '').split('\\').join('/');
+}
+
+/**
+ * Partition lint findings into `blocking` (a file this session is accountable
+ * for) vs `notice` (pre-existing debt elsewhere — surfaced, not blocking).
+ *
+ * `scope` = iterable of repo-relative paths the session is accountable for.
+ * Membership is exact on the normalized path. Only findings passed in are
+ * classified — callers pass lint ERRORS; broken wikilinks (lint W4 warnings) are
+ * intentionally warn-only (forward references to planned pages are normal in a
+ * wiki) and are NOT promoted to blocking by this gate.
+ */
+export function partitionLintScope(findings, scope) {
+  const normScope = new Set([...scope].map(posixPath));
+  const blocking = [];
+  const notice = [];
+  for (const f of findings || []) {
+    if (normScope.has(posixPath(f.file))) blocking.push(f);
+    else notice.push(f);
+  }
+  return { blocking, notice };
+}
+
 // ── session-close checklist ────────────────────────────────────────────────
 
 /**
