@@ -10020,6 +10020,117 @@ test('w8-lint-omits-id-for-other-warns', () => {
   });
 });
 
+// ── Track E: lint --strict warning→error promotion ──────────────────────────
+// spec-v1.3.0 Track E. Stable warning IDs (W1 no-frontmatter / W2 unknown-type
+// / W3 missing-updated / W4 broken-wikilink; W8 design-history-stale predates).
+// `--strict` promotes STRICT_PROMOTE_IDS = {W1,W2,W4} to errors (exit 1).
+// Default mode must stay byte-identical (only W8 exposes `id` in --json).
+
+suite('Track E: lint --strict warning ID promotion');
+
+function runLintE(root, extraArgs = []) {
+  return spawnSync(
+    process.execPath,
+    [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${root}`, '--json', ...extraArgs],
+    { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+  );
+}
+
+// page that triggers W2 (unknown-type) + W3 (missing-updated) + W4 (broken-wikilink)
+function setupStrictFixture(root) {
+  mkdirSync(join(root, 'pages'), { recursive: true });
+  writeFileSync(
+    join(root, 'pages', 'a.md'),
+    '---\ntitle: a\ntype: notarealtype\n---\n\nbody with [[nonexistent-page]] link\n',
+  );
+}
+
+test('strict: default --json keeps W1/W2/W4 ids internal (byte-identical guard)', () => {
+  withTmpDir((root) => {
+    setupStrictFixture(root);
+    const r = runLintE(root);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, 'default mode: warnings do not change exit code');
+    assert.equal(parsed.ok, true);
+    // every warn in this fixture is W2/W3/W4 (no W8) → none may expose `id`
+    const withId = (parsed.warns || []).filter((w) => 'id' in w);
+    assert.equal(
+      withId.length,
+      0,
+      `default --json must not leak non-W8 ids: ${JSON.stringify(parsed.warns)}`,
+    );
+    assert.equal((parsed.warns || []).length, 3);
+  });
+});
+
+test('strict: --strict promotes W2 + W4 to errors and exits 1', () => {
+  withTmpDir((root) => {
+    setupStrictFixture(root);
+    const r = runLintE(root, ['--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 1, 'promoted warnings exit 1');
+    assert.equal(parsed.ok, false);
+    const errIds = (parsed.errors || []).map((e) => e.id).sort();
+    assert.deepEqual(errIds, ['W2', 'W4'], `expected W2+W4 promoted: ${JSON.stringify(parsed)}`);
+    // W3 (missing-updated) is NOT in STRICT_PROMOTE_IDS → stays a warn
+    const warnIds = (parsed.warns || []).map((w) => w.id);
+    assert.deepEqual(warnIds, ['W3'], `W3 must stay a warn: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+test('strict: W3-only fixture is not promoted (exit 0)', () => {
+  withTmpDir((root) => {
+    // valid type + valid links → only W3 (missing `updated`) remains
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(join(root, 'pages', 'a.md'), '---\ntitle: a\ntype: concept\n---\n\nbody\n');
+    const r = runLintE(root, ['--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, 'W3 is excluded from STRICT_PROMOTE_IDS → exit 0');
+    assert.equal(parsed.ok, true);
+    assert.equal((parsed.errors || []).length, 0);
+    assert.deepEqual(
+      (parsed.warns || []).map((w) => w.id),
+      ['W3'],
+    );
+  });
+});
+
+test('strict: W8 design-history-stale is not promoted (exit 0)', () => {
+  withTmpDir((root) => {
+    // valid frontmatter on both files so the *only* finding is W8 (stale) —
+    // otherwise the bare design-history.md/session-log.md trip W1 (no-frontmatter)
+    // which --strict would promote, masking what this test asserts.
+    setupDhProject(root, 'demo', {
+      dh: '---\ntitle: dh\ntype: reference\nupdated: 2026-05-10\n---\n\n## 2026-05-10\nfoo\n',
+      sessionLogMd:
+        '---\ntitle: sl\ntype: session-log\nupdated: 2026-05-20\n---\n\n## [2026-05-20] s\n',
+    });
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    const r = runLintE(root, ['--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, 'W8 is excluded from STRICT_PROMOTE_IDS → exit 0');
+    assert.equal(parsed.ok, true);
+    const w8 = (parsed.warns || []).filter((w) => w.id === 'W8');
+    assert.equal(w8.length, 1, `W8 stays a warn under --strict: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+test('strict: W1 no-frontmatter promotes and preserves early-return skip', () => {
+  withTmpDir((root) => {
+    // no frontmatter at all → W1 fires and lintPage returns early, so no
+    // "Missing required frontmatter field" errors are also emitted for this page
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(join(root, 'pages', 'a.md'), 'plain body, no frontmatter\n');
+    const r = runLintE(root, ['--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 1);
+    assert.equal(parsed.ok, false);
+    const errs = parsed.errors || [];
+    assert.equal(errs.length, 1, `early-return preserved → only W1: ${JSON.stringify(errs)}`);
+    assert.equal(errs[0].id, 'W1');
+  });
+});
+
 // ── check-bilingual: release-doc bilingual rule enforcement ─────────────────
 
 suite('check-bilingual — CHANGELOG section validator');

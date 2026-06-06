@@ -11,6 +11,9 @@
  *   --hypo-dir=<path>   Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --json              Output results as JSON
  *   --fix               Auto-add missing `updated` field (safe repairs only)
+ *   --strict            Promote selected warnings (STRICT_PROMOTE_IDS) to errors
+ *                       so they exit 1. Opt-in gate for release-checklist /
+ *                       pre-commit; default mode stays byte-identical.
  */
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
@@ -25,11 +28,12 @@ import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, json: false, fix: false };
+  const args = { hypoDir: null, json: false, fix: false, strict: false };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json') args.json = true;
     else if (arg === '--fix') args.fix = true;
+    else if (arg === '--strict') args.strict = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -199,6 +203,20 @@ const VALID_TYPES = [
 
 const issues = [];
 
+// Stable warning class IDs (W1..Wn). `--strict` promotes a frozen subset to
+// errors by ID — never by brittle message-text matching. W8 (design-history
+// stale) predates this scheme; hooks/hypo-personal-check.mjs filters `w.id ===
+// 'W8'`, so it must keep that number — the W5..W7 gap is honest history, not a
+// bug. (spec-v1.3.0 Track E)
+//
+// STRICT_PROMOTE_IDS (OQ-E1, frozen as a code constant): confirmed content
+// defects only.
+//   W1 no-frontmatter / W2 unknown-type / W4 broken-wikilink → promote.
+//   W3 missing-updated  → excluded (auto-repaired by --fix).
+//   W8 design-history-stale → excluded (hypo-personal-check handles it; would
+//                             double-gate).
+const STRICT_PROMOTE_IDS = new Set(['W1', 'W2', 'W4']);
+
 function issue(severity, rel, msg, fullPath = null, id = null) {
   issues.push({ severity, file: rel, message: msg, path: fullPath, id });
 }
@@ -250,7 +268,7 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
   }
 
   if (!content.match(/^---\r?\n/)) {
-    issue('warn', rel, 'No frontmatter found');
+    issue('warn', rel, 'No frontmatter found', null, 'W1');
     return;
   }
 
@@ -265,11 +283,11 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
   }
 
   if (fm.type && !VALID_TYPES.includes(fm.type)) {
-    issue('warn', rel, `Unknown type: "${fm.type}"`);
+    issue('warn', rel, `Unknown type: "${fm.type}"`, null, 'W2');
   }
 
   if (!fm.updated) {
-    issue('warn', rel, 'Missing frontmatter field: updated', path);
+    issue('warn', rel, 'Missing frontmatter field: updated', path, 'W3');
   }
 
   // type-conditional required fields
@@ -337,7 +355,7 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
 
   for (const link of extractWikilinks(content)) {
     if (!slugMap.has(link)) {
-      issue('warn', rel, `Broken wikilink: [[${link}]]`);
+      issue('warn', rel, `Broken wikilink: [[${link}]]`, null, 'W4');
     }
   }
 }
@@ -409,12 +427,29 @@ if (args.fix) {
   }
 }
 
+// --strict: promote selected warnings (by stable ID) to errors *before* the
+// errors/warns split, so exit code, counts, plain-text icons, and --json `ok`
+// all derive from the post-promotion severities through the existing paths.
+if (args.strict) {
+  for (const iss of issues) {
+    if (iss.severity === 'warn' && iss.id && STRICT_PROMOTE_IDS.has(iss.id)) {
+      iss.severity = 'error';
+    }
+  }
+}
+
 const errors = issues.filter((i) => i.severity === 'error');
 const warns = issues.filter((i) => i.severity === 'warn');
 
 if (args.json) {
+  // Default mode is byte-identical: only W8 carries an `id` in the JSON payload
+  // (hooks/hypo-personal-check.mjs filters on it). All other IDs stay internal
+  // unless `--strict` is set, where the full ID set is exposed so promoted
+  // findings are traceable to their warning class.
   const toOut = ({ severity, file, message, id }) =>
-    id ? { severity, file, message, id } : { severity, file, message };
+    id && (id === 'W8' || args.strict)
+      ? { severity, file, message, id }
+      : { severity, file, message };
   console.log(
     JSON.stringify(
       {
