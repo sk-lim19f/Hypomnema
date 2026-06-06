@@ -16,6 +16,8 @@
  * retired are NOT matched as positive claims.
  */
 
+import { parseFrontmatter } from './frontmatter.mjs';
+
 const POSITIVE_STATUSES = new Set(['merged', 'TRUE_MERGED', 'resolved']);
 
 // Words that disqualify a line as a positive claim (case-sensitive).
@@ -49,6 +51,18 @@ export function parseAnchors(runnerText) {
     if (!list.includes(name)) list.push(name);
   }
   return out;
+}
+
+/**
+ * Detect a redirect-stub spec: a page whose frontmatter declares
+ * `type: reference`. These are placeholders left behind after an archive move
+ * (e.g. spec-v1.2.md → archive/spec-v1.2.md) and carry zero fix-status claims.
+ * Pointing the verifier at one yields a vacuous green, so verifyMatrix rejects
+ * it up front.
+ */
+export function isReferenceStub(specText) {
+  const fm = parseFrontmatter(specText);
+  return fm?.type === 'reference';
 }
 
 /**
@@ -137,11 +151,48 @@ export function parseRunnerOutput(stdout) {
  *   MISSING_TEST    — anchor names a test, runner output does not contain it.
  *   FAILING_TEST    — anchor names a test, runner output marks it failed.
  *   ORPHAN_ANCHOR   — anchor exists, no positive status claim in spec (warn).
+ *   STUB_SPEC       — spec is unusable: a `type: reference` redirect stub, or
+ *                     it parses zero positive status claims while anchors exist
+ *                     (the vacuous-gate the tool exists to prevent). Error.
  *
  * Returns { ok, findings: [...] }. ok=false if any ERROR-level finding.
  * ORPHAN_ANCHOR is WARN-only.
+ *
+ * STUB_SPEC is a precondition failure, so it short-circuits: when the spec is
+ * unusable there is nothing meaningful to cross-check, and the per-anchor
+ * ORPHAN noise would only bury the one decisive error.
  */
-export function verifyMatrix({ anchors, status, testResults }) {
+export function verifyMatrix({ anchors, status, testResults, specIsStub = false }) {
+  if (specIsStub) {
+    return {
+      ok: false,
+      findings: [
+        {
+          level: 'error',
+          class: 'STUB_SPEC',
+          detail:
+            'spec is a `type: reference` redirect stub (0 fix-status claims by design) — pass --spec pointing at the real spec',
+        },
+      ],
+    };
+  }
+  // Vacuous-gate invariant: anchors exist in the runner but the spec yields no
+  // positive status claim to verify them against. Greening here would defeat
+  // the tool's purpose. (No anchors + no claims is an empty/custom matrix, not
+  // a vacuous gate, so it is left to the normal path.)
+  if (status.size === 0 && anchors.size > 0) {
+    return {
+      ok: false,
+      findings: [
+        {
+          level: 'error',
+          class: 'STUB_SPEC',
+          detail: `${anchors.size} anchor(s) in runner but 0 positive status claims parsed from spec — gate would be vacuous`,
+        },
+      ],
+    };
+  }
+
   const findings = [];
 
   for (const [fixNum, statusValue] of status.entries()) {

@@ -11039,6 +11039,7 @@ const {
   parseStatus: fsvParseStatus,
   parseRunnerOutput: fsvParseRunnerOutput,
   verifyMatrix: fsvVerifyMatrix,
+  isReferenceStub: fsvIsReferenceStub,
 } = await import(`${SCRIPTS}/lib/fix-status-verify.mjs`);
 
 suite('fix-status-verify — parseAnchors');
@@ -11073,6 +11074,30 @@ test('parseAnchors: accumulates multiple anchors per fix #, dedupes', () => {
 test('parseAnchors: NO_AUTO_TEST sentinel preserved as-is', () => {
   const a = fsvParseAnchors('// @fix #20: NO_AUTO_TEST');
   assert.deepEqual(a.get(20), ['NO_AUTO_TEST']);
+});
+
+suite('fix-status-verify — isReferenceStub');
+
+test('isReferenceStub: true for type: reference frontmatter', () => {
+  const spec = [
+    '---',
+    'title: moved',
+    'type: reference',
+    'status: archived',
+    '---',
+    '',
+    '# moved',
+  ].join('\n');
+  assert.equal(fsvIsReferenceStub(spec), true);
+});
+
+test('isReferenceStub: false for a normal spec (type: spec)', () => {
+  const spec = ['---', 'title: real spec', 'type: spec', '---', '', '| #1 | merged |'].join('\n');
+  assert.equal(fsvIsReferenceStub(spec), false);
+});
+
+test('isReferenceStub: false when no frontmatter at all', () => {
+  assert.equal(fsvIsReferenceStub('# just a body\n| #1 | merged |'), false);
 });
 
 suite('fix-status-verify — parseStatus');
@@ -11182,12 +11207,71 @@ test('verifyMatrix: NO_AUTO_TEST sentinel → info finding, not error', () => {
 });
 
 test('verifyMatrix: ORPHAN_ANCHOR is warn-only, does not break ok', () => {
-  const anchors = new Map([[99, ['orphan-test']]]);
-  const status = new Map();
-  const testResults = new Map([['orphan-test', 'pass']]);
+  // status must hold ≥1 positive claim — an empty status with anchors is now a
+  // STUB_SPEC error (vacuous gate), not a warn. #15 is claimed+green; #99 is the
+  // orphan whose warn-only semantics this test guards.
+  const anchors = new Map([
+    [15, ['real-test']],
+    [99, ['orphan-test']],
+  ]);
+  const status = new Map([[15, 'TRUE_MERGED']]);
+  const testResults = new Map([
+    ['real-test', 'pass'],
+    ['orphan-test', 'pass'],
+  ]);
   const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
   assert.equal(ok, true);
-  assert.ok(findings.some((f) => f.class === 'ORPHAN_ANCHOR' && f.level === 'warn'));
+  assert.ok(
+    findings.some((f) => f.class === 'ORPHAN_ANCHOR' && f.level === 'warn' && f.fixNum === 99),
+  );
+  assert.ok(!findings.some((f) => f.class === 'STUB_SPEC'));
+});
+
+test('verifyMatrix: STUB_SPEC error when spec is a type:reference stub', () => {
+  const anchors = new Map([[15, ['real-test']]]);
+  const status = new Map([[15, 'TRUE_MERGED']]);
+  const testResults = new Map([['real-test', 'pass']]);
+  // Even with otherwise-green inputs, a stub spec short-circuits to one error.
+  const { ok, findings } = fsvVerifyMatrix({
+    anchors,
+    status,
+    testResults,
+    specIsStub: true,
+  });
+  assert.equal(ok, false);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].class, 'STUB_SPEC');
+  assert.equal(findings[0].level, 'error');
+});
+
+test('verifyMatrix: STUB_SPEC error when anchors exist but 0 status claims (vacuous)', () => {
+  const anchors = new Map([[15, ['real-test']]]);
+  const status = new Map();
+  const testResults = new Map([['real-test', 'pass']]);
+  const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
+  assert.equal(ok, false);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].class, 'STUB_SPEC');
+  assert.match(findings[0].detail, /vacuous/);
+});
+
+test('verifyMatrix: no STUB_SPEC when status has ≥1 claim', () => {
+  const anchors = new Map([[15, ['real-test']]]);
+  const status = new Map([[15, 'TRUE_MERGED']]);
+  const testResults = new Map([['real-test', 'pass']]);
+  const { ok, findings } = fsvVerifyMatrix({ anchors, status, testResults });
+  assert.equal(ok, true);
+  assert.ok(!findings.some((f) => f.class === 'STUB_SPEC'));
+});
+
+test('verifyMatrix: no STUB_SPEC when both status and anchors empty (custom/empty matrix)', () => {
+  const { ok, findings } = fsvVerifyMatrix({
+    anchors: new Map(),
+    status: new Map(),
+    testResults: new Map(),
+  });
+  assert.equal(ok, true);
+  assert.ok(!findings.some((f) => f.class === 'STUB_SPEC'));
 });
 
 test('verifyMatrix: all-green case → ok:true with no error findings', () => {
@@ -11232,6 +11316,74 @@ test('CLI: green fixture → exit 0', () => {
     assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
     assert.match(r.stdout, /verified/);
     assert.match(r.stdout, /ADR core decision grep NOT checked/);
+  });
+});
+
+test('CLI: type:reference stub spec → exit 1 with STUB_SPEC', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    writeFileSync(
+      specPath,
+      ['---', 'title: moved', 'type: reference', '---', '', '# moved to archive/'].join('\n'),
+    );
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    // Anchor present so the stub is the only reason to fail.
+    writeFileSync(
+      runnerPath,
+      ['#!/usr/bin/env node', '// @fix #100: t', "console.log('  ✓ t');"].join('\n'),
+    );
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const j = JSON.parse(r.stdout);
+    assert.equal(j.ok, false);
+    assert.ok(
+      j.findings.some((f) => f.class === 'STUB_SPEC'),
+      `expected STUB_SPEC finding: ${JSON.stringify(j.findings)}`,
+    );
+  });
+});
+
+test('CLI: vacuous spec (anchors but 0 claims) → exit 1 with STUB_SPEC', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    // Real (non-stub) spec but no positive status claim → vacuous gate.
+    writeFileSync(specPath, '# spec with no merged/resolved claims\nsome prose\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(
+      runnerPath,
+      ['#!/usr/bin/env node', '// @fix #100: t', "console.log('  ✓ t');"].join('\n'),
+    );
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 1);
+    const j = JSON.parse(r.stdout);
+    assert.equal(j.ok, false);
+    assert.ok(j.findings.some((f) => f.class === 'STUB_SPEC'));
   });
 });
 
