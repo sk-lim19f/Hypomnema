@@ -8517,7 +8517,11 @@ test('feedback-sync-import-no-conflict-noop: clean target imports nothing, exit 
     runFb(['--write']);
     const r = runFb(['--import-target-change', '--from=claude', '--json']);
     assert.equal(r.status, 0);
-    assert.equal(JSON.parse(r.stdout).imported.length, 0, 'no conflict → nothing imported');
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.imported.length, 0, 'no conflict → nothing imported');
+    // report shape contract: `skipped` is added only in the conflict path
+    // (loadImportConflicts/runImport), so the no-conflict report must NOT grow it.
+    assert.ok(!('skipped' in rep), 'no-conflict import report must not carry a skipped field');
   });
 });
 
@@ -8636,6 +8640,392 @@ test('feedback-sync-import-no-clobber: re-import same day preserves the prior dr
       'second import created a new numbered draft, not a clobber',
     );
   });
+});
+
+// ── Track B: per-mode source-loader golden (byte-identical characterization) ──
+// Locks the complete observable output of each mode so the source-loader refactor
+// (Track B) can be proven byte-identical: same fixture → same golden before and
+// after the extraction. Each mode runs twice in fresh envs — once with --json,
+// once plain — and BOTH streams are captured for each run (exit code, stdout,
+// stderr), so the snapshot also pins that --json emits nothing to stderr and the
+// plain run emits nothing to stdout. The plain run additionally snapshots every
+// on-disk artifact (files + draft listing). Volatile bytes (tmp base path, import
+// draft date-stamp) are masked.
+const fbNorm = (base) => (s) =>
+  String(s)
+    .split(base)
+    .join('<BASE>')
+    .replace(/import-(claude|memory)-\d{8}/g, 'import-$1-<STAMP>');
+
+function fbSnapshotFiles(norm, wiki, claudeHome, memDir) {
+  const out = [];
+  const collect = (label, p) => {
+    if (existsSync(p)) out.push(`### FILE ${label}\n${norm(readFileSync(p, 'utf-8'))}`);
+  };
+  collect('CLAUDE.md', join(claudeHome, 'CLAUDE.md'));
+  collect('MEMORY.md', join(memDir, 'MEMORY.md'));
+  for (const f of (existsSync(memDir) ? readdirSync(memDir) : [])
+    .filter((f) => /^feedback_.+\.md$/.test(f))
+    .sort())
+    collect(f, join(memDir, f));
+  const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+  const draftList = (existsSync(draftsDir) ? readdirSync(draftsDir) : []).sort();
+  out.push(`### DRAFT_LIST\n${draftList.map(norm).join('\n')}`);
+  for (const f of draftList)
+    out.push(`### DRAFT ${norm(f)}\n${norm(readFileSync(join(draftsDir, f), 'utf-8'))}`);
+  return out;
+}
+
+function fbGolden(pages, opts, setup, baseArgs) {
+  let jsonPart, plainPart;
+  withFeedbackEnv(
+    pages,
+    (ctx) => {
+      setup(ctx);
+      const norm = fbNorm(ctx.base);
+      const res = ctx.runFb([...baseArgs, '--json']);
+      jsonPart = [
+        '=== JSON-RUN ===',
+        `STATUS ${res.status}`,
+        `STDOUT\n${norm(res.stdout)}`,
+        `STDERR\n${norm(res.stderr)}`,
+      ];
+    },
+    opts,
+  );
+  withFeedbackEnv(
+    pages,
+    (ctx) => {
+      setup(ctx);
+      const norm = fbNorm(ctx.base);
+      const res = ctx.runFb(baseArgs);
+      plainPart = [
+        '=== PLAIN-RUN ===',
+        `STATUS ${res.status}`,
+        `STDOUT\n${norm(res.stdout)}`,
+        `STDERR\n${norm(res.stderr)}`,
+        ...fbSnapshotFiles(norm, ctx.wiki, ctx.claudeHome, ctx.memDir),
+      ];
+    },
+    opts,
+  );
+  return [...jsonPart, ...plainPart].join('\n');
+}
+
+const FB_GOLDEN_WRITE = `=== JSON-RUN ===
+STATUS 0
+STDOUT
+{
+  "mode": "write",
+  "projectId": "proj",
+  "projectIdResolved": true,
+  "targets": {
+    "memory": {
+      "candidates": 2,
+      "conflicts": [],
+      "unpaired": false,
+      "intruder": false,
+      "outOfContainer": false,
+      "overCap": false,
+      "dirty": true
+    },
+    "claude": {
+      "candidates": 1,
+      "conflicts": [],
+      "unpaired": false,
+      "intruder": false,
+      "outOfContainer": false,
+      "overCap": false,
+      "dirty": true
+    }
+  }
+}
+
+STDERR
+
+=== PLAIN-RUN ===
+STATUS 0
+STDOUT
+
+STDERR
+[feedback-sync] projections written.
+
+### FILE CLAUDE.md
+# Global
+<learned_behaviors>
+- manual entry
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=829952d557370646323ab1630c165ce8d6edcd45d5a1a5836f79bb631a944032 -->
+- [2026-05-20] always do A — 근거: [[rule-a]]
+<!-- HYPO:FEEDBACK-SYNC:END -->
+</learned_behaviors>
+
+### FILE MEMORY.md
+# Memory Index
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=1b742d57d519e1715e7d3e36ccac73617147022a5ab69cbaf2f09f525ca379aa -->
+- [Rule A](feedback_rule-a.md) — do A
+<!-- HYPO:FEEDBACK-SYNC:END -->
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-b sha256=7a8c12be4e66e219b61ebb46543f84cf8935386fe2b8dcb1d351c37fd55e59e1 -->
+- [Rule B](feedback_rule-b.md) — do B
+<!-- HYPO:FEEDBACK-SYNC:END -->
+
+### FILE feedback_rule-a.md
+<!-- HYPO:FEEDBACK-SYNC source=rule-a -->
+---
+title: Rule A
+type: feedback
+status: active
+scope: global
+tier: L1
+targets: [project-memory, claude-learned]
+sensitivity: public
+priority: 5
+memory_summary: do A
+global_summary: always do A
+promote_to_global: true
+reason: because A
+source: session:2026-05-20
+updated: 2026-05-20
+---
+body
+
+### FILE feedback_rule-b.md
+<!-- HYPO:FEEDBACK-SYNC source=rule-b -->
+---
+title: Rule B
+type: feedback
+status: active
+scope: project:proj
+tier: L2
+targets: [project-memory]
+sensitivity: public
+priority: 2
+memory_summary: do B
+reason: because B
+source: session:2026-05-19
+updated: 2026-05-19
+---
+body
+
+### DRAFT_LIST
+`;
+
+const FB_GOLDEN_BOOTSTRAP = `=== JSON-RUN ===
+STATUS 0
+STDOUT
+{
+  "mode": "bootstrap",
+  "dryRun": false,
+  "created": [
+    {
+      "slug": "legacy-claude-20260501-legacy-rule-one",
+      "origin": "claude-learned",
+      "path": "<BASE>/wiki/pages/feedback/_drafts/legacy-claude-20260501-legacy-rule-one.md"
+    },
+    {
+      "slug": "loose-y",
+      "origin": "memory-index",
+      "path": "<BASE>/wiki/pages/feedback/_drafts/loose-y.md"
+    }
+  ],
+  "skipped": []
+}
+
+STDERR
+
+=== PLAIN-RUN ===
+STATUS 0
+STDOUT
+
+STDERR
+[feedback-sync] created draft: pages/feedback/_drafts/legacy-claude-20260501-legacy-rule-one.md (claude-learned)
+[feedback-sync] created draft: pages/feedback/_drafts/loose-y.md (memory-index)
+[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/targets/promote_to_global and move into pages/feedback/.
+
+### FILE CLAUDE.md
+# Global
+<learned_behaviors>
+- [2026-05-01] legacy rule one
+</learned_behaviors>
+
+### FILE MEMORY.md
+# Memory Index
+- [Loose Y](feedback_loose_y.md) — legacy hand entry
+
+### DRAFT_LIST
+legacy-claude-20260501-legacy-rule-one.md
+loose-y.md
+### DRAFT legacy-claude-20260501-legacy-rule-one.md
+<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=claude-learned -->
+---
+title: legacy rule one
+type: feedback
+status: draft
+scope: TODO              # global | project:<project-id>
+tier: TODO               # L1 (CLAUDE.md <learned_behaviors> candidate) | L2
+targets: [project-memory]   # + claude-learned for a global L1 rule
+sensitivity: public      # public | sanitized (private is forbidden)
+priority: 3              # 1-5, higher wins over-cap
+memory_summary: legacy rule one
+global_summary: legacy rule one
+promote_to_global: false # set true to project into <learned_behaviors>
+reason: TODO
+source: session:2026-05-01
+created: 2026-05-01
+updated: 2026-05-01
+bootstrap_origin: claude-learned
+---
+
+# legacy rule one
+
+legacy rule one
+
+### DRAFT loose-y.md
+<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=memory-index -->
+---
+title: Loose Y
+type: feedback
+status: draft
+scope: TODO              # global | project:<project-id>
+tier: TODO               # L1 (CLAUDE.md <learned_behaviors> candidate) | L2
+targets: [project-memory]   # + claude-learned for a global L1 rule
+sensitivity: public      # public | sanitized (private is forbidden)
+priority: 3              # 1-5, higher wins over-cap
+memory_summary: legacy hand entry
+global_summary: legacy hand entry
+promote_to_global: false # set true to project into <learned_behaviors>
+reason: TODO
+source: TODO
+bootstrap_origin: memory-index
+---
+
+# Loose Y
+
+legacy hand entry
+`;
+
+const FB_GOLDEN_IMPORT = `=== JSON-RUN ===
+STATUS 0
+STDOUT
+{
+  "mode": "import",
+  "from": "claude",
+  "dryRun": false,
+  "imported": [
+    {
+      "slug": "rule-a",
+      "path": "<BASE>/wiki/pages/feedback/_drafts/rule-a.import-claude-<STAMP>.md"
+    }
+  ],
+  "skipped": []
+}
+
+STDERR
+
+=== PLAIN-RUN ===
+STATUS 0
+STDOUT
+
+STDERR
+[feedback-sync] imported rule-a → <BASE>/wiki/pages/feedback/_drafts/rule-a.import-claude-<STAMP>.md
+[feedback-sync] import: 1 draft(s). Reconcile into the SoT page, then feedback-sync --write.
+
+### FILE CLAUDE.md
+# Global
+<learned_behaviors>
+- manual entry
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=829952d557370646323ab1630c165ce8d6edcd45d5a1a5836f79bb631a944032 -->
+- [2026-05-20] HAND EDITED — 근거: [[rule-a]]
+<!-- HYPO:FEEDBACK-SYNC:END -->
+</learned_behaviors>
+
+### FILE MEMORY.md
+# Memory Index
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=1b742d57d519e1715e7d3e36ccac73617147022a5ab69cbaf2f09f525ca379aa -->
+- [Rule A](feedback_rule-a.md) — do A
+<!-- HYPO:FEEDBACK-SYNC:END -->
+
+### FILE feedback_rule-a.md
+<!-- HYPO:FEEDBACK-SYNC source=rule-a -->
+---
+title: Rule A
+type: feedback
+status: active
+scope: global
+tier: L1
+targets: [project-memory, claude-learned]
+sensitivity: public
+priority: 5
+memory_summary: do A
+global_summary: always do A
+promote_to_global: true
+reason: because A
+source: session:2026-05-20
+updated: 2026-05-20
+---
+body
+
+### DRAFT_LIST
+rule-a.import-claude-<STAMP>.md
+### DRAFT rule-a.import-claude-<STAMP>.md
+<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=import-claude -->
+---
+title: imported rule-a
+type: feedback
+status: draft
+scope: TODO
+tier: TODO
+targets: [project-memory]
+sensitivity: public
+priority: 3
+memory_summary: - [2026-05-20] HAND EDITED — 근거: [[rule-a]]
+global_summary: - [2026-05-20] HAND EDITED — 근거: [[rule-a]]
+promote_to_global: false
+reason: imported from claude <learned_behaviors>/MEMORY managed block (hand-edited)
+source: TODO
+imported_from: claude
+---
+
+# imported rule-a
+
+> The managed block below was edited outside the wiki. Reconcile it into
+> pages/feedback/rule-a.md (the SoT), then re-run feedback-sync --write.
+
+- [2026-05-20] HAND EDITED — 근거: [[rule-a]]
+`;
+
+suite('feedback-sync.mjs — Track B source-loader golden (byte-identical)');
+
+test('feedback-sync-golden-write: check/write loader full output is byte-identical', () => {
+  assert.equal(
+    fbGolden({ 'rule-a': FB_GLOBAL_L1, 'rule-b': FB_PROJECT_L2 }, {}, () => {}, ['--write']),
+    FB_GOLDEN_WRITE,
+  );
+});
+
+test('feedback-sync-golden-bootstrap: bootstrap loader full output is byte-identical', () => {
+  const claudeMd =
+    '# Global\n<learned_behaviors>\n- [2026-05-01] legacy rule one\n</learned_behaviors>\n';
+  const memoryMd = '# Memory Index\n- [Loose Y](feedback_loose_y.md) — legacy hand entry\n';
+  assert.equal(
+    fbGolden({ 'rule-a': FB_GLOBAL_L1 }, { claudeMd, memoryMd }, () => {}, ['--bootstrap']),
+    FB_GOLDEN_BOOTSTRAP,
+  );
+});
+
+test('feedback-sync-golden-import: import loader full output is byte-identical', () => {
+  assert.equal(
+    fbGolden(
+      { 'rule-a': FB_GLOBAL_L1 },
+      {},
+      (ctx) => {
+        ctx.runFb(['--write']);
+        const p = join(ctx.claudeHome, 'CLAUDE.md');
+        writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED'));
+      },
+      ['--import-target-change', '--from=claude'],
+    ),
+    FB_GOLDEN_IMPORT,
+  );
 });
 
 test('feedback-sync-existing-9-pages-pass-new-schema: schema-complete pages lint green + parse', () => {
