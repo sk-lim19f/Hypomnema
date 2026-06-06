@@ -89,10 +89,14 @@ synthesis (no session-close intent) — the marker is then simply not written.
 | `--apply-session-close --payload=<path> --session-id=<id>` | Same as above, **plus** writes the per-session closed marker on success (clean git required). The Stop-chain Layer 3 path. |
 | `--apply-session-close --force` | Skips the probe early-exit. `--payload` still required for any actual apply work. |
 
-**Two lint gates run automatically (fix #40):**
+**Two lint gates run automatically (fix #40), scoped to the files this close writes:**
 
-1. **Preflight** — `lint.mjs --json` runs **before** any payload bytes are written. Errors in files this payload will overwrite (sessionState / projectHot / rootHot / openQuestions) are filtered (they're about to be replaced anyway). Errors in any other file → exit 1 with `stage='preflight-lint'`, no apply occurs.
-2. **Post-apply** — lint re-runs after the writes. Catches payloads that introduce a broken wikilink or malformed body. Surfaces as `stage='post-apply-lint'` (or `'post-apply-verification+lint'` if the freshness gate also fails).
+Both gates judge only the **payload files** (the 5 mandatory close files + `open-questions.md`). Lint debt in other projects or shared `pages/` this close did not author is reported as a non-blocking `notices[]` entry, never gated — so an unrelated broken page elsewhere cannot block your close.
+
+1. **Preflight** — `lint.mjs --json` runs **before** any payload bytes are written. Errors in overwrite targets (sessionState / projectHot / rootHot / openQuestions) are filtered (about to be replaced). Errors in an **append target** (session-log / log.md) still block (appending can't repair existing corruption) → exit 1 with `stage='preflight-lint'`. Errors outside the payload files → `notices[]`, apply proceeds.
+2. **Post-apply** — lint re-runs after the writes. Blocks only on **errors** in payload files (a payload-introduced malformed body / bad frontmatter); pre-existing errors elsewhere → `notices[]`. A lint crash (unparseable output) always blocks. Broken wikilinks are lint **warnings** (W4 — forward references to planned pages are normal) and are not gated here. Surfaces as `stage='post-apply-lint'` (or `'post-apply-verification+lint'` if freshness also fails).
+
+> **Manual close (direct Write tool calls)** clears the Stop-chain block via `--mark-session-closed --session-id=<id>`. Pass `--transcript-path=<path>` (the Stop hook surfaces it in its block message) so the marker is refused when a file **this session edited** still has lint errors — keeping the marker coherent with the PreCompact gate. Without `--transcript-path` it falls back to freshness + clean-git only (lint left to PreCompact).
 
 ---
 
@@ -102,9 +106,9 @@ The result JSON includes a `stage` field when `ok: false`. Branch on it:
 
 | `stage` | What broke | How to recover |
 |---|---|---|
-| `preflight-lint` | A non-payload file in the wiki has a blocking lint error. | Fix the lint error in that file (separate from session-close), then re-run. No payload bytes were written. |
+| `preflight-lint` | A payload file (append target — session-log / log.md) has a pre-existing blocking lint error. | Fix the lint error in that file, then re-run. No payload bytes were written. (Debt outside the payload files is a non-blocking notice, not this stage.) |
 | `post-apply-verification` | A mandatory file's `updated:` frontmatter is stale (≠ today) after apply. | Edit the payload's stale `content` (or supply correct `date`), then re-run. Writes are idempotent — re-applying a corrected payload is safe. |
-| `post-apply-lint` | The payload itself introduced a lint blocker (broken wikilink, bad frontmatter). | Fix the offending content in the payload, then re-run. |
+| `post-apply-lint` | The payload introduced an error-level lint blocker in a payload file (malformed body / bad frontmatter), or lint crashed. | Fix the offending content in the payload, then re-run. (Broken wikilinks are W4 warnings — not gated.) |
 | `post-apply-verification+lint` | Both above. | Fix both; re-run. |
 
 Once `ok: true`, report:

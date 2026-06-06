@@ -733,6 +733,9 @@ const {
   isGateSkipped,
   buildOutput,
   isClosePattern,
+  extractTouchedWikiFiles,
+  closeFileTargets,
+  partitionLintScope,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -951,6 +954,74 @@ test('merges extra fields alongside additionalContext', () => {
   const out = buildOutput('ctx', { continue: true });
   assert.equal(out.continue, true);
   assert.equal(out.additionalContext, 'ctx');
+});
+
+suite('hypo-shared.mjs — session-scoped lint (Bug A/B)');
+
+test('partitionLintScope: in-scope error blocks, out-of-scope error → notice', () => {
+  const findings = [
+    { file: 'projects/p/session-state.md', message: 'bad' },
+    { file: 'pages/feedback/other.md', message: 'Unknown tag: "x"' },
+  ];
+  const scope = new Set(['projects/p/session-state.md']);
+  const { blocking, notice } = partitionLintScope(findings, scope);
+  assert.equal(blocking.length, 1);
+  assert.equal(blocking[0].file, 'projects/p/session-state.md');
+  assert.equal(notice.length, 1);
+  assert.equal(notice[0].file, 'pages/feedback/other.md');
+});
+
+test('partitionLintScope: scope membership is separator-normalized (Windows path safety)', () => {
+  // lint.mjs emits `file` via path.relative — back-slashes on Windows — while the
+  // scope builders use forward slashes. Both sides are normalized so an in-scope
+  // error is never misclassified as out-of-scope (which would weaken the gate).
+  const findings = [{ file: 'projects\\p\\session-state.md', message: 'bad' }];
+  const scope = new Set(['projects/p/session-state.md']);
+  const { blocking, notice } = partitionLintScope(findings, scope);
+  assert.equal(blocking.length, 1);
+  assert.equal(notice.length, 0);
+});
+
+test('closeFileTargets: returns the 5 mandatory close files for the active project', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hot.md'), '| proj | 2026-06-07 | [[projects/proj/hot]] |\n');
+    const t = closeFileTargets(dir);
+    assert.ok(t.has('hot.md'));
+    assert.ok(t.has('log.md'));
+    assert.ok(t.has('projects/proj/session-state.md'));
+    assert.ok(t.has('projects/proj/hot.md'));
+    assert.ok([...t].some((f) => /^projects\/proj\/session-log\/\d{4}-\d{2}\.md$/.test(f)));
+  });
+});
+
+test('extractTouchedWikiFiles: pulls Edit/Write file_paths under hypoDir, ignores outside paths', () => {
+  withTmpDir((dir) => {
+    const inside = join(dir, 'projects', 'p', 'session-state.md');
+    const transcript = join(dir, 't.jsonl');
+    const lines = [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: inside } },
+            { type: 'tool_use', name: 'Write', input: { file_path: '/etc/outside.md' } },
+            { type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } },
+          ],
+        },
+      }),
+      'truncated-bad-json-line{',
+    ];
+    writeFileSync(transcript, lines.join('\n'));
+    const touched = extractTouchedWikiFiles(transcript, dir);
+    assert.ok(touched.has('projects/p/session-state.md'));
+    assert.equal(touched.has('/etc/outside.md'), false);
+    assert.equal(touched.size, 1);
+  });
+});
+
+test('extractTouchedWikiFiles: missing transcript → empty set (caller falls back)', () => {
+  assert.equal(extractTouchedWikiFiles('/no/such/transcript.jsonl', '/tmp').size, 0);
+  assert.equal(extractTouchedWikiFiles(null, '/tmp').size, 0);
 });
 
 suite('hypo-compact-guard.mjs — contract');
@@ -1815,11 +1886,10 @@ test('payload via stdin (`--payload=-`) works the same as a file', () => {
 
 // ── fix #40: helper lint preflight + post-apply check ───────────────────────
 
-test('preflight (#40): pre-existing lint blocker → exit 1 stage=preflight-lint, payload NOT applied', () => {
-  // Inject a malformed-frontmatter page (unclosed ---) under projects/. lint.mjs
-  // raises an 'error' for that, which must abort apply before any byte is
-  // written. Verify by checking session-state.md still carries the fixture's
-  // original "- next" body (payload sentinel did not land).
+test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT abort, apply proceeds (scoped)', () => {
+  // Bug B fix: lint debt OUTSIDE the files this close writes (here a malformed
+  // page under projects/, not one of the 5 mandatory close files) must NOT block
+  // the documented apply path. It is surfaced as a notice and the payload lands.
   withWiki(
     (dir) => {
       writeFileSync(
@@ -1834,20 +1904,52 @@ test('preflight (#40): pre-existing lint blocker → exit 1 stage=preflight-lint
         content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
       };
       const r = runApply(dir, payload);
-      assert.equal(r.status, 1, `preflight must abort, got ${r.status}\n${r.stdout}`);
+      assert.equal(
+        r.status,
+        0,
+        `apply should proceed past out-of-scope debt, got ${r.status}\n${r.stdout}`,
+      );
       const out = JSON.parse(r.stdout);
-      assert.equal(out.ok, false);
-      assert.equal(out.stage, 'preflight-lint', `stage should be preflight-lint: ${r.stdout}`);
+      assert.equal(out.ok, true);
+      assert.ok(
+        out.notices.some((f) => f.endsWith('broken.md')),
+        `out-of-scope blocker should surface as a notice: ${r.stdout}`,
+      );
       const onDisk = readFileSync(
         join(dir, 'projects', 'test-project', 'session-state.md'),
         'utf-8',
       );
-      assert.ok(
-        !onDisk.includes(sentinel),
-        'preflight failure must NOT have written payload sentinel',
-      );
+      assert.ok(onDisk.includes(sentinel), 'apply should have written the payload sentinel');
     },
   );
+});
+
+test('preflight (#40 + Bug B): corrupt APPEND target (session-log) STILL blocks — appending cannot repair it', () => {
+  // The scoping carve-out preserves the #40 guarantee for append targets: a
+  // pre-existing malformed session-log file is in the payload scope and is NOT an
+  // overwrite target, so it must still abort preflight before any byte is written.
+  withWiki(null, (dir, today) => {
+    const ym = today.slice(0, 7);
+    writeFileSync(
+      join(dir, 'projects', 'test-project', 'session-log', `${ym}.md`),
+      '---\ntitle: sl\ntype: session-log\n\nbody (frontmatter never closes)\n',
+    );
+    const sentinel = `<!-- append-block-sentinel-${Date.now()} -->`;
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionState = {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
+    };
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `corrupt append target must abort, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.stage, 'preflight-lint', `stage should be preflight-lint: ${r.stdout}`);
+    const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    assert.ok(
+      !onDisk.includes(sentinel),
+      'preflight failure must NOT have written payload sentinel',
+    );
+  });
 });
 
 test('post-apply (#40): payload introduces lint blocker → exit 1 stage=post-apply-lint, bytes written', () => {
@@ -7669,6 +7771,90 @@ test('--mark-session-closed with ok gate + clean git → exit 0, marker created'
     assert.equal(marker.verification, 'session-close-file-status:ok');
     assert.ok(marker.closed_at, 'marker must carry closed_at timestamp');
   });
+});
+
+test('--mark-session-closed --transcript-path: lint error in a TOUCHED file → marker refused (Bug A)', () => {
+  withWiki(
+    (dir) => {
+      // committed in mutate (before git commit) so git stays clean while the
+      // lint error is present — the gate's freshness+git check passes and the
+      // new scoped-lint check is what must refuse.
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'note.md'),
+        '---\ntitle: note\ntype: concept\n\nbody never closes\n',
+      );
+    },
+    (dir) => {
+      const noteAbs = join(dir, 'projects', 'test-project', 'note.md');
+      const transcript = join(tmpdir(), `hypo-mark-touch-${process.pid}.jsonl`);
+      writeFileSync(
+        transcript,
+        JSON.stringify({
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: noteAbs } }] },
+        }) + '\n',
+      );
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        '--session-id=s-touch',
+        `--transcript-path=${transcript}`,
+        '--json',
+      ]);
+      rmSync(transcript, { force: true });
+      assert.equal(r.status, 1, `expected marker refused, got ${r.status}\n${r.stdout}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false);
+      assert.ok(
+        (out.lint_blockers || []).some((f) => f.endsWith('note.md')),
+        `lint_blockers should name the touched file: ${r.stdout}`,
+      );
+      assert.ok(
+        !existsSync(join(dir, '.cache', 'session-closed-s-touch.marker')),
+        'marker must NOT be written when a touched file has lint errors',
+      );
+    },
+  );
+});
+
+test('--mark-session-closed --transcript-path: lint error only in an UNTOUCHED file → marker still written (Bug B)', () => {
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'note.md'),
+        '---\ntitle: note\ntype: concept\n\nbody never closes\n',
+      );
+    },
+    (dir) => {
+      // transcript edited a clean close file, NOT the broken note.md
+      const cleanAbs = join(dir, 'projects', 'test-project', 'session-state.md');
+      const transcript = join(tmpdir(), `hypo-mark-untouch-${process.pid}.jsonl`);
+      writeFileSync(
+        transcript,
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [{ type: 'tool_use', name: 'Edit', input: { file_path: cleanAbs } }],
+          },
+        }) + '\n',
+      );
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        '--session-id=s-untouch',
+        `--transcript-path=${transcript}`,
+        '--json',
+      ]);
+      rmSync(transcript, { force: true });
+      assert.equal(r.status, 0, `expected marker written, got ${r.status}\n${r.stdout}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+      assert.ok(
+        existsSync(join(dir, '.cache', 'session-closed-s-untouch.marker')),
+        "marker must be written — the lint error is out of this session's scope",
+      );
+    },
+  );
 });
 
 test('--apply-session-close --session-id leaves payload uncommitted → marker NOT written until git clean', () => {

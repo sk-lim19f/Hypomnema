@@ -80,6 +80,10 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
 2. Update `projects/<name>/hot.md` (what was done, ≤500 words, overwrite)
 3. Append to `projects/<name>/session-log/YYYY-MM.md` (narrative entry, append-only)
 4. Update root `hot.md` pointer table + date
+5. Run `scripts/lint.mjs` and fix errors in files **you** touched — debt in other
+   projects / shared pages you did not author is reported as a non-blocking
+   notice, not a gate. (The documented `crystallize.mjs --apply-session-close`
+   path runs this lint automatically, scoped to the files it writes.)
 
 Skip session close for: single bug fix, single-file edit, Q&A only.
 

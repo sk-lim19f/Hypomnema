@@ -54,12 +54,17 @@ function emitContinue() {
   console.log(JSON.stringify({ continue: true, suppressOutput: true }));
 }
 
-function emitBlock(sessionId) {
+function emitBlock(sessionId, transcriptPath) {
   // One-line, skill-first. /hypo:crystallize is the documented session-close
   // alias; passing --session-id there writes the per-session marker that clears
   // this block. CLI fallback + bypass live in commands/crystallize.md, not here
   // — keep the Stop reason terse so the actionable instruction stands out.
-  const reason = `[WIKI_AUTOCLOSE] session-close 미완료 — /hypo:crystallize 실행으로 마무리 (session_id=${sessionId}).`;
+  // Surface the transcript path so the close can pass --transcript-path=<path>,
+  // which scopes the marker's lint gate to this session's own files (Bug A
+  // coherence: a marker written without lint would only let Stop pass for
+  // /compact to immediately re-block on the same errors).
+  const transcriptHint = transcriptPath ? ` --transcript-path=${transcriptPath}` : '';
+  const reason = `[WIKI_AUTOCLOSE] session-close 미완료 — /hypo:crystallize 실행으로 마무리 (session_id=${sessionId}${transcriptHint}).`;
   console.log(
     JSON.stringify({
       decision: 'block',
@@ -136,7 +141,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    emitBlock(sessionId);
+    emitBlock(sessionId, transcriptPath);
   } catch (err) {
     // Fail-open on any unexpected error.
     process.stderr.write(`[hypo-auto-minimal-crystallize] error: ${err?.message ?? String(err)}\n`);

@@ -33,6 +33,9 @@ import {
   isGateSkipped,
   isClosePattern,
   extractUserMessages,
+  extractTouchedWikiFiles,
+  closeFileTargets,
+  partitionLintScope,
 } from './hypo-shared.mjs';
 
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
@@ -107,6 +110,7 @@ process.stdin.on('end', () => {
   const lintPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'lint.mjs') : null;
   let lintBlockers = [];
   let lintW8 = [];
+  let lintNotices = []; // pre-existing debt in files this session did not touch
   let lintSkipped = false;
   if (!lintPath || !existsSync(lintPath)) {
     lintSkipped = true;
@@ -118,8 +122,35 @@ process.stdin.on('end', () => {
         timeout: 30000,
       });
       const parsed = JSON.parse(r.stdout || '{}');
-      lintBlockers = parsed.errors || [];
-      lintW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
+      const allErrors = parsed.errors || [];
+      const allW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
+      // Bug B: judge this session on the files IT touched, not the whole vault.
+      // A readable transcript lets us scope (edited files ∪ mandatory close
+      // files); a missing/unreadable transcript falls back to the conservative
+      // global gate (never weaker than before).
+      const haveTranscript = !!(transcriptPath && existsSync(transcriptPath));
+      if (haveTranscript) {
+        const scope = new Set([
+          ...extractTouchedWikiFiles(transcriptPath, HYPO_DIR),
+          ...closeFileTargets(HYPO_DIR),
+        ]);
+        const part = partitionLintScope(allErrors, scope);
+        lintBlockers = part.blocking;
+        lintNotices = part.notice;
+        // W8 (design-history stale) is the CURRENT project's close
+        // responsibility, not cross-project debt — block on the active
+        // project's, surface others' as notices.
+        if (closeFiles.project) {
+          const mine = `projects/${closeFiles.project}/design-history.md`;
+          lintW8 = allW8.filter((w) => w.file === mine);
+          lintNotices.push(...allW8.filter((w) => w.file !== mine));
+        } else {
+          lintW8 = allW8;
+        }
+      } else {
+        lintBlockers = allErrors;
+        lintW8 = allW8;
+      }
     } catch (err) {
       /* fail-open */
       process.stderr.write(`[hypo-personal-check] error: ${err?.message ?? String(err)}\n`);
@@ -128,6 +159,16 @@ process.stdin.on('end', () => {
 
   const lintOk = lintBlockers.length === 0;
   const designHistoryOk = lintW8.length === 0;
+  // Non-blocking heads-up about pre-existing lint debt in untouched files (other
+  // projects / shared pages). Surfaced so it is visible but never blocks compact.
+  const noticeText =
+    lintNotices.length > 0
+      ? `[WIKI CHECK] ${lintNotices.length} pre-existing lint issue(s) in files this session did not touch (not blocking): ${[
+          ...new Set(lintNotices.map((b) => b.file)),
+        ]
+          .slice(0, 5)
+          .join(', ')}${lintNotices.length > 5 ? ', …' : ''} — clean up when convenient.`
+      : '';
 
   // ── fix #37 Phase C: feedback projection drift (ADR 0031) ──
   // Single blocking gate invariant (spec §7.5): integrate into THIS hook, never
@@ -210,7 +251,13 @@ process.stdin.on('end', () => {
     closeFiles.ok &&
     feedbackOk
   ) {
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    console.log(
+      JSON.stringify(
+        noticeText
+          ? { continue: true, systemMessage: noticeText }
+          : { continue: true, suppressOutput: true },
+      ),
+    );
     return;
   }
 
@@ -267,7 +314,9 @@ process.stdin.on('end', () => {
       `  [ ] 9. hot.md    — update projects/<name>/hot.md (no exceptions)`,
       `  [ ] 10. root hot.md — update ~/hypomnema/hot.md active project table`,
       `  [ ] 11. updated: field — verify today's date on all touched .md files`,
-      `  [ ] 12. git commit & push`,
+      `  [ ] 12. lint — run scripts/lint.mjs; fix errors in files YOU touched`,
+      `           (other projects' / shared-page debt is reported as non-blocking notice)`,
+      `  [ ] 13. git commit & push`,
     ].join('\n');
 
   const closeIntentNote = hasCloseIntent
@@ -282,6 +331,7 @@ process.stdin.on('end', () => {
         `Run the checklist below in order, then retry /compact:`,
         ``,
         checklistText,
+        ...(noticeText ? ['', noticeText] : []),
         ``,
         `Trivial session? Bypass with HYPO_SKIP_GATE=1`,
       ].join('\n'),

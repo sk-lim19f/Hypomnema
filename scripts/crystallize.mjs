@@ -55,7 +55,9 @@
  *     hypo-personal-check is still the final enforcement.
  *   • Post-apply — runs after the writes. Surfaces as stage='post-apply-lint'
  *     (or 'post-apply-verification+lint' if freshness also fails). Catches
- *     payloads that introduce a broken wikilink / malformed body.
+ *     payloads that introduce a malformed body / bad frontmatter (error-level);
+ *     broken wikilinks are lint W4 warnings and are not gated. A lint crash
+ *     hard-fails regardless of scope.
  */
 
 import {
@@ -77,6 +79,9 @@ import {
   writeSessionClosedMarker,
   sessionClosedMarkerPath,
   hypoIsClean,
+  extractTouchedWikiFiles,
+  closeFileTargets,
+  partitionLintScope,
 } from '../hooks/hypo-shared.mjs';
 
 const LINT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'lint.mjs');
@@ -117,6 +122,7 @@ function parseArgs(argv) {
     sessionId: null,
     payload: null,
     force: false,
+    transcriptPath: null,
   };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
@@ -126,6 +132,7 @@ function parseArgs(argv) {
     else if (arg === '--mark-session-closed') args.markSessionClosed = true;
     else if (arg.startsWith('--session-id=')) args.sessionId = arg.slice(13);
     else if (arg.startsWith('--payload=')) args.payload = arg.slice(10);
+    else if (arg.startsWith('--transcript-path=')) args.transcriptPath = expandHome(arg.slice(18));
     else if (arg === '--force') args.force = true;
     else if (arg === '--json') args.json = true;
   }
@@ -359,6 +366,49 @@ function runMarkSessionClosed(args) {
     }
     process.exit(1);
   }
+  // Bug A coherence: the marker suppresses the Stop hook, but PreCompact blocks
+  // on lint. If a transcript is provided, refuse the marker when THIS session's
+  // own files (edited ∪ mandatory close files) carry lint errors — otherwise
+  // Stop would pass only for /compact to immediately re-block. No transcript →
+  // legacy freshness+git recovery path (lint left to PreCompact).
+  if (args.transcriptPath) {
+    let scopedLint = null;
+    try {
+      scopedLint = runLint(args.hypoDir);
+    } catch (err) {
+      // Lint crash → fail-open (never strand the marker writer on tooling), same
+      // posture as the PreCompact hook.
+      process.stderr.write(
+        `[crystallize] mark-session-closed lint skipped: ${err?.message ?? err}\n`,
+      );
+    }
+    if (scopedLint) {
+      const scope = new Set([
+        ...extractTouchedWikiFiles(args.transcriptPath, args.hypoDir),
+        ...closeFileTargets(args.hypoDir),
+      ]);
+      const { blocking } = partitionLintScope(scopedLint.errors || [], scope);
+      if (blocking.length > 0) {
+        const files = [...new Set(blocking.map((b) => b.file))];
+        const result = {
+          ok: false,
+          session_id: args.sessionId,
+          project: status.project,
+          lint_blockers: files,
+          error: "session-close gate not satisfied — lint errors in this session's files",
+        };
+        if (args.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(
+            `✗ lint errors in files this session touched — marker not written (fix then re-run):`,
+          );
+          for (const b of blocking) console.log(`  ✗ ${b.file}: ${b.message}`);
+        }
+        process.exit(1);
+      }
+    }
+  }
   writeSessionClosedMarker(args.hypoDir, args.sessionId, { project: status.project });
   // Marker writer swallows IO errors (best-effort, see hypo-shared.mjs). Verify
   // the file actually landed before claiming success — otherwise CLI exits 0
@@ -477,6 +527,19 @@ function applySessionClose(args) {
   if (payload.rootHot) overwriteTargets.add('hot.md');
   if (payload.openQuestions) overwriteTargets.add(join('pages', 'open-questions.md'));
 
+  // Bug B: the documented close path must not be blocked by lint debt OUTSIDE
+  // the files it writes (other projects, shared pages this close did not author).
+  // payloadScope = every file this apply writes or appends. Both lint passes are
+  // judged against it; errors elsewhere are surfaced as notices, never blocking.
+  const payloadScope = new Set([
+    join('projects', project, 'session-state.md'),
+    join('projects', project, 'hot.md'),
+    'hot.md',
+    join('projects', project, 'session-log', `${ym}.md`),
+    'log.md',
+    ...(payload.openQuestions ? [join('pages', 'open-questions.md')] : []),
+  ]);
+
   let preflightLint;
   try {
     preflightLint = runLint(args.hypoDir);
@@ -485,7 +548,13 @@ function applySessionClose(args) {
     console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${e.message}`);
     process.exit(1);
   }
-  const blockingErrors = preflightLint.errors.filter((e) => !overwriteTargets.has(e.file));
+  // Block only on errors in payload files we are NOT about to overwrite (append
+  // targets — session-log, log.md — can't be repaired by appending, so existing
+  // corruption there must block). Overwrite targets are about to be replaced;
+  // out-of-scope debt is not this close's concern (Bug B).
+  const blockingErrors = preflightLint.errors.filter(
+    (e) => payloadScope.has(e.file) && !overwriteTargets.has(e.file),
+  );
   if (blockingErrors.length > 0) {
     const out = {
       ok: false,
@@ -546,14 +615,19 @@ function applySessionClose(args) {
 
   const verification = sessionCloseFileStatus(args.hypoDir);
 
-  // Fix #40 post-apply lint: payload may have introduced a broken wikilink or
-  // a malformed session-state body. Surface as a distinct `stage` so caller can
-  // tell "lint broke" apart from "frontmatter stale". This runs even if the
-  // freshness gate also failed — both failure modes are useful to the caller.
+  // Fix #40 post-apply lint: payload may have introduced a malformed body or
+  // bad frontmatter. Surface as a distinct `stage` so caller can tell "lint
+  // broke" apart from "frontmatter stale". This runs even if the freshness gate
+  // also failed — both failure modes are useful to the caller.
   let postApplyLint;
+  let postApplyCrashed = false;
   try {
     postApplyLint = runLint(args.hypoDir);
   } catch (e) {
+    // A lint crash (unparseable output) after writes is NOT scopeable — there is
+    // no reliable `file` to classify — and must stay a HARD failure, exactly as
+    // before scoping was introduced.
+    postApplyCrashed = true;
     postApplyLint = {
       ok: false,
       errors: [{ file: '(lint crash)', message: e.message }],
@@ -561,7 +635,22 @@ function applySessionClose(args) {
     };
   }
 
-  const ok = verification.ok && postApplyLint.ok;
+  // Scope post-apply lint to payload files (Bug B): a payload-introduced error
+  // lands in a file this apply wrote, so it blocks; pre-existing debt elsewhere
+  // is a non-blocking notice. A lint crash bypasses scoping and blocks outright.
+  let postBlocking;
+  let postNotice;
+  if (postApplyCrashed) {
+    postBlocking = postApplyLint.errors;
+    postNotice = [];
+  } else {
+    ({ blocking: postBlocking, notice: postNotice } = partitionLintScope(
+      postApplyLint.errors || [],
+      payloadScope,
+    ));
+  }
+  const postLintOk = !postApplyCrashed && postBlocking.length === 0;
+  const ok = verification.ok && postLintOk;
 
   // ADR 0022 amendment 2026-05-19: auto-write the per-session
   // closed marker on a verified close. Hook authority is read-only; this is
@@ -581,7 +670,7 @@ function applySessionClose(args) {
   }
   const stage = ok
     ? null
-    : !verification.ok && !postApplyLint.ok
+    : !verification.ok && !postLintOk
       ? 'post-apply-verification+lint'
       : !verification.ok
         ? 'post-apply-verification'
@@ -595,6 +684,9 @@ function applySessionClose(args) {
     skipped,
     verification,
     lint: { preflight: preflightLint, postApply: postApplyLint },
+    // Pre-existing lint debt in files this close did not author (Bug B): surfaced
+    // for visibility, never gated. Empty on a clean vault.
+    notices: [...new Set(postNotice.map((e) => e.file))],
   };
 
   if (args.json) {
@@ -614,11 +706,20 @@ function applySessionClose(args) {
         console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
         console.log('  Fix the payload (likely an `updated:` field) and retry.');
       }
-      if (!postApplyLint.ok) {
+      if (!postLintOk) {
         console.log('\n✗ post-apply lint failed:');
-        for (const e of postApplyLint.errors) console.log(`  ✗ ${e.file}: ${e.message}`);
+        for (const e of postBlocking) console.log(`  ✗ ${e.file}: ${e.message}`);
         console.log('  Payload introduced a lint blocker — fix the payload content and retry.');
       }
+    }
+    if (postNotice.length > 0) {
+      console.log(
+        `\n· ${postNotice.length} pre-existing lint issue(s) in untouched files (not blocking): ${[
+          ...new Set(postNotice.map((e) => e.file)),
+        ]
+          .slice(0, 5)
+          .join(', ')}${postNotice.length > 5 ? ', …' : ''}`,
+      );
     }
   }
   process.exit(ok ? 0 : 1);

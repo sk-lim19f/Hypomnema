@@ -11,7 +11,7 @@ When invoked at the end of a session (or with phrases like "세션 종료", "wra
 
 ## What this does
 
-- **Close mode**: walks the 6-step checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) and verifies via `crystallize.mjs --check-session-close` — same gate the PreCompact hook runs.
+- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `crystallize.mjs --apply-session-close --payload=<path>` — which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). `--check-session-close` remains a read-only probe (freshness only). The PreCompact gate runs the same scoped lint, judging the session on the files it touched.
 - **Synthesis mode**: finds tag clusters (≥ N pages), orphan pages (no outbound `[[wikilinks]]`), and draft / stub pages, then guides consolidation into `pages/syntheses/<topic>.md` with back-links and `index.md` updates.
 
 ---
