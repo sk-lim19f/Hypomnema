@@ -122,10 +122,20 @@ If you need to share new logic, prefer extending an existing helper over adding 
 npm test           # tests/runner.mjs — unit + smoke + contract tests
 npm run lint       # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale vs session-log)
 npm run fix:verify # Phase 1 of learned_behavior #6 — verifies fix #N status claims in
-                   # wiki spec-v1.2.md against `// @fix #N: <test-name>` anchors in
+                   # a wiki spec against `// @fix #N: <test-name>` anchors in
                    # tests/runner.mjs. Maintainer dogfood; needs a local wiki at
                    # $HYPO_DIR or ~/hypomnema. Does NOT grep ADR core decision lines.
 ```
+
+> **`fix:verify` needs an explicit `--spec`.** The default path
+> (`projects/hypomnema/spec-v1.2.md`) is now a `type: reference` redirect stub —
+> the real spec moved to `archive/`. Running the bare command fails with
+> `STUB_SPEC` by design (a stub carries zero status claims, so greening it would
+> be vacuous). Point it at the real spec:
+>
+> ```bash
+> npm run fix:verify -- --spec ~/hypomnema/projects/hypomnema/archive/spec-v1.2.md
+> ```
 
 ### `// @fix #N:` anchor convention
 
@@ -138,7 +148,7 @@ test('replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → 
 
 The anchor's body must be the EXACT test name (whole rest of the line; no comma splitting). Multiple anchor lines per fix # accumulate. For fixes whose verification is behavioral / prompt-driven (no automated test by design), use the sentinel `// @fix #N: NO_AUTO_TEST`.
 
-`npm run fix:verify` reads these anchors plus the spec status claims and reports any drift (`NO_ANCHOR`, `MISSING_TEST`, `FAILING_TEST`, `ORPHAN_ANCHOR`). Plain `// fix #N: …` comments without the `@` prefix are treated as prose and ignored by the verifier.
+`npm run fix:verify` reads these anchors plus the spec status claims and reports any drift (`NO_ANCHOR`, `MISSING_TEST`, `FAILING_TEST`, `ORPHAN_ANCHOR`, `STUB_SPEC`). Plain `// fix #N: …` comments without the `@` prefix are treated as prose and ignored by the verifier.
 
 The test runner uses only Node.js built-ins. Tests create scoped temp directories and clean up after themselves; you can run the suite without any environment setup.
 

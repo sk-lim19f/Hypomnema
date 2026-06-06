@@ -25,6 +25,7 @@ import {
   parseStatus,
   parseRunnerOutput,
   verifyMatrix,
+  isReferenceStub,
 } from './lib/fix-status-verify.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -72,6 +73,10 @@ function printHelp() {
       '',
       'Exit 0 if no error findings, 1 otherwise.',
       '',
+      'NOTE: The default --spec is a `type: reference` redirect stub (the real',
+      'spec moved to archive/). Running without --spec fails with STUB_SPEC by',
+      'design — pass --spec <real spec> to verify against actual claims.',
+      '',
       'NOTE: This tool only verifies that mapped tests exist and pass.',
       'It does NOT grep ADR core decision lines — see Phase 2 / v1.3.0.',
     ].join('\n'),
@@ -98,11 +103,11 @@ function runTests(testCommand) {
 
 function formatFinding(f) {
   const icon = f.level === 'error' ? '✗' : '⚠';
-  return (
-    `  ${icon} [${f.class}] fix #${f.fixNum}` +
-    (f.testName ? ` (${f.testName})` : '') +
-    `: ${f.detail}`
-  );
+  // Some findings are not tied to a specific fix # (STUB_SPEC,
+  // TEST_RUN_NONZERO_EXIT). Only render the `fix #N` segment when present so
+  // they don't print `fix #undefined`.
+  const ref = f.fixNum != null ? ` fix #${f.fixNum}` : '';
+  return `  ${icon} [${f.class}]${ref}` + (f.testName ? ` (${f.testName})` : '') + `: ${f.detail}`;
 }
 
 function main() {
@@ -123,6 +128,7 @@ function main() {
 
   const anchors = parseAnchors(runnerText);
   const status = parseStatus(specText);
+  const specIsStub = isReferenceStub(specText);
 
   if (!opts.json) {
     console.log(`fix-status-verify (Phase 1)`);
@@ -141,7 +147,7 @@ function main() {
     console.log(`  test run: ${passes} pass, ${fails} fail (exit ${testRun.exitCode})`);
   }
 
-  const matrixResult = verifyMatrix({ anchors, status, testResults });
+  const matrixResult = verifyMatrix({ anchors, status, testResults, specIsStub });
   const findings = [...matrixResult.findings];
 
   // CLI-level error: if the test command itself exited nonzero, the test run
