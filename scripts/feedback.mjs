@@ -19,7 +19,7 @@
  *   --title=<text>          Frontmatter title (default: topic)
  *
  * Classification (lint #8 schema — required on create):
- *   --scope=<v>             global | project:<slug>           (required)
+ *   --scope=<v>             global | project:<project-id>     (required)
  *   --tier=<v>              L1 | L2                            (required)
  *   --targets=<list>        comma list of project-memory,claude-learned (default: project-memory)
  *   --sensitivity=<v>       public | sanitized                (default: public)
@@ -47,6 +47,7 @@ import { join } from 'path';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
 
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 
@@ -120,7 +121,6 @@ function listTopics(hypoDir) {
 
 // ── classification validation (mirrors lint #8 / ADR 0031 §6) ──────────────────
 
-const SCOPE_RE = /^(global|project:[a-z0-9][a-z0-9-]*)$/;
 const TIER_ENUM = ['L1', 'L2'];
 const SENSITIVITY_ENUM = ['public', 'sanitized']; // private is forbidden (wiki is git-public)
 const TARGET_ENUM = ['project-memory', 'claude-learned'];
@@ -135,8 +135,8 @@ function parseTargets(raw) {
 // Validate the create-mode classification. Returns an array of error strings.
 function validateClassification(args, targets) {
   const errs = [];
-  if (!args.scope) errs.push('--scope is required (global | project:<slug>)');
-  else if (!SCOPE_RE.test(args.scope)) errs.push(`--scope invalid: "${args.scope}"`);
+  if (!args.scope) errs.push('--scope is required (global | project:<project-id>)');
+  else if (!FEEDBACK_SCOPE_RE.test(args.scope)) errs.push(`--scope invalid: "${args.scope}"`);
   if (!args.tier) errs.push('--tier is required (L1 | L2)');
   else if (!TIER_ENUM.includes(args.tier)) errs.push(`--tier invalid: "${args.tier}"`);
   if (!SENSITIVITY_ENUM.includes(args.sensitivity))

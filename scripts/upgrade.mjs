@@ -521,15 +521,16 @@ checklist below is manual:
 - [ ] **Re-run \`hypomnema lint\` after backfilling — confirm 0 feedback errors
       remain (including the conditional \`claude-learned\` fields above)**
 
-## Caveat — \`scope: project:<project-id>\` and slug regex
+## Note — \`scope: project:<project-id>\` and the scope regex
 
-The lint regex \`^project:[a-z0-9][a-z0-9-]*$\` accepts only short slugs, but
-\`feedback-sync\`'s default resolved project-id is cwd-derived (e.g.
-\`-Users-you-Workspace-Project\`), which the regex rejects. To use a
-\`scope: project:*\` page in v1.2.0 you must override with
-\`--project-id=<slug>\` so the resolved id is slug-safe. The full resolved-id
-↔ wiki-slug reconciliation is deferred to v1.3.0; \`commands/feedback.md\`
-documents the interim pattern.
+As of v1.3.0 the feedback scope regex \`^(global|project:[A-Za-z0-9_-]+)\$\`
+accepts cwd-derived project-ids directly (e.g.
+\`-Users-you-Workspace-Project\`), so a \`scope: project:*\` page no longer needs
+a \`--project-id=<slug>\` override just to pass \`lint\`. The resolved id must
+still exact-match \`feedback-sync\`'s project-id for projection (default: cwd
+with \`/\` and \`.\` replaced by \`-\`). Known limit: a cwd containing spaces or
+other characters outside \`[A-Za-z0-9_-]\` still derives an id the regex
+rejects — pass \`--project-id=<id>\` for those.
 `
     : `## What changed
 
