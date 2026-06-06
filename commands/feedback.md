@@ -68,7 +68,7 @@ node <package-root>/scripts/feedback.mjs \
 
 When `--targets` includes `claude-learned`, `--global-summary` and `--promote-to-global` are required (and `--scope=global --tier=L1`).
 
-> **`scope: project:<project-id>` 주의 (v1.2.0).** `<project-id>`는 `feedback-sync`가 resolve한 project-id와 정확히 일치해야 한다 (default: cwd의 `/`,`.` → `-` 치환; `--project-id=<id>` 로 override). 일치하지 않으면 그 페이지는 해당 project의 MEMORY로 projection되지 **않는다** (silent skip — lint error 아님). 다만 현재 lint scope regex(`^project:[a-z0-9][a-z0-9-]*$`)는 cwd-derived id 형식(`-Users-...`)을 거부하므로, **`project:*` scope를 사용하려면 slug-safe id로 `--project-id=<slug>`를 override해서 wiki 디렉터리도 그 id에 맞추는 운영 패턴이 필요하다**. resolved-id ↔ slug 정합화는 v1.3.0 트랙에서 다룸.
+> **`scope: project:<project-id>` 주의.** `<project-id>`는 `feedback-sync`가 resolve한 project-id와 정확히 일치해야 한다 (default: cwd의 `/`,`.` → `-` 치환; `--project-id=<id>` 로 override). 일치하지 않으면 그 페이지는 해당 project의 MEMORY로 projection되지 **않는다** (silent skip — lint error 아님). v1.3.0부터 scope regex(`^(global|project:[A-Za-z0-9_-]+)$`)가 cwd-derived id 형식(`-Users-...`)을 그대로 허용하므로 lint 통과를 위해 `--project-id=<slug>`를 override할 필요는 없다. 단 cwd에 공백 등 `[A-Za-z0-9_-]` 밖 문자가 있으면 그 id는 여전히 거부되니 그때만 `--project-id=<id>`로 override한다.
 
 On a real (non-dry-run) write, the script automatically runs `feedback-sync --write` to refresh MEMORY.md / CLAUDE.md. If that post-step reports drift it prints a one-line warning — the page is still saved; reconcile with `hypomnema feedback-sync --check`.
 

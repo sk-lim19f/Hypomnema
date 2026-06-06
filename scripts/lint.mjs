@@ -20,6 +20,7 @@ import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import { parseSchemaVocab, checkForbidden, parseSchemaPageDirs } from './lib/schema-vocab.mjs';
 import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
+import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -296,8 +297,12 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
   // feedback: scope vocabulary + conditional claude-learned fields (ADR 0031)
   if (fm.type === 'feedback') {
     const scope = fm.scope || '';
-    if (scope && scope !== 'global' && !/^project:[a-z0-9][a-z0-9-]*$/.test(scope)) {
-      issue('error', rel, `Invalid feedback scope: "${scope}" (allowed: global | project:<slug>)`);
+    if (scope && !FEEDBACK_SCOPE_RE.test(scope)) {
+      issue(
+        'error',
+        rel,
+        `Invalid feedback scope: "${scope}" (allowed: global | project:<project-id>)`,
+      );
     }
     const fbTargets = parseTagsField(fm.targets) || [];
     if (fbTargets.includes('claude-learned')) {

@@ -5092,6 +5092,64 @@ test('feedback invalid scope → error', () => {
   );
 });
 
+// ── Track D (OQ-34): scope regex accepts cwd-derived project-ids ──────────────
+// deriveProjectId emits leading-dash, mixed-case ids (cwd `/`,`.` → `-`). The
+// v1.2 regex `^project:[a-z0-9][a-z0-9-]*$` rejected them, forcing a
+// `--project-id=<slug>` override; v1.3 relaxes the shared FEEDBACK_SCOPE_RE to
+// `^(global|project:[A-Za-z0-9_-]+)$`. These cover the lint stage of the
+// create → lint → projection consistency chain plus the hardening edges from
+// the codex design review (`.` excluded → no `project:.`/`project:..`; spaces
+// still rejected = documented limit).
+test('feedback scope: cwd-derived project-id (leading dash, mixed case) → no error', () => {
+  const { r } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('targets: [project-memory, claude-learned]', 'targets: [project-memory]')
+      .replace('global_summary: g\n', '')
+      .replace('promote_to_global: true\n', '')
+      .replace('scope: global', 'scope: project:-Users-you-Workspace-Project')
+      .replace('tier: L1', 'tier: L2'),
+  );
+  assert.equal(r.status, 0, `cwd-derived scope must lint clean: ${r.stdout}`);
+});
+
+test('feedback scope: existing short slug still accepted (backcompat regression)', () => {
+  const { r } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('targets: [project-memory, claude-learned]', 'targets: [project-memory]')
+      .replace('global_summary: g\n', '')
+      .replace('promote_to_global: true\n', '')
+      .replace('scope: global', 'scope: project:hypomnema')
+      .replace('tier: L1', 'tier: L2'),
+  );
+  assert.equal(r.status, 0, `short slug must remain clean: ${r.stdout}`);
+});
+
+test('feedback scope: dot-only project-id (project:. / project:..) → error', () => {
+  for (const bad of ['project:.', 'project:..']) {
+    const { r, out } = lintWithSchema(
+      'pages/feedback/x.md',
+      FB_FM_OK.replace('scope: global', `scope: ${bad}`),
+    );
+    assert.equal(r.status, 1, `${bad} must error`);
+    assert.ok(
+      out.errors.some((e) => e.message.includes('Invalid feedback scope')),
+      `${bad} must be rejected: ${r.stdout}`,
+    );
+  }
+});
+
+test('feedback scope: cwd-derived id with space still rejected (documented limit) → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('scope: global', 'scope: project:-Users-My Name-Proj'),
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Invalid feedback scope')),
+    `space-bearing derived id must error: ${r.stdout}`,
+  );
+});
+
 test('feedback status:superseded + sensitivity:sanitized → no error (allowed enums)', () => {
   const { r } = lintWithSchema(
     'pages/feedback/x.md',
@@ -7668,11 +7726,10 @@ function fbPage(fields) {
 
 // Build a wiki + claude-home pair, seed feedback pages, run feedback-sync.
 // `pages` is { slug: fieldsObject }. Returns { dir, claudeHome, projectId, runFb(args) }.
-function withFeedbackEnv(pages, fn, { claudeMd, memoryMd } = {}) {
+function withFeedbackEnv(pages, fn, { claudeMd, memoryMd, projectId = 'proj' } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'hypo-fb-'));
   const wiki = join(base, 'wiki');
   const claudeHome = join(base, 'claude');
-  const projectId = 'proj';
   const memDir = join(claudeHome, 'projects', projectId, 'memory');
   try {
     mkdirSync(join(wiki, 'pages', 'feedback'), { recursive: true });
@@ -7853,6 +7910,35 @@ test('feedback-sync-scope-project-rejected-from-claude: project scope only reach
     assert.equal(rep.targets.claude.candidates, 0, 'scope:project:* must be rejected from CLAUDE');
     assert.equal(rep.targets.memory.candidates, 1, 'project scope still projects to memory');
   });
+});
+
+// Track D 3rd stage (projection): a cwd-derived project-id round-trips through
+// projection. The page scope and the resolved project-id are matched by exact
+// string equality (feedback-sync.mjs:222 — unchanged by D), so a relaxed-lint
+// leading-dash id projects into the matching project's MEMORY exactly like a
+// short slug. Completes the create → lint → projection consistency chain.
+test('feedback-sync-scope-cwd-derived-id-projects: leading-dash mixed-case id reaches its MEMORY', () => {
+  const pid = '-Users-you-Workspace-Project';
+  const page = { ...FB_PROJECT_L2, scope: `project:${pid}`, memory_summary: 'do derived' };
+  withFeedbackEnv(
+    { derived: page },
+    ({ memDir, runFb }) => {
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.equal(
+        rep.targets.memory.candidates,
+        1,
+        `cwd-derived scope must project to memory: got ${rep.targets.memory.candidates}`,
+      );
+      const w = runFb(['--write']);
+      assert.equal(w.status, 0, `--write should succeed: ${w.stderr}`);
+      const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      assert.ok(
+        mem.includes('feedback_derived.md'),
+        `derived-id page must appear in MEMORY: ${mem}`,
+      );
+    },
+    { projectId: pid },
+  );
 });
 
 // Cross-project pollution guard (ADR 0031 cwd-scoped projection invariant):
@@ -8807,6 +8893,53 @@ test('feedback.mjs create: full classification → page written + lint-clean', (
     const lint = run('lint.mjs', ['--json', `--hypo-dir=${dir}`]);
     const report = JSON.parse(lint.stdout);
     assert.equal(report.errors.length, 0, `lint errors on generated page: ${lint.stdout}`);
+  });
+});
+
+// Track D 1st stage (create): /hypo:feedback accepts a cwd-derived project scope
+// at create time (feedback.mjs --scope validation shares FEEDBACK_SCOPE_RE), and
+// the generated page lints clean — so create → lint is consistent end-to-end.
+test('feedback.mjs create: cwd-derived project scope → page written + lint-clean (Track D)', () => {
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', [
+      '--topic=derived-scope-rule',
+      '--entry=프로젝트 한정 규칙.',
+      '--scope=project:-Users-you-Workspace-Project',
+      '--tier=L2',
+      '--targets=project-memory',
+      '--priority=2',
+      '--memory-summary=프로젝트 규칙 수행',
+      '--reason=정합 확인',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+    ]);
+    assert.equal(r.status, 0, `cwd-derived scope create failed: ${r.stderr}`);
+    const page = readFileSync(join(dir, 'pages', 'feedback', 'derived-scope-rule.md'), 'utf-8');
+    assert.ok(
+      page.includes('scope: project:-Users-you-Workspace-Project'),
+      `derived scope not written: ${page}`,
+    );
+    const lint = run('lint.mjs', ['--json', `--hypo-dir=${dir}`]);
+    const report = JSON.parse(lint.stdout);
+    assert.equal(report.errors.length, 0, `lint errors on generated page: ${lint.stdout}`);
+  });
+});
+
+test('feedback.mjs create: invalid scope vocabulary (project:.) → exit 1 (Track D edge)', () => {
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', [
+      '--topic=bad-scope',
+      '--entry=x.',
+      '--scope=project:.',
+      '--tier=L2',
+      '--targets=project-memory',
+      '--priority=2',
+      '--memory-summary=x',
+      '--reason=x',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+    ]);
+    assert.equal(r.status, 1, `project:. must be rejected at create time: ${r.stdout}`);
   });
 });
 

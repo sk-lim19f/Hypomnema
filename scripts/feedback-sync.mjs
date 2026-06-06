@@ -602,7 +602,7 @@ function bootstrapDraftContent({ title, summary, body, date, origin }) {
     `title: ${title}`,
     'type: feedback',
     'status: draft',
-    'scope: TODO              # global | project:<slug>',
+    'scope: TODO              # global | project:<project-id>',
     'tier: TODO               # L1 (CLAUDE.md <learned_behaviors> candidate) | L2',
     'targets: [project-memory]   # + claude-learned for a global L1 rule',
     'sensitivity: public      # public | sanitized (private is forbidden)',
