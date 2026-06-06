@@ -660,13 +660,18 @@ function existingPageSlugs(hypoDir) {
   );
 }
 
-// --bootstrap: read the two legacy projection surfaces (CLAUDE.md
-// <learned_behaviors> + MEMORY.md feedback_* index) and scaffold drafts.
-function runBootstrap(args) {
-  const draftsDir = join(args.hypoDir, 'pages', 'feedback', '_drafts');
-  const existing = existingPageSlugs(args.hypoDir);
-  const report = { mode: 'bootstrap', dryRun: args.dryRun, created: [], skipped: [] };
+// Source loader for --bootstrap (input side, symmetric with the output-side
+// target descriptors): read the two legacy projection surfaces — CLAUDE.md
+// <learned_behaviors> + the project MEMORY.md feedback_* index — and shape them
+// into ordered draft candidates. CLAUDE candidates come first (file order from
+// parseLearnedBehaviors), then MEMORY (parseMemoryIndex order); this order drives
+// duplicate handling in runBootstrap, so it must be preserved. Returns
+// { candidates, warnings, skipped } where `skipped` carries the unsafe MEMORY
+// slugs the loader could not sanitize (seeded into report.skipped before the
+// dedup loop appends its own skips).
+function loadBootstrapSources(args) {
   const warnings = [];
+  const skipped = [];
   const candidates = [];
 
   const claudeFile = join(args.claudeHome, 'CLAUDE.md');
@@ -692,7 +697,7 @@ function runBootstrap(args) {
     for (const e of parseMemoryIndex(readFileSync(memFile, 'utf-8'))) {
       const slug = safeDraftSlug(e.name.replace(/_/g, '-'));
       if (!slug) {
-        report.skipped.push({ slug: e.name, reason: 'unsafe-slug' });
+        skipped.push({ slug: e.name, reason: 'unsafe-slug' });
         continue;
       }
       candidates.push({
@@ -709,6 +714,17 @@ function runBootstrap(args) {
       `MEMORY.md not found for project-id "${pid.id}" at ${memFile} — memory source skipped`,
     );
   }
+
+  return { candidates, warnings, skipped };
+}
+
+// --bootstrap: load the two legacy projection surfaces (loadBootstrapSources)
+// and scaffold one draft per deduped candidate.
+function runBootstrap(args) {
+  const draftsDir = join(args.hypoDir, 'pages', 'feedback', '_drafts');
+  const existing = existingPageSlugs(args.hypoDir);
+  const { candidates, warnings, skipped } = loadBootstrapSources(args);
+  const report = { mode: 'bootstrap', dryRun: args.dryRun, created: [], skipped: [...skipped] };
 
   const seen = new Set();
   for (const c of candidates) {
@@ -736,20 +752,33 @@ function runBootstrap(args) {
   return { code: 0, report, warnings };
 }
 
-// --import-target-change --from=<memory|claude>: capture hand-edited (conflict)
-// managed blocks back into drafts so the human can reconcile them into the SoT.
-function runImport(args) {
+// Source loader for --import-target-change (input side): select the target
+// projection file (CLAUDE.md or the project MEMORY.md), read it, and return the
+// managed blocks whose inner content no longer matches their marker hash
+// (hand-edited = conflict). This IS the import contract — findBlocks + hash-
+// mismatch filter, NOT projection evaluation. Returns { file, conflicts } or
+// { error } for an invalid --from / missing target file.
+function loadImportConflicts(args) {
   if (args.from !== 'memory' && args.from !== 'claude') {
-    return { code: 1, error: '--import-target-change requires --from=memory|claude' };
+    return { error: '--import-target-change requires --from=memory|claude' };
   }
   const file =
     args.from === 'claude'
       ? join(args.claudeHome, 'CLAUDE.md')
       : join(args.claudeHome, 'projects', deriveProjectId(args).id, 'memory', 'MEMORY.md');
-  if (!existsSync(file)) return { code: 1, error: `target file not found: ${file}` };
+  if (!existsSync(file)) return { error: `target file not found: ${file}` };
 
   const { blocks } = findBlocks(readFileSync(file, 'utf-8'));
   const conflicts = blocks.filter((b) => b.actualHash !== b.declaredHash);
+  return { file, conflicts };
+}
+
+// --import-target-change --from=<memory|claude>: capture hand-edited (conflict)
+// managed blocks back into drafts so the human can reconcile them into the SoT.
+function runImport(args) {
+  const src = loadImportConflicts(args);
+  if (src.error) return { code: 1, error: src.error };
+  const { file, conflicts } = src;
   const report = { mode: 'import', from: args.from, dryRun: args.dryRun, imported: [] };
   const warnings = [];
   if (!conflicts.length) {
