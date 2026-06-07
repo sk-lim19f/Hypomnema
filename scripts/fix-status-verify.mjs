@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 /**
- * fix-status-verify (CLI) — verify fix→test linkage against wiki spec claims.
+ * fix-status-verify (CLI) — verify fix→test linkage + ADR-line evidence
+ * against wiki spec claims.
  *
- * Phase 1 (test-green half only). ADR core decision grep is out of scope —
- * see scripts/lib/fix-status-verify.mjs header.
+ * Phase 1: test-green half (anchors × spec status × runner results).
+ * Phase 2 (A-sot): manifest validation + manifest↔anchor drift + ADR core
+ * decision grep against the production corpus. See scripts/lib/fix-manifest.mjs
+ * and scripts/lib/fix-status-verify.mjs headers.
  *
  * Usage:
  *   node scripts/fix-status-verify.mjs [--hypo-dir <path>]
@@ -19,16 +22,29 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   parseAnchors,
   parseStatus,
   parseRunnerOutput,
   verifyMatrix,
   isReferenceStub,
+  validateManifest,
+  checkManifestCoverage,
+  checkAdrLines,
+  FIX_MANIFEST,
+  NO_ADR,
 } from './lib/fix-status-verify.mjs';
+import { buildCorpusSearch } from './lib/adr-corpus.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+// Production-code corpus for the ADR-line grep (spec §A amendment 2026-06-07:
+// templates/ ships via npm `files`, so prompt-driven fixes are verifiable).
+const CORPUS_DIRS = ['scripts', 'hooks', 'commands', 'skills', 'templates'];
+// MUST exclude the manifest itself — it holds every adrKeyLine as a literal and
+// would self-match, making ADR_LINE_MISSING impossible to ever fire.
+const CORPUS_EXCLUDE = ['scripts/lib/fix-manifest.mjs'];
 
 function parseArgs(argv) {
   const out = {
@@ -37,6 +53,7 @@ function parseArgs(argv) {
     runner: join(REPO, 'tests/runner.mjs'),
     testCommand: 'npm test',
     json: false,
+    manifest: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -44,6 +61,7 @@ function parseArgs(argv) {
     else if (a === '--spec') out.spec = argv[++i];
     else if (a === '--runner') out.runner = argv[++i];
     else if (a === '--test-command') out.testCommand = argv[++i];
+    else if (a === '--manifest') out.manifest = argv[++i];
     else if (a === '--json') out.json = true;
     else if (a === '--help' || a === '-h') {
       printHelp();
@@ -77,8 +95,9 @@ function printHelp() {
       'spec moved to archive/). Running without --spec fails with STUB_SPEC by',
       'design — pass --spec <real spec> to verify against actual claims.',
       '',
-      'NOTE: This tool only verifies that mapped tests exist and pass.',
-      'It does NOT grep ADR core decision lines — see Phase 2 / v1.3.0.',
+      'Phase 2 (A-sot): also greps each manifest adrKeyLine against the',
+      'production corpus (scripts/ hooks/ commands/ skills/ templates/) and',
+      'checks manifest↔anchor drift. NO_ADR rows skip the grep (test-green only).',
     ].join('\n'),
   );
 }
@@ -110,8 +129,21 @@ function formatFinding(f) {
   return `  ${icon} [${f.class}]${ref}` + (f.testName ? ` (${f.testName})` : '') + `: ${f.detail}`;
 }
 
-function main() {
+async function main() {
   const opts = parseArgs(process.argv.slice(2));
+
+  // Manifest source: built-in code constant by default (ADR 0036). --manifest
+  // <path.mjs> overrides for tests, which inject a fixture manifest matching
+  // their synthetic fixes so the real manifest does not couple to fixtures.
+  let manifest = FIX_MANIFEST;
+  if (opts.manifest) {
+    if (!existsSync(opts.manifest)) {
+      console.error(`manifest not found: ${opts.manifest}`);
+      process.exit(2);
+    }
+    const mod = await import(pathToFileURL(resolve(opts.manifest)).href);
+    manifest = mod.FIX_MANIFEST;
+  }
 
   if (!existsSync(opts.spec)) {
     console.error(`spec not found: ${opts.spec}`);
@@ -150,6 +182,19 @@ function main() {
   const matrixResult = verifyMatrix({ anchors, status, testResults, specIsStub });
   const findings = [...matrixResult.findings];
 
+  // Phase 2 (A-sot): manifest validation + ADR-line grep. validateManifest and
+  // checkAdrLines are spec-independent (manifest/code health) and run always;
+  // checkManifestCoverage keys off the spec status (a no-op under STUB_SPEC,
+  // where status is empty).
+  const needsCorpus = manifest.some((r) => r.adrKeyLine !== NO_ADR);
+  const adrSearch = needsCorpus
+    ? buildCorpusSearch({ repoRoot: REPO, includeDirs: CORPUS_DIRS, excludePaths: CORPUS_EXCLUDE })
+    : () => false;
+  const adrExists = (adrPath) => existsSync(join(opts.hypoDir, 'projects/hypomnema', adrPath));
+  findings.push(...validateManifest(manifest));
+  findings.push(...checkManifestCoverage({ manifest, anchors, status }));
+  findings.push(...checkAdrLines({ manifest, searchFn: adrSearch, adrExistsFn: adrExists }));
+
   // CLI-level error: if the test command itself exited nonzero, the test run
   // is not green even if the anchored tests happen to all pass in the parsed
   // output. Surface as a synthetic error finding so `ok` flips false.
@@ -161,10 +206,10 @@ function main() {
       exitCode: testRun.exitCode,
     });
   }
-  const ok = matrixResult.ok && testRun.exitCode === 0;
+  const ok = !findings.some((f) => f.level === 'error') && testRun.exitCode === 0;
 
   const MANDATORY_NOTE =
-    'test-linkage + green only — ADR core decision grep NOT checked, see Phase 2 / v1.3.0';
+    'test-linkage + green + ADR-line grep (Phase 2): manifest evidence checked against production corpus';
 
   if (opts.json) {
     console.log(
@@ -205,4 +250,7 @@ function main() {
   process.exit(ok ? 0 : 1);
 }
 
-main();
+main().catch((e) => {
+  console.error(e);
+  process.exit(2);
+});

@@ -11700,7 +11700,14 @@ const {
   parseRunnerOutput: fsvParseRunnerOutput,
   verifyMatrix: fsvVerifyMatrix,
   isReferenceStub: fsvIsReferenceStub,
+  validateManifest: fsvValidateManifest,
+  checkManifestCoverage: fsvCheckManifestCoverage,
+  checkAdrLines: fsvCheckAdrLines,
+  FIX_MANIFEST: FSV_FIX_MANIFEST,
+  NO_ADR: FSV_NO_ADR,
+  NO_AUTO_TEST: FSV_NO_AUTO_TEST,
 } = await import(`${SCRIPTS}/lib/fix-status-verify.mjs`);
+const { buildCorpusSearch: fsvBuildCorpusSearch } = await import(`${SCRIPTS}/lib/adr-corpus.mjs`);
 
 suite('fix-status-verify — parseAnchors');
 
@@ -11943,6 +11950,224 @@ test('verifyMatrix: all-green case → ok:true with no error findings', () => {
   assert.equal(findings.filter((f) => f.level === 'error').length, 0);
 });
 
+// ── fix-status-verify — manifest (Phase 2, A-sot) ────────────────────────────
+
+suite('fix-status-verify — validateManifest');
+
+test('validateManifest: real FIX_MANIFEST is structurally clean', () => {
+  assert.deepEqual(fsvValidateManifest(FSV_FIX_MANIFEST), []);
+});
+
+test('validateManifest: duplicate fixId → MANIFEST_DUP_FIXID', () => {
+  const m = [
+    { fixId: 1, testNames: ['t'], adrPath: null, adrKeyLine: FSV_NO_ADR },
+    { fixId: 1, testNames: ['u'], adrPath: null, adrKeyLine: FSV_NO_ADR },
+  ];
+  const f = fsvValidateManifest(m);
+  assert.ok(f.some((x) => x.class === 'MANIFEST_DUP_FIXID' && x.fixNum === 1));
+});
+
+test('validateManifest: empty testNames → MANIFEST_EMPTY_TESTS', () => {
+  const m = [{ fixId: 2, testNames: [], adrPath: null, adrKeyLine: FSV_NO_ADR }];
+  const f = fsvValidateManifest(m);
+  assert.ok(f.some((x) => x.class === 'MANIFEST_EMPTY_TESTS' && x.fixNum === 2));
+});
+
+test('validateManifest: NO_AUTO_TEST mixed with real name → MANIFEST_SENTINEL_MIX', () => {
+  const m = [
+    { fixId: 3, testNames: [FSV_NO_AUTO_TEST, 'real'], adrPath: null, adrKeyLine: FSV_NO_ADR },
+  ];
+  const f = fsvValidateManifest(m);
+  assert.ok(f.some((x) => x.class === 'MANIFEST_SENTINEL_MIX' && x.fixNum === 3));
+});
+
+test('validateManifest: lone NO_AUTO_TEST is allowed (no sentinel-mix)', () => {
+  const m = [{ fixId: 4, testNames: [FSV_NO_AUTO_TEST], adrPath: null, adrKeyLine: FSV_NO_ADR }];
+  const f = fsvValidateManifest(m);
+  assert.ok(!f.some((x) => x.class === 'MANIFEST_SENTINEL_MIX'));
+});
+
+test('validateManifest: blank adrKeyLine → MANIFEST_EMPTY_KEYLINE', () => {
+  const m = [{ fixId: 5, testNames: ['t'], adrPath: 'decisions/x.md', adrKeyLine: '   ' }];
+  const f = fsvValidateManifest(m);
+  assert.ok(f.some((x) => x.class === 'MANIFEST_EMPTY_KEYLINE' && x.fixNum === 5));
+});
+
+test('validateManifest: NO_ADR with non-null adrPath → MANIFEST_NO_ADR_SHAPE', () => {
+  const m = [{ fixId: 6, testNames: ['t'], adrPath: 'decisions/x.md', adrKeyLine: FSV_NO_ADR }];
+  const f = fsvValidateManifest(m);
+  assert.ok(f.some((x) => x.class === 'MANIFEST_NO_ADR_SHAPE' && x.fixNum === 6));
+});
+
+test('validateManifest: real adrKeyLine with null adrPath → MANIFEST_NO_ADR_SHAPE', () => {
+  const m = [{ fixId: 7, testNames: ['t'], adrPath: null, adrKeyLine: 'some literal' }];
+  const f = fsvValidateManifest(m);
+  assert.ok(f.some((x) => x.class === 'MANIFEST_NO_ADR_SHAPE' && x.fixNum === 7));
+});
+
+suite('fix-status-verify — checkManifestCoverage');
+
+test('checkManifestCoverage: clean when rows match anchors + claims', () => {
+  const manifest = [{ fixId: 1, testNames: ['t1'], adrPath: null, adrKeyLine: FSV_NO_ADR }];
+  const anchors = new Map([[1, ['t1']]]);
+  const status = new Map([[1, 'merged']]);
+  assert.deepEqual(fsvCheckManifestCoverage({ manifest, anchors, status }), []);
+});
+
+test('checkManifestCoverage: claimed+anchored without row → MANIFEST_MISSING_ROW', () => {
+  const manifest = [];
+  const anchors = new Map([[9, ['t9']]]);
+  const status = new Map([[9, 'merged']]);
+  const f = fsvCheckManifestCoverage({ manifest, anchors, status });
+  assert.ok(f.some((x) => x.class === 'MANIFEST_MISSING_ROW' && x.fixNum === 9));
+});
+
+test('checkManifestCoverage: claimed but unanchored → no MISSING_ROW (NO_ANCHOR domain)', () => {
+  const manifest = [];
+  const anchors = new Map();
+  const status = new Map([[9, 'merged']]);
+  const f = fsvCheckManifestCoverage({ manifest, anchors, status });
+  assert.ok(!f.some((x) => x.class === 'MANIFEST_MISSING_ROW'));
+});
+
+test('checkManifestCoverage: testNames ≠ anchors → MANIFEST_TEST_DRIFT', () => {
+  const manifest = [
+    { fixId: 1, testNames: ['t1', 'stale'], adrPath: null, adrKeyLine: FSV_NO_ADR },
+  ];
+  const anchors = new Map([[1, ['t1']]]);
+  const status = new Map([[1, 'merged']]);
+  const f = fsvCheckManifestCoverage({ manifest, anchors, status });
+  assert.ok(f.some((x) => x.class === 'MANIFEST_TEST_DRIFT' && x.fixNum === 1));
+});
+
+test('checkManifestCoverage: NO_AUTO_TEST row set-equal to anchor → no drift', () => {
+  const manifest = [
+    { fixId: 20, testNames: [FSV_NO_AUTO_TEST], adrPath: null, adrKeyLine: FSV_NO_ADR },
+  ];
+  const anchors = new Map([[20, [FSV_NO_AUTO_TEST]]]);
+  const status = new Map([[20, 'merged']]);
+  assert.deepEqual(fsvCheckManifestCoverage({ manifest, anchors, status }), []);
+});
+
+test('checkManifestCoverage: drift is order-insensitive', () => {
+  const manifest = [{ fixId: 1, testNames: ['b', 'a'], adrPath: null, adrKeyLine: FSV_NO_ADR }];
+  const anchors = new Map([[1, ['a', 'b']]]);
+  const status = new Map([[1, 'merged']]);
+  assert.deepEqual(fsvCheckManifestCoverage({ manifest, anchors, status }), []);
+});
+
+suite('fix-status-verify — checkAdrLines');
+
+test('checkAdrLines: clean when adrPath exists and literal found', () => {
+  const manifest = [{ fixId: 1, testNames: ['t'], adrPath: 'decisions/x.md', adrKeyLine: 'LIT' }];
+  const f = fsvCheckAdrLines({ manifest, searchFn: () => true, adrExistsFn: () => true });
+  assert.deepEqual(f, []);
+});
+
+test('checkAdrLines: literal not in corpus → ADR_LINE_MISSING', () => {
+  const manifest = [{ fixId: 1, testNames: ['t'], adrPath: 'decisions/x.md', adrKeyLine: 'LIT' }];
+  const f = fsvCheckAdrLines({ manifest, searchFn: () => false, adrExistsFn: () => true });
+  assert.ok(f.some((x) => x.class === 'ADR_LINE_MISSING' && x.fixNum === 1));
+});
+
+test('checkAdrLines: adrPath unresolved → ADR_PATH_MISSING', () => {
+  const manifest = [{ fixId: 1, testNames: ['t'], adrPath: 'decisions/x.md', adrKeyLine: 'LIT' }];
+  const f = fsvCheckAdrLines({ manifest, searchFn: () => true, adrExistsFn: () => false });
+  assert.ok(f.some((x) => x.class === 'ADR_PATH_MISSING' && x.fixNum === 1));
+});
+
+test('checkAdrLines: NO_ADR row is skipped entirely', () => {
+  const manifest = [{ fixId: 1, testNames: ['t'], adrPath: null, adrKeyLine: FSV_NO_ADR }];
+  // Even with searchFn always false, a NO_ADR row produces no finding.
+  const f = fsvCheckAdrLines({ manifest, searchFn: () => false, adrExistsFn: () => false });
+  assert.deepEqual(f, []);
+});
+
+suite('fix-status-verify — buildCorpusSearch (self-match exclusion)');
+
+test('buildCorpusSearch: finds a literal present in an included dir', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'scripts'), { recursive: true });
+    writeFileSync(join(root, 'scripts', 'foo.mjs'), 'const x = "UNIQUE_DECISION_LINE";\n');
+    const search = fsvBuildCorpusSearch({ repoRoot: root, includeDirs: ['scripts'] });
+    assert.equal(search('UNIQUE_DECISION_LINE'), true);
+    assert.equal(search('not present anywhere'), false);
+  });
+});
+
+test('buildCorpusSearch: CRITICAL — excluded manifest does NOT self-satisfy the grep', () => {
+  withTmpDir((root) => {
+    // Literal lives ONLY inside scripts/lib/fix-manifest.mjs (the manifest).
+    mkdirSync(join(root, 'scripts', 'lib'), { recursive: true });
+    writeFileSync(
+      join(root, 'scripts', 'lib', 'fix-manifest.mjs'),
+      "export const FIX_MANIFEST = [{ adrKeyLine: 'ONLY_IN_MANIFEST' }];\n",
+    );
+    writeFileSync(join(root, 'scripts', 'other.mjs'), '// no decision literal here\n');
+    // With the manifest excluded, the literal is NOT found → ADR_LINE_MISSING
+    // would correctly fire. This is the guard that keeps the gate non-vacuous.
+    const excluded = fsvBuildCorpusSearch({
+      repoRoot: root,
+      includeDirs: ['scripts'],
+      excludePaths: ['scripts/lib/fix-manifest.mjs'],
+    });
+    assert.equal(excluded('ONLY_IN_MANIFEST'), false);
+    // Without the exclusion, it self-matches — proving exclusion is the mechanism.
+    const notExcluded = fsvBuildCorpusSearch({ repoRoot: root, includeDirs: ['scripts'] });
+    assert.equal(notExcluded('ONLY_IN_MANIFEST'), true);
+  });
+});
+
+test('buildCorpusSearch: case-sensitive fixed-string match', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'hooks'), { recursive: true });
+    writeFileSync(join(root, 'hooks', 'h.mjs'), 'WIKI_AUTOCLOSE marker\n');
+    const search = fsvBuildCorpusSearch({ repoRoot: root, includeDirs: ['hooks'] });
+    assert.equal(search('WIKI_AUTOCLOSE'), true);
+    assert.equal(search('wiki_autoclose'), false);
+  });
+});
+
+test('buildCorpusSearch: missing include dir is tolerated (not fatal)', () => {
+  withTmpDir((root) => {
+    const search = fsvBuildCorpusSearch({ repoRoot: root, includeDirs: ['does-not-exist'] });
+    assert.equal(search('anything'), false);
+  });
+});
+
+test('manifest integration: real FIX_MANIFEST verifies clean against the real corpus', () => {
+  // Regression guard for the adrKeyLine curation: every non-NO_ADR row's literal
+  // must still exist in the production corpus (excluding the manifest itself),
+  // and every adrPath must resolve under the wiki. Skips if the wiki is absent.
+  const f1 = fsvValidateManifest(FSV_FIX_MANIFEST);
+  assert.deepEqual(f1, []);
+  const search = fsvBuildCorpusSearch({
+    repoRoot: REPO,
+    includeDirs: ['scripts', 'hooks', 'commands', 'skills', 'templates'],
+    excludePaths: ['scripts/lib/fix-manifest.mjs'],
+  });
+  const wikiDecisions = join(homedir(), 'hypomnema', 'projects', 'hypomnema');
+  const adrExists = (p) => existsSync(join(wikiDecisions, p));
+  const haveWiki = FSV_FIX_MANIFEST.every(
+    (r) => r.adrPath == null || existsSync(join(wikiDecisions, r.adrPath)),
+  );
+  // ADR-line grep is corpus-only (no wiki dependency); always assert it.
+  const lineFindings = fsvCheckAdrLines({
+    manifest: FSV_FIX_MANIFEST,
+    searchFn: search,
+    adrExistsFn: () => true,
+  }).filter((x) => x.class === 'ADR_LINE_MISSING');
+  assert.deepEqual(lineFindings, [], `ADR_LINE_MISSING: ${JSON.stringify(lineFindings)}`);
+  if (haveWiki) {
+    const pathFindings = fsvCheckAdrLines({
+      manifest: FSV_FIX_MANIFEST,
+      searchFn: search,
+      adrExistsFn: adrExists,
+    }).filter((x) => x.class === 'ADR_PATH_MISSING');
+    assert.deepEqual(pathFindings, [], `ADR_PATH_MISSING: ${JSON.stringify(pathFindings)}`);
+  }
+});
+
 // ── fix-status-verify CLI integration ────────────────────────────────────────
 
 suite('fix-status-verify — CLI integration');
@@ -11960,6 +12185,11 @@ test('CLI: green fixture → exit 0', () => {
         "console.log('  ✓ green-fixture-test');",
       ].join('\n'),
     );
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(
+      manifestPath,
+      "export const FIX_MANIFEST = [{ fixId: 100, testNames: ['green-fixture-test'], adrPath: null, adrKeyLine: 'NO_ADR' }];\n",
+    );
     const r = spawnSync(
       process.execPath,
       [
@@ -11968,6 +12198,8 @@ test('CLI: green fixture → exit 0', () => {
         specPath,
         '--runner',
         runnerPath,
+        '--manifest',
+        manifestPath,
         '--test-command',
         `${process.execPath} ${runnerPath}`,
       ],
@@ -11975,7 +12207,7 @@ test('CLI: green fixture → exit 0', () => {
     );
     assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
     assert.match(r.stdout, /verified/);
-    assert.match(r.stdout, /ADR core decision grep NOT checked/);
+    assert.match(r.stdout, /ADR-line grep \(Phase 2\)/);
   });
 });
 
@@ -11992,6 +12224,8 @@ test('CLI: type:reference stub spec → exit 1 with STUB_SPEC', () => {
       runnerPath,
       ['#!/usr/bin/env node', '// @fix #100: t', "console.log('  ✓ t');"].join('\n'),
     );
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(manifestPath, 'export const FIX_MANIFEST = [];\n');
     const r = spawnSync(
       process.execPath,
       [
@@ -12000,6 +12234,8 @@ test('CLI: type:reference stub spec → exit 1 with STUB_SPEC', () => {
         specPath,
         '--runner',
         runnerPath,
+        '--manifest',
+        manifestPath,
         '--test-command',
         `${process.execPath} ${runnerPath}`,
         '--json',
@@ -12026,6 +12262,8 @@ test('CLI: vacuous spec (anchors but 0 claims) → exit 1 with STUB_SPEC', () =>
       runnerPath,
       ['#!/usr/bin/env node', '// @fix #100: t', "console.log('  ✓ t');"].join('\n'),
     );
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(manifestPath, 'export const FIX_MANIFEST = [];\n');
     const r = spawnSync(
       process.execPath,
       [
@@ -12034,6 +12272,8 @@ test('CLI: vacuous spec (anchors but 0 claims) → exit 1 with STUB_SPEC', () =>
         specPath,
         '--runner',
         runnerPath,
+        '--manifest',
+        manifestPath,
         '--test-command',
         `${process.execPath} ${runnerPath}`,
         '--json',
@@ -12053,6 +12293,8 @@ test('CLI: missing anchor → exit 1 with NO_ANCHOR finding', () => {
     writeFileSync(specPath, '| #200 | merged | **resolved (PR #1)** — body |\n');
     const runnerPath = join(wikiDir, 'fixture-runner.mjs');
     writeFileSync(runnerPath, '// no anchor for #200\n');
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(manifestPath, 'export const FIX_MANIFEST = [];\n');
     const r = spawnSync(
       process.execPath,
       [
@@ -12061,6 +12303,8 @@ test('CLI: missing anchor → exit 1 with NO_ANCHOR finding', () => {
         specPath,
         '--runner',
         runnerPath,
+        '--manifest',
+        manifestPath,
         '--test-command',
         `${process.execPath} ${runnerPath}`,
       ],
@@ -12084,6 +12328,11 @@ test('CLI: anchor names test that does not run → exit 1 with MISSING_TEST', ()
         "console.log('  ✓ different-name');",
       ].join('\n'),
     );
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(
+      manifestPath,
+      "export const FIX_MANIFEST = [{ fixId: 300, testNames: ['ghost-test-name'], adrPath: null, adrKeyLine: 'NO_ADR' }];\n",
+    );
     const r = spawnSync(
       process.execPath,
       [
@@ -12092,6 +12341,8 @@ test('CLI: anchor names test that does not run → exit 1 with MISSING_TEST', ()
         specPath,
         '--runner',
         runnerPath,
+        '--manifest',
+        manifestPath,
         '--test-command',
         `${process.execPath} ${runnerPath}`,
       ],
@@ -12111,6 +12362,11 @@ test('CLI: --json emits machine-readable report with ok flag', () => {
       runnerPath,
       ['#!/usr/bin/env node', '// @fix #400: t', "console.log('  ✓ t');"].join('\n'),
     );
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(
+      manifestPath,
+      "export const FIX_MANIFEST = [{ fixId: 400, testNames: ['t'], adrPath: null, adrKeyLine: 'NO_ADR' }];\n",
+    );
     const r = spawnSync(
       process.execPath,
       [
@@ -12119,6 +12375,8 @@ test('CLI: --json emits machine-readable report with ok flag', () => {
         specPath,
         '--runner',
         runnerPath,
+        '--manifest',
+        manifestPath,
         '--test-command',
         `${process.execPath} ${runnerPath}`,
         '--json',
@@ -12133,7 +12391,7 @@ test('CLI: --json emits machine-readable report with ok flag', () => {
     // Mandatory note string is identical in human and JSON outputs.
     assert.equal(
       j.note,
-      'test-linkage + green only — ADR core decision grep NOT checked, see Phase 2 / v1.3.0',
+      'test-linkage + green + ADR-line grep (Phase 2): manifest evidence checked against production corpus',
     );
   });
 });
@@ -12149,6 +12407,11 @@ test('CLI: anchored test fails → exit 1 with FAILING_TEST', () => {
         '\n',
       ),
     );
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(
+      manifestPath,
+      "export const FIX_MANIFEST = [{ fixId: 500, testNames: ['real-test'], adrPath: null, adrKeyLine: 'NO_ADR' }];\n",
+    );
     const r = spawnSync(
       process.execPath,
       [
@@ -12157,6 +12420,8 @@ test('CLI: anchored test fails → exit 1 with FAILING_TEST', () => {
         specPath,
         '--runner',
         runnerPath,
+        '--manifest',
+        manifestPath,
         '--test-command',
         `${process.execPath} ${runnerPath}`,
       ],
@@ -12177,6 +12442,8 @@ test('CLI: test command exits nonzero → exit 1 with TEST_RUN_NONZERO_EXIT', ()
       runnerPath,
       ['#!/usr/bin/env node', "console.log('  ✓ a test passed');", 'process.exit(7);'].join('\n'),
     );
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(manifestPath, 'export const FIX_MANIFEST = [];\n');
     const r = spawnSync(
       process.execPath,
       [
@@ -12185,6 +12452,8 @@ test('CLI: test command exits nonzero → exit 1 with TEST_RUN_NONZERO_EXIT', ()
         specPath,
         '--runner',
         runnerPath,
+        '--manifest',
+        manifestPath,
         '--test-command',
         `${process.execPath} ${runnerPath}`,
         '--json',
@@ -12198,6 +12467,88 @@ test('CLI: test command exits nonzero → exit 1 with TEST_RUN_NONZERO_EXIT', ()
     assert.ok(
       j.findings.some((f) => f.class === 'TEST_RUN_NONZERO_EXIT'),
       `expected TEST_RUN_NONZERO_EXIT finding: ${JSON.stringify(j.findings)}`,
+    );
+  });
+});
+
+test('CLI: manifest adrKeyLine absent from corpus → exit 1 with ADR_LINE_MISSING', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    writeFileSync(specPath, '| #600 | merged | **TRUE_MERGED** — body |\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(
+      runnerPath,
+      ['#!/usr/bin/env node', '// @fix #600: t600', "console.log('  ✓ t600');"].join('\n'),
+    );
+    // adrPath resolves (temp wiki has the file) so the ONLY failure is the
+    // missing corpus literal.
+    mkdirSync(join(wikiDir, 'projects', 'hypomnema', 'decisions'), { recursive: true });
+    writeFileSync(join(wikiDir, 'projects', 'hypomnema', 'decisions', 'real.md'), '# adr\n');
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(
+      manifestPath,
+      "export const FIX_MANIFEST = [{ fixId: 600, testNames: ['t600'], adrPath: 'decisions/real.md', adrKeyLine: 'ZZ_LITERAL_NOT_IN_ANY_PRODUCTION_FILE_zz' }];\n",
+    );
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--manifest',
+        manifestPath,
+        '--hypo-dir',
+        wikiDir,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const j = JSON.parse(r.stdout);
+    assert.ok(
+      j.findings.some((f) => f.class === 'ADR_LINE_MISSING' && f.fixNum === 600),
+      `expected ADR_LINE_MISSING: ${JSON.stringify(j.findings)}`,
+    );
+    assert.ok(!j.findings.some((f) => f.class === 'ADR_PATH_MISSING'));
+  });
+});
+
+test('CLI: claimed+anchored fix with no manifest row → exit 1 with MANIFEST_MISSING_ROW', () => {
+  withTmpDir((wikiDir) => {
+    const specPath = join(wikiDir, 'spec.md');
+    writeFileSync(specPath, '| #700 | merged | **TRUE_MERGED** — body |\n');
+    const runnerPath = join(wikiDir, 'fixture-runner.mjs');
+    writeFileSync(
+      runnerPath,
+      ['#!/usr/bin/env node', '// @fix #700: t700', "console.log('  ✓ t700');"].join('\n'),
+    );
+    const manifestPath = join(wikiDir, 'manifest.mjs');
+    writeFileSync(manifestPath, 'export const FIX_MANIFEST = [];\n');
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'fix-status-verify.mjs'),
+        '--spec',
+        specPath,
+        '--runner',
+        runnerPath,
+        '--manifest',
+        manifestPath,
+        '--test-command',
+        `${process.execPath} ${runnerPath}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', cwd: REPO },
+    );
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const j = JSON.parse(r.stdout);
+    assert.ok(
+      j.findings.some((f) => f.class === 'MANIFEST_MISSING_ROW' && f.fixNum === 700),
+      `expected MANIFEST_MISSING_ROW: ${JSON.stringify(j.findings)}`,
     );
   });
 });

@@ -260,4 +260,179 @@ export function verifyMatrix({ anchors, status, testResults, specIsStub = false 
   return { ok, findings };
 }
 
-export { POSITIVE_STATUSES, NEGATIVE_STATUS_TOKENS };
+// ── Phase 2 (A-sot) — manifest validation, coverage/drift, ADR-line grep ─────
+// ADR 0036: manifest is the evidence SoT (fix → test + ADR-line). status SoT
+// stays in the spec. These are pure functions; the CLI injects fs-backed
+// searchFn / adrExistsFn so the corpus walk stays out of the pure layer.
+
+import { FIX_MANIFEST, NO_ADR, NO_AUTO_TEST } from './fix-manifest.mjs';
+
+/** Order-insensitive set equality over string arrays (deduped). */
+function sameStringSet(a, b) {
+  const sa = new Set(a);
+  const sb = new Set(b);
+  if (sa.size !== sb.size) return false;
+  for (const x of sa) if (!sb.has(x)) return false;
+  return true;
+}
+
+/**
+ * Structural validation of the manifest shape (ADR 0036).
+ *
+ * Findings (all error):
+ *   MANIFEST_DUP_FIXID       — two rows share a fixId.
+ *   MANIFEST_EMPTY_TESTS     — testNames is empty.
+ *   MANIFEST_SENTINEL_MIX    — NO_AUTO_TEST mixed with real test names.
+ *   MANIFEST_EMPTY_KEYLINE   — adrKeyLine missing/blank.
+ *   MANIFEST_NO_ADR_SHAPE    — NO_ADR row with non-null adrPath, or a non-NO_ADR
+ *                              row with null adrPath.
+ */
+export function validateManifest(manifest = FIX_MANIFEST) {
+  const findings = [];
+  const seen = new Set();
+  for (const row of manifest) {
+    const fixNum = row.fixId;
+    if (seen.has(fixNum)) {
+      findings.push({
+        level: 'error',
+        class: 'MANIFEST_DUP_FIXID',
+        fixNum,
+        detail: `duplicate manifest row for fix #${fixNum}`,
+      });
+    }
+    seen.add(fixNum);
+
+    const names = Array.isArray(row.testNames) ? row.testNames : [];
+    if (names.length === 0) {
+      findings.push({
+        level: 'error',
+        class: 'MANIFEST_EMPTY_TESTS',
+        fixNum,
+        detail: `fix #${fixNum} manifest row has empty testNames`,
+      });
+    }
+    if (names.includes(NO_AUTO_TEST) && names.length > 1) {
+      findings.push({
+        level: 'error',
+        class: 'MANIFEST_SENTINEL_MIX',
+        fixNum,
+        detail: `fix #${fixNum} mixes NO_AUTO_TEST sentinel with real test names`,
+      });
+    }
+
+    const keyLine = typeof row.adrKeyLine === 'string' ? row.adrKeyLine.trim() : '';
+    if (!keyLine) {
+      findings.push({
+        level: 'error',
+        class: 'MANIFEST_EMPTY_KEYLINE',
+        fixNum,
+        detail: `fix #${fixNum} manifest row has empty adrKeyLine`,
+      });
+      continue;
+    }
+    const isNoAdr = row.adrKeyLine === NO_ADR;
+    if (isNoAdr && row.adrPath != null) {
+      findings.push({
+        level: 'error',
+        class: 'MANIFEST_NO_ADR_SHAPE',
+        fixNum,
+        detail: `fix #${fixNum} is NO_ADR but adrPath is not null`,
+      });
+    }
+    if (!isNoAdr && row.adrPath == null) {
+      findings.push({
+        level: 'error',
+        class: 'MANIFEST_NO_ADR_SHAPE',
+        fixNum,
+        detail: `fix #${fixNum} has a real adrKeyLine but null adrPath`,
+      });
+    }
+  }
+  return findings;
+}
+
+/**
+ * Coverage + drift between manifest, runner anchors, and spec status claims.
+ *
+ *   MANIFEST_MISSING_ROW  — a fix claimed-merged AND anchored has no manifest
+ *                           row (its ADR-line check would be silently skipped).
+ *                           Error: a missing row bypasses the whole gate.
+ *   MANIFEST_TEST_DRIFT   — a manifest row's testNames do not set-equal the
+ *                           runner anchors for that fix (stale evidence).
+ *
+ * Both error-level. The claimed∩anchored requirement mirrors the manifest
+ * scope (ADR 0036): rows exist to prove claims; anchors-without-claims are
+ * ORPHAN_ANCHOR (handled in verifyMatrix), not manifest gaps.
+ */
+export function checkManifestCoverage({ manifest = FIX_MANIFEST, anchors, status }) {
+  const findings = [];
+  const byFix = new Map(manifest.map((r) => [r.fixId, r]));
+
+  for (const fixNum of status.keys()) {
+    if (!anchors.has(fixNum)) continue; // claimed but unanchored → NO_ANCHOR (verifyMatrix)
+    if (!byFix.has(fixNum)) {
+      findings.push({
+        level: 'error',
+        class: 'MANIFEST_MISSING_ROW',
+        fixNum,
+        detail: `fix #${fixNum} is claimed-merged and anchored but has no manifest row`,
+      });
+    }
+  }
+
+  for (const row of manifest) {
+    const fixNum = row.fixId;
+    const anchored = anchors.get(fixNum) || [];
+    const names = Array.isArray(row.testNames) ? row.testNames : [];
+    if (!sameStringSet(names, anchored)) {
+      findings.push({
+        level: 'error',
+        class: 'MANIFEST_TEST_DRIFT',
+        fixNum,
+        detail:
+          `fix #${fixNum} manifest testNames ${JSON.stringify(names)} ` +
+          `≠ runner anchors ${JSON.stringify(anchored)}`,
+      });
+    }
+  }
+  return findings;
+}
+
+/**
+ * ADR-line grep: each non-NO_ADR manifest row must point at an existing ADR
+ * file and its adrKeyLine must exist verbatim in the production-code corpus.
+ *
+ *   ADR_PATH_MISSING   — adrPath does not resolve to a file.
+ *   ADR_LINE_MISSING   — adrKeyLine not found in the corpus (fixed-string).
+ *
+ * searchFn(literal) → boolean: true iff the literal appears in the corpus
+ * (the corpus MUST exclude scripts/lib/fix-manifest.mjs, else every line
+ * self-matches and the gate is vacuous — see the CLI corpus builder).
+ * adrExistsFn(adrPath) → boolean. NO_ADR rows are skipped (test-green only).
+ */
+export function checkAdrLines({ manifest = FIX_MANIFEST, searchFn, adrExistsFn }) {
+  const findings = [];
+  for (const row of manifest) {
+    if (row.adrKeyLine === NO_ADR) continue;
+    const fixNum = row.fixId;
+    if (row.adrPath != null && !adrExistsFn(row.adrPath)) {
+      findings.push({
+        level: 'error',
+        class: 'ADR_PATH_MISSING',
+        fixNum,
+        detail: `fix #${fixNum} adrPath does not resolve: ${row.adrPath}`,
+      });
+    }
+    if (!searchFn(row.adrKeyLine)) {
+      findings.push({
+        level: 'error',
+        class: 'ADR_LINE_MISSING',
+        fixNum,
+        detail: `fix #${fixNum} adrKeyLine not found in production corpus: "${row.adrKeyLine}"`,
+      });
+    }
+  }
+  return findings;
+}
+
+export { POSITIVE_STATUSES, NEGATIVE_STATUS_TOKENS, FIX_MANIFEST, NO_ADR, NO_AUTO_TEST };
