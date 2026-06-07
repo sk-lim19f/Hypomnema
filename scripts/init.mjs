@@ -46,6 +46,7 @@ import {
   readFileIfRegular,
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
+import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -108,6 +109,7 @@ function parseArgs(argv) {
     fromRemote: null,
     shellSetup: true,
     shellConfig: null,
+    allowDowngrade: false,
   };
   for (const arg of argv.slice(2)) {
     if (arg === '--help' || arg === '-h') {
@@ -136,6 +138,8 @@ Init options:
   --from-remote=<url>    Clone existing Hypomnema wiki from remote and install hooks
   --no-shell             Skip shell function setup (~/.zshrc / ~/.bashrc)
   --shell-config=<path>  Shell config file path (default: auto-detect)
+  --allow-downgrade      Override the guard that refuses to overwrite NEWER active
+                         hooks with an older package (stale-PATH-CLI footgun)
   --dry-run              Show what would be done without making changes
   --help, -h             Show this help message
 
@@ -160,6 +164,7 @@ docstring at the top of scripts/<command>.mjs.`);
     } else if (arg === '--dry-run') args.dryRun = true;
     else if (arg === '--no-shell') args.shellSetup = false;
     else if (arg.startsWith('--shell-config=')) args.shellConfig = expandHome(arg.slice(15));
+    else if (arg === '--allow-downgrade') args.allowDowngrade = true;
   }
   return args;
 }
@@ -417,6 +422,27 @@ node "$REPO_ROOT/scripts/upgrade.mjs" --apply
 
 function pkgJsonPath() {
   return join(HOME, '.claude', 'hypo-pkg.json');
+}
+
+/**
+ * ADR 0038 (P): abort when this package would DOWNGRADE a newer active install.
+ * Exit 2 (distinct from the generic exit-1 error class) on refusal so callers and
+ * tests can tell "refused downgrade" apart from "init failed". No-ops on a fresh
+ * install (no metadata), unparseable versions, the same package re-running itself,
+ * --allow-downgrade, or --dry-run.
+ */
+function maybeRefuseDowngrade(op, allowDowngrade, dryRun) {
+  if (allowDowngrade || dryRun) return;
+  const active = readPkgJsonSafe(pkgJsonPath());
+  if (!active || !active.pkgVersion || !PKG_VERSION) return;
+  const verdict = classifyInstall(
+    { pkgRoot: PKG_ROOT, version: PKG_VERSION },
+    { pkgRoot: active.pkgRoot, version: active.pkgVersion },
+  );
+  if (verdict === 'downgrade') {
+    console.error(downgradeGuardMessage(PKG_VERSION, active.pkgVersion, op));
+    process.exit(2);
+  }
 }
 
 function writePkgJson(dryRun, extraFields = {}) {
@@ -777,6 +803,17 @@ const args = parseArgs(process.argv);
 // Validate hooks.json before any file writes so a bad package leaves no partial state
 const HOOK_MAP = args.hooks || args.codex ? loadHookMap() : null;
 
+// Downgrade guard (ADR 0038, P): refuse to overwrite a NEWER active install with
+// an older package. The footgun: a stale `npm i -g hypomnema` owns the `hypomnema`
+// bin on PATH, so `hypomnema init` runs the OLD package and silently downgrades
+// the newer install (dropping features like the update-notifier). Runs
+// UNCONDITIONALLY before the first write — `--no-hooks --no-commands` is NOT safe:
+// init still installs the wiki pre-commit hook (repointed to the stale pkgRoot)
+// and, with `--codex`, writes ~/.codex hooks/settings. The guard no-ops on a fresh
+// install, same realpath'd pkgRoot (dev re-run / npm-link / post-commit sync),
+// --allow-downgrade, or --dry-run, so legitimate flows are unaffected.
+maybeRefuseDowngrade('init', args.allowDowngrade, args.dryRun);
+
 if (args.fromRemote) {
   // ── from-remote path: clone → read config → install hooks ──────────────────
   const cloned = cloneFromRemote(args.fromRemote, args.hypoDir, args.dryRun);
@@ -863,9 +900,13 @@ if (args.hooks) {
   mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun, HOOK_MAP);
 }
 
-if (args.hooks || args.commands) {
-  writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {});
-}
+// Always record the active install identity (pkgRoot + pkgVersion), even for a
+// --no-hooks --no-commands scaffold. That flow still installs the wiki pre-commit
+// hook (and, with --codex, ~/.codex hooks); without a recorded pkgVersion baseline
+// the ADR 0038 downgrade guard has nothing to compare against, so a later stale
+// sibling could repoint those surfaces unguarded. writePkgJson merges (...existing),
+// so this never clobbers a commands/extensions map written elsewhere.
+writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {});
 
 // 4b. user extensions companion sync (ADR 0024). Runs after
 // writePkgJson so the per-target SHA map is merged into the same hypo-pkg.json

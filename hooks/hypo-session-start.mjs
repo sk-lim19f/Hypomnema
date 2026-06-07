@@ -37,6 +37,10 @@ import {
   computeNotice,
   markNotified,
   isOptedOut,
+  resolveCliOnPath,
+  computeSiblingNotice,
+  siblingAlreadyNotified,
+  markSiblingNotified,
 } from './version-check.mjs';
 
 // Privacy guard: refuse to read+inject .hypoignore-matched
@@ -113,6 +117,45 @@ function buildUpdateNotice() {
     const notice = computeNotice(cache, channel, version);
     if (!notice) return '';
     markNotified(cachePath, channel, notice.latest);
+    return notice.line;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Stale-sibling notice (ADR 0038, D3). The update-notifier above only knows
+ * whether the ACTIVE install is behind latest — it is blind to an OLDER sibling
+ * that owns the `hypomnema` bin on PATH. That sibling is the live footgun:
+ * running `hypomnema init`/`upgrade` through it downgrades the active hooks.
+ *
+ * This is the ONLY surface that reaches a user already in that state, because it
+ * runs from the (newer) active hook — `doctor` invoked via the stale CLI would
+ * run the stale doctor. fs-only (no npm/which spawn). Throttled via the cache so
+ * it nags once per (cliPath@cliVersion → activeVersion) tuple. Best-effort.
+ */
+function buildSiblingNotice() {
+  try {
+    if (isOptedOut()) return '';
+    // Active install identity = hypo-pkg.json (what init/upgrade write). This is
+    // the authoritative pkgRoot+version; ACTIVE_ROOT (~/.claude) has no package.json.
+    let active = null;
+    try {
+      active = JSON.parse(readFileSync(join(homedir(), '.claude', 'hypo-pkg.json'), 'utf-8'));
+    } catch {
+      return ''; // no active metadata → nothing to compare a sibling against
+    }
+    if (!active || !active.pkgVersion) return '';
+    const cli = resolveCliOnPath('hypomnema');
+    const notice = computeSiblingNotice(cli, {
+      pkgRoot: active.pkgRoot,
+      version: active.pkgVersion,
+    });
+    if (!notice) return '';
+    const cachePath = defaultCachePath();
+    const cache = readCache(cachePath);
+    if (siblingAlreadyNotified(cache, notice.key)) return '';
+    markSiblingNotified(cachePath, notice.key);
     return notice.line;
   } catch {
     return '';
@@ -295,17 +338,21 @@ process.stdin.on('end', () => {
     // immediately after read.
     const clearRecoveryLine = buildClearRecoveryLine(data.source);
     const updateLine = buildUpdateNotice();
+    const siblingLine = buildSiblingNotice();
     // Intentional dual emit: stderr (yellow/cyan) is the human-visible nudge in
     // the terminal; noticePrefix injects the same plain-text lines into the
     // LLM's additionalContext so model and user start the session looking at
     // the same state. ANSI escapes are kept out of additionalContext on purpose.
-    const notices = [syncLine, growthLine, clearRecoveryLine, updateLine].filter(Boolean);
+    const notices = [syncLine, growthLine, clearRecoveryLine, updateLine, siblingLine].filter(
+      Boolean,
+    );
     let noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
     if (syncLine) process.stderr.write(`\n\x1b[33m${syncLine}\x1b[0m\n`);
     if (growthLine) process.stderr.write(`\n\x1b[36m${growthLine}\x1b[0m\n`);
     if (clearRecoveryLine)
       process.stderr.write(`\n\x1b[33m${clearRecoveryLine.split('\n')[0]}\x1b[0m\n`);
     if (updateLine) process.stderr.write(`\n\x1b[33m${updateLine}\x1b[0m\n`);
+    if (siblingLine) process.stderr.write(`\n\x1b[33m${siblingLine}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = sessionMarkerPath(sessionId);

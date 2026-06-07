@@ -31,7 +31,8 @@ import {
   EXT_TYPES,
   CODEX_TYPES,
 } from './lib/extensions.mjs';
-import { sha256, readFileIfRegular } from './lib/pkg-json.mjs';
+import { sha256, readFileIfRegular, readPkgJson } from './lib/pkg-json.mjs';
+import { resolveCliOnPath, classifyInstall } from '../hooks/version-check.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -1008,6 +1009,40 @@ function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
   }
 }
 
+// ── stale sibling install (ADR 0038, D) ──────────────────────────────────────
+//
+// Detect a SECOND, older Hypomnema that owns the `hypomnema` bin on PATH while a
+// newer copy owns the active hooks. That sibling is a footgun: `hypomnema init` /
+// `upgrade --apply` routed through it downgrades the active hooks. This is a
+// detective backstop to the preventive init/upgrade guard — but it must NOT be
+// the only surface, since `hypomnema doctor` invoked via the stale CLI would run
+// the OLD doctor (the active-hook notifier covers that live case). fs-only.
+function checkStaleSibling() {
+  const active = readPkgJson(join(HOME, '.claude', 'hypo-pkg.json'));
+  if (!active || !active.pkgVersion) {
+    pass('PATH CLI vs active install', 'no active metadata (skipped)');
+    return;
+  }
+  const cli = resolveCliOnPath('hypomnema');
+  if (!cli) {
+    pass('PATH CLI vs active install', `no \`hypomnema\` on PATH (active v${active.pkgVersion})`);
+    return;
+  }
+  const verdict = classifyInstall(
+    { pkgRoot: cli.pkgRoot, version: cli.version },
+    { pkgRoot: active.pkgRoot, version: active.pkgVersion },
+  );
+  if (verdict === 'downgrade') {
+    warn(
+      'PATH CLI vs active install',
+      `stale sibling: \`${cli.binPath}\` is v${cli.version}, active is v${active.pkgVersion} — ` +
+        `running it would DOWNGRADE hooks. Remove with \`npm uninstall -g hypomnema\``,
+    );
+  } else {
+    pass('PATH CLI vs active install', `v${cli.version} (active v${active.pkgVersion})`);
+  }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -1023,6 +1058,7 @@ if (rootOk) {
 }
 checkHooks();
 checkSettingsJson();
+checkStaleSibling();
 if (args.codex) checkCodexPaths();
 if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');

@@ -9670,6 +9670,28 @@ test('compareSemver: release outranks prerelease, build metadata ignored', () =>
   assert.equal(vc.compareSemver('1.2.3+build9', '1.2.3'), 0);
 });
 
+test('compareSemver: full SemVer §11 prerelease precedence (gates the guard)', () => {
+  // numeric identifiers compare numerically, NOT lexically (the old bug: rc.10 < rc.2)
+  assert.equal(vc.compareSemver('1.2.3-rc.2', '1.2.3-rc.10'), -1);
+  assert.equal(vc.compareSemver('1.2.3-rc.10', '1.2.3-rc.2'), 1);
+  // numeric identifiers rank LOWER than alphanumeric
+  assert.equal(vc.compareSemver('1.0.0-1', '1.0.0-alpha'), -1);
+  // a larger set of fields outranks a strict prefix
+  assert.equal(vc.compareSemver('1.0.0-alpha', '1.0.0-alpha.1'), -1);
+  assert.equal(vc.compareSemver('1.0.0-alpha.beta', '1.0.0-alpha'), 1);
+  // canonical SemVer example chain
+  assert.equal(vc.compareSemver('1.0.0-alpha.1', '1.0.0-alpha.beta'), -1);
+  assert.equal(vc.compareSemver('1.0.0-beta', '1.0.0-beta.2'), -1);
+  assert.equal(vc.compareSemver('1.0.0-rc.1', '1.0.0'), -1);
+  // numeric identifiers beyond 2^53 must not collapse via Number() (codex re-review)
+  assert.equal(vc.compareSemver('1.0.0-9007199254740992', '1.0.0-9007199254740993'), -1);
+  assert.equal(vc.compareSemver('1.0.0-9007199254740993', '1.0.0-9007199254740992'), 1);
+  assert.equal(vc.compareSemver('1.0.0-10', '1.0.0-9'), 1); // length-aware: 10 > 9
+  // CORE major/minor/patch is precision-safe too (codex final-pass CONCERN)
+  assert.equal(vc.compareSemver('9007199254740992.0.0', '9007199254740993.0.0'), -1);
+  assert.equal(vc.compareSemver('2.0.0', '10.0.0'), -1); // length-aware core ordering
+});
+
 test('compareSemver: invalid input returns null', () => {
   assert.equal(vc.compareSemver('not-a-version', '1.0.0'), null);
   assert.equal(vc.compareSemver('1.0.0', ''), null);
@@ -9795,6 +9817,439 @@ test('mergeLatest: refreshes latest but preserves notifiedFor', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── stale-sibling detection (ADR 0038) ────────────────────────────────────────
+// Two Hypomnema installs coexist; an OLDER one owns the `hypomnema` bin on PATH
+// while a newer one owns the active hooks. P = init/upgrade downgrade-guard,
+// D3 = notifier sibling notice, D = doctor sibling scan. Shared logic lives in
+// version-check.mjs (classifyInstall / resolveCliOnPath / computeSiblingNotice).
+
+suite('stale-sibling: classifyInstall()');
+
+test('classifyInstall: strictly older incoming → downgrade', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-cl-'));
+  const a = join(dir, 'a');
+  const b = join(dir, 'b');
+  mkdirSync(a);
+  mkdirSync(b);
+  try {
+    assert.equal(
+      vc.classifyInstall({ pkgRoot: a, version: '1.1.0' }, { pkgRoot: b, version: '1.2.1' }),
+      'downgrade',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('classifyInstall: same realpath root is never a downgrade (dev re-run / npm-link)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-cl-'));
+  try {
+    // identical pkgRoot even though versions differ → exempt
+    assert.equal(
+      vc.classifyInstall({ pkgRoot: dir, version: '1.1.0' }, { pkgRoot: dir, version: '9.9.9' }),
+      'same',
+    );
+    // a symlink to the same dir must resolve equal, too
+    const link = join(tmpdir(), `hypo-cl-link-${process.pid}`);
+    try {
+      symlinkSync(dir, link);
+      assert.equal(
+        vc.classifyInstall({ pkgRoot: link, version: '1.1.0' }, { pkgRoot: dir, version: '9.9.9' }),
+        'same',
+      );
+    } finally {
+      try {
+        unlinkSync(link);
+      } catch {}
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('classifyInstall: newer-or-equal → ok; unparseable → unknown', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-cl-'));
+  const a = join(dir, 'a');
+  const b = join(dir, 'b');
+  mkdirSync(a);
+  mkdirSync(b);
+  try {
+    assert.equal(
+      vc.classifyInstall({ pkgRoot: a, version: '1.3.0' }, { pkgRoot: b, version: '1.2.1' }),
+      'ok',
+    );
+    assert.equal(
+      vc.classifyInstall({ pkgRoot: a, version: '1.2.1' }, { pkgRoot: b, version: '1.2.1' }),
+      'ok',
+    );
+    assert.equal(
+      vc.classifyInstall({ pkgRoot: a, version: 'garbage' }, { pkgRoot: b, version: '1.2.1' }),
+      'unknown',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+suite('stale-sibling: resolveCliOnPath()');
+
+// Build a fake npm-global layout: bin/hypomnema is a symlink into
+// node_modules/hypomnema/scripts/init.mjs, mirroring a real `npm i -g` install.
+function withFakeCli(version, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-cli-'));
+  try {
+    const pkgRoot = join(dir, 'lib', 'node_modules', 'hypomnema');
+    mkdirSync(join(pkgRoot, 'scripts'), { recursive: true });
+    writeFileSync(
+      join(pkgRoot, 'package.json'),
+      JSON.stringify({ name: 'hypomnema', version, bin: { hypomnema: 'scripts/init.mjs' } }),
+    );
+    writeFileSync(join(pkgRoot, 'scripts', 'init.mjs'), '#!/usr/bin/env node\n');
+    const binDir = join(dir, 'bin');
+    mkdirSync(binDir);
+    symlinkSync(join(pkgRoot, 'scripts', 'init.mjs'), join(binDir, 'hypomnema'));
+    fn({ dir, binDir, pkgRoot });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('resolveCliOnPath: resolves symlinked bin → owning package version', () => {
+  withFakeCli('1.1.0', ({ binDir, pkgRoot }) => {
+    const info = vc.resolveCliOnPath('hypomnema', { PATH: binDir });
+    assert.ok(info, 'expected a hit');
+    assert.equal(info.version, '1.1.0');
+    assert.equal(vc.realpathSafe(info.pkgRoot), vc.realpathSafe(pkgRoot));
+  });
+});
+
+test('resolveCliOnPath: returns null when bin is absent from PATH', () => {
+  const empty = mkdtempSync(join(tmpdir(), 'hypo-empty-'));
+  try {
+    assert.equal(vc.resolveCliOnPath('hypomnema', { PATH: empty }), null);
+    assert.equal(vc.resolveCliOnPath('hypomnema', { PATH: '' }), null);
+  } finally {
+    rmSync(empty, { recursive: true, force: true });
+  }
+});
+
+test('resolveCliOnPath: first PATH hit wins (shell resolution order)', () => {
+  withFakeCli('1.1.0', ({ binDir: oldBin }) => {
+    withFakeCli('9.9.9', ({ binDir: newBin }) => {
+      // old dir first → that's the one the shell runs
+      const info = vc.resolveCliOnPath('hypomnema', { PATH: `${oldBin}:${newBin}` });
+      assert.equal(info.version, '1.1.0');
+    });
+  });
+});
+
+suite('stale-sibling: computeSiblingNotice() + throttle');
+
+test('computeSiblingNotice: older PATH CLI than active → notice with key + remediation', () => {
+  const cli = { binPath: '/opt/homebrew/bin/hypomnema', pkgRoot: '/a', version: '1.1.0' };
+  const notice = vc.computeSiblingNotice(cli, { pkgRoot: '/b', version: '1.2.1' });
+  assert.ok(notice);
+  assert.equal(notice.cliVersion, '1.1.0');
+  assert.match(notice.line, /Stale install on PATH/);
+  assert.match(notice.line, /npm uninstall -g hypomnema/);
+  assert.match(notice.line, /DOWNGRADE/);
+  assert.equal(notice.key, '/opt/homebrew/bin/hypomnema@1.1.0->1.2.1');
+});
+
+test('computeSiblingNotice: equal/newer/same-root/missing → null', () => {
+  assert.equal(
+    vc.computeSiblingNotice(
+      { binPath: '/x', pkgRoot: '/a', version: '1.2.1' },
+      { pkgRoot: '/b', version: '1.2.1' },
+    ),
+    null,
+  );
+  assert.equal(vc.computeSiblingNotice(null, { pkgRoot: '/b', version: '1.2.1' }), null);
+  assert.equal(
+    vc.computeSiblingNotice({ binPath: '/x', pkgRoot: '/a', version: '1.1.0' }, null),
+    null,
+  );
+  assert.equal(
+    vc.computeSiblingNotice({ binPath: '/x', pkgRoot: '/a', version: '1.1.0' }, { version: '' }),
+    null,
+  );
+});
+
+test('siblingNotified throttle: mark + read round-trip', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-sib-'));
+  const path = join(dir, 'version-check.json');
+  try {
+    assert.equal(vc.siblingAlreadyNotified(vc.readCache(path), 'k1'), false);
+    vc.markSiblingNotified(path, 'k1');
+    assert.equal(vc.siblingAlreadyNotified(vc.readCache(path), 'k1'), true);
+    assert.equal(vc.siblingAlreadyNotified(vc.readCache(path), 'k2'), false); // different tuple
+    // mark preserves other cache fields
+    vc.writeCacheAtomic(path, { latest: { npm: '1.2.0' }, siblingNotifiedFor: 'k1' });
+    vc.markSiblingNotified(path, 'k3');
+    const c = vc.readCache(path);
+    assert.equal(c.siblingNotifiedFor, 'k3');
+    assert.equal(c.latest.npm, '1.2.0');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('downgradeGuardMessage: names both versions + the override flag', () => {
+  const msg = vc.downgradeGuardMessage('1.1.0', '1.2.1', 'init');
+  assert.match(msg, /Refusing to init/);
+  assert.match(msg, /v1\.1\.0/);
+  assert.match(msg, /v1\.2\.1/);
+  assert.match(msg, /--allow-downgrade/);
+});
+
+suite('stale-sibling: init/upgrade downgrade guard (P, integration)');
+
+// Seed a tmp HOME with ~/.claude/hypo-pkg.json describing the ACTIVE install.
+function seedActivePkg(home, { pkgRoot, pkgVersion }) {
+  const claudeDir = join(home, '.claude');
+  mkdirSync(claudeDir, { recursive: true });
+  writeFileSync(
+    join(claudeDir, 'hypo-pkg.json'),
+    JSON.stringify({ pkgRoot, pkgVersion, schemaVersion: '2.0' }, null, 2),
+  );
+}
+
+test('init: refuses (exit 2) when active install is NEWER and a different root', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      // active = a different root at a far-future version → this repo would downgrade it
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '99.0.0' });
+      const r = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${wiki}`, '--no-git-init', '--no-shell'],
+        home,
+      );
+      assert.equal(r.status, 2, `expected refusal exit 2, got ${r.status}\n${r.stderr}`);
+      assert.match(r.stderr, /Refusing to init/);
+      // guard fired BEFORE writes: no hooks installed into the tmp HOME
+      assert.equal(existsSync(join(home, '.claude', 'hooks')), false);
+    });
+  });
+});
+
+test('init: --allow-downgrade overrides the guard', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '99.0.0' });
+      const r = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${wiki}`, '--no-git-init', '--no-shell', '--allow-downgrade'],
+        home,
+      );
+      assert.notEqual(r.status, 2, `should not be refused\n${r.stderr}`);
+    });
+  });
+});
+
+test('init: same package root re-running itself is exempt (no false refusal)', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      // active pkgRoot == this repo (what init runs from) → realpath-equal → exempt
+      seedActivePkg(home, { pkgRoot: REPO, pkgVersion: '99.0.0' });
+      const r = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${wiki}`, '--no-git-init', '--no-shell'],
+        home,
+      );
+      assert.notEqual(r.status, 2, `same-root must not be refused\n${r.stderr}`);
+    });
+  });
+});
+
+test('init: fresh HOME with no active metadata is not blocked', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      const r = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${wiki}`, '--no-git-init', '--no-shell'],
+        home,
+      );
+      assert.notEqual(r.status, 2, `fresh install must not be refused\n${r.stderr}`);
+    });
+  });
+});
+
+// Guard regression (codex pre-commit BLOCKER): the guard must NOT be gated on
+// hooks/commands — init still writes the wiki pre-commit hook unconditionally and
+// ~/.codex hooks under --codex, both of which downgrade-repoint to the stale root.
+test('init: --no-hooks --no-commands is still guarded (wiki pre-commit repoint footgun)', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '99.0.0' });
+      const r = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${wiki}`, '--no-git-init', '--no-shell', '--no-hooks', '--no-commands'],
+        home,
+      );
+      assert.equal(r.status, 2, `expected refusal exit 2, got ${r.status}\n${r.stderr}`);
+      assert.match(r.stderr, /Refusing to init/);
+    });
+  });
+});
+
+test('init: --codex --no-hooks --no-commands is guarded (no ~/.codex downgrade bypass)', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '99.0.0' });
+      const r = runWithHome(
+        'init.mjs',
+        [
+          `--hypo-dir=${wiki}`,
+          '--no-git-init',
+          '--no-shell',
+          '--no-hooks',
+          '--no-commands',
+          '--codex',
+        ],
+        home,
+      );
+      assert.equal(r.status, 2, `expected refusal exit 2, got ${r.status}\n${r.stderr}`);
+      // guard fired before the codex write block
+      assert.equal(existsSync(join(home, '.codex', 'hooks')), false);
+    });
+  });
+});
+
+// codex re-review BLOCKER #1: a --no-hooks --no-commands install must STILL record
+// the pkgVersion baseline, or a later stale sibling bypasses the guard (no baseline
+// to compare). Prove init writes hypo-pkg.json.pkgVersion even with both off, and
+// that a subsequent older init is then refused.
+test('init: --no-hooks --no-commands still records pkgVersion baseline → guards later stale sibling', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      // 1st install: hooks+commands OFF, fresh HOME → must still write the baseline
+      const first = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${wiki}`, '--no-git-init', '--no-shell', '--no-hooks', '--no-commands'],
+        home,
+      );
+      assert.notEqual(
+        first.status,
+        2,
+        `fresh --no-hooks --no-commands must not refuse\n${first.stderr}`,
+      );
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.pkgVersion,
+        'baseline pkgVersion must be recorded even with hooks/commands off',
+      );
+      // 2nd install: simulate an OLDER sibling by bumping the recorded baseline to a
+      // far-future version + a different root, then re-run → must now be refused.
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '99.0.0' });
+      const second = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${wiki}`, '--no-git-init', '--no-shell', '--no-hooks', '--no-commands'],
+        home,
+      );
+      assert.equal(second.status, 2, `stale re-init must be refused\n${second.stderr}`);
+    });
+  });
+});
+
+test('upgrade --apply: refuses (exit 2) when active install is NEWER and a different root', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '99.0.0' });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(r.status, 2, `expected refusal exit 2, got ${r.status}\n${r.stderr}`);
+      assert.match(r.stderr, /Refusing to upgrade --apply/);
+    });
+  });
+});
+
+test('upgrade --check: never blocked by the guard (report-only)', () => {
+  withTmpHome((home) => {
+    withTmpDir((wiki) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '99.0.0' });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${wiki}`], home);
+      assert.notEqual(r.status, 2, `check mode must not refuse\n${r.stderr}`);
+    });
+  });
+});
+
+suite('stale-sibling: doctor scan (D) + notifier notice (D3, integration)');
+
+// Run a script with both a custom HOME and a custom PATH (for CLI resolution).
+function runWithHomeAndPath(script, args, home, pathDir, extraEnv = {}) {
+  return spawnSync(process.execPath, [join(SCRIPTS, script), ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: pathDir, ...extraEnv },
+  });
+}
+
+test('doctor: warns when an older `hypomnema` owns PATH vs the active install', () => {
+  withTmpHome((home) => {
+    withFakeCli('1.1.0', ({ binDir }) => {
+      // active install is newer than the PATH CLI
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      const r = runWithHomeAndPath('doctor.mjs', ['--json'], home, binDir);
+      const checks = JSON.parse(r.stdout);
+      const sib = checks.find((c) => c.label === 'PATH CLI vs active install');
+      assert.ok(sib, 'expected a sibling check');
+      assert.equal(sib.status, 'warn');
+      assert.match(sib.detail, /stale sibling/);
+      assert.match(sib.detail, /npm uninstall -g hypomnema/);
+    });
+  });
+});
+
+test('doctor: passes when PATH CLI matches/exceeds the active install', () => {
+  withTmpHome((home) => {
+    withFakeCli('9.9.9', ({ binDir }) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      const r = runWithHomeAndPath('doctor.mjs', ['--json'], home, binDir);
+      const checks = JSON.parse(r.stdout);
+      const sib = checks.find((c) => c.label === 'PATH CLI vs active install');
+      assert.equal(sib.status, 'pass');
+    });
+  });
+});
+
+test('session-start (D3): stale PATH sibling surfaces a one-shot notice, then throttles', () => {
+  withTmpHome((home) => {
+    withFakeCli('1.1.0', ({ binDir }) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      const payload = JSON.stringify({ cwd: home, session_id: 'sib-test' });
+      const first = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
+        input: payload,
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: binDir },
+      });
+      assert.match(first.stderr, /Stale install on PATH/);
+      assert.match(first.stderr, /1\.1\.0/);
+      // additionalContext (LLM-visible) carries it too
+      const out = JSON.parse(first.stdout);
+      assert.match(out.additionalContext || '', /Stale install on PATH/);
+      // second start: same tuple already notified → suppressed
+      const second = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
+        input: payload,
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: binDir },
+      });
+      assert.doesNotMatch(second.stderr, /Stale install on PATH/);
+    });
+  });
+});
+
+test('session-start (D3): no notice when CLI matches active (no false nag)', () => {
+  withTmpHome((home) => {
+    withFakeCli('9.9.9', ({ binDir }) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      const r = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
+        input: JSON.stringify({ cwd: home, session_id: 'sib-ok' }),
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: binDir },
+      });
+      assert.doesNotMatch(r.stderr, /Stale install on PATH/);
+    });
+  });
 });
 
 // ── #12: unified hook stderr log format ────────────────────────────────────────

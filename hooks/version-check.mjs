@@ -18,8 +18,8 @@
  *     than overwrites so it never erases the hook's `notifiedFor` marks.
  */
 
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'fs';
-import { dirname, join } from 'path';
+import { readFileSync, writeFileSync, renameSync, mkdirSync, realpathSync, existsSync } from 'fs';
+import { dirname, join, delimiter } from 'path';
 import { homedir } from 'os';
 
 export const TTL_MS = 24 * 60 * 60 * 1000; // 24h
@@ -48,24 +48,72 @@ export function parseSemver(v) {
     .replace(/^v/, '')
     .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
   if (!m) return null;
-  return { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] || '' };
+  // Keep core identifiers as RAW DIGIT STRINGS (not +Number) so compareSemver can
+  // order them precisely — SemVer caps neither core nor prerelease numeric length,
+  // and Number() silently loses precision past 2^53.
+  return { major: m[1], minor: m[2], patch: m[3], pre: m[4] || '' };
+}
+
+/**
+ * Compare two SemVer numeric identifier strings (digits only, no leading zeros).
+ * Done WITHOUT Number() so arbitrary-length identifiers order exactly: fewer
+ * digits ⇒ smaller value; equal length ⇒ ASCII order is numeric order.
+ */
+function compareNumericId(x, y) {
+  if (x.length !== y.length) return x.length < y.length ? -1 : 1;
+  if (x !== y) return x < y ? -1 : 1;
+  return 0;
+}
+
+/**
+ * Compare two prerelease strings per the SemVer §11 precedence rules. Identifiers
+ * are dot-separated; numeric ones compare numerically and always rank LOWER than
+ * alphanumeric ones; a larger set of identifiers outranks a smaller one when all
+ * preceding identifiers are equal. Both inputs are non-empty prereleases here.
+ */
+function comparePrerelease(a, b) {
+  const ai = a.split('.');
+  const bi = b.split('.');
+  const len = Math.max(ai.length, bi.length);
+  for (let i = 0; i < len; i++) {
+    // "a larger set of pre-release fields has higher precedence" → the one that
+    // still has identifiers wins once the shorter one runs out.
+    if (i >= ai.length) return -1;
+    if (i >= bi.length) return 1;
+    const x = ai[i];
+    const y = bi[i];
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) {
+      const c = compareNumericId(x, y);
+      if (c !== 0) return c;
+    } else if (xn !== yn) {
+      return xn ? -1 : 1; // numeric identifiers have lower precedence
+    } else if (x !== y) {
+      return x < y ? -1 : 1; // ASCII lexical for alphanumeric
+    }
+  }
+  return 0;
 }
 
 /**
  * Compare two semver strings. Returns -1 / 0 / 1, or null if either is invalid.
- * A release outranks a prerelease of the same x.y.z (1.2.3 > 1.2.3-rc.1).
+ * A release outranks a prerelease of the same x.y.z (1.2.3 > 1.2.3-rc.1), and
+ * prereleases follow full SemVer §11 precedence (1.2.3-rc.2 < 1.2.3-rc.10) — this
+ * matters because compareSemver now gates the init/upgrade downgrade guard.
  */
 export function compareSemver(a, b) {
   const pa = parseSemver(a);
   const pb = parseSemver(b);
   if (!pa || !pb) return null;
   for (const k of ['major', 'minor', 'patch']) {
-    if (pa[k] !== pb[k]) return pa[k] < pb[k] ? -1 : 1;
+    const c = compareNumericId(pa[k], pb[k]);
+    if (c !== 0) return c;
   }
   if (pa.pre === pb.pre) return 0;
   if (!pa.pre) return 1; // release > prerelease
   if (!pb.pre) return -1;
-  return pa.pre < pb.pre ? -1 : 1; // lexicographic fallback (good enough)
+  return comparePrerelease(pa.pre, pb.pre);
 }
 
 // ── channel detection ──────────────────────────────────────────────────────
@@ -181,4 +229,154 @@ export function mergeLatest(path, latest, now = Date.now()) {
 /** True if any opt-out env var is set. */
 export function isOptedOut(env = process.env) {
   return Boolean(env.HYPO_NO_UPDATE_CHECK || env.NO_UPDATE_NOTIFIER || env.CI);
+}
+
+// ── stale-sibling detection (ADR 0038) ───────────────────────────────────────
+//
+// A second, OLDER Hypomnema can sit on $PATH (e.g. a stale `npm i -g hypomnema`)
+// while a newer copy owns the active hooks. The CLI bin (`hypomnema`) then routes
+// `hypomnema init` / `upgrade --apply` through the OLD package, which silently
+// downgrades the newer registered hooks (dropping features like this notifier).
+//
+// The update-notifier above only asks "is MY install behind latest?" — it is
+// blind to a stale SIBLING. These helpers add that axis. They are fs-only and
+// offline (no `npm`, no `which` spawn) so they are safe inside the SessionStart
+// hook and `doctor`.
+
+/** realpathSync that returns null instead of throwing on a missing/broken path. */
+export function realpathSafe(p) {
+  if (typeof p !== 'string' || !p) return null;
+  try {
+    return realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the nearest ancestor `package.json` named `hypomnema`, starting at `start`
+ * and walking up. Returns { pkgRoot, version } or null. Used to map a resolved
+ * bin path back to the package that owns it.
+ */
+function readOwningPkg(start) {
+  let dir = start;
+  // Bounded ascent (filesystem depth is finite; cap defensively).
+  for (let i = 0; i < 64; i++) {
+    const pkgPath = join(dir, 'package.json');
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+        if (pkg && pkg.name === 'hypomnema' && typeof pkg.version === 'string') {
+          return { pkgRoot: dir, version: pkg.version };
+        }
+      } catch {
+        /* keep ascending — a non-hypomnema package.json is not our target */
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Locate the `hypomnema` CLI on $PATH WITHOUT spawning `which`/`npm`.
+ *
+ * Splits $PATH, probes each dir for the bin (plus PATHEXT variants on Windows),
+ * resolves symlinks (npm global bins are symlinks into node_modules), then walks
+ * up to the owning package.json. Returns { binPath, pkgRoot, version } for the
+ * FIRST hit — that is the one the shell would actually run — or null.
+ *
+ * Windows note: npm installs `.cmd`/`.ps1` launcher shims (not symlinks), so the
+ * realpath→package.json walk usually fails there and we return null rather than
+ * guess. POSIX (the reported footgun) resolves cleanly.
+ */
+export function resolveCliOnPath(binName = 'hypomnema', env = process.env) {
+  const pathVar = env.PATH || env.Path || '';
+  if (!pathVar) return null;
+  const dirs = pathVar.split(delimiter).filter(Boolean);
+  const exts =
+    process.platform === 'win32'
+      ? (env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
+      : [''];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const candidate = join(dir, binName + ext.toLowerCase());
+      const real = realpathSafe(candidate);
+      if (!real) continue;
+      const owner = readOwningPkg(dirname(real));
+      if (owner) return { binPath: candidate, ...owner };
+    }
+  }
+  return null;
+}
+
+/**
+ * Classify two installs by version and identity. Returns:
+ *   'same'      — same package root (dev re-run / npm-link) → never a downgrade
+ *   'downgrade' — `incoming` is strictly OLDER than `active`
+ *   'ok'        — `incoming` >= `active`
+ *   'unknown'   — either version unparseable; cannot prove a downgrade
+ *
+ * realpath-compares the roots first so a dev workspace re-running its own
+ * init/upgrade is never mis-flagged.
+ */
+export function classifyInstall(incoming, active) {
+  const ri = realpathSafe(incoming && incoming.pkgRoot);
+  const ra = realpathSafe(active && active.pkgRoot);
+  if (ri && ra && ri === ra) return 'same';
+  const cmp = compareSemver(incoming && incoming.version, active && active.version);
+  if (cmp === null) return 'unknown';
+  return cmp < 0 ? 'downgrade' : 'ok';
+}
+
+/**
+ * Decide whether to warn about a stale sibling owning the CLI. Returns
+ * { cliVersion, line, key } or null. Warns only when the PATH CLI is a DIFFERENT,
+ * strictly OLDER package than the active install.
+ *
+ * `key` is a throttle token (cli path+version → active version) so the
+ * SessionStart hook can suppress repeats via `siblingNotifiedFor`.
+ */
+export function computeSiblingNotice(cli, active) {
+  if (!cli || !active || !active.version) return null;
+  if (classifyInstall(cli, active) !== 'downgrade') return null;
+  const key = `${cli.binPath || cli.pkgRoot}@${cli.version}->${active.version}`;
+  const line =
+    `[Hypomnema] Stale install on PATH: \`${cli.binPath || cli.pkgRoot}\` is v${cli.version}, ` +
+    `but your active install is v${active.version}.\n` +
+    `  Running \`hypomnema init\`/\`upgrade\` from PATH would DOWNGRADE your hooks.\n` +
+    `  → remove the old one:  npm uninstall -g hypomnema   (then re-check with \`hypomnema doctor\`)`;
+  return { cliVersion: cli.version, line, key };
+}
+
+/** Has this exact sibling tuple already been surfaced? */
+export function siblingAlreadyNotified(cache, key) {
+  return Boolean(cache && cache.siblingNotifiedFor === key);
+}
+
+/** Record that the sibling banner for `key` was shown (read-merge-write). */
+export function markSiblingNotified(path, key) {
+  try {
+    const cache = readCache(path) || {};
+    cache.siblingNotifiedFor = key;
+    writeCacheAtomic(path, cache);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Shared one-line message for the init/upgrade downgrade guard (P). `op` is
+ * 'init' or 'upgrade'. Kept here so guard text stays identical across both CLIs.
+ */
+export function downgradeGuardMessage(incomingVersion, activeVersion, op) {
+  return (
+    `[Hypomnema] Refusing to ${op}: this package is v${incomingVersion}, but your ` +
+    `active install is NEWER (v${activeVersion}).\n` +
+    `  This is usually a stale global CLI on PATH — proceeding would DOWNGRADE your hooks.\n` +
+    `  → upgrade the stale copy:  npm install -g hypomnema\n` +
+    `  → or, if you really mean to downgrade:  re-run with --allow-downgrade`
+  );
 }
