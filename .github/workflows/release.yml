@@ -4,10 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual trigger for the publish-credential pre-check below. It NEVER publishes
+  # for real (the publish job is gated to tag pushes) — it only runs `npm whoami`
+  # + `npm publish --dry-run` to verify the NPM_TOKEN secret can still authenticate
+  # BEFORE a real tag depends on it. Use it after rotating NPM_TOKEN.
+  workflow_dispatch:
 
 jobs:
   publish:
     name: Publish to npm
+    # Real publish runs ONLY on a tag push — a manual workflow_dispatch must never
+    # publish (it is for the credential pre-check job only).
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,3 +71,56 @@ jobs:
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-precheck:
+    name: Publish credential pre-check (never publishes)
+    # Runs ONLY on manual dispatch — validates the NPM_TOKEN secret WITHOUT
+    # publishing, so a credential rotation can be sanity-checked before a real
+    # tag depends on it. The v1.2.x → E404 outage (CI token lost publish
+    # capability; packages were published manually) is the failure class this
+    # surfaces early. SCOPE LIMIT (honest): this proves the token authenticates
+    # and — best effort — that its identity has read-write on the package. It
+    # CANNOT prove the final registry PUT or the `--provenance` signing path;
+    # only a real tag publish exercises those.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 18
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify token authenticates and has publish access
+        # `npm whoami` resolves the token to an npm identity (a revoked/invalid
+        # token fails here). `npm access list collaborators` then surfaces that
+        # identity's permission on the package — read-write is required to
+        # publish. A narrowly-scoped token may not be allowed to list
+        # collaborators; that is downgraded to a warning (whoami already proved
+        # auth), not a hard failure.
+        run: |
+          WHO=$(npm whoami)
+          echo "authenticated as: $WHO"
+          PERM=$(npm access list collaborators hypomnema --json 2>/dev/null \
+            | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8")||"{}"); process.stdout.write(d[process.argv[1]]||"")' "$WHO" 2>/dev/null || true)
+          if [ -z "$PERM" ]; then
+            echo "::warning::could not determine $WHO's permission on hypomnema (token may be narrowly scoped) — whoami succeeded, but publish access is unverified"
+          elif [ "$PERM" != "read-write" ]; then
+            echo "::error::$WHO has '$PERM' on hypomnema — read-write is required to publish"
+            exit 1
+          else
+            echo "$WHO has read-write (publish) access ✓"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Dry-run publish (build + prepublishOnly, no PUT, no auth)
+        # `--dry-run` packs the tarball and runs prepublishOnly
+        # (test/lint/smoke-pack/check:bilingual) but performs NO registry PUT, so
+        # nothing is published and no token is needed. Confirms the package still
+        # builds and the publish gates pass.
+        run: npm publish --dry-run --access public
