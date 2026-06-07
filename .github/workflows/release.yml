@@ -16,10 +16,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # fetch-depth: 0 fetches full history including annotated tag objects;
-          # the default shallow clone leaves git unable to read the tag body
-          # that `check-bilingual --tag` validates.
+          # fetch-depth: 0 fetches full history, but actions/checkout still
+          # materializes the *triggering tag* as a LIGHTWEIGHT local ref (it
+          # fetches the commit by SHA, not the annotated tag object). So
+          # `git rev-parse <tag>^{tag}` — how check-bilingual detects annotation
+          # — fails in CI on a tag that is annotated on the remote. The explicit
+          # tag re-fetch below restores the annotated object. (Verified: this
+          # was the v1.3.0 release-gate false-fail.)
           fetch-depth: 0
+
+      - name: Fetch annotated tag object
+        # Without this, check-bilingual --tag sees the triggering tag as
+        # lightweight (see checkout note above) and the bilingual gate
+        # false-fails on a genuinely annotated tag.
+        run: |
+          git fetch --force origin \
+            "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          git cat-file -t "${GITHUB_REF_NAME}"   # prints "tag" for annotated
 
       - uses: actions/setup-node@v5
         with:
