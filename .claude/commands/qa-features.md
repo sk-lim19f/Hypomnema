@@ -99,9 +99,28 @@ SANDBOX_HEAD_SHA=$(git -C "$SANDBOX_PKG_ROOT" rev-parse HEAD 2>/dev/null || echo
 [ "$SANDBOX_HEAD_SHA" != "$(cat "$QA_SANDBOX/HEAD.sha")" ] && echo "WARN: sandbox pkgRoot HEAD sha differs from recorded HEAD.sha"
 ```
 
-Each worker prompt MUST export `HOME="$QA_SANDBOX/claude-home"` (claude workers) or `CODEX_HOME="$QA_SANDBOX/codex-home"` (codex workers) AND `HYPO_DIR="$QA_SANDBOX/vault"` so installs/hooks land in the sandbox, not the user's real home.
+Each worker prompt MUST export `CODEX_HOME="$QA_SANDBOX/codex-home"` (codex workers) AND `HYPO_DIR="$QA_SANDBOX/vault"` so installs/hooks land in the sandbox, not the user's real home. **Exception — `claude` slash / skill rows cannot be HOME-isolated this way** (auth is HOME-scoped; env-via-prompt is swallowed by headless `-p`); see the dedicated subsection just below before routing any claude row.
 
 If a scenario explicitly tests "real install side effects on the user's machine" (rare), mark it `requires-real-home` in the matrix and warn the user before running.
+
+### ⚠ claude / skill rows cannot be HOME-sandbox-isolated (auth is HOME-scoped)
+
+The preflight's `HOME="$QA_SANDBOX/claude-home"` isolation **works for codex / CLI / script rows but NOT for `claude` slash-command or skill rows**. Two hard constraints, both observed in the 2026-06-07 dogfood:
+
+1. **`claude` auth is HOME-scoped.** A `claude` process launched with `HOME=$QA_SANDBOX/...` has no login session → it exits with `Not logged in · Please run /login` and runs nothing. Copying the real `~/.claude/.credentials.json` (or `~/.claude.json`) into the sandbox is the only way to give it auth — and that is **credential scavenging**; the Claude Code auto-mode classifier blocks it, correctly. So sandbox-HOME + claude is a dead end.
+2. **env-via-prompt does not set process env for headless `-p` agents.** `spawn.sh` launches claude/gemini as `<agent> -p "$(cat prompt.txt)"`, so an `export HOME=…` line placed in the worker *prompt* becomes prompt **text**, never shell env. (codex TUI "works around" this only because the model interactively runs the `export` as a Bash tool call — but even then it cannot change the already-started process's HOME, which is what command/skill resolution binds to.)
+
+**Therefore, route `claude` slash / skill rows by one of these three strategies (pick per row, record which in the matrix):**
+
+- **(A) inline-command (preferred for prompt-layer features).** Do not depend on the installed copy at all: paste the **HEAD version of the command/skill spec** (e.g. the `Step 1a` section of `commands/crystallize.md`) verbatim into the worker prompt, give it the scenario, and instruct **no file/script writes** (pure reasoning — "output what you would surface"). This tests the *feature behavior* (does the prompt text drive the LLM to do X?) decoupled from install location, needs no auth juggling, and cannot pollute the real vault. Verify `~/hypomnema` is `git status` clean afterward regardless.
+- **(B) real-HOME + upgrade-first + vault-only isolation.** Run the claude worker with the **real (logged-in) HOME**, but FIRST sync the install to HEAD (`hypomnema upgrade --apply`, or re-`init` the real home) — otherwise the worker tests a **stale** installed command (the post-merge real install lags until upgrade runs; the stale-install guard, clause C, exists to catch exactly this). Isolate only the **vault** via `HYPO_DIR=$QA_SANDBOX/vault` (vault access needs no auth), and prefer no-write/sandbox-vault scenarios. Mark the row `requires-real-home`.
+- **(C) drop the row** — if neither (A) nor (B) fits, move the claude row to `manual` and surface it to the user; do not fake a sandbox pass.
+
+`codex` / CLI / script rows are unaffected — keep using sandbox `CODEX_HOME` / `HOME` isolation as written above.
+
+### Headless `-p` output capture (fixed 2026-06-07)
+
+`spawn.sh` previously launched `claude -p` / `gemini -p` as `<agent> -p "$(cat prompt)"` and relied on the codex-style Stop-hook `cmux read-screen` scrape to fill `output.txt`. That scrape only captured the launch line for headless `-p` (the answer goes to stdout, not the rendered TUI). **Fixed**: `spawn_headless_cmd` now tees `-p` stdout/stderr straight to `output.txt` and writes the `done` marker inline (and does not export `TEAMS_WORKER_DIR`, so the Stop hook no-ops and cannot clobber the file). Result collection reads `output.txt` for `-p` agents the same as for codex. If you see a claude/gemini worker's `output.txt` holding only the shell launch line, you are on a pre-fix `spawn.sh` — update the teams skill.
 
 ## Execution protocol
 
@@ -115,15 +134,23 @@ If a scenario explicitly tests "real install side effects on the user's machine"
 
    For a typical QA run with both CLIs, you end up with at most **two** spawn calls (one codex team, one claude team). Within each team, decompose row sets across the N workers in the prompt itself (e.g., "Worker 1: rows 1–3. Worker 2: rows 4–6.").
 
-   **`spawn.sh` delivers the same prompt to every worker in the team** (single `prompt.txt` copied into `$TEAM_DIR/`, every worker runs `codex "$(cat …/prompt.txt)"` or equivalent). Workers therefore need an explicit self-identification rule in the prompt body: instruct each worker to read its index from `$TEAMS_WORKER_DIR` (basename ends in `worker-<N>`) and execute only the rows assigned to that `<N>`. Without that rule the row decomposition is unenforced and every worker runs every row.
+   **`spawn.sh` delivers the same prompt to every worker in the team** (single `prompt.txt` copied into `$TEAM_DIR/`, every worker runs `codex "$(cat …/prompt.txt)"` or equivalent). Workers therefore need an explicit self-identification rule in the prompt body. The index source differs by agent type:
+   - **codex** workers: read the index from `$TEAMS_WORKER_DIR` (basename ends in `worker-<N>`).
+   - **claude / gemini (`-p`)** workers: read it from **`$TEAMS_WORKER_INDEX`** — `spawn.sh` withholds `$TEAMS_WORKER_DIR` for headless agents (so the capture-clobbering Stop hook no-ops; see the headless-capture note above) and exports `$TEAMS_WORKER_INDEX=<N>` instead.
 
-   Pass `HOME`/`CODEX_HOME`/`HYPO_DIR`/`HEAD_VERSION`/`REPO_ROOT` via the worker prompt's env preamble (the last two are required by clause C below). Example for a 5-row codex group + 8-row claude group:
+   Instruct each worker to execute only the rows assigned to its `<N>`. Without that rule the row decomposition is unenforced and every worker runs every row.
+
+   **Env handling differs by agent type** (see the headless-`-p` constraint above):
+   - **codex** workers interactively execute their prompt's bash, so an `export CODEX_HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…` preamble in the prompt DOES take effect for the rows they then run. Index via `$TEAMS_WORKER_DIR`. Clause C applies.
+   - **claude** workers run headless `claude -p` — a prompt `export HOME=…` is **inert** (prompt text, and HOME can't be re-bound after process start). Do NOT rely on it. Route claude rows by strategy A (inline-command, no install dependency) or B (real-HOME + `upgrade --apply` first + `HYPO_DIR` vault-only); index via `$TEAMS_WORKER_INDEX`.
+
+   Example for a 5-row codex group + a claude group (strategy A inline-command):
    ```
-   /teams 2:codex  "export HOME=… CODEX_HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='1-3 (CLI subcommands)';; 2) ROWS='4-5 (scripts)';; esac; run clause-C stale-install check first, then your assigned rows; capture exit code + output + filesystem effect; PASS/FAIL with evidence."
-   /teams 3:claude "export HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='6-8 (slash A)';; 2) ROWS='9-11 (slash B)';; 3) ROWS='12-13 (hooks+manual)';; esac; run clause-C check, then your assigned rows."
+   /teams 2:codex  "export CODEX_HOME=… HYPO_DIR=… HEAD_VERSION=… REPO_ROOT=…; N=$(basename \"$TEAMS_WORKER_DIR\" | sed 's/worker-//'); case $N in 1) ROWS='1-3 (CLI subcommands)';; 2) ROWS='4-5 (scripts)';; esac; run clause-C stale-install check first, then your assigned rows; capture exit code + output + filesystem effect; PASS/FAIL with evidence."
+   /teams 2:claude "N=$TEAMS_WORKER_INDEX; case $N in 1) ROWS='slash rows 6-8';; 2) ROWS='slash rows 9-11';; esac; the prompt INLINES the HEAD command/skill spec under test (strategy A) — verify the inlined spec matches branch HEAD, do NOT touch the installed copy, run your rows with no file/vault writes, PASS/FAIL with quoted evidence."
    ```
-6. **One scenario per row** — each row must be assigned explicitly inside the team prompt (via the `$TEAMS_WORKER_DIR`-based dispatch above) with scenario, expected outcome, and evidence requirement (file path / grep / exit code). Worker prompts MUST also include the **mandatory clauses** below (placeholder rule + exact-quote rule + stale-install rule + ack-echo) — workers without these clauses produced 4/5 false-positive FAILs in the first dogfood run.
-7. **Collect** — block on Stop-hook markers, read `output.txt` per worker, parse PASS/FAIL, capture evidence excerpts.
+6. **One scenario per row** — each row must be assigned explicitly inside the team prompt (via the index dispatch above: `$TEAMS_WORKER_DIR` for codex, `$TEAMS_WORKER_INDEX` for claude/gemini) with scenario, expected outcome, and evidence requirement (file path / grep / exit code). Worker prompts MUST also include the **mandatory clauses** below (placeholder rule + exact-quote rule + stale-install rule + ack-echo) — workers without these clauses produced 4/5 false-positive FAILs in the first dogfood run. **Exception:** clause C (stale-install detection) is for rows that exercise the *installed* copy (codex/CLI/script rows, claude strategy B). For claude **strategy A (inline-command)** rows, clause C does not apply — the row deliberately bypasses the install; replace it with a check that the **inlined spec matches branch HEAD** (e.g. the worker confirms the pasted section is verbatim from the repo file at HEAD).
+7. **Collect** — block on the `done` markers (codex writes them via its Stop hook; headless `-p` agents write them inline — see the headless-capture note), read `output.txt` per worker, parse PASS/FAIL, capture evidence excerpts.
 8. **Orchestrator re-verification (MANDATORY before logging)** — for every FAIL the workers reported, the orchestrating Claude MUST live-re-run the failing scenario against a **fresh HEAD-version sandbox** (created by re-running the preflight against the current working tree, NOT against the user's real `~/.claude` / `~/.codex` / `~/hypomnema`) before recording it as a real defect.
    - **CLI / script rows** (`hypomnema doctor`, `node scripts/lint.mjs`, etc.) — run directly against the working tree from `$REPO_ROOT`; if the row passes, mark `WORKER_FALSE_POSITIVE`.
    - **Slash / hook / install rows** (`/hypo:resume`, `hypo-first-prompt`, …) — bind a second sandbox via the same preflight, re-execute the scenario there, compare.
