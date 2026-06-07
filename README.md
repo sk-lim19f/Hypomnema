@@ -23,13 +23,15 @@ _Make Claude take notes — and measure whether it actually does._
 
 > **Quick decoder for terms used below.** *frontmatter* = the YAML block at the top of a markdown file; *wikilink* = a `[[page-slug]]` cross-reference; *ADR* = "Architecture Decision Record", a short markdown page that records *why* a design choice was made; *projection* = a one-way derive (`pages/feedback/*.md` → `MEMORY.md` / `<learned_behaviors>`); *hook* = a script that Claude Code runs automatically on lifecycle events; *hot.md* / *session-state.md* = the per-project cache files that hold "what just happened" and "what's next" so a paused project resumes in one read. Full glossary lives under [Term decoder](#term-decoder).
 
-> **Current state vs. v2 vision.** v1.2.0 (today) is honest about its trigger model: most wiki behavior — ingest, query, session-close — still fires on **explicit `/hypo:*` commands**, but the auto-behavior surface is growing. The v2 thesis is *fully autonomous* — Claude reading, writing, and synthesizing the wiki without being asked. **v1.1.0** shipped the **observability score** that measures how often the wiki is actually used per session (ingest / query / session-close / citation rates). **v1.2.0** adds four load-bearing autonomous lanes on top:
+> **Current state vs. v2 vision.** v1.3.0 (today) is honest about its trigger model: most wiki behavior — ingest, query, session-close — still fires on **explicit `/hypo:*` commands**, but the auto-behavior surface is growing. The v2 thesis is *fully autonomous* — Claude reading, writing, and synthesizing the wiki without being asked. **v1.1.0** shipped the **observability score** that measures how often the wiki is actually used per session (ingest / query / session-close / citation rates). **v1.2.0** adds four load-bearing autonomous lanes on top:
 > - **feedback-as-SoT with one-way projections** — `pages/feedback/` becomes the single source-of-truth (SoT) for behavior corrections; the wiki one-way derives `MEMORY.md` and the `<learned_behaviors>` block inside `~/.claude/CLAUDE.md`, so you edit one place and the projections refresh on their own (ADR 0031 — full design rationale lives in `projects/hypomnema/decisions/0031-*.md` inside your wiki).
 > - **extensions companion sync** — anything you drop under `~/hypomnema/extensions/{agents,commands,hooks,skills}/` is mirrored into `~/.claude/` automatically; the optional `--codex` flag additionally mirrors `hooks` and `commands` into `~/.codex/` (agents/skills are Claude-only and skipped on the Codex target by design) (ADR 0024).
 > - **auto-project creation on cwd match** — when you `cd` into a git repo with a project marker (`package.json`, `Cargo.toml`, etc.) and no matching wiki project exists, Hypomnema offers to scaffold one for you (ADR 0023).
 > - **Stop-chain auto-minimal-crystallize + `/clear` recovery** — non-trivial sessions get an automatic "save a minimal session-close note?" prompt; `/clear` after a forgotten close is detected and recovered cleanly (ADR 0022).
 >
 > The schema (`SCHEMA.md`) bumps to 2.0 — the `feedback` page type now requires 9 mandatory frontmatter fields. `hypomnema upgrade --apply` writes `MIGRATION-v2.0.md` into the wiki root with a step-by-step backfill checklist. Your own `SCHEMA.md` is **never overwritten** by upgrade — we call this policy *Option C*: the upgrade only tells you what changed, and you apply the diff yourself.
+>
+> **v1.3.0** refines this layer rather than expanding autonomy: the session-close flow gains four *advisory* reflections (they suggest, never auto-act — ADR 0029), `hypomnema lint --strict` promotes selected warnings to errors for release gates, and install hardens with **stale-sibling detection** — an older `hypomnema` on `$PATH` can no longer silently downgrade your active hooks (ADR 0038).
 
 ---
 
@@ -247,7 +249,7 @@ All hooks resolve the wiki root via `HYPO_DIR` env → `hypo-config.md` scan →
 
 Additionally, the `SessionStart` hook performs a non-blocking background check against npm and the Claude Code plugin marketplace and prints an "Update available!" banner the next time a newer Hypomnema version has been published. Opt out with `HYPO_NO_UPDATE_CHECK=1`, `NO_UPDATE_NOTIFIER=1`, or by running under `CI=true`.
 
-For fix-level v1.2 detail beyond the lanes above — `W8` stale `design-history.md` lint, exact-match `project:*` filter for cross-project feedback projection (PR #59), and the comment-hygiene Phase 1 cleanup (PR #58) — see [`CHANGELOG.md`](CHANGELOG.md).
+For fix-level v1.3 detail beyond the lanes above — session-close lint scoped to touched files so `/compact` is no longer blocked by unrelated debt (ADR 0037), the `feedback` scope validator accepting cwd-derived project ids (OQ-34), and the stable lint warning IDs `W1`/`W2`/`W4` that `--strict` promotes to errors (while `W3`, auto-repaired by `--fix`, stays a warning) — see [`CHANGELOG.md`](CHANGELOG.md).
 
 ### Setup & maintenance
 
