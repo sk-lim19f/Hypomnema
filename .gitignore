@@ -1,9 +1,10 @@
 # Runtime state — never commit
 .omc/
-.claude/*
-# Exception: project-scoped slash commands (dev workflow) are tracked
-!.claude/commands/
-!.claude/commands/*.md
+# .claude/ is maintainer-local Claude Code state, not shipped product (the
+# plugin ships via package.json "files": commands/ hooks/ skills/ templates/
+# .claude-plugin/). Personal dev-workflow commands (qa-features, qa-before-ship)
+# live in the maintainer's own ~/.claude/commands/, not here.
+.claude/
 
 # Node
 node_modules/
