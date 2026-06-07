@@ -12553,6 +12553,74 @@ test('CLI: claimed+anchored fix with no manifest row → exit 1 with MANIFEST_MI
   });
 });
 
+// ── session-close advisory reflections (#41~#44) — surface-drift guard ───────
+// The four advisories are prompt text, not script logic. The defect class is
+// "a shipped session-close surface drifts and silently loses an advisory" — so
+// these tests assert each advisory + each identity-guard phrase is present on
+// every IN-SCOPE shipped close surface. hypo-guide.md is intentionally out of
+// scope (ADR 0019/0022 auto-layer, not 0029 advisory-layer; not machine-read by
+// readChecklist — no `[ ] 0.` marker). Reconciling it is logged as #47.
+suite('session-close advisory reflections (#41~#44) — present on shipped surfaces');
+
+const ADVISORY_SURFACES = [
+  join(REPO, 'commands', 'crystallize.md'),
+  join(REPO, 'skills', 'crystallize', 'SKILL.md'),
+];
+
+// Markers that must appear on every in-scope surface. Keyed by advisory.
+const ADVISORY_MARKERS = {
+  '#44 trivial': ['(#44)', 'Trivial-session check'],
+  '#41 ADR-candidate': ['(#41)', 'ADR-candidate check', 'Never auto-write an ADR'],
+  '#42 design-history': ['(#42)', 'design-history staleness check'],
+  '#43 ingest': ['(#43)', 'Ingest check', '/hypo:ingest'],
+};
+
+// Identity-guard phrases (ADR 0029): advisory-only, no auto-action, no gate
+// bypass. The no-auto contract asserts the actual contract sentence — not just
+// the word "advisory" — so a future surface that keeps "advisory" while
+// permitting an auto-action (auto-ingest, auto-update) still fails this gate.
+const GUARD_PHRASES = [
+  'ADR 0029',
+  'advisory', // advisory-only framing
+  'none performs an automatic action', // no-auto contract (not merely the word "advisory")
+  'writes on its own', // closing reminder: none writes on its own
+  'must not run `--mark-session-closed`', // #44 must not bypass the gate
+  'Any real close still requires all 5 mandatory files', // gate still applies
+];
+
+for (const surface of ADVISORY_SURFACES) {
+  const rel = surface.slice(REPO.length + 1);
+  test(`${rel}: all four advisories (#41~#44) present`, () => {
+    const txt = readFileSync(surface, 'utf-8');
+    for (const [advisory, needles] of Object.entries(ADVISORY_MARKERS)) {
+      for (const needle of needles) {
+        assert.ok(
+          txt.includes(needle),
+          `${rel} missing ${advisory} marker: ${JSON.stringify(needle)}`,
+        );
+      }
+    }
+  });
+
+  test(`${rel}: identity-guard phrases (advisory-only, no gate bypass) present`, () => {
+    const txt = readFileSync(surface, 'utf-8');
+    for (const phrase of GUARD_PHRASES) {
+      assert.ok(txt.includes(phrase), `${rel} missing guard phrase: ${JSON.stringify(phrase)}`);
+    }
+  });
+}
+
+// hypo-guide.md is the deliberately-excluded auto-layer surface. Pin that it is
+// NOT in the in-scope list so a future edit that "helpfully" adds it here has to
+// consciously remove this assertion (and address the #47 backstop reconcile).
+test('hypo-guide.md intentionally excluded from advisory surfaces (#47 follow-up)', () => {
+  const guidePath = join(REPO, 'templates', 'hypo-guide.md');
+  assert.ok(
+    !ADVISORY_SURFACES.includes(guidePath),
+    'templates/hypo-guide.md must stay out of ADVISORY_SURFACES until #47 reconciles its auto-layer wording',
+  );
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
