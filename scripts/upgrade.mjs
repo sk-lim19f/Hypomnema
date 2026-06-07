@@ -19,6 +19,8 @@
  *                       wiki-*.mjs → hypo-*.mjs rename migration (fix #48), and
  *                       the user-extensions companion sync (E4 / fix #32).
  *   --json              Output results as JSON
+ *   --allow-downgrade   Override the guard that refuses to overwrite a NEWER
+ *                       active install with an older package (ADR 0038)
  */
 
 import {
@@ -45,6 +47,7 @@ import {
   readFileIfRegular,
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
+import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -76,6 +79,7 @@ function parseArgs(argv) {
     forceCommands: false,
     forceExtensions: false,
     codex: false,
+    allowDowngrade: false,
   };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
@@ -84,6 +88,7 @@ function parseArgs(argv) {
     else if (arg === '--force-extensions') args.forceExtensions = true;
     else if (arg === '--codex') args.codex = true;
     else if (arg === '--json') args.json = true;
+    else if (arg === '--allow-downgrade') args.allowDowngrade = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -840,6 +845,32 @@ let appliedExtensions = null;
 let appliedExtensionsCodex = null;
 
 if (args.apply) {
+  // Downgrade guard (ADR 0038, P): an `--apply` from an OLDER package than the
+  // active install would overwrite newer hooks (upgrade.mjs:287 copyFileSync) and
+  // rewrite hypo-pkg.json to the older version. Refuse before the first mutation.
+  // A dev workspace re-running its own --apply (incl. the post-commit sync hook)
+  // is exempt via realpath'd pkgRoot equality. Exit 2 = refused downgrade.
+  if (!args.allowDowngrade) {
+    const _active = readPkgJsonSafe(pkgJsonPath());
+    let _incomingVersion = null;
+    try {
+      _incomingVersion = JSON.parse(readFileSync(join(PKG_ROOT, 'package.json'), 'utf-8')).version;
+    } catch {
+      /* unreadable own package.json — cannot prove a downgrade, allow */
+    }
+    if (
+      _active &&
+      _active.pkgVersion &&
+      _incomingVersion &&
+      classifyInstall(
+        { pkgRoot: PKG_ROOT, version: _incomingVersion },
+        { pkgRoot: _active.pkgRoot, version: _active.pkgVersion },
+      ) === 'downgrade'
+    ) {
+      console.error(downgradeGuardMessage(_incomingVersion, _active.pkgVersion, 'upgrade --apply'));
+      process.exit(2);
+    }
+  }
   if (oldHookRefs.length > 0) {
     appliedHookNameRenames = applyHookNameMigration(
       oldHookRefs,
