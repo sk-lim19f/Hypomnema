@@ -43,7 +43,18 @@ Show the output verbatim.
 
 ## Step 3 — Session-close checklist (if triggered at session end)
 
-If `/hypo:crystallize` was invoked as a session-close action, run through this checklist before synthesizing. Proceed automatically without confirmation unless the user has not said "auto".
+If `/hypo:crystallize` was invoked as a session-close action, run through this checklist before synthesizing. The mechanical checklist items (1–6 below) proceed automatically without confirmation unless the user has not said "auto"; the advisory reflections that precede them (#41~#44) always surface to the user for confirmation — they are recommendations, never auto-actions.
+
+### Advisory reflections (run before the checklist below — advisory only)
+
+Surface each of these four to the user first. Every one is **advisory** (ADR 0029 identity guard): the user confirms or declines, and none performs an automatic action, writes a file on its own, or bypasses the mandatory gate.
+
+- **Trivial-session check (#44)** — Was this session trivial (a single bug fix, a single-file edit, or Q&A with no durable artifact)? If so, recommend skipping session-close: *"이 세션은 trivial해 보입니다 — session-close를 건너뛸까요?"* A trivial skip is a recommendation, **not** a bypass: it must not mark the session closed, must not run `--mark-session-closed`, and must not claim `/compact` can pass. Any real close still requires all 5 mandatory files.
+- **ADR-candidate check (#41)** — Did this session make an architectural or design decision (a new pattern, a tradeoff, a convention)? If yes, ask whether it warrants an ADR and capture that intent in the session-log entry. If nothing rose to ADR level, record `ADR 없음 — <one-line reason>` in that same session-log entry. **Never auto-write an ADR file** — the session-log note is the only action here.
+- **design-history staleness check (#42)** — If `projects/<name>/design-history.md` exists and this session changed design decisions it does not yet reflect, recommend updating it (W8 lint flags this mechanically; an active-project W8 can also block at PreCompact). If the file does not exist, skip silently — do **not** create it just for this check. Never auto-update it.
+- **Ingest check (#43)** — Did this session consume trustworthy external knowledge (a fetched URL, official docs, or code you verified directly)? If so, recommend running `/hypo:ingest` to capture it under `sources/`. Proceed only on the user's confirmation.
+
+When uncertain, surface the question rather than skip it. None of the four blocks the close or writes on its own.
 
 1. **session-state.md** — update `projects/<name>/session-state.md` with the next tasks list (what to tackle first next time).
 2. **hot.md (project)** — update `projects/<name>/hot.md` with a session snapshot: what changed and decisions made. Keep under 500 words. Do not put next-step tasks here; those belong in session-state.md.

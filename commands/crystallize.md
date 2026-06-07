@@ -11,7 +11,20 @@ You are running `/hypo:crystallize`. This command serves two purposes:
 
 ## Step 1 — Detect context
 
-If the user invoked `/hypo:crystallize` to close a session (phrases like "세션 종료", "오늘 작업 마무리", "session close", or "wrap up"), run Steps 2–4 (session-close mechanical apply + recovery) **before** the synthesis scan. Otherwise skip to Step 5.
+If the user invoked `/hypo:crystallize` to close a session (phrases like "세션 종료", "오늘 작업 마무리", "session close", or "wrap up"), run Step 1a (advisory reflections) then Steps 2–4 (session-close mechanical apply + recovery) **before** the synthesis scan. Otherwise skip to Step 5.
+
+---
+
+## Step 1a — Session-close advisory reflections
+
+Before composing the payload (Step 2), run these four reflections and surface each to the user. Every one is **advisory** (ADR 0029 identity guard) — the user confirms or declines, and none performs an automatic action, writes a file on its own, or bypasses the mandatory gate.
+
+1. **Trivial-session check (#44)** — Was this session trivial (a single bug fix, a single-file edit, or Q&A with no durable artifact)? If so, recommend skipping session-close: *"이 세션은 trivial해 보입니다 — session-close를 건너뛸까요?"* and proceed only if the user wants a close. A trivial skip is a recommendation, **not** a bypass: it must not mark the session closed, must not run `--mark-session-closed`, and must not claim `/compact` can pass. Any real close still requires all 5 mandatory files.
+2. **ADR-candidate check (#41)** — Did this session make an architectural or design decision (a new pattern, a tradeoff chosen, a convention established)? If yes, ask whether it warrants an ADR and, if so, capture that intent in the `sessionLog` entry you compose in Step 2. If nothing rose to ADR level, record `ADR 없음 — <one-line reason>` in that same `sessionLog` entry. **Never auto-write an ADR file** — recording the decision (or its absence) in the session-log payload is the only action here.
+3. **design-history staleness check (#42)** — If `projects/<name>/design-history.md` exists and this session changed design decisions it does not yet reflect, recommend updating it (the W8 lint warning flags this mechanically; an active-project W8 can also block at PreCompact). If the file does not exist, skip silently — do **not** create it just for this check. Never auto-update it.
+4. **Ingest check (#43)** — Did this session consume trustworthy external knowledge (a fetched URL, official docs, or code you verified directly)? If so, recommend running `/hypo:ingest` to capture it under `sources/`. Proceed only on the user's confirmation.
+
+These are judgment calls; when uncertain, surface the question rather than skip it. None of the four blocks the close or writes on its own.
 
 ---
 
