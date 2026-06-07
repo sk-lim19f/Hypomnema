@@ -10212,6 +10212,11 @@ test('doctor: passes when PATH CLI matches/exceeds the active install', () => {
   });
 });
 
+// The sibling notice (like the update notifier) honors isOptedOut() — so under CI
+// it is suppressed. The CI runner sets CI=true, so these tests must explicitly opt
+// back IN by clearing the opt-out vars in the child env (CI failure 2026-06-07).
+const NOTIFY_ON = { CI: '', NO_UPDATE_NOTIFIER: '', HYPO_NO_UPDATE_CHECK: '' };
+
 test('session-start (D3): stale PATH sibling surfaces a one-shot notice, then throttles', () => {
   withTmpHome((home) => {
     withFakeCli('1.1.0', ({ binDir }) => {
@@ -10220,7 +10225,7 @@ test('session-start (D3): stale PATH sibling surfaces a one-shot notice, then th
       const first = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
         input: payload,
         encoding: 'utf-8',
-        env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: binDir },
+        env: { ...process.env, ...NOTIFY_ON, HYPO_DIR: '', HOME: home, PATH: binDir },
       });
       assert.match(first.stderr, /Stale install on PATH/);
       assert.match(first.stderr, /1\.1\.0/);
@@ -10231,7 +10236,7 @@ test('session-start (D3): stale PATH sibling surfaces a one-shot notice, then th
       const second = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
         input: payload,
         encoding: 'utf-8',
-        env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: binDir },
+        env: { ...process.env, ...NOTIFY_ON, HYPO_DIR: '', HOME: home, PATH: binDir },
       });
       assert.doesNotMatch(second.stderr, /Stale install on PATH/);
     });
@@ -10245,7 +10250,21 @@ test('session-start (D3): no notice when CLI matches active (no false nag)', () 
       const r = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
         input: JSON.stringify({ cwd: home, session_id: 'sib-ok' }),
         encoding: 'utf-8',
-        env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: binDir },
+        env: { ...process.env, ...NOTIFY_ON, HYPO_DIR: '', HOME: home, PATH: binDir },
+      });
+      assert.doesNotMatch(r.stderr, /Stale install on PATH/);
+    });
+  });
+});
+
+test('session-start (D3): opted out (CI/NO_UPDATE_NOTIFIER) suppresses the sibling notice', () => {
+  withTmpHome((home) => {
+    withFakeCli('1.1.0', ({ binDir }) => {
+      seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      const r = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
+        input: JSON.stringify({ cwd: home, session_id: 'sib-optout' }),
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: binDir, CI: 'true' },
       });
       assert.doesNotMatch(r.stderr, /Stale install on PATH/);
     });
