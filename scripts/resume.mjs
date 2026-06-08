@@ -9,7 +9,15 @@
  *   node scripts/resume.mjs [options]
  *
  * Options:
- *   --hypo-dir=<path>     Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
+ *   --hypo-dir=<path>     Hypomnema root. When omitted, resolveHypoRoot()
+ *                         (see lib/hypo-root.mjs) resolves it in priority order:
+ *                           1. $HYPO_DIR if set — returned immediately; the
+ *                              hypo-config.md scan below is then skipped.
+ *                           2. else the first of 7 fixed candidates
+ *                              (~/{hypomnema,wiki,notes,knowledge},
+ *                              ~/Documents/{hypomnema,wiki,notes}) that contains
+ *                              a hypo-config.md marker.
+ *                           3. else the default ~/hypomnema.
  *   --project=<name>      Project name (default: most recently active from hot.md)
  *   --json                Output as JSON
  */
