@@ -2346,6 +2346,201 @@ test('--apply migration report tags are all in installed SCHEMA vocab', () => {
   });
 });
 
+// ── ISSUE-6: plugin-mode guard (upgrade.mjs) ───────────────────
+// When /hypo:upgrade runs as the Claude Code PLUGIN, the core hooks/commands/
+// settings are provided by the plugin loader, not ~/.claude/. The manual-model
+// check must NOT report them "missing" and `--apply` must NOT copy/register them
+// (double-registration). pluginMode is gated on PKG_ROOT containing /.claude/plugins/,
+// so we run a COPY of upgrade.mjs from a fake root whose path matches that shape.
+suite('upgrade.mjs — plugin-mode guard (ISSUE-6)');
+
+// underPlugins=true → fake root under .claude/plugins (channel 'plugin');
+// false → under node_modules (channel 'npm', regression baseline).
+function withFakeUpgradeInstall(underPlugins, fn) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-upg-'));
+  try {
+    const root = underPlugins
+      ? join(base, '.claude', 'plugins', 'cache', 'mp', 'hypomnema', '1.3.0')
+      : join(base, 'lib', 'node_modules', 'hypomnema');
+    mkdirSync(root, { recursive: true });
+    cpSync(SCRIPTS, join(root, 'scripts'), { recursive: true });
+    cpSync(HOOKS, join(root, 'hooks'), { recursive: true });
+    cpSync(join(REPO, 'commands'), join(root, 'commands'), { recursive: true });
+    cpSync(join(REPO, 'templates'), join(root, 'templates'), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(root, 'package.json'));
+    const home = join(base, 'home');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    const wiki = join(base, 'wiki');
+    mkdirSync(wiki, { recursive: true });
+    writeFileSync(join(wiki, 'hypo-config.md'), '---\ntitle: config\ntype: reference\n---\n');
+    cpSync(join(REPO, 'templates', 'SCHEMA.md'), join(wiki, 'SCHEMA.md'));
+    fn({ upgrade: join(root, 'scripts', 'upgrade.mjs'), root, home, wiki });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+function runUpgrade(upgrade, args, home) {
+  return spawnSync(process.execPath, [upgrade, ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '', HOME: home },
+  });
+}
+
+test('plugin mode: check reports core surfaces as plugin-managed, not missing', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    assert.match(r.stdout, /Plugin install detected/, 'missing plugin banner');
+    assert.match(r.stdout, /provided by the plugin loader/, 'hooks not relabeled plugin-managed');
+    // the manual-model "✗ <hook>.mjs [not found ...]" per-hook nag must be absent
+    assert.doesNotMatch(
+      r.stdout,
+      /✗ hypo-session-start\.mjs/,
+      'plugin mode must not report core hooks missing',
+    );
+    // The legacy bug surfaced ~47 items; plugin mode must only ever flag the
+    // (safe, metadata-only) hypo-pkg.json — never a multi-item hook/command nag.
+    const m = r.stdout.match(/Result: (\d+) item\(s\) need updating/);
+    if (m) assert.ok(Number(m[1]) <= 1, `plugin check over-reported drift: ${m[0]}`);
+  });
+});
+
+test('plugin mode: --json sets pluginMode true', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.pluginMode, true, 'pluginMode flag not set in JSON');
+  });
+});
+
+test('plugin mode: --apply does NOT copy hooks or register settings (no double-registration)', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `plugin --apply should exit 0: ${r.stderr}`);
+    assert.equal(
+      existsSync(join(home, '.claude', 'hooks')),
+      false,
+      '--apply must NOT create ~/.claude/hooks in plugin mode (double-registration footgun)',
+    );
+    assert.equal(
+      existsSync(join(home, '.claude', 'commands', 'hypo')),
+      false,
+      '--apply must NOT create ~/.claude/commands/hypo in plugin mode',
+    );
+    // settings.json must not gain hypo-* hook registrations
+    const settingsPath = join(home, '.claude', 'settings.json');
+    if (existsSync(settingsPath)) {
+      assert.doesNotMatch(
+        readFileSync(settingsPath, 'utf-8'),
+        /hypo-session-start/,
+        'plugin --apply must not register hooks into settings.json',
+      );
+    }
+  });
+});
+
+test('plugin mode: --apply still writes hypo-pkg.json so runtime resolves PKG_ROOT (lint/feedback)', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, root, home, wiki }) => {
+    runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    assert.ok(existsSync(pkgPath), 'plugin --apply must still write hypo-pkg.json metadata');
+    const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    // realpath both sides: macOS /var is a symlink to /private/var, and the
+    // executed script path resolves to the realpath form.
+    assert.equal(
+      realpathSync(meta.pkgRoot),
+      realpathSync(root),
+      'hypo-pkg.json pkgRoot must point at the plugin package root',
+    );
+    // hypo-personal-check resolves lint.mjs/feedback-sync.mjs under pkgRoot/scripts:
+    assert.ok(
+      existsSync(join(meta.pkgRoot, 'scripts', 'lint.mjs')),
+      'pkgRoot must contain the runtime scripts (PreCompact gate dependency)',
+    );
+    // no command-SHA map is recorded (no commands were copied)
+    assert.ok(!('commands' in meta), 'plugin metadata must not record a command-SHA map');
+    // steady state: with metadata now written, a fresh check has no drift → exit 0
+    // (no perpetual nag for a plugin user who has already applied once).
+    const recheck = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    assert.equal(
+      recheck.status,
+      0,
+      `plugin check after --apply should be clean (exit 0): ${recheck.stdout}`,
+    );
+  });
+});
+
+test('regression: non-plugin install (npm path) still manages core hooks/commands', () => {
+  withFakeUpgradeInstall(false, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.pluginMode, false, 'non-plugin install must not enter plugin mode');
+    // manual model: core hooks are reported (missing here, since fake HOME is empty)
+    assert.ok(
+      out.hooks.some((h) => h.status === 'missing'),
+      'npm mode should still check hooks',
+    );
+    const apply = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(apply.status, 0, `npm --apply should exit 0: ${apply.stderr}`);
+    assert.ok(
+      existsSync(join(home, '.claude', 'hooks')),
+      'npm mode --apply must install hooks into ~/.claude/hooks (unchanged behavior)',
+    );
+  });
+});
+
+test('plugin mode: --apply drops a stale command-SHA map but preserves other metadata', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    // Simulate a prior manual install: hypo-pkg.json with a commands map + an
+    // unrelated extensions field that must survive.
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(
+      join(home, '.claude', 'hypo-pkg.json'),
+      JSON.stringify({
+        pkgRoot: '/old/manual/root',
+        pkgVersion: '1.0.0',
+        schemaVersion: '2.0',
+        commands: { 'resume.md': 'deadbeef' },
+        extensions: { claude: { 'x.mjs': 'cafe' } },
+      }),
+    );
+    runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    const meta = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+    assert.ok(!('commands' in meta), 'stale command-SHA map must be dropped in plugin mode');
+    assert.deepEqual(
+      meta.extensions,
+      { claude: { 'x.mjs': 'cafe' } },
+      'extensions must be preserved',
+    );
+  });
+});
+
+test('plugin mode: check does NOT print a hook-name rename instruction --apply will not honor', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    // Seed a legacy wiki-*.mjs reference in ~/.claude/settings.json (the source of
+    // oldHookRefs). In plugin mode --apply skips the rename, so the report must not
+    // tell the user to run it.
+    writeFileSync(
+      join(home, '.claude', 'settings.json'),
+      JSON.stringify({
+        hooks: {
+          SessionStart: [
+            {
+              hooks: [{ type: 'command', command: 'node ~/.claude/hooks/wiki-session-start.mjs' }],
+            },
+          ],
+        },
+      }),
+    );
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    assert.doesNotMatch(
+      r.stdout,
+      /old wiki-\*\.mjs reference/,
+      'plugin mode must not surface the Claude hook-name rename instruction',
+    );
+  });
+});
+
 // ── extensions companion sync (ADR 0024) ──────────────────────
 
 suite('extensions companion sync (upgrade.mjs, ADR 0024)');
