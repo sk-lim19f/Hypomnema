@@ -32,6 +32,24 @@ import { fileURLToPath } from 'node:url';
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const KEEP = process.argv.includes('--keep');
 
+// When this script runs inside `npm publish --dry-run` (the release workflow's
+// publish-credential pre-check), npm exports `npm_config_dry_run=true` into the
+// lifecycle environment. spawnSync inherits process.env, so the nested
+// `npm pack` below would ALSO run in dry-run mode — reporting a tarball
+// filename/size it never actually writes to disk — and the subsequent
+// `npm install <tarball>` then fails with ENOENT (npm maps errno -2 → exit 254).
+// Strip the flag so the nested npm commands always perform real writes,
+// matching the real tag-push publish job (which has no outer `--dry-run`). The
+// outer workflow stays dry-run and still skips the registry PUT.
+// (This was the precheck-254 root cause; the earlier "missing NODE_AUTH_TOKEN"
+// theory was wrong — it is file absence, not auth.)
+const npmEnv = { ...process.env };
+for (const key of Object.keys(npmEnv)) {
+  if (key.toLowerCase().replaceAll('-', '_') === 'npm_config_dry_run') {
+    delete npmEnv[key];
+  }
+}
+
 const PKG = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf-8'));
 const PKG_NAME = PKG.name;
 
@@ -64,7 +82,7 @@ try {
   const preCommitBefore = existsSync(preCommitPath) ? readFileSync(preCommitPath, 'utf-8') : null;
 
   step('npm pack');
-  const pack = run('npm', ['pack', '--json'], { cwd: REPO });
+  const pack = run('npm', ['pack', '--json'], { cwd: REPO, env: npmEnv });
   const meta = JSON.parse(pack.stdout)[0];
   const tarball = join(REPO, meta.filename);
   console.log(`  → ${meta.filename} (${meta.size} bytes, ${meta.entryCount} entries)`);
@@ -79,7 +97,10 @@ try {
       private: true,
     }) + '\n',
   );
-  run('npm', ['install', '--no-audit', '--no-fund', '--silent', tarball], { cwd: installRoot });
+  // No `--silent`: run() only prints npm's stdout/stderr on a non-zero exit, so
+  // a real nested-install failure must not be muted (the precheck-254 error was
+  // masked by `--silent` for two release cycles).
+  run('npm', ['install', '--no-audit', '--no-fund', tarball], { cwd: installRoot, env: npmEnv });
 
   // Move tarball into the work dir so it's not left in the repo.
   renameSync(tarball, join(work, meta.filename));
