@@ -18,7 +18,7 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # create the GitHub Release (was read; bumped for gh release create)
       id-token: write
 
     steps:
@@ -68,9 +68,35 @@ jobs:
         run: npm run lint
 
       - name: Publish
-        run: npm publish --access public --provenance
+        # Idempotent: re-running a release (e.g. after the GitHub Release step
+        # below failed) must not 409 on an already-published version. Skip the
+        # PUT only when this EXACT version is already on the registry; a
+        # genuinely new version still hard-publishes (keyed on
+        # `npm view <name>@<version>`). A network/lookup failure falls through to
+        # publish — never a silent skip that would read as "shipped".
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "hypomnema@${VERSION}" version >/dev/null 2>&1; then
+            echo "hypomnema@${VERSION} already published — skipping npm publish"
+          else
+            npm publish --access public --provenance
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        # Publish the GitHub Release from the annotated tag body (already
+        # bilingual-validated above). Idempotent: skip if a Release for this tag
+        # already exists, so a re-run does not error. Past v1.x Releases were
+        # hand-created — this automates them on every tag push.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "GitHub Release ${GITHUB_REF_NAME} already exists — skipping"
+          else
+            gh release create "${GITHUB_REF_NAME}" --verify-tag --notes-from-tag
+          fi
 
   publish-precheck:
     name: Publish credential pre-check (never publishes)
