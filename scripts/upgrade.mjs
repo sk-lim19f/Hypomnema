@@ -458,7 +458,7 @@ function applyHypoignoreMigration(result) {
   return appended;
 }
 
-function writeMigrationReport(hypoDir, fromVersion, toVersion) {
+function writeMigrationReport(hypoDir, fromVersion, toVersion, { pluginMode = false } = {}) {
   const today = new Date().toISOString().slice(0, 10);
   const filename = `MIGRATION-v${toVersion}.md`;
   const dest = join(hypoDir, filename);
@@ -544,9 +544,15 @@ Review the SCHEMA diff and update your wiki pages accordingly.
 
 ## Action items
 
-This report was generated during \`/hypo:upgrade --apply\`. Hook files and settings.json
-entries were applied by that run (or skipped with a warning if the target was malformed —
-see the upgrade output). \`SCHEMA.md\` is intentionally **not** overwritten by upgrade — the
+This report was generated during \`/hypo:upgrade --apply\`. ${
+        pluginMode
+          ? 'You are on a **plugin install**, so the core hook files and settings.json hook ' +
+            'registrations were NOT touched — the Claude Code plugin loader owns them (upgrade the ' +
+            'plugin via `/plugin marketplace update hypomnema` then `/reload-plugins`). Vault ' +
+            'extensions, if any, were still synced.'
+          : 'Hook files and settings.json entries were applied by that run (or skipped with a ' +
+            'warning if the target was malformed — see the upgrade output).'
+      } \`SCHEMA.md\` is intentionally **not** overwritten by upgrade — the
 remaining steps are manual:
 
 - [ ] Compare your \`SCHEMA.md\` (v${fromVersion}) with the package template (v${toVersion}) and merge changes manually
@@ -749,6 +755,31 @@ function applyCommands(commandResults, force) {
   return applied;
 }
 
+// ISSUE-6: in plugin mode `applyCommands` is skipped (no command copy), but the
+// runtime still needs hypo-pkg.json to resolve PKG_ROOT for lint/feedback scripts
+// (hooks/hypo-shared.mjs → hypo-personal-check). Write minimal metadata pointing
+// at the plugin's package root, preserving any existing fields (e.g. `extensions`)
+// but DROPPING any prior `commands` map (no commands were copied, so a stale map
+// would falsely assert ownership of ~/.claude/commands/hypo).
+function writePluginModeMetadata() {
+  const path = pkgJsonPath();
+  // Drop any prior top-level `commands` SHA map: no commands were copied in plugin
+  // mode, so keeping a manual install's map would falsely assert ownership of
+  // ~/.claude/commands/hypo. Preserve every other field (e.g. `extensions`).
+  const { commands: _droppedCommands, ...existing } = readPkgJsonSafe(path) || {};
+  let pkgVersion = null;
+  try {
+    pkgVersion = JSON.parse(readFileSync(join(PKG_ROOT, 'package.json'), 'utf-8')).version;
+  } catch {}
+  writePkgJsonAtomic(path, {
+    ...existing,
+    pkgRoot: PKG_ROOT,
+    pkgVersion,
+    schemaVersion: '2.0',
+  });
+  return true;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -759,6 +790,29 @@ const claudeHooksDir = join(HOME, '.claude', 'hooks');
 const claudeSettingsPath = join(HOME, '.claude', 'settings.json');
 const codexHooksDir = join(HOME, '.codex', 'hooks');
 const codexSettingsPath = join(HOME, '.codex', 'settings.json');
+
+// ISSUE-6: when `/hypo:upgrade` runs as the Claude Code PLUGIN, the 15 core hooks
+// and 14 slash commands are provided by the plugin's hooks.json + commands/
+// (auto-wired by Claude Code), NOT copied into ~/.claude/. The manual/npm health
+// check below would then report all of them "missing" and recommend `--apply`,
+// which copies the hooks into ~/.claude/hooks/ and registers 14 settings.json
+// events → Claude Code runs BOTH the plugin hooks.json AND user settings.json, so
+// every hook fires TWICE. The decisive signal: the plugin command runs the
+// PLUGIN's upgrade.mjs, so PKG_ROOT lives under ~/.claude/plugins/. (A manual/npm
+// upgrade.mjs run while the plugin is ALSO enabled is a different failure mode —
+// dual install — tracked as ISSUE-8.)
+// Match the Claude plugin cache shape specifically (`~/.claude/plugins/…`), NOT a
+// generic `/plugins/` substring — this flag now GATES install behavior, so a
+// legitimate npm/dev checkout under some unrelated `…/plugins/…` path must not be
+// misclassified and silently stop managing its hooks. (detectChannel's broad
+// `/plugins/` test is fine for the notifier's display-only use, but too loose here.)
+const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
+// Surface policy: pluginMode gates ONLY the Claude core surface (hooks/settings/
+// commands/hook-name migration), which the plugin already provides. The codex
+// core surface (--codex) and vault-defined extensions are NOT plugin-provided, so
+// they stay managed. Package metadata (hypo-pkg.json) is still written so the
+// runtime can resolve PKG_ROOT for lint/feedback scripts (hooks/hypo-shared.mjs).
+const managesClaudeCore = !pluginMode;
 
 const schema = checkSchemaVersion(args.hypoDir);
 const hooks = checkHookFiles(claudeHooksDir);
@@ -871,21 +925,34 @@ if (args.apply) {
       process.exit(2);
     }
   }
-  if (oldHookRefs.length > 0) {
-    appliedHookNameRenames = applyHookNameMigration(
-      oldHookRefs,
-      claudeSettingsPath,
-      claudeHooksDir,
-    );
-  }
+  // Migration report is vault-side (writes into the Hypomnema root) and applies
+  // in both install models.
   if (schema.bump === 'major' && schema.installed && schema.current && existsSync(args.hypoDir)) {
-    migrationPath = writeMigrationReport(args.hypoDir, schema.installed, schema.current);
+    migrationPath = writeMigrationReport(args.hypoDir, schema.installed, schema.current, {
+      pluginMode,
+    });
   }
-  appliedHooks = applyHookFiles(hooks, claudeHooksDir);
-  appliedSettings = applySettingsJson(settings, claudeSettingsPath);
-  // applyCommands handles the single atomic hypo-pkg.json write (pkgRoot, version, schema, commands map)
-  appliedCommands = applyCommands(commands, args.forceCommands);
-  appliedPkgJson = true;
+  if (managesClaudeCore) {
+    if (oldHookRefs.length > 0) {
+      appliedHookNameRenames = applyHookNameMigration(
+        oldHookRefs,
+        claudeSettingsPath,
+        claudeHooksDir,
+      );
+    }
+    appliedHooks = applyHookFiles(hooks, claudeHooksDir);
+    appliedSettings = applySettingsJson(settings, claudeSettingsPath);
+    // applyCommands handles the single atomic hypo-pkg.json write (pkgRoot, version, schema, commands map)
+    appliedCommands = applyCommands(commands, args.forceCommands);
+    appliedPkgJson = true;
+  } else {
+    // ISSUE-6 plugin mode: the plugin loader owns the core hooks/commands and
+    // settings.json wiring — copying them here would double-register. Skip those,
+    // but STILL write minimal package metadata so the runtime can resolve PKG_ROOT
+    // for lint/feedback scripts (hooks/hypo-shared.mjs → hypo-personal-check). The
+    // commands SHA map is intentionally omitted (no command copy happened).
+    appliedPkgJson = writePluginModeMetadata();
+  }
   appliedHypoignore = applyHypoignoreMigration(hypoignore);
   // codex core hooks + settings + wiki-*→hypo-* rename mirror. Same order
   // as the claude side (rename first so subsequent hook copy can find renamed targets).
@@ -939,17 +1006,28 @@ const codexCoreDrift =
     invalidSettingsCodex ||
     (oldHookRefsCodex?.length ?? 0) > 0);
 
-const hasDrift =
+// Claude core-surface drift (hooks/settings/commands/rename/metadata). In plugin
+// mode these are plugin-managed, so they must NOT count as drift — otherwise the
+// report nags "N items need updating" and recommends a double-registering --apply.
+// Plugin-provided surface (hooks/settings/commands/rename) — excluded from drift
+// in plugin mode. pkgJsonDrift is intentionally NOT here: hypo-pkg.json is written
+// in BOTH install models (plugin mode writes minimal metadata so the runtime can
+// resolve PKG_ROOT for lint/feedback), so a missing/stale metadata file should
+// still prompt a (safe, metadata-only) --apply.
+const claudeCoreDrift =
   staleHooks.length > 0 ||
   missingSettings.length > 0 ||
-  schemaDrift ||
   invalidSettings ||
-  pkgJsonDrift ||
   oldHookRefs.length > 0 ||
   staleCommands.length > 0 ||
   userModifiedCommands.length > 0 ||
   orphanedCommands.length > 0 ||
-  nonRegularCommands.length > 0 ||
+  nonRegularCommands.length > 0;
+
+const hasDrift =
+  (managesClaudeCore && claudeCoreDrift) ||
+  pkgJsonDrift ||
+  schemaDrift ||
   hypoignore.status === 'needs-migration' ||
   extDrift ||
   codexCoreDrift;
@@ -958,6 +1036,7 @@ if (args.json) {
   console.log(
     JSON.stringify(
       {
+        pluginMode,
         schema,
         hooks,
         settings,
@@ -1001,6 +1080,23 @@ if (args.json) {
 
 // Human-readable report
 const lines = [];
+
+// ISSUE-6: lead with the plugin-mode banner so the user understands why the core
+// hook/command/settings sections read "managed by plugin" and that `--apply` will
+// NOT touch them (only vault-side migrations + package metadata).
+if (pluginMode) {
+  lines.push(
+    'ℹ Plugin install detected — Hypomnema is loaded via the Claude Code plugin.',
+    '  Core hooks, slash commands, and settings.json wiring are provided by the',
+    '  plugin loader, so `/hypo:upgrade` does NOT manage them (and `--apply` will',
+    '  not copy/register them — that would double-register every hook).',
+    '  → To upgrade the plugin: `/plugin marketplace update hypomnema` then `/reload-plugins`.',
+    '  → `/hypo:upgrade --apply` here applies vault-side migrations (SCHEMA,',
+    '    .hypoignore), refreshes package metadata, and still syncs any vault',
+    '    extensions — but does NOT install the core hooks/commands/settings.',
+    '',
+  );
+}
 
 // Schema version
 if (schema.bump === 'none') {
@@ -1047,7 +1143,13 @@ function pushHookSummary(hookList, label, targetPath) {
     }
   }
 }
-pushHookSummary(hooks, '', '~/.claude/hooks/');
+if (managesClaudeCore) {
+  pushHookSummary(hooks, '', '~/.claude/hooks/');
+} else {
+  lines.push(
+    '✓ Hook files          provided by the plugin loader (not managed in ~/.claude/hooks/)',
+  );
+}
 if (hooksCodex) pushHookSummary(hooksCodex, ' (codex)', '~/.codex/hooks/');
 
 // settings.json registrations (target-aware mirror; fix #48).
@@ -1066,7 +1168,13 @@ function pushSettingsSummary(sList, label, invalidFlag) {
     }
   }
 }
-pushSettingsSummary(settings, '', invalidSettings);
+if (managesClaudeCore) {
+  pushSettingsSummary(settings, '', invalidSettings);
+} else {
+  lines.push(
+    '✓ settings.json       hook wiring provided by the plugin (no ~/.claude registration)',
+  );
+}
 if (settingsCodex) pushSettingsSummary(settingsCodex, ' (codex)', invalidSettingsCodex);
 
 // Package metadata
@@ -1087,7 +1195,9 @@ const cmdMissCount = commands.filter((c) => c.status === 'missing').length;
 const cmdUserCount = userModifiedCommands.length;
 const cmdOrphanCount = orphanedCommands.length;
 const cmdNonRegCount = nonRegularCommands.length;
-if (commands.length === 0) {
+if (!managesClaudeCore) {
+  lines.push('✓ Slash commands    provided by the plugin loader (not ~/.claude/commands/hypo/)');
+} else if (commands.length === 0) {
   lines.push(`⚠ Slash commands    package commands/ is empty`);
 } else if (
   cmdStaleCount === 0 &&
@@ -1134,7 +1244,10 @@ function pushHookNameSummary(refs, label) {
     lines.push(`✓ ${colN}All hook references use current hypo-*.mjs names`);
   }
 }
-pushHookNameSummary(oldHookRefs, '');
+// In plugin mode the Claude settings.json is plugin-owned and --apply skips the
+// rename migration, so do not print a "run --apply to rename" instruction it will
+// not honor. (codex hook-name migration is unaffected by pluginMode.)
+if (managesClaudeCore) pushHookNameSummary(oldHookRefs, '');
 if (oldHookRefsCodex) pushHookNameSummary(oldHookRefsCodex, ' (codex)');
 
 // .hypoignore migration (ensure required runtime patterns are present)
@@ -1269,17 +1382,23 @@ pushAppliedExt(appliedExtensionsCodex, ' (codex)');
 
 // Summary
 lines.push('');
+// Claude core-surface item count — zeroed in plugin mode (plugin-managed), so the
+// summary never reads "N items need updating" for hooks/settings/commands.
+const claudeCoreCount = managesClaudeCore
+  ? staleHooks.length +
+    missingSettings.length +
+    (invalidSettings ? 1 : 0) +
+    oldHookRefs.length +
+    staleCommands.length +
+    userModifiedCommands.length +
+    orphanedCommands.length +
+    nonRegularCommands.length
+  : 0;
+
 const totalDrift =
-  staleHooks.length +
-  missingSettings.length +
-  (schemaDrift ? 1 : 0) +
-  (invalidSettings ? 1 : 0) +
+  claudeCoreCount +
   (pkgJsonDrift ? 1 : 0) +
-  oldHookRefs.length +
-  staleCommands.length +
-  userModifiedCommands.length +
-  orphanedCommands.length +
-  nonRegularCommands.length +
+  (schemaDrift ? 1 : 0) +
   (hypoignore.status === 'needs-migration' ? hypoignore.missing.length : 0) +
   extCheck.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
