@@ -232,13 +232,56 @@ export function freshDates() {
   return local === utc ? [local] : [local, utc];
 }
 
+// Parse a single frontmatter scalar (mirrors hypo-session-start.mjs /
+// hypo-cwd-change.mjs; local copy per the hook self-contained convention).
+function parseFrontmatterField(content, key) {
+  const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return null;
+  const line = m[1].split('\n').find((l) => l.startsWith(`${key}:`));
+  if (!line) return null;
+  return line
+    .slice(key.length + 1)
+    .trim()
+    .replace(/^['"]|['"]$/g, '');
+}
+
+// Among `slugs`, return the one whose projects/<slug>/index.md `working_dir`
+// is the LONGEST prefix of cwd (so /repo/sub wins over /repo). Returns null
+// when cwd is falsy or matches none. Used only as a same-date tie-breaker.
+function pickByCwd(hypoDir, slugs, cwd) {
+  if (!cwd) return null;
+  let best = null;
+  let bestLen = -1;
+  for (const slug of slugs) {
+    const indexPath = join(hypoDir, 'projects', slug, 'index.md');
+    if (!existsSync(indexPath)) continue;
+    const wd = parseFrontmatterField(readFileSync(indexPath, 'utf-8'), 'working_dir');
+    if (!wd) continue;
+    let resolved = wd.startsWith('~/') ? join(homedir(), wd.slice(2)) : wd;
+    resolved = resolved.replace(/\/+$/, ''); // trailing-slash normalize
+    if ((cwd === resolved || cwd.startsWith(resolved + '/')) && resolved.length > bestLen) {
+      bestLen = resolved.length;
+      best = slug;
+    }
+  }
+  return best;
+}
+
 /**
  * Resolve the most-recently-active project slug from root hot.md.
- * Mirrors scripts/resume.mjs resolveActiveProject — kept in sync by hand.
+ * The cwd helpers (parseFrontmatterField / pickByCwd) and the same-date
+ * tie-break are kept in sync with scripts/resume.mjs by hand; the surrounding
+ * wrapper intentionally differs (resume.mjs adds an mtime fallback, this does not).
+ * `cwd` is an optional same-date tie-breaker (ISSUE-1): resume passes
+ * process.cwd(); session-close callers (sessionCloseFileStatus /
+ * closeFileTargets) intentionally pass null — close has a different
+ * authority (payload.project / freshness), tracked separately as ISSUE-7.
+ * When cwd is omitted, behavior is identical to the legacy version.
  * @param {string} hypoDir
+ * @param {string|null} [cwd]
  * @returns {string|null}
  */
-export function resolveActiveProject(hypoDir) {
+export function resolveActiveProject(hypoDir, cwd = null) {
   const hotPath = join(hypoDir, 'hot.md');
   if (!existsSync(hotPath)) return null;
   let content;
@@ -257,6 +300,19 @@ export function resolveActiveProject(hypoDir) {
   ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
     wikiRows.sort((a, b) => b.date.localeCompare(a.date));
+    // Same-date tie-break (ISSUE-1): when the top date is shared by >1 row,
+    // prefer the project whose working_dir contains cwd. No cwd / no match →
+    // keep the stable-sort winner (the legacy "first table row" behavior).
+    const topDate = wikiRows[0].date;
+    const tied = wikiRows.filter((r) => r.date === topDate);
+    if (cwd && tied.length > 1) {
+      const picked = pickByCwd(
+        hypoDir,
+        tied.map((r) => r.slug),
+        cwd,
+      );
+      if (picked) return picked;
+    }
     return wikiRows[0].slug;
   }
   // Legacy markdown-link rows: | [name](projects/name/...) | ...
