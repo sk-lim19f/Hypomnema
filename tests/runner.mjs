@@ -20,6 +20,7 @@ import {
   unlinkSync,
   utimesSync,
   cpSync,
+  realpathSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -28,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 // entry check, so importing it for unit tests does not run the CLI.
 import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync.mjs';
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
-import { buildProjectSuggestionLine } from '../hooks/hypo-shared.mjs';
+import { buildProjectSuggestionLine, resolveActiveProject } from '../hooks/hypo-shared.mjs';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 import {
   validateChangelog,
@@ -7427,6 +7428,155 @@ tags: [wiki, operations]
       !r.stdout.includes('slug') && !r.stderr.includes('"slug"'),
       `slug placeholder must not leak: stdout=${r.stdout} stderr=${r.stderr}`,
     );
+  });
+});
+
+// ── ISSUE-1: resolveActiveProject cwd same-date tie-break ─────────────────────
+
+suite('resolveActiveProject — cwd same-date tie-break (ISSUE-1)');
+
+// Build a tmp wiki: root hot.md pointer table + per-project index.md working_dir.
+// rows: [{ slug, date, workingDir? }]
+function makeTieBreakWiki(wikiDir, rows) {
+  mkdirSync(wikiDir, { recursive: true });
+  const tableRows = rows.map((r) => `| ${r.slug} | ${r.date} | [[projects/${r.slug}/hot]] |`);
+  const hot = `---
+title: Hot
+type: reference
+updated: 2026-06-08
+---
+
+## Active Projects
+
+| Project | Last Session | Hot Cache |
+|---|---|---|
+${tableRows.join('\n')}
+`;
+  writeFileSync(join(wikiDir, 'hot.md'), hot);
+  for (const r of rows) {
+    const pdir = join(wikiDir, 'projects', r.slug);
+    mkdirSync(pdir, { recursive: true });
+    if (r.workingDir) {
+      writeFileSync(
+        join(pdir, 'index.md'),
+        `---\ntitle: ${r.slug}\ntype: project-index\nupdated: 2026-06-08\nworking_dir: "${r.workingDir}"\n---\n# ${r.slug}\n`,
+      );
+    }
+  }
+}
+
+test('same-date tie → cwd-matched project wins over table order', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'alpha', date: '2026-06-08' }, // table-top, no working_dir
+      { slug: 'beta', date: '2026-06-08', workingDir: join(dir, 'code/beta') },
+    ]);
+    assert.equal(resolveActiveProject(dir, join(dir, 'code/beta')), 'beta');
+    // sanity: without cwd, the legacy first-row winner stands
+    assert.equal(resolveActiveProject(dir), 'alpha');
+  });
+});
+
+test('tie-breaker-only: newer single row kept even when cwd matches an older row', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'alpha', date: '2026-06-08' },
+      { slug: 'beta', date: '2026-06-07', workingDir: join(dir, 'code/beta') },
+    ]);
+    // cwd matches beta, but beta is older and NOT in the top-date group →
+    // most-recent alpha must still win (tie-breaker-only, not cwd-first).
+    assert.equal(resolveActiveProject(dir, join(dir, 'code/beta')), 'alpha');
+  });
+});
+
+test('longest working_dir prefix wins on tie (/repo vs /repo/sub)', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'parent', date: '2026-06-08', workingDir: join(dir, 'repo') },
+      { slug: 'child', date: '2026-06-08', workingDir: join(dir, 'repo/sub') },
+    ]);
+    assert.equal(resolveActiveProject(dir, join(dir, 'repo/sub/x')), 'child');
+  });
+});
+
+test('cwd null → legacy stable-sort winner (no behavior change)', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'alpha', date: '2026-06-08', workingDir: join(dir, 'code/alpha') },
+      { slug: 'beta', date: '2026-06-08', workingDir: join(dir, 'code/beta') },
+    ]);
+    assert.equal(resolveActiveProject(dir), 'alpha');
+  });
+});
+
+test('cwd matches no project on tie → legacy first row', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'alpha', date: '2026-06-08' },
+      { slug: 'beta', date: '2026-06-08', workingDir: join(dir, 'code/beta') },
+    ]);
+    assert.equal(resolveActiveProject(dir, join(dir, 'elsewhere')), 'alpha');
+  });
+});
+
+test('all rows dateless → cwd still breaks the all-tie group', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'alpha', date: '' },
+      { slug: 'beta', date: '', workingDir: join(dir, 'code/beta') },
+    ]);
+    assert.equal(resolveActiveProject(dir, join(dir, 'code/beta')), 'beta');
+  });
+});
+
+test('sibling-prefix is not a match (/repo does not match cwd /repoX)', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'alpha', date: '2026-06-08' },
+      { slug: 'beta', date: '2026-06-08', workingDir: join(dir, 'repo') },
+    ]);
+    // cwd is a sibling dir sharing a string prefix but not a path prefix →
+    // must NOT match beta; legacy first row stands.
+    assert.equal(resolveActiveProject(dir, join(dir, 'repoX')), 'alpha');
+  });
+});
+
+test('trailing-slash working_dir is normalized before matching', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'alpha', date: '2026-06-08' },
+      { slug: 'beta', date: '2026-06-08', workingDir: `${join(dir, 'code/beta')}/` },
+    ]);
+    assert.equal(resolveActiveProject(dir, join(dir, 'code/beta')), 'beta');
+  });
+});
+
+test('resume.mjs honors process.cwd() for same-date tie (ISSUE-1 wiring)', () => {
+  withTmpDir((dir) => {
+    // process.cwd() reports the realpath, so the fixture working_dir must use
+    // the realpath too (tmpdir is /var → /private/var on macOS).
+    const realDir = realpathSync(dir);
+    const hypoDir = join(dir, 'wiki');
+    const betaWd = join(realDir, 'code/beta');
+    makeTieBreakWiki(hypoDir, [
+      { slug: 'alpha', date: '2026-06-08' },
+      { slug: 'beta', date: '2026-06-08', workingDir: betaWd },
+    ]);
+    for (const s of ['alpha', 'beta']) {
+      writeFileSync(
+        join(hypoDir, 'projects', s, 'session-state.md'),
+        `---\ntitle: ss — ${s}\ntype: session-state\nupdated: 2026-06-08\n---\n\n## 다음\n- t\n`,
+      );
+    }
+    const cwd = betaWd;
+    mkdirSync(cwd, { recursive: true });
+    const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
+      encoding: 'utf-8',
+      cwd,
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.ok(r.stdout.startsWith('Project: beta'), `expected 'Project: beta', got: ${r.stdout}`);
   });
 });
 

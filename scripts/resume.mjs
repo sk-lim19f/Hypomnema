@@ -16,6 +16,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
@@ -33,7 +34,43 @@ function parseArgs(argv) {
 
 // ── active project from hot.md ───────────────────────────────────────────────
 
-function resolveActiveProject(hypoDir) {
+// Parse a single frontmatter scalar (mirrors the hook helpers in
+// hypo-session-start.mjs / hypo-cwd-change.mjs — kept local per the hook
+// self-contained convention rather than shared, to avoid script↔hook coupling).
+function parseFrontmatterField(content, key) {
+  const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return null;
+  const line = m[1].split('\n').find((l) => l.startsWith(`${key}:`));
+  if (!line) return null;
+  return line
+    .slice(key.length + 1)
+    .trim()
+    .replace(/^['"]|['"]$/g, '');
+}
+
+// Among `slugs`, return the one whose projects/<slug>/index.md `working_dir`
+// is the LONGEST prefix of cwd (so /repo/sub wins over /repo). Returns null
+// when cwd is falsy or matches none. Used only as a same-date tie-breaker.
+function pickByCwd(hypoDir, slugs, cwd) {
+  if (!cwd) return null;
+  let best = null;
+  let bestLen = -1;
+  for (const slug of slugs) {
+    const indexPath = join(hypoDir, 'projects', slug, 'index.md');
+    if (!existsSync(indexPath)) continue;
+    const wd = parseFrontmatterField(readFileSync(indexPath, 'utf-8'), 'working_dir');
+    if (!wd) continue;
+    let resolved = wd.startsWith('~/') ? join(homedir(), wd.slice(2)) : wd;
+    resolved = resolved.replace(/\/+$/, ''); // trailing-slash normalize
+    if ((cwd === resolved || cwd.startsWith(resolved + '/')) && resolved.length > bestLen) {
+      bestLen = resolved.length;
+      best = slug;
+    }
+  }
+  return best;
+}
+
+function resolveActiveProject(hypoDir, cwd = null) {
   const hotPath = join(hypoDir, 'hot.md');
   if (!existsSync(hotPath)) return null;
 
@@ -49,6 +86,19 @@ function resolveActiveProject(hypoDir) {
   ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
     wikiRows.sort((a, b) => b.date.localeCompare(a.date));
+    // Same-date tie-break (ISSUE-1): when the top date is shared by >1 row,
+    // prefer the project whose working_dir contains cwd. No cwd / no match →
+    // keep the stable-sort winner (the legacy "first table row" behavior).
+    const topDate = wikiRows[0].date;
+    const tied = wikiRows.filter((r) => r.date === topDate);
+    if (cwd && tied.length > 1) {
+      const picked = pickByCwd(
+        hypoDir,
+        tied.map((r) => r.slug),
+        cwd,
+      );
+      if (picked) return picked;
+    }
     return wikiRows[0].slug;
   }
   // Legacy markdown-link rows: | [name](projects/name/...) | ...
@@ -93,7 +143,7 @@ function readHot(hypoDir, project) {
 
 const args = parseArgs(process.argv);
 
-const project = args.project || resolveActiveProject(args.hypoDir);
+const project = args.project || resolveActiveProject(args.hypoDir, process.cwd());
 
 if (!project) {
   console.error('Error: no active project found. Use --project=<name> or create a hot.md entry.');
