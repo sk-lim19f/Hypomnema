@@ -323,6 +323,10 @@ let raw = '';
 process.stdin.setEncoding('utf-8');
 process.stdin.on('data', (chunk) => (raw += chunk));
 process.stdin.on('end', () => {
+  // ISSUE-5: declared before the try so every emit branch — including the outer
+  // catch — carries the same `systemMessage` (the user-visible update/sibling
+  // banner). Reassigned once below after the notices are computed.
+  let outExtra = { continue: true, suppressOutput: true };
   try {
     let data = {};
     try {
@@ -339,10 +343,16 @@ process.stdin.on('end', () => {
     const clearRecoveryLine = buildClearRecoveryLine(data.source);
     const updateLine = buildUpdateNotice();
     const siblingLine = buildSiblingNotice();
-    // Intentional dual emit: stderr (yellow/cyan) is the human-visible nudge in
-    // the terminal; noticePrefix injects the same plain-text lines into the
-    // LLM's additionalContext so model and user start the session looking at
-    // the same state. ANSI escapes are kept out of additionalContext on purpose.
+    // ISSUE-5: the update + stale-sibling banners must reach the USER. On a
+    // SessionStart hook that exits 0, stderr is invisible in the normal TUI
+    // (only shown on exit 2 / --verbose) and additionalContext is model-only —
+    // `systemMessage` is the documented user-visible channel. Route those two
+    // banners there. They ALSO stay in noticePrefix → additionalContext below,
+    // so the model and the user start the session looking at the same state.
+    // (The other stderr notices — sync/growth/clear/suggest — are intentionally
+    // transcript/--verbose only and out of ISSUE-5's scope.)
+    const userMessage = [updateLine, siblingLine].filter(Boolean).join('\n\n');
+    if (userMessage) outExtra = { ...outExtra, systemMessage: userMessage };
     const notices = [syncLine, growthLine, clearRecoveryLine, updateLine, siblingLine].filter(
       Boolean,
     );
@@ -383,7 +393,7 @@ process.stdin.on('end', () => {
           JSON.stringify(
             buildOutput(
               `${noticePrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}]\n\n${parts.join('\n\n')}`,
-              { continue: true, suppressOutput: true },
+              outExtra,
             ),
           ),
         );
@@ -399,10 +409,7 @@ process.stdin.on('end', () => {
           JSON.stringify(
             buildOutput(
               `${noticePrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}, no snapshot yet]`,
-              {
-                continue: true,
-                suppressOutput: true,
-              },
+              outExtra,
             ),
           ),
         );
@@ -425,9 +432,9 @@ process.stdin.on('end', () => {
     if (!existsSync(GLOBAL_HOT)) {
       const notice = notices.join('\n\n');
       if (notice) {
-        console.log(JSON.stringify(buildOutput(notice, { continue: true, suppressOutput: true })));
+        console.log(JSON.stringify(buildOutput(notice, outExtra)));
       } else {
-        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+        console.log(JSON.stringify(outExtra));
       }
       return;
     }
@@ -439,9 +446,9 @@ process.stdin.on('end', () => {
       // would otherwise be silently dropped here.
       const notice = notices.join('\n\n');
       if (notice) {
-        console.log(JSON.stringify(buildOutput(notice, { continue: true, suppressOutput: true })));
+        console.log(JSON.stringify(buildOutput(notice, outExtra)));
       } else {
-        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+        console.log(JSON.stringify(outExtra));
       }
       return;
     }
@@ -449,12 +456,12 @@ process.stdin.on('end', () => {
       JSON.stringify(
         buildOutput(
           `${noticePrefix}[WIKI HOT CACHE: global — no project matched cwd=${cwd}]\n\n${globalContent}`,
-          { continue: true, suppressOutput: true },
+          outExtra,
         ),
       ),
     );
   } catch (err) {
     process.stderr.write(`[hypo-session-start] error: ${err?.message ?? String(err)}\n`);
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    console.log(JSON.stringify(outExtra));
   }
 });

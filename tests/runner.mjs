@@ -10382,6 +10382,9 @@ test('session-start (D3): stale PATH sibling surfaces a one-shot notice, then th
       // additionalContext (LLM-visible) carries it too
       const out = JSON.parse(first.stdout);
       assert.match(out.additionalContext || '', /Stale install on PATH/);
+      // ISSUE-5: and the user-visible channel (systemMessage) carries it as well
+      // — stderr alone is invisible on a SessionStart hook that exits 0.
+      assert.match(out.systemMessage || '', /Stale install on PATH/);
       // second start: same tuple already notified → suppressed
       const second = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
         input: payload,
@@ -10418,6 +10421,98 @@ test('session-start (D3): opted out (CI/NO_UPDATE_NOTIFIER) suppresses the sibli
       });
       assert.doesNotMatch(r.stderr, /Stale install on PATH/);
     });
+  });
+});
+
+// ── ISSUE-5: update-notifier banner routed to user-visible systemMessage ──────
+// The update notice fires only for the npm/plugin channels (computeNotice skips
+// 'unknown'), and the channel is derived from the RUNNING hook's install root
+// (dirname(dirname(hook))). So copy the (self-contained) hooks/ tree into a fake
+// `node_modules/hypomnema` root — making detectChannel() resolve to 'npm' — and
+// run the COPIED hook with a seeded cache + fake HOME. Proves the banner reaches
+// `systemMessage` (the user channel), not just stderr/additionalContext.
+suite('update-notifier (ISSUE-5): banner routed to user-visible systemMessage');
+
+function withFakeNpmInstall(installedVersion, fn) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-npm-'));
+  try {
+    const root = join(base, 'node_modules', 'hypomnema');
+    mkdirSync(root, { recursive: true });
+    cpSync(HOOKS, join(root, 'hooks'), { recursive: true }); // hooks are self-contained
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'hypomnema', version: installedVersion }),
+    );
+    const home = join(base, 'home');
+    const cacheDir = join(home, '.claude', 'hypomnema', 'cache');
+    mkdirSync(cacheDir, { recursive: true });
+    const wiki = join(base, 'wiki');
+    mkdirSync(wiki, { recursive: true });
+    fn({
+      hook: join(root, 'hooks', 'hypo-session-start.mjs'),
+      home,
+      wiki,
+      cachePath: join(cacheDir, 'version-check.json'),
+    });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+function runFakeStart(hook, home, wiki, sessionId, extraEnv = {}) {
+  return spawnSync(process.execPath, [hook], {
+    input: JSON.stringify({ cwd: wiki, session_id: sessionId }),
+    encoding: 'utf-8',
+    env: { ...process.env, ...NOTIFY_ON, HOME: home, HYPO_DIR: wiki, ...extraEnv },
+  });
+}
+
+test('session-start: fresh npm update → systemMessage carries the banner (dual-emit keeps additionalContext)', () => {
+  withFakeNpmInstall('0.0.0', ({ hook, home, wiki, cachePath }) => {
+    writeFileSync(
+      cachePath,
+      JSON.stringify({ checkedAt: Date.now(), latest: { npm: '999.0.0' }, notifiedFor: {} }),
+    );
+    const out = JSON.parse(runFakeStart(hook, home, wiki, 'upd-issue5').stdout);
+    assert.match(
+      out.systemMessage || '',
+      /Update available! 0\.0\.0 → 999\.0\.0/,
+      `update banner missing from systemMessage: ${JSON.stringify(out.systemMessage)}`,
+    );
+    // dual emit: the model still sees the same state via additionalContext
+    assert.match(out.additionalContext || '', /Update available! 0\.0\.0 → 999\.0\.0/);
+  });
+});
+
+test('session-start: already-notified version → no systemMessage (no nag)', () => {
+  withFakeNpmInstall('0.0.0', ({ hook, home, wiki, cachePath }) => {
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        checkedAt: Date.now(),
+        latest: { npm: '999.0.0' },
+        notifiedFor: { npm: '999.0.0' },
+      }),
+    );
+    const out = JSON.parse(runFakeStart(hook, home, wiki, 'upd-issue5-nonag').stdout);
+    assert.ok(
+      !('systemMessage' in out),
+      `expected no systemMessage when already notified: ${JSON.stringify(out.systemMessage)}`,
+    );
+  });
+});
+
+test('session-start: opted out (CI) → update banner suppressed on every channel', () => {
+  withFakeNpmInstall('0.0.0', ({ hook, home, wiki, cachePath }) => {
+    writeFileSync(
+      cachePath,
+      JSON.stringify({ checkedAt: Date.now(), latest: { npm: '999.0.0' }, notifiedFor: {} }),
+    );
+    // CI:'true' overrides NOTIFY_ON's CI:'' → isOptedOut() true
+    const out = JSON.parse(
+      runFakeStart(hook, home, wiki, 'upd-issue5-optout', { CI: 'true' }).stdout,
+    );
+    assert.ok(!('systemMessage' in out), 'opted-out session must not surface an update banner');
   });
 });
 
