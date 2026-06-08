@@ -147,11 +147,16 @@ jobs:
       - name: Dry-run publish (build + prepublishOnly, no PUT)
         # `--dry-run` packs the tarball and runs prepublishOnly
         # (test/lint/smoke-pack/check:bilingual) but performs NO registry PUT, so
-        # nothing is published. NODE_AUTH_TOKEN IS required: prepublishOnly runs
-        # `smoke-pack`, which `npm install`s the packed tarball, and setup-node
-        # writes an always-auth `.npmrc` — without the token that nested install
-        # fails (exit 254). This matches the real publish job, whose prepublishOnly
-        # runs with the same token.
+        # nothing is published.
+        #
+        # Historical note (precheck-254): this `--dry-run` exports
+        # `npm_config_dry_run=true` into the lifecycle env, which leaked into
+        # smoke-pack's nested `npm pack` — making it a no-op that wrote no tarball,
+        # so the nested `npm install` died with ENOENT (exit 254). Fixed in
+        # scripts/smoke-pack.mjs by stripping `npm_config_dry_run` for its nested
+        # npm calls. (NOT a missing-token problem — that was an earlier wrong
+        # theory.) NODE_AUTH_TOKEN is kept below to mirror the real publish job's
+        # environment, so this dry-run stays representative.
         run: npm publish --dry-run --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
