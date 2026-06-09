@@ -2633,7 +2633,13 @@ function withSettingsFile(content, fn) {
   }
 }
 
-test('enabled: hypomnema@<marketplace> mapped to true → true', () => {
+test('enabled: hypo@<marketplace> mapped to true → true (current plugin name)', () => {
+  withSettingsFile({ enabledPlugins: { 'hypo@hypomnema': true } }, (p) => {
+    assert.equal(isHypomnemaPluginEnabled(p), true);
+  });
+});
+
+test('enabled: legacy hypomnema@<marketplace> mapped to true → true (migration window)', () => {
   withSettingsFile({ enabledPlugins: { 'hypomnema@hypomnema': true } }, (p) => {
     assert.equal(isHypomnemaPluginEnabled(p), true);
   });
@@ -2657,8 +2663,20 @@ test('only other plugins enabled → false', () => {
   );
 });
 
+test('bare "hypo": true (no @marketplace) → false (not a valid identifier)', () => {
+  withSettingsFile({ enabledPlugins: { hypo: true } }, (p) => {
+    assert.equal(isHypomnemaPluginEnabled(p), false);
+  });
+});
+
 test('bare "hypomnema": true (no @marketplace) → false (not a valid identifier)', () => {
   withSettingsFile({ enabledPlugins: { hypomnema: true } }, (p) => {
+    assert.equal(isHypomnemaPluginEnabled(p), false);
+  });
+});
+
+test('prefix collision hypo-foo@mp: true → false (exact name only)', () => {
+  withSettingsFile({ enabledPlugins: { 'hypo-foo@mp': true } }, (p) => {
     assert.equal(isHypomnemaPluginEnabled(p), false);
   });
 });
@@ -10379,6 +10397,45 @@ test('buildUpdateLine: channel-specific update command', () => {
   );
   assert.match(vc.buildUpdateLine('plugin', '1.0.0', '1.1.0'), /reload-plugins/);
   assert.match(vc.buildUpdateLine('unknown', '1.0.0', '1.1.0'), /1\.0\.0 → 1\.1\.0/);
+});
+
+test('selectPluginVersion: resolves current name, legacy name, ordering, and bad input', () => {
+  // current plugin name
+  assert.equal(vc.selectPluginVersion([{ name: 'hypo', version: '1.3.2' }]), '1.3.2');
+  // legacy name (stale/transitional marketplace.json)
+  assert.equal(vc.selectPluginVersion([{ name: 'hypomnema', version: '1.3.1' }]), '1.3.1');
+  // selects by name, not index — other plugins listed first must not win
+  assert.equal(
+    vc.selectPluginVersion([
+      { name: 'other', version: '9.9.9' },
+      { name: 'hypo', version: '1.3.2' },
+    ]),
+    '1.3.2',
+  );
+  // both aliases present → prefer `hypo` regardless of order (no legacy shadowing)
+  assert.equal(
+    vc.selectPluginVersion([
+      { name: 'hypomnema', version: '1.3.1' },
+      { name: 'hypo', version: '1.3.2' },
+    ]),
+    '1.3.2',
+  );
+  assert.equal(
+    vc.selectPluginVersion([
+      { name: 'hypo', version: '1.3.2' },
+      { name: 'hypomnema', version: '1.3.1' },
+    ]),
+    '1.3.2',
+  );
+  // no matching entry → null
+  assert.equal(vc.selectPluginVersion([{ name: 'other', version: '9.9.9' }]), null);
+  // non-string / missing version → null
+  assert.equal(vc.selectPluginVersion([{ name: 'hypo' }]), null);
+  assert.equal(vc.selectPluginVersion([{ name: 'hypo', version: 42 }]), null);
+  // not an array → null
+  assert.equal(vc.selectPluginVersion(null), null);
+  assert.equal(vc.selectPluginVersion(undefined), null);
+  assert.equal(vc.selectPluginVersion({}), null);
 });
 
 test('cacheIsFresh: fresh / stale / future / missing', () => {

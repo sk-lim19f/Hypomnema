@@ -14,7 +14,7 @@
  * Usage: node version-check-fetch.mjs [cachePath]
  */
 
-import { defaultCachePath, mergeLatest } from './version-check.mjs';
+import { defaultCachePath, mergeLatest, selectPluginVersion } from './version-check.mjs';
 
 const NPM_URL = 'https://registry.npmjs.org/hypomnema/latest';
 const PLUGIN_URL =
@@ -42,13 +42,7 @@ async function fetchNpmLatest() {
 
 async function fetchPluginLatest() {
   const data = await fetchJson(PLUGIN_URL);
-  if (!data || !Array.isArray(data.plugins)) return null;
-  // Select by name rather than plugins[0]: a future marketplace.json could list
-  // more than one plugin or reorder entries, which would otherwise read the
-  // wrong version.
-  const entry = data.plugins.find((p) => p && p.name === 'hypomnema');
-  const v = entry && entry.version;
-  return typeof v === 'string' ? v : null;
+  return selectPluginVersion(data && data.plugins);
 }
 
 async function main() {

@@ -45,7 +45,7 @@ Claude Code 안에서:
 
 ```
 /plugin marketplace add sk-lim19f/Hypomnema
-/plugin install hypomnema@hypomnema
+/plugin install hypo@hypomnema
 /hypo:init
 ```
 

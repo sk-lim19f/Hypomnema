@@ -8,7 +8,7 @@
   },
   "plugins": [
     {
-      "name": "hypomnema",
+      "name": "hypo",
       "source": "./",
       "description": "LLM-native personal wiki — session-aware knowledge base for Claude Code",
       "version": "1.3.1",
