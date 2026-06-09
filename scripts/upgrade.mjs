@@ -21,7 +21,7 @@
  *   --json              Output results as JSON
  *   --allow-downgrade   Override the guard that refuses to overwrite a NEWER
  *                       active install with an older package (ADR 0038)
- *   --allow-dual-install  Override the ISSUE-8 guard: register the Claude core
+ *   --allow-dual-install  Override the dual-install guard: register the Claude core
  *                       surface even though the Hypomnema plugin is also enabled
  *                       (knowingly accept the double-registration risk)
  */
@@ -806,14 +806,14 @@ const codexSettingsPath = join(HOME, '.codex', 'settings.json');
 // every hook fires TWICE. The decisive signal: the plugin command runs the
 // PLUGIN's upgrade.mjs, so PKG_ROOT lives under ~/.claude/plugins/. (A manual/npm
 // upgrade.mjs run while the plugin is ALSO enabled is a different failure mode —
-// dual install — tracked as ISSUE-8.)
+// dual install — handled by the guard below.)
 // Match the Claude plugin cache shape specifically (`~/.claude/plugins/…`), NOT a
 // generic `/plugins/` substring — this flag now GATES install behavior, so a
 // legitimate npm/dev checkout under some unrelated `…/plugins/…` path must not be
 // misclassified and silently stop managing its hooks. (detectChannel's broad
 // `/plugins/` test is fine for the notifier's display-only use, but too loose here.)
 const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
-// ISSUE-8 (dual install): the OTHER way the same double-registration can happen.
+// Dual install: the OTHER way the same double-registration can happen.
 // Here the MANUAL/npm upgrade.mjs is running (pluginMode=false), but the Hypomnema
 // plugin is ALSO enabled in ~/.claude/settings.json — so the plugin loader already
 // provides the core hooks/commands/settings. A manual/npm `--apply` would copy and
@@ -897,7 +897,7 @@ const invalidSettingsCodex = settingsCodex
   ? settingsCodex.some((s) => s.status === 'invalid-json')
   : false;
 const schemaDrift = schema.bump !== 'none' && schema.bump !== 'unknown' && schema.bump !== 'ahead';
-// ISSUE-8 dual-install: when core is skipped, hypo-pkg.json is deliberately left
+// Dual-install: when core is skipped, hypo-pkg.json is deliberately left
 // pointing at the PLUGIN's package root (preserved identity), so checkPkgJson()
 // reports it 'stale' relative to this npm/manual PKG_ROOT. That mismatch is
 // INTENTIONAL — `--apply` will not (and must not) rewrite it — so it must not
@@ -958,7 +958,7 @@ if (args.apply) {
     migrationPath = writeMigrationReport(args.hypoDir, schema.installed, schema.current, {
       // Use the core-skipped predicate, not raw pluginMode: in a dual-install skip
       // the core surface is plugin-owned too, so the report must not claim the
-      // core hooks/settings were applied (ISSUE-8, W2 review note).
+      // core hooks/settings were applied.
       pluginMode: !managesClaudeCore,
     });
   }
@@ -984,7 +984,7 @@ if (args.apply) {
     // is the plugin's own path here, so this metadata is authoritative.
     appliedPkgJson = writePluginModeMetadata();
   } else {
-    // ISSUE-8 dual-install skip: a manual/npm run while the plugin is enabled. We
+    // Dual-install skip: a manual/npm run while the plugin is enabled. We
     // skip the core surface (the plugin owns it), but — unlike true plugin mode —
     // PKG_ROOT here is the npm/manual path while the ACTIVE runtime hooks are the
     // PLUGIN's. Rewriting a VALID hypo-pkg.json.pkgRoot to this npm path would
@@ -1089,7 +1089,7 @@ if (args.json) {
     JSON.stringify(
       {
         pluginMode,
-        // ISSUE-8 dual-install signals.
+        // Dual-install signals.
         hypomnemaPluginEnabled,
         dualInstallCoreConflict,
         coreManagedBy: managesClaudeCore ? 'self' : pluginMode ? 'plugin' : 'plugin-enabled',
@@ -1155,7 +1155,7 @@ if (pluginMode) {
   );
 }
 
-// ISSUE-8: a manual/npm upgrade.mjs is running while the Hypomnema plugin is ALSO
+// Dual install: a manual/npm upgrade.mjs is running while the Hypomnema plugin is ALSO
 // enabled — a dual install. Lead with a loud banner: the core surface is owned by
 // the plugin and is intentionally skipped, so `--apply` will not double-register.
 if (dualSkip) {
@@ -1262,7 +1262,7 @@ if (settingsCodex) pushSettingsSummary(settingsCodex, ' (codex)', invalidSetting
 
 // Package metadata
 if (dualSkip && pkgJson.status === 'stale') {
-  // ISSUE-8: the 'stale' here is the preserved plugin identity (pkgRoot points at
+  // Dual-install: the 'stale' here is the preserved plugin identity (pkgRoot points at
   // the plugin, not this npm/manual copy). That is intentional — not actionable.
   lines.push(
     `✓ Package metadata  hypo-pkg.json plugin-owned (preserved — not rewritten in a dual install)`,

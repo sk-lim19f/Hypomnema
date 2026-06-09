@@ -1675,7 +1675,7 @@ test('missing payload → exit 1 with clear error', () => {
   );
 });
 
-test('ISSUE-7: post-apply verify follows payload.project on same-date tie (no cross-project false-block)', () => {
+test('session-close: post-apply verify follows payload.project on same-date tie (no cross-project false-block)', () => {
   // Reproduces the 2026-06-09 security-ops-kb incident. The payload closes
   // project B, but root hot.md has A (table-top) and B tied on today's date.
   // Pre-fix, the post-apply check re-resolved via resolveActiveProject → picked
@@ -1736,7 +1736,7 @@ test('ISSUE-7: post-apply verify follows payload.project on same-date tie (no cr
       assert.equal(
         out.ok,
         true,
-        `ISSUE-7: same-date tie must not false-block a completed close: ${JSON.stringify(out.verification)}`,
+        `same-date tie must not false-block a completed close: ${JSON.stringify(out.verification)}`,
       );
       assert.equal(
         out.verification.project,
@@ -2614,12 +2614,12 @@ test('plugin mode: check does NOT print a hook-name rename instruction --apply w
   });
 });
 
-// ── ISSUE-8: dual-install guard (upgrade.mjs + lib/plugin-detect.mjs) ─────────
+// ── dual-install guard (upgrade.mjs + lib/plugin-detect.mjs) ────────────────
 // A manual/npm upgrade.mjs run while the plugin is ALSO enabled would copy+register
 // the core hooks the plugin already provides → double-registration. The detector is
 // fail-open so a legit npm-only user is never blocked.
 
-suite('lib/plugin-detect.mjs — isHypomnemaPluginEnabled (ISSUE-8 parser)');
+suite('lib/plugin-detect.mjs — isHypomnemaPluginEnabled (dual-install parser)');
 
 function withSettingsFile(content, fn) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-settings-'));
@@ -2702,7 +2702,7 @@ test('corrupt JSON → false (fail open)', () => {
   withSettingsFile('{ not valid json', (p) => assert.equal(isHypomnemaPluginEnabled(p), false));
 });
 
-suite('upgrade.mjs — dual-install guard (ISSUE-8)');
+suite('upgrade.mjs — dual-install guard');
 
 // Build a manual/npm fake install (NOT under .claude/plugins) and write a
 // ~/.claude/settings.json whose enabledPlugins enables the hypomnema plugin.

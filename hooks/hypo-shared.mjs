@@ -333,7 +333,7 @@ export function resolveActiveProject(hypoDir, cwd = null) {
  * project A can't be masked by a fresh close of project B (and vice versa).
  * open-questions.md (file #5) is conditional and not gated.
  *
- * `projectOverride` (ISSUE-7 Part A): when the caller already holds the
+ * `projectOverride` (same-date-tie fix): when the caller already holds the
  * authoritative project being closed (e.g. crystallize apply derives it from
  * `payload.project`), it passes that slug so verification checks the SAME
  * project it just wrote — instead of re-deriving via resolveActiveProject(),

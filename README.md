@@ -249,7 +249,7 @@ All hooks resolve the wiki root via `HYPO_DIR` env → `hypo-config.md` scan →
 
 Additionally, the `SessionStart` hook performs a non-blocking background check against npm and the Claude Code plugin marketplace and prints an "Update available!" banner the next time a newer Hypomnema version has been published. Opt out with `HYPO_NO_UPDATE_CHECK=1`, `NO_UPDATE_NOTIFIER=1`, or by running under `CI=true`.
 
-For fix-level v1.3 detail beyond the lanes above — session-close lint scoped to touched files so `/compact` is no longer blocked by unrelated debt (ADR 0037), the `feedback` scope validator accepting cwd-derived project ids (OQ-34), and the stable lint warning IDs `W1`/`W2`/`W4` that `--strict` promotes to errors (while `W3`, auto-repaired by `--fix`, stays a warning) — see [`CHANGELOG.md`](CHANGELOG.md).
+For fix-level v1.3 detail beyond the lanes above — session-close lint scoped to touched files so `/compact` is no longer blocked by unrelated debt (ADR 0037), the `feedback` scope validator accepting cwd-derived project ids (OQ-34), and the stable lint warning IDs `W1`/`W2`/`W4` that `--strict` promotes to errors (while `W3`, auto-repaired by `--fix`, stays a warning) — see [`CHANGELOG.md`](CHANGELOG.md). **v1.3.1** is a fixes-only patch: update-notifier banners now actually reach the user via the top-level `systemMessage` channel instead of an invisible stderr write, `/hypo:upgrade` no longer double-registers core hooks for plugin or dual (manual + plugin) installs, and session-close no longer false-blocks a completed close when two projects share the latest date.
 
 ### Setup & maintenance
 
