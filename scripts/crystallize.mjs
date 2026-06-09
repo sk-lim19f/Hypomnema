@@ -613,7 +613,7 @@ function applySessionClose(args) {
     (wrote ? applied : skipped).push('log (log.md)');
   }
 
-  // ISSUE-7 Part A: verify against the SAME project this apply just wrote
+  // Same-date-tie fix: verify against the SAME project this apply just wrote
   // (`project` = payload.project || probe.project, resolved at the top). Without
   // the override, sessionCloseFileStatus re-derives via resolveActiveProject and,
   // on a same-date root-hot.md tie, can pick a different project — false-failing

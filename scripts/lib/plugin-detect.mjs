@@ -1,6 +1,6 @@
 // Detect whether the Hypomnema Claude Code plugin is enabled in a settings.json.
 //
-// ISSUE-8 (dual-install guard): the manual/npm `upgrade.mjs` must know when the
+// Dual-install guard: the manual/npm `upgrade.mjs` must know when the
 // plugin is ALSO enabled, because the plugin loader already provides the core
 // hooks/commands/settings — copying+registering them from a manual/npm `--apply`
 // would double-register every hook.
