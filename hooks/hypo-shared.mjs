@@ -333,12 +333,21 @@ export function resolveActiveProject(hypoDir, cwd = null) {
  * project A can't be masked by a fresh close of project B (and vice versa).
  * open-questions.md (file #5) is conditional and not gated.
  *
+ * `projectOverride` (ISSUE-7 Part A): when the caller already holds the
+ * authoritative project being closed (e.g. crystallize apply derives it from
+ * `payload.project`), it passes that slug so verification checks the SAME
+ * project it just wrote — instead of re-deriving via resolveActiveProject(),
+ * which on a same-date root-hot.md tie can resolve a DIFFERENT project and
+ * false-fail a completed close. When omitted, behavior is byte-identical to the
+ * legacy single-arg version (resolve from root hot.md).
+ *
  * @param {string} hypoDir
+ * @param {{projectOverride?: string|null}} [opts]
  * @returns {{ok: boolean, project: string|null, dates: string[], stale: string[], missing: string[]}}
  */
-export function sessionCloseFileStatus(hypoDir) {
+export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {}) {
   const dates = freshDates();
-  const project = resolveActiveProject(hypoDir);
+  const project = projectOverride || resolveActiveProject(hypoDir);
   if (!project) {
     return {
       ok: false,

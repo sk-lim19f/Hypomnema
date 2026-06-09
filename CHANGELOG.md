@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Session-close no longer false-blocks a completed close on a same-date project tie (ISSUE-7, Part A).** `crystallize --apply-session-close` resolves the authoritative project once (`payload.project || probe.project`) and writes the five mandatory close files for it (three project-scoped, plus the project's row/entry in root `hot.md` and `log.md`), but the **post-apply verification** re-derived the project via `resolveActiveProject()` — which, on a same-date tie in root `hot.md`'s pointer table, returns the table's **top** row (stable-sort). So a finished close of project B could be verified against a *different* project A and reported `ok:false` (A's `log.md` entry was missing), leaving the closed-marker unwritten and the Stop hook re-prompting (observed 2026-06-09: a completed `security-ops-kb` close was blocked by an unrelated `hypomnema` row). `sessionCloseFileStatus` now accepts a `projectOverride`, and the apply path passes the project it actually wrote, so write-project and verify-project can no longer diverge. Scope: the **apply** path only — the Stop-hook / payload-less probe paths still resolve from the pointer table (a cwd-aware tie-break there has a cross-project masking risk and is tracked separately as ISSUE-7 Part B). No signature change for any existing caller (new arg is an options object).
+
+### 한글 요약
+
+- **세션-close가 동률 날짜 프로젝트 tie에서 완료된 close를 더는 false-block 하지 않음 (ISSUE-7, Part A).** `crystallize --apply-session-close`는 닫는 프로젝트를 한 번 확정(`payload.project || probe.project`)해 그 프로젝트의 5개 필수 close 파일을 쓰지만(3개는 project-scoped, 나머지는 루트 `hot.md`·`log.md`의 해당 프로젝트 행/엔트리), **post-apply 검증**이 `resolveActiveProject()`로 프로젝트를 재해석했다 — 루트 `hot.md` 포인터 테이블에서 날짜가 동률이면 stable-sort로 **테이블 최상단** 행을 반환한다. 그래서 프로젝트 B의 완료된 close가 *다른* 프로젝트 A 기준으로 검증돼 `ok:false`(A의 `log.md` 엔트리 부재)를 받고, closed-marker 미기록 → Stop 훅 재프롬프트가 발생했다(2026-06-09 실증: 완료된 `security-ops-kb` close가 무관한 `hypomnema` 행 때문에 막힘). 이제 `sessionCloseFileStatus`가 `projectOverride`를 받고 apply 경로가 실제로 쓴 프로젝트를 전달 → write-project와 verify-project가 갈릴 수 없다. 범위: **apply** 경로만 — Stop-훅/무-payload probe 경로는 여전히 포인터 테이블로 해석(거기에 cwd tie-break을 넣으면 cross-project 마스킹 위험이라 ISSUE-7 Part B로 분리 추적). 기존 caller 시그니처 변경 없음(새 인자는 옵션 객체).
+
 ## [1.3.0] - 2026-06-07
 
 ### Added
