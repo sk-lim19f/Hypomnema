@@ -31,6 +31,7 @@ import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
 import { buildProjectSuggestionLine, resolveActiveProject } from '../hooks/hypo-shared.mjs';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
+import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import {
   validateChangelog,
   validateTagBody,
@@ -2609,6 +2610,246 @@ test('plugin mode: check does NOT print a hook-name rename instruction --apply w
       r.stdout,
       /old wiki-\*\.mjs reference/,
       'plugin mode must not surface the Claude hook-name rename instruction',
+    );
+  });
+});
+
+// ── ISSUE-8: dual-install guard (upgrade.mjs + lib/plugin-detect.mjs) ─────────
+// A manual/npm upgrade.mjs run while the plugin is ALSO enabled would copy+register
+// the core hooks the plugin already provides → double-registration. The detector is
+// fail-open so a legit npm-only user is never blocked.
+
+suite('lib/plugin-detect.mjs — isHypomnemaPluginEnabled (ISSUE-8 parser)');
+
+function withSettingsFile(content, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-settings-'));
+  try {
+    const p = join(dir, 'settings.json');
+    if (content !== null)
+      writeFileSync(p, typeof content === 'string' ? content : JSON.stringify(content));
+    fn(p);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('enabled: hypomnema@<marketplace> mapped to true → true', () => {
+  withSettingsFile({ enabledPlugins: { 'hypomnema@hypomnema': true } }, (p) => {
+    assert.equal(isHypomnemaPluginEnabled(p), true);
+  });
+});
+
+test('disabled value: hypomnema@mp: false → false', () => {
+  withSettingsFile({ enabledPlugins: { 'hypomnema@hypomnema': false } }, (p) => {
+    assert.equal(isHypomnemaPluginEnabled(p), false);
+  });
+});
+
+test('only other plugins enabled → false', () => {
+  withSettingsFile(
+    {
+      enabledPlugins: {
+        'frontend-design@claude-plugins-official': true,
+        'oh-my-claudecode@omc': true,
+      },
+    },
+    (p) => assert.equal(isHypomnemaPluginEnabled(p), false),
+  );
+});
+
+test('bare "hypomnema": true (no @marketplace) → false (not a valid identifier)', () => {
+  withSettingsFile({ enabledPlugins: { hypomnema: true } }, (p) => {
+    assert.equal(isHypomnemaPluginEnabled(p), false);
+  });
+});
+
+test('prefix collision hypomnema-foo@mp: true → false (exact name only)', () => {
+  withSettingsFile({ enabledPlugins: { 'hypomnema-foo@mp': true } }, (p) => {
+    assert.equal(isHypomnemaPluginEnabled(p), false);
+  });
+});
+
+test('leading @ (@hypomnema) → false', () => {
+  withSettingsFile({ enabledPlugins: { '@hypomnema': true } }, (p) => {
+    assert.equal(isHypomnemaPluginEnabled(p), false);
+  });
+});
+
+test('truthy-but-not-true value (1 / "yes") → false (strict === true)', () => {
+  withSettingsFile({ enabledPlugins: { 'hypomnema@mp': 1 } }, (p) =>
+    assert.equal(isHypomnemaPluginEnabled(p), false),
+  );
+  withSettingsFile({ enabledPlugins: { 'hypomnema@mp': 'yes' } }, (p) =>
+    assert.equal(isHypomnemaPluginEnabled(p), false),
+  );
+});
+
+test('enabledPlugins as array → false (fail open)', () => {
+  withSettingsFile({ enabledPlugins: ['hypomnema@mp'] }, (p) =>
+    assert.equal(isHypomnemaPluginEnabled(p), false),
+  );
+});
+
+test('enabledPlugins absent → false', () => {
+  withSettingsFile({ hooks: {} }, (p) => assert.equal(isHypomnemaPluginEnabled(p), false));
+});
+
+test('missing file → false (fail open, never blocks npm-only user)', () => {
+  assert.equal(isHypomnemaPluginEnabled('/no/such/settings.json'), false);
+});
+
+test('corrupt JSON → false (fail open)', () => {
+  withSettingsFile('{ not valid json', (p) => assert.equal(isHypomnemaPluginEnabled(p), false));
+});
+
+suite('upgrade.mjs — dual-install guard (ISSUE-8)');
+
+// Build a manual/npm fake install (NOT under .claude/plugins) and write a
+// ~/.claude/settings.json whose enabledPlugins enables the hypomnema plugin.
+function withDualInstall(enablePlugin, fn) {
+  withFakeUpgradeInstall(false, (ctx) => {
+    const settingsPath = join(ctx.home, '.claude', 'settings.json');
+    if (enablePlugin) {
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ enabledPlugins: { 'hypomnema@hypomnema': true } }),
+      );
+    }
+    fn({ ...ctx, settingsPath });
+  });
+}
+
+test('dual install: --json flags dualInstallCoreConflict and coreManagedBy plugin-enabled', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.pluginMode, false, 'this is a manual/npm run, not a plugin run');
+    assert.equal(out.hypomnemaPluginEnabled, true, 'plugin should be detected as enabled');
+    assert.equal(out.dualInstallCoreConflict, true);
+    assert.equal(out.coreManagedBy, 'plugin-enabled');
+  });
+});
+
+test('dual install: --apply does NOT copy hooks or register settings (no double-register)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `dual-install --apply should exit 0: ${r.stderr}\n${r.stdout}`);
+    assert.equal(
+      existsSync(join(home, '.claude', 'hooks')),
+      false,
+      'dual-install --apply must NOT create ~/.claude/hooks (the plugin owns core)',
+    );
+    assert.equal(
+      existsSync(join(home, '.claude', 'commands', 'hypo')),
+      false,
+      'dual-install --apply must NOT create ~/.claude/commands/hypo',
+    );
+    // settings.json must not gain hypo-* core hook registrations (the actual
+    // double-registration vector — the plugin's hooks.json already wires them).
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const settingsAfter = existsSync(settingsPath) ? readFileSync(settingsPath, 'utf-8') : '';
+    assert.doesNotMatch(
+      settingsAfter,
+      /hypo-session-start/,
+      'dual-install --apply must NOT register core hooks into settings.json',
+    );
+    assert.match(r.stdout, /Dual install detected/, 'must surface the loud dual-install banner');
+  });
+});
+
+test('dual install + missing metadata: --apply writes fallback with a pkgRoot (no pkgRoot-less file)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    assert.equal(existsSync(pkgPath), false, 'precondition: no metadata yet');
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `dual-install --apply (missing meta) should exit 0: ${r.stderr}`);
+    assert.ok(existsSync(pkgPath), 'a fallback hypo-pkg.json must be written when none existed');
+    const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    assert.equal(
+      typeof meta.pkgRoot === 'string' && meta.pkgRoot.length > 0,
+      true,
+      'fallback metadata must carry a pkgRoot — never a pkgRoot-less file (codex CONCERN)',
+    );
+    // still no core hooks copied (skip stands; only metadata was written)
+    assert.equal(
+      existsSync(join(home, '.claude', 'hooks')),
+      false,
+      'fallback metadata write must not also copy core hooks',
+    );
+  });
+});
+
+test('dual install: hypo-pkg.json identity is preserved (pkgRoot NOT repointed to npm)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    // Seed an existing plugin-written hypo-pkg.json pointing at a plugin path.
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    const pluginRoot = '/some/.claude/plugins/cache/mp/hypomnema/1.3.0';
+    writeFileSync(
+      pkgPath,
+      JSON.stringify({ pkgRoot: pluginRoot, pkgVersion: '1.3.0', schemaVersion: '2.0' }),
+    );
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `dual-install --apply should exit 0: ${r.stderr}`);
+    const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    assert.equal(
+      meta.pkgRoot,
+      pluginRoot,
+      'dual-install --apply must preserve the plugin-owned pkgRoot, not repoint to npm',
+    );
+  });
+});
+
+test('dual install: preserved metadata is not perpetually nagged as stale (check exit 0)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    writeFileSync(
+      pkgPath,
+      JSON.stringify({
+        pkgRoot: '/some/.claude/plugins/cache/mp/hypomnema/1.3.0',
+        pkgVersion: '1.3.0',
+        schemaVersion: '2.0',
+      }),
+    );
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    assert.equal(
+      r.status,
+      0,
+      `dual-install check with preserved plugin metadata must not nag (exit 0): ${r.stdout}`,
+    );
+    assert.match(
+      r.stdout,
+      /plugin-owned \(preserved/,
+      'metadata line should read plugin-owned/preserved',
+    );
+  });
+});
+
+test('dual install + --allow-dual-install: core IS registered (override honored)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--allow-dual-install'], home);
+    assert.equal(r.status, 0, `override --apply should exit 0: ${r.stderr}\n${r.stdout}`);
+    assert.equal(
+      existsSync(join(home, '.claude', 'hooks')),
+      true,
+      '--allow-dual-install must register the core hooks despite the enabled plugin',
+    );
+  });
+});
+
+test('manual install, plugin NOT enabled → normal core management (no false positive)', () => {
+  withDualInstall(false, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.hypomnemaPluginEnabled, false, 'no plugin enabled → must not be flagged');
+    assert.equal(out.dualInstallCoreConflict, false);
+    assert.equal(out.coreManagedBy, 'self', 'npm-only user must keep managing the core surface');
+    // and --apply must still install core hooks as before
+    const ra = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(ra.status, 0, `npm-only --apply should exit 0: ${ra.stderr}`);
+    assert.equal(
+      existsSync(join(home, '.claude', 'hooks')),
+      true,
+      'npm-only --apply must still copy core hooks (no regression)',
     );
   });
 });
