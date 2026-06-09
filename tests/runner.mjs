@@ -1674,6 +1674,78 @@ test('missing payload → exit 1 with clear error', () => {
   );
 });
 
+test('ISSUE-7: post-apply verify follows payload.project on same-date tie (no cross-project false-block)', () => {
+  // Reproduces the 2026-06-09 security-ops-kb incident. The payload closes
+  // project B, but root hot.md has A (table-top) and B tied on today's date.
+  // Pre-fix, the post-apply check re-resolved via resolveActiveProject → picked
+  // A (stable-sort top row) → flagged log.md stale (A has no entry) → returned a
+  // false ok:false on a COMPLETED B close. With projectOverride, verification
+  // checks B (the project actually written), so the completed close passes.
+  withWiki(
+    (dir, today) => {
+      const ym = today.slice(0, 7);
+      // Second project 'beta' (= B, the one actually being closed) — fresh files.
+      const betaDir = join(dir, 'projects', 'beta');
+      mkdirSync(join(betaDir, 'session-log'), { recursive: true });
+      writeFileSync(
+        join(betaDir, 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- next\n`,
+      );
+      writeFileSync(
+        join(betaDir, 'hot.md'),
+        `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot\n`,
+      );
+      writeFileSync(
+        join(betaDir, 'session-log', `${ym}.md`),
+        `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] beta session\n`,
+      );
+      // Root hot.md: test-project (A) on TOP, beta (B) below — both dated today
+      // (same-date tie). Stable sort makes A the legacy resolveActiveProject win.
+      writeFileSync(
+        join(dir, 'hot.md'),
+        `---\ntitle: Hot\nupdated: ${today}\n---\n# Hot\n\n## Active Projects\n\n` +
+          `| Project | Last Session | Hot Cache |\n|---|---|---|\n` +
+          `| test-project | ${today} | [[projects/test-project/hot]] |\n` +
+          `| beta | ${today} | [[projects/beta/hot]] |\n`,
+      );
+      // log.md carries an unrelated project's entry — neither A nor B. So A's
+      // close is genuinely incomplete (no A entry); pre-fix the verify resolves
+      // to A and false-fails on the missing A entry.
+      writeFileSync(join(dir, 'log.md'), `## [${today}] session | gamma\n`);
+    },
+    (dir, today) => {
+      const payload = {
+        project: 'beta',
+        date: today,
+        sessionState: {
+          content: readFileSync(join(dir, 'projects', 'beta', 'session-state.md'), 'utf-8'),
+        },
+        projectHot: { content: readFileSync(join(dir, 'projects', 'beta', 'hot.md'), 'utf-8') },
+        rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+        sessionLog: { entry: `## [${today}] beta close\n` },
+        log: { entry: `## [${today}] session | beta\n` },
+      };
+      const r = runApply(dir, payload);
+      assert.equal(
+        r.status,
+        0,
+        `completed beta close must pass, got ${r.status}\n${r.stdout}\n${r.stderr}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.ok,
+        true,
+        `ISSUE-7: same-date tie must not false-block a completed close: ${JSON.stringify(out.verification)}`,
+      );
+      assert.equal(
+        out.verification.project,
+        'beta',
+        `verification must check payload.project (beta), not the table-top (test-project): ${JSON.stringify(out.verification)}`,
+      );
+    },
+  );
+});
+
 test('same-day second close: distinct entries are both appended (W1 regression)', () => {
   // Sub-session within the same day must produce a second log entry, not be
   // silently deduped because today's heading already exists — exact-entry dedup

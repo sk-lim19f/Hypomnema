@@ -613,7 +613,12 @@ function applySessionClose(args) {
     (wrote ? applied : skipped).push('log (log.md)');
   }
 
-  const verification = sessionCloseFileStatus(args.hypoDir);
+  // ISSUE-7 Part A: verify against the SAME project this apply just wrote
+  // (`project` = payload.project || probe.project, resolved at the top). Without
+  // the override, sessionCloseFileStatus re-derives via resolveActiveProject and,
+  // on a same-date root-hot.md tie, can pick a different project — false-failing
+  // a completed close (the 2026-06-09 security-ops-kb incident).
+  const verification = sessionCloseFileStatus(args.hypoDir, { projectOverride: project });
 
   // Fix #40 post-apply lint: payload may have introduced a malformed body or
   // bad frontmatter. Surface as a distinct `stage` so caller can tell "lint
