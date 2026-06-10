@@ -12,16 +12,16 @@
  * Options:
  *   --hypo-dir=<path>        Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --min-group=<n>          Min pages per tag group to report (default: 2)
- *   --check-session-close    Verify the strict session-close memory files — 5 mandatory + open-questions conditional (fix #17)
+ *   --check-session-close    Verify the strict session-close memory files — 5 mandatory + open-questions conditional
  *   --apply-session-close    Apply a JSON payload that updates the 5 mandatory memory files
  *                            (+ optional open-questions). Idempotent — re-running with the same
  *                            payload is a no-op. Always finishes with the strict gate check.
  *
  *                            Without --payload, runs as a cheap "already complete?" probe:
  *                            if the strict gate is ok, exits 0 with alreadyComplete:true;
- *                            otherwise exits 1 with "payload is required". Fix #39 (option D):
+ *                            otherwise exits 1 with "payload is required". Option D:
  *                            payload presence = explicit close intent → always full apply
- *                            (fix #38's per-entry idempotency keeps re-apply cheap).
+ *                            (the per-entry idempotency keeps re-apply cheap).
  *   --payload=<path|->       Path to JSON payload (file or `-` for stdin). Required for any
  *                            apply work; omit only for the probe path above.
  *   --force                  Bypass the no-payload probe early-exit. Payload is still required
@@ -29,7 +29,7 @@
  *                            shortcut. Reserved for explicit diagnostics / scripted recovery.
  *   --json                   Output as JSON
  *
- * Payload schema (fix #38):
+ * Payload schema:
  *   {
  *     "project":      "<slug>",                       // optional — defaults to resolveActiveProject()
  *     "date":         "YYYY-MM-DD",                   // optional — defaults to today (local)
@@ -45,7 +45,7 @@
  * stale date, the final sessionCloseFileStatus check fails with a clear error so the
  * caller fixes the payload and retries. Silent rewrites would mask payload bugs.
  *
- * Lint gates (fix #40):
+ * Lint gates:
  *   • Preflight — runs `lint.mjs --json` BEFORE any payload byte is written.
  *     Errors in files this payload will OVERWRITE (sessionState/projectHot/
  *     rootHot/openQuestions) are filtered out — they're about to be replaced,
@@ -94,7 +94,7 @@ const LINT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'lint.mjs');
 // with valid JSON is a normal "errors present" signal, not a crash.
 // maxBuffer raised to 64 MiB: warn-only output on a large wiki can otherwise
 // trip Node's 1 MiB default, truncate stdout, and turn a clean wiki into a
-// JSON.parse crash (codex P3 — fix #40 follow-up).
+// JSON.parse crash (codex P3 follow-up).
 function runLint(hypoDir) {
   const r = spawnSync(process.execPath, [LINT_SCRIPT, `--hypo-dir=${hypoDir}`, '--json'], {
     encoding: 'utf-8',
@@ -283,7 +283,7 @@ function todayLocal() {
 // bug, not a no-op. Caller is the LLM session-close flow, which composes the
 // payload deliberately; partial payloads must fail loudly so caller fixes them
 // rather than silently relying on yesterday's freshness state. (Codex review
-// of fix #38 — Worker 1 finding 1.)
+// of the apply path — Worker 1 finding 1.)
 const REQUIRED_PAYLOAD_FIELDS = [
   ['sessionState', 'content'],
   ['projectHot', 'content'],
@@ -440,9 +440,9 @@ function runMarkSessionClosed(args) {
 }
 
 function applySessionClose(args) {
-  // Fix #39 (option D): early-exit fires only when NO payload was supplied.
+  // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
-  // the full apply path — fix #38's per-entry idempotency (writeIfChanged +
+  // the full apply path — the per-entry idempotency (writeIfChanged +
   // exact-entry append dedup) keeps re-apply cheap without short-circuiting,
   // and avoids silent-success when a same-day second close brings new bytes.
   // Payload-less invocation is treated as a cheap "already complete?" probe.
@@ -508,7 +508,7 @@ function applySessionClose(args) {
   const date = payload.date || todayLocal();
   const ym = date.slice(0, 7);
 
-  // Fix #40 preflight: lint the wiki BEFORE writing any payload bytes. If lint
+  // Preflight: lint the wiki BEFORE writing any payload bytes. If lint
   // has blockers (errors) in files this apply WON'T overwrite, the wiki is in
   // a degraded state and apply would mask the root cause — abort fail-fast.
   //
@@ -590,7 +590,7 @@ function applySessionClose(args) {
   // dated today". The freshness gate (sessionCloseFileStatus) is what answers
   // "was this file touched today?"; that's a different concern and must not
   // be reused for apply-time dedup, or a legitimate same-day second close gets
-  // silently dropped (Codex review of fix #38 — Worker 1 finding 2).
+  // silently dropped (Codex review of the apply path — Worker 1 finding 2).
   const entryAlreadyPresent = (entry) => (content) =>
     content.includes(entry.endsWith('\n') ? entry.replace(/\n+$/, '') : entry);
 
@@ -620,7 +620,7 @@ function applySessionClose(args) {
   // a completed close (the 2026-06-09 security-ops-kb incident).
   const verification = sessionCloseFileStatus(args.hypoDir, { projectOverride: project });
 
-  // Fix #40 post-apply lint: payload may have introduced a malformed body or
+  // Post-apply lint: payload may have introduced a malformed body or
   // bad frontmatter. Surface as a distinct `stage` so caller can tell "lint
   // broke" apart from "frontmatter stale". This runs even if the freshness gate
   // also failed — both failure modes are useful to the caller.

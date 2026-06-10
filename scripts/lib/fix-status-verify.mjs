@@ -27,8 +27,8 @@ const NEGATIVE_STATUS_TOKENS = ['STALE_MERGED', 'partial', 'retired'];
 /**
  * Parse anchor comments out of runner.mjs source text.
  *
- *   // @fix #15: all type-conditional fields present → green
- *   // @fix #15: another test name
+ *   // @fix #N: all type-conditional fields present → green
+ *   // @fix #N: another test name
  *
  * The `@fix` prefix is mandatory — distinguishes anchors from prose comments
  * that mention "fix #N" in passing. Each anchor line maps ONE fix # to ONE
@@ -79,8 +79,9 @@ export function parseStatus(specText) {
   // For each line, find every fix # mention and check whether a positive
   // status token sits within a small proximity window AFTER the mention. This
   // avoids false positives when a line mentions multiple fix #s with status
-  // tokens that only apply to some of them (e.g. "fix #38 (resolved); fix #41
-  // (v1.3.0 advisory)" — only #38 should be picked up).
+  // tokens that only apply to some of them (e.g. a line where the first
+  // mention is "(resolved)" and a later one is "(advisory)" — only the first
+  // should be picked up).
   const lines = specText.split('\n');
   const PROXIMITY = 120; // chars after fix # to scan for status
   for (const line of lines) {

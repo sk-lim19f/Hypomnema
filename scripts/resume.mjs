@@ -94,7 +94,7 @@ function resolveActiveProject(hypoDir, cwd = null) {
   ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
     wikiRows.sort((a, b) => b.date.localeCompare(a.date));
-    // Same-date tie-break (ISSUE-1): when the top date is shared by >1 row,
+    // Same-date tie-break: when the top date is shared by >1 row,
     // prefer the project whose working_dir contains cwd. No cwd / no match →
     // keep the stable-sort winner (the legacy "first table row" behavior).
     const topDate = wikiRows[0].date;

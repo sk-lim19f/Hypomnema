@@ -16,8 +16,8 @@
  *   --force-extensions  Overwrite user-modified / conflicting extension copies (creates .bak)
  *   --codex             Mirror to ~/.codex/{hooks,commands,settings.json} — core
  *                       hook drift/apply, settings.json registration, the
- *                       wiki-*.mjs → hypo-*.mjs rename migration (fix #48), and
- *                       the user-extensions companion sync (E4 / fix #32).
+ *                       wiki-*.mjs → hypo-*.mjs rename migration, and
+ *                       the user-extensions companion sync (E4).
  *   --json              Output results as JSON
  *   --allow-downgrade   Override the guard that refuses to overwrite a NEWER
  *                       active install with an older package (ADR 0038)
@@ -412,7 +412,7 @@ function applyHookNameMigration(oldRefs, settingsPath, hooksDir) {
   if (applied.length > 0) {
     writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
     // Copy renamed hook files to the target hooks dir (~/.claude/hooks or
-    // ~/.codex/hooks per the caller — fix #48 mirror).
+    // ~/.codex/hooks per the caller — codex mirror).
     for (const [oldName, newName] of Object.entries(HOOK_RENAMES)) {
       const oldPath = join(hooksDir, oldName);
       const newPath = join(hooksDir, newName);
@@ -761,7 +761,7 @@ function applyCommands(commandResults, force) {
   return applied;
 }
 
-// ISSUE-6: in plugin mode `applyCommands` is skipped (no command copy), but the
+// In plugin mode `applyCommands` is skipped (no command copy), but the
 // runtime still needs hypo-pkg.json to resolve PKG_ROOT for lint/feedback scripts
 // (hooks/hypo-shared.mjs → hypo-personal-check). Write minimal metadata pointing
 // at the plugin's package root, preserving any existing fields (e.g. `extensions`)
@@ -797,7 +797,7 @@ const claudeSettingsPath = join(HOME, '.claude', 'settings.json');
 const codexHooksDir = join(HOME, '.codex', 'hooks');
 const codexSettingsPath = join(HOME, '.codex', 'settings.json');
 
-// ISSUE-6: when `/hypo:upgrade` runs as the Claude Code PLUGIN, the 15 core hooks
+// When `/hypo:upgrade` runs as the Claude Code PLUGIN, the 15 core hooks
 // and 14 slash commands are provided by the plugin's hooks.json + commands/
 // (auto-wired by Claude Code), NOT copied into ~/.claude/. The manual/npm health
 // check below would then report all of them "missing" and recommend `--apply`,
@@ -865,7 +865,7 @@ const extCheck = syncExtensions({
   force: args.forceExtensions,
 });
 
-// E4 (fix #32): --codex mirrors the extensions sync into ~/.codex (hooks + commands
+// E4: --codex mirrors the extensions sync into ~/.codex (hooks + commands
 // only; skills/agents skipped with a notice). The per-target SHA map lives in the
 // same ~/.claude/hypo-pkg.json under extensions.codex, so pkgPath is unchanged.
 const extCodexSettingsPath = codexSettingsPath;
@@ -977,7 +977,7 @@ if (args.apply) {
     appliedCommands = applyCommands(commands, args.forceCommands);
     appliedPkgJson = true;
   } else if (pluginMode) {
-    // ISSUE-6 plugin mode: the plugin loader owns the core hooks/commands and
+    // Plugin mode: the plugin loader owns the core hooks/commands and
     // settings.json wiring — copying them here would double-register. Skip those,
     // but STILL write minimal package metadata so the runtime can resolve PKG_ROOT
     // for lint/feedback scripts (hooks/hypo-shared.mjs → hypo-personal-check). The
@@ -1030,7 +1030,7 @@ if (args.apply) {
     apply: true,
     force: args.forceExtensions,
   });
-  // E4 (fix #32): codex apply runs AFTER the claude apply so it reads the freshly
+  // E4: codex apply runs AFTER the claude apply so it reads the freshly
   // written hypo-pkg.json and merges extensions.codex alongside extensions.claude
   // (the per-target spread in syncExtensions preserves the other target's map).
   if (args.codex) {
@@ -1139,7 +1139,7 @@ if (args.json) {
 // Human-readable report
 const lines = [];
 
-// ISSUE-6: lead with the plugin-mode banner so the user understands why the core
+// Lead with the plugin-mode banner so the user understands why the core
 // hook/command/settings sections read "managed by plugin" and that `--apply` will
 // NOT touch them (only vault-side migrations + package metadata).
 if (pluginMode) {
@@ -1203,7 +1203,7 @@ if (schema.bump === 'none') {
   );
 }
 
-// Hook files (target-aware so --codex can mirror the same block; fix #48).
+// Hook files (target-aware so --codex can mirror the same block).
 function pushHookSummary(hookList, label, targetPath) {
   const colHook = `Hook files${label}`.padEnd(20);
   const up = hookList.filter((h) => h.status === 'up-to-date').length;
@@ -1236,7 +1236,7 @@ if (managesClaudeCore) {
 }
 if (hooksCodex) pushHookSummary(hooksCodex, ' (codex)', '~/.codex/hooks/');
 
-// settings.json registrations (target-aware mirror; fix #48).
+// settings.json registrations (target-aware mirror).
 function pushSettingsSummary(sList, label, invalidFlag) {
   const colS = `settings.json${label}`.padEnd(20);
   const reg = sList.filter((s) => s.status === 'registered').length;
@@ -1387,7 +1387,7 @@ function pushExtSummary(check, label) {
     for (const c of check.conflicts) lines.push(`    ✗ ${c.file}  [${c.action} — left untouched]`);
     for (const d of check.drifts) lines.push(`    ⚠ ${d.file}  [drift — left untouched]`);
   }
-  // E3 (fix #31): a hard conflict blocks install (exit 1, even under --apply); drift is
+  // E3: a hard conflict blocks install (exit 1, even under --apply); drift is
   // resolvable advisory. Emit the spec'd WIKI messages so the user knows the recovery.
   if (nConflicts > 0) {
     lines.push('  [WIKI: existing file conflicts. Backup and retry, or use --force-extensions]');
@@ -1503,11 +1503,11 @@ const totalDrift =
   extCheck.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
   ).length +
-  // E3 (fix #31): unresolved drift/conflict is pending work too — without these the
+  // E3: unresolved drift/conflict is pending work too — without these the
   // summary printed "up to date" while the exit code was 1.
   extCheck.conflicts.length +
   extCheck.drifts.length +
-  // E4 (fix #32): codex-target pending work counts identically (same message/exit
+  // E4: codex-target pending work counts identically (same message/exit
   // consistency the E3 review caught — a codex conflict must not read "up to date").
   (extCheckCodex
     ? extCheckCodex.actions.filter(
@@ -1548,7 +1548,7 @@ if (totalDrift === 0) {
 
 console.log(lines.join('\n'));
 
-// E3 (fix #31): a hard extension conflict blocks even under --apply (unlike ordinary
+// E3: a hard extension conflict blocks even under --apply (unlike ordinary
 // drift, which only fails check mode). --force-extensions clears the resolvable
 // cases; an unfollowable symlink/non-regular dest still counts and stays exit 1.
 const extBlocked = extCheck.conflicts.length > 0 || (extCheckCodex?.conflicts.length ?? 0) > 0;

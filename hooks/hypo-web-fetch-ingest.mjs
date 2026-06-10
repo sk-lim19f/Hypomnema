@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * hypo-web-fetch-ingest.mjs — PostToolUse hook (fix #2)
+ * hypo-web-fetch-ingest.mjs — PostToolUse hook
  *
  * When the LLM uses WebFetch or WebSearch, nudge it to follow §8.4 path A:
  * "external research → /hypo:ingest into sources/". This hook produces a
  * *signal*, not an automatic ingest call — per spec §5.4.6 Q-5.4.6:
- *   "WebFetch/WebSearch 자동 ingest 시그널은 별도 hook(fix #2)으로 분리."
+ *   "WebFetch/WebSearch 자동 ingest 시그널은 별도 hook으로 분리."
  *
  * Why signal-only (not direct ingest):
  *   - slug derivation is LLM-driven (commands/ingest.md), so a hook cannot

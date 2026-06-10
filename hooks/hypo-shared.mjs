@@ -173,7 +173,7 @@ export function hotMdIsClean() {
 // so a second session on the same day that skips updating a file still passes
 // if an earlier close that day already stamped it. freshDates() accepting both
 // local and UTC dates widens that window by up to one UTC offset. A per-session
-// boundary is out of scope for fix #17.
+// boundary is out of scope for the strict session-close check.
 
 /** Parse the frontmatter `updated:` field. Returns the trimmed value or null. */
 function frontmatterUpdated(content) {
@@ -272,10 +272,10 @@ function pickByCwd(hypoDir, slugs, cwd) {
  * The cwd helpers (parseFrontmatterField / pickByCwd) and the same-date
  * tie-break are kept in sync with scripts/resume.mjs by hand; the surrounding
  * wrapper intentionally differs (resume.mjs adds an mtime fallback, this does not).
- * `cwd` is an optional same-date tie-breaker (ISSUE-1): resume passes
+ * `cwd` is an optional same-date tie-breaker: resume passes
  * process.cwd(); session-close callers (sessionCloseFileStatus /
  * closeFileTargets) intentionally pass null — close has a different
- * authority (payload.project / freshness), tracked separately as ISSUE-7.
+ * authority (payload.project / freshness), tracked separately.
  * When cwd is omitted, behavior is identical to the legacy version.
  * @param {string} hypoDir
  * @param {string|null} [cwd]
@@ -300,7 +300,7 @@ export function resolveActiveProject(hypoDir, cwd = null) {
   ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
     wikiRows.sort((a, b) => b.date.localeCompare(a.date));
-    // Same-date tie-break (ISSUE-1): when the top date is shared by >1 row,
+    // Same-date tie-break: when the top date is shared by >1 row,
     // prefer the project whose working_dir contains cwd. No cwd / no match →
     // keep the stable-sort winner (the legacy "first table row" behavior).
     const topDate = wikiRows[0].date;
@@ -322,7 +322,7 @@ export function resolveActiveProject(hypoDir, cwd = null) {
 }
 
 /**
- * Strict session-close verification (fix #17, spec §5.2.7 / §8.3).
+ * Strict session-close verification (spec §5.2.7 / §8.3).
  * Confirms the memory files a session close must touch were updated today:
  *   - projects/<project>/session-state.md       — frontmatter `updated:` is today
  *   - projects/<project>/hot.md                 — frontmatter `updated:` is today
@@ -423,9 +423,9 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
 
 // ── sync-state ────────────────────────────────────────────
 // `.cache/sync-state.json` is JSONL: one {timestamp, op, error, host} entry per
-// line. hypo-auto-commit (fix #9) appends on pull/push failure; hypo-session-start
-// (fix #10) surfaces open entries and clears them once sync is healthy again;
-// doctor (fix #11) warns while entries remain. Keep the schema defined here only.
+// line. hypo-auto-commit appends on pull/push failure; hypo-session-start
+// surfaces open entries and clears them once sync is healthy again;
+// doctor warns while entries remain. Keep the schema defined here only.
 
 /** @returns {string} path to the sync-state JSONL file for a wiki root. */
 function syncStatePath(hypoDir) {
@@ -1036,14 +1036,14 @@ export function isClearCommand(prompt) {
   return prompt === '/clear' || /^\/clear(\s|$)/.test(prompt);
 }
 
-/** Returns true if the prompt is either /compact or /clear (ADR 0022 Layer 2, fix #25). */
+/** Returns true if the prompt is either /compact or /clear (ADR 0022 Layer 2). */
 export function isCompactOrClearCommand(prompt) {
   return isCompactCommand(prompt) || isClearCommand(prompt);
 }
 
 /**
  * Extract recent user-role message text from a JSONL transcript (last `tailN`
- * lines). Promoted from hypo-personal-check.mjs (fix #27 PR-C) so both the
+ * lines). Promoted from hypo-personal-check.mjs so both the
  * PreCompact gate and the Stop-chain Layer 3 hook share one close-intent
  * signal source. Claude Code transcript format: each line is
  * `{ type:"user", message:{ role:"user", content: ... } }`; the older

@@ -30,7 +30,7 @@ These are judgment calls; when uncertain, surface the question rather than skip 
 
 ## Step 2 — Compose the session-close payload
 
-The session-close path is **payload-driven** (fix #38). Instead of writing the 5 mandatory files one-by-one, you compose a single JSON payload that describes the full session-close state, then hand it to `crystallize.mjs --apply-session-close`, which performs idempotent atomic writes and gates the result with lint.
+The session-close path is **payload-driven**. Instead of writing the 5 mandatory files one-by-one, you compose a single JSON payload that describes the full session-close state, then hand it to `crystallize.mjs --apply-session-close`, which performs idempotent atomic writes and gates the result with lint.
 
 Payload shape (5 required + 1 conditional, per Spec §5.2.7 / §8.3 + ADR 0029):
 
@@ -84,7 +84,7 @@ node <package-root>/scripts/crystallize.mjs \
   --json
 ```
 
-**`--session-id` (fix #27 PR-C):** pass the current session's id whenever you
+**`--session-id`:** pass the current session's id whenever you
 know it — most importantly when this close was triggered by a `[WIKI_AUTOCLOSE]`
 Stop-hook block (the block reason prints the exact `--session-id` to use). On a
 verified close (`ok: true` + clean git tree), it writes the per-session marker
@@ -93,7 +93,7 @@ Stop-chain Layer 3 hook (`hypo-auto-minimal-crystallize`) the session is closed,
 so it stops re-prompting. Omit it only when running crystallize purely for
 synthesis (no session-close intent) — the marker is then simply not written.
 
-**Behavior (fix #39 option D + fix #40 lint gates):**
+**Behavior (option D + lint gates):**
 
 | Invocation | Behavior |
 |---|---|
@@ -102,7 +102,7 @@ synthesis (no session-close intent) — the marker is then simply not written.
 | `--apply-session-close --payload=<path> --session-id=<id>` | Same as above, **plus** writes the per-session closed marker on success (clean git required). The Stop-chain Layer 3 path. |
 | `--apply-session-close --force` | Skips the probe early-exit. `--payload` still required for any actual apply work. |
 
-**Two lint gates run automatically (fix #40), scoped to the files this close writes:**
+**Two lint gates run automatically, scoped to the files this close writes:**
 
 Both gates judge only the **payload files** (the 5 mandatory close files + `open-questions.md`). Lint debt in other projects or shared `pages/` this close did not author is reported as a non-blocking `notices[]` entry, never gated — so an unrelated broken page elsewhere cannot block your close.
 

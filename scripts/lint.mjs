@@ -81,7 +81,7 @@ const TYPE_CONDITIONAL_FIELDS = {
   'tool-eval': ['status'],
   postmortem: ['outcome'],
   learning: ['source'],
-  // feedback: ADR 0031 / fix #37 — projection SoT requires full classification
+  // feedback: ADR 0031 — projection SoT requires full classification
   feedback: [
     'status',
     'scope',
@@ -102,7 +102,7 @@ const TYPE_ENUM_FIELDS = {
   prd: { status: ['draft', 'active', 'completed', 'cancelled', 'archived'] },
   adr: { status: ['proposed', 'accepted', 'deprecated', 'superseded'] },
   'tool-eval': { status: ['adopted', 'evaluating', 'rejected'] },
-  // feedback: ADR 0031 / fix #37 — sensitivity:private is forbidden (wiki is a
+  // feedback: ADR 0031 — sensitivity:private is forbidden (wiki is a
   // git-pushed public surface)
   feedback: {
     status: ['active', 'superseded', 'archived'],

@@ -69,7 +69,7 @@ After completing the checklist, verify it before reporting:
 node <package-root>/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
 ```
 
-This runs the same strict check as the PreCompact hard gate (fix #17). Fix any
+This runs the same strict check as the PreCompact hard gate. Fix any
 file reported `missing` or `stale` and re-run until it passes — otherwise
 `/compact` will be blocked.
 

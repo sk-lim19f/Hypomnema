@@ -3,9 +3,9 @@
  * hypo-first-prompt.mjs — UserPromptSubmit hook
  *
  * Consumes the marker written by hypo-session-start.mjs (source omitted /
- * 'session-start') or hypo-cwd-change.mjs (source 'cwd-change', fix #13).
+ * 'session-start') or hypo-cwd-change.mjs (source 'cwd-change').
  * On the FIRST user prompt after the marker is written, FORCES a one-line
- * resume summary into the reply (fix #3 — the old "answer only if related"
+ * resume summary into the reply (the old "answer only if related"
  * conditional is removed; the line is injected unconditionally).
  *
  * hot.md / session-state.md content is NOT re-injected here — the upstream

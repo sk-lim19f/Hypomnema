@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * feedback-sync.mjs — project wiki feedback as SoT, external memory as projection (ADR 0031, fix #37)
+ * feedback-sync.mjs — project wiki feedback as SoT, external memory as projection (ADR 0031)
  *
  * Wiki `pages/feedback/<slug>.md` is the single source of truth for
  * learning/correction knowledge. Two Claude Code memory surfaces are derived

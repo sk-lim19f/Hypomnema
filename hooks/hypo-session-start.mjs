@@ -176,7 +176,7 @@ function readLastGrowthLine() {
 }
 
 /**
- * fix #25 PR-A2 (ADR 0022 amendment 2026-05-14): if the prior session ended
+ * ADR 0022 amendment 2026-05-14: if the prior session ended
  * via `/clear`, hypo-session-end stashed its identity in `.cache/clear-marker.json`.
  * Read it (with 7-day stale guard), unlink it (one-shot), and return a
  * `[WIKI_AUTOCLOSE]` recovery line for additionalContext + stderr.
@@ -212,8 +212,8 @@ function gitPull(dir) {
 }
 
 /**
- * fix #10: surface unresolved sync failures recorded by a prior session's
- * Stop hook (fix #9). The entry is cleared only once this session's pull has
+ * Surface unresolved sync failures recorded by a prior session's
+ * Stop hook. The entry is cleared only once this session's pull has
  * succeeded AND there is no unpushed commit left behind by a failed push
  * (`[ahead N]`).
  *
@@ -323,7 +323,7 @@ let raw = '';
 process.stdin.setEncoding('utf-8');
 process.stdin.on('data', (chunk) => (raw += chunk));
 process.stdin.on('end', () => {
-  // ISSUE-5: declared before the try so every emit branch — including the outer
+  // Declared before the try so every emit branch — including the outer
   // catch — carries the same `systemMessage` (the user-visible update/sibling
   // banner). Reassigned once below after the notices are computed.
   let outExtra = { continue: true, suppressOutput: true };
@@ -343,14 +343,14 @@ process.stdin.on('end', () => {
     const clearRecoveryLine = buildClearRecoveryLine(data.source);
     const updateLine = buildUpdateNotice();
     const siblingLine = buildSiblingNotice();
-    // ISSUE-5: the update + stale-sibling banners must reach the USER. On a
+    // The update + stale-sibling banners must reach the USER. On a
     // SessionStart hook that exits 0, stderr is invisible in the normal TUI
     // (only shown on exit 2 / --verbose) and additionalContext is model-only —
     // `systemMessage` is the documented user-visible channel. Route those two
     // banners there. They ALSO stay in noticePrefix → additionalContext below,
     // so the model and the user start the session looking at the same state.
     // (The other stderr notices — sync/growth/clear/suggest — are intentionally
-    // transcript/--verbose only and out of ISSUE-5's scope.)
+    // transcript/--verbose only and out of this banner's scope.)
     const userMessage = [updateLine, siblingLine].filter(Boolean).join('\n\n');
     if (userMessage) outExtra = { ...outExtra, systemMessage: userMessage };
     const notices = [syncLine, growthLine, clearRecoveryLine, updateLine, siblingLine].filter(
@@ -417,7 +417,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // MISS: cwd matches no project. fix #23 / ADR 0023 — offer to create one
+    // MISS: cwd matches no project. ADR 0023 — offer to create one
     // when the ADR trigger conditions hold (git repo + project marker + no
     // cooldown + not previously declined). The actual scaffold is the LLM's
     // job on a "Y" reply (scripts/lib/project-create.mjs); the hook only nudges.

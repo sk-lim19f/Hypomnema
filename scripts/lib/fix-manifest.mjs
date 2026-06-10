@@ -76,10 +76,10 @@ export const FIX_MANIFEST = [
     // deliberate removal-marker comment + the negative-control test.
     fixId: 26,
     testNames: [
-      'replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (fix #26 negative control)',
+      'replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (negative control)',
     ],
     adrPath: 'decisions/0022-session-close-ux-automation.md',
-    adrKeyLine: 'Capacity bypass (≥90%) REMOVED — fix #26',
+    adrKeyLine: 'Capacity bypass (≥90%) REMOVED',
   },
   {
     fixId: 27,
