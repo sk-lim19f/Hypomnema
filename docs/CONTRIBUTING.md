@@ -142,7 +142,7 @@ npm run fix:verify # Phase 1 of learned_behavior #6 — verifies fix #N status c
 When a test verifies behavior tied to a numbered fix in the wiki spec, add an anchor immediately above the `suite(...)` or `test(...)` call:
 
 ```js
-// @fix #25: replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE
+// @fix #N: replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE
 test('replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE', () => { ... });
 ```
 

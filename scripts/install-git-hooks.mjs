@@ -79,10 +79,39 @@ function shellSingleQuote(s) {
   return `'` + s.replace(/'/g, `'\\''`) + `'`;
 }
 
-function shimBody(root, gitDir) {
+// Hook-specific gate body. Runs AFTER the shared identity guards, so everything
+// here is already proven to be our trusted checkout. `set +e` is active, so the
+// gate must explicitly `|| exit 1` to BLOCK a commit; a missing script is a
+// fail-open skip (old checkout that predates the script).
+function gateLines(kind) {
+  // CHECK_TRACKER_ROOT is a test-only seam in check-tracker-ids.mjs. Clear any
+  // inherited value so the real hook always gates THIS checkout's index, never a
+  // redirected one.
+  const unsetSeam = 'unset CHECK_TRACKER_ROOT';
+  if (kind === 'pre-commit') {
+    // 1) Auto-format staged files (its own exit 1 = a true git-add failure block).
+    //    The sentinel tells pre-commit-format.mjs it runs under the trusted shim,
+    //    so it preserves an inherited GIT_INDEX_FILE (index-whitelist defence).
+    // 2) Tracker-id gate on the staged blobs — blocks the commit on a leak.
+    return `${unsetSeam}
+FMT="$HYPOMNEMA_ROOT/scripts/pre-commit-format.mjs"
+[ -f "$FMT" ] && { HYPOMNEMA_HOOK_INVOCATION=1 node "$FMT" || exit 1; }
+TRK="$HYPOMNEMA_ROOT/scripts/check-tracker-ids.mjs"
+[ -f "$TRK" ] && { node "$TRK" --staged || exit 1; }
+exit 0`;
+  }
+  // commit-msg: scan the message file (passed as $1) for wiki tracker ids.
+  return `${unsetSeam}
+TRK="$HYPOMNEMA_ROOT/scripts/check-tracker-ids.mjs"
+[ -f "$TRK" ] || exit 0
+node "$TRK" --commit-msg "$1" || exit 1
+exit 0`;
+}
+
+function shimBody(kind, root, gitDir) {
   return `#!/bin/sh
-# hypomnema-pre-commit-marker v1
-# Fail-open at every guard. Only the .mjs (after identity checks) can exit nonzero.
+# hypomnema-${kind}-marker v2
+# Fail-open at every identity/setup guard. Only the gate below can exit nonzero.
 set +e
 HYPOMNEMA_ROOT=${shellSingleQuote(root)}
 HYPOMNEMA_GIT_DIR=${shellSingleQuote(gitDir)}
@@ -91,28 +120,51 @@ TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 [ "$TOPLEVEL" = "$HYPOMNEMA_ROOT" ] || exit 0
 ABSGITDIR="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
 [ "$ABSGITDIR" = "$HYPOMNEMA_GIT_DIR" ] || exit 0
-SCRIPT="$HYPOMNEMA_ROOT/scripts/pre-commit-format.mjs"
-[ -f "$SCRIPT" ] || exit 0
 command -v node >/dev/null 2>&1 || exit 0
-# Sentinel: tells the .mjs it is running under our trusted shim (not direct
-# attacker invocation). The .mjs preserves inherited GIT_INDEX_FILE only when
-# this sentinel is present — direct invocation drops it and falls back to the
-# default \`.git/index\`. This closes prefix-matching attacks on the index
-# whitelist (e.g. attacker-crafted .git/next-index-attack.lock).
-HYPOMNEMA_HOOK_INVOCATION=1 exec node "$SCRIPT"
+${gateLines(kind)}
 `;
 }
 
-function writeShim(target, root, gitDir) {
+// Write a single hook shim. Returns true on success, false on write failure.
+// Does NOT exit — the caller installs multiple hooks and reports once.
+function writeShim(target, kind, root, gitDir) {
   try {
-    fs.writeFileSync(target, shimBody(root, gitDir), { mode: 0o755 });
+    fs.writeFileSync(target, shimBody(kind, root, gitDir), { mode: 0o755 });
     try {
       fs.chmodSync(target, 0o755);
     } catch {}
-    return exitSilent(`installed pre-commit hook for ${root}`);
-  } catch (e) {
-    return exitSilent(`write hook failed: ${e.code || e.message}; skipping`);
+    return true;
+  } catch {
+    return false;
   }
+}
+
+// Install/refresh one hook of the given kind under absHooksDir. Returns a short
+// status string (never throws, never exits). Refreshes our own marker (any
+// version) so a checkout move or a shim-body change re-propagates; never
+// clobbers a user's own non-marker hook or a symlink.
+function installHook(kind, absHooksDir, root, gitDir) {
+  const target = path.join(absHooksDir, kind);
+  let existing;
+  try {
+    existing = fs.lstatSync(target);
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      return writeShim(target, kind, root, gitDir) ? `installed ${kind}` : `write ${kind} failed`;
+    }
+    return `stat ${kind} failed: ${e.code}`;
+  }
+  if (existing.isSymbolicLink()) return `${kind} is symlink; not overwriting`;
+  let head;
+  try {
+    head = fs.readFileSync(target, 'utf-8').split('\n').slice(0, 3).join('\n');
+  } catch {
+    return `read ${kind} failed; skipping`;
+  }
+  if (head.includes(`hypomnema-${kind}-marker`)) {
+    return writeShim(target, kind, root, gitDir) ? `refreshed ${kind}` : `refresh ${kind} failed`;
+  }
+  return `existing non-marker ${kind}; not overwriting`;
 }
 
 async function main() {
@@ -225,31 +277,14 @@ async function main() {
       return exitSilent('hooks dir outside .git/; skipping');
     }
 
-    // (7) Existing pre-commit logic.
-    const target = path.join(absHooksDir, 'pre-commit');
-    let existing;
-    try {
-      existing = fs.lstatSync(target);
-    } catch (e) {
-      if (e.code === 'ENOENT') {
-        return writeShim(target, expectedRoot, absGitDir);
-      }
-      return exitSilent(`stat target failed: ${e.code}; skipping`);
-    }
-    if (existing.isSymbolicLink()) {
-      return exitSilent('pre-commit is symlink; not overwriting');
-    }
-    let head;
-    try {
-      head = fs.readFileSync(target, 'utf-8').split('\n').slice(0, 3).join('\n');
-    } catch {
-      return exitSilent('read existing pre-commit failed; skipping');
-    }
-    if (head.includes('hypomnema-pre-commit-marker v1')) {
-      // Same marker — regenerate (refreshes embedded root if checkout moved).
-      return writeShim(target, expectedRoot, absGitDir);
-    }
-    return exitSilent('existing non-marker pre-commit; not overwriting');
+    // (7) Install both hooks: pre-commit (format + tracker-id gate on staged
+    //     blobs) and commit-msg (tracker-id gate on the message). Each is
+    //     independently marker-detected so a user's own hook is never clobbered.
+    const results = [
+      installHook('pre-commit', absHooksDir, expectedRoot, absGitDir),
+      installHook('commit-msg', absHooksDir, expectedRoot, absGitDir),
+    ];
+    return exitSilent(results.join('; '));
   } catch (e) {
     return exitSilent(`unexpected: ${e.code || e.message}; skipping`);
   }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * hypo-session-end.mjs — SessionEnd hook (fix #25 PR-A2, ADR 0022 Layer 2)
+ * hypo-session-end.mjs — SessionEnd hook (ADR 0022 Layer 2)
  *
  * `/clear` cannot be blocked: it never fires UserPromptSubmit (Stage 0 PoC,
  * 2026-05-14). The only intervention point is the SessionEnd(reason='clear')

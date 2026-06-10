@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * hypo-auto-minimal-crystallize.mjs — Stop hook (fix #27 PR-C, ADR 0022 Layer 3)
+ * hypo-auto-minimal-crystallize.mjs — Stop hook (ADR 0022 Layer 3)
  *
  * Last hook in the Stop chain: a final-line defense that blocks `Stop` when
  * the current session performed mutation work but never produced a verified
@@ -69,7 +69,7 @@ function emitBlock(sessionId, transcriptPath) {
     JSON.stringify({
       decision: 'block',
       reason,
-      stopReason: 'session-close incomplete (fix #27 PR-C / ADR 0022 Layer 3)',
+      stopReason: 'session-close incomplete (ADR 0022 Layer 3)',
     }),
   );
 }

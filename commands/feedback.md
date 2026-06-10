@@ -2,7 +2,7 @@
 description: Record an AI behavior correction or preference into the wiki
 ---
 
-You are running `/hypo:feedback`. Capture a behavior correction or preference into `pages/feedback/` — the **single source of truth** for learned behaviors (ADR 0031 / fix #37).
+You are running `/hypo:feedback`. Capture a behavior correction or preference into `pages/feedback/` — the **single source of truth** for learned behaviors (ADR 0031).
 
 ## What this does
 

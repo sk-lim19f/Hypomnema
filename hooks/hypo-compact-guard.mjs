@@ -2,7 +2,7 @@
 /**
  * hypo-compact-guard.mjs — UserPromptSubmit hook
  *
- * Scope: detects "/compact" or "/clear" typed in chat only (ADR 0022 Layer 2, fix #25).
+ * Scope: detects "/compact" or "/clear" typed in chat only (ADR 0022 Layer 2).
  * The CLI built-in /compact does NOT fire UserPromptSubmit — use personal-wiki-check.mjs
  * (PreCompact hook) as the hard gate for that path. /clear has no PreCompact event, so
  * this hook is the only chat-side gate that can prompt session-close before context wipe.

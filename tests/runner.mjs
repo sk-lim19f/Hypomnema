@@ -38,6 +38,11 @@ import {
   countHangul,
   HANGUL_BODY_THRESHOLD,
 } from '../scripts/lib/check-bilingual.mjs';
+import {
+  scanText,
+  stripScissors,
+  messageHasGitTemplate,
+} from '../scripts/lib/check-tracker-ids.mjs';
 
 const HOME = homedir();
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
@@ -1363,11 +1368,11 @@ test('HYPO_SKIP_GATE=1 bypasses an incomplete session close', () => {
 });
 
 // ── replay-personal-check-bypass-order (ADR 0022 amendment 2026-05-13) ──
-// @fix #26: replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (fix #26 negative control)
+// @fix #26: replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (negative control)
 // Capacity bypass (wiki-context-critical.json ≥90%) was removed. Spec §7.5:
 // the only bypass paths are HYPO_SKIP_GATE env / transcript user-role message.
 
-test('replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (fix #26 negative control)', () => {
+test('replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (negative control)', () => {
   withWiki(
     (dir) => {
       // Make session-close stale so the gate would normally block.
@@ -12350,11 +12355,47 @@ test('installer: fresh repo → installs shim with marker + 0755', () => {
     const target = join(dir, '.git', 'hooks', 'pre-commit');
     assert.ok(existsSync(target));
     const content = readFileSync(target, 'utf-8');
-    assert.ok(content.includes('hypomnema-pre-commit-marker v1'));
+    assert.ok(content.includes('hypomnema-pre-commit-marker v2'));
     assert.ok(content.includes('HYPOMNEMA_ROOT='));
     assert.ok(content.includes('HYPOMNEMA_GIT_DIR='));
+    // pre-commit chains the format step AND the tracker-id gate on staged blobs.
+    assert.ok(content.includes('pre-commit-format.mjs'));
+    assert.ok(content.includes('check-tracker-ids.mjs'));
+    assert.ok(content.includes('"$TRK" --staged'));
     const mode = statSync(target).mode & 0o777;
     assert.equal(mode & 0o100, 0o100, 'should be executable');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('installer: fresh repo → also installs commit-msg hook (tracker gate)', () => {
+  const { dir } = setupHypomnemaFixture();
+  try {
+    const r = runInstaller(dir);
+    assert.equal(r.status, 0);
+    const target = join(dir, '.git', 'hooks', 'commit-msg');
+    assert.ok(existsSync(target), 'commit-msg hook installed');
+    const content = readFileSync(target, 'utf-8');
+    assert.ok(content.includes('hypomnema-commit-msg-marker v2'));
+    assert.ok(content.includes('check-tracker-ids.mjs'));
+    assert.ok(content.includes('"$TRK" --commit-msg "$1"'));
+    assert.equal(statSync(target).mode & 0o100, 0o100, 'should be executable');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('installer: existing non-marker commit-msg → not overwritten', () => {
+  const { dir } = setupHypomnemaFixture();
+  try {
+    const target = join(dir, '.git', 'hooks', 'commit-msg');
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, '#!/bin/sh\n# user commit-msg hook\nexit 0\n');
+    const before = readFileSync(target, 'utf-8');
+    const r = runInstaller(dir);
+    assert.equal(r.status, 0);
+    assert.equal(readFileSync(target, 'utf-8'), before, 'user commit-msg hook preserved');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -13429,6 +13470,244 @@ test('hypo-guide.md intentionally excluded from advisory surfaces (#47 follow-up
     !ADVISORY_SURFACES.includes(guidePath),
     'templates/hypo-guide.md must stay out of ADVISORY_SURFACES until #47 reconciles its auto-layer wording',
   );
+});
+
+// ── tracker-id gate (no-internal-tracker-ids-in-oss-artifacts) ───────────────
+suite('tracker-id gate (check-tracker-ids)');
+
+test('scanText flags ISSUE-N and fix #N (case + tab/space tolerant)', () => {
+  assert.equal(scanText('see ISSUE-7 here').length, 1);
+  assert.equal(scanText('issue-42 lowercase').length, 1);
+  assert.equal(scanText('(fix #68)')[0].match, 'fix #68');
+  assert.equal(scanText('Fix\t#40').length, 1);
+  assert.equal(scanText('fix  #3 multi-space').length, 1);
+  assert.equal(scanText('ISSUE-1 and fix #2').length, 2); // two hits on one line
+});
+
+test('scanText allows GitHub refs and lookalikes', () => {
+  for (const s of [
+    'PR #50',
+    'PRs #53~#56',
+    '(#101)',
+    'see #48',
+    'prefix #7',
+    'suffix #3',
+    'ADR 0040',
+    'decisions/0040',
+    'https://github.com/x/y/issues/3',
+  ]) {
+    assert.equal(scanText(s).length, 0, `should not flag: ${s}`);
+  }
+});
+
+test('scanText reports 1-based line/col', () => {
+  const hits = scanText('clean\nleak ISSUE-9 here');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].line, 2);
+  assert.equal(hits[0].col, 6);
+});
+
+test('messageHasGitTemplate detects editor template / scissors, not -m messages', () => {
+  assert.equal(messageHasGitTemplate('subject\n\nbody only\n'), false);
+  assert.equal(messageHasGitTemplate('subject\n\n# a plain user comment\n'), false);
+  assert.ok(
+    messageHasGitTemplate('subject\n# Please enter the commit message for your changes.\n'),
+  );
+  assert.ok(messageHasGitTemplate('subject\n# On branch main\n'));
+  assert.ok(
+    messageHasGitTemplate('subject\n# ------------------------ >8 ------------------------\n'),
+  );
+});
+
+test('stripScissors drops the --verbose diff from the >8 line onward', () => {
+  const msg =
+    'subject\n\nbody clean\n# ------------------------ >8 ------------------------\ndiff with fix #9 in it';
+  const out = stripScissors(msg);
+  assert.ok(out.includes('body clean'));
+  assert.ok(!out.includes('fix #9'));
+  assert.equal(stripScissors('plain\nmessage'), 'plain\nmessage'); // no scissors → unchanged
+});
+
+function runChecker(args, env = {}) {
+  return spawnSync(process.execPath, [join(SCRIPTS, 'check-tracker-ids.mjs'), ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, ...env },
+  });
+}
+
+test('CLI --commit-msg: blocks a leak (exit 1)', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    writeFileSync(f, 'feat: thing\n\nImplements fix #99.\n');
+    const r = runChecker(['--commit-msg', f]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /fix #99/);
+  });
+});
+
+test('CLI --commit-msg: clean with GitHub refs (exit 0)', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    writeFileSync(f, 'feat: thing (#101)\n\nSee PR #50 and #48. ADR 0040.\n');
+    assert.equal(runChecker(['--commit-msg', f]).status, 0);
+  });
+});
+
+test('CLI --commit-msg: a #-comment leak IS flagged when git has no template (commit -m / whitespace keeps it)', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    // No git template present → this is a `commit -m` / whitespace-style message,
+    // where git KEEPS the `#` line. Must be flagged (closes the false-negative).
+    writeFileSync(f, 'clean subject\n\n# ISSUE-7 kept by whitespace cleanup\nreal body\n');
+    assert.equal(runChecker(['--commit-msg', f]).status, 1);
+  });
+});
+
+test('CLI --commit-msg: a leak after a bare ">8" line IS flagged with no template (git keeps it in -m)', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    // No git template (commit -m / -F style). A bare ">8" line is NOT a git
+    // scissors marker (git only honors a comment-prefixed one in editor mode),
+    // so git keeps the line below it — the checker must scan it.
+    writeFileSync(
+      f,
+      'subject\n\n------------------------ >8 ------------------------\nafter fix #55\n',
+    );
+    const r = runChecker(['--commit-msg', f]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /fix #55/);
+  });
+});
+
+test('CLI --commit-msg: a #-comment leak is ignored when git WILL strip it (editor template present)', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    // Editor/strip mode: git appends its instructional template and strips ALL
+    // `#` lines, so a tracker id in a comment never reaches the commit → not flagged.
+    writeFileSync(
+      f,
+      'clean subject\n\n# ISSUE-7 in an editor comment\n' +
+        '# Please enter the commit message for your changes. Lines starting\n' +
+        '# with "#" will be ignored, and an empty message aborts the commit.\n' +
+        '# On branch feat/x\n',
+    );
+    assert.equal(runChecker(['--commit-msg', f]).status, 0);
+  });
+});
+
+test('CLI --commit-msg: a real prose leak is flagged even with an editor template', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    writeFileSync(
+      f,
+      'feat: thing\n\nImplements fix #99 in the body.\n' +
+        '# Please enter the commit message for your changes.\n# On branch main\n',
+    );
+    const r = runChecker(['--commit-msg', f]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /fix #99/);
+  });
+});
+
+// Synthetic git repo isolates --staged from the real index (CHECK_TRACKER_ROOT
+// test seam). Covers the staged-blob-vs-working-tree distinction codex flagged.
+function withSyntheticRepo(fn) {
+  withTmpDir((dir) => {
+    const env0 = {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_SYSTEM: '/dev/null',
+    };
+    const g = (args) => spawnSync('git', args, { cwd: dir, encoding: 'utf-8', env: env0 });
+    g(['init', '-q']);
+    g(['config', 'user.email', 't@t']);
+    g(['config', 'user.name', 't']);
+    g(['config', 'commit.gpgsign', 'false']);
+    mkdirSync(join(dir, 'docs'), { recursive: true });
+    fn({ dir, g });
+  });
+}
+
+test('CLI --staged: blocks a staged leak, passes when clean', () => {
+  withSyntheticRepo(({ dir, g }) => {
+    writeFileSync(join(dir, 'docs', 'a.md'), 'clean see PR #5 and (#9)\n');
+    g(['add', 'docs/a.md']);
+    assert.equal(
+      runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir }).status,
+      0,
+      'clean staged set should pass',
+    );
+    writeFileSync(join(dir, 'docs', 'b.md'), 'leak fix #9 here\n');
+    g(['add', 'docs/b.md']);
+    const r = runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'staged leak should block');
+    assert.match(r.stderr, /fix #9/);
+  });
+});
+
+test('CLI --staged: a working-tree-only leak is NOT gated (only the staged blob)', () => {
+  withSyntheticRepo(({ dir, g }) => {
+    writeFileSync(join(dir, 'docs', 'c.md'), 'clean\n');
+    g(['add', 'docs/c.md']);
+    writeFileSync(join(dir, 'docs', 'c.md'), 'clean\nfix #7 unstaged\n'); // working tree only
+    assert.equal(
+      runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir }).status,
+      0,
+      'unstaged leak must not block — only the staged blob is gated',
+    );
+  });
+});
+
+test('CLI --staged: a leak in an EXCLUDED path (tests/) is not gated', () => {
+  withSyntheticRepo(({ dir, g }) => {
+    mkdirSync(join(dir, 'tests'), { recursive: true });
+    writeFileSync(join(dir, 'tests', 't.mjs'), '// ISSUE-7 legit test anchor\n');
+    g(['add', 'tests/t.mjs']);
+    assert.equal(
+      runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir }).status,
+      0,
+      'tests/ is excluded maintainer scope',
+    );
+  });
+});
+
+test('CLI --all: package.json IS in scope (npm auto-ships it); a stray root file is NOT', () => {
+  withTmpDir((dir) => {
+    // package.json leak → flagged
+    writeFileSync(join(dir, 'package.json'), '{ "description": "leak fix #123" }\n');
+    assert.equal(
+      runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status,
+      1,
+      'package.json leak must be caught',
+    );
+  });
+  withTmpDir((dir) => {
+    // an out-of-scope root file → NOT flagged (matches --staged scope)
+    writeFileSync(join(dir, 'NOTES.md'), 'random fix #123 in an unshipped root file\n');
+    assert.equal(
+      runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status,
+      0,
+      'stray root file is out of scope',
+    );
+  });
+});
+
+test('CLI --staged: package.json leak is gated (scope agrees with --all)', () => {
+  withSyntheticRepo(({ dir, g }) => {
+    writeFileSync(join(dir, 'package.json'), '{ "description": "leak fix #7" }\n');
+    g(['add', 'package.json']);
+    const r = runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'staged package.json leak must block');
+    assert.match(r.stderr, /fix #7/);
+  });
+});
+
+test('CLI checker source files are NOT exempt — they scan clean via N placeholders', () => {
+  // Regression guard for the self-exclusion blocker: the shipped checker files
+  // must be scanned by --all and must be clean.
+  const r = runChecker(['--all']);
+  assert.equal(r.status, 0, `repo has tracker-id leaks:\n${r.stdout}${r.stderr}`);
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────

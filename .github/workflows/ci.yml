@@ -32,6 +32,17 @@ jobs:
       - name: Run lint
         run: npm run lint
 
+  tracker-ids:
+    name: Tracker-id gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: No wiki-internal tracker ids in public artifacts
+        run: npm run check:tracker-ids
+
   init-snapshot:
     name: Init snapshot
     runs-on: ubuntu-latest

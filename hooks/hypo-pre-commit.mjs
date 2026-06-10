@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * hypo-pre-commit.mjs — wiki git pre-commit hook worker (§6.8 fix #24)
+ * hypo-pre-commit.mjs — wiki git pre-commit hook worker (§6.8)
  *
  * Blocks staged files that match .hypoignore patterns.
  * Installed by `hypo init` to <wiki>/.git/hooks/pre-commit.

@@ -15,7 +15,7 @@
  *   --force-extensions   Remove user-modified extension files (hypo-ext-*) instead of preserving them
  *   --hooks-dir=<path>   Override Claude hooks directory (default: ~/.claude/hooks)
  *
- * Extensions (ADR 0024 fix #34): hypo-ext-* hard-copies under
+ * Extensions (ADR 0024): hypo-ext-* hard-copies under
  * ~/.claude/{hooks,commands,skills,agents}/ and ~/.codex/{hooks,commands}/ (with
  * --codex) are removed when their on-disk SHA matches the recorded one in
  * ~/.claude/hypo-pkg.json#extensions.<target>. User-modified copies are preserved

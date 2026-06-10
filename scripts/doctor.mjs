@@ -222,7 +222,7 @@ function checkDirectories(hypoDir) {
     'projects',
     'sources',
     // Extensions baseline (ADR 0024). Existence only — SHA / settings /
-    // manifest integrity is E5 (fix #33).
+    // manifest integrity is E5.
     'extensions/hooks',
     'extensions/commands',
     'extensions/skills',
@@ -310,7 +310,7 @@ function checkSettingsJson() {
   // stale hypo-* entries (uninstall remnants).
   // hypo-ext-* commands are user-extension entries (ADR 0024) — not core hooks,
   // so they are intentionally absent from HOOK_MAP. Excluded here; their
-  // integrity (SHA + manifest + entry match) is checked separately in E5 (fix #33).
+  // integrity (SHA + manifest + entry match) is checked separately in E5.
   const isExtCommand = (cmd) => /(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(cmd);
   const expectedCmds = new Set(
     Object.entries(HOOK_MAP).flatMap(([, files]) =>
@@ -352,7 +352,7 @@ function checkSettingsJson() {
       if (!g || typeof g !== 'object') continue;
       for (const h of g.hooks || []) {
         if (typeof h.command !== 'string' || !/hypo-[^/]+\.mjs/.test(h.command)) continue;
-        if (isExtCommand(h.command)) continue; // ext duplicates are E5's concern (fix #33)
+        if (isExtCommand(h.command)) continue; // ext duplicates are E5's concern
         if (seen.has(h.command)) dupes.push(`${event}:${h.command}`);
         else seen.add(h.command);
       }
@@ -399,10 +399,7 @@ function checkGit(hypoDir) {
       );
     }
   } else {
-    warn(
-      '.git/hooks/pre-commit',
-      'Not installed — run /hypo:init to install .hypoignore guard (fix #24)',
-    );
+    warn('.git/hooks/pre-commit', 'Not installed — run /hypo:init to install .hypoignore guard');
   }
 }
 
@@ -679,7 +676,7 @@ function checkCodexPaths() {
 //
 // E5 is doctor SURFACE for extensions integrity. The mixed-group surgical
 // *write* (preserve sibling-plugin hooks, swap only ours) used to be deferred
-// here; fix #47 (ADR 0024 amendment 2026-05-23) lifted that deferral —
+// here; ADR 0024 amendment 2026-05-23 lifted that deferral —
 // registerSettings (extensions.mjs:478 docstring) now does occurrence-first +
 // 8-rank canonical write, and the (b) loop below mirrors that read-path via
 // collectOurOccurrences so a valid mixed-group occurrence is no longer warned
@@ -773,7 +770,7 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
     const expected = buildExpectedSettingsEntries(discovered.hooks, hooksDir);
 
     // (b) for each registrable hook: locate every occurrence of our command
-    // (single-hook OR mixed group, fix #47) and pick the canonical via the
+    // (single-hook OR mixed group) and pick the canonical via the
     // SAME 8-rank logic registerSettings uses.
     // Without this mirror, doctor picked the first traversal-order occurrence
     // under the target event and warned "differs" even when a later

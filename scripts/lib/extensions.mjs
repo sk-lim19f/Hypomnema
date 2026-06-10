@@ -1,5 +1,5 @@
 /**
- * scripts/lib/extensions.mjs — User extensions companion sync (ADR 0024, fix #29 + #30).
+ * scripts/lib/extensions.mjs — User extensions companion sync (ADR 0024).
  *
  * `~/hypomnema/extensions/{hooks,commands,skills,agents}/` holds user-authored
  * extensions, git-tracked alongside the wiki. init/upgrade hard-copy them into
@@ -80,7 +80,7 @@ function pkgRootDir(target) {
 
 /**
  * Discover sync-eligible extensions under `extDir`. Returns a per-type map plus a
- * `warnings` array. Applies the `.hypoignore` filter (fix #30), the basename
+ * `warnings` array. Applies the `.hypoignore` filter, the basename
  * whitelist (plan §5 #9), and pairs each file with its optional `<name>.manifest.json`.
  * No-ops gracefully when extDir is absent (e.g. --from-remote clones, plan §5 #8).
  */
@@ -364,7 +364,7 @@ export function syncExtensions({
   const discovered = discoverExtensions(extDir, patterns, hypoDir);
   result.warnings.push(...discovered.warnings);
 
-  // E4 (fix #32): Codex supports hooks + commands only. If the user authored
+  // E4: Codex supports hooks + commands only. If the user authored
   // skills/agents extensions, surface a one-time notice that they are skipped
   // for this target rather than silently dropping them (plan §2 E4).
   if (target === 'codex') {
@@ -505,7 +505,7 @@ export function syncExtensions({
  *   7. non-target event · mixed                                        (extract + append new)
  *   8. no occurrence                                                   (append new)
  *
- * Mixed-group invariant (fix #47, ADR 0024 amendment 2026-05-23): foreign hooks
+ * Mixed-group invariant (ADR 0024 amendment 2026-05-23): foreign hooks
  * sharing the matcher group are NEVER read, modified, or reordered. The hosting
  * group's matcher is also left exactly as-is once we extract — even when our
  * extraction is the reason the group becomes single-foreign. Foreign handler-

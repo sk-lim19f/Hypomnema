@@ -3,8 +3,8 @@
  * hypo-personal-check.mjs — PreCompact hook
  *
  * Hard gate before /compact. Blocks if:
- *   - the session-close memory files were not updated this session (fix #17:
- *     session-state.md, project hot.md, root hot.md, session-log, log.md)
+ *   - the session-close memory files were not updated this session
+ *     (session-state.md, project hot.md, root hot.md, session-log, log.md)
  *   - wiki git repo has uncommitted/unpushed changes
  *   - hot.md has forbidden structure
  *   - lint blockers exist
@@ -14,7 +14,7 @@
  *   2. HYPO_SKIP_GATE=1 in a recent *user-role* transcript message
  *      (assistant/tool output is excluded to prevent self-triggering from block reason text)
  *
- * NOTE: capacity bypass (wiki-context-critical.json ≥90%) was REMOVED by fix #26
+ * NOTE: capacity bypass (wiki-context-critical.json ≥90%) was REMOVED
  * (ADR 0022 amendment 2026-05-13). Spec §7.5: even at full context, minimal
  * session-close is mandatory — auto-bypass on capacity caused silent state loss.
  */
@@ -52,7 +52,7 @@ process.stdin.on('end', () => {
     /* fail-open */
   }
 
-  // ── Capacity bypass (≥90%) REMOVED — fix #26, ADR 0022 amendment 2026-05-13.
+  // ── Capacity bypass (≥90%) REMOVED — ADR 0022 amendment 2026-05-13.
   //    Even at full context, minimal session-close is mandatory (spec §7.5).
   //    Bypass paths are now only: HYPO_SKIP_GATE env / HYPO_SKIP_GATE in transcript.
 
@@ -170,7 +170,7 @@ process.stdin.on('end', () => {
           .join(', ')}${lintNotices.length > 5 ? ', …' : ''} — clean up when convenient.`
       : '';
 
-  // ── fix #37 Phase C: feedback projection drift (ADR 0031) ──
+  // ── Phase C: feedback projection drift (ADR 0031) ──
   // Single blocking gate invariant (spec §7.5): integrate into THIS hook, never
   // add a separate PreCompact hook. `feedback-sync --check --strict` reports
   // projection drift (wiki feedback SoT vs MEMORY / CLAUDE.md learned-behaviors

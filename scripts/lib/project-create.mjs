@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * project-create.mjs — atomic auto-project scaffold (fix #23, ADR 0023)
+ * project-create.mjs — atomic auto-project scaffold (ADR 0023)
  *
  * Invoked by the LLM (NOT a user-facing subcommand — ADR 0023 deprecated
  * `hypomnema project new`) after the user answers "Y" to a SessionStart /
