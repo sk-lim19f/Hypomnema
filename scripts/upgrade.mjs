@@ -819,7 +819,8 @@ const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
 // provides the core hooks/commands/settings. A manual/npm `--apply` would copy and
 // register them on top, and every core hook fires twice. The detector is fail-open
 // (see lib/plugin-detect.mjs): a false positive would wrongly alter a legitimate
-// npm-only user's upgrade, so it only fires on an exact `hypomnema@<mp>: true`.
+// npm-only user's upgrade, so it only fires on an exact `hypo@<mp>: true` (or the
+// legacy `hypomnema@<mp>: true`, matched across the plugin-rename migration window).
 const hypomnemaPluginEnabled = !pluginMode && isHypomnemaPluginEnabled(claudeSettingsPath);
 const dualInstallCoreConflict = hypomnemaPluginEnabled;
 // Surface policy: the Claude core surface (hooks/settings/commands/hook-name

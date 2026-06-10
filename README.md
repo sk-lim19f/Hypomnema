@@ -45,7 +45,7 @@ Inside Claude Code:
 
 ```
 /plugin marketplace add sk-lim19f/Hypomnema
-/plugin install hypomnema@hypomnema
+/plugin install hypo@hypomnema
 /hypo:init
 ```
 

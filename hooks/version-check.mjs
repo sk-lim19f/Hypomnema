@@ -138,6 +138,24 @@ export function detectChannel(pkgRoot) {
   return 'unknown';
 }
 
+/**
+ * Pick the plugin's published version out of a marketplace.json `plugins` array.
+ * Select by name rather than plugins[0]: the file could list more than one
+ * plugin or reorder entries. Accept the current name (`hypo`) and the legacy one
+ * (`hypomnema`) so a stale-cached or transitional marketplace.json still
+ * resolves. Returns the version string or null.
+ */
+export function selectPluginVersion(plugins) {
+  if (!Array.isArray(plugins)) return null;
+  // Prefer the current name over the legacy one so that a transitional
+  // marketplace.json listing BOTH aliases resolves to `hypo` regardless of the
+  // entries' order (a legacy-first list must not shadow a newer `hypo` entry).
+  const entry =
+    plugins.find((p) => p && p.name === 'hypo') || plugins.find((p) => p && p.name === 'hypomnema');
+  const v = entry && entry.version;
+  return typeof v === 'string' ? v : null;
+}
+
 /** Channel-specific one-line update instruction. */
 export function buildUpdateLine(channel, current, latest) {
   const head = `[Hypomnema] Update available! ${current} → ${latest}`;

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The Claude marketplace plugin is renamed `hypomnema` to `hypo`, so its slash commands now match the docs.** Claude Code namespaces a plugin's slash commands by the plugin's `name` field, so the plugin (named `hypomnema`) actually registered its commands as `/hypomnema:resume`, `/hypomnema:init`, and so on. Every doc, command body, and `/hypo:init` reference assumed `/hypo:*`, so a user who installed via the marketplace and followed the README hit "command not found". (The npm/manual install path was never affected: it copies the command files into `~/.claude/commands/hypo/`, which already yields `/hypo:*`.) Renaming the plugin to `hypo` makes both install paths expose the same `/hypo:*` namespace the docs describe. The marketplace itself keeps its name (`hypomnema`), so `/plugin marketplace add` and `/plugin marketplace update hypomnema` are unchanged; only the plugin identifier in the install command changes.
+
+  **Migration for existing plugin users:** the install identifier changes from `hypomnema@hypomnema` to `hypo@hypomnema`. Disable or remove the old plugin, then run `/plugin install hypo@hypomnema` followed by `/reload-plugins`. Until you reinstall, the old `/hypomnema:*` commands keep working from the cached plugin. The npm/manual `/hypo:upgrade` dual-install guard now recognizes both the new `hypo` and the legacy `hypomnema` plugin entry in `enabledPlugins`, so it still suppresses the double-registration of core hooks across the migration window, and the update notifier resolves the plugin's latest version under either name.
+
+### 한글 요약
+
+- **Claude 마켓플레이스 플러그인 이름을 `hypomnema`에서 `hypo`로 변경해 슬래시 커맨드가 문서와 일치하게 됨.** Claude Code는 플러그인 슬래시 커맨드를 플러그인의 `name` 필드로 네임스페이싱한다. 그래서 이름이 `hypomnema`인 플러그인은 커맨드를 실제로 `/hypomnema:resume`, `/hypomnema:init` 등으로 등록했다. 모든 문서·커맨드 본문·`/hypo:init` 안내는 `/hypo:*`을 가정했으므로, 마켓플레이스로 설치하고 README를 따라 한 사용자는 "command not found"를 만났다. (npm/수동 설치 경로는 영향이 없었다: 커맨드 파일을 `~/.claude/commands/hypo/`로 복사하므로 처음부터 `/hypo:*`이 된다.) 플러그인 이름을 `hypo`로 바꾸면 두 설치 경로 모두 문서가 설명하는 동일한 `/hypo:*` 네임스페이스를 노출한다. 마켓플레이스 이름(`hypomnema`)은 그대로라 `/plugin marketplace add`와 `/plugin marketplace update hypomnema`는 불변이며, 설치 명령의 플러그인 식별자만 바뀐다.
+
+  **기존 플러그인 사용자 마이그레이션:** 설치 식별자가 `hypomnema@hypomnema`에서 `hypo@hypomnema`로 바뀐다. 기존 플러그인을 비활성/제거한 뒤 `/plugin install hypo@hypomnema` 다음 `/reload-plugins`를 실행하라. 재설치 전까지는 캐시된 플러그인의 기존 `/hypomnema:*` 커맨드가 계속 동작한다. npm/수동 `/hypo:upgrade`의 dual-install 가드는 이제 `enabledPlugins`에서 새 `hypo`와 레거시 `hypomnema` 항목을 모두 인식하므로 마이그레이션 기간에도 core 훅 중복 등록을 계속 막고, 업데이트 notifier도 두 이름 중 어느 쪽으로든 플러그인 최신 버전을 해석한다.
+
 ## [1.3.1] - 2026-06-09
 
 ### Fixed
