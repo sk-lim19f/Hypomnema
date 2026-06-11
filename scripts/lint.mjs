@@ -382,7 +382,7 @@ for (const s of findDesignHistoryStale(args.hypoDir)) {
   issue(
     'warn',
     `projects/${s.project}/design-history.md`,
-    `design-history stale: session-log 최신=${s.lastSession} > design-history 최신=${s.lastDesignHistory}${gap} — projects/${s.project}/design-history.md에 설계 변경 사항을 append 하세요`,
+    `design-history stale: session-log 설계-관련 최신=${s.lastSession} > design-history 최신=${s.lastDesignHistory}${gap} — projects/${s.project}/design-history.md에 설계 변경 사항을 append 하거나, 무-설계 세션이면 session-log 엔트리에 "ADR 없음" 마커를 명시하세요`,
     null,
     'W8',
   );

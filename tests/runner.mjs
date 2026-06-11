@@ -11583,6 +11583,139 @@ test('w8-edge: frontmatter updated newer than body date → still stale on body 
   });
 });
 
+// ── issue①: design-marker precision (W8 false-positive) ──────────────────────
+// A no-design session declares `ADR 없음`; it must NOT count toward staleness,
+// or it pushes session-log past design-history forever (treadmill). A real
+// design session (ADR ref, or no marker at all) still must block.
+suite('issue①: W8 design-marker precision');
+
+test('marker: latest entry "ADR 없음" (no ADR ref) is excluded → not stale', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'm1', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd: '## [2026-06-05] feature\n- **ADR 없음** — fix only\n',
+    });
+    assert.equal(findDesignHistoryStale(root).length, 0);
+  });
+});
+
+test('marker: treadmill — repeated "ADR 없음" sessions never trip W8', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'm2', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd: '## [2026-06-05] a\n- ADR 없음 — fix\n\n## [2026-06-09] b\n- ADR 없음 — docs\n',
+    });
+    assert.equal(findDesignHistoryStale(root).length, 0);
+  });
+});
+
+test('marker: no marker at all → conservative include → still stale (ADR 0041 intent)', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'm3', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd: '## [2026-06-05] unmarked session\nbody with no marker\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-06-05');
+  });
+});
+
+test('marker: real design session (ADR ref, no 없음) → stale (forgot-append case)', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'm4', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd: '## [2026-06-10] rename (ADR 0040)\n- → [[decisions/0040-rename]]\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-06-10');
+  });
+});
+
+test('marker: "ADR 없음" + "ADR 0040" coexist → ambiguous → included (not excluded)', () => {
+  // Excluding a contradictory entry would re-introduce the false-negative W8
+  // exists to catch (codex review). Treat mixed entries as design entries.
+  withTmpDir((root) => {
+    setupDhProject(root, 'm5', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd: '## [2026-06-12] mixed\n- ADR 없음 but mentions ADR 0040 별개\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-06-12');
+  });
+});
+
+test('marker: only the latest entry is excluded → earlier design entry still governs', () => {
+  // Excluding the no-design latest entry must reveal the prior design entry's
+  // date, not collapse to clean. 06-08 (ADR 0040) > design-history 06-01.
+  withTmpDir((root) => {
+    setupDhProject(root, 'm6', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd:
+        '## [2026-06-08] design (ADR 0040)\n- [[decisions/0040]]\n\n## [2026-06-11] cleanup\n- ADR 없음 — docs\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-06-08');
+  });
+});
+
+test('regex: bracketless "## YYYY-MM-DD" session-log heading is parsed', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'm7', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd: '## 2026-06-07 bracketless SHIP entry\nbody\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-06-07');
+  });
+});
+
+test('regex: malformed partial bracket "## [2026-06-07" is NOT a valid heading', () => {
+  // Two-branch regex (not \[?...\]?) rejects half-bracketed headings.
+  withTmpDir((root) => {
+    setupDhProject(root, 'm8', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd: '## [2026-06-20 missing close bracket\nbody\n## [2026-06-05] real\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-06-05'); // 06-20 ignored (malformed)
+  });
+});
+
+test('regex: trailing-only bracket "## 2026-06-20]" is NOT a valid heading', () => {
+  // The bare branch must reject a stray closing bracket via (?!\]); otherwise it
+  // would match the date and ignore the `]` (codex pre-commit review).
+  withTmpDir((root) => {
+    setupDhProject(root, 'm8b', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd: '## 2026-06-20] stray close bracket\nbody\n## [2026-06-05] real\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-06-05'); // 06-20] ignored (malformed)
+  });
+});
+
+test('parse: last entry without trailing newline is sliced to EOF', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'm9', {
+      dh: '## 2026-06-01\ninitial\n',
+      sessionLogMd:
+        '## [2026-06-05] first\nbody\n## [2026-06-15] last no newline\n- ADR 없음 — eof',
+    });
+    // last entry (06-15) is "ADR 없음" → excluded even at EOF; 06-05 has no
+    // marker → included → governs.
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-06-05');
+  });
+});
+
 suite('fix #49: lint.mjs --json W8 wiring');
 
 test('w8-lint-emits-id-and-posix-file-in-json', () => {

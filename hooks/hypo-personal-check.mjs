@@ -310,7 +310,9 @@ process.stdin.on('end', () => {
     [
       `  [ ] 0. Read SCHEMA.md + hypo-guide.md (required before wiki work)`,
       `  [ ] 1. PRD       — create projects/<name>/prd.md if missing`,
-      `  [ ] 2. ADR       — decide yes/no on 5 types; if all N, note "no ADR — reason: <why>"`,
+      `  [ ] 2. ADR       — decide yes/no on 5 types. Design change → append to projects/<name>/design-history.md.`,
+      `           If none, note the literal marker "ADR 없음 — reason: <why>" in the session-log entry`,
+      `           (machine-readable; suppresses the W8 design-history gate for no-design sessions).`,
       `  [ ] 3. Ingest    — if new external knowledge, save to sources/ and ingest`,
       `  [ ] 4. Pages     — extract new concepts/patterns to pages/`,
       `  [ ] 5. Synthesis — if 3+ cross-page analysis results, save to pages/syntheses/`,
