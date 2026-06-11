@@ -125,30 +125,36 @@ process.stdin.on('end', () => {
       const allErrors = parsed.errors || [];
       const allW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
       // Bug B: judge this session on the files IT touched, not the whole vault.
-      // A readable transcript lets us scope (edited files ∪ mandatory close
-      // files); a missing/unreadable transcript falls back to the conservative
-      // global gate (never weaker than before).
+      // Scope = the mandatory close files (always derivable without a transcript)
+      // plus the files this session edited (only knowable with a transcript). A
+      // readable transcript widens the scope to the session's Edit/Write targets.
+      // Without one (headless, apply-path close, or programmatic invocation) the
+      // scope is exactly closeFileTargets, the mandatory close files and the only
+      // files derivable without a transcript. (crystallize --apply-session-close
+      // can also write an optional pages/open-questions.md, but PreCompact cannot
+      // locate that without a transcript or payload and the apply path gates it
+      // on its own.) Cross-project or shared-page debt the
+      // session did not touch becomes a non-blocking notice either way, so an
+      // unrelated lint error elsewhere never holds /compact hostage. See ADR 0041,
+      // which reverses ADR 0037's conservative global fallback (real interactive
+      // /compact always carries a transcript, so the old fallback only ever fired
+      // in transcript-less modes where closeFileTargets is already complete).
       const haveTranscript = !!(transcriptPath && existsSync(transcriptPath));
+      const scope = new Set(closeFileTargets(HYPO_DIR));
       if (haveTranscript) {
-        const scope = new Set([
-          ...extractTouchedWikiFiles(transcriptPath, HYPO_DIR),
-          ...closeFileTargets(HYPO_DIR),
-        ]);
-        const part = partitionLintScope(allErrors, scope);
-        lintBlockers = part.blocking;
-        lintNotices = part.notice;
-        // W8 (design-history stale) is the CURRENT project's close
-        // responsibility, not cross-project debt — block on the active
-        // project's, surface others' as notices.
-        if (closeFiles.project) {
-          const mine = `projects/${closeFiles.project}/design-history.md`;
-          lintW8 = allW8.filter((w) => w.file === mine);
-          lintNotices.push(...allW8.filter((w) => w.file !== mine));
-        } else {
-          lintW8 = allW8;
-        }
+        for (const f of extractTouchedWikiFiles(transcriptPath, HYPO_DIR)) scope.add(f);
+      }
+      const part = partitionLintScope(allErrors, scope);
+      lintBlockers = part.blocking;
+      lintNotices = part.notice;
+      // W8 (design-history stale) is the CURRENT project's close
+      // responsibility, not cross-project debt: block on the active project's,
+      // surface others' as notices.
+      if (closeFiles.project) {
+        const mine = `projects/${closeFiles.project}/design-history.md`;
+        lintW8 = allW8.filter((w) => w.file === mine);
+        lintNotices.push(...allW8.filter((w) => w.file !== mine));
       } else {
-        lintBlockers = allErrors;
         lintW8 = allW8;
       }
     } catch (err) {

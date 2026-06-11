@@ -1271,6 +1271,42 @@ test('lint blockers without id field → reason names files, no empty placeholde
   // never carry an id (only W8 warns do). The result was a reason like
   // `lint blockers: , , , , , , ,` — blocks correctly but tells the user
   // nothing actionable. Fix: fall back to file path + dedupe.
+  //
+  // The lint error must live in an IN-SCOPE close file (ADR 0041): a no-transcript
+  // PreCompact scopes blocking lint to closeFileTargets, so an out-of-scope page
+  // would only surface as a notice. session-state.md (a mandatory close file)
+  // missing its required next-task heading is a SCHEMA-independent lint error.
+  withWiki(
+    (dir, today) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## Wrong Heading\n\n- next\n`,
+      );
+    },
+    (dir) => {
+      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.decision, 'block', `expected block: ${r.stdout}`);
+      assert.ok(
+        out.reason.includes('lint blockers: projects/test-project/session-state.md'),
+        `lint blockers should name the file, got: ${out.reason}`,
+      );
+      assert.ok(
+        !/lint blockers:\s*,/.test(out.reason),
+        `lint blockers section must not start with empty commas: ${out.reason}`,
+      );
+    },
+  );
+});
+
+test('no-transcript PreCompact: out-of-scope lint error → notice, not blocking (ADR 0041)', () => {
+  // ADR 0041 (reverses ADR 0037's global fallback): a PreCompact with no
+  // transcript scopes blocking lint to closeFileTargets. An error in a file this
+  // session did not touch (other project / shared page) must NOT hold /compact
+  // hostage — it surfaces as a non-blocking notice. Real interactive /compact
+  // always carries a transcript, so this fallback only fires in headless /
+  // apply-path / programmatic modes where closeFileTargets is the complete set
+  // of session-accountable files.
   withWiki(
     (dir) => {
       mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
@@ -1282,14 +1318,58 @@ test('lint blockers without id field → reason names files, no empty placeholde
     (dir) => {
       const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
       const out = JSON.parse(r.stdout);
-      assert.equal(out.decision, 'block', `expected block: ${r.stdout}`);
-      assert.ok(
-        out.reason.includes('lint blockers: pages/feedback/broken.md'),
-        `lint blockers should name the file, got: ${out.reason}`,
+      assert.equal(
+        out.continue,
+        true,
+        `out-of-scope lint debt must not block a no-transcript compact: ${r.stdout}`,
       );
       assert.ok(
-        !/lint blockers:\s*,/.test(out.reason),
-        `lint blockers section must not start with empty commas: ${out.reason}`,
+        out.systemMessage && out.systemMessage.includes('pages/feedback/broken.md'),
+        `the out-of-scope error should surface as a notice naming the file: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('PreCompact with transcript touching an out-of-scope file → that file blocks', () => {
+  // The transcript widens the scope: a file the session actually edited via
+  // Edit/Write is in-scope and its lint error blocks, even though it lives
+  // outside closeFileTargets. This is the have-transcript half of ADR 0041.
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(
+        join(dir, 'pages', 'feedback', 'broken.md'),
+        '---\ntitle: broken\ntype: feedback\nstatus: active\nscope: INVALID-SCOPE\nsensitivity: public\nupdated: 2026-05-26\n---\n',
+      );
+    },
+    (dir) => {
+      const transcript = join(dir, 'transcript.jsonl');
+      writeFileSync(
+        transcript,
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [
+              {
+                type: 'tool_use',
+                name: 'Edit',
+                input: { file_path: join(dir, 'pages', 'feedback', 'broken.md') },
+              },
+            ],
+          },
+        }),
+      );
+      const r = runHook(
+        'hypo-personal-check.mjs',
+        { transcript_path: transcript },
+        { HYPO_DIR: dir },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.decision, 'block', `a touched file's lint error must block: ${r.stdout}`);
+      assert.ok(
+        out.reason.includes('lint blockers: pages/feedback/broken.md'),
+        `block reason should name the touched file: ${out.reason}`,
       );
     },
   );

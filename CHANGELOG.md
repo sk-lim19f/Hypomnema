@@ -13,11 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Migration for existing plugin users:** the install identifier changes from `hypomnema@hypomnema` to `hypo@hypomnema`. Disable or remove the old plugin, then run `/plugin install hypo@hypomnema` followed by `/reload-plugins`. Until you reinstall, the old `/hypomnema:*` commands keep working from the cached plugin. The npm/manual `/hypo:upgrade` dual-install guard now recognizes both the new `hypo` and the legacy `hypomnema` plugin entry in `enabledPlugins`, so it still suppresses the double-registration of core hooks across the migration window, and the update notifier resolves the plugin's latest version under either name.
 
+### Fixed
+
+- **A transcript-less PreCompact no longer blocks `/compact` on unrelated lint debt.** The session-close gate scopes blocking lint to the files this session is accountable for (the mandatory close files, plus any file the transcript shows it edited), surfacing everything else as a non-blocking notice. The no-transcript fallback was the exception: it reverted to gating the **whole vault**, so a lint error in another project or a shared page (debt this session never touched) would hold `/compact` hostage. The fallback now scopes to the mandatory close files (`closeFileTargets`), the only files derivable without a transcript. Normal interactive `/compact` is unaffected (both manual and automatic compaction always carry a transcript, per the Claude Code hooks contract); this only changes the headless / programmatic path, where the old global gate was the wrong scope rather than a safer one. The have-transcript path is behavior-preserving.
+
 ### 한글 요약
 
 - **Claude 마켓플레이스 플러그인 이름을 `hypomnema`에서 `hypo`로 변경해 슬래시 커맨드가 문서와 일치하게 됨.** Claude Code는 플러그인 슬래시 커맨드를 플러그인의 `name` 필드로 네임스페이싱한다. 그래서 이름이 `hypomnema`인 플러그인은 커맨드를 실제로 `/hypomnema:resume`, `/hypomnema:init` 등으로 등록했다. 모든 문서·커맨드 본문·`/hypo:init` 안내는 `/hypo:*`을 가정했으므로, 마켓플레이스로 설치하고 README를 따라 한 사용자는 "command not found"를 만났다. (npm/수동 설치 경로는 영향이 없었다: 커맨드 파일을 `~/.claude/commands/hypo/`로 복사하므로 처음부터 `/hypo:*`이 된다.) 플러그인 이름을 `hypo`로 바꾸면 두 설치 경로 모두 문서가 설명하는 동일한 `/hypo:*` 네임스페이스를 노출한다. 마켓플레이스 이름(`hypomnema`)은 그대로라 `/plugin marketplace add`와 `/plugin marketplace update hypomnema`는 불변이며, 설치 명령의 플러그인 식별자만 바뀐다.
 
   **기존 플러그인 사용자 마이그레이션:** 설치 식별자가 `hypomnema@hypomnema`에서 `hypo@hypomnema`로 바뀐다. 기존 플러그인을 비활성/제거한 뒤 `/plugin install hypo@hypomnema` 다음 `/reload-plugins`를 실행하라. 재설치 전까지는 캐시된 플러그인의 기존 `/hypomnema:*` 커맨드가 계속 동작한다. npm/수동 `/hypo:upgrade`의 dual-install 가드는 이제 `enabledPlugins`에서 새 `hypo`와 레거시 `hypomnema` 항목을 모두 인식하므로 마이그레이션 기간에도 core 훅 중복 등록을 계속 막고, 업데이트 notifier도 두 이름 중 어느 쪽으로든 플러그인 최신 버전을 해석한다.
+
+### Fixed (한글)
+
+- **transcript가 없는 PreCompact가 무관한 lint debt로 `/compact`를 더는 차단하지 않음.** session-close 게이트는 차단성 lint을 이 세션이 책임지는 파일(필수 close 파일 + transcript가 보여주는 편집 파일)로 스코프하고 나머지는 non-blocking notice로 표시한다. 무-transcript fallback만 예외로 **vault 전체**를 게이트해서, 이 세션이 건드리지도 않은 타 프로젝트·공유 페이지의 lint error가 `/compact`를 인질로 잡았다. 이제 fallback은 필수 close 파일(`closeFileTargets`)로 스코프된다. 이 파일들은 transcript 없이 도출 가능한 유일한 파일이다. 일반 인터랙티브 `/compact`는 영향 없음(manual·auto 압축 모두 Claude Code 훅 계약상 항상 transcript를 실음). 이 변경은 headless/프로그램적 경로에만 적용되며, 거기서 옛 전역 게이트는 더 안전한 스코프가 아니라 잘못된 스코프였다. transcript가 있는 경로는 동작이 보존된다.
 
 ## [1.3.1] - 2026-06-09
 
