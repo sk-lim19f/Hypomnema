@@ -1375,6 +1375,63 @@ test('PreCompact with transcript touching an out-of-scope file → that file blo
   );
 });
 
+test('no-transcript PreCompact: active project design-history stale → blocks (W8)', () => {
+  // W8 (design-history stale) for the ACTIVE project is this session's close
+  // responsibility and must block, in the no-transcript path too (ADR 0041
+  // unifies the branches so W8 is scoped to the active project either way).
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'design-history.md'),
+        '---\ntitle: design-history\ntype: design-history\nupdated: 2026-01-01\n---\n\n## 2026-01-01\n- old\n',
+      );
+    },
+    (dir) => {
+      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.decision,
+        'block',
+        `active-project stale design-history must block: ${r.stdout}`,
+      );
+      assert.ok(
+        out.reason.includes('design-history stale'),
+        `block reason should name design-history staleness: ${out.reason}`,
+      );
+    },
+  );
+});
+
+test('no-transcript PreCompact: another project design-history stale → notice, not blocking (W8 scoped to active, ADR 0041)', () => {
+  // A DIFFERENT project's stale design-history is cross-project debt, not this
+  // session's responsibility. The old no-transcript branch gated on all
+  // projects' W8 (lintW8 = allW8); the unified branch scopes W8 to the active
+  // project, so another project's staleness surfaces as a notice, not a block.
+  withWiki(
+    (dir, today) => {
+      const otherLog = join(dir, 'projects', 'other-proj', 'session-log');
+      mkdirSync(otherLog, { recursive: true });
+      writeFileSync(
+        join(dir, 'projects', 'other-proj', 'design-history.md'),
+        '---\ntitle: design-history\ntype: design-history\nupdated: 2026-01-01\n---\n\n## 2026-01-01\n- old\n',
+      );
+      writeFileSync(
+        join(otherLog, `${today.slice(0, 7)}.md`),
+        `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] other session\n`,
+      );
+    },
+    (dir) => {
+      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.continue,
+        true,
+        `another project's stale design-history must not block the active project's compact: ${r.stdout}`,
+      );
+    },
+  );
+});
+
 test('open-questions.md absent/stale → still passes (conditional, not gated)', () => {
   withWiki(
     (dir) => {
