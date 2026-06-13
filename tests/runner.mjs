@@ -742,6 +742,8 @@ const {
   isClosePattern,
   extractTouchedWikiFiles,
   closeFileTargets,
+  closeFileTargetsGlobal,
+  sessionCloseGlobalStatus,
   partitionLintScope,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
@@ -8246,6 +8248,234 @@ test('resume.mjs honors process.cwd() for same-date tie (ISSUE-1 wiring)', () =>
     assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
     assert.ok(r.stdout.startsWith('Project: beta'), `expected 'Project: beta', got: ${r.stdout}`);
   });
+});
+
+// ── sessionCloseGlobalStatus — global close invariant (ADR 0043) ──────────────
+suite('sessionCloseGlobalStatus — global close invariant (ADR 0043)');
+
+// Build a wiki where each project's 5 close files can be independently fresh or
+// stale. `projects`: [{ slug, date, sessionState?, projectHot?, sessionLog?,
+// logEntry?, hotRow? }] — each optional field defaults to `date` (fresh) and can
+// be set to an old date string (or false to omit). Root hot.md rows are built
+// from `hotRow ?? date`; root hot.md frontmatter `updated:` is always today.
+function makeMultiProjectWiki(dir, today, projects) {
+  mkdirSync(dir, { recursive: true });
+  const ym = today.slice(0, 7);
+  const rows = [];
+  const logLines = [];
+  for (const p of projects) {
+    const d = p.date ?? today;
+    const pdir = join(dir, 'projects', p.slug);
+    mkdirSync(join(pdir, 'session-log'), { recursive: true });
+    const ss = p.sessionState === false ? null : (p.sessionState ?? d);
+    if (ss !== null) {
+      writeFileSync(
+        join(pdir, 'session-state.md'),
+        `---\ntitle: ss\ntype: session-state\nupdated: ${ss}\n---\n\n## next\n`,
+      );
+    }
+    const ph = p.projectHot === false ? null : (p.projectHot ?? d);
+    if (ph !== null) {
+      writeFileSync(
+        join(pdir, 'hot.md'),
+        `---\ntitle: hot\ntype: reference\nupdated: ${ph}\n---\n\n# Hot\n`,
+      );
+    }
+    const slDate = p.sessionLog === false ? null : (p.sessionLog ?? d);
+    if (slDate !== null) {
+      writeFileSync(
+        join(pdir, 'session-log', `${slDate.slice(0, 7)}.md`),
+        `---\ntitle: log\ntype: session-log\nupdated: ${slDate}\n---\n\n## [${slDate}] session\n`,
+      );
+    } else {
+      // still create the current month's file (empty of today heading) so the
+      // status reports it `stale`, not `missing`.
+      writeFileSync(
+        join(pdir, 'session-log', `${ym}.md`),
+        `---\ntitle: log\ntype: session-log\nupdated: 2000-01-01\n---\n\n## [2000-01-01] old\n`,
+      );
+    }
+    const le = p.logEntry === false ? null : (p.logEntry ?? d);
+    if (le !== null) logLines.push(`## [${le}] session | ${p.slug}`);
+    const hr = p.hotRow === false ? null : (p.hotRow ?? d);
+    if (hr !== null) rows.push(`| ${p.slug} | ${hr} | [[projects/${p.slug}/hot]] |`);
+  }
+  writeFileSync(join(dir, 'log.md'), logLines.join('\n') + '\n');
+  writeFileSync(
+    join(dir, 'hot.md'),
+    `---\ntitle: Hot\nupdated: ${today}\n---\n# Hot\n\n## Active Projects\n\n` +
+      `| Project | Last Session | Hot Cache |\n|---|---|---|\n${rows.join('\n')}\n`,
+  );
+}
+
+test('no-payload incident form: fully-closed B passes even though stale A is the top hot.md row', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // A is the recency/top row but has NO today activity (last touched long ago).
+    // B is fully closed today. Legacy recency pick would resolve A and false-block.
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: '2020-01-01' }, // top row, all stale, zero today activity
+      { slug: 'beta', date: today }, // fully closed today
+    ]);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(
+      s.ok,
+      true,
+      `beta is fully closed; alpha has no today activity → ok. got ${JSON.stringify(s)}`,
+    );
+    assert.deepEqual(
+      s.projects.map((p) => p.project),
+      ['beta'],
+      'only beta is today-active',
+    );
+  });
+});
+
+test('masking guard: a DIFFERENT project with a partial close still blocks (no single-pick mask)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha fully closed; beta has a today log.md entry (activity) but stale own files.
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      {
+        slug: 'beta',
+        date: today,
+        sessionState: '2020-01-01',
+        projectHot: '2020-01-01',
+        sessionLog: false,
+      },
+    ]);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, false, 'beta has a dangling close → block');
+    const beta = s.projects.find((p) => p.project === 'beta');
+    assert.ok(beta && !beta.ok, 'beta reported incomplete');
+    assert.ok(
+      s.stale.some((f) => f.includes('projects/beta/')),
+      `block names beta's stale files: ${JSON.stringify(s.stale)}`,
+    );
+  });
+});
+
+test('from-zero fallback: no project has today activity → legacy force-close of the recency project blocks', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: '2020-01-01', hotRow: '2020-01-01' },
+      { slug: 'beta', date: '2020-01-01', hotRow: '2020-01-01' },
+    ]);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.fallback, true, 'no today activity → fallback path');
+    assert.equal(s.ok, false, 'recency project is stale → still blocks (force initial close)');
+    assert.ok(s.primary, 'a recency primary is resolved');
+  });
+});
+
+test('multi today-active: both complete → ok; one partial → block only the partial one', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      { slug: 'beta', date: today },
+    ]);
+    assert.equal(sessionCloseGlobalStatus(dir).ok, true, 'both complete → ok');
+
+    // now break beta's session-state
+    writeFileSync(
+      join(dir, 'projects', 'beta', 'session-state.md'),
+      `---\ntitle: ss\ntype: session-state\nupdated: 2020-01-01\n---\n\n## next\n`,
+    );
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, false, 'beta now incomplete → block');
+    assert.ok(s.projects.find((p) => p.project === 'alpha').ok, 'alpha still ok');
+    assert.ok(!s.projects.find((p) => p.project === 'beta').ok, 'beta blocked');
+    assert.ok(
+      s.stale.some((f) => f === 'projects/beta/session-state.md'),
+      'names beta session-state',
+    );
+    assert.ok(!s.stale.some((f) => f.startsWith('projects/alpha/')), 'does not flag alpha files');
+  });
+});
+
+test('back-compat: single today-active project → flat aliases byte-identical (unprefixed paths)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'solo', date: today, logEntry: '2020-01-01' }]);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, false, 'solo log.md entry stale → block');
+    assert.equal(s.project, 'solo', 'flat .project alias = the single project');
+    assert.ok(
+      s.missing.concat(s.stale).includes('log.md'),
+      'log.md flagged unprefixed (root file)',
+    );
+  });
+});
+
+test('project-dir-only candidate is gated (readdirSync leg) — guards the swallowed-import false-pass', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha is fully closed and visible via root hot.md row + log.md entry.
+    // gamma has today activity ONLY in its own session-state.md — it is absent
+    // from both the root hot.md rows and log.md, so ONLY the project-dirs leg
+    // (readdirSync over projects/*) can surface it. If that leg silently drops
+    // (e.g. an unimported readdirSync swallowed by the try/catch), gamma's
+    // dangling close is missed and the gate false-passes.
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      {
+        slug: 'gamma',
+        date: today,
+        hotRow: false,
+        logEntry: false,
+        sessionLog: false,
+        projectHot: '2020-01-01',
+      },
+    ]);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.ok(
+      s.projects.some((p) => p.project === 'gamma'),
+      `gamma must be found via the project-dirs leg: ${JSON.stringify(s.projects.map((p) => p.project))}`,
+    );
+    assert.equal(s.ok, false, 'gamma has a dangling close → block (must not false-pass)');
+  });
+});
+
+test('closeFileTargetsGlobal: union over today-active projects, all freshDate months', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      { slug: 'beta', date: today },
+    ]);
+    const t = closeFileTargetsGlobal(dir);
+    assert.ok(t.has('hot.md') && t.has('log.md'), 'root files always in scope');
+    for (const p of ['alpha', 'beta']) {
+      assert.ok(t.has(`projects/${p}/session-state.md`), `${p} session-state in scope`);
+      assert.ok(t.has(`projects/${p}/hot.md`), `${p} hot in scope`);
+      assert.ok(
+        [...t].some((f) => new RegExp(`^projects/${p}/session-log/`).test(f)),
+        `${p} session-log in scope`,
+      );
+    }
+  });
+});
+
+test('regression: the close path never passes cwd into resolveActiveProject (resume=cwd / close=no-pick split)', () => {
+  // ADR 0043: close callers must not import a cwd-aware project pick. Guard the
+  // source so a future "re-sync" with resume.mjs cannot reintroduce cwd masking.
+  const shared = readFileSync(join(HOOKS, 'hypo-shared.mjs'), 'utf-8');
+  // Every CALL to resolveActiveProject in hypo-shared.mjs (the close-side module)
+  // must be single-arg. The 2-arg form lives only in the function DEFINITION
+  // (for resume.mjs, a separate file) — exclude that line, then assert no call
+  // passes a 2nd (cwd) argument.
+  const cwdCalls = shared
+    .split('\n')
+    .filter((l) => !/function resolveActiveProject/.test(l))
+    .filter((l) => /resolveActiveProject\([^)]*,/.test(l));
+  assert.equal(
+    cwdCalls.length,
+    0,
+    `close-side resolveActiveProject calls must be single-arg (no cwd); found: ${JSON.stringify(cwdCalls)}`,
+  );
 });
 
 // ── hypo-auto-minimal-crystallize.mjs (ADR 0022 Layer 3) ─────

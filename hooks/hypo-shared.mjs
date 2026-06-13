@@ -6,7 +6,15 @@
  * Hooks are deployed to ~/.claude/hooks/ — no external imports allowed.
  */
 
-import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, rmSync } from 'fs';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  appendFileSync,
+  mkdirSync,
+  rmSync,
+  readdirSync,
+} from 'fs';
 import { join, relative, basename } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
@@ -419,6 +427,169 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
   }
 
   return { ok: stale.length === 0 && missing.length === 0, project, dates, stale, missing };
+}
+
+// ── global session-close gate (ADR 0043) ────
+// The no-payload close paths must NOT pick one project (recency / cwd) and check
+// it — that re-derivation is the prior session-close false-block, and a cwd
+// tie-break here would let a fresh cwd mask a DIFFERENT project's dangling
+// close. Instead the gate enforces a global invariant: no project may end a
+// session with a partial close. resume stays cwd-positive; close never picks.
+// The two copies of resolveActiveProject deliberately differ — see resume.mjs.
+
+// Root hot.md Active-Projects rows as {slug, date}. The per-row date column is
+// project-scoped (unlike the shared frontmatter `updated:`), so a today-dated
+// row is a legitimate close-activity signal. Mirrors resolveActiveProject's regex.
+function rootHotRows(hypoDir) {
+  const hotPath = join(hypoDir, 'hot.md');
+  if (!existsSync(hotPath)) return [];
+  let content;
+  try {
+    content = readFileSync(hotPath, 'utf-8').replace(/<!--[\s\S]*?-->/g, '');
+  } catch {
+    return [];
+  }
+  return [
+    ...content.matchAll(
+      /\|\s*([^|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2})?\s*\|\s*\[\[projects\/([^\]/]+)\/[^\]]+\]\]/g,
+    ),
+  ].map((m) => ({ slug: m[3], date: m[2] || '' }));
+}
+
+// Candidate slugs the global gate must consider: real project dirs (with a
+// session-state.md, skip _template) ∪ slugs in a today-dated `## [today] session
+// | P` log.md entry ∪ slugs in a today-dated root hot.md row. The log/row unions
+// catch a dangling close whose own project files are missing —
+// sessionCloseFileStatus(projectOverride) reports those as `missing` correctly.
+function closeCandidateSlugs(hypoDir, dates) {
+  const slugs = new Set();
+  const projectsDir = join(hypoDir, 'projects');
+  if (existsSync(projectsDir)) {
+    let entries = [];
+    try {
+      entries = readdirSync(projectsDir);
+    } catch {
+      entries = [];
+    }
+    for (const p of entries) {
+      if (p === '_template') continue;
+      if (existsSync(join(projectsDir, p, 'session-state.md'))) slugs.add(p);
+    }
+  }
+  for (const r of rootHotRows(hypoDir)) {
+    if (r.date && dates.includes(r.date)) slugs.add(r.slug);
+  }
+  const logPath = join(hypoDir, 'log.md');
+  if (existsSync(logPath)) {
+    let content = '';
+    try {
+      content = readFileSync(logPath, 'utf-8');
+    } catch {
+      content = '';
+    }
+    for (const d of dates) {
+      const re = new RegExp('^## \\[' + escapeRegExp(d) + '\\] session \\| (\\S+)', 'gm');
+      for (const m of content.matchAll(re)) slugs.add(m[1]);
+    }
+  }
+  return slugs;
+}
+
+// True when project P shows ANY today close-activity signal: session-state or
+// project hot.md frontmatter `updated:` today, a today-dated session-log heading,
+// a today log.md `session | P` entry, or a today-dated root hot.md row for P.
+// (Root hot.md *frontmatter* is shared and is NOT a signal; the per-project ROW
+// date is.)
+function hasTodayCloseActivity(hypoDir, project, dates) {
+  const fresh = (rel) => {
+    const full = join(hypoDir, rel);
+    if (!existsSync(full)) return false;
+    try {
+      return dates.includes(frontmatterUpdated(readFileSync(full, 'utf-8')));
+    } catch {
+      return false;
+    }
+  };
+  if (fresh(join('projects', project, 'session-state.md'))) return true;
+  if (fresh(join('projects', project, 'hot.md'))) return true;
+  for (const d of dates) {
+    const sl = join(hypoDir, 'projects', project, 'session-log', `${d.slice(0, 7)}.md`);
+    if (existsSync(sl)) {
+      try {
+        if (hasSessionLogHeading(readFileSync(sl, 'utf-8'), d)) return true;
+      } catch {
+        /* skip */
+      }
+    }
+  }
+  const logPath = join(hypoDir, 'log.md');
+  if (existsSync(logPath)) {
+    try {
+      const c = readFileSync(logPath, 'utf-8');
+      if (dates.some((d) => hasLogEntry(c, d, project))) return true;
+    } catch {
+      /* skip */
+    }
+  }
+  for (const r of rootHotRows(hypoDir)) {
+    if (r.slug === project && r.date && dates.includes(r.date)) return true;
+  }
+  return false;
+}
+
+/**
+ * Global session-close status for the no-payload close paths (ADR 0043).
+ * Checks EVERY project with today close-activity; ok only when all are complete.
+ * When no project has today activity, falls back to the legacy single recency
+ * project (preserves "force the initial close" behavior, byte-identical gate).
+ *
+ * stale/missing entries are self-describing paths — project-specific files carry
+ * `projects/<slug>/…`, root files (`hot.md`/`log.md`) are shared — so the flat
+ * aliases need no project prefix and a single-project session is byte-identical
+ * to sessionCloseFileStatus (back-compat for the flat-field readers).
+ *
+ * @param {string} hypoDir
+ * @returns {{ok: boolean, projects: Array<{project:string, ok:boolean, stale:string[], missing:string[]}>,
+ *            dates: string[], fallback: boolean, primary: string|null,
+ *            project: string|null, stale: string[], missing: string[]}}
+ */
+export function sessionCloseGlobalStatus(hypoDir) {
+  const dates = freshDates();
+  const recency = resolveActiveProject(hypoDir); // no cwd — close never picks by cwd
+  const todayActive = [...closeCandidateSlugs(hypoDir, dates)].filter((p) =>
+    hasTodayCloseActivity(hypoDir, p, dates),
+  );
+
+  if (todayActive.length === 0) {
+    const legacy = sessionCloseFileStatus(hypoDir);
+    return {
+      ok: legacy.ok,
+      projects: legacy.project
+        ? [{ project: legacy.project, ok: legacy.ok, stale: legacy.stale, missing: legacy.missing }]
+        : [],
+      dates,
+      fallback: true,
+      primary: legacy.project,
+      project: legacy.project,
+      stale: legacy.stale,
+      missing: legacy.missing,
+    };
+  }
+
+  // primary = the recency project when it is itself today-active, else the first
+  // today-active slug (stable order from the candidate set). Used only as the
+  // single-slug alias (marker `project` field, message header) — never to gate.
+  const primary = recency && todayActive.includes(recency) ? recency : todayActive[0];
+  const ordered = [primary, ...todayActive.filter((p) => p !== primary)];
+
+  const projects = ordered.map((p) => {
+    const s = sessionCloseFileStatus(hypoDir, { projectOverride: p });
+    return { project: p, ok: s.ok, stale: s.stale, missing: s.missing };
+  });
+  const ok = projects.every((x) => x.ok);
+  const stale = [...new Set(projects.flatMap((x) => x.stale))];
+  const missing = [...new Set(projects.flatMap((x) => x.missing))];
+  return { ok, projects, dates, fallback: false, primary, project: primary, stale, missing };
 }
 
 // ── sync-state ────────────────────────────────────────────
@@ -961,6 +1132,31 @@ export function closeFileTargets(hypoDir) {
     out.add(`projects/${project}/hot.md`);
     const month = freshDates()[0].slice(0, 7);
     out.add(`projects/${project}/session-log/${month}.md`);
+  }
+  return out;
+}
+
+/**
+ * Global variant of closeFileTargets for the no-payload lint-scope callers
+ * (ADR 0043). Union of the close files over every today-active project
+ * (fallback: the recency project when none is active). Includes the session-log
+ * month for EVERY freshDate (not just dates[0]) so the lint scope matches what
+ * sessionCloseFileStatus actually checks across a local/UTC month boundary.
+ */
+export function closeFileTargetsGlobal(hypoDir) {
+  const dates = freshDates();
+  const out = new Set(['hot.md', 'log.md']);
+  let active = [...closeCandidateSlugs(hypoDir, dates)].filter((p) =>
+    hasTodayCloseActivity(hypoDir, p, dates),
+  );
+  if (active.length === 0) {
+    const recency = resolveActiveProject(hypoDir);
+    if (recency) active = [recency];
+  }
+  for (const p of active) {
+    out.add(`projects/${p}/session-state.md`);
+    out.add(`projects/${p}/hot.md`);
+    for (const d of dates) out.add(`projects/${p}/session-log/${d.slice(0, 7)}.md`);
   }
   return out;
 }
