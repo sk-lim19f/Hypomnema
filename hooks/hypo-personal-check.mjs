@@ -172,7 +172,7 @@ process.stdin.on('end', () => {
   const designHistoryOk = lintW8.length === 0;
   // Non-blocking heads-up about pre-existing lint debt in untouched files (other
   // projects / shared pages). Surfaced so it is visible but never blocks compact.
-  const noticeText =
+  let noticeText =
     lintNotices.length > 0
       ? `[WIKI CHECK] ${lintNotices.length} pre-existing lint issue(s) in files this session did not touch (not blocking): ${[
           ...new Set(lintNotices.map((b) => b.file)),
@@ -188,11 +188,14 @@ process.stdin.on('end', () => {
   // projection). `--no-input` keeps this non-TTY hook from ever blocking on a
   // prompt, and the engine's skip-MEMORY warning is *soft* (never escalated by
   // --strict) so a fresh / external user whose ~/.claude/projects/<id> dir does
-  // not exist yet is never gated (contract §5 step 4). Fail-open on any spawn
-  // error, exactly like the lint check above.
+  // not exist yet is never gated (contract §5 step 4). The --check spawn
+  // fails open on any error, exactly like the lint check above; the self-heal
+  // --write below fails CLOSED (blocks transparently) because by then real
+  // drift is confirmed and silently passing it would defeat the gate.
   const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
   let feedbackOk = true;
   let feedbackReason = '';
+  let feedbackHealed = ''; // self-heal notice when pure drift was auto-resolved (ADR 0045)
   let feedbackSkipped = false;
   if (!feedbackPath || !existsSync(feedbackPath)) {
     feedbackSkipped = true;
@@ -230,22 +233,58 @@ process.stdin.on('end', () => {
         } catch {
           /* unparseable → fail-open below */
         }
-        const targets = report ? Object.values(report.targets || {}) : [];
-        const conflicted = targets.some(
-          (t) =>
-            t.intruder || t.unpaired || t.outOfContainer || (t.conflicts && t.conflicts.length),
-        );
-        const overCap = targets.some((t) => t.overCap);
-        const drifted = targets.some((t) => t.dirty);
-        if (!report || !(conflicted || overCap || drifted)) {
+        const entries = report ? Object.entries(report.targets || {}) : [];
+        const conflictedT = entries
+          .filter(
+            ([, t]) =>
+              t.intruder || t.unpaired || t.outOfContainer || (t.conflicts && t.conflicts.length),
+          )
+          .map(([n]) => n);
+        const overCapT = entries.filter(([, t]) => t.overCap).map(([n]) => n);
+        const driftedT = entries.filter(([, t]) => t.dirty).map(([n]) => n);
+        if (!report || !(conflictedT.length || overCapT.length || driftedT.length)) {
           feedbackSkipped = true; // missing target / pure warning / unparseable → fail-open
-        } else {
+        } else if (conflictedT.length || overCapT.length) {
+          // Genuine human-decision cases (ADR 0031 rules 3 & 6) — always surface,
+          // never auto-resolve. Name the target so the block reason is actionable.
           feedbackOk = false;
-          feedbackReason = conflicted
-            ? 'feedback projection conflict (manual edit) — run `hypomnema feedback-sync --import-target-change --from=<memory|claude>`'
-            : overCap
-              ? 'feedback projection over cap — demote/archive feedback pages'
-              : 'feedback projection drift — run `hypomnema feedback-sync --write`';
+          feedbackReason = conflictedT.length
+            ? `feedback projection conflict (manual edit of ${conflictedT.join(', ')}) — run \`hypomnema feedback-sync --import-target-change --from=<memory|claude>\``
+            : `feedback projection over cap (${overCapT.join(', ')}) — demote/archive feedback pages`;
+        } else {
+          // Pure projection drift (deterministic derive, byte-identical per ADR
+          // 0031 rule 5). Self-heal: regenerate the projection so the gate does
+          // not block on a mechanical, auto-resolvable diff (ADR 0045). The write
+          // touches managed blocks / per-feedback side-files; the visible
+          // MEMORY.md body is often unchanged (the drift lives in the side-file
+          // copies). Effect = gate unblock + next-session coherence, NOT an
+          // in-context memory refresh (MEMORY.md is injected at session start).
+          // --write is NOT --strict and only applies when nothing blocks
+          // (code===0 across ALL targets), so a late conflict/over-cap (race vs
+          // the --check above) exits non-zero and we block transparently rather
+          // than passing on unresolved drift. Note: --write is semantic-preflight
+          // atomic (it refuses to write any target when one conflicts/over-caps),
+          // but not filesystem-atomic — a concurrent edit between eval and apply,
+          // or an I/O fault mid-write, is best-effort, same as any feedback-sync
+          // --write. Hardening that is out of scope here (pre-existing engine
+          // behavior, not introduced by the self-heal).
+          const w = spawnSync(
+            process.execPath,
+            [
+              feedbackPath,
+              '--write',
+              '--no-input',
+              `--hypo-dir=${HYPO_DIR}`,
+              `--claude-home=${join(homedir(), '.claude')}`,
+            ],
+            { encoding: 'utf-8', timeout: 30000 },
+          );
+          if (w.error || w.status === null || w.status !== 0) {
+            feedbackOk = false;
+            feedbackReason = `feedback projection drift (${driftedT.join(', ')}) — auto-sync failed; run \`hypomnema feedback-sync --write\` manually`;
+          } else {
+            feedbackHealed = `[WIKI CHECK] feedback projection re-synced (${driftedT.join(', ')}); MEMORY.md body may be unchanged — drift was in the managed block / side-files.`;
+          }
         }
       }
     } catch (err) {
@@ -253,6 +292,10 @@ process.stdin.on('end', () => {
       process.stderr.write(`[hypo-personal-check] error: ${err?.message ?? String(err)}\n`);
     }
   }
+
+  // Surface the self-heal so a re-synced projection is not a silent mutation of
+  // the user's MEMORY.md / CLAUDE.md (ADR 0045 transparency).
+  if (feedbackHealed) noticeText = noticeText ? `${noticeText}\n${feedbackHealed}` : feedbackHealed;
 
   if (
     gitStatus.clean &&
