@@ -18,7 +18,11 @@
  *                              ~/Documents/{hypomnema,wiki,notes}) that contains
  *                              a hypo-config.md marker.
  *                           3. else the default ~/hypomnema.
- *   --project=<name>      Project name (default: most recently active from hot.md)
+ *   --project=<name>      Project name. When omitted, resolveActiveProject()
+ *                         prefers the project whose working_dir contains the
+ *                         current directory (cwd-first), and only falls back to
+ *                         the most recently active hot.md row when nothing under
+ *                         cwd matches.
  *   --json                Output as JSON
  */
 
@@ -58,7 +62,8 @@ function parseFrontmatterField(content, key) {
 
 // Among `slugs`, return the one whose projects/<slug>/index.md `working_dir`
 // is the LONGEST prefix of cwd (so /repo/sub wins over /repo). Returns null
-// when cwd is falsy or matches none. Used only as a same-date tie-breaker.
+// when cwd is falsy or matches none. resume gives this authority OVER recency
+// (ADR 0044): a cwd↔working_dir match wins regardless of which row is newest.
 function pickByCwd(hypoDir, slugs, cwd) {
   if (!cwd) return null;
   let best = null;
@@ -93,38 +98,54 @@ function resolveActiveProject(hypoDir, cwd = null) {
     ),
   ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
-    wikiRows.sort((a, b) => b.date.localeCompare(a.date));
-    // Same-date tie-break: when the top date is shared by >1 row,
-    // prefer the project whose working_dir contains cwd. No cwd / no match →
-    // keep the stable-sort winner (the legacy "first table row" behavior).
-    const topDate = wikiRows[0].date;
-    const tied = wikiRows.filter((r) => r.date === topDate);
-    if (cwd && tied.length > 1) {
+    // cwd-first (ADR 0044): a cwd↔working_dir match wins over recency, across
+    // ALL rows (not just a same-date tie). The user is physically in that
+    // project, so cwd is a stronger intent signal than "some other project was
+    // touched more recently". This reverses the earlier tie-breaker-only
+    // semantics now that resume=cwd-positive (ADR 0043). Tradeoff: a stale cwd
+    // match can mask a genuinely newer project; `--project` overrides. close
+    // callers pass null → recency path below (resume=cwd-positive / close=no-pick).
+    if (cwd) {
       const picked = pickByCwd(
         hypoDir,
-        tied.map((r) => r.slug),
+        wikiRows.map((r) => r.slug),
         cwd,
       );
       if (picked) return picked;
     }
+    // No cwd match → most recent by date (stable-sort keeps the first table row
+    // on a tie, the legacy behavior).
+    wikiRows.sort((a, b) => b.date.localeCompare(a.date));
     return wikiRows[0].slug;
   }
   // Legacy markdown-link rows: | [name](projects/name/...) | ...
-  const mdRow = content.match(/\|\s*\[([^\]]+)\]\(projects\/([^/)]+)/);
-  if (mdRow) return mdRow[2];
+  const mdSlugs = [...content.matchAll(/\|\s*\[([^\]]+)\]\(projects\/([^/)]+)/g)].map((m) => m[2]);
+  if (mdSlugs.length > 0) {
+    if (cwd) {
+      const picked = pickByCwd(hypoDir, mdSlugs, cwd);
+      if (picked) return picked;
+    }
+    return mdSlugs[0]; // legacy: first table row
+  }
 
-  // fallback: most recently modified project with a session-state.md
+  // fallback: a cwd-matched project, else the most recently modified one with a
+  // session-state.md. (mtime is only a heuristic once hot.md can't name a
+  // project — an explicit working_dir match is safer, so cwd-first here too.)
   const projectsDir = join(hypoDir, 'projects');
   if (!existsSync(projectsDir)) return null;
 
+  // Skip the scaffold project init.mjs writes — it isn't a real active project.
+  const candidates = readdirSync(projectsDir).filter(
+    (p) => p !== '_template' && existsSync(join(projectsDir, p, 'session-state.md')),
+  );
+  if (cwd) {
+    const picked = pickByCwd(hypoDir, candidates, cwd);
+    if (picked) return picked;
+  }
   let latest = null;
   let latestMtime = 0;
-  for (const p of readdirSync(projectsDir)) {
-    // Skip the scaffold project init.mjs writes — it isn't a real active project.
-    if (p === '_template') continue;
-    const ssPath = join(projectsDir, p, 'session-state.md');
-    if (!existsSync(ssPath)) continue;
-    const mtime = statSync(ssPath).mtimeMs;
+  for (const p of candidates) {
+    const mtime = statSync(join(projectsDir, p, 'session-state.md')).mtimeMs;
     if (mtime > latestMtime) {
       latestMtime = mtime;
       latest = p;
