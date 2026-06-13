@@ -9181,18 +9181,20 @@ const FB_PROJECT_L2 = {
 };
 
 // ── hypo-personal-check.mjs — feedback projection gate ──────
-// The PreCompact gate runs `feedback-sync --check --strict`; projection drift
-// must surface as a block, but only when PKG_ROOT resolves (a custom HOME with
-// hypo-pkg.json). The single-blocking-gate invariant (spec §7.5) means this is
-// integrated into hypo-personal-check, not a separate hook.
+// The PreCompact gate runs `feedback-sync --check --strict` when PKG_ROOT
+// resolves (a custom HOME with hypo-pkg.json). Per ADR 0045, PURE projection
+// drift self-heals (the gate runs --write and continues); conflict and over-cap
+// still block (human decision required). The single-blocking-gate invariant
+// (spec §7.5) means this is integrated into hypo-personal-check, not a separate
+// hook.
 suite('hypo-personal-check.mjs — feedback projection gate (fix #37 Phase C)');
 
-test('feedback projection drift → block names feedback projection', () => {
+test('feedback projection pure drift → self-heal (auto --write) + continue, not block (ADR 0045)', () => {
   withWiki(
     (dir) => {
       // A global-L1 page is a CLAUDE projection candidate; the controlled
       // CLAUDE.md below has an empty <learned_behaviors> with no managed region
-      // yet, so `--check` sees the projection as stale → exit 1.
+      // yet, so `--check` sees the projection as stale → pure drift (exit 1).
       mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
       writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
     },
@@ -9203,16 +9205,115 @@ test('feedback projection drift → block names feedback projection', () => {
       try {
         mkdirSync(join(home, '.claude'), { recursive: true });
         writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        const claudePath = join(home, '.claude', 'CLAUDE.md');
+        writeFileSync(claudePath, '# Global\n<learned_behaviors>\n</learned_behaviors>\n');
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const out = JSON.parse(r.stdout);
+        // Pure drift self-heals: the gate runs --write and proceeds.
+        assert.equal(out.continue, true, `pure drift must self-heal, not block: ${r.stdout}`);
+        assert.notEqual(out.decision, 'block', `must not block on pure drift: ${r.stdout}`);
+        assert.ok(
+          /re-synced/.test(out.systemMessage || ''),
+          `continue must carry the self-heal notice: ${r.stdout}`,
+        );
+        // The write actually resolved the drift: the managed block now exists.
+        assert.ok(
+          readFileSync(claudePath, 'utf-8').includes('HYPO:FEEDBACK-SYNC:START source=rule-a'),
+          'self-heal must have written the managed projection block',
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('feedback projection conflict (hand-edited block) → still blocks, no auto-merge (ADR 0045)', () => {
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-conflict-'));
+      try {
+        mkdirSync(join(home, '.claude'), { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        const claudePath = join(home, '.claude', 'CLAUDE.md');
+        writeFileSync(claudePath, '# Global\n<learned_behaviors>\n</learned_behaviors>\n');
+        // First, materialize the projection, then hand-edit the managed block so
+        // its hash no longer matches → conflict (ADR 0031 rule 6).
+        spawnSync(
+          process.execPath,
+          [
+            join(REPO, 'scripts', 'feedback-sync.mjs'),
+            '--write',
+            '--no-input',
+            `--hypo-dir=${dir}`,
+            `--claude-home=${join(home, '.claude')}`,
+          ],
+          { encoding: 'utf-8' },
+        );
         writeFileSync(
-          join(home, '.claude', 'CLAUDE.md'),
-          '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+          claudePath,
+          readFileSync(claudePath, 'utf-8').replace('always do A', 'HAND EDITED'),
         );
         const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
         const out = JSON.parse(r.stdout);
-        assert.equal(out.decision, 'block', `expected block, got: ${r.stdout}`);
+        assert.equal(out.decision, 'block', `conflict must still block: ${r.stdout}`);
         assert.ok(
-          out.reason.includes('feedback projection'),
-          `block reason should name feedback projection: ${out.reason}`,
+          /conflict/.test(out.reason || ''),
+          `block reason must name the conflict: ${r.stdout}`,
+        );
+        // Never auto-merged over the hand edit.
+        assert.ok(
+          readFileSync(claudePath, 'utf-8').includes('HAND EDITED'),
+          'conflict must not be auto-merged by the gate',
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('feedback projection over cap → still blocks, never auto-writes (ADR 0045)', () => {
+  withWiki(
+    (dir) => {
+      // 11 distinct global-L1 pages → CLAUDE projection has 11 candidates > the
+      // 10-entry cap (ADR 0031 rule 3) → over-cap. A human must demote/archive,
+      // so the gate must block and must NOT invoke the self-heal --write.
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      for (let i = 0; i < 11; i++) {
+        writeFileSync(
+          join(dir, 'pages', 'feedback', `rule-${i}.md`),
+          fbPage({
+            ...FB_GLOBAL_L1,
+            title: `Rule ${i}`,
+            global_summary: `always do thing number ${i}`,
+            memory_summary: `do ${i}`,
+          }),
+        );
+      }
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-overcap-'));
+      try {
+        mkdirSync(join(home, '.claude'), { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        const claudePath = join(home, '.claude', 'CLAUDE.md');
+        writeFileSync(claudePath, '# Global\n<learned_behaviors>\n</learned_behaviors>\n');
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const out = JSON.parse(r.stdout);
+        assert.equal(out.decision, 'block', `over-cap must still block: ${r.stdout}`);
+        assert.ok(
+          /over cap/.test(out.reason || ''),
+          `block reason must name the over-cap: ${r.stdout}`,
+        );
+        // Self-heal must NOT have run --write: no managed block was materialized.
+        assert.ok(
+          !readFileSync(claudePath, 'utf-8').includes('HYPO:FEEDBACK-SYNC:START'),
+          'over-cap must not trigger auto-write',
         );
       } finally {
         rmSync(home, { recursive: true, force: true });
