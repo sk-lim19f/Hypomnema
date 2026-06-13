@@ -92,7 +92,17 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    error in a close file or a feedback projection over-cap. (Not a hard
    guarantee: the live gate can still differ on a context-≥70% prompt,
    `HYPO_SKIP_GATE`, or a transcript-scoped lint error — pass `--transcript-path`
-   to include the last.)
+   to include the last.) Pass `--session-id=<id>` to also see `marker_present`
+   (step 7).
+7. Record the session-closed marker (ADR 0047). The Stop hook blocks until this
+   session's per-session marker exists, and a hand-edit close (writing the files
+   directly + committing) never writes it; the marker is written only by the
+   crystallize writer, never by the hook (ADR 0022 bypass guard). Normal path:
+   close via `crystallize.mjs --apply-session-close --session-id=<id> --transcript-path=<path>`,
+   which writes the marker once the gate is green. Hand-edit recovery: after
+   committing the files, run `crystallize.mjs --mark-session-closed --session-id=<id> --transcript-path=<path>`.
+   Both writers gate the marker on the SAME `precompactGateStatus` as `/compact`,
+   so the marker only lands when step 6 would print **"Compact-ready"**.
 
 Skip session close for: single bug fix, single-file edit, Q&A only.
 

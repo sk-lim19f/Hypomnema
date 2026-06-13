@@ -48,13 +48,14 @@ import {
   extractUserMessages,
   isClosePattern,
   isGateSkipped,
+  precompactGateStatus,
 } from './hypo-shared.mjs';
 
 function emitContinue() {
   console.log(JSON.stringify({ continue: true, suppressOutput: true }));
 }
 
-function emitBlock(sessionId, transcriptPath) {
+function emitBlock(sessionId, transcriptPath, gate = null) {
   // One-line, skill-first. /hypo:crystallize is the documented session-close
   // alias; passing --session-id there writes the per-session marker that clears
   // this block. CLI fallback + bypass live in commands/crystallize.md, not here
@@ -64,7 +65,23 @@ function emitBlock(sessionId, transcriptPath) {
   // coherence: a marker written without lint would only let Stop pass for
   // /compact to immediately re-block on the same errors).
   const transcriptHint = transcriptPath ? ` --transcript-path=${transcriptPath}` : '';
-  const reason = `[WIKI_AUTOCLOSE] session-close 미완료 — /hypo:crystallize 실행으로 마무리 (session_id=${sessionId}${transcriptHint}).`;
+  const markCmd = `crystallize --mark-session-closed --session-id=${sessionId}${transcriptHint}`;
+  // ADR 0047: refine the message with the read-only /compact gate result.
+  // - gate green → the close is compact-ready and ONLY the marker is missing
+  //   (the hand-edit close case: files Written + committed directly, bypassing
+  //   the marker writer). Say so precisely + give the one command, instead of
+  //   the generic "미완료" that reads as "you never closed".
+  // - gate has blockers → surface them so the user fixes the real issue first.
+  // - gate null (tooling error/unavailable) → generic message (fail-open).
+  let reason;
+  if (gate && gate.ok) {
+    reason = `[WIKI_AUTOCLOSE] close gate green — only the session-closed marker is missing. Run \`${markCmd}\` to finish (session_id=${sessionId}).`;
+  } else if (gate && gate.blockers && gate.blockers.length > 0) {
+    const blockers = gate.blockers.map((b) => b.reason).join('; ');
+    reason = `[WIKI_AUTOCLOSE] session-close incomplete — resolve: ${blockers}. Then run \`${markCmd}\` (session_id=${sessionId}).`;
+  } else {
+    reason = `[WIKI_AUTOCLOSE] session-close 미완료 — /hypo:crystallize 실행으로 마무리 (session_id=${sessionId}${transcriptHint}).`;
+  }
   console.log(
     JSON.stringify({
       decision: 'block',
@@ -141,7 +158,20 @@ process.stdin.on('end', () => {
       return;
     }
 
-    emitBlock(sessionId, transcriptPath);
+    // ADR 0047: read-only /compact gate (same precompactGateStatus the real
+    // PreCompact hook uses) sharpens the block message — distinguishes "close
+    // is compact-ready, only the marker is missing" from "there are real
+    // blockers". The hook NEVER writes the marker here (file-header invariant);
+    // this is read-only. Any error → null → emitBlock falls back to the generic
+    // message (fail-open).
+    let gate = null;
+    try {
+      gate = precompactGateStatus(HYPO_DIR, transcriptPath ? { transcriptPath } : {});
+    } catch {
+      gate = null;
+    }
+
+    emitBlock(sessionId, transcriptPath, gate);
   } catch (err) {
     // Fail-open on any unexpected error.
     process.stderr.write(`[hypo-auto-minimal-crystallize] error: ${err?.message ?? String(err)}\n`);

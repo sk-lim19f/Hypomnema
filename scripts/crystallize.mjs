@@ -80,9 +80,7 @@ import {
   precompactGateStatus,
   writeSessionClosedMarker,
   sessionClosedMarkerPath,
-  hypoIsClean,
-  extractTouchedWikiFiles,
-  closeFileTargetsGlobal,
+  readSessionClosedMarker,
   partitionLintScope,
 } from '../hooks/hypo-shared.mjs';
 
@@ -156,6 +154,23 @@ function runSessionCloseCheck(args) {
   const status = precompactGateStatus(args.hypoDir, { transcriptPath: args.transcriptPath });
   const close = status.close;
 
+  // ADR 0047: when a --session-id is supplied, report whether THIS session's
+  // per-session marker (the Stop-chain completion signal) exists. This is a
+  // separate field, NOT folded into `ok` — `ok` stays the ADR 0046 compact-
+  // readiness verdict. A green gate with marker_present=false is exactly the
+  // hand-edit close state: close is compact-ready but the Stop hook will
+  // still block until the marker is written.
+  //
+  // Use the SAME reader the Stop hook gates on (readSessionClosedMarker), not
+  // raw file existence: a stale/corrupt marker file exists on disk but the hook
+  // rejects (and unlinks) it, so raw existsSync would report marker_present=true
+  // while /compact's Stop still blocks — the exact incoherence this ADR closes
+  // (codex pre-commit CONCERN). readSessionClosedMarker unlinks an invalid
+  // marker as it reads, matching the hook's behavior on the next Stop.
+  const markerPresent = args.sessionId
+    ? readSessionClosedMarker(args.hypoDir, args.sessionId) !== null
+    : null;
+
   if (args.json) {
     console.log(
       JSON.stringify(
@@ -169,6 +184,7 @@ function runSessionCloseCheck(args) {
           blockers: status.blockers,
           notices: status.notices,
           skipped: status.skipped,
+          ...(args.sessionId ? { session_id: args.sessionId, marker_present: markerPresent } : {}),
         },
         null,
         2,
@@ -206,6 +222,16 @@ function runSessionCloseCheck(args) {
   if (status.notices.length > 0) {
     console.log('');
     for (const n of status.notices) console.log(`  · ${n.reason}`);
+  }
+  // ADR 0047: surface the per-session marker state (separate from compact-
+  // readiness) so a green-but-unmarked close is visible at verify time.
+  if (args.sessionId) {
+    console.log('');
+    console.log(
+      markerPresent
+        ? `  ✓ session-closed marker present (session_id: ${args.sessionId}).`
+        : `  · session-closed marker absent (session_id: ${args.sessionId}) — the Stop hook will block until it is written. Run \`crystallize --mark-session-closed --session-id=${args.sessionId}${args.transcriptPath ? ` --transcript-path=${args.transcriptPath}` : ''}\`.`,
+    );
   }
   console.log('');
   console.log(
@@ -352,8 +378,9 @@ function validatePayloadShape(payload) {
 // crystallize` is the only Reader; writer authority is intentionally split
 // between this CLI and the auto-write at the tail of applySessionClose.
 //
-// Contract: marker is only written when sessionCloseFileStatus(hypoDir).ok.
-// A failed check exits 1 with no marker — the next Stop hook will re-block.
+// Contract: the marker is written only when the FULL /compact gate
+// (precompactGateStatus, ADR 0046) is green. A failed gate exits 1 with no
+// marker — the next Stop hook re-blocks.
 
 function runMarkSessionClosed(args) {
   if (!args.sessionId) {
@@ -361,22 +388,30 @@ function runMarkSessionClosed(args) {
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
-  // ADR 0022 amendment 2026-05-19 Q2: marker write authority requires BOTH
-  // close gate ok AND hypoIsClean.clean — git dirty would let a Stop hook pass
-  // while wiki changes are still uncommitted (auto-commit may have failed in
-  // this run). Codex Worker-1 BLOCKER (pre-commit review).
-  // ADR 0043: global invariant — a marker must not be written
-  // while ANY today-active project still has a dangling close (no recency pick).
-  const status = sessionCloseGlobalStatus(args.hypoDir);
-  const git = hypoIsClean(args.hypoDir);
-  if (!status.ok || !git.clean) {
+  // ADR 0047: the per-session marker is the THIRD session-close completion
+  // signal (after the PreCompact gate and `--check-session-close`). It must use
+  // the SAME gate that governs /compact — precompactGateStatus — so the marker
+  // can never attest "closed" while /compact would still block. This subsumes
+  // the prior (sessionCloseGlobalStatus + hypoIsClean + scoped-lint) gate and
+  // additionally enforces feedback projection (over-cap/conflict), W8 design-
+  // history staleness, and root hot.md structure — the checks that the narrower
+  // marker gate skipped (the divergence behind this fix). git-clean is now a
+  // `git` blocker inside the gate. Pass --transcript-path to widen the lint
+  // scope to this session's edited files exactly as the interactive hook does;
+  // without it the scope is the mandatory close files only.
+  const gate = precompactGateStatus(
+    args.hypoDir,
+    args.transcriptPath ? { transcriptPath: args.transcriptPath } : {},
+  );
+  const status = gate.close;
+  if (!gate.ok) {
     const result = {
       ok: false,
       session_id: args.sessionId,
       project: status.project,
       missing: status.missing,
       stale: status.stale,
-      git_reason: git.clean ? null : git.reason,
+      blockers: gate.blockers,
       error: 'session-close gate not satisfied — marker not written',
     };
     if (args.json) {
@@ -385,54 +420,9 @@ function runMarkSessionClosed(args) {
       console.log(
         `✗ session-close gate not satisfied — marker not written (project: ${status.project || '(unresolved)'}):`,
       );
-      for (const f of status.missing) console.log(`  ✗ ${f} (missing)`);
-      for (const f of status.stale) console.log(`  ✗ ${f} (stale)`);
-      if (!git.clean) console.log(`  ✗ git: ${git.reason}`);
+      for (const b of gate.blockers) console.log(`  ✗ ${b.reason}`);
     }
     process.exit(1);
-  }
-  // Bug A coherence: the marker suppresses the Stop hook, but PreCompact blocks
-  // on lint. If a transcript is provided, refuse the marker when THIS session's
-  // own files (edited ∪ mandatory close files) carry lint errors — otherwise
-  // Stop would pass only for /compact to immediately re-block. No transcript →
-  // legacy freshness+git recovery path (lint left to PreCompact).
-  if (args.transcriptPath) {
-    let scopedLint = null;
-    try {
-      scopedLint = runLint(args.hypoDir);
-    } catch (err) {
-      // Lint crash → fail-open (never strand the marker writer on tooling), same
-      // posture as the PreCompact hook.
-      process.stderr.write(
-        `[crystallize] mark-session-closed lint skipped: ${err?.message ?? err}\n`,
-      );
-    }
-    if (scopedLint) {
-      const scope = new Set([
-        ...extractTouchedWikiFiles(args.transcriptPath, args.hypoDir),
-        ...closeFileTargetsGlobal(args.hypoDir),
-      ]);
-      const { blocking } = partitionLintScope(scopedLint.errors || [], scope);
-      if (blocking.length > 0) {
-        const files = [...new Set(blocking.map((b) => b.file))];
-        const result = {
-          ok: false,
-          session_id: args.sessionId,
-          project: status.project,
-          lint_blockers: files,
-          error: "session-close gate not satisfied — lint errors in this session's files",
-        };
-        if (args.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(
-            `✗ lint errors in files this session touched — marker not written (fix then re-run):`,
-          );
-          for (const b of blocking) console.log(`  ✗ ${b.file}: ${b.message}`);
-        }
-        process.exit(1);
-      }
-    }
   }
   writeSessionClosedMarker(args.hypoDir, args.sessionId, { project: status.project });
   // Marker writer swallows IO errors (best-effort, see hypo-shared.mjs). Verify
@@ -453,6 +443,12 @@ function runMarkSessionClosed(args) {
     session_id: args.sessionId,
     project: status.project,
     date: status.dates[0],
+    notices: gate.notices,
+    // ADR 0047: pure feedback-projection drift is a non-blocker — the marker
+    // attests "compact-ready (no human-fixable blocker)", and the PreCompact
+    // hook self-heals the projection (feedback-sync --write) at /compact. Surface
+    // the deferral so the caller knows MEMORY/CLAUDE sync is pending, not lost.
+    drift_deferred: gate.driftTargets,
   };
   if (args.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -460,6 +456,11 @@ function runMarkSessionClosed(args) {
     console.log(
       `✓ session-closed marker written (session_id: ${args.sessionId}, project: ${status.project}).`,
     );
+    if (gate.driftTargets.length > 0) {
+      console.log(
+        `  · feedback projection drift (${gate.driftTargets.join(', ')}) — will self-heal at /compact.`,
+      );
+    }
   }
   process.exit(0);
 }
@@ -687,18 +688,26 @@ function applySessionClose(args) {
   // ADR 0022 amendment 2026-05-19: auto-write the per-session
   // closed marker on a verified close. Hook authority is read-only; this is
   // one of the two writer paths (the other is --mark-session-closed standalone).
-  // Marker requires BOTH file/lint gate (already in `ok`) AND clean git tree —
-  // ADR Q2 explicit. Auto-commit may have failed silently in the Stop chain;
-  // a dirty git would otherwise let the marker pass for an unrecorded close.
+  //
+  // ADR 0047: the marker write is governed by the SAME gate as standalone
+  // --mark-session-closed and /compact (precompactGateStatus), NOT just apply's
+  // `ok` + git-clean. Apply's payload preflight/post-apply lint and `ok` still
+  // govern apply SUCCESS (exit code below), but the marker must additionally
+  // clear feedback projection / W8 design-history / hot.md structure, else this
+  // path could issue a marker the standalone path would refuse (the second
+  // divergence codex flagged). git-clean is subsumed by the gate's git blocker.
   if (ok && args.sessionId) {
-    const git = hypoIsClean(args.hypoDir);
-    if (git.clean) {
+    const markerGate = precompactGateStatus(
+      args.hypoDir,
+      args.transcriptPath ? { transcriptPath: args.transcriptPath } : {},
+    );
+    if (markerGate.ok) {
       writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
     }
-    // git not clean → silent skip: caller's `result.ok` already reflects the
+    // gate not ok → silent skip: caller's `result.ok` already reflects the
     // file/lint state; surfacing a "marker skipped" warning here would
-    // confuse the close-applied success path. Next Stop re-blocks until
-    // git is clean (auto-commit retries on subsequent runs).
+    // confuse the close-applied success path. Next Stop re-blocks until the
+    // remaining blocker (git/feedback/W8/hot/lint) is resolved.
   }
   const stage = ok
     ? null
