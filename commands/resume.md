@@ -20,7 +20,7 @@ If the user named a project in the command invocation, use that. Otherwise, loca
 node <package-root>/scripts/resume.mjs [--hypo-dir="<path>"] [--project=<name>]
 ```
 
-The script will resolve the most recently active project from `hot.md` if `--project` is omitted.
+When `--project` is omitted, the script prefers the project whose `working_dir` contains the current directory (cwd-first); if nothing under the current directory matches, it falls back to the most recently active project from `hot.md`.
 
 ---
 

@@ -255,7 +255,8 @@ function parseFrontmatterField(content, key) {
 
 // Among `slugs`, return the one whose projects/<slug>/index.md `working_dir`
 // is the LONGEST prefix of cwd (so /repo/sub wins over /repo). Returns null
-// when cwd is falsy or matches none. Used only as a same-date tie-breaker.
+// when cwd is falsy or matches none. resume gives this authority OVER recency
+// (ADR 0044); close callers never pass cwd, so it stays inert for them.
 function pickByCwd(hypoDir, slugs, cwd) {
   if (!cwd) return null;
   let best = null;
@@ -276,15 +277,18 @@ function pickByCwd(hypoDir, slugs, cwd) {
 }
 
 /**
- * Resolve the most-recently-active project slug from root hot.md.
- * The cwd helpers (parseFrontmatterField / pickByCwd) and the same-date
- * tie-break are kept in sync with scripts/resume.mjs by hand; the surrounding
- * wrapper intentionally differs (resume.mjs adds an mtime fallback, this does not).
- * `cwd` is an optional same-date tie-breaker: resume passes
- * process.cwd(); session-close callers (sessionCloseFileStatus /
- * closeFileTargets) intentionally pass null — close has a different
- * authority (payload.project / freshness), tracked separately.
- * When cwd is omitted, behavior is identical to the legacy version.
+ * Resolve the active project slug from root hot.md. With a cwd, a project whose
+ * working_dir contains it wins (cwd-first, ADR 0044); otherwise the
+ * most-recently-active row is returned.
+ * The cwd helpers (parseFrontmatterField / pickByCwd) and the cwd-first body
+ * are kept in sync with scripts/resume.mjs by hand; the surrounding wrapper
+ * intentionally differs (resume.mjs adds an mtime fallback, this does not).
+ * `cwd` is an optional cwd-first selector (ADR 0044): a cwd↔working_dir match
+ * wins over recency. resume passes process.cwd(); session-close callers
+ * (sessionCloseFileStatus / closeFileTargets) intentionally pass null — close
+ * has a different authority (payload.project / freshness, the global invariant
+ * of ADR 0043), so it never picks by cwd. When cwd is omitted, behavior is
+ * identical to the legacy recency version.
  * @param {string} hypoDir
  * @param {string|null} [cwd]
  * @returns {string|null}
@@ -307,25 +311,31 @@ export function resolveActiveProject(hypoDir, cwd = null) {
     ),
   ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
-    wikiRows.sort((a, b) => b.date.localeCompare(a.date));
-    // Same-date tie-break: when the top date is shared by >1 row,
-    // prefer the project whose working_dir contains cwd. No cwd / no match →
-    // keep the stable-sort winner (the legacy "first table row" behavior).
-    const topDate = wikiRows[0].date;
-    const tied = wikiRows.filter((r) => r.date === topDate);
-    if (cwd && tied.length > 1) {
+    // cwd-first (ADR 0044): a cwd↔working_dir match wins over recency, across
+    // ALL rows. Kept in sync with scripts/resume.mjs. close callers pass null →
+    // recency path below (resume=cwd-positive / close=no-pick).
+    if (cwd) {
       const picked = pickByCwd(
         hypoDir,
-        tied.map((r) => r.slug),
+        wikiRows.map((r) => r.slug),
         cwd,
       );
       if (picked) return picked;
     }
+    // No cwd match → most recent by date (stable-sort keeps the first table row
+    // on a tie, the legacy behavior).
+    wikiRows.sort((a, b) => b.date.localeCompare(a.date));
     return wikiRows[0].slug;
   }
   // Legacy markdown-link rows: | [name](projects/name/...) | ...
-  const mdRow = content.match(/\|\s*\[([^\]]+)\]\(projects\/([^/)]+)/);
-  if (mdRow) return mdRow[2];
+  const mdSlugs = [...content.matchAll(/\|\s*\[([^\]]+)\]\(projects\/([^/)]+)/g)].map((m) => m[2]);
+  if (mdSlugs.length > 0) {
+    if (cwd) {
+      const picked = pickByCwd(hypoDir, mdSlugs, cwd);
+      if (picked) return picked;
+    }
+    return mdSlugs[0]; // legacy: first table row
+  }
   return null;
 }
 
@@ -434,8 +444,9 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
 // it — that re-derivation is the prior session-close false-block, and a cwd
 // tie-break here would let a fresh cwd mask a DIFFERENT project's dangling
 // close. Instead the gate enforces a global invariant: no project may end a
-// session with a partial close. resume stays cwd-positive; close never picks.
-// The two copies of resolveActiveProject deliberately differ — see resume.mjs.
+// session with a partial close. resume stays cwd-positive (ADR 0044); close
+// never picks. The two copies of resolveActiveProject share the cwd-first body
+// but the resume.mjs copy adds an mtime fallback this one omits — see resume.mjs.
 
 // Root hot.md Active-Projects rows as {slug, date}. The per-row date column is
 // project-scoped (unlike the shared frontmatter `updated:`), so a today-dated

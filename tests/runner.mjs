@@ -8101,9 +8101,11 @@ tags: [wiki, operations]
   });
 });
 
-// ── ISSUE-1: resolveActiveProject cwd same-date tie-break ─────────────────────
+// ── ISSUE-1 / ISSUE-12: resolveActiveProject cwd-first project selection ───────
+// ISSUE-1 introduced cwd↔working_dir matching as a same-date tie-breaker; ISSUE-12
+// (ADR 0044) promoted it to cwd-first — a cwd match wins over recency outright.
 
-suite('resolveActiveProject — cwd same-date tie-break (ISSUE-1)');
+suite('resolveActiveProject — cwd-first project selection (ISSUE-1 / ISSUE-12)');
 
 // Build a tmp wiki: root hot.md pointer table + per-project index.md working_dir.
 // rows: [{ slug, date, workingDir? }]
@@ -8147,15 +8149,30 @@ test('same-date tie → cwd-matched project wins over table order', () => {
   });
 });
 
-test('tie-breaker-only: newer single row kept even when cwd matches an older row', () => {
+test('cwd-first (ISSUE-12, ADR 0044): cwd-matched older row wins over a newer non-matching row', () => {
   withTmpDir((dir) => {
     makeTieBreakWiki(dir, [
       { slug: 'alpha', date: '2026-06-08' },
       { slug: 'beta', date: '2026-06-07', workingDir: join(dir, 'code/beta') },
     ]);
-    // cwd matches beta, but beta is older and NOT in the top-date group →
-    // most-recent alpha must still win (tie-breaker-only, not cwd-first).
-    assert.equal(resolveActiveProject(dir, join(dir, 'code/beta')), 'alpha');
+    // ISSUE-12 repro: cwd matches the OLDER beta and a NEWER non-matching alpha
+    // exists. Reverses ISSUE-1's tie-breaker-only semantics — beta must now win
+    // because the user is physically in it (cwd-first, not recency-first).
+    assert.equal(resolveActiveProject(dir, join(dir, 'code/beta')), 'beta');
+    // sanity: without cwd, recency still wins (the newer alpha).
+    assert.equal(resolveActiveProject(dir), 'alpha');
+  });
+});
+
+test('cwd-first: a newer non-matching row no longer masks the cwd project (ISSUE-12 exact repro)', () => {
+  withTmpDir((dir) => {
+    // hypomnema(older, cwd-matched) vs security-ops-kb(newer, absent dir) — the
+    // 2026-06-13 incident shape. cwd-first must load the project under the cwd.
+    makeTieBreakWiki(dir, [
+      { slug: 'security-ops-kb', date: '2026-06-12' }, // newer, no working_dir here
+      { slug: 'hypomnema', date: '2026-06-11', workingDir: join(dir, 'repo') },
+    ]);
+    assert.equal(resolveActiveProject(dir, join(dir, 'repo')), 'hypomnema');
   });
 });
 
@@ -8247,6 +8264,147 @@ test('resume.mjs honors process.cwd() for same-date tie (ISSUE-1 wiring)', () =>
     });
     assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
     assert.ok(r.stdout.startsWith('Project: beta'), `expected 'Project: beta', got: ${r.stdout}`);
+  });
+});
+
+test('resume.mjs cwd-first: cwd-matched older project wins over a newer non-matching row (ISSUE-12 e2e)', () => {
+  withTmpDir((dir) => {
+    // End-to-end through the real resume.mjs process: cwd matches the OLDER
+    // project, a NEWER non-matching project exists. Pre-ADR-0044 this loaded the
+    // newer one (and dead-ended when its working_dir was absent); now cwd wins.
+    const realDir = realpathSync(dir);
+    const hypoDir = join(dir, 'wiki');
+    const betaWd = join(realDir, 'code/beta');
+    makeTieBreakWiki(hypoDir, [
+      { slug: 'alpha', date: '2026-06-12' }, // newer, no working_dir → cannot match cwd
+      { slug: 'beta', date: '2026-06-11', workingDir: betaWd }, // older, cwd-matched
+    ]);
+    for (const s of ['alpha', 'beta']) {
+      writeFileSync(
+        join(hypoDir, 'projects', s, 'session-state.md'),
+        `---\ntitle: ss — ${s}\ntype: session-state\nupdated: 2026-06-11\n---\n\n## 다음\n- t\n`,
+      );
+    }
+    mkdirSync(betaWd, { recursive: true });
+    const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
+      encoding: 'utf-8',
+      cwd: betaWd,
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.ok(r.stdout.startsWith('Project: beta'), `expected 'Project: beta', got: ${r.stdout}`);
+  });
+});
+
+test('cwd-first applies to the legacy markdown-link row branch (ADR 0044)', () => {
+  withTmpDir((dir) => {
+    // No wikilink rows → resolveActiveProject falls to the legacy md-link branch.
+    // cwd-first must hold there too (matchAll over all rows, not just the first).
+    const hot = `---\ntitle: Hot\ntype: reference\nupdated: 2026-06-08\n---\n
+## Active Projects
+
+| Project | Last Session |
+|---|---|
+| [alpha](projects/alpha/hot.md) | 2026-06-08 |
+| [beta](projects/beta/hot.md) | 2026-06-08 |
+`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'hot.md'), hot);
+    for (const s of ['alpha', 'beta']) {
+      mkdirSync(join(dir, 'projects', s), { recursive: true });
+    }
+    writeFileSync(
+      join(dir, 'projects', 'beta', 'index.md'),
+      `---\ntitle: beta\ntype: project-index\nupdated: 2026-06-08\nworking_dir: "${join(dir, 'code/beta')}"\n---\n# beta\n`,
+    );
+    // cwd matches beta (the SECOND md-row) → cwd-first picks beta, not the first.
+    assert.equal(resolveActiveProject(dir, join(dir, 'code/beta')), 'beta');
+    // no cwd → legacy first row stands.
+    assert.equal(resolveActiveProject(dir), 'alpha');
+  });
+});
+
+test('resume.mjs cwd-first applies to the legacy markdown-link branch (ADR 0044 e2e)', () => {
+  withTmpDir((dir) => {
+    // resume.mjs keeps its OWN hand-synced copy of the md-row branch, so prove it
+    // end-to-end through the actual process (not just the hooks/hypo-shared copy).
+    const realDir = realpathSync(dir);
+    const hypoDir = join(dir, 'wiki');
+    const betaWd = join(realDir, 'code/beta');
+    const hot = `---\ntitle: Hot\ntype: reference\nupdated: 2026-06-08\n---\n
+## Active Projects
+
+| Project | Last Session |
+|---|---|
+| [alpha](projects/alpha/hot.md) | 2026-06-08 |
+| [beta](projects/beta/hot.md) | 2026-06-08 |
+`;
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(join(hypoDir, 'hot.md'), hot);
+    for (const s of ['alpha', 'beta']) {
+      mkdirSync(join(hypoDir, 'projects', s), { recursive: true });
+      writeFileSync(
+        join(hypoDir, 'projects', s, 'session-state.md'),
+        `---\ntitle: ss — ${s}\ntype: session-state\nupdated: 2026-06-08\n---\n\n## 다음\n- t\n`,
+      );
+    }
+    writeFileSync(
+      join(hypoDir, 'projects', 'beta', 'index.md'),
+      `---\ntitle: beta\ntype: project-index\nupdated: 2026-06-08\nworking_dir: "${betaWd}"\n---\n# beta\n`,
+    );
+    mkdirSync(betaWd, { recursive: true });
+    const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
+      encoding: 'utf-8',
+      cwd: betaWd,
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.ok(
+      r.stdout.startsWith('Project: beta'),
+      `md-row cwd-first must hold in resume.mjs; got: ${r.stdout}`,
+    );
+  });
+});
+
+test('resume.mjs cwd-first applies to the mtime fallback (no hot.md rows, ADR 0044)', () => {
+  withTmpDir((dir) => {
+    // hot.md present but with NO parseable rows → resume.mjs reaches the mtime
+    // fallback. A cwd↔working_dir match must beat the newest-mtime project.
+    const realDir = realpathSync(dir);
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(
+      join(hypoDir, 'hot.md'),
+      `---\ntitle: Hot\ntype: reference\nupdated: 2026-06-08\n---\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n`,
+    );
+    const betaWd = join(realDir, 'code/beta');
+    for (const s of ['alpha', 'beta']) {
+      const pdir = join(hypoDir, 'projects', s);
+      mkdirSync(pdir, { recursive: true });
+      writeFileSync(
+        join(pdir, 'session-state.md'),
+        `---\ntitle: ss — ${s}\ntype: session-state\nupdated: 2026-06-08\n---\n\n## 다음\n- t\n`,
+      );
+    }
+    writeFileSync(
+      join(hypoDir, 'projects', 'beta', 'index.md'),
+      `---\ntitle: beta\ntype: project-index\nupdated: 2026-06-08\nworking_dir: "${betaWd}"\n---\n# beta\n`,
+    );
+    // Make alpha's session-state NEWER so mtime alone would pick alpha.
+    const betaMtime = statSync(join(hypoDir, 'projects', 'beta', 'session-state.md')).mtimeMs;
+    const newer = new Date(betaMtime + 5000);
+    utimesSync(join(hypoDir, 'projects', 'alpha', 'session-state.md'), newer, newer);
+    mkdirSync(betaWd, { recursive: true });
+    const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
+      encoding: 'utf-8',
+      cwd: betaWd,
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.ok(
+      r.stdout.startsWith('Project: beta'),
+      `mtime fallback must honor cwd; got: ${r.stdout}`,
+    );
   });
 });
 
