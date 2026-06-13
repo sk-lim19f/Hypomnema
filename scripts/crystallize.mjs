@@ -76,11 +76,12 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import {
   sessionCloseFileStatus,
+  sessionCloseGlobalStatus,
   writeSessionClosedMarker,
   sessionClosedMarkerPath,
   hypoIsClean,
   extractTouchedWikiFiles,
-  closeFileTargets,
+  closeFileTargetsGlobal,
   partitionLintScope,
 } from '../hooks/hypo-shared.mjs';
 
@@ -145,7 +146,9 @@ function parseArgs(argv) {
 // flow can self-verify before /compact triggers PreCompact.
 
 function runSessionCloseCheck(args) {
-  const status = sessionCloseFileStatus(args.hypoDir);
+  // ADR 0043: no-payload self-check uses the global invariant
+  // so it mirrors the PreCompact gate (every today-active project must be closed).
+  const status = sessionCloseGlobalStatus(args.hypoDir);
 
   if (args.json) {
     console.log(
@@ -339,10 +342,12 @@ function runMarkSessionClosed(args) {
     process.exit(1);
   }
   // ADR 0022 amendment 2026-05-19 Q2: marker write authority requires BOTH
-  // sessionCloseFileStatus.ok AND hypoIsClean.clean — git dirty would let a
-  // Stop hook pass while wiki changes are still uncommitted (auto-commit may
-  // have failed in this run). Codex Worker-1 BLOCKER (pre-commit review).
-  const status = sessionCloseFileStatus(args.hypoDir);
+  // close gate ok AND hypoIsClean.clean — git dirty would let a Stop hook pass
+  // while wiki changes are still uncommitted (auto-commit may have failed in
+  // this run). Codex Worker-1 BLOCKER (pre-commit review).
+  // ADR 0043: global invariant — a marker must not be written
+  // while ANY today-active project still has a dangling close (no recency pick).
+  const status = sessionCloseGlobalStatus(args.hypoDir);
   const git = hypoIsClean(args.hypoDir);
   if (!status.ok || !git.clean) {
     const result = {
@@ -385,7 +390,7 @@ function runMarkSessionClosed(args) {
     if (scopedLint) {
       const scope = new Set([
         ...extractTouchedWikiFiles(args.transcriptPath, args.hypoDir),
-        ...closeFileTargets(args.hypoDir),
+        ...closeFileTargetsGlobal(args.hypoDir),
       ]);
       const { blocking } = partitionLintScope(scopedLint.errors || [], scope);
       if (blocking.length > 0) {
@@ -450,7 +455,9 @@ function applySessionClose(args) {
   // for any actual apply work (readPayload below surfaces "payload is
   // required" the same way it always has).
   if (!args.force && !args.payload) {
-    const probe = sessionCloseFileStatus(args.hypoDir);
+    // ADR 0043: no-payload "already complete?" probe uses the
+    // global invariant, not a recency pick.
+    const probe = sessionCloseGlobalStatus(args.hypoDir);
     if (probe.ok) {
       const result = {
         ok: true,

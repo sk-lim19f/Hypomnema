@@ -28,13 +28,13 @@ import {
   PKG_ROOT,
   hypoIsClean,
   hotMdIsClean,
-  sessionCloseFileStatus,
+  sessionCloseGlobalStatus,
   readChecklist,
   isGateSkipped,
   isClosePattern,
   extractUserMessages,
   extractTouchedWikiFiles,
-  closeFileTargets,
+  closeFileTargetsGlobal,
   partitionLintScope,
 } from './hypo-shared.mjs';
 
@@ -99,7 +99,10 @@ process.stdin.on('end', () => {
   // checklist). closeFiles gates the 5 mandatory files (steps 1-4 + log.md);
   // open-questions.md (step 5) is conditional ("변경 시") and intentionally
   // ungated — see hypo-shared.mjs sessionCloseFileStatus and spec §5.2.7.
-  const closeFiles = sessionCloseFileStatus(HYPO_DIR);
+  // ADR 0043: global invariant — block if ANY today-active project has a
+  // dangling close, never a single recency/cwd pick. Flat aliases
+  // (.missing/.stale/.project) keep a single-project session byte-identical.
+  const closeFiles = sessionCloseGlobalStatus(HYPO_DIR);
   const closeFilesReason = closeFiles.ok
     ? ''
     : `memory files not updated this session: ${[
@@ -140,20 +143,22 @@ process.stdin.on('end', () => {
       // /compact always carries a transcript, so the old fallback only ever fired
       // in transcript-less modes where closeFileTargets is already complete).
       const haveTranscript = !!(transcriptPath && existsSync(transcriptPath));
-      const scope = new Set(closeFileTargets(HYPO_DIR));
+      const scope = new Set(closeFileTargetsGlobal(HYPO_DIR));
       if (haveTranscript) {
         for (const f of extractTouchedWikiFiles(transcriptPath, HYPO_DIR)) scope.add(f);
       }
       const part = partitionLintScope(allErrors, scope);
       lintBlockers = part.blocking;
       lintNotices = part.notice;
-      // W8 (design-history stale) is the CURRENT project's close
-      // responsibility, not cross-project debt: block on the active project's,
-      // surface others' as notices.
-      if (closeFiles.project) {
-        const mine = `projects/${closeFiles.project}/design-history.md`;
-        lintW8 = allW8.filter((w) => w.file === mine);
-        lintNotices.push(...allW8.filter((w) => w.file !== mine));
+      // W8 (design-history stale) is each today-active project's own close
+      // responsibility, not cross-project debt: block on every today-active
+      // project's design-history, surface others' as notices (ADR 0043 —
+      // multiple projects can be closing in one session).
+      const activeSlugs = (closeFiles.projects || []).map((p) => p.project).filter(Boolean);
+      if (activeSlugs.length > 0) {
+        const mine = new Set(activeSlugs.map((s) => `projects/${s}/design-history.md`));
+        lintW8 = allW8.filter((w) => mine.has(w.file));
+        lintNotices.push(...allW8.filter((w) => !mine.has(w.file)));
       } else {
         lintW8 = allW8;
       }
