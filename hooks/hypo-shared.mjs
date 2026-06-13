@@ -146,9 +146,10 @@ export function hypoIsClean(dir = HYPO_DIR) {
   }
 }
 
-export function hotMdIsClean() {
-  if (!existsSync(HOT_PATH)) return { clean: true };
-  const content = readFileSync(HOT_PATH, 'utf-8');
+export function hotMdIsClean(dir = HYPO_DIR) {
+  const hotPath = dir === HYPO_DIR ? HOT_PATH : join(dir, 'hot.md');
+  if (!existsSync(hotPath)) return { clean: true };
+  const content = readFileSync(hotPath, 'utf-8');
   const reasons = [];
 
   // Optional: check H2 allowlist if HYPO_ALLOWED_HOT_H2 is set
@@ -1198,6 +1199,174 @@ export function partitionLintScope(findings, scope) {
     else notice.push(f);
   }
   return { blocking, notice };
+}
+
+// ── PreCompact gate — single source of truth ────────────────────────────────
+/**
+ * The full PreCompact gate decision as a READ-ONLY status. This is the single
+ * source of truth for "is the wiki compact-ready?": both hypo-personal-check.mjs
+ * (the PreCompact hook) and `crystallize --check-session-close` call it, so a
+ * green status means /compact will not block on a human-fixable issue.
+ *
+ * Read-only: feedback projection PURE drift is reported as a non-blocking notice
+ * with its targets in `driftTargets` (an "effect requirement"), NOT a blocker —
+ * the hook self-heals it with `feedback-sync --write` before continuing (ADR
+ * 0045) and a verify caller needs no human action for it. over-cap and conflict
+ * DO block (ADR 0031 rules 3 & 6 — human demote/import required).
+ *
+ * Faithfulness caveats (why "compact-ready", not "guaranteed pass"): the hook
+ * has paths outside this status — a context-≥70% early block, HYPO_SKIP_GATE
+ * bypass, and a fail-closed if the self-heal `--write` itself errors. And without
+ * a transcript the lint scope is the mandatory close files only; pass
+ * opts.transcriptPath to widen it to the session's edited files exactly as the
+ * hook does.
+ *
+ * @param {string} hypoDir
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string}} [opts]
+ * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
+ */
+export function precompactGateStatus(hypoDir, opts = {}) {
+  const blockers = [];
+  const notices = [];
+  const driftTargets = [];
+  const skipped = { lint: false, feedback: false };
+
+  // 1. wiki git clean
+  const git = hypoIsClean(hypoDir);
+  if (!git.clean) blockers.push({ type: 'git', reason: git.reason });
+
+  // 2. root hot.md structure
+  const hot = hotMdIsClean(hypoDir);
+  if (!hot.clean) blockers.push({ type: 'hot', reason: hot.reason });
+
+  // 3. session-close files (global invariant, ADR 0043)
+  const close = sessionCloseGlobalStatus(hypoDir);
+  if (!close.ok) {
+    blockers.push({
+      type: 'close',
+      reason: `memory files not updated this session: ${[
+        ...close.missing.map((f) => `${f} (missing)`),
+        ...close.stale.map((f) => `${f} (stale)`),
+      ].join(', ')}`,
+    });
+  }
+
+  // 4. lint blockers + W8 design-history (scoped). Mirrors hypo-personal-check.
+  const lintPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'lint.mjs') : null;
+  if (!lintPath || !existsSync(lintPath)) {
+    skipped.lint = true; // no package → fail-open (never block on missing tooling)
+  } else {
+    try {
+      // Pass --hypo-dir explicitly: lint.mjs resolves the vault via HYPO_DIR /
+      // home dirs and ignores cwd, so a --hypo-dir caller (crystallize, tests)
+      // would otherwise lint the ambient wiki, not the one under test.
+      const r = spawnSync('node', [lintPath, '--json', `--hypo-dir=${hypoDir}`], {
+        encoding: 'utf-8',
+        cwd: hypoDir,
+        timeout: 30000,
+      });
+      const parsed = JSON.parse(r.stdout || '{}');
+      const allErrors = parsed.errors || [];
+      const allW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
+      const scope = new Set(opts.lintScope || closeFileTargetsGlobal(hypoDir));
+      if (opts.transcriptPath && existsSync(opts.transcriptPath)) {
+        for (const f of extractTouchedWikiFiles(opts.transcriptPath, hypoDir)) scope.add(f);
+      }
+      const part = partitionLintScope(allErrors, scope);
+      if (part.blocking.length > 0) {
+        blockers.push({
+          type: 'lint',
+          reason: `lint blockers: ${[...new Set(part.blocking.map((b) => b.id || b.file))].join(', ')}`,
+        });
+      }
+      for (const n of part.notice)
+        notices.push({ type: 'lint', reason: `${n.file}${n.id ? ` (${n.id})` : ''}` });
+      // W8 (design-history stale) is each today-active project's own close
+      // responsibility; others' are non-blocking notices (ADR 0043).
+      const activeSlugs = (close.projects || []).map((p) => p.project).filter(Boolean);
+      const mine = new Set(activeSlugs.map((s) => `projects/${s}/design-history.md`));
+      const w8Blocking = activeSlugs.length > 0 ? allW8.filter((w) => mine.has(w.file)) : allW8;
+      const w8Notice = activeSlugs.length > 0 ? allW8.filter((w) => !mine.has(w.file)) : [];
+      if (w8Blocking.length > 0) {
+        blockers.push({
+          type: 'design-history',
+          reason: `design-history stale: ${w8Blocking.map((w) => w.file.split('/')[1]).join(', ')}`,
+        });
+      }
+      for (const w of w8Notice) notices.push({ type: 'design-history', reason: w.file });
+    } catch {
+      skipped.lint = true; // fail-open on tooling error
+    }
+  }
+
+  // 5. feedback projection (ADR 0031 / 0045). over-cap/conflict block; pure
+  //    drift is a self-healable notice (driftTargets = effect requirement the
+  //    hook runs as --write). Classification mirrors hypo-personal-check exactly.
+  const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
+  const claudeHome = opts.claudeHome || join(HOME, '.claude');
+  if (!feedbackPath || !existsSync(feedbackPath)) {
+    skipped.feedback = true;
+  } else {
+    try {
+      const r = spawnSync(
+        process.execPath,
+        [
+          feedbackPath,
+          '--check',
+          '--strict',
+          '--no-input',
+          '--json',
+          `--hypo-dir=${hypoDir}`,
+          `--claude-home=${claudeHome}`,
+        ],
+        { encoding: 'utf-8', timeout: 30000 },
+      );
+      if (r.error || r.status === null) {
+        skipped.feedback = true; // spawn failure → fail-open
+      } else if (r.status !== 0) {
+        // Only a non-zero exit carries an actionable issue. A clean check exits 0
+        // (the implicit else below) — that is NOT skipped, just nothing to do.
+        let report = null;
+        try {
+          report = JSON.parse(r.stdout || '');
+        } catch {
+          /* unparseable → fail-open below */
+        }
+        const entries = report ? Object.entries(report.targets || {}) : [];
+        const conflictedT = entries
+          .filter(
+            ([, t]) =>
+              t.intruder || t.unpaired || t.outOfContainer || (t.conflicts && t.conflicts.length),
+          )
+          .map(([n]) => n);
+        const overCapT = entries.filter(([, t]) => t.overCap).map(([n]) => n);
+        const driftedT = entries.filter(([, t]) => t.dirty).map(([n]) => n);
+        if (!report || !(conflictedT.length || overCapT.length || driftedT.length)) {
+          skipped.feedback = true; // buildError / unparseable / non-actionable → fail-open
+        } else if (conflictedT.length) {
+          blockers.push({
+            type: 'feedback',
+            reason: `feedback projection conflict (manual edit of ${conflictedT.join(', ')}) — run \`hypomnema feedback-sync --import-target-change --from=<memory|claude>\``,
+          });
+        } else if (overCapT.length) {
+          blockers.push({
+            type: 'feedback',
+            reason: `feedback projection over cap (${overCapT.join(', ')}) — demote/archive feedback pages`,
+          });
+        } else {
+          driftTargets.push(...driftedT); // pure drift → self-healable, not a blocker
+          notices.push({
+            type: 'feedback',
+            reason: `feedback projection drift (${driftedT.join(', ')}) — will self-heal at /compact`,
+          });
+        }
+      }
+    } catch {
+      skipped.feedback = true;
+    }
+  }
+
+  return { ok: blockers.length === 0, close, blockers, notices, driftTargets, skipped };
 }
 
 // ── session-close checklist ────────────────────────────────────────────────

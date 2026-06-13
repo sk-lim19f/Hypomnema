@@ -26,16 +26,11 @@ import { homedir } from 'os';
 import {
   HYPO_DIR,
   PKG_ROOT,
-  hypoIsClean,
-  hotMdIsClean,
-  sessionCloseGlobalStatus,
+  precompactGateStatus,
   readChecklist,
   isGateSkipped,
   isClosePattern,
   extractUserMessages,
-  extractTouchedWikiFiles,
-  closeFileTargetsGlobal,
-  partitionLintScope,
 } from './hypo-shared.mjs';
 
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
@@ -93,218 +88,79 @@ process.stdin.on('end', () => {
   // ── Heavy checks ──
   const today = new Date().toISOString().slice(0, 10);
 
-  const gitStatus = hypoIsClean();
-  const hotStatus = hotMdIsClean();
-  // strict session-close (steps 1~6 of the 11-step crystallize
-  // checklist). closeFiles gates the 5 mandatory files (steps 1-4 + log.md);
-  // open-questions.md (step 5) is conditional ("변경 시") and intentionally
-  // ungated — see hypo-shared.mjs sessionCloseFileStatus and spec §5.2.7.
-  // ADR 0043: global invariant — block if ANY today-active project has a
-  // dangling close, never a single recency/cwd pick. Flat aliases
-  // (.missing/.stale/.project) keep a single-project session byte-identical.
-  const closeFiles = sessionCloseGlobalStatus(HYPO_DIR);
-  const closeFilesReason = closeFiles.ok
-    ? ''
-    : `memory files not updated this session: ${[
-        ...closeFiles.missing.map((f) => `${f} (missing)`),
-        ...closeFiles.stale.map((f) => `${f} (stale)`),
-      ].join(', ')}`;
+  // The full PreCompact gate decision, single-sourced (ADR 0046). The SAME
+  // function backs `crystallize --check-session-close`, so a green self-check
+  // there means this hook will not block. precompactGateStatus runs git-clean +
+  // hot.md structure + session-close files (ADR 0043 global invariant) + scoped
+  // lint + W8 design-history + feedback projection. The transcript widens the
+  // lint scope to this session's edited files (ADR 0041); without one the scope
+  // is the mandatory close files. Read-only: pure feedback drift comes back as
+  // gate.driftTargets, a self-heal effect requirement we run as --write below.
+  let gate;
+  try {
+    gate = precompactGateStatus(HYPO_DIR, { transcriptPath });
+  } catch (err) {
+    // Defense-in-depth: precompactGateStatus fails open per-check, but if it ever
+    // throws, never crash the PreCompact hook — fail open (continue) so a tooling
+    // fault can't wedge /compact.
+    process.stderr.write(`[hypo-personal-check] error: ${err?.message ?? String(err)}\n`);
+    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    return;
+  }
 
-  const lintPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'lint.mjs') : null;
-  let lintBlockers = [];
-  let lintW8 = [];
-  let lintNotices = []; // pre-existing debt in files this session did not touch
-  let lintSkipped = false;
-  if (!lintPath || !existsSync(lintPath)) {
-    lintSkipped = true;
-  } else {
-    try {
-      const r = spawnSync('node', [lintPath, '--json'], {
-        encoding: 'utf-8',
-        cwd: HYPO_DIR,
-        timeout: 30000,
+  // Self-heal pure feedback projection drift (ADR 0045): the one mutation the
+  // read-only gate leaves to the caller. Fails CLOSED — if the --write errors we
+  // turn the (otherwise non-blocking) drift into a blocker, since real drift is
+  // confirmed and silently passing it would defeat the gate. --write only applies
+  // when no target conflicts/over-caps (code===0 across ALL targets), so a late
+  // race exits non-zero and blocks here. It is semantic-preflight atomic but not
+  // filesystem-atomic (concurrent edit / mid-write I/O fault is best-effort) —
+  // pre-existing engine behavior, not introduced by the self-heal.
+  let feedbackHealed = '';
+  if (gate.ok && gate.driftTargets.length > 0) {
+    const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
+    const w = feedbackPath
+      ? spawnSync(
+          process.execPath,
+          [
+            feedbackPath,
+            '--write',
+            '--no-input',
+            `--hypo-dir=${HYPO_DIR}`,
+            `--claude-home=${join(homedir(), '.claude')}`,
+          ],
+          { encoding: 'utf-8', timeout: 30000 },
+        )
+      : { status: 1 };
+    if (w.error || w.status === null || w.status !== 0) {
+      gate.ok = false;
+      gate.blockers.push({
+        type: 'feedback',
+        reason: `feedback projection drift (${gate.driftTargets.join(', ')}) — auto-sync failed; run \`hypomnema feedback-sync --write\` manually`,
       });
-      const parsed = JSON.parse(r.stdout || '{}');
-      const allErrors = parsed.errors || [];
-      const allW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
-      // Bug B: judge this session on the files IT touched, not the whole vault.
-      // Scope = the mandatory close files (always derivable without a transcript)
-      // plus the files this session edited (only knowable with a transcript). A
-      // readable transcript widens the scope to the session's Edit/Write targets.
-      // Without one (headless, apply-path close, or programmatic invocation) the
-      // scope is exactly closeFileTargets, the mandatory close files and the only
-      // files derivable without a transcript. (crystallize --apply-session-close
-      // can also write an optional pages/open-questions.md, but PreCompact cannot
-      // locate that without a transcript or payload and the apply path gates it
-      // on its own.) Cross-project or shared-page debt the
-      // session did not touch becomes a non-blocking notice either way, so an
-      // unrelated lint error elsewhere never holds /compact hostage. See ADR 0041,
-      // which reverses ADR 0037's conservative global fallback (real interactive
-      // /compact always carries a transcript, so the old fallback only ever fired
-      // in transcript-less modes where closeFileTargets is already complete).
-      const haveTranscript = !!(transcriptPath && existsSync(transcriptPath));
-      const scope = new Set(closeFileTargetsGlobal(HYPO_DIR));
-      if (haveTranscript) {
-        for (const f of extractTouchedWikiFiles(transcriptPath, HYPO_DIR)) scope.add(f);
-      }
-      const part = partitionLintScope(allErrors, scope);
-      lintBlockers = part.blocking;
-      lintNotices = part.notice;
-      // W8 (design-history stale) is each today-active project's own close
-      // responsibility, not cross-project debt: block on every today-active
-      // project's design-history, surface others' as notices (ADR 0043 —
-      // multiple projects can be closing in one session).
-      const activeSlugs = (closeFiles.projects || []).map((p) => p.project).filter(Boolean);
-      if (activeSlugs.length > 0) {
-        const mine = new Set(activeSlugs.map((s) => `projects/${s}/design-history.md`));
-        lintW8 = allW8.filter((w) => mine.has(w.file));
-        lintNotices.push(...allW8.filter((w) => !mine.has(w.file)));
-      } else {
-        lintW8 = allW8;
-      }
-    } catch (err) {
-      /* fail-open */
-      process.stderr.write(`[hypo-personal-check] error: ${err?.message ?? String(err)}\n`);
+    } else {
+      feedbackHealed = `[WIKI CHECK] feedback projection re-synced (${gate.driftTargets.join(', ')}); MEMORY.md body may be unchanged — drift was in the managed block / side-files.`;
     }
   }
 
-  const lintOk = lintBlockers.length === 0;
-  const designHistoryOk = lintW8.length === 0;
-  // Non-blocking heads-up about pre-existing lint debt in untouched files (other
-  // projects / shared pages). Surfaced so it is visible but never blocks compact.
+  // Non-blocking heads-up about pre-existing lint / out-of-scope design-history
+  // debt in untouched files (other projects / shared pages). Surfaced so it is
+  // visible but never blocks compact. (Mirrors the pre-ADR-0046 inline behavior,
+  // which lumped out-of-scope W8 into the same lint-notice list.)
+  const debtNotices = gate.notices.filter((n) => n.type === 'lint' || n.type === 'design-history');
   let noticeText =
-    lintNotices.length > 0
-      ? `[WIKI CHECK] ${lintNotices.length} pre-existing lint issue(s) in files this session did not touch (not blocking): ${[
-          ...new Set(lintNotices.map((b) => b.file)),
+    debtNotices.length > 0
+      ? `[WIKI CHECK] ${debtNotices.length} pre-existing lint issue(s) in files this session did not touch (not blocking): ${[
+          ...new Set(debtNotices.map((n) => n.reason.replace(/ \([^)]*\)$/, ''))),
         ]
           .slice(0, 5)
-          .join(', ')}${lintNotices.length > 5 ? ', …' : ''} — clean up when convenient.`
+          .join(', ')}${debtNotices.length > 5 ? ', …' : ''} — clean up when convenient.`
       : '';
-
-  // ── Phase C: feedback projection drift (ADR 0031) ──
-  // Single blocking gate invariant (spec §7.5): integrate into THIS hook, never
-  // add a separate PreCompact hook. `feedback-sync --check --strict` reports
-  // projection drift (wiki feedback SoT vs MEMORY / CLAUDE.md learned-behaviors
-  // projection). `--no-input` keeps this non-TTY hook from ever blocking on a
-  // prompt, and the engine's skip-MEMORY warning is *soft* (never escalated by
-  // --strict) so a fresh / external user whose ~/.claude/projects/<id> dir does
-  // not exist yet is never gated (contract §5 step 4). The --check spawn
-  // fails open on any error, exactly like the lint check above; the self-heal
-  // --write below fails CLOSED (blocks transparently) because by then real
-  // drift is confirmed and silently passing it would defeat the gate.
-  const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
-  let feedbackOk = true;
-  let feedbackReason = '';
-  let feedbackHealed = ''; // self-heal notice when pure drift was auto-resolved (ADR 0045)
-  let feedbackSkipped = false;
-  if (!feedbackPath || !existsSync(feedbackPath)) {
-    feedbackSkipped = true;
-  } else {
-    try {
-      const r = spawnSync(
-        process.execPath,
-        [
-          feedbackPath,
-          '--check',
-          '--strict',
-          '--no-input',
-          '--json',
-          `--hypo-dir=${HYPO_DIR}`,
-          `--claude-home=${join(homedir(), '.claude')}`,
-        ],
-        { encoding: 'utf-8', timeout: 30000 },
-      );
-      if (r.error || r.status === null) {
-        feedbackSkipped = true; // spawn failure → fail-open (never block on tooling)
-      } else if (r.status !== 0) {
-        // exit≠0 alone is ambiguous. A *missing* target file (e.g. a system
-        // whose ~/.claude/CLAUDE.md was never created) reports buildError +
-        // exit 1, which is benign — there is nothing to gate. Decide from the
-        // JSON report's per-target state instead of the raw exit code: block
-        // ONLY when some target has a genuine, actionable issue (drift,
-        // conflict, over-cap, or a malformed managed region). buildError is
-        // never actionable here, so any mix that lacks a real issue fails open
-        // — including memory:clean + claude:buildError, where the prior
-        // `every(buildError)` predicate wrongly blocked that case. Mirrors
-        // doctor's buildError→warn (non-fatal) handling.
-        let report = null;
-        try {
-          report = JSON.parse(r.stdout || '');
-        } catch {
-          /* unparseable → fail-open below */
-        }
-        const entries = report ? Object.entries(report.targets || {}) : [];
-        const conflictedT = entries
-          .filter(
-            ([, t]) =>
-              t.intruder || t.unpaired || t.outOfContainer || (t.conflicts && t.conflicts.length),
-          )
-          .map(([n]) => n);
-        const overCapT = entries.filter(([, t]) => t.overCap).map(([n]) => n);
-        const driftedT = entries.filter(([, t]) => t.dirty).map(([n]) => n);
-        if (!report || !(conflictedT.length || overCapT.length || driftedT.length)) {
-          feedbackSkipped = true; // missing target / pure warning / unparseable → fail-open
-        } else if (conflictedT.length || overCapT.length) {
-          // Genuine human-decision cases (ADR 0031 rules 3 & 6) — always surface,
-          // never auto-resolve. Name the target so the block reason is actionable.
-          feedbackOk = false;
-          feedbackReason = conflictedT.length
-            ? `feedback projection conflict (manual edit of ${conflictedT.join(', ')}) — run \`hypomnema feedback-sync --import-target-change --from=<memory|claude>\``
-            : `feedback projection over cap (${overCapT.join(', ')}) — demote/archive feedback pages`;
-        } else {
-          // Pure projection drift (deterministic derive, byte-identical per ADR
-          // 0031 rule 5). Self-heal: regenerate the projection so the gate does
-          // not block on a mechanical, auto-resolvable diff (ADR 0045). The write
-          // touches managed blocks / per-feedback side-files; the visible
-          // MEMORY.md body is often unchanged (the drift lives in the side-file
-          // copies). Effect = gate unblock + next-session coherence, NOT an
-          // in-context memory refresh (MEMORY.md is injected at session start).
-          // --write is NOT --strict and only applies when nothing blocks
-          // (code===0 across ALL targets), so a late conflict/over-cap (race vs
-          // the --check above) exits non-zero and we block transparently rather
-          // than passing on unresolved drift. Note: --write is semantic-preflight
-          // atomic (it refuses to write any target when one conflicts/over-caps),
-          // but not filesystem-atomic — a concurrent edit between eval and apply,
-          // or an I/O fault mid-write, is best-effort, same as any feedback-sync
-          // --write. Hardening that is out of scope here (pre-existing engine
-          // behavior, not introduced by the self-heal).
-          const w = spawnSync(
-            process.execPath,
-            [
-              feedbackPath,
-              '--write',
-              '--no-input',
-              `--hypo-dir=${HYPO_DIR}`,
-              `--claude-home=${join(homedir(), '.claude')}`,
-            ],
-            { encoding: 'utf-8', timeout: 30000 },
-          );
-          if (w.error || w.status === null || w.status !== 0) {
-            feedbackOk = false;
-            feedbackReason = `feedback projection drift (${driftedT.join(', ')}) — auto-sync failed; run \`hypomnema feedback-sync --write\` manually`;
-          } else {
-            feedbackHealed = `[WIKI CHECK] feedback projection re-synced (${driftedT.join(', ')}); MEMORY.md body may be unchanged — drift was in the managed block / side-files.`;
-          }
-        }
-      }
-    } catch (err) {
-      feedbackSkipped = true;
-      process.stderr.write(`[hypo-personal-check] error: ${err?.message ?? String(err)}\n`);
-    }
-  }
-
   // Surface the self-heal so a re-synced projection is not a silent mutation of
   // the user's MEMORY.md / CLAUDE.md (ADR 0045 transparency).
   if (feedbackHealed) noticeText = noticeText ? `${noticeText}\n${feedbackHealed}` : feedbackHealed;
 
-  if (
-    gitStatus.clean &&
-    hotStatus.clean &&
-    lintOk &&
-    designHistoryOk &&
-    closeFiles.ok &&
-    feedbackOk
-  ) {
+  if (gate.ok) {
     console.log(
       JSON.stringify(
         noticeText
@@ -318,13 +174,9 @@ process.stdin.on('end', () => {
   // ── Bypass 3: HYPO_SKIP_GATE ──
   if (isGateSkipped()) {
     const skipped = [
-      !gitStatus.clean ? gitStatus.reason : '',
-      !hotStatus.clean ? hotStatus.reason : '',
-      !closeFiles.ok ? closeFilesReason : '',
-      !designHistoryOk ? `design-history stale (${lintW8.length})` : '',
-      !feedbackOk ? feedbackReason : '',
-      lintSkipped ? 'lint skipped (hypo-pkg.json missing)' : '',
-      feedbackSkipped ? 'feedback-sync skipped (hypo-pkg.json missing)' : '',
+      ...gate.blockers.map((b) => b.reason),
+      gate.skipped.lint ? 'lint skipped (hypo-pkg.json missing)' : '',
+      gate.skipped.feedback ? 'feedback-sync skipped (hypo-pkg.json missing)' : '',
     ]
       .filter(Boolean)
       .join(', ');
@@ -338,18 +190,12 @@ process.stdin.on('end', () => {
   }
 
   // ── Block ──
+  // gate.blockers already carry per-type reasons in the canonical order
+  // (git, hot, close, lint, design-history, feedback) — same strings as before
+  // ADR 0046, now sourced from the shared gate instead of inline checks.
   const reasons = [
-    !gitStatus.clean ? gitStatus.reason : '',
-    !hotStatus.clean ? hotStatus.reason : '',
-    !closeFiles.ok ? closeFilesReason : '',
-    !lintOk
-      ? `lint blockers: ${[...new Set(lintBlockers.map((b) => b.id || b.file))].join(', ')}`
-      : '',
-    !designHistoryOk
-      ? `design-history stale: ${lintW8.map((w) => w.file.split('/')[1]).join(', ')}`
-      : '',
-    !feedbackOk ? feedbackReason : '',
-    lintSkipped ? 'lint skipped (run `hypomnema init` to enable lint gate)' : '',
+    ...gate.blockers.map((b) => b.reason),
+    gate.skipped.lint ? 'lint skipped (run `hypomnema init` to enable lint gate)' : '',
   ].filter(Boolean);
 
   const checklist = readChecklist(today);
@@ -373,6 +219,8 @@ process.stdin.on('end', () => {
       `  [ ] 12. lint — run scripts/lint.mjs; fix errors in files YOU touched`,
       `           (other projects' / shared-page debt is reported as non-blocking notice)`,
       `  [ ] 13. git commit & push`,
+      `  [ ] 14. verify — run \`crystallize.mjs --check-session-close\`; only declare`,
+      `           the session closed once it prints "Compact-ready" (= this gate passes).`,
     ].join('\n');
 
   const closeIntentNote = hasCloseIntent

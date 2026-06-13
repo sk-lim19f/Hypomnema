@@ -11,7 +11,7 @@ When invoked at the end of a session (or with phrases like "세션 종료", "wra
 
 ## What this does
 
-- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `crystallize.mjs --apply-session-close --payload=<path>` — which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). `--check-session-close` remains a read-only probe (freshness only). The PreCompact gate runs the same scoped lint, judging the session on the files it touched.
+- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `crystallize.mjs --apply-session-close --payload=<path>` — which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). `--check-session-close` is a read-only dry-run of the **full** PreCompact gate (ADR 0046) — close files + scoped lint + design-history + feedback projection — sharing one function (`precompactGateStatus`) with the gate. A green check means no gate blocker needs a human fix, so it is the signal to declare the session closed (pass `--transcript-path` to widen the lint scope to this session's edited files exactly as the interactive hook does). It is not a hard guarantee: the live `/compact` can still differ on a context-≥70% prompt, `HYPO_SKIP_GATE`, or a transcript-scoped lint error the check did not see.
 - **Synthesis mode**: finds tag clusters (≥ N pages), orphan pages (no outbound `[[wikilinks]]`), and draft / stub pages, then guides consolidation into `pages/syntheses/<topic>.md` with back-links and `index.md` updates.
 
 ---
@@ -69,9 +69,12 @@ After completing the checklist, verify it before reporting:
 node <package-root>/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
 ```
 
-This runs the same strict check as the PreCompact hard gate. Fix any
-file reported `missing` or `stale` and re-run until it passes — otherwise
-`/compact` will be blocked.
+This runs the **full** PreCompact gate via the shared `precompactGateStatus`
+(ADR 0046): close files (`missing` / `stale`) plus lint blockers, stale
+design-history, and feedback projection over-cap/conflict. Fix every `✗` it
+reports and re-run until it prints **"Compact-ready"** — that is the signal the
+session is closed. A close-files-only pass is not enough; the real `/compact`
+also blocks on those other checks.
 
 Once it passes, report each item with ✓ and ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
 

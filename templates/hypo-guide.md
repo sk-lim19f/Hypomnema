@@ -84,6 +84,15 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    projects / shared pages you did not author is reported as a non-blocking
    notice, not a gate. (The documented `crystallize.mjs --apply-session-close`
    path runs this lint automatically, scoped to the files it writes.)
+6. Verify with `scripts/crystallize.mjs --check-session-close`: a dry-run of the
+   **full** PreCompact gate (close files + lint + design-history + feedback
+   projection, ADR 0046), sharing one function with the gate. Only declare the
+   session closed once it prints **"Compact-ready"**. A "close files updated"
+   check alone is not enough — the real `/compact` gate also blocks on a lint
+   error in a close file or a feedback projection over-cap. (Not a hard
+   guarantee: the live gate can still differ on a context-≥70% prompt,
+   `HYPO_SKIP_GATE`, or a transcript-scoped lint error — pass `--transcript-path`
+   to include the last.)
 
 Skip session close for: single bug fix, single-file edit, Q&A only.
 

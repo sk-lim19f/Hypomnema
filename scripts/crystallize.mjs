@@ -77,6 +77,7 @@ import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import {
   sessionCloseFileStatus,
   sessionCloseGlobalStatus,
+  precompactGateStatus,
   writeSessionClosedMarker,
   sessionClosedMarkerPath,
   hypoIsClean,
@@ -146,19 +147,28 @@ function parseArgs(argv) {
 // flow can self-verify before /compact triggers PreCompact.
 
 function runSessionCloseCheck(args) {
-  // ADR 0043: no-payload self-check uses the global invariant
-  // so it mirrors the PreCompact gate (every today-active project must be closed).
-  const status = sessionCloseGlobalStatus(args.hypoDir);
+  // ADR 0046: the check mirrors the FULL PreCompact gate via the shared
+  // precompactGateStatus (close files + lint + design-history + feedback
+  // projection), not just the close files — so a green check means /compact
+  // won't block on a human-fixable issue. Pass --transcript-path to widen the
+  // lint scope to the session's edited files exactly as the interactive hook
+  // does (without it, the scope is the mandatory close files only).
+  const status = precompactGateStatus(args.hypoDir, { transcriptPath: args.transcriptPath });
+  const close = status.close;
 
   if (args.json) {
     console.log(
       JSON.stringify(
         {
           ok: status.ok,
-          project: status.project,
-          dates: status.dates,
-          stale: status.stale,
-          missing: status.missing,
+          // flat close fields preserved for back-compat with prior readers
+          project: close.project,
+          dates: close.dates,
+          stale: close.stale,
+          missing: close.missing,
+          blockers: status.blockers,
+          notices: status.notices,
+          skipped: status.skipped,
         },
         null,
         2,
@@ -167,31 +177,41 @@ function runSessionCloseCheck(args) {
     process.exit(status.ok ? 0 : 1);
   }
 
-  const proj = status.project || '(unresolved)';
-  console.log(`Session-close check (project: ${proj}, date: ${status.dates.join(' / ')}):\n`);
+  const proj = close.project || '(unresolved)';
+  console.log(`Compact-ready check (project: ${proj}, date: ${close.dates.join(' / ')}):\n`);
 
-  const required = status.project
+  const required = close.project
     ? [
-        `projects/${status.project}/session-state.md`,
-        `projects/${status.project}/hot.md`,
+        `projects/${close.project}/session-state.md`,
+        `projects/${close.project}/hot.md`,
         'hot.md',
-        `projects/${status.project}/session-log/${status.dates[0].slice(0, 7)}.md`,
+        `projects/${close.project}/session-log/${close.dates[0].slice(0, 7)}.md`,
         'log.md',
       ]
     : [];
   for (const f of required) {
-    const bad = status.missing.includes(f) ? 'missing' : status.stale.includes(f) ? 'stale' : '';
+    const bad = close.missing.includes(f) ? 'missing' : close.stale.includes(f) ? 'stale' : '';
     console.log(`  ${bad ? '✗' : '✓'} ${f}${bad ? ` — ${bad}` : ''}`);
   }
   // Surface anything not covered by the canonical list (e.g. unresolved project).
-  for (const f of [...status.missing, ...status.stale]) {
+  for (const f of [...close.missing, ...close.stale]) {
     if (!required.includes(f)) console.log(`  ✗ ${f}`);
+  }
+  // Beyond the close files: the rest of the PreCompact gate (lint, design-history,
+  // feedback over-cap/conflict). These are what made a "close-complete" check
+  // disagree with the real /compact gate before ADR 0046.
+  for (const b of status.blockers) {
+    if (b.type !== 'close') console.log(`  ✗ ${b.reason}`);
+  }
+  if (status.notices.length > 0) {
+    console.log('');
+    for (const n of status.notices) console.log(`  · ${n.reason}`);
   }
   console.log('');
   console.log(
     status.ok
-      ? '✓ All required memory files updated this session. (open-questions.md: conditional, not checked)'
-      : '✗ Session close incomplete — update the files marked above, then retry.',
+      ? '✓ Compact-ready — no PreCompact gate blocker needs a human fix. (open-questions.md: conditional, not checked. The live /compact can still differ on a context-≥70% prompt, HYPO_SKIP_GATE, or a transcript-scoped lint error this check did not see — pass --transcript-path to include the latter.)'
+      : '✗ Not compact-ready — resolve the ✗ items above, then retry. /compact would block on these.',
   );
   process.exit(status.ok ? 0 : 1);
 }
