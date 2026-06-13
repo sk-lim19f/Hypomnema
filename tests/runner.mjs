@@ -9346,6 +9346,60 @@ test('feedback gate: memory clean + missing CLAUDE.md → fail-open (no false bl
   });
 });
 
+// ── precompactGateStatus / crystallize --check-session-close — single source ──
+// ADR 0046: `crystallize --check-session-close` now runs the FULL PreCompact gate
+// (via precompactGateStatus), so it can no longer report a clean close while
+// /compact blocks on a feedback over-cap or a lint error in a close file. The
+// feedback classification itself (over-cap/conflict block, pure drift self-heals)
+// is already locked hermetically by the spawned hypo-personal-check.mjs tests
+// above (which set a controlled HOME with hypo-pkg.json so PKG_ROOT resolves);
+// the gap this ADR closes is that the CHECK reflects that gate too. We exercise
+// it through the real CLI with a controlled HOME — a direct precompactGateStatus
+// import would resolve PKG_ROOT from the ambient ~/.claude and skip the feedback
+// path under a clean CI HOME, making the test a no-op (or fail).
+suite('crystallize --check-session-close — full gate, single source of truth (ADR 0046)');
+
+test('check-session-close surfaces a feedback over-cap as a gate blocker (not just close files)', () => {
+  withTmpDir((dir) => {
+    const wiki = join(dir, 'wiki');
+    mkdirSync(join(wiki, 'pages', 'feedback'), { recursive: true });
+    writeFileSync(join(wiki, 'hypo-config.md'), '# config');
+    // 11 distinct global-L1 pages → CLAUDE projection over the 10-entry cap.
+    for (let i = 0; i < 11; i++) {
+      writeFileSync(
+        join(wiki, 'pages', 'feedback', `rule-${i}.md`),
+        fbPage({
+          ...FB_GLOBAL_L1,
+          title: `R${i}`,
+          global_summary: `do thing ${i}`,
+          memory_summary: `m ${i}`,
+        }),
+      );
+    }
+    // Controlled HOME so the crystallize child resolves PKG_ROOT (→ REPO) and
+    // reads a real claude-home — hermetic regardless of the CI runner's HOME.
+    const home = join(dir, 'home');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+    writeFileSync(
+      join(home, '.claude', 'CLAUDE.md'),
+      '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+    );
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'crystallize.mjs'), '--check-session-close', `--hypo-dir=${wiki}`, '--json'],
+      { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
+    );
+    assert.equal(r.status, 1, `over-cap must make the check not compact-ready: ${r.stdout}`);
+    const report = JSON.parse(r.stdout);
+    assert.equal(report.ok, false, 'ok must reflect the full gate, not just close files');
+    assert.ok(
+      (report.blockers || []).some((b) => b.type === 'feedback' && /over cap/.test(b.reason)),
+      `feedback over-cap must appear in the check's blockers (proves the feedback path ran): ${r.stdout}`,
+    );
+  });
+});
+
 suite('feedback-sync.mjs — ADR 0031 / fix #37 Phase A');
 
 test('feedback-sync-check-detects-drift: fresh projection targets are dirty → exit 1', () => {
