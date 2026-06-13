@@ -8714,9 +8714,13 @@ test('replay-auto-minimal-crystallize-on-incomplete-close: mutating + no marker 
       /WIKI_AUTOCLOSE/.test(out.reason),
       `reason must mention WIKI_AUTOCLOSE: ${out.reason}`,
     );
+    // ADR 0047: the recovery command is now `crystallize --mark-session-closed`
+    // (gate-green / blockers branches) or `/hypo:crystallize` (generic fallback
+    // when the read-only gate is unavailable). All paths name a crystallize
+    // recovery action.
     assert.ok(
-      /\/hypo:crystallize/.test(out.reason),
-      'reason must point at /hypo:crystallize skill',
+      /crystallize/.test(out.reason),
+      `reason must point at a crystallize recovery command: ${out.reason}`,
     );
     assert.ok(out.reason.includes('s-substantial'), 'reason must embed the session_id to use');
   });
@@ -8947,7 +8951,12 @@ test('--mark-session-closed with ok gate but dirty git → exit 1, no marker (AD
     assert.equal(r.status, 1, `expected exit 1 on dirty git, stdout: ${r.stdout}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
-    assert.ok(out.git_reason, `dirty-git result must carry git_reason: ${JSON.stringify(out)}`);
+    // ADR 0047: git-clean is now a `git` blocker inside the unified gate
+    // (precompactGateStatus), not a separate git_reason field.
+    assert.ok(
+      (out.blockers || []).some((b) => b.type === 'git'),
+      `dirty-git result must carry a git blocker: ${JSON.stringify(out)}`,
+    );
     assert.ok(
       !existsSync(join(dir, '.cache', 'session-closed-s-dirty.marker')),
       'marker must not land on dirty git',
@@ -9011,9 +9020,10 @@ test('--mark-session-closed --transcript-path: lint error in a TOUCHED file → 
       assert.equal(r.status, 1, `expected marker refused, got ${r.status}\n${r.stdout}`);
       const out = JSON.parse(r.stdout);
       assert.equal(out.ok, false);
+      // ADR 0047: lint failures are now `lint` blockers in the unified gate.
       assert.ok(
-        (out.lint_blockers || []).some((f) => f.endsWith('note.md')),
-        `lint_blockers should name the touched file: ${r.stdout}`,
+        (out.blockers || []).some((b) => b.type === 'lint' && /note\.md/.test(b.reason)),
+        `a lint blocker should name the touched file: ${r.stdout}`,
       );
       assert.ok(
         !existsSync(join(dir, '.cache', 'session-closed-s-touch.marker')),
@@ -9397,6 +9407,293 @@ test('check-session-close surfaces a feedback over-cap as a gate blocker (not ju
       (report.blockers || []).some((b) => b.type === 'feedback' && /over cap/.test(b.reason)),
       `feedback over-cap must appear in the check's blockers (proves the feedback path ran): ${r.stdout}`,
     );
+  });
+});
+
+// ── ADR 0047: both marker writers share the /compact gate ────────────────────
+// The per-session marker is the THIRD session-close completion signal. It used
+// to gate on a NARROWER check (close files + git + optional scoped-lint) than
+// the real /compact gate (precompactGateStatus also enforces feedback
+// projection over-cap/conflict, W8 design-history, and hot.md structure). That
+// divergence let a marker attest "closed" while /compact would still block.
+// These tests lock the writer⟺gate coherence for BOTH writer paths (standalone
+// --mark-session-closed and --apply-session-close), the pure-drift carve-out,
+// the verify marker field, and the refined Stop message. They use a controlled
+// HOME with hypo-pkg.json so the crystallize/hook child resolves PKG_ROOT and
+// actually runs the lint + feedback subprocesses (under a clean CI HOME those
+// paths skip, making the test a no-op) — same hermetic pattern as the
+// check-session-close over-cap test above.
+suite('ADR 0047 — marker writers share the /compact gate (precompactGateStatus)');
+
+function adr47CommitWiki(dir) {
+  spawnSync('git', ['init'], { cwd: dir });
+  spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+  spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  spawnSync('git', ['add', '-A'], { cwd: dir });
+  spawnSync('git', ['commit', '-m', 'init'], { cwd: dir });
+}
+
+function adr47ControlledHome(dir) {
+  const home = join(dir, 'home');
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+  writeFileSync(
+    join(home, '.claude', 'CLAUDE.md'),
+    '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+  );
+  return home;
+}
+
+function adr47SeedFeedback(wiki, count) {
+  mkdirSync(join(wiki, 'pages', 'feedback'), { recursive: true });
+  for (let i = 0; i < count; i++) {
+    writeFileSync(
+      join(wiki, 'pages', 'feedback', `rule-${i}.md`),
+      fbPage({
+        ...FB_GLOBAL_L1,
+        title: `R${i}`,
+        global_summary: `do thing ${i}`,
+        memory_summary: `m ${i}`,
+      }),
+    );
+  }
+}
+
+test('--mark-session-closed refuses the marker on a feedback over-cap even when close files are fresh + git clean', () => {
+  withTmpDir((dir) => {
+    const wiki = join(dir, 'wiki');
+    const today = todayLocal();
+    mkdirSync(wiki, { recursive: true });
+    buildCleanWikiTree(wiki, today); // 5 close files fresh
+    adr47SeedFeedback(wiki, 11); // 11 global-L1 → CLAUDE projection over the 10 cap
+    adr47CommitWiki(wiki); // git clean
+    const home = adr47ControlledHome(dir);
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'crystallize.mjs'),
+        '--mark-session-closed',
+        '--session-id=s-overcap',
+        `--hypo-dir=${wiki}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
+    );
+    assert.equal(r.status, 1, `over-cap must refuse the marker: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(
+      (out.blockers || []).some((b) => b.type === 'feedback' && /over cap/.test(b.reason)),
+      `marker must be refused on the feedback over-cap (the check the narrow gate skipped): ${r.stdout}`,
+    );
+    assert.ok(
+      !existsSync(join(wiki, '.cache', 'session-closed-s-overcap.marker')),
+      'marker must not land while the gate blocks',
+    );
+  });
+});
+
+test('--apply-session-close routes the marker write through the full gate — refuses on feedback over-cap', () => {
+  withTmpDir((dir) => {
+    const wiki = join(dir, 'wiki');
+    const today = todayLocal();
+    mkdirSync(wiki, { recursive: true });
+    buildCleanWikiTree(wiki, today);
+    adr47SeedFeedback(wiki, 11);
+    adr47CommitWiki(wiki);
+    const home = adr47ControlledHome(dir);
+    // Idempotent payload: full-content fields echo current bytes, append entries
+    // match the existing headings → apply writes NOTHING → git stays clean. So
+    // the only thing that can refuse the marker is the new gate (feedback), not
+    // a git-dirty masking it.
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(wiki, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(wiki, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] test session\n` },
+      log: { entry: `## [${today}] session | test-project\n` },
+    };
+    const payloadPath = join(dir, 'payload.json'); // outside the wiki git tree
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'crystallize.mjs'),
+        '--apply-session-close',
+        `--payload=${payloadPath}`,
+        '--session-id=s-apply-oc',
+        `--hypo-dir=${wiki}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
+    );
+    assert.equal(
+      r.status,
+      0,
+      `apply itself must succeed (idempotent no-op): ${r.stdout}\n${r.stderr}`,
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `apply ok (files fresh, lint clean): ${r.stdout}`);
+    const st = spawnSync('git', ['status', '--porcelain'], { cwd: wiki, encoding: 'utf-8' });
+    assert.equal(
+      st.stdout.trim(),
+      '',
+      `payload must be a no-op so git stays clean (else git, not feedback, masks the test): ${st.stdout}`,
+    );
+    assert.ok(
+      !existsSync(join(wiki, '.cache', 'session-closed-s-apply-oc.marker')),
+      'apply must NOT write the marker while the full gate blocks on feedback over-cap',
+    );
+  });
+});
+
+test('--mark-session-closed writes the marker on PURE feedback drift and surfaces drift_deferred', () => {
+  withTmpDir((dir) => {
+    const wiki = join(dir, 'wiki');
+    const today = todayLocal();
+    mkdirSync(wiki, { recursive: true });
+    buildCleanWikiTree(wiki, today);
+    adr47SeedFeedback(wiki, 2); // under the cap → pure drift (CLAUDE.md not yet synced)
+    adr47CommitWiki(wiki);
+    const home = adr47ControlledHome(dir);
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'crystallize.mjs'),
+        '--mark-session-closed',
+        '--session-id=s-drift',
+        `--hypo-dir=${wiki}`,
+        '--json',
+      ],
+      { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
+    );
+    assert.equal(r.status, 0, `pure drift must NOT block the marker: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.ok(
+      existsSync(join(wiki, '.cache', 'session-closed-s-drift.marker')),
+      'marker must land on pure drift (non-blocker)',
+    );
+    assert.ok(
+      Array.isArray(out.drift_deferred) && out.drift_deferred.length > 0,
+      `drift_deferred must surface the pending projection sync (self-heals at /compact): ${r.stdout}`,
+    );
+  });
+});
+
+test('--check-session-close --session-id reports marker presence without altering ok', () => {
+  withWiki(null, (dir) => {
+    const r1 = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--session-id=s-mp',
+      '--json',
+    ]);
+    const o1 = JSON.parse(r1.stdout);
+    assert.equal(o1.session_id, 's-mp');
+    assert.equal(o1.marker_present, false, `marker absent must report false: ${r1.stdout}`);
+    // `ok` is the compact-ready verdict and must NOT require the marker: a clean
+    // close is compact-ready even before the marker exists (that IS the hand-edit
+    // state). Prove independence directly rather than across two runs.
+    assert.equal(
+      o1.ok,
+      true,
+      `a clean close must be compact-ready without the marker: ${r1.stdout}`,
+    );
+    writeSessionClosedMarkerFile(dir, 's-mp');
+    // Commit the marker file so the second run's git tree stays clean (otherwise
+    // the new .cache/ file would dirty git and flip ok via the git blocker —
+    // unrelated to marker_present).
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-m', 'marker'], { cwd: dir });
+    const r2 = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--session-id=s-mp',
+      '--json',
+    ]);
+    const o2 = JSON.parse(r2.stdout);
+    assert.equal(o2.marker_present, true, `marker present must report true: ${r2.stdout}`);
+    assert.equal(o1.ok, o2.ok, 'marker_present must not change the compact-ready ok verdict');
+  });
+});
+
+test('--check-session-close --session-id: a STALE marker reports marker_present:false (matches the Stop hook reader, not raw existsSync)', () => {
+  withWiki(null, (dir) => {
+    // A marker file exists on disk but is stale → the Stop hook would reject and
+    // unlink it, so /compact's Stop still blocks. marker_present must agree
+    // (codex pre-commit CONCERN: raw existsSync would falsely report true).
+    writeSessionClosedMarkerFile(dir, 's-stale-mp', '2020-01-01T00:00:00.000Z');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--session-id=s-stale-mp',
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.marker_present,
+      false,
+      `a stale marker must report marker_present:false: ${r.stdout}`,
+    );
+    // The shared reader unlinks the invalid marker as it reads (same as the hook).
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-stale-mp.marker')),
+      'stale marker should be unlinked by the validity check',
+    );
+  });
+});
+
+test('Stop hook: close gate green but marker absent → precise "close gate green" message', () => {
+  withTmpDir((dir) => {
+    const wiki = join(dir, 'wiki');
+    const today = todayLocal();
+    mkdirSync(wiki, { recursive: true });
+    buildCleanWikiTree(wiki, today); // no feedback pages → gate fully green once committed
+    adr47CommitWiki(wiki);
+    const home = adr47ControlledHome(dir); // PKG_ROOT resolves so the hook's read-only gate runs
+    const transcript = join(dir, 'stop.jsonl');
+    writeFileSync(
+      transcript,
+      [
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Edit', input: { file_path: join(wiki, 'hot.md') } },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: '오늘은 이만 마무리하자' },
+        }),
+      ].join('\n') + '\n',
+    );
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-minimal-crystallize.mjs')], {
+      input: JSON.stringify({
+        session_id: 's-green',
+        transcript_path: transcript,
+        stop_hook_active: false,
+      }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: home, HYPO_DIR: wiki },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `must block while the marker is absent: ${r.stdout}`);
+    assert.ok(
+      /close gate green/.test(out.reason),
+      `a green gate must produce the precise marker-missing message: ${out.reason}`,
+    );
+    assert.ok(/--mark-session-closed/.test(out.reason), 'message must give the exact mark command');
+    assert.ok(out.reason.includes('s-green'), 'message must embed the session_id');
   });
 });
 
