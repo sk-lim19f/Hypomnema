@@ -742,6 +742,8 @@ const {
   isGateSkipped,
   buildOutput,
   isClosePattern,
+  hasMutatingTranscriptActivity,
+  isSubstantialSession,
   extractTouchedWikiFiles,
   closeFileTargets,
   closeFileTargetsGlobal,
@@ -924,6 +926,13 @@ test('일반 작업 문장 → false (false-positive 방지)', () => {
   assert.equal(isClosePattern('작업 종료 조건을 바꿔줘'), false); // Codex P2
   assert.equal(isClosePattern('wrap up this PR'), false); // Codex P2
   assert.equal(isClosePattern('wrap up this feature'), false); // Codex P2
+  // 6a: read-only review/debug sessions are now "substantial", so task-level
+  // "wrap up the <work>" phrasing must NOT read as a session-close signal.
+  assert.equal(isClosePattern('wrap up the review'), false);
+  assert.equal(isClosePattern('wrap up this analysis'), false);
+  assert.equal(isClosePattern('wrapping up the investigation'), false);
+  assert.equal(isClosePattern('wrap up the debugging'), false);
+  assert.equal(isClosePattern('wrap up the audit'), false);
   assert.equal(isClosePattern(''), false);
   assert.equal(isClosePattern(null), false);
 });
@@ -931,6 +940,69 @@ test('일반 작업 문장 → false (false-positive 방지)', () => {
 test('혼합 텍스트(트랜스크립트)에서도 패턴 감지', () => {
   const transcript = '이 PR 리뷰 마저 봐줘\n오늘은 여기까지 하자\n내일 다시 볼게';
   assert.equal(isClosePattern(transcript), true);
+});
+
+// ── 6a: substantial-session gate (read-only investigation volume) ──
+suite('isSubstantialSession() / hasMutatingTranscriptActivity()');
+
+function writeJsonl(dir, entries) {
+  const path = join(dir, `t-${Math.random().toString(36).slice(2, 8)}.jsonl`);
+  writeFileSync(path, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  return path;
+}
+function toolUse(name) {
+  return { type: 'assistant', message: { content: [{ type: 'tool_use', name, input: {} }] } };
+}
+
+test('mutation tool → substantial AND mutating', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [toolUse('Edit')]);
+    assert.equal(hasMutatingTranscriptActivity(p), true);
+    assert.equal(isSubstantialSession(p), true);
+  });
+});
+
+test('read-only below threshold (4 investigation) → NOT substantial', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [toolUse('Read'), toolUse('Grep'), toolUse('Glob'), toolUse('Bash')]);
+    assert.equal(hasMutatingTranscriptActivity(p), false, 'no mutation tool');
+    assert.equal(isSubstantialSession(p), false, '4 < threshold 5');
+  });
+});
+
+test('read-only at threshold (5 investigation) → substantial, still NOT mutating', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      toolUse('Read'),
+      toolUse('Grep'),
+      toolUse('Glob'),
+      toolUse('Read'),
+      toolUse('Grep'),
+    ]);
+    assert.equal(
+      hasMutatingTranscriptActivity(p),
+      false,
+      'read-only never trips the mutation oracle',
+    );
+    assert.equal(isSubstantialSession(p), true, '5 >= threshold 5');
+  });
+});
+
+test('Bash-only at threshold (5) → substantial (Bash counts as investigation)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(
+      dir,
+      Array.from({ length: 5 }, () => toolUse('Bash')),
+    );
+    assert.equal(isSubstantialSession(p), true, 'Bash-dominant read-only session is substantial');
+  });
+});
+
+test('missing / null transcript → not substantial (fail-open)', () => {
+  withTmpDir((dir) => {
+    assert.equal(isSubstantialSession(null), false);
+    assert.equal(isSubstantialSession(join(dir, 'nope.jsonl')), false);
+  });
 });
 
 suite('isGateSkipped()');
@@ -9024,6 +9096,102 @@ test('replay-auto-minimal-crystallize-on-incomplete-close: HYPO_SKIP_GATE=1 → 
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.continue, true, 'HYPO_SKIP_GATE=1 → continue');
+  });
+});
+
+// ── 6a: read-only investigation sessions reach the close-intent gate ──
+// A read-only review/debug session (≥5 Read/Grep/Glob/Bash, no mutation) is now
+// "substantial". The block still requires a wrap-up signal; pure-volume alone
+// must NOT block (close-intent gate unchanged).
+function readonlyInvestigationLines(n) {
+  const tools = ['Read', 'Grep', 'Glob', 'Bash'];
+  return Array.from({ length: n }, (_, i) => ({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', name: tools[i % tools.length], input: {} }] },
+  }));
+}
+
+test('replay-auto-minimal-crystallize-on-incomplete-close: read-only ≥5 + close-intent → block (6a)', () => {
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      { type: 'user', content: '이 모듈 좀 리뷰해줘' },
+      ...readonlyInvestigationLines(5),
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-readonly-close',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.decision,
+      'block',
+      `read-only investigation + wrap-up must block: ${JSON.stringify(out)}`,
+    );
+    assert.ok(out.reason.includes('s-readonly-close'), 'reason embeds session_id');
+  });
+});
+
+test('replay-auto-minimal-crystallize-on-incomplete-close: read-only 4 (below threshold) + close-intent → continue (6a)', () => {
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      ...readonlyInvestigationLines(4),
+      { type: 'user', message: { role: 'user', content: '세션 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-readonly-light',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.continue,
+      true,
+      '4 investigation calls < threshold → not substantial → continue',
+    );
+    assert.equal(out.decision, undefined, 'must NOT block a light read-only session');
+  });
+});
+
+test('replay-auto-minimal-crystallize-on-incomplete-close: read-only ≥5, NO close-intent → continue (6a)', () => {
+  withGrowthWiki((dir) => {
+    // Substantial by volume, but no wrap-up signal → the close-intent gate must
+    // still continue. This is the every-turn-nag guard that bounds 6a's reach.
+    const transcript = writeTranscript(dir, [
+      { type: 'user', message: { role: 'user', content: '이 함수 어떻게 동작하는지 설명해줘' } },
+      ...readonlyInvestigationLines(6),
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-readonly-midwork',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, 'no close-intent → continue even when substantial');
+    assert.equal(out.decision, undefined, 'close-intent gate bounds the 6a broadening');
+  });
+});
+
+test('replay-auto-minimal-crystallize-on-incomplete-close: read-only ≥5 + close-intent + valid marker → continue (6a)', () => {
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      ...readonlyInvestigationLines(5),
+      { type: 'user', message: { role: 'user', content: '세션 종료하자' } },
+    ]);
+    writeSessionClosedMarkerFile(dir, 's-readonly-closed');
+    const r = runAutoMinimal(dir, {
+      session_id: 's-readonly-closed',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, 'valid marker overrides a substantial read-only session');
+    assert.equal(out.decision, undefined);
   });
 });
 

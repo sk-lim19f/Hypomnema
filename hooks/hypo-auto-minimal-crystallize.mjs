@@ -3,7 +3,8 @@
  * hypo-auto-minimal-crystallize.mjs — Stop hook (ADR 0022 Layer 3)
  *
  * Last hook in the Stop chain: a final-line defense that blocks `Stop` when
- * the current session performed mutation work but never produced a verified
+ * the current session did substantial work (mutation, or a high-volume
+ * read-only investigation — see step 3) but never produced a verified
  * session-close. Forces Claude to run minimal session-close before the
  * conversation context evaporates.
  *
@@ -11,8 +12,10 @@
  *
  *   1. stop_hook_active === true  → continue       (loop guard; PoC 2026-05-14)
  *   2. wiki absent                 → continue       (fail-open)
- *   3. transcript has zero Edit/Write/MultiEdit/NotebookEdit tool_use
- *                                  → continue       (substantial-session gate)
+ *   3. not a substantial session   → continue       (substantial-session gate)
+ *        substantial = ≥1 mutation tool_use, OR ≥5 read-only investigation
+ *        calls (Read/Grep/Glob/Bash) — 6a, so read-only review/debug sessions
+ *        are also nudged to close. Pure Q&A / incidental lookups still skip.
  *   4. no recent user close-intent → continue       (close-intent gate, see below)
  *   5. readSessionClosedMarker(session_id) valid
  *                                  → continue       (close already verified)
@@ -43,7 +46,7 @@ import { join } from 'path';
 import {
   HYPO_DIR,
   PKG_ROOT,
-  hasMutatingTranscriptActivity,
+  isSubstantialSession,
   readSessionClosedMarker,
   extractUserMessages,
   isClosePattern,
@@ -129,8 +132,10 @@ process.stdin.on('end', () => {
     const sessionId = payload.session_id || payload.sessionId || null;
     const transcriptPath = payload.transcript_path || payload.transcriptPath || null;
 
-    // 3. substantial-session gate. Read-only / Q&A sessions skip the block.
-    if (!hasMutatingTranscriptActivity(transcriptPath)) {
+    // 3. substantial-session gate. Pure Q&A / incidental-lookup sessions skip
+    // the block; mutating sessions AND high-volume read-only investigations
+    // (6a) pass through to the close-intent gate.
+    if (!isSubstantialSession(transcriptPath)) {
       emitContinue();
       return;
     }
