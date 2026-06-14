@@ -12,7 +12,12 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { HYPO_DIR, computeSessionGrowth, formatGrowthMetrics } from './hypo-shared.mjs';
+import {
+  HYPO_DIR,
+  computeSessionGrowth,
+  formatGrowthMetrics,
+  deriveRootLogEntries,
+} from './hypo-shared.mjs';
 
 const HOT_PATH = join(HYPO_DIR, 'hot.md');
 const GROWTH_CACHE = join(HYPO_DIR, '.cache', 'last-session-growth.json');
@@ -106,6 +111,14 @@ try {
   rebuild();
 } catch (err) {
   process.stderr.write(`[hypo-hot-rebuild] error: ${err?.message ?? String(err)}\n`);
+}
+// Auto-derive the root log.md session entry from each project's session-log
+// heading (runs AFTER rebuild() so root hot.md is already fresh and isn't itself
+// counted as the project's open gate problem). Best-effort: own try/catch.
+try {
+  deriveRootLogEntries(HYPO_DIR);
+} catch (err) {
+  process.stderr.write(`[hypo-hot-rebuild] log-derive error: ${err?.message ?? String(err)}\n`);
 }
 try {
   emitGrowth();

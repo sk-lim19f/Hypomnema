@@ -604,6 +604,110 @@ export function sessionCloseGlobalStatus(hypoDir) {
   return { ok, projects, dates, fallback: false, primary, project: primary, stale, missing };
 }
 
+// ── derivable-artifact auto-derive: root log.md session entry ──────────────────
+// The root log.md `## [date] session | <slug>` entry is a DERIVABLE artifact —
+// it restates a project's session-log heading, which the close already authored.
+// root hot.md is already auto-derived here (rebuild() above); log.md was the only
+// derivable still left as a manual checklist step, so a hand-edited close that
+// skipped it left the global gate (sessionCloseGlobalStatus) hard-blocking /compact
+// for EVERY today-active project — cross-session, looking like a fresh bug each
+// time. This derives the missing entry from the session-log heading so the gate
+// never blocks on a purely-derivable gap. The session-closed MARKER is NOT derived
+// here: it is a proof artifact the close gate actually ran (ADR 0022 invariant).
+//
+// Safety guard (codex design review): derive ONLY for a project whose close is
+// otherwise complete — i.e. its sole gate problem is log.md. If session-state /
+// project hot / session-log are also stale/missing, the authored close is genuinely
+// incomplete and MUST keep blocking; deriving log.md then would mask it.
+
+// Build the canonical root log.md heading from a raw session-log heading tail.
+// The gate's session-log freshness check accepts ANY `## [date] ...` heading, but
+// the log.md check requires `## [date] session | <slug>` — so normalise to that
+// shape rather than copying a heading that might not carry `session | <slug>`.
+function deriveLogTitle(tail) {
+  let t = (tail || '').trim();
+  t = t.replace(/^session\b\s*/i, ''); // drop a leading "session" token
+  if (t.startsWith('|')) {
+    // Drop a leading "| <old label/slug>" segment up to the first em-dash, so a
+    // renamed-project heading (`| oldslug — title`) does not leak its old slug
+    // into the derived title. A pipe segment with no separator is a bare label
+    // (e.g. `| slug`) → no title.
+    const dash = t.indexOf('—');
+    t = dash === -1 ? '' : t.slice(dash);
+  }
+  return t.replace(/^\s*[—:-]\s*/, '').trim(); // drop a leading separator
+}
+
+/**
+ * Append any missing root log.md `## [date] session | <slug>` entries derived from
+ * each today-active project's session-log heading(s). Idempotent: dedups on the
+ * exact generated heading line, so re-running (or a same-day apply that already
+ * wrote the entry) is a no-op, and multiple same-day sessions each get their own
+ * entry. Best-effort and read-mostly: returns the number of entries appended.
+ *
+ * @param {string} hypoDir
+ * @returns {number} count of entries appended to log.md
+ */
+export function deriveRootLogEntries(hypoDir) {
+  const logPath = join(hypoDir, 'log.md');
+  if (!existsSync(logPath)) return 0;
+  const dates = freshDates();
+  const todayActive = [...closeCandidateSlugs(hypoDir, dates)].filter((p) =>
+    hasTodayCloseActivity(hypoDir, p, dates),
+  );
+  if (todayActive.length === 0) return 0;
+
+  let logContent;
+  try {
+    logContent = readFileSync(logPath, 'utf-8');
+  } catch {
+    return 0;
+  }
+
+  // Exact-LINE dedup: a titleless heading (`## [d] session | a`) is a substring/
+  // prefix of a titled one (`## [d] session | a — first`), so substring checks
+  // would wrongly drop a distinct same-day session. Track whole heading lines.
+  const seenHeadings = new Set((logContent || '').split(/\r?\n/));
+  const additions = [];
+  for (const slug of todayActive) {
+    // Guard: only the log.md entry may be the gap; an otherwise-incomplete close
+    // must keep blocking (do not mask missing authored files).
+    const st = sessionCloseFileStatus(hypoDir, { projectOverride: slug });
+    const problems = [...st.stale, ...st.missing];
+    if (!(problems.length === 1 && problems[0] === 'log.md')) continue;
+
+    for (const date of dates) {
+      const ym = date.slice(0, 7);
+      const slogPath = join(hypoDir, 'projects', slug, 'session-log', `${ym}.md`);
+      if (!existsSync(slogPath)) continue;
+      let slog;
+      try {
+        slog = readFileSync(slogPath, 'utf-8');
+      } catch {
+        continue;
+      }
+      const headingRe = new RegExp('^#{1,6} \\[' + escapeRegExp(date) + '\\]\\s*(.*)$', 'gm');
+      let m;
+      while ((m = headingRe.exec(slog)) !== null) {
+        const title = deriveLogTitle(m[1]);
+        const heading = `## [${date}] session | ${slug}` + (title ? ` — ${title}` : '');
+        if (seenHeadings.has(heading)) continue; // exact-line dedup (log.md + queued)
+        seenHeadings.add(heading);
+        additions.push(`${heading}\n→ [[projects/${slug}/hot]]`);
+      }
+    }
+  }
+
+  if (additions.length === 0) return 0;
+  const sep = logContent.endsWith('\n') ? '\n' : '\n\n';
+  try {
+    writeFileSync(logPath, logContent + sep + additions.join('\n\n') + '\n');
+  } catch {
+    return 0;
+  }
+  return additions.length;
+}
+
 // ── sync-state ────────────────────────────────────────────
 // `.cache/sync-state.json` is JSONL: one {timestamp, op, error, host} entry per
 // line. hypo-auto-commit appends on pull/push failure; hypo-session-start
