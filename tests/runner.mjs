@@ -746,6 +746,7 @@ const {
   closeFileTargets,
   closeFileTargetsGlobal,
   sessionCloseGlobalStatus,
+  deriveRootLogEntries,
   partitionLintScope,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
@@ -8636,6 +8637,129 @@ test('regression: the close path never passes cwd into resolveActiveProject (res
     0,
     `close-side resolveActiveProject calls must be single-arg (no cwd); found: ${JSON.stringify(cwdCalls)}`,
   );
+});
+
+// ── deriveRootLogEntries — auto-derive root log.md session entry ──────────────
+suite('deriveRootLogEntries — root log.md derivable auto-fill');
+
+test('derives the canonical log.md entry when only log.md is the gap', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha: fully closed today except the root log.md entry is missing.
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    assert.equal(sessionCloseGlobalStatus(dir).ok, false, 'precondition: gate blocks on log.md');
+    const n = deriveRootLogEntries(dir);
+    assert.equal(n, 1, 'one entry derived');
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha`, 'm'));
+    assert.equal(sessionCloseGlobalStatus(dir).ok, true, 'gate now passes after derive');
+  });
+});
+
+test('is idempotent — a second run appends nothing', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    assert.equal(deriveRootLogEntries(dir), 1);
+    assert.equal(deriveRootLogEntries(dir), 0, 'no duplicate on re-run');
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.equal((log.match(/session \| alpha/g) || []).length, 1, 'exactly one alpha entry');
+  });
+});
+
+test('guard: does NOT derive when the authored close is otherwise incomplete', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // beta is today-active (fresh session-log heading) but session-state is stale
+    // AND log.md missing → incomplete authored close, must keep blocking.
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'beta', date: today, sessionState: '2020-01-01', logEntry: false },
+    ]);
+    assert.equal(deriveRootLogEntries(dir), 0, 'log.md not masked while session-state stale');
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.doesNotMatch(log, /session \| beta/, 'no beta entry derived');
+    assert.equal(sessionCloseGlobalStatus(dir).ok, false, 'gate still blocks the real gap');
+  });
+});
+
+test('normalises a non-"session | slug" heading into the canonical entry', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    // Overwrite the session-log with a titled, non-canonical heading shape.
+    writeFileSync(
+      join(dir, 'projects', 'alpha', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] Refactor the parser\n`,
+    );
+    assert.equal(deriveRootLogEntries(dir), 1);
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.match(
+      log,
+      new RegExp(`^## \\[${today}\\] session \\| alpha — Refactor the parser`, 'm'),
+    );
+  });
+});
+
+test('derives one entry per same-day session-log heading', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    writeFileSync(
+      join(dir, 'projects', 'alpha', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: log\ntype: session-log\nupdated: ${today}\n---\n\n` +
+        `## [${today}] session | alpha — first\n\n## [${today}] session | alpha — second\n`,
+    );
+    assert.equal(deriveRootLogEntries(dir), 2, 'both same-day sessions derived');
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.match(log, /session \| alpha — first/);
+    assert.match(log, /session \| alpha — second/);
+  });
+});
+
+test('does not leak a renamed-project old slug into the derived title', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'newslug', date: today, logEntry: false }]);
+    writeFileSync(
+      join(dir, 'projects', 'newslug', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] session | oldslug — Migrate\n`,
+    );
+    assert.equal(deriveRootLogEntries(dir), 1);
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| newslug — Migrate$`, 'm'));
+    assert.doesNotMatch(log, /oldslug/, 'old slug must not appear in the derived entry');
+  });
+});
+
+test('exact-line dedup keeps a titleless heading distinct from a titled one', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    // A titleless and a titled same-day heading: a substring dedup would drop the
+    // titleless one (it is a prefix of the titled one); exact-line keeps both.
+    writeFileSync(
+      join(dir, 'projects', 'alpha', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: log\ntype: session-log\nupdated: ${today}\n---\n\n` +
+        `## [${today}] session | alpha — first\n\n## [${today}] session | alpha\n`,
+    );
+    assert.equal(deriveRootLogEntries(dir), 2, 'both the titled and titleless entries derived');
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha — first$`, 'm'));
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha$`, 'm'));
+  });
+});
+
+test('hypo-hot-rebuild Stop hook fills the missing log.md entry end-to-end', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha`, 'm'));
+    assert.equal(sessionCloseGlobalStatus(dir).ok, true, 'gate passes after the Stop hook ran');
+  });
 });
 
 // ── hypo-auto-minimal-crystallize.mjs (ADR 0022 Layer 3) ─────
