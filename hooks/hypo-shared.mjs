@@ -1077,15 +1077,33 @@ export function clearSessionClosedMarker(hypoDir, sessionId) {
   }
 }
 
-// ── transcript activity heuristic (ADR 0022 amendment 2026-05-19) ──
-// Substantial-session gate for the Stop hook: a session that performed at least
-// one mutation tool call (Edit / Write / MultiEdit / NotebookEdit) is "worth"
-// blocking on for session-close. Pure Q&A / read-only sessions skip the block.
+// ── transcript activity heuristic (ADR 0022 amendment 2026-05-19; 6a 2026-06-14) ──
+// Substantial-session gate for the Stop hook: a session "worth" blocking on for
+// session-close is either (a) any mutation (Edit/Write/MultiEdit/NotebookEdit)
+// or (b) a high-volume read-only investigation (≥ READONLY_SUBSTANTIAL_THRESHOLD
+// Read/Grep/Glob/Bash calls). Pure Q&A / incidental lookups skip the block.
 //
-// Bash is intentionally excluded — running tests would otherwise trigger
-// block. Future fix may broaden to read-heavy sessions (Grep ≥ N).
+// 6a rationale: code-review / debugging sessions reach real conclusions worth
+// crystallizing while touching only read-only tools. The original gate keyed
+// purely on mutation tools, so those sessions were never nudged to close. The
+// investigation threshold (5) mirrors session-audit.mjs's "search-many" cutoff
+// (scripts/session-audit.mjs:206) and sits in the empirical gap between
+// incidental lookups (0–3 calls) and real investigation (16–22 calls). Bash is
+// now counted (it is the dominant signal in read-only sessions); over-firing is
+// bounded by the close-intent gate (the Stop hook only blocks when the user also
+// signalled wrap-up) — see hypo-auto-minimal-crystallize.mjs.
+//
+// NOTE: counting a Bash call here does NOT widen the lint scope. Lint scoping
+// (precompactGateStatus) still seeds only Edit/Write-touched files plus the
+// mandatory close files — a Bash-written wiki file is not auto-scoped.
 
 const MUTATING_TOOL_NAMES = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+// Read-only investigation tools. Bash included: read-only sessions are
+// Bash-dominant (git/grep/cat), so excluding it would leave most of them
+// undetectable (a real session had read=0, bash=16).
+const INVESTIGATION_TOOL_NAMES = new Set(['Read', 'Grep', 'Glob', 'Bash']);
+// Investigation-volume cutoff for a read-only session to count as substantial.
+const READONLY_SUBSTANTIAL_THRESHOLD = 5;
 
 /** Mirror of `scripts/session-audit.mjs` extractToolNames: handles both top-level
  *  `tool_use` entries (legacy fixtures) and nested `message.content[].tool_use`
@@ -1115,27 +1133,30 @@ function extractTranscriptToolNames(entry) {
 }
 
 /**
- * True if the JSONL transcript at `transcriptPath` contains ≥1 mutation
- * tool_use (Edit/Write/MultiEdit/NotebookEdit).
+ * Single-pass tool-use census over a JSONL transcript. Both public predicates
+ * (`hasMutatingTranscriptActivity`, `isSubstantialSession`) derive from this one
+ * census so the mutation leg stays identical between them. (They still diverge
+ * on read-only ≥ threshold sessions, where only `isSubstantialSession` is true.)
  *
- * Granularity:
- *   • Whole-file unreadable / missing path → returns false (fail-open).
+ * Granularity (shared contract):
+ *   • Whole-file unreadable / missing path → all counts 0 (fail-open).
  *   • Per-line malformed JSON → that line is skipped, scan continues. Real
  *     transcripts occasionally carry truncated lines; one bad line must not
- *     hide a clearly-mutating session that follows. (Codex Worker-2 CONCERN
+ *     hide a clearly-active session that follows. (Codex Worker-2 CONCERN
  *     resolved 2026-05-19: line-level skip is the intended contract.)
  *
  * @param {string|null|undefined} transcriptPath
- * @returns {boolean}
+ * @returns {{ mutationCount: number, investigationCount: number }}
  */
-export function hasMutatingTranscriptActivity(transcriptPath) {
-  if (!transcriptPath || typeof transcriptPath !== 'string') return false;
-  if (!existsSync(transcriptPath)) return false;
+function transcriptActivityStats(transcriptPath) {
+  const stats = { mutationCount: 0, investigationCount: 0 };
+  if (!transcriptPath || typeof transcriptPath !== 'string') return stats;
+  if (!existsSync(transcriptPath)) return stats;
   let raw;
   try {
     raw = readFileSync(transcriptPath, 'utf-8');
   } catch {
-    return false;
+    return stats;
   }
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
@@ -1147,10 +1168,41 @@ export function hasMutatingTranscriptActivity(transcriptPath) {
       continue;
     }
     for (const name of extractTranscriptToolNames(entry)) {
-      if (MUTATING_TOOL_NAMES.has(name)) return true;
+      if (MUTATING_TOOL_NAMES.has(name)) stats.mutationCount++;
+      else if (INVESTIGATION_TOOL_NAMES.has(name)) stats.investigationCount++;
     }
   }
-  return false;
+  return stats;
+}
+
+/**
+ * True if the JSONL transcript at `transcriptPath` contains ≥1 mutation
+ * tool_use (Edit/Write/MultiEdit/NotebookEdit). Kept as a precise, standalone
+ * helper (and regression oracle) even though the Stop hook now gates on the
+ * broader `isSubstantialSession`.
+ *
+ * @param {string|null|undefined} transcriptPath
+ * @returns {boolean}
+ */
+export function hasMutatingTranscriptActivity(transcriptPath) {
+  return transcriptActivityStats(transcriptPath).mutationCount > 0;
+}
+
+/**
+ * True if the session is "substantial" enough to nudge a session-close:
+ * any mutation, OR a read-only investigation of at least
+ * READONLY_SUBSTANTIAL_THRESHOLD Read/Grep/Glob/Bash calls (6a). The mutation
+ * leg is identical to `hasMutatingTranscriptActivity`, so mutating sessions
+ * behave exactly as before; only high-volume read-only sessions are newly
+ * caught. Over-firing on read-only sessions is bounded downstream by the
+ * close-intent gate in hypo-auto-minimal-crystallize.mjs.
+ *
+ * @param {string|null|undefined} transcriptPath
+ * @returns {boolean}
+ */
+export function isSubstantialSession(transcriptPath) {
+  const { mutationCount, investigationCount } = transcriptActivityStats(transcriptPath);
+  return mutationCount > 0 || investigationCount >= READONLY_SUBSTANTIAL_THRESHOLD;
 }
 
 // ── session-scoped lint classification ──────────────────────────────────────
@@ -1580,8 +1632,11 @@ export function isClosePattern(text) {
     /오늘은?\s*이만/,
   ];
   const enPatterns = [
-    // wrap up: requires session-level context or sentence-end, not code-level objects
-    /wrap(?:ping)?\s+up(?!\s+(?:this|the)\s+(?:pr|issue|bug|task|function|component|module|feature|code|test)\b)/i,
+    // wrap up: requires session-level context or sentence-end, not code-level
+    // objects. The review/analysis/debug/audit/investigation nouns were added
+    // for 6a — read-only review sessions are now "substantial", so "wrap up the
+    // review" must read as a task-level signal, not a session-close one.
+    /wrap(?:ping)?\s+up(?!\s+(?:this|the)\s+(?:pr|issue|bug|task|function|component|module|feature|code|test|review|analysis|investigation|debugging|debug|audit|refactor)\b)/i,
     /done\s+for\s+(?:today|now|the\s+day)/i,
     /that'?s?\s+(?:all|it)\s+for\s+(?:today|now|the\s+day)/i,
     /signing\s+off/i,
