@@ -15,6 +15,11 @@
  *   - /\bISSUE-\d+\b/i      → the wiki issue tracker, any case (e.g. ISSUE-N)
  *   - /\bfix[ \t ]+#\d+\b/i → the wiki fix tracker, any case (e.g. fix #N)
  *
+ * User-facing docs ONLY (README.md, README.ko.md, docs/) additionally block
+ * `ADR NNNN` / `decisions/NNNN` (USER_FACING_PATTERNS) — dangling pointers into the
+ * maintainer's private wiki ADR set. The CLI scope-gates these so shipped code
+ * comments and CHANGELOG history keep their ADR anchors.
+ *
  * Accepted edge cases (documented, not bugs):
  *   - FALSE POSITIVE: `FOO-ISSUE-N` matches (the `-` gives a word boundary
  *     before ISSUE). Such a string in this repo would still be a tracker ref.
@@ -22,6 +27,25 @@
  *     `#`, so `prefix #N`, `suffix #N`, `PR #N`, `(#N)`, and bare `#N` are all
  *     safe — none start the word `fix` right before the `#`.
  */
+
+// Applied by the CLI to user-facing docs ONLY (README.md / README.ko.md / docs/),
+// never to shipped code or CHANGELOG. A `ADR NNNN` / `decisions/NNNN` reference in
+// prose a user reads points into the maintainer's private wiki ADR set, which the
+// user does not have — a dangling pointer. The same anchor inside a code comment
+// is maintainer rationale (kept), so this set is scope-gated rather than global.
+// Examples below use `NNNN`, not real digits, so this file scans clean.
+export const USER_FACING_PATTERNS = [
+  {
+    name: 'ADR NNNN',
+    label: 'wiki ADR pointer (user-facing docs)',
+    re: /\bADR[ \t]+\d{3,4}\b/gi,
+  },
+  {
+    name: 'decisions/NNNN',
+    label: 'wiki decisions path (user-facing docs)',
+    re: /\bdecisions\/\d{3,4}\b/gi,
+  },
+];
 
 // Each entry: a named, /g/i regex over a single line of text.
 export const BLOCKED_PATTERNS = [
@@ -38,17 +62,18 @@ export const BLOCKED_PATTERNS = [
 ];
 
 /**
- * Scan a blob of text. Returns an array of hits:
+ * Scan a blob of text against `patterns` (default BLOCKED_PATTERNS). Returns hits:
  *   { pattern, label, match, line, col, lineText }
- * `line`/`col` are 1-based. Empty array => clean.
+ * `line`/`col` are 1-based. Empty array => clean. The CLI passes the broader
+ * [...BLOCKED_PATTERNS, ...USER_FACING_PATTERNS] set only for user-facing docs.
  */
-export function scanText(text) {
+export function scanText(text, patterns = BLOCKED_PATTERNS) {
   if (typeof text !== 'string' || text.length === 0) return [];
   const hits = [];
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const lineText = lines[i];
-    for (const { name, label, re } of BLOCKED_PATTERNS) {
+    for (const { name, label, re } of patterns) {
       re.lastIndex = 0; // reset shared /g regex between lines
       let m;
       while ((m = re.exec(lineText)) !== null) {
