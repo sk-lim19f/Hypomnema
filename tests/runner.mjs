@@ -42,6 +42,8 @@ import {
   scanText,
   stripScissors,
   messageHasGitTemplate,
+  BLOCKED_PATTERNS,
+  USER_FACING_PATTERNS,
 } from '../scripts/lib/check-tracker-ids.mjs';
 
 const HOME = homedir();
@@ -14610,6 +14612,18 @@ test('scanText allows GitHub refs and lookalikes', () => {
   }
 });
 
+test('scanText with USER_FACING_PATTERNS flags ADR / decisions pointers', () => {
+  const docPatterns = [...BLOCKED_PATTERNS, ...USER_FACING_PATTERNS];
+  assert.equal(scanText('see ADR 0040 for rationale', docPatterns).length, 1);
+  assert.equal(scanText('ADR\t0019 detail', docPatterns)[0].match, 'ADR\t0019');
+  assert.equal(scanText('lives in decisions/0031-foo.md', docPatterns)[0].match, 'decisions/0031');
+  // GitHub refs and tracker ids still behave: PR #N safe, ISSUE-N still caught.
+  assert.equal(scanText('PR #50 and (#9)', docPatterns).length, 0);
+  assert.equal(scanText('ISSUE-7 and ADR 0040', docPatterns).length, 2);
+  // Default pattern set (shipped code / commit msgs) never flags ADR refs.
+  assert.equal(scanText('ADR 0040 and decisions/0031 anchor').length, 0);
+});
+
 test('scanText reports 1-based line/col', () => {
   const hits = scanText('clean\nleak ISSUE-9 here');
   assert.equal(hits.length, 1);
@@ -14810,6 +14824,56 @@ test('CLI --staged: package.json leak is gated (scope agrees with --all)', () =>
     const r = runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir });
     assert.equal(r.status, 1, 'staged package.json leak must block');
     assert.match(r.stderr, /fix #7/);
+  });
+});
+
+test('CLI --all: ADR pointer in README is gated, but kept in code / CHANGELOG', () => {
+  withTmpDir((dir) => {
+    // README.md is user-facing → ADR pointer flagged.
+    writeFileSync(join(dir, 'README.md'), 'rationale lives in ADR 0031.\n');
+    const r = runChecker(['--all'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'README ADR pointer must be gated');
+    assert.match(r.stderr, /ADR 0031/);
+  });
+  withTmpDir((dir) => {
+    // README.ko.md too (the bilingual surface).
+    writeFileSync(join(dir, 'README.ko.md'), '근거는 decisions/0031 참고.\n');
+    assert.equal(runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status, 1);
+  });
+  withTmpDir((dir) => {
+    // docs/ tree is user-facing → flagged.
+    mkdirSync(join(dir, 'docs'), { recursive: true });
+    writeFileSync(join(dir, 'docs', 'ARCHITECTURE.md'), '## Section (ADR 0019)\n');
+    assert.equal(runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status, 1);
+  });
+  withTmpDir((dir) => {
+    // Shipped CODE keeps ADR rationale anchors → NOT flagged.
+    mkdirSync(join(dir, 'hooks'), { recursive: true });
+    writeFileSync(join(dir, 'hooks', 'x.mjs'), '// cwd-first (ADR 0044)\n');
+    assert.equal(
+      runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status,
+      0,
+      'code comment ADR anchors must NOT be gated',
+    );
+  });
+  withTmpDir((dir) => {
+    // CHANGELOG keeps version-history ADR refs → NOT flagged.
+    writeFileSync(join(dir, 'CHANGELOG.md'), '- gate single SoT (ADR 0046)\n');
+    assert.equal(
+      runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status,
+      0,
+      'CHANGELOG ADR refs must NOT be gated',
+    );
+  });
+});
+
+test('CLI --staged: a staged ADR pointer in README is gated', () => {
+  withSyntheticRepo(({ dir, g }) => {
+    writeFileSync(join(dir, 'README.md'), 'see ADR 0024 inside your wiki\n');
+    g(['add', 'README.md']);
+    const r = runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'staged README ADR pointer must block');
+    assert.match(r.stderr, /ADR 0024/);
   });
 });
 

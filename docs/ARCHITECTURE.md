@@ -80,7 +80,7 @@ The synthesis-heavy commands (`ingest`, `query`, `crystallize`, `lint`, `verify`
 
 ## Agent Skills
 
-`skills/<name>/SKILL.md` follows the Claude Agent Skills convention (per ADR `decisions/0001` in the wiki). When a conversation matches the skill's description, Claude auto-loads it without needing the slash command.
+`skills/<name>/SKILL.md` follows the Claude Agent Skills convention. When a conversation matches the skill's description, Claude auto-loads it without needing the slash command.
 
 > v1.0 originally planned flat `skills/*.md` files; v1.1 switched to `<name>/SKILL.md` for compatibility with the official Agent Skills loader.
 
@@ -331,7 +331,7 @@ scripts/weekly-report.mjs                  ← aggregated weekly autonomy score
 journal/weekly/<YYYY-Www>.md               ← committed report (heuristic v0, spec §6.4 SoT)
 ```
 
-### Transcript dual-source (ADR 0019)
+### Transcript dual-source
 
 `session-audit.mjs` reads transcripts from two locations, in priority order:
 

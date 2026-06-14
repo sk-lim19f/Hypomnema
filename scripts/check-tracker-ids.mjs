@@ -34,13 +34,24 @@
  * and never reaches an installed user), node_modules/, .git/. The checker's OWN
  * sources are scanned (NOT exempt); their examples use `N` placeholders so they
  * stay clean.
+ *
+ * ADR scope (narrower): README.md, README.ko.md, and docs/ additionally block
+ * `ADR NNNN` / `decisions/NNNN` wiki-ADR pointers (USER_FACING_PATTERNS). Shipped
+ * code comments and CHANGELOG history keep their ADR anchors, so this set is
+ * applied per-file via patternsFor() only inside that doc surface.
  */
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative, sep, extname } from 'node:path';
-import { scanText, stripScissors, messageHasGitTemplate } from './lib/check-tracker-ids.mjs';
+import {
+  scanText,
+  stripScissors,
+  messageHasGitTemplate,
+  BLOCKED_PATTERNS,
+  USER_FACING_PATTERNS,
+} from './lib/check-tracker-ids.mjs';
 import {
   parseNameStatus,
   parseLsFilesStage,
@@ -106,6 +117,20 @@ function isInScope(relPath) {
   if (!isTextFile(relPath)) return false;
   if (SCOPE_FILES.includes(relPath)) return true;
   return SCOPE_DIRS.includes(relPath.split(sep)[0]);
+}
+
+// User-facing prose surface: README.md, README.ko.md, and the docs/ tree. These
+// additionally block `ADR NNNN` / `decisions/NNNN` (dangling wiki-ADR pointers).
+// Everything else in scope — shipped code, CHANGELOG, package.json — keeps its ADR
+// anchors, so the broader pattern set is applied here ONLY.
+const USER_FACING_DOCS = new Set(['README.md', 'README.ko.md']);
+function isUserFacingDoc(relPath) {
+  return USER_FACING_DOCS.has(relPath) || relPath.split(sep)[0] === 'docs';
+}
+function patternsFor(relPath) {
+  return isUserFacingDoc(relPath)
+    ? [...BLOCKED_PATTERNS, ...USER_FACING_PATTERNS]
+    : BLOCKED_PATTERNS;
 }
 
 // Recursively collect in-scope text files under an absolute dir.
@@ -190,7 +215,7 @@ function runAll(json) {
     } catch {
       continue;
     }
-    for (const h of scanText(text)) violations.push({ file: rel, ...h });
+    for (const h of scanText(text, patternsFor(rel))) violations.push({ file: rel, ...h });
   }
   process.exit(report(violations, json));
 }
@@ -224,7 +249,8 @@ function runStaged(json) {
     // committed is gated (partial stage safety).
     const show = git(['show', `:${e.path}`]);
     if (show.status !== 0) continue;
-    for (const h of scanText(show.stdout || '')) violations.push({ file: e.path, ...h });
+    for (const h of scanText(show.stdout || '', patternsFor(e.path)))
+      violations.push({ file: e.path, ...h });
   }
   process.exit(report(violations, json));
 }

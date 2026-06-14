@@ -317,7 +317,7 @@ Major bumps must include an `upgrade.mjs` migration fixture in `tests/runner.mjs
 These documents live in the maintainer's personal wiki, not in this repo:
 
 - `~/hypomnema/projects/hypomnema/prd-v1.1.md` — current product requirements
-- `~/hypomnema/projects/hypomnema/decisions/0001..0014.md` — architecture decision records
+- `~/hypomnema/projects/hypomnema/decisions/*.md` — architecture decision records
 - `~/hypomnema/projects/hypomnema/design-history.md` — narrative design history
 - `~/hypomnema/projects/hypomnema/backlog-v1.0.md` — historical gap analysis (archived)
 - `~/hypomnema/projects/hypomnema/test-cases-v1.0.md` — historical QA spec (archived)
