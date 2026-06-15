@@ -28,7 +28,7 @@ tags: [project]
 | `prd.md` | Purpose and success criteria |
 | `hot.md` | Session snapshot and background |
 | `session-state.md` | Next-session handoff |
-| `session-log/` | Monthly work narrative |
+| `session-log/` | Daily-sharded work narrative (YYYY-MM-DD.md) |
 | `decisions/` | Architecture decision records |
 
 ---

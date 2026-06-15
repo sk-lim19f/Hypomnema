@@ -82,6 +82,9 @@ import {
   sessionClosedMarkerPath,
   readSessionClosedMarker,
   partitionLintScope,
+  sessionLogShardPath,
+  sessionLogReadCandidates,
+  sessionLogScopePath,
 } from '../hooks/hypo-shared.mjs';
 
 const LINT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'lint.mjs');
@@ -201,7 +204,7 @@ function runSessionCloseCheck(args) {
         `projects/${close.project}/session-state.md`,
         `projects/${close.project}/hot.md`,
         'hot.md',
-        `projects/${close.project}/session-log/${close.dates[0].slice(0, 7)}.md`,
+        sessionLogShardPath(close.project, close.dates[0]),
         'log.md',
       ]
     : [];
@@ -301,7 +304,7 @@ function writeIfChanged(path, content) {
 /**
  * Append `entry` to `path` only if `alreadyPresent(content)` is false.
  * Atomic: rebuilds the full file content and writes via atomicWrite — a crash
- * mid-append cannot leave log.md or session-log/YYYY-MM.md half-written, which
+ * mid-append cannot leave log.md or session-log/YYYY-MM-DD.md half-written, which
  * matters for these append-only history files.
  */
 function appendIfAbsent(path, entry, alreadyPresent) {
@@ -534,7 +537,6 @@ function applySessionClose(args) {
     process.exit(1);
   }
   const date = payload.date || todayLocal();
-  const ym = date.slice(0, 7);
 
   // Preflight: lint the wiki BEFORE writing any payload bytes. If lint
   // has blockers (errors) in files this apply WON'T overwrite, the wiki is in
@@ -559,11 +561,27 @@ function applySessionClose(args) {
   // the files it writes (other projects, shared pages this close did not author).
   // payloadScope = every file this apply writes or appends. Both lint passes are
   // judged against it; errors elsewhere are surfaced as notices, never blocking.
+  //
+  // session-log needs TWO entries (ADR 0050): the daily WRITE target (what this
+  // apply creates/appends, judged by post-apply lint) AND the freshness EVIDENCE
+  // file. They coincide except in the hybrid cutover month, where a fallback-
+  // aware no-op (the identical entry already lives in the legacy monthly file)
+  // writes no daily shard, leaving the monthly as the proof of freshness. Scope
+  // must then include that monthly file, or a CORRUPT monthly evidence file would
+  // pass the gate with its lint error demoted to a non-blocking notice.
+  // sessionLogScopePath returns the monthly ONLY when it carries today's heading
+  // (otherwise the daily write target), so unrelated monthly debt stays a notice.
+  // join() (platform-native), not the POSIX helper output: payloadScope membership
+  // is tested against lint's raw `e.file` (path.relative) WITHOUT posix
+  // normalization, so it must use the OS-native separator the sibling entries use.
+  const sessionLogWriteTarget = join('projects', project, 'session-log', `${date}.md`);
+  const sessionLogEvidence = join(...sessionLogScopePath(args.hypoDir, project, date).split('/'));
   const payloadScope = new Set([
     join('projects', project, 'session-state.md'),
     join('projects', project, 'hot.md'),
     'hot.md',
-    join('projects', project, 'session-log', `${ym}.md`),
+    sessionLogWriteTarget,
+    sessionLogEvidence, // == write target, except a hybrid-month monthly fallback
     'log.md',
     ...(payload.openQuestions ? [join('pages', 'open-questions.md')] : []),
   ]);
@@ -623,13 +641,51 @@ function applySessionClose(args) {
     content.includes(entry.endsWith('\n') ? entry.replace(/\n+$/, '') : entry);
 
   {
-    const rel = join('projects', project, 'session-log', `${ym}.md`);
-    const wrote = appendIfAbsent(
-      join(args.hypoDir, rel),
-      payload.sessionLog.entry,
-      entryAlreadyPresent(payload.sessionLog.entry),
-    );
-    (wrote ? applied : skipped).push(`sessionLog (${rel})`);
+    const rel = join('projects', project, 'session-log', `${date}.md`);
+    const full = join(args.hypoDir, rel);
+    const isPresent = entryAlreadyPresent(payload.sessionLog.entry);
+    // Fallback-aware idempotency (ADR 0050 hybrid cutover): during the month the
+    // shard takes over, today's entry may already live in the legacy monthly
+    // file from an earlier (pre-cutover) close. Treat presence in EITHER the
+    // daily shard or the legacy monthly file as "already written" so a same-day
+    // second close does not duplicate an identical entry across both files —
+    // and so an idempotent re-apply stays a true no-op (no shard is created).
+    let alreadyThere = false;
+    for (const cand of sessionLogReadCandidates(project, date)) {
+      const cf = join(args.hypoDir, cand);
+      if (!existsSync(cf)) continue;
+      try {
+        if (isPresent(readFileSync(cf, 'utf-8'))) {
+          alreadyThere = true;
+          break;
+        }
+      } catch {
+        /* unreadable candidate — fall through to the write path */
+      }
+    }
+    if (alreadyThere) {
+      skipped.push(`sessionLog (${rel})`);
+    } else if (!existsSync(full)) {
+      // A daily shard is a new file most days. Seed minimal valid frontmatter
+      // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
+      // wiki page rather than a W1 "no frontmatter" warning, and write the header
+      // AND the first entry in ONE atomic write — never leave a header-only shard
+      // on disk, which freshness would skip (no dated heading) while derive could
+      // otherwise mistake it for the evidence file. The dated `## [date] ...`
+      // heading lives inside the entry, so freshness / derive / design-history
+      // are unchanged.
+      const header =
+        `---\ntitle: Session Log ${date} (${project})\n` +
+        `type: session-log\nupdated: ${date}\n---\n\n` +
+        `# Session Log ${date} (${project})\n`;
+      const entry = payload.sessionLog.entry;
+      const body = entry.endsWith('\n') ? entry : `${entry}\n`;
+      atomicWrite(full, `${header}\n${body}`);
+      applied.push(`sessionLog (${rel})`);
+    } else {
+      const wrote = appendIfAbsent(full, payload.sessionLog.entry, isPresent);
+      (wrote ? applied : skipped).push(`sessionLog (${rel})`);
+    }
   }
 
   {

@@ -179,7 +179,7 @@ Helpers used by command scripts only. Not deployed to hooks.
 │       ├── hot.md            ← project-level current state
 │       ├── session-state.md  ← next tasks + last session summary
 │       └── session-log/
-│           └── YYYY-MM.md    ← append-only monthly session log
+│           └── YYYY-MM-DD.md ← append-only daily session-log shard
 ├── journal/
 │   ├── daily/
 │   ├── weekly/

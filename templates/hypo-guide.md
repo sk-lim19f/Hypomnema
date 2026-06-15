@@ -78,7 +78,7 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
 
 1. Update `projects/<name>/session-state.md` (next tasks, overwrite)
 2. Update `projects/<name>/hot.md` (what was done, ≤500 words, overwrite)
-3. Append to `projects/<name>/session-log/YYYY-MM.md` (narrative entry, append-only)
+3. Append to `projects/<name>/session-log/YYYY-MM-DD.md` (daily shard, narrative entry, append-only)
 4. Update root `hot.md` pointer table + date
 5. Run `scripts/lint.mjs` and fix errors in files **you** touched — debt in other
    projects / shared pages you did not author is reported as a non-blocking

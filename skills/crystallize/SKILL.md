@@ -59,7 +59,7 @@ When uncertain, surface the question rather than skip it. None of the four block
 1. **session-state.md** — update `projects/<name>/session-state.md` with the next tasks list (what to tackle first next time).
 2. **hot.md (project)** — update `projects/<name>/hot.md` with a session snapshot: what changed and decisions made. Keep under 500 words. Do not put next-step tasks here; those belong in session-state.md.
 3. **hot.md (root)** — update `<wiki-root>/hot.md` active-projects pointer table: set the `Last Session` date for this project to today.
-4. **session-log** — append a session entry to `projects/<name>/session-log/YYYY-MM.md` (create the file if it does not exist for this month).
+4. **session-log** — append a session entry to `projects/<name>/session-log/YYYY-MM-DD.md` (daily shard; the apply path creates today's file with seeded frontmatter if it does not exist yet).
 5. **open-questions** — only if `pages/open-questions.md` exists and questions were raised or resolved this session: move resolved ones out; add newly raised ones. Skip if unchanged.
 6. **log.md** — append a `session` entry to `<wiki-root>/log.md`.
 

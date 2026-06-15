@@ -41,7 +41,7 @@ Payload shape (5 required + 1 conditional, per Spec §5.2.7 / §8.3 + ADR 0029):
   "sessionState": { "content": "<full body of projects/<name>/session-state.md>" },
   "projectHot": { "content": "<full body of projects/<name>/hot.md>" },
   "rootHot": { "content": "<full body of <hypo-root>/hot.md>" },
-  "sessionLog": { "entry": "<entry to append to projects/<name>/session-log/YYYY-MM.md>" },
+  "sessionLog": { "entry": "<entry to append to projects/<name>/session-log/YYYY-MM-DD.md (daily shard)>" },
   "log": { "entry": "<entry to append to <hypo-root>/log.md>" },
   "openQuestions": { "content": "<full body of pages/open-questions.md>" }
 }
@@ -67,7 +67,7 @@ Content guidance for each slot:
 1. **sessionState** — next tasks list for the upcoming session (what to tackle first next time).
 2. **projectHot** — session snapshot under 500 words: what changed and decisions made. Do **not** put next-step tasks here; those belong in `sessionState`.
 3. **rootHot** — active-projects pointer table with this project's `Last Session` date set to today.
-4. **sessionLog** — one session entry to append to `projects/<name>/session-log/YYYY-MM.md`.
+4. **sessionLog** — one session entry to append to `projects/<name>/session-log/YYYY-MM-DD.md` (daily shard).
 5. **log** — one `session` entry to append to `<hypo-root>/log.md`.
 6. **openQuestions** (conditional) — only if `pages/open-questions.md` exists and questions were raised or resolved this session.
 

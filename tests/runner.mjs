@@ -750,6 +750,9 @@ const {
   sessionCloseGlobalStatus,
   deriveRootLogEntries,
   partitionLintScope,
+  sessionLogShardPath,
+  sessionLogReadCandidates,
+  sessionCloseFileStatus,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -1074,8 +1077,177 @@ test('closeFileTargets: returns the 5 mandatory close files for the active proje
     assert.ok(t.has('log.md'));
     assert.ok(t.has('projects/proj/session-state.md'));
     assert.ok(t.has('projects/proj/hot.md'));
-    assert.ok([...t].some((f) => /^projects\/proj\/session-log\/\d{4}-\d{2}\.md$/.test(f)));
+    assert.ok([...t].some((f) => /^projects\/proj\/session-log\/\d{4}-\d{2}-\d{2}\.md$/.test(f)));
   });
+});
+
+suite('session-log daily shard (ADR 0050)');
+
+test('sessionLogShardPath: date is the filename (daily canonical, POSIX)', () => {
+  assert.equal(
+    sessionLogShardPath('proj', '2026-06-15'),
+    'projects/proj/session-log/2026-06-15.md',
+  );
+});
+
+test('sessionLogReadCandidates: daily shard first, legacy monthly fallback', () => {
+  assert.deepEqual(sessionLogReadCandidates('proj', '2026-06-15'), [
+    'projects/proj/session-log/2026-06-15.md',
+    'projects/proj/session-log/2026-06.md',
+  ]);
+});
+
+test('freshness: a today-dated heading in the daily shard (no monthly file) passes the gate', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    // Remove the monthly file the fixture seeds; put the entry in the daily shard only.
+    rmSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`));
+    writeFileSync(
+      join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
+      `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] daily-shard session\n`,
+    );
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    assert.ok(
+      !st.stale.some((f) => f.includes('session-log')) &&
+        !st.missing.some((f) => f.includes('session-log')),
+      `daily shard should satisfy freshness: ${JSON.stringify(st)}`,
+    );
+  });
+});
+
+test('freshness: legacy monthly file (no daily shard) still passes via fallback', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today); // seeds the monthly file only
+    assert.ok(
+      !existsSync(join(dir, 'projects', 'test-project', 'session-log', `${today}.md`)),
+      'no daily shard should exist for this fixture',
+    );
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    assert.ok(
+      !st.stale.some((f) => f.includes('session-log')) &&
+        !st.missing.some((f) => f.includes('session-log')),
+      `legacy monthly fallback should satisfy freshness: ${JSON.stringify(st)}`,
+    );
+  });
+});
+
+test('freshness: when NEITHER daily nor monthly carries today, the gap is reported as the daily shard', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    // Make the monthly file carry an OLD date (no today heading) and no daily shard.
+    writeFileSync(
+      join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n`,
+    );
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    const reported = [...st.stale, ...st.missing].filter((f) => f.includes('session-log'));
+    assert.ok(
+      reported.length === 1 && /\/\d{4}-\d{2}-\d{2}\.md$/.test(reported[0]),
+      `gap must be reported as the daily shard, got: ${JSON.stringify(reported)}`,
+    );
+  });
+});
+
+test('apply: a new daily shard is created with seeded frontmatter (lint-clean, not monthly)', () => {
+  withWiki(null, (dir, today) => {
+    // buildCleanWikiTree seeds the monthly file with today's heading; the payload
+    // carries a DISTINCT entry, so the apply must create the daily shard.
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] brand-new daily entry\n\nbody\n` };
+    payload.log = { entry: `## [${today}] session | test-project — daily\n` };
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 0, `apply must succeed: ${r.stdout}\n${r.stderr}`);
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    assert.ok(existsSync(shard), 'daily shard must be created');
+    const body = readFileSync(shard, 'utf-8');
+    assert.ok(/^---\n/.test(body), 'shard must start with seeded frontmatter');
+    assert.ok(/\ntype: session-log\n/.test(body), 'shard frontmatter must carry type');
+    assert.ok(/\ntitle: /.test(body), 'shard frontmatter must carry title');
+    assert.ok(body.includes('brand-new daily entry'), 'entry must be appended after the header');
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `post-apply lint on the seeded shard must be clean: ${r.stdout}`);
+  });
+});
+
+test('apply: identical entry already in the legacy monthly file → no duplicate, no daily shard (hybrid no-op)', () => {
+  withWiki(null, (dir, today) => {
+    // The fixture's monthly file already carries `## [today] test session`.
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] test session\n` }; // identical to the seeded monthly heading
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 0, `apply must succeed: ${r.stdout}\n${r.stderr}`);
+    assert.ok(
+      !existsSync(join(dir, 'projects', 'test-project', 'session-log', `${today}.md`)),
+      'no daily shard should be created when the identical entry already lives in the monthly file',
+    );
+  });
+});
+
+test('apply (ADR 0050 regression): a CORRUPT monthly evidence file in the no-op path blocks (no false-pass)', () => {
+  withWiki(
+    (dir, today) => {
+      // Pre-commit: corrupt the monthly file's frontmatter (--- never closes) but
+      // keep today's heading, so freshness still accepts it via the fallback.
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        `---\ntitle: sl\ntype: session-log\n\n## [${today}] test session\n`,
+      );
+    },
+    (dir, today) => {
+      // Identical entry → fallback-aware idempotency would skip the daily write,
+      // leaving the corrupt monthly as the freshness evidence. Because that file
+      // is now the resolved evidence, it is IN payloadScope and its malformed
+      // frontmatter must abort preflight — not pass with an out-of-scope notice.
+      const payload = payloadForCleanWiki(dir, today);
+      payload.sessionLog = { entry: `## [${today}] test session\n` };
+      const r = runApply(dir, payload);
+      assert.equal(
+        r.status,
+        1,
+        `corrupt monthly evidence must block, got ${r.status}\n${r.stdout}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false);
+      assert.equal(out.stage, 'preflight-lint', `stage should be preflight-lint: ${r.stdout}`);
+    },
+  );
+});
+
+test('apply (ADR 0050): a corrupt monthly is OUT of scope (a notice) once the daily shard is the evidence (Bug B preserved)', () => {
+  withWiki(
+    (dir, today) => {
+      // The daily shard carries today's heading → IT is the evidence, not the
+      // monthly. The monthly is corrupt but unrelated debt: it must stay a
+      // non-blocking notice (Bug B), exactly like any other out-of-scope file.
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
+        `---\ntitle: Session Log ${today} (test-project)\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] daily session\n`,
+      );
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        `---\ntitle: sl\ntype: session-log\n\n## [2020-01-01] old\n`,
+      );
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      payload.sessionLog = { entry: `## [${today}] another distinct entry\n` };
+      const r = runApply(dir, payload);
+      assert.equal(
+        r.status,
+        0,
+        `corrupt monthly debt must NOT block when the daily shard is the evidence: ${r.stdout}\n${r.stderr}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.ok,
+        true,
+        `apply ok; the monthly error is an out-of-scope notice: ${r.stdout}`,
+      );
+    },
+  );
 });
 
 test('extractTouchedWikiFiles: pulls Edit/Write file_paths under hypoDir, ignores outside paths', () => {
@@ -1984,7 +2156,7 @@ test('same-day second close: distinct entries are both appended (W1 regression)'
     assert.equal(r2.status, 0, `second apply failed: ${r2.stdout}\n${r2.stderr}`);
 
     const sl = readFileSync(
-      join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+      join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
       'utf-8',
     );
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
@@ -2108,7 +2280,7 @@ test('apply (#39): payload supplied + gate ok → still full apply (W1-2 guard, 
     assert.equal(out.ok, true);
     assert.ok(!out.alreadyComplete, 'payload path must run full apply, not probe');
     const sl = readFileSync(
-      join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+      join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
       'utf-8',
     );
     assert.ok(sl.includes('2nd close'), `2nd-close entry must land on disk: ${sl}`);
@@ -2222,9 +2394,10 @@ test('preflight (#40 + Bug B): corrupt APPEND target (session-log) STILL blocks 
   // pre-existing malformed session-log file is in the payload scope and is NOT an
   // overwrite target, so it must still abort preflight before any byte is written.
   withWiki(null, (dir, today) => {
-    const ym = today.slice(0, 7);
+    // The append target is now the daily shard (ADR 0050), so a corrupt daily
+    // file is the in-scope, non-overwrite append target that must still block.
     writeFileSync(
-      join(dir, 'projects', 'test-project', 'session-log', `${ym}.md`),
+      join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
       '---\ntitle: sl\ntype: session-log\n\nbody (frontmatter never closes)\n',
     );
     const sentinel = `<!-- append-block-sentinel-${Date.now()} -->`;
@@ -8692,6 +8865,57 @@ test('closeFileTargetsGlobal: union over today-active projects, all freshDate mo
   });
 });
 
+test('regression (ADR 0050): the legacy monthly file that PROVES freshness is in lint scope (no false-pass)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    const ym = today.slice(0, 7);
+    // alpha's freshness evidence is the legacy monthly file; there is NO daily
+    // shard. If the scope only ever named the daily shard, a corrupt monthly
+    // evidence file would pass the gate with its lint error demoted to a notice.
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today }]);
+    const scope = closeFileTargetsGlobal(dir);
+    assert.ok(
+      scope.has(`projects/alpha/session-log/${ym}.md`),
+      `the monthly evidence file must be in scope, got: ${JSON.stringify([...scope])}`,
+    );
+    // A lint error in that evidence file must therefore be classified blocking.
+    const { blocking } = partitionLintScope(
+      [
+        {
+          file: `projects/alpha/session-log/${ym}.md`,
+          message: 'Malformed frontmatter (unclosed ---)',
+          severity: 'error',
+        },
+      ],
+      scope,
+    );
+    assert.equal(
+      blocking.length,
+      1,
+      'an error in the file the gate trusts as freshness proof must block, not be a notice',
+    );
+  });
+});
+
+test('regression (ADR 0050): once a daily shard carries today, IT (not the monthly) is the scoped evidence', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    const ym = today.slice(0, 7);
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today }]);
+    // Add a daily shard that carries today's heading → it becomes the evidence.
+    writeFileSync(
+      join(dir, 'projects', 'alpha', 'session-log', `${today}.md`),
+      `---\ntitle: Session Log ${today} (alpha)\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] session\n`,
+    );
+    const scope = closeFileTargetsGlobal(dir);
+    assert.ok(scope.has(`projects/alpha/session-log/${today}.md`), 'daily shard is the evidence');
+    assert.ok(
+      !scope.has(`projects/alpha/session-log/${ym}.md`),
+      'the monthly file is no longer the evidence, so it is out of scope (its stale debt does not block)',
+    );
+  });
+});
+
 test('regression: the close path never passes cwd into resolveActiveProject (resume=cwd / close=no-pick split)', () => {
   // ADR 0043: close callers must not import a cwd-aware project pick. Guard the
   // source so a future "re-sync" with resume.mjs cannot reintroduce cwd masking.
@@ -8725,6 +8949,30 @@ test('derives the canonical log.md entry when only log.md is the gap', () => {
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
     assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha`, 'm'));
     assert.equal(sessionCloseGlobalStatus(dir).ok, true, 'gate now passes after derive');
+  });
+});
+
+test('regression (ADR 0050): derive recovers from the legacy monthly when the daily shard is header-only', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha's real today heading lives in the legacy monthly; a daily shard
+    // exists but is HEADER-ONLY (a seeded-but-interrupted write). log.md is the
+    // only gap. Derive must skip the header-only shard and read the monthly —
+    // matching freshness, which also accepts the monthly via fallback. Stopping
+    // at the first *existing* candidate would silently fail to recover log.md.
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    writeFileSync(
+      join(dir, 'projects', 'alpha', 'session-log', `${today}.md`),
+      `---\ntitle: Session Log ${today} (alpha)\ntype: session-log\nupdated: ${today}\n---\n\n# Session Log ${today} (alpha)\n`,
+    );
+    const n = deriveRootLogEntries(dir);
+    assert.equal(
+      n,
+      1,
+      'derive must recover the entry from the legacy monthly, not stop at the header-only shard',
+    );
+    const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha`, 'm'));
   });
 });
 
