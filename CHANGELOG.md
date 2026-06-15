@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Highlights
 
 - The marketplace plugin now installs as `hypo`, so the documented `/hypo:*` commands work straight away (#101).
-- Session logs are sharded by day, so each session close reads today's small file instead of the whole month (#114).
+- Session logs are sharded by day, so each session close reads today's small file instead of the whole month (#118).
 - `crystallize --check-session-close` now agrees with `/compact` exactly, so a green check means the gate will not block (#109).
 
 > [!IMPORTANT]
@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The Claude marketplace plugin is renamed `hypomnema` to `hypo`, so its slash commands now match the docs.** Claude Code namespaces a plugin's slash commands by the plugin's `name` field, so the plugin (named `hypomnema`) actually registered its commands as `/hypomnema:resume`, `/hypomnema:init`, and so on. Every doc, command body, and `/hypo:init` reference assumed `/hypo:*`, so a user who installed via the marketplace and followed the README hit "command not found". (The npm/manual install path was never affected: it copies the command files into `~/.claude/commands/hypo/`, which already yields `/hypo:*`.) Renaming the plugin to `hypo` makes both install paths expose the same `/hypo:*` namespace the docs describe. The marketplace itself keeps its name (`hypomnema`), so `/plugin marketplace add` and `/plugin marketplace update hypomnema` are unchanged; only the plugin identifier in the install command changes. (See the migration callout above.) (#101)
 
-- **Session logs are now written as daily shards (`session-log/YYYY-MM-DD.md`) instead of one file per month.** A month's log grew to thousands of lines, and every session close read the whole file (to append without duplicating and to verify the close is fresh), so the read cost climbed as the month filled up. Each close now touches only today's small file. Existing monthly files (`YYYY-MM.md`) are still read as a fallback, so nothing needs to be migrated or split: daily shards take over going forward, and a close during the cutover month resolves correctly from whichever file holds today's entry. The dated `## [YYYY-MM-DD]` heading still lives inside each entry, so search, root-log derivation, and design-history tracking are unchanged. A new daily file is created with seeded frontmatter (title and type) on its first write. (#114)
+- **Session logs are now written as daily shards (`session-log/YYYY-MM-DD.md`) instead of one file per month.** A month's log grew to thousands of lines, and every session close read the whole file (to append without duplicating and to verify the close is fresh), so the read cost climbed as the month filled up. Each close now touches only today's small file. Existing monthly files (`YYYY-MM.md`) are still read as a fallback, so nothing needs to be migrated or split: daily shards take over going forward, and a close during the cutover month resolves correctly from whichever file holds today's entry. The dated `## [YYYY-MM-DD]` heading still lives inside each entry, so search, root-log derivation, and design-history tracking are unchanged. A new daily file is created with seeded frontmatter (title and type) on its first write. (#118)
 
 ### Fixed
 
@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **하이라이트**
 
 - 마켓플레이스 플러그인이 이제 `hypo`로 설치되어, 문서에 적힌 `/hypo:*` 커맨드가 바로 동작합니다 (#101).
-- 세션 로그를 일별로 분할(shard)하여, 매 세션 종료가 한 달치 전체 대신 오늘치 작은 파일만 읽습니다 (#114).
+- 세션 로그를 일별로 분할(shard)하여, 매 세션 종료가 한 달치 전체 대신 오늘치 작은 파일만 읽습니다 (#118).
 - `crystallize --check-session-close`가 이제 `/compact`와 정확히 일치하여, 체크가 깨끗하면 게이트도 막지 않습니다 (#109).
 
 > [!IMPORTANT]
@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Claude 마켓플레이스 플러그인 이름을 `hypomnema`에서 `hypo`로 변경하여 슬래시 커맨드가 문서와 일치하게 되었습니다.** Claude Code는 플러그인 슬래시 커맨드를 플러그인의 `name` 필드로 네임스페이싱합니다. 그래서 이름이 `hypomnema`인 플러그인은 커맨드를 실제로 `/hypomnema:resume`, `/hypomnema:init` 등으로 등록했습니다. 모든 문서·커맨드 본문·`/hypo:init` 안내는 `/hypo:*`을 가정했으므로, 마켓플레이스로 설치하고 README를 따른 사용자는 "command not found"를 만났습니다. (npm/수동 설치 경로는 영향이 없었습니다. 커맨드 파일을 `~/.claude/commands/hypo/`로 복사하므로 처음부터 `/hypo:*`이 됩니다.) 플러그인 이름을 `hypo`로 바꾸면 두 설치 경로 모두 문서가 설명하는 동일한 `/hypo:*` 네임스페이스를 노출합니다. 마켓플레이스 이름(`hypomnema`)은 그대로이므로 `/plugin marketplace add`와 `/plugin marketplace update hypomnema`는 변하지 않으며, 설치 명령의 플러그인 식별자만 바뀝니다. (위 마이그레이션 콜아웃을 참조하세요.) (#101)
 
-- **세션 로그를 월별 단일 파일 대신 일별 shard(`session-log/YYYY-MM-DD.md`)로 기록합니다.** 한 달치 로그가 수천 줄로 커지면서 매 세션 종료가 그 파일 전체를 읽었고(중복 없이 append하고 종료 신선도를 확인하기 위해서입니다), 달이 찰수록 읽기 비용이 커졌습니다. 이제 종료는 오늘치 작은 파일만 건드립니다. 기존 월별 파일(`YYYY-MM.md`)은 fallback으로 계속 읽으므로 마이그레이션이나 분할이 필요 없습니다. 일별 shard가 이후부터 인계받고, 전환 달의 종료는 오늘 항목이 든 파일에서 올바르게 해석됩니다. 날짜 헤딩(`## [YYYY-MM-DD]`)은 각 항목 안에 그대로 있으므로 검색·루트 로그 도출·design-history 추적은 변함이 없습니다. 새 일별 파일은 첫 기록 시 frontmatter(title·type)를 seed하여 생성합니다. (#114)
+- **세션 로그를 월별 단일 파일 대신 일별 shard(`session-log/YYYY-MM-DD.md`)로 기록합니다.** 한 달치 로그가 수천 줄로 커지면서 매 세션 종료가 그 파일 전체를 읽었고(중복 없이 append하고 종료 신선도를 확인하기 위해서입니다), 달이 찰수록 읽기 비용이 커졌습니다. 이제 종료는 오늘치 작은 파일만 건드립니다. 기존 월별 파일(`YYYY-MM.md`)은 fallback으로 계속 읽으므로 마이그레이션이나 분할이 필요 없습니다. 일별 shard가 이후부터 인계받고, 전환 달의 종료는 오늘 항목이 든 파일에서 올바르게 해석됩니다. 날짜 헤딩(`## [YYYY-MM-DD]`)은 각 항목 안에 그대로 있으므로 검색·루트 로그 도출·design-history 추적은 변함이 없습니다. 새 일별 파일은 첫 기록 시 frontmatter(title·type)를 seed하여 생성합니다. (#118)
 
 ### Fixed (한글)
 
