@@ -172,7 +172,7 @@ export function hotMdIsClean(dir = HYPO_DIR) {
 // spec §5.2.7 / §8.3 (updated 2026-05-15): session-close = steps 1~6 of the
 // 11-step crystallize checklist (synthesis is steps 7~11). The hard gate
 // (sessionCloseFileStatus) confirms the 5 mandatory files — session-state.md,
-// project hot.md, root hot.md, session-log/YYYY-MM.md, and log.md.
+// project hot.md, root hot.md, session-log/YYYY-MM-DD.md, and log.md.
 // pages/open-questions.md (step 5) is conditional ("변경 시") — it is a
 // cross-project queue, so a session that raises no questions should not be
 // forced to touch it. Gating it would produce false-blocks; spec §5.2.7
@@ -205,6 +205,56 @@ function escapeRegExp(s) {
  */
 export function hasSessionLogHeading(content, date) {
   return new RegExp('^#{1,6} \\[' + escapeRegExp(date) + '\\]', 'm').test(content || '');
+}
+
+/**
+ * Canonical session-log shard path (repo-relative POSIX) for a single day.
+ * ADR 0050 / option D: the date IS the filename (`YYYY-MM-DD.md`), so no
+ * "current part" resolver is needed and the per-session write touches a small
+ * file instead of a multi-thousand-line monthly log. This is the WRITE target.
+ */
+export function sessionLogShardPath(project, date) {
+  return `projects/${project}/session-log/${date}.md`;
+}
+
+/**
+ * Read candidates for a date's session-log entry, in priority order:
+ *   1. the daily shard `YYYY-MM-DD.md` (canonical, small)
+ *   2. the legacy monthly `YYYY-MM.md` (pre-shard history is never split)
+ * Callers iterate and short-circuit on the first file carrying the dated
+ * heading, so once a daily shard exists the large monthly file is never read —
+ * which is where the per-close token saving comes from. The monthly fallback
+ * keeps pre-cutover months (and a hybrid cutover month) resolving correctly
+ * without a retroactive split.
+ */
+export function sessionLogReadCandidates(project, date) {
+  return [
+    sessionLogShardPath(project, date),
+    `projects/${project}/session-log/${date.slice(0, 7)}.md`,
+  ];
+}
+
+/**
+ * The session-log file the close gate should hold accountable for `date` — i.e.
+ * the read candidate that ACTUALLY carries a today-dated heading (daily shard
+ * preferred), or the daily write target when none does yet. The freshness gate
+ * accepts a today-heading found in the legacy monthly file via fallback; if the
+ * lint scope only ever named the daily shard, a close could pass on a *corrupt*
+ * monthly evidence file while that file's lint error was demoted to a
+ * non-blocking notice (out of scope). Scoping to the resolved evidence file
+ * closes that gap: whatever file the gate trusts as proof, lint judges too.
+ */
+export function sessionLogScopePath(hypoDir, project, date) {
+  for (const rel of sessionLogReadCandidates(project, date)) {
+    const full = join(hypoDir, rel);
+    if (!existsSync(full)) continue;
+    try {
+      if (hasSessionLogHeading(readFileSync(full, 'utf-8'), date)) return rel;
+    } catch {
+      /* unreadable candidate — keep looking */
+    }
+  }
+  return sessionLogShardPath(project, date);
 }
 
 /**
@@ -346,7 +396,8 @@ export function resolveActiveProject(hypoDir, cwd = null) {
  *   - projects/<project>/session-state.md       — frontmatter `updated:` is today
  *   - projects/<project>/hot.md                 — frontmatter `updated:` is today
  *   - hot.md (root)                             — frontmatter `updated:` is today
- *   - projects/<project>/session-log/YYYY-MM.md — has a `## [today]` heading
+ *   - projects/<project>/session-log/YYYY-MM-DD.md — has a `## [today]` heading
+ *     (daily shard, ADR 0050; legacy YYYY-MM.md is still accepted as fallback)
  *   - log.md                                    — has a `## [today] session | <project>` entry
  * The log.md check is project-scoped so a session close left incomplete for
  * project A can't be masked by a fresh close of project B (and vice versa).
@@ -400,25 +451,30 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
   checkUpdated(join('projects', project, 'hot.md'));
   checkUpdated('hot.md');
 
-  // session-log: monthly append-only file — must carry a today-dated heading.
-  // Reported under the local date's month (dates[0]) when no match is found.
+  // session-log: daily shard (ADR 0050), with legacy monthly fallback — must
+  // carry a today-dated heading in whichever file holds it. Daily-first read
+  // order short-circuits on the small shard. When no match is found, the gap is
+  // reported under the canonical daily shard for the local date (dates[0]).
   let sessionLogOk = false;
   for (const date of dates) {
-    const full = join(hypoDir, 'projects', project, 'session-log', `${date.slice(0, 7)}.md`);
-    if (!existsSync(full)) continue;
-    let content = '';
-    try {
-      content = readFileSync(full, 'utf-8');
-    } catch {
-      continue;
+    for (const rel of sessionLogReadCandidates(project, date)) {
+      const full = join(hypoDir, rel);
+      if (!existsSync(full)) continue;
+      let content = '';
+      try {
+        content = readFileSync(full, 'utf-8');
+      } catch {
+        continue;
+      }
+      if (hasSessionLogHeading(content, date)) {
+        sessionLogOk = true;
+        break;
+      }
     }
-    if (hasSessionLogHeading(content, date)) {
-      sessionLogOk = true;
-      break;
-    }
+    if (sessionLogOk) break;
   }
   if (!sessionLogOk) {
-    const logRel = join('projects', project, 'session-log', `${dates[0].slice(0, 7)}.md`);
+    const logRel = sessionLogShardPath(project, dates[0]);
     (existsSync(join(hypoDir, logRel)) ? stale : missing).push(logRel);
   }
 
@@ -525,8 +581,9 @@ function hasTodayCloseActivity(hypoDir, project, dates) {
   if (fresh(join('projects', project, 'session-state.md'))) return true;
   if (fresh(join('projects', project, 'hot.md'))) return true;
   for (const d of dates) {
-    const sl = join(hypoDir, 'projects', project, 'session-log', `${d.slice(0, 7)}.md`);
-    if (existsSync(sl)) {
+    for (const rel of sessionLogReadCandidates(project, d)) {
+      const sl = join(hypoDir, rel);
+      if (!existsSync(sl)) continue;
       try {
         if (hasSessionLogHeading(readFileSync(sl, 'utf-8'), d)) return true;
       } catch {
@@ -677,15 +734,27 @@ export function deriveRootLogEntries(hypoDir) {
     if (!(problems.length === 1 && problems[0] === 'log.md')) continue;
 
     for (const date of dates) {
-      const ym = date.slice(0, 7);
-      const slogPath = join(hypoDir, 'projects', slug, 'session-log', `${ym}.md`);
-      if (!existsSync(slogPath)) continue;
-      let slog;
-      try {
-        slog = readFileSync(slogPath, 'utf-8');
-      } catch {
-        continue;
+      // Pick the candidate that actually CARRIES this date's heading (daily shard
+      // preferred), mirroring the freshness gate's resolution. Selecting merely
+      // the first *existing* file would diverge from freshness: a header-only
+      // daily shard (e.g. a seeded-but-not-yet-appended file) would be chosen and
+      // the real heading in the legacy monthly fallback missed — freshness would
+      // pass while derive failed to recover the log.md entry.
+      let slog = null;
+      for (const rel of sessionLogReadCandidates(slug, date)) {
+        const slogPath = join(hypoDir, rel);
+        if (!existsSync(slogPath)) continue;
+        let content;
+        try {
+          content = readFileSync(slogPath, 'utf-8');
+        } catch {
+          continue;
+        }
+        if (!hasSessionLogHeading(content, date)) continue;
+        slog = content;
+        break;
       }
+      if (slog === null) continue;
       const headingRe = new RegExp('^#{1,6} \\[' + escapeRegExp(date) + '\\]\\s*(.*)$', 'gm');
       let m;
       while ((m = headingRe.exec(slog)) !== null) {
@@ -1298,8 +1367,7 @@ export function closeFileTargets(hypoDir) {
   if (project) {
     out.add(`projects/${project}/session-state.md`);
     out.add(`projects/${project}/hot.md`);
-    const month = freshDates()[0].slice(0, 7);
-    out.add(`projects/${project}/session-log/${month}.md`);
+    out.add(sessionLogScopePath(hypoDir, project, freshDates()[0]));
   }
   return out;
 }
@@ -1308,8 +1376,8 @@ export function closeFileTargets(hypoDir) {
  * Global variant of closeFileTargets for the no-payload lint-scope callers
  * (ADR 0043). Union of the close files over every today-active project
  * (fallback: the recency project when none is active). Includes the session-log
- * month for EVERY freshDate (not just dates[0]) so the lint scope matches what
- * sessionCloseFileStatus actually checks across a local/UTC month boundary.
+ * evidence file for EVERY freshDate (not just dates[0]) so the lint scope matches
+ * what sessionCloseFileStatus actually checks across a local/UTC date boundary.
  */
 export function closeFileTargetsGlobal(hypoDir) {
   const dates = freshDates();
@@ -1324,7 +1392,10 @@ export function closeFileTargetsGlobal(hypoDir) {
   for (const p of active) {
     out.add(`projects/${p}/session-state.md`);
     out.add(`projects/${p}/hot.md`);
-    for (const d of dates) out.add(`projects/${p}/session-log/${d.slice(0, 7)}.md`);
+    // Scope to the file each date's freshness is PROVEN by (daily shard or, via
+    // fallback, the legacy monthly), so a corrupt evidence file can't pass the
+    // gate while its lint error is demoted to an out-of-scope notice.
+    for (const d of dates) out.add(sessionLogScopePath(hypoDir, p, d));
   }
   return out;
 }

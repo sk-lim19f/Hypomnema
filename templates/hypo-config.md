@@ -36,6 +36,6 @@ HYPO_SKIP_GATE=1
 │   └── <name>/
 │       ├── index.md    ← project overview (working_dir: field)
 │       ├── hot.md      ← project-scoped session snapshot
-│       └── session-log/    ← monthly logs (YYYY-MM.md)
+│       └── session-log/    ← daily shards (YYYY-MM-DD.md)
 └── sources/            ← raw ingested sources (read-only)
 ```

@@ -210,7 +210,7 @@ process.stdin.on('end', () => {
       `  [ ] 3. Ingest    — if new external knowledge, save to sources/ and ingest`,
       `  [ ] 4. Pages     — extract new concepts/patterns to pages/`,
       `  [ ] 5. Synthesis — if 3+ cross-page analysis results, save to pages/syntheses/`,
-      `  [ ] 6. session-log — append to projects/<name>/session-log/YYYY-MM.md`,
+      `  [ ] 6. session-log — append to projects/<name>/session-log/YYYY-MM-DD.md (daily shard)`,
       `  [ ] 7. index.md  — update Projects section if needed`,
       `  [ ] 8. log.md    — append ## [${today}] session | <project-name>`,
       `  [ ] 9. hot.md    — update projects/<name>/hot.md (no exceptions)`,

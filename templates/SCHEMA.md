@@ -30,7 +30,7 @@ Read this before any wiki operation (ingest / query / lint).
 | `weekly-journal` | `journal/weekly/YYYY-Www.md` | Weekly session/ingest summary | append-only |
 | `prd` | `projects/*/prd.md` | Project purpose, success criteria, constraints | mutable |
 | `adr` | `projects/*/decisions/NNNN-*.md` | Architecture decision records | immutable |
-| `session-log` | `projects/*/session-log/YYYY-MM.md` | Chronological session narrative (monthly) | append-only |
+| `session-log` | `projects/*/session-log/YYYY-MM-DD.md` | Chronological session narrative (daily shard) | append-only |
 | `session-state` | `projects/*/session-state.md` | Next-session handoff — overwritten each close | overwrite |
 | `project-index` | `projects/*/index.md` | Project overview + progress checklist | mutable |
 | `open-questions` | `pages/open-questions.md` | Unresolved question queue | append+resolve |
@@ -54,7 +54,7 @@ Files responsible for session continuity — separate from the type taxonomy abo
 | `hot.md` (root) | Active project pointer table + last session date | Pointers only. No session content. |
 | `projects/<name>/hot.md` | Last session snapshot — "what was done" | 500-word cap. No next-tasks. Overwrite each close. |
 | `projects/<name>/session-state.md` | Next-session handoff — "what to do next" | Overwrite each close. Read at session start. |
-| `projects/<name>/session-log/YYYY-MM.md` | Append-only narrative timeline (monthly) | No edits to existing entries. |
+| `projects/<name>/session-log/YYYY-MM-DD.md` | Append-only narrative timeline (daily shard; legacy `YYYY-MM.md` still read) | No edits to existing entries. |
 | `pages/open-questions.md` | Cross-project unresolved question queue | Append + mark resolved. |
 
 **Operations**:
