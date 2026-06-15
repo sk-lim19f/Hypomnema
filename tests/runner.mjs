@@ -6456,6 +6456,145 @@ test('lint --json: large warn-heavy output survives the 64 KiB pipe boundary', (
   }
 });
 
+suite('lint.mjs wikilink resolution (ISSUE-21)');
+
+// Build a multi-file vault, run lint --json, return broken-wikilink targets plus
+// the error count and exit status (so a test can assert target-only files are NOT
+// linted). `files` maps relPath → content; SCHEMA.md is auto-seeded unless given.
+function lintWiki(files) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-wl-'));
+  try {
+    if (!files['SCHEMA.md']) writeFileSync(join(dir, 'SCHEMA.md'), VOCAB_SCHEMA);
+    for (const [rel, content] of Object.entries(files)) {
+      const full = join(dir, rel);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, content);
+    }
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${dir}`, '--json'],
+      {
+        encoding: 'utf-8',
+        maxBuffer: 64 * 1024 * 1024,
+        env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+      },
+    );
+    const out = JSON.parse(r.stdout);
+    const broken = out.warns
+      .filter((w) => /Broken wikilink/.test(w.message))
+      .map((w) => (w.message.match(/\[\[(.+?)\]\]/) || [])[1]);
+    return { broken, errors: out.errors, status: r.status };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const wlPage = (type, body) =>
+  `---\ntitle: T\ntype: ${type}\nupdated: 2026-06-08\n---\n\n${body}\n`;
+
+test('dir-relative link [[learnings/foo]] resolves to pages/learnings/foo.md', () => {
+  const { broken } = lintWiki({
+    'pages/learnings/foo.md': wlPage('learning', '# foo'),
+    'pages/index.md': wlPage('reference', 'see [[learnings/foo]]'),
+  });
+  assert.ok(
+    !broken.includes('learnings/foo'),
+    `dir-relative link must resolve, broken=${JSON.stringify(broken)}`,
+  );
+});
+
+test('root *.md and sources are target-only — linkable but NOT linted', () => {
+  // Each target file OMITS the required title/type frontmatter, which is an
+  // ERROR if the file is linted. As pure link targets they must resolve AND
+  // raise zero errors — so if a future change widens scanDirs to include root or
+  // sources, the missing-field error fires and this test fails (it would pass
+  // with valid-frontmatter fixtures, the weakness codex flagged).
+  const { broken, errors, status } = lintWiki({
+    'log.md': '---\nupdated: 2026-06-08\n---\n# operational log, no title/type\n',
+    'hypo-guide.md': '---\nupdated: 2026-06-08\n---\n# guide, no title/type\n',
+    'sources/2026-01-01-x.md': '---\nupdated: 2026-06-08\n---\n# source, no title/type\n',
+    'pages/index.md': wlPage('reference', 'see [[log]], [[hypo-guide]], [[sources/2026-01-01-x]]'),
+  });
+  assert.equal(
+    errors.length,
+    0,
+    `target-only files must NOT be linted (got errors): ${JSON.stringify(errors)}`,
+  );
+  assert.equal(status, 0, `clean exit expected, got ${status}`);
+  for (const t of ['log', 'hypo-guide', 'sources/2026-01-01-x']) {
+    assert.ok(!broken.includes(t), `target "${t}" must resolve: ${JSON.stringify(broken)}`);
+  }
+});
+
+test('root .md honors .hypoignore — an ignored root file is NOT a valid target', () => {
+  // collectLinkTargets must skip .hypoignore'd root files; otherwise [[secret]]
+  // would resolve to an ignored file (the false negative codex reproduced).
+  const { broken } = lintWiki({
+    '.hypoignore': 'secret.md\n',
+    'secret.md': '---\ntitle: S\ntype: reference\nupdated: 2026-06-08\n---\n# secret\n',
+    'pages/index.md': wlPage('reference', 'leak [[secret]]'),
+  });
+  assert.ok(
+    broken.includes('secret'),
+    `an ignored root file must NOT resolve as a link target: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('sources is target-only by full slug, NOT bare basename (no false negative)', () => {
+  const { broken } = lintWiki({
+    'sources/2026-01-01-x.md': '---\ntitle: S\ntype: source\nupdated: 2026-06-08\n---\n# s\n',
+    'pages/index.md': wlPage('reference', 'stale [[2026-01-01-x]]'), // bare basename
+  });
+  assert.ok(
+    broken.includes('2026-01-01-x'),
+    `a bare basename must NOT resolve to a source file: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('table-escaped alias [[a/b\\|label]] yields the clean target a/b', () => {
+  const { broken } = lintWiki({
+    'projects/p/issue.md': wlPage('reference', '# issue'),
+    'pages/index.md': wlPage('reference', '| x | [[projects/p/issue\\|issue.md]] |'),
+  });
+  assert.ok(
+    !broken.includes('projects/p/issue'),
+    `escaped-pipe alias must resolve: ${JSON.stringify(broken)}`,
+  );
+  assert.ok(
+    !broken.some((b) => b && b.includes('\\')),
+    `no target should carry a trailing backslash: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('genuinely missing links are still W4 broken (no false negative)', () => {
+  const { broken } = lintWiki({
+    'pages/index.md': wlPage('reference', 'see [[learnings/does-not-exist]] and [[nope]]'),
+  });
+  assert.ok(
+    broken.includes('learnings/does-not-exist'),
+    `missing dir-relative must stay broken: ${JSON.stringify(broken)}`,
+  );
+  assert.ok(
+    broken.includes('nope'),
+    `missing bare slug must stay broken: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('dir-relative collision across scan dirs resolves when a real file matches', () => {
+  // pages/x/foo.md and projects/x/foo.md both yield the dir-relative key x/foo.
+  // The Set semantics resolve [[x/foo]] because a real file backs the key — this
+  // pins the collision behavior codex flagged so a future change can't regress it.
+  const { broken } = lintWiki({
+    'pages/x/foo.md': wlPage('learning', '# pf'),
+    'projects/x/foo.md': wlPage('reference', '# pjf'),
+    'pages/index.md': wlPage('reference', 'see [[x/foo]]'),
+  });
+  assert.ok(
+    !broken.includes('x/foo'),
+    `collision key must resolve when a real file exists: ${JSON.stringify(broken)}`,
+  );
+});
+
 // ── Lane B: formatGrowthMetrics + growth echo regressions ─────────────────
 
 const { formatGrowthMetrics, computeSessionGrowth } = await import(join(HOOKS, 'hypo-shared.mjs'));

@@ -135,13 +135,54 @@ function collectPages(dir, root, pages = [], ignorePatterns = []) {
 
 // ── slug map ─────────────────────────────────────────────────────────────────
 
-function buildSlugMap(pages) {
+// `extraTargets` are link-target-only slugs (root *.md, sources/*) that resolve
+// wikilinks but are not themselves linted — added verbatim, with NO derived
+// basename/dir-relative aliases, so they can't mask an unrelated broken link.
+function buildSlugMap(pages, extraTargets = []) {
   const map = new Set();
   for (const { rel } of pages) {
-    map.add(rel.replace(/\.md$/, '').replace(/\\/g, '/'));
+    const noExt = rel.replace(/\.md$/, '').replace(/\\/g, '/');
+    map.add(noExt);
     map.add(basename(rel, '.md'));
+    // Dir-relative alias: drop the leading scan-dir segment so the vault's
+    // convention link [[learnings/foo]] resolves to pages/learnings/foo.md.
+    // (A page directly under a scan dir has no extra segment to drop.)
+    const slash = noExt.indexOf('/');
+    if (slash !== -1) map.add(noExt.slice(slash + 1));
   }
+  for (const t of extraTargets) map.add(t);
   return map;
+}
+
+// Link-target-only slugs: files that are valid wikilink destinations but are
+// NOT linted themselves. Root-level *.md (hot.md / log.md / hypo-guide.md /
+// SCHEMA.md — special operational files whose types sit outside VALID_TYPES)
+// and sources/* (immutable captured sources). Returned as verbatim slugs so
+// buildSlugMap adds no derived aliases for them.
+function collectLinkTargets(hypoDir, ignorePatterns = []) {
+  const targets = [];
+  if (existsSync(hypoDir)) {
+    for (const entry of readdirSync(hypoDir)) {
+      const full = join(hypoDir, entry);
+      // root-level *.md FILES only (no recursion), honoring .hypoignore exactly
+      // like collectPages — otherwise an ignored root file (e.g. a secret) would
+      // resolve [[its-slug]] as valid, a false negative.
+      if (
+        extname(entry) === '.md' &&
+        !entry.startsWith('.') &&
+        !isIgnored(full, hypoDir, ignorePatterns) &&
+        statSync(full).isFile()
+      ) {
+        targets.push(entry.replace(/\.md$/, ''));
+      }
+    }
+  }
+  // sources/*: linkable as the full 'sources/<name>' slug only — deliberately no
+  // bare basename, so a stale [[name]] can't silently resolve to a source file.
+  for (const { rel } of collectPages(join(hypoDir, 'sources'), hypoDir, [], ignorePatterns)) {
+    targets.push(rel.replace(/\.md$/, '').replace(/\\/g, '/'));
+  }
+  return targets;
 }
 
 // ── wikilink extractor ────────────────────────────────────────────────────────
@@ -168,7 +209,12 @@ function stripNonWikilinkRegions(content) {
 function extractWikilinks(content) {
   const stripped = stripNonWikilinkRegions(content);
   const links = [];
-  for (const m of stripped.matchAll(/\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]/g)) {
+  // Target capture excludes `\` and stops before an optional `\` preceding the
+  // alias/anchor delimiter, so a markdown-table-escaped alias
+  // `[[a/b\|label]]` (the `\|` is a literal pipe inside a table cell) yields the
+  // clean target `a/b`, not `a/b\`. A bare `[[a\]]` (no delimiter) simply fails
+  // to match rather than being mis-read as `[[a]]`.
+  for (const m of stripped.matchAll(/\[\[([^\]|#\\]+?)(?:\\?[|#][^\]]*?)?\]\]/g)) {
     links.push(m[1].trim());
   }
   return links;
@@ -367,7 +413,8 @@ const args = parseArgs(process.argv);
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects', 'journal'].map((d) => join(args.hypoDir, d));
 const pages = scanDirs.flatMap((d) => collectPages(d, args.hypoDir, [], ignorePatterns));
-const slugMap = buildSlugMap(pages);
+const linkTargets = collectLinkTargets(args.hypoDir, ignorePatterns);
+const slugMap = buildSlugMap(pages, linkTargets);
 const tagVocab = parseSchemaVocab(args.hypoDir);
 const pageDirs = parseSchemaPageDirs(args.hypoDir);
 
