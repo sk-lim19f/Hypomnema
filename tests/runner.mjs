@@ -10519,6 +10519,173 @@ test('--check-session-close --session-id reports marker presence without alterin
   });
 });
 
+// ── ISSUE-10: --log-only first-class non-project close path ───────────────────
+suite('crystallize.mjs --mark-session-closed --log-only (ISSUE-10)');
+
+// A non-project (tooling / wiki-only) session leaves a today log.md entry but
+// closes NO project. The current marker gate resolves the active project via
+// sessionCloseGlobalStatus and demands its mandatory files — trapping the session
+// and pushing it to clobber an unrelated project's handoff. --log-only is the
+// first-class signal: exempt the project-close blocker, still require git/hot/lint
+// clean + a today log.md entry (the log-only minimum proof), record project:null.
+test('--log-only: active project not closed today → marker written, project:null, scope log-only', () => {
+  withWiki(
+    (dir) => {
+      // Backdate the project's mandatory files so sessionCloseGlobalStatus would
+      // block on them, but keep the today log.md entry (the log-only session's own
+      // trace) so the gate still has its minimum proof.
+      const stale = '2000-01-01';
+      const projDir = join(dir, 'projects', 'test-project');
+      writeFileSync(
+        join(projDir, 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${stale}\n---\n\n## 다음 작업\n\n- next\n`,
+      );
+      writeFileSync(
+        join(projDir, 'hot.md'),
+        `---\ntitle: hot\ntype: reference\nupdated: ${stale}\n---\n\n# Hot\n`,
+      );
+      const ym = todayLocal().slice(0, 7);
+      writeFileSync(
+        join(projDir, 'session-log', `${ym}.md`),
+        `---\ntitle: Session Log\ntype: session-log\nupdated: ${stale}\n---\n\n## [${stale}] old session\n`,
+      );
+    },
+    (dir) => {
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        '--log-only',
+        '--session-id=s-logonly',
+        '--json',
+      ]);
+      assert.equal(
+        r.status,
+        0,
+        `--log-only must close a non-project session despite a stale active project: ${r.stdout}\n${r.stderr}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+      assert.equal(out.scope, 'log-only');
+      const markerPath = join(dir, '.cache', 'session-closed-s-logonly.marker');
+      assert.ok(existsSync(markerPath), 'log-only marker must be written');
+      const marker = JSON.parse(readFileSync(markerPath, 'utf-8'));
+      assert.equal(
+        marker.project,
+        null,
+        'log-only marker must NOT attribute to a project (clobber-safe)',
+      );
+      assert.equal(marker.scope, 'log-only');
+    },
+  );
+});
+
+// log-only is NOT a global-gate bypass: git must still be clean.
+test('--log-only: dirty git still blocks (not a global bypass)', () => {
+  withWiki(null, (dir) => {
+    writeFileSync(join(dir, 'untracked.md'), 'dirty\n');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      '--log-only',
+      '--session-id=s-lo-dirty',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `log-only must still block on dirty git: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(
+      (out.blockers || []).some((b) => b.type === 'git'),
+      `dirty-git log-only result must carry a git blocker: ${JSON.stringify(out)}`,
+    );
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-lo-dirty.marker')),
+      'log-only marker must not land on dirty git',
+    );
+  });
+});
+
+// log-only requires its minimum proof: a today log.md entry. Without one the
+// session left no trace and the marker is refused.
+test('--log-only: no today log.md entry → marker refused (minimum proof)', () => {
+  withWiki(
+    (dir) => {
+      // Wipe log.md to its header so there is NO today session entry at all.
+      writeFileSync(join(dir, 'log.md'), '# Log\n');
+    },
+    (dir) => {
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        '--log-only',
+        '--session-id=s-lo-nolog',
+        '--json',
+      ]);
+      assert.equal(r.status, 1, `log-only with no today log entry must block: ${r.stdout}`);
+      assert.ok(
+        !existsSync(join(dir, '.cache', 'session-closed-s-lo-nolog.marker')),
+        'log-only marker must not land without a today log.md entry',
+      );
+    },
+  );
+});
+
+// Completion-signal trio coherence (codex design Finding 2): after a log-only
+// marker, --check-session-close --session-id must read the SAME log-only gate —
+// marker_present:true AND ok:true — even though the active project is stale.
+// Without passing sessionId into the gate it would report marker_present:true
+// while ok:false from the stale project (the divergence this guards).
+test('--check-session-close --session-id: log-only marker → ok:true, marker_present:true (trio coherence)', () => {
+  withWiki(
+    (dir) => {
+      const stale = '2000-01-01';
+      const projDir = join(dir, 'projects', 'test-project');
+      writeFileSync(
+        join(projDir, 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${stale}\n---\n\n## 다음 작업\n\n- next\n`,
+      );
+      writeFileSync(
+        join(projDir, 'hot.md'),
+        `---\ntitle: hot\ntype: reference\nupdated: ${stale}\n---\n\n# Hot\n`,
+      );
+      const ym = todayLocal().slice(0, 7);
+      writeFileSync(
+        join(projDir, 'session-log', `${ym}.md`),
+        `---\ntitle: Session Log\ntype: session-log\nupdated: ${stale}\n---\n\n## [${stale}] old session\n`,
+      );
+    },
+    (dir) => {
+      // First write the log-only marker, then commit it so git stays clean.
+      const m = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        '--log-only',
+        '--session-id=s-trio',
+        '--json',
+      ]);
+      assert.equal(m.status, 0, `log-only marker write must succeed: ${m.stdout}\n${m.stderr}`);
+      spawnSync('git', ['add', '-A'], { cwd: dir });
+      spawnSync('git', ['commit', '-m', 'marker'], { cwd: dir });
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--check-session-close',
+        '--session-id=s-trio',
+        '--json',
+      ]);
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.marker_present,
+        true,
+        `the log-only marker must be reported present: ${r.stdout}`,
+      );
+      assert.equal(
+        out.ok,
+        true,
+        `log-only check must be compact-ready despite the stale project: ${r.stdout}`,
+      );
+    },
+  );
+});
+
 test('--check-session-close --session-id: a STALE marker reports marker_present:false (matches the Stop hook reader, not raw existsSync)', () => {
   withWiki(null, (dir) => {
     // A marker file exists on disk but is stale → the Stop hook would reject and

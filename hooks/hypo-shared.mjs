@@ -277,6 +277,31 @@ export function hasLogEntry(content, date, project) {
 }
 
 /**
+ * True when log.md carries ANY `## [<freshDate>] session | <slug>` heading —
+ * project-agnostic. The minimum proof for a log-only close: a
+ * non-project (tooling/wiki-only) session has no project mandatory files, but it
+ * MUST still leave a today log.md trace so the close is not a content-free bypass.
+ * Uses the same canonical heading parser as hasLogEntry (not a loose substring —
+ * codex design review: keep the fresh-date/canonical-heading style) so a stray
+ * mention of the date elsewhere cannot satisfy it.
+ * @param {string} hypoDir
+ * @returns {boolean}
+ */
+export function hasAnyTodayLogEntry(hypoDir) {
+  const logPath = join(hypoDir, 'log.md');
+  if (!existsSync(logPath)) return false;
+  let content = '';
+  try {
+    content = readFileSync(logPath, 'utf-8');
+  } catch {
+    return false;
+  }
+  return freshDates().some((d) =>
+    new RegExp('^## \\[' + escapeRegExp(d) + '\\] session \\| \\S', 'm').test(content),
+  );
+}
+
+/**
  * Date strings that count as "today" for freshness checks. Both the local and
  * UTC dates are accepted: Claude writes file dates in the user's local zone,
  * while hypo-hot-rebuild stamps root hot.md with the UTC date. Accepting both
@@ -1083,19 +1108,25 @@ export function sessionClosedMarkerPath(hypoDir, sessionId) {
  *
  * @param {string} hypoDir
  * @param {string} sessionId
- * @param {{project?: string, transcript_path?: string}} info
+ * @param {{project?: string, scope?: string, transcript_path?: string}} info
  */
 export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
   if (!sessionId) return;
   try {
     const cacheDir = join(hypoDir, '.cache');
     if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
+    // scope distinguishes a project close (the 5 mandatory files were verified
+    // fresh) from a log-only close (a non-project session, no project
+    // attribution). Readers (precompactGateStatus / --check-session-close) key
+    // the gate semantics on this field, so it must be recorded.
+    const scope = info.scope === 'log-only' ? 'log-only' : 'project';
     const payload = {
       session_id: sessionId,
       project: info.project || null,
+      scope,
       transcript_path: info.transcript_path || null,
       closed_at: new Date().toISOString(),
-      verification: 'session-close-file-status:ok',
+      verification: scope === 'log-only' ? 'log-only-close:ok' : 'session-close-file-status:ok',
     };
     writeFileSync(sessionClosedMarkerPath(hypoDir, sessionId), JSON.stringify(payload) + '\n');
   } catch (err) {
@@ -1458,6 +1489,19 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const driftTargets = [];
   const skipped = { lint: false, feedback: false };
 
+  // log-only synthetic close mode. A non-project (tooling / wiki-only)
+  // session has no project to close. Activated either by the explicit writer flag
+  // (opts.logOnly, from `--mark-session-closed --log-only`) or by a log-only marker
+  // for opts.sessionId (the PreCompact / --check-session-close readers). In this
+  // mode the project-close invariant is replaced by a today log.md entry (minimum
+  // proof), and — critically — the active/phantom project is NEVER put in
+  // close.projects, because that set ALSO drives the lint scope and W8 ownership
+  // below. Exempting only the close blocker would still let an unrelated project's
+  // stale design-history / lint block the non-project session (codex design
+  // BLOCKER). git / hot / lint(self) / feedback all still apply — not a bypass.
+  const marker = opts.sessionId ? readSessionClosedMarker(hypoDir, opts.sessionId) : null;
+  const logOnly = opts.logOnly === true || marker?.scope === 'log-only';
+
   // 1. wiki git clean
   const git = hypoIsClean(hypoDir);
   if (!git.clean) blockers.push({ type: 'git', reason: git.reason });
@@ -1466,16 +1510,38 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const hot = hotMdIsClean(hypoDir);
   if (!hot.clean) blockers.push({ type: 'hot', reason: hot.reason });
 
-  // 3. session-close files (global invariant, ADR 0043)
-  const close = sessionCloseGlobalStatus(hypoDir);
-  if (!close.ok) {
-    blockers.push({
-      type: 'close',
-      reason: `memory files not updated this session: ${[
-        ...close.missing.map((f) => `${f} (missing)`),
-        ...close.stale.map((f) => `${f} (stale)`),
-      ].join(', ')}`,
-    });
+  // 3. session-close files (global invariant, ADR 0043) — or, in log-only mode,
+  //    the minimum proof (a today log.md entry) with NO project attribution.
+  let close;
+  if (logOnly) {
+    const hasLog = hasAnyTodayLogEntry(hypoDir);
+    close = {
+      ok: hasLog,
+      projects: [],
+      dates: freshDates(),
+      fallback: false,
+      primary: null,
+      project: null,
+      stale: [],
+      missing: hasLog ? [] : ['log.md (no today session entry)'],
+    };
+    if (!hasLog) {
+      blockers.push({
+        type: 'close',
+        reason: 'log-only close: log.md has no today session entry (minimum proof)',
+      });
+    }
+  } else {
+    close = sessionCloseGlobalStatus(hypoDir);
+    if (!close.ok) {
+      blockers.push({
+        type: 'close',
+        reason: `memory files not updated this session: ${[
+          ...close.missing.map((f) => `${f} (missing)`),
+          ...close.stale.map((f) => `${f} (stale)`),
+        ].join(', ')}`,
+      });
+    }
   }
 
   // 4. lint blockers + W8 design-history (scoped). Mirrors hypo-personal-check.
@@ -1512,7 +1578,14 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       const parsed = JSON.parse(r.stdout);
       const allErrors = parsed.errors || [];
       const allW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
-      const scope = new Set(opts.lintScope || closeFileTargetsGlobal(hypoDir));
+      // log-only base scope = the shared root files only (hot.md / log.md) — NOT
+      // closeFileTargetsGlobal, which would fold the active/phantom project's
+      // mandatory files in and re-introduce the cross-project attribution. The
+      // session's own transcript-touched files are still added below (a log-only
+      // session is accountable for the wiki files it actually edited).
+      const scope = new Set(
+        opts.lintScope || (logOnly ? ['hot.md', 'log.md'] : closeFileTargetsGlobal(hypoDir)),
+      );
       if (opts.transcriptPath && existsSync(opts.transcriptPath)) {
         for (const f of extractTouchedWikiFiles(opts.transcriptPath, hypoDir)) scope.add(f);
       }
@@ -1526,11 +1599,25 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       for (const n of part.notice)
         notices.push({ type: 'lint', reason: `${n.file}${n.id ? ` (${n.id})` : ''}` });
       // W8 (design-history stale) is each today-active project's own close
-      // responsibility; others' are non-blocking notices (ADR 0043).
-      const activeSlugs = (close.projects || []).map((p) => p.project).filter(Boolean);
+      // responsibility; others' are non-blocking notices (ADR 0043). In log-only
+      // mode there is NO project this session is accountable for, so every W8 is a
+      // notice — a non-project session must never be blocked by some project's
+      // stale design-history (codex design BLOCKER: the attribution leak this fix
+      // closes).
+      const activeSlugs = logOnly
+        ? []
+        : (close.projects || []).map((p) => p.project).filter(Boolean);
       const mine = new Set(activeSlugs.map((s) => `projects/${s}/design-history.md`));
-      const w8Blocking = activeSlugs.length > 0 ? allW8.filter((w) => mine.has(w.file)) : allW8;
-      const w8Notice = activeSlugs.length > 0 ? allW8.filter((w) => !mine.has(w.file)) : [];
+      const w8Blocking = logOnly
+        ? []
+        : activeSlugs.length > 0
+          ? allW8.filter((w) => mine.has(w.file))
+          : allW8;
+      const w8Notice = logOnly
+        ? allW8
+        : activeSlugs.length > 0
+          ? allW8.filter((w) => !mine.has(w.file))
+          : [];
       if (w8Blocking.length > 0) {
         blockers.push({
           type: 'design-history',

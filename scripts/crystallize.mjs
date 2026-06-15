@@ -131,6 +131,7 @@ function parseArgs(argv) {
     checkSessionClose: false,
     applySessionClose: false,
     markSessionClosed: false,
+    logOnly: false,
     sessionId: null,
     payload: null,
     force: false,
@@ -142,6 +143,7 @@ function parseArgs(argv) {
     else if (arg === '--check-session-close') args.checkSessionClose = true;
     else if (arg === '--apply-session-close') args.applySessionClose = true;
     else if (arg === '--mark-session-closed') args.markSessionClosed = true;
+    else if (arg === '--log-only') args.logOnly = true;
     else if (arg.startsWith('--session-id=')) args.sessionId = arg.slice(13);
     else if (arg.startsWith('--payload=')) args.payload = arg.slice(10);
     else if (arg.startsWith('--transcript-path=')) args.transcriptPath = expandHome(arg.slice(18));
@@ -163,7 +165,15 @@ function runSessionCloseCheck(args) {
   // won't block on a human-fixable issue. Pass --transcript-path to widen the
   // lint scope to the session's edited files exactly as the interactive hook
   // does (without it, the scope is the mandatory close files only).
-  const status = precompactGateStatus(args.hypoDir, { transcriptPath: args.transcriptPath });
+  // Pass --session-id so a log-only marker activates log-only gate
+  // semantics here too. Without it the check would read the marker as present
+  // (marker_present:true) while `ok` still reflected the stale active project —
+  // the completion-signal trio (PreCompact / --check / marker) would diverge
+  // (codex design Finding 2).
+  const status = precompactGateStatus(args.hypoDir, {
+    ...(args.transcriptPath ? { transcriptPath: args.transcriptPath } : {}),
+    ...(args.sessionId ? { sessionId: args.sessionId } : {}),
+  });
   const close = status.close;
 
   // ADR 0047: when a --session-id is supplied, report whether THIS session's
@@ -411,10 +421,15 @@ function runMarkSessionClosed(args) {
   // `git` blocker inside the gate. Pass --transcript-path to widen the lint
   // scope to this session's edited files exactly as the interactive hook does;
   // without it the scope is the mandatory close files only.
-  const gate = precompactGateStatus(
-    args.hypoDir,
-    args.transcriptPath ? { transcriptPath: args.transcriptPath } : {},
-  );
+  // --log-only marks a non-project (tooling / wiki-only) session as
+  // closed without attributing it to any project. The gate runs in log-only mode
+  // (project-close invariant → a today log.md entry; lint/W8 scoped to shared +
+  // touched files, never the active/phantom project), but git / hot / feedback
+  // still apply — log-only is NOT a global-gate bypass.
+  const gate = precompactGateStatus(args.hypoDir, {
+    ...(args.transcriptPath ? { transcriptPath: args.transcriptPath } : {}),
+    ...(args.logOnly ? { logOnly: true } : {}),
+  });
   const status = gate.close;
   if (!gate.ok) {
     const result = {
@@ -436,7 +451,10 @@ function runMarkSessionClosed(args) {
     }
     process.exit(1);
   }
-  writeSessionClosedMarker(args.hypoDir, args.sessionId, { project: status.project });
+  writeSessionClosedMarker(args.hypoDir, args.sessionId, {
+    project: status.project,
+    ...(args.logOnly ? { scope: 'log-only' } : {}),
+  });
   // Marker writer swallows IO errors (best-effort, see hypo-shared.mjs). Verify
   // the file actually landed before claiming success — otherwise CLI exits 0
   // while next Stop re-blocks, hiding a permission/disk problem.
@@ -454,6 +472,7 @@ function runMarkSessionClosed(args) {
     ok: true,
     session_id: args.sessionId,
     project: status.project,
+    scope: args.logOnly ? 'log-only' : 'project',
     date: status.dates[0],
     notices: gate.notices,
     // ADR 0047: pure feedback-projection drift is a non-blocker — the marker
@@ -466,7 +485,9 @@ function runMarkSessionClosed(args) {
     console.log(JSON.stringify(result, null, 2));
   } else {
     console.log(
-      `✓ session-closed marker written (session_id: ${args.sessionId}, project: ${status.project}).`,
+      args.logOnly
+        ? `✓ session-closed marker written (session_id: ${args.sessionId}, scope: log-only — no project attribution).`
+        : `✓ session-closed marker written (session_id: ${args.sessionId}, project: ${status.project}).`,
     );
     if (gate.driftTargets.length > 0) {
       console.log(

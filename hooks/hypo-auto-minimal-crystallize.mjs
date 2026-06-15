@@ -69,6 +69,11 @@ function emitBlock(sessionId, transcriptPath, gate = null) {
   // /compact to immediately re-block on the same errors).
   const transcriptHint = transcriptPath ? ` --transcript-path=${transcriptPath}` : '';
   const markCmd = `crystallize --mark-session-closed --session-id=${sessionId}${transcriptHint}`;
+  // The log-only escape hatch for a non-project (wiki/tooling-only)
+  // session. Offered ONLY as an explicit alternative when a close blocker is
+  // present — never as the default recovery, so a real project session is not
+  // taught to bypass the ADR 0043 close invariant (codex design Finding 3).
+  const logOnlyCmd = `crystallize --mark-session-closed --log-only --session-id=${sessionId}${transcriptHint}`;
   // ADR 0047: refine the message with the read-only /compact gate result.
   // - gate green → the close is compact-ready and ONLY the marker is missing
   //   (the hand-edit close case: files Written + committed directly, bypassing
@@ -82,6 +87,12 @@ function emitBlock(sessionId, transcriptPath, gate = null) {
   } else if (gate && gate.blockers && gate.blockers.length > 0) {
     const blockers = gate.blockers.map((b) => b.reason).join('; ');
     reason = `[WIKI_AUTOCLOSE] session-close incomplete — resolve: ${blockers}. Then run \`${markCmd}\` (session_id=${sessionId}).`;
+    // Only when a project-close blocker is what's holding the session: a
+    // non-project session has nothing to close, so offer log-only as the way out
+    // (Claude decides whether this session is project-scoped — no auto-attribution).
+    if (gate.blockers.some((b) => b.type === 'close')) {
+      reason += ` If this was a non-project (wiki/tooling-only) session with no project to close, run \`${logOnlyCmd}\` instead (log-only close, no project attribution).`;
+    }
   } else {
     reason = `[WIKI_AUTOCLOSE] session-close 미완료 — /hypo:crystallize 실행으로 마무리 (session_id=${sessionId}${transcriptHint}).`;
   }
