@@ -40,9 +40,14 @@ process.stdin.setEncoding('utf-8');
 process.stdin.on('data', (chunk) => (raw += chunk));
 process.stdin.on('end', () => {
   let transcriptPath = null;
+  let sessionId = null;
   try {
     const input = JSON.parse(raw || '{}');
     transcriptPath = input.transcript_path ?? null;
+    // A log-only marker for this session activates log-only gate
+    // semantics (no project attribution) so /compact does not block a closed
+    // non-project session on the active/phantom project's files.
+    sessionId = input.session_id ?? input.sessionId ?? null;
   } catch {
     /* fail-open */
   }
@@ -98,7 +103,10 @@ process.stdin.on('end', () => {
   // gate.driftTargets, a self-heal effect requirement we run as --write below.
   let gate;
   try {
-    gate = precompactGateStatus(HYPO_DIR, { transcriptPath });
+    gate = precompactGateStatus(HYPO_DIR, {
+      transcriptPath,
+      ...(sessionId ? { sessionId } : {}),
+    });
   } catch (err) {
     // Defense-in-depth: precompactGateStatus fails open per-check, but if it ever
     // throws, never crash the PreCompact hook — fail open (continue) so a tooling
