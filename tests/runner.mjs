@@ -15944,6 +15944,234 @@ test('CLI checker source files are NOT exempt — they scan clean via N placehol
   assert.equal(r.status, 0, `repo has tracker-id leaks:\n${r.stdout}${r.stderr}`);
 });
 
+// ── rename.mjs (inbound wikilink rewrite) ─────────────────────────────────────
+
+suite('rename.mjs');
+
+test('rewrites bare / alias / anchor inbound links and moves the page', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nself\n');
+    writeFileSync(
+      join(dir, 'pages', 'a.md'),
+      '---\ntitle: a\n---\nsee [[foo]] and [[foo|the foo]] and [[foo#sec]].\n',
+    );
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.links_rewritten, 3, `all three forms rewritten: ${r.stdout}`);
+    assert.ok(existsSync(join(dir, 'pages', 'bar.md')), 'page moved to bar.md');
+    assert.ok(!existsSync(join(dir, 'pages', 'foo.md')), 'old foo.md removed');
+    const a = readFileSync(join(dir, 'pages', 'a.md'), 'utf-8');
+    assert.ok(
+      a.includes('[[bar]]') && a.includes('[[bar|the foo]]') && a.includes('[[bar#sec]]'),
+      `alias/anchor preserved with new target: ${a}`,
+    );
+  });
+});
+
+// advisor: the correctness axis — a bare basename shared by two pages must NOT
+// be blind-rewritten; only the unambiguous (dir-relative) form is.
+test('bare collision → ambiguous link reported, dir-relative form is rewritten', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages', 'x'), { recursive: true });
+    mkdirSync(join(dir, 'pages', 'y'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x', 'foo.md'), 'x foo\n');
+    writeFileSync(join(dir, 'pages', 'y', 'foo.md'), 'y foo\n');
+    writeFileSync(join(dir, 'pages', 'ref.md'), 'bare [[foo]] and dirrel [[x/foo]]\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=pages/x/foo',
+      '--to=baz',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    const ref = readFileSync(join(dir, 'pages', 'ref.md'), 'utf-8');
+    assert.ok(ref.includes('[[foo]]'), `ambiguous bare link must be untouched: ${ref}`);
+    assert.ok(ref.includes('[[x/baz]]'), `dir-relative link must be rewritten: ${ref}`);
+    assert.ok(
+      out.ambiguous.some((a) => a.file === 'pages/ref.md'),
+      `ambiguity must be reported: ${r.stdout}`,
+    );
+  });
+});
+
+// advisor: preserve append-only time records — rewriting a [[old]] inside a past
+// journal/session-log snapshot would falsify that moment.
+test('preserved append-only sources (journal) are skipped', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'journal'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), 'foo\n');
+    writeFileSync(join(dir, 'pages', 'live.md'), 'live [[foo]]\n');
+    writeFileSync(join(dir, 'journal', '2026-W01.md'), 'snapshot [[foo]]\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    const live = readFileSync(join(dir, 'pages', 'live.md'), 'utf-8');
+    const snap = readFileSync(join(dir, 'journal', '2026-W01.md'), 'utf-8');
+    assert.ok(live.includes('[[bar]]'), 'live link rewritten');
+    assert.ok(snap.includes('[[foo]]'), 'journal snapshot preserved (not rewritten)');
+  });
+});
+
+test('links inside code fences are not rewritten', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), 'foo\n');
+    writeFileSync(join(dir, 'pages', 'doc.md'), 'real [[foo]]\n```\ncode [[foo]]\n```\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    const doc = readFileSync(join(dir, 'pages', 'doc.md'), 'utf-8');
+    assert.ok(doc.includes('real [[bar]]'), 'prose link rewritten');
+    assert.ok(doc.includes('code [[foo]]'), 'code-fenced link preserved');
+    assert.equal(out.links_rewritten, 1, `only the prose link counts: ${r.stdout}`);
+  });
+});
+
+test('--to already exists → refused (no blind overwrite of a live page)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), 'foo\n');
+    writeFileSync(join(dir, 'pages', 'bar.md'), 'bar\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `overwrite must be refused: ${r.stdout}`);
+    assert.ok(existsSync(join(dir, 'pages', 'foo.md')), 'from not moved on refusal');
+  });
+});
+
+test('--from missing → refused', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'a.md'), 'a\n');
+    const r = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=nope', '--to=bar', '--json']);
+    assert.equal(r.status, 1, `missing from must be refused: ${r.stdout}`);
+  });
+});
+
+test('dry-run (no --apply) reports but writes nothing', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), 'foo\n');
+    writeFileSync(join(dir, 'pages', 'a.md'), '[[foo]]\n');
+    const r = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=foo', '--to=bar', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.applied, false);
+    assert.equal(out.links_rewritten, 1);
+    assert.ok(existsSync(join(dir, 'pages', 'foo.md')), 'dry-run does not move the page');
+    assert.ok(
+      readFileSync(join(dir, 'pages', 'a.md'), 'utf-8').includes('[[foo]]'),
+      'dry-run does not rewrite',
+    );
+  });
+});
+
+// advisor minor: idempotency — after an apply, no inbound link to the old slug
+// remains, and a second pass for the same target finds nothing to do.
+test('idempotency: after apply, no stale link remains and re-pass is a no-op', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), 'foo\n');
+    writeFileSync(join(dir, 'pages', 'a.md'), '[[foo]] [[foo]]\n');
+    run('rename.mjs', [`--hypo-dir=${dir}`, '--from=foo', '--to=bar', '--apply', '--json']);
+    const a = readFileSync(join(dir, 'pages', 'a.md'), 'utf-8');
+    assert.ok(!a.includes('[[foo]]'), 'no stale [[foo]] remains');
+    // A second pass targeting the new slug rewrites nothing (already current).
+    const r2 = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=bar', '--to=bar', '--json']);
+    assert.equal(r2.status, 1, 'same from/to is rejected (nothing to rename)');
+  });
+});
+
+// codex commit review: a cross-directory basename collision must be refused —
+// existsSync(toPath) alone misses pages/bar.md vs projects/bar.md, and proceeding
+// would emit ambiguous [[bar]] links.
+test('--to colliding with another dir on bare form → refused (no ambiguous links)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), 'foo\n');
+    writeFileSync(join(dir, 'projects', 'bar.md'), 'bar\n');
+    writeFileSync(join(dir, 'pages', 'ref.md'), '[[foo]]\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `collision must be refused: ${r.stdout}`);
+    assert.ok(existsSync(join(dir, 'pages', 'foo.md')), 'from not moved on collision');
+    assert.ok(
+      readFileSync(join(dir, 'pages', 'ref.md'), 'utf-8').includes('[[foo]]'),
+      'no rewrite on refusal',
+    );
+  });
+});
+
+// codex commit review: sources/* are full-slug-only targets (lint parity), so a
+// bare [[foo]] is NOT made ambiguous by a same-basename source file.
+test('sources/* same-basename does not block a bare-link rewrite (full-slug-only parity)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), 'foo\n');
+    writeFileSync(join(dir, 'sources', 'foo.md'), 'captured\n');
+    writeFileSync(join(dir, 'pages', 'ref.md'), 'see [[foo]]\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=pages/foo',
+      '--to=baz',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    const ref = readFileSync(join(dir, 'pages', 'ref.md'), 'utf-8');
+    assert.ok(ref.includes('[[baz]]'), `bare link must rewrite despite same-name source: ${ref}`);
+  });
+});
+
+// codex commit review: --to must not escape the wiki root.
+test('--to with ../ escaping the vault → refused', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), 'foo\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=../evil',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `escaping --to must be refused: ${r.stdout}`);
+    assert.ok(existsSync(join(dir, 'pages', 'foo.md')), 'from not moved');
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
