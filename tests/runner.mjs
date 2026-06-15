@@ -2134,6 +2134,14 @@ test('session-close: post-apply verify follows payload.project on same-date tie 
         'beta',
         `verification must check payload.project (beta), not the table-top (test-project): ${JSON.stringify(out.verification)}`,
       );
+      // ISSUE-17: the same payload≠inferred divergence must be surfaced on stderr so
+      // the operator can see which project the close actually verified. stdout (parsed
+      // above) stays pure JSON — the note must NOT leak there.
+      assert.match(
+        r.stderr,
+        /payload\.project="beta" differs from the inferred active project "test-project"/,
+        `ISSUE-17: payload targeting a project other than the inferred active one must emit a stderr note: ${JSON.stringify(r.stderr)}`,
+      );
     },
   );
 });
@@ -8278,6 +8286,14 @@ test('resume on fresh-init vault: graceful "no active project found" — no slug
       !r.stdout.includes('slug') && !r.stderr.includes('"slug"'),
       `slug placeholder must not leak: stdout=${r.stdout} stderr=${r.stderr}`,
     );
+    // The mtime-fallback branch runs with zero candidate projects here (_template is
+    // skipped). warnCwdFallback must stay silent — there is nothing to "fall back to
+    // most-recent" toward, so the misleading note must NOT appear alongside the real
+    // "no active project found" error.
+    assert.ok(
+      !/falling back to most-recent/.test(r.stderr),
+      `empty-candidate fresh-init must not emit a fallback note: ${JSON.stringify(r.stderr)}`,
+    );
   });
 });
 
@@ -8541,6 +8557,106 @@ test('resume.mjs cwd-first: cwd-matched older project wins over a newer non-matc
     });
     assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
     assert.ok(r.stdout.startsWith('Project: beta'), `expected 'Project: beta', got: ${r.stdout}`);
+    // Negative: a successful cwd match must NOT emit the fallback diagnostic.
+    assert.ok(
+      !/matched no project working_dir/.test(r.stderr),
+      `cwd-matched resume must stay silent on stderr: ${JSON.stringify(r.stderr)}`,
+    );
+  });
+});
+
+test('resume.mjs cwd no-match: emits a stderr fallback diagnostic, --json stdout stays pure (ISSUE-15)', () => {
+  withTmpDir((dir) => {
+    // cwd is an unrelated repo: NO project's working_dir contains it. alpha (newest)
+    // has no index.md at all; beta's working_dir points elsewhere. Pre-fix this fell
+    // back to recency SILENTLY — the user couldn't tell why an unrelated project
+    // loaded. Now resolveActiveProject emits a one-line stderr note naming the gap.
+    const realDir = realpathSync(dir);
+    const hypoDir = join(dir, 'wiki');
+    makeTieBreakWiki(hypoDir, [
+      { slug: 'alpha', date: '2026-06-12' }, // newest, no working_dir → no index.md
+      { slug: 'beta', date: '2026-06-11', workingDir: join(realDir, 'code/beta') },
+    ]);
+    for (const s of ['alpha', 'beta']) {
+      writeFileSync(
+        join(hypoDir, 'projects', s, 'session-state.md'),
+        `---\ntitle: ss — ${s}\ntype: session-state\nupdated: 2026-06-11\n---\n\n## 다음\n- t\n`,
+      );
+    }
+    const unrelatedCwd = join(realDir, 'code/elsewhere');
+    mkdirSync(unrelatedCwd, { recursive: true });
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`, '--json'],
+      {
+        encoding: 'utf-8',
+        cwd: unrelatedCwd,
+        env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+      },
+    );
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    // stdout stays pure JSON (the diagnostic must NOT leak onto stdout) and recency
+    // fallback resolves to the newest project, alpha.
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.project,
+      'alpha',
+      `expected recency fallback to alpha, got: ${JSON.stringify(out.project)}`,
+    );
+    // stderr carries the diagnostic, naming the candidate that lacks cwd metadata.
+    assert.match(
+      r.stderr,
+      /matched no project working_dir; falling back to most-recent/,
+      `expected fallback note on stderr: ${JSON.stringify(r.stderr)}`,
+    );
+    assert.match(
+      r.stderr,
+      /alpha \(no index\.md\)/,
+      `expected per-candidate reason for alpha: ${JSON.stringify(r.stderr)}`,
+    );
+  });
+});
+
+test('resume.mjs mtime-fallback branch cwd no-match: emits the fallback diagnostic (ISSUE-15)', () => {
+  withTmpDir((dir) => {
+    // hot.md has NO project rows → resolveActiveProject reaches the mtime fallback,
+    // the THIRD warnCwdFallback call site. A real project (gamma) exists with a
+    // session-state but no index.md, and cwd is unrelated → it warns yet still
+    // resolves gamma by mtime (candidates is non-empty, so the guard lets it speak).
+    const realDir = realpathSync(dir);
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(
+      join(hypoDir, 'hot.md'),
+      `---\ntitle: Hot\ntype: reference\nupdated: 2026-06-08\n---\n\n## Active Projects\n\n(none)\n`,
+    );
+    mkdirSync(join(hypoDir, 'projects', 'gamma'), { recursive: true });
+    writeFileSync(
+      join(hypoDir, 'projects', 'gamma', 'session-state.md'),
+      `---\ntitle: ss — gamma\ntype: session-state\nupdated: 2026-06-08\n---\n\n## 다음\n- t\n`,
+    );
+    const unrelatedCwd = join(realDir, 'code/elsewhere');
+    mkdirSync(unrelatedCwd, { recursive: true });
+    const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
+      encoding: 'utf-8',
+      cwd: unrelatedCwd,
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.ok(
+      r.stdout.startsWith('Project: gamma'),
+      `expected mtime fallback to gamma, got: ${r.stdout}`,
+    );
+    assert.match(
+      r.stderr,
+      /matched no project working_dir; falling back to most-recent/,
+      `expected mtime branch fallback note: ${JSON.stringify(r.stderr)}`,
+    );
+    assert.match(
+      r.stderr,
+      /gamma \(no index\.md\)/,
+      `expected per-candidate reason for gamma: ${JSON.stringify(r.stderr)}`,
+    );
   });
 });
 
@@ -8569,6 +8685,59 @@ test('cwd-first applies to the legacy markdown-link row branch (ADR 0044)', () =
     assert.equal(resolveActiveProject(dir, join(dir, 'code/beta')), 'beta');
     // no cwd → legacy first row stands.
     assert.equal(resolveActiveProject(dir), 'alpha');
+  });
+});
+
+test('resume.mjs md-link branch cwd no-match: emits the fallback diagnostic (ISSUE-15)', () => {
+  withTmpDir((dir) => {
+    // Legacy markdown-link rows (no wikilink rows) exercise the SECOND warnCwdFallback
+    // call site. cwd is unrelated: alpha has no index.md, beta's working_dir points
+    // elsewhere → md-link branch returns the first row (alpha) and warns.
+    const realDir = realpathSync(dir);
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    const hot = `---\ntitle: Hot\ntype: reference\nupdated: 2026-06-08\n---\n
+## Active Projects
+
+| Project | Last Session |
+|---|---|
+| [alpha](projects/alpha/hot.md) | 2026-06-08 |
+| [beta](projects/beta/hot.md) | 2026-06-08 |
+`;
+    writeFileSync(join(hypoDir, 'hot.md'), hot);
+    for (const s of ['alpha', 'beta']) {
+      mkdirSync(join(hypoDir, 'projects', s), { recursive: true });
+      writeFileSync(
+        join(hypoDir, 'projects', s, 'session-state.md'),
+        `---\ntitle: ss — ${s}\ntype: session-state\nupdated: 2026-06-08\n---\n\n## 다음\n- t\n`,
+      );
+    }
+    writeFileSync(
+      join(hypoDir, 'projects', 'beta', 'index.md'),
+      `---\ntitle: beta\ntype: project-index\nupdated: 2026-06-08\nworking_dir: "${join(realDir, 'code/beta')}"\n---\n# beta\n`,
+    );
+    const unrelatedCwd = join(realDir, 'code/elsewhere');
+    mkdirSync(unrelatedCwd, { recursive: true });
+    const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
+      encoding: 'utf-8',
+      cwd: unrelatedCwd,
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.ok(
+      r.stdout.startsWith('Project: alpha'),
+      `expected md-link first-row alpha, got: ${r.stdout}`,
+    );
+    assert.match(
+      r.stderr,
+      /matched no project working_dir; falling back to most-recent/,
+      `expected md-link branch fallback note: ${JSON.stringify(r.stderr)}`,
+    );
+    assert.match(
+      r.stderr,
+      /alpha \(no index\.md\)/,
+      `expected per-candidate reason for alpha: ${JSON.stringify(r.stderr)}`,
+    );
   });
 });
 
