@@ -536,6 +536,19 @@ function applySessionClose(args) {
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
+  // The freshness verification below (and at the post-apply check) already honors
+  // payload.project — `project` wins over the inferred active project, and the
+  // post-apply sessionCloseFileStatus call passes it as projectOverride. But when the
+  // payload targets a DIFFERENT project than the one active-project resolution infers
+  // (probe.project), that divergence used to be silent, so an operator couldn't tell
+  // which project the close actually verified. Surface it on stderr (the stdout JSON
+  // contract is untouched) so the verified/closed project is always explicit.
+  if (payload.project && probe.project && probe.project !== payload.project) {
+    process.stderr.write(
+      `note: payload.project="${payload.project}" differs from the inferred active ` +
+        `project "${probe.project}"; verifying and closing "${payload.project}".\n`,
+    );
+  }
   const date = payload.date || todayLocal();
 
   // Preflight: lint the wiki BEFORE writing any payload bytes. If lint

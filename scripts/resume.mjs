@@ -83,6 +83,33 @@ function pickByCwd(hypoDir, slugs, cwd) {
   return best;
 }
 
+// When cwd is set but no project's working_dir matches it, resume falls back to
+// recency silently — the user lands in an unrelated project with no clue why.
+// Emit a one-line stderr diagnostic (stdout `Project:`/`--json` contract is untouched)
+// naming why each candidate failed: missing index.md, missing working_dir, or a
+// working_dir that simply doesn't contain cwd. Logic mirrors pickByCwd's lookup.
+function warnCwdFallback(hypoDir, slugs, cwd) {
+  // No cwd, or no candidate rows at all (fresh-init / no real project): there is
+  // nothing to "fall back to most-recent" toward, so stay silent — the caller
+  // surfaces the real "no active project found" error instead.
+  if (!cwd || slugs.length === 0) return;
+  const reasons = [];
+  for (const slug of slugs) {
+    const indexPath = join(hypoDir, 'projects', slug, 'index.md');
+    if (!existsSync(indexPath)) {
+      reasons.push(`${slug} (no index.md)`);
+      continue;
+    }
+    const wd = parseFrontmatterField(readFileSync(indexPath, 'utf-8'), 'working_dir');
+    if (!wd) reasons.push(`${slug} (no working_dir)`);
+    // else: has working_dir but didn't contain cwd — expected, not flagged.
+  }
+  const detail = reasons.length ? ` Candidates missing cwd metadata: ${reasons.join(', ')}.` : '';
+  process.stderr.write(
+    `note: cwd "${cwd}" matched no project working_dir; falling back to most-recent.${detail}\n`,
+  );
+}
+
 function resolveActiveProject(hypoDir, cwd = null) {
   const hotPath = join(hypoDir, 'hot.md');
   if (!existsSync(hotPath)) return null;
@@ -115,6 +142,12 @@ function resolveActiveProject(hypoDir, cwd = null) {
     }
     // No cwd match → most recent by date (stable-sort keeps the first table row
     // on a tie, the legacy behavior).
+    if (cwd)
+      warnCwdFallback(
+        hypoDir,
+        wikiRows.map((r) => r.slug),
+        cwd,
+      );
     wikiRows.sort((a, b) => b.date.localeCompare(a.date));
     return wikiRows[0].slug;
   }
@@ -124,6 +157,7 @@ function resolveActiveProject(hypoDir, cwd = null) {
     if (cwd) {
       const picked = pickByCwd(hypoDir, mdSlugs, cwd);
       if (picked) return picked;
+      warnCwdFallback(hypoDir, mdSlugs, cwd);
     }
     return mdSlugs[0]; // legacy: first table row
   }
@@ -141,6 +175,7 @@ function resolveActiveProject(hypoDir, cwd = null) {
   if (cwd) {
     const picked = pickByCwd(hypoDir, candidates, cwd);
     if (picked) return picked;
+    warnCwdFallback(hypoDir, candidates, cwd);
   }
   let latest = null;
   let latestMtime = 0;
