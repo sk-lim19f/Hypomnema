@@ -474,4 +474,12 @@ if (args.json) {
   }
 }
 
-process.exit(errors.length > 0 ? 1 : 0);
+// Set exitCode and let Node exit naturally rather than calling process.exit():
+// when stdout is a pipe, the JSON write above is async, and a synchronous
+// process.exit() tears the process down before the OS pipe buffer (64 KiB) is
+// drained — truncating large `--json` output mid-string. Consumers that spawn
+// this script and JSON.parse the stdout (crystallize's runLint, the PreCompact
+// gate) then crash on the partial output. There are no pending async handles
+// here (pure synchronous fs), so the event loop empties at end-of-script and
+// Node flushes stdout fully before exiting with this code.
+process.exitCode = errors.length > 0 ? 1 : 0;

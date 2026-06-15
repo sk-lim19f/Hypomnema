@@ -6411,6 +6411,51 @@ test('fresh init wiki passes lint (regression: observability scaffold vs B6)', (
   );
 });
 
+suite('lint.mjs --json large-output flush (ISSUE-16)');
+
+test('lint --json: large warn-heavy output survives the 64 KiB pipe boundary', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-big-'));
+  try {
+    writeFileSync(join(dir, 'SCHEMA.md'), VOCAB_SCHEMA);
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    // One frontmatter-valid page with many DISTINCT broken wikilinks → one W4 warn
+    // each. Enough to push --json stdout well past 64 KiB — the exact point where
+    // lint's old synchronous process.exit() cut stdout at 65536 bytes mid-string,
+    // making JSON.parse throw for every spawn-and-parse consumer (crystallize's
+    // runLint, the PreCompact gate).
+    const N = 3000;
+    let body = '---\ntitle: many\ntype: wiki\nupdated: 2026-06-08\n---\n\n# many\n\n';
+    for (let i = 0; i < N; i++) body += `- [[missing-target-${i}]]\n`;
+    writeFileSync(join(dir, 'pages', 'many.md'), body);
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${dir}`, '--json'],
+      {
+        encoding: 'utf-8',
+        maxBuffer: 64 * 1024 * 1024,
+        env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+      },
+    );
+    // Output must exceed the old 64 KiB cutoff AND parse cleanly (pre-fix it was
+    // truncated to exactly 65536 bytes and JSON.parse threw here). Don't assert an
+    // exact size — only that it crosses the boundary and every warn survived.
+    assert.ok(r.stdout.length > 64 * 1024, `expected >64 KiB stdout, got ${r.stdout.length}`);
+    const parsed = JSON.parse(r.stdout);
+    const broken = parsed.warns.filter((w) =>
+      /Broken wikilink: \[\[missing-target-/.test(w.message),
+    );
+    assert.equal(
+      broken.length,
+      N,
+      `expected all ${N} broken-link warns intact, got ${broken.length}`,
+    );
+    // exit code contract preserved: warns are not errors → clean exit 0.
+    assert.equal(r.status, 0, `warn-only lint must exit 0, got ${r.status}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── Lane B: formatGrowthMetrics + growth echo regressions ─────────────────
 
 const { formatGrowthMetrics, computeSessionGrowth } = await import(join(HOOKS, 'hypo-shared.mjs'));

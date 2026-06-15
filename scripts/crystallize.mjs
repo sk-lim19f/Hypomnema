@@ -106,8 +106,17 @@ function runLint(hypoDir) {
   try {
     return JSON.parse(r.stdout);
   } catch {
+    // Report diagnostic metadata (sizes, exit/signal, spawn error code, a stderr
+    // tail) instead of dumping the whole — possibly huge, possibly truncated —
+    // stdout. lint.mjs now sets exitCode and exits naturally so its stdout is no
+    // longer cut at the 64 KiB pipe boundary; if this still fires it signals a
+    // genuine crash, and these fields say which kind.
+    const stderrTail = (r.stderr || '').slice(-2000);
     throw new Error(
-      `lint helper produced unparseable output (exit=${r.status}):\n${r.stdout}\n${r.stderr}`,
+      `lint helper produced unparseable output ` +
+        `(exit=${r.status}, signal=${r.signal || 'none'}, ` +
+        `stdoutBytes=${(r.stdout || '').length}, spawnError=${r.error?.code || 'none'})` +
+        (stderrTail ? `\nstderr tail:\n${stderrTail}` : ''),
     );
   }
 }
