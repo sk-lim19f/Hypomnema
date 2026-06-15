@@ -1487,12 +1487,29 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // Pass --hypo-dir explicitly: lint.mjs resolves the vault via HYPO_DIR /
       // home dirs and ignores cwd, so a --hypo-dir caller (crystallize, tests)
       // would otherwise lint the ambient wiki, not the one under test.
+      // maxBuffer matches crystallize's runLint (64 MiB): warn-heavy output on a
+      // large wiki easily exceeds Node's 1 MiB default, which would truncate
+      // stdout and (via the catch below) silently fail-open this gate.
       const r = spawnSync('node', [lintPath, '--json', `--hypo-dir=${hypoDir}`], {
         encoding: 'utf-8',
         cwd: hypoDir,
         timeout: 30000,
+        maxBuffer: 64 * 1024 * 1024,
       });
-      const parsed = JSON.parse(r.stdout || '{}');
+      // A spawn failure (ENOENT), a timeout/kill (status === null), or a crash
+      // that produced no stdout must NOT be parsed as `{}` and treated as a clean
+      // lint — that path leaves skipped.lint=false with no notice, an INVISIBLE
+      // fail-open. Throw instead so the catch below records skipped.lint=true WITH
+      // a reason notice.
+      if (r.error || r.status === null) {
+        throw new Error(`lint spawn failed: ${r.error?.code || `signal ${r.signal}`}`);
+      }
+      if (!r.stdout || !r.stdout.trim()) {
+        throw new Error(
+          `lint produced no stdout (exit=${r.status})${r.stderr ? `: ${r.stderr.slice(-500)}` : ''}`,
+        );
+      }
+      const parsed = JSON.parse(r.stdout);
       const allErrors = parsed.errors || [];
       const allW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
       const scope = new Set(opts.lintScope || closeFileTargetsGlobal(hypoDir));
@@ -1521,8 +1538,14 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         });
       }
       for (const w of w8Notice) notices.push({ type: 'design-history', reason: w.file });
-    } catch {
+    } catch (e) {
       skipped.lint = true; // fail-open on tooling error
+      // Surface WHY the gate skipped lint (truncated stdout, timeout, spawn error)
+      // instead of silently dropping the check — a fail-open is invisible otherwise.
+      notices.push({
+        type: 'lint',
+        reason: `lint skipped (fail-open): ${e.message || e.code || 'unknown error'}`,
+      });
     }
   }
 
