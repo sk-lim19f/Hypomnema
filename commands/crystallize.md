@@ -1,5 +1,5 @@
 ---
-description: Crystallize draft notes into stable knowledge — also the session-close alias
+description: Crystallize draft notes into stable wiki knowledge; also the session-close path. Use when the user is wrapping up a session, asks to save or consolidate notes, or before a /compact.
 ---
 
 You are running `/hypo:crystallize`. This command serves two purposes:

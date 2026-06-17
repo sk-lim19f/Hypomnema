@@ -1,5 +1,5 @@
 ---
-description: Check verify_by fields and surface overdue or missing verifications
+description: Check verify_by fields and surface overdue or missing verifications. Use when the user asks what wiki knowledge needs re-checking or wants to audit freshness.
 ---
 
 You are running `/hypo:verify`. Audit wiki pages for overdue or missing `verify_by` fields.

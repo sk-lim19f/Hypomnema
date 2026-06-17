@@ -1,5 +1,5 @@
 ---
-description: Show statistics about the wiki
+description: Show statistics about the wiki (page counts, link density, growth). Use when the user asks how big the wiki is, how it has grown, or its overall shape.
 ---
 
 You are running `/hypo:stats`. Display a summary of wiki health and activity.

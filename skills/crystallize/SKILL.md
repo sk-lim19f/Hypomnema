@@ -1,5 +1,5 @@
 ---
-description: Close a session (steps 1~6) and, on request, consolidate scattered wiki knowledge into stable pages (steps 7~11)
+description: Close a session by capturing what happened into the wiki (steps 1-6), and on request consolidate scattered notes into stable pages (steps 7-11). Use when the user signals they are wrapping up, asks to save or crystallize the session, or before a /compact.
 ---
 
 You are running `/hypo:crystallize`. The command serves two modes (spec §5.2.7 / §8.3):

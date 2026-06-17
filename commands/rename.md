@@ -1,5 +1,5 @@
 ---
-description: Rename a wiki page or directory and rewrite inbound wikilinks
+description: Rename a wiki page or directory and rewrite the inbound wikilinks so live links survive. Use when the user wants to move or rename a page or folder without breaking references.
 ---
 
 You are running `/hypo:rename`. Move a page or directory and content-aware rewrite every inbound `[[wikilink]]` across the vault so the rename never breaks a link.

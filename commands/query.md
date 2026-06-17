@@ -1,5 +1,5 @@
 ---
-description: Query the wiki and synthesize an answer from relevant pages
+description: Query the wiki and synthesize an answer from the relevant pages. Use when the user asks what the wiki knows, wants to recall a past decision, or needs prior context before starting work.
 ---
 
 You are running `/hypo:query`. Answer a question by searching the wiki and synthesizing from relevant pages.

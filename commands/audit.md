@@ -1,5 +1,5 @@
 ---
-description: Run the observability audit on recent sessions and (optionally) write the weekly report
+description: Audit recent sessions for observability gaps and optionally write the weekly report. Use when the user asks to review session quality, find tracking gaps, or generate the weekly summary.
 ---
 
 You are running `/hypo:audit`. Inspect recent Claude Code sessions to see how much of the wiki's value motion is actually happening (search, ingest, citation, feedback), then either show the result inline or write a weekly observability page.

@@ -1,5 +1,5 @@
 ---
-description: Ingest an external source into the wiki
+description: Ingest an external source (URL, doc, article, command output) into the wiki as a citable page. Use when the user shares a source to capture or wants external knowledge saved for reuse.
 ---
 
 You are running `/hypo:ingest`. Save a raw source and synthesize it into wiki pages.

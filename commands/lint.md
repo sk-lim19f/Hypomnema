@@ -1,5 +1,5 @@
 ---
-description: Validate wiki pages for frontmatter correctness and broken wikilinks
+description: Validate wiki pages for frontmatter correctness and broken wikilinks. Use when the user asks to check wiki health, before a commit, or after bulk edits or renames.
 ---
 
 You are running `/hypo:lint`. Validate all wiki pages for frontmatter correctness and broken `[[wikilink]]` references.

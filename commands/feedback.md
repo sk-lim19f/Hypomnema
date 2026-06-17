@@ -1,5 +1,5 @@
 ---
-description: Record an AI behavior correction or preference into the wiki
+description: Record an AI behavior correction or preference into the wiki. Use when the user corrects how you work or states a lasting preference to remember.
 ---
 
 You are running `/hypo:feedback`. Capture a behavior correction or preference into `pages/feedback/` — the **single source of truth** for learned behaviors (ADR 0031).
