@@ -1760,7 +1760,9 @@ export function isCompactOrClearCommand(prompt) {
  * PreCompact gate and the Stop-chain Layer 3 hook share one close-intent
  * signal source. Claude Code transcript format: each line is
  * `{ type:"user", message:{ role:"user", content: ... } }`; the older
- * top-level `{ role, content }` shape is also accepted.
+ * top-level `{ role, content }` shape is also accepted. tool_result blocks
+ * (also role:'user') are excluded so tool output never feeds the close-intent
+ * gate — only top-level `type:'text'` blocks and string content count.
  *
  * @param {string} transcriptPath
  * @param {number} tailN  how many trailing lines to scan (default 30)
@@ -1778,7 +1780,19 @@ export function extractUserMessages(transcriptPath, tailN = 30) {
           const role = msg.role ?? obj.role ?? obj.type;
           if (role !== 'user') return '';
           const content = msg.content ?? obj.content;
-          return typeof content === 'string' ? content : JSON.stringify(content);
+          if (typeof content === 'string') return content;
+          if (Array.isArray(content)) {
+            // Only genuine user-typed text blocks. tool_result blocks are also
+            // recorded with role:'user' in the Claude Code transcript; slurping
+            // them via JSON.stringify let tool output (e.g. close-pattern example
+            // strings read out of code/docs) trip the close-intent gate.
+            // Do NOT recurse into tool_result.content, or the pollution returns.
+            return content
+              .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+              .map((b) => b.text)
+              .join('\n');
+          }
+          return '';
         } catch {
           return '';
         }
@@ -1800,7 +1814,12 @@ export function extractUserMessages(transcriptPath, tailN = 30) {
 export function isClosePattern(text) {
   if (!text || typeof text !== 'string') return false;
   const krPatterns = [
-    /세션\s*(끝|종료|마무리)/,
+    // 끝: bare terminal noun, but boundary-guarded so "세션 끝내는 방법" /
+    // "세션 끝나면" don't trip. 마무리/종료: require a verb ending (mirrors the
+    // 작업 마무리/종료 sibling below) so mentions/negations like
+    // "세션 마무리 할 때가 아닌데" are excluded. 임 is boundary-guarded so
+    // "세션 종료 임시 플래그" doesn't match.
+    /세션\s*(?:끝(?![가-힣])|(?:마무리|종료)\s*(?:하자|할게|하겠|했어|임(?![가-힣])))/,
     /오늘\s*은?\s*(여기|작업|세션).*(끝|마치|마무리|종료)/,
     // 여기까지: requires no continuation action word (e.g. 여기까지 구현해줘 is not a close signal)
     /여기(서)?까지(?!\s*(?:구현|작성|완성|수정|변경|추가|삭제|테스트|확인|검토|해줘|해야|하고|하면))/,
