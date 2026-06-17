@@ -742,6 +742,7 @@ const {
   isGateSkipped,
   buildOutput,
   isClosePattern,
+  extractUserMessages,
   hasMutatingTranscriptActivity,
   isSubstantialSession,
   extractTouchedWikiFiles,
@@ -936,6 +937,13 @@ test('일반 작업 문장 → false (false-positive 방지)', () => {
   assert.equal(isClosePattern('wrapping up the investigation'), false);
   assert.equal(isClosePattern('wrap up the debugging'), false);
   assert.equal(isClosePattern('wrap up the audit'), false);
+  // ISSUE-29 부 fix: 세션 + 마무리/종료 needs a verb ending; bare 끝/임 are
+  // boundary-guarded so mentions/negations and noun-prefix forms don't trip.
+  assert.equal(isClosePattern('세션 마무리 할 때가 아닌데'), false);
+  assert.equal(isClosePattern('세션 종료 조건을 바꿔줘'), false);
+  assert.equal(isClosePattern('세션 종료 임시 플래그'), false);
+  assert.equal(isClosePattern('세션 끝내는 방법'), false);
+  assert.equal(isClosePattern('세션 끝나면 알려줘'), false);
   assert.equal(isClosePattern(''), false);
   assert.equal(isClosePattern(null), false);
 });
@@ -943,6 +951,71 @@ test('일반 작업 문장 → false (false-positive 방지)', () => {
 test('혼합 텍스트(트랜스크립트)에서도 패턴 감지', () => {
   const transcript = '이 PR 리뷰 마저 봐줘\n오늘은 여기까지 하자\n내일 다시 볼게';
   assert.equal(isClosePattern(transcript), true);
+});
+
+// ── ISSUE-29: extractUserMessages must not slurp tool_result content ──
+suite('extractUserMessages() — tool_result exclusion');
+
+test('tool_result carrying close-phrase examples is excluded → no false close', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      // tool_result (role:'user') carrying close-pattern example strings, as a
+      // Read of close logic/docs would produce — must NOT count as user text.
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'x',
+              content: '패턴 예시: "이만 마치자", "오늘 여기까지", "wrap up", "session close"',
+            },
+          ],
+        },
+      },
+      // a genuine, neutral user message in a text block
+      {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: '이 close 로직 좀 봐줘' }] },
+      },
+    ]);
+    const text = extractUserMessages(p);
+    assert.equal(text.includes('이 close 로직'), true); // real text kept
+    assert.equal(text.includes('이만 마치자'), false); // tool_result dropped
+    assert.equal(isClosePattern(text), false); // the ISSUE-29 false-positive is dead
+  });
+});
+
+test('genuine close in a text block still fires', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'y', content: 'noise' }],
+        },
+      },
+      {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: '오늘은 여기까지 하자' }] },
+      },
+    ]);
+    assert.equal(isClosePattern(extractUserMessages(p)), true);
+  });
+});
+
+test('string content and legacy top-level shape still extracted', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      { type: 'user', message: { role: 'user', content: '세션 마무리하자' } },
+      { role: 'user', content: '추가 메모' }, // legacy top-level shape
+    ]);
+    const text = extractUserMessages(p);
+    assert.equal(text.includes('세션 마무리하자'), true);
+    assert.equal(text.includes('추가 메모'), true);
+  });
 });
 
 // ── 6a: substantial-session gate (read-only investigation volume) ──
