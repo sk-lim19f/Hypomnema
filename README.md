@@ -225,6 +225,7 @@ Eight commands cover the full capture → retrieval → consolidation cycle.
 | `/hypo:verify` | Audits pages with `verify_by` frontmatter | When time-bound knowledge might have aged out |
 | `/hypo:lint` | Validates frontmatter, wikilinks, schema | Before commits, in CI |
 | `/hypo:graph` | Generates a wikilink dependency graph | When you want to see structural growth |
+| `/hypo:rename` | Renames a page or directory and rewrites inbound `[[wikilinks]]` | When a page or project folder needs a new name |
 
 ### Lifecycle hooks (14)
 
