@@ -1,5 +1,5 @@
 ---
-description: Add a source document to the wiki and synthesize a source-summary page
+description: Add an external source (URL, doc, article, command output) to the wiki and synthesize a citable summary page. Use when the user shares a source to capture, asks to ingest something, or wants reliable external knowledge saved for reuse.
 ---
 
 You are running `/hypo:ingest`. Add a new source document to `sources/` and create (or update) its corresponding `source-summary` page under `pages/`.

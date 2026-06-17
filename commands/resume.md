@@ -1,5 +1,5 @@
 ---
-description: Resume the most recent session for an active project
+description: Resume an active project and pick up where you left off. Use when the user asks to continue prior work or what they were working on.
 ---
 
 You are running `/hypo:resume`. Load the session state for an active project and pick up where you left off.

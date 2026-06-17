@@ -1,5 +1,5 @@
 ---
-description: Check for Hypomnema updates and optionally apply them
+description: Check for Hypomnema updates and optionally apply them. Use when the user asks to update Hypomnema or sees an update-available notice.
 ---
 
 You are running `/hypo:upgrade`. Check if the installed Hypomnema wiki is out of date and offer to apply updates.

@@ -1,5 +1,5 @@
 ---
-description: Initialize a new Hypomnema wiki
+description: Initialize a new Hypomnema wiki (structure, config, hooks). Use when the user is setting up a wiki for the first time or starting a fresh vault.
 ---
 
 You are running `/hypo:init`. Set up a new personal wiki powered by Hypomnema.

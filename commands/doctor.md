@@ -1,5 +1,5 @@
 ---
-description: Health check for a Hypomnema wiki installation
+description: Run a health check on a Hypomnema wiki installation (hooks, settings, structure). Use when the user reports the wiki misbehaving, after an install or upgrade, or to diagnose setup problems.
 ---
 
 You are running `/hypo:doctor`. Verify the health of the current Hypomnema wiki installation.

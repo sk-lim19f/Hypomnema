@@ -1,5 +1,5 @@
 ---
-description: Lint wiki pages for frontmatter and broken wikilinks
+description: Lint wiki pages for frontmatter errors and broken wikilinks. Use when the user asks to check or validate the wiki health, before a commit, or after bulk edits or renames.
 ---
 
 You are running `/hypo:lint`. Validate all wiki pages for frontmatter correctness and broken `[[wikilink]]` references.

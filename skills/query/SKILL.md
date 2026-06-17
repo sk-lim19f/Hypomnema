@@ -1,5 +1,5 @@
 ---
-description: Search wiki pages by keyword and retrieve relevant knowledge
+description: Search the wiki by keyword and synthesize an answer from the relevant pages. Use when the user asks what the wiki knows about a topic, wants to recall a past decision, or needs prior context before starting work.
 ---
 
 You are running `/hypo:query`. Full-text search across all wiki pages and projects, then synthesize an answer from the matching pages.

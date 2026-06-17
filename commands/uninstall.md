@@ -1,5 +1,5 @@
 ---
-description: Remove Hypomnema hooks and clean up settings.json
+description: Remove Hypomnema hooks and clean up settings.json. Use when the user wants to uninstall or disable the wiki integration.
 ---
 
 You are running `/hypo:uninstall`. Remove Hypomnema from this machine.

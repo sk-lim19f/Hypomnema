@@ -1,5 +1,5 @@
 ---
-description: Check wiki pages for stale or unverified knowledge and prompt review
+description: Surface wiki knowledge that is stale or past its verify-by date and prompt review. Use when the user asks what needs re-checking, wants to audit knowledge freshness, or is reviewing the wiki for rot.
 ---
 
 You are running `/hypo:verify`. Check all wiki pages for `verify_by` and `verify_by_date` fields, surface overdue pages, and guide a review pass.

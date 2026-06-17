@@ -1,5 +1,5 @@
 ---
-description: Generate a wikilink dependency graph from wiki pages
+description: Generate a wikilink dependency graph from wiki pages (json, mermaid, or dot). Use when the user asks to visualize wiki structure, find orphan or hub pages, or map how notes link together.
 ---
 
 You are running `/hypo:graph`. Build a wikilink dependency graph from all pages under `pages/` and `projects/` and output it in the requested format.
