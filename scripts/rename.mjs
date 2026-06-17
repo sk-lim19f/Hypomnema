@@ -11,6 +11,12 @@
  *
  * Default is a dry-run (report only); --apply performs the move + rewrites.
  *
+ * Two modes, auto-detected from --from:
+ *   • page mode — --from resolves to a .md page (the original behavior below).
+ *   • directory mode — --from is an existing directory: the whole subtree is
+ *     relocated (renameSync, carrying non-.md assets) and inbound full-slug /
+ *     dir-relative links are rewritten across the vault. See runDirectory.
+ *
  * Two design invariants:
  *
  * 1. Resolution, not string-match. A link `[[foo]]` (bare basename) can be
@@ -36,9 +42,12 @@ import {
   rmSync,
   mkdirSync,
   readdirSync,
+  renameSync,
   statSync,
+  lstatSync,
+  realpathSync,
 } from 'fs';
-import { join, relative, extname, basename, dirname, normalize, isAbsolute } from 'path';
+import { join, relative, extname, basename, dirname, normalize, isAbsolute, sep } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 
@@ -64,8 +73,12 @@ function collectPages(dir, root, pages = [], ignorePatterns = []) {
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
     if (isIgnored(full, root, ignorePatterns)) continue;
-    const st = statSync(full);
-    if (st.isDirectory()) {
+    // lstat (never follow): a symlinked dir or file is skipped entirely so the
+    // whole-vault scan can never traverse out of the vault via a symlink.
+    const st = lstatSync(full);
+    if (st.isSymbolicLink()) {
+      continue;
+    } else if (st.isDirectory()) {
       collectPages(full, root, pages, ignorePatterns);
     } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
       const rel = relative(root, full).replace(/\\/g, '/');
@@ -75,19 +88,34 @@ function collectPages(dir, root, pages = [], ignorePatterns = []) {
   return pages;
 }
 
-// ── preserved (append-only / immutable) link-source paths ──────────────────────
-// These are skipped as link SOURCES: their content is a frozen record. Rewriting
-// a [[old]] reference inside a past journal/session-log/weekly/archive/postmortem
-// snapshot (or root log.md) would falsify that moment. sources/* is immutable
-// captured material. decisions/ and other-project handoffs are NOT preserved here
-// (they were kept in the read-side triage for renumber/ownership reasons, not
-// because they are time records — a forward rename should update their live
-// cross-references). Matches a path SEGMENT so `pages/journal/x.md` and
-// `projects/p/session-log/2026-06.md` both qualify.
-function isPreservedSource(rel) {
+// ── preservation class of a link-source path ───────────────────────────────────
+// Two distinct reasons a file is normally skipped as a link SOURCE, kept separate
+// because directory mode treats them differently (codex design BLOCKER):
+//
+//   'timerecord' — append-only snapshots (journal / session-log / weekly / archive
+//      / postmortems + root log.md). Rewriting a [[old]] inside a past entry would
+//      falsify that moment. BUT a directory move relocates the whole subtree, so a
+//      time-record INSIDE the moved subtree that links a moving sibling must update
+//      that intra-subtree path label (the page genuinely moved); see runDirectory.
+//
+//   'sources'    — sources/* immutable CAPTURED material. Never rewritten, not even
+//      inside a moved subtree: a directory move must not claim ownership over the
+//      bytes of an external source we transcribed verbatim.
+//
+// Matches a path SEGMENT so `pages/journal/x.md` and `projects/p/session-log/y.md`
+// both qualify. Returns null for ordinary live pages.
+function preservationClass(rel) {
   const p = rel.replace(/\\/g, '/');
-  if (p === 'log.md') return true; // root append-only log
-  return /(^|\/)(journal|session-log|weekly|archive|postmortems|sources)(\/|$)/.test(p);
+  if (/(^|\/)sources(\/|$)/.test(p)) return 'sources';
+  if (p === 'log.md') return 'timerecord';
+  if (/(^|\/)(journal|session-log|weekly|archive|postmortems)(\/|$)/.test(p)) return 'timerecord';
+  return null;
+}
+
+// Single-page mode preserves BOTH classes as link sources (unchanged behavior): a
+// rename elsewhere in the vault must never churn a frozen snapshot or a source.
+function isPreservedSource(rel) {
+  return preservationClass(rel) !== null;
 }
 
 // ── slug-form index (resolution with collision detection) ──────────────────────
@@ -223,6 +251,408 @@ function fail(args, msg) {
   process.exit(1);
 }
 
+// ── directory mode ─────────────────────────────────────────────────────────────
+// A directory rename relocates a whole subtree (`projects/old/**` → `projects/new/**`)
+// and rewrites inbound links across the vault. Key facts that shape the algorithm:
+//
+//  • A directory move does NOT change basenames, only the path prefix. So bare
+//    `[[0052]]` links keep resolving to the relocated page automatically and need
+//    NO rewrite — only the FULL-slug and 1-seg DIR-RELATIVE forms encode the moved
+//    prefix and break. (Forms that drop ≥2 segments, e.g. `[[decisions/0052]]`, do
+//    not encode the renamed prefix either: lint cannot resolve them today and they
+//    survive a move unchanged — out of scope, matching lint's buildSlugMap.)
+//  • Every moved page is BOTH a target (it relocates) and a source (its links to
+//    moving siblings must update). The move is done with one renameSync of the
+//    whole directory — which also carries non-.md assets (logo svg/png, etc.) — and
+//    rewritten page bodies are written at their NEW paths afterward.
+
+// Recursively detect any symlink under a directory (lstat, never follows). A moved
+// subtree containing a symlink is refused: renameSync would move the link verbatim
+// and statSync-based page collection could otherwise pull external pages in.
+function subtreeHasSymlink(dir) {
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    let st;
+    try {
+      st = lstatSync(full);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) return true;
+    if (st.isDirectory() && subtreeHasSymlink(full)) return true;
+  }
+  return false;
+}
+
+// Classify a link target against the SET of moving pages. Only FULL / DIR-RELATIVE
+// kinds are rewritten (bare survives a dir move untouched). Returns:
+//   { kind: null }                              → not (uniquely) a moving target
+//   { kind: null, ambiguous: true, target }     → form shared by >1 page, a mover
+//                                                  among them → report, never rewrite
+//   { kind, fromPage, toPage }                  → unambiguous moving target
+function classifyMovedTarget(target, movedByRel, formIndex) {
+  const owners = formIndex.get(target);
+  if (!owners) return { kind: null };
+  const movingOwners = [...owners].filter((rel) => movedByRel.has(rel));
+  if (movingOwners.length === 0) return { kind: null }; // link unrelated to this move
+  if (owners.size > 1) {
+    // Shared form. Bare collisions are irrelevant (bare is never rewritten in dir
+    // mode); only a shared full/dirrel form is worth reporting. full slugs are
+    // unique, so this realistically only guards an exotic dir-relative clash.
+    const rel = movingOwners[0];
+    const { fromPage } = movedByRel.get(rel);
+    if (target === fromPage.slug || target === dirRelForm(fromPage.slug)) {
+      return { kind: null, ambiguous: true, target };
+    }
+    return { kind: null };
+  }
+  const rel = movingOwners[0];
+  const { fromPage, toPage } = movedByRel.get(rel);
+  let kind = null;
+  if (target === fromPage.slug) kind = 'full';
+  else if (target === dirRelForm(fromPage.slug)) kind = 'dirrel';
+  // bare (target === fromPage.bare) → intentionally null: unchanged by a dir move.
+  if (!kind) return { kind: null };
+  return { kind, fromPage, toPage };
+}
+
+// Rewrite inbound references to any moving page in `content`. aliasPreserve keeps
+// the original rendered label via `[[new|old]]` for unaliased links — used for
+// time-record files inside the moved subtree so a relocated snapshot still reads
+// with its original path label while linking to the live page.
+function rewriteContentDir(content, movedByRel, formIndex, aliasPreserve) {
+  const mask = maskNonWikilinkRegions(content);
+  const re = /\[\[([^\]]+?)\]\]/g;
+  const edits = [];
+  const rewrites = [];
+  const ambiguous = [];
+  let m;
+  while ((m = re.exec(mask)) !== null) {
+    const start = m.index;
+    const end = start + m[0].length;
+    const body = content.slice(start + 2, end - 2);
+    const parsed = splitLinkBody(body);
+    if (!parsed) continue;
+    const cls = classifyMovedTarget(parsed.target, movedByRel, formIndex);
+    const line = content.slice(0, start).split('\n').length;
+    if (cls.ambiguous) {
+      ambiguous.push({ link: m[0], line, target: parsed.target });
+      continue;
+    }
+    if (!cls.kind) continue;
+    const newTarget = newTargetFor(cls.kind, cls.toPage);
+    const replacement =
+      aliasPreserve && parsed.suffix === ''
+        ? `[[${newTarget}|${parsed.target}]]`
+        : `[[${newTarget}${parsed.suffix}]]`;
+    edits.push({ start, end, replacement });
+    rewrites.push({ from: m[0], to: replacement, line });
+  }
+  let out = content;
+  for (const e of edits.sort((a, b) => b.start - a.start)) {
+    out = out.slice(0, e.start) + e.replacement + out.slice(e.end);
+  }
+  return { content: out, rewrites, ambiguous };
+}
+
+// Verify a path resolves — following any symlink ANCESTOR — to a location inside
+// the real vault root. A lexical ../-check cannot catch this: `projects/link/new`
+// where `projects/link` → /tmp/outside is lexically in-vault, yet renameSync would
+// follow the symlink and write across the vault boundary. The destination may not
+// exist, so the deepest existing prefix is resolved (its realpath is where a write
+// would actually land). Fail-closed: returns false on any resolution error.
+//
+// The walk uses lstat (NOT existsSync) so a DANGLING symlink prefix is detected as
+// present-but-unresolvable rather than skipped as absent — otherwise the walk would
+// step past it to an in-vault parent and wrongly report containment, letting an
+// external rewrite land before renameSync crashes on the dangling target.
+function realContainedInVault(absPath, realRoot) {
+  let probe = absPath;
+  // Walk up to the deepest path component that exists as a link-or-real entry.
+  for (;;) {
+    let exists = true;
+    try {
+      lstatSync(probe);
+    } catch {
+      exists = false;
+    }
+    if (exists) break;
+    const parent = dirname(probe);
+    if (parent === probe) return false;
+    probe = parent;
+  }
+  let real;
+  try {
+    real = realpathSync(probe); // follows links; throws on a dangling symlink
+  } catch {
+    return false;
+  }
+  return real === realRoot || real.startsWith(realRoot + sep);
+}
+
+// The destination's deepest existing ancestor must be a directory. Otherwise
+// mkdirSync(dirname, {recursive}) fails with ENOTDIR — but only AFTER the inbound
+// rewrites were already written, leaving a partial mutation on a move that can
+// never complete (e.g. `--to=projects/file/sub` where `projects/file` is a regular
+// file). Refuse up front so a failed move never churns the vault. Runs after the
+// realpath-containment check, so a symlink-to-dir ancestor is already in-vault.
+function destinationHostable(absPath) {
+  let probe = dirname(absPath);
+  for (;;) {
+    let st;
+    try {
+      st = statSync(probe);
+    } catch {
+      const parent = dirname(probe);
+      if (parent === probe) return false;
+      probe = parent;
+      continue;
+    }
+    return st.isDirectory();
+  }
+}
+
+function runDirectory(args, fromDirRel, ignorePatterns) {
+  const fromAbs = join(args.hypoDir, fromDirRel);
+  if (lstatSync(fromAbs).isSymbolicLink()) {
+    fail(args, `--from '${args.from}' is a symlink — refusing to rename a linked directory`);
+  }
+  // Real-root containment: reject a --from whose realpath (after following any
+  // symlink ancestor) lands outside the vault — else the move would drag an
+  // outside-the-vault directory in.
+  let realRoot;
+  try {
+    realRoot = realpathSync(args.hypoDir);
+  } catch {
+    fail(args, `wiki root cannot be resolved: ${args.hypoDir}`);
+  }
+  if (!realContainedInVault(fromAbs, realRoot)) {
+    fail(args, `--from '${args.from}' resolves outside the wiki root (symlink escape)`);
+  }
+
+  // Destination: normalize + keep inside the vault (mirrors page mode's --to guard).
+  const toNorm = args.to.replace(/\\/g, '/').replace(/\.md$/, '').replace(/\/+$/, '');
+  const toDirRel = normalize(toNorm).replace(/\\/g, '/');
+  if (toDirRel === '..' || toDirRel.startsWith('../') || isAbsolute(toDirRel) || toDirRel === '.') {
+    fail(args, `--to escapes the wiki root: ${args.to}`);
+  }
+  if (toDirRel === fromDirRel) {
+    fail(args, `--from and --to are the same directory (${toDirRel}) — nothing to rename`);
+  }
+  // Same top-level segment only. A move that changes the leading scan-dir segment
+  // (e.g. journal/x → pages/x) would change the targetability class and the
+  // dir-relative form semantics; that is out of scope for this increment.
+  const fromTop = fromDirRel.split('/')[0];
+  const toTop = toDirRel.split('/')[0];
+  if (fromTop !== toTop) {
+    fail(
+      args,
+      `--to '${toDirRel}' changes the top-level area ('${fromTop}' → '${toTop}'). ` +
+        `Cross-area directory moves are not supported (they change link resolution).`,
+    );
+  }
+  // No nesting either way: renaming a dir into its own subtree (or vice versa) is
+  // undefined.
+  if (toDirRel === fromDirRel || toDirRel.startsWith(`${fromDirRel}/`)) {
+    fail(args, `--to '${toDirRel}' is nested inside --from '${fromDirRel}'`);
+  }
+  if (fromDirRel.startsWith(`${toDirRel}/`)) {
+    fail(args, `--from '${fromDirRel}' is nested inside --to '${toDirRel}'`);
+  }
+  // Real-root containment for the destination: a symlinked --to ancestor (e.g.
+  // `projects/link` → /tmp/outside) is lexically in-vault but renameSync would
+  // follow it and write outside the vault. Resolve the deepest existing prefix.
+  const toAbs = join(args.hypoDir, toDirRel);
+  if (!realContainedInVault(toAbs, realRoot)) {
+    fail(args, `--to '${args.to}' resolves outside the wiki root (symlink escape)`);
+  }
+  if (!destinationHostable(toAbs)) {
+    fail(args, `--to '${args.to}' has a non-directory ancestor — destination cannot be created`);
+  }
+  if (subtreeHasSymlink(fromAbs)) {
+    fail(args, `--from subtree contains a symlink — refusing (move could escape the vault)`);
+  }
+
+  const pages = collectPages(args.hypoDir, args.hypoDir, [], ignorePatterns);
+  const formIndex = buildFormIndex(pages);
+
+  // The moving pages: every collected page whose rel is under the from-directory.
+  const prefix = `${fromDirRel}/`;
+  const movedByRel = new Map(); // rel → { fromPage, toPage }
+  for (const p of pages) {
+    if (!p.rel.startsWith(prefix)) continue;
+    const toRel = `${toDirRel}/${p.rel.slice(prefix.length)}`;
+    const toPage = {
+      rel: toRel,
+      slug: toRel.replace(/\.md$/, ''),
+      bare: basename(toRel, '.md'),
+      path: join(args.hypoDir, toRel),
+    };
+    movedByRel.set(p.rel, { fromPage: p, toPage });
+  }
+  if (movedByRel.size === 0) {
+    fail(args, `--from '${fromDirRel}' contains no wiki pages to rename`);
+  }
+
+  // Renumber / merge report: a destination that already exists means this is not a
+  // clean 1:1 move. Rather than a terse hard-fail, report exactly which destination
+  // paths collide and refuse --apply, leaving the merge/renumber for manual handling.
+  if (existsSync(toAbs)) {
+    const collisions = [];
+    for (const { toPage } of movedByRel.values()) {
+      if (existsSync(toPage.path)) collisions.push(toPage.rel);
+    }
+    const report = {
+      ok: false,
+      error: `--to '${toDirRel}' already exists — directory rename requires a fresh destination`,
+      reason: 'renumber-or-merge',
+      from: fromDirRel,
+      to: toDirRel,
+      destination_collisions: collisions,
+    };
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else {
+      console.error(`✗ ${report.error}`);
+      console.error(
+        `  This is a renumber/merge: ${collisions.length} destination page(s) already exist.`,
+      );
+      for (const c of collisions) console.error(`    · ${c}`);
+      console.error(`  Resolve manually (merge or renumber), then retry into a fresh directory.`);
+    }
+    process.exit(1);
+  }
+
+  // Post-move form index: validate that no moved page's GENERATED full/dir-relative
+  // form collides with a different page in the post-move world. (Bare forms and
+  // full slugs cannot collide here — the destination dir is fresh — so this guards
+  // the exotic dir-relative clash, per the codex design BLOCKER.)
+  const postIndex = new Map(); // form → Set<post-rel>
+  const addPost = (form, rel) => {
+    if (!form) return;
+    if (!postIndex.has(form)) postIndex.set(form, new Set());
+    postIndex.get(form).add(rel);
+  };
+  for (const p of pages) {
+    const mv = movedByRel.get(p.rel);
+    const target = mv ? mv.toPage : p;
+    addPost(target.slug, target.rel);
+    if (/(^|\/)sources(\/|$)/.test(target.rel)) continue;
+    addPost(target.bare, target.rel);
+    addPost(dirRelForm(target.slug), target.rel);
+  }
+  const formCollisions = [];
+  for (const { toPage } of movedByRel.values()) {
+    for (const form of [toPage.slug, dirRelForm(toPage.slug)]) {
+      if (!form) continue;
+      const owners = postIndex.get(form);
+      if (owners && [...owners].some((rel) => rel !== toPage.rel)) {
+        formCollisions.push({ form, page: toPage.rel });
+      }
+    }
+  }
+  if (formCollisions.length > 0) {
+    const report = {
+      ok: false,
+      error: 'directory rename would create ambiguous link forms',
+      reason: 'form-collision',
+      from: fromDirRel,
+      to: toDirRel,
+      form_collisions: formCollisions,
+    };
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else {
+      console.error(`✗ ${report.error}`);
+      for (const fc of formCollisions) console.error(`    · '${fc.form}' (${fc.page})`);
+    }
+    process.exit(1);
+  }
+
+  // Rewrite inbound references across the vault.
+  const externalWrites = new Map(); // abs path → content (non-moved source files)
+  const movedBodies = new Map(); // new rel → content (moved page bodies, written post-move)
+  const fileResults = [];
+  const ambiguities = [];
+  let totalRewrites = 0;
+  for (const p of pages) {
+    const cls = preservationClass(p.rel);
+    const inSubtree = movedByRel.has(p.rel);
+    // Eligibility:
+    //  sources/*            → never rewritten (immutable), even inside the subtree.
+    //  time-record outside  → frozen (a snapshot elsewhere must not change).
+    //  time-record inside   → rewrite intra-subtree links, preserving the rendered
+    //                         label via [[new|old]] (the page genuinely relocated).
+    //  ordinary page        → rewrite normally.
+    if (cls === 'sources') continue;
+    if (cls === 'timerecord' && !inSubtree) continue;
+    const aliasPreserve = cls === 'timerecord' && inSubtree;
+    let raw;
+    try {
+      raw = readFileSync(p.path, 'utf-8');
+    } catch {
+      continue;
+    }
+    const { content, rewrites, ambiguous } = rewriteContentDir(
+      raw,
+      movedByRel,
+      formIndex,
+      aliasPreserve,
+    );
+    if (rewrites.length > 0) {
+      const landRel = inSubtree ? movedByRel.get(p.rel).toPage.rel : p.rel;
+      fileResults.push({ file: landRel, rewrites });
+      totalRewrites += rewrites.length;
+      if (inSubtree) movedBodies.set(movedByRel.get(p.rel).toPage.rel, content);
+      else externalWrites.set(p.path, content);
+    }
+    if (ambiguous.length > 0) ambiguities.push({ file: p.rel, ambiguous });
+  }
+
+  // Apply: external rewrites in place → renameSync the whole subtree (carries
+  // non-.md assets) → write rewritten moved bodies at their new paths.
+  let moved = false;
+  if (args.apply) {
+    for (const [path, content] of externalWrites) writeFileSync(path, content);
+    mkdirSync(dirname(toAbs), { recursive: true });
+    renameSync(fromAbs, toAbs);
+    for (const [newRel, content] of movedBodies) {
+      writeFileSync(join(args.hypoDir, newRel), content);
+    }
+    moved = true;
+  }
+
+  const result = {
+    ok: true,
+    applied: args.apply,
+    mode: 'directory',
+    from: fromDirRel,
+    to: toDirRel,
+    moved,
+    pages_moved: movedByRel.size,
+    files_rewritten: fileResults.length,
+    links_rewritten: totalRewrites,
+    rewrites: fileResults,
+    ambiguous: ambiguities,
+  };
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    const mode = args.apply ? 'Renamed directory' : 'Dry-run (no changes written)';
+    console.log(`${mode}: ${fromDirRel}/ → ${toDirRel}/ (${movedByRel.size} page(s))`);
+    console.log(`  ${totalRewrites} inbound link(s) across ${fileResults.length} file(s).`);
+    for (const f of fileResults) {
+      console.log(`  · ${f.file}: ${f.rewrites.map((r) => `${r.from}→${r.to}`).join(', ')}`);
+    }
+    if (ambiguities.length > 0) {
+      console.log('\n  ⚠ ambiguous links NOT rewritten (form shared by >1 page):');
+      for (const a of ambiguities) {
+        for (const x of a.ambiguous) console.log(`    · ${a.file}:${x.line} ${x.link}`);
+      }
+    }
+    if (!args.apply) console.log('\n  Re-run with --apply to write the move + rewrites.');
+  }
+  process.exit(0);
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 function run(args) {
@@ -230,6 +660,22 @@ function run(args) {
     fail(args, '--from=<slug|rel> and --to=<slug|rel> are required');
   }
   const ignorePatterns = loadHypoIgnore(args.hypoDir);
+
+  // Directory mode: --from points at an existing directory → relocate the subtree.
+  const fromNorm = args.from.replace(/\\/g, '/').replace(/\.md$/, '').replace(/\/+$/, '');
+  const fromAbs = join(args.hypoDir, fromNorm);
+  const fromIsDir = existsSync(fromAbs) && statSync(fromAbs).isDirectory();
+  if (fromIsDir) {
+    // A literal `foo/` directory AND a `foo.md` page both present → ambiguous intent.
+    if (existsSync(`${fromAbs}.md`)) {
+      fail(
+        args,
+        `--from '${args.from}' is ambiguous: both a directory and a page exist. Pass a more specific path.`,
+      );
+    }
+    return runDirectory(args, fromNorm, ignorePatterns);
+  }
+
   const pages = collectPages(args.hypoDir, args.hypoDir, [], ignorePatterns);
   const formIndex = buildFormIndex(pages);
 
@@ -254,6 +700,23 @@ function run(args) {
   }
   const toSlug = toRel.replace(/\.md$/, '');
   const toPath = join(args.hypoDir, toRel);
+
+  // Real-root containment: a symlinked --to ancestor (e.g. `projects/link` →
+  // /tmp/outside) is lexically in-vault, yet writeFileSync(toPath) would follow it
+  // and write the moved page outside the wiki. Resolve the deepest existing prefix
+  // (lstat-based, fail-closed on a dangling link) and require it to stay in-vault.
+  let realRoot;
+  try {
+    realRoot = realpathSync(args.hypoDir);
+  } catch {
+    fail(args, `wiki root cannot be resolved: ${args.hypoDir}`);
+  }
+  if (!realContainedInVault(toPath, realRoot)) {
+    fail(args, `--to '${args.to}' resolves outside the wiki root (symlink escape)`);
+  }
+  if (!destinationHostable(toPath)) {
+    fail(args, `--to '${args.to}' has a non-directory ancestor — destination cannot be created`);
+  }
 
   // Guard: never overwrite an existing destination (an ADR-renumber / merge would
   // land here — that is a report-only case, not a blind move).
