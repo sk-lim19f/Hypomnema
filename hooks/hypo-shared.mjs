@@ -14,6 +14,7 @@ import {
   mkdirSync,
   rmSync,
   readdirSync,
+  realpathSync,
 } from 'fs';
 import { join, relative, basename } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
@@ -1771,16 +1772,37 @@ export function isCompactOrClearCommand(prompt) {
 export function extractUserMessages(transcriptPath, tailN = 30) {
   try {
     const lines = readFileSync(transcriptPath, 'utf-8').split('\n');
-    const tail = lines.slice(-tailN);
+    // tailN === Infinity → whole transcript (the marker-write hard gate needs the
+    // full prefix; a close request can precede the marker by the entire close
+    // checklist). The Stop hook keeps the 30-line default so a stale old close
+    // signal doesn't re-trigger every turn.
+    const tail = Number.isFinite(tailN) ? lines.slice(-tailN) : lines;
     return tail
       .map((line) => {
         try {
           const obj = JSON.parse(line);
+          // Skill-injection vector (ADR 0055): drop system-injected role:user
+          // messages before they pollute the close-intent signal.
+          //  • isMeta:true   — slash-command bodies, skill bodies, local-command
+          //    caveats. Their text is docs/specs, often full of close vocabulary
+          //    (e.g. the /hypo:crystallize spec literally contains close phrases),
+          //    which would let the gate self-satisfy the moment the model invokes
+          //    a close command. Confirmed isMeta:true in the transcript.
+          //  • promptSource system|sdk — task-notifications (system) and
+          //    SDK / QA-harness synthetic prompts (sdk). Neither is user-typed.
+          if (obj.isMeta === true) return '';
+          if (obj.promptSource === 'system' || obj.promptSource === 'sdk') return '';
           const msg = obj.message ?? obj;
           const role = msg.role ?? obj.role ?? obj.type;
           if (role !== 'user') return '';
           const content = msg.content ?? obj.content;
-          if (typeof content === 'string') return content;
+          if (typeof content === 'string') {
+            // Stop-hook block feedback is recorded as a role:user string. It is
+            // the hook's OWN nudge ("[WIKI_AUTOCLOSE] … Run crystallize …"), not
+            // user intent — counting it would be circular (the hook that prods the
+            // model to close would become proof the user wanted to close).
+            return content.startsWith('Stop hook feedback') ? '' : content;
+          }
           if (Array.isArray(content)) {
             // Only genuine user-typed text blocks. tool_result blocks are also
             // recorded with role:'user' in the Claude Code transcript; slurping
@@ -1814,12 +1836,28 @@ export function extractUserMessages(transcriptPath, tailN = 30) {
 export function isClosePattern(text) {
   if (!text || typeof text !== 'string') return false;
   const krPatterns = [
-    // 끝: bare terminal noun, but boundary-guarded so "세션 끝내는 방법" /
-    // "세션 끝나면" don't trip. 마무리/종료: require a verb ending (mirrors the
-    // 작업 마무리/종료 sibling below) so mentions/negations like
-    // "세션 마무리 할 때가 아닌데" are excluded. 임 is boundary-guarded so
-    // "세션 종료 임시 플래그" doesn't match.
-    /세션\s*(?:끝(?![가-힣])|(?:마무리|종료)\s*(?:하자|할게|하겠|했어|임(?![가-힣])))/,
+    // 끝: bare terminal noun, boundary-guarded so "세션 끝내는 방법" /
+    // "세션 끝나면" don't trip.
+    /세션\s*끝(?![가-힣])/,
+    // 세션 마무리/종료 (ADR 0055): the OLD pattern required a fixed verb suffix
+    // (하자/할게/했어) and missed the most common real phrasings — "세션 마무리
+    // 해줘" (imperative), bare "세션 마무리", "세션마무리" (no space). A
+    // blacklist lookahead (excluding 조건/로직/여부/…) is whack-a-mole because
+    // noun-modifiers are an open class. WHITELIST instead: match only when
+    // 마무리/종료 is followed by a close-intent verb suffix OR sentence-end. This
+    // structurally rejects noun-modifiers (세션 종료 여부/로직/작업 정리) and
+    // negations (세션 종료 안 해도 돼, 세션 마무리하지 않아도) without enumerating.
+    // The suffixes are COMPLETE terminal forms followed by a non-Hangul boundary
+    // (?![가-힣]), so connective continuations die: 해주는/해주기 (해 alone, then
+    // 주 follows), 해야 하는 / 해도 되는지 (해 alone, then 야/도 follows). 하고 is
+    // deliberately dropped — "마무리하고 블로그"(close) and "마무리하고 싶은지"(not)
+    // are structurally identical, and over-close is the worse failure, so we accept
+    // the rare FN over the FP. The residual: connective forms that happen to put a
+    // space after a complete terminal can't be separated by regex without a
+    // morphological parser — that's bounded by the compound gate (precompact-green
+    // + signal) and the unambiguous /compact and AskUserQuestion channels (ADR 0055
+    // threat boundary), not chased further.
+    /세션\s*(?:마무리|종료)(?:\s*(?:해줘|해주세요|해요|해|하자|하죠|했어|했다|했음|했지|합시다|합니다|할게|할께|할래|할까|할까요|한\s?거(?:지|야|니)?|함)(?![가-힣])|\s*[)\].,!?~。…]|\s*$)/m,
     /오늘\s*은?\s*(여기|작업|세션).*(끝|마치|마무리|종료)/,
     // 여기까지: requires no continuation action word (e.g. 여기까지 구현해줘 is not a close signal)
     /여기(서)?까지(?!\s*(?:구현|작성|완성|수정|변경|추가|삭제|테스트|확인|검토|해줘|해야|하고|하면))/,
@@ -1836,14 +1874,141 @@ export function isClosePattern(text) {
     // objects. The review/analysis/debug/audit/investigation nouns were added
     // for 6a — read-only review sessions are now "substantial", so "wrap up the
     // review" must read as a task-level signal, not a session-close one.
-    /wrap(?:ping)?\s+up(?!\s+(?:this|the)\s+(?:pr|issue|bug|task|function|component|module|feature|code|test|review|analysis|investigation|debugging|debug|audit|refactor)\b)/i,
-    /done\s+for\s+(?:today|now|the\s+day)/i,
-    /that'?s?\s+(?:all|it)\s+for\s+(?:today|now|the\s+day)/i,
-    /signing\s+off/i,
-    /end(?:ing)?\s+(?:the|this)\s+(?:session|work|day)/i,
-    /close\s+(?:the|this)\s+session/i,
+    // Leading \b on each pattern (ADR 0055) so an EN close phrase embedded as a
+    // substring of a longer token can't trip the gate (e.g. "designing off…").
+    /\bwrap(?:ping)?\s+up(?!\s+(?:this|the)\s+(?:pr|issue|bug|task|function|component|module|feature|code|test|review|analysis|investigation|debugging|debug|audit|refactor)\b)/i,
+    /\bdone\s+for\s+(?:today|now|the\s+day)\b/i,
+    /\bthat'?s?\s+(?:all|it)\s+for\s+(?:today|now|the\s+day)\b/i,
+    /\bsigning\s+off\b/i,
+    /\bend(?:ing)?\s+(?:the|this)\s+(?:session|work|day)\b/i,
+    /\bclose\s+(?:the|this)\s+session\b/i,
   ];
   return [...krPatterns, ...enPatterns].some((re) => re.test(text));
+}
+
+/**
+ * Resolve a session's transcript path from its (globally-unique) session id by
+ * globbing every Claude project dir: ~/.claude/projects/<slug>/<id>.jsonl.
+ *
+ * Why glob, not cwd-derive: the transcript lives under a slug built from the cwd
+ * AT SESSION START, but the marker-writer subprocess can run from a DIFFERENT cwd
+ * (the real over-close ran `cd ~/hypomnema && crystallize …`), so a cwd-derived
+ * slug would miss the file. The session id is a UUID, so the glob disambiguates
+ * without needing the slug — verified globally unique across all project dirs.
+ *
+ * Fail-closed on ambiguity (ADR 0055, codex review): returns the single resolved
+ * path, or null when ZERO or MORE-THAN-ONE distinct files match (realpath-deduped
+ * so a symlink to the same file is not "multiple"). The caller treats null as
+ * "refuse the marker".
+ *
+ * `projectsRoot` defaults to the real ~/.claude/projects; tests pass a controlled
+ * root so they exercise the real resolver instead of a forgeable path override.
+ */
+export function resolveTranscriptBySessionId(
+  sessionId,
+  projectsRoot = join(HOME, '.claude', 'projects'),
+) {
+  if (!sessionId || typeof sessionId !== 'string') return null;
+  // Session ids are UUID-shaped; reject anything with path separators / glob
+  // chars so a crafted id can't escape the projects root or match siblings.
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
+  try {
+    const base = projectsRoot;
+    const seen = new Set();
+    for (const ent of readdirSync(base, { withFileTypes: true })) {
+      if (!ent.isDirectory()) continue;
+      const p = join(base, ent.name, `${sessionId}.jsonl`);
+      if (!existsSync(p)) continue;
+      try {
+        seen.add(realpathSync(p));
+      } catch {
+        seen.add(p);
+      }
+    }
+    return seen.size === 1 ? [...seen][0] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns true iff the transcript carries a genuine USER session-close signal —
+ * the hard gate for the session-closed marker writers (ADR 0055). Scans the FULL
+ * transcript: a close request can precede the marker write by the entire close
+ * checklist, so the Stop hook's 30-line tail would miss it.
+ *
+ * Evidence (any one is sufficient):
+ *   1. a de-polluted NL close phrase — isClosePattern over extractUserMessages,
+ *      which already drops injected / tool / hook-feedback text (ADR 0055);
+ *   2. a `/compact` invocation (queue-operation). `/clear` is deliberately NOT
+ *      counted: it abandons context, whereas a session-close PRESERVES the work
+ *      to the wiki — a different intent;
+ *   3. an AskUserQuestion answer whose SELECTED value names a close action (the
+ *      canonical "offer [세션 마무리] → user picks it" flow).
+ *
+ * A Stop-hook block is NOT evidence: it is the hook's own nudge to close, so
+ * counting it would be circular (the incident's block told the model to write the
+ * marker). extractUserMessages already strips it.
+ *
+ * Fail-closed: any read error → false (caller refuses the marker).
+ */
+export function hasUserCloseSignal(transcriptPath) {
+  if (!transcriptPath) return false;
+  let lines;
+  try {
+    lines = readFileSync(transcriptPath, 'utf-8').split('\n');
+  } catch {
+    return false;
+  }
+  // (1) NL close over the full, de-polluted transcript.
+  if (isClosePattern(extractUserMessages(transcriptPath, Infinity))) return true;
+  // AskUserQuestion answers (3) must be correlated to a real AskUserQuestion
+  // tool_use by id — otherwise ANY tool_result string containing "have been
+  // answered" (e.g. a Read/Grep of this very file, or of a transcript) would
+  // satisfy the gate, reintroducing the tool_result pollution the de-pollution
+  // layer closes. First pass collects the genuine AskUserQuestion tool_use ids;
+  // the tool_use (assistant) always precedes its tool_result (user) in the log,
+  // so a single forward scan suffices.
+  const askIds = new Set();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    // (2) /compact (queue-operation). Not /clear — see doc above.
+    if (
+      obj.type === 'queue-operation' &&
+      typeof obj.content === 'string' &&
+      /^\/compact(?:\s|$)/.test(obj.content.trim())
+    ) {
+      return true;
+    }
+    const content = (obj.message ?? obj).content;
+    if (!Array.isArray(content)) continue;
+    for (const b of content) {
+      if (!b || typeof b !== 'object') continue;
+      // record AskUserQuestion tool_use ids
+      if (b.type === 'tool_use' && b.name === 'AskUserQuestion' && b.id) {
+        askIds.add(b.id);
+        continue;
+      }
+      // (3) AskUserQuestion answer naming a close action — only when this
+      // tool_result actually answers a recorded AskUserQuestion. The answer lands
+      // in a role:user tool_result string: `… have been answered: "Q"="A". …`.
+      // Match the answer value(s) (the `="…"` side), never the question text, and
+      // run the SAME isClosePattern as the NL path so the two channels agree.
+      if (b.type === 'tool_result' && b.tool_use_id && askIds.has(b.tool_use_id)) {
+        const s = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+        for (const m of s.matchAll(/="([^"]*)"/g)) {
+          if (isClosePattern(m[1])) return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 /**

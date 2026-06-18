@@ -85,6 +85,8 @@ import {
   sessionLogShardPath,
   sessionLogReadCandidates,
   sessionLogScopePath,
+  resolveTranscriptBySessionId,
+  hasUserCloseSignal,
 } from '../hooks/hypo-shared.mjs';
 
 const LINT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'lint.mjs');
@@ -153,6 +155,18 @@ function parseArgs(argv) {
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
+
+// ── session-close hard gate (ADR 0055) ───────────────────────────────────────
+// The marker attests "the USER closed this session". Its evidence transcript is
+// resolved STRICTLY from the session id (a globally-unique UUID) by globbing the
+// Claude project dirs — never from a CLI arg. A model owns the whole subprocess
+// invocation, so trusting a `--transcript-path` it supplies would let it point at
+// a forged `<session-id>.jsonl` it just wrote with a fake close phrase. Resolving
+// from the id alone closes that: the only file the glob finds is the live
+// transcript the harness itself maintains, which the model cannot author. (If the
+// model drops a second `<id>.jsonl` elsewhere the glob returns >1 and fails
+// closed.) `--transcript-path` survives ONLY for `--check-session-close`'s lint
+// scope, which writes no marker and so cannot cause an over-close.
 
 // ── session-close check (spec §5.2.7 / §8.3) ────────────────────────
 // Mirrors the hard gate in hypo-personal-check.mjs so the /hypo:crystallize
@@ -426,8 +440,12 @@ function runMarkSessionClosed(args) {
   // (project-close invariant → a today log.md entry; lint/W8 scoped to shared +
   // touched files, never the active/phantom project), but git / hot / feedback
   // still apply — log-only is NOT a global-gate bypass.
+  // Resolve the close transcript once from the session id (glob, never a CLI
+  // arg): it both widens the lint scope inside the gate AND is the evidence
+  // source for the user-close hard gate below.
+  const closeTranscript = resolveTranscriptBySessionId(args.sessionId);
   const gate = precompactGateStatus(args.hypoDir, {
-    ...(args.transcriptPath ? { transcriptPath: args.transcriptPath } : {}),
+    ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
     ...(args.logOnly ? { logOnly: true } : {}),
   });
   const status = gate.close;
@@ -449,6 +467,26 @@ function runMarkSessionClosed(args) {
       );
       for (const b of gate.blockers) console.log(`  ✗ ${b.reason}`);
     }
+    process.exit(1);
+  }
+  // User-close hard gate (ADR 0055): the compact gate above only proves the wiki
+  // is compact-ready; it does NOT prove the USER asked to close. Refuse the marker
+  // unless the transcript carries a genuine user close signal (NL close phrase,
+  // /compact, or an AskUserQuestion close answer). This is the hard backstop for
+  // model over-close, where prose guidance lost to a conflicting global rule.
+  // Fail-closed when the transcript can't be resolved.
+  if (!closeTranscript || !hasUserCloseSignal(closeTranscript)) {
+    const reason = !closeTranscript
+      ? `cannot resolve a transcript for session ${args.sessionId} — the session-closed marker requires a verifiable user close signal`
+      : "no user close signal in this session's transcript — marker refused (the user did not signal session close)";
+    const result = {
+      ok: false,
+      session_id: args.sessionId,
+      project: status.project,
+      skipReason: 'no-user-close-signal',
+      error: reason,
+    };
+    console.log(args.json ? JSON.stringify(result, null, 2) : `✗ ${reason}`);
     process.exit(1);
   }
   writeSessionClosedMarker(args.hypoDir, args.sessionId, {
@@ -795,18 +833,29 @@ function applySessionClose(args) {
   // clear feedback projection / W8 design-history / hot.md structure, else this
   // path could issue a marker the standalone path would refuse (the second
   // divergence codex flagged). git-clean is subsumed by the gate's git blocker.
+  let markerWritten = false;
+  let markerSkipReason = null;
   if (ok && args.sessionId) {
+    const closeTranscript = resolveTranscriptBySessionId(args.sessionId);
     const markerGate = precompactGateStatus(
       args.hypoDir,
-      args.transcriptPath ? { transcriptPath: args.transcriptPath } : {},
+      closeTranscript ? { transcriptPath: closeTranscript } : {},
     );
-    if (markerGate.ok) {
+    if (!markerGate.ok) {
+      // compact gate not ok → skip. Caller's `result.ok` already reflects the
+      // file/lint state; next Stop re-blocks until the remaining blocker
+      // (git/feedback/W8/hot/lint) is resolved.
+      markerSkipReason = 'compact-gate-not-ok';
+    } else if (!closeTranscript || !hasUserCloseSignal(closeTranscript)) {
+      // User-close hard gate (ADR 0055): apply succeeded (payload files written)
+      // but the user never signalled session close, so the marker — which attests
+      // "user closed" — is withheld. The wiki record stands; the session is simply
+      // not marked closed. Surfaced (not silent) so the caller knows.
+      markerSkipReason = closeTranscript ? 'no-user-close-signal' : 'transcript-unresolved';
+    } else {
       writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
+      markerWritten = true;
     }
-    // gate not ok → silent skip: caller's `result.ok` already reflects the
-    // file/lint state; surfacing a "marker skipped" warning here would
-    // confuse the close-applied success path. Next Stop re-blocks until the
-    // remaining blocker (git/feedback/W8/hot/lint) is resolved.
   }
   const stage = ok
     ? null
@@ -823,6 +872,9 @@ function applySessionClose(args) {
     applied,
     skipped,
     verification,
+    // ADR 0055: surface the marker outcome instead of skipping silently, so the
+    // caller can tell "closed" from "applied but not marked".
+    ...(args.sessionId ? { markerWritten, markerSkipReason } : {}),
     lint: { preflight: preflightLint, postApply: postApplyLint },
     // Pre-existing lint debt in files this close did not author (Bug B): surfaced
     // for visibility, never gated. Empty on a clean vault.
