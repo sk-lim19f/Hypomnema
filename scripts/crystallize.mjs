@@ -87,6 +87,7 @@ import {
   sessionLogScopePath,
   resolveTranscriptBySessionId,
   hasUserCloseSignal,
+  commitWikiChanges,
 } from '../hooks/hypo-shared.mjs';
 
 const LINT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'lint.mjs');
@@ -832,29 +833,53 @@ function applySessionClose(args) {
   // govern apply SUCCESS (exit code below), but the marker must additionally
   // clear feedback projection / W8 design-history / hot.md structure, else this
   // path could issue a marker the standalone path would refuse (the second
-  // divergence codex flagged). git-clean is subsumed by the gate's git blocker.
+  // divergence codex flagged).
+  //
+  // ADR 0056: apply just wrote the payload, so the tree is dirty by its OWN
+  // writes — the gate's `uncommitted` git blocker would always trip and the
+  // marker would be skipped, deferring the close to a manual --mark-session-closed
+  // (the ADR 0047 "done but still blocked" regression). Commit the payload HERE, via
+  // the SAME .hypoignore-aware helper the auto-commit Stop hook uses, so the gate sees
+  // a committed tree. Push stays deferred to the Stop hook; the resulting
+  // committed-but-unpushed state is a gate notice, not a blocker (ADR 0056), so
+  // this still marks. A commit failure (not a repo / pre-commit reject / git error)
+  // skips the marker WITH a surfaced reason — today's behavior was also "no marker",
+  // but silently.
   let markerWritten = false;
   let markerSkipReason = null;
   if (ok && args.sessionId) {
-    const closeTranscript = resolveTranscriptBySessionId(args.sessionId);
-    const markerGate = precompactGateStatus(
-      args.hypoDir,
-      closeTranscript ? { transcriptPath: closeTranscript } : {},
-    );
-    if (!markerGate.ok) {
-      // compact gate not ok → skip. Caller's `result.ok` already reflects the
-      // file/lint state; next Stop re-blocks until the remaining blocker
-      // (git/feedback/W8/hot/lint) is resolved.
-      markerSkipReason = 'compact-gate-not-ok';
-    } else if (!closeTranscript || !hasUserCloseSignal(closeTranscript)) {
-      // User-close hard gate (ADR 0055): apply succeeded (payload files written)
-      // but the user never signalled session close, so the marker — which attests
-      // "user closed" — is withheld. The wiki record stands; the session is simply
-      // not marked closed. Surfaced (not silent) so the caller knows.
-      markerSkipReason = closeTranscript ? 'no-user-close-signal' : 'transcript-unresolved';
+    const commitOutcome = commitWikiChanges(args.hypoDir);
+    if (!commitOutcome.committed) {
+      markerSkipReason = `commit-failed: ${commitOutcome.reason}`;
     } else {
-      writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
-      markerWritten = true;
+      const closeTranscript = resolveTranscriptBySessionId(args.sessionId);
+      const markerGate = precompactGateStatus(
+        args.hypoDir,
+        closeTranscript ? { transcriptPath: closeTranscript } : {},
+      );
+      if (!markerGate.ok) {
+        // compact gate not ok → skip. Caller's `result.ok` already reflects the
+        // file/lint state; next Stop re-blocks until the remaining blocker
+        // (feedback/W8/hot/lint — git is now committed) is resolved.
+        markerSkipReason = 'compact-gate-not-ok';
+      } else if (!closeTranscript || !hasUserCloseSignal(closeTranscript)) {
+        // User-close hard gate (ADR 0055): apply succeeded (payload files written)
+        // but the user never signalled session close, so the marker — which attests
+        // "user closed" — is withheld. The wiki record stands; the session is simply
+        // not marked closed. Surfaced (not silent) so the caller knows.
+        markerSkipReason = closeTranscript ? 'no-user-close-signal' : 'transcript-unresolved';
+      } else {
+        writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
+        // Codex CONCERN (ADR 0055/0056): the writer swallows IO errors (best-effort).
+        // Verify the file actually landed — mirroring the standalone path — instead of
+        // asserting markerWritten=true, so a .cache permission/disk problem surfaces
+        // rather than the caller reporting "closed" while the next Stop re-blocks.
+        if (existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
+          markerWritten = true;
+        } else {
+          markerSkipReason = 'marker-did-not-land';
+        }
+      }
     }
   }
   const stage = ok

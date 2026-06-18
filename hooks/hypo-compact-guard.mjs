@@ -42,14 +42,17 @@ process.stdin.on('end', () => {
     const gitStatus = hypoIsClean();
     const hotStatus = hotMdIsClean();
 
-    if (hasSession && gitStatus.clean && hotStatus.clean) {
+    // ADR 0056: block on uncommitted (real unsaved work); unpushed commits (ahead)
+    // are a soft, auto-synced state and must not block /compact or /clear — mirrors
+    // the precompactGateStatus demote so the chat-side gate stays consistent.
+    if (hasSession && !gitStatus.uncommitted && hotStatus.clean) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
 
     const reasons = [
       !hasSession ? 'session log entry missing' : '',
-      !gitStatus.clean ? gitStatus.reason : '',
+      gitStatus.uncommitted ? gitStatus.reason : '',
       !hotStatus.clean ? hotStatus.reason : '',
     ].filter(Boolean);
 

@@ -128,22 +128,43 @@ export function lastSubstantialOpIsSession() {
   return /^## \[\d{4}-\d{2}-\d{2}\] session/.test(substantial[substantial.length - 1]);
 }
 
+// Returns the wiki's git state split into its two independent axes (ADR 0056):
+//   uncommitted — working-tree changes (real unsaved work; a human-fixable blocker)
+//   ahead       — committed-but-unpushed commits (a soft, auto-synced state: the
+//                 auto-commit Stop hook pushes, and push failures are non-fatal —
+//                 see hypo-auto-commit.mjs / appendSyncFailure)
+// `clean` stays `!uncommitted && !ahead` for back-compat with callers that only
+// read it. Callers that gate session-close / compact distinguish the two: they
+// block on `uncommitted` and demote `ahead` to a notice (precompactGateStatus,
+// hypo-compact-guard) so a committed-but-unpushed close is still "compact-ready".
 export function hypoIsClean(dir = HYPO_DIR) {
   try {
     const porcelain = spawnSync('git', ['-C', dir, 'status', '--porcelain'], {
       encoding: 'utf-8',
     });
-    if (porcelain.status !== 0) return { clean: false, reason: `git check failed in ${dir}` };
-    if (porcelain.stdout.trim() !== '')
-      return { clean: false, reason: `uncommitted changes in ${dir}` };
-    const ahead = spawnSync('git', ['-C', dir, 'status', '--branch', '--porcelain'], {
+    if (porcelain.status !== 0)
+      return {
+        clean: false,
+        uncommitted: true,
+        ahead: false,
+        reason: `git check failed in ${dir}`,
+      };
+    const uncommitted = porcelain.stdout.trim() !== '';
+    const aheadRes = spawnSync('git', ['-C', dir, 'status', '--branch', '--porcelain'], {
       encoding: 'utf-8',
     });
-    if (/\[ahead \d+\]/.test(ahead.stdout || ''))
-      return { clean: false, reason: `unpushed commits in ${dir}` };
-    return { clean: true };
+    const ahead = /\[ahead \d+\]/.test(aheadRes.stdout || '');
+    const reasons = [];
+    if (uncommitted) reasons.push(`uncommitted changes in ${dir}`);
+    if (ahead) reasons.push(`unpushed commits in ${dir}`);
+    return {
+      clean: !uncommitted && !ahead,
+      uncommitted,
+      ahead,
+      reason: reasons.length ? reasons.join('; ') : undefined,
+    };
   } catch {
-    return { clean: false, reason: `git check failed in ${dir}` };
+    return { clean: false, uncommitted: true, ahead: false, reason: `git check failed in ${dir}` };
   }
 }
 
@@ -844,6 +865,61 @@ export function appendSyncFailure(hypoDir, op, error) {
 }
 
 /**
+ * Stage + commit every non-.hypoignore change in the wiki. Does NOT pull/push —
+ * remote sync stays in the auto-commit Stop hook (commit is local + cheap; sync is
+ * network + soft-fail). Shared by hypo-auto-commit.mjs and crystallize.mjs's
+ * --apply-session-close path so the .hypoignore staging filter cannot diverge
+ * between the two commit loci (ADR 0056).
+ *
+ * "Nothing to commit" (clean tree, or only .hypoignore'd changes) is SUCCESS, not
+ * failure — the caller's tree is already in the committed state it wanted.
+ *
+ * @param {string} hypoDir
+ * @returns {{committed: boolean, reason?: string}} committed:true when a commit was
+ *   created OR nothing needed committing; committed:false (with reason) on a real
+ *   failure: not a git repo, or git status/add/commit erroring.
+ */
+export function commitWikiChanges(hypoDir) {
+  const git = (...args) =>
+    spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
+  if (git('rev-parse', '--is-inside-work-tree').status !== 0)
+    return { committed: false, reason: `not a git repository: ${hypoDir}` };
+  const porcelain = git('status', '--porcelain', '-uall');
+  if (porcelain.status !== 0)
+    return { committed: false, reason: `git status failed in ${hypoDir}` };
+  // `.hypoignore` is the project privacy boundary. `git add -A` ignores it, so
+  // enumerate changed paths, drop ignored ones, then stage explicitly.
+  const ignorePatterns = loadHypoIgnore(hypoDir);
+  const paths = [];
+  for (const line of (porcelain.stdout || '').split('\n')) {
+    if (!line) continue;
+    const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
+    if (!file) continue;
+    if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns))
+      continue;
+    paths.push(file);
+  }
+  if (paths.length > 0) {
+    const add = git('add', '--', ...paths);
+    if (add.status !== 0)
+      return {
+        committed: false,
+        reason: `git add failed: ${(add.stderr || '').trim() || 'unknown'}`,
+      };
+  }
+  const staged = git('diff', '--cached', '--name-only').stdout?.trim() || '';
+  if (!staged) return { committed: true }; // nothing to commit = success (idempotent)
+  const today = new Date().toISOString().slice(0, 10);
+  const commit = git('commit', '-m', `auto: ${today} wiki update`);
+  if (commit.status !== 0)
+    return {
+      committed: false,
+      reason: `git commit failed: ${(commit.stderr || '').trim() || 'unknown'}`,
+    };
+  return { committed: true };
+}
+
+/**
  * Read sync-state entries.
  * @param {string} hypoDir
  * @returns {{entries: object[], parseError: boolean}}
@@ -1503,9 +1579,20 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const marker = opts.sessionId ? readSessionClosedMarker(hypoDir, opts.sessionId) : null;
   const logOnly = opts.logOnly === true || marker?.scope === 'log-only';
 
-  // 1. wiki git clean
+  // 1. wiki git state (ADR 0056). Uncommitted changes (real unsaved work) BLOCK —
+  //    they are human-fixable. Unpushed commits (ahead) DEMOTE to a notice: push is
+  //    automatic (auto-commit Stop hook) and its failures are already non-fatal, so
+  //    "ahead" is a transient sync state, not a human-fixable blocker. Demoting it
+  //    here (the shared gate) keeps the marker == compact-ready invariant (ADR 0047):
+  //    a committed-but-unpushed close marks AND compacts, instead of the close writer
+  //    committing its own payload and then being blocked by its own (unpushed) commit.
   const git = hypoIsClean(hypoDir);
-  if (!git.clean) blockers.push({ type: 'git', reason: git.reason });
+  if (git.uncommitted) blockers.push({ type: 'git', reason: git.reason });
+  else if (git.ahead)
+    notices.push({
+      type: 'git-sync',
+      reason: `unpushed commits in ${hypoDir} (push deferred to Stop hook)`,
+    });
 
   // 2. root hot.md structure
   const hot = hotMdIsClean(hypoDir);
