@@ -1,5 +1,5 @@
 ---
-description: Crystallize draft notes into stable wiki knowledge; also the session-close path. Use when the user is wrapping up a session, asks to save or consolidate notes, or before a /compact.
+description: Crystallize draft notes into stable wiki knowledge; also the session-close path. Use when the user explicitly signals session end (종료/마무리/wrap up), asks to save or consolidate notes, or before a /compact. Task completion alone is not a close signal.
 ---
 
 You are running `/hypo:crystallize`. This command serves two purposes:
@@ -11,7 +11,7 @@ You are running `/hypo:crystallize`. This command serves two purposes:
 
 ## Step 1 — Detect context
 
-If the user invoked `/hypo:crystallize` to close a session (phrases like "세션 종료", "오늘 작업 마무리", "session close", or "wrap up"), run Step 1a (advisory reflections) then Steps 2–4 (session-close mechanical apply + recovery) **before** the synthesis scan. Otherwise skip to Step 5.
+If `/hypo:crystallize` was invoked to close a session (via an explicit close signal like "세션 종료" / "오늘 작업 마무리" / "session close" / "wrap up", an accepted proactive-offer [세션 마무리], or `/compact`), run Step 1a (advisory reflections) then Steps 2–4 (session-close mechanical apply + recovery) **before** the synthesis scan. Task completion alone does not put you in close mode. Otherwise skip to Step 5.
 
 ---
 

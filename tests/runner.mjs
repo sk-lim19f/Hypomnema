@@ -15717,6 +15717,56 @@ test('hypo-guide.md intentionally excluded from advisory surfaces (#47 follow-up
   );
 });
 
+// ── over-close guard (ISSUE-31) — proactive-offer path scoping ──────────────
+// Forensic (session d8d6ecd0): the model self-ran close (session-closed marker
+// write + "session ended" declaration) with NO user close signal — it skipped
+// the AskUserQuestion gate, pushed by a competing global instruction. The fix
+// is prose-only on shipped surfaces, so the defect class is "guard text drifts
+// out and a surface silently permits self-close again". Pin the scoping phrases
+// per surface, and pin REMOVAL of the over-trigger "wrapping up a session"
+// description wording that PR #127 introduced (which read as task-wrap-up).
+suite('over-close guard (ISSUE-31) — proactive path scoping on shipped surfaces');
+
+const OVERCLOSE_SURFACES = [
+  {
+    file: join(REPO, 'templates', 'hypo-guide.md'),
+    present: ['Proactive offer means offer, not close', 'Task completion is not a close trigger'],
+    absent: [],
+  },
+  {
+    file: join(REPO, 'commands', 'crystallize.md'),
+    present: [
+      'Task completion alone is not a close signal', // description
+      'Task completion alone does not put you in close mode', // body trigger
+    ],
+    absent: ['Use when the user is wrapping up a session'], // PR #127 over-trigger wording
+  },
+  {
+    file: join(REPO, 'skills', 'crystallize', 'SKILL.md'),
+    present: [
+      'Task completion alone is not a close signal',
+      'Task completion alone does not put you in close mode',
+    ],
+    absent: ['Use when the user signals they are wrapping up'],
+  },
+];
+
+for (const { file, present, absent } of OVERCLOSE_SURFACES) {
+  const rel = file.slice(REPO.length + 1);
+  test(`${rel}: over-close scoping present, over-trigger wording absent`, () => {
+    const txt = readFileSync(file, 'utf-8');
+    for (const needle of present) {
+      assert.ok(txt.includes(needle), `${rel} missing over-close guard: ${JSON.stringify(needle)}`);
+    }
+    for (const needle of absent) {
+      assert.ok(
+        !txt.includes(needle),
+        `${rel} still has over-trigger wording (PR #127 regression): ${JSON.stringify(needle)}`,
+      );
+    }
+  });
+}
+
 // ── tracker-id gate (no-internal-tracker-ids-in-oss-artifacts) ───────────────
 suite('tracker-id gate (check-tracker-ids)');
 
