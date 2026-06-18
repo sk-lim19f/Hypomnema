@@ -756,6 +756,9 @@ const {
   sessionLogShardPath,
   sessionLogReadCandidates,
   sessionCloseFileStatus,
+  hypoIsClean,
+  precompactGateStatus,
+  commitWikiChanges,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -1632,6 +1635,38 @@ test('/compact with clean wiki → pass-through', () => {
     const out = JSON.parse(r.stdout);
     assert.equal(out.continue, true);
     assert.equal(out.suppressOutput, true);
+  });
+});
+
+test('/compact with committed-but-unpushed (ahead) wiki → pass-through (ADR 0056)', () => {
+  // The 3rd hypoIsClean consumer: ahead-only must NOT block /compact (mirrors the
+  // precompactGateStatus demote — unpushed is a soft, auto-synced state).
+  withCleanWiki((dir) => {
+    const remote = mkdtempSync(join(tmpdir(), 'hypo-cg-remote-'));
+    spawnSync('git', ['init', '--bare', '-q', remote]);
+    spawnSync('git', ['-C', dir, 'remote', 'add', 'origin', remote]);
+    spawnSync('git', ['-C', dir, 'push', '-q', '-u', 'origin', 'HEAD']);
+    writeFileSync(join(dir, 'extra.md'), '# extra\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'unpushed']);
+    const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
+    rmSync(remote, { recursive: true, force: true });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true);
+    assert.equal(out.suppressOutput, true, `ahead-only must not block /compact: ${r.stdout}`);
+  });
+});
+
+test('/compact with uncommitted change → blocks (git axis still enforced, ADR 0056)', () => {
+  withCleanWiki((dir) => {
+    writeFileSync(join(dir, 'dirty.md'), '# dirty\n');
+    const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true);
+    assert.ok(
+      /WIKI_AUTOCLOSE/.test(out.additionalContext || ''),
+      `uncommitted work must still block /compact: ${r.stdout}`,
+    );
   });
 });
 
@@ -8026,6 +8061,118 @@ test('replay-session-start-preserves-sync-state-when-ahead: unpushed commit keep
   });
 });
 
+// ── ADR 0056: git state split — uncommitted blocks, ahead (unpushed) is a notice ──
+
+suite('ADR 0056 — hypoIsClean axes + precompactGateStatus ahead-demote + commitWikiChanges');
+
+test('hypoIsClean: committed-but-unpushed → uncommitted:false, ahead:true, clean:false', () => {
+  withSyncedWiki((dir) => {
+    // a local commit not on the remote (the real-vault state after auto-commit
+    // commits but before/without a successful push)
+    writeFileSync(join(dir, 'ahead.md'), '# ahead\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'ahead']);
+    const st = hypoIsClean(dir);
+    assert.equal(st.uncommitted, false, 'tree is committed → not uncommitted');
+    assert.equal(st.ahead, true, 'commit is unpushed → ahead');
+    assert.equal(st.clean, false, 'clean stays false while ahead (back-compat)');
+  });
+});
+
+test('hypoIsClean: uncommitted working-tree change → uncommitted:true', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'dirty.md'), '# dirty\n');
+    const st = hypoIsClean(dir);
+    assert.equal(st.uncommitted, true, 'untracked file → uncommitted');
+    assert.equal(st.clean, false);
+  });
+});
+
+test('precompactGateStatus: ahead-only → NO git blocker, has git-sync notice', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'ahead.md'), '# ahead\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'ahead']);
+    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git'),
+      `unpushed commits must NOT be a git blocker: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      (gate.notices || []).some((n) => n.type === 'git-sync'),
+      `ahead must surface a git-sync notice: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+test('precompactGateStatus: uncommitted change → git blocker (unchanged)', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'dirty.md'), '# dirty\n');
+    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `uncommitted work must still be a git blocker: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('commitWikiChanges: dirty tree → commits, leaves tree uncommitted-clean', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'new.md'), '# new\n');
+    const res = commitWikiChanges(dir);
+    assert.equal(res.committed, true, `expected commit: ${JSON.stringify(res)}`);
+    assert.equal(hypoIsClean(dir).uncommitted, false, 'no uncommitted work after commit');
+  });
+});
+
+test('commitWikiChanges: commits ALL non-ignored changes, not a subset (parity with auto-commit)', () => {
+  // codex round-2 CONCERN: apply commits the whole working tree, not just the
+  // payload it wrote. This is intentional — it is the SAME helper (and behavior)
+  // the auto-commit Stop hook has always used. Lock it so the parity is documented.
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'payload-like.md'), '# payload\n');
+    writeFileSync(join(dir, 'unrelated.md'), '# unrelated pre-existing edit\n');
+    const res = commitWikiChanges(dir);
+    assert.equal(res.committed, true);
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files'], { encoding: 'utf-8' }).stdout;
+    assert.ok(
+      /payload-like\.md/.test(tracked) && /unrelated\.md/.test(tracked),
+      `both the payload-like and unrelated files must be committed: ${tracked}`,
+    );
+    assert.equal(hypoIsClean(dir).uncommitted, false, 'tree fully committed');
+  });
+});
+
+test('commitWikiChanges: nothing to commit (clean tree) → committed:true (success)', () => {
+  withSyncedWiki((dir) => {
+    const res = commitWikiChanges(dir);
+    assert.equal(res.committed, true, `nothing-to-commit must be success: ${JSON.stringify(res)}`);
+  });
+});
+
+test('commitWikiChanges: not a git repo → committed:false with reason', () => {
+  withTmpDir((dir) => {
+    const res = commitWikiChanges(dir);
+    assert.equal(res.committed, false);
+    assert.ok(/not a git repository/.test(res.reason || ''), `reason: ${res.reason}`);
+  });
+});
+
+test('commitWikiChanges: respects .hypoignore (ignored file not staged)', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), 'secret.md\n');
+    writeFileSync(join(dir, 'secret.md'), '# private\n');
+    writeFileSync(join(dir, 'public.md'), '# public\n');
+    const res = commitWikiChanges(dir);
+    assert.equal(res.committed, true);
+    // secret.md must remain uncommitted (ignored); the tree is therefore still
+    // "uncommitted" because of the ignored file — confirm secret.md was not staged.
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files'], { encoding: 'utf-8' }).stdout;
+    assert.ok(!/secret\.md/.test(tracked), `secret.md must not be committed: ${tracked}`);
+    assert.ok(/public\.md/.test(tracked), `public.md must be committed: ${tracked}`);
+  });
+});
+
 // ── hypo-session-end / clear-marker (ADR 0022 amendment) ────
 
 suite('hypo-session-end.mjs / hypo-session-start.mjs — clear-marker replay');
@@ -10329,9 +10476,12 @@ test('--mark-session-closed --transcript-path: lint error only in an UNTOUCHED f
   );
 });
 
-test('--apply-session-close --session-id leaves payload uncommitted → marker NOT written until git clean', () => {
+test('--apply-session-close --session-id with NO user-close signal → commits payload, marker withheld (ADR 0055/0056)', () => {
+  // ADR 0056: apply now commits its own payload before the marker gate, so the git
+  // axis no longer blocks. The marker is still withheld here — but because there is
+  // no resolvable close transcript (no user-close signal, ADR 0055 hard gate), NOT
+  // because the tree is dirty. The skip is surfaced, not silent.
   withWiki(null, (dir, today) => {
-    const ym = today.slice(0, 7);
     const payload = {
       project: 'test-project',
       date: today,
@@ -10357,18 +10507,61 @@ test('--apply-session-close --session-id leaves payload uncommitted → marker N
     assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, true);
-    // After apply, payload writes leave .payload.json + new file content
-    // uncommitted — but the marker is written BEFORE that becomes a problem
-    // because the post-apply branch happens inside the same process. The
-    // assertion is just "marker file landed".
-    const markerPath = join(dir, '.cache', 'session-closed-s-apply.marker');
-    // git is "dirty" with payload bytes by the time hypoIsClean runs, so the
-    // marker is intentionally NOT written in that branch. Document the
-    // outcome rather than asserting marker presence.
+    // The payload was committed by apply (the .hypoignore-aware helper) — the tree
+    // has no uncommitted work left (the git axis is satisfied, ADR 0056).
+    assert.equal(hypoIsClean(dir).uncommitted, false, 'apply must commit its own payload');
+    // Marker withheld: no user-close signal, surfaced as markerSkipReason.
+    assert.equal(out.markerWritten, false, 'no close signal → marker not written');
     assert.equal(
-      existsSync(markerPath),
+      out.markerSkipReason,
+      'transcript-unresolved',
+      `skip reason must be the ADR 0055 user-close gate, not git: ${out.markerSkipReason}`,
+    );
+    assert.equal(
+      existsSync(join(dir, '.cache', 'session-closed-s-apply.marker')),
       false,
-      'apply leaves payload writes uncommitted → ADR Q2 git-clean gate skips marker until auto-commit lands',
+      'marker must not land without a user-close signal',
+    );
+  });
+});
+
+test('--apply-session-close --session-id WITH user-close signal → commits payload AND marker lands (ISSUE-27 fix, ADR 0056)', () => {
+  // The core regression fix: apply commits its payload (so the git axis clears) and
+  // then writes the marker in the SAME process — no manual --mark-session-closed.
+  withWiki(null, (dir, today) => {
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] auto-mark landed test\n` },
+      log: { entry: `## [${today}] session | test-project — auto-mark landed\n` },
+    };
+    const payloadPath = join(dir, '.payload.json');
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    // Plant a transcript resolvable by session-id that carries a user-close signal.
+    const cleanup = seedCloseTranscript('s-apply-land');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-land',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.equal(out.markerWritten, true, `marker must land: ${JSON.stringify(out)}`);
+    assert.equal(out.markerSkipReason, null, `no skip reason expected: ${out.markerSkipReason}`);
+    assert.ok(
+      existsSync(join(dir, '.cache', 'session-closed-s-apply-land.marker')),
+      'marker file must exist after a verified close with a user-close signal',
     );
   });
 });
