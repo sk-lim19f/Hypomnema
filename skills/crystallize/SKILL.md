@@ -1,5 +1,5 @@
 ---
-description: Close a session by capturing what happened into the wiki (steps 1-6), and on request consolidate scattered notes into stable pages (steps 7-11). Use when the user signals they are wrapping up, asks to save or crystallize the session, or before a /compact.
+description: Close a session by capturing what happened into the wiki (steps 1-6), and on request consolidate scattered notes into stable pages (steps 7-11). Use when the user explicitly signals session end, asks to save or crystallize the session, or before a /compact. Task completion alone is not a close signal.
 ---
 
 You are running `/hypo:crystallize`. The command serves two modes (spec §5.2.7 / §8.3):
@@ -7,7 +7,7 @@ You are running `/hypo:crystallize`. The command serves two modes (spec §5.2.7 
 1. **Session close (steps 1~6)** — gate the 5 mandatory memory files plus open-questions (conditional) so `/compact` can pass.
 2. **Synthesis (steps 7~11)** — surface tag clusters, orphan pages, and drafts that are ready to consolidate.
 
-When invoked at the end of a session (or with phrases like "세션 종료", "wrap up"), run the session-close checklist first. The synthesis scan only runs after close is confirmed and the user agrees.
+When invoked to close a session — via an explicit close signal ("세션 종료", "wrap up"), an accepted proactive-offer [세션 마무리], or `/compact` — run the session-close checklist first. Task completion alone does not put you in close mode. The synthesis scan only runs after close is confirmed and the user agrees.
 
 ## What this does
 

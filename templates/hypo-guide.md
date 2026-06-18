@@ -74,6 +74,8 @@ Trigger: explicit close mention, `/compact` request, or context limit approachin
 
 Do **not** treat these as completion: plan approvals, clarification answers, permission grants, progress updates, partial findings, or mid-task checkpoints. A "좋아요" / "감사합니다" / "ok" following any of those is *not* a close signal — only offer after a genuine final completion/verification report.
 
+**Proactive offer means offer, not close.** In this path (task done, no close signal) do not run the close checklist, write the `session-closed` marker, or declare the session ended on your own. Fire `AskUserQuestion` and proceed only after the user picks [세션 마무리]. Task completion is not a close trigger; closing without asking violates this procedure. This scopes the proactive path only: a real close signal, `/compact`, or context limit still closes via the triggers above.
+
 Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까요?"* with options **[세션 마무리 / 계속 작업]**. On **세션 마무리** → run the session close checklist (or invoke `/hypo:crystallize`). On **계속 작업** → continue and do not re-ask until the next task completes. Ask at most once per completed task; never loop. (Decline simply ends the turn — Layer 3's Stop-chain only blocks on an explicit close signal, so no repeated prompts occur.)
 
 1. Update `projects/<name>/session-state.md` (next tasks, overwrite)
