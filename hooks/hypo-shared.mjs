@@ -553,8 +553,11 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
 // but the resume.mjs copy adds an mtime fallback this one omits — see resume.mjs.
 
 // Root hot.md Active-Projects rows as {slug, date}. The per-row date column is
-// project-scoped (unlike the shared frontmatter `updated:`), so a today-dated
-// row is a legitimate close-activity signal. Mirrors resolveActiveProject's regex.
+// project-scoped (unlike the shared frontmatter `updated:`). Used for candidate
+// DISCOVERY in closeCandidateSlugs — NOT as close-activity evidence: ADR 0057
+// dropped the row date as an activity signal because project-create and
+// hypo-hot-rebuild both stamp rows today without a real session. Mirrors
+// resolveActiveProject's regex.
 function rootHotRows(hypoDir) {
   const hotPath = join(hypoDir, 'hot.md');
   if (!existsSync(hotPath)) return [];
@@ -610,23 +613,29 @@ function closeCandidateSlugs(hypoDir, dates) {
   return slugs;
 }
 
-// True when project P shows ANY today close-activity signal: session-state or
-// project hot.md frontmatter `updated:` today, a today-dated session-log heading,
-// a today log.md `session | P` entry, or a today-dated root hot.md row for P.
-// (Root hot.md *frontmatter* is shared and is NOT a signal; the per-project ROW
-// date is.)
+// True when project P shows an AUTHORITATIVE today close-activity signal: a
+// today-dated session-log heading, or a today-dated `## [today] session | P`
+// log.md entry. These are written ONLY by a real session close (apply, or its
+// auto-derived root log — ADR 0049).
+//
+// ADR 0057: soft state files are EXCLUDED, because each is bumped to today by
+// non-session tooling and is therefore indistinguishable from a real close:
+//   - session-state.md `updated:`  — tracker bookkeeping mirrors a new item into
+//     the "next tasks" section (a cross-block incident: editing one project's
+//     tracker bumped session-state and blocked an unrelated project's /compact).
+//   - project hot.md `updated:`    — project-create stamps the template `updated: today`.
+//   - root hot.md ROW date         — project-create inserts a today-dated row, and
+//     hypo-hot-rebuild defaults a row to today when a project hot.md is missing.
+// (Root hot.md *frontmatter* was already never a signal — it is shared and
+// hypo-hot-rebuild stamps it today every session.)
+//
+// Tradeoff (documented, accepted): apply writes session-state.md FIRST, then the
+// project files, then the session-log + log entry. A process crash before the
+// session-log write leaves a torn close that this gate no longer flags. Accepted:
+// a torn close never reached apply's ok=true so it wrote no marker (ADR 0055/0056);
+// the surviving session-state is the resume pointer the next session overwrites;
+// what is lost is a narrative log entry, not continuity.
 function hasTodayCloseActivity(hypoDir, project, dates) {
-  const fresh = (rel) => {
-    const full = join(hypoDir, rel);
-    if (!existsSync(full)) return false;
-    try {
-      return dates.includes(frontmatterUpdated(readFileSync(full, 'utf-8')));
-    } catch {
-      return false;
-    }
-  };
-  if (fresh(join('projects', project, 'session-state.md'))) return true;
-  if (fresh(join('projects', project, 'hot.md'))) return true;
   for (const d of dates) {
     for (const rel of sessionLogReadCandidates(project, d)) {
       const sl = join(hypoDir, rel);
@@ -646,9 +655,6 @@ function hasTodayCloseActivity(hypoDir, project, dates) {
     } catch {
       /* skip */
     }
-  }
-  for (const r of rootHotRows(hypoDir)) {
-    if (r.slug === project && r.date && dates.includes(r.date)) return true;
   }
   return false;
 }
