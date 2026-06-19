@@ -5,6 +5,30 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.4] - 2026-06-19
+
+### Highlights
+
+- `init` no longer drops a duplicate stock page next to one you wrote by hand. If you already have a `wiki-automation.md`, installing the templates keeps it and skips the stock `hypo-automation.md`, with a loud "merge manually" notice instead of a silent, 0-reference orphan (#133).
+- Regenerable report output at the vault root (the upgrade `MIGRATION-v*.md` report, plus the reserved `GRAPH_REPORT.md` name) no longer clutters your knowledge catalog. These root files are excluded from the catalog scans (lint link targets, rename, doctor) while staying fully committable (#133).
+
+### Fixed
+
+- **Template injection keeps your hand-authored page instead of dropping a duplicate orphan.** `init` checked only the exact destination filename, so a stock `hypo-automation.md` landed next to a user's `wiki-automation.md` (the `hypo-`/`wiki-` namespace split), leaving a 0-reference duplicate orphan. `init` now carries an explicit equivalents map (the same idiom the hook-rename migration uses): when a legacy `wiki-*` page exists it keeps that page, skips the stock one, and reports the skip loudly so you can merge by hand. `hypo-guide.md` is exempt, because the runtime loads it by name and a mid-migration vault must still receive it. The check also fires in `--dry-run`. (#133, ADR 0058)
+- **Generated root artifacts no longer pollute the knowledge catalog.** The upgrade report (`MIGRATION-v*.md`) sits at the vault root, and the catalog scans (lint link targets, rename, doctor) treated it as a knowledge page. (`GRAPH_REPORT.md` has no writer today; its name is reserved preventively so a future dump cannot pollute the catalog either.) They cannot go in `.hypoignore`, because that list also drives the pre-commit secret gate, so listing them there would block their own commit and freeze every auto-commit while the report sits at root. A root-anchored, catalog-only exclusion now hides them from the scans while the pre-commit gate and `ingest --check` keep treating them normally, so the report still commits and enters git history but stops cluttering the catalog. Same-named files nested under `pages/` or `projects/` are untouched. (#133, ADR 0059)
+
+### 한글 요약
+
+**하이라이트**
+
+- `init`이 손수 쓴 페이지 옆에 중복 stock 페이지를 떨구지 않습니다. 이미 `wiki-automation.md`가 있으면 템플릿 설치 시 그걸 유지하고 stock `hypo-automation.md`는 건너뛰며, 조용한 참조 0곳 고아 대신 "수동 머지" 경고를 크게 냅니다 (#133).
+- 볼트 루트의 재생성 가능한 리포트 산출물(업그레이드 `MIGRATION-v*.md` 리포트, 예약된 `GRAPH_REPORT.md` 이름 포함)이 지식 카탈로그를 더는 어지럽히지 않습니다. 이 루트 파일들은 카탈로그 스캔(lint 링크 타깃·rename·doctor)에서 제외되면서도 정상 커밋됩니다 (#133).
+
+**수정**
+
+- **템플릿 주입이 중복 고아를 떨구지 않고 손수 쓴 페이지를 유지합니다.** `init`이 정확한 대상 파일명만 검사해서 stock `hypo-automation.md`가 사용자의 `wiki-automation.md`(hypo-/wiki- 네임스페이스 split) 옆에 떨어지며 참조 0곳 중복 고아를 남겼습니다. 이제 `init`은 명시적 등가본 맵(hook-rename 마이그레이션과 같은 관용구)을 갖춰, 레거시 `wiki-*` 페이지가 있으면 그 페이지를 유지하고 stock 페이지는 건너뛰며 그 사실을 크게 보고해 수동 머지하게 합니다. `hypo-guide.md`는 런타임이 이름으로 읽고 마이그레이션 중간 볼트도 받아야 하므로 예외입니다. `--dry-run`에서도 발화합니다. (#133, ADR 0058)
+- **생성된 루트 산출물이 지식 카탈로그를 오염하지 않습니다.** 업그레이드 리포트(`MIGRATION-v*.md`)가 볼트 루트에 있어 카탈로그 스캔(lint 링크 타깃·rename·doctor)이 지식 페이지로 취급했습니다. (`GRAPH_REPORT.md`는 현재 writer가 없고, 향후 덤프가 카탈로그를 오염하지 못하도록 이름만 예방적으로 예약했습니다.) 이들은 `.hypoignore`에 넣을 수 없는데, 그 목록이 pre-commit 시크릿 게이트도 구동하므로 거기 넣으면 자기 커밋이 차단되고 리포트가 루트에 있는 동안 모든 auto-commit이 동결되기 때문입니다. 이제 root-anchored 카탈로그 전용 제외가 스캔에서 가리되 pre-commit 게이트와 `ingest --check`은 정상 취급하므로, 리포트는 여전히 커밋되어 git 히스토리에 들어가면서 카탈로그를 어지럽히지 않습니다. `pages/`·`projects/` 아래 중첩 동명 파일은 영향받지 않습니다. (#133, ADR 0059)
+
 ## [1.3.3] - 2026-06-19
 
 ### Highlights
