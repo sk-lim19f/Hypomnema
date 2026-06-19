@@ -43,6 +43,19 @@ jobs:
       - name: No wiki-internal tracker ids in public artifacts
         run: npm run check:tracker-ids
 
+  plugin-channel:
+    name: Plugin channel (versions + smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: All version-carrying files agree (drift caught pre-release)
+        run: npm run check:versions
+      - name: Plugin surfaces load-valid (manifest, hooks, commands/skills)
+        run: npm run smoke:plugin
+
   init-snapshot:
     name: Init snapshot
     runs-on: ubuntu-latest

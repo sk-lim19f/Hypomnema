@@ -242,15 +242,21 @@ a missing `### 한글 요약` section will block `npm publish`.
 #    and templates/hypo-config.md. Takes a concrete semver (not patch/minor/major).
 node scripts/bump-version.mjs <new-semver>   # e.g. 1.2.2 or 1.3.0-rc.1
 
+# 1b. bump-version does NOT touch package-lock.json — sync it so `npm ci` and the
+#     version-consistency gate stay green (the lock carries the version twice).
+npm install --package-lock-only
+
 # 2. Edit CHANGELOG.md — the new section MUST include a "### 한글 요약"
 #    sub-section with at least 10 Hangul characters of real summary text.
 $EDITOR CHANGELOG.md
 
-# 3. Verify locally before tagging (same check that runs in CI)
+# 3. Verify locally before tagging (same checks that run in CI)
 node scripts/check-bilingual.mjs --changelog
+npm run check:versions   # all version-carrying files (incl. package-lock) agree
+npm run smoke:plugin     # plugin manifest + hooks/commands/skills load-valid
 
-# 4. Commit
-git add package.json CHANGELOG.md
+# 4. Commit — include EVERY file the bump touched, not just package.json.
+git add package.json package-lock.json .claude-plugin/ templates/hypo-config.md CHANGELOG.md
 git commit -m "chore: release v<version>"
 
 # 5. Tag with an ANNOTATED tag — never a lightweight tag.
@@ -278,11 +284,15 @@ git push origin main --tags
 
 The `release.yml` workflow then:
 
-1. Verifies the tag matches `package.json` version.
-2. Validates the CHANGELOG section AND the tag annotation are bilingual
+1. Verifies the tag matches the version in EVERY version-carrying file —
+   `package.json`, `package-lock.json`, `.claude-plugin/{plugin,marketplace}.json`,
+   and `templates/hypo-config.md` (`scripts/check-versions.mjs --tag`).
+2. Smokes the plugin channel — manifest, `hooks/hooks.json` targets, and
+   command/skill component files (`scripts/smoke-plugin.mjs`).
+3. Validates the CHANGELOG section AND the tag annotation are bilingual
    (`scripts/check-bilingual.mjs`).
-3. Runs `npm test` and `npm run lint`.
-4. Publishes to npm with `npm publish --access public --provenance`.
+4. Runs `npm test` and `npm run lint`.
+5. Publishes to npm with `npm publish --access public --provenance`.
 
 `NPM_TOKEN` must be set as a repository secret.
 

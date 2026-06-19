@@ -47,14 +47,19 @@ jobs:
           node-version: 18
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Validate tag matches package version
-        run: |
-          PKG_VERSION="v$(node -p "require('./package.json').version")"
-          TAG_VERSION="${GITHUB_REF_NAME}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "Tag ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
-            exit 1
-          fi
+      - name: Validate version consistency (tag + all release channels)
+        # Supersedes the old package.json-only tag check (IMPR-12). Asserts the tag
+        # AND every version-carrying file agree — package.json, package-lock.json,
+        # .claude-plugin/{plugin,marketplace}.json, templates/hypo-config.md — so a
+        # forgotten plugin/marketplace/lockfile bump hard-fails the release instead
+        # of publishing a split-version plugin.
+        run: node scripts/check-versions.mjs --tag "${GITHUB_REF_NAME}"
+
+      - name: Plugin path smoke
+        # The repo is dual-channel (npm + Claude Code plugin). Smoke the plugin
+        # surfaces (manifest, hooks/hooks.json targets, command/skill files,
+        # marketplace parity) so a broken plugin channel cannot ship green.
+        run: node scripts/smoke-plugin.mjs
 
       - name: Validate bilingual release docs (CHANGELOG + annotated tag)
         run: |
