@@ -9624,11 +9624,13 @@ test('project-dir-only candidate is gated (readdirSync leg) — guards the swall
   withTmpDir((dir) => {
     const today = todayLocal();
     // alpha is fully closed and visible via root hot.md row + log.md entry.
-    // gamma has today activity ONLY in its own session-state.md — it is absent
-    // from both the root hot.md rows and log.md, so ONLY the project-dirs leg
-    // (readdirSync over projects/*) can surface it. If that leg silently drops
-    // (e.g. an unimported readdirSync swallowed by the try/catch), gamma's
-    // dangling close is missed and the gate false-passes.
+    // gamma's only authoritative today signal is its own session-log heading
+    // (ADR 0057); it is absent from both the root hot.md rows and log.md, so ONLY
+    // the project-dirs leg (readdirSync over projects/* for session-state.md) can
+    // surface it as a candidate. If that leg silently drops (e.g. an unimported
+    // readdirSync swallowed by the try/catch), gamma's dangling close is missed
+    // and the gate false-passes. (session-state exists but is stale — it is the
+    // discovery handle, not the activity signal.)
     makeMultiProjectWiki(dir, today, [
       { slug: 'alpha', date: today },
       {
@@ -9636,7 +9638,7 @@ test('project-dir-only candidate is gated (readdirSync leg) — guards the swall
         date: today,
         hotRow: false,
         logEntry: false,
-        sessionLog: false,
+        sessionState: '2020-01-01',
         projectHot: '2020-01-01',
       },
     ]);
@@ -9646,6 +9648,97 @@ test('project-dir-only candidate is gated (readdirSync leg) — guards the swall
       `gamma must be found via the project-dirs leg: ${JSON.stringify(s.projects.map((p) => p.project))}`,
     );
     assert.equal(s.ok, false, 'gamma has a dangling close → block (must not false-pass)');
+  });
+});
+
+test('ADR 0057: bookkeeping-only freshness is NOT today close-activity (session-state bump must not cross-block)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha: a real, fully-closed session today. beta: ONLY soft state is fresh —
+    // session-state.md bumped today by tracker bookkeeping; no session-log heading,
+    // no log.md `session | beta` entry, stale hot.md + root row. beta must NOT be
+    // today-active, so alpha's completed close passes instead of cross-blocking.
+    // (Before ADR 0057 this asserted false — session-state freshness false-blocked.)
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      {
+        slug: 'beta',
+        date: today,
+        projectHot: '2020-01-01',
+        hotRow: '2020-01-01',
+        sessionLog: false,
+        logEntry: false,
+        // sessionState defaults to today — the bookkeeping bump
+      },
+    ]);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, true, `beta is bookkeeping-only → not today-active: ${JSON.stringify(s)}`);
+    assert.deepEqual(
+      s.projects.map((p) => p.project),
+      ['alpha'],
+      'only alpha is today-active; beta (session-state-only) excluded',
+    );
+  });
+});
+
+test('ADR 0057: project-create artifacts are NOT today close-activity (soft state + non-session log entry)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // newproj looks fresh the way project-create leaves a project — today hot.md +
+    // today root row + a `## [today] project-create | newproj` log entry (NOT a
+    // `session | …` close entry) + no session-log heading. None is authoritative.
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      {
+        slug: 'newproj',
+        date: today,
+        sessionLog: false,
+        logEntry: false,
+        // session-state + project hot + root row default to today (project-create stamps)
+      },
+    ]);
+    const logPath = join(dir, 'log.md');
+    writeFileSync(
+      logPath,
+      readFileSync(logPath, 'utf-8') + `## [${today}] project-create | newproj\n`,
+    );
+    const s = sessionCloseGlobalStatus(dir);
+    assert.deepEqual(
+      s.projects.map((p) => p.project),
+      ['alpha'],
+      'project-create (non-session log entry) must not make newproj today-active',
+    );
+    assert.equal(s.ok, true);
+  });
+});
+
+test('ADR 0057 no-regress: a real incomplete close still blocks (session-log heading present, log.md gap)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // beta had a genuine session (today session-log heading) but the root log.md
+    // entry is missing and session-state is stale. Still today-active via the
+    // session-log heading → still blocks. Dropping the soft-state signals (ISSUE-14
+    // family) must not lose this.
+    makeMultiProjectWiki(dir, today, [
+      {
+        slug: 'beta',
+        date: today,
+        sessionState: '2020-01-01',
+        projectHot: '2020-01-01',
+        hotRow: '2020-01-01',
+        logEntry: false,
+      },
+    ]);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(
+      s.ok,
+      false,
+      'real incomplete close (session-log present, log.md gap) must still block',
+    );
+    assert.ok(
+      s.projects.some((p) => p.project === 'beta' && !p.ok),
+      'beta detected as today-active via its session-log heading despite stale soft state',
+    );
   });
 });
 
