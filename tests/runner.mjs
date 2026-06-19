@@ -17666,6 +17666,240 @@ test('directory move: dry-run reports but writes nothing', () => {
   });
 });
 
+// ── IMPR-12: release-channel version assert + plugin smoke ────────────────────
+suite('check-versions.mjs (IMPR-12)');
+
+// Build a minimal repo-shaped fixture where every version-carrying location holds
+// `v`. Tests mutate one location to prove drift is caught.
+function buildVersionFixture(dir, v) {
+  mkdirSync(join(dir, '.claude-plugin'), { recursive: true });
+  mkdirSync(join(dir, 'templates'), { recursive: true });
+  writeFileSync(
+    join(dir, 'package.json'),
+    JSON.stringify({ name: 'hypomnema', version: v }, null, 2),
+  );
+  writeFileSync(
+    join(dir, 'package-lock.json'),
+    JSON.stringify(
+      {
+        name: 'hypomnema',
+        version: v,
+        lockfileVersion: 3,
+        packages: { '': { name: 'hypomnema', version: v } },
+      },
+      null,
+      2,
+    ),
+  );
+  writeFileSync(
+    join(dir, '.claude-plugin', 'plugin.json'),
+    JSON.stringify({ name: 'hypo', version: v }, null, 2),
+  );
+  writeFileSync(
+    join(dir, '.claude-plugin', 'marketplace.json'),
+    JSON.stringify(
+      { name: 'hypomnema', plugins: [{ name: 'hypo', source: './', version: v }] },
+      null,
+      2,
+    ),
+  );
+  writeFileSync(
+    join(dir, 'templates', 'hypo-config.md'),
+    `---\ntitle: cfg\ntype: config\nversion: "${v}"\n---\n`,
+  );
+}
+
+test('all files agree → exit 0', () => {
+  withTmpDir((dir) => {
+    buildVersionFixture(dir, '1.4.0');
+    const r = run('check-versions.mjs', ['--root', dir]);
+    assert.equal(r.status, 0, `expected 0: ${r.stdout}\n${r.stderr}`);
+  });
+});
+
+test('one file drifts → exit 1 (drift caught)', () => {
+  withTmpDir((dir) => {
+    buildVersionFixture(dir, '1.4.0');
+    // bump-version does NOT touch the lockfile, so a stale lock is the realistic drift.
+    writeFileSync(
+      join(dir, 'package-lock.json'),
+      JSON.stringify(
+        {
+          name: 'hypomnema',
+          version: '1.3.9',
+          lockfileVersion: 3,
+          packages: { '': { version: '1.3.9' } },
+        },
+        null,
+        2,
+      ),
+    );
+    const r = run('check-versions.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, `expected 1 on drift: ${r.stdout}`);
+    assert.ok(/drift/.test(r.stderr + r.stdout), 'should report drift');
+  });
+});
+
+test('--tag matching the files → exit 0; mismatch → exit 1', () => {
+  withTmpDir((dir) => {
+    buildVersionFixture(dir, '1.4.0');
+    assert.equal(
+      run('check-versions.mjs', ['--root', dir, '--tag', 'v1.4.0']).status,
+      0,
+      'tag match → 0',
+    );
+    const bad = run('check-versions.mjs', ['--root', dir, '--tag', 'v1.4.1']);
+    assert.equal(bad.status, 1, 'tag mismatch → 1');
+    assert.ok(/does not match/.test(bad.stderr + bad.stdout), 'should report tag mismatch');
+  });
+});
+
+test('marketplace entry selected by name, not position (parity enforced)', () => {
+  withTmpDir((dir) => {
+    buildVersionFixture(dir, '1.4.0');
+    // A first entry with a DIFFERENT name must not be treated as the authority.
+    writeFileSync(
+      join(dir, '.claude-plugin', 'marketplace.json'),
+      JSON.stringify(
+        {
+          plugins: [
+            { name: 'other', source: './x', version: '9.9.9' },
+            { name: 'hypo', source: './', version: '1.4.0' },
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+    const r = run('check-versions.mjs', ['--root', dir]);
+    assert.equal(
+      r.status,
+      0,
+      `name-matched entry (1.4.0) should win over positional 9.9.9: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+test('--tag bare "v" (normalizes to empty) → exit 1 (gate not bypassed)', () => {
+  withTmpDir((dir) => {
+    buildVersionFixture(dir, '1.4.0');
+    const r = run('check-versions.mjs', ['--root', dir, '--tag', 'v']);
+    assert.equal(r.status, 1, 'a bare v tag must hard-fail, not be read as "no tag"');
+    assert.ok(/valid semver/.test(r.stderr + r.stdout), 'should report invalid tag');
+  });
+});
+
+test('an unreadable version file → exit 1 (no silent pass)', () => {
+  withTmpDir((dir) => {
+    buildVersionFixture(dir, '1.4.0');
+    rmSync(join(dir, 'templates', 'hypo-config.md'));
+    const r = run('check-versions.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'a missing version source must fail');
+    assert.ok(/unreadable/.test(r.stderr + r.stdout), 'should report unreadable source');
+  });
+});
+
+suite('smoke-plugin.mjs (IMPR-12)');
+
+function buildPluginFixture(dir) {
+  mkdirSync(join(dir, '.claude-plugin'), { recursive: true });
+  mkdirSync(join(dir, 'commands'), { recursive: true });
+  mkdirSync(join(dir, 'skills', 'demo'), { recursive: true });
+  mkdirSync(join(dir, 'hooks'), { recursive: true });
+  writeFileSync(
+    join(dir, '.claude-plugin', 'plugin.json'),
+    JSON.stringify(
+      { name: 'hypo', version: '1.4.0', commands: './commands/', skills: './skills/' },
+      null,
+      2,
+    ),
+  );
+  writeFileSync(
+    join(dir, '.claude-plugin', 'marketplace.json'),
+    JSON.stringify({ plugins: [{ name: 'hypo', source: './', version: '1.4.0' }] }, null, 2),
+  );
+  writeFileSync(join(dir, 'commands', 'foo.md'), '# foo\n');
+  writeFileSync(join(dir, 'skills', 'demo', 'SKILL.md'), '# demo\n');
+  writeFileSync(join(dir, 'hooks', 'h.mjs'), '// hook\n');
+  writeFileSync(join(dir, 'hooks', 'shared-lib.mjs'), '// shared\n');
+  writeFileSync(
+    join(dir, 'hooks', 'hooks.json'),
+    JSON.stringify(
+      {
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: 'command', command: 'node ${CLAUDE_PLUGIN_ROOT}/hooks/h.mjs' }] },
+          ],
+        },
+        shared: ['shared-lib.mjs'],
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+test('valid plugin surfaces → exit 0', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 0, `expected 0: ${r.stdout}\n${r.stderr}`);
+  });
+});
+
+test('missing hook target → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    rmSync(join(dir, 'hooks', 'h.mjs')); // hooks.json still references it
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, `expected 1 on missing hook target: ${r.stdout}`);
+    assert.ok(/is not a file/.test(r.stderr + r.stdout), 'should report missing target');
+  });
+});
+
+test('empty commands (.gitkeep only) → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    rmSync(join(dir, 'commands', 'foo.md'));
+    writeFileSync(join(dir, 'commands', '.gitkeep'), '');
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'a placeholder-only commands/ must fail');
+    assert.ok(/command files/.test(r.stderr + r.stdout), 'should report no command files');
+  });
+});
+
+test('empty skills (.gitkeep only) → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    rmSync(join(dir, 'skills', 'demo', 'SKILL.md'));
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'a placeholder-only skills/ must fail');
+    assert.ok(/SKILL\.md/.test(r.stderr + r.stdout), 'should report no skills');
+  });
+});
+
+test('missing shared hook file → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    rmSync(join(dir, 'hooks', 'shared-lib.mjs')); // hooks.json.shared still lists it
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'a missing shared file must fail');
+    assert.ok(/shared/.test(r.stderr + r.stdout), 'should report missing shared file');
+  });
+});
+
+test('marketplace name mismatch → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    writeFileSync(
+      join(dir, '.claude-plugin', 'marketplace.json'),
+      JSON.stringify({ plugins: [{ name: 'WRONG', source: './', version: '1.4.0' }] }, null, 2),
+    );
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'name parity must be enforced');
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

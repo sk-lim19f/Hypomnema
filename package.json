@@ -42,12 +42,14 @@
     "fix:verify": "node scripts/fix-status-verify.mjs",
     "graph": "node scripts/graph.mjs",
     "smoke-pack": "node scripts/smoke-pack.mjs",
+    "check:versions": "node scripts/check-versions.mjs",
+    "smoke:plugin": "node scripts/smoke-plugin.mjs",
     "check:bilingual": "node scripts/check-bilingual.mjs --changelog",
     "check:tracker-ids": "node scripts/check-tracker-ids.mjs --all",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepublishOnly": "npm test && npm run lint && npm run smoke-pack && npm run check:bilingual && npm run check:tracker-ids"
+    "prepublishOnly": "npm test && npm run lint && npm run check:versions && npm run smoke:plugin && npm run smoke-pack && npm run check:bilingual && npm run check:tracker-ids"
   },
   "devDependencies": {
     "prettier": "^3.8.3"
