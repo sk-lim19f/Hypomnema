@@ -18,7 +18,7 @@ import { homedir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
-import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 import { readSyncState, projectSuggestionsPath } from '../hooks/hypo-shared.mjs';
 import {
@@ -443,7 +443,7 @@ function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
-    if (hypoDir && isIgnored(full, hypoDir, ignorePatterns)) continue;
+    if (hypoDir && isScanIgnored(full, hypoDir, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) collectMdFiles(full, acc, hypoDir, ignorePatterns);
     else if (extname(entry) === '.md') acc.push(full);

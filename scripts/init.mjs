@@ -32,7 +32,7 @@ import {
   renameSync,
   unlinkSync,
 } from 'fs';
-import { join, basename } from 'path';
+import { join, basename, dirname } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -171,7 +171,19 @@ docstring at the top of scripts/<command>.mjs.`);
 
 // ── result tracking ──────────────────────────────────────────────────────────
 
-const results = { created: [], skipped: [], merged: [], errors: [] };
+const results = { created: [], skipped: [], merged: [], deduped: [], errors: [] };
+
+// Stock template basename → legacy hand-authored equivalents to honor instead of
+// injecting a duplicate. The hypo-/wiki- namespace split (the rename that
+// produced hypo-guide from wiki-guide, etc.) means an exact-filename check misses
+// a user's existing page and drops a 0-reference duplicate orphan beside it.
+// Mirrors the explicit HOOK_RENAMES idiom in upgrade.mjs. hypo-guide.md is
+// intentionally absent: the runtime reads it by name, so a mid-migration vault
+// must still receive it even when wiki-guide.md is present.
+const PAGE_EQUIVALENTS = {
+  'hypo-automation.md': ['wiki-automation.md'],
+  'hypo-help.md': ['wiki-help.md'],
+};
 
 function log(action, path) {
   results[action].push(path);
@@ -211,6 +223,19 @@ function copyTemplate(srcName, destPath, dryRun, transform) {
   }
   if (existsSync(destPath)) {
     log('skipped', destPath);
+    return;
+  }
+  // If a legacy hand-authored equivalent already exists, do NOT inject the stock
+  // page — that is exactly what produced a duplicate orphan. Skip LOUDLY (own
+  // bucket, ⚠ in the summary) so the user can merge manually. Fires in --dry-run
+  // too, so a dry run previews the suppression.
+  const equivalents = PAGE_EQUIVALENTS[basename(srcName)] || [];
+  const existingEquivalent = equivalents.find((name) => existsSync(join(dirname(destPath), name)));
+  if (existingEquivalent) {
+    log(
+      'deduped',
+      `${destPath} — kept existing ${existingEquivalent}; stock ${basename(srcName)} not installed (merge manually if you want the template content)`,
+    );
     return;
   }
   if (!dryRun) {
@@ -1017,6 +1042,10 @@ if (results.skipped.length)
   );
 if (results.merged.length)
   lines.push(`↪ Merged into settings.json:\n${results.merged.map((p) => `  ${p}`).join('\n')}`);
+if (results.deduped.length)
+  lines.push(
+    `⚠ Skipped to avoid a duplicate — an equivalent page already exists (${results.deduped.length}):\n${results.deduped.map((p) => `  ${p}`).join('\n')}`,
+  );
 if (results.errors.length)
   lines.push(`✗ Errors:\n${results.errors.map((p) => `  ${p}`).join('\n')}`);
 

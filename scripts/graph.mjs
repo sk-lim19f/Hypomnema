@@ -17,7 +17,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
-import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
@@ -38,7 +38,7 @@ function collectPages(dir, root, pages = [], ignorePatterns = []) {
   if (!existsSync(dir)) return pages;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
-    if (isIgnored(full, root, ignorePatterns)) continue;
+    if (isScanIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) {
       collectPages(full, root, pages, ignorePatterns);
