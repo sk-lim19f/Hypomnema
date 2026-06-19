@@ -70,6 +70,7 @@ import {
   renameSync,
 } from 'fs';
 import { join, relative, extname, dirname } from 'path';
+import { hostname } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
@@ -756,9 +757,21 @@ function applySessionClose(args) {
       // otherwise mistake it for the evidence file. The dated `## [date] ...`
       // heading lives inside the entry, so freshness / derive / design-history
       // are unchanged.
+      // PRAC-17 audit fields. The shard frontmatter is git-tracked and synced, so
+      // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
+      // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
+      // machine that first seeds the daily shard is recorded; later same-day
+      // appends do not touch it. The per-session-accurate store is the LOCAL
+      // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
+      // `session_id` is honest naming: the value is the Claude session UUID, and
+      // it is present only on the Stop-chain close path that passes --session-id.
+      const device = String(hostname() || 'unknown').replace(/[\r\n]/g, '');
+      const auditFm =
+        (args.sessionId ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n` : '') +
+        `device: ${device}\n`;
       const header =
         `---\ntitle: Session Log ${date} (${project})\n` +
-        `type: session-log\nupdated: ${date}\n---\n\n` +
+        `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
         `# Session Log ${date} (${project})\n`;
       const entry = payload.sessionLog.entry;
       const body = entry.endsWith('\n') ? entry : `${entry}\n`;
