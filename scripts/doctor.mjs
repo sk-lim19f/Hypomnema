@@ -528,10 +528,19 @@ function checkSyncState(hypoDir) {
     pass('Sync state', 'No unresolved sync failures');
   } else {
     const last = entries[entries.length - 1];
-    warn(
-      'Sync state',
-      `${entries.length} unresolved failure(s) — last: ${last.op || '?'} at ${last.timestamp || '?'}. Inspect .cache/sync-state.json or push/pull manually to clear.`,
-    );
+    // A merge conflict needs a real manual merge, not a plain push/pull — give
+    // the same explicit guidance session-start does instead of the generic hint.
+    if (String(last.op || '').startsWith('conflict')) {
+      warn(
+        'Sync state',
+        `${entries.length} unresolved sync issue(s) — last: remote diverged (merge conflict). Your local work is committed; the other machine's version is on the remote. Resolve with \`git pull --no-rebase\`, fix conflicts, then push.`,
+      );
+    } else {
+      warn(
+        'Sync state',
+        `${entries.length} unresolved failure(s) — last: ${last.op || '?'} at ${last.timestamp || '?'}. Inspect .cache/sync-state.json or push/pull manually to clear.`,
+      );
+    }
   }
 }
 
