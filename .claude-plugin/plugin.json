@@ -1,6 +1,6 @@
 {
   "name": "hypo",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "LLM-native personal wiki system — session-aware knowledge base for Claude Code",
   "author": {
     "name": "sk-lim19f",
