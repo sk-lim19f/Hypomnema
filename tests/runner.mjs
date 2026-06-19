@@ -2342,7 +2342,7 @@ function payloadForCleanWiki(dir, today) {
   };
 }
 
-function runApply(dir, payload, { force = false } = {}) {
+function runApply(dir, payload, { force = false, sessionId = null } = {}) {
   // Fix #39 (option D): payload presence = explicit close intent → always runs
   // full apply. --force only matters for the no-payload probe path, so tests
   // that supply a payload do NOT need --force.
@@ -2355,6 +2355,7 @@ function runApply(dir, payload, { force = false } = {}) {
     '--json',
   ];
   if (force) flags.push('--force');
+  if (sessionId) flags.push(`--session-id=${sessionId}`);
   return run('crystallize.mjs', flags);
 }
 
@@ -2399,6 +2400,79 @@ test('idempotent: re-running same payload produces no new bytes (file mtimes unc
       'session-log must not grow on re-apply (idempotent append)',
     );
     assert.equal(logAfter, logBefore, 'log.md must not grow on re-apply (idempotent append)');
+  });
+});
+
+// PRAC-17: the test above measures the LEGACY MONTHLY shard path; the apply code
+// writes the DAILY shard for a distinct entry. This dedicated test targets the
+// daily shard and pins both (a) the new audit frontmatter (device present once,
+// no session_id when --session-id is not passed) and (b) byte-equal idempotency
+// on the daily shard — the gap the monthly-path test cannot catch.
+test('PRAC-17: daily shard seeds device frontmatter once + byte-equal on re-apply', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] prac17 daily entry\n\nbody\n` };
+    const r1 = runApply(dir, payload);
+    assert.equal(r1.status, 0, `first apply failed: ${r1.stdout}\n${r1.stderr}`);
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    assert.ok(existsSync(shard), 'daily shard must be created');
+    const fm1 = readFileSync(shard, 'utf-8');
+    // device is always seeded; appears exactly once (in the seeded header).
+    assert.ok(/\ndevice: \S+\n/.test(fm1), `shard frontmatter must carry device: ${fm1}`);
+    assert.equal((fm1.match(/^device: /gm) || []).length, 1, 'device must appear exactly once');
+    // runApply does not pass --session-id, so session_id must be absent (not a
+    // dead/empty field) on the manual close path.
+    assert.ok(!/^session_id:/m.test(fm1), `session_id must be absent without --session-id: ${fm1}`);
+    // Post-apply lint stays clean with the extra fields (lint requires only title+type).
+    assert.equal(JSON.parse(r1.stdout).ok, true, `post-apply lint must be clean: ${r1.stdout}`);
+
+    const r2 = runApply(dir, payload);
+    assert.equal(r2.status, 0, `second apply failed: ${r2.stdout}\n${r2.stderr}`);
+    assert.equal(
+      readFileSync(shard, 'utf-8'),
+      fm1,
+      'daily shard must be byte-equal on re-apply (frontmatter not regenerated)',
+    );
+  });
+});
+
+test('PRAC-17: --session-id seeds the session_id frontmatter line on the daily shard', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] prac17 session-id entry\n\nbody\n` };
+    const sid = '0c9d1234-aaaa-bbbb-cccc-0123456789ab';
+    const r = runApply(dir, payload, { sessionId: sid });
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    const fm = readFileSync(shard, 'utf-8');
+    assert.ok(
+      new RegExp(`^session_id: ${sid}$`, 'm').test(fm),
+      `shard frontmatter must carry the passed session_id: ${fm}`,
+    );
+    assert.ok(/^device: \S+$/m.test(fm), `device must still be present: ${fm}`);
+    assert.equal(JSON.parse(r.stdout).ok, true, `post-apply lint must be clean: ${r.stdout}`);
+  });
+});
+
+// PRAC-17: the OTHER write site — the per-session index.jsonl. This store is
+// local-only (.cache/ gitignored) and accurate for every session, so it pins
+// that the Stop hook stamps `device` on every recorded entry.
+test('PRAC-17: hypo-session-record stamps device on the index.jsonl entry', () => {
+  withTmpDir((dir) => {
+    const r = runHook(
+      'hypo-session-record.mjs',
+      { session_id: 'rec-prac17', transcript_path: '/tmp/t.jsonl', cwd: '/tmp/work' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `hook failed: ${r.stderr}`);
+    const idx = join(dir, '.cache', 'sessions', 'index.jsonl');
+    assert.ok(existsSync(idx), 'index.jsonl must be written');
+    const entry = JSON.parse(readFileSync(idx, 'utf-8').trim().split('\n').pop());
+    assert.equal(entry.session_id, 'rec-prac17');
+    assert.ok(
+      typeof entry.device === 'string' && entry.device.length > 0,
+      `device must be recorded on the index entry: ${JSON.stringify(entry)}`,
+    );
   });
 });
 

@@ -115,7 +115,7 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | `hypo-personal-check` | PreCompact validation: lint blockers, uncommitted changes, missing session-log entries → block compact |
 | `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`) |
 | `hypo-hot-rebuild` | At session stop, regenerate root `hot.md` from recent activity; emit growth metrics + cache for next SessionStart |
-| `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
+| `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd, device}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
 | `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote) |
 | `hypo-cwd-change` | When working directory changes, re-resolve the active project and inject its `hot.md` |
 | `hypo-file-watch` | Notify on external wiki edits so the in-session view stays consistent |
@@ -335,7 +335,7 @@ journal/weekly/<YYYY-Www>.md               ← committed report (heuristic v0, s
 
 `session-audit.mjs` reads transcripts from two locations, in priority order:
 
-1. **Primary:** `<hypo-root>/.cache/sessions/index.jsonl` — written by the Stop hook `hypo-session-record.mjs`. Each line: `{ session_id, transcript_path, recorded_at, cwd }`.
+1. **Primary:** `<hypo-root>/.cache/sessions/index.jsonl` — written by the Stop hook `hypo-session-record.mjs`. Each line: `{ session_id, transcript_path, recorded_at, cwd, device }`. `device` (PRAC-17) is `os.hostname()` for multi-machine audit; the index lives under `.cache/` (gitignored in a normal vault) so it is a local-only per-session record.
 2. **Fallback:** `~/.claude/projects/<encoded>/*.jsonl` — scanned when the index is missing or empty (legacy / freshly-installed wikis).
 
 ### Classification
@@ -365,6 +365,8 @@ The score is a **proxy, not ground truth**. The four-week baseline plan (capture
 ### Privacy
 
 The observability pipeline reads but never republishes raw transcripts. Weekly reports only emit `session_id` plus aggregate counts — no transcript content, no URLs, no tool inputs. Transcripts themselves live under `~/.claude/projects/` or `.cache/sessions/` which `.hypoignore` already excludes from any sync.
+
+**PRAC-17 audit fields (`device`, `session_id`).** `device` (`os.hostname()`) is recorded in two places with different sync boundaries, by design. In `.cache/sessions/index.jsonl` it is per-session-accurate but **local-only** (`.cache/` is gitignored in a normal vault). In the seeded session-log daily-shard frontmatter it is an **intentional synced field** — a creator-only stamp (the session/machine that first created the day's shard), carried across machines so the wiki itself records which machine opened each day. `session_id` (the Claude session UUID) is seeded into that same synced frontmatter, but only on the Stop-chain close path that passes `--session-id`; on manual/skill closes it is omitted. This deliberately puts a hostname (and, on the automated path, the session UUID) into git-tracked, synced content; it is acceptable for a single-user private vault where multi-machine identification is the goal. Operators who do not want a hostname synced can override `os.hostname()` at the OS level or treat the field as a pseudonymous label.
 
 ### Growth metrics (Lane B)
 

@@ -12,6 +12,7 @@
 
 import { existsSync, mkdirSync, appendFileSync } from 'fs';
 import { dirname, join } from 'path';
+import { hostname } from 'os';
 import { HYPO_DIR } from './hypo-shared.mjs';
 
 const INDEX_PATH = join(HYPO_DIR, '.cache', 'sessions', 'index.jsonl');
@@ -50,6 +51,10 @@ process.stdin.on('end', () => {
       transcript_path: transcriptPath,
       recorded_at: new Date().toISOString(),
       cwd: payload.cwd || process.cwd(),
+      // PRAC-17: machine identity for multi-machine audit. index.jsonl lives
+      // under .cache/ (gitignored in a normal vault), so this is a LOCAL-only
+      // per-session record — accurate for every session, no sync/privacy cost.
+      device: hostname() || 'unknown',
     };
     appendFileSync(INDEX_PATH, JSON.stringify(entry) + '\n');
   } catch (err) {
