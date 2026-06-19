@@ -243,6 +243,13 @@ function syncStateNotice(pullOk) {
     return '';
   }
   const last = entries[entries.length - 1];
+  if (last.op === 'conflict') {
+    return (
+      `[WIKI: remote diverged — auto-merge was aborted to protect your edits ` +
+      `(your local work is committed and safe; the other machine's version is on the remote). ` +
+      `Resolve manually: \`git -C ${HYPO_DIR} pull --no-rebase\`, fix conflicts, then push.]`
+    );
+  }
   return `[WIKI: last sync failed: ${last.op || '?'} — ${last.error || 'unknown'}]`;
 }
 const GLOBAL_HOT = join(HYPO_DIR, 'hot.md');

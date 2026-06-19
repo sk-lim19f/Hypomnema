@@ -669,6 +669,34 @@ test('doctor-sync-state-warn: open sync-state.json entries → warn', () => {
   });
 });
 
+test('doctor-sync-state-warn: conflict entry → manual-merge guidance, not generic hint', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({
+        timestamp: '2026-06-19T00:00:00Z',
+        op: 'conflict',
+        error: 'CONFLICT (content): Merge conflict in page.md',
+        host: 'test',
+      }) + '\n',
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(
+      /diverged|pull --no-rebase/.test(check.detail),
+      `conflict must get manual-merge guidance, not the generic hint: ${check.detail}`,
+    );
+  });
+});
+
 // fix #23: doctor-project-suggestions skip-persistence schema check
 suite('doctor.mjs — fix #23: auto-project skip-persistence');
 
@@ -827,6 +855,7 @@ const {
   hypoIsClean,
   precompactGateStatus,
   commitWikiChanges,
+  syncRemote,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -8212,6 +8241,106 @@ test('replay-session-start-preserves-sync-state-when-ahead: unpushed commit keep
       `unresolved push failure must stay surfaced: ${ctx}`,
     );
     assert.ok(existsSync(p), 'sync-state.json must not be cleared while local is ahead of remote');
+  });
+});
+
+// ── FEAT-17: no-data-loss on a merge conflict (syncRemote) ──────────────────────
+//
+// Deterministic two-clone regression for the data-integrity hole: a Stop-hook
+// `pull --no-rebase` that hits a merge conflict must NOT leave the tree with
+// `<<<<<<<` markers (which the next session would read as corrupted pages).
+// ADR 0055 live QA cannot run in CI, so this is the machine-enforced guard.
+//
+// Sets up: bare remote ← clone A (pushes a divergent edit) + clone B (commits a
+// conflicting edit to the same file, then runs syncRemote).
+function withConflictingClones(fn) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-conflict-'));
+  const remote = join(base, 'remote.git');
+  const a = join(base, 'a');
+  const b = join(base, 'b');
+  const gitq = (dir, ...args) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8' });
+  try {
+    spawnSync('git', ['init', '--bare', '-q', remote]);
+    spawnSync('git', ['init', '-q', a]);
+    gitq(a, 'config', 'user.email', 'a@test.com');
+    gitq(a, 'config', 'user.name', 'A');
+    writeFileSync(join(a, 'page.md'), '---\ntitle: Page\n---\nbase line\n');
+    gitq(a, 'add', '-A');
+    gitq(a, 'commit', '-q', '-m', 'init');
+    gitq(a, 'remote', 'add', 'origin', remote);
+    gitq(a, 'push', '-q', '-u', 'origin', 'HEAD');
+    // clone B from the shared remote, on the same base commit
+    spawnSync('git', ['clone', '-q', remote, b]);
+    gitq(b, 'config', 'user.email', 'b@test.com');
+    gitq(b, 'config', 'user.name', 'B');
+    // A edits the line and pushes first → remote now ahead of B
+    writeFileSync(join(a, 'page.md'), '---\ntitle: Page\n---\nedit from A\n');
+    gitq(a, 'add', '-A');
+    gitq(a, 'commit', '-q', '-m', 'A edit');
+    gitq(a, 'push', '-q');
+    // B commits a conflicting edit to the same line (not yet pushed)
+    writeFileSync(join(b, 'page.md'), '---\ntitle: Page\n---\nedit from B\n');
+    gitq(b, 'add', '-A');
+    gitq(b, 'commit', '-q', '-m', 'B edit');
+    fn({ a, b, remote, gitq });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+suite('FEAT-17 — syncRemote no-data-loss on merge conflict');
+
+test('syncRemote aborts a conflicting merge and leaves the tree clean (no markers, ours kept)', () => {
+  withConflictingClones(({ b, remote, gitq }) => {
+    const res = syncRemote(b);
+
+    // 1. the conflict was detected and reported, not silently swallowed
+    assert.equal(res.conflict, true, `expected conflict result, got ${JSON.stringify(res)}`);
+    assert.equal(res.pushed, false, 'must not push from a diverged branch');
+
+    // 2. the tree is NOT left half-merged: no unmerged index entries…
+    const unmerged = gitq(b, 'ls-files', '-u').stdout || '';
+    assert.equal(unmerged.trim(), '', `unmerged index entries remain: ${unmerged}`);
+    // …and no conflict markers written into the page
+    const page = readFileSync(join(b, 'page.md'), 'utf-8');
+    assert.ok(!page.includes('<<<<<<<'), 'conflict markers must not survive in the working tree');
+    assert.ok(!page.includes('>>>>>>>'), 'conflict markers must not survive in the working tree');
+
+    // 3. no data lost: ours stays canonical locally, theirs stays on the remote
+    assert.ok(page.includes('edit from B'), `local (ours) edit must be preserved: ${page}`);
+    const remoteHead = spawnSync('git', ['-C', remote, 'show', 'HEAD:page.md'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      remoteHead.includes('edit from A'),
+      `remote (theirs) edit must remain recoverable: ${remoteHead}`,
+    );
+
+    // 4. the divergence is surfaced for the user
+    const entries = readSyncEntries(b);
+    assert.ok(
+      entries.some((e) => e.op === 'conflict'),
+      `a conflict entry must be recorded: ${JSON.stringify(entries)}`,
+    );
+  });
+});
+
+test('session-start surfaces a conflict entry with manual-merge guidance', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({
+        timestamp: '2026-06-19T00:00:00Z',
+        op: 'conflict',
+        error: 'CONFLICT (content): Merge conflict in page.md',
+        host: 'test',
+      }) + '\n',
+    );
+    const r = runStart(dir);
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(ctx.includes('remote diverged'), `conflict notice missing: ${ctx}`);
+    assert.ok(ctx.includes('pull --no-rebase'), `manual-merge guidance missing: ${ctx}`);
   });
 });
 

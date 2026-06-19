@@ -6,14 +6,10 @@
  */
 
 import { spawnSync } from 'child_process';
-import { HYPO_DIR, appendSyncFailure, commitWikiChanges } from './hypo-shared.mjs';
-
-function git(...args) {
-  return spawnSync('git', ['-C', HYPO_DIR, ...args], { encoding: 'utf-8', timeout: 30000 });
-}
+import { HYPO_DIR, syncRemote, commitWikiChanges } from './hypo-shared.mjs';
 
 function hasRemote() {
-  const r = git('remote');
+  const r = spawnSync('git', ['-C', HYPO_DIR, 'remote'], { encoding: 'utf-8', timeout: 30000 });
   return (r.stdout || '').trim().length > 0;
 }
 
@@ -28,12 +24,10 @@ if (!result.committed) {
 
 if (hasRemote()) {
   // pull/push failures must not stop the session, but they can no longer be
-  // swallowed silently — record each to .cache/sync-state.json so session-start
-  // and doctor can surface them next session.
-  const pull = git('pull', '--no-rebase', '-q');
-  if (pull.status !== 0) appendSyncFailure(HYPO_DIR, 'pull', pull.stderr || pull.stdout);
-  const push = git('push');
-  if (push.status !== 0) appendSyncFailure(HYPO_DIR, 'push', push.stderr || push.stdout);
+  // swallowed silently — syncRemote records each to .cache/sync-state.json and,
+  // on a merge conflict, aborts the merge so the tree is never left half-merged
+  // (FEAT-17 hardening). session-start + doctor surface the result next session.
+  syncRemote(HYPO_DIR);
 }
 
 console.log(JSON.stringify({ continue: true, suppressOutput: true }));

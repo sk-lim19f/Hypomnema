@@ -846,7 +846,10 @@ function syncStatePath(hypoDir) {
  * failure-log must not break the Stop hook that calls it.
  *
  * @param {string} hypoDir
- * @param {'pull'|'push'} op
+ * @param {'pull'|'push'|'conflict'|'conflict-unresolved'} op  'conflict' = a
+ *   merge conflict was detected and aborted (the tree was left clean at the
+ *   local commit); 'conflict-unresolved' = the abort itself failed and the tree
+ *   may still be half-merged (rare). See syncRemote.
  * @param {string} error  raw stderr/stdout; first non-empty line is kept
  */
 export function appendSyncFailure(hypoDir, op, error) {
@@ -868,6 +871,70 @@ export function appendSyncFailure(hypoDir, op, error) {
   } catch {
     // best-effort
   }
+}
+
+/**
+ * Pull + push the wiki against its remote, guaranteeing the working tree is
+ * never left half-merged. Called by the auto-commit Stop hook after a local
+ * commit succeeds.
+ *
+ * Failure policy (v1.4 "sync hardening", tracker FEAT-17):
+ *   - clean fast-forward / conflict-free merge → push.
+ *   - MERGE CONFLICT (`git pull --no-rebase` leaves unmerged paths): abort the
+ *     merge so the tree returns to the just-committed local state ("ours"),
+ *     record op='conflict', and do NOT push (a diverged branch cannot
+ *     fast-forward, so the push would only add a noisy second failure). No data
+ *     is lost: ours stays committed locally, "theirs" stays on the remote, and
+ *     the divergence is surfaced by session-start + doctor until the user merges
+ *     manually. Inline auto-resolution (preserving the losing version as a
+ *     `.conflict-*` sibling) is deferred — see tracker PRAC-18.
+ *   - non-conflict pull failure (network/auth: no unmerged paths) → record
+ *     op='pull', then still attempt push (a transient pull blip should not block
+ *     an otherwise-pushable commit); record op='push' if that also fails.
+ *
+ * Best-effort: never throws — a sync failure must not break the Stop hook.
+ *
+ * @param {string} hypoDir
+ * @returns {{pulled: boolean, pushed: boolean, conflict: boolean}}
+ */
+export function syncRemote(hypoDir) {
+  const git = (...args) =>
+    spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
+  const result = { pulled: false, pushed: false, conflict: false };
+  try {
+    const pull = git('pull', '--no-rebase', '-q');
+    if (pull.status === 0) {
+      result.pulled = true;
+    } else {
+      // A merge conflict leaves unmerged index entries; a network/auth failure
+      // leaves none. Only the former must be aborted to keep the tree clean.
+      const unmerged = git('ls-files', '-u');
+      const hasConflict = unmerged.status === 0 && (unmerged.stdout || '').trim().length > 0;
+      if (hasConflict) {
+        // Abort to return the tree to the just-committed local state. Verify the
+        // abort actually cleaned up: if it fails (filesystem/concurrent-mutation
+        // edge), the tree may still be half-merged, so record that distinctly
+        // ('conflict-unresolved') rather than masking it as a clean abort.
+        const abort = git('merge', '--abort');
+        const stillUnmerged = git('ls-files', '-u');
+        const aborted = abort.status === 0 && (stillUnmerged.stdout || '').trim().length === 0;
+        appendSyncFailure(
+          hypoDir,
+          aborted ? 'conflict' : 'conflict-unresolved',
+          pull.stderr || pull.stdout,
+        );
+        result.conflict = true;
+        return result; // do not push from a diverged branch
+      }
+      appendSyncFailure(hypoDir, 'pull', pull.stderr || pull.stdout);
+    }
+    const push = git('push');
+    if (push.status === 0) result.pushed = true;
+    else appendSyncFailure(hypoDir, 'push', push.stderr || push.stdout);
+  } catch {
+    // best-effort — never break the Stop hook
+  }
+  return result;
 }
 
 /**
