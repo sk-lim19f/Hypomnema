@@ -19,7 +19,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
-import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ function collectMdFiles(dir, root, acc = [], ignorePatterns = []) {
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
-    if (isIgnored(full, root, ignorePatterns)) continue;
+    if (isScanIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) collectMdFiles(full, root, acc, ignorePatterns);
     else if (extname(entry) === '.md') acc.push({ path: full, rel: relative(root, full) });

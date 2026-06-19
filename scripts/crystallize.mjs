@@ -73,7 +73,7 @@ import { join, relative, extname, dirname } from 'path';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
-import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import {
   sessionCloseFileStatus,
   sessionCloseGlobalStatus,
@@ -949,7 +949,7 @@ function collectPages(dir, root, acc = [], ignorePatterns = []) {
   for (const entry of readdirSync(dir)) {
     if (entry.startsWith('.')) continue;
     const full = join(dir, entry);
-    if (isIgnored(full, root, ignorePatterns)) continue;
+    if (isScanIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) collectPages(full, root, acc, ignorePatterns);
     else if (extname(entry) === '.md') {

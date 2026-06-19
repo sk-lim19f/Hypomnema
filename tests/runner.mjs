@@ -281,6 +281,74 @@ test('init creates .gitignore with .cache/ entry', () => {
   });
 });
 
+suite('init.mjs — duplicate-orphan dedup (hypo-/wiki- namespace split)');
+
+test('skips stock hypo-automation.md when a legacy wiki-automation.md exists', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(join(hypoDir, 'wiki-automation.md'), '# my hand-authored automation\n');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !existsSync(join(hypoDir, 'hypo-automation.md')),
+      'stock hypo-automation.md must NOT be injected beside the user page',
+    );
+    assert.ok(existsSync(join(hypoDir, 'wiki-automation.md')), 'user page must be preserved');
+    assert.match(
+      r.stdout,
+      /kept existing wiki-automation\.md/,
+      `dedup must warn LOUDLY: ${r.stdout}`,
+    );
+  });
+});
+
+test('injects hypo-automation.md normally when no equivalent exists', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      existsSync(join(hypoDir, 'hypo-automation.md')),
+      'hypo-automation.md should be created when there is nothing to dedup against',
+    );
+  });
+});
+
+test('hypo-guide.md is still injected even when wiki-guide.md exists (runtime-required)', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(join(hypoDir, 'wiki-guide.md'), '# legacy guide\n');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      existsSync(join(hypoDir, 'hypo-guide.md')),
+      'core hypo-guide.md must still be installed (runtime reads it by name)',
+    );
+  });
+});
+
+test('--dry-run previews the dedup suppression and writes nothing', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(join(hypoDir, 'wiki-automation.md'), '# my automation\n');
+    const r = run('init.mjs', [
+      `--hypo-dir=${hypoDir}`,
+      '--no-hooks',
+      '--no-git-init',
+      '--dry-run',
+    ]);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(r.stdout, /kept existing wiki-automation\.md/, `dry-run must warn: ${r.stdout}`);
+    assert.ok(
+      !existsSync(join(hypoDir, 'hypo-automation.md')),
+      'dry-run must not write hypo-automation.md',
+    );
+  });
+});
+
 // init-creates-extensions-baseline (§8.12, ADR 0024)
 test('init-creates-extensions-baseline', () => {
   withTmpDir((dir) => {
@@ -6795,6 +6863,46 @@ test('lint --json: large warn-heavy output survives the 64 KiB pipe boundary', (
   }
 });
 
+suite('lib/hypo-ignore.mjs — generated-artifact catalog exclusion');
+
+const {
+  isGeneratedArtifact,
+  isScanIgnored,
+  isIgnored: isHypoIgnored,
+} = await import(`${SCRIPTS}/lib/hypo-ignore.mjs`);
+const GA_ROOT = '/tmp/ga-vault';
+
+test('root MIGRATION-v*.md and GRAPH_REPORT.md are generated artifacts', () => {
+  assert.ok(isGeneratedArtifact(join(GA_ROOT, 'MIGRATION-v2.0.md'), GA_ROOT));
+  assert.ok(isGeneratedArtifact(join(GA_ROOT, 'MIGRATION-v1.3.4.md'), GA_ROOT));
+  assert.ok(isGeneratedArtifact(join(GA_ROOT, 'GRAPH_REPORT.md'), GA_ROOT));
+});
+
+test('exclusion is root-anchored — a same-named nested file is NOT an artifact', () => {
+  assert.ok(!isGeneratedArtifact(join(GA_ROOT, 'pages', 'MIGRATION-v2.0.md'), GA_ROOT));
+  assert.ok(!isGeneratedArtifact(join(GA_ROOT, 'projects', 'x', 'GRAPH_REPORT.md'), GA_ROOT));
+  assert.ok(!isGeneratedArtifact(join(GA_ROOT, 'sources', 'MIGRATION-v2.0.md'), GA_ROOT));
+});
+
+test('lookalike root names are NOT artifacts', () => {
+  assert.ok(!isGeneratedArtifact(join(GA_ROOT, 'MIGRATION.md'), GA_ROOT)); // no -v segment
+  assert.ok(!isGeneratedArtifact(join(GA_ROOT, 'GRAPH_REPORT_NOTES.md'), GA_ROOT));
+  assert.ok(!isGeneratedArtifact(join(GA_ROOT, 'hot.md'), GA_ROOT));
+});
+
+test('isScanIgnored hides a generated root artifact but isIgnored does NOT', () => {
+  // The split matters: pre-commit runs isIgnored() — if it hid the report, the
+  // commit (and every auto-commit) would be blocked while it sits at root.
+  const report = join(GA_ROOT, 'MIGRATION-v2.0.md');
+  assert.equal(isHypoIgnored(report, GA_ROOT, []), false, 'pre-commit must still commit it');
+  assert.equal(isScanIgnored(report, GA_ROOT, []), true, 'catalog scan must skip it');
+});
+
+test('isScanIgnored still honors .hypoignore patterns (secret-block preserved)', () => {
+  const secret = join(GA_ROOT, 'my-token.md');
+  assert.equal(isScanIgnored(secret, GA_ROOT, ['*token*']), true);
+});
+
 suite('lint.mjs wikilink resolution (ISSUE-21)');
 
 // Build a multi-file vault, run lint --json, return broken-wikilink targets plus
@@ -6902,6 +7010,52 @@ test('table-escaped alias [[a/b\\|label]] yields the clean target a/b', () => {
   assert.ok(
     !broken.some((b) => b && b.includes('\\')),
     `no target should carry a trailing backslash: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('generated root artifact MIGRATION-v*.md is NOT a valid link target', () => {
+  // A regenerable upgrade report at the root must not pollute the catalog: a
+  // stale [[MIGRATION-v9.9]] reads as broken instead of silently resolving.
+  const { broken } = lintWiki({
+    'MIGRATION-v9.9.md': '---\nupdated: 2026-06-08\n---\n# one-time upgrade report\n',
+    'pages/index.md': wlPage('reference', 'stale [[MIGRATION-v9.9]]'),
+  });
+  assert.ok(
+    broken.includes('MIGRATION-v9.9'),
+    `a generated root artifact must NOT resolve as a link target: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('generated root artifact GRAPH_REPORT.md is NOT a valid link target', () => {
+  const { broken } = lintWiki({
+    'GRAPH_REPORT.md': '---\nupdated: 2026-06-08\n---\n# regenerable graph dump\n',
+    'pages/index.md': wlPage('reference', 'stale [[GRAPH_REPORT]]'),
+  });
+  assert.ok(
+    broken.includes('GRAPH_REPORT'),
+    `GRAPH_REPORT.md must NOT resolve as a link target: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('a real root operational file is still a valid target (no over-exclusion)', () => {
+  const { broken } = lintWiki({
+    'hot.md': '---\nupdated: 2026-06-08\n---\n# hot\n',
+    'pages/index.md': wlPage('reference', 'see [[hot]]'),
+  });
+  assert.ok(
+    !broken.includes('hot'),
+    `a non-artifact root file must still resolve: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('only ROOT artifacts are excluded — a nested same-named page still resolves', () => {
+  const { broken } = lintWiki({
+    'pages/MIGRATION-v9.9.md': wlPage('reference', '# a real page that happens to share the name'),
+    'pages/index.md': wlPage('reference', 'see [[MIGRATION-v9.9]]'),
+  });
+  assert.ok(
+    !broken.includes('MIGRATION-v9.9'),
+    `a nested page must NOT be treated as a generated artifact: ${JSON.stringify(broken)}`,
   );
 });
 

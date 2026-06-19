@@ -20,7 +20,7 @@ import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from '
 import { join, relative, extname, basename } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
-import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { parseSchemaVocab, checkForbidden, parseSchemaPageDirs } from './lib/schema-vocab.mjs';
 import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
@@ -117,7 +117,7 @@ function collectPages(dir, root, pages = [], ignorePatterns = []) {
   if (!existsSync(dir)) return pages;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
-    if (isIgnored(full, root, ignorePatterns)) continue;
+    if (isScanIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) {
       // `_`-prefixed dirs (e.g. pages/feedback/_drafts) hold scaffolds / scratch
@@ -164,13 +164,14 @@ function collectLinkTargets(hypoDir, ignorePatterns = []) {
   if (existsSync(hypoDir)) {
     for (const entry of readdirSync(hypoDir)) {
       const full = join(hypoDir, entry);
-      // root-level *.md FILES only (no recursion), honoring .hypoignore exactly
-      // like collectPages — otherwise an ignored root file (e.g. a secret) would
-      // resolve [[its-slug]] as valid, a false negative.
+      // root-level *.md FILES only (no recursion), honoring .hypoignore plus the
+      // scan-only generated-artifact exclusions (isScanIgnored) like collectPages
+      // — otherwise an ignored root file (e.g. a secret) or a regenerable report
+      // would resolve [[its-slug]] as valid, a false negative.
       if (
         extname(entry) === '.md' &&
         !entry.startsWith('.') &&
-        !isIgnored(full, hypoDir, ignorePatterns) &&
+        !isScanIgnored(full, hypoDir, ignorePatterns) &&
         statSync(full).isFile()
       ) {
         targets.push(entry.replace(/\.md$/, ''));

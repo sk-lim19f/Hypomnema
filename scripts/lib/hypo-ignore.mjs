@@ -23,6 +23,30 @@ function globToRegex(glob) {
   );
 }
 
+// Generated, regenerable tool artifacts that live at the WIKI ROOT and must not
+// pollute the knowledge catalog. These are intentionally NOT added to
+// .hypoignore: that list also drives the pre-commit secret gate
+// (hooks/hypo-pre-commit.mjs), so listing them there would block the report's
+// commit and freeze every auto-commit while it sits at root. Instead they are
+// excluded from catalog/scan only, via isScanIgnored(). The patterns are
+// anchored to the root-relative path (no '/'), so an equivalent name nested
+// under pages/, projects/, or sources/ is left untouched.
+const GENERATED_ARTIFACT_RES = [/^MIGRATION-v[^/]*\.md$/, /^GRAPH_REPORT\.md$/];
+
+export function isGeneratedArtifact(filePath, hypoDir) {
+  const rel = relative(hypoDir, filePath).replace(/\\/g, '/');
+  return GENERATED_ARTIFACT_RES.some((re) => re.test(rel));
+}
+
+// Catalog/scan exclusion = privacy/.hypoignore patterns PLUS generated root
+// artifacts. Use this in tools that build the knowledge catalog (lint, graph,
+// stats, query, verify, crystallize, rename, doctor broken-links). Do NOT use it
+// in the pre-commit gate or ingest --check, which are privacy boundaries that
+// must stay on isIgnored()/.hypoignore alone.
+export function isScanIgnored(filePath, hypoDir, patterns) {
+  return isIgnored(filePath, hypoDir, patterns) || isGeneratedArtifact(filePath, hypoDir);
+}
+
 export function isIgnored(filePath, hypoDir, patterns) {
   const rel = relative(hypoDir, filePath).replace(/\\/g, '/');
   const base = basename(filePath);
