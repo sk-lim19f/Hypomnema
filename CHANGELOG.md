@@ -5,6 +5,56 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] - 2026-06-19
+
+### Highlights
+
+- Session close is much harder to trigger by accident. The model can no longer mark a session closed without a real user close signal, and merely reading close-related text (docs, a prior transcript, a skill body) no longer false-blocks your turn (#129, #126, #128).
+- `--apply-session-close` now finishes the close in one step: it commits its own payload and writes the session-closed marker, instead of silently skipping the marker and leaving you to run `--mark-session-closed` by hand (#130).
+- Routine tracker bookkeeping no longer cross-blocks an unrelated project's `/compact`. Only a real session (a session-log entry) counts as close activity, not a touched `session-state.md` (#131).
+- `rename` now moves a whole directory subtree, with its own slash command and a renumber report for ordered directories (#125).
+
+### Added
+
+- **`rename` handles a directory subtree, not just a single page.** The rename helper shipped for pages in 1.3.2; renaming a folder still meant moving each page by hand. `scripts/rename.mjs` (and a `/hypo:rename` slash command) now relocates an entire subtree, rewrites the eligible inbound wikilinks across the vault the same way the page mode does, and emits a renumber report when an ordered directory (e.g. numbered decisions) needs its prefixes reassigned. It stays a dry-run by default; pass `--apply` to write the move. (#125, ADR 0053)
+
+### Fixed
+
+- **A session is no longer marked closed without a real user close signal.** Both session-closed marker writers gated only on "is the wiki compact-ready", never on whether you actually asked to close, so the model could self-close (write the marker and declare done) on its own judgment. A hard gate now requires a genuine user close signal in the session (a natural-language close phrase, `/compact`, or an AskUserQuestion close answer), resolved strictly from the session id, separate from the compact-readiness check. This blocks inadvertent over-close; it is not a claim of unforgeability (the model owns its own subprocess), and a direct marker write stays inert because the Stop hook only consults the marker once a close signal is already present. (#129, ADR 0055)
+- **Reading close-related text no longer false-blocks the turn.** The Stop-gate close-intent check stringified `role:user` tool results and injected skill or command bodies, so a session that merely read close vocabulary (a prior transcript, the close docs, a skill body full of "wrap up" / "session close" examples) tripped the gate every turn. Close-intent now ignores tool results and injected meta/system content, and the Korean close pattern moved from a verb-suffix blacklist to a complete-terminal whitelist, so it matches the common real phrasings and rejects noun-modifier and negation forms. (#126, #129, ADR 0054)
+- **The proactive close offer can no longer close the session by itself.** The "looks like you're wrapping up" path could proceed all the way to a self-close; it is now scoped to offering only, and the actual close still requires you to choose it. (#128)
+- **`--apply-session-close` writes the session-closed marker instead of silently skipping it.** apply wrote its payload files (leaving the tree dirty) and then checked a gate whose git-clean blocker its own writes had just tripped, so the marker was skipped and you were nudged to run `--mark-session-closed` by hand, after the close had already reported success. apply now commits its own payload first, via the same `.hypoignore`-aware helper the auto-commit Stop hook uses, then writes and verifies the marker. Unpushed commits ("ahead") are demoted from a blocker to a notice across the shared gate (push is automatic and its failures are already non-fatal), so a committed-but-unpushed close still marks and still compacts. (#130, ADR 0056)
+- **Tracker bookkeeping no longer cross-blocks an unrelated project's `/compact`.** The global close invariant treated a freshly-dated `session-state.md` as close activity, but routine tracker bookkeeping (mirroring a new item into "next tasks") bumps that date with no real session, so an unrelated project's `/compact` was held hostage demanding the bookkept project's full close. Close activity is now recognized only from the artifacts a real close writes (a today session-log heading or a `## [today] session | P` log entry); the soft state files (`session-state.md`, project `hot.md`, the root `hot.md` row) no longer count, which also stops `project-create` and hot-cache rebuilds from looking like sessions. (#131, ADR 0057)
+
+### Changed
+
+- **The `/hypo:*` command descriptions are now trigger-rich.** Each slash command's description spells out when to reach for it, so the command picker and the model surface the right command from a wider range of phrasings. (#127)
+
+### 한글 요약
+
+**하이라이트**
+
+- 세션 종료가 실수로 발동되기 훨씬 어려워졌습니다. 모델이 실제 사용자 종료 신호 없이 세션을 닫을 수 없고, 종료 관련 텍스트(문서·이전 transcript·스킬 본문)를 단지 읽는 것만으로 턴이 false-block되지 않습니다 (#129, #126, #128).
+- `--apply-session-close`가 이제 종료를 한 번에 끝냅니다. 자기 payload를 커밋하고 session-closed 마커까지 써서, 마커를 조용히 건너뛰고 사용자가 `--mark-session-closed`를 손수 돌리게 두던 동작이 사라졌습니다 (#130).
+- 일상적인 트래커 bookkeeping이 무관한 프로젝트의 `/compact`를 더는 cross-block하지 않습니다. 실제 세션(session-log 항목)만 close 활동으로 치고, 건드린 `session-state.md`는 치지 않습니다 (#131).
+- `rename`이 이제 디렉터리 서브트리 전체를 옮기며, 전용 슬래시 커맨드와 순서 디렉터리용 renumber 리포트를 갖췄습니다 (#125).
+
+**추가**
+
+- **`rename`이 단일 페이지뿐 아니라 디렉터리 서브트리를 처리합니다.** rename 헬퍼는 1.3.2에서 페이지용으로 출시됐는데, 폴더 이름 변경은 여전히 페이지를 하나씩 손으로 옮겨야 했습니다. `scripts/rename.mjs`(및 `/hypo:rename` 슬래시 커맨드)가 이제 서브트리 전체를 옮기고, 페이지 모드와 동일하게 볼트 전체의 해당하는 인바운드 위키링크를 갱신하며, 순서 디렉터리(예: 번호가 붙은 decisions)의 prefix 재배정이 필요하면 renumber 리포트를 냅니다. 기본은 dry-run이며 `--apply`로 이동을 기록합니다. (#125, ADR 0053)
+
+**수정**
+
+- **실제 사용자 종료 신호 없이 세션이 닫히지 않습니다.** 두 session-closed 마커 writer는 "위키가 compact-ready인가"만 검사하고 사용자가 실제로 종료를 요청했는지는 보지 않아, 모델이 자의로 self-close(마커를 쓰고 완료 선언)할 수 있었습니다. 이제 hard gate가 세션 안의 진짜 사용자 종료 신호(자연어 종료 표현·`/compact`·AskUserQuestion 종료 답변)를 요구하며, session id에서만 해석하고 compact-readiness 검사와는 별개입니다. 이는 무심코 일어나는 over-close를 막는 것이지 위조 불가를 주장하는 것은 아니며(모델은 자기 subprocess를 소유합니다), 직접 마커를 써도 Stop 훅은 종료 신호가 이미 있을 때만 마커를 참조하므로 무력합니다. (#129, ADR 0055)
+- **종료 관련 텍스트를 읽는 것이 턴을 false-block하지 않습니다.** Stop 게이트의 close-intent 검사가 `role:user` tool result와 주입된 스킬·커맨드 본문을 통째로 문자열화해서, 종료 어휘를 단지 읽은 세션(이전 transcript·종료 문서·"wrap up"·"session close" 예시가 가득한 스킬 본문)이 매 턴 게이트에 걸렸습니다. 이제 close-intent는 tool result와 주입된 meta/system 콘텐츠를 무시하고, 한국어 종료 패턴은 동사어미 blacklist에서 종결형 완전체 whitelist로 바뀌어 흔한 실제 표현은 잡고 명사수식·부정형은 거부합니다. (#126, #129, ADR 0054)
+- **선제적 종료 제안이 스스로 세션을 닫을 수 없습니다.** "마무리하는 것 같다" 경로가 self-close까지 진행될 수 있었는데, 이제 제안만 하도록 스코프되고 실제 종료는 사용자가 선택해야 합니다. (#128)
+- **`--apply-session-close`가 session-closed 마커를 조용히 건너뛰지 않고 기록합니다.** apply는 payload 파일을 쓰고(트리가 dirty해짐) 나서 자기 write가 방금 건드린 git-clean 차단을 검사해서, 마커가 건너뛰어지고 종료가 이미 성공으로 보고된 뒤에 사용자가 `--mark-session-closed`를 손수 돌리도록 내몰렸습니다. 이제 apply는 auto-commit Stop 훅과 동일한 `.hypoignore` 인지 헬퍼로 자기 payload를 먼저 커밋한 뒤 마커를 쓰고 검증합니다. unpushed 커밋("ahead")은 공유 게이트 전반에서 차단이 아니라 notice로 강등되어(push는 자동이고 그 실패는 이미 비치명적입니다), committed-but-unpushed 종료도 마커가 써지고 `/compact`도 통과합니다. (#130, ADR 0056)
+- **트래커 bookkeeping이 무관한 프로젝트의 `/compact`를 cross-block하지 않습니다.** 전역 close 불변식이 갓 갱신된 `session-state.md`를 close 활동으로 봤는데, 일상적 트래커 bookkeeping("다음 작업"에 새 항목 미러)은 실제 세션 없이 그 날짜를 bump하므로 무관한 프로젝트의 `/compact`가 bookkeeping된 프로젝트의 완전 close를 요구하며 인질이 됐습니다. 이제 close 활동은 실제 종료가 쓰는 아티팩트(오늘 session-log 헤딩 또는 `## [today] session | P` log 항목)에서만 인식하고, soft state 파일(`session-state.md`·프로젝트 `hot.md`·루트 `hot.md` row)은 치지 않으므로 `project-create`나 hot-cache 재빌드도 세션처럼 보이지 않습니다. (#131, ADR 0057)
+
+**변경**
+
+- **`/hypo:*` 커맨드 설명이 trigger-rich해졌습니다.** 각 슬래시 커맨드 설명이 언제 그 커맨드를 써야 하는지 명시해, 커맨드 선택기와 모델이 더 넓은 표현 범위에서 알맞은 커맨드를 떠올립니다. (#127)
+
 ## [1.3.2] - 2026-06-16
 
 ### Highlights
