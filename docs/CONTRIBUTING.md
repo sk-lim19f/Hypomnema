@@ -232,10 +232,20 @@ Hypomnema uses semver. Releases are automated via `release.yml` on `v*` tag push
 
 ### Cutting a release
 
+The maintainer drives this checklist with a personal `/ship` command (it lives in
+`~/.claude/commands/`, alongside `qa-before-ship` — it is maintainer tooling, not
+a shipped plugin command, since an OSS user has no reason to release Hypomnema
+itself). The sequence below is that same checklist, and is the authoritative
+in-repo reference; follow it whether or not you have the `/ship` convenience
+command.
+
 Every Hypomnema release must carry a Korean summary alongside the English body
 in **both** the CHANGELOG section AND the git tag annotation. The release
 workflow enforces this with `scripts/check-bilingual.mjs`; lightweight tags or
-a missing `### 한글 요약` section will block `npm publish`.
+a missing `### 한글 요약` section will block `npm publish`. It also requires the
+release version to appear in **both** `README.md` and `README.ko.md`
+(`scripts/check-readme-version.mjs`) — the floor that stops the README reconcile
+from being dropped.
 
 ```bash
 # 1. Bump the version across package.json, plugin.json, marketplace.json,
@@ -250,16 +260,28 @@ npm install --package-lock-only
 #    sub-section with at least 10 Hangul characters of real summary text.
 $EDITOR CHANGELOG.md
 
-# 3. Verify locally before tagging (same checks that run in CI)
-node scripts/check-bilingual.mjs --changelog
-npm run check:versions   # all version-carrying files (incl. package-lock) agree
-npm run smoke:plugin     # plugin manifest + hooks/commands/skills load-valid
+# 3. Reconcile BOTH READMEs — add a v<version> sentence to the rolling version
+#    narrative in README.md AND README.ko.md, and update the first-viewport
+#    "current release" pointer. (Dropped 3x historically; check:readme is the floor.)
+$EDITOR README.md README.ko.md
 
-# 4. Commit — include EVERY file the bump touched, not just package.json.
-git add package.json package-lock.json .claude-plugin/ templates/hypo-config.md CHANGELOG.md
+# 4. Verify locally before tagging (the full gate set CI + prepublishOnly run)
+npm test                   # unit suite
+npm run lint               # vault linter
+npm run check:versions     # all version-carrying files (incl. package-lock) agree
+npm run check:bilingual    # CHANGELOG section has a 한글 요약
+npm run check:readme       # v<version> present in BOTH READMEs
+npm run smoke:plugin       # plugin manifest + hooks/commands/skills load-valid
+npm run smoke-pack         # packed tarball installs and resolves
+npm run check:tracker-ids  # no private-tracker pointers leaked into shipped files
+
+# 5. Commit — include EVERY file the bump touched, the READMEs, and the lockfile.
+git add package.json package-lock.json .claude-plugin/ templates/hypo-config.md \
+        CHANGELOG.md README.md README.ko.md
 git commit -m "chore: release v<version>"
+#    Then open the release PR, pass review + green CI, and squash-merge to main.
 
-# 5. Tag with an ANNOTATED tag — never a lightweight tag.
+# 6. Tag the merge commit with an ANNOTATED tag — never a lightweight tag.
 #    Annotation body shape: English summary, then "---" on its own line,
 #    then a Korean summary block.
 git tag -a v<version> -m "$(cat <<'EOF'
@@ -275,11 +297,14 @@ Hypomnema v<version> — <한 줄 한글 요약>
 EOF
 )"
 
-# 6. Verify the tag annotation locally (same check that runs in CI)
+# 7. Rehearse the release locally (same checks CI runs against the tag)
 node scripts/check-bilingual.mjs --tag v<version>
+node scripts/check-versions.mjs --tag v<version>
+npm publish --dry-run --access public   # packs + prepublishOnly, NO registry PUT
 
-# 7. Push
-git push origin main --tags
+# 8. Push the SPECIFIC tag alone — NOT --tags (that would push stale local tags
+#    and could trigger releases for versions you did not intend).
+git push origin v<version>
 ```
 
 The `release.yml` workflow then:
@@ -290,11 +315,15 @@ The `release.yml` workflow then:
 2. Smokes the plugin channel — manifest, `hooks/hooks.json` targets, and
    command/skill component files (`scripts/smoke-plugin.mjs`).
 3. Validates the CHANGELOG section AND the tag annotation are bilingual
-   (`scripts/check-bilingual.mjs`).
+   (`scripts/check-bilingual.mjs`), and that the version is present in both
+   READMEs (`scripts/check-readme-version.mjs`).
 4. Runs `npm test` and `npm run lint`.
-5. Publishes to npm with `npm publish --access public --provenance`.
+5. Publishes to npm with `npm publish --access public --provenance` and creates
+   the GitHub Release from the tag body.
 
-`NPM_TOKEN` must be set as a repository secret.
+`NPM_TOKEN` must be set as a repository secret. After rotating it, run the
+`release.yml` `workflow_dispatch` "publish credential pre-check" — it verifies the
+token authenticates without publishing anything.
 
 ### Versioning rules
 
