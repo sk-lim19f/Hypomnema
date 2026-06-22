@@ -51,13 +51,27 @@ for (const { path, pattern } of targets) {
   console.log(`✓ ${path}: ${current} → ${next}`);
 }
 
+console.log(`\nThis bumps the 4 manifest files only. The full release checklist lives in`);
+console.log(`docs/CONTRIBUTING.md "Cutting a release" — follow it, or these steps:`);
 console.log(`\nNext steps:`);
-console.log(`  1. Edit CHANGELOG.md — ensure the "## [${next}]" section has a`);
+console.log(`  1. Sync package-lock (bump-version does NOT touch it; the lock carries the`);
+console.log(`     version twice and a stale lock fails check:versions + breaks npm ci):`);
+console.log(`       npm install --package-lock-only`);
+console.log(`  2. Edit CHANGELOG.md — ensure the "## [${next}]" section has a`);
 console.log(`     "### 한글 요약" sub-section (release.yml check-bilingual gate).`);
-console.log(`  2. node scripts/check-bilingual.mjs --changelog   # local pre-check`);
-console.log(`  3. git add -A && git commit -m "chore(release): v${next}"`);
-console.log(`  4. Create an ANNOTATED tag (lightweight tags are rejected by CI):`);
+console.log(`  3. Reconcile BOTH READMEs — add a v${next} sentence to README.md AND`);
+console.log(`     README.ko.md, and update the first-viewport "current release" pointer.`);
+console.log(`     (This step was dropped 3x; check:readme is now the floor gate.)`);
+console.log(`  4. Local pre-checks — the full gate set CI + prepublishOnly run:`);
+console.log(`       npm test && npm run lint && npm run check:versions \\`);
+console.log(`         && npm run check:bilingual && npm run check:readme \\`);
+console.log(`         && npm run smoke:plugin && npm run smoke-pack && npm run check:tracker-ids`);
+console.log(`  5. git add package.json package-lock.json .claude-plugin/ \\`);
+console.log(`            templates/hypo-config.md CHANGELOG.md README.md README.ko.md`);
+console.log(`     git commit -m "chore(release): v${next}"`);
+console.log(`  6. Create an ANNOTATED tag (lightweight tags are rejected by CI):`);
 console.log(`       git tag -a v${next} -m "<English body>\\n\\n---\\n\\n<한글 요약>"`);
 console.log(`     See docs/CONTRIBUTING.md "Cutting a release" for the full template.`);
-console.log(`  5. node scripts/check-bilingual.mjs --tag v${next}   # local pre-check`);
-console.log(`  6. git push origin <branch> --tags`);
+console.log(`  7. node scripts/check-bilingual.mjs --tag v${next}   # local pre-check`);
+console.log(`  8. git push origin <branch>   # then push the tag ALONE to trigger release:`);
+console.log(`       git push origin v${next}   # NOT --tags (avoid triggering stale tags)`);
