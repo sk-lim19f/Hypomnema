@@ -47,9 +47,10 @@ import {
   lstatSync,
   realpathSync,
 } from 'fs';
-import { join, relative, extname, basename, dirname, normalize, isAbsolute, sep } from 'path';
+import { join, basename, dirname, normalize, isAbsolute, sep } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
-import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
+import { collectPagesRename, slugForms } from './lib/wikilink.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
@@ -64,28 +65,6 @@ function parseArgs(argv) {
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
-}
-
-// ── page collection (mirrors graph.mjs / crystallize.mjs collectPages) ──────────
-
-function collectPages(dir, root, pages = [], ignorePatterns = []) {
-  if (!existsSync(dir)) return pages;
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    if (isScanIgnored(full, root, ignorePatterns)) continue;
-    // lstat (never follow): a symlinked dir or file is skipped entirely so the
-    // whole-vault scan can never traverse out of the vault via a symlink.
-    const st = lstatSync(full);
-    if (st.isSymbolicLink()) {
-      continue;
-    } else if (st.isDirectory()) {
-      collectPages(full, root, pages, ignorePatterns);
-    } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
-      const rel = relative(root, full).replace(/\\/g, '/');
-      pages.push({ path: full, rel, slug: rel.replace(/\.md$/, ''), bare: basename(full, '.md') });
-    }
-  }
-  return pages;
 }
 
 // ── preservation class of a link-source path ───────────────────────────────────
@@ -123,10 +102,7 @@ function isPreservedSource(rel) {
 // needs to KNOW when a form is shared, so it maps each form → the set of page
 // rels that expose it. precedence forms per page: full noExt slug, bare
 // basename, dir-relative (drop the leading scan-dir segment).
-function dirRelForm(slug) {
-  const slash = slug.indexOf('/');
-  return slash === -1 ? null : slug.slice(slash + 1);
-}
+const dirRelForm = (slug) => slugForms(slug).dirRel;
 
 function buildFormIndex(pages) {
   const index = new Map(); // form → Set<rel>
@@ -473,7 +449,7 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
     fail(args, `--from subtree contains a symlink — refusing (move could escape the vault)`);
   }
 
-  const pages = collectPages(args.hypoDir, args.hypoDir, [], ignorePatterns);
+  const pages = collectPagesRename(args.hypoDir, args.hypoDir, ignorePatterns);
   const formIndex = buildFormIndex(pages);
 
   // The moving pages: every collected page whose rel is under the from-directory.
@@ -676,7 +652,7 @@ function run(args) {
     return runDirectory(args, fromNorm, ignorePatterns);
   }
 
-  const pages = collectPages(args.hypoDir, args.hypoDir, [], ignorePatterns);
+  const pages = collectPagesRename(args.hypoDir, args.hypoDir, ignorePatterns);
   const formIndex = buildFormIndex(pages);
 
   const fromPage = resolveArgToPage(args.from, pages, formIndex);

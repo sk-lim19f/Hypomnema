@@ -22,7 +22,7 @@ import {
   cpSync,
   realpathSync,
 } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 // static import (no top-level await) — feedback-sync.mjs guards main() behind an
@@ -45,6 +45,14 @@ import {
   BLOCKED_PATTERNS,
   USER_FACING_PATTERNS,
 } from '../scripts/lib/check-tracker-ids.mjs';
+import {
+  collectPagesLint,
+  collectPagesGraph,
+  collectPagesRename,
+  collectPagesCrystallize,
+  slugForms,
+  extractWikilinks,
+} from '../scripts/lib/wikilink.mjs';
 
 const HOME = homedir();
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
@@ -18049,6 +18057,80 @@ test('marketplace name mismatch → exit 1', () => {
     );
     const r = run('smoke-plugin.mjs', ['--root', dir]);
     assert.equal(r.status, 1, 'name parity must be enforced');
+  });
+});
+
+// ── wikilink.mjs — shared resolver (IMPR-13) ──────────────────────────────────
+
+suite('wikilink.mjs — shared resolver (IMPR-13)');
+
+test('slugForms derives full / bare / dirRel', () => {
+  assert.deepEqual(slugForms('pages/learnings/foo'), {
+    full: 'pages/learnings/foo',
+    bare: 'foo',
+    dirRel: 'learnings/foo',
+  });
+  // no `/` → nothing to drop, dirRel is null (a page directly under a scan dir)
+  assert.deepEqual(slugForms('hot'), { full: 'hot', bare: 'hot', dirRel: null });
+});
+
+test('extractWikilinks: target from [[t]] / [[t|alias]] / [[t#anchor]], code fences included (raw)', () => {
+  // graph/crystallize variant is intentionally RAW — a [[link]] inside a fence
+  // still counts (preserves pre-IMPR-13 edge/unlinked behavior). lint/rename use
+  // their own strippers, so this must NOT strip.
+  const md = 'x [[foo]] y [[bar/baz|label]] z [[qux#sec]]\n```\n[[in-fence]]\n```\n';
+  assert.deepEqual(extractWikilinks(md), ['foo', 'bar/baz', 'qux', 'in-fence']);
+});
+
+test('collectPages presets enforce distinct traversal policy', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'sub'));
+    mkdirSync(join(dir, '_drafts'));
+    mkdirSync(join(dir, '.hidden'));
+    writeFileSync(join(dir, 'a.md'), '');
+    writeFileSync(join(dir, '_keep.md'), ''); // `_`-FILE: lint keeps it
+    writeFileSync(join(dir, '.secret.md'), ''); // `.`-file: all skip
+    writeFileSync(join(dir, 'sub', 'b.md'), '');
+    writeFileSync(join(dir, '_drafts', 'c.md'), ''); // `_`-DIR: only lint skips
+    writeFileSync(join(dir, '.hidden', 'h.md'), ''); // `.`-DIR: only crystallize skips
+    symlinkSync(join(dir, 'a.md'), join(dir, 'link.md')); // symlink: only rename skips
+
+    const names = (pages) =>
+      pages.map((p) => basename((p.slug ?? p.rel).replace(/\\/g, '/'), '.md')).sort();
+
+    // lint: `_`-dir skipped (no c), `_`-file kept, symlink + `.`-dir followed
+    assert.deepEqual(names(collectPagesLint(dir, dir, [])), ['_keep', 'a', 'b', 'h', 'link']);
+    // graph: most permissive — `_`-dir and `.`-dir and symlink all followed
+    assert.deepEqual(names(collectPagesGraph(dir, dir, [])), ['_keep', 'a', 'b', 'c', 'h', 'link']);
+    // rename: symlink skipped (security boundary), no link
+    assert.deepEqual(names(collectPagesRename(dir, dir, [])), ['_keep', 'a', 'b', 'c', 'h']);
+    // crystallize: `.`-dir skipped (no h), `.`-file skipped
+    assert.deepEqual(names(collectPagesCrystallize(dir, dir, [])), [
+      '_keep',
+      'a',
+      'b',
+      'c',
+      'link',
+    ]);
+  });
+});
+
+test('collectPages presets emit the historical output shape', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'sub'));
+    writeFileSync(join(dir, 'sub', 'b.md'), '');
+    const norm = (s) => s.replace(/\\/g, '/');
+    const [r] = collectPagesRename(dir, dir, []);
+    assert.equal(norm(r.slug), 'sub/b');
+    assert.equal(norm(r.rel), 'sub/b.md');
+    assert.equal(r.bare, 'b');
+    const [g] = collectPagesGraph(dir, dir, []);
+    assert.equal(norm(g.slug), 'sub/b');
+    assert.equal(g.bare, 'b');
+    // lint/crystallize emit only { path, rel } (no slug/bare)
+    const [l] = collectPagesLint(dir, dir, []);
+    assert.equal(norm(l.rel), 'sub/b.md');
+    assert.equal(l.slug, undefined);
   });
 });
 
