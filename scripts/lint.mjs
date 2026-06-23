@@ -17,13 +17,14 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
-import { join, relative, extname, basename } from 'path';
+import { join, extname, basename } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { parseSchemaVocab, checkForbidden, parseSchemaPageDirs } from './lib/schema-vocab.mjs';
 import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
+import { collectPagesLint, slugForms } from './lib/wikilink.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -113,26 +114,6 @@ const TYPE_ENUM_FIELDS = {
 
 // ── page collector ────────────────────────────────────────────────────────────
 
-function collectPages(dir, root, pages = [], ignorePatterns = []) {
-  if (!existsSync(dir)) return pages;
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    if (isScanIgnored(full, root, ignorePatterns)) continue;
-    const st = statSync(full);
-    if (st.isDirectory()) {
-      // `_`-prefixed dirs (e.g. pages/feedback/_drafts) hold scaffolds / scratch
-      // not yet promoted to content — skip so incomplete frontmatter never errors
-      // (mirrors loadFeedbackPages in feedback-sync.mjs). `_`-prefixed *files*
-      // (e.g. _index.md) are still linted.
-      if (entry.startsWith('_')) continue;
-      collectPages(full, root, pages, ignorePatterns);
-    } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
-      pages.push({ path: full, rel: relative(root, full) });
-    }
-  }
-  return pages;
-}
-
 // ── slug map ─────────────────────────────────────────────────────────────────
 
 // `extraTargets` are link-target-only slugs (root *.md, sources/*) that resolve
@@ -142,13 +123,14 @@ function buildSlugMap(pages, extraTargets = []) {
   const map = new Set();
   for (const { rel } of pages) {
     const noExt = rel.replace(/\.md$/, '').replace(/\\/g, '/');
-    map.add(noExt);
-    map.add(basename(rel, '.md'));
-    // Dir-relative alias: drop the leading scan-dir segment so the vault's
-    // convention link [[learnings/foo]] resolves to pages/learnings/foo.md.
-    // (A page directly under a scan dir has no extra segment to drop.)
-    const slash = noExt.indexOf('/');
-    if (slash !== -1) map.add(noExt.slice(slash + 1));
+    // full slug + bare basename + dir-relative alias (drop the leading scan-dir
+    // segment so the convention link [[learnings/foo]] resolves to
+    // pages/learnings/foo.md). slugForms returns dirRel=null when the slug has no
+    // `/` (a page directly under a scan dir has no extra segment to drop).
+    const { full, bare, dirRel } = slugForms(noExt);
+    map.add(full);
+    map.add(bare);
+    if (dirRel) map.add(dirRel);
   }
   for (const t of extraTargets) map.add(t);
   return map;
@@ -165,7 +147,7 @@ function collectLinkTargets(hypoDir, ignorePatterns = []) {
     for (const entry of readdirSync(hypoDir)) {
       const full = join(hypoDir, entry);
       // root-level *.md FILES only (no recursion), honoring .hypoignore plus the
-      // scan-only generated-artifact exclusions (isScanIgnored) like collectPages
+      // scan-only generated-artifact exclusions (isScanIgnored) like collectPagesLint
       // — otherwise an ignored root file (e.g. a secret) or a regenerable report
       // would resolve [[its-slug]] as valid, a false negative.
       if (
@@ -180,7 +162,7 @@ function collectLinkTargets(hypoDir, ignorePatterns = []) {
   }
   // sources/*: linkable as the full 'sources/<name>' slug only — deliberately no
   // bare basename, so a stale [[name]] can't silently resolve to a source file.
-  for (const { rel } of collectPages(join(hypoDir, 'sources'), hypoDir, [], ignorePatterns)) {
+  for (const { rel } of collectPagesLint(join(hypoDir, 'sources'), hypoDir, ignorePatterns)) {
     targets.push(rel.replace(/\.md$/, '').replace(/\\/g, '/'));
   }
   return targets;
@@ -413,7 +395,7 @@ const args = parseArgs(process.argv);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects', 'journal'].map((d) => join(args.hypoDir, d));
-const pages = scanDirs.flatMap((d) => collectPages(d, args.hypoDir, [], ignorePatterns));
+const pages = scanDirs.flatMap((d) => collectPagesLint(d, args.hypoDir, ignorePatterns));
 const linkTargets = collectLinkTargets(args.hypoDir, ignorePatterns);
 const slugMap = buildSlugMap(pages, linkTargets);
 const tagVocab = parseSchemaVocab(args.hypoDir);

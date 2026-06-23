@@ -14,10 +14,11 @@
  *   --min-edges=<n>     Only include nodes with at least N edges (default: 0)
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
-import { join, relative, extname, basename } from 'path';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
-import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
+import { collectPagesGraph, extractWikilinks } from './lib/wikilink.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
@@ -32,24 +33,6 @@ function parseArgs(argv) {
   return args;
 }
 
-// ── page collector ────────────────────────────────────────────────────────────
-
-function collectPages(dir, root, pages = [], ignorePatterns = []) {
-  if (!existsSync(dir)) return pages;
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    if (isScanIgnored(full, root, ignorePatterns)) continue;
-    const st = statSync(full);
-    if (st.isDirectory()) {
-      collectPages(full, root, pages, ignorePatterns);
-    } else if (extname(entry) === '.md' && !entry.startsWith('.')) {
-      const slug = relative(root, full).replace(/\.md$/, '').replace(/\\/g, '/');
-      pages.push({ path: full, slug, bare: basename(full, '.md') });
-    }
-  }
-  return pages;
-}
-
 // ── slug resolver ─────────────────────────────────────────────────────────────
 
 function buildSlugIndex(pages) {
@@ -59,16 +42,6 @@ function buildSlugIndex(pages) {
     if (!index.has(p.bare)) index.set(p.bare, p.slug);
   }
   return index;
-}
-
-// ── wikilink extractor ────────────────────────────────────────────────────────
-
-function extractWikilinks(content) {
-  const links = [];
-  for (const m of content.matchAll(/\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]/g)) {
-    links.push(m[1].trim());
-  }
-  return links;
 }
 
 // ── graph builder ─────────────────────────────────────────────────────────────
@@ -180,7 +153,7 @@ const args = parseArgs(process.argv);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
-const pages = scanDirs.flatMap((d) => collectPages(d, args.hypoDir, [], ignorePatterns));
+const pages = scanDirs.flatMap((d) => collectPagesGraph(d, args.hypoDir, ignorePatterns));
 const slugIndex = buildSlugIndex(pages);
 const graph = buildGraph(pages, slugIndex);
 

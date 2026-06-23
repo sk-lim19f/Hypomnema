@@ -60,21 +60,14 @@
  *     hard-fails regardless of scope.
  */
 
-import {
-  existsSync,
-  readFileSync,
-  readdirSync,
-  statSync,
-  writeFileSync,
-  mkdirSync,
-  renameSync,
-} from 'fs';
-import { join, relative, extname, dirname } from 'path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { join, dirname } from 'path';
 import { hostname } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
-import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
+import { collectPagesCrystallize, extractWikilinks } from './lib/wikilink.mjs';
 import {
   sessionCloseFileStatus,
   sessionCloseGlobalStatus,
@@ -957,21 +950,6 @@ function applySessionClose(args) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function collectPages(dir, root, acc = [], ignorePatterns = []) {
-  if (!existsSync(dir)) return acc;
-  for (const entry of readdirSync(dir)) {
-    if (entry.startsWith('.')) continue;
-    const full = join(dir, entry);
-    if (isScanIgnored(full, root, ignorePatterns)) continue;
-    const st = statSync(full);
-    if (st.isDirectory()) collectPages(full, root, acc, ignorePatterns);
-    else if (extname(entry) === '.md') {
-      acc.push({ path: full, rel: relative(root, full) });
-    }
-  }
-  return acc;
-}
-
 function parseFrontmatter(content) {
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return null;
@@ -996,10 +974,6 @@ function parseTags(fm) {
     .filter(Boolean);
 }
 
-function extractWikilinks(content) {
-  return [...content.matchAll(/\[\[([^\]|#]+?)(?:[|#][^\]]*?)?\]\]/g)].map((m) => m[1].trim());
-}
-
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -1018,7 +992,7 @@ if (args.checkSessionClose) {
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const pagesDir = join(args.hypoDir, 'pages');
-const pages = collectPages(pagesDir, args.hypoDir, [], ignorePatterns);
+const pages = collectPagesCrystallize(pagesDir, args.hypoDir, ignorePatterns);
 
 const tagGroups = {}; // tag → [{ slug, title }]
 const unlinked = []; // pages with no outbound wikilinks
