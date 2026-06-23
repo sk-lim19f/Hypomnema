@@ -46,6 +46,7 @@ import {
   readFileIfRegular,
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
+import { templateSchemaVersion } from './lib/template-schema-version.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 
 const HOME = homedir();
@@ -477,7 +478,7 @@ function writePkgJson(dryRun, extraFields = {}) {
     ...existing,
     pkgRoot: PKG_ROOT,
     pkgVersion: PKG_VERSION,
-    schemaVersion: '2.0',
+    schemaVersion: templateSchemaVersion(PKG_ROOT) ?? '2.1',
     ...extraFields,
   };
   if (!dryRun) {

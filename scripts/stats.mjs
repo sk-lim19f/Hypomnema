@@ -45,16 +45,25 @@ function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
   return acc;
 }
 
+// Local top-level-only extractor, behavior-aligned with lib/frontmatter.mjs:
+// skip indented / list lines, first-wins, strip a trailing `# comment`. Without
+// the comment strip a `failure_type: overreach # note` would aggregate under the
+// literal "overreach # note" key (FEAT-1). Kept local (not the shared import) to
+// hold stats' dependency surface flat per the FEAT-1 scope split.
 function parseFrontmatter(content) {
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return null;
   const fm = {};
-  for (const line of m[1].split('\n')) {
+  for (const line of m[1].split(/\r?\n/)) {
+    if (/^\s/.test(line) || /^-(\s|$)/.test(line)) continue; // nested / list item
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line
+    const key = line.slice(0, idx).trim();
+    if (!key || Object.hasOwn(fm, key)) continue; // first-wins
+    fm[key] = line
       .slice(idx + 1)
       .trim()
+      .replace(/\s+#.*$/, '')
       .replace(/^["']|["']$/g, '');
   }
   return fm;
@@ -92,6 +101,7 @@ const sources = existsSync(join(args.hypoDir, 'sources'))
   : [];
 
 const typeCounts = {};
+const failureTypeCounts = {}; // FEAT-1: feedback pages carrying a failure_type
 let missingFrontmatter = 0;
 
 for (const f of pageFiles) {
@@ -108,6 +118,9 @@ for (const f of pageFiles) {
   }
   const t = fm.type || 'unknown';
   typeCounts[t] = (typeCounts[t] || 0) + 1;
+  if (t === 'feedback' && fm.failure_type) {
+    failureTypeCounts[fm.failure_type] = (failureTypeCounts[fm.failure_type] || 0) + 1;
+  }
 }
 
 let adrCount = 0;
@@ -122,6 +135,9 @@ const lastActivity = getLastActivity(args.hypoDir);
 
 const stats = {
   pages: { total: pageFiles.length, byType: typeCounts, missingFrontmatter },
+  // Omit the key entirely when no feedback page is classified (OQ-4: no empty
+  // section noise) so consumers can branch on presence.
+  ...(Object.keys(failureTypeCounts).length ? { failureTypes: failureTypeCounts } : {}),
   projects: projects.length,
   sources: sources.length,
   adrs: adrCount,
@@ -138,6 +154,10 @@ if (args.json) {
   }
   if (missingFrontmatter) {
     console.log(`  missing frontmatter: ${missingFrontmatter}`);
+  }
+  const ftEntries = Object.entries(failureTypeCounts).sort((a, b) => b[1] - a[1]);
+  if (ftEntries.length) {
+    console.log(`  failure types: ${ftEntries.map(([t, n]) => `${t} (${n})`).join(', ')}`);
   }
   console.log(`Projects: ${projects.length}`);
   console.log(`Sources:  ${sources.length}`);

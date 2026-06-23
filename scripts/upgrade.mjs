@@ -42,6 +42,7 @@ import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
+import { templateSchemaVersion } from './lib/template-schema-version.mjs';
 import {
   readPkgJson as readPkgJsonSafe,
   writePkgJsonAtomic,
@@ -477,7 +478,14 @@ function writeMigrationReport(hypoDir, fromVersion, toVersion, { pluginMode = fa
   // right to keep SCHEMA.md as user-owned (Option C); auto-stub of the 9 new
   // fields is rejected because scope/tier/targets/sensitivity/reason/source
   // are semantic decisions whose wrong defaults would project wrong behavior.
-  const isV1ToV2 = fromVersion === '1.0' && toVersion === '2.0';
+  // Fire for any 1.x → 2.x major crossing, not just 1.0 → 2.0 exactly: the ADR
+  // 0031 feedback-field backfill that this body explains was introduced at 2.0
+  // and still applies to a user landing on any later 2.x (e.g. 2.1's additive
+  // failure_type — FEAT-1). Keying on the exact target string would silently
+  // drop this guidance the moment the template minor moves.
+  const fromV = parseVersion(fromVersion);
+  const toV = parseVersion(toVersion);
+  const isV1ToV2 = fromV?.major === 1 && toV?.major === 2;
   const specificBody = isV1ToV2
     ? `## What changed in SCHEMA 2.0
 
@@ -755,7 +763,7 @@ function applyCommands(commandResults, force) {
     ...existing,
     pkgRoot: PKG_ROOT,
     pkgVersion,
-    schemaVersion: '2.0',
+    schemaVersion: templateSchemaVersion(PKG_ROOT) ?? '2.1',
     commands: newSHAs,
   });
   return applied;
@@ -781,7 +789,7 @@ function writePluginModeMetadata() {
     ...existing,
     pkgRoot: PKG_ROOT,
     pkgVersion,
-    schemaVersion: '2.0',
+    schemaVersion: templateSchemaVersion(PKG_ROOT) ?? '2.1',
   });
   return true;
 }

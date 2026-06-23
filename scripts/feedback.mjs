@@ -48,6 +48,8 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
+import { FAILURE_TYPE_ENUM } from './lib/failure-type.mjs';
+import { parseFrontmatter } from './lib/frontmatter.mjs';
 
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 
@@ -69,6 +71,7 @@ function parseArgs(argv) {
     promoteToGlobal: false,
     reason: null,
     source: null,
+    failureType: null,
     behavior: null,
     claudeHome: null,
     projectId: null,
@@ -91,6 +94,7 @@ function parseArgs(argv) {
     else if (arg === '--promote-to-global') args.promoteToGlobal = true;
     else if (arg.startsWith('--reason=')) args.reason = arg.slice(9);
     else if (arg.startsWith('--source=')) args.source = arg.slice(9);
+    else if (arg.startsWith('--failure-type=')) args.failureType = arg.slice(15);
     else if (arg.startsWith('--behavior=')) args.behavior = arg.slice(11);
     else if (arg.startsWith('--claude-home=')) args.claudeHome = expandHome(arg.slice(14));
     else if (arg.startsWith('--project-id=')) args.projectId = arg.slice(13);
@@ -132,6 +136,16 @@ function parseTargets(raw) {
     .filter(Boolean);
 }
 
+// FEAT-1: `failure_type` is OPTIONAL — an unset value is always fine. A set value
+// must be one of the eight enum members (same vocabulary lint enforces). Returns
+// an error string or null. Shared by create (validateClassification) and append.
+function failureTypeError(value) {
+  if (!value) return null;
+  if (!FAILURE_TYPE_ENUM.includes(value))
+    return `--failure-type invalid: "${value}" (allowed: ${FAILURE_TYPE_ENUM.join(', ')})`;
+  return null;
+}
+
 // Validate the create-mode classification. Returns an array of error strings.
 function validateClassification(args, targets) {
   const errs = [];
@@ -151,6 +165,8 @@ function validateClassification(args, targets) {
     errs.push(`--priority must be an integer 1-5 (got "${args.priority}")`);
   if (!args.memorySummary) errs.push('--memory-summary is required');
   if (!args.reason) errs.push('--reason is required');
+  const ftErr = failureTypeError(args.failureType);
+  if (ftErr) errs.push(ftErr);
 
   // CLAUDE.md projection candidates must be global + L1 (ADR 0031 §6 filter), and
   // carry the two conditional fields (lint #8). Enforce here so we never write a
@@ -201,6 +217,7 @@ function renderPage(args, targets, today) {
   }
   lines.push(`reason: ${oneLine(args.reason)}`);
   lines.push(`source: ${oneLine(args.source || `session:${today}`)}`);
+  if (args.failureType) lines.push(`failure_type: ${args.failureType}`);
   lines.push(`corrected_at: ${today}`);
   lines.push(`updated: ${today}`);
   lines.push(`created: ${today}`);
@@ -233,6 +250,24 @@ function bumpUpdated(content, today) {
   return content.replace(m[0], `---\n${bumped}\n---`);
 }
 
+// Set `failure_type: <value>` in the leading frontmatter block. Scoped to the
+// first `---` fence (like bumpUpdated) so a body line starting "failure_type:" is
+// never touched; the `^` anchor keeps it top-level (an indented/nested key starts
+// with whitespace and won't match). CRLF-aware (the shared parser accepts CRLF,
+// so this must too — an LF-only match would silently skip a CRLF page) and it
+// REPLACES an existing empty `failure_type:` line rather than leaving it blank.
+// The caller only invokes this when the page has no real value (absent or empty),
+// so a populated top-level key never reaches here.
+function addFailureType(content, value) {
+  const m = content.match(/^---(\r?\n)([\s\S]*?)\r?\n---/);
+  if (!m) return content; // no frontmatter fence to host the field
+  const nl = m[1];
+  const fm = /^failure_type:\s*.*$/m.test(m[2])
+    ? m[2].replace(/^failure_type:\s*.*$/m, `failure_type: ${value}`)
+    : `${m[2]}${nl}failure_type: ${value}`;
+  return content.replace(m[0], `---${nl}${fm}${nl}---`);
+}
+
 function writeFeedback(args, today) {
   const feedbackDir = join(args.hypoDir, 'pages', 'feedback');
   const filePath = join(feedbackDir, `${args.topic}.md`);
@@ -244,7 +279,39 @@ function writeFeedback(args, today) {
     // Append a dated entry; preserve existing frontmatter classification.
     mode = 'append';
     const existing = readFileSync(filePath, 'utf-8');
-    const appended = existing.trimEnd() + `\n\n## ${today}\n\n${args.entry}\n`;
+    // FEAT-1: failure_type is a per-page classification property. On append,
+    // set it if the page has none, error if it conflicts with an existing value,
+    // no-op if it matches. Without the flag, append is byte-for-byte unchanged.
+    const existingFt = (parseFrontmatter(existing) || {}).failure_type || null;
+    if (args.failureType) {
+      const ftErr = failureTypeError(args.failureType);
+      if (ftErr) {
+        console.error(`Error: ${ftErr}`);
+        process.exit(1);
+      }
+      if (existingFt && existingFt !== args.failureType) {
+        console.error(
+          `Error: failure_type mismatch on append: page has "${existingFt}", ` +
+            `--failure-type=${args.failureType}. A feedback page carries a single ` +
+            `failure_type; use a separate topic for a different failure type.`,
+        );
+        process.exit(1);
+      }
+    }
+    let appended = existing.trimEnd() + `\n\n## ${today}\n\n${args.entry}\n`;
+    if (args.failureType && !existingFt) {
+      appended = addFailureType(appended, args.failureType);
+      // Fail loud rather than silently appending without the field: if the page's
+      // frontmatter is too malformed to host failure_type (no fence at all), the
+      // set-if-absent contract could not be honored.
+      if ((parseFrontmatter(appended) || {}).failure_type !== args.failureType) {
+        console.error(
+          `Error: could not set failure_type on "${args.topic}" — its frontmatter ` +
+            `is malformed (no parseable --- block). Fix the page, then retry.`,
+        );
+        process.exit(1);
+      }
+    }
     content = bumpUpdated(appended, today);
   } else {
     mode = 'create';
