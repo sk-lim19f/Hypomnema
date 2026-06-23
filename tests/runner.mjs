@@ -3169,9 +3169,38 @@ test('--apply generates migration report for major SCHEMA bump', () => {
       const content = readFileSync(out.migrationReport, 'utf-8');
       assert.ok(content.includes('0.9'), 'migration report should reference old version');
       assert.ok(
-        content.includes('2.0'),
-        'migration report should reference the new (current) version 2.0',
+        content.includes('2.1'),
+        'migration report should reference the new (current) version 2.1',
       );
+    });
+  });
+});
+
+// FEAT-1 boundary: SCHEMA 2.0 → 2.1 is an additive minor bump (optional
+// failure_type). A minor bump needs no migration report — nothing to backfill.
+test('--apply: SCHEMA 2.0 → 2.1 is a minor bump with no migration report', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // init stamps the current template (2.1); roll the wiki SCHEMA back one minor.
+      const schemaPath = join(hypoDir, 'SCHEMA.md');
+      writeFileSync(
+        schemaPath,
+        readFileSync(schemaPath, 'utf-8').replace(/^version: .+$/m, 'version: 2.0'),
+      );
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.signal, null, `process killed with signal: ${r.signal}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.schema.bump,
+        'minor',
+        `expected minor bump, got: ${JSON.stringify(out.schema)}`,
+      );
+      assert.ok(!out.migrationReport, 'minor bump must not emit a migration report');
     });
   });
 });
@@ -3188,8 +3217,8 @@ test('--apply migration report v1→v2 includes ADR 0031 feedback fields guidanc
       assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
 
       // Simulate a wiki that's still on SCHEMA 1.0 (a v1.1.0 hypomnema user).
-      // The package template is now 2.0, so --apply produces MIGRATION-v2.0.md
-      // and the specific body path must fire.
+      // The package template is now 2.1, so --apply produces MIGRATION-v2.1.md
+      // and the v1.x→2.x specific body path must still fire (major crossing).
       const schemaPath = join(hypoDir, 'SCHEMA.md');
       writeFileSync(
         schemaPath,
@@ -6719,6 +6748,33 @@ test('feedback invalid tier → error', () => {
     out.errors.some((e) => e.message.includes('Invalid value for tier')),
     `invalid tier must error: ${r.stdout}`,
   );
+});
+
+// ── FEAT-1: optional failure_type enum ──────────────────────────────────────
+test('feedback failure_type valid value → no error', () => {
+  const { r } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('reason: r\n', 'reason: r\nfailure_type: incompleteness\n'),
+  );
+  assert.equal(r.status, 0, `valid failure_type must lint clean: ${r.stdout}`);
+});
+
+test('feedback failure_type invalid value → error', () => {
+  const { r, out } = lintWithSchema(
+    'pages/feedback/x.md',
+    FB_FM_OK.replace('reason: r\n', 'reason: r\nfailure_type: tool-misuse\n'),
+  );
+  assert.equal(r.status, 1);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Invalid value for failure_type')),
+    `invalid failure_type must error: ${r.stdout}`,
+  );
+});
+
+test('feedback failure_type omitted → no error (optional, migration-safe)', () => {
+  // FB_FM_OK carries no failure_type; assert the field is genuinely optional.
+  const { r } = lintWithSchema('pages/feedback/x.md', FB_FM_OK);
+  assert.equal(r.status, 0, `omitted failure_type must be clean: ${r.stdout}`);
 });
 
 test('feedback claude-learned target without promote_to_global → error', () => {
@@ -13467,6 +13523,146 @@ test('feedback.mjs create: invalid scope vocabulary (project:.) → exit 1 (Trac
   });
 });
 
+// ── FEAT-1: --failure-type create + append rules ────────────────────────────
+const FB_BASE_ARGS = (dir, topic) => [
+  `--topic=${topic}`,
+  '--entry=항상 X를 한다.',
+  '--scope=project:hypomnema',
+  '--tier=L2',
+  '--targets=project-memory',
+  '--priority=3',
+  '--memory-summary=X 수행',
+  '--reason=Y 방지',
+  '--no-sync',
+  `--hypo-dir=${dir}`,
+];
+
+test('feedback.mjs create: --failure-type written + lint-clean', () => {
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', [
+      ...FB_BASE_ARGS(dir, 'ft-rule'),
+      '--failure-type=incompleteness',
+    ]);
+    assert.equal(r.status, 0, `create with failure-type failed: ${r.stderr}`);
+    const page = readFileSync(join(dir, 'pages', 'feedback', 'ft-rule.md'), 'utf-8');
+    assert.ok(page.includes('failure_type: incompleteness'), `failure_type not written:\n${page}`);
+    const lint = run('lint.mjs', ['--json', `--hypo-dir=${dir}`]);
+    assert.equal(JSON.parse(lint.stdout).errors.length, 0, `lint errors: ${lint.stdout}`);
+  });
+});
+
+test('feedback.mjs create: invalid --failure-type → exit 1', () => {
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', [...FB_BASE_ARGS(dir, 'ft-bad'), '--failure-type=tool-misuse']);
+    assert.equal(r.status, 1, `invalid failure-type must be rejected: ${r.stdout}`);
+    assert.ok(/failure-type invalid/.test(r.stderr), `error message missing: ${r.stderr}`);
+  });
+});
+
+test('feedback.mjs create: --failure-type omitted → no field (optional)', () => {
+  withFeedbackWriterWiki((dir) => {
+    const r = run('feedback.mjs', FB_BASE_ARGS(dir, 'ft-none'));
+    assert.equal(r.status, 0, `create without failure-type failed: ${r.stderr}`);
+    const page = readFileSync(join(dir, 'pages', 'feedback', 'ft-none.md'), 'utf-8');
+    assert.ok(!/^failure_type:/m.test(page), `failure_type should be absent:\n${page}`);
+  });
+});
+
+test('feedback.mjs append: set-if-absent adds failure_type to existing page', () => {
+  withFeedbackWriterWiki((dir) => {
+    run('feedback.mjs', FB_BASE_ARGS(dir, 'ft-app')); // create without failure_type
+    const r = run('feedback.mjs', [
+      `--topic=ft-app`,
+      '--entry=두 번째 교정.',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+      '--failure-type=convention-violation',
+    ]);
+    assert.equal(r.status, 0, `append with failure-type failed: ${r.stderr}`);
+    const page = readFileSync(join(dir, 'pages', 'feedback', 'ft-app.md'), 'utf-8');
+    assert.ok(
+      page.includes('failure_type: convention-violation'),
+      `append did not add failure_type:\n${page}`,
+    );
+    assert.ok(page.includes('두 번째 교정.'), 'dated entry not appended');
+  });
+});
+
+// codex stage-2 CONCERN: an existing EMPTY `failure_type:` key must be filled by
+// set-if-absent, not left blank (parseFrontmatter reads empty → "absent").
+test('feedback.mjs append: empty failure_type key is filled, not left blank', () => {
+  withFeedbackWriterWiki((dir) => {
+    writeFileSync(
+      join(dir, 'pages', 'feedback', 'ft-empty.md'),
+      '---\ntitle: T\ntype: feedback\nstatus: active\nfailure_type:\nupdated: 2026-06-23\n---\nbody\n',
+    );
+    const r = run('feedback.mjs', [
+      '--topic=ft-empty',
+      '--entry=교정.',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+      '--failure-type=overreach',
+    ]);
+    assert.equal(r.status, 0, `append over empty key failed: ${r.stderr}`);
+    const page = readFileSync(join(dir, 'pages', 'feedback', 'ft-empty.md'), 'utf-8');
+    assert.ok(/^failure_type: overreach$/m.test(page), `empty key not filled:\n${page}`);
+  });
+});
+
+// codex stage-2 CONCERN: CRLF frontmatter must be handled (the shared parser is
+// CRLF-aware, so the injector must be too — an LF-only match silently skipped it).
+test('feedback.mjs append: CRLF frontmatter still gets failure_type set', () => {
+  withFeedbackWriterWiki((dir) => {
+    writeFileSync(
+      join(dir, 'pages', 'feedback', 'ft-crlf.md'),
+      '---\r\ntitle: T\r\ntype: feedback\r\nstatus: active\r\nupdated: 2026-06-23\r\n---\r\nbody\r\n',
+    );
+    const r = run('feedback.mjs', [
+      '--topic=ft-crlf',
+      '--entry=교정.',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+      '--failure-type=process-stall',
+    ]);
+    assert.equal(r.status, 0, `append on CRLF page failed: ${r.stderr}`);
+    const page = readFileSync(join(dir, 'pages', 'feedback', 'ft-crlf.md'), 'utf-8');
+    assert.ok(/failure_type: process-stall/.test(page), `CRLF page not set:\n${page}`);
+  });
+});
+
+test('feedback.mjs append: conflicting failure_type → exit 1 (no silent ignore)', () => {
+  withFeedbackWriterWiki((dir) => {
+    run('feedback.mjs', [...FB_BASE_ARGS(dir, 'ft-cnf'), '--failure-type=incompleteness']);
+    const r = run('feedback.mjs', [
+      `--topic=ft-cnf`,
+      '--entry=다른 유형 교정.',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+      '--failure-type=overreach',
+    ]);
+    assert.equal(r.status, 1, `mismatched failure_type must error: ${r.stdout}`);
+    assert.ok(/failure_type mismatch/.test(r.stderr), `mismatch message missing: ${r.stderr}`);
+  });
+});
+
+test('feedback.mjs append: no --failure-type → frontmatter unchanged (regression)', () => {
+  withFeedbackWriterWiki((dir) => {
+    run('feedback.mjs', FB_BASE_ARGS(dir, 'ft-reg'));
+    const before = readFileSync(join(dir, 'pages', 'feedback', 'ft-reg.md'), 'utf-8');
+    const fmBefore = before.match(/^---\n[\s\S]*?\n---/)[0];
+    run('feedback.mjs', [`--topic=ft-reg`, '--entry=추가 교정.', '--no-sync', `--hypo-dir=${dir}`]);
+    const after = readFileSync(join(dir, 'pages', 'feedback', 'ft-reg.md'), 'utf-8');
+    const fmAfter = after.match(/^---\n[\s\S]*?\n---/)[0];
+    // only `updated:` may change; failure_type must not appear and no other key added
+    assert.ok(!/^failure_type:/m.test(fmAfter), `failure_type leaked into append:\n${fmAfter}`);
+    assert.equal(
+      fmBefore.replace(/^updated:.*$/m, 'updated:X'),
+      fmAfter.replace(/^updated:.*$/m, 'updated:X'),
+      'append mutated frontmatter beyond updated:',
+    );
+  });
+});
+
 test('feedback.mjs create: projection post-step targets --claude-home (no ~/.claude touch)', () => {
   withFeedbackWriterWiki((dir) => {
     // Isolated projection target: --claude-home keeps the post-step out of the
@@ -13500,6 +13696,54 @@ test('feedback.mjs create: projection post-step targets --claude-home (no ~/.cla
         claudeMd.includes('HYPO:FEEDBACK-SYNC:START source=proj-rule'),
         `projection should write a managed block:\n${claudeMd}`,
       );
+    } finally {
+      rmSync(cHome, { recursive: true, force: true });
+    }
+  });
+});
+
+// FEAT-1: the failure_type field must not perturb the default (non-`--no-sync`)
+// projection path. feedback-sync field-selects known keys, so an extra
+// failure_type is ignored — assert the full create→auto-sync flow still projects.
+test('feedback.mjs create: --failure-type page still projects clean (no --no-sync)', () => {
+  withFeedbackWriterWiki((dir) => {
+    const cHome = mkdtempSync(join(tmpdir(), 'hypo-fbw-claude-'));
+    try {
+      mkdirSync(join(cHome, 'projects', 'pid', 'memory'), { recursive: true });
+      writeFileSync(
+        join(cHome, 'CLAUDE.md'),
+        '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+      );
+      writeFileSync(join(cHome, 'projects', 'pid', 'memory', 'MEMORY.md'), '# Memory Index\n');
+      const r = run('feedback.mjs', [
+        '--topic=ft-proj',
+        '--entry=항상 게이트를 돌린다.',
+        '--scope=global',
+        '--tier=L1',
+        '--targets=project-memory,claude-learned',
+        '--priority=4',
+        '--memory-summary=게이트 수행',
+        '--global-summary=항상 게이트',
+        '--promote-to-global',
+        '--reason=false-completion 방지',
+        '--failure-type=false-completion',
+        `--claude-home=${cHome}`,
+        '--project-id=pid',
+        `--hypo-dir=${dir}`,
+      ]);
+      assert.equal(r.status, 0, `create+sync with failure_type failed: ${r.stderr}`);
+      const page = readFileSync(join(dir, 'pages', 'feedback', 'ft-proj.md'), 'utf-8');
+      assert.ok(
+        page.includes('failure_type: false-completion'),
+        `failure_type not written:\n${page}`,
+      );
+      const claudeMd = readFileSync(join(cHome, 'CLAUDE.md'), 'utf-8');
+      assert.ok(
+        claudeMd.includes('HYPO:FEEDBACK-SYNC:START source=ft-proj'),
+        `projection must still write a managed block:\n${claudeMd}`,
+      );
+      // the projected line carries the summary, not the failure_type key
+      assert.ok(!claudeMd.includes('failure_type'), 'failure_type must not leak into projection');
     } finally {
       rmSync(cHome, { recursive: true, force: true });
     }
@@ -13804,6 +14048,67 @@ test('mergeLatest: refreshes latest but preserves notifiedFor', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── FEAT-1: stats.mjs failure_type aggregation ───────────────────────────────
+suite('stats.mjs — failure_type aggregation (FEAT-1)');
+
+function withStatsWiki(pages, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-stats-'));
+  try {
+    mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+    for (const [name, body] of Object.entries(pages)) {
+      writeFileSync(join(dir, 'pages', 'feedback', name), body);
+    }
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const fbWithFt = (ft) =>
+  `---\ntitle: T\ntype: feedback\nstatus: active\nfailure_type: ${ft}\nupdated: 2026-06-23\n---\nbody\n`;
+
+test('stats: counts failure_type across feedback pages', () => {
+  withStatsWiki(
+    {
+      'a.md': fbWithFt('incompleteness'),
+      'b.md': fbWithFt('incompleteness'),
+      'c.md': fbWithFt('overreach'),
+      'd.md': '---\ntitle: T\ntype: feedback\nstatus: active\nupdated: 2026-06-23\n---\nno ft\n',
+    },
+    (dir) => {
+      const r = run('stats.mjs', ['--json', `--hypo-dir=${dir}`]);
+      const out = JSON.parse(r.stdout);
+      assert.deepEqual(out.failureTypes, { incompleteness: 2, overreach: 1 });
+    },
+  );
+});
+
+test('stats: strips trailing comment + ignores nested failure_type line', () => {
+  withStatsWiki(
+    {
+      'a.md': fbWithFt('overreach # noted'),
+      'b.md':
+        '---\ntitle: T\ntype: feedback\nstatus: active\nrelations:\n  - failure_type: bogus\nupdated: 2026-06-23\n---\nnested must not count\n',
+    },
+    (dir) => {
+      const r = run('stats.mjs', ['--json', `--hypo-dir=${dir}`]);
+      const out = JSON.parse(r.stdout);
+      assert.deepEqual(out.failureTypes, { overreach: 1 }, `got: ${r.stdout}`);
+    },
+  );
+});
+
+test('stats: omits failureTypes key when no page is classified (OQ-4)', () => {
+  withStatsWiki(
+    { 'a.md': '---\ntitle: T\ntype: feedback\nstatus: active\nupdated: 2026-06-23\n---\nx\n' },
+    (dir) => {
+      const r = run('stats.mjs', ['--json', `--hypo-dir=${dir}`]);
+      const out = JSON.parse(r.stdout);
+      assert.ok(!('failureTypes' in out), `failureTypes should be absent: ${r.stdout}`);
+    },
+  );
 });
 
 // ── stale-sibling detection (ADR 0038) ────────────────────────────────────────

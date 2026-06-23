@@ -29,6 +29,7 @@ import {
 } from './lib/schema-vocab.mjs';
 import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
+import { FAILURE_TYPE_ENUM } from './lib/failure-type.mjs';
 import { collectPagesLint, slugForms } from './lib/wikilink.mjs';
 import { parseFrontmatter, SEQUENCE_ENTRY_RE } from './lib/frontmatter.mjs';
 
@@ -141,6 +142,9 @@ const TYPE_ENUM_FIELDS = {
     status: ['active', 'superseded', 'archived'],
     tier: ['L1', 'L2'],
     sensitivity: ['public', 'sanitized'],
+    // FEAT-1: optional failure taxonomy. The enum loop guards on `if (fm[field])`,
+    // so an omitted failure_type is never validated (optional, migration-safe).
+    failure_type: FAILURE_TYPE_ENUM,
   },
 };
 

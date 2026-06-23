@@ -2,7 +2,7 @@
 title: Wiki Schema
 type: schema
 updated: YYYY-MM-DD
-version: 2.0
+version: 2.1
 ---
 
 # Wiki Schema
@@ -118,10 +118,34 @@ memory_summary: <one line for the MEMORY.md index>
 reason: <why this rule is needed>
 source: session:YYYY-MM-DD | commit:<hash> | pr:<n> | https://...
 
+# optional (2.1) — failure taxonomy for incident-driven corrections:
+failure_type: <enum>                     # one of the 8 values below; OMIT for pure
+                                         # preferences / new conventions ("always do X")
+
 # conditional — required when `targets` includes `claude-learned`:
 global_summary: <one line for the <learned_behaviors> entry>
 promote_to_global: true                  # explicit opt-in to global projection
 ```
+
+`failure_type` (optional, added 2.1) classifies feedback that came from a real
+failure incident so recurring mistake types become machine-aggregatable
+(surfaced by `hypomnema stats`). Leave it off when the page records a preference
+rather than a failure. The eight values, in classification-precedence order
+(most specific first — a failure matching several takes the earliest):
+
+| value | when |
+|-------|------|
+| `hallucination` | fabricated a fact / API / path |
+| `false-completion` | declared "done" without running the required gate or test |
+| `process-stall` | stopped instead of asking / continuing when it should have |
+| `over-caution` | re-asked or re-gated despite standing authority |
+| `overreach` | acted beyond the requested scope |
+| `incompleteness` | started correctly but omitted a required step or scope |
+| `instruction-miss` | ignored an explicit this-session instruction |
+| `convention-violation` | broke a standing documented convention (not restated) |
+
+`lint` rejects any value outside this set; an omitted `failure_type` is always
+allowed.
 
 Edit the feedback page only — never hand-edit the generated
 `<!-- HYPO:FEEDBACK-SYNC:START … -->` managed blocks (sync detects tampering as a conflict).

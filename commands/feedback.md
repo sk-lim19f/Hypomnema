@@ -26,6 +26,7 @@ If the user did not provide them, ask. The classification fields are required so
 6. **Targets**: "Where should this project?" → `project-memory` (MEMORY.md) and/or `claude-learned` (global CLAUDE.md). Default `project-memory`.
 7. **Priority** (1–5, higher sorts first; default 3).
 8. **Sensitivity**: `public` (default) or `sanitized` (redacted secrets/paths). `private` is not allowed — the wiki is git-pushed.
+9. **Failure type** (optional): if this correction came from a real failure incident, classify it — `hallucination` | `false-completion` | `process-stall` | `over-caution` | `overreach` | `incompleteness` | `instruction-miss` | `convention-violation`. Omit it for a pure preference or a brand-new convention ("always do X"). When several fit, take the most specific (the list is in precedence order; see SCHEMA §3.1).
 
 If **claude-learned** is among the targets, the page must be `scope: global` + `tier: L1`, and you must also collect:
 - **Global summary**: a one-line summary for the CLAUDE.md learned-behaviors entry.
@@ -61,12 +62,15 @@ node <package-root>/scripts/feedback.mjs \
   --memory-summary="<one-line MEMORY.md summary>" \
   --reason="<why this rule exists>" \
   [--global-summary="<one-line CLAUDE.md summary>" --promote-to-global] \
+  [--failure-type="<enum>"] \
   [--source="session:<date>"] \
   [--hypo-dir="<path>"] \
   [--dry-run]
 ```
 
 When `--targets` includes `claude-learned`, `--global-summary` and `--promote-to-global` are required (and `--scope=global --tier=L1`).
+
+`--failure-type` is optional (one of the eight values above). On **append** to an existing topic it is set only if the page has none; if the page already carries a different `failure_type` the command errors (a page holds a single failure_type — use a separate topic for a different one). Without the flag, an append leaves the frontmatter untouched as before.
 
 > **`scope: project:<project-id>` 주의.** `<project-id>`는 `feedback-sync`가 resolve한 project-id와 정확히 일치해야 한다 (default: cwd의 `/`,`.` → `-` 치환; `--project-id=<id>` 로 override). 일치하지 않으면 그 페이지는 해당 project의 MEMORY로 projection되지 **않는다** (silent skip — lint error 아님). v1.3.0부터 scope regex(`^(global|project:[A-Za-z0-9_-]+)$`)가 cwd-derived id 형식(`-Users-...`)을 그대로 허용하므로 lint 통과를 위해 `--project-id=<slug>`를 override할 필요는 없다. 단 cwd에 공백 등 `[A-Za-z0-9_-]` 밖 문자가 있으면 그 id는 여전히 거부되니 그때만 `--project-id=<id>`로 override한다.
 
