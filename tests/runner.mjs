@@ -31,6 +31,7 @@ import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
 import { buildProjectSuggestionLine, resolveActiveProject } from '../hooks/hypo-shared.mjs';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
+import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import {
   validateChangelog,
@@ -6743,6 +6744,215 @@ test('feedback missing targets → error', () => {
       e.message.includes('Missing required field for type "feedback": targets'),
     ),
     `missing targets error: ${r.stdout}`,
+  );
+});
+
+// ── lint.mjs frontmatter hardening (IMPR-3) ─────────────────────────────────
+// A: top-level-only field extraction (nested `type:` no longer clobbers).
+// B: W9 invalid-YAML detector (colon-space / tab-indent / dup-key) + strict.
+// C: VALID_TYPES ∪ SCHEMA-derived types (vault-local type extensions).
+
+// Direct unit coverage for the shared helper (used by lint, doctor,
+// feedback-sync, upgrade). The integration tests below exercise it via lint;
+// these pin the contract so the lib function can't silently rot if a consumer
+// re-inlines its own parser (the doctor clobber bug that drove consolidation).
+suite('lib/frontmatter.mjs parseFrontmatter (shared)');
+
+test('nested type: under a relations list does not clobber top-level type', () => {
+  const fm = libParseFrontmatter(
+    '---\ntitle: T\ntype: learning\nrelations:\n  - target: y\n    type: depends_on\n---\nbody\n',
+  );
+  assert.equal(fm.type, 'learning');
+  assert.equal(fm['- target'], undefined, 'list item leaked as a key');
+});
+
+test('first-wins on a duplicate top-level key', () => {
+  const fm = libParseFrontmatter('---\ntype: concept\ntype: reference\n---\nbody\n');
+  assert.equal(fm.type, 'concept');
+});
+
+test('CRLF frontmatter parses top-level fields', () => {
+  const fm = libParseFrontmatter('---\r\ntitle: T\r\ntype: concept\r\n---\r\nbody\r\n');
+  assert.equal(fm.type, 'concept');
+  assert.equal(fm.title, 'T');
+});
+
+test('trailing comment stripped only after whitespace', () => {
+  assert.equal(libParseFrontmatter('---\ntype: concept # note\n---\n').type, 'concept');
+  assert.equal(libParseFrontmatter('---\ntype: concept#bad\n---\n').type, 'concept#bad');
+});
+
+suite('lint.mjs frontmatter hardening (IMPR-3)');
+
+// SCHEMA with a Page Type Taxonomy table — parseSchemaTypes reads the first
+// backticked cell of each row, so `working-doc` becomes an accepted type.
+const TAXONOMY_SCHEMA = `---
+title: SCHEMA
+type: schema
+---
+# Schema
+
+## 1. Page Type Taxonomy
+
+| type | location | mutability |
+|------|----------|------------|
+| \`concept\` | \`pages/\` | mutable |
+| \`working-doc\` | \`projects/*/\` | mutable |
+
+## 4. Tag Vocabulary
+
+\`concept\` \`project\`
+`;
+
+function lintStrict(pageRel, content, schemaContent = VOCAB_SCHEMA) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-strict-'));
+  writeFileSync(join(dir, 'SCHEMA.md'), schemaContent);
+  const fullPath = join(dir, pageRel);
+  mkdirSync(dirname(fullPath), { recursive: true });
+  writeFileSync(fullPath, content);
+  const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json', '--strict']);
+  const out = JSON.parse(r.stdout);
+  rmSync(dir, { recursive: true, force: true });
+  return { r, out };
+}
+
+// A — nested `type:` inside a relations list must not clobber the page type.
+test('A: nested type: under relations does not trigger W2 unknown-type', () => {
+  const { r, out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-06-23\nrelations:\n  - target: y\n    type: depends_on\n---\nbody\n',
+  );
+  assert.ok(
+    !out.warns.some((w) => /Unknown type/.test(w.message)),
+    `nested type clobbered top-level: ${r.stdout}`,
+  );
+});
+
+// B — colon-space in an unquoted top-level value → W9 warn (default), error (--strict).
+test('B: unquoted value with ": " → W9 warn', () => {
+  const { out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: Plan: phase 2\ntype: concept\nupdated: 2026-06-23\n---\nbody\n',
+  );
+  const w9 = out.warns.filter((w) => /Invalid YAML/.test(w.message));
+  assert.equal(w9.length, 1, `expected one W9 warn: ${JSON.stringify(out.warns)}`);
+});
+
+test('B: W9 promoted to error under --strict', () => {
+  const { r, out } = lintStrict(
+    'pages/x.md',
+    '---\ntitle: Plan: phase 2\ntype: concept\nupdated: 2026-06-23\n---\nbody\n',
+  );
+  assert.equal(r.status, 1, `--strict should exit 1: ${r.stdout}`);
+  assert.ok(
+    out.errors.some((e) => e.id === 'W9' && /Invalid YAML/.test(e.message)),
+    `W9 not promoted: ${r.stdout}`,
+  );
+});
+
+// B — quoted / flow / commented values containing ":" are valid YAML → no W9.
+test('B: quoted, flow, and comment values do not false-positive W9', () => {
+  for (const fm of ['title: "a: b"', 'tags: ["a: b"]', 'meta: {a: b}', 'title: foo # note: bar']) {
+    const { out } = lintWithSchema(
+      'pages/x.md',
+      `---\n${fm}\ntype: concept\nupdated: 2026-06-23\n---\nbody\n`,
+    );
+    assert.ok(!out.warns.some((w) => /Invalid YAML/.test(w.message)), `false W9 on "${fm}"`);
+  }
+});
+
+// B — duplicate top-level key → W9.
+test('B: duplicate top-level key → W9 warn', () => {
+  const { out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\ntype: reference\nupdated: 2026-06-23\n---\nbody\n',
+  );
+  assert.ok(
+    out.warns.some((w) => /Invalid YAML.*duplicate key/.test(w.message)),
+    `dup-key W9 missing: ${JSON.stringify(out.warns)}`,
+  );
+});
+
+// C — a vault-local type defined only in SCHEMA's taxonomy is accepted.
+test('C: SCHEMA-defined type (working-doc) is not W2 unknown-type', () => {
+  const { out } = lintWithSchema(
+    'projects/p/scope.md',
+    '---\ntitle: T\ntype: working-doc\nupdated: 2026-06-23\n---\nbody\n',
+    TAXONOMY_SCHEMA,
+  );
+  assert.ok(
+    !out.warns.some((w) => /Unknown type/.test(w.message)),
+    `SCHEMA-defined type flagged: ${JSON.stringify(out.warns)}`,
+  );
+});
+
+// C — core type stays valid even when SCHEMA has no taxonomy table (union floor).
+test('C: core type valid when SCHEMA lacks a taxonomy table', () => {
+  const { out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-06-23\n---\nbody\n',
+  );
+  assert.ok(
+    !out.warns.some((w) => /Unknown type/.test(w.message)),
+    `core type lost: ${JSON.stringify(out.warns)}`,
+  );
+});
+
+// C — a non-core type present only in the (template-like) taxonomy is accepted.
+test('C: SCHEMA taxonomy row (log) admits a non-core type', () => {
+  const schema = TAXONOMY_SCHEMA.replace(
+    '| `working-doc` | `projects/*/` | mutable |',
+    '| `log` | `log.md` | append-only |',
+  );
+  const { out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: log\nupdated: 2026-06-23\n---\nbody\n',
+    schema,
+  );
+  assert.ok(
+    !out.warns.some((w) => /Unknown type/.test(w.message)),
+    `SCHEMA taxonomy type rejected: ${JSON.stringify(out.warns)}`,
+  );
+});
+
+// B — tabs in block-scalar bodies are valid content, never W9. Covers plain,
+// structural-looking (`key:` / `- item`) tabbed lines — W9 inspects only
+// top-level lines, so none of these false-positive (codex stage-2/2b guard).
+test('B: tab in block-scalar body does not false-positive W9', () => {
+  for (const body of ['  \tbar', '  \tkey: value', '  \t- item']) {
+    const { out } = lintWithSchema(
+      'pages/x.md',
+      `---\ntitle: T\ntype: concept\nupdated: 2026-06-23\ndesc: |\n  foo\n${body}\n---\nbody\n`,
+    );
+    assert.ok(
+      !out.warns.some((w) => /Invalid YAML/.test(w.message)),
+      `block-scalar tab false-positived on "${body}": ${JSON.stringify(out.warns)}`,
+    );
+  }
+});
+
+// B — `#` without a leading space is a literal scalar char, not a comment, so an
+// unknown type like `concept#bad` must still trip W2 (not be silently stripped).
+test('B: "#" without leading space is literal (W2 still fires)', () => {
+  const { out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept#bad\nupdated: 2026-06-23\n---\nbody\n',
+  );
+  assert.ok(
+    out.warns.some((w) => /Unknown type: "concept#bad"/.test(w.message)),
+    `comment-strip hid unknown type: ${JSON.stringify(out.warns)}`,
+  );
+});
+
+// A — CRLF frontmatter: nested type: still must not clobber, fields still read.
+test('A: CRLF frontmatter parses and nested type does not clobber', () => {
+  const { out } = lintWithSchema(
+    'pages/x.md',
+    '---\r\ntitle: T\r\ntype: concept\r\nupdated: 2026-06-23\r\nrelations:\r\n  - type: depends_on\r\n---\r\nbody\r\n',
+  );
+  assert.ok(
+    !out.warns.some((w) => /Unknown type/.test(w.message)),
+    `CRLF nested type clobbered: ${JSON.stringify(out.warns)}`,
   );
 });
 
@@ -14688,7 +14898,7 @@ test('w8-lint-omits-id-for-other-warns', () => {
 // ── Track E: lint --strict warning→error promotion ──────────────────────────
 // spec-v1.3.0 Track E. Stable warning IDs (W1 no-frontmatter / W2 unknown-type
 // / W3 missing-updated / W4 broken-wikilink; W8 design-history-stale predates).
-// `--strict` promotes STRICT_PROMOTE_IDS = {W1,W2,W4} to errors (exit 1).
+// `--strict` promotes STRICT_PROMOTE_IDS = {W1,W2,W4,W9} to errors (exit 1).
 // Default mode must stay byte-identical (only W8 exposes `id` in --json).
 
 suite('Track E: lint --strict warning ID promotion');

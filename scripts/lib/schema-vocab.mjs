@@ -94,3 +94,38 @@ export function parseSchemaPageDirs(hypoDir) {
   }
   return dirs;
 }
+
+// Type-token shape: lowercase identifier (a-z, digits, hyphen). Excludes
+// memory-layer rows whose first cell is a filename (`hot.md`, `log.md`) — those
+// carry a `.` and never match — so only real type names survive.
+const TYPE_TOKEN_RE = /^[a-z][a-z0-9-]+$/;
+
+// Derive the set of valid page `type` values from the SCHEMA "Page Type
+// Taxonomy" table — the FIRST backticked cell of each table row (the type
+// column). Single source of truth, mirroring parseSchemaPageDirs: adding a type
+// row to a vault's SCHEMA automatically widens the accepted types, so a
+// vault-local extension (e.g. working-doc / draft / qa-run) stops tripping the
+// W2 unknown-type warning without editing lint. Returns an empty Set when
+// SCHEMA.md or the table is absent — callers union this with a hardcoded core so
+// the core types never depend on a present/complete SCHEMA.
+export function parseSchemaTypes(hypoDir) {
+  const path = join(hypoDir, 'SCHEMA.md');
+  if (!existsSync(path)) return new Set();
+  const content = readFileSync(path, 'utf-8');
+
+  const headerMatch = TYPE_TAXONOMY_HEADER_RE.exec(content);
+  if (!headerMatch) return new Set();
+
+  const sectionStart = headerMatch.index + headerMatch[0].length;
+  const rest = content.slice(sectionStart);
+  const nextH2 = NEXT_H2_RE.exec(rest);
+  const section = nextH2 ? rest.slice(0, nextH2.index) : rest;
+
+  const types = new Set();
+  for (const rawLine of section.split('\n')) {
+    if (!rawLine.trimStart().startsWith('|')) continue;
+    const m = rawLine.match(/`([^`]+)`/); // first backtick token = type column
+    if (m && TYPE_TOKEN_RE.test(m[1].trim())) types.add(m[1].trim());
+  }
+  return types;
+}
