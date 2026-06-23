@@ -21,10 +21,16 @@ import { join, extname, basename } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
-import { parseSchemaVocab, checkForbidden, parseSchemaPageDirs } from './lib/schema-vocab.mjs';
+import {
+  parseSchemaVocab,
+  checkForbidden,
+  parseSchemaPageDirs,
+  parseSchemaTypes,
+} from './lib/schema-vocab.mjs';
 import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
 import { collectPagesLint, slugForms } from './lib/wikilink.mjs';
+import { parseFrontmatter, SEQUENCE_ENTRY_RE } from './lib/frontmatter.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -42,19 +48,45 @@ function parseArgs(argv) {
 
 // ── frontmatter parser ────────────────────────────────────────────────────────
 
-function parseFrontmatter(content) {
-  const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (!m) return null;
-  const fm = {};
-  for (const line of m[1].split('\n')) {
+// ── W9: narrow invalid-YAML detector ───────────────────────────────────────────
+// NOT a full YAML parser (zero-dep policy). Catches only specific classes the
+// lenient line-scanner (parseFrontmatter, imported from lib) silently passes but
+// a real YAML parser (js-yaml, what Obsidian uses) rejects. Each class is
+// conservative — it may miss, but must NOT false-positive on valid YAML, so it
+// inspects only top-level (unindented) lines: indented lines may be block-scalar
+// content where ": "/tabs are legal, and reliably telling content from structure
+// needs a real parser. (A leading-tab class was considered and dropped for this
+// reason — it cannot distinguish `relations:\n\t- x` from a tabbed block-scalar
+// body without tracking block context.) Returns an array of reasons.
+function checkYamlInvalid(block) {
+  const reasons = [];
+  const seen = new Set();
+  for (const raw of block.split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (!line.trim()) continue;
+    if (/^\s/.test(line) || SEQUENCE_ENTRY_RE.test(line)) continue; // top-level keys only
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    fm[line.slice(0, idx).trim()] = line
-      .slice(idx + 1)
-      .trim()
-      .replace(/^["']|["']$/g, '');
+    const key = line.slice(0, idx).trim();
+    if (!key) continue;
+    // duplicate top-level key (YAML rejects; line-scanner silently keeps one)
+    if (seen.has(key)) reasons.push(`duplicate key: "${key}"`);
+    else seen.add(key);
+    // colon-space inside an unquoted, non-flow plain scalar. A plain scalar may
+    // not contain ": " — js-yaml hard-errors or silently truncates. Skip quoted
+    // ("/') and flow ([/{) values where ": " is legal, and strip an inline
+    // " #" comment before scanning.
+    let val = line.slice(idx + 1).trim();
+    const c = val[0];
+    if (val && c !== '"' && c !== "'" && c !== '[' && c !== '{') {
+      const hash = val.indexOf(' #');
+      if (hash >= 0) val = val.slice(0, hash);
+      if (/:\s/.test(val)) {
+        reasons.push(`unquoted "${key}" value contains ": " (quote it): "${val.slice(0, 40)}"`);
+      }
+    }
   }
-  return fm;
+  return reasons;
 }
 
 function parseTagsField(rawValue) {
@@ -241,10 +273,15 @@ const issues = [];
 // STRICT_PROMOTE_IDS (OQ-E1, frozen as a code constant): confirmed content
 // defects only.
 //   W1 no-frontmatter / W2 unknown-type / W4 broken-wikilink → promote.
+//   W9 invalid-YAML → promote (frontmatter a real YAML parser rejects).
 //   W3 missing-updated  → excluded (auto-repaired by --fix).
 //   W8 design-history-stale → excluded (hypo-personal-check handles it; would
 //                             double-gate).
-const STRICT_PROMOTE_IDS = new Set(['W1', 'W2', 'W4']);
+// NOTE: no gate currently passes --strict (npm run lint / CI / release.yml /
+// crystallize / the close-gate all run plain lint), so promotion is
+// forward-looking — these surface as warnings today. IMPR-3's deliverable is
+// "stop silently green-passing invalid YAML"; the W9 warning satisfies that.
+const STRICT_PROMOTE_IDS = new Set(['W1', 'W2', 'W4', 'W9']);
 
 function issue(severity, rel, msg, fullPath = null, id = null) {
   issues.push({ severity, file: rel, message: msg, path: fullPath, id });
@@ -267,7 +304,7 @@ function lintSessionStateHeadings(content, rel) {
   }
 }
 
-function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
+function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
   // Directory whitelist: a content page under pages/<subdir>/ must live in a
   // SCHEMA-defined directory. Catches typo'd dirs (e.g. pages/learning/ vs the
   // canonical pages/learnings/) regardless of frontmatter, since a directory
@@ -301,6 +338,16 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
     return;
   }
 
+  // W9: invalid-YAML frontmatter the lenient line-scanner would otherwise pass
+  // green. Runs on the raw `---` block (the `content.match` above guarantees an
+  // opening fence; an unclosed fence falls through to the W3/parse path below).
+  const fmBlock = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (fmBlock) {
+    for (const reason of checkYamlInvalid(fmBlock[1])) {
+      issue('warn', rel, `Invalid YAML frontmatter: ${reason}`, null, 'W9');
+    }
+  }
+
   const fm = parseFrontmatter(content);
   if (!fm) {
     issue('error', rel, 'Malformed frontmatter (unclosed ---)');
@@ -311,7 +358,7 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs) {
     if (!fm[field]) issue('error', rel, `Missing required frontmatter field: ${field}`);
   }
 
-  if (fm.type && !VALID_TYPES.includes(fm.type)) {
+  if (fm.type && !validTypes.has(fm.type)) {
     issue('warn', rel, `Unknown type: "${fm.type}"`, null, 'W2');
   }
 
@@ -400,8 +447,14 @@ const linkTargets = collectLinkTargets(args.hypoDir, ignorePatterns);
 const slugMap = buildSlugMap(pages, linkTargets);
 const tagVocab = parseSchemaVocab(args.hypoDir);
 const pageDirs = parseSchemaPageDirs(args.hypoDir);
+// Accepted page types = hardcoded core ∪ the vault SCHEMA's taxonomy. Union (not
+// replace) so core types lint specially handles (session-state, source, …) are
+// never lost when a vault's SCHEMA omits or predates them, while a vault-local
+// extension (working-doc / draft / qa-run) is honored without editing lint —
+// mirroring how tags and page dirs are SCHEMA-derived.
+const validTypes = new Set([...VALID_TYPES, ...parseSchemaTypes(args.hypoDir)]);
 
-for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs);
+for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs, validTypes);
 
 // W8: design-history.md stale relative to session-log.md. Emitted once per
 // project (not per page) — runs outside the page loop. POSIX-separated path
