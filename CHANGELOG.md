@@ -5,6 +5,52 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-06-23
+
+### Highlights
+
+- **Feedback pages can now carry an optional `failure_type`** so you can see which kinds of mistakes recur instead of re-reading every page. It is one of eight values (`hallucination`, `false-completion`, `process-stall`, `over-caution`, `overreach`, `incompleteness`, `instruction-miss`, `convention-violation`), classified by a fixed precedence order, and `hypomnema stats` aggregates the counts. The field is optional — leave it off for a plain preference rather than a failure (#141).
+- **An auto-commit that hits a merge conflict no longer leaves a half-merged vault.** The sync step now detects a real conflict, aborts the merge back to your just-committed state, and surfaces the divergence with manual-merge guidance — so the next session never opens `.md` pages full of `<<<<<<<` markers (#135).
+- **`lint` stops silently green-passing invalid YAML frontmatter.** Frontmatter that Obsidian's parser would reject (an unquoted value containing `: `, a duplicate top-level key) is now flagged, and a nested mapping key can no longer overwrite the page's real `type` (#140).
+
+### Added
+
+- **`failure_type` classification for feedback.** `/hypo:feedback` takes an optional `--failure-type`, the writer records it, `lint` rejects an out-of-vocabulary value, and `stats` reports the per-type counts. On append to an existing topic the field is set if absent and refuses a conflicting value (one page holds one failure_type). `SCHEMA` moves to 2.1 (an additive, optional field — a page that does not use it is unaffected). The eight values and their precedence are documented in `SCHEMA.md` §3.1. If you had hand-written a free-text `failure_type` on a page before this release, `lint` now flags it — re-label it with one of the eight values. (#141)
+- **Session and device audit fields on session records.** Each session-log day-shard is seeded with the `device` that created it (and a `session_id` on the Stop-chain close path), and the local `.cache/` session index records the `device`, so multi-machine, multi-session activity is identifiable. The synced shard stamp is a documented, intentional cross-machine identifier; the always-accurate per-session record stays local-only. (#136)
+
+### Fixed
+
+- **Merge conflicts abort instead of corrupting the tree.** The auto-commit Stop hook's `git pull` could leave unmerged files with conflict markers. A new sync primitive separates a true merge conflict (unmerged index entries) from an ordinary network or auth failure, aborts on the former — losing no data, your commit stays local and the remote is untouched — and reports the divergence from session-start and `doctor` until you resolve it by hand. (#135)
+- **Invalid-YAML detection, nested-key clobber, and a `doctor` verify-skip.** The shared frontmatter parser now reads only top-level lines with first-wins, so a `type:` inside a `relations:` list no longer masquerades as the page type — which also fixes `doctor`'s freshness scan silently skipping `learning`/`adr` pages that carried a relations block. A narrow invalid-YAML check (a warning by default, so no vault turns red) catches the colon-space and duplicate-key classes a real parser rejects, and the accepted-type set is now derived from the `SCHEMA` taxonomy instead of a hardcoded list. (#140)
+
+### Changed
+
+- **The release pipeline now owns the Claude Code plugin channel, not just npm.** A new version-consistency check asserts every version-carrying file agrees (and matches the release tag), a network-free plugin smoke check verifies the manifest, hook targets, and command/skill files all resolve to real files, and a README floor gate blocks a publish whose version was never written into both `README.md` and `README.ko.md` — the reconcile step that had been dropped three times. (#137, #138)
+- **Shared wikilink resolver.** The `collectPages` / `extractWikilinks` / slug-form logic duplicated across `lint`, `rename`, `graph`, and `crystallize` is consolidated into one `lib/wikilink.mjs` with four named traversal presets that preserve each caller's deliberate policy. A pure internal refactor with no behavior change. (#139)
+
+### 한글 요약
+
+**하이라이트**
+
+- **피드백 페이지에 선택적 `failure_type`를 달 수 있습니다.** 어떤 종류의 실수가 반복되는지 매 페이지를 다시 읽지 않고 집계로 볼 수 있습니다. 여덟 값(`hallucination`, `false-completion`, `process-stall`, `over-caution`, `overreach`, `incompleteness`, `instruction-miss`, `convention-violation`) 중 하나이며 정해진 우선순위로 분류하고, `hypomnema stats`가 유형별 개수를 모아 보여줍니다. 선택 필드라 실패가 아닌 단순 선호에는 비워 둡니다 (#141).
+- **auto-commit이 머지 충돌을 만나도 절반만 머지된 볼트를 남기지 않습니다.** 동기화 단계가 실제 충돌을 감지하면 방금 커밋한 상태로 머지를 되돌리고, 수동 머지 안내와 함께 분기를 드러냅니다. 다음 세션이 `<<<<<<<` 마커로 가득 찬 `.md` 페이지를 여는 일이 없습니다 (#135).
+- **`lint`이 invalid YAML frontmatter를 조용히 통과시키지 않습니다.** Obsidian 파서가 거부할 frontmatter(따옴표 없는 값 안의 `: `, 중복 top-level 키)를 이제 표시하고, 중첩 매핑 키가 페이지의 실제 `type`을 덮어쓰지 못합니다 (#140).
+
+**추가**
+
+- **피드백 `failure_type` 분류.** `/hypo:feedback`이 선택 인자 `--failure-type`를 받고, writer가 기록하며, `lint`이 어휘 밖 값을 거부하고, `stats`가 유형별 개수를 보고합니다. 기존 토픽에 append할 때 값이 없으면 설정하고 다른 값과 충돌하면 거부합니다(한 페이지는 하나의 failure_type을 가집니다). `SCHEMA`는 2.1로 올라갑니다(추가형 선택 필드라 이 필드를 안 쓰는 페이지는 영향받지 않습니다). 여덟 값과 우선순위는 `SCHEMA.md` §3.1에 있습니다. 이번 릴리스 전에 `failure_type`에 자유서술을 손으로 적어 두었다면 이제 `lint`이 표시하니 여덟 값 중 하나로 다시 분류하세요. (#141)
+- **세션 기록의 세션·기기 감사 필드.** 세션로그 일별 shard에 이를 만든 `device`(그리고 Stop-체인 close 경로에서는 `session_id`)를 심고, 로컬 `.cache/` 세션 인덱스가 `device`를 기록해 여러 기기·여러 세션 활동을 식별할 수 있습니다. 동기화되는 shard 스탬프는 의도된 cross-machine 식별자로 문서화돼 있고, 항상 정확한 세션별 기록은 로컬 전용으로 둡니다. (#136)
+
+**수정**
+
+- **머지 충돌 시 트리를 망가뜨리지 않고 abort합니다.** auto-commit Stop 훅의 `git pull`이 충돌 마커가 박힌 미머지 파일을 남길 수 있었습니다. 새 동기화 프리미티브가 실제 머지 충돌(미머지 인덱스 항목)과 일반 네트워크·인증 실패를 구분해 전자에서 abort하고(데이터 손실 없음 — 커밋은 로컬에 남고 원격은 그대로), 사용자가 직접 해소할 때까지 session-start와 `doctor`가 분기를 보고합니다. (#135)
+- **invalid-YAML 검출, 중첩 키 clobber, `doctor` verify-skip.** 공유 frontmatter 파서가 이제 top-level 줄만 first-wins로 읽어, `relations:` 리스트 안의 `type:`이 페이지 타입 행세를 못 합니다. relations 블록을 가진 `learning`/`adr` 페이지를 `doctor`의 freshness 스캔이 조용히 건너뛰던 버그도 함께 고쳤습니다. 좁은 invalid-YAML 검사(기본은 경고라 어떤 볼트도 red가 되지 않습니다)가 실제 파서가 거부하는 colon-space·중복 키 부류를 잡고, 허용 타입 집합을 하드코딩 대신 `SCHEMA` taxonomy에서 도출합니다. (#140)
+
+**변경**
+
+- **릴리스 파이프라인이 npm뿐 아니라 Claude Code 플러그인 채널까지 소유합니다.** 새 버전 일치 검사가 버전을 담은 모든 파일이 (그리고 릴리스 태그와) 일치하는지 단언하고, 네트워크 없는 플러그인 smoke 검사가 매니페스트·훅 타깃·커맨드/스킬 파일이 모두 실제 파일로 존재하는지 확인하며, README floor 게이트가 버전이 `README.md`·`README.ko.md` 양쪽에 적히지 않은 publish를 막습니다. 세 번이나 누락됐던 reconcile 단계입니다. (#137, #138)
+- **공유 wikilink resolver.** `lint`·`rename`·`graph`·`crystallize`에 중복돼 있던 `collectPages`/`extractWikilinks`/slug 로직을 각 호출자의 의도적 정책을 보존하는 네 개의 named 순회 preset과 함께 단일 `lib/wikilink.mjs`로 통합했습니다. 동작 변화 없는 순수 내부 리팩터입니다. (#139)
+
 ## [1.3.4] - 2026-06-19
 
 ### Highlights
