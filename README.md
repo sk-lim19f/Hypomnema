@@ -19,15 +19,15 @@ _Make Claude take notes, and measure whether it actually does._
 
 [Quick Start](#quick-start) • [How It Compares](#how-it-compares) • [Design Decisions](#design-decisions) • [Features](#features) • [Architecture](docs/ARCHITECTURE.md) • [Contributing](docs/CONTRIBUTING.md)
 
-Inspired by Andrej Karpathy's "LLM-native wiki" sketch, shaped by ten months of personal AI-workflow experiments and a month of dogfooding before the public release. Hypomnema ships the full lifecycle, from capturing a source to synthesizing it into a page, retrieving it, and resuming a paused session, as Claude Code commands and lifecycle hooks.
+Inspired by Andrej Karpathy's "LLM-native wiki" sketch, shaped by ten months of personal AI-workflow experiments and a month of dogfooding before the public release. Hypomnema ships the full lifecycle, from capturing a source to synthesizing, retrieving, and resuming a paused session, as Claude Code commands and lifecycle hooks.
 
-New to the terms below? Keep the [Term decoder](#term-decoder) open in another tab. It defines frontmatter, wikilink, projection, hook, `hot.md`, and `session-state.md` one line each.
+New to the terms below? Keep the [Term decoder](#term-decoder) open in another tab. It defines frontmatter, wikilink, projection, hook, `hot.md`, and `session-state.md`, one line each.
 
 ### Where automation stands today
 
-Wiki work, ingest, query, and session-close, still fires on explicit `/hypo:*` commands. The v2 goal is fully autonomous, with Claude reading, writing, and synthesizing the wiki without being asked, and that is the direction of travel. v1.1.0 shipped the observability score that measures how often the wiki is actually used per session. v1.2.0 added four autonomous lanes on top:
+Wiki work (ingest, query, session-close) still runs on explicit `/hypo:*` commands. The v2 goal is full autonomy: Claude reading, writing, and synthesizing the wiki without being asked, which is the direction this is heading. v1.1.0 shipped the observability score that measures how often the wiki is actually used per session. v1.2.0 added four autonomous lanes on top:
 
-- Edit feedback in one place and the rest follows. `pages/feedback/` is the single source of truth for behavior corrections; the wiki one-way derives `MEMORY.md` and the `<learned_behaviors>` block inside `~/.claude/CLAUDE.md` on its own.
+- Edit feedback in one place and the rest follows. `pages/feedback/` is the single source of truth for behavior corrections, and Hypomnema derives `MEMORY.md` and the `<learned_behaviors>` block inside `~/.claude/CLAUDE.md` from it automatically.
 - Extensions sync alongside. Anything under `~/hypomnema/extensions/{agents,commands,hooks,skills}/` is mirrored into `~/.claude/` automatically. The `--codex` flag also mirrors `hooks` and `commands` into `~/.codex/`; `agents` and `skills` are Claude-only and skipped on purpose.
 - Auto-project creation. When you `cd` into a git repo with a project marker (`package.json`, `Cargo.toml`, etc.) and no matching wiki project exists, Hypomnema offers to scaffold one.
 - Session-close cleanup and `/clear` recovery. After a non-trivial session, a "save a minimal session-close note?" prompt appears automatically; a `/clear` after a forgotten close is detected and recovered at the next session start.
@@ -126,7 +126,7 @@ Hypomnema          ───►  synthesis · markdown · git · hooks · local
 - Synthesis over storage. You don't end up with a graveyard of half-read articles. Each `/hypo:ingest` produces a structured page, and the next ingest on the same topic updates that page instead of adding a new one.
 - Compounding density. A wiki with 100 sources should not be 100 disconnected pages. After a few months of real use, page count grows sub-linearly while cross-links grow faster.
 - No context switch. You're already in Claude Code. The wiki is one slash command away, with no extra tab, app, or login.
-- Future-proof storage. Plain markdown + git reads in 20 years, greps offline, moves to another tool anytime, and stays readable by AI assistants that don't exist yet, no conversion needed.
+- Future-proof storage. Plain markdown + git will still be readable in 20 years, greps offline, moves to another tool anytime, and stays usable by AI assistants that don't exist yet, with no conversion needed.
 
 ---
 
