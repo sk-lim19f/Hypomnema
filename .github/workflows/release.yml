@@ -96,6 +96,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Validate tag body has no wiki tracker IDs
+        # The GitHub Release below republishes the annotated tag body verbatim
+        # (--notes-from-tag), so any FEAT-/IMPR-/ISSUE-/PRAC-/fix #N in it becomes
+        # a public dangling pointer into the private wiki tracker. The file gate
+        # (check-tracker-ids --all) never reads the tag body — this closes that
+        # leak path. Independent of the npm publish step (a re-run that skips
+        # publish still gates the tag before the Release). (changelog-pr-guide T4.)
+        run: node scripts/check-tracker-ids.mjs --tag "${GITHUB_REF_NAME}"
+
       - name: Create GitHub Release
         # Publish the GitHub Release from the annotated tag body (already
         # bilingual-validated above). Idempotent: skip if a Release for this tag

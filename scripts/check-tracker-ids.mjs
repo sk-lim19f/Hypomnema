@@ -51,6 +51,7 @@ import {
   messageHasGitTemplate,
   BLOCKED_PATTERNS,
   USER_FACING_PATTERNS,
+  TAG_BODY_PATTERNS,
 } from './lib/check-tracker-ids.mjs';
 import {
   parseNameStatus,
@@ -297,6 +298,52 @@ function runCommitMsg(file, json) {
   process.exit(report(violations, json));
 }
 
+// Scan an annotated tag's body for ALL wiki tracker prefixes (TAG_BODY_PATTERNS:
+// ISSUE-/fix #/FEAT-/IMPR-/PRAC-). The tag body is the PUBLIC release surface —
+// `gh release create --notes-from-tag` republishes it verbatim — and it carries
+// no code, so unlike the file gate it must reject every prefix (changelog-pr-
+// guide §5 / T4). Wired into release.yml before `gh release create`. `--tag -`
+// reads the body from stdin (piping / test), `--tag <ref>` reads it from git.
+function runTag(ref, json) {
+  let body;
+  if (ref === '-') {
+    try {
+      body = readFileSync(0, 'utf-8');
+    } catch (err) {
+      process.stderr.write(`[check-tracker-ids] --tag -: cannot read stdin: ${err.message}\n`);
+      process.exit(2);
+    }
+  } else {
+    // Require an annotated tag: `<ref>^{tag}` peels only for an annotated tag
+    // object. A lightweight tag has no body to leak, but a release uses
+    // --notes-from-tag on an annotated tag, so a lightweight one here is a
+    // release misconfiguration — fail loudly rather than silently pass.
+    const tagObj = git(['rev-parse', '--verify', '--quiet', `${ref}^{tag}`]);
+    if (tagObj.status !== 0) {
+      const exists = git(['rev-parse', '--verify', '--quiet', ref]);
+      if (exists.status !== 0) {
+        process.stderr.write(`[check-tracker-ids] --tag: tag ${ref} not found\n`);
+      } else {
+        process.stderr.write(
+          `[check-tracker-ids] --tag: ${ref} is a lightweight tag (no annotation body to scan)\n`,
+        );
+      }
+      process.exit(2);
+    }
+    const tagBody = git(['tag', '-l', '--format=%(contents)', ref]);
+    if (tagBody.status !== 0) {
+      process.stderr.write(
+        `[check-tracker-ids] --tag: failed to read tag ${ref}: ${tagBody.stderr}\n`,
+      );
+      process.exit(2);
+    }
+    body = tagBody.stdout || '';
+  }
+  const file = ref === '-' ? '<stdin>' : `tag:${ref}`;
+  const violations = scanText(body, TAG_BODY_PATTERNS).map((h) => ({ file, ...h }));
+  process.exit(report(violations, json));
+}
+
 // ── arg parsing ────────────────────────────────────────────────────────────
 
 function usage(code) {
@@ -304,7 +351,10 @@ function usage(code) {
     'Usage:\n' +
       '  node scripts/check-tracker-ids.mjs [--all] [--json]\n' +
       '  node scripts/check-tracker-ids.mjs --staged [--json]\n' +
-      '  node scripts/check-tracker-ids.mjs --commit-msg <file> [--json]\n',
+      '  node scripts/check-tracker-ids.mjs --commit-msg <file> [--json]\n' +
+      '  node scripts/check-tracker-ids.mjs --tag <ref|-> [--json]\n' +
+      '      Scan an annotated tag body (or stdin via "-") for ALL tracker\n' +
+      '      prefixes; the public release surface must be tracker-ID-0.\n',
   );
   process.exit(code);
 }
@@ -321,6 +371,15 @@ if (argv.includes('--commit-msg')) {
     usage(2);
   }
   runCommitMsg(file, json);
+} else if (argv.includes('--tag')) {
+  const i = argv.indexOf('--tag');
+  const ref = argv[i + 1];
+  // `-` (stdin) is a valid ref token here; only a missing/flag value is an error.
+  if (!ref || (ref.startsWith('--') && ref !== '-')) {
+    process.stderr.write('[check-tracker-ids] --tag requires a ref argument (or "-" for stdin)\n');
+    usage(2);
+  }
+  runTag(ref, json);
 } else if (argv.includes('--staged')) {
   runStaged(json);
 } else {

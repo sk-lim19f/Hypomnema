@@ -20,7 +20,12 @@ import { readFileSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { validateChangelog, validateTagBody } from './lib/check-bilingual.mjs';
+import {
+  validateChangelog,
+  validateTagBody,
+  listChangelogVersions,
+  meetsKoreanCutoff,
+} from './lib/check-bilingual.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..');
@@ -43,7 +48,11 @@ function usage(exitCode) {
   process.stdout.write(
     `Usage:\n` +
       `  node scripts/check-bilingual.mjs --changelog [version]\n` +
-      `      Validate CHANGELOG.md "## [<version>]" section. Default version: package.json.\n` +
+      `      Validate one CHANGELOG.md "## [<version>]" section (section model).\n` +
+      `      Default version: package.json.\n` +
+      `  node scripts/check-bilingual.mjs --changelog --all\n` +
+      `      Validate EVERY documented version (Korean enforced at >= 1.2.0,\n` +
+      `      English-only versions below the cutoff pass).\n` +
       `  node scripts/check-bilingual.mjs --tag <ref>\n` +
       `      Validate annotated tag body (lightweight tags are rejected).\n`,
   );
@@ -52,12 +61,44 @@ function usage(exitCode) {
 
 const args = process.argv.slice(2);
 const mode = args[0];
+const wantAll = args.includes('--all');
 
 if (mode === '--help' || mode === '-h') usage(0);
 if (!mode) usage(1);
 
 if (mode === '--changelog') {
-  let version = args[1];
+  let content;
+  try {
+    content = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8');
+  } catch (err) {
+    fail(`cannot read CHANGELOG.md: ${err.message}`);
+  }
+
+  if (wantAll) {
+    // Validate every documented version. Korean is enforced only at/after the
+    // cutoff; pre-cutoff versions pass on English presence (format.md §9). This
+    // is the migration gate — it must not green-pass a half-migrated file.
+    const versions = listChangelogVersions(content);
+    if (versions.length === 0) fail('no "## [<version>]" sections found in CHANGELOG.md');
+    const failures = [];
+    let enforced = 0;
+    for (const v of versions) {
+      const r = validateChangelog(content, v);
+      if (meetsKoreanCutoff(v)) enforced++;
+      if (!r.ok) failures.push(`  [${v}] ${r.reason}`);
+    }
+    if (failures.length) {
+      fail(`${failures.length}/${versions.length} version(s) failed:\n${failures.join('\n')}`);
+    }
+    ok(
+      `CHANGELOG.md --all: ${versions.length} versions conform ` +
+        `(${enforced} Korean-enforced at >= 1.2.0, ${versions.length - enforced} English-only below cutoff).`,
+    );
+  }
+
+  // single-version path (kept: prepublishOnly and release.yml call --changelog
+  // with no version, defaulting to package.json's).
+  let version = args[1] && !args[1].startsWith('--') ? args[1] : undefined;
   if (!version) {
     try {
       const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8'));
@@ -68,16 +109,13 @@ if (mode === '--changelog') {
   }
   if (!version) fail('no version (arg empty, package.json has no "version" field)');
 
-  let content;
-  try {
-    content = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8');
-  } catch (err) {
-    fail(`cannot read CHANGELOG.md: ${err.message}`);
-  }
-
   const result = validateChangelog(content, version);
   if (!result.ok) fail(result.reason);
-  ok(`CHANGELOG.md [${version}] — ${result.hangulCount} Hangul chars in "### 한글 요약".`);
+  if (result.koreanExempt) {
+    ok(`CHANGELOG.md [${version}] — pre-cutoff version, English-only (Korean exempt).`);
+  } else {
+    ok(`CHANGELOG.md [${version}] — ${result.hangulCount} Hangul chars across "#### 한국어" sub-blocks.`);
+  }
 } else if (mode === '--tag') {
   const ref = args[1];
   if (!ref) fail('--tag requires a ref argument (e.g. v1.2.1)');

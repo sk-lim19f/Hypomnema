@@ -38,6 +38,9 @@ import {
   validateTagBody,
   countHangul,
   HANGUL_BODY_THRESHOLD,
+  listChangelogVersions,
+  meetsKoreanCutoff,
+  parseSemver,
 } from '../scripts/lib/check-bilingual.mjs';
 import {
   scanText,
@@ -45,6 +48,8 @@ import {
   messageHasGitTemplate,
   BLOCKED_PATTERNS,
   USER_FACING_PATTERNS,
+  TAG_BODY_PATTERNS,
+  SURFACE_TRACKER_PATTERNS,
 } from '../scripts/lib/check-tracker-ids.mjs';
 import {
   collectPagesLint,
@@ -54,6 +59,13 @@ import {
   slugForms,
   extractWikilinks,
 } from '../scripts/lib/wikilink.mjs';
+import {
+  classifyChange,
+  sanitizeTrackerIds,
+  hasTrackerId,
+  detectInternalLabels,
+  SECTION,
+} from '../scripts/lib/changelog-classify.mjs';
 
 const HOME = homedir();
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
@@ -15327,68 +15339,211 @@ function makeChangelogFixture(sections) {
   return CHANGELOG_HEADER + sections.join('\n');
 }
 
-const KOREAN_FILLER = '이번 릴리스에서는 새로운 기능을 추가했고 몇 가지 버그를 수정했습니다.';
+// Section-model fixtures (changelog-pr-guide T3). A gated section carries
+// "#### English" + "#### 한국어" sub-blocks at/after the 1.2.0 cutoff.
+function gatedSection(heading, english, korean) {
+  let s = `### ${heading}\n\n#### English\n\n- ${english}\n`;
+  if (korean != null) s += `\n#### 한국어\n\n- ${korean}\n`;
+  return s;
+}
+const KO = '이번 릴리스에서 기능을 추가하고 버그를 고쳤습니다.';
+const KO2 = '내부 정리와 리팩터를 진행했습니다 충분한 분량입니다.';
 
-test('check-bilingual: valid section with 한글 요약 sub-section passes', () => {
+test('check-bilingual: cutoff+ version with bilingual gated sections passes', () => {
   const cl = makeChangelogFixture([
-    `## [1.2.1] - 2026-05-26
+    `## [1.2.0] - 2026-05-24
 
-### Fixed
+${gatedSection('New Features', 'add a thing (#10)', '기능을 추가했습니다 (#10)')}
+${gatedSection('Bug Fixes', 'fix a thing (#11)', '버그를 고쳤습니다 (#11)')}
+### Changelog
 
-- some English fix
-
-### 한글 요약
-
-- ${KOREAN_FILLER}
-
-### Internal
-
-- some English internal note
+- #10 add (@a)
 `,
   ]);
-  const r = validateChangelog(cl, '1.2.1');
+  const r = validateChangelog(cl, '1.2.0');
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.ok(r.hangulCount >= HANGUL_BODY_THRESHOLD);
 });
 
-test('check-bilingual: 한글 요약 heading with English-only body fails', () => {
+test('check-bilingual: cutoff+ gated section missing "#### 한국어" fails', () => {
   const cl = makeChangelogFixture([
-    `## [1.0.0] - 2026-01-01
+    `## [1.3.0] - 2026-06-07
 
-### 한글 요약
+### New Features
 
-- This body is only English with no Korean characters.
+#### English
+
+- only english here (#1)
 `,
   ]);
-  const r = validateChangelog(cl, '1.0.0');
+  const r = validateChangelog(cl, '1.3.0');
   assert.equal(r.ok, false);
-  assert.match(r.reason, /Hangul chars/);
+  assert.match(r.reason, /missing "#### 한국어"/);
 });
 
-test('check-bilingual: section without 한글 요약 sub-section fails', () => {
+test('check-bilingual: cutoff+ "#### 한국어" heading with no Korean text fails', () => {
   const cl = makeChangelogFixture([
-    `## [1.0.0] - 2026-01-01
+    `## [1.3.0] - 2026-06-07
 
-### Fixed
+### Bug Fixes
 
-- some English fix
+#### English
+
+- english (#1)
+
+#### 한국어
+
+- only english words here, no hangul
 `,
   ]);
+  const r = validateChangelog(cl, '1.3.0');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no Korean text/);
+});
+
+test('check-bilingual: cutoff+ gated section missing "#### English" fails', () => {
+  const cl = makeChangelogFixture([
+    `## [1.3.0] - 2026-06-07
+
+### Chores
+
+#### 한국어
+
+- ${KO2}
+`,
+  ]);
+  const r = validateChangelog(cl, '1.3.0');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /missing "#### English"/);
+});
+
+test('check-bilingual: cutoff+ with no gated section fails', () => {
+  const cl = makeChangelogFixture([
+    `## [1.3.0] - 2026-06-07
+
+### Changelog
+
+- #1 a change (@a)
+`,
+  ]);
+  const r = validateChangelog(cl, '1.3.0');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no gated section/);
+});
+
+test('check-bilingual: cutoff+ total Korean below threshold fails', () => {
+  const cl = makeChangelogFixture([
+    `## [1.3.0] - 2026-06-07
+
+### Chores
+
+#### English
+
+- tidy (#1)
+
+#### 한국어
+
+- 정리함
+`,
+  ]);
+  const r = validateChangelog(cl, '1.3.0');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /threshold/);
+});
+
+test('check-bilingual: Highlights is a gated section (Korean enforced at cutoff)', () => {
+  const cl = makeChangelogFixture([
+    `## [1.3.0] - 2026-06-07
+
+### Highlights
+
+#### English
+
+- a highlight (#1)
+`,
+  ]);
+  const r = validateChangelog(cl, '1.3.0');
+  assert.equal(r.ok, false, 'Highlights must require a Korean sub-block at cutoff');
+  assert.match(r.reason, /Highlights.*한국어/);
+});
+
+test('check-bilingual: Changelog/Known Issues are NOT gated (no Korean required)', () => {
+  // A version with one bilingual gated section plus a language-neutral Changelog
+  // and an English-only Known Issues note must still pass.
+  const cl = makeChangelogFixture([
+    `## [1.3.0] - 2026-06-07
+
+${gatedSection('New Features', 'add (#1)', '기능을 추가했고 분량을 채웁니다 (#1)')}
+### Known Issues
+
+- a known caveat, English only
+
+### Changelog
+
+- #1 add (@a)
+`,
+  ]);
+  const r = validateChangelog(cl, '1.3.0');
+  assert.equal(r.ok, true, JSON.stringify(r));
+});
+
+test('check-bilingual: Korean in a sibling non-gated section does not satisfy the gate', () => {
+  // Hangul lives only in a non-gated "### Notes"; the gated New Features has an
+  // English-only "#### 한국어" → must fail (no leak across ### boundary).
+  const cl = makeChangelogFixture([
+    `## [1.3.0] - 2026-06-07
+
+### New Features
+
+#### English
+
+- add (#1)
+
+#### 한국어
+
+- english only, no hangul
+
+### Notes
+
+- 여기에는 한국어가 가득합니다 임계값을 넘기고도 남습니다.
+`,
+  ]);
+  const r = validateChangelog(cl, '1.3.0');
+  assert.equal(r.ok, false, 'Korean in Notes must not count for the gated section');
+});
+
+test('check-bilingual: pre-cutoff (1.0.0/1.1.0) is English-only, Korean exempt', () => {
+  for (const v of ['1.0.0', '1.1.0']) {
+    const cl = makeChangelogFixture([
+      `## [${v}] - 2026-01-01
+
+### Added
+
+- an English-only entry, no Korean at all (#1)
+`,
+    ]);
+    const r = validateChangelog(cl, v);
+    assert.equal(r.ok, true, `${v} must pass English-only: ${JSON.stringify(r)}`);
+    assert.equal(r.koreanExempt, true);
+    assert.equal(r.hangulCount, 0);
+  }
+});
+
+test('check-bilingual: pre-cutoff with no content fails', () => {
+  const cl = makeChangelogFixture([`## [1.0.0] - 2026-01-01\n\n`]);
   const r = validateChangelog(cl, '1.0.0');
   assert.equal(r.ok, false);
-  assert.match(r.reason, /missing "### 한글 요약"/);
+  assert.match(r.reason, /no content/);
 });
 
 test('check-bilingual: version not in CHANGELOG fails', () => {
-  const cl = makeChangelogFixture([`## [1.0.0] - 2026-01-01\n\n- stuff\n`]);
+  const cl = makeChangelogFixture([`## [1.2.0] - 2026-05-24\n\n- stuff\n`]);
   const r = validateChangelog(cl, '9.9.9');
   assert.equal(r.ok, false);
   assert.match(r.reason, /no "## \[9\.9\.9\]"/);
 });
 
 test('check-bilingual: [Unreleased] does NOT satisfy a version-target lookup', () => {
-  // The fixture's header contains "## [Unreleased]" but the lookup is for 1.2.0
-  // → must fail (no special-casing — codex BLOCKER fix).
   const cl = makeChangelogFixture([]);
   const r = validateChangelog(cl, '1.2.0');
   assert.equal(r.ok, false);
@@ -15398,84 +15553,89 @@ test('check-bilingual: 1.2.1 does not match 1.2.10 (semver escape)', () => {
   const cl = makeChangelogFixture([
     `## [1.2.10] - 2026-06-01
 
-### 한글 요약
-
-- ${KOREAN_FILLER}
-`,
+${gatedSection('Bug Fixes', 'fix (#1)', '버그를 고쳤습니다 충분한 분량입니다 (#1)')}`,
   ]);
   const r = validateChangelog(cl, '1.2.1');
   assert.equal(r.ok, false, 'must not match 1.2.10 prefix as 1.2.1');
 });
 
-test('check-bilingual: prerelease (1.2.1-rc.1) is matched literally', () => {
+test('check-bilingual: prerelease (1.2.0-rc.1) is matched and treated as cutoff+', () => {
   const cl = makeChangelogFixture([
-    `## [1.2.1-rc.1] - 2026-05-20
+    `## [1.2.0-rc.1] - 2026-05-20
 
-### 한글 요약
-
-- ${KOREAN_FILLER}
-`,
+${gatedSection('New Features', 'add (#1)', '기능을 추가했습니다 충분한 분량입니다 (#1)')}`,
   ]);
-  const r = validateChangelog(cl, '1.2.1-rc.1');
-  assert.equal(r.ok, true);
+  const r = validateChangelog(cl, '1.2.0-rc.1');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(meetsKoreanCutoff('1.2.0-rc.1'), true);
 });
 
 test('check-bilingual: duplicate version sections fail', () => {
   const cl = makeChangelogFixture([
-    `## [1.0.0] - 2026-01-01
+    `## [1.2.0] - 2026-05-24
 
-### 한글 요약
+${gatedSection('New Features', 'add (#1)', '기능을 추가 (#1)')}
+## [1.2.0] - 2026-05-25
 
-- ${KOREAN_FILLER}
-
-## [1.0.0] - 2026-01-02
-
-### 한글 요약
-
-- ${KOREAN_FILLER}
-`,
+${gatedSection('Bug Fixes', 'fix (#2)', '버그 수정 (#2)')}`,
   ]);
-  const r = validateChangelog(cl, '1.0.0');
+  const r = validateChangelog(cl, '1.2.0');
   assert.equal(r.ok, false);
   assert.match(r.reason, /duplicate.*sections/);
 });
 
-test('check-bilingual: Korean block boundary stops at next H3 (Internal section)', () => {
-  // The 한글 요약 body itself has 0 Korean chars (a parser bug would leak Hangul
-  // from the next "### Internal" section back into the "### 한글 요약" body).
-  // The boundary must stop at the next ### to prevent that false pass.
-  const KOREAN_INTERNAL =
-    '내부 변경 사항 한국어 텍스트입니다 더 많은 한글 단어들로 임계값을 넘기게 합니다.';
-  const cl = makeChangelogFixture([
-    `## [1.0.0] - 2026-01-01
-
-### 한글 요약
-
-- only English body here, no Korean at all.
-
-### Internal
-
-- ${KOREAN_INTERNAL}
-`,
-  ]);
-  const r = validateChangelog(cl, '1.0.0');
-  assert.equal(r.ok, false, 'must fail — Korean lives in Internal, not in 한글 요약');
-});
-
 test('check-bilingual: CRLF line endings normalized', () => {
-  const ko = `## [1.0.0] - 2026-01-01\r\n\r\n### 한글 요약\r\n\r\n- ${KOREAN_FILLER}\r\n`;
-  const cl = CHANGELOG_HEADER.replace(/\n/g, '\r\n') + ko;
-  const r = validateChangelog(cl, '1.0.0');
-  assert.equal(r.ok, true);
+  const block = `## [1.2.0] - 2026-05-24\n\n### New Features\n\n#### English\n\n- add (#1)\n\n#### 한국어\n\n- ${KO}\n`;
+  const cl = (CHANGELOG_HEADER + block).replace(/\n/g, '\r\n');
+  const r = validateChangelog(cl, '1.2.0');
+  assert.equal(r.ok, true, JSON.stringify(r));
 });
 
 test('check-bilingual: NFC normalizes decomposed Hangul jamo before counting', () => {
-  // "가나다라마바사아자차" precomposed = 10 syllables. Decomposed = jamo-only.
   const decomposed = '가나다라마바사아자차'.normalize('NFD');
   assert.notEqual(decomposed, '가나다라마바사아자차');
-  const cl = makeChangelogFixture([`## [1.0.0] - 2026-01-01\n\n### 한글 요약\n\n${decomposed}\n`]);
-  const r = validateChangelog(cl, '1.0.0');
+  const cl = makeChangelogFixture([
+    `## [1.2.0] - 2026-05-24\n\n### Chores\n\n#### English\n\n- tidy (#1)\n\n#### 한국어\n\n${decomposed}\n`,
+  ]);
+  const r = validateChangelog(cl, '1.2.0');
   assert.equal(r.ok, true, `decomposed input must NFC-normalize; got: ${JSON.stringify(r)}`);
+});
+
+test('check-bilingual: parseSemver + meetsKoreanCutoff', () => {
+  assert.deepEqual(parseSemver('1.2.3'), [1, 2, 3]);
+  assert.deepEqual(parseSemver('1.2.0-rc.1'), [1, 2, 0]);
+  assert.equal(parseSemver('nope'), null);
+  assert.equal(meetsKoreanCutoff('1.1.0'), false);
+  assert.equal(meetsKoreanCutoff('1.2.0'), true);
+  assert.equal(meetsKoreanCutoff('1.4.0'), true);
+  assert.equal(meetsKoreanCutoff('2.0.0'), true);
+  assert.equal(meetsKoreanCutoff('1.0.1'), false);
+});
+
+test('check-bilingual: listChangelogVersions lists versions, skips Unreleased', () => {
+  const cl = makeChangelogFixture([
+    `## [1.2.0] - 2026-05-24\n\n- x\n`,
+    `## [1.1.0] - 2026-05-13\n\n- y\n`,
+  ]);
+  assert.deepEqual(listChangelogVersions(cl), ['1.2.0', '1.1.0']);
+});
+
+test('check-bilingual: --all model passes a mixed pre/post-cutoff document', () => {
+  const cl = makeChangelogFixture([
+    `## [1.2.0] - 2026-05-24
+
+${gatedSection('New Features', 'add (#1)', '기능을 추가했습니다 충분한 분량입니다 (#1)')}`,
+    `## [1.1.0] - 2026-05-13
+
+### Added
+
+- english-only pre-cutoff (#0)
+`,
+  ]);
+  const versions = listChangelogVersions(cl);
+  for (const v of versions) {
+    assert.equal(validateChangelog(cl, v).ok, true, `${v} must pass`);
+  }
 });
 
 suite('check-bilingual — git tag annotation body validator');
@@ -17267,6 +17427,34 @@ test('scanText with USER_FACING_PATTERNS flags ADR / decisions pointers', () => 
   assert.equal(scanText('ADR 0040 and decisions/0031 anchor').length, 0);
 });
 
+test('TAG_BODY_PATTERNS gates all four tracker prefixes; file gate keeps FEAT/IMPR/PRAC (changelog-pr-guide T4)', () => {
+  // The tag body is the public release surface — every prefix is a leak.
+  for (const id of ['ISSUE-7', 'fix #7', 'FEAT-1', 'IMPR-3', 'PRAC-17']) {
+    assert.equal(scanText(`leak ${id} here`, TAG_BODY_PATTERNS).length, 1, `tag body must flag ${id}`);
+  }
+  // GitHub refs and ADR anchors stay legitimate even on the tag surface.
+  assert.equal(scanText('PR #50 (#9) ADR 0040', TAG_BODY_PATTERNS).length, 0);
+  // The DEFAULT file gate must NOT flag FEAT/IMPR/PRAC — shipped code comments
+  // cite them for maintainer context (like ADR anchors). Only ISSUE-/fix # there.
+  assert.equal(scanText('// FEAT-17 hardening, see PRAC-18 and IMPR-13').length, 0);
+  assert.equal(scanText('// ISSUE-7 leak in a comment').length, 1);
+  // SURFACE_TRACKER_PATTERNS is exactly the three extra prefixes.
+  assert.deepEqual(
+    SURFACE_TRACKER_PATTERNS.map((p) => p.name).sort(),
+    ['FEAT-N', 'IMPR-N', 'PRAC-N'],
+  );
+});
+
+test('CHANGELOG.md is tracker-ID-0 across all four prefixes (surface ID 0 regression, §5)', () => {
+  const cl = readFileSync(join(REPO, 'CHANGELOG.md'), 'utf-8');
+  const hits = scanText(cl, TAG_BODY_PATTERNS);
+  assert.equal(
+    hits.length,
+    0,
+    `CHANGELOG.md carries tracker IDs: ${hits.map((h) => `${h.line}:${h.match}`).join(', ')}`,
+  );
+});
+
 test('scanText reports 1-based line/col', () => {
   const hits = scanText('clean\nleak ISSUE-9 here');
   assert.equal(hits.length, 1);
@@ -18647,6 +18835,195 @@ test('collectPages presets emit the historical output shape', () => {
     assert.equal(norm(l.rel), 'sub/b.md');
     assert.equal(l.slug, undefined);
   });
+});
+
+// ── changelog-classify (changelog-pr-guide T2) ───────────────────────────────
+
+test('classifyChange: tracker ID beats Conventional-Commit type', () => {
+  // feat(...) typed, but IMPR-/PRAC- tracker → Chores (the real 1.4.0 cases).
+  assert.deepEqual(
+    classifyChange('feat(release): version floor gate (IMPR-14) (#138)'),
+    { section: SECTION.CHORES, basis: 'tracker' },
+  );
+  assert.deepEqual(
+    classifyChange('feat(audit): stamp session_id/device (PRAC-17) (#136)'),
+    { section: SECTION.CHORES, basis: 'tracker' },
+  );
+  // FEAT- tracker → New Features.
+  assert.deepEqual(
+    classifyChange('feat(feedback): add failure_type (FEAT-1) (#141)'),
+    { section: SECTION.NEW_FEATURES, basis: 'tracker' },
+  );
+  // docs(...) typed, but ISSUE- tracker → Bug Fixes (real 1.3.1 case).
+  assert.deepEqual(
+    classifyChange('docs(resume): correct comment (ISSUE-2) (#93)'),
+    { section: SECTION.BUG_FIXES, basis: 'tracker' },
+  );
+});
+
+test('classifyChange: type when no tracker, Chores fallback otherwise', () => {
+  assert.deepEqual(classifyChange('fix(catalog): dedup injection (#133)'), {
+    section: SECTION.BUG_FIXES,
+    basis: 'type',
+  });
+  assert.deepEqual(classifyChange('feat(rename): subtree rename (#125)'), {
+    section: SECTION.NEW_FEATURES,
+    basis: 'type',
+  });
+  // refactor/docs/ci/chore are all internal → Chores by KIND (format.md §4).
+  assert.deepEqual(classifyChange('refactor(lib): extract resolver (#139)'), {
+    section: SECTION.CHORES,
+    basis: 'type',
+  });
+  assert.deepEqual(classifyChange('docs(readme): document install paths'), {
+    section: SECTION.CHORES,
+    basis: 'type',
+  });
+  // breaking-change bang in the type prefix still parses.
+  assert.deepEqual(classifyChange('feat(api)!: drop legacy flag'), {
+    section: SECTION.NEW_FEATURES,
+    basis: 'type',
+  });
+  // no tracker, unrecognized/absent type → Chores fallback (flagged as a guess).
+  assert.deepEqual(classifyChange('random prose with no prefix'), {
+    section: SECTION.CHORES,
+    basis: 'fallback',
+  });
+  assert.deepEqual(classifyChange(''), { section: SECTION.CHORES, basis: 'fallback' });
+});
+
+test('classifyChange: legacy heading hint for ID-less, type-less prose (format.md §3 step 3)', () => {
+  // a pre-convention `### Added` item with no tracker and no `feat:` prefix
+  // maps by its heading, not the Chores default.
+  assert.deepEqual(classifyChange('add resolveWikiRoot() and OSS utilities', { legacyHeading: '### Added' }), {
+    section: SECTION.NEW_FEATURES,
+    basis: 'heading',
+  });
+  assert.deepEqual(classifyChange('lint no longer false-flags links', { legacyHeading: 'Fixed' }), {
+    section: SECTION.BUG_FIXES,
+    basis: 'heading',
+  });
+  assert.deepEqual(classifyChange('bump deps', { legacyHeading: '### Internal' }), {
+    section: SECTION.CHORES,
+    basis: 'heading',
+  });
+  // heading-variant normalization: `### Fixed (한글)` and `⚠ Breaking`.
+  assert.deepEqual(classifyChange('한국어 항목', { legacyHeading: '### Fixed (한글)' }), {
+    section: SECTION.BUG_FIXES,
+    basis: 'heading',
+  });
+  // a non-section heading (Breaking/Highlights) does NOT resolve → fallback.
+  assert.deepEqual(classifyChange('drop legacy flag', { legacyHeading: '⚠ Breaking' }), {
+    section: SECTION.CHORES,
+    basis: 'fallback',
+  });
+  // tracker / type still win over the heading hint.
+  assert.deepEqual(classifyChange('feat: add thing', { legacyHeading: 'Fixed' }), {
+    section: SECTION.NEW_FEATURES,
+    basis: 'type',
+  });
+  assert.deepEqual(classifyChange('docs: tweak (ISSUE-2)', { legacyHeading: 'Changed' }), {
+    section: SECTION.BUG_FIXES,
+    basis: 'tracker',
+  });
+});
+
+test('detectInternalLabels: finds Track A / OQ-NN, ignores tracker IDs and PR numbers', () => {
+  assert.deepEqual(detectInternalLabels('feat (Track A-sot) (OQ-34) (#82)'), ['Track A-sot', 'OQ-34']);
+  assert.deepEqual(detectInternalLabels('Track E gate'), ['Track E']);
+  assert.deepEqual(detectInternalLabels('nothing here (FEAT-1) (#141)'), []);
+  assert.deepEqual(detectInternalLabels(''), []);
+  // /g regex is reset between calls.
+  assert.deepEqual(detectInternalLabels('Track E gate'), ['Track E']);
+});
+
+test('sanitizeTrackerIds: strips tracker IDs, keeps #N, cleans empty parens', () => {
+  assert.equal(
+    sanitizeTrackerIds('feat(feedback): add failure_type (FEAT-1) (#141)'),
+    'feat(feedback): add failure_type (#141)',
+  );
+  // bare ID, not parenthesized.
+  assert.equal(sanitizeTrackerIds('IMPR-3 reconcile types'), 'reconcile types');
+  // ID inside a larger paren keeps the rest, drops the leading gap.
+  assert.equal(
+    sanitizeTrackerIds('verify on tie (ISSUE-7 Part A) (#97)'),
+    'verify on tie (Part A) (#97)',
+  );
+  // #N PR numbers and ADR anchors are untouched (format.md §10).
+  assert.equal(
+    sanitizeTrackerIds('whitelist activity (ADR 0057) (#131)'),
+    'whitelist activity (ADR 0057) (#131)',
+  );
+  // a removed leading label leaves orphaned punctuation → dropped.
+  assert.equal(sanitizeTrackerIds('ISSUE-7: starts with label'), 'starts with label');
+  assert.equal(sanitizeTrackerIds(null), '');
+});
+
+test('hasTrackerId: detects all four prefixes, ignores #N / ADR', () => {
+  assert.equal(hasTrackerId('foo (FEAT-1)'), true);
+  assert.equal(hasTrackerId('foo (IMPR-14)'), true);
+  assert.equal(hasTrackerId('foo (ISSUE-8)'), true);
+  assert.equal(hasTrackerId('foo (PRAC-17)'), true);
+  assert.equal(hasTrackerId('foo (#141) (ADR 0057)'), false);
+  // /g regex is reset between calls — repeated calls stay correct.
+  assert.equal(hasTrackerId('foo (FEAT-1)'), true);
+});
+
+test('changelog-classify snapshot: 11 versions lock to expected section/basis', () => {
+  const fixture = JSON.parse(
+    readFileSync(join(REPO, 'tests', 'fixtures', 'changelog-classify.snapshot.json'), 'utf-8'),
+  );
+  const entries = fixture.entries;
+  assert.ok(Array.isArray(entries) && entries.length >= 30, 'fixture must be a non-trivial array');
+
+  // every release is represented (regression: a dropped version goes unnoticed).
+  const versions = new Set(entries.map((e) => e.version));
+  for (const v of ['1.0.0', '1.0.1', '1.1.0', '1.2.0', '1.2.1', '1.3.0', '1.3.1', '1.3.2', '1.3.3', '1.3.4', '1.4.0']) {
+    assert.ok(versions.has(v), `fixture missing version ${v}`);
+  }
+
+  for (const e of entries) {
+    const got = classifyChange(e.title);
+    assert.equal(
+      got.section,
+      e.section,
+      `[${e.version}] section drift: "${e.title}" → ${got.section} (expected ${e.section})`,
+    );
+    assert.equal(
+      got.basis,
+      e.basis,
+      `[${e.version}] basis drift: "${e.title}" → ${got.basis} (expected ${e.basis})`,
+    );
+    // surface ID 0: after sanitize, no tracker ID survives but the PR number does.
+    const clean = sanitizeTrackerIds(e.title);
+    assert.equal(hasTrackerId(clean), false, `[${e.version}] tracker ID survived sanitize: "${clean}"`);
+    const pr = e.title.match(/\(#\d+\)/);
+    if (pr) assert.ok(clean.includes(pr[0]), `[${e.version}] PR number dropped by sanitize: "${clean}"`);
+  }
+
+  // The fixture claims to hold REAL commit subjects — verify each title exists
+  // verbatim in git history. Skipped (with a note) when full history is absent
+  // (shallow clone / not a repo), so a CI shallow-checkout never false-fails.
+  let realSubjects = null;
+  try {
+    const out = spawnSync('git', ['log', '--all', '--no-merges', '--format=%s'], {
+      cwd: REPO,
+      encoding: 'utf-8',
+    });
+    if (out.status === 0 && out.stdout) {
+      realSubjects = new Set(out.stdout.split('\n').map((s) => s.trim()));
+    }
+  } catch {}
+  if (realSubjects && realSubjects.size > 50) {
+    for (const e of entries) {
+      assert.ok(
+        realSubjects.has(e.title.trim()),
+        `[${e.version}] fixture title is not a verbatim git subject: "${e.title}"`,
+      );
+    }
+  } else {
+    console.log('    (note: git history unavailable — skipped verbatim-subject check)');
+  }
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
