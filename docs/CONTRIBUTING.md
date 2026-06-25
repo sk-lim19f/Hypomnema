@@ -222,7 +222,81 @@ Open the PR against `main`. Include:
 - **What changed** — short summary
 - **Why** — the user-visible motivation
 - **Manual verification steps** — anything the test suite cannot cover
+- **Changelog**: one English line plus one Korean line if the change is user-visible (see CHANGELOG conventions below)
 - **Migration notes** — if upgrading existing installs needs special handling
+
+---
+
+## CHANGELOG conventions
+
+`CHANGELOG.md` is the source of truth for release history. It follows a fixed section model, and contributors feed it through the `## Changelog` block in the PR template rather than editing `CHANGELOG.md` directly. The release collector and the maintainer assemble the final entries at release time.
+
+### PR title vs. merge commit
+
+- **PR title**: Conventional Commits plus a scope, e.g. `feat(feedback): add failure_type enum`. The type drives the CHANGELOG section (see the classification table below).
+- **Merge commit**: the squash-merge subject carries the PR number (`#123`). That is where `#N` comes from, not the PR title. The two conventions stay separate.
+- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`) may appear in your local notes, but never on a public surface: not in the CHANGELOG body, not in a tag annotation, not in a release entry. The only identifier that ships is the PR number `#N`.
+
+### The `## Changelog` block
+
+If a change is user-visible, fill the `## Changelog` block in the PR body with one English line and one Korean line:
+
+```
+## Changelog
+
+- EN: Feedback pages accept an optional `failure_type` so recurring mistakes are visible.
+- KO: 피드백 페이지에 선택적 `failure_type`를 달아 반복되는 실수를 집계로 볼 수 있습니다.
+```
+
+- Reference the PR by number only (`#123`). No internal tracker ids on this surface.
+- No em dashes; use a colon, comma, or parentheses.
+- Internal-only changes (a refactor with no user-visible effect, test-only, CI plumbing) write `None` and skip the lines.
+
+### Section model
+
+Each version block in `CHANGELOG.md` is ordered, top to bottom:
+
+1. Optional `> [!IMPORTANT]` migration or breaking callout.
+2. Optional `### Highlights`: a maintainer's hand-written top-N, not auto-collected.
+3. `### New Features`, `### Bug Fixes`, `### Chores`: present only when that version has entries of that kind. An empty section is omitted.
+4. `### Changelog`: the PR-link index plus contributors. Always present. Language-neutral.
+
+At and after the v1.2.0 cutoff, each non-empty gated section (`Highlights`, `New Features`, `Bug Fixes`, `Chores`) splits its content into `#### English` then `#### 한국어`, in that order:
+
+```
+### New Features
+#### English
+- Feedback pages accept an optional `failure_type`. (#141)
+#### 한국어
+- 피드백 페이지가 선택적 `failure_type`를 받습니다. (#141)
+```
+
+Versions below the v1.2.0 cutoff (1.0.0, 1.0.1, 1.1.0) are English-only: the English body sits directly under the section header with no `####` sub-blocks. Korean is not back-filled for those releases.
+
+The `### Changelog` index is language-neutral, one merged PR per line:
+
+```
+### Changelog
+- #141 feedback failure_type classification
+- #140 invalid-YAML lint guard
+Contributors: @handle
+```
+
+Each line is `- #N <short title>`, no em dash. The `Contributors:` line lists that version's PR authors, de-duplicated; the release collector fills the handles from the GitHub API.
+
+A `### Known Issues` or `### Notes` block, when a version has one, is a trailing note (a caveat, not a change). It is not one of the gated sections, so it carries no `####` sub-blocks even at or after the cutoff; bilingual text there is recommended, not enforced.
+
+### Classification
+
+The section is decided by change kind, with the Conventional Commit type as the default and content as the override:
+
+| Input | Section |
+|---|---|
+| `feat:` / `FEAT-` | New Features |
+| `fix:` / `ISSUE-` | Bug Fixes |
+| `chore:` / `refactor:` / `docs:` / `ci:` / `perf:` / `IMPR-` / `PRAC-` | Chores |
+
+Chores is defined by kind, not by visibility: improvements (`IMPR`), refactors, and release or internal cleanup all land in Chores even when user-visible. The external changelog highlights only New Features and Bug Fixes; everything else is a Chore.
 
 ---
 
@@ -239,10 +313,10 @@ itself). The sequence below is that same checklist, and is the authoritative
 in-repo reference; follow it whether or not you have the `/ship` convenience
 command.
 
-Every Hypomnema release must carry a Korean summary alongside the English body
+Every Hypomnema release must carry Korean alongside the English body
 in **both** the CHANGELOG section AND the git tag annotation. The release
-workflow enforces this with `scripts/check-bilingual.mjs`; lightweight tags or
-a missing `### 한글 요약` section will block `npm publish`. It also requires the
+workflow enforces this with `scripts/check-bilingual.mjs`; a lightweight tag, or
+a gated CHANGELOG section missing its `#### 한국어` sub-block, will block `npm publish`. It also requires the
 release version to appear in **both** `README.md` and `README.ko.md`
 (`scripts/check-readme-version.mjs`) — the floor that stops the README reconcile
 from being dropped.
@@ -256,8 +330,10 @@ node scripts/bump-version.mjs <new-semver>   # e.g. 1.2.2 or 1.3.0-rc.1
 #     version-consistency gate stay green (the lock carries the version twice).
 npm install --package-lock-only
 
-# 2. Edit CHANGELOG.md — the new section MUST include a "### 한글 요약"
-#    sub-section with at least 10 Hangul characters of real summary text.
+# 2. Assemble the new CHANGELOG.md section from the merged PRs' `## Changelog`
+#    blocks (the collector drafts it; see CHANGELOG conventions above). Each
+#    gated section (Highlights / New Features / Bug Fixes / Chores) MUST carry
+#    both a "#### English" and a "#### 한국어" sub-block; check:bilingual enforces it.
 $EDITOR CHANGELOG.md
 
 # 3. Reconcile BOTH READMEs — add a v<version> sentence to the rolling version
@@ -269,7 +345,7 @@ $EDITOR README.md README.ko.md
 npm test                   # unit suite
 npm run lint               # vault linter
 npm run check:versions     # all version-carrying files (incl. package-lock) agree
-npm run check:bilingual    # CHANGELOG section has a 한글 요약
+npm run check:bilingual    # each gated CHANGELOG section has #### English + #### 한국어
 npm run check:readme       # v<version> present in BOTH READMEs
 npm run smoke:plugin       # plugin manifest + hooks/commands/skills load-valid
 npm run smoke-pack         # packed tarball installs and resolves
