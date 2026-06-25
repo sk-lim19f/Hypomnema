@@ -9,6 +9,11 @@
   },
   "files": [
     "scripts/",
+    "!scripts/collect-changelog.mjs",
+    "!scripts/lib/collect-changelog.mjs",
+    "!scripts/bump-version.mjs",
+    "!scripts/smoke-pack.mjs",
+    "!scripts/smoke-plugin.mjs",
     "commands/",
     "hooks/",
     "skills/",

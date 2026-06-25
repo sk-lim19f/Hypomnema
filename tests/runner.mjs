@@ -66,6 +66,14 @@ import {
   detectInternalLabels,
   SECTION,
 } from '../scripts/lib/changelog-classify.mjs';
+import {
+  parsePrNumber,
+  isMergeBoilerplate,
+  parseChangelogBlock,
+  normalizeIndexTitle,
+  assembleSections,
+  renderDraft,
+} from '../scripts/lib/collect-changelog.mjs';
 
 const HOME = homedir();
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
@@ -17430,7 +17438,11 @@ test('scanText with USER_FACING_PATTERNS flags ADR / decisions pointers', () => 
 test('TAG_BODY_PATTERNS gates all four tracker prefixes; file gate keeps FEAT/IMPR/PRAC (changelog-pr-guide T4)', () => {
   // The tag body is the public release surface — every prefix is a leak.
   for (const id of ['ISSUE-7', 'fix #7', 'FEAT-1', 'IMPR-3', 'PRAC-17']) {
-    assert.equal(scanText(`leak ${id} here`, TAG_BODY_PATTERNS).length, 1, `tag body must flag ${id}`);
+    assert.equal(
+      scanText(`leak ${id} here`, TAG_BODY_PATTERNS).length,
+      1,
+      `tag body must flag ${id}`,
+    );
   }
   // GitHub refs and ADR anchors stay legitimate even on the tag surface.
   assert.equal(scanText('PR #50 (#9) ADR 0040', TAG_BODY_PATTERNS).length, 0);
@@ -17439,10 +17451,11 @@ test('TAG_BODY_PATTERNS gates all four tracker prefixes; file gate keeps FEAT/IM
   assert.equal(scanText('// FEAT-17 hardening, see PRAC-18 and IMPR-13').length, 0);
   assert.equal(scanText('// ISSUE-7 leak in a comment').length, 1);
   // SURFACE_TRACKER_PATTERNS is exactly the three extra prefixes.
-  assert.deepEqual(
-    SURFACE_TRACKER_PATTERNS.map((p) => p.name).sort(),
-    ['FEAT-N', 'IMPR-N', 'PRAC-N'],
-  );
+  assert.deepEqual(SURFACE_TRACKER_PATTERNS.map((p) => p.name).sort(), [
+    'FEAT-N',
+    'IMPR-N',
+    'PRAC-N',
+  ]);
 });
 
 test('CHANGELOG.md is tracker-ID-0 across all four prefixes (surface ID 0 regression, §5)', () => {
@@ -18841,24 +18854,24 @@ test('collectPages presets emit the historical output shape', () => {
 
 test('classifyChange: tracker ID beats Conventional-Commit type', () => {
   // feat(...) typed, but IMPR-/PRAC- tracker → Chores (the real 1.4.0 cases).
-  assert.deepEqual(
-    classifyChange('feat(release): version floor gate (IMPR-14) (#138)'),
-    { section: SECTION.CHORES, basis: 'tracker' },
-  );
-  assert.deepEqual(
-    classifyChange('feat(audit): stamp session_id/device (PRAC-17) (#136)'),
-    { section: SECTION.CHORES, basis: 'tracker' },
-  );
+  assert.deepEqual(classifyChange('feat(release): version floor gate (IMPR-14) (#138)'), {
+    section: SECTION.CHORES,
+    basis: 'tracker',
+  });
+  assert.deepEqual(classifyChange('feat(audit): stamp session_id/device (PRAC-17) (#136)'), {
+    section: SECTION.CHORES,
+    basis: 'tracker',
+  });
   // FEAT- tracker → New Features.
-  assert.deepEqual(
-    classifyChange('feat(feedback): add failure_type (FEAT-1) (#141)'),
-    { section: SECTION.NEW_FEATURES, basis: 'tracker' },
-  );
+  assert.deepEqual(classifyChange('feat(feedback): add failure_type (FEAT-1) (#141)'), {
+    section: SECTION.NEW_FEATURES,
+    basis: 'tracker',
+  });
   // docs(...) typed, but ISSUE- tracker → Bug Fixes (real 1.3.1 case).
-  assert.deepEqual(
-    classifyChange('docs(resume): correct comment (ISSUE-2) (#93)'),
-    { section: SECTION.BUG_FIXES, basis: 'tracker' },
-  );
+  assert.deepEqual(classifyChange('docs(resume): correct comment (ISSUE-2) (#93)'), {
+    section: SECTION.BUG_FIXES,
+    basis: 'tracker',
+  });
 });
 
 test('classifyChange: type when no tracker, Chores fallback otherwise', () => {
@@ -18895,10 +18908,13 @@ test('classifyChange: type when no tracker, Chores fallback otherwise', () => {
 test('classifyChange: legacy heading hint for ID-less, type-less prose (format.md §3 step 3)', () => {
   // a pre-convention `### Added` item with no tracker and no `feat:` prefix
   // maps by its heading, not the Chores default.
-  assert.deepEqual(classifyChange('add resolveWikiRoot() and OSS utilities', { legacyHeading: '### Added' }), {
-    section: SECTION.NEW_FEATURES,
-    basis: 'heading',
-  });
+  assert.deepEqual(
+    classifyChange('add resolveWikiRoot() and OSS utilities', { legacyHeading: '### Added' }),
+    {
+      section: SECTION.NEW_FEATURES,
+      basis: 'heading',
+    },
+  );
   assert.deepEqual(classifyChange('lint no longer false-flags links', { legacyHeading: 'Fixed' }), {
     section: SECTION.BUG_FIXES,
     basis: 'heading',
@@ -18929,7 +18945,10 @@ test('classifyChange: legacy heading hint for ID-less, type-less prose (format.m
 });
 
 test('detectInternalLabels: finds Track A / OQ-NN, ignores tracker IDs and PR numbers', () => {
-  assert.deepEqual(detectInternalLabels('feat (Track A-sot) (OQ-34) (#82)'), ['Track A-sot', 'OQ-34']);
+  assert.deepEqual(detectInternalLabels('feat (Track A-sot) (OQ-34) (#82)'), [
+    'Track A-sot',
+    'OQ-34',
+  ]);
   assert.deepEqual(detectInternalLabels('Track E gate'), ['Track E']);
   assert.deepEqual(detectInternalLabels('nothing here (FEAT-1) (#141)'), []);
   assert.deepEqual(detectInternalLabels(''), []);
@@ -18978,7 +18997,19 @@ test('changelog-classify snapshot: 11 versions lock to expected section/basis', 
 
   // every release is represented (regression: a dropped version goes unnoticed).
   const versions = new Set(entries.map((e) => e.version));
-  for (const v of ['1.0.0', '1.0.1', '1.1.0', '1.2.0', '1.2.1', '1.3.0', '1.3.1', '1.3.2', '1.3.3', '1.3.4', '1.4.0']) {
+  for (const v of [
+    '1.0.0',
+    '1.0.1',
+    '1.1.0',
+    '1.2.0',
+    '1.2.1',
+    '1.3.0',
+    '1.3.1',
+    '1.3.2',
+    '1.3.3',
+    '1.3.4',
+    '1.4.0',
+  ]) {
     assert.ok(versions.has(v), `fixture missing version ${v}`);
   }
 
@@ -18996,9 +19027,14 @@ test('changelog-classify snapshot: 11 versions lock to expected section/basis', 
     );
     // surface ID 0: after sanitize, no tracker ID survives but the PR number does.
     const clean = sanitizeTrackerIds(e.title);
-    assert.equal(hasTrackerId(clean), false, `[${e.version}] tracker ID survived sanitize: "${clean}"`);
+    assert.equal(
+      hasTrackerId(clean),
+      false,
+      `[${e.version}] tracker ID survived sanitize: "${clean}"`,
+    );
     const pr = e.title.match(/\(#\d+\)/);
-    if (pr) assert.ok(clean.includes(pr[0]), `[${e.version}] PR number dropped by sanitize: "${clean}"`);
+    if (pr)
+      assert.ok(clean.includes(pr[0]), `[${e.version}] PR number dropped by sanitize: "${clean}"`);
   }
 
   // The fixture claims to hold REAL commit subjects — verify each title exists
@@ -19024,6 +19060,373 @@ test('changelog-classify snapshot: 11 versions lock to expected section/basis', 
   } else {
     console.log('    (note: git history unavailable — skipped verbatim-subject check)');
   }
+});
+
+// ── collect-changelog (T8) ───────────────────────────────────────────────────
+
+suite('collect-changelog: parsePrNumber()');
+
+test('squash subject: trailing (#N)', () => {
+  assert.equal(parsePrNumber('docs: thing (#143)'), 143);
+});
+test('squash subject: last (#N) wins when prose mentions an earlier PR', () => {
+  assert.equal(parsePrNumber('fix: follow-up to #41, done (#142)'), 142);
+});
+test('merge-commit subject', () => {
+  assert.equal(parsePrNumber('Merge pull request #99 from sk-lim19f/feat/x'), 99);
+});
+test('no PR number → null', () => {
+  assert.equal(parsePrNumber('chore: local tweak'), null);
+});
+test('mid-sentence (#N) is NOT a PR ref → null (a direct push is not faked as a PR)', () => {
+  assert.equal(parsePrNumber('docs: explain the (#12) placeholder syntax'), null);
+});
+
+suite('collect-changelog: isMergeBoilerplate()');
+
+test('merge-commit subject is boilerplate', () => {
+  assert.equal(isMergeBoilerplate('Merge pull request #99 from a/b'), true);
+});
+test('squash Conventional subject is NOT boilerplate', () => {
+  assert.equal(isMergeBoilerplate('feat: add x (#99)'), false);
+});
+
+suite('collect-changelog: parseChangelogBlock()');
+
+test('both EN + KO present', () => {
+  const body =
+    '## What\nstuff\n\n## Changelog\n\n- EN: did a thing\n- KO: 무언가 했습니다\n\n## Migration notes\nNone';
+  assert.deepEqual(parseChangelogBlock(body), { en: 'did a thing', ko: '무언가 했습니다' });
+});
+test('literal None → "none"', () => {
+  assert.equal(parseChangelogBlock('## Changelog\n\nNone\n'), 'none');
+});
+test('heading absent → null', () => {
+  assert.equal(parseChangelogBlock('## What\nno changelog section here'), null);
+});
+test('HTML comment instructions are stripped', () => {
+  const body = '## Changelog\n<!-- one EN line + one KO line -->\n- EN: x\n- KO: 엑스\n';
+  assert.deepEqual(parseChangelogBlock(body), { en: 'x', ko: '엑스' });
+});
+test('missing KO → malformed', () => {
+  const r = parseChangelogBlock('## Changelog\n- EN: only english\n');
+  assert.ok(r && r.malformed, 'should be malformed');
+});
+test('empty EN value → malformed (unfilled template)', () => {
+  const r = parseChangelogBlock('## Changelog\n- EN:\n- KO:\n');
+  assert.ok(r && r.malformed, 'should be malformed');
+});
+test('duplicate EN line → malformed', () => {
+  const r = parseChangelogBlock('## Changelog\n- EN: a\n- EN: b\n- KO: 가\n');
+  assert.ok(r && r.malformed, 'should be malformed');
+});
+test('None mixed with EN/KO → malformed', () => {
+  const r = parseChangelogBlock('## Changelog\nNone\n- EN: a\n- KO: 가\n');
+  assert.ok(r && r.malformed, 'should be malformed');
+});
+
+suite('collect-changelog: normalizeIndexTitle()');
+
+test('strips a single trailing (#N)', () => {
+  assert.equal(normalizeIndexTitle('docs: thing (#143)'), 'docs: thing');
+});
+test('strips tracker IDs off the surface', () => {
+  assert.equal(hasTrackerId(normalizeIndexTitle('feat: x FEAT-1 (#5)')), false);
+});
+
+suite('collect-changelog: assembleSections()');
+
+test('groups by section; none/null skip the body but still index + credit', () => {
+  const entries = [
+    {
+      pr: 1,
+      subject: 'feat: a (#1)',
+      section: SECTION.NEW_FEATURES,
+      basis: 'type',
+      author: 'A',
+      handle: 'gh-a',
+      block: { en: 'added a', ko: 'a 추가' },
+    },
+    {
+      pr: 2,
+      subject: 'fix: b (#2)',
+      section: SECTION.BUG_FIXES,
+      basis: 'type',
+      author: 'B',
+      handle: 'gh-b',
+      block: { en: 'fixed b', ko: 'b 수정' },
+    },
+    {
+      pr: 3,
+      subject: 'chore: c (#3)',
+      section: SECTION.CHORES,
+      basis: 'type',
+      author: 'A',
+      handle: 'gh-a',
+      block: 'none',
+    },
+  ];
+  const a = assembleSections(entries);
+  assert.equal(a.sections[SECTION.NEW_FEATURES].en.length, 1);
+  assert.equal(a.sections[SECTION.BUG_FIXES].ko.length, 1);
+  assert.equal(a.sections[SECTION.CHORES].en.length, 0, 'none-block contributes no body line');
+  assert.equal(a.index.length, 3, 'every PR is indexed, incl. the none-block one');
+  assert.deepEqual(a.contributors, ['gh-a', 'gh-b'], 'de-duped, first-seen order');
+});
+test('sanitizes tracker IDs out of body lines', () => {
+  const entries = [
+    {
+      pr: 5,
+      subject: 'feat: x (#5)',
+      section: SECTION.NEW_FEATURES,
+      basis: 'type',
+      author: 'A',
+      handle: 'a',
+      block: { en: 'x FEAT-1', ko: 'x IMPR-2' },
+    },
+  ];
+  const a = assembleSections(entries);
+  assert.equal(hasTrackerId(a.sections[SECTION.NEW_FEATURES].en[0]), false);
+  assert.equal(hasTrackerId(a.sections[SECTION.NEW_FEATURES].ko[0]), false);
+});
+test('merge entry is indexed by titleSource, never its boilerplate subject', () => {
+  const a = assembleSections([
+    {
+      pr: 99,
+      subject: 'Merge pull request #99 from a/x',
+      titleSource: 'feat: shiny thing',
+      section: SECTION.NEW_FEATURES,
+      basis: 'type',
+      author: 'A',
+      handle: 'gh-a',
+      block: null,
+    },
+  ]);
+  assert.equal(a.index[0].title, 'feat: shiny thing');
+});
+test('no verified handle → unresolved (TODO), never a fabricated @author', () => {
+  const a = assembleSections([
+    {
+      pr: 7,
+      subject: 'fix: x (#7)',
+      titleSource: 'fix: x (#7)',
+      section: SECTION.BUG_FIXES,
+      basis: 'type',
+      author: '임상규',
+      handle: null,
+      block: null,
+    },
+  ]);
+  assert.equal(a.contributors.length, 0);
+  assert.deepEqual(a.unresolved, ['임상규']);
+  const md = renderDraft(a);
+  assert.doesNotMatch(md, /@임상규/);
+  assert.match(md, /TODO: add @handle for: 임상규/);
+});
+
+suite('collect-changelog: renderDraft()');
+
+test('emits section model + bare index + Contributors, omits empty sections', () => {
+  const entries = [
+    {
+      pr: 1,
+      subject: 'feat: a (#1)',
+      section: SECTION.NEW_FEATURES,
+      basis: 'type',
+      author: 'A',
+      handle: 'gh-a',
+      block: { en: 'added a', ko: 'a 추가' },
+    },
+  ];
+  const md = renderDraft(assembleSections(entries));
+  assert.match(md, /### New Features/);
+  assert.match(md, /#### English\n- added a \(#1\)/);
+  assert.match(md, /#### 한국어\n- a 추가 \(#1\)/);
+  assert.match(md, /### Changelog\n- #1 feat: a/);
+  assert.match(md, /Contributors: @gh-a/);
+  assert.doesNotMatch(md, /### Bug Fixes/, 'empty section omitted');
+});
+
+suite('collect-changelog CLI');
+
+const COLLECT = join(SCRIPTS, 'collect-changelog.mjs');
+function runCollect(args, extraEnv = {}) {
+  return spawnSync(process.execPath, [COLLECT, ...args], {
+    cwd: REPO,
+    encoding: 'utf-8',
+    env: { ...process.env, ...extraEnv },
+  });
+}
+
+test('--help exits 0 with usage', () => {
+  const r = runCollect(['--help']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /collect-changelog/);
+});
+test('--strict --no-api is a usage error (exit 2)', () => {
+  const r = runCollect(['--strict', '--no-api']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /rejected/);
+});
+test('empty range exits 2 with a message', () => {
+  const r = runCollect(['--range', 'HEAD..HEAD']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /empty range/);
+});
+// Hermetic git repos via --repo so the CLI tests do not depend on the real
+// repo's history (CI uses a shallow clone, so a fixed SHA or HEAD~1 may be
+// absent). Each test builds its own repo and points the collector at it.
+function withGitRepo(setup, fn) {
+  withTmpDir((dir) => {
+    const g = (args) =>
+      spawnSync('git', args, {
+        cwd: dir,
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'T',
+          GIT_AUTHOR_EMAIL: 't@e',
+          GIT_COMMITTER_NAME: 'T',
+          GIT_COMMITTER_EMAIL: 't@e',
+        },
+      });
+    g(['init', '-q']);
+    g(['commit', '--allow-empty', '-qm', 'base']);
+    setup(g, dir);
+    fn(dir, g);
+  });
+}
+
+test('--no-api offline: warns and still drafts an index', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'feat: a thing (#7)']);
+    },
+    (dir) => {
+      const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--no-api']);
+      assert.equal(r.status, 0);
+      assert.match(r.stderr, /--no-api/);
+      assert.match(r.stdout, /- #7 feat: a thing/);
+    },
+  );
+});
+
+test('fake gh success: CLI fills block bodies + @handle from the API', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'feat: a thing (#42)']);
+    },
+    (dir) => {
+      const stub = join(dir, 'gh');
+      // node stub → JSON.stringify handles \n escaping (a bash printf would
+      // inject raw newlines and produce invalid JSON).
+      writeFileSync(
+        stub,
+        '#!/usr/bin/env node\n' +
+          "process.stdout.write(JSON.stringify({author:{login:'tester'},body:'## Changelog\\n- EN: stubbed entry\\n- KO: 스텁 항목\\n'}));\n",
+        { mode: 0o755 },
+      );
+      const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD'], {
+        PATH: `${dir}:${process.env.PATH}`,
+      });
+      assert.equal(r.status, 0);
+      assert.match(r.stdout, /stubbed entry/);
+      assert.match(r.stdout, /스텁 항목/);
+      assert.match(r.stdout, /Contributors: @tester/);
+    },
+  );
+});
+
+test('fake gh failure: flagged as apiError (warn exits 0, strict exits 1), never silent', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'feat: a thing (#42)']);
+    },
+    (dir) => {
+      const stub = join(dir, 'gh');
+      writeFileSync(
+        stub,
+        '#!/usr/bin/env node\nprocess.stderr.write("gh: rate limit exceeded\\n");process.exit(1);\n',
+        { mode: 0o755 },
+      );
+      const env = { PATH: `${dir}:${process.env.PATH}` };
+      const warn = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD'], env);
+      assert.equal(warn.status, 0, 'warn mode tolerates an API failure');
+      assert.match(warn.stderr, /gh API failed/);
+      const strict = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--strict'], env);
+      assert.equal(strict.status, 1, 'strict fails on an API error');
+    },
+  );
+});
+
+test('CLI: merge commit indexed by body PR title; direct-push → TODO not a fake #N', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'Merge pull request #99 from a/x\n\nfeat: shiny thing']);
+      g(['commit', '--allow-empty', '-qm', 'chore: a direct push']);
+    },
+    (dir) => {
+      const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--no-api']);
+      assert.equal(r.status, 0);
+      assert.match(r.stdout, /- #99 feat: shiny thing/);
+      assert.doesNotMatch(r.stdout, /Merge pull request/);
+      assert.match(r.stdout, /TODO: direct push/);
+    },
+  );
+});
+
+test('CLI --strict: a direct-push commit (no PR) exits 1', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'chore: a direct push, no PR']);
+    },
+    (dir) => {
+      // no PR-bearing commit in range → no gh call → strict fails on directPush.
+      const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--strict']);
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /commit with no PR/);
+    },
+  );
+});
+
+test('CLI: no tags and no --range → exit 2 with "no tags found"', () => {
+  withGitRepo(
+    () => {
+      /* leave the repo tagless */
+    },
+    (dir) => {
+      const r = runCollect(['--repo', dir]);
+      assert.equal(r.status, 2);
+      assert.match(r.stderr, /no tags found/);
+    },
+  );
+});
+
+test('CLI --strict: a PR missing its ## Changelog block exits 1', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'feat: a thing (#42)']);
+    },
+    (dir) => {
+      const stub = join(dir, 'gh');
+      writeFileSync(
+        stub,
+        '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({author:{login:"t"},body:"no changelog block here"}));\n',
+        { mode: 0o755 },
+      );
+      const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--strict'], {
+        PATH: `${dir}:${process.env.PATH}`,
+      });
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /no ## Changelog block/);
+    },
+  );
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
