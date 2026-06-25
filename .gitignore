@@ -1,5 +1,11 @@
 # Runtime state — never commit
 .omc/
+
+# Spec-driven working copies. The durable spec lives in the maintainer's wiki
+# (_specs/), not in this public repo. specs/ here is a scratch copy and must
+# never reach git or npm (npm "files" already excludes it; this stops git add).
+specs/
+
 # .claude/ is maintainer-local Claude Code state, not shipped product (the
 # plugin ships via package.json "files": commands/ hooks/ skills/ templates/
 # .claude-plugin/). Personal dev-workflow commands (qa-features, qa-before-ship)

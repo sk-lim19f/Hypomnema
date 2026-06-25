@@ -1,0 +1,54 @@
+{
+  "_comment": "Snapshot fixture for lib/changelog-classify.mjs (changelog-pr-guide T2). Real Conventional-Commit subjects across all 11 released versions, each locked to its expected { section, basis }. Verified by hand against format.md section 3 (tracker-ID first, type second, Chores fallback). Catches reclassification regressions. NOT shipped (tests/ is absent from package.json files). Section keys: new-features | bug-fixes | chores. Basis: tracker | type | fallback. Notable locks: a `feat(...)` commit tagged IMPR-/PRAC- lands in chores (tracker beats type); a `docs(...)` commit tagged ISSUE- lands in bug-fixes. ISSUE-N appears in real 1.3.1 subjects because check-tracker-ids (which blocks ISSUE-N in commit messages) only landed in 1.3.2 (#102).",
+  "entries": [
+    { "version": "1.0.0", "title": "feat: add /hypo:init command and init script (§9-2)", "section": "new-features", "basis": "type" },
+    { "version": "1.0.0", "title": "fix: apply Codex review fixes to /hypo:doctor (§9-3)", "section": "bug-fixes", "basis": "type" },
+
+    { "version": "1.0.1", "title": "feat(init): install slash commands to ~/.claude/commands/hypo with SHA tracking", "section": "new-features", "basis": "type" },
+    { "version": "1.0.1", "title": "fix(uninstall): preserve user-modified slash commands with SHA gate", "section": "bug-fixes", "basis": "type" },
+    { "version": "1.0.1", "title": "docs(readme): document plugin + npm install paths, env precedence, ingest behaviour", "section": "chores", "basis": "type" },
+
+    { "version": "1.1.0", "title": "feat(cli): route `hypomnema <upgrade|doctor|uninstall>` to the right script", "section": "new-features", "basis": "type" },
+    { "version": "1.1.0", "title": "fix(privacy): auto-commit and auto-stage honor .hypoignore", "section": "bug-fixes", "basis": "type" },
+    { "version": "1.1.0", "title": "chore(github): add issue, PR, and security policy templates", "section": "chores", "basis": "type" },
+
+    { "version": "1.2.0", "title": "feat(schema): SCHEMA 2.0 bump + v1→v2 migration report guidance (ADR 0034) (#60)", "section": "new-features", "basis": "type" },
+    { "version": "1.2.0", "title": "fix(feedback-sync): MEMORY projection cross-project pollution (ADR 0031 §4) (#59)", "section": "bug-fixes", "basis": "type" },
+    { "version": "1.2.0", "title": "chore: strip rot-prone references from code comments (Phase 1) (#58)", "section": "chores", "basis": "type" },
+    { "version": "1.2.0", "title": "chore(release): v1.2.0 (#61)", "section": "chores", "basis": "type" },
+
+    { "version": "1.2.1", "title": "feat(skills): add /qa-features and /qa-before-ship dev workflows (#67)", "section": "new-features", "basis": "type" },
+    { "version": "1.2.1", "title": "fix(resume): strip HTML comments + skip _template fallback (placeholder leak) (#68)", "section": "bug-fixes", "basis": "type" },
+    { "version": "1.2.1", "title": "chore(release): v1.2.1 (#69)", "section": "chores", "basis": "type" },
+
+    { "version": "1.3.0", "title": "feat(release): enforce bilingual CHANGELOG + annotated tag at publish-time (#70)", "section": "new-features", "basis": "type" },
+    { "version": "1.3.0", "title": "refactor(feedback-sync): extract per-mode source loaders + byte-identical golden tests (#77)", "section": "chores", "basis": "type" },
+    { "version": "1.3.0", "title": "chore(ci): bump actions/checkout + actions/setup-node to v5 (#73)", "section": "chores", "basis": "type" },
+    { "version": "1.3.0", "title": "fix(close-gate): scope session-close lint to touched files + coherent marker gate (#80)", "section": "bug-fixes", "basis": "type" },
+
+    { "version": "1.3.1", "title": "fix(upgrade): guard manual/npm --apply from double-registering core when plugin is enabled (ISSUE-8) (#98)", "section": "bug-fixes", "basis": "tracker" },
+    { "version": "1.3.1", "title": "docs(resume): correct --hypo-dir resolution-order comment (ISSUE-2) (#93)", "section": "bug-fixes", "basis": "tracker" },
+    { "version": "1.3.1", "title": "ci(release): add GitHub Release step + idempotent publish guard (#92)", "section": "chores", "basis": "type" },
+
+    { "version": "1.3.2", "title": "feat(session-log): shard session logs by day (YYYY-MM-DD.md) (#118)", "section": "new-features", "basis": "type" },
+    { "version": "1.3.2", "title": "fix(lint): resolve vault-convention wikilinks instead of false-flagging them (#121)", "section": "bug-fixes", "basis": "type" },
+    { "version": "1.3.2", "title": "feat(gate): block wiki-internal tracker IDs in OSS-public artifacts (#102)", "section": "new-features", "basis": "type" },
+    { "version": "1.3.2", "title": "chore(docs): scrub wiki-ADR pointers from user-facing docs + scope-gated guard (#111)", "section": "chores", "basis": "type" },
+
+    { "version": "1.3.3", "title": "fix(close): user-close hard gate on session-close marker writers (ADR 0055) (#129)", "section": "bug-fixes", "basis": "type" },
+    { "version": "1.3.3", "title": "fix(close-gate): whitelist close-activity to authoritative artifacts (ADR 0057) (#131)", "section": "bug-fixes", "basis": "type" },
+    { "version": "1.3.3", "title": "chore(commands): make hypo:* descriptions trigger-rich (#127)", "section": "chores", "basis": "type" },
+
+    { "version": "1.3.4", "title": "fix(catalog): dedup template injection + scan-exclude generated root artifacts (#133)", "section": "bug-fixes", "basis": "type" },
+    { "version": "1.3.4", "title": "chore(release): v1.3.4 (#134)", "section": "chores", "basis": "type" },
+
+    { "version": "1.4.0", "title": "feat(feedback): add optional failure_type enum to feedback frontmatter (FEAT-1) (#141)", "section": "new-features", "basis": "tracker" },
+    { "version": "1.4.0", "title": "feat(sync): abort merge conflicts to never leave a half-merged tree (FEAT-17) (#135)", "section": "new-features", "basis": "tracker" },
+    { "version": "1.4.0", "title": "feat(lint): reject invalid-YAML frontmatter + reconcile types with SCHEMA (IMPR-3) (#140)", "section": "chores", "basis": "tracker" },
+    { "version": "1.4.0", "title": "feat(release): README-version floor gate + maintainer release checklist (IMPR-14) (#138)", "section": "chores", "basis": "tracker" },
+    { "version": "1.4.0", "title": "feat(release): assert version consistency + plugin-path smoke (IMPR-12) (#137)", "section": "chores", "basis": "tracker" },
+    { "version": "1.4.0", "title": "feat(audit): stamp session_id/device on session-log shard + index.jsonl (PRAC-17) (#136)", "section": "chores", "basis": "tracker" },
+    { "version": "1.4.0", "title": "refactor(lib): extract shared wikilink resolver to lib/wikilink.mjs (IMPR-13) (#139)", "section": "chores", "basis": "tracker" },
+    { "version": "1.4.0", "title": "chore(release): v1.4.0 (#142)", "section": "chores", "basis": "type" }
+  ]
+}

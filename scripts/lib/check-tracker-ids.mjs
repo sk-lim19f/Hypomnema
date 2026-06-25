@@ -61,6 +61,25 @@ export const BLOCKED_PATTERNS = [
   },
 ];
 
+// The remaining wiki tracker prefixes (FEAT-/IMPR-/PRAC-). These are NOT in
+// BLOCKED_PATTERNS because shipped CODE COMMENTS legitimately cite them for
+// maintainer context (e.g. `// FEAT-17 hardening`), exactly like ADR anchors —
+// blocking them everywhere would flag ~20 real in-code references. They ARE
+// blocked on the PUBLIC RELEASE SURFACE that carries no code: the annotated tag
+// body (the source of the GitHub Release via --notes-from-tag). The CLI applies
+// [...BLOCKED_PATTERNS, ...SURFACE_TRACKER_PATTERNS] only in --tag mode. The
+// CHANGELOG's own surface-ID-0 is held by the section migration + a grep
+// regression test, not by widening this file-scan set (changelog-pr-guide §5).
+// Examples below use `N`, not a real digit, so this file scans clean.
+export const SURFACE_TRACKER_PATTERNS = [
+  { name: 'FEAT-N', label: 'wiki feature-tracker id', re: /\bFEAT-\d+\b/gi },
+  { name: 'IMPR-N', label: 'wiki improvement-tracker id', re: /\bIMPR-\d+\b/gi },
+  { name: 'PRAC-N', label: 'wiki practice-tracker id', re: /\bPRAC-\d+\b/gi },
+];
+
+// The full tracker-ID set for a no-code public surface (the annotated tag body).
+export const TAG_BODY_PATTERNS = [...BLOCKED_PATTERNS, ...SURFACE_TRACKER_PATTERNS];
+
 /**
  * Scan a blob of text against `patterns` (default BLOCKED_PATTERNS). Returns hits:
  *   { pattern, label, match, line, col, lineText }
