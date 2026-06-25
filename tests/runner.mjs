@@ -19273,53 +19273,9 @@ test('empty range exits 2 with a message', () => {
   assert.equal(r.status, 2);
   assert.match(r.stderr, /empty range/);
 });
-test('--no-api offline: warns and still drafts an index', () => {
-  const r = runCollect(['--range', 'HEAD~1..HEAD', '--no-api']);
-  assert.equal(r.status, 0);
-  assert.match(r.stderr, /--no-api/);
-});
-
-// A fixed-SHA range (the #143 squash merge) so the CLI always sees one commit
-// carrying a PR number, independent of any later commits on the branch.
-const PR143_RANGE = 'f6a7144~1..f6a7144';
-
-test('fake gh success: CLI fills block bodies + @handle from the API', () => {
-  withTmpDir((dir) => {
-    const stub = join(dir, 'gh');
-    // node stub → JSON.stringify handles \n escaping (a bash printf would inject
-    // raw newlines and produce invalid JSON).
-    writeFileSync(
-      stub,
-      '#!/usr/bin/env node\n' +
-        "process.stdout.write(JSON.stringify({author:{login:'tester'},body:'## Changelog\\n- EN: stubbed entry\\n- KO: 스텁 항목\\n'}));\n",
-      { mode: 0o755 },
-    );
-    const r = runCollect(['--range', PR143_RANGE], { PATH: `${dir}:${process.env.PATH}` });
-    assert.equal(r.status, 0);
-    assert.match(r.stdout, /stubbed entry/);
-    assert.match(r.stdout, /스텁 항목/);
-    assert.match(r.stdout, /Contributors: @tester/);
-  });
-});
-
-test('fake gh failure: flagged as apiError (warn exits 0, strict exits 1), never silent', () => {
-  withTmpDir((dir) => {
-    const stub = join(dir, 'gh');
-    writeFileSync(
-      stub,
-      '#!/usr/bin/env node\nprocess.stderr.write("gh: rate limit exceeded\\n");process.exit(1);\n',
-      { mode: 0o755 },
-    );
-    const env = { PATH: `${dir}:${process.env.PATH}` };
-    const warn = runCollect(['--range', PR143_RANGE], env);
-    assert.equal(warn.status, 0, 'warn mode tolerates an API failure');
-    assert.match(warn.stderr, /gh API failed/);
-    const strict = runCollect(['--range', PR143_RANGE, '--strict'], env);
-    assert.equal(strict.status, 1, 'strict fails on an API error');
-  });
-});
-
-// Hermetic git repos via --repo so the defect paths are deterministic.
+// Hermetic git repos via --repo so the CLI tests do not depend on the real
+// repo's history (CI uses a shallow clone, so a fixed SHA or HEAD~1 may be
+// absent). Each test builds its own repo and points the collector at it.
 function withGitRepo(setup, fn) {
   withTmpDir((dir) => {
     const g = (args) =>
@@ -19340,6 +19296,71 @@ function withGitRepo(setup, fn) {
     fn(dir, g);
   });
 }
+
+test('--no-api offline: warns and still drafts an index', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'feat: a thing (#7)']);
+    },
+    (dir) => {
+      const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--no-api']);
+      assert.equal(r.status, 0);
+      assert.match(r.stderr, /--no-api/);
+      assert.match(r.stdout, /- #7 feat: a thing/);
+    },
+  );
+});
+
+test('fake gh success: CLI fills block bodies + @handle from the API', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'feat: a thing (#42)']);
+    },
+    (dir) => {
+      const stub = join(dir, 'gh');
+      // node stub → JSON.stringify handles \n escaping (a bash printf would
+      // inject raw newlines and produce invalid JSON).
+      writeFileSync(
+        stub,
+        '#!/usr/bin/env node\n' +
+          "process.stdout.write(JSON.stringify({author:{login:'tester'},body:'## Changelog\\n- EN: stubbed entry\\n- KO: 스텁 항목\\n'}));\n",
+        { mode: 0o755 },
+      );
+      const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD'], {
+        PATH: `${dir}:${process.env.PATH}`,
+      });
+      assert.equal(r.status, 0);
+      assert.match(r.stdout, /stubbed entry/);
+      assert.match(r.stdout, /스텁 항목/);
+      assert.match(r.stdout, /Contributors: @tester/);
+    },
+  );
+});
+
+test('fake gh failure: flagged as apiError (warn exits 0, strict exits 1), never silent', () => {
+  withGitRepo(
+    (g) => {
+      g(['tag', 'v0.0.1']);
+      g(['commit', '--allow-empty', '-qm', 'feat: a thing (#42)']);
+    },
+    (dir) => {
+      const stub = join(dir, 'gh');
+      writeFileSync(
+        stub,
+        '#!/usr/bin/env node\nprocess.stderr.write("gh: rate limit exceeded\\n");process.exit(1);\n',
+        { mode: 0o755 },
+      );
+      const env = { PATH: `${dir}:${process.env.PATH}` };
+      const warn = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD'], env);
+      assert.equal(warn.status, 0, 'warn mode tolerates an API failure');
+      assert.match(warn.stderr, /gh API failed/);
+      const strict = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--strict'], env);
+      assert.equal(strict.status, 1, 'strict fails on an API error');
+    },
+  );
+});
 
 test('CLI: merge commit indexed by body PR title; direct-push → TODO not a fake #N', () => {
   withGitRepo(
