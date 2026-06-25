@@ -235,7 +235,7 @@ Open the PR against `main`. Include:
 
 - **PR title**: Conventional Commits plus a scope, e.g. `feat(feedback): add failure_type enum`. The type drives the CHANGELOG section (see the classification table below).
 - **Merge commit**: the squash-merge subject carries the PR number (`#123`). That is where `#N` comes from, not the PR title. The two conventions stay separate.
-- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`) may appear in your local notes, but never on a public surface: not in the CHANGELOG body, not in a tag annotation, not in a release entry. The only identifier that ships is the PR number `#N`.
+- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`) may appear in your local notes and in source or workflow comments (an internal reference, like an ADR anchor), but never on the published changelog and release surface: not in the CHANGELOG body, not in the PR `## Changelog` block, not in a tag annotation, not in a GitHub Release. The only identifier that ships in those is the PR number `#N`. `check-tracker-ids --tag` gates the tag body; the migration keeps the CHANGELOG body clean.
 
 ### The `## Changelog` block
 
@@ -321,6 +321,8 @@ release version to appear in **both** `README.md` and `README.ko.md`
 (`scripts/check-readme-version.mjs`) — the floor that stops the README reconcile
 from being dropped.
 
+Prerequisite: the changelog collector in step 2 reads merged-PR data through the GitHub CLI, so have `gh` installed and authenticated (`gh auth status`) before you start. It is a maintainer-only release script and is not shipped to npm.
+
 ```bash
 # 1. Bump the version across package.json, plugin.json, marketplace.json,
 #    and templates/hypo-config.md. Takes a concrete semver (not patch/minor/major).
@@ -330,10 +332,14 @@ node scripts/bump-version.mjs <new-semver>   # e.g. 1.2.2 or 1.3.0-rc.1
 #     version-consistency gate stay green (the lock carries the version twice).
 npm install --package-lock-only
 
-# 2. Assemble the new CHANGELOG.md section from the merged PRs' `## Changelog`
-#    blocks (the collector drafts it; see CHANGELOG conventions above). Each
-#    gated section (Highlights / New Features / Bug Fixes / Chores) MUST carry
-#    both a "#### English" and a "#### 한국어" sub-block; check:bilingual enforces it.
+# 2. Draft the new CHANGELOG.md section from the merged PRs' `## Changelog`
+#    blocks (see CHANGELOG conventions above). The collector prints a draft for
+#    the range since the last tag; paste it, then write Highlights and finalize
+#    the wording by hand. --strict fails if any PR lacks a usable block.
+node scripts/collect-changelog.mjs --strict   # maintainer-only; not shipped to npm
+#    Each gated section (Highlights / New Features / Bug Fixes / Chores) MUST
+#    carry both a "#### English" and a "#### 한국어" sub-block; check:bilingual
+#    enforces it.
 $EDITOR CHANGELOG.md
 
 # 3. Reconcile BOTH READMEs — add a v<version> sentence to the rolling version
@@ -357,17 +363,19 @@ git add package.json package-lock.json .claude-plugin/ templates/hypo-config.md 
 git commit -m "chore: release v<version>"
 #    Then open the release PR, pass review + green CI, and squash-merge to main.
 
-# 6. Tag the merge commit with an ANNOTATED tag — never a lightweight tag.
+# 6. Tag the merge commit with an ANNOTATED tag, never a lightweight tag.
 #    Annotation body shape: English summary, then "---" on its own line,
-#    then a Korean summary block.
+#    then a Korean summary block. The GitHub Release republishes this body
+#    verbatim, so keep it on the same public surface as the CHANGELOG: PR
+#    numbers (#N) only, no internal tracker ids (check-tracker-ids --tag gates it).
 git tag -a v<version> -m "$(cat <<'EOF'
-Hypomnema v<version> — <one-line English summary>
+Hypomnema v<version>: <one-line English summary>
 
-<a few lines of English body — what shipped, links, etc.>
+<a few lines of English body: what shipped, links, etc.>
 
 ---
 
-Hypomnema v<version> — <한 줄 한글 요약>
+Hypomnema v<version>: <한 줄 한글 요약>
 
 <몇 줄의 한글 요약 본문.>
 EOF
@@ -376,6 +384,7 @@ EOF
 # 7. Rehearse the release locally (same checks CI runs against the tag)
 node scripts/check-bilingual.mjs --tag v<version>
 node scripts/check-versions.mjs --tag v<version>
+node scripts/check-tracker-ids.mjs --tag v<version>   # no tracker ids leak into the tag body
 npm publish --dry-run --access public   # packs + prepublishOnly, NO registry PUT
 
 # 8. Push the SPECIFIC tag alone — NOT --tags (that would push stale local tags
