@@ -36,10 +36,12 @@ If **claude-learned** is among the targets, the page must be `scope: global` + `
 
 ## Step 2 — List existing feedback (optional)
 
-To check for an existing topic, locate the Hypomnema package root and run:
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
+
+To check for an existing topic, run:
 
 ```bash
-node <package-root>/scripts/feedback.mjs --list [--hypo-dir="<path>"]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/feedback.mjs --list [--hypo-dir="<path>"]
 ```
 
 If a matching topic exists, appending adds a dated entry and bumps `updated:` (classification frontmatter is preserved).
@@ -51,7 +53,7 @@ If a matching topic exists, appending adds a dated entry and bumps `updated:` (c
 Run with `--dry-run` first to preview the generated page, then without it to write. Pass every collected field:
 
 ```bash
-node <package-root>/scripts/feedback.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/feedback.mjs \
   --topic="<slug>" \
   --entry="<one-line rule>" \
   --scope="global|project:<project-id>" \

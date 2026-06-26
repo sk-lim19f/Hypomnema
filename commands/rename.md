@@ -14,9 +14,9 @@ You are running `/hypo:rename`. Move a page or directory and content-aware rewri
 
 ---
 
-## Step 1 — Locate package root
+## Step 1 — Run script
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag.
 
@@ -27,7 +27,7 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 Always run the dry-run (no `--apply`) before writing anything:
 
 ```bash
-node <package-root>/scripts/rename.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/rename.mjs \
   [--hypo-dir="<path>"] \
   --from=<slug|rel|dir> \
   --to=<slug|rel|dir> \
@@ -61,7 +61,7 @@ If the result is `ok: false`:
 Once the user confirms the dry-run looks right, re-run with `--apply`:
 
 ```bash
-node <package-root>/scripts/rename.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/rename.mjs \
   [--hypo-dir="<path>"] \
   --from=<slug|rel|dir> \
   --to=<slug|rel|dir> \

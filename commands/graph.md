@@ -12,9 +12,9 @@ You are running `/hypo:graph`. Generate a link dependency graph from wiki pages.
 
 ---
 
-## Step 1 — Locate package root
+## Step 1 — Run script
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag.
 
@@ -23,7 +23,7 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 ## Step 2 — Run the graph script
 
 ```bash
-node <package-root>/scripts/graph.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/graph.mjs \
   [--hypo-dir="<path>"] \
   [--format=json|mermaid|dot] \
   [--min-edges=<n>]

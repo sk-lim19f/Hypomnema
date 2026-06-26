@@ -11,12 +11,12 @@ You are running `/hypo:verify`. Audit wiki pages for overdue or missing `verify_
 
 ---
 
-## Step 1 — Locate package root and run
+## Step 1 — Run
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 ```bash
-node <package-root>/scripts/verify.mjs [--hypo-dir="<path>"] [--file=<path>]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs [--hypo-dir="<path>"] [--file=<path>]
 ```
 
 Options:

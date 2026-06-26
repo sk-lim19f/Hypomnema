@@ -75,8 +75,10 @@ Content guidance for each slot:
 
 ## Step 3 — Apply the payload
 
+The script paths in this command resolve via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run them as written. If one appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
+
 ```bash
-node <package-root>/scripts/crystallize.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs \
   --apply-session-close \
   --payload=/tmp/hypo-session-close-<YYYY-MM-DD>.json \
   --session-id=<current-session-id> \
@@ -92,6 +94,14 @@ verified close (`ok: true` + clean git tree), it writes the per-session marker
 Stop-chain Layer 3 hook (`hypo-auto-minimal-crystallize`) the session is closed,
 so it stops re-prompting. Omit it only when running crystallize purely for
 synthesis (no session-close intent) — the marker is then simply not written.
+
+> **Source rule for `--session-id`:** use only the main conversation's session id
+> (the id shown in the `[WIKI_AUTOCLOSE]` block reason, or `$CLAUDE_SESSION_ID`).
+> Do NOT extract it from a background task output path or Agent thread (e.g.,
+> `/tmp/.../<uuid>/tasks/...`). A UUID from such a path is a background task id,
+> not the main conversation id. Passing it causes `markerSkipReason:
+> "transcript-unresolved"` or `"no-user-close-signal"` and leaves the Stop-chain
+> open, even though `ok: true`.
 
 **Behavior (option D + lint gates):**
 
@@ -132,8 +142,11 @@ Once `ok: true`, report:
 - ✓ open-questions applied (or skipped if unchanged)
 - ✓ log.md entry appended
 - ✓ post-apply lint clean
+- **marker written?** (required check): if `markerWritten: true`, report "session-close marker written"; if `markerWritten: false`, report "session-close marker NOT written (reason: `<markerSkipReason>`)" and do NOT declare the session "closed" or "complete". A missing marker means the Stop-chain is still open. Instruct the user to re-run with the correct main-conversation `--session-id`.
 
-Then ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+If `markerWritten: true` (or `--session-id` was not passed): ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+
+If `markerWritten: false`: do NOT say "session closed." Say instead: "Files applied and verified (ok: true), but the session-close marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. To fully close: re-run with the correct main-conversation `--session-id`."
 
 If the user says stop, end here. Otherwise continue to Step 5.
 
@@ -141,10 +154,10 @@ If the user says stop, end here. Otherwise continue to Step 5.
 
 ## Step 5 — Surface synthesis candidates
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 ```bash
-node <package-root>/scripts/crystallize.mjs [--hypo-dir="<path>"] [--min-group=2]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs [--hypo-dir="<path>"] [--min-group=2]
 ```
 
 Show the output to the user. If no candidates are found, tell them Hypomnema looks well-connected and no crystallization is needed.
@@ -217,7 +230,7 @@ Show what was created or modified, and offer to run `/hypo:lint` to verify all n
 `--check-session-close` (read-only strict gate, same check PreCompact runs) is still supported as a probe-only verification. Use it when you only want to verify that today's session-close is complete without applying anything:
 
 ```bash
-node <package-root>/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
 ```
 
 It reports any file as `missing` or `stale`. For an actual close, prefer `--apply-session-close --payload=<path>` (Step 3) — it bundles freshness + lint into one gate and is the documented dogfood path. (`parseArgs` only accepts the `--payload=<path>` spelling; a space-separated `--payload <path>` is silently ignored and triggers "payload is required".)

@@ -919,8 +919,36 @@ function applySessionClose(args) {
     for (const a of applied) console.log(`  ✓ wrote ${a}`);
     for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
     if (ok) {
-      console.log('\n✓ session-close verified — all 5 mandatory files fresh, lint clean.');
-    } else {
+      // When the marker was withheld, qualify the success line so a reader scanning
+      // stdout alone cannot mistake "verified" for "fully closed". markerSkipReason
+      // is non-null exactly when args.sessionId is set and the marker did not land.
+      if (markerSkipReason) {
+        console.log(
+          '\n✓ session-close files verified (all 5 mandatory files fresh, lint clean).' +
+            '\n  session NOT fully closed: the Stop-chain marker was not written (see warning below).',
+        );
+      } else {
+        console.log('\n✓ session-close verified — all 5 mandatory files fresh, lint clean.');
+      }
+    }
+    // When ok:true but the session-close marker was NOT written, the Stop-chain
+    // still sees an open session and will re-prompt at the next Stop. Surface this
+    // loudly so neither the human nor a skill-following model reads "ok:true" as
+    // "session fully closed". Gate on markerSkipReason (non-null exactly when
+    // args.sessionId is present and the marker was withheld).
+    if (markerSkipReason) {
+      process.stderr.write(
+        `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
+          `    The 5 mandatory files were applied and verified (ok:true), but the\n` +
+          `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
+          `    closed: the Stop hook will re-prompt until the marker is present.\n` +
+          `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +
+          `    a background task or Agent UUID from a /tmp/... path).\n` +
+          `    Example: crystallize.mjs --apply-session-close --payload=<path>\n` +
+          `             --session-id=<main-conversation-id> --hypo-dir=<path>\n`,
+      );
+    }
+    if (!ok) {
       if (!verification.ok) {
         const bad = [
           ...verification.missing.map((f) => `${f} (missing)`),
