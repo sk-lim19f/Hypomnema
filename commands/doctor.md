@@ -16,9 +16,9 @@ You are running `/hypo:doctor`. Verify the health of the current Hypomnema wiki 
 
 ---
 
-## Step 1 — Locate package root and resolve Hypomnema directory
+## Step 1 — Resolve Hypomnema directory
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag and the script resolves the Hypomnema root automatically: `HYPO_DIR` env → `hypo-config.md` scan → `~/hypomnema` default.
 
@@ -27,7 +27,7 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 ## Step 2 — Run the doctor script
 
 ```bash
-node <package-root>/scripts/doctor.mjs [--hypo-dir="<path>"] [--json]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs [--hypo-dir="<path>"] [--json]
 ```
 
 - `--hypo-dir=<path>` — override Hypomnema root (takes precedence over `HYPO_DIR` env and auto-scan)

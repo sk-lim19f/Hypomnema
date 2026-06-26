@@ -43,10 +43,12 @@ Ask the following questions **one at a time**. Use the default if the user press
 
 ## Step 2a — From Remote (skip wizard) {#step-2a}
 
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
+
 If the user provided `--from-remote <url>`, run:
 
 ```bash
-node <package-root>/scripts/init.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/init.mjs \
   --from-remote="<url>" \
   --hypo-dir="<hypo-dir>" \
   [--no-hooks] \
@@ -62,11 +64,11 @@ node <package-root>/scripts/init.mjs \
 
 ## Step 2 — Run the init script (new wiki)
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 Then run:
 
 ```bash
-node <package-root>/scripts/init.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/init.mjs \
   --hypo-dir="<hypo-dir>" \
   [--no-hooks] \
   [--codex] \

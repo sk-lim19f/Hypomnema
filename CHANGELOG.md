@@ -5,6 +5,32 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-06-26
+
+### Bug Fixes
+
+#### English
+
+- `/hypo:*` commands resolve script paths via `${CLAUDE_PLUGIN_ROOT}` instead of a guessed `<package-root>`, with an `installed_plugins.json` fallback. (#147)
+- `crystallize --apply-session-close` warns when the files verify but the Stop-chain marker was withheld, instead of reading `ok: true` as closed. (#147)
+- `weekly-report` links the observability index only when the page exists, else plain text. (#147)
+
+#### 한국어
+
+- `/hypo:*` 커맨드가 스크립트 경로를 추측한 `<package-root>` 대신 `${CLAUDE_PLUGIN_ROOT}`로 해소하고, `installed_plugins.json` 폴백을 둡니다. (#147)
+- `crystallize --apply-session-close`가 파일은 검증됐는데 Stop-체인 마커가 빠지면 `ok: true`를 닫힘으로 읽지 않고 경고합니다. (#147)
+- `weekly-report`가 observability 인덱스를 페이지가 있을 때만 링크하고, 없으면 일반 텍스트입니다. (#147)
+
+### Changelog
+
+- #147 plugin-root command paths, session-close marker visibility, weekly link guard
+- #146 finalize changelog-pr-guide release flow
+- #145 semi-automatic changelog collector + exclude maintainer scripts from npm
+- #144 document changelog section-model + PR conventions
+- #143 changelog section model + classifier, README humanization
+
+Contributors: @sk-lim19f
+
 ## [1.4.0] - 2026-06-23
 
 ### Highlights

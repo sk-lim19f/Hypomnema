@@ -257,11 +257,10 @@ If a change is user-visible, fill the `## Changelog` block in the PR body with o
 Each version block in `CHANGELOG.md` is ordered, top to bottom:
 
 1. Optional `> [!IMPORTANT]` migration or breaking callout.
-2. Optional `### Highlights`: a maintainer's hand-written top-N, not auto-collected.
-3. `### New Features`, `### Bug Fixes`, `### Chores`: present only when that version has entries of that kind. An empty section is omitted.
-4. `### Changelog`: the PR-link index plus contributors. Always present. Language-neutral.
+2. `### New Features`, `### Bug Fixes`, `### Chores`: present only when that version has a user-relevant entry of that kind. An empty section is omitted. Keep each entry to one compact line; split or trim anything that runs to multiple sentences. Describe only what a user sees: purely internal work (release tooling, contributor docs, a refactor with no user-visible effect) gets no prose entry and lives in the `### Changelog` index alone.
+3. `### Changelog`: the PR-link index plus contributors. Always present. Language-neutral. It lists every merged PR, internal ones included.
 
-At and after the v1.2.0 cutoff, each non-empty gated section (`Highlights`, `New Features`, `Bug Fixes`, `Chores`) splits its content into `#### English` then `#### 한국어`, in that order:
+At and after the v1.2.0 cutoff, each non-empty gated section (`New Features`, `Bug Fixes`, `Chores`) splits its content into `#### English` then `#### 한국어`, in that order:
 
 ```
 ### New Features
@@ -334,12 +333,12 @@ npm install --package-lock-only
 
 # 2. Draft the new CHANGELOG.md section from the merged PRs' `## Changelog`
 #    blocks (see CHANGELOG conventions above). The collector prints a draft for
-#    the range since the last tag; paste it, then write Highlights and finalize
-#    the wording by hand. --strict fails if any PR lacks a usable block.
+#    the range since the last tag; paste it, then finalize the wording by hand,
+#    dropping any entry that is not user-relevant. --strict fails if any PR lacks
+#    a usable block.
 node scripts/collect-changelog.mjs --strict   # maintainer-only; not shipped to npm
-#    Each gated section (Highlights / New Features / Bug Fixes / Chores) MUST
-#    carry both a "#### English" and a "#### 한국어" sub-block; check:bilingual
-#    enforces it.
+#    Each gated section (New Features / Bug Fixes / Chores) MUST carry both a
+#    "#### English" and a "#### 한국어" sub-block; check:bilingual enforces it.
 $EDITOR CHANGELOG.md
 
 # 3. Reconcile BOTH READMEs — add a v<version> sentence to the rolling version

@@ -27,18 +27,20 @@ Do **not** fetch the URL or read the file yet — the privacy guard in Step 2 mu
 
 ## Step 2 — Privacy guard (`.hypoignore`)
 
-Refuse to ingest secrets (`.env`, SSH keys, credentials) before they ever reach `sources/`. Locate the Hypomnema package root and run the guard for **both** the input path and the destination path:
+The script paths below resolve via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run them as written. If one appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
+
+Refuse to ingest secrets (`.env`, SSH keys, credentials) before they ever reach `sources/`. Run the guard for **both** the input path and the destination path:
 
 1. **If the source is a file path**, check it (use an absolute path):
 
    ```bash
-   node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] --check="<absolute-input-path>"
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/ingest.mjs [--hypo-dir="<path>"] --check="<absolute-input-path>"
    ```
 
 2. **Always** check the destination `sources/<slug>.<ext>`:
 
    ```bash
-   node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] --check="sources/<slug>.<ext>"
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/ingest.mjs [--hypo-dir="<path>"] --check="sources/<slug>.<ext>"
    ```
 
 If either command exits non-zero, **stop**: surface the `Refused: ...` message to the user and do not fetch, read, or save the source. The slug check matters because a user could rename a `.env` to an innocuous slug — the destination must still be blocked.
@@ -50,7 +52,7 @@ If either command exits non-zero, **stop**: surface the `Refused: ...` message t
 Run the ingest helper to surface existing orphaned sources:
 
 ```bash
-node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/ingest.mjs [--hypo-dir="<path>"]
 ```
 
 If there are orphaned sources already in `sources/`, ask: "There are N unprocessed sources — do you want to ingest one of those instead?"

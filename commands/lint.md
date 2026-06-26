@@ -14,9 +14,9 @@ You are running `/hypo:lint`. Validate all wiki pages for frontmatter correctnes
 
 ---
 
-## Step 1 — Locate package root
+## Step 1 — Run script
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag and the script resolves the Hypomnema root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
 
@@ -25,7 +25,7 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 ## Step 2 — Run lint
 
 ```bash
-node <package-root>/scripts/lint.mjs [--hypo-dir="<path>"] [--json] [--fix]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/lint.mjs [--hypo-dir="<path>"] [--json] [--fix]
 ```
 
 Options:

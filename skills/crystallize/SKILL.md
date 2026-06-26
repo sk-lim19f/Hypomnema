@@ -76,7 +76,27 @@ reports and re-run until it prints **"Compact-ready"** — that is the signal th
 session is closed. A close-files-only pass is not enough; the real `/compact`
 also blocks on those other checks.
 
-Once it passes, report each item with ✓ and ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+**When using `--apply-session-close --session-id=<id>`** (the payload-driven
+path), the `--session-id` must be the main conversation's session id. Do NOT
+extract it from a background task or Agent output path (e.g., a UUID from
+`/tmp/.../<uuid>/tasks/...`). Such a UUID is a background task id, not the
+main conversation id. Passing the wrong id causes `markerWritten: false` with
+`markerSkipReason: "transcript-unresolved"` or `"no-user-close-signal"`: the
+5 mandatory files are written (ok: true) but the Stop-chain marker is withheld,
+so the session is not actually closed and the Stop hook re-prompts. The correct
+id comes from the `[WIKI_AUTOCLOSE]` block reason or `$CLAUDE_SESSION_ID`.
+
+Once it passes, report each item with ✓:
+- ✓ session-state.md
+- ✓ hot.md (project + root)
+- ✓ session-log entry
+- ✓ open-questions (or skipped if unchanged)
+- ✓ log.md entry
+- **marker written?** (required, if `--apply-session-close --session-id` was used): check `markerWritten` in the JSON output. If `true`, report "session-close marker written." If `false`, do NOT declare the session closed or complete. Instead report: "Files applied and verified (ok: true), but the session-close marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. Re-run with the correct main-conversation `--session-id`."
+
+If `markerWritten: true` (or `--session-id` was not passed), ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+
+If `markerWritten: false`, do NOT say "session closed." Surface the skip reason and instruct a re-run with the correct main-conversation `--session-id` (see the bullet above) before treating the session as closed.
 
 ---
 

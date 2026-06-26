@@ -9041,6 +9041,46 @@ test('--write produces journal/weekly/<YYYY-Www>.md with autonomy score', () => 
   });
 });
 
+test('weekly heuristic wikilink only emitted when _index page exists', () => {
+  withTmpDir((dir) => {
+    const cacheDir = join(dir, '.cache', 'sessions');
+    mkdirSync(cacheDir, { recursive: true });
+    const transcriptPath = join(cacheDir, 'w.jsonl');
+    writeFileSync(transcriptPath, JSON.stringify({ type: 'tool_use', name: 'Grep' }) + '\n');
+    writeFileSync(
+      join(cacheDir, 'index.jsonl'),
+      JSON.stringify({
+        session_id: 'w1',
+        transcript_path: transcriptPath,
+        recorded_at: '2026-05-06T12:00:00Z',
+        cwd: dir,
+      }) + '\n',
+    );
+
+    // (a) target page absent → plain-text fallback, no broken wikilink
+    let r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-W19']);
+    assert.equal(r.status, 0, `weekly-report failed: ${r.stderr}`);
+    assert.ok(
+      !r.stdout.includes('[[pages/observability/_index]]'),
+      'absent target must not emit a wikilink',
+    );
+    assert.ok(
+      r.stdout.includes('`pages/observability/_index.md` (not present in this vault)'),
+      'absent target should fall back to plain text',
+    );
+
+    // (b) target page present → wikilink restored
+    mkdirSync(join(dir, 'pages', 'observability'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'observability', '_index.md'), '# index\n');
+    r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-W19']);
+    assert.equal(r.status, 0, `weekly-report failed: ${r.stderr}`);
+    assert.ok(
+      r.stdout.includes('[[pages/observability/_index]]'),
+      'present target should emit the wikilink',
+    );
+  });
+});
+
 test('autonomy score: clamped to 100 with ingest-heavy session', () => {
   withTmpDir((dir) => {
     const cacheDir = join(dir, '.cache', 'sessions');
@@ -11265,6 +11305,54 @@ test('--apply-session-close --session-id with NO user-close signal → commits p
       existsSync(join(dir, '.cache', 'session-closed-s-apply.marker')),
       false,
       'marker must not land without a user-close signal',
+    );
+  });
+});
+
+test('--apply-session-close text output: markerWritten:false prints loud stderr warning (not silent)', () => {
+  // When the marker gate is withheld (no resolvable transcript), the human-facing
+  // text output (no --json) must print a loud warning to stderr so neither the
+  // user nor a model mis-reads "ok:true" as "session fully closed". This locks in
+  // the observability fix: a missing marker must never be silent.
+  withWiki(null, (dir, today) => {
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] marker-warning text test\n` },
+      log: { entry: `## [${today}] session | test-project: marker-warning text\n` },
+    };
+    const payloadPath = join(dir, '.payload.json');
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    // Run WITHOUT --json so the human text path is exercised.
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-text-warn',
+    ]);
+    assert.equal(r.status, 0, `apply must exit 0 even when marker is withheld: ${r.stderr}`);
+    assert.ok(
+      r.stderr.includes('session-close marker NOT written'),
+      `stderr must contain the marker-not-written warning: ${JSON.stringify(r.stderr)}`,
+    );
+    // The exact skip reason depends on which gate fires first (compact-gate-not-ok
+    // when the precompact gate has a blocker, or transcript-unresolved when the
+    // gate is clean but no transcript is seeded). Both are valid -- what matters
+    // is that any reason is surfaced, not which one.
+    assert.ok(
+      /reason: \w/.test(r.stderr),
+      `stderr must include a non-empty skip reason: ${JSON.stringify(r.stderr)}`,
+    );
+    assert.ok(
+      r.stderr.includes('Stop-chain'),
+      `stderr must mention Stop-chain so the reader knows the session is not closed: ${JSON.stringify(r.stderr)}`,
     );
   });
 });

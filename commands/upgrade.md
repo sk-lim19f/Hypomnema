@@ -12,9 +12,9 @@ You are running `/hypo:upgrade`. Check if the installed Hypomnema wiki is out of
 
 ---
 
-## Step 1 — Locate package root
+## Step 1 — Run script
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag.
 
@@ -23,7 +23,7 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 ## Step 2 — Run upgrade check
 
 ```bash
-node <package-root>/scripts/upgrade.mjs [--hypo-dir="<path>"]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/upgrade.mjs [--hypo-dir="<path>"]
 ```
 
 Show the output verbatim.
@@ -54,7 +54,7 @@ If there is anything to update, ask the user:
 
 - If **yes** → run with `--apply`:
   ```bash
-  node <package-root>/scripts/upgrade.mjs [--hypo-dir="<path>"] --apply
+  node ${CLAUDE_PLUGIN_ROOT}/scripts/upgrade.mjs [--hypo-dir="<path>"] --apply
   ```
 - If **no** → tell the user they can apply later by running `/hypo:upgrade` again.
 

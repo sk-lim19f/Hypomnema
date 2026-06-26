@@ -18,14 +18,14 @@ Ask the user what they want to know if it was not provided in the command invoca
 
 ---
 
-## Step 2 — Locate package root and search
+## Step 2 — Search
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 Run full-text search:
 
 ```bash
-node <package-root>/scripts/query.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/query.mjs \
   --q="<query terms>" \
   [--hypo-dir="<path>"] \
   [--limit=10]

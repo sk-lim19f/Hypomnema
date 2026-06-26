@@ -14,9 +14,9 @@ Definition: [[pages/observability/_index]].
 
 ---
 
-## Step 1 — Locate package root
+## Step 1 — Run script
 
-Locate the Hypomnema package root (the directory containing this file's parent `commands/`).
+The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
 
 If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag.
 
@@ -26,11 +26,11 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 
 - **Per-session view (default)** — show recent sessions with metrics + classification:
   ```bash
-  node <package-root>/scripts/session-audit.mjs [--hypo-dir="<path>"] [--limit=20]
+  node ${CLAUDE_PLUGIN_ROOT}/scripts/session-audit.mjs [--hypo-dir="<path>"] [--limit=20]
   ```
 - **Weekly report (when the user asks for "weekly", "score", or names a week)** — write the report to `journal/weekly/<YYYY-Www>.md` (spec §6.4 SoT):
   ```bash
-  node <package-root>/scripts/weekly-report.mjs [--hypo-dir="<path>"] [--week=YYYY-Www] --write
+  node ${CLAUDE_PLUGIN_ROOT}/scripts/weekly-report.mjs [--hypo-dir="<path>"] [--week=YYYY-Www] --write
   ```
 - **JSON for tooling** — append `--json` to either script.
 
