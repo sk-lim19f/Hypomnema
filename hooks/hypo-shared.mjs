@@ -10,6 +10,7 @@ import {
   readFileSync,
   writeFileSync,
   existsSync,
+  statSync,
   appendFileSync,
   mkdirSync,
   rmSync,
@@ -607,7 +608,15 @@ function closeCandidateSlugs(hypoDir, dates) {
     }
     for (const d of dates) {
       const re = new RegExp('^## \\[' + escapeRegExp(d) + '\\] session \\| (\\S+)', 'gm');
-      for (const m of content.matchAll(re)) slugs.add(m[1]);
+      for (const m of content.matchAll(re)) {
+        // B-1: only real projects are close candidates. A malformed log heading
+        // (`## [d] session | hypomnema:`) or a stale slug yields a ghost token
+        // that no longer maps to a `projects/<slug>/` directory — gating on disk
+        // keeps it out of the dangling-close set. Directory (not bare-exists)
+        // mirrors the apply-path project check (crystallize.mjs:193).
+        const dir = join(projectsDir, m[1]);
+        if (existsSync(dir) && statSync(dir).isDirectory()) slugs.add(m[1]);
+      }
     }
   }
   return slugs;
@@ -771,6 +780,21 @@ function deriveLogTitle(tail) {
 }
 
 /**
+ * Build the canonical root log.md entry for ONE session-log heading. Single
+ * source of truth for the derived-entry format, shared by the global Stop-hook
+ * derive (deriveRootLogEntries) and apply's direct per-close write (B-1), so the
+ * two paths never drift on the `→ [[projects/<slug>/hot]]` pointer or spacing.
+ * `headingTail` is the text AFTER `## [date]` in the authored session-log heading.
+ * @returns {{ heading: string, block: string }} heading = the `## [date] session
+ *   | <slug>` line used for exact-line dedup; block = the full two-line entry.
+ */
+export function rootLogEntry(slug, date, headingTail) {
+  const title = deriveLogTitle(headingTail);
+  const heading = `## [${date}] session | ${slug}` + (title ? ` — ${title}` : '');
+  return { heading, block: `${heading}\n→ [[projects/${slug}/hot]]` };
+}
+
+/**
  * Append any missing root log.md `## [date] session | <slug>` entries derived from
  * each today-active project's session-log heading(s). Idempotent: dedups on the
  * exact generated heading line, so re-running (or a same-day apply that already
@@ -833,11 +857,10 @@ export function deriveRootLogEntries(hypoDir) {
       const headingRe = new RegExp('^#{1,6} \\[' + escapeRegExp(date) + '\\]\\s*(.*)$', 'gm');
       let m;
       while ((m = headingRe.exec(slog)) !== null) {
-        const title = deriveLogTitle(m[1]);
-        const heading = `## [${date}] session | ${slug}` + (title ? ` — ${title}` : '');
+        const { heading, block } = rootLogEntry(slug, date, m[1]);
         if (seenHeadings.has(heading)) continue; // exact-line dedup (log.md + queued)
         seenHeadings.add(heading);
-        additions.push(`${heading}\n→ [[projects/${slug}/hot]]`);
+        additions.push(block);
       }
     }
   }

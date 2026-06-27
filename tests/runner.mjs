@@ -2857,6 +2857,128 @@ test('payload schema: invalid date format → exit 1', () => {
   });
 });
 
+// ── B-1: payload.log optional + apply auto-derives the root log.md entry ──────
+test('B-1: apply without payload.log auto-derives the canonical log.md entry (exit 0)', () => {
+  withWiki(
+    (dir) => {
+      // Pre-apply: log.md carries NO fresh test-project entry, so the absent-log
+      // path must reconstruct it via deriveRootLogEntries (not fail the gate).
+      writeFileSync(join(dir, 'log.md'), `## [2020-01-01] session | old-project\n`);
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      delete payload.log; // optional field omitted (B-1)
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true, `apply must pass with log derived: ${r.stdout}`);
+      const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+      assert.match(
+        log,
+        new RegExp(`^## \\[${today}\\] session \\| test-project`, 'm'),
+        'apply must auto-derive the canonical log.md entry when payload.log is absent',
+      );
+      assert.ok(
+        out.applied.join(' ').includes('log (log.md, derived)'),
+        `derived log slot must be reported applied: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('B-1: apply WITH payload.log keeps the explicit append path (no double-write)', () => {
+  withWiki(
+    (dir) => {
+      writeFileSync(join(dir, 'log.md'), `## [2020-01-01] session | old-project\n`);
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today); // includes log
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+      const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+      // The explicit payload.log line is written once; the derive path is gated
+      // behind `!payload.log`, so it must NOT append a second canonical line.
+      const matches = (log.match(new RegExp(`\\[${today}\\] session \\| test-project`, 'g')) || [])
+        .length;
+      assert.equal(matches, 1, `exactly one test-project entry, got ${matches}:\n${log}`);
+      assert.ok(out.applied.join(' ').includes('log (log.md)'), 'explicit log slot applied');
+      assert.ok(
+        !out.applied.join(' ').includes('derived'),
+        'derive must not run alongside an explicit payload.log',
+      );
+    },
+  );
+});
+
+test('B-1: payload.log present but malformed → exit 1 (fail-loud preserved, not silently derived)', () => {
+  withWiki(
+    (dir) => {
+      writeFileSync(join(dir, 'log.md'), `## [2020-01-01] session | old-project\n`);
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      // A non-canonical log line (no `session | <project>` form). The old
+      // behavior hard-fails verification; with derive gated to the absent path,
+      // that fail-loud must survive — derive must not paper over a bad explicit
+      // entry (codex design review).
+      payload.log = { entry: `## [${today}] not a canonical session line\n` };
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 1, `malformed explicit log must fail loud: ${r.stdout}`);
+    },
+  );
+});
+
+test('B-1: absent payload.log + sessionLog with no dated heading → exit 1 (no silent no-write)', () => {
+  withWiki(
+    (dir, today) => {
+      // An earlier same-day close already satisfies date-level freshness, so the
+      // post-apply verifier alone would NOT catch a current close that derives
+      // nothing. The pre-write guard must fail loud instead of skipping silently.
+      writeFileSync(join(dir, 'log.md'), `## [${today}] session | test-project — first\n`);
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      payload.sessionLog = { entry: `no dated heading here\n` };
+      delete payload.log;
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 1, `must fail loud when nothing is derivable: ${r.stdout}`);
+      assert.match(
+        JSON.stringify(JSON.parse(r.stdout)),
+        /heading to derive the log\.md/,
+        `error must name the un-derivable sessionLog heading: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('B-1: same-day second close without payload.log derives the distinct entry', () => {
+  withWiki(
+    (dir, today) => {
+      // A first close already left a today entry for test-project. Now that
+      // callers no longer hand-write log (SKILL/T6), the absent-log path must
+      // still recover the SECOND close's distinct heading — the derive guard is
+      // entry-level, not "log.md is wholly absent".
+      writeFileSync(join(dir, 'log.md'), `## [${today}] session | test-project — first\n`);
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      payload.sessionLog = { entry: `## [${today}] session | test-project — second\n` };
+      delete payload.log;
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+      const log = readFileSync(join(dir, 'log.md'), 'utf-8');
+      assert.match(log, /session \| test-project — first/, 'first close entry retained');
+      assert.match(
+        log,
+        /session \| test-project — second/,
+        'second same-day close must derive its own distinct root entry',
+      );
+    },
+  );
+});
+
 test('hasLogEntry: project "foo" must NOT match "foo-bar" (W2 boundary regression)', () => {
   // Pre-existing bug in sessionCloseFileStatus that the helper extraction
   // inherited. \b after "foo" matches before "-" (non-word char), so the
@@ -10903,6 +11025,83 @@ test('guard: does NOT derive when the authored close is otherwise incomplete', (
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
     assert.doesNotMatch(log, /session \| beta/, 'no beta entry derived');
     assert.equal(sessionCloseGlobalStatus(dir).ok, false, 'gate still blocks the real gap');
+  });
+});
+
+test('guard: does NOT derive when the session-log heading is the gap (T5 AC)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha is a today close candidate via its log.md entry, but its session-log
+    // carries NO today heading (stale). log.md is therefore not the SOLE gap, and
+    // there is no today heading to derive a line from — derive must return 0.
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, sessionLog: false }]);
+    assert.equal(
+      deriveRootLogEntries(dir),
+      0,
+      'no derive while the session-log heading is missing (guard unmet)',
+    );
+    assert.equal(
+      sessionCloseGlobalStatus(dir).ok,
+      false,
+      'gate still blocks the stale session-log',
+    );
+  });
+});
+
+// ── B-1: closeCandidateSlugs disk-gates log.md slugs (ghost-slug fix) ──────────
+test('B-1: a log.md slug with no projects/<slug>/ dir is not a close candidate', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha is fully closed today; on its own the gate passes.
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today }]);
+    assert.equal(sessionCloseGlobalStatus(dir).ok, true, 'precondition: alpha alone is complete');
+    // A ghost entry (`hypomnema:` has no projects/ directory). Before the disk
+    // gate, closeCandidateSlugs unioned it in and sessionCloseFileStatus reported
+    // it all-missing → the gate false-blocked a finished session.
+    const logPath = join(dir, 'log.md');
+    writeFileSync(logPath, readFileSync(logPath, 'utf-8') + `## [${today}] session | hypomnema:\n`);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, true, 'ghost slug must not be treated as a dangling close');
+    assert.ok(
+      !s.projects.some((p) => p.project === 'hypomnema:'),
+      'ghost slug must not appear in the close-candidate set',
+    );
+  });
+});
+
+test('B-1: a log.md slug that exists as a FILE (not a directory) is excluded', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today }]);
+    // projects/notdir is a regular file, not a project directory.
+    writeFileSync(join(dir, 'projects', 'notdir'), 'x');
+    const logPath = join(dir, 'log.md');
+    writeFileSync(logPath, readFileSync(logPath, 'utf-8') + `## [${today}] session | notdir\n`);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, true, 'a file (not directory) slug must not gate a close');
+    assert.ok(
+      !s.projects.some((p) => p.project === 'notdir'),
+      'file slug excluded from candidates',
+    );
+  });
+});
+
+test('B-1: a real project dir keeps its log.md slug as a close candidate (disk gate keeps reals)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha fully closed; beta has a today log.md entry + real dir but is
+    // INCOMPLETE (no session-state). The disk gate must still include beta so
+    // the gate keeps blocking — the fix excludes ghosts, not real directories.
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      { slug: 'beta', date: today, sessionState: false },
+    ]);
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, false, 'beta is an incomplete real close → gate blocks');
+    assert.ok(
+      s.projects.some((p) => p.project === 'beta'),
+      'real-dir slug stays a candidate',
+    );
   });
 });
 
