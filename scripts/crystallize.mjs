@@ -31,7 +31,7 @@
  *
  * Payload schema:
  *   {
- *     "project":      "<slug>",                       // optional — defaults to resolveActiveProject()
+ *     "project":      "<slug>",                       // REQUIRED — single segment [A-Za-z0-9._-]+ (≥1 alnum, not dot-only), projects/<slug>/ dir must exist (B-3: no recency fallback for apply)
  *     "date":         "YYYY-MM-DD",                   // optional — defaults to today (local)
  *     "sessionState": { "content": "<full file>" },   // overwrite (idempotent: identical bytes → skip)
  *     "projectHot":   { "content": "<full file>" },   // overwrite
@@ -60,7 +60,7 @@
  *     hard-fails regardless of scope.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { existsSync, statSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { join, dirname } from 'path';
 import { hostname } from 'os';
 import { spawnSync } from 'child_process';
@@ -68,6 +68,7 @@ import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
 import { collectPagesCrystallize, extractWikilinks } from './lib/wikilink.mjs';
+import { isValidProjectName } from './lib/project-create.mjs';
 import {
   sessionCloseFileStatus,
   sessionCloseGlobalStatus,
@@ -585,20 +586,48 @@ function applySessionClose(args) {
     process.exit(1);
   }
 
-  // Resolve project: explicit payload.project wins; else fall back to active project.
-  // Done via sessionCloseFileStatus to keep one source of truth (and so a
-  // missing pointer table surfaces the same error shape as --check-session-close).
+  // Resolve project: payload.project is REQUIRED (B-3, close-gate-hardening). The
+  // old recency fallback (payload.project || probe.project) could, on a same-date
+  // root-hot.md tie, resolve a DIFFERENT project than the one the payload's files
+  // belong to — apply would then write the close into the wrong project (silent
+  // data loss). Validate fail-fast, BEFORE the probe is consulted:
+  //   - missing      → no target to write; abort rather than infer.
+  //   - invalid name → reject (non-string, wrong charset, or dot-only) BEFORE the
+  //                    existsSync(join(...)) path build, so a `../`-style value
+  //                    never reaches a path builder (traversal guard — order is
+  //                    the guard). isValidProjectName is SHARED with createProject
+  //                    so apply accepts exactly the namespace the repo can
+  //                    scaffold (A-Za-z0-9._-, single segment) — no narrower.
+  //   - non-existent → projects/<slug>/ absent; abort rather than create.
+  // A payload.project that merely DIFFERS from the inferred active project is NOT an
+  // error — it is surfaced as a stderr note below and the close proceeds.
+  if (payload.project === undefined || payload.project === null) {
+    const msg = 'payload.project is required (apply must not infer the close target project)';
+    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+    process.exit(1);
+  }
+  if (!isValidProjectName(payload.project)) {
+    const msg = `payload.project ${JSON.stringify(payload.project)} is not a valid project name (single segment, charset A-Za-z0-9._-, ≥1 alnum, not "."/"..")`;
+    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+    process.exit(1);
+  }
+  // existsSync alone is not enough: a regular FILE at projects/<slug> would pass,
+  // then apply would build child paths under it and fail with an unstructured
+  // filesystem error (codex re-review). Require it to be a directory.
+  const projectDir = join(args.hypoDir, 'projects', payload.project);
+  if (!existsSync(projectDir) || !statSync(projectDir).isDirectory()) {
+    const msg = `payload.project "${payload.project}" does not exist as a directory (no projects/${payload.project}/ directory)`;
+    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+    process.exit(1);
+  }
+  const project = payload.project;
+  // probe (the recency-inferred active project) is now consulted ONLY to surface a
+  // divergence note — never to resolve the target. Computed AFTER validation so a
+  // malformed/missing payload.project fails fast without a pointer-table read.
   // Resolved BEFORE preflight because preflight needs overwrite-target paths
   // (which require the project slug) to filter out errors in files this apply
   // is about to replace — see the filter rationale below.
   const probe = sessionCloseFileStatus(args.hypoDir);
-  const project = payload.project || probe.project;
-  if (!project) {
-    const msg =
-      'no project resolved (payload.project missing and root hot.md has no active-project row)';
-    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
-    process.exit(1);
-  }
   // The freshness verification below (and at the post-apply check) already honors
   // payload.project — `project` wins over the inferred active project, and the
   // post-apply sessionCloseFileStatus call passes it as projectOverride. But when the
@@ -606,7 +635,7 @@ function applySessionClose(args) {
   // (probe.project), that divergence used to be silent, so an operator couldn't tell
   // which project the close actually verified. Surface it on stderr (the stdout JSON
   // contract is untouched) so the verified/closed project is always explicit.
-  if (payload.project && probe.project && probe.project !== payload.project) {
+  if (probe.project && probe.project !== payload.project) {
     process.stderr.write(
       `note: payload.project="${payload.project}" differs from the inferred active ` +
         `project "${probe.project}"; verifying and closing "${payload.project}".\n`,

@@ -2685,6 +2685,116 @@ test('session-close: post-apply verify follows payload.project on same-date tie 
   );
 });
 
+// B-3 (close-gate-hardening): apply must NOT infer the close target from recency.
+// payload.project is REQUIRED and validated (slug shape + on-disk existence) so a
+// same-date root-hot.md tie can never silently write the close into the wrong
+// project. Each guard fails fast with a distinct, named error.
+test('apply: payload.project missing → exit 1 (B-3 data-loss guard)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    delete payload.project;
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `missing project must hard-fail: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.match(
+      out.error,
+      /payload\.project is required/,
+      `error must name the missing field: ${r.stdout}`,
+    );
+  });
+});
+
+test('apply: payload.project malformed name → exit 1 (B-3 traversal/segment guard)', () => {
+  // Path-traversal, separators, whitespace, dot-only: all rejected BEFORE any
+  // existsSync/path build, so a `../`-style value never reaches a path builder.
+  for (const bad of ['../escape', 'a/b', 'has space', '..', '.']) {
+    withWiki(null, (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      payload.project = bad;
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 1, `malformed name "${bad}" must hard-fail: ${r.stdout}\n${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.match(
+        out.error,
+        /not a valid project name/,
+        `error must flag name validity for "${bad}": ${r.stdout}`,
+      );
+    });
+  }
+});
+
+test('apply: payload.project non-string → exit 1 (B-3 regex-coercion guard)', () => {
+  // A JS regex coerces non-strings (42 → "42"); isValidProjectName's typeof guard rejects first.
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.project = 42;
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `non-string project must hard-fail: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.match(
+      out.error,
+      /not a valid project name/,
+      `error must reject non-string project: ${r.stdout}`,
+    );
+  });
+});
+
+test('apply: wide-charset valid name (A-Z/_/.) not rejected as malformed (B-3 namespace parity)', () => {
+  // createProject accepts the namespace A-Za-z0-9._- (single segment). Apply must
+  // accept exactly that, not a narrower one — else an existing Foo_Bar / foo.bar
+  // project can be scaffolded and resumed but never closed (codex review). A
+  // non-existent such name must fail as "does not exist", NOT "not a valid name".
+  for (const name of ['Foo_Bar', 'foo.bar']) {
+    withWiki(null, (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      payload.project = name;
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 1, `non-existent dir still fails, got ${r.status}: ${r.stdout}`);
+      const out = JSON.parse(r.stdout);
+      assert.match(
+        out.error,
+        /does not exist/,
+        `valid wide-charset name must pass name-validity and fail only on existence: ${r.stdout}`,
+      );
+      assert.doesNotMatch(
+        out.error,
+        /not a valid project name/,
+        `valid wide-charset name must NOT be rejected as malformed: ${r.stdout}`,
+      );
+    });
+  }
+});
+
+test('apply: payload.project does not exist on disk → exit 1 (B-3)', () => {
+  // A well-formed slug with no projects/<slug>/ directory: abort rather than create.
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.project = 'ghost-project';
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `non-existent project must hard-fail: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.match(out.error, /does not exist/, `error must flag the missing dir: ${r.stdout}`);
+  });
+});
+
+test('apply: payload.project is a regular file, not a directory → exit 1 (B-3 dir guard)', () => {
+  // A valid-name slug whose projects/<slug> is a FILE (not a dir) must be rejected
+  // structurally here, not crash later building child paths (codex re-review).
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.project = 'filenode';
+    writeFileSync(join(dir, 'projects', 'filenode'), 'not a dir\n');
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `file-at-path must hard-fail: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.match(
+      out.error,
+      /does not exist as a directory/,
+      `error must flag the non-directory: ${r.stdout}`,
+    );
+  });
+});
+
 test('same-day second close: distinct entries are both appended (W1 regression)', () => {
   // Sub-session within the same day must produce a second log entry, not be
   // silently deduped because today's heading already exists — exact-entry dedup

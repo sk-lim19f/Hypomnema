@@ -32,7 +32,7 @@ These are judgment calls; when uncertain, surface the question rather than skip 
 
 The session-close path is **payload-driven**. Instead of writing the 5 mandatory files one-by-one, you compose a single JSON payload that describes the full session-close state, then hand it to `crystallize.mjs --apply-session-close`, which performs idempotent atomic writes and gates the result with lint.
 
-Payload shape (5 required + 1 conditional, per Spec §5.2.7 / §8.3 + ADR 0029):
+Payload shape (`project` + 5 content fields required, 1 conditional, per Spec §5.2.7 / §8.3 + ADR 0029):
 
 ```json
 {
@@ -51,7 +51,7 @@ Payload shape (5 required + 1 conditional, per Spec §5.2.7 / §8.3 + ADR 0029):
 
 Field rules:
 
-- `project` — optional. Falls back to the active project from root `hot.md` pointer table.
+- `project`: **required**. Slug of the project being closed (matches a `projects/<slug>/` directory). Must be a single path segment, charset `A-Za-z0-9._-`, with at least one alphanumeric and not a dot-only name (`.`, `..`, `...`). Apply never infers the target from recency; a same-date pointer-table tie could otherwise write the close into the wrong project (B-3). A missing, malformed, or non-existent value fails the apply before any write.
 - `date` — optional. Defaults to today (local). Must be `YYYY-MM-DD` if supplied.
 - `openQuestions` — optional. Include only when `pages/open-questions.md` exists and changed this session.
 - All other top-level fields are required.

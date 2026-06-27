@@ -90,13 +90,31 @@ export function insertHotRow(content, name, today) {
  * @param {{hypoDir: string, name: string, workingDir: string, started?: string, today?: string}} opts
  * @returns {{created: string[], skipped: string[], warnings: string[], projectDir: string}}
  */
+/**
+ * A project name must be a SINGLE path segment with at least one alnum. The
+ * charset alone is not enough: `.`, `..`, `...` all pass `[A-Za-z0-9._-]+` yet
+ * would resolve `projects/<name>` to the wiki root or `projects/` itself (codex
+ * review 2026-05-22, both workers) — so dot-only names are rejected and ≥1 alnum
+ * required. The leading `typeof` guard lets non-CLI callers (e.g. a JSON payload
+ * where the value could be a number) reuse this without a JS regex coercing a
+ * non-string into a "valid" name. Shared so the apply path (crystallize.mjs B-3)
+ * accepts exactly the namespace createProject can scaffold — no wider, no narrower.
+ *
+ * @param {unknown} name
+ * @returns {boolean}
+ */
+export function isValidProjectName(name) {
+  return (
+    typeof name === 'string' &&
+    /^[A-Za-z0-9._-]+$/.test(name) &&
+    !/^\.+$/.test(name) &&
+    /[A-Za-z0-9]/.test(name)
+  );
+}
+
 export function createProject(opts) {
   const { name, workingDir } = opts;
-  // Name must be a single path segment with at least one alnum. The charset
-  // alone is not enough: `.`, `..`, `...` all pass `[A-Za-z0-9._-]+` yet would
-  // resolve `projects/<name>` to the wiki root or `projects/` itself (codex
-  // review 2026-05-22, both workers). Reject dot-only names and require alnum.
-  if (!name || !/^[A-Za-z0-9._-]+$/.test(name) || /^\.+$/.test(name) || !/[A-Za-z0-9]/.test(name)) {
+  if (!isValidProjectName(name)) {
     throw new Error(
       `invalid project name: ${JSON.stringify(name)} (need a single segment with ≥1 alnum, charset A-Za-z0-9._-, not "."/"..")`,
     );
