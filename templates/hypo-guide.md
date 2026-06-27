@@ -95,7 +95,10 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    guarantee: the live gate can still differ on a context-≥70% prompt,
    `HYPO_SKIP_GATE`, or a transcript-scoped lint error — pass `--transcript-path`
    to include the last.) Pass `--session-id=<id>` to also see `marker_present`
-   (step 7).
+   (step 7). `--project=<slug>` narrows the check to one project (a scoped
+   diagnostic, JSON `scope: "project"`): green there means only that slug is
+   close-complete, **not** that `/compact` is globally unblocked. Use the plain
+   check for the go/no-go signal.
 7. Record the session-closed marker (ADR 0047). The Stop hook blocks until this
    session's per-session marker exists, and a hand-edit close (writing the files
    directly + committing) never writes it; the marker is written only by the

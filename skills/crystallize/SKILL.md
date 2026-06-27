@@ -76,6 +76,13 @@ reports and re-run until it prints **"Compact-ready"** — that is the signal th
 session is closed. A close-files-only pass is not enough; the real `/compact`
 also blocks on those other checks.
 
+Optional `--project=<slug>` narrows the check to ONE project (close status plus
+lint scope). It is a project-scoped **diagnostic**, not the compact-ready
+signal. A green `--project` result (JSON `scope: "project"`) means only that
+project is close-complete; another today-active project can still block
+`/compact`. Use the plain `--check-session-close` (no `--project`) for the
+go/no-go close signal.
+
 **When using `--apply-session-close --session-id=<id>`** (the payload-driven
 path), the `--session-id` must be the main conversation's session id. Do NOT
 extract it from a background task or Agent output path (e.g., a UUID from
