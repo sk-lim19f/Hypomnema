@@ -12570,6 +12570,25 @@ test('--check-session-close --session-id reports marker presence without alterin
   });
 });
 
+test('--check-session-close text output: marker-absent recovery is a runnable node command, not a bare bin', () => {
+  withWiki(null, (dir) => {
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--session-id=s-recover',
+    ]);
+    // ISSUE-40: `crystallize` is a package.json bin not on PATH in a plugin
+    // install. The marker-absent recovery line must spell out a runnable
+    // `node <pkg>/scripts/crystallize.mjs --mark-session-closed ...`.
+    assert.ok(
+      /Run `node "\S*crystallize\.mjs" --mark-session-closed --session-id=s-recover`/.test(
+        r.stdout,
+      ),
+      `recovery command must be a runnable, path-quoted node invocation: ${r.stdout}`,
+    );
+  });
+});
+
 // ── ISSUE-10: --log-only first-class non-project close path ───────────────────
 suite('crystallize.mjs --mark-session-closed --log-only (ISSUE-10)');
 
@@ -12810,6 +12829,12 @@ test('Stop hook: close gate green but marker absent → precise "close gate gree
       `a green gate must produce the precise marker-missing message: ${out.reason}`,
     );
     assert.ok(/--mark-session-closed/.test(out.reason), 'message must give the exact mark command');
+    // ISSUE-40: the marker command must be a runnable `node <pkg>/.../crystallize.mjs`
+    // invocation, never a bare `crystallize` bin (not on PATH in a plugin install).
+    assert.ok(
+      /node "\S*crystallize\.mjs" --mark-session-closed/.test(out.reason),
+      `marker command must be a runnable, path-quoted node invocation, not a bare bin (ISSUE-40): ${out.reason}`,
+    );
     assert.ok(out.reason.includes('s-green'), 'message must embed the session_id');
   });
 });

@@ -59,21 +59,33 @@ function emitContinue() {
 }
 
 function emitBlock(sessionId, transcriptPath, gate = null) {
-  // One-line, skill-first. /hypo:crystallize is the documented session-close
-  // alias; passing --session-id there writes the per-session marker that clears
-  // this block. CLI fallback + bypass live in commands/crystallize.md, not here
-  // — keep the Stop reason terse so the actionable instruction stands out.
-  // Surface the transcript path so the close can pass --transcript-path=<path>,
-  // which scopes the marker's lint gate to this session's own files (Bug A
-  // coherence: a marker written without lint would only let Stop pass for
-  // /compact to immediately re-block on the same errors).
-  const transcriptHint = transcriptPath ? ` --transcript-path=${transcriptPath}` : '';
-  const markCmd = `crystallize --mark-session-closed --session-id=${sessionId}${transcriptHint}`;
+  // One-line recovery action. The gate-precise branches below name an EXACT
+  // command so "only the marker is missing" stays a one-shot fix — but that
+  // command must be a runnable `node <pkg>/scripts/crystallize.mjs` invocation,
+  // never a bare `crystallize` (a package.json `bin` that is NOT on PATH in a
+  // plugin install → `command not found`). When PKG_ROOT is
+  // unresolved we cannot build that path, so fall back to the /hypo:crystallize
+  // skill, which resolves its own package root (the same alias the generic
+  // branch uses). Passing --session-id writes the per-session marker that clears
+  // this block. Surface the transcript path so the close can pass
+  // --transcript-path=<path>, which scopes the marker's lint gate to this
+  // session's own files (Bug A coherence: a marker written without lint would
+  // only let Stop pass for /compact to immediately re-block on the same errors).
+  // Quote the paths so the printed command stays copy-paste runnable even when
+  // an install/transcript path contains spaces (display text only — never exec'd
+  // here).
+  const transcriptHint = transcriptPath ? ` --transcript-path="${transcriptPath}"` : '';
+  const cliBase = PKG_ROOT ? `node "${join(PKG_ROOT, 'scripts', 'crystallize.mjs')}"` : null;
+  const markCmd = cliBase
+    ? `${cliBase} --mark-session-closed --session-id=${sessionId}${transcriptHint}`
+    : `/hypo:crystallize (session_id=${sessionId}${transcriptHint})`;
   // The log-only escape hatch for a non-project (wiki/tooling-only)
   // session. Offered ONLY as an explicit alternative when a close blocker is
   // present — never as the default recovery, so a real project session is not
   // taught to bypass the ADR 0043 close invariant (codex design Finding 3).
-  const logOnlyCmd = `crystallize --mark-session-closed --log-only --session-id=${sessionId}${transcriptHint}`;
+  const logOnlyCmd = cliBase
+    ? `${cliBase} --mark-session-closed --log-only --session-id=${sessionId}${transcriptHint}`
+    : `/hypo:crystallize --log-only (session_id=${sessionId}${transcriptHint})`;
   // ADR 0047: refine the message with the read-only /compact gate result.
   // - gate green → the close is compact-ready and ONLY the marker is missing
   //   (the hand-edit close case: files Written + committed directly, bypassing
