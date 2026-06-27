@@ -426,7 +426,15 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
         continue;
       }
       if (!tagVocab.has(tag)) {
-        issue('error', rel, `Unknown tag: "${tag}" (not in SCHEMA.md Tag Vocabulary)`);
+        // W10 (B-4): an unknown but non-forbidden tag is a WARNING, not a hard
+        // error — a session close must never stall on a vocabulary gap. The
+        // crystallize apply path parses these warns (by this exact message
+        // string — load-bearing, see scripts/crystallize.mjs auto-register block)
+        // and registers them into SCHEMA.md's `### Pending` section, so the next
+        // lint sees them as known. W10 is intentionally NOT in STRICT_PROMOTE_IDS:
+        // an unregistered tag is a vocabulary lag, not a content defect, so even
+        // `--strict` keeps it a warning (it only surfaces the id in --json output).
+        issue('warn', rel, `Unknown tag: "${tag}" (not in SCHEMA.md Tag Vocabulary)`, null, 'W10');
       }
     }
   }

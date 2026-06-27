@@ -74,6 +74,7 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
 import { collectPagesCrystallize, extractWikilinks } from './lib/wikilink.mjs';
 import { isValidProjectName } from './lib/project-create.mjs';
+import { appendPendingTags, checkForbidden } from './lib/schema-vocab.mjs';
 import {
   sessionCloseFileStatus,
   sessionCloseGlobalStatus,
@@ -971,6 +972,29 @@ function applySessionClose(args) {
   // on a same-date root-hot.md tie, can pick a different project — false-failing
   // a completed close (the 2026-06-09 security-ops-kb incident).
   const verification = sessionCloseFileStatus(args.hypoDir, { projectOverride: project });
+
+  // B-4 auto-register: lift unknown (non-forbidden) tags surfaced by the PREFLIGHT
+  // lint into SCHEMA.md's `### Pending` section so the post-apply lint sees them as
+  // known and the close never stalls on a vocabulary gap. The W10 id is hidden in
+  // non-strict --json output (lint.mjs toOut), so the unknown-tag warns are matched
+  // and the tag extracted from the message string itself — kept in lockstep with
+  // lint.mjs's W10 emit (a copy-edit there breaks this; the close-path round-trip
+  // test guards it). Forbidden patterns stay hard errors and are filtered out.
+  // SCOPE (eventual consistency, intended): this registers PRE-EXISTING wiki debt
+  // visible at preflight, NOT a novel tag this very close's payload introduces —
+  // that one would surface only at post-apply and lands on the NEXT close. The
+  // contract is "must not stall", which warns (not errors) already satisfy; the
+  // registration just keeps the vocabulary catching up.
+  // The capture is anchored on the FULL message suffix (not `[^"]+`) so a tag that
+  // itself contains a `"` — non-forbidden, so reachable — is captured whole rather
+  // than truncated at its first quote (codex stage-2 CONCERN).
+  const unknownTagRe = /^Unknown tag: "(.+)" \(not in SCHEMA\.md Tag Vocabulary\)/;
+  const pendingTags = [];
+  for (const w of preflightLint.warns || []) {
+    const m = unknownTagRe.exec(w.message || '');
+    if (m && !checkForbidden(m[1])) pendingTags.push(m[1]);
+  }
+  if (pendingTags.length > 0) appendPendingTags(args.hypoDir, pendingTags);
 
   // Post-apply lint: payload may have introduced a malformed body or
   // bad frontmatter. Surface as a distinct `stage` so caller can tell "lint

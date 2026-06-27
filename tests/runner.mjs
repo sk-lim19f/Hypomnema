@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync.mjs';
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
 import { buildProjectSuggestionLine, resolveActiveProject } from '../hooks/hypo-shared.mjs';
-import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
+import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
 import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import {
@@ -7297,15 +7297,19 @@ test('generic tag (todo) → error', () => {
   assert.ok(out.errors.some((e) => e.message.includes('Forbidden tag pattern (generic)')));
 });
 
-test('unknown tag (not in vocab) → error', () => {
+test('unknown tag (not in vocab) → W10 warn, not error (B-4)', () => {
   const { r, out } = lintWithSchema(
     'pages/x.md',
     '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [zzz-unknown]\n---\nbody\n',
   );
-  assert.equal(r.status, 1);
+  assert.equal(r.status, 0, `unknown tag must be a warning, not an error: ${r.stdout}`);
   assert.ok(
-    out.errors.some((e) => e.message.includes('Unknown tag: "zzz-unknown"')),
-    `expected unknown tag error: ${r.stdout}`,
+    out.warns.some((w) => w.message.includes('Unknown tag: "zzz-unknown"')),
+    `expected unknown tag warn: ${r.stdout}`,
+  );
+  assert.ok(
+    !out.errors.some((e) => e.message.includes('Unknown tag')),
+    `unknown tag must not be a hard error: ${r.stdout}`,
   );
 });
 
@@ -7335,9 +7339,12 @@ test('vocab parser excludes prose backticks and Forbidden table examples', () =>
     '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [lint]\n---\nbody\n',
     schema,
   );
-  assert.equal(r.status, 1, `expected error for prose-only tag, got ${r.status}`);
+  // Post B-4 the prose-only tag is an unknown-tag WARNING (not an error), but the
+  // point stands: the parser must not have admitted the prose `lint` token into
+  // the vocabulary, so `lint` is still flagged as unknown.
+  assert.equal(r.status, 0, `prose-only tag is now a warning, got ${r.status}: ${r.stdout}`);
   assert.ok(
-    out.errors.some((e) => e.message.includes('Unknown tag: "lint"')),
+    out.warns.some((w) => w.message.includes('Unknown tag: "lint"')),
     `parser leaked prose token "lint" into vocab: ${r.stdout}`,
   );
 });
@@ -7353,6 +7360,147 @@ test('vocab check skipped when SCHEMA.md absent (back-compat)', () => {
   const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
   rmSync(dir, { recursive: true, force: true });
   assert.equal(r.status, 0, `expected green when SCHEMA.md missing, got ${r.status}: ${r.stdout}`);
+});
+
+// ── B-4: unknown-tag warn (W10) + SCHEMA Pending auto-registration ──────────────
+
+suite('B-4 — unknown-tag warn + auto-register');
+
+test('B-4: unknown tag stays a warning under --strict (W10 not promoted), id exposed', () => {
+  const { r, out } = lintStrict(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [zzz-unknown]\n---\nbody\n',
+  );
+  assert.equal(r.status, 0, `W10 must NOT promote to error under --strict: ${r.stdout}`);
+  assert.ok(
+    out.warns.some((w) => w.id === 'W10' && /Unknown tag: "zzz-unknown"/.test(w.message)),
+    `W10 id must surface in --strict --json: ${r.stdout}`,
+  );
+  assert.ok(
+    !out.errors.some((e) => /Unknown tag/.test(e.message)),
+    `W10 wrongly promoted to error: ${r.stdout}`,
+  );
+});
+
+test('B-4: forbidden tag stays a hard error (not demoted to a warn)', () => {
+  const { r, out } = lintWithSchema(
+    'pages/x.md',
+    '---\ntitle: T\ntype: concept\nupdated: 2026-05-18\ntags: [Jenkins]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1, `forbidden tag must still be an error: ${r.stdout}`);
+  assert.ok(out.errors.some((e) => e.message.includes('Forbidden tag pattern (PascalCase)')));
+});
+
+test('B-4: appendPendingTags round-trips into parseSchemaVocab and is idempotent', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-pending-'));
+  try {
+    writeFileSync(join(dir, 'SCHEMA.md'), VOCAB_SCHEMA);
+    assert.ok(!parseSchemaVocab(dir).has('new-tag-a'), 'precondition: tag absent');
+    const added = appendPendingTags(dir, ['new-tag-a', 'new-tag-b']);
+    assert.deepEqual([...added].sort(), ['new-tag-a', 'new-tag-b']);
+    const vocab = parseSchemaVocab(dir);
+    assert.ok(vocab.has('new-tag-a') && vocab.has('new-tag-b'), 'pending tags not in vocab');
+    assert.ok(vocab.has('wiki') && vocab.has('concept'), 'existing vocab clobbered');
+    // idempotent: a second register of the same tags writes nothing new
+    assert.equal(appendPendingTags(dir, ['new-tag-a', 'new-tag-b']).length, 0, 'not idempotent');
+    // forbidden patterns are filtered out (registering them is pointless)
+    assert.equal(appendPendingTags(dir, ['BadTag']).length, 0, 'forbidden tag registered');
+    assert.ok(!parseSchemaVocab(dir).has('BadTag'), 'forbidden tag leaked into vocab');
+    // edge tags (codex stage-2): a `"` is non-forbidden and must round-trip; a
+    // backtick can't be serialized and is skipped WITHOUT corrupting siblings.
+    assert.deepEqual(appendPendingTags(dir, ['has"quote']), ['has"quote']);
+    assert.ok(parseSchemaVocab(dir).has('has"quote'), 'quote tag did not round-trip');
+    assert.equal(appendPendingTags(dir, ['bad`tick']).length, 0, 'backtick tag must be skipped');
+    assert.ok(!parseSchemaVocab(dir).has('bad`tick'), 'backtick tag leaked into vocab');
+    assert.ok(parseSchemaVocab(dir).has('new-tag-a'), 'sibling tag lost after edge-case calls');
+    // no-op when SCHEMA.md has no Tag Vocabulary header
+    const dir2 = mkdtempSync(join(tmpdir(), 'hypo-pending-novocab-'));
+    writeFileSync(
+      join(dir2, 'SCHEMA.md'),
+      '---\ntitle: S\ntype: schema\n---\n# Schema\n\n## 1. Other\n',
+    );
+    assert.equal(appendPendingTags(dir2, ['x']).length, 0, 'must no-op without a vocab header');
+    rmSync(dir2, { recursive: true, force: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('B-4: appendPendingTags fills a pre-existing empty Pending block (template shape)', () => {
+  // Mirrors the templates/SCHEMA.md shape: an empty `### Pending` (heading +
+  // prose, no data line) sitting before `### Forbidden patterns`. The helper must
+  // seed the data line inside that block, not create a second one.
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-pending-empty-'));
+  try {
+    writeFileSync(
+      join(dir, 'SCHEMA.md'),
+      '---\ntitle: S\ntype: schema\n---\n# Schema\n\n## 4. Tag Vocabulary\n\n' +
+        '**Meta**: `wiki`\n\n### Pending (auto-registered)\n\nAuto-registered tags land here.\n\n' +
+        '### Forbidden patterns\n\n| Pattern | Reason |\n|---|---|\n| PascalCase (`Jenkins`) | x |\n\n## 5. Next\n',
+    );
+    assert.deepEqual(appendPendingTags(dir, ['fresh-tag']), ['fresh-tag']);
+    const vocab = parseSchemaVocab(dir);
+    assert.ok(vocab.has('fresh-tag'), 'tag not added to empty Pending block');
+    assert.ok(vocab.has('wiki'), 'existing vocab lost');
+    assert.ok(!vocab.has('Jenkins'), 'Forbidden table example token leaked into vocab');
+    // exactly one Pending data line (no duplicate block created)
+    const data = readFileSync(join(dir, 'SCHEMA.md'), 'utf-8').match(/^\*\*Pending\b/gm) || [];
+    assert.equal(data.length, 1, 'expected exactly one **Pending** data line');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('B-4: apply-session-close auto-registers a preflight unknown tag; re-lint clean', () => {
+  withWiki(
+    (dir) => {
+      // A SCHEMA with a vocab section (no Pending block yet) + a page carrying an
+      // unknown but well-formed tag → preflight surfaces a W10 warn for it. The
+      // page is OUTSIDE the close payload, so it models PRE-EXISTING wiki debt:
+      // the apply path registers it (eventual consistency), not this close's own
+      // payload tags. Forbidden patterns would stay errors and never reach here.
+      writeFileSync(
+        join(dir, 'SCHEMA.md'),
+        '---\ntitle: SCHEMA\ntype: schema\n---\n# Schema\n\n## 4. Tag Vocabulary\n\n' +
+          '**Meta**: `wiki`, `concept`\n\n## 5. Next\n',
+      );
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(
+        join(dir, 'pages', 'note.md'),
+        '---\ntitle: N\ntype: concept\nupdated: 2026-06-27\ntags: [brand-new-tag]\n---\nbody\n',
+      );
+      // A second page whose tag contains a `"` — non-forbidden, so it reaches the
+      // auto-register path. Proves the message parse captures the WHOLE tag rather
+      // than truncating at the embedded quote (codex stage-2 fix), end to end.
+      writeFileSync(
+        join(dir, 'pages', 'note2.md'),
+        "---\ntitle: N2\ntype: concept\nupdated: 2026-06-27\ntags: ['weird\"tag']\n---\nbody\n",
+      );
+    },
+    (dir, today) => {
+      assert.ok(!parseSchemaVocab(dir).has('brand-new-tag'), 'precondition: tag unknown');
+      const r = runApply(dir, payloadForCleanWiki(dir, today));
+      assert.equal(r.status, 0, `apply must not stall on a vocab gap: ${r.stdout}\n${r.stderr}`);
+      const vocab = parseSchemaVocab(dir);
+      assert.ok(
+        vocab.has('brand-new-tag'),
+        'unknown tag was not auto-registered into SCHEMA Pending',
+      );
+      assert.ok(vocab.has('weird"tag'), 'quote-containing tag truncated, not registered whole');
+      // Drive REAL lint (not just the round-trip helper): neither registered tag
+      // warns — proves the message-string parse and the SCHEMA write agree.
+      const lr = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
+      const lout = JSON.parse(lr.stdout);
+      assert.ok(
+        !lout.warns.some((w) => /Unknown tag: "brand-new-tag"/.test(w.message)),
+        `re-lint still warns on the registered tag: ${lr.stdout}`,
+      );
+      assert.ok(
+        !lout.warns.some((w) => /Unknown tag: "weird"tag"/.test(w.message)),
+        `re-lint still warns on the quote tag: ${lr.stdout}`,
+      );
+    },
+  );
 });
 
 // ── lint.mjs pages/ directory whitelist (B6 — SCHEMA dir typo guard) ─────────
