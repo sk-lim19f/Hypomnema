@@ -61,7 +61,8 @@ When uncertain, surface the question rather than skip it. None of the four block
 3. **hot.md (root)** — update `<wiki-root>/hot.md` active-projects pointer table: set the `Last Session` date for this project to today.
 4. **session-log** — append a session entry to `projects/<name>/session-log/YYYY-MM-DD.md` (daily shard; the apply path creates today's file with seeded frontmatter if it does not exist yet).
 5. **open-questions** — only if `pages/open-questions.md` exists and questions were raised or resolved this session: move resolved ones out; add newly raised ones. Skip if unchanged.
-6. **log.md** — append a `session` entry to `<wiki-root>/log.md`.
+
+> Do **not** hand-write the root `log.md` session entry, and do **not** put a `log` field in the apply payload. The `## [date] session | <project>` entry is a derivable artifact: `--apply-session-close` calls `deriveRootLogEntries` after writing the session-log, reconstructing the canonical line from the session-log heading. (Supply `log` only for a deliberately custom line; it is now an optional payload field.)
 
 After completing the checklist, verify it before reporting:
 

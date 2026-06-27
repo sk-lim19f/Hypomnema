@@ -42,7 +42,7 @@
  *     "projectHot":   { "content": "<full file>" },   // overwrite
  *     "rootHot":      { "content": "<full file>" },   // overwrite
  *     "sessionLog":   { "entry":   "## [date] ..." }, // append, skip if heading already present
- *     "log":          { "entry":   "## [date] session | <project> ..." }, // append, skip if entry present
+ *     "log":          { "entry":   "## [date] session | <project> ..." }, // OPTIONAL (B-1): omit it and apply derives the root log.md entry from this close's sessionLog heading; supply it only for a deliberately custom log line
  *     "openQuestions":{ "content": "<full file>" }    // optional overwrite
  *   }
  *
@@ -85,6 +85,7 @@ import {
   sessionLogShardPath,
   sessionLogReadCandidates,
   sessionLogScopePath,
+  rootLogEntry,
   resolveTranscriptBySessionId,
   hasUserCloseSignal,
   commitWikiChanges,
@@ -444,18 +445,19 @@ function todayLocal() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-// Spec §5.2.7 / §8.3 + ADR 0029: 5 mandatory + 1 conditional. The payload
-// shape MUST mirror that contract — missing a mandatory field is a payload
-// bug, not a no-op. Caller is the LLM session-close flow, which composes the
-// payload deliberately; partial payloads must fail loudly so caller fixes them
-// rather than silently relying on yesterday's freshness state. (Codex review
-// of the apply path — Worker 1 finding 1.)
+// Spec §5.2.7 / §8.3 + ADR 0029: 4 mandatory + 2 optional (`log`, `openQuestions`).
+// The payload shape MUST mirror that contract — missing a mandatory field is a
+// payload bug, not a no-op. Caller is the LLM session-close flow, which composes
+// the payload deliberately; partial payloads must fail loudly so caller fixes
+// them rather than silently relying on yesterday's freshness state. (Codex review
+// of the apply path — Worker 1 finding 1.) `log` left the mandatory set in B-1:
+// the root log.md entry is a DERIVABLE artifact (rootLogEntry over this close's
+// sessionLog heading), so apply auto-fills it when the field is absent.
 const REQUIRED_PAYLOAD_FIELDS = [
   ['sessionState', 'content'],
   ['projectHot', 'content'],
   ['rootHot', 'content'],
   ['sessionLog', 'entry'],
-  ['log', 'entry'],
 ];
 
 function validatePayloadShape(payload) {
@@ -481,6 +483,11 @@ function validatePayloadShape(payload) {
       typeof payload.openQuestions.content !== 'string'
     ) {
       errs.push('payload.openQuestions, when present, must be { content: string }');
+    }
+  }
+  if (payload.log !== undefined) {
+    if (!payload.log || typeof payload.log !== 'object' || typeof payload.log.entry !== 'string') {
+      errs.push('payload.log, when present, must be { entry: string }');
     }
   }
   if (payload.date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(payload.date))) {
@@ -740,6 +747,23 @@ function applySessionClose(args) {
   }
   const date = payload.date || todayLocal();
 
+  // B-1 derive precondition: when `log` is omitted, apply reconstructs the root
+  // log.md entry from THIS close's sessionLog heading. If sessionLog.entry has no
+  // `## [<date>] …` heading there is nothing to derive — and on a same-day SECOND
+  // close the date-level freshness verifier would still pass on the earlier
+  // close's entry, so the no-write would slip through as ok:true. Fail loud here,
+  // before any writes (codex pre-commit review).
+  if (
+    !payload.log &&
+    !new RegExp(`^#{1,6} \\[${date}\\]`, 'm').test(payload.sessionLog.entry || '')
+  ) {
+    const msg =
+      `payload.sessionLog.entry has no "## [${date}] …" heading to derive the log.md ` +
+      `entry from. Give it a dated heading, or supply payload.log explicitly.`;
+    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+    process.exit(1);
+  }
+
   // Preflight: lint the wiki BEFORE writing any payload bytes. If lint
   // has blockers (errors) in files this apply WON'T overwrite, the wiki is in
   // a degraded state and apply would mask the root cause — abort fail-fast.
@@ -902,13 +926,43 @@ function applySessionClose(args) {
     }
   }
 
-  {
+  // log.md: `payload.log` is OPTIONAL (B-1). When the caller supplies it, keep
+  // the explicit appendIfAbsent path (backward-compat: a custom log line, with
+  // the same idempotent dedup). When it is ABSENT, the root log.md entry is a
+  // DERIVABLE artifact: reconstruct the canonical `## [date] session | <project>`
+  // line directly from THIS close's session-log heading (`payload.sessionLog`),
+  // not by re-reading the session-log files. Deriving from the payload is what
+  // makes the per-close entry exact: a same-day second close lands its distinct
+  // heading, and a hybrid daily/monthly session-log split can't hide it (apply
+  // never reads those files for this). The global scan-based deriveRootLogEntries
+  // (the Stop hook) still backfills OTHER projects; calling it here would either
+  // miss the current entry (single-candidate read) or, with a loosened guard,
+  // append onto a deliberately custom payload.log (codex pre-commit review). The
+  // two payload paths are mutually exclusive: deriving on top of a present-but-
+  // malformed payload.log would mask it and weaken the verifier's fail-loud.
+  if (payload.log) {
     const wrote = appendIfAbsent(
       join(args.hypoDir, 'log.md'),
       payload.log.entry,
       entryAlreadyPresent(payload.log.entry),
     );
     (wrote ? applied : skipped).push('log (log.md)');
+  } else {
+    // matchAll (not exec) mirrors deriveRootLogEntries: a payload that carried
+    // more than one dated heading derives one canonical line each, symmetric with
+    // the global path. Exact-line dedup on the heading keeps a second apply (or a
+    // titleless vs titled same-day pair) from duplicating.
+    const logFull = join(args.hypoDir, 'log.md');
+    const headingRe = new RegExp(`^#{1,6} \\[${date}\\]\\s*(.*)$`, 'gm');
+    let wroteAny = false;
+    for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
+      const { heading, block } = rootLogEntry(project, date, m[1]);
+      const wrote = appendIfAbsent(logFull, block, (c) =>
+        (c || '').split(/\r?\n/).includes(heading),
+      );
+      wroteAny = wroteAny || wrote;
+    }
+    (wroteAny ? applied : skipped).push('log (log.md, derived)');
   }
 
   // Same-date-tie fix: verify against the SAME project this apply just wrote
