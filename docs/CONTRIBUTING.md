@@ -217,13 +217,20 @@ Before opening:
 4. If you changed a template or `init` flow, a fresh `init` produces the expected vault structure.
 5. README / ARCHITECTURE / docs are updated to match.
 
-Open the PR against `main`. Include:
+Open the PR against `main`. The body is **bilingual**: write the full description twice, once under a `# English` heading and once under a `# 한국어` heading, each carrying the same sections. The `## Changelog` and `## Checklist` blocks are language-neutral, so they appear once, after both language blocks. Do **not** add any tool-attribution footer (no "Generated with ..." line) to the body.
 
-- **What changed** — short summary
-- **Why** — the user-visible motivation
-- **Manual verification steps** — anything the test suite cannot cover
+Each language block includes:
+
+- **What changed** / **변경 내용**: short summary
+- **Why** / **이유**: the user-visible motivation
+- **How** / **방법**: approach notes that aren't obvious from the diff
+- **Manual verification** / **수동 검증**: anything the test suite cannot cover
+- **Migration notes** / **마이그레이션 노트**: if upgrading existing installs needs special handling (else "None")
+
+After both blocks, language-neutral:
+
 - **Changelog**: one English line plus one Korean line if the change is user-visible (see CHANGELOG conventions below)
-- **Migration notes** — if upgrading existing installs needs special handling
+- **Checklist**: the boxes from the PR template
 
 ---
 
