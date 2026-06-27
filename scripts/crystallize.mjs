@@ -92,7 +92,11 @@ import {
   commitWikiChanges,
 } from '../hooks/hypo-shared.mjs';
 
-const LINT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'lint.mjs');
+// This script's own absolute path. Used to print copy-pasteable recovery
+// commands as `node <SELF_SCRIPT> ...` rather than a bare `crystallize` bin,
+// which is not on PATH in a Claude Code plugin install (only in an npm global).
+const SELF_SCRIPT = fileURLToPath(import.meta.url);
+const LINT_SCRIPT = join(dirname(SELF_SCRIPT), 'lint.mjs');
 
 // Spawn lint.mjs --json against `hypoDir` and return parsed result.
 // We shell out instead of refactoring lint.mjs into a library because lint.mjs
@@ -339,7 +343,7 @@ function runSessionCloseCheck(args) {
     console.log(
       markerPresent
         ? `  ✓ session-closed marker present (session_id: ${args.sessionId}).`
-        : `  · session-closed marker absent (session_id: ${args.sessionId}) — the Stop hook will block until it is written. Run \`crystallize --mark-session-closed --session-id=${args.sessionId}${args.transcriptPath ? ` --transcript-path=${args.transcriptPath}` : ''}\`.`,
+        : `  · session-closed marker absent (session_id: ${args.sessionId}) — the Stop hook will block until it is written. Run \`node "${SELF_SCRIPT}" --mark-session-closed --session-id=${args.sessionId}${args.transcriptPath ? ` --transcript-path="${args.transcriptPath}"` : ''}\`.`,
     );
   }
   console.log('');
