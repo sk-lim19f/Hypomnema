@@ -1,7 +1,7 @@
 ---
 title: Hypomnema Config
 type: config
-version: "1.4.1"
+version: "1.4.2"
 created: YYYY-MM-DD
 ---
 
