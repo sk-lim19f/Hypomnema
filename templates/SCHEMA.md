@@ -154,9 +154,11 @@ Edit the feedback page only — never hand-edit the generated
 
 ## 4. Tag Vocabulary
 
-Use lowercase, hyphenated tags. Vocabulary is locked — `lint` blocks unknown tags
-and forbidden patterns (PascalCase, plurals, whitespace, generic words).
-Extend this list (and `~/hypomnema/SCHEMA.md`) before introducing a new tag.
+Use lowercase, hyphenated tags. `lint` hard-blocks forbidden patterns (PascalCase,
+plurals, whitespace, generic words); an unknown but well-formed tag is a warning,
+and a session close auto-registers it into the `### Pending` section below so the
+next lint accepts it. Promote a pending tag into a category here (and in
+`~/hypomnema/SCHEMA.md`) once it has settled.
 
 **Meta**: `wiki`, `index`, `pages`, `home`, `overview`, `guide`, `operations`, `schema`, `reference`, `hypo`, `commands`, `hot-cache`, `migration`
 **Workflow**: `automation`, `hooks`, `observability`, `autonomy`, `wiki-health`, `weekly`
@@ -164,6 +166,12 @@ Extend this list (and `~/hypomnema/SCHEMA.md`) before introducing a new tag.
 **Domain**: `ai`, `dev`, `ops`, `security`, `data`, `design`, `management`
 **Status**: `active`, `completed`, `archived`, `draft`, `stable`, `deprecated`, `needs-review`, `proposed`, `superseded`
 **Content classification**: `learning`, `tip`, `feedback`, `gotcha`, `concept`, `pattern`
+
+### Pending (auto-registered)
+
+Tags auto-registered by a crystallize close because they were not yet in the
+vocabulary above. Review periodically: promote each into a category and delete it
+here, or drop the tag from the page.
 
 ### Forbidden patterns
 
