@@ -875,6 +875,7 @@ const {
   extractTouchedWikiFiles,
   closeFileTargets,
   closeFileTargetsGlobal,
+  closeFileTargetsForProject,
   sessionCloseGlobalStatus,
   deriveRootLogEntries,
   partitionLintScope,
@@ -10611,6 +10612,211 @@ test('regression (ADR 0050): once a daily shard carries today, IT (not the month
       !scope.has(`projects/alpha/session-log/${ym}.md`),
       'the monthly file is no longer the evidence, so it is out of scope (its stale debt does not block)',
     );
+  });
+});
+
+// ── B-3 T2: --project=<slug> override (close-gate-hardening) ──────────────────
+suite('--project=<slug> override (B-3 T2: scoped check + global-gate mark attribution)');
+
+// projectOverride narrows the close status to ONE project, bypassing recency /
+// today-active discovery. Key invariant: a scoped-green status must NOT imply
+// global compact-readiness (the contract caveat behind the redesign).
+test('sessionCloseGlobalStatus(projectOverride): scoped-green while global is red', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha fully closed today; beta today-active but with a dangling session-state.
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      { slug: 'beta', date: today, sessionState: '2020-01-01' },
+    ]);
+    assert.equal(sessionCloseGlobalStatus(dir).ok, false, 'global blocks on beta');
+    const a = sessionCloseGlobalStatus(dir, { projectOverride: 'alpha' });
+    assert.equal(a.ok, true, 'scoped to alpha → green even though beta is dangling');
+    assert.deepEqual(
+      a.projects.map((p) => p.project),
+      ['alpha'],
+      'only alpha reported',
+    );
+    assert.equal(a.project, 'alpha');
+    assert.equal(a.fallback, false);
+    assert.equal(
+      sessionCloseGlobalStatus(dir, { projectOverride: 'beta' }).ok,
+      false,
+      'scoped to beta → red (its own files are stale)',
+    );
+  });
+});
+
+test('sessionCloseGlobalStatus(projectOverride): overrides the recency pick, not just the top hot row', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // alpha is the recency/top row but stale + no today activity; beta is closed.
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: '2020-01-01' },
+      { slug: 'beta', date: today },
+    ]);
+    const s = sessionCloseGlobalStatus(dir, { projectOverride: 'alpha' });
+    assert.equal(s.project, 'alpha', 'override picks alpha regardless of activity');
+    assert.equal(s.ok, false, 'alpha is stale → red');
+  });
+});
+
+test('closeFileTargetsForProject: root baseline + that project only', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today },
+      { slug: 'beta', date: today },
+    ]);
+    const t = closeFileTargetsForProject(dir, 'alpha');
+    assert.ok(t.has('hot.md') && t.has('log.md'), 'root files in scope');
+    assert.ok(
+      t.has('projects/alpha/session-state.md') && t.has('projects/alpha/hot.md'),
+      'alpha files in scope',
+    );
+    assert.ok(
+      [...t].some((f) => /^projects\/alpha\/session-log\//.test(f)),
+      'alpha session-log in scope',
+    );
+    assert.ok(![...t].some((f) => f.includes('projects/beta/')), 'beta files NOT in scope');
+  });
+});
+
+// codex design finding 1 regression: the closeFileTargetsGlobal refactor MUST keep
+// the recency fallback when no project closed today. Dropping it to a root-only
+// scope would make lint narrower than the close status — a false-pass reopener.
+test('closeFileTargetsGlobal: no today-active project → recency-fallback files still in scope (not root-only)', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    // nobody closed today (all old dates); alpha is the recency project.
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: '2020-01-01', hotRow: '2020-01-01' }]);
+    const scope = closeFileTargetsGlobal(dir);
+    assert.ok(scope.has('hot.md') && scope.has('log.md'), 'root baseline present');
+    assert.ok(
+      scope.has('projects/alpha/session-state.md') && scope.has('projects/alpha/hot.md'),
+      `recency fallback must keep alpha's files in scope, got ${JSON.stringify([...scope])}`,
+    );
+  });
+});
+
+suite('crystallize.mjs --project= override (B-3 T2 CLI)');
+
+test('--check-session-close --project=<traversal> → exit 1 (syntax rejected in parseArgs)', () => {
+  withTmpDir((dir) => {
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--project=../etc',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, r.stdout);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.match(out.error, /not a valid project name/);
+  });
+});
+
+test('--check-session-close --project=<absent> → exit 1 (does not exist as a directory)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects'), { recursive: true }); // valid syntax, no ghost dir
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--project=ghost',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, r.stdout);
+    assert.match(JSON.parse(r.stdout).error, /does not exist as a directory/);
+  });
+});
+
+test('--check-session-close --project=<real>: JSON carries scope:project + scoped_project', () => {
+  withCleanWiki((dir) => {
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--project=test-project',
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.scope, 'project', `scope must be project: ${r.stdout}`);
+    assert.equal(out.scoped_project, 'test-project');
+    assert.equal(out.ok, true, 'test-project is fully closed → scoped green');
+  });
+});
+
+test('--check-session-close (no --project): JSON scope is global, no scoped_project', () => {
+  withCleanWiki((dir) => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.scope, 'global');
+    assert.ok(!('scoped_project' in out), 'no scoped_project on the global path');
+  });
+});
+
+test('--mark-session-closed --project=<absent> → exit 1 before the gate (existence check)', () => {
+  withCleanWiki((dir) => {
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      '--session-id=s-ghost',
+      '--project=ghost',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, r.stdout);
+    assert.match(JSON.parse(r.stdout).error, /does not exist as a directory/);
+  });
+});
+
+test('--mark-session-closed --project=<real>: global gate passes + marker attributed to the slug', () => {
+  withCleanWiki((dir) => {
+    const cleanup = seedCloseTranscript('s-attr');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      '--session-id=s-attr',
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.equal(out.project, 'test-project', 'result attributed to --project slug');
+    const marker = JSON.parse(
+      readFileSync(join(dir, '.cache', 'session-closed-s-attr.marker'), 'utf-8'),
+    );
+    assert.equal(marker.project, 'test-project', 'marker carries the attribution slug');
+  });
+});
+
+// log-only marker governs the session → log-only mode wins and --project is
+// IGNORED (no project is checked). The JSON must say so, not imply X was checked.
+test('--check-session-close --project=<X> with a log-only marker → scope:log-only, override ignored', () => {
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-s-logonly.marker'),
+      JSON.stringify({
+        session_id: 's-logonly',
+        project: null,
+        scope: 'log-only',
+        transcript_path: null,
+        closed_at: new Date().toISOString(),
+        verification: 'log-only-close:ok',
+      }) + '\n',
+    );
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--project=test-project',
+      '--session-id=s-logonly',
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.scope, 'log-only', `log-only marker must win: ${r.stdout}`);
+    assert.equal(out.scoped_project, 'test-project');
+    assert.equal(out.project_override_ignored, true);
   });
 });
 

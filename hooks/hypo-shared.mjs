@@ -675,7 +675,29 @@ function hasTodayCloseActivity(hypoDir, project, dates) {
  *            dates: string[], fallback: boolean, primary: string|null,
  *            project: string|null, stale: string[], missing: string[]}}
  */
-export function sessionCloseGlobalStatus(hypoDir) {
+export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
+  // projectOverride (check-only): the caller (`crystallize --check-session-close
+  // --project=<slug>`) wants THIS project's close status, not the recency pick —
+  // bypass discovery and report the single project, preserving the global return
+  // shape. NEVER threaded from a marker-writing path (--mark / apply auto-marker /
+  // PreCompact): those stay global so the marker == compact-ready invariant holds
+  // (ADR 0047, codex design review). A green status here is a project-scoped
+  // diagnostic, not the global compact-readiness verdict.
+  if (opts.projectOverride) {
+    const s = sessionCloseFileStatus(hypoDir, { projectOverride: opts.projectOverride });
+    return {
+      ok: s.ok,
+      projects: s.project
+        ? [{ project: s.project, ok: s.ok, stale: s.stale, missing: s.missing }]
+        : [],
+      dates: freshDates(),
+      fallback: false,
+      primary: s.project,
+      project: s.project,
+      stale: s.stale,
+      missing: s.missing,
+    };
+  }
   const dates = freshDates();
   const recency = resolveActiveProject(hypoDir); // no cwd — close never picks by cwd
   const todayActive = [...closeCandidateSlugs(hypoDir, dates)].filter((p) =>
@@ -1560,23 +1582,40 @@ export function closeFileTargets(hypoDir) {
  * evidence file for EVERY freshDate (not just dates[0]) so the lint scope matches
  * what sessionCloseFileStatus actually checks across a local/UTC date boundary.
  */
+// The lint-scope target set for ONE project's close: the shared root files
+// (hot.md / log.md) plus that project's mandatory close files — session-state,
+// project hot, and each fresh date's session-log evidence file. Used both by
+// `--check-session-close --project=<slug>` (a project-scoped diagnostic — see
+// precompactGateStatus opts.projectOverride) and as the per-project building
+// block of closeFileTargetsGlobal, so the two scopes stay identical per project.
+export function closeFileTargetsForProject(hypoDir, slug) {
+  const dates = freshDates();
+  const out = new Set(['hot.md', 'log.md']);
+  out.add(`projects/${slug}/session-state.md`);
+  out.add(`projects/${slug}/hot.md`);
+  // Scope to the file each date's freshness is PROVEN by (daily shard or, via
+  // fallback, the legacy monthly), so a corrupt evidence file can't pass the
+  // gate while its lint error is demoted to an out-of-scope notice.
+  for (const d of dates) out.add(sessionLogScopePath(hypoDir, slug, d));
+  return out;
+}
+
 export function closeFileTargetsGlobal(hypoDir) {
   const dates = freshDates();
   const out = new Set(['hot.md', 'log.md']);
   let active = [...closeCandidateSlugs(hypoDir, dates)].filter((p) =>
     hasTodayCloseActivity(hypoDir, p, dates),
   );
+  // No project closed today → fall back to the recency project (mirrors
+  // sessionCloseGlobalStatus's own fallback at the top of this file), so the lint
+  // scope never narrows below the close-status scope. Dropping this (root-only
+  // when active=[]) would re-open the very gap closeFileTargetsForProject closes.
   if (active.length === 0) {
     const recency = resolveActiveProject(hypoDir);
     if (recency) active = [recency];
   }
   for (const p of active) {
-    out.add(`projects/${p}/session-state.md`);
-    out.add(`projects/${p}/hot.md`);
-    // Scope to the file each date's freshness is PROVEN by (daily shard or, via
-    // fallback, the legacy monthly), so a corrupt evidence file can't pass the
-    // gate while its lint error is demoted to an out-of-scope notice.
-    for (const d of dates) out.add(sessionLogScopePath(hypoDir, p, d));
+    for (const f of closeFileTargetsForProject(hypoDir, p)) out.add(f);
   }
   return out;
 }
@@ -1629,8 +1668,18 @@ export function partitionLintScope(findings, scope) {
  * opts.transcriptPath to widen it to the session's edited files exactly as the
  * hook does.
  *
+ * opts.projectOverride (CHECK-ONLY) narrows BOTH the close status and the lint
+ * scope to a single project, for `--check-session-close --project=<slug>`. A
+ * green result is then a project-scoped diagnostic, NOT the global compact-ready
+ * verdict (ADR 0046) — the caller must surface the scope. It is NEVER passed from
+ * a marker-writing path (--mark / apply auto-marker / PreCompact); those stay
+ * global so a marker can't attest compact-ready while PreCompact re-checks red
+ * (the marker == compact-ready invariant, ADR 0047 / codex design review). When a
+ * log-only marker governs the session, log-only mode wins and projectOverride is
+ * ignored.
+ *
  * @param {string} hypoDir
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string}} [opts]
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null}} [opts]
  * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
@@ -1693,7 +1742,9 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       });
     }
   } else {
-    close = sessionCloseGlobalStatus(hypoDir);
+    // projectOverride narrows the close status to one project (check-only); a
+    // marker-writing caller never sets it, so the marker path stays global.
+    close = sessionCloseGlobalStatus(hypoDir, { projectOverride: opts.projectOverride });
     if (!close.ok) {
       blockers.push({
         type: 'close',
@@ -1744,8 +1795,16 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // mandatory files in and re-introduce the cross-project attribution. The
       // session's own transcript-touched files are still added below (a log-only
       // session is accountable for the wiki files it actually edited).
+      // Lint scope: explicit opts.lintScope wins; else log-only uses the shared
+      // root files only; else projectOverride narrows to that one project's close
+      // files (matching the narrowed close status above); else the global set.
       const scope = new Set(
-        opts.lintScope || (logOnly ? ['hot.md', 'log.md'] : closeFileTargetsGlobal(hypoDir)),
+        opts.lintScope ||
+          (logOnly
+            ? ['hot.md', 'log.md']
+            : opts.projectOverride
+              ? closeFileTargetsForProject(hypoDir, opts.projectOverride)
+              : closeFileTargetsGlobal(hypoDir)),
       );
       if (opts.transcriptPath && existsSync(opts.transcriptPath)) {
         for (const f of extractTouchedWikiFiles(opts.transcriptPath, hypoDir)) scope.add(f);

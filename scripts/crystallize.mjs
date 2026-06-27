@@ -13,6 +13,11 @@
  *   --hypo-dir=<path>        Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --min-group=<n>          Min pages per tag group to report (default: 2)
  *   --check-session-close    Verify the strict session-close memory files — 5 mandatory + open-questions conditional
+ *   --project=<slug>         Override the recency-inferred project on --check / --mark (single segment
+ *                            [A-Za-z0-9._-]+, projects/<slug>/ must exist). On --check it NARROWS the
+ *                            gate to that one project — a project-scoped diagnostic, NOT a global
+ *                            compact-ready verdict. On --mark it is ATTRIBUTION only; the gate stays
+ *                            global (the marker == compact-ready invariant). Ignored on --apply.
  *   --apply-session-close    Apply a JSON payload that updates the 5 mandatory memory files
  *                            (+ optional open-questions). Idempotent — re-running with the same
  *                            payload is a no-op. Always finishes with the strict gate check.
@@ -134,6 +139,7 @@ function parseArgs(argv) {
     payload: null,
     force: false,
     transcriptPath: null,
+    project: null,
   };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
@@ -145,10 +151,23 @@ function parseArgs(argv) {
     else if (arg.startsWith('--session-id=')) args.sessionId = arg.slice(13);
     else if (arg.startsWith('--payload=')) args.payload = arg.slice(10);
     else if (arg.startsWith('--transcript-path=')) args.transcriptPath = expandHome(arg.slice(18));
+    else if (arg.startsWith('--project=')) args.project = arg.slice(10);
     else if (arg === '--force') args.force = true;
     else if (arg === '--json') args.json = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
+  // --project=<slug> override (check/mark only). Validate the SYNTAX here so a
+  // traversal/charset attack (`--project=../x`) is rejected before any path is
+  // built from it — sessionCloseFileStatus(projectOverride) joins it directly.
+  // isValidProjectName is the SHARED validator (project-create.mjs), so the
+  // override accepts exactly the namespace createProject can scaffold. Existence
+  // (a real projects/<slug>/ directory) is checked in the run functions, where
+  // hypoDir is resolved and only the check/mark paths consume --project.
+  if (args.project != null && !isValidProjectName(args.project)) {
+    const msg = `--project "${args.project}" is not a valid project name (need a single segment with ≥1 alnum, charset A-Za-z0-9._-, not "."/"..")`;
+    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+    process.exit(1);
+  }
   return args;
 }
 
@@ -163,6 +182,20 @@ function parseArgs(argv) {
 // model drops a second `<id>.jsonl` elsewhere the glob returns >1 and fails
 // closed.) `--transcript-path` survives ONLY for `--check-session-close`'s lint
 // scope, which writes no marker and so cannot cause an over-close.
+
+// Validate that an explicit --project=<slug> override names a real project
+// DIRECTORY. Syntax was already checked in parseArgs; this is the existence half,
+// mirroring apply's payload.project check — a regular file or an absent dir at
+// projects/<slug> is a hard error so the override never silently resolves to an
+// all-missing status (which a reader would misread as "exists but incomplete").
+function requireProjectDir(args, slug) {
+  const projectDir = join(args.hypoDir, 'projects', slug);
+  if (!existsSync(projectDir) || !statSync(projectDir).isDirectory()) {
+    const msg = `--project "${slug}" does not exist as a directory (no projects/${slug}/ directory)`;
+    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+    process.exit(1);
+  }
+}
 
 // ── session-close check (spec §5.2.7 / §8.3) ────────────────────────
 // Mirrors the hard gate in hypo-personal-check.mjs so the /hypo:crystallize
@@ -180,8 +213,21 @@ function runSessionCloseCheck(args) {
   // (marker_present:true) while `ok` still reflected the stale active project —
   // the completion-signal trio (PreCompact / --check / marker) would diverge
   // (codex design Finding 2).
+  //
+  // --project=<slug> narrows BOTH the close status and the lint scope to that one
+  // project: a project-scoped DIAGNOSTIC, NOT the global compact-ready verdict
+  // (ADR 0046 caveat below). It is check-only — the marker writers stay global so
+  // the marker == compact-ready invariant holds (ADR 0047). When narrowed, the
+  // transcript widening is suppressed: a transcript touch in some OTHER project
+  // would re-add that project's files to the lint scope and re-block the scoped
+  // check, defeating the point. The global (no --project) check keeps widening.
+  if (args.project) requireProjectDir(args, args.project);
   const status = precompactGateStatus(args.hypoDir, {
-    ...(args.transcriptPath ? { transcriptPath: args.transcriptPath } : {}),
+    ...(args.project
+      ? { projectOverride: args.project }
+      : args.transcriptPath
+        ? { transcriptPath: args.transcriptPath }
+        : {}),
     ...(args.sessionId ? { sessionId: args.sessionId } : {}),
   });
   const close = status.close;
@@ -199,9 +245,18 @@ function runSessionCloseCheck(args) {
   // while /compact's Stop still blocks — the exact incoherence this ADR closes
   // (codex pre-commit CONCERN). readSessionClosedMarker unlinks an invalid
   // marker as it reads, matching the hook's behavior on the next Stop.
-  const markerPresent = args.sessionId
-    ? readSessionClosedMarker(args.hypoDir, args.sessionId) !== null
-    : null;
+  const markerObj = args.sessionId ? readSessionClosedMarker(args.hypoDir, args.sessionId) : null;
+  const markerPresent = args.sessionId ? markerObj !== null : null;
+
+  // Scope of this check (codex design review finding 2 — the scope must be
+  // explicit in JSON + prose, not implied). `global` = the full PreCompact mirror
+  // (green ⇒ compact-ready). `project` = narrowed to --project=<slug> (green ⇒
+  // only THAT project is close-complete, NOT global compact-readiness). When a
+  // log-only marker governs the session, the gate runs in log-only mode and the
+  // --project override is IGNORED — surface that rather than implying X was
+  // checked (it was not).
+  const logOnlyWon = args.project != null && markerObj?.scope === 'log-only';
+  const scope = args.project ? (logOnlyWon ? 'log-only' : 'project') : 'global';
 
   if (args.json) {
     console.log(
@@ -216,6 +271,14 @@ function runSessionCloseCheck(args) {
           blockers: status.blockers,
           notices: status.notices,
           skipped: status.skipped,
+          // scope is additive; `global` keeps prior semantics for existing readers
+          scope,
+          ...(args.project
+            ? {
+                scoped_project: args.project,
+                ...(logOnlyWon ? { project_override_ignored: true } : {}),
+              }
+            : {}),
           ...(args.sessionId ? { session_id: args.sessionId, marker_present: markerPresent } : {}),
         },
         null,
@@ -225,8 +288,20 @@ function runSessionCloseCheck(args) {
     process.exit(status.ok ? 0 : 1);
   }
 
+  if (logOnlyWon) {
+    console.log(
+      `Note: a log-only session-closed marker governs session ${args.sessionId}, so the gate ran in log-only mode and --project=${args.project} was IGNORED (no project was checked).\n`,
+    );
+  } else if (scope === 'project') {
+    console.log(
+      `Note: --project=${args.project} — this is a PROJECT-SCOPED diagnostic, not the global /compact gate. A green result means only ${args.project} is close-complete; another project can still block /compact.\n`,
+    );
+  }
+
   const proj = close.project || '(unresolved)';
-  console.log(`Compact-ready check (project: ${proj}, date: ${close.dates.join(' / ')}):\n`);
+  console.log(
+    `Compact-ready check (${scope === 'global' ? `project: ${proj}` : `scope: ${scope}, project: ${proj}`}, date: ${close.dates.join(' / ')}):\n`,
+  );
 
   const required = close.project
     ? [
@@ -266,11 +341,21 @@ function runSessionCloseCheck(args) {
     );
   }
   console.log('');
-  console.log(
-    status.ok
-      ? '✓ Compact-ready — no PreCompact gate blocker needs a human fix. (open-questions.md: conditional, not checked. The live /compact can still differ on a context-≥70% prompt, HYPO_SKIP_GATE, or a transcript-scoped lint error this check did not see — pass --transcript-path to include the latter.)'
-      : '✗ Not compact-ready — resolve the ✗ items above, then retry. /compact would block on these.',
-  );
+  if (scope === 'project') {
+    // Project-scoped diagnostic: green means ONLY this project is close-complete.
+    // Do NOT claim global compact-readiness (the whole point of the narrow).
+    console.log(
+      status.ok
+        ? `✓ ${args.project} is close-complete (project-scoped). This is NOT a global /compact guarantee — run \`--check-session-close\` without --project for that.`
+        : `✗ ${args.project} is not close-complete — resolve the ✗ items above.`,
+    );
+  } else {
+    console.log(
+      status.ok
+        ? '✓ Compact-ready — no PreCompact gate blocker needs a human fix. (open-questions.md: conditional, not checked. The live /compact can still differ on a context-≥70% prompt, HYPO_SKIP_GATE, or a transcript-scoped lint error this check did not see — pass --transcript-path to include the latter.)'
+        : '✗ Not compact-ready — resolve the ✗ items above, then retry. /compact would block on these.',
+    );
+  }
   process.exit(status.ok ? 0 : 1);
 }
 
@@ -420,6 +505,14 @@ function runMarkSessionClosed(args) {
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
+  // --project=<slug> on --mark is ATTRIBUTION ONLY (the marker's `project` field).
+  // The gate stays GLOBAL — never narrowed — because a marker that narrowed its
+  // gate could attest compact-ready while PreCompact re-checks all of today's
+  // projects and stays red (the marker == compact-ready invariant, ADR 0047 /
+  // codex design finding 1/2). Validate the attribution slug exists as a
+  // directory, exactly as --check does, but only when it is actually used (a
+  // --log-only mark attributes to no project, so --project is moot there).
+  if (args.project && !args.logOnly) requireProjectDir(args, args.project);
   // ADR 0047: the per-session marker is the THIRD session-close completion
   // signal (after the PreCompact gate and `--check-session-close`). It must use
   // the SAME gate that governs /compact — precompactGateStatus — so the marker
@@ -485,8 +578,12 @@ function runMarkSessionClosed(args) {
     console.log(args.json ? JSON.stringify(result, null, 2) : `✗ ${reason}`);
     process.exit(1);
   }
+  // --project attributes the marker to that slug (gate stayed global); falls back
+  // to the gate's resolved primary. log-only marks attribute to no project. Used
+  // for the marker, the JSON result, and the success message so all three agree.
+  const markerProject = !args.logOnly && args.project ? args.project : status.project;
   writeSessionClosedMarker(args.hypoDir, args.sessionId, {
-    project: status.project,
+    project: markerProject,
     ...(args.logOnly ? { scope: 'log-only' } : {}),
   });
   // Marker writer swallows IO errors (best-effort, see hypo-shared.mjs). Verify
@@ -505,7 +602,7 @@ function runMarkSessionClosed(args) {
   const result = {
     ok: true,
     session_id: args.sessionId,
-    project: status.project,
+    project: markerProject,
     scope: args.logOnly ? 'log-only' : 'project',
     date: status.dates[0],
     notices: gate.notices,
@@ -521,7 +618,7 @@ function runMarkSessionClosed(args) {
     console.log(
       args.logOnly
         ? `✓ session-closed marker written (session_id: ${args.sessionId}, scope: log-only — no project attribution).`
-        : `✓ session-closed marker written (session_id: ${args.sessionId}, project: ${status.project}).`,
+        : `✓ session-closed marker written (session_id: ${args.sessionId}, project: ${markerProject}).`,
     );
     if (gate.driftTargets.length > 0) {
       console.log(
