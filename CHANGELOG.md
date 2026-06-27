@@ -5,6 +5,55 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-06-28
+
+### New Features
+
+#### English
+
+- `crystallize --check-session-close --project=<slug>` scopes the close check to one project, and `--mark-session-closed --project=<slug>` sets the marker attribution. (#150)
+
+#### 한국어
+
+- `crystallize --check-session-close --project=<slug>`로 close 체크를 한 프로젝트로 좁히고, `--mark-session-closed --project=<slug>`로 마커 attribution을 지정합니다. (#150)
+
+### Bug Fixes
+
+#### English
+
+- Session-close recovery commands are now runnable in a plugin install: `node ".../crystallize.mjs"` instead of a bare `crystallize` bin that is not on PATH. (#153)
+- Session close no longer stalls on an unregistered tag: an unknown but well-formed tag is a lint warning (W10) and is auto-registered into the SCHEMA Pending section, while forbidden patterns stay hard errors. (#152)
+- Session close no longer needs a hand-written `log.md` entry (it is derived from the session-log heading), and a malformed or stale `log.md` slug no longer false-blocks a finished close. (#151)
+- Session-close apply now requires a valid project and fails fast on a missing, malformed, or non-directory project, so a close can no longer be written to the wrong project on a same-date tie. (#148)
+
+#### 한국어
+
+- 플러그인 설치에서 세션 close 복구 명령이 실행됩니다: PATH에 없는 bare `crystallize` 대신 `node ".../crystallize.mjs"`를 안내합니다. (#153)
+- 세션 close가 미등록 태그에서 멈추지 않습니다: 형식은 맞지만 어휘에 없는 태그는 lint 경고(W10)이자 SCHEMA Pending에 자동 등록되고, 금지 패턴은 hard error로 남습니다. (#152)
+- 세션 close가 `log.md` 엔트리를 수기로 쓸 필요가 없어졌고(세션 로그 heading에서 파생), malformed/stale `log.md` slug가 끝난 close를 더는 false-block 하지 않습니다. (#151)
+- 세션 close apply가 유효한 프로젝트를 요구하고 누락이나 형식 오류, 디렉터리 아님이면 즉시 실패해서, 같은 날짜 동점 상황에서 close가 엉뚱한 프로젝트에 기록되는 일을 막습니다. (#148)
+
+### Chores
+
+#### English
+
+- The PR template and contributing guide now require a bilingual PR body (English and Korean blocks) and ban a tool-attribution footer in the PR body. (#149)
+
+#### 한국어
+
+- PR 템플릿과 기여 가이드가 PR 본문을 이중 언어(영어·한국어 블록)로 요구하고 PR 본문의 tool-attribution 푸터를 금지합니다. (#149)
+
+### Changelog
+
+- #153 fix(close): emit runnable node CLI for session-close recovery, not bare crystallize bin
+- #152 fix(close): demote unknown-tag to warn (W10) and auto-register pending tags
+- #151 fix(close): disk-gate ghost slugs and derive root log.md per-close
+- #150 feat(close): add --project=<slug> override for session-close check/mark
+- #149 docs(pr): bilingual PR body (EN/KO blocks) and ban tool-attribution footer
+- #148 fix(close): require and validate payload.project on session-close apply
+
+Contributors: @sk-lim19f
+
 ## [1.4.1] - 2026-06-26
 
 ### Bug Fixes

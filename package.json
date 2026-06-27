@@ -1,6 +1,6 @@
 {
   "name": "hypomnema",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "LLM-native personal wiki system for Claude Code",
   "type": "module",
   "license": "MIT",
