@@ -14,7 +14,7 @@ You are running `/hypo:verify`. Check all wiki pages for `verify_by` and `verify
 
 ## Step 1 — Locate package root
 
-Locate the Hypomnema package root (the directory two levels above this file (`skills/<name>/SKILL.md` → package root)).
+Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` or reinstall instead of guessing the cache layout.
 
 If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
 
@@ -23,7 +23,7 @@ If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherw
 ## Step 2 — Run verify
 
 ```bash
-node <package-root>/scripts/verify.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs \
   [--wiki-dir="<path>"] \
   [--file="<path>"] \
   [--json]

@@ -30,7 +30,7 @@ These are judgment calls; when uncertain, surface the question rather than skip 
 
 ## Step 2 — Compose the session-close payload
 
-The session-close path is **payload-driven**. Instead of writing the 5 mandatory files one-by-one, you compose a single JSON payload that describes the full session-close state, then hand it to `crystallize.mjs --apply-session-close`, which performs idempotent atomic writes and gates the result with lint.
+The session-close path is **payload-driven**. Instead of writing the 5 mandatory files one-by-one, you compose a single JSON payload that describes the full session-close state, then hand it to the `--apply-session-close` apply path (the Step 3 command), which performs idempotent atomic writes and gates the result with lint.
 
 Payload shape (`project` + 5 content fields required, 1 conditional, per Spec §5.2.7 / §8.3 + ADR 0029):
 
@@ -75,7 +75,7 @@ Content guidance for each slot:
 
 ## Step 3 — Apply the payload
 
-The script paths in this command resolve via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run them as written. If one appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
+Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` or reinstall instead of guessing the cache layout.
 
 ```bash
 node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs \
@@ -114,9 +114,9 @@ synthesis (no session-close intent) — the marker is then simply not written.
 
 **Two lint gates run automatically, scoped to the files this close writes:**
 
-Both gates judge only the **payload files** (the 5 mandatory close files + `open-questions.md`). Lint debt this close did not author is never gated — so an unrelated broken page elsewhere cannot block your close. It is reported as a non-blocking notice, scoped to the close-target project: debt under `projects/<project>/` is listed by file in `notices[]`; debt elsewhere (other projects, shared `pages/`, root files) folds into the `otherDebtCount` integer so the same untouched-file debt does not re-list its filenames on every close (run `node scripts/lint.mjs` for the full list).
+Both gates judge only the **payload files** (the 5 mandatory close files + `open-questions.md`). Lint debt this close did not author is never gated — so an unrelated broken page elsewhere cannot block your close. It is reported as a non-blocking notice, scoped to the close-target project: debt under `projects/<project>/` is listed by file in `notices[]`; debt elsewhere (other projects, shared `pages/`, root files) folds into the `otherDebtCount` integer so the same untouched-file debt does not re-list its filenames on every close (run `/hypo:lint` for the full list).
 
-1. **Preflight** — `lint.mjs --json` runs **before** any payload bytes are written. Errors in overwrite targets (sessionState / projectHot / rootHot / openQuestions) are filtered (about to be replaced). Errors in an **append target** (session-log / log.md) still block (appending can't repair existing corruption) → exit 1 with `stage='preflight-lint'`. Errors outside the payload files → `notices[]`, apply proceeds.
+1. **Preflight** — an internal `lint --json` preflight runs **before** any payload bytes are written. Errors in overwrite targets (sessionState / projectHot / rootHot / openQuestions) are filtered (about to be replaced). Errors in an **append target** (session-log / log.md) still block (appending can't repair existing corruption) → exit 1 with `stage='preflight-lint'`. Errors outside the payload files → `notices[]`, apply proceeds.
 2. **Post-apply** — lint re-runs after the writes. Blocks only on **errors** in payload files (a payload-introduced malformed body / bad frontmatter); pre-existing errors elsewhere → `notices[]`. A lint crash (unparseable output) always blocks. Broken wikilinks are lint **warnings** (W4 — forward references to planned pages are normal) and are not gated here. Surfaces as `stage='post-apply-lint'` (or `'post-apply-verification+lint'` if freshness also fails).
 
 > **Manual close (direct Write tool calls)** clears the Stop-chain block via `--mark-session-closed --session-id=<id>`. Both marker writers apply a **user-close hard gate** (ADR 0055): the marker is written only when the session's transcript carries a genuine user close signal — an NL close phrase, a `/compact`, or an accepted AskUserQuestion [세션 마무리] answer. The transcript is resolved **strictly from `--session-id`** (a globally-unique id, globbed under `~/.claude/projects/`), never from a CLI arg, so a model that runs the writer on its own — without the user ever signalling close — is refused, and a forged path cannot point the gate at someone else's close-intent. The lint scope is widened from that same resolved transcript. `--transcript-path` is **not** consulted by the marker gate; it survives only to scope `--check-session-close`'s lint (which writes no marker).
@@ -154,7 +154,7 @@ If the user says stop, end here. Otherwise continue to Step 5.
 
 ## Step 5 — Surface synthesis candidates
 
-The script path below resolves via `${CLAUDE_PLUGIN_ROOT}`, which the plugin harness expands to this package's absolute path before you see it, so run it as written. If it appears unexpanded (a literal `${CLAUDE_PLUGIN_ROOT}`), read the package root from the `hypo@hypomnema` installPath in `~/.claude/plugins/installed_plugins.json` rather than guessing from the cache layout.
+Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` or reinstall instead of guessing the cache layout.
 
 ```bash
 node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs [--hypo-dir="<path>"] [--min-group=2]

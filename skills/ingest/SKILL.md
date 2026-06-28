@@ -14,7 +14,7 @@ You are running `/hypo:ingest`. Add a new source document to `sources/` and crea
 
 ## Step 1 — Locate package root
 
-Locate the Hypomnema package root (the directory two levels above this file (`skills/<name>/SKILL.md` → package root)).
+Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` or reinstall instead of guessing the cache layout.
 
 If the user specified a wiki directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
 
@@ -23,7 +23,7 @@ If the user specified a wiki directory, pass it as `--hypo-dir="<path>"`. Otherw
 ## Step 2 — Run ingest status check
 
 ```bash
-node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] [--json]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/ingest.mjs [--hypo-dir="<path>"] [--json]
 ```
 
 Options:
@@ -40,13 +40,13 @@ Before touching any source content, refuse to ingest secrets (`.env`, SSH keys, 
 1. **If the user provided a file path**, check it (use an absolute path):
 
    ```bash
-   node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] --check="<absolute-input-path>"
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/ingest.mjs [--hypo-dir="<path>"] --check="<absolute-input-path>"
    ```
 
 2. **Always** check the destination `sources/<slug>.<ext>`:
 
    ```bash
-   node <package-root>/scripts/ingest.mjs [--hypo-dir="<path>"] --check="sources/<slug>.<ext>"
+   node ${CLAUDE_PLUGIN_ROOT}/scripts/ingest.mjs [--hypo-dir="<path>"] --check="sources/<slug>.<ext>"
    ```
 
 If either command exits non-zero, **stop**: surface the `Refused: ...` message to the user and do not download, read, or save the source. The slug check matters because a user could rename a `.env` to an innocuous slug — the destination must still be blocked.
