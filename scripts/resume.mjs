@@ -26,10 +26,10 @@
  *   --json                Output as JSON
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, statSync, realpathSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { pickProjectByCwd, collectProjectWorkingDirs } from './lib/wd-match.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -60,27 +60,25 @@ function parseFrontmatterField(content, key) {
     .replace(/^['"]|['"]$/g, '');
 }
 
-// Among `slugs`, return the one whose projects/<slug>/index.md `working_dir`
-// is the LONGEST prefix of cwd (so /repo/sub wins over /repo). Returns null
-// when cwd is falsy or matches none. resume gives this authority OVER recency
-// (ADR 0044): a cwd↔working_dir match wins regardless of which row is newest.
+// Return the project (among `slugs`) that owns cwd: a longest-prefix
+// working_dir match, or — when no absolute path matches because the vault was
+// synced from another machine — a cwd ancestor whose directory name is a
+// globally-unique project basename. Uniqueness is judged over EVERY project on
+// disk (not just `slugs`), so a shared dirname declines and falls back to
+// recency. resume gives this authority over recency: a cwd↔project match wins
+// regardless of which hot.md row is newest.
 function pickByCwd(hypoDir, slugs, cwd) {
   if (!cwd) return null;
-  let best = null;
-  let bestLen = -1;
-  for (const slug of slugs) {
-    const indexPath = join(hypoDir, 'projects', slug, 'index.md');
-    if (!existsSync(indexPath)) continue;
-    const wd = parseFrontmatterField(readFileSync(indexPath, 'utf-8'), 'working_dir');
-    if (!wd) continue;
-    let resolved = wd.startsWith('~/') ? join(homedir(), wd.slice(2)) : wd;
-    resolved = resolved.replace(/\/+$/, ''); // trailing-slash normalize
-    if ((cwd === resolved || cwd.startsWith(resolved + '/')) && resolved.length > bestLen) {
-      bestLen = resolved.length;
-      best = slug;
-    }
+  let realpathCwd = null;
+  try {
+    realpathCwd = realpathSync(cwd);
+  } catch {
+    realpathCwd = null;
   }
-  return best;
+  return pickProjectByCwd(collectProjectWorkingDirs(hypoDir), cwd, {
+    eligible: slugs,
+    realpathCwd,
+  });
 }
 
 // When cwd is set but no project's working_dir matches it, resume falls back to

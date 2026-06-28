@@ -6,8 +6,7 @@
  * project hot.md. Skips if still within the same project subtree.
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
-import { homedir } from 'os';
+import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs';
 import { join } from 'path';
 import {
   HYPO_DIR,
@@ -19,6 +18,8 @@ import {
   buildProjectSuggestionLine,
   recordSuggestionCooldown,
   sanitizeProjForPrompt,
+  pickProjectByCwd,
+  collectProjectWorkingDirs,
 } from './hypo-shared.mjs';
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
@@ -33,42 +34,26 @@ function readIfNotIgnored(path, patterns) {
   return readFileSync(path, 'utf-8').slice(0, MAX_CHARS);
 }
 
-function parseFrontmatterField(content, key) {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (!match) return null;
-  const line = match[1].split('\n').find((l) => l.startsWith(`${key}:`));
-  if (!line) return null;
-  return line
-    .slice(key.length + 1)
-    .trim()
-    .replace(/^['"]|['"]$/g, '');
-}
-
 function findProjectHot(cwd) {
   if (!existsSync(PROJECTS_DIR)) return null;
-  for (const proj of readdirSync(PROJECTS_DIR)) {
-    const projDir = join(PROJECTS_DIR, proj);
-    if (!statSync(projDir).isDirectory()) continue;
-    const indexPath = join(projDir, 'index.md');
-    if (!existsSync(indexPath)) continue;
-    const content = readFileSync(indexPath, 'utf-8');
-    const workingDir = parseFrontmatterField(content, 'working_dir');
-    if (!workingDir) continue;
-    const resolved = workingDir.startsWith('~/')
-      ? join(homedir(), workingDir.slice(2))
-      : workingDir;
-    if (cwd === resolved || cwd.startsWith(resolved + '/')) {
-      const hotPath = join(projDir, 'hot.md');
-      const statePath = join(projDir, 'session-state.md');
-      return {
-        proj,
-        hotPath: existsSync(hotPath) ? hotPath : null,
-        statePath: existsSync(statePath) ? statePath : null,
-        resolved,
-      };
-    }
+  let realpathCwd = null;
+  try {
+    realpathCwd = realpathSync(cwd);
+  } catch {
+    realpathCwd = null;
   }
-  return null;
+  // Two-tier match (absolute prefix, then cross-machine unique basename) so a
+  // vault synced from another machine still resolves the cwd to its project.
+  const proj = pickProjectByCwd(collectProjectWorkingDirs(HYPO_DIR), cwd, { realpathCwd });
+  if (!proj) return null;
+  const projDir = join(PROJECTS_DIR, proj);
+  const hotPath = join(projDir, 'hot.md');
+  const statePath = join(projDir, 'session-state.md');
+  return {
+    proj,
+    hotPath: existsSync(hotPath) ? hotPath : null,
+    statePath: existsSync(statePath) ? statePath : null,
+  };
 }
 
 let raw = '';

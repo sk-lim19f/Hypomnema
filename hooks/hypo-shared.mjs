@@ -352,27 +352,155 @@ function parseFrontmatterField(content, key) {
     .replace(/^['"]|['"]$/g, '');
 }
 
-// Among `slugs`, return the one whose projects/<slug>/index.md `working_dir`
-// is the LONGEST prefix of cwd (so /repo/sub wins over /repo). Returns null
-// when cwd is falsy or matches none. resume gives this authority OVER recency
-// (ADR 0044); close callers never pass cwd, so it stays inert for them.
+// ── cwd ↔ project matcher ────────────────────────────────────────────────────
+// Hand-synced with scripts/lib/wd-match.mjs: hooks deploy to ~/.claude/hooks/
+// without scripts/, so this cannot import the lib and must mirror it. Keep the
+// two in step; the lib carries the unit tests.
+
+// Expand a leading ~/ (or bare ~), strip trailing slashes. null for empty.
+export function normalizeWorkingDir(p) {
+  if (!p) return null;
+  let s = String(p).trim();
+  if (s === '~') s = homedir();
+  else if (s.startsWith('~/')) s = `${homedir()}/${s.slice(2)}`;
+  s = s.replace(/\/+$/, '');
+  return s || null;
+}
+
+// macOS/Windows match paths case-insensitively; Linux does not. Fold only there.
+export function isCaseInsensitiveFs(platform = process.platform) {
+  return platform === 'darwin' || platform === 'win32';
+}
+
+function _fold(s, ci) {
+  return ci ? s.toLowerCase() : s;
+}
+function _lastSeg(p) {
+  const i = p.lastIndexOf('/');
+  return i < 0 ? p : p.slice(i + 1);
+}
+
+// Resolve which project owns cwd. Tier 1: longest absolute working_dir prefix
+// (the original behavior). Tier 2 (cross-machine): when the synced vault holds
+// another machine's absolute path, a cwd ancestor whose directory name is a
+// GLOBALLY unique project basename identifies the project; a shared dirname
+// declines (null) so the caller falls back to recency. `projects` is the whole
+// universe (for the uniqueness gate); `eligible` restricts the answer.
+export function pickProjectByCwd(projects, cwd, opts = {}) {
+  const { eligible = null, realpathCwd = null, caseInsensitive = isCaseInsensitiveFs() } = opts;
+  if (!cwd && !realpathCwd) return null;
+  const eligibleSet = eligible ? new Set(eligible) : null;
+  const isEligible = (slug) => !eligibleSet || eligibleSet.has(slug);
+
+  const entries = [];
+  for (const p of projects) {
+    const path = normalizeWorkingDir(p.workingDir);
+    if (path) entries.push({ slug: p.slug, path });
+  }
+  if (entries.length === 0) return null;
+
+  // raw cwd first, realpath only as a fallback (a raw match must not be
+  // overridden by a longer realpath match).
+  const cwds = [];
+  for (const c of [cwd, realpathCwd]) {
+    const n = normalizeWorkingDir(c);
+    if (n && !cwds.includes(n)) cwds.push(n);
+  }
+
+  // Tier 1: first cwd variant with any longest-prefix match wins.
+  for (const c of cwds) {
+    const cf = _fold(c, caseInsensitive);
+    let bestSlug = null;
+    let bestLen = -1;
+    for (const e of entries) {
+      if (!isEligible(e.slug)) continue;
+      const pf = _fold(e.path, caseInsensitive);
+      if ((cf === pf || cf.startsWith(`${pf}/`)) && e.path.length > bestLen) {
+        bestLen = e.path.length;
+        bestSlug = e.slug;
+      }
+    }
+    if (bestSlug) return bestSlug;
+  }
+
+  // Tier 2: unique-basename ancestor, but only when the chain points at exactly
+  // ONE project (two distinct matches along the path → decline, fail closed).
+  const byBasename = new Map();
+  for (const e of entries) {
+    const b = _fold(_lastSeg(e.path), caseInsensitive);
+    if (!b) continue;
+    const hit = byBasename.get(b);
+    if (hit) hit.count += 1;
+    else byBasename.set(b, { slug: e.slug, count: 1 });
+  }
+
+  for (const c of cwds) {
+    const matched = new Set();
+    let cur = c;
+    while (cur && cur.includes('/')) {
+      const b = _fold(_lastSeg(cur), caseInsensitive);
+      const hit = b && byBasename.get(b);
+      if (hit && hit.count === 1 && isEligible(hit.slug)) matched.add(hit.slug);
+      cur = cur.slice(0, cur.lastIndexOf('/'));
+    }
+    if (matched.size === 1) return [...matched][0];
+  }
+  return null;
+}
+
+// Disk companion: [{slug, workingDir}] for every real project (skips _template
+// and dirs without index.md). The full set is the tier-2 uniqueness universe.
+// working_dir is cleaned exactly like scripts/lib/frontmatter.mjs parseFrontmatter
+// (strip a trailing ` # comment`, then surrounding quotes) so this stays in step
+// with the script-side collector — parseFrontmatterField alone skips the comment.
+export function collectProjectWorkingDirs(hypoDir) {
+  const projectsDir = join(hypoDir, 'projects');
+  if (!existsSync(projectsDir)) return [];
+  const out = [];
+  for (const slug of readdirSync(projectsDir)) {
+    if (slug === '_template') continue;
+    const dir = join(projectsDir, slug);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const indexPath = join(dir, 'index.md');
+    if (!existsSync(indexPath)) continue;
+    let workingDir = null;
+    try {
+      const fm = readFileSync(indexPath, 'utf-8').match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      const line = fm && fm[1].split(/\r?\n/).find((l) => /^working_dir:/.test(l));
+      if (line) {
+        workingDir = line
+          .slice('working_dir:'.length)
+          .trim()
+          .replace(/\s+#.*$/, '')
+          .replace(/^['"]|['"]$/g, '');
+      }
+    } catch {
+      workingDir = null;
+    }
+    out.push({ slug, workingDir: workingDir || null });
+  }
+  return out;
+}
+
+// resume/close entry: match `slugs` against cwd via the two-tier matcher.
+// Uniqueness is judged over EVERY project on disk, not just `slugs`. close
+// callers pass no cwd, so it stays inert for them.
 function pickByCwd(hypoDir, slugs, cwd) {
   if (!cwd) return null;
-  let best = null;
-  let bestLen = -1;
-  for (const slug of slugs) {
-    const indexPath = join(hypoDir, 'projects', slug, 'index.md');
-    if (!existsSync(indexPath)) continue;
-    const wd = parseFrontmatterField(readFileSync(indexPath, 'utf-8'), 'working_dir');
-    if (!wd) continue;
-    let resolved = wd.startsWith('~/') ? join(homedir(), wd.slice(2)) : wd;
-    resolved = resolved.replace(/\/+$/, ''); // trailing-slash normalize
-    if ((cwd === resolved || cwd.startsWith(resolved + '/')) && resolved.length > bestLen) {
-      bestLen = resolved.length;
-      best = slug;
-    }
+  let realpathCwd = null;
+  try {
+    realpathCwd = realpathSync(cwd);
+  } catch {
+    realpathCwd = null;
   }
-  return best;
+  return pickProjectByCwd(collectProjectWorkingDirs(hypoDir), cwd, {
+    eligible: slugs,
+    realpathCwd,
+  });
 }
 
 /**
