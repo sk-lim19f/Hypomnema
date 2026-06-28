@@ -11,14 +11,14 @@ When invoked to close a session — via an explicit close signal ("세션 종료
 
 ## What this does
 
-- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `crystallize.mjs --apply-session-close --payload=<path>` — which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). `--check-session-close` is a read-only dry-run of the **full** PreCompact gate (ADR 0046) — close files + scoped lint + design-history + feedback projection — sharing one function (`precompactGateStatus`) with the gate. A green check means no gate blocker needs a human fix, so it is the signal to declare the session closed (pass `--transcript-path` to widen the lint scope to this session's edited files exactly as the interactive hook does). It is not a hard guarantee: the live `/compact` can still differ on a context-≥70% prompt, `HYPO_SKIP_GATE`, or a transcript-scoped lint error the check did not see.
+- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `/hypo:crystallize` in `--apply-session-close --payload=<path>` mode — which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). `--check-session-close` is a read-only dry-run of the **full** PreCompact gate (ADR 0046) — close files + scoped lint + design-history + feedback projection — sharing one function (`precompactGateStatus`) with the gate. A green check means no gate blocker needs a human fix, so it is the signal to declare the session closed (pass `--transcript-path` to widen the lint scope to this session's edited files exactly as the interactive hook does). It is not a hard guarantee: the live `/compact` can still differ on a context-≥70% prompt, `HYPO_SKIP_GATE`, or a transcript-scoped lint error the check did not see.
 - **Synthesis mode**: finds tag clusters (≥ N pages), orphan pages (no outbound `[[wikilinks]]`), and draft / stub pages, then guides consolidation into `pages/syntheses/<topic>.md` with back-links and `index.md` updates.
 
 ---
 
 ## Step 1 — Locate package root
 
-Locate the Hypomnema package root (the directory two levels above this file (`skills/<name>/SKILL.md` → package root)).
+Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` or reinstall instead of guessing the cache layout.
 
 If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
 
@@ -27,7 +27,7 @@ If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherw
 ## Step 2 — Run crystallize scan
 
 ```bash
-node <package-root>/scripts/crystallize.mjs \
+node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs \
   [--wiki-dir="<path>"] \
   [--min-group=<n>] \
   [--json]
@@ -67,7 +67,7 @@ When uncertain, surface the question rather than skip it. None of the four block
 After completing the checklist, verify it before reporting:
 
 ```bash
-node <package-root>/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
 ```
 
 This runs the **full** PreCompact gate via the shared `precompactGateStatus`

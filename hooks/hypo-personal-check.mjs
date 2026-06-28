@@ -239,10 +239,10 @@ process.stdin.on('end', () => {
       `  [ ] 9. hot.md    — update projects/<name>/hot.md (no exceptions)`,
       `  [ ] 10. root hot.md — update ~/hypomnema/hot.md active project table`,
       `  [ ] 11. updated: field — verify today's date on all touched .md files`,
-      `  [ ] 12. lint — run scripts/lint.mjs; fix errors in files YOU touched`,
+      `  [ ] 12. lint — run /hypo:lint; fix errors in files YOU touched`,
       `           (other projects' / shared-page debt is reported as non-blocking notice)`,
       `  [ ] 13. git commit & push`,
-      `  [ ] 14. verify — run \`crystallize.mjs --check-session-close\`; only declare`,
+      `  [ ] 14. verify — run /hypo:crystallize (--check-session-close mode); only declare`,
       `           the session closed once it prints "Compact-ready" (= this gate passes).`,
     ].join('\n');
 

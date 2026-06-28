@@ -20633,6 +20633,97 @@ test('CLI --strict: a PR missing its ## Changelog block exits 1', () => {
   );
 });
 
+// Guards the package-root resolution contract across the shipped surfaces that
+// INSTRUCT the model to run a bundled script: every slash command, every skill,
+// and the operational wiki guide. When such a surface is read outside a plugin
+// context (npm/init copies commands into ~/.claude/commands/hypo/; the guide is
+// installed into ~/hypomnema/) the harness never expands ${CLAUDE_PLUGIN_ROOT}, so
+// every script reference must route through ${CLAUDE_PLUGIN_ROOT}/scripts or the
+// clause's <pkgRoot>/scripts; a bare `scripts/x.mjs`, `./scripts/x.mjs`, or a
+// guessed `<package-root>`/`<pkg-root>` is cwd-dependent and breaks. Both inline
+// code spans (e.g. "Run `scripts/lint.mjs`") and fenced blocks are scanned, since
+// an imperative reference can appear either way. Wiki CONTENT template pages (e.g.
+// observability dashboards) are not execution instructions and are out of scope.
+test('prompt surfaces: bundled-script references resolve via CLAUDE_PLUGIN_ROOT/scripts or pkgRoot (no bare/placeholder paths)', () => {
+  const surfaceFiles = [];
+  const cmdDir = join(REPO, 'commands');
+  for (const f of readdirSync(cmdDir).filter((x) => x.endsWith('.md'))) {
+    surfaceFiles.push(join(cmdDir, f));
+  }
+  const skillsDir = join(REPO, 'skills');
+  for (const d of readdirSync(skillsDir)) {
+    const skillMd = join(skillsDir, d, 'SKILL.md');
+    if (existsSync(skillMd)) surfaceFiles.push(skillMd);
+  }
+  surfaceFiles.push(join(REPO, 'templates', 'hypo-guide.md')); // the operational guide
+
+  // Collect code-context text: fenced-block lines + inline `code` spans on prose lines.
+  const codeText = (md) => {
+    const out = [];
+    let inFence = false;
+    for (const line of md.split('\n')) {
+      if (line.trim().startsWith('```')) {
+        inFence = !inFence;
+        continue;
+      }
+      if (inFence) {
+        out.push(line);
+        continue;
+      }
+      const spans = line.match(/`[^`]+`/g);
+      if (spans) out.push(spans.join(' '));
+    }
+    return out.join('\n');
+  };
+
+  // Known bundled-script basenames, derived from scripts/ so the gate stays current.
+  // A reference is a violation when it names one of these but is NOT the accepted
+  // ${CLAUDE_PLUGIN_ROOT}/scripts/... or <pkgRoot>/scripts/... form: that covers both a
+  // path-prefixed `scripts/x.mjs` / `<package-root>/scripts/x.mjs` and a bare `x.mjs`
+  // executable name (e.g. "run `crystallize.mjs --mark-session-closed`"). Hook basenames
+  // live in hooks/, not scripts/, so a descriptive mention of one is not flagged.
+  const scriptBasenames = new Set();
+  const collectMjs = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) collectMjs(full);
+      else if (e.name.endsWith('.mjs')) scriptBasenames.add(e.name);
+    }
+  };
+  collectMjs(join(REPO, 'scripts'));
+
+  // Remove the two ACCEPTED forms first; any bundled-script name surviving is bare/guessed.
+  const stripResolved = (s) =>
+    s
+      .replace(/\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/[A-Za-z0-9._/-]+\.mjs/g, '')
+      .replace(/<pkgRoot>\/scripts\/[A-Za-z0-9._/-]+\.mjs/g, '');
+  const pluginInvokeRe = /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\//;
+
+  const unresolved = [];
+  const missingFallback = [];
+  for (const p of surfaceFiles) {
+    const text = readFileSync(p, 'utf8');
+    const code = codeText(text);
+    const rel = p.slice(REPO.length + 1);
+    const hits = new Set();
+    for (const m of stripResolved(code).match(/[A-Za-z0-9._/-]*\.mjs/g) || []) {
+      if (scriptBasenames.has(m.split('/').pop())) hits.add(m);
+    }
+    if (hits.size) unresolved.push(`${rel} [${[...hits].join(', ')}]`);
+    if (pluginInvokeRe.test(code) && !text.includes('hypo-pkg.json')) missingFallback.push(rel);
+  }
+  assert.equal(
+    unresolved.length,
+    0,
+    `surfaces with a bundled-script reference not routed through CLAUDE_PLUGIN_ROOT/scripts or <pkgRoot>/scripts (cwd-dependent or model-guessed; breaks when read outside a plugin context): ${unresolved.join('; ')}`,
+  );
+  assert.equal(
+    missingFallback.length,
+    0,
+    `surfaces invoking a bundled script but missing the hypo-pkg.json resolution fallback: ${missingFallback.join(', ')}`,
+  );
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
