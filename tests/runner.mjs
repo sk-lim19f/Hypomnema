@@ -232,6 +232,172 @@ test('finds wiki by hypo-config.md marker', () => {
   }
 });
 
+// ── lib/wd-match.mjs (cross-machine project matcher) ─────────────────────────
+
+const { pickProjectByCwd, normalizeWorkingDir } = await import(`${SCRIPTS}/lib/wd-match.mjs`);
+
+suite('normalizeWorkingDir()');
+
+test('expands ~ and ~/ and strips trailing slashes', () => {
+  assert.equal(normalizeWorkingDir('~'), HOME);
+  assert.equal(normalizeWorkingDir('~/foo/bar/'), join(HOME, 'foo/bar'));
+  assert.equal(normalizeWorkingDir('/abs/path///'), '/abs/path');
+  assert.equal(normalizeWorkingDir(''), null);
+  assert.equal(normalizeWorkingDir(null), null);
+});
+
+suite('pickProjectByCwd() — tier 1 (absolute prefix, original behavior)');
+
+const PJS = [
+  { slug: 'hypomnema', workingDir: '/Users/sangkyu/Workspace/Hypomnema' },
+  { slug: 'guardia', workingDir: '/Users/sangkyu/Workspace/guardia' },
+];
+
+test('exact cwd match', () => {
+  assert.equal(pickProjectByCwd(PJS, '/Users/sangkyu/Workspace/Hypomnema'), 'hypomnema');
+});
+
+test('subdirectory of working_dir matches', () => {
+  assert.equal(
+    pickProjectByCwd(PJS, '/Users/sangkyu/Workspace/Hypomnema/scripts/lib'),
+    'hypomnema',
+  );
+});
+
+test('longest prefix wins (/repo/sub beats /repo)', () => {
+  const nested = [
+    { slug: 'outer', workingDir: '/Users/x/Workspace' },
+    { slug: 'inner', workingDir: '/Users/x/Workspace/Hypomnema' },
+  ];
+  assert.equal(pickProjectByCwd(nested, '/Users/x/Workspace/Hypomnema/scripts'), 'inner');
+});
+
+test('no false prefix match on sibling (Hypomnema vs Hypomnema-old)', () => {
+  const sib = [{ slug: 'h', workingDir: '/Users/x/Hypomnema' }];
+  assert.equal(pickProjectByCwd(sib, '/Users/x/Hypomnema-old'), null);
+});
+
+test('~ working_dir is expanded before compare', () => {
+  const tilde = [{ slug: 'h', workingDir: '~/Workspace/Hypomnema' }];
+  assert.equal(pickProjectByCwd(tilde, join(HOME, 'Workspace/Hypomnema/x')), 'h');
+});
+
+suite('pickProjectByCwd() — tier 2 (cross-machine unique basename)');
+
+test('different machine path matches by unique basename', () => {
+  // working_dir recorded on machine A; cwd is the same repo on machine B.
+  assert.equal(pickProjectByCwd(PJS, '/Users/SKLIM/Workspace/Sangkyu/Hypomnema'), 'hypomnema');
+});
+
+test('basename match works from a subdirectory on the other machine', () => {
+  assert.equal(
+    pickProjectByCwd(PJS, '/Users/SKLIM/Workspace/Sangkyu/Hypomnema/scripts'),
+    'hypomnema',
+  );
+});
+
+test('shared basename across projects fails closed (no tier-2 match)', () => {
+  const dup = [
+    { slug: 'a', workingDir: '/Users/sangkyu/work/Hypomnema' },
+    { slug: 'b', workingDir: '/Users/sangkyu/other/Hypomnema' },
+  ];
+  assert.equal(pickProjectByCwd(dup, '/Users/SKLIM/elsewhere/Hypomnema'), null);
+});
+
+test('uniqueness is judged over ALL projects, not just eligible ones', () => {
+  // 'b' is not eligible to be the answer, but it shares the basename so the
+  // tier-2 gate must still see it as a collision and decline.
+  const dup = [
+    { slug: 'a', workingDir: '/Users/sangkyu/work/Repo' },
+    { slug: 'b', workingDir: '/Users/sangkyu/other/Repo' },
+  ];
+  assert.equal(pickProjectByCwd(dup, '/Users/SKLIM/x/Repo', { eligible: ['a'] }), null);
+});
+
+test('unique basename mapping to an ineligible slug yields null', () => {
+  assert.equal(pickProjectByCwd(PJS, '/Users/SKLIM/x/Hypomnema', { eligible: ['guardia'] }), null);
+});
+
+test('tier 1 wins over tier 2 when an absolute prefix exists', () => {
+  assert.equal(pickProjectByCwd(PJS, '/Users/sangkyu/Workspace/Hypomnema/sub'), 'hypomnema');
+});
+
+suite('pickProjectByCwd() — case folding + symlinks + edges');
+
+test('case-insensitive FS folds case (macOS/Windows)', () => {
+  assert.equal(
+    pickProjectByCwd(PJS, '/Users/sangkyu/Workspace/hypomnema', { caseInsensitive: true }),
+    'hypomnema',
+  );
+});
+
+test('case-sensitive FS does not fold (Linux): case-only diff is no match', () => {
+  // tier 1 fails (different case), tier 2 basename 'hypomnema' != 'Hypomnema'
+  assert.equal(
+    pickProjectByCwd(PJS, '/Users/sangkyu/Workspace/hypomnema', { caseInsensitive: false }),
+    null,
+  );
+});
+
+test('realpathCwd variant is tried in addition to raw cwd', () => {
+  assert.equal(
+    pickProjectByCwd(PJS, '/tmp/symlink', {
+      realpathCwd: '/Users/sangkyu/Workspace/Hypomnema',
+    }),
+    'hypomnema',
+  );
+});
+
+test('empty universe or no cwd yields null', () => {
+  assert.equal(pickProjectByCwd([], '/Users/x/Hypomnema'), null);
+  assert.equal(pickProjectByCwd(PJS, ''), null);
+  assert.equal(pickProjectByCwd(PJS, null, { realpathCwd: null }), null);
+});
+
+test('projects without working_dir are skipped', () => {
+  const mixed = [
+    { slug: 'nowd', workingDir: null },
+    { slug: 'hypomnema', workingDir: '/Users/sangkyu/Workspace/Hypomnema' },
+  ];
+  assert.equal(pickProjectByCwd(mixed, '/Users/SKLIM/y/Hypomnema'), 'hypomnema');
+});
+
+suite('pickProjectByCwd() — review-hardened edges (raw-first, fail-closed tier 2)');
+
+test('raw cwd match wins over a longer realpath match (fallback, not race)', () => {
+  const pjs = [
+    { slug: 'a', workingDir: '/links/a' },
+    { slug: 'b', workingDir: '/physical/deep/b' },
+  ];
+  // raw cwd is under /links/a; realpath resolves under the longer /physical/deep/b.
+  // A naive global longest-prefix race would pick 'b'; raw-first must keep 'a'.
+  assert.equal(pickProjectByCwd(pjs, '/links/a/x', { realpathCwd: '/physical/deep/b/sub' }), 'a');
+});
+
+test('realpath still rescues a tier-1 match when raw cwd matches nothing', () => {
+  const pjs = [{ slug: 'b', workingDir: '/physical/b' }];
+  assert.equal(pickProjectByCwd(pjs, '/links/b/x', { realpathCwd: '/physical/b/x' }), 'b');
+});
+
+test('tier 2 declines when two projects match along the cwd chain (fail closed)', () => {
+  const pjs = [
+    { slug: 'monorepo', workingDir: '/Users/A/monorepo' },
+    { slug: 'api', workingDir: '/Users/A/services/api' },
+  ];
+  // cross-machine cwd: no absolute prefix; both `monorepo` and `api` are unique
+  // basenames in the chain, so cwd cannot disambiguate → null (not a guess).
+  assert.equal(pickProjectByCwd(pjs, '/Users/B/monorepo/api'), null);
+});
+
+test('tier 2 still matches when only one project sits in the cwd chain', () => {
+  const pjs = [
+    { slug: 'monorepo', workingDir: '/Users/A/monorepo' },
+    { slug: 'other', workingDir: '/Users/A/other' },
+  ];
+  // `api` is not a project basename, only `monorepo` matches → single, so it wins.
+  assert.equal(pickProjectByCwd(pjs, '/Users/B/monorepo/api'), 'monorepo');
+});
+
 // ── init.mjs smoke tests ─────────────────────────────────────────────────────
 
 suite('init.mjs --dry-run');
@@ -10164,6 +10330,50 @@ test('cwd null → legacy stable-sort winner (no behavior change)', () => {
       { slug: 'beta', date: '2026-06-08', workingDir: join(dir, 'code/beta') },
     ]);
     assert.equal(resolveActiveProject(dir), 'alpha');
+  });
+});
+
+test('cross-machine: synced index.md (other-machine path) matches by unique basename', () => {
+  withTmpDir((dir) => {
+    // index.md carries another machine's absolute working_dir (the synced-vault
+    // case): no absolute prefix matches this machine's cwd, but the repo dirname
+    // is a globally-unique project basename, so tier 2 recovers the match.
+    makeTieBreakWiki(dir, [
+      { slug: 'other', date: '2026-06-09' }, // newer recency winner, no working_dir
+      { slug: 'myrepo', date: '2026-06-07', workingDir: '/Users/OTHERMACHINE/ws/myrepo' },
+    ]);
+    assert.equal(resolveActiveProject(dir, join(dir, 'clones/myrepo')), 'myrepo');
+    assert.equal(resolveActiveProject(dir, join(dir, 'clones/myrepo/scripts')), 'myrepo');
+    // sanity: without cwd, recency (newer 'other') still wins.
+    assert.equal(resolveActiveProject(dir), 'other');
+  });
+});
+
+test('cross-machine: shared repo basename fails closed → recency wins (no false match)', () => {
+  withTmpDir((dir) => {
+    makeTieBreakWiki(dir, [
+      { slug: 'newer', date: '2026-06-09', workingDir: '/Users/A/x/myrepo' },
+      { slug: 'older', date: '2026-06-07', workingDir: '/Users/A/y/myrepo' },
+    ]);
+    // 'myrepo' basename is not unique → tier 2 declines → recency picks 'newer'.
+    assert.equal(resolveActiveProject(dir, join(dir, 'z/myrepo')), 'newer');
+  });
+});
+
+test('working_dir with a trailing YAML comment is stripped before matching', () => {
+  withTmpDir((dir) => {
+    // The hook-side collectProjectWorkingDirs must clean `working_dir: /repo # note`
+    // identically to the script-side parser, or same-machine resume would miss.
+    mkdirSync(join(dir, 'projects', 'p'), { recursive: true });
+    writeFileSync(
+      join(dir, 'hot.md'),
+      `---\ntitle: Hot\ntype: reference\nupdated: 2026-06-08\n---\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n| p | 2026-06-08 | [[projects/p/hot]] |\n`,
+    );
+    writeFileSync(
+      join(dir, 'projects', 'p', 'index.md'),
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-06-08\nworking_dir: ${join(dir, 'repo')} # synced note\n---\n# p\n`,
+    );
+    assert.equal(resolveActiveProject(dir, join(dir, 'repo')), 'p');
   });
 });
 
