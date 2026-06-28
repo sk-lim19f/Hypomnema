@@ -486,6 +486,58 @@ export function collectProjectWorkingDirs(hypoDir) {
   return out;
 }
 
+/**
+ * When the session cwd is a project working_dir distinct from the vault root,
+ * the wiki/knowledge files live in the VAULT, not in this cwd. SessionStart and
+ * CwdChanged inject hot.md/session-state content but never the vault's absolute
+ * path, so the AI re-discovers it each session and can wrongly conclude a wiki
+ * file is missing after checking only the code repo (a real misjudgment seen in
+ * a dev-repo session, 2026-06-23).
+ *
+ * Returns a one-line "look in the vault, not here" orientation carrying the
+ * absolute vault path, or '' when cwd is anywhere inside the vault tree (the
+ * "wiki files live in the vault, not here" framing would be false there) or
+ * hypoDir is unset. The HIT matcher is prefix-based, so a project whose
+ * working_dir is the vault root can match a vault SUBDIRECTORY; checking only
+ * exact root-equality would wrongly fire for those. Compared via realpath so a
+ * symlinked cwd or vault still matches.
+ *
+ * Containment uses the SAME normalize + case-fold + prefix policy as
+ * pickProjectByCwd so the two never disagree: on a case-insensitive FS the
+ * matcher case-folds, so a cwd differing only in case is still a HIT and must be
+ * suppressed here too (otherwise a false orientation leaks).
+ *
+ * @param {string} cwd  the session cwd (already known to be a project HIT)
+ * @param {string} [hypoDir=HYPO_DIR]
+ * @param {{caseInsensitive?: boolean}} [opts]  override FS case policy (tests)
+ * @returns {string}
+ */
+export function buildVaultOrientation(cwd, hypoDir = HYPO_DIR, opts = {}) {
+  if (!cwd || !hypoDir) return '';
+  const { caseInsensitive = isCaseInsensitiveFs() } = opts;
+  let realCwd = cwd;
+  let realVault = hypoDir;
+  try {
+    realCwd = realpathSync(cwd);
+  } catch {
+    /* keep raw path when cwd is unreadable */
+  }
+  try {
+    realVault = realpathSync(hypoDir);
+  } catch {
+    /* keep raw path when vault is unreadable */
+  }
+  // Suppress when cwd is the vault root OR a descendant of it.
+  const c = _fold(normalizeWorkingDir(realCwd) || '', caseInsensitive);
+  const v = _fold(normalizeWorkingDir(realVault) || '', caseInsensitive);
+  if (!c || !v) return '';
+  if (c === v || c.startsWith(`${v}/`)) return '';
+  return (
+    `[WIKI VAULT: ${hypoDir}] 이 cwd는 작업/코드 레포이고 vault가 아니다. ` +
+    `wiki·knowledge·세션로그 파일은 여기가 아니라 vault(${hypoDir})에서 조회한다.`
+  );
+}
+
 // resume/close entry: match `slugs` against cwd via the two-tier matcher.
 // Uniqueness is judged over EVERY project on disk, not just `slugs`. close
 // callers pass no cwd, so it stays inert for them.
