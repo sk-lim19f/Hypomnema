@@ -2204,9 +2204,40 @@ test('no-transcript PreCompact: out-of-scope lint error → notice, not blocking
         true,
         `out-of-scope lint debt must not block a no-transcript compact: ${r.stdout}`,
       );
+      // The debt lives in a shared page (pages/feedback/, not under an active
+      // project dir), so it is surfaced as a folded count, not named per-file —
+      // the same untouched-file debt must not re-list its filenames every compact.
       assert.ok(
-        out.systemMessage && out.systemMessage.includes('pages/feedback/broken.md'),
-        `the out-of-scope error should surface as a notice naming the file: ${r.stdout}`,
+        out.systemMessage &&
+          /pre-existing lint issue\(s\) elsewhere in the vault/.test(out.systemMessage),
+        `the out-of-scope shared-page error should surface as a folded notice: ${r.stdout}`,
+      );
+      assert.ok(
+        !out.systemMessage.includes('pages/feedback/broken.md'),
+        `out-of-scope shared-page debt must NOT be named per-file (it folds): ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('PreCompact notice scope: debt UNDER an active project dir is named, not folded', () => {
+  // The complement of the shared-page fold: lint debt under the close-target
+  // (today-active) project's own dir is this close's neighborhood, so it stays
+  // listed by filename rather than collapsing into the "+N elsewhere" count.
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'notes.md'),
+        '---\ntitle: notes\ntype: concept\n\nbody (frontmatter never closes)\n',
+      );
+    },
+    (dir) => {
+      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.continue, true, `in-project debt must not block compact: ${r.stdout}`);
+      assert.ok(
+        out.systemMessage && out.systemMessage.includes('projects/test-project/notes.md'),
+        `debt under the active project dir should be named, not folded: ${r.stdout}`,
       );
     },
   );
@@ -3331,6 +3362,37 @@ test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT
         'utf-8',
       );
       assert.ok(onDisk.includes(sentinel), 'apply should have written the payload sentinel');
+    },
+  );
+});
+
+test('apply notice scope: debt OUTSIDE the close project folds into otherDebtCount, not notices', () => {
+  // The close project is test-project. Pre-existing lint debt under a DIFFERENT
+  // project dir is real out-of-scope debt that must surface (never silently
+  // dropped) but must NOT be named per-file — it folds into otherDebtCount so the
+  // same untouched-file debt does not re-list its filenames on every close.
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'projects', 'other-proj'), { recursive: true });
+      writeFileSync(
+        join(dir, 'projects', 'other-proj', 'broken.md'),
+        '---\ntitle: broken\ntype: concept\n\nbody (frontmatter never closes)\n',
+      );
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 0, `apply should proceed past other-project debt: ${r.stdout}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+      assert.ok(
+        out.otherDebtCount >= 1,
+        `other-project debt should be counted in otherDebtCount: ${r.stdout}`,
+      );
+      assert.ok(
+        !out.notices.some((f) => f.endsWith('broken.md')),
+        `other-project debt must NOT be named in notices[] (it folds): ${r.stdout}`,
+      );
     },
   );
 });
