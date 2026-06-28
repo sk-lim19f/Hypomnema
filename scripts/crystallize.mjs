@@ -838,7 +838,7 @@ function applySessionClose(args) {
       ok: false,
       stage: 'preflight-lint',
       error: 'lint preflight failed — apply aborted (no payload bytes written)',
-      lint: { ...preflightLint, blockingErrors },
+      lint: { ...summarizeLintForOutput(preflightLint), blockingErrors },
     };
     if (args.json) {
       console.log(JSON.stringify(out, null, 2));
@@ -1121,7 +1121,10 @@ function applySessionClose(args) {
     // ADR 0055: surface the marker outcome instead of skipping silently, so the
     // caller can tell "closed" from "applied but not marked".
     ...(args.sessionId ? { markerWritten, markerSkipReason } : {}),
-    lint: { preflight: preflightLint, postApply: postApplyLint },
+    lint: {
+      preflight: summarizeLintForOutput(preflightLint),
+      postApply: summarizeLintForOutput(postApplyLint),
+    },
     // Pre-existing lint debt in files this close did not author: surfaced for
     // visibility, never gated. Empty on a clean vault. Scoped to the close-target
     // project's own dir — debt under projects/<project>/ is this close's
@@ -1203,6 +1206,29 @@ function applySessionClose(args) {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+// Cap the warn list in MODEL-FACING lint output. `result.lint` is serialized
+// into the --json apply result the documented close path reads, and lint runs
+// twice per close (preflight + post-apply), so an un-capped warn list (e.g.
+// hundreds of broken-wikilink warnings) lands in model context twice on every
+// close. Errors stay full (few, actionable); warns collapse to a count plus a
+// small sample for quick diagnosis. The INTERNAL preflightLint / postApplyLint
+// objects are untouched — the blocking filter and the pending-tag scan still
+// read the full warn list. lint.mjs --json itself also stays full: its
+// programmatic consumers (the pending-tag scan, the PreCompact W8 filter, tests)
+// need every warn.
+function summarizeLintForOutput(l) {
+  const SAMPLE = 10;
+  const warns = l.warns || [];
+  const out = {
+    ok: l.ok,
+    errors: l.errors || [],
+    warnCount: warns.length,
+    warns: warns.slice(0, SAMPLE),
+  };
+  if (warns.length > SAMPLE) out.warnsTruncated = warns.length - SAMPLE;
+  return out;
+}
 
 function parseFrontmatter(content) {
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
