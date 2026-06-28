@@ -3397,6 +3397,48 @@ test('apply notice scope: debt OUTSIDE the close project folds into otherDebtCou
   );
 });
 
+test('apply lint output caps the warn list (model-context guard): full count + sample + remainder', () => {
+  // result.lint is serialized into the --json apply result the close path reads,
+  // and lint runs twice (preflight + post-apply), so an un-capped warn list would
+  // land in model context twice on every close. The warns must collapse to a
+  // count + small sample; errors stay full. (Internal pending-tag / blocking
+  // logic still sees the full warn list — covered by other tests.)
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'bulk'), { recursive: true });
+      // 12 pages, each with one broken wikilink → 12 W4 warnings, over the sample cap.
+      for (let i = 0; i < 12; i++) {
+        writeFileSync(
+          join(dir, 'pages', 'bulk', `p${i}.md`),
+          `---\ntitle: p${i}\ntype: concept\nupdated: 2026-06-28\n---\n\nsee [[does-not-exist-${i}]]\n`,
+        );
+      }
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 0, `apply should succeed past warn debt: ${r.stdout}`);
+      const out = JSON.parse(r.stdout);
+      for (const phase of ['preflight', 'postApply']) {
+        const l = out.lint[phase];
+        assert.ok(
+          l.warnCount >= 12,
+          `${phase}.warnCount should be the full count: ${JSON.stringify(l)}`,
+        );
+        assert.ok(
+          l.warns.length <= 10,
+          `${phase}.warns should be capped to the sample: ${l.warns.length}`,
+        );
+        assert.equal(
+          l.warnsTruncated,
+          l.warnCount - l.warns.length,
+          `${phase}.warnsTruncated should be the remainder: ${JSON.stringify(l)}`,
+        );
+      }
+    },
+  );
+});
+
 test('preflight (#40 + Bug B): corrupt APPEND target (session-log) STILL blocks — appending cannot repair it', () => {
   // The scoping carve-out preserves the #40 guarantee for append targets: a
   // pre-existing malformed session-log file is in the payload scope and is NOT an
