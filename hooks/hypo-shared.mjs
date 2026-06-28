@@ -1851,6 +1851,21 @@ export function partitionLintScope(findings, scope) {
   return { blocking, notice };
 }
 
+/**
+ * True if a repo-relative file lives under any of the given project dirs
+ * (`projects/<slug>/...`, or the dir itself). Both surfaces that surface
+ * pre-existing lint-debt NOTICES use this to decide what to LIST vs fold: debt
+ * under a close-target project is the close's own neighborhood and stays listed;
+ * debt elsewhere (other projects, shared `pages/`, root `hot.md`/`log.md`) folds
+ * to a count so the same untouched-file debt does not re-list its filenames on
+ * every close. Same path policy as the lint-scope matcher above: separators
+ * normalized to POSIX, exact prefix at a segment boundary.
+ */
+export function isUnderProjectDirs(file, slugs) {
+  const f = posixPath(file);
+  return (slugs || []).some((s) => s && (f === `projects/${s}` || f.startsWith(`projects/${s}/`)));
+}
+
 // ── PreCompact gate — single source of truth ────────────────────────────────
 /**
  * The full PreCompact gate decision as a READ-ONLY status. This is the single
@@ -1883,7 +1898,7 @@ export function partitionLintScope(findings, scope) {
  *
  * @param {string} hypoDir
  * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null}} [opts]
- * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
+ * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
   const blockers = [];
@@ -2020,7 +2035,11 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         });
       }
       for (const n of part.notice)
-        notices.push({ type: 'lint', reason: `${n.file}${n.id ? ` (${n.id})` : ''}` });
+        notices.push({
+          type: 'lint',
+          file: n.file,
+          reason: `${n.file}${n.id ? ` (${n.id})` : ''}`,
+        });
       // W8 (design-history stale) is each today-active project's own close
       // responsibility; others' are non-blocking notices (ADR 0043). In log-only
       // mode there is NO project this session is accountable for, so every W8 is a
@@ -2047,7 +2066,8 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           reason: `design-history stale: ${w8Blocking.map((w) => w.file.split('/')[1]).join(', ')}`,
         });
       }
-      for (const w of w8Notice) notices.push({ type: 'design-history', reason: w.file });
+      for (const w of w8Notice)
+        notices.push({ type: 'design-history', file: w.file, reason: w.file });
     } catch (e) {
       skipped.lint = true; // fail-open on tooling error
       // Surface WHY the gate skipped lint (truncated stdout, timeout, spawn error)

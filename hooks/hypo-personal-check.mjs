@@ -31,6 +31,7 @@ import {
   isGateSkipped,
   isClosePattern,
   extractUserMessages,
+  isUnderProjectDirs,
 } from './hypo-shared.mjs';
 
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
@@ -152,18 +153,32 @@ process.stdin.on('end', () => {
   }
 
   // Non-blocking heads-up about pre-existing lint / out-of-scope design-history
-  // debt in untouched files (other projects / shared pages). Surfaced so it is
-  // visible but never blocks compact. (Mirrors the pre-ADR-0046 inline behavior,
-  // which lumped out-of-scope W8 into the same lint-notice list.)
+  // debt in untouched files. Surfaced so it is visible but never blocks compact.
+  // Scoped to the close-target (today-active) projects: debt under one of their
+  // dirs stays listed by filename; debt elsewhere (other projects, shared pages,
+  // root files) folds into a count so the same untouched-file debt does not
+  // re-list its filenames on every compact. Non-file diagnostics (a fail-open
+  // "lint skipped" notice carries no path) are preserved verbatim, never folded.
   const debtNotices = gate.notices.filter((n) => n.type === 'lint' || n.type === 'design-history');
-  let noticeText =
-    debtNotices.length > 0
-      ? `[WIKI CHECK] ${debtNotices.length} pre-existing lint issue(s) in files this session did not touch (not blocking): ${[
-          ...new Set(debtNotices.map((n) => n.reason.replace(/ \([^)]*\)$/, ''))),
-        ]
-          .slice(0, 5)
-          .join(', ')}${debtNotices.length > 5 ? ', …' : ''} — clean up when convenient.`
-      : '';
+  const activeSlugs = (gate.close?.projects || []).map((p) => p.project).filter(Boolean);
+  const nonFileNotices = debtNotices.filter((n) => !n.file);
+  const fileNotices = debtNotices.filter((n) => n.file);
+  const inScopeNotices = fileNotices.filter((n) => isUnderProjectDirs(n.file, activeSlugs));
+  const otherDebtCount = fileNotices.length - inScopeNotices.length;
+  const listed = [
+    ...nonFileNotices.map((n) => n.reason),
+    ...new Set(inScopeNotices.map((n) => n.reason.replace(/ \([^)]*\)$/, ''))),
+  ];
+  let noticeText = '';
+  if (listed.length > 0) {
+    noticeText = `[WIKI CHECK] ${listed.length} pre-existing lint issue(s) in files this session did not touch (not blocking): ${listed
+      .slice(0, 5)
+      .join(', ')}${listed.length > 5 ? ', …' : ''} — clean up when convenient.`;
+  }
+  if (otherDebtCount > 0) {
+    const fold = `+${otherDebtCount} pre-existing lint issue(s) elsewhere in the vault (other projects / shared pages, not blocking) — run \`/hypo:lint\` for the full list.`;
+    noticeText = noticeText ? `${noticeText}\n${fold}` : `[WIKI CHECK] ${fold}`;
+  }
   // Surface the self-heal so a re-synced projection is not a silent mutation of
   // the user's MEMORY.md / CLAUDE.md (ADR 0045 transparency).
   if (feedbackHealed) noticeText = noticeText ? `${noticeText}\n${feedbackHealed}` : feedbackHealed;

@@ -83,6 +83,7 @@ import {
   sessionClosedMarkerPath,
   readSessionClosedMarker,
   partitionLintScope,
+  isUnderProjectDirs,
   sessionLogShardPath,
   sessionLogReadCandidates,
   sessionLogScopePath,
@@ -1037,6 +1038,12 @@ function applySessionClose(args) {
   const postLintOk = !postApplyCrashed && postBlocking.length === 0;
   const ok = verification.ok && postLintOk;
 
+  // Scope the non-blocking notice to the close-target project: debt under
+  // projects/<project>/ stays listed; debt elsewhere folds to a count so the
+  // same untouched-file debt does not re-list its filenames on every close.
+  const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
+  const otherDebtCount = postNotice.length - closeScopeNotice.length;
+
   // ADR 0022 amendment 2026-05-19: auto-write the per-session
   // closed marker on a verified close. Hook authority is read-only; this is
   // one of the two writer paths (the other is --mark-session-closed standalone).
@@ -1115,9 +1122,15 @@ function applySessionClose(args) {
     // caller can tell "closed" from "applied but not marked".
     ...(args.sessionId ? { markerWritten, markerSkipReason } : {}),
     lint: { preflight: preflightLint, postApply: postApplyLint },
-    // Pre-existing lint debt in files this close did not author (Bug B): surfaced
-    // for visibility, never gated. Empty on a clean vault.
-    notices: [...new Set(postNotice.map((e) => e.file))],
+    // Pre-existing lint debt in files this close did not author: surfaced for
+    // visibility, never gated. Empty on a clean vault. Scoped to the close-target
+    // project's own dir — debt under projects/<project>/ is this close's
+    // neighborhood and stays listed; debt elsewhere (other projects, shared
+    // pages, root files) folds into otherDebtCount so the same untouched-file
+    // debt does not re-list its filenames on every close (run `node
+    // scripts/lint.mjs` for the full list).
+    notices: [...new Set(closeScopeNotice.map((e) => e.file))],
+    otherDebtCount,
   };
 
   if (args.json) {
@@ -1171,13 +1184,18 @@ function applySessionClose(args) {
         console.log('  Payload introduced a lint blocker — fix the payload content and retry.');
       }
     }
-    if (postNotice.length > 0) {
+    if (closeScopeNotice.length > 0) {
       console.log(
-        `\n· ${postNotice.length} pre-existing lint issue(s) in untouched files (not blocking): ${[
-          ...new Set(postNotice.map((e) => e.file)),
+        `\n· ${closeScopeNotice.length} pre-existing lint issue(s) in untouched files (not blocking): ${[
+          ...new Set(closeScopeNotice.map((e) => e.file)),
         ]
           .slice(0, 5)
-          .join(', ')}${postNotice.length > 5 ? ', …' : ''}`,
+          .join(', ')}${closeScopeNotice.length > 5 ? ', …' : ''}`,
+      );
+    }
+    if (otherDebtCount > 0) {
+      console.log(
+        `\n· +${otherDebtCount} pre-existing lint issue(s) elsewhere in the vault (other projects / shared pages, not blocking) — run \`node scripts/lint.mjs\` for the full list.`,
       );
     }
   }
