@@ -20,6 +20,7 @@ import {
   sanitizeProjForPrompt,
   pickProjectByCwd,
   collectProjectWorkingDirs,
+  buildVaultOrientation,
 } from './hypo-shared.mjs';
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
@@ -108,10 +109,14 @@ process.stdin.on('end', () => {
           );
         }
       }
+      // Same vault orientation as session-start: when the new cwd is a project
+      // working_dir distinct from the vault, surface where wiki files live.
+      const vaultOrientation = buildVaultOrientation(newCwd);
+      const orientPrefix = vaultOrientation ? `${vaultOrientation}\n\n` : '';
       console.log(
         JSON.stringify(
           buildOutput(
-            `[WIKI: cwd changed → project=${sanitizeProjForPrompt(newHit.proj)}]\n\n${content}`,
+            `${orientPrefix}[WIKI: cwd changed → project=${sanitizeProjForPrompt(newHit.proj)}]\n\n${content}`,
             {
               continue: true,
               suppressOutput: true,

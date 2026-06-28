@@ -30,6 +30,7 @@ import {
   sanitizeProjForPrompt,
   pickProjectByCwd,
   collectProjectWorkingDirs,
+  buildVaultOrientation,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -364,6 +365,12 @@ process.stdin.on('end', () => {
 
     const ignorePatterns = loadHypoIgnore(HYPO_DIR);
 
+    // When cwd is a project working_dir that is NOT the vault itself, tell the
+    // AI where the vault lives so it does not re-discover the path or look for
+    // wiki files in the code repo. '' when cwd === vault root.
+    const vaultOrientation = hit ? buildVaultOrientation(cwd) : '';
+    const hitPrefix = vaultOrientation ? `${vaultOrientation}\n\n` : '';
+
     if (hit) {
       const hotContent = readIfNotIgnored(hit.hotPath, HOT_CHARS, ignorePatterns);
       const stateContent = readIfNotIgnored(hit.statePath, STATE_CHARS, ignorePatterns);
@@ -386,7 +393,7 @@ process.stdin.on('end', () => {
         console.log(
           JSON.stringify(
             buildOutput(
-              `${noticePrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}]\n\n${parts.join('\n\n')}`,
+              `${noticePrefix}${hitPrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}]\n\n${parts.join('\n\n')}`,
               outExtra,
             ),
           ),
@@ -402,7 +409,7 @@ process.stdin.on('end', () => {
         console.log(
           JSON.stringify(
             buildOutput(
-              `${noticePrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}, no snapshot yet]`,
+              `${noticePrefix}${hitPrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}, no snapshot yet]`,
               outExtra,
             ),
           ),

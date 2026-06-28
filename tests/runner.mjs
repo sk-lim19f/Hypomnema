@@ -8337,6 +8337,89 @@ test('session-start still injects non-ignored project hot/state', () => {
   });
 });
 
+// ── vault orientation (IMPR-19) ─────────────────────────────────────
+// When cwd is a project working_dir distinct from the vault, the hooks surface
+// a one-line "[WIKI VAULT: <path>]" orientation so the AI does not re-discover
+// the vault path or look for wiki files in the code repo.
+suite('hypo-session-start.mjs / hypo-cwd-change.mjs — vault orientation (IMPR-19)');
+
+test('session-start injects vault orientation when cwd is a project HIT ≠ vault', () => {
+  withPrivateProject((dir, work) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: work, session_id: 'test-impr19-ss' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(r.stdout, /\[WIKI VAULT:/, `expected vault orientation, got: ${r.stdout}`);
+    assert.ok(
+      r.stdout.includes(dir),
+      `vault orientation must carry the absolute vault path: ${r.stdout}`,
+    );
+  });
+});
+
+test('session-start omits vault orientation when cwd IS the vault root', () => {
+  withGrowthWiki((dir) => {
+    const projDir = join(dir, 'projects', 'vaultproj');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      `---\ntitle: vaultproj\ntype: project-index\nupdated: 2026-06-28\nworking_dir: "${dir}"\n---\n# vaultproj\n`,
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\nVAULT_ROOT_HOT\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: dir, session_id: 'test-impr19-ss-vault' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !/\[WIKI VAULT:/.test(r.stdout),
+      `orientation must be suppressed when cwd === vault: ${r.stdout}`,
+    );
+  });
+});
+
+test('session-start omits vault orientation when cwd is a vault SUBDIR (working_dir=vault root)', () => {
+  withGrowthWiki((dir) => {
+    // A project whose working_dir is the vault root. The HIT matcher is
+    // prefix-based, so a session started in a vault subdirectory matches it —
+    // the orientation must still be suppressed (cwd is inside the vault).
+    const projDir = join(dir, 'projects', 'vaultroot');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      `---\ntitle: vaultroot\ntype: project-index\nupdated: 2026-06-28\nworking_dir: "${dir}"\n---\n# vaultroot\n`,
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\nVAULT_SUBDIR_HOT\n');
+    const subdir = join(dir, 'pages');
+    mkdirSync(subdir, { recursive: true });
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: subdir, session_id: 'test-impr19-ss-subdir' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !/\[WIKI VAULT:/.test(r.stdout),
+      `orientation must be suppressed inside the vault tree: ${r.stdout}`,
+    );
+  });
+});
+
+test('cwd-change injects vault orientation when new cwd is a project HIT ≠ vault', () => {
+  withPrivateProject((dir, work) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+      input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other', session_id: 'test-impr19-cc' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(r.stdout, /\[WIKI VAULT:/, `expected vault orientation, got: ${r.stdout}`);
+  });
+});
+
 test('cwd-change refuses to inject .hypoignore-matched project hot.md', () => {
   withPrivateProject((dir, work) => {
     writeFileSync(join(dir, '.hypoignore'), 'projects/private/hot.md\n');
@@ -8809,6 +8892,37 @@ test('replay-first-prompt-forces-summary: marker.proj is sanitized before interp
 });
 
 const sharedMod = await import(`${REPO}/hooks/hypo-shared.mjs`);
+
+test('buildVaultOrientation: containment honors FS case policy (IMPR-19, codex review)', () => {
+  const { buildVaultOrientation } = sharedMod;
+  // Fake (nonexistent) paths so realpathSync throws and the raw strings are
+  // compared — keeps the case behavior deterministic across platforms.
+  const VAULT = '/nonexistent-hypo-test/Vault';
+  const SUBDIR = '/nonexistent-hypo-test/Vault/pages';
+  // exact root → always suppressed
+  assert.equal(buildVaultOrientation(VAULT, VAULT, { caseInsensitive: false }), '');
+  // descendant (same case) → suppressed on either policy
+  assert.equal(buildVaultOrientation(SUBDIR, VAULT, { caseInsensitive: false }), '');
+  // case-only difference: suppressed on a case-insensitive FS (matches the
+  // case-folding HIT matcher), NOT suppressed on a case-sensitive FS
+  const CASE_CWD = '/nonexistent-hypo-test/vault/pages';
+  assert.equal(
+    buildVaultOrientation(CASE_CWD, VAULT, { caseInsensitive: true }),
+    '',
+    'case-insensitive FS must suppress a case-only vault subdir',
+  );
+  assert.match(
+    buildVaultOrientation(CASE_CWD, VAULT, { caseInsensitive: false }),
+    /\[WIKI VAULT:/,
+    'case-sensitive FS treats a different-case path as outside the vault',
+  );
+  // genuinely distinct repo → orientation injected, carries the vault path
+  const out = buildVaultOrientation('/nonexistent-hypo-test/code/repo', VAULT, {
+    caseInsensitive: false,
+  });
+  assert.match(out, /\[WIKI VAULT:/);
+  assert.ok(out.includes(VAULT), 'orientation carries the absolute vault path');
+});
 
 test('sanitizeProjForPrompt: strips angle brackets, control chars, and Unicode line separators (codex v2 review)', () => {
   const { sanitizeProjForPrompt } = sharedMod;
