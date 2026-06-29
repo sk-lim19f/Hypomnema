@@ -48,7 +48,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Validate version consistency (tag + all release channels)
-        # Supersedes the old package.json-only tag check (IMPR-12). Asserts the tag
+        # Supersedes the old package.json-only tag check. Asserts the tag
         # AND every version-carrying file agree — package.json, package-lock.json,
         # .claude-plugin/{plugin,marketplace}.json, templates/hypo-config.md — so a
         # forgotten plugin/marketplace/lockfile bump hard-fails the release instead
@@ -67,7 +67,7 @@ jobs:
           node scripts/check-bilingual.mjs --tag "${GITHUB_REF_NAME}"
 
       - name: Validate README version reconcile (both languages)
-        # The README-reconcile floor (IMPR-14): the release version MUST appear in
+        # The README-reconcile floor: the release version MUST appear in
         # README.md AND README.ko.md. README reconcile was dropped 3x (v1.2/v1.3.0/
         # v1.3.1) because no gate owned it. check-versions excludes the READMEs (they
         # carry prose HISTORY); this is their complement.

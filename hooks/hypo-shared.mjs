@@ -1103,7 +1103,7 @@ export function appendSyncFailure(hypoDir, op, error) {
  * never left half-merged. Called by the auto-commit Stop hook after a local
  * commit succeeds.
  *
- * Failure policy (v1.4 "sync hardening", tracker FEAT-17):
+ * Failure policy (v1.4 "sync hardening"):
  *   - clean fast-forward / conflict-free merge → push.
  *   - MERGE CONFLICT (`git pull --no-rebase` leaves unmerged paths): abort the
  *     merge so the tree returns to the just-committed local state ("ours"),
@@ -1112,7 +1112,7 @@ export function appendSyncFailure(hypoDir, op, error) {
  *     is lost: ours stays committed locally, "theirs" stays on the remote, and
  *     the divergence is surfaced by session-start + doctor until the user merges
  *     manually. Inline auto-resolution (preserving the losing version as a
- *     `.conflict-*` sibling) is deferred — see tracker PRAC-18.
+ *     `.conflict-*` sibling) is deferred.
  *   - non-conflict pull failure (network/auth: no unmerged paths) → record
  *     op='pull', then still attempt push (a transient pull blip should not block
  *     an otherwise-pushable commit); record op='push' if that also fails.

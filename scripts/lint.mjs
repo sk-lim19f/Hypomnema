@@ -142,7 +142,7 @@ const TYPE_ENUM_FIELDS = {
     status: ['active', 'superseded', 'archived'],
     tier: ['L1', 'L2'],
     sensitivity: ['public', 'sanitized'],
-    // FEAT-1: optional failure taxonomy. The enum loop guards on `if (fm[field])`,
+    // optional failure taxonomy. The enum loop guards on `if (fm[field])`,
     // so an omitted failure_type is never validated (optional, migration-safe).
     failure_type: FAILURE_TYPE_ENUM,
   },
@@ -283,7 +283,7 @@ const issues = [];
 //                             double-gate).
 // NOTE: no gate currently passes --strict (npm run lint / CI / release.yml /
 // crystallize / the close-gate all run plain lint), so promotion is
-// forward-looking — these surface as warnings today. IMPR-3's deliverable is
+// forward-looking: these surface as warnings today. The deliverable is
 // "stop silently green-passing invalid YAML"; the W9 warning satisfies that.
 const STRICT_PROMOTE_IDS = new Set(['W1', 'W2', 'W4', 'W9']);
 

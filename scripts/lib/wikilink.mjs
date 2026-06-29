@@ -7,7 +7,7 @@
 //   - scripts/graph.mjs       (slug index, page collection, link extraction)
 //   - scripts/crystallize.mjs (page collection, link extraction)
 //
-// IMPR-13 consolidation. Before this lib, each script carried its own copy of
+// Shared-resolver consolidation. Before this lib, each script carried its own copy of
 // collectPages + a slug-form deriver, drifting in subtle ways. The four
 // collectPages variants are NOT interchangeable — they differ deliberately in
 // traversal/security/output-shape policy (codex design review, CONCERN):

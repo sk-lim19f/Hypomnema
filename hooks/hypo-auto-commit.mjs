@@ -26,7 +26,7 @@ if (hasRemote()) {
   // pull/push failures must not stop the session, but they can no longer be
   // swallowed silently — syncRemote records each to .cache/sync-state.json and,
   // on a merge conflict, aborts the merge so the tree is never left half-merged
-  // (FEAT-17 hardening). session-start + doctor surface the result next session.
+  // (part of the v1.4 sync hardening). session-start + doctor surface the result next session.
   syncRemote(HYPO_DIR);
 }
 

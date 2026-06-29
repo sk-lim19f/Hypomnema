@@ -53,7 +53,7 @@ jobs:
           node-version: 20
       - name: All version-carrying files agree (drift caught pre-release)
         run: npm run check:versions
-      - name: README version reconcile present in both languages (IMPR-14)
+      - name: README version reconcile present in both languages
         run: npm run check:readme
       - name: Plugin surfaces load-valid (manifest, hooks, commands/skills)
         run: npm run smoke:plugin

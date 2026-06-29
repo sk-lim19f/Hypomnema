@@ -906,7 +906,7 @@ function applySessionClose(args) {
       // otherwise mistake it for the evidence file. The dated `## [date] ...`
       // heading lives inside the entry, so freshness / derive / design-history
       // are unchanged.
-      // PRAC-17 audit fields. The shard frontmatter is git-tracked and synced, so
+      // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
       // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
       // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
       // machine that first seeds the daily shard is recorded; later same-day

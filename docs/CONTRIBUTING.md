@@ -124,7 +124,8 @@ npm run lint       # scripts/lint.mjs — frontmatter + wikilink validation + W8
 npm run fix:verify # Phase 1 of learned_behavior #6 — verifies fix #N status claims in
                    # a wiki spec against `// @fix #N: <test-name>` anchors in
                    # tests/runner.mjs. Maintainer dogfood; needs a local wiki at
-                   # $HYPO_DIR or ~/hypomnema. Does NOT grep ADR core decision lines.
+                   # $HYPO_DIR or ~/hypomnema (source checkout only; not shipped in
+                   # the npm package). Does NOT grep ADR core decision lines.
 ```
 
 > **`fix:verify` needs an explicit `--spec`.** The default path
@@ -242,7 +243,7 @@ After both blocks, language-neutral:
 
 - **PR title**: Conventional Commits plus a scope, e.g. `feat(feedback): add failure_type enum`. The type drives the CHANGELOG section (see the classification table below).
 - **Merge commit**: the squash-merge subject carries the PR number (`#123`). That is where `#N` comes from, not the PR title. The two conventions stay separate.
-- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`) may appear in your local notes and in source or workflow comments (an internal reference, like an ADR anchor), but never on the published changelog and release surface: not in the CHANGELOG body, not in the PR `## Changelog` block, not in a tag annotation, not in a GitHub Release. The only identifier that ships in those is the PR number `#N`. `check-tracker-ids --tag` gates the tag body; the migration keeps the CHANGELOG body clean.
+- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`) may appear in your local notes and in `tests/` / `qa-runs/` (where they aid test-to-issue traceability and never reach an installed user), but not in shipped code or workflow comments, and never on the published changelog and release surface: not in the CHANGELOG body, not in the PR `## Changelog` block, not in a tag annotation, not in a GitHub Release. The only identifier that ships in those is the PR number `#N`. `check-tracker-ids` gates every surface (`--all`/`--staged` for files, `--commit-msg` for messages, `--tag` for the tag body); the migration keeps the CHANGELOG body clean.
 
 ### The `## Changelog` block
 

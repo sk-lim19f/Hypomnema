@@ -6,7 +6,7 @@ import { parseFrontmatter } from './frontmatter.mjs';
 // frontmatter. init.mjs / upgrade.mjs stamp it into hypo-pkg.json metadata;
 // deriving it here (rather than hardcoding a literal at each write site) keeps
 // the stamped value from going stale on a schema bump — the failure mode that
-// FEAT-1's 2.0 → 2.1 bump would otherwise have introduced. Returns null only if
+// the 2.0 → 2.1 schema bump would otherwise have introduced. Returns null only if
 // the template is missing/unreadable (a broken package), in which case callers
 // keep their prior literal default.
 export function templateSchemaVersion(pkgRoot) {
