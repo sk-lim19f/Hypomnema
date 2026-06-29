@@ -41,6 +41,7 @@
 //   exposing its inner commits as PR-less.
 
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { classifyChange, SECTION_TITLE } from './lib/changelog-classify.mjs';
@@ -50,6 +51,7 @@ import {
   parseChangelogBlock,
   assembleSections,
   renderDraft,
+  repoUrlToPrBase,
 } from './lib/collect-changelog.mjs';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -224,7 +226,18 @@ function main() {
     });
   }
 
-  const assembled = assembleSections(entries);
+  // Inline-link PR numbers to their GitHub PRs (CHANGELOG.md is a repo file, where
+  // GitHub does not autolink a bare `#N`). Derive the base from package.json's
+  // repository URL; if it is unreadable or unrecognized, the renderer falls back
+  // to a bare `#N` rather than a broken link.
+  let prUrlBase = null;
+  try {
+    const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
+    prUrlBase = repoUrlToPrBase(pkg.repository?.url);
+  } catch {
+    // no/unreadable package.json: keep prUrlBase null (bare #N fallback)
+  }
+  const assembled = assembleSections(entries, { prUrlBase });
 
   // Warnings (always emitted to stderr; never silent).
   const warn = (msg) => process.stderr.write(`[collect-changelog] ${msg}\n`);
