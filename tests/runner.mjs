@@ -47,7 +47,7 @@ import {
   stripScissors,
   messageHasGitTemplate,
   BLOCKED_PATTERNS,
-  USER_FACING_PATTERNS,
+  DECISION_PATTERNS,
   TAG_BODY_PATTERNS,
 } from '../scripts/lib/check-tracker-ids.mjs';
 import {
@@ -3731,7 +3731,7 @@ test('--apply: SCHEMA 2.0 → 2.1 is a minor bump with no migration report', () 
 // specialized body that names ADR 0031, all 9 hard-required feedback fields,
 // the manual-backfill requirement, and the project-id/slug regex caveat from
 // PR-B. Generic major bumps (covered above) keep their original body.
-test('--apply migration report v1→v2 includes ADR 0031 feedback fields guidance', () => {
+test('--apply migration report v1→v2 includes SCHEMA 2.0 feedback fields guidance', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {
       const hypoDir = join(dir, 'wiki');
@@ -3754,10 +3754,13 @@ test('--apply migration report v1→v2 includes ADR 0031 feedback fields guidanc
       assert.ok(out.migrationReport, 'migrationReport must be set on v1→v2 bump');
 
       const body = readFileSync(out.migrationReport, 'utf-8');
-      // ADR + 9 hard-required fields must all be named explicitly so a user
-      // running --apply sees exactly what needs backfilling.
-      assert.ok(body.includes('ADR 0031'), 'v1→v2 report must reference ADR 0031');
-      assert.ok(body.includes('ADR 0034'), 'v1→v2 report must reference ADR 0034');
+      // The SCHEMA 2.0 guidance + the 9 hard-required fields must all be named
+      // explicitly so a user running --apply sees exactly what needs backfilling.
+      assert.ok(
+        body.includes('What changed in SCHEMA 2.0'),
+        'v1→v2 report must explain the SCHEMA 2.0 change',
+      );
+      assert.ok(body.includes('semver-major'), 'v1→v2 report must explain why the bump is major');
       for (const field of [
         'status',
         'scope',
@@ -18507,7 +18510,6 @@ const ADVISORY_MARKERS = {
 // the word "advisory" — so a future surface that keeps "advisory" while
 // permitting an auto-action (auto-ingest, auto-update) still fails this gate.
 const GUARD_PHRASES = [
-  'ADR 0029',
   'advisory', // advisory-only framing
   'none performs an automatic action', // no-auto contract (not merely the word "advisory")
   'writes on its own', // closing reminder: none writes on its own
@@ -18626,15 +18628,17 @@ test('scanText allows GitHub refs and lookalikes', () => {
   }
 });
 
-test('scanText with USER_FACING_PATTERNS flags ADR / decisions pointers', () => {
-  const docPatterns = [...BLOCKED_PATTERNS, ...USER_FACING_PATTERNS];
+test('scanText with DECISION_PATTERNS flags ADR (space/tab/hyphen) and decisions pointers', () => {
+  const docPatterns = [...BLOCKED_PATTERNS, ...DECISION_PATTERNS];
   assert.equal(scanText('see ADR 0040 for rationale', docPatterns).length, 1);
   assert.equal(scanText('ADR\t0019 detail', docPatterns)[0].match, 'ADR\t0019');
+  assert.equal(scanText('hyphen form ADR-0018 here', docPatterns)[0].match, 'ADR-0018');
   assert.equal(scanText('lives in decisions/0031-foo.md', docPatterns)[0].match, 'decisions/0031');
   // GitHub refs and tracker ids still behave: PR #N safe, ISSUE-N still caught.
   assert.equal(scanText('PR #50 and (#9)', docPatterns).length, 0);
   assert.equal(scanText('ISSUE-7 and ADR 0040', docPatterns).length, 2);
-  // Default pattern set (shipped code / commit msgs) never flags ADR refs.
+  // The bare scanText default (BLOCKED_PATTERNS) still never flags ADR refs — only
+  // the CLI's patternsFor() layers DECISION_PATTERNS on for non-CHANGELOG files.
   assert.equal(scanText('ADR 0040 and decisions/0031 anchor').length, 0);
 });
 
@@ -18676,6 +18680,34 @@ test('scanText reports 1-based line/col', () => {
   assert.equal(hits.length, 1);
   assert.equal(hits[0].line, 2);
   assert.equal(hits[0].col, 6);
+});
+
+test('scanText catches a tracker token that line-wraps inside a comment', () => {
+  const docPatterns = [...BLOCKED_PATTERNS, ...DECISION_PATTERNS];
+  // ADR wrapped across a JSDoc continuation: prefix on line 1, digits on line 2.
+  const wrapped = ' * before continuing (ADR\n * 0045) and after';
+  const h = scanText(wrapped, docPatterns);
+  assert.equal(h.length, 1, 'wrapped ADR must be caught');
+  assert.equal(h[0].match, 'ADR 0045');
+  assert.equal(h[0].line, 1, 'reported at the prefix line');
+  // Space-form wraps (the break stands in for a space).
+  assert.equal(scanText('truth (fix\n // #37) projection').length, 1, 'fix #N word-wrap');
+  // Separator-flush wraps: the break falls right at `-` / `/` / `#`, where the
+  // digit must sit flush — the no-gap join catches these.
+  assert.equal(scanText('see ISSUE-\n * 9 here').length, 1, 'ISSUE- separator wrap');
+  assert.equal(
+    scanText('lives in decisions/\n // 0031-foo', docPatterns).length,
+    1,
+    'decisions/ wrap',
+  );
+  assert.equal(scanText('blocks (fix #\n * 37)').length, 1, 'fix #<wrap>N separator wrap');
+  assert.equal(scanText('per FEAT-\n // 1 detail', docPatterns).length, 1, 'FEAT- separator wrap');
+  // The ADR hyphen form can match in BOTH joins; it must be de-duplicated to one.
+  assert.equal(scanText('ref ADR\n -0045 end', docPatterns).length, 1, 'ADR hyphen wrap deduped');
+  // A non-wrapped token is still counted exactly once (no double-count from the
+  // join pass), and a token split by a blank line (not an adjacent wrap) is ignored.
+  assert.equal(scanText('one ISSUE-9 here\nplain next line').length, 1);
+  assert.equal(scanText('trailing ADR\n\n0045 far away', docPatterns).length, 0);
 });
 
 test('messageHasGitTemplate detects editor template / scissors, not -m messages', () => {
@@ -18895,9 +18927,9 @@ test('CLI --staged: package.json leak is gated (scope agrees with --all)', () =>
   });
 });
 
-test('CLI --all: ADR pointer in README is gated, but kept in code / CHANGELOG', () => {
+test('CLI --all: ADR / decisions pointers are gated everywhere except CHANGELOG', () => {
   withTmpDir((dir) => {
-    // README.md is user-facing → ADR pointer flagged.
+    // README.md → ADR pointer flagged.
     writeFileSync(join(dir, 'README.md'), 'rationale lives in ADR 0031.\n');
     const r = runChecker(['--all'], { CHECK_TRACKER_ROOT: dir });
     assert.equal(r.status, 1, 'README ADR pointer must be gated');
@@ -18909,28 +18941,36 @@ test('CLI --all: ADR pointer in README is gated, but kept in code / CHANGELOG', 
     assert.equal(runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status, 1);
   });
   withTmpDir((dir) => {
-    // docs/ tree is user-facing → flagged.
+    // docs/ tree → flagged.
     mkdirSync(join(dir, 'docs'), { recursive: true });
     writeFileSync(join(dir, 'docs', 'ARCHITECTURE.md'), '## Section (ADR 0019)\n');
     assert.equal(runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status, 1);
   });
   withTmpDir((dir) => {
-    // Shipped CODE keeps ADR rationale anchors → NOT flagged.
+    // Shipped CODE comments now block ADR anchors too (space and hyphen forms).
     mkdirSync(join(dir, 'hooks'), { recursive: true });
-    writeFileSync(join(dir, 'hooks', 'x.mjs'), '// cwd-first (ADR 0044)\n');
-    assert.equal(
-      runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status,
-      0,
-      'code comment ADR anchors must NOT be gated',
-    );
+    writeFileSync(join(dir, 'hooks', 'x.mjs'), '// cwd-first (ADR 0044), see ADR-0018\n');
+    const r = runChecker(['--all'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'code comment ADR anchors must now be gated');
+    assert.match(r.stderr, /ADR 0044/);
+    assert.match(r.stderr, /ADR-0018/);
   });
   withTmpDir((dir) => {
-    // CHANGELOG keeps version-history ADR refs → NOT flagged.
-    writeFileSync(join(dir, 'CHANGELOG.md'), '- gate single SoT (ADR 0046)\n');
+    // A decisions/ path in shipped code → flagged.
+    mkdirSync(join(dir, 'scripts'), { recursive: true });
+    writeFileSync(join(dir, 'scripts', 'y.mjs'), '// see decisions/0052-foo.md\n');
+    assert.equal(runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status, 1);
+  });
+  withTmpDir((dir) => {
+    // CHANGELOG keeps version-history ADR / decisions refs → NOT flagged.
+    writeFileSync(
+      join(dir, 'CHANGELOG.md'),
+      '- gate single SoT (ADR 0046), see decisions/0046-foo.md\n',
+    );
     assert.equal(
       runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status,
       0,
-      'CHANGELOG ADR refs must NOT be gated',
+      'CHANGELOG ADR / decisions refs must NOT be gated',
     );
   });
 });

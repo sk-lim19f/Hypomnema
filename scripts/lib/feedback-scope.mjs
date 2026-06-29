@@ -4,7 +4,7 @@
 //   - scripts/lint.mjs      (lint-time validation of feedback page frontmatter)
 //   - scripts/feedback.mjs  (create-time --scope validation in /hypo:feedback)
 // Keep this the ONLY definition; both consumers import it so the two validators
-// never drift (ADR 0034 / OQ-34). feedback-sync.mjs matches scope by plain string
+// never drift. feedback-sync.mjs matches scope by plain string
 // equality (not this regex), so it is intentionally not a consumer.
 //
 // Accepts `global` or `project:<id>`. The `<id>` charset matches what

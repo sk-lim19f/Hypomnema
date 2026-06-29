@@ -129,7 +129,7 @@ export function lastSubstantialOpIsSession() {
   return /^## \[\d{4}-\d{2}-\d{2}\] session/.test(substantial[substantial.length - 1]);
 }
 
-// Returns the wiki's git state split into its two independent axes (ADR 0056):
+// Returns the wiki's git state split into its two independent axes:
 //   uncommitted — working-tree changes (real unsaved work; a human-fixable blocker)
 //   ahead       — committed-but-unpushed commits (a soft, auto-synced state: the
 //                 auto-commit Stop hook pushes, and push failures are non-fatal —
@@ -232,7 +232,7 @@ export function hasSessionLogHeading(content, date) {
 
 /**
  * Canonical session-log shard path (repo-relative POSIX) for a single day.
- * ADR 0050 / option D: the date IS the filename (`YYYY-MM-DD.md`), so no
+ * Option D: the date IS the filename (`YYYY-MM-DD.md`), so no
  * "current part" resolver is needed and the per-session write touches a small
  * file instead of a multi-thousand-line monthly log. This is the WRITE target.
  */
@@ -557,16 +557,16 @@ function pickByCwd(hypoDir, slugs, cwd) {
 
 /**
  * Resolve the active project slug from root hot.md. With a cwd, a project whose
- * working_dir contains it wins (cwd-first, ADR 0044); otherwise the
+ * working_dir contains it wins (cwd-first); otherwise the
  * most-recently-active row is returned.
  * The cwd helpers (parseFrontmatterField / pickByCwd) and the cwd-first body
  * are kept in sync with scripts/resume.mjs by hand; the surrounding wrapper
  * intentionally differs (resume.mjs adds an mtime fallback, this does not).
- * `cwd` is an optional cwd-first selector (ADR 0044): a cwd↔working_dir match
+ * `cwd` is an optional cwd-first selector: a cwd↔working_dir match
  * wins over recency. resume passes process.cwd(); session-close callers
  * (sessionCloseFileStatus / closeFileTargets) intentionally pass null — close
- * has a different authority (payload.project / freshness, the global invariant
- * of ADR 0043), so it never picks by cwd. When cwd is omitted, behavior is
+ * has a different authority (payload.project / freshness, the global invariant),
+ * so it never picks by cwd. When cwd is omitted, behavior is
  * identical to the legacy recency version.
  * @param {string} hypoDir
  * @param {string|null} [cwd]
@@ -590,7 +590,7 @@ export function resolveActiveProject(hypoDir, cwd = null) {
     ),
   ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
-    // cwd-first (ADR 0044): a cwd↔working_dir match wins over recency, across
+    // cwd-first: a cwd↔working_dir match wins over recency, across
     // ALL rows. Kept in sync with scripts/resume.mjs. close callers pass null →
     // recency path below (resume=cwd-positive / close=no-pick).
     if (cwd) {
@@ -625,7 +625,7 @@ export function resolveActiveProject(hypoDir, cwd = null) {
  *   - projects/<project>/hot.md                 — frontmatter `updated:` is today
  *   - hot.md (root)                             — frontmatter `updated:` is today
  *   - projects/<project>/session-log/YYYY-MM-DD.md — has a `## [today]` heading
- *     (daily shard, ADR 0050; legacy YYYY-MM.md is still accepted as fallback)
+ *     (daily shard; legacy YYYY-MM.md is still accepted as fallback)
  *   - log.md                                    — has a `## [today] session | <project>` entry
  * The log.md check is project-scoped so a session close left incomplete for
  * project A can't be masked by a fresh close of project B (and vice versa).
@@ -679,7 +679,7 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
   checkUpdated(join('projects', project, 'hot.md'));
   checkUpdated('hot.md');
 
-  // session-log: daily shard (ADR 0050), with legacy monthly fallback — must
+  // session-log: daily shard, with legacy monthly fallback: must
   // carry a today-dated heading in whichever file holds it. Daily-first read
   // order short-circuits on the small shard. When no match is found, the gap is
   // reported under the canonical daily shard for the local date (dates[0]).
@@ -724,19 +724,19 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
   return { ok: stale.length === 0 && missing.length === 0, project, dates, stale, missing };
 }
 
-// ── global session-close gate (ADR 0043) ────
+// ── global session-close gate ────────────────
 // The no-payload close paths must NOT pick one project (recency / cwd) and check
 // it — that re-derivation is the prior session-close false-block, and a cwd
 // tie-break here would let a fresh cwd mask a DIFFERENT project's dangling
 // close. Instead the gate enforces a global invariant: no project may end a
-// session with a partial close. resume stays cwd-positive (ADR 0044); close
+// session with a partial close. resume stays cwd-positive; close
 // never picks. The two copies of resolveActiveProject share the cwd-first body
 // but the resume.mjs copy adds an mtime fallback this one omits — see resume.mjs.
 
 // Root hot.md Active-Projects rows as {slug, date}. The per-row date column is
 // project-scoped (unlike the shared frontmatter `updated:`). Used for candidate
-// DISCOVERY in closeCandidateSlugs — NOT as close-activity evidence: ADR 0057
-// dropped the row date as an activity signal because project-create and
+// DISCOVERY in closeCandidateSlugs, not as close-activity evidence: the row date
+// was dropped as an activity signal because project-create and
 // hypo-hot-rebuild both stamp rows today without a real session. Mirrors
 // resolveActiveProject's regex.
 function rootHotRows(hypoDir) {
@@ -805,9 +805,9 @@ function closeCandidateSlugs(hypoDir, dates) {
 // True when project P shows an AUTHORITATIVE today close-activity signal: a
 // today-dated session-log heading, or a today-dated `## [today] session | P`
 // log.md entry. These are written ONLY by a real session close (apply, or its
-// auto-derived root log — ADR 0049).
+// auto-derived root log).
 //
-// ADR 0057: soft state files are EXCLUDED, because each is bumped to today by
+// Soft state files are EXCLUDED, because each is bumped to today by
 // non-session tooling and is therefore indistinguishable from a real close:
 //   - session-state.md `updated:`  — tracker bookkeeping mirrors a new item into
 //     the "next tasks" section (a cross-block incident: editing one project's
@@ -821,7 +821,7 @@ function closeCandidateSlugs(hypoDir, dates) {
 // Tradeoff (documented, accepted): apply writes session-state.md FIRST, then the
 // project files, then the session-log + log entry. A process crash before the
 // session-log write leaves a torn close that this gate no longer flags. Accepted:
-// a torn close never reached apply's ok=true so it wrote no marker (ADR 0055/0056);
+// a torn close never reached apply's ok=true so it wrote no marker;
 // the surviving session-state is the resume pointer the next session overwrites;
 // what is lost is a narrative log entry, not continuity.
 function hasTodayCloseActivity(hypoDir, project, dates) {
@@ -849,7 +849,7 @@ function hasTodayCloseActivity(hypoDir, project, dates) {
 }
 
 /**
- * Global session-close status for the no-payload close paths (ADR 0043).
+ * Global session-close status for the no-payload close paths.
  * Checks EVERY project with today close-activity; ok only when all are complete.
  * When no project has today activity, falls back to the legacy single recency
  * project (preserves "force the initial close" behavior, byte-identical gate).
@@ -870,7 +870,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // bypass discovery and report the single project, preserving the global return
   // shape. NEVER threaded from a marker-writing path (--mark / apply auto-marker /
   // PreCompact): those stay global so the marker == compact-ready invariant holds
-  // (ADR 0047, codex design review). A green status here is a project-scoped
+  // (codex design review). A green status here is a project-scoped
   // diagnostic, not the global compact-readiness verdict.
   if (opts.projectOverride) {
     const s = sessionCloseFileStatus(hypoDir, { projectOverride: opts.projectOverride });
@@ -934,7 +934,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
 // for EVERY today-active project — cross-session, looking like a fresh bug each
 // time. This derives the missing entry from the session-log heading so the gate
 // never blocks on a purely-derivable gap. The session-closed MARKER is NOT derived
-// here: it is a proof artifact the close gate actually ran (ADR 0022 invariant).
+// here: it is a proof artifact the close gate actually ran.
 //
 // Safety guard (codex design review): derive ONLY for a project whose close is
 // otherwise complete — i.e. its sole gate problem is log.md. If session-state /
@@ -1167,7 +1167,7 @@ export function syncRemote(hypoDir) {
  * remote sync stays in the auto-commit Stop hook (commit is local + cheap; sync is
  * network + soft-fail). Shared by hypo-auto-commit.mjs and crystallize.mjs's
  * --apply-session-close path so the .hypoignore staging filter cannot diverge
- * between the two commit loci (ADR 0056).
+ * between the two commit loci.
  *
  * "Nothing to commit" (clean tree, or only .hypoignore'd changes) is SUCCESS, not
  * failure — the caller's tree is already in the committed state it wanted.
@@ -1245,7 +1245,7 @@ export function clearSyncState(hypoDir) {
   }
 }
 
-// ── auto-project suggestion (ADR 0023) ────────────────────────────
+// ── auto-project suggestion ────────────────────────────────────────
 // `.cache/project-suggestions.json` is a single JSON object:
 //   { "skips": [{cwd, declined_at, reason}], "cooldowns": {"<cwd>": "<iso>"} }
 // `skips` is written by the LLM (Layer-1 behavioral rule) when the user answers
@@ -1319,7 +1319,7 @@ export function cwdHasProjectMarker(cwd) {
 /**
  * Decide whether SessionStart/CwdChanged should offer to create a project for
  * `cwd`. The caller MUST have already confirmed `cwd` matches no project's
- * `working_dir` (the hook's MISS branch); this evaluates the remaining ADR 0023
+ * `working_dir` (the hook's MISS branch); this evaluates the remaining
  * trigger conditions: (a) cwd is a git repo, (b) carries a project marker
  * (`.git` alone is a weak signal — §8.11), (c) not in cooldown, (d) not a cwd
  * the user previously declined. A corrupt store stays silent (doctor surfaces).
@@ -1364,7 +1364,7 @@ export function buildProjectSuggestionLine(cwd) {
   return `[WIKI: cwd '${safe}'에 매칭되는 프로젝트가 없습니다. 자동 생성할까요? (Y/n)]`;
 }
 
-// ── clear-marker (ADR 0022 amendment 2026-05-14) ────────────
+// ── clear-marker (amendment 2026-05-14) ──────────────────────
 // `/clear` cannot be blocked (no UserPromptSubmit fire). The only intervention
 // point is the SessionEnd(reason='clear') → SessionStart(source='clear') pair:
 // SessionEnd writes `.cache/clear-marker.json` with the dying session's id +
@@ -1382,7 +1382,7 @@ function clearMarkerPath(hypoDir) {
 
 /**
  * Persist the dying session's identity so the next SessionStart(source=clear)
- * can issue a recovery nudge. Single-file by design (see ADR 0022 amendment):
+ * can issue a recovery nudge. Single-file by design (see the amendment):
  * /clear is a single-client UX action, multi-marker disambiguation buys no
  * safety and breaks the 1-of-1 read-and-unlink contract.
  *
@@ -1449,7 +1449,7 @@ export function clearClearMarker(hypoDir) {
   }
 }
 
-// ── session-closed marker (ADR 0022 amendment 2026-05-19) ────
+// ── session-closed marker (amendment 2026-05-19) ─────────────
 // Per-session marker proving session-close completed. Stop hook
 // (`hypo-auto-minimal-crystallize`) reads it; `scripts/crystallize.mjs` writes
 // it after a verified close. Per-session (not per-day) precision resolves the
@@ -1457,7 +1457,7 @@ export function clearClearMarker(hypoDir) {
 // later session reuses an earlier session's entry on the same day.
 //
 // Writer authority lives in crystallize, NOT this hook: the hook only checks
-// presence. See ADR 0022 amendment 2026-05-19 Q2 for the split rationale.
+// presence. See amendment 2026-05-19 Q2 for the split rationale.
 
 const SESSION_CLOSED_MARKER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -1552,7 +1552,7 @@ export function clearSessionClosedMarker(hypoDir, sessionId) {
   }
 }
 
-// ── transcript activity heuristic (ADR 0022 amendment 2026-05-19; 6a 2026-06-14) ──
+// ── transcript activity heuristic (amendment 2026-05-19; 6a 2026-06-14) ─────────
 // Substantial-session gate for the Stop hook: a session "worth" blocking on for
 // session-close is either (a) any mutation (Edit/Write/MultiEdit/NotebookEdit)
 // or (b) a high-volume read-only investigation (≥ READONLY_SUBSTANTIAL_THRESHOLD
@@ -1780,7 +1780,7 @@ export function closeFileTargets(hypoDir) {
 
 /**
  * Global variant of closeFileTargets for the no-payload lint-scope callers
- * (ADR 0043). Union of the close files over every today-active project
+ * Union of the close files over every today-active project
  * (fallback: the recency project when none is active). Includes the session-log
  * evidence file for EVERY freshDate (not just dates[0]) so the lint scope matches
  * what sessionCloseFileStatus actually checks across a local/UTC date boundary.
@@ -1875,9 +1875,9 @@ export function isUnderProjectDirs(file, slugs) {
  *
  * Read-only: feedback projection PURE drift is reported as a non-blocking notice
  * with its targets in `driftTargets` (an "effect requirement"), NOT a blocker —
- * the hook self-heals it with `feedback-sync --write` before continuing (ADR
- * 0045) and a verify caller needs no human action for it. over-cap and conflict
- * DO block (ADR 0031 rules 3 & 6 — human demote/import required).
+ * the hook self-heals it with `feedback-sync --write` before continuing,
+ * and a verify caller needs no human action for it. over-cap and conflict
+ * DO block (human demote/import required).
  *
  * Faithfulness caveats (why "compact-ready", not "guaranteed pass"): the hook
  * has paths outside this status — a context-≥70% early block, HYPO_SKIP_GATE
@@ -1889,10 +1889,10 @@ export function isUnderProjectDirs(file, slugs) {
  * opts.projectOverride (CHECK-ONLY) narrows BOTH the close status and the lint
  * scope to a single project, for `--check-session-close --project=<slug>`. A
  * green result is then a project-scoped diagnostic, NOT the global compact-ready
- * verdict (ADR 0046) — the caller must surface the scope. It is NEVER passed from
+ * verdict: the caller must surface the scope. It is NEVER passed from
  * a marker-writing path (--mark / apply auto-marker / PreCompact); those stay
  * global so a marker can't attest compact-ready while PreCompact re-checks red
- * (the marker == compact-ready invariant, ADR 0047 / codex design review). When a
+ * (the marker == compact-ready invariant, codex design review). When a
  * log-only marker governs the session, log-only mode wins and projectOverride is
  * ignored.
  *
@@ -1919,11 +1919,11 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const marker = opts.sessionId ? readSessionClosedMarker(hypoDir, opts.sessionId) : null;
   const logOnly = opts.logOnly === true || marker?.scope === 'log-only';
 
-  // 1. wiki git state (ADR 0056). Uncommitted changes (real unsaved work) BLOCK —
+  // 1. wiki git state. Uncommitted changes (real unsaved work) BLOCK:
   //    they are human-fixable. Unpushed commits (ahead) DEMOTE to a notice: push is
   //    automatic (auto-commit Stop hook) and its failures are already non-fatal, so
   //    "ahead" is a transient sync state, not a human-fixable blocker. Demoting it
-  //    here (the shared gate) keeps the marker == compact-ready invariant (ADR 0047):
+  //    here (the shared gate) keeps the marker == compact-ready invariant:
   //    a committed-but-unpushed close marks AND compacts, instead of the close writer
   //    committing its own payload and then being blocked by its own (unpushed) commit.
   const git = hypoIsClean(hypoDir);
@@ -1938,7 +1938,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const hot = hotMdIsClean(hypoDir);
   if (!hot.clean) blockers.push({ type: 'hot', reason: hot.reason });
 
-  // 3. session-close files (global invariant, ADR 0043) — or, in log-only mode,
+  // 3. session-close files (global invariant); in log-only mode,
   //    the minimum proof (a today log.md entry) with NO project attribution.
   let close;
   if (logOnly) {
@@ -2041,7 +2041,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           reason: `${n.file}${n.id ? ` (${n.id})` : ''}`,
         });
       // W8 (design-history stale) is each today-active project's own close
-      // responsibility; others' are non-blocking notices (ADR 0043). In log-only
+      // responsibility; others' are non-blocking notices. In log-only
       // mode there is NO project this session is accountable for, so every W8 is a
       // notice — a non-project session must never be blocked by some project's
       // stale design-history (codex design BLOCKER: the attribution leak this fix
@@ -2079,7 +2079,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     }
   }
 
-  // 5. feedback projection (ADR 0031 / 0045). over-cap/conflict block; pure
+  // 5. feedback projection. over-cap/conflict block; pure
   //    drift is a self-healable notice (driftTargets = effect requirement the
   //    hook runs as --write). Classification mirrors hypo-personal-check exactly.
   const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
@@ -2192,7 +2192,7 @@ export function isClearCommand(prompt) {
   return prompt === '/clear' || /^\/clear(\s|$)/.test(prompt);
 }
 
-/** Returns true if the prompt is either /compact or /clear (ADR 0022 Layer 2). */
+/** Returns true if the prompt is either /compact or /clear (Layer 2). */
 export function isCompactOrClearCommand(prompt) {
   return isCompactCommand(prompt) || isClearCommand(prompt);
 }
@@ -2223,7 +2223,7 @@ export function extractUserMessages(transcriptPath, tailN = 30) {
       .map((line) => {
         try {
           const obj = JSON.parse(line);
-          // Skill-injection vector (ADR 0055): drop system-injected role:user
+          // Skill-injection vector: drop system-injected role:user
           // messages before they pollute the close-intent signal.
           //  • isMeta:true   — slash-command bodies, skill bodies, local-command
           //    caveats. Their text is docs/specs, often full of close vocabulary
@@ -2281,7 +2281,7 @@ export function isClosePattern(text) {
     // 끝: bare terminal noun, boundary-guarded so "세션 끝내는 방법" /
     // "세션 끝나면" don't trip.
     /세션\s*끝(?![가-힣])/,
-    // 세션 마무리/종료 (ADR 0055): the OLD pattern required a fixed verb suffix
+    // 세션 마무리/종료: the OLD pattern required a fixed verb suffix
     // (하자/할게/했어) and missed the most common real phrasings — "세션 마무리
     // 해줘" (imperative), bare "세션 마무리", "세션마무리" (no space). A
     // blacklist lookahead (excluding 조건/로직/여부/…) is whack-a-mole because
@@ -2297,8 +2297,8 @@ export function isClosePattern(text) {
     // the rare FN over the FP. The residual: connective forms that happen to put a
     // space after a complete terminal can't be separated by regex without a
     // morphological parser — that's bounded by the compound gate (precompact-green
-    // + signal) and the unambiguous /compact and AskUserQuestion channels (ADR 0055
-    // threat boundary), not chased further.
+    // + signal) and the unambiguous /compact and AskUserQuestion channels (threat
+    // boundary), not chased further.
     /세션\s*(?:마무리|종료)(?:\s*(?:해줘|해주세요|해요|해|하자|하죠|했어|했다|했음|했지|합시다|합니다|할게|할께|할래|할까|할까요|한\s?거(?:지|야|니)?|함)(?![가-힣])|\s*[)\].,!?~。…]|\s*$)/m,
     /오늘\s*은?\s*(여기|작업|세션).*(끝|마치|마무리|종료)/,
     // 여기까지: requires no continuation action word (e.g. 여기까지 구현해줘 is not a close signal)
@@ -2316,7 +2316,7 @@ export function isClosePattern(text) {
     // objects. The review/analysis/debug/audit/investigation nouns were added
     // for 6a — read-only review sessions are now "substantial", so "wrap up the
     // review" must read as a task-level signal, not a session-close one.
-    // Leading \b on each pattern (ADR 0055) so an EN close phrase embedded as a
+    // Leading \b on each pattern so an EN close phrase embedded as a
     // substring of a longer token can't trip the gate (e.g. "designing off…").
     /\bwrap(?:ping)?\s+up(?!\s+(?:this|the)\s+(?:pr|issue|bug|task|function|component|module|feature|code|test|review|analysis|investigation|debugging|debug|audit|refactor)\b)/i,
     /\bdone\s+for\s+(?:today|now|the\s+day)\b/i,
@@ -2338,7 +2338,7 @@ export function isClosePattern(text) {
  * slug would miss the file. The session id is a UUID, so the glob disambiguates
  * without needing the slug — verified globally unique across all project dirs.
  *
- * Fail-closed on ambiguity (ADR 0055, codex review): returns the single resolved
+ * Fail-closed on ambiguity (codex review): returns the single resolved
  * path, or null when ZERO or MORE-THAN-ONE distinct files match (realpath-deduped
  * so a symlink to the same file is not "multiple"). The caller treats null as
  * "refuse the marker".
@@ -2375,13 +2375,13 @@ export function resolveTranscriptBySessionId(
 
 /**
  * Returns true iff the transcript carries a genuine USER session-close signal —
- * the hard gate for the session-closed marker writers (ADR 0055). Scans the FULL
+ * the hard gate for the session-closed marker writers. Scans the FULL
  * transcript: a close request can precede the marker write by the entire close
  * checklist, so the Stop hook's 30-line tail would miss it.
  *
  * Evidence (any one is sufficient):
  *   1. a de-polluted NL close phrase — isClosePattern over extractUserMessages,
- *      which already drops injected / tool / hook-feedback text (ADR 0055);
+ *      which already drops injected / tool / hook-feedback text;
  *   2. a `/compact` invocation (queue-operation). `/clear` is deliberately NOT
  *      counted: it abandons context, whereas a session-close PRESERVES the work
  *      to the wiki — a different intent;
@@ -2464,7 +2464,7 @@ export function buildOutput(context, extra = {}) {
 // ── growth metrics (F2 + E4) ───────────────────────────────────────────────
 // Single formatter used by Stop (hot-rebuild) and SessionStart hooks so the
 // "[hypo] +N pages, ~M updated, K wikilinks" line stays consistent at both
-// ends of a session. See ADR-0018 / Lane B.
+// ends of a session. See Lane B.
 
 /**
  * Format a growth-metrics one-liner. Returns '' when all counts are 0 so

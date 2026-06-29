@@ -21,7 +21,7 @@ tags: [hot-cache, project]
 ## Key Decisions
 
 <!-- Brief pointers to important ADRs or design choices -->
-<!-- [[decisions/0001-topic]] — decision summary -->
+<!-- [[decisions/NNNN-topic]] — decision summary -->
 
 ## Blockers / Open Questions
 

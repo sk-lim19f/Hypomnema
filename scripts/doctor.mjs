@@ -221,7 +221,7 @@ function checkDirectories(hypoDir) {
     'pages',
     'projects',
     'sources',
-    // Extensions baseline (ADR 0024). Existence only — SHA / settings /
+    // Extensions baseline. Existence only — SHA / settings /
     // manifest integrity is E5.
     'extensions/hooks',
     'extensions/commands',
@@ -308,7 +308,7 @@ function checkSettingsJson() {
   }
 
   // stale hypo-* entries (uninstall remnants).
-  // hypo-ext-* commands are user-extension entries (ADR 0024) — not core hooks,
+  // hypo-ext-* commands are user-extension entries — not core hooks,
   // so they are intentionally absent from HOOK_MAP. Excluded here; their
   // integrity (SHA + manifest + entry match) is checked separately in E5.
   const isExtCommand = (cmd) => /(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(cmd);
@@ -545,7 +545,7 @@ function checkSyncState(hypoDir) {
 }
 
 function checkProjectSuggestions(hypoDir) {
-  // ADR 0023: the auto-project skip-persistence store. Absent file is
+  // Auto-project skip-persistence store. Absent file is
   // healthy (no offers declined yet). Validate the RAW JSON shape here rather
   // than via readProjectSuggestions(): that helper deliberately normalizes a
   // non-array `skips` to [] for fail-open hook reads, which would mask a
@@ -665,7 +665,7 @@ function checkCodexPaths() {
   }
 }
 
-// ── extensions integrity (ADR 0024, E5) ───────────────────────────
+// ── extensions integrity (E5) ─────────────────────────────────────
 
 // Detect drift between the user's `~/hypomnema/extensions/` source, the recorded
 // per-target SHA map (`hypo-pkg.json`), and the installed copies + settings.json
@@ -685,7 +685,7 @@ function checkCodexPaths() {
 //
 // E5 is doctor SURFACE for extensions integrity. The mixed-group surgical
 // *write* (preserve sibling-plugin hooks, swap only ours) used to be deferred
-// here; ADR 0024 amendment 2026-05-23 lifted that deferral —
+// here; amendment 2026-05-23 lifted that deferral:
 // registerSettings (extensions.mjs:478 docstring) now does occurrence-first +
 // 8-rank canonical write, and the (b) loop below mirrors that read-path via
 // collectOurOccurrences so a valid mixed-group occurrence is no longer warned
@@ -926,7 +926,7 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
   else warn(label, `${sample}${extra}`);
 }
 
-// ── feedback projection (ADR 0031) ──────────────────────────────
+// ── feedback projection ──────────────────────────────────────────
 
 // Spawn feedback-sync.mjs --check --json and map its drift report onto doctor's
 // pass/warn/fail. Integrity violations (exit-3 class: conflict / unpaired marker
@@ -1015,7 +1015,7 @@ function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
   }
 }
 
-// ── stale sibling install (ADR 0038, D) ──────────────────────────────────────
+// ── stale sibling install (D) ────────────────────────────────────────────────
 //
 // Detect a SECOND, older Hypomnema that owns the `hypomnema` bin on PATH while a
 // newer copy owns the active hooks. That sibling is a footgun: `hypomnema init` /

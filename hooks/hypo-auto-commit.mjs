@@ -14,7 +14,7 @@ function hasRemote() {
 }
 
 // Stage + commit via the shared helper (same .hypoignore filter the apply path
-// uses — ADR 0056). A real commit failure short-circuits before sync, exactly as
+// uses). A real commit failure short-circuits before sync, exactly as
 // the inline logic did; "nothing to commit" is success and falls through to sync.
 const result = commitWikiChanges(HYPO_DIR);
 if (!result.committed) {

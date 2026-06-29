@@ -11,7 +11,7 @@ When invoked to close a session — via an explicit close signal ("세션 종료
 
 ## What this does
 
-- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `/hypo:crystallize` in `--apply-session-close --payload=<path>` mode — which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). `--check-session-close` is a read-only dry-run of the **full** PreCompact gate (ADR 0046) — close files + scoped lint + design-history + feedback projection — sharing one function (`precompactGateStatus`) with the gate. A green check means no gate blocker needs a human fix, so it is the signal to declare the session closed (pass `--transcript-path` to widen the lint scope to this session's edited files exactly as the interactive hook does). It is not a hard guarantee: the live `/compact` can still differ on a context-≥70% prompt, `HYPO_SKIP_GATE`, or a transcript-scoped lint error the check did not see.
+- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `/hypo:crystallize` in `--apply-session-close --payload=<path>` mode — which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). `--check-session-close` is a read-only dry-run of the **full** PreCompact gate: close files + scoped lint + design-history + feedback projection, sharing one function (`precompactGateStatus`) with the gate. A green check means no gate blocker needs a human fix, so it is the signal to declare the session closed (pass `--transcript-path` to widen the lint scope to this session's edited files exactly as the interactive hook does). It is not a hard guarantee: the live `/compact` can still differ on a context-≥70% prompt, `HYPO_SKIP_GATE`, or a transcript-scoped lint error the check did not see.
 - **Synthesis mode**: finds tag clusters (≥ N pages), orphan pages (no outbound `[[wikilinks]]`), and draft / stub pages, then guides consolidation into `pages/syntheses/<topic>.md` with back-links and `index.md` updates.
 
 ---
@@ -47,7 +47,7 @@ If `/hypo:crystallize` was invoked as a session-close action, run through this c
 
 ### Advisory reflections (run before the checklist below — advisory only)
 
-Surface each of these four to the user first. Every one is **advisory** (ADR 0029 identity guard): the user confirms or declines, and none performs an automatic action, writes a file on its own, or bypasses the mandatory gate.
+Surface each of these four to the user first. Every one is **advisory** (identity guard): the user confirms or declines, and none performs an automatic action, writes a file on its own, or bypasses the mandatory gate.
 
 - **Trivial-session check (#44)** — Was this session trivial (a single bug fix, a single-file edit, or Q&A with no durable artifact)? If so, recommend skipping session-close: *"이 세션은 trivial해 보입니다 — session-close를 건너뛸까요?"* A trivial skip is a recommendation, **not** a bypass: it must not mark the session closed, must not run `--mark-session-closed`, and must not claim `/compact` can pass. Any real close still requires all 5 mandatory files.
 - **ADR-candidate check (#41)** — Did this session make an architectural or design decision (a new pattern, a tradeoff, a convention)? If yes, ask whether it warrants an ADR and capture that intent in the session-log entry. If nothing rose to ADR level, you may record the literal marker `ADR 없음 — <one-line reason>` in that same session-log entry — but gate it on #42's bar, not this one: the marker is machine-read and W8 treats a session-log entry carrying `ADR 없음` (and no ADR reference) as a *no-design* session, excluding it from the design-history staleness check. So write `ADR 없음` only when the session had no design change at all. If it had a sub-ADR design shift (background / tradeoff / differentiation), append to design-history (#42a) instead — writing the marker there would suppress the W8 nudge that shift needs. **Never auto-write an ADR file** — the session-log note is the only action here.
@@ -70,8 +70,8 @@ After completing the checklist, verify it before reporting:
 node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
 ```
 
-This runs the **full** PreCompact gate via the shared `precompactGateStatus`
-(ADR 0046): close files (`missing` / `stale`) plus lint blockers, stale
+This runs the **full** PreCompact gate via the shared `precompactGateStatus`:
+close files (`missing` / `stale`) plus lint blockers, stale
 design-history, and feedback projection over-cap/conflict. Fix every `✗` it
 reports and re-run until it prints **"Compact-ready"** — that is the signal the
 session is closed. A close-files-only pass is not enough; the real `/compact`

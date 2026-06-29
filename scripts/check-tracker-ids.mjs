@@ -38,10 +38,10 @@
  * checker's OWN sources are scanned (NOT exempt); their examples use `N`
  * placeholders so they stay clean.
  *
- * ADR scope (narrower): README.md, README.ko.md, and docs/ additionally block
- * `ADR NNNN` / `decisions/NNNN` wiki-ADR pointers (USER_FACING_PATTERNS). Shipped
- * code comments and CHANGELOG history keep their ADR anchors, so this set is
- * applied per-file via patternsFor() only inside that doc surface.
+ * ADR scope: `ADR NNNN` / `decisions/NNNN` wiki-ADR pointers (DECISION_PATTERNS)
+ * are blocked everywhere in scope EXCEPT CHANGELOG.md, whose version history
+ * legitimately cites the decision behind a release line. patternsFor() applies the
+ * broader set to every in-scope file but the CHANGELOG.
  */
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
@@ -53,7 +53,7 @@ import {
   stripScissors,
   messageHasGitTemplate,
   BLOCKED_PATTERNS,
-  USER_FACING_PATTERNS,
+  DECISION_PATTERNS,
   TAG_BODY_PATTERNS,
 } from './lib/check-tracker-ids.mjs';
 import {
@@ -159,19 +159,17 @@ function isInScope(relPath) {
   return SCOPE_DIRS.includes(p.split('/')[0]);
 }
 
-// User-facing prose surface: README.md, README.ko.md, and the docs/ tree. These
-// additionally block `ADR NNNN` / `decisions/NNNN` (dangling wiki-ADR pointers).
-// Everything else in scope — shipped code, CHANGELOG, package.json — keeps its ADR
-// anchors, so the broader pattern set is applied here ONLY.
-const USER_FACING_DOCS = new Set(['README.md', 'README.ko.md']);
-function isUserFacingDoc(relPath) {
-  const p = toPosix(relPath);
-  return USER_FACING_DOCS.has(p) || p.split('/')[0] === 'docs';
-}
+// `ADR NNNN` / `decisions/NNNN` are dangling pointers into the maintainer's
+// private wiki ADR set, so they are blocked everywhere in scope EXCEPT the
+// CHANGELOG, whose version history legitimately cites the decision behind a
+// release line (and never reaches an installed user as a live link). The verifier
+// subsystem that carries `decisions/` paths as runtime data is already removed by
+// EXCLUDED_FILES, so it is never reached here.
+const ADR_EXEMPT_FILES = new Set(['CHANGELOG.md']);
 function patternsFor(relPath) {
-  return isUserFacingDoc(relPath)
-    ? [...BLOCKED_PATTERNS, ...USER_FACING_PATTERNS]
-    : BLOCKED_PATTERNS;
+  return ADR_EXEMPT_FILES.has(toPosix(relPath))
+    ? BLOCKED_PATTERNS
+    : [...BLOCKED_PATTERNS, ...DECISION_PATTERNS];
 }
 
 // Recursively collect in-scope text files under an absolute dir.

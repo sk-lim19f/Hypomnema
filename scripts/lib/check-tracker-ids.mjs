@@ -25,10 +25,10 @@
  * carries `decisions/NNNN` runtime data is excluded from the scan instead (see the
  * CLI's EXCLUDED_FILES).
  *
- * User-facing docs ONLY (README.md, README.ko.md, docs/) additionally block
- * `ADR NNNN` / `decisions/NNNN` (USER_FACING_PATTERNS) — dangling pointers into the
- * maintainer's private wiki ADR set. The CLI scope-gates these so shipped code
- * comments and CHANGELOG history keep their ADR anchors.
+ * `ADR NNNN` / `ADR-NNNN` / `decisions/NNNN` (DECISION_PATTERNS) are dangling
+ * pointers into the maintainer's private wiki ADR set. They block everywhere in
+ * scope EXCEPT CHANGELOG.md, whose version history legitimately cites the decision
+ * behind a release line. The CLI applies these per-file via patternsFor().
  *
  * Accepted edge cases (documented, not bugs):
  *   - FALSE POSITIVE: `FOO-ISSUE-N` matches (the `-` gives a word boundary
@@ -38,21 +38,22 @@
  *     safe — none start the word `fix` right before the `#`.
  */
 
-// Applied by the CLI to user-facing docs ONLY (README.md / README.ko.md / docs/),
-// never to shipped code or CHANGELOG. A `ADR NNNN` / `decisions/NNNN` reference in
-// prose a user reads points into the maintainer's private wiki ADR set, which the
-// user does not have — a dangling pointer. The same anchor inside a code comment
-// is maintainer rationale (kept), so this set is scope-gated rather than global.
-// Examples below use `NNNN`, not real digits, so this file scans clean.
-export const USER_FACING_PATTERNS = [
+// `ADR NNNN` / `ADR-NNNN` / `decisions/NNNN` point into the maintainer's private
+// wiki ADR set, which an OSS user does not have. The CLI applies this set to every
+// in-scope file EXCEPT CHANGELOG.md (version history may cite a decision); the
+// verifier subsystem that carries decisions/ paths as runtime data is removed by
+// EXCLUDED_FILES first. The ADR matcher tolerates a space, tab, or hyphen between
+// `ADR` and the number. Examples below use `NNNN`, not real digits, so this file
+// scans clean.
+export const DECISION_PATTERNS = [
   {
     name: 'ADR NNNN',
-    label: 'wiki ADR pointer (user-facing docs)',
-    re: /\bADR[ \t]+\d{3,4}\b/gi,
+    label: 'wiki ADR pointer',
+    re: /\bADR[ \t-]+\d{3,4}\b/gi,
   },
   {
     name: 'decisions/NNNN',
-    label: 'wiki decisions path (user-facing docs)',
+    label: 'wiki decisions path',
     re: /\bdecisions\/\d{3,4}\b/gi,
   },
 ];
@@ -86,11 +87,23 @@ export const BLOCKED_PATTERNS = [
 // migration + a grep regression test (changelog-pr-guide §5).
 export const TAG_BODY_PATTERNS = [...BLOCKED_PATTERNS];
 
+// Strip a leading comment-continuation marker (`*`, `//`, `#`) so a wrapped
+// comment line can be re-joined to its predecessor as flowing text.
+const COMMENT_CONT_RE = /^[ \t]*(?:\*|\/\/|#+)[ \t]?/;
+
 /**
  * Scan a blob of text against `patterns` (default BLOCKED_PATTERNS). Returns hits:
  *   { pattern, label, match, line, col, lineText }
  * `line`/`col` are 1-based. Empty array => clean. The CLI passes the broader
- * [...BLOCKED_PATTERNS, ...USER_FACING_PATTERNS] set only for user-facing docs.
+ * [...BLOCKED_PATTERNS, ...DECISION_PATTERNS] set for every in-scope file but the
+ * CHANGELOG.
+ *
+ * Tracker tokens also line-wrap inside comments (`... continuing (ADR\n * 0045)`).
+ * A pure per-line scan misses those, so each line is ALSO scanned joined to the
+ * next (with the next line's comment-continuation marker collapsed to a space);
+ * only matches that START on the current line and CROSS the join are kept, so a
+ * wrap is reported exactly once at its prefix line and non-wrapped tokens are
+ * never double-counted.
  */
 export function scanText(text, patterns = BLOCKED_PATTERNS) {
   if (typeof text !== 'string' || text.length === 0) return [];
@@ -111,6 +124,45 @@ export function scanText(text, patterns = BLOCKED_PATTERNS) {
           lineText,
         });
         if (m.index === re.lastIndex) re.lastIndex++; // never-zero-width guard
+      }
+    }
+    // Wrapped-token guard: a token can line-wrap at two points — between its
+    // prefix WORD and its number (`ADR\n0045`, where the break stands in for a
+    // space) OR right at its separator (`ISSUE-\n9`, `decisions/\n0031`,
+    // `fix #\n37`, where the digit must sit flush against `-`/`/`/`#`). So scan
+    // this line joined to the next BOTH with a space (space-separated forms) and
+    // with no gap (separator-flush forms), keeping only matches that begin on this
+    // line and cross the join. A token reconstructed by both joins (e.g. the ADR
+    // hyphen form) is de-duplicated by its whitespace-collapsed text.
+    if (i + 1 < lines.length) {
+      const lt = lineText.length;
+      const tail = lines[i + 1].replace(COMMENT_CONT_RE, '');
+      const seen = new Set();
+      for (const [joined, tailAt] of [
+        [lineText + ' ' + tail, lt + 1],
+        [lineText + tail, lt],
+      ]) {
+        for (const { name, label, re } of patterns) {
+          re.lastIndex = 0;
+          let m;
+          while ((m = re.exec(joined)) !== null) {
+            if (m.index < lt && m.index + m[0].length > tailAt) {
+              const key = name + ':' + m[0].replace(/\s+/g, '');
+              if (!seen.has(key)) {
+                seen.add(key);
+                hits.push({
+                  pattern: name,
+                  label,
+                  match: m[0],
+                  line: i + 1,
+                  col: m.index + 1,
+                  lineText: joined,
+                });
+              }
+            }
+            if (m.index === re.lastIndex) re.lastIndex++;
+          }
+        }
       }
     }
   }

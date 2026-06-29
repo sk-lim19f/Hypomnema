@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * hypo-auto-minimal-crystallize.mjs — Stop hook (ADR 0022 Layer 3)
+ * hypo-auto-minimal-crystallize.mjs — Stop hook (Layer 3)
  *
  * Last hook in the Stop chain: a final-line defense that blocks `Stop` when
  * the current session did substantial work (mutation, or a high-volume
@@ -8,7 +8,7 @@
  * session-close. Forces Claude to run minimal session-close before the
  * conversation context evaporates.
  *
- * Decision flow (see ADR 0022 amendment 2026-05-19 Q1+Q2 + 2nd amendment Q-close-gate):
+ * Decision flow (see amendment 2026-05-19 Q1+Q2 + 2nd amendment Q-close-gate):
  *
  *   1. stop_hook_active === true  → continue       (loop guard; PoC 2026-05-14)
  *   2. wiki absent                 → continue       (fail-open)
@@ -24,7 +24,7 @@
  * Close-intent gate (added after PR-C dogfooding revealed every-turn block —
  * codex 2-worker debate 2026-05-19, both REQUEST_CHANGES). Stop fires after
  * EVERY assistant turn, not at session end; blocking on "mutation + no marker"
- * alone nags the user on every turn of a long mutating session. ADR 0022's
+ * alone nags the user on every turn of a long mutating session. The hook's
  * real intent is "block when the session is ENDING and close is incomplete".
  * We approximate the end signal by reusing isClosePattern() over recent
  * user-message text (the same low-false-positive signal PreCompact uses):
@@ -82,11 +82,11 @@ function emitBlock(sessionId, transcriptPath, gate = null) {
   // The log-only escape hatch for a non-project (wiki/tooling-only)
   // session. Offered ONLY as an explicit alternative when a close blocker is
   // present — never as the default recovery, so a real project session is not
-  // taught to bypass the ADR 0043 close invariant (codex design Finding 3).
+  // taught to bypass the close invariant (codex design Finding 3).
   const logOnlyCmd = cliBase
     ? `${cliBase} --mark-session-closed --log-only --session-id=${sessionId}${transcriptHint}`
     : `/hypo:crystallize --log-only (session_id=${sessionId}${transcriptHint})`;
-  // ADR 0047: refine the message with the read-only /compact gate result.
+  // Refine the message with the read-only /compact gate result.
   // - gate green → the close is compact-ready and ONLY the marker is missing
   //   (the hand-edit close case: files Written + committed directly, bypassing
   //   the marker writer). Say so precisely + give the one command, instead of
@@ -112,7 +112,7 @@ function emitBlock(sessionId, transcriptPath, gate = null) {
     JSON.stringify({
       decision: 'block',
       reason,
-      stopReason: 'session-close incomplete (ADR 0022 Layer 3)',
+      stopReason: 'session-close incomplete (Layer 3)',
     }),
   );
 }
@@ -186,7 +186,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // ADR 0047: read-only /compact gate (same precompactGateStatus the real
+    // Read-only /compact gate (same precompactGateStatus the real
     // PreCompact hook uses) sharpens the block message — distinguishes "close
     // is compact-ready, only the marker is missing" from "there are real
     // blockers". The hook NEVER writes the marker here (file-header invariant);

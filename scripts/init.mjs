@@ -123,7 +123,7 @@ Commands:
   doctor                  Health check: directories, files, hooks, settings.json, git
   uninstall               Remove hooks and registrations (dry-run by default; pass --apply)
   feedback-sync           Project feedback (SoT) → MEMORY.md / CLAUDE.md learned-behaviors
-                          projection (--check default, --write to apply; ADR 0031)
+                          projection (--check default, --write to apply)
 
   Running \`hypomnema\` with no command is equivalent to \`hypomnema init\`.
 
@@ -200,7 +200,7 @@ const HYPO_DIRS = [
   'journal/weekly',
   'journal/monthly',
   'pages/observability',
-  // User extensions companion (ADR 0024). init creates the baseline
+  // User extensions companion. init creates the baseline
   // dirs; #29 (E2) adds the hard-copy / manifest / settings sync into them.
   'extensions/hooks',
   'extensions/commands',
@@ -451,7 +451,7 @@ function pkgJsonPath() {
 }
 
 /**
- * ADR 0038 (P): abort when this package would DOWNGRADE a newer active install.
+ * Abort when this package would DOWNGRADE a newer active install.
  * Exit 2 (distinct from the generic exit-1 error class) on refusal so callers and
  * tests can tell "refused downgrade" apart from "init failed". No-ops on a fresh
  * install (no metadata), unparseable versions, the same package re-running itself,
@@ -829,7 +829,7 @@ const args = parseArgs(process.argv);
 // Validate hooks.json before any file writes so a bad package leaves no partial state
 const HOOK_MAP = args.hooks || args.codex ? loadHookMap() : null;
 
-// Downgrade guard (ADR 0038, P): refuse to overwrite a NEWER active install with
+// Downgrade guard: refuse to overwrite a NEWER active install with
 // an older package. The footgun: a stale `npm i -g hypomnema` owns the `hypomnema`
 // bin on PATH, so `hypomnema init` runs the OLD package and silently downgrades
 // the newer install (dropping features like the update-notifier). Runs
@@ -854,7 +854,7 @@ if (args.fromRemote) {
   for (const d of HYPO_DIRS) ensureDir(join(args.hypoDir, d), args.dryRun);
 
   // 1b. extensions baseline: drop a .gitkeep into each so the empty dirs are
-  // git-trackable in the user's wiki repo (ADR 0024).
+  // git-trackable in the user's wiki repo.
   for (const t of ['hooks', 'commands', 'skills', 'agents']) {
     copyTemplate(
       join('extensions', t, '.gitkeep'),
@@ -929,12 +929,12 @@ if (args.hooks) {
 // Always record the active install identity (pkgRoot + pkgVersion), even for a
 // --no-hooks --no-commands scaffold. That flow still installs the wiki pre-commit
 // hook (and, with --codex, ~/.codex hooks); without a recorded pkgVersion baseline
-// the ADR 0038 downgrade guard has nothing to compare against, so a later stale
+// the downgrade guard has nothing to compare against, so a later stale
 // sibling could repoint those surfaces unguarded. writePkgJson merges (...existing),
 // so this never clobbers a commands/extensions map written elsewhere.
 writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {});
 
-// 4b. user extensions companion sync (ADR 0024). Runs after
+// 4b. user extensions companion sync. Runs after
 // writePkgJson so the per-target SHA map is merged into the same hypo-pkg.json
 // (preserving the commands map) rather than racing it.
 if (args.hooks) {

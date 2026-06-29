@@ -3,8 +3,8 @@
  * Hypomnema feedback script
  *
  * Creates or appends to pages/feedback/<topic>.md with a behaviour-correction
- * entry. The wiki feedback page is the single source of truth (ADR 0031 / fix
- * #37); MEMORY.md and CLAUDE.md <learned_behaviors> are one-way *projections*
+ * entry. The wiki feedback page is the single source of truth; MEMORY.md and
+ * CLAUDE.md <learned_behaviors> are one-way *projections*
  * derived from it. Never hand-edit those targets — this script writes the page
  * and then runs `feedback-sync --write` to refresh the projection automatically.
  *
@@ -123,7 +123,7 @@ function listTopics(hypoDir) {
   for (const f of files) console.log(`  ${f.replace(/\.md$/, '')}`);
 }
 
-// ── classification validation (mirrors lint #8 / ADR 0031 §6) ──────────────────
+// ── classification validation (mirrors lint #8) ─────────────────────────────────
 
 const TIER_ENUM = ['L1', 'L2'];
 const SENSITIVITY_ENUM = ['public', 'sanitized']; // private is forbidden (wiki is git-public)
@@ -168,7 +168,7 @@ function validateClassification(args, targets) {
   const ftErr = failureTypeError(args.failureType);
   if (ftErr) errs.push(ftErr);
 
-  // CLAUDE.md projection candidates must be global + L1 (ADR 0031 §6 filter), and
+  // CLAUDE.md projection candidates must be global + L1 (SoT filter), and
   // carry the two conditional fields (lint #8). Enforce here so we never write a
   // claude-learned page that lint rejects or that silently never projects.
   if (targets.includes('claude-learned')) {
@@ -176,9 +176,8 @@ function validateClassification(args, targets) {
       errs.push('--global-summary is required when --targets includes claude-learned');
     if (!args.promoteToGlobal)
       errs.push('--promote-to-global is required when --targets includes claude-learned');
-    if (args.scope !== 'global')
-      errs.push('claude-learned projection requires --scope=global (ADR 0031 §6)');
-    if (args.tier !== 'L1') errs.push('claude-learned projection requires --tier=L1 (ADR 0031 §6)');
+    if (args.scope !== 'global') errs.push('claude-learned projection requires --scope=global');
+    if (args.tier !== 'L1') errs.push('claude-learned projection requires --tier=L1');
   }
   return errs;
 }
@@ -348,7 +347,7 @@ function writeFeedback(args, today) {
   return { wrote: true };
 }
 
-// ── projection post-step (ADR 0031) ────────────────────────────────────────────
+// ── projection post-step ────────────────────────────────────────────────────────
 
 // Refresh the MEMORY.md / CLAUDE.md projection from the just-written page. This
 // is best-effort and NON-blocking: a projection failure (over-cap, conflict,

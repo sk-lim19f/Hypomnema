@@ -123,11 +123,11 @@ function resolveActiveProject(hypoDir, cwd = null) {
     ),
   ].map((m) => ({ name: m[1].trim(), date: m[2] || '', slug: m[3] }));
   if (wikiRows.length > 0) {
-    // cwd-first (ADR 0044): a cwd↔working_dir match wins over recency, across
+    // cwd-first: a cwd↔working_dir match wins over recency, across
     // ALL rows (not just a same-date tie). The user is physically in that
     // project, so cwd is a stronger intent signal than "some other project was
     // touched more recently". This reverses the earlier tie-breaker-only
-    // semantics now that resume=cwd-positive (ADR 0043). Tradeoff: a stale cwd
+    // semantics now that resume=cwd-positive. Tradeoff: a stale cwd
     // match can mask a genuinely newer project; `--project` overrides. close
     // callers pass null → recency path below (resume=cwd-positive / close=no-pick).
     if (cwd) {

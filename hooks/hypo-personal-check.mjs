@@ -9,13 +9,13 @@
  *   - hot.md has forbidden structure
  *   - lint blockers exist
  *
- * Bypass options (checked in order, per ADR 0022 / spec §7.5):
+ * Bypass options (checked in order, per spec §7.5):
  *   1. HYPO_SKIP_GATE=1 env var
  *   2. HYPO_SKIP_GATE=1 in a recent *user-role* transcript message
  *      (assistant/tool output is excluded to prevent self-triggering from block reason text)
  *
  * NOTE: capacity bypass (wiki-context-critical.json ≥90%) was REMOVED
- * (ADR 0022 amendment 2026-05-13). Spec §7.5: even at full context, minimal
+ * (amendment 2026-05-13). Spec §7.5: even at full context, minimal
  * session-close is mandatory — auto-bypass on capacity caused silent state loss.
  */
 
@@ -53,7 +53,7 @@ process.stdin.on('end', () => {
     /* fail-open */
   }
 
-  // ── Capacity bypass (≥90%) REMOVED — ADR 0022 amendment 2026-05-13.
+  // ── Capacity bypass (≥90%) REMOVED: amendment 2026-05-13.
   //    Even at full context, minimal session-close is mandatory (spec §7.5).
   //    Bypass paths are now only: HYPO_SKIP_GATE env / HYPO_SKIP_GATE in transcript.
 
@@ -94,12 +94,12 @@ process.stdin.on('end', () => {
   // ── Heavy checks ──
   const today = new Date().toISOString().slice(0, 10);
 
-  // The full PreCompact gate decision, single-sourced (ADR 0046). The SAME
+  // The full PreCompact gate decision, single-sourced. The SAME
   // function backs `crystallize --check-session-close`, so a green self-check
   // there means this hook will not block. precompactGateStatus runs git-clean +
-  // hot.md structure + session-close files (ADR 0043 global invariant) + scoped
+  // hot.md structure + session-close files (global invariant) + scoped
   // lint + W8 design-history + feedback projection. The transcript widens the
-  // lint scope to this session's edited files (ADR 0041); without one the scope
+  // lint scope to this session's edited files; without one the scope
   // is the mandatory close files. Read-only: pure feedback drift comes back as
   // gate.driftTargets, a self-heal effect requirement we run as --write below.
   let gate;
@@ -117,7 +117,7 @@ process.stdin.on('end', () => {
     return;
   }
 
-  // Self-heal pure feedback projection drift (ADR 0045): the one mutation the
+  // Self-heal pure feedback projection drift: the one mutation the
   // read-only gate leaves to the caller. Fails CLOSED — if the --write errors we
   // turn the (otherwise non-blocking) drift into a blocker, since real drift is
   // confirmed and silently passing it would defeat the gate. --write only applies
@@ -180,7 +180,7 @@ process.stdin.on('end', () => {
     noticeText = noticeText ? `${noticeText}\n${fold}` : `[WIKI CHECK] ${fold}`;
   }
   // Surface the self-heal so a re-synced projection is not a silent mutation of
-  // the user's MEMORY.md / CLAUDE.md (ADR 0045 transparency).
+  // the user's MEMORY.md / CLAUDE.md (transparency).
   if (feedbackHealed) noticeText = noticeText ? `${noticeText}\n${feedbackHealed}` : feedbackHealed;
 
   if (gate.ok) {
@@ -215,7 +215,7 @@ process.stdin.on('end', () => {
   // ── Block ──
   // gate.blockers already carry per-type reasons in the canonical order
   // (git, hot, close, lint, design-history, feedback) — same strings as before
-  // ADR 0046, now sourced from the shared gate instead of inline checks.
+  // Now sourced from the shared gate instead of inline checks.
   const reasons = [
     ...gate.blockers.map((b) => b.reason),
     gate.skipped.lint ? 'lint skipped (run `hypomnema init` to enable lint gate)' : '',

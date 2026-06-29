@@ -234,7 +234,7 @@ function fail(args, msg) {
 //  • A directory move does NOT change basenames, only the path prefix. So bare
 //    `[[0052]]` links keep resolving to the relocated page automatically and need
 //    NO rewrite — only the FULL-slug and 1-seg DIR-RELATIVE forms encode the moved
-//    prefix and break. (Forms that drop ≥2 segments, e.g. `[[decisions/0052]]`, do
+//    prefix and break. (Forms that drop ≥2 segments, e.g. `[[decisions/NNNN]]`, do
 //    not encode the renamed prefix either: lint cannot resolve them today and they
 //    survive a move unchanged — out of scope, matching lint's buildSlugMap.)
 //  • Every moved page is BOTH a target (it relocates) and a source (its links to

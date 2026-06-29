@@ -1,5 +1,5 @@
 /**
- * scripts/lib/extensions.mjs — User extensions companion sync (ADR 0024).
+ * scripts/lib/extensions.mjs — User extensions companion sync.
  *
  * `~/hypomnema/extensions/{hooks,commands,skills,agents}/` holds user-authored
  * extensions, git-tracked alongside the wiki. init/upgrade hard-copy them into
@@ -38,12 +38,12 @@ const HOME = homedir();
 // Extension types and their on-disk target subdirectory under ~/.claude or ~/.codex.
 export const EXT_TYPES = ['hooks', 'commands', 'skills', 'agents'];
 
-// Required filename prefix (ADR 0024 §2 recommends; plan §5 #9 enforces). Files
+// Required filename prefix (plan §5 #9 enforces). Files
 // without it are skipped so uninstall (which strips hypo-ext-*) can always reach
 // every file we install — and so a stray name cannot collide with core hooks.
 export const EXT_PREFIX = 'hypo-ext-';
 
-// Codex supports hooks + commands only; skills/agents are Claude-only (ADR 0024 §4).
+// Codex supports hooks + commands only; skills/agents are Claude-only.
 export const CODEX_TYPES = ['hooks', 'commands'];
 
 // Per-type expected file extension. Hooks are executable .mjs; the rest are .md.
@@ -505,7 +505,7 @@ export function syncExtensions({
  *   7. non-target event · mixed                                        (extract + append new)
  *   8. no occurrence                                                   (append new)
  *
- * Mixed-group invariant (ADR 0024 amendment 2026-05-23): foreign hooks
+ * Mixed-group invariant (amendment 2026-05-23): foreign hooks
  * sharing the matcher group are NEVER read, modified, or reordered. The hosting
  * group's matcher is also left exactly as-is once we extract — even when our
  * extraction is the reason the group becomes single-foreign. Foreign handler-
@@ -516,7 +516,7 @@ export function syncExtensions({
  * Our hook entry, however, is canonical-reset on any drift mutation (ranks 3
  * and 4): the entire prior hook object — including any handler-level fields a
  * user appended to our hypo-ext-* entry — is replaced by the manifest-derived
- * `{ type, command, timeout? }` shape. This mirrors the ADR 0024 hard-copy
+ * `{ type, command, timeout? }` shape. This mirrors the hard-copy
  * ownership semantic for hypo-ext-* file copies. Users who want extra handler
  * fields on a Hypomnema-managed extension must extend the manifest, not edit
  * settings.json directly (manifest-as-SoT). registerSettings is honest about
@@ -718,7 +718,7 @@ function registerSettings(settingsPath, expectedEntries, apply) {
       // target single-hook drift → replace the canonical group object with
       // the manifest-derived shape. Our hook entry is canonical-reset on this
       // path (any user-added handler fields are discarded — that mirrors the
-      // ADR 0024 hard-copy ownership semantic for hypo-ext-*).
+      // hard-copy ownership semantic for hypo-ext-*).
       const loc = locateGroup(settings.hooks, canonical.group);
       if (loc) settings.hooks[loc.event][loc.groupIdx] = desiredGroup;
     } else if (canonicalRank === 4) {
@@ -726,7 +726,7 @@ function registerSettings(settingsPath, expectedEntries, apply) {
       // entry (looked up by identity) with the manifest-derived shape.
       // Foreign hooks and the group-level matcher are untouched; our own
       // hook is canonical-reset (handler-level user mods on the hypo-ext-*
-      // hook are not preserved — by the same ADR 0024 ownership semantic).
+      // hook are not preserved — by the same ownership semantic).
       const hi = canonical.group.hooks.indexOf(canonical.hook);
       if (hi !== -1) canonical.group.hooks[hi] = desiredHook;
     } else {
