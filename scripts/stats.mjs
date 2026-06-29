@@ -48,8 +48,8 @@ function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
 // Local top-level-only extractor, behavior-aligned with lib/frontmatter.mjs:
 // skip indented / list lines, first-wins, strip a trailing `# comment`. Without
 // the comment strip a `failure_type: overreach # note` would aggregate under the
-// literal "overreach # note" key (FEAT-1). Kept local (not the shared import) to
-// hold stats' dependency surface flat per the FEAT-1 scope split.
+// literal "overreach # note" key. Kept local (not the shared import) to
+// hold stats' dependency surface flat per the scope split.
 function parseFrontmatter(content) {
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return null;
@@ -101,7 +101,7 @@ const sources = existsSync(join(args.hypoDir, 'sources'))
   : [];
 
 const typeCounts = {};
-const failureTypeCounts = {}; // FEAT-1: feedback pages carrying a failure_type
+const failureTypeCounts = {}; // feedback pages carrying a failure_type
 let missingFrontmatter = 0;
 
 for (const f of pageFiles) {

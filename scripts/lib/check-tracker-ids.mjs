@@ -10,10 +10,20 @@
  * This module is PURE (no fs, no git, no process) so it is unit-testable; the
  * CLI wrapper (scripts/check-tracker-ids.mjs) does the file/git/commit-msg I/O.
  *
- * Blocked (examples use an `N` placeholder, NOT a real digit, so this file
- * itself scans clean and is NOT exempted from --all):
+ * Blocked everywhere in scope (examples use an `N` placeholder, NOT a real
+ * digit, so this file itself scans clean and is NOT exempted from --all):
  *   - /\bISSUE-\d+\b/i      → the wiki issue tracker, any case (e.g. ISSUE-N)
  *   - /\bfix[ \t ]+#\d+\b/i → the wiki fix tracker, any case (e.g. fix #N)
+ *   - /\bFEAT-\d+\b/i       → the wiki feature tracker, any case (e.g. FEAT-N)
+ *   - /\bIMPR-\d+\b/i       → the wiki improvement tracker, any case (e.g. IMPR-N)
+ *   - /\bPRAC-\d+\b/i       → the wiki practice tracker, any case (e.g. PRAC-N)
+ *
+ * FEAT-/IMPR-/PRAC- were once exempt inside shipped code comments; that exemption
+ * shipped dangling pointers into the maintainer's private wiki to OSS users, so it
+ * was removed. They now block everywhere in scope; the maintainer keeps them only
+ * in tests/, qa-runs/, and local notes. The verifier subsystem that legitimately
+ * carries `decisions/NNNN` runtime data is excluded from the scan instead (see the
+ * CLI's EXCLUDED_FILES).
  *
  * User-facing docs ONLY (README.md, README.ko.md, docs/) additionally block
  * `ADR NNNN` / `decisions/NNNN` (USER_FACING_PATTERNS) — dangling pointers into the
@@ -59,26 +69,22 @@ export const BLOCKED_PATTERNS = [
     label: 'wiki fix-tracker id',
     re: /\bfix[ \t ]+#\d+\b/gi,
   },
-];
-
-// The remaining wiki tracker prefixes (FEAT-/IMPR-/PRAC-). These are NOT in
-// BLOCKED_PATTERNS because shipped CODE COMMENTS legitimately cite them for
-// maintainer context (e.g. `// FEAT-17 hardening`), exactly like ADR anchors —
-// blocking them everywhere would flag ~20 real in-code references. They ARE
-// blocked on the PUBLIC RELEASE SURFACE that carries no code: the annotated tag
-// body (the source of the GitHub Release via --notes-from-tag). The CLI applies
-// [...BLOCKED_PATTERNS, ...SURFACE_TRACKER_PATTERNS] only in --tag mode. The
-// CHANGELOG's own surface-ID-0 is held by the section migration + a grep
-// regression test, not by widening this file-scan set (changelog-pr-guide §5).
-// Examples below use `N`, not a real digit, so this file scans clean.
-export const SURFACE_TRACKER_PATTERNS = [
+  // FEAT-/IMPR-/PRAC- were a tag-body-only set until they were promoted here so
+  // they block in shipped code comments too (the old exemption leaked dead wiki
+  // pointers to OSS users). Examples below use `N`, not a real digit, so this
+  // file scans clean and is NOT exempted from --all.
   { name: 'FEAT-N', label: 'wiki feature-tracker id', re: /\bFEAT-\d+\b/gi },
   { name: 'IMPR-N', label: 'wiki improvement-tracker id', re: /\bIMPR-\d+\b/gi },
   { name: 'PRAC-N', label: 'wiki practice-tracker id', re: /\bPRAC-\d+\b/gi },
 ];
 
-// The full tracker-ID set for a no-code public surface (the annotated tag body).
-export const TAG_BODY_PATTERNS = [...BLOCKED_PATTERNS, ...SURFACE_TRACKER_PATTERNS];
+// The full tracker-ID set for a no-code public surface (the annotated tag body,
+// republished verbatim by `gh release create --notes-from-tag`). It equals
+// BLOCKED_PATTERNS now that FEAT-/IMPR-/PRAC- live there; ADR/decisions anchors
+// are intentionally allowed in the tag body (release notes cite decisions the way
+// CHANGELOG history does). The CHANGELOG's own surface-ID-0 is held by the section
+// migration + a grep regression test (changelog-pr-guide §5).
+export const TAG_BODY_PATTERNS = [...BLOCKED_PATTERNS];
 
 /**
  * Scan a blob of text against `patterns` (default BLOCKED_PATTERNS). Returns hits:

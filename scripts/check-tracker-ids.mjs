@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
  * check-tracker-ids.mjs — CLI gate: no wiki-internal tracker IDs (ISSUE-N,
- * fix #N) in OSS-public artifacts.
+ * fix #N, FEAT-N, IMPR-N, PRAC-N) in OSS-public artifacts.
  *
  * Rule source: CLAUDE.md learned_behaviors (no-internal-tracker-ids-in-oss-
  * artifacts, 2026-06-09). The repo ships through npm + a Claude Code plugin;
- * a `fix #N` / `ISSUE-N` in any shipped file or in README/CHANGELOG is a
- * dangling pointer into the maintainer's PRIVATE wiki tracker. GitHub refs
- * (`PR #N`, `(#N)`, `#N`, issue URLs) are legitimate and never flagged.
+ * an `ISSUE-N` / `fix #N` / `FEAT-N` / `IMPR-N` / `PRAC-N` in any shipped file or
+ * in README/CHANGELOG is a dangling pointer into the maintainer's PRIVATE wiki
+ * tracker. GitHub refs (`PR #N`, `(#N)`, `#N`, issue URLs) are legitimate and
+ * never flagged.
  *
  * Modes:
  *   --all (default)        Walk the public-artifact scope and scan every text
@@ -31,9 +32,11 @@
  * auto-ships it) + shipped trees commands/ hooks/ scripts/ skills/ templates/
  * docs/ .github/ .claude-plugin/. Excluded: tests/ and qa-runs/ (internal
  * maintainer artifacts — a tracker id in a test description aids traceability
- * and never reaches an installed user), node_modules/, .git/. The checker's OWN
- * sources are scanned (NOT exempt); their examples use `N` placeholders so they
- * stay clean.
+ * and never reaches an installed user), node_modules/, .git/, and the
+ * fix-status-verify subsystem (EXCLUDED_FILES — maintainer-only, carries wiki
+ * `decisions/` paths as runtime data, un-shipped from the npm package). The
+ * checker's OWN sources are scanned (NOT exempt); their examples use `N`
+ * placeholders so they stay clean.
  *
  * ADR scope (narrower): README.md, README.ko.md, and docs/ additionally block
  * `ADR NNNN` / `decisions/NNNN` wiki-ADR pointers (USER_FACING_PATTERNS). Shipped
@@ -70,7 +73,8 @@ const REPO_ROOT = process.env.CHECK_TRACKER_ROOT || join(__dirname, '..');
 
 const RULE_REF =
   'Rule: CLAUDE.md learned_behaviors (no-internal-tracker-ids-in-oss-artifacts). ' +
-  'OSS-public artifacts must not reference the private wiki tracker (ISSUE-N / fix #N). ' +
+  'OSS-public artifacts must not reference the private wiki tracker ' +
+  '(ISSUE-N / fix #N / FEAT-N / IMPR-N / PRAC-N). ' +
   'Use a GitHub ref (#N / PR #N) or drop the reference.';
 
 // Top-level public-artifact entry points. Files are scanned directly; dirs are
@@ -94,15 +98,49 @@ const SCOPE_DIRS = [
 // and never reaches an installed user). The checker's OWN sources are NOT
 // excluded — they use `N` placeholders in their examples so they scan clean.
 const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'tests', 'qa-runs']);
-const EXCLUDED_FILES = new Set();
+// The fix-status-verify subsystem (run only via `npm run fix:verify`, never by a
+// shipped command/hook/skill) is a maintainer evidence-verification tool. Its
+// manifest carries `decisions/NNNN` wiki paths as RUNTIME DATA (resolved against
+// the maintainer's local wiki), so the anchors cannot be stripped the way a
+// comment can. It is removed from the npm package (package.json `files`) and
+// excluded here so the gate does not flag its load-bearing data.
+// Stored POSIX-style ('/'); paths are normalized before lookup (see toPosix).
+const EXCLUDED_FILES = new Set([
+  'scripts/fix-status-verify.mjs',
+  'scripts/lib/fix-status-verify.mjs',
+  'scripts/lib/fix-manifest.mjs',
+  'scripts/lib/adr-corpus.mjs',
+]);
 
 // Only text artifacts. Binary / lockfiles add noise and never carry prose refs.
-const TEXT_EXT = new Set(['.md', '.mjs', '.js', '.cjs', '.json', '.yml', '.yaml', '.sh', '.txt']);
+// .svg is included because the shipped docs/assets/ logos are hand-authored XML
+// text whose <title>/<desc>/comment fields could carry a dangling wiki pointer.
+const TEXT_EXT = new Set([
+  '.md',
+  '.mjs',
+  '.js',
+  '.cjs',
+  '.json',
+  '.yml',
+  '.yaml',
+  '.sh',
+  '.txt',
+  '.svg',
+]);
+
+// Normalize OS separators to '/' so the two scan modes classify a path the same
+// way on every host: --all builds relPath via relative() (platform sep, so '\' on
+// Windows) while --staged takes git's output (always '/'). Without this, a Windows
+// --staged run would neither exclude the verifier files nor recognize scope dirs.
+// No-op on POSIX (sep is already '/').
+function toPosix(relPath) {
+  return sep === '/' ? relPath : relPath.split(sep).join('/');
+}
 
 function isExcludedRel(relPath) {
-  const parts = relPath.split(sep);
-  if (parts.some((p) => EXCLUDED_DIRS.has(p))) return true;
-  if (EXCLUDED_FILES.has(relPath)) return true;
+  const p = toPosix(relPath);
+  if (p.split('/').some((seg) => EXCLUDED_DIRS.has(seg))) return true;
+  if (EXCLUDED_FILES.has(p)) return true;
   return false;
 }
 
@@ -116,8 +154,9 @@ function isTextFile(p) {
 function isInScope(relPath) {
   if (isExcludedRel(relPath)) return false;
   if (!isTextFile(relPath)) return false;
-  if (SCOPE_FILES.includes(relPath)) return true;
-  return SCOPE_DIRS.includes(relPath.split(sep)[0]);
+  const p = toPosix(relPath);
+  if (SCOPE_FILES.includes(p)) return true;
+  return SCOPE_DIRS.includes(p.split('/')[0]);
 }
 
 // User-facing prose surface: README.md, README.ko.md, and the docs/ tree. These
@@ -126,7 +165,8 @@ function isInScope(relPath) {
 // anchors, so the broader pattern set is applied here ONLY.
 const USER_FACING_DOCS = new Set(['README.md', 'README.ko.md']);
 function isUserFacingDoc(relPath) {
-  return USER_FACING_DOCS.has(relPath) || relPath.split(sep)[0] === 'docs';
+  const p = toPosix(relPath);
+  return USER_FACING_DOCS.has(p) || p.split('/')[0] === 'docs';
 }
 function patternsFor(relPath) {
   return isUserFacingDoc(relPath)

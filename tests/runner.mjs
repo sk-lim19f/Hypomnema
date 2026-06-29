@@ -49,7 +49,6 @@ import {
   BLOCKED_PATTERNS,
   USER_FACING_PATTERNS,
   TAG_BODY_PATTERNS,
-  SURFACE_TRACKER_PATTERNS,
 } from '../scripts/lib/check-tracker-ids.mjs';
 import {
   collectPagesLint,
@@ -18639,27 +18638,27 @@ test('scanText with USER_FACING_PATTERNS flags ADR / decisions pointers', () => 
   assert.equal(scanText('ADR 0040 and decisions/0031 anchor').length, 0);
 });
 
-test('TAG_BODY_PATTERNS gates all four tracker prefixes; file gate keeps FEAT/IMPR/PRAC (changelog-pr-guide T4)', () => {
-  // The tag body is the public release surface — every prefix is a leak.
+test('default gate AND tag body flag all five tracker prefixes; FEAT/IMPR/PRAC now block in code comments too', () => {
+  // FEAT-/IMPR-/PRAC- were promoted into BLOCKED_PATTERNS, so the DEFAULT file
+  // gate (shipped code, commit msgs) now flags them, not just the tag body.
   for (const id of ['ISSUE-7', 'fix #7', 'FEAT-1', 'IMPR-3', 'PRAC-17']) {
+    assert.equal(scanText(`leak ${id} here`).length, 1, `default gate must flag ${id}`);
     assert.equal(
       scanText(`leak ${id} here`, TAG_BODY_PATTERNS).length,
       1,
       `tag body must flag ${id}`,
     );
   }
-  // GitHub refs and ADR anchors stay legitimate even on the tag surface.
+  // A code comment that once cited three trackers is now three hits.
+  assert.equal(scanText('// FEAT-17 hardening, see PRAC-18 and IMPR-13').length, 3);
+  // GitHub refs, bare prefixes (no digit), and ADR anchors stay legitimate.
+  assert.equal(scanText('PR #50 (#9) ADR 0040 FEAT- IMPR- PRAC-').length, 0);
   assert.equal(scanText('PR #50 (#9) ADR 0040', TAG_BODY_PATTERNS).length, 0);
-  // The DEFAULT file gate must NOT flag FEAT/IMPR/PRAC — shipped code comments
-  // cite them for maintainer context (like ADR anchors). Only ISSUE-/fix # there.
-  assert.equal(scanText('// FEAT-17 hardening, see PRAC-18 and IMPR-13').length, 0);
-  assert.equal(scanText('// ISSUE-7 leak in a comment').length, 1);
-  // SURFACE_TRACKER_PATTERNS is exactly the three extra prefixes.
-  assert.deepEqual(SURFACE_TRACKER_PATTERNS.map((p) => p.name).sort(), [
-    'FEAT-N',
-    'IMPR-N',
-    'PRAC-N',
-  ]);
+  // TAG_BODY_PATTERNS now equals BLOCKED_PATTERNS (the surface set was folded in).
+  assert.deepEqual(
+    TAG_BODY_PATTERNS.map((p) => p.name),
+    BLOCKED_PATTERNS.map((p) => p.name),
+  );
 });
 
 test('CHANGELOG.md is tracker-ID-0 across all four prefixes (surface ID 0 regression, §5)', () => {
@@ -18844,6 +18843,27 @@ test('CLI --staged: a leak in an EXCLUDED path (tests/) is not gated', () => {
   });
 });
 
+test('CLI --staged: the fix-verify subsystem is excluded (git slash paths normalize the same as --all)', () => {
+  withSyntheticRepo(({ dir, g }) => {
+    // git feeds --staged a slash path; EXCLUDED_FILES is stored slash-style and
+    // toPosix() normalizes, so the verifier files are excluded in BOTH modes.
+    mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
+    writeFileSync(join(dir, 'scripts', 'lib', 'fix-manifest.mjs'), '// FEAT-99 manifest row\n');
+    g(['add', 'scripts/lib/fix-manifest.mjs']);
+    assert.equal(
+      runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir }).status,
+      0,
+      'staged verifier file is excluded',
+    );
+    // A non-excluded staged script with the same id still blocks (scope intact).
+    writeFileSync(join(dir, 'scripts', 'other.mjs'), '// FEAT-99 leak\n');
+    g(['add', 'scripts/other.mjs']);
+    const r = runChecker(['--staged'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'a non-excluded staged script must still flag FEAT-99');
+    assert.match(r.stderr, /FEAT-99/);
+  });
+});
+
 test('CLI --all: package.json IS in scope (npm auto-ships it); a stray root file is NOT', () => {
   withTmpDir((dir) => {
     // package.json leak → flagged
@@ -18912,6 +18932,44 @@ test('CLI --all: ADR pointer in README is gated, but kept in code / CHANGELOG', 
       0,
       'CHANGELOG ADR refs must NOT be gated',
     );
+  });
+});
+
+test('CLI --all: the fix-verify subsystem is excluded from the scan, but the same id is flagged elsewhere', () => {
+  withTmpDir((dir) => {
+    // The verifier trio + helper is maintainer-only (un-shipped from npm) and
+    // carries decisions/ paths as runtime data, so EXCLUDED_FILES keeps the gate
+    // off them. A now-blocked FEAT id sitting in them must NOT be flagged.
+    mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
+    writeFileSync(join(dir, 'scripts', 'lib', 'fix-manifest.mjs'), '// FEAT-99 manifest row\n');
+    writeFileSync(join(dir, 'scripts', 'fix-status-verify.mjs'), '// FEAT-99 verifier\n');
+    writeFileSync(join(dir, 'scripts', 'lib', 'fix-status-verify.mjs'), '// FEAT-99 lib\n');
+    writeFileSync(join(dir, 'scripts', 'lib', 'adr-corpus.mjs'), '// FEAT-99 corpus\n');
+    assert.equal(
+      runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status,
+      0,
+      'fix-verify subsystem files are excluded from the scan',
+    );
+    // The SAME id in an ordinary shipped script IS flagged — proves it is the
+    // exclusion at work, not a missing pattern.
+    writeFileSync(join(dir, 'scripts', 'other.mjs'), '// FEAT-99 leak\n');
+    const r = runChecker(['--all'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'a non-excluded script must still flag FEAT-99');
+    assert.match(r.stderr, /FEAT-99/);
+    assert.doesNotMatch(r.stderr, /fix-manifest|fix-status-verify|adr-corpus/);
+  });
+});
+
+test('CLI --all: shipped docs/ SVG assets are scanned (.svg in TEXT_EXT)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'docs', 'assets'), { recursive: true });
+    writeFileSync(
+      join(dir, 'docs', 'assets', 'logo.svg'),
+      '<svg><title>logo</title><!-- ISSUE-7 --></svg>\n',
+    );
+    const r = runChecker(['--all'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'a tracker id in a shipped SVG must be gated');
+    assert.match(r.stderr, /ISSUE-7/);
   });
 });
 

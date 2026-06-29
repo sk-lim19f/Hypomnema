@@ -136,7 +136,7 @@ function parseTargets(raw) {
     .filter(Boolean);
 }
 
-// FEAT-1: `failure_type` is OPTIONAL — an unset value is always fine. A set value
+// `failure_type` is OPTIONAL: an unset value is always fine. A set value
 // must be one of the eight enum members (same vocabulary lint enforces). Returns
 // an error string or null. Shared by create (validateClassification) and append.
 function failureTypeError(value) {
@@ -279,7 +279,7 @@ function writeFeedback(args, today) {
     // Append a dated entry; preserve existing frontmatter classification.
     mode = 'append';
     const existing = readFileSync(filePath, 'utf-8');
-    // FEAT-1: failure_type is a per-page classification property. On append,
+    // failure_type is a per-page classification property. On append,
     // set it if the page has none, error if it conflicts with an existing value,
     // no-op if it matches. Without the flag, append is byte-for-byte unchanged.
     const existingFt = (parseFrontmatter(existing) || {}).failure_type || null;

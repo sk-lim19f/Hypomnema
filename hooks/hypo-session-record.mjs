@@ -51,7 +51,7 @@ process.stdin.on('end', () => {
       transcript_path: transcriptPath,
       recorded_at: new Date().toISOString(),
       cwd: payload.cwd || process.cwd(),
-      // PRAC-17: machine identity for multi-machine audit. index.jsonl lives
+      // machine identity for multi-machine audit. index.jsonl lives
       // under .cache/ (gitignored in a normal vault), so this is a LOCAL-only
       // per-session record — accurate for every session, no sync/privacy cost.
       device: hostname() || 'unknown',

@@ -481,7 +481,7 @@ function writeMigrationReport(hypoDir, fromVersion, toVersion, { pluginMode = fa
   // Fire for any 1.x → 2.x major crossing, not just 1.0 → 2.0 exactly: the ADR
   // 0031 feedback-field backfill that this body explains was introduced at 2.0
   // and still applies to a user landing on any later 2.x (e.g. 2.1's additive
-  // failure_type — FEAT-1). Keying on the exact target string would silently
+  // failure_type). Keying on the exact target string would silently
   // drop this guidance the moment the template minor moves.
   const fromV = parseVersion(fromVersion);
   const toV = parseVersion(toVersion);
