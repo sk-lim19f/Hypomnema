@@ -273,9 +273,9 @@ At and after the v1.2.0 cutoff, each non-empty gated section (`New Features`, `B
 ```
 ### New Features
 #### English
-- Feedback pages accept an optional `failure_type`. (#141)
+- Feedback pages accept an optional `failure_type`. ([#141](https://github.com/sk-lim19f/Hypomnema/pull/141))
 #### 한국어
-- 피드백 페이지가 선택적 `failure_type`를 받습니다. (#141)
+- 피드백 페이지가 선택적 `failure_type`를 받습니다. ([#141](https://github.com/sk-lim19f/Hypomnema/pull/141))
 ```
 
 Versions below the v1.2.0 cutoff (1.0.0, 1.0.1, 1.1.0) are English-only: the English body sits directly under the section header with no `####` sub-blocks. Korean is not back-filled for those releases.
@@ -284,12 +284,12 @@ The `### Changelog` index is language-neutral, one merged PR per line:
 
 ```
 ### Changelog
-- #141 feedback failure_type classification
-- #140 invalid-YAML lint guard
+- [#141](https://github.com/sk-lim19f/Hypomnema/pull/141) feedback failure_type classification
+- [#140](https://github.com/sk-lim19f/Hypomnema/pull/140) invalid-YAML lint guard
 Contributors: @handle
 ```
 
-Each line is `- #N <short title>`, no em dash. The `Contributors:` line lists that version's PR authors, de-duplicated; the release collector fills the handles from the GitHub API.
+Each line is `- [#N](<pr-url>) <short title>`, no em dash: the collector links each `#N` to its GitHub PR (a repo markdown file does not autolink a bare `#N`), deriving the URL from the `repository` field in `package.json`. The `Contributors:` line lists that version's PR authors, de-duplicated; the release collector fills the handles from the GitHub API.
 
 A `### Known Issues` or `### Notes` block, when a version has one, is a trailing note (a caveat, not a change). It is not one of the gated sections, so it carries no `####` sub-blocks even at or after the cutoff; bilingual text there is recommended, not enforced.
 

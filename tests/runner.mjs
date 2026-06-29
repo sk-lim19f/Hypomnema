@@ -72,6 +72,8 @@ import {
   normalizeIndexTitle,
   assembleSections,
   renderDraft,
+  repoUrlToPrBase,
+  prRef,
 } from '../scripts/lib/collect-changelog.mjs';
 
 const HOME = homedir();
@@ -20549,6 +20551,66 @@ test('emits section model + bare index + Contributors, omits empty sections', ()
   assert.doesNotMatch(md, /### Bug Fixes/, 'empty section omitted');
 });
 
+suite('collect-changelog: repoUrlToPrBase()');
+
+test('derives the /pull base from https, git+https, and ssh forms', () => {
+  const want = 'https://github.com/sk-lim19f/Hypomnema/pull';
+  assert.equal(repoUrlToPrBase('https://github.com/sk-lim19f/Hypomnema.git'), want);
+  assert.equal(repoUrlToPrBase('git+https://github.com/sk-lim19f/Hypomnema.git'), want);
+  assert.equal(repoUrlToPrBase('https://github.com/sk-lim19f/Hypomnema'), want);
+  assert.equal(repoUrlToPrBase('git@github.com:sk-lim19f/Hypomnema.git'), want);
+});
+
+test('returns null on absent or non-GitHub URL so the caller falls back to bare #N', () => {
+  assert.equal(repoUrlToPrBase(undefined), null);
+  assert.equal(repoUrlToPrBase(''), null);
+  assert.equal(repoUrlToPrBase('https://gitlab.com/x/y.git'), null);
+});
+
+test('declines a non-host github.com and a URL with extra path (anchored contract)', () => {
+  // github.com in the path, not the host: must not be treated as GitHub
+  assert.equal(repoUrlToPrBase('https://example.com/github.com/sk-lim19f/Hypomnema.git'), null);
+  // owner/repo is not the whole path: decline rather than emit a /issues/pull base
+  assert.equal(repoUrlToPrBase('https://github.com/sk-lim19f/Hypomnema/issues'), null);
+  assert.equal(repoUrlToPrBase('https://github.com/sk-lim19f'), null);
+});
+
+suite('collect-changelog: prRef()');
+
+test('links #N when a base is known, bare #N otherwise', () => {
+  const base = 'https://github.com/sk-lim19f/Hypomnema/pull';
+  assert.equal(prRef(141, base), '[#141](https://github.com/sk-lim19f/Hypomnema/pull/141)');
+  assert.equal(prRef(141, null), '#141');
+  assert.equal(prRef(141, undefined), '#141');
+});
+
+test('assembleSections + renderDraft inline-link #N when prUrlBase is passed', () => {
+  const entries = [
+    {
+      pr: 156,
+      subject: 'feat: vault path (#156)',
+      section: SECTION.NEW_FEATURES,
+      basis: 'type',
+      author: 'A',
+      handle: 'gh-a',
+      block: { en: 'shows vault path', ko: '볼트 경로 표시' },
+    },
+  ];
+  const base = 'https://github.com/sk-lim19f/Hypomnema/pull';
+  const md = renderDraft(assembleSections(entries, { prUrlBase: base }));
+  // body line carries the parenthesized inline link
+  assert.match(
+    md,
+    /- shows vault path \(\[#156\]\(https:\/\/github\.com\/sk-lim19f\/Hypomnema\/pull\/156\)\)/,
+  );
+  // index line is the inline link, not a bare #156
+  assert.match(
+    md,
+    /### Changelog\n- \[#156\]\(https:\/\/github\.com\/sk-lim19f\/Hypomnema\/pull\/156\) feat: vault path/,
+  );
+  assert.doesNotMatch(md, /\n- #156 /, 'index must not emit a bare #N when a base is known');
+});
+
 suite('collect-changelog CLI');
 
 const COLLECT = join(SCRIPTS, 'collect-changelog.mjs');
@@ -20609,7 +20671,10 @@ test('--no-api offline: warns and still drafts an index', () => {
       const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--no-api']);
       assert.equal(r.status, 0);
       assert.match(r.stderr, /--no-api/);
-      assert.match(r.stdout, /- #7 feat: a thing/);
+      assert.match(
+        r.stdout,
+        /- \[#7\]\(https:\/\/github\.com\/sk-lim19f\/Hypomnema\/pull\/7\) feat: a thing/,
+      );
     },
   );
 });
@@ -20674,7 +20739,10 @@ test('CLI: merge commit indexed by body PR title; direct-push → TODO not a fak
     (dir) => {
       const r = runCollect(['--repo', dir, '--range', 'v0.0.1..HEAD', '--no-api']);
       assert.equal(r.status, 0);
-      assert.match(r.stdout, /- #99 feat: shiny thing/);
+      assert.match(
+        r.stdout,
+        /- \[#99\]\(https:\/\/github\.com\/sk-lim19f\/Hypomnema\/pull\/99\) feat: shiny thing/,
+      );
       assert.doesNotMatch(r.stdout, /Merge pull request/);
       assert.match(r.stdout, /TODO: direct push/);
     },

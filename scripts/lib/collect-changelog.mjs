@@ -7,9 +7,10 @@
 // Format target (docs/CONTRIBUTING.md "CHANGELOG conventions"):
 // - gated sections New Features / Bug Fixes / Chores, each `#### English` then
 //   `#### 한국어`, fed from each PR's `## Changelog` block (one EN, one KO line).
-// - a language-neutral `### Changelog` index: bare `- #N <short title>` lines
-//   plus one de-duplicated `Contributors:` line. No per-line @handle, no tracker
-//   ids on the surface.
+// - a language-neutral `### Changelog` index: `- [#N](<pr-url>) <short title>`
+//   lines (the PR number linked to its GitHub PR when the repository URL is
+//   known, else a bare `#N`) plus one de-duplicated `Contributors:` line. No
+//   per-line @handle, no tracker ids on the surface.
 
 import {
   classifyChange,
@@ -17,6 +18,33 @@ import {
   SECTION,
   SECTION_TITLE,
 } from './changelog-classify.mjs';
+
+// Derive the `…/pull` base URL for inline PR links from a package.json
+// repository URL (`https://github.com/owner/repo.git`, `git+https://…`, or the
+// `git@github.com:owner/repo.git` SSH form). Returns null when the URL is absent
+// or unrecognized, so the caller falls back to a bare `#N` rather than emitting a
+// broken link. A trailing `.git` and any trailing slash are dropped.
+export function repoUrlToPrBase(repoUrl) {
+  const s = String(repoUrl ?? '').trim();
+  // Anchor on the host so `https://example.com/github.com/o/r.git` is not
+  // mistaken for GitHub, and require owner/repo to be the whole path so a
+  // `…/owner/repo/issues` URL declines (no `/issues/pull` base) rather than
+  // producing a wrong link. Accepts https, git+https, ssh://git@, and scp-style
+  // git@ forms; a trailing `.git` and slash are optional.
+  const m =
+    /^(?:git\+)?(?:https?:\/\/|ssh:\/\/git@|git@)github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(
+      s,
+    );
+  if (!m) return null;
+  return `https://github.com/${m[1]}/${m[2]}/pull`;
+}
+
+// Render a PR number as an inline markdown link when a pull base URL is known,
+// else a bare `#N` (offline unit tests, missing repo metadata). The `#N` text is
+// preserved either way so a reader sees the same token, linked or not.
+export function prRef(pr, prUrlBase) {
+  return prUrlBase ? `[#${pr}](${prUrlBase}/${pr})` : `#${pr}`;
+}
 
 // A GitHub merge-commit subject (`Merge pull request #N from owner/branch`) is
 // boilerplate, so classifying it by subject would always fall through to Chores.
@@ -129,7 +157,7 @@ export function parseChangelogBlock(body) {
 // name is NOT a GitHub handle, so an entry with a PR but no resolved handle goes
 // to `unresolved` (the caller emits a manual-fill TODO) rather than being
 // rendered as a fake `@name`.
-export function assembleSections(entries) {
+export function assembleSections(entries, { prUrlBase = null } = {}) {
   const sections = {
     [SECTION.NEW_FEATURES]: { en: [], ko: [] },
     [SECTION.BUG_FIXES]: { en: [], ko: [] },
@@ -145,7 +173,7 @@ export function assembleSections(entries) {
     const block = e.block;
     if (block && typeof block === 'object' && block.en && block.ko) {
       const bucket = sections[e.section] || sections[SECTION.CHORES];
-      const pr = e.pr != null ? ` (#${e.pr})` : '';
+      const pr = e.pr != null ? ` (${prRef(e.pr, prUrlBase)})` : '';
       bucket.en.push(`- ${sanitizeTrackerIds(block.en)}${pr}`);
       bucket.ko.push(`- ${sanitizeTrackerIds(block.ko)}${pr}`);
     }
@@ -162,7 +190,7 @@ export function assembleSections(entries) {
       }
     }
   }
-  return { sections, index, contributors, unresolved };
+  return { sections, index, contributors, unresolved, prUrlBase };
 }
 
 // Render an assembled draft to CHANGELOG markdown (the maintainer pastes it,
@@ -186,7 +214,7 @@ export function renderDraft(assembled, { headingLevel = '###' } = {}) {
   if (assembled.index.length) {
     out.push(`${headingLevel} Changelog`);
     for (const it of assembled.index) {
-      out.push(`- #${it.pr} ${it.title}`.trimEnd());
+      out.push(`- ${prRef(it.pr, assembled.prUrlBase)} ${it.title}`.trimEnd());
     }
     if (assembled.contributors.length) {
       out.push(
