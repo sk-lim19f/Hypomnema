@@ -127,7 +127,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // MISS: cwd matches no project. ADR 0023 — offer to create one
+    // MISS: cwd matches no project. Offer to create one
     // when the trigger conditions hold. Same nudge-only model as session-start.
     let suggestPrefix = '';
     if (shouldSuggestProjectCreation(newCwd, HYPO_DIR)) {

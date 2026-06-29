@@ -127,7 +127,7 @@ function buildUpdateNotice() {
 }
 
 /**
- * Stale-sibling notice (ADR 0038, D3). The update-notifier above only knows
+ * Stale-sibling notice (D3). The update-notifier above only knows
  * whether the ACTIVE install is behind latest — it is blind to an OLDER sibling
  * that owns the `hypomnema` bin on PATH. That sibling is the live footgun:
  * running `hypomnema init`/`upgrade` through it downgrades the active hooks.
@@ -179,7 +179,7 @@ function readLastGrowthLine() {
 }
 
 /**
- * ADR 0022 amendment 2026-05-14: if the prior session ended
+ * Amendment 2026-05-14: if the prior session ended
  * via `/clear`, hypo-session-end stashed its identity in `.cache/clear-marker.json`.
  * Read it (with 7-day stale guard), unlink it (one-shot), and return a
  * `[WIKI_AUTOCLOSE]` recovery line for additionalContext + stderr.
@@ -331,7 +331,7 @@ process.stdin.on('end', () => {
     const pullOk = gitPull(HYPO_DIR);
     const syncLine = syncStateNotice(pullOk);
     const growthLine = readLastGrowthLine();
-    // ADR 0022 amendment: on source='clear', surface the dying
+    // On source='clear', surface the dying
     // session's identity that hypo-session-end stashed so Claude can recover
     // session-close work that /clear skipped. One-shot: marker is unlinked
     // immediately after read.
@@ -418,8 +418,8 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // MISS: cwd matches no project. ADR 0023 — offer to create one
-    // when the ADR trigger conditions hold (git repo + project marker + no
+    // MISS: cwd matches no project. Offer to create one
+    // when the trigger conditions hold (git repo + project marker + no
     // cooldown + not previously declined). The actual scaffold is the LLM's
     // job on a "Y" reply (scripts/lib/project-create.mjs); the hook only nudges.
     if (shouldSuggestProjectCreation(cwd, HYPO_DIR)) {

@@ -96,7 +96,7 @@ verify_by: <question to re-check at next review>
 verify_by_date: YYYY-MM-DD
 ```
 
-### 3.1. `feedback` type — projection fields (ADR 0031)
+### 3.1. `feedback` type — projection fields
 
 Feedback pages are the single source of truth for behavior corrections;
 `hypomnema feedback-sync` projects them one-way into Claude Code's `MEMORY.md`

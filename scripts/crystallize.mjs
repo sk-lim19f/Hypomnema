@@ -178,7 +178,7 @@ function parseArgs(argv) {
   return args;
 }
 
-// ── session-close hard gate (ADR 0055) ───────────────────────────────────────
+// ── session-close hard gate ───────────────────────────────────────────────────
 // The marker attests "the USER closed this session". Its evidence transcript is
 // resolved STRICTLY from the session id (a globally-unique UUID) by globbing the
 // Claude project dirs — never from a CLI arg. A model owns the whole subprocess
@@ -209,7 +209,7 @@ function requireProjectDir(args, slug) {
 // flow can self-verify before /compact triggers PreCompact.
 
 function runSessionCloseCheck(args) {
-  // ADR 0046: the check mirrors the FULL PreCompact gate via the shared
+  // The check mirrors the FULL PreCompact gate via the shared
   // precompactGateStatus (close files + lint + design-history + feedback
   // projection), not just the close files — so a green check means /compact
   // won't block on a human-fixable issue. Pass --transcript-path to widen the
@@ -222,9 +222,9 @@ function runSessionCloseCheck(args) {
   // (codex design Finding 2).
   //
   // --project=<slug> narrows BOTH the close status and the lint scope to that one
-  // project: a project-scoped DIAGNOSTIC, NOT the global compact-ready verdict
-  // (ADR 0046 caveat below). It is check-only — the marker writers stay global so
-  // the marker == compact-ready invariant holds (ADR 0047). When narrowed, the
+  // project: a project-scoped DIAGNOSTIC, NOT the global compact-ready verdict.
+  // It is check-only: the marker writers stay global so
+  // the marker == compact-ready invariant holds. When narrowed, the
   // transcript widening is suppressed: a transcript touch in some OTHER project
   // would re-add that project's files to the lint scope and re-block the scoped
   // check, defeating the point. The global (no --project) check keeps widening.
@@ -239,9 +239,9 @@ function runSessionCloseCheck(args) {
   });
   const close = status.close;
 
-  // ADR 0047: when a --session-id is supplied, report whether THIS session's
+  // When a --session-id is supplied, report whether THIS session's
   // per-session marker (the Stop-chain completion signal) exists. This is a
-  // separate field, NOT folded into `ok` — `ok` stays the ADR 0046 compact-
+  // separate field, NOT folded into `ok`: `ok` stays the compact-
   // readiness verdict. A green gate with marker_present=false is exactly the
   // hand-edit close state: close is compact-ready but the Stop hook will
   // still block until the marker is written.
@@ -329,7 +329,7 @@ function runSessionCloseCheck(args) {
   }
   // Beyond the close files: the rest of the PreCompact gate (lint, design-history,
   // feedback over-cap/conflict). These are what made a "close-complete" check
-  // disagree with the real /compact gate before ADR 0046.
+  // disagree with the real /compact gate before this check was added.
   for (const b of status.blockers) {
     if (b.type !== 'close') console.log(`  ✗ ${b.reason}`);
   }
@@ -337,7 +337,7 @@ function runSessionCloseCheck(args) {
     console.log('');
     for (const n of status.notices) console.log(`  · ${n.reason}`);
   }
-  // ADR 0047: surface the per-session marker state (separate from compact-
+  // Surface the per-session marker state (separate from compact-
   // readiness) so a green-but-unmarked close is visible at verify time.
   if (args.sessionId) {
     console.log('');
@@ -451,7 +451,7 @@ function todayLocal() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-// Spec §5.2.7 / §8.3 + ADR 0029: 4 mandatory + 2 optional (`log`, `openQuestions`).
+// Spec §5.2.7 / §8.3: 4 mandatory + 2 optional (`log`, `openQuestions`).
 // The payload shape MUST mirror that contract — missing a mandatory field is a
 // payload bug, not a no-op. Caller is the LLM session-close flow, which composes
 // the payload deliberately; partial payloads must fail loudly so caller fixes
@@ -502,14 +502,14 @@ function validatePayloadShape(payload) {
   return errs;
 }
 
-// ── session-close marker (ADR 0022 amendment 2026-05-19) ──────
+// ── session-close marker (amendment 2026-05-19) ───────────────
 // Standalone marker writer. Used when the LLM closes the session via direct
 // Write tool calls (not --apply-session-close). Hook `hypo-auto-minimal-
 // crystallize` is the only Reader; writer authority is intentionally split
 // between this CLI and the auto-write at the tail of applySessionClose.
 //
 // Contract: the marker is written only when the FULL /compact gate
-// (precompactGateStatus, ADR 0046) is green. A failed gate exits 1 with no
+// (precompactGateStatus) is green. A failed gate exits 1 with no
 // marker — the next Stop hook re-blocks.
 
 function runMarkSessionClosed(args) {
@@ -521,12 +521,12 @@ function runMarkSessionClosed(args) {
   // --project=<slug> on --mark is ATTRIBUTION ONLY (the marker's `project` field).
   // The gate stays GLOBAL — never narrowed — because a marker that narrowed its
   // gate could attest compact-ready while PreCompact re-checks all of today's
-  // projects and stays red (the marker == compact-ready invariant, ADR 0047 /
+  // projects and stays red (the marker == compact-ready invariant,
   // codex design finding 1/2). Validate the attribution slug exists as a
   // directory, exactly as --check does, but only when it is actually used (a
   // --log-only mark attributes to no project, so --project is moot there).
   if (args.project && !args.logOnly) requireProjectDir(args, args.project);
-  // ADR 0047: the per-session marker is the THIRD session-close completion
+  // The per-session marker is the THIRD session-close completion
   // signal (after the PreCompact gate and `--check-session-close`). It must use
   // the SAME gate that governs /compact — precompactGateStatus — so the marker
   // can never attest "closed" while /compact would still block. This subsumes
@@ -571,7 +571,7 @@ function runMarkSessionClosed(args) {
     }
     process.exit(1);
   }
-  // User-close hard gate (ADR 0055): the compact gate above only proves the wiki
+  // User-close hard gate: the compact gate above only proves the wiki
   // is compact-ready; it does NOT prove the USER asked to close. Refuse the marker
   // unless the transcript carries a genuine user close signal (NL close phrase,
   // /compact, or an AskUserQuestion close answer). This is the hard backstop for
@@ -619,7 +619,7 @@ function runMarkSessionClosed(args) {
     scope: args.logOnly ? 'log-only' : 'project',
     date: status.dates[0],
     notices: gate.notices,
-    // ADR 0047: pure feedback-projection drift is a non-blocker — the marker
+    // pure feedback-projection drift is a non-blocker: the marker
     // attests "compact-ready (no human-fixable blocker)", and the PreCompact
     // hook self-heals the projection (feedback-sync --write) at /compact. Surface
     // the deferral so the caller knows MEMORY/CLAUDE sync is pending, not lost.
@@ -653,7 +653,7 @@ function applySessionClose(args) {
   // for any actual apply work (readPayload below surfaces "payload is
   // required" the same way it always has).
   if (!args.force && !args.payload) {
-    // ADR 0043: no-payload "already complete?" probe uses the
+    // No-payload "already complete?" probe uses the
     // global invariant, not a recency pick.
     const probe = sessionCloseGlobalStatus(args.hypoDir);
     if (probe.ok) {
@@ -794,7 +794,7 @@ function applySessionClose(args) {
   // payloadScope = every file this apply writes or appends. Both lint passes are
   // judged against it; errors elsewhere are surfaced as notices, never blocking.
   //
-  // session-log needs TWO entries (ADR 0050): the daily WRITE target (what this
+  // session-log needs TWO entries: the daily WRITE target (what this
   // apply creates/appends, judged by post-apply lint) AND the freshness EVIDENCE
   // file. They coincide except in the hybrid cutover month, where a fallback-
   // aware no-op (the identical entry already lives in the legacy monthly file)
@@ -876,7 +876,7 @@ function applySessionClose(args) {
     const rel = join('projects', project, 'session-log', `${date}.md`);
     const full = join(args.hypoDir, rel);
     const isPresent = entryAlreadyPresent(payload.sessionLog.entry);
-    // Fallback-aware idempotency (ADR 0050 hybrid cutover): during the month the
+    // Fallback-aware idempotency (hybrid cutover): during the month the
     // shard takes over, today's entry may already live in the legacy monthly
     // file from an earlier (pre-cutover) close. Treat presence in EITHER the
     // daily shard or the legacy monthly file as "already written" so a same-day
@@ -1044,11 +1044,11 @@ function applySessionClose(args) {
   const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
   const otherDebtCount = postNotice.length - closeScopeNotice.length;
 
-  // ADR 0022 amendment 2026-05-19: auto-write the per-session
+  // Amendment 2026-05-19: auto-write the per-session
   // closed marker on a verified close. Hook authority is read-only; this is
   // one of the two writer paths (the other is --mark-session-closed standalone).
   //
-  // ADR 0047: the marker write is governed by the SAME gate as standalone
+  // The marker write is governed by the SAME gate as standalone
   // --mark-session-closed and /compact (precompactGateStatus), NOT just apply's
   // `ok` + git-clean. Apply's payload preflight/post-apply lint and `ok` still
   // govern apply SUCCESS (exit code below), but the marker must additionally
@@ -1056,13 +1056,13 @@ function applySessionClose(args) {
   // path could issue a marker the standalone path would refuse (the second
   // divergence codex flagged).
   //
-  // ADR 0056: apply just wrote the payload, so the tree is dirty by its OWN
-  // writes — the gate's `uncommitted` git blocker would always trip and the
+  // Apply just wrote the payload, so the tree is dirty by its OWN
+  // writes: the gate's `uncommitted` git blocker would always trip and the
   // marker would be skipped, deferring the close to a manual --mark-session-closed
-  // (the ADR 0047 "done but still blocked" regression). Commit the payload HERE, via
+  // ("done but still blocked" regression). Commit the payload HERE, via
   // the SAME .hypoignore-aware helper the auto-commit Stop hook uses, so the gate sees
   // a committed tree. Push stays deferred to the Stop hook; the resulting
-  // committed-but-unpushed state is a gate notice, not a blocker (ADR 0056), so
+  // committed-but-unpushed state is a gate notice, not a blocker, so
   // this still marks. A commit failure (not a repo / pre-commit reject / git error)
   // skips the marker WITH a surfaced reason — today's behavior was also "no marker",
   // but silently.
@@ -1084,14 +1084,14 @@ function applySessionClose(args) {
         // (feedback/W8/hot/lint — git is now committed) is resolved.
         markerSkipReason = 'compact-gate-not-ok';
       } else if (!closeTranscript || !hasUserCloseSignal(closeTranscript)) {
-        // User-close hard gate (ADR 0055): apply succeeded (payload files written)
+        // User-close hard gate: apply succeeded (payload files written)
         // but the user never signalled session close, so the marker — which attests
         // "user closed" — is withheld. The wiki record stands; the session is simply
         // not marked closed. Surfaced (not silent) so the caller knows.
         markerSkipReason = closeTranscript ? 'no-user-close-signal' : 'transcript-unresolved';
       } else {
         writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
-        // Codex CONCERN (ADR 0055/0056): the writer swallows IO errors (best-effort).
+        // Codex CONCERN: the writer swallows IO errors (best-effort).
         // Verify the file actually landed — mirroring the standalone path — instead of
         // asserting markerWritten=true, so a .cache permission/disk problem surfaces
         // rather than the caller reporting "closed" while the next Stop re-blocks.
@@ -1118,7 +1118,7 @@ function applySessionClose(args) {
     applied,
     skipped,
     verification,
-    // ADR 0055: surface the marker outcome instead of skipping silently, so the
+    // Surface the marker outcome instead of skipping silently, so the
     // caller can tell "closed" from "applied but not marked".
     ...(args.sessionId ? { markerWritten, markerSkipReason } : {}),
     lint: {

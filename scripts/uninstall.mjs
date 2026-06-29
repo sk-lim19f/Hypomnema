@@ -15,7 +15,7 @@
  *   --force-extensions   Remove user-modified extension files (hypo-ext-*) instead of preserving them
  *   --hooks-dir=<path>   Override Claude hooks directory (default: ~/.claude/hooks)
  *
- * Extensions (ADR 0024): hypo-ext-* hard-copies under
+ * Extensions: hypo-ext-* hard-copies under
  * ~/.claude/{hooks,commands,skills,agents}/ and ~/.codex/{hooks,commands}/ (with
  * --codex) are removed when their on-disk SHA matches the recorded one in
  * ~/.claude/hypo-pkg.json#extensions.<target>. User-modified copies are preserved
@@ -94,7 +94,7 @@ function removeCommands(apply, force) {
   return { removed, skippedUserModified, skippedNonRegular };
 }
 
-// ── extensions removal (ADR 0024) ───────────────────────────────────
+// ── extensions removal ───────────────────────────────────
 
 // Strip per-target extension SHA records from ~/.claude/hypo-pkg.json. Surgical:
 // we only touch the entries for keys we actually removed, so a `--force-extensions`
@@ -424,7 +424,7 @@ const hookResult = removeHookFiles(claudeHooksDir, hookFiles, args.apply);
 const settingsResult = stripSettingsJson(claudeSettings, claudeHooksDir, hookMap, args.apply);
 const commandResult = removeCommands(args.apply, args.forceCommands);
 
-// Extensions (ADR 0024). Order matters: remove files first, then strip
+// Extensions. Order matters: remove files first, then strip
 // settings, then surgically clear the per-target SHA map. The SHA strip uses
 // removedKeys so a user-modified file we left in place keeps its recorded SHA
 // (doctor still has a baseline next run). Settings are path-based and run even

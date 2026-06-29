@@ -249,7 +249,7 @@ export function isOptedOut(env = process.env) {
   return Boolean(env.HYPO_NO_UPDATE_CHECK || env.NO_UPDATE_NOTIFIER || env.CI);
 }
 
-// ── stale-sibling detection (ADR 0038) ───────────────────────────────────────
+// ── stale-sibling detection ───────────────────────────────────────────────────
 //
 // A second, OLDER Hypomnema can sit on $PATH (e.g. a stale `npm i -g hypomnema`)
 // while a newer copy owns the active hooks. The CLI bin (`hypomnema`) then routes

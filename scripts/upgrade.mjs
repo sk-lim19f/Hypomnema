@@ -20,7 +20,7 @@
  *                       the user-extensions companion sync (E4).
  *   --json              Output results as JSON
  *   --allow-downgrade   Override the guard that refuses to overwrite a NEWER
- *                       active install with an older package (ADR 0038)
+ *                       active install with an older package
  *   --allow-dual-install  Override the dual-install guard: register the Claude core
  *                       surface even though the Hypomnema plugin is also enabled
  *                       (knowingly accept the double-registration risk)
@@ -235,7 +235,7 @@ function checkSchemaVersion(hypoDir) {
 
 // Target-aware: the same core-hook integrity check runs against ~/.claude/hooks/
 // for the default claude target, and against ~/.codex/hooks/ when --codex is set
-// (ADR 0024). The function reads only — apply happens in applyHookFiles.
+// The function reads only (apply happens in applyHookFiles).
 function checkHookFiles(hooksDir) {
   const results = [];
 
@@ -473,13 +473,13 @@ function writeMigrationReport(hypoDir, fromVersion, toVersion, { pluginMode = fa
   // Don't overwrite an existing report
   if (existsSync(dest)) return dest;
 
-  // v1 → v2 specific guidance for the ADR 0031 feedback classification bump.
-  // Other major jumps fall back to the generic body. ADR 0034 reserves the
-  // right to keep SCHEMA.md as user-owned (Option C); auto-stub of the 9 new
-  // fields is rejected because scope/tier/targets/sensitivity/reason/source
-  // are semantic decisions whose wrong defaults would project wrong behavior.
-  // Fire for any 1.x → 2.x major crossing, not just 1.0 → 2.0 exactly: the ADR
-  // 0031 feedback-field backfill that this body explains was introduced at 2.0
+  // v1 → v2 specific guidance for the feedback classification bump. Other major
+  // jumps fall back to the generic body. The schema deliberately keeps SCHEMA.md
+  // user-owned (Option C); auto-stub of the 9 new fields is rejected because
+  // scope/tier/targets/sensitivity/reason/source are semantic decisions whose
+  // wrong defaults would project wrong behavior.
+  // Fire for any 1.x → 2.x major crossing, not just 1.0 → 2.0 exactly: the
+  // feedback-field backfill that this body explains was introduced at 2.0
   // and still applies to a user landing on any later 2.x (e.g. 2.1's additive
   // failure_type). Keying on the exact target string would silently
   // drop this guidance the moment the template minor moves.
@@ -489,8 +489,7 @@ function writeMigrationReport(hypoDir, fromVersion, toVersion, { pluginMode = fa
   const specificBody = isV1ToV2
     ? `## What changed in SCHEMA 2.0
 
-ADR 0031 (\`projects/hypomnema/decisions/0031-feedback-as-sot-external-memory-projection.md\`)
-made \`feedback\` pages the single source of truth for behavior corrections and added
+This release made \`feedback\` pages the single source of truth for behavior corrections and added
 **9 hard-required frontmatter fields** for every \`feedback\` page:
 
 - \`status\` (active | superseded | archived)
@@ -510,8 +509,8 @@ that does not satisfy all four is rejected by both \`hypomnema lint\` and
 \`hypomnema feedback\` (see \`scripts/lint.mjs\` and \`scripts/feedback.mjs\`
 enforcement).
 
-ADR 0034 records this schema bump and the reasoning (semver-major because
-existing feedback pages without these fields now fail \`hypomnema lint\`).
+This schema bump is semver-major because existing feedback pages without these
+fields now fail \`hypomnema lint\`.
 
 ## Action items — existing wiki
 
@@ -799,7 +798,7 @@ function writePluginModeMetadata() {
 const args = parseArgs(process.argv);
 
 // Target paths. Claude is always checked; codex is checked only when --codex is set
-// (ADR 0024) so users without codex installed see no false drift.
+// so users without codex installed see no false drift.
 const claudeHooksDir = join(HOME, '.claude', 'hooks');
 const claudeSettingsPath = join(HOME, '.claude', 'settings.json');
 const codexHooksDir = join(HOME, '.codex', 'hooks');
@@ -858,7 +857,7 @@ const hooksCodex = args.codex ? checkHookFiles(codexHooksDir) : null;
 const settingsCodex = args.codex ? checkSettingsJson(codexSettingsPath, codexHooksDir) : null;
 const oldHookRefsCodex = args.codex ? checkOldHookNames(codexSettingsPath) : null;
 
-// Extensions companion (ADR 0024). Read-only check; the apply
+// Extensions companion. Read-only check; the apply
 // happens below, AFTER applyCommands, so the per-target SHA map merges into the
 // hypo-pkg.json that applyCommands writes (rather than being clobbered by it).
 const extSettingsPath = claudeSettingsPath;
@@ -935,7 +934,7 @@ let appliedExtensions = null;
 let appliedExtensionsCodex = null;
 
 if (args.apply) {
-  // Downgrade guard (ADR 0038, P): an `--apply` from an OLDER package than the
+  // Downgrade guard: an `--apply` from an OLDER package than the
   // active install would overwrite newer hooks (upgrade.mjs:287 copyFileSync) and
   // rewrite hypo-pkg.json to the older version. Refuse before the first mutation.
   // A dev workspace re-running its own --apply (incl. the post-commit sync hook)
@@ -1370,7 +1369,7 @@ if (hypoignore.status === 'no-file') {
   for (const e of hypoignore.missing) lines.push(`    + ${e.pattern}`);
 }
 
-// Extensions companion (ADR 0024; conflict/drift gating E3, #31). Shared by the
+// Extensions companion (conflict/drift gating E3, #31). Shared by the
 // claude target and, under --codex, the codex target (E4, #32) — the label keeps
 // the two blocks distinguishable in the report.
 function pushExtSummary(check, label) {

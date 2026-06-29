@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * feedback-sync.mjs — project wiki feedback as SoT, external memory as projection (ADR 0031)
+ * feedback-sync.mjs — project wiki feedback as SoT, external memory as projection
  *
  * Wiki `pages/feedback/<slug>.md` is the single source of truth for
  * learning/correction knowledge. Two Claude Code memory surfaces are derived
@@ -506,7 +506,7 @@ async function resolveProjectId(args, { prompt = defaultPrompt, isTTY } = {}) {
 //
 // Both modes are *reverse* one-time helpers that scaffold wiki DRAFTS under
 // pages/feedback/_drafts/ — they NEVER write pages/feedback/<slug>.md directly
-// (the single-direction invariant, ADR 0031 §6). A human reviews each draft,
+// (the single-direction invariant). A human reviews each draft,
 // fills the decision fields (scope/tier/targets/promote_to_global), and moves
 // it into pages/feedback/. _drafts/ is excluded from sync candidates
 // (loadFeedbackPages) and from lint (collectPages skips `_`-dirs), so an
@@ -856,7 +856,7 @@ function run(args, resolvedPid = null) {
   // not actionable drift — contract §5 step 4 promises this never hard-fails,
   // so it must stay OUT of strictWarnings or the PreCompact gate (#3, which
   // runs `--check --strict`) would block every first-run user. A private-
-  // sensitivity page IS a real SoT violation (ADR 0031 §7; lint #8 blocks it
+  // sensitivity page IS a real SoT violation (lint #8 blocks it
   // at the source) so it stays strict-escalatable as defense-in-depth.
   const warnings = [];
   const strictWarnings = [];
@@ -875,8 +875,8 @@ function run(args, resolvedPid = null) {
 
   // pass 1: preflight every target before touching disk — validates the write
   // plan (container/anchor, markers) and computes next content. A conflict /
-  // over-cap / build error in ANY target blocks writes to ALL (atomicity — ADR
-  // 0031 Decision §6 "no auto-merge"; avoids a partial write where one target
+  // over-cap / build error in ANY target blocks writes to ALL (atomicity:
+  // "no auto-merge"; avoids a partial write where one target
   // lands and another refuses).
   const evals = targets.map((target) => ({ target, res: evaluateTarget(pages, target) }));
   for (const { target, res } of evals) {

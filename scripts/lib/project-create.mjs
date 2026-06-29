@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * project-create.mjs — atomic auto-project scaffold (ADR 0023)
+ * project-create.mjs — atomic auto-project scaffold
  *
- * Invoked by the LLM (NOT a user-facing subcommand — ADR 0023 deprecated
+ * Invoked by the LLM (NOT a user-facing subcommand; `hypomnema project new` is deprecated
  * `hypomnema project new`) after the user answers "Y" to a SessionStart /
  * CwdChanged auto-project offer. One call materializes a whole project:
  *

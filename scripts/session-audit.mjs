@@ -6,7 +6,7 @@
  * (search count, ingest count, URLs mentioned, feedback count) so the
  * weekly observability report (Lane E) can compute autonomy scores.
  *
- * Transcript dual-source (ADR 0019):
+ * Transcript dual-source:
  *   1) Primary: <hypo-dir>/.cache/sessions/index.jsonl
  *      Written by hooks/hypo-session-record.mjs (Stop hook).
  *   2) Fallback: ~/.claude/projects/<encoded>/*.jsonl

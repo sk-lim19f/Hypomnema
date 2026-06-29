@@ -5,7 +5,7 @@
  * Appends an entry to ~/hypomnema/.cache/sessions/index.jsonl for each
  * completed session. The index.jsonl is the **primary** source for
  * scripts/session-audit.mjs (which falls back to ~/.claude/projects/<encoded>/
- * if the index is empty or missing — see ADR 0019).
+ * if the index is empty or missing).
  *
  * Silent: never blocks, never emits user-visible output.
  */

@@ -4,7 +4,7 @@
 //   - scripts/lint.mjs      (lint-time enum validation of feedback frontmatter)
 //   - scripts/feedback.mjs  (create/append-time --failure-type validation)
 // Keep this the ONLY definition; both consumers import it so the two validators
-// never drift (mirrors feedback-scope.mjs / ADR 0034). stats.mjs aggregates by
+// never drift (mirrors feedback-scope.mjs). stats.mjs aggregates by
 // plain string and does not validate, so it is intentionally not a consumer.
 //
 // `failure_type` is an OPTIONAL field: it classifies feedback that came from a

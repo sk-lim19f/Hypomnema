@@ -88,7 +88,7 @@ export function findDesignHistoryStale(hypoDir) {
     if (!existsSync(dhPath)) continue;
 
     // session-log can live as a flat `session-log.md` (legacy) or a directory of
-    // daily shards `session-log/YYYY-MM-DD.md` (ADR 0050 canonical; legacy
+    // daily shards `session-log/YYYY-MM-DD.md` (canonical; legacy
     // monthly `YYYY-MM.md` files still appear pre-cutover). This globs every
     // `.md` in the directory, so daily and monthly shapes are both aggregated —
     // the staleness check needs to see all of them.
