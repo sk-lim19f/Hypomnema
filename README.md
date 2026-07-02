@@ -15,7 +15,7 @@ English | [한국어](README.ko.md)
 
 LLM-native personal wiki for Claude Code. Knowledge that compounds.
 
-_Make Claude take notes, and measure whether it actually does._
+Make Claude take notes, and measure whether it actually does.
 
 [Quick Start](#quick-start) • [How It Compares](#how-it-compares) • [Design Decisions](#design-decisions) • [Features](#features) • [Architecture](docs/ARCHITECTURE.md) • [Contributing](docs/CONTRIBUTING.md)
 
@@ -25,14 +25,20 @@ New to the terms below? Keep the [Term decoder](#term-decoder) open in another t
 
 ### Where automation stands today
 
-The current release is v1.5.0, which turns to cross-machine reliability and everyday friction: `cwd`-first resume now finds the right project on a git-synced vault shared across machines, a session working in a code repo is told where the wiki lives instead of re-discovering it each time, and session close stops re-listing unrelated lint debt or dumping hundreds of warnings into context. The v1.4.x line hardened the session-close path before it. Wiki work (ingest, query, session-close) still runs on explicit `/hypo:*` commands. The v2 goal is full autonomy: Claude reading, writing, and synthesizing the wiki without being asked, which is the direction this is heading. v1.1.0 shipped the observability score that measures how often the wiki is actually used per session. v1.2.0 added four autonomous lanes on top:
+The current release is v1.5.0. It turns to cross-machine reliability and everyday friction. On a git-synced vault shared across machines, `cwd`-first resume finds the right project; a session working in a code repo is told where the wiki lives instead of re-discovering it each time; and session close no longer re-lists unrelated lint debt or dumps hundreds of warnings into context. The v1.4.x line hardened the session-close path before it.
+
+Wiki work (ingest, query, session-close) still starts from an explicit `/hypo:*` command or plain language. The v2 goal is full autonomy: Claude reading, writing, and synthesizing the wiki without being asked, which is the direction this is heading.
+
+The lanes that already run on their own: v1.1.0 shipped the observability score that measures how often the wiki is used per session, and v1.2.0 added four automated areas on top.
 
 - Edit feedback in one place and the rest follows. `pages/feedback/` is the single source of truth for behavior corrections, and Hypomnema derives `MEMORY.md` and the `<learned_behaviors>` block inside `~/.claude/CLAUDE.md` from it automatically.
 - Extensions sync alongside. Anything under `~/hypomnema/extensions/{agents,commands,hooks,skills}/` is mirrored into `~/.claude/` automatically. The `--codex` flag also mirrors `hooks` and `commands` into `~/.codex/`; `agents` and `skills` are Claude-only and skipped on purpose.
 - Auto-project creation. When you `cd` into a git repo with a project marker (`package.json`, `Cargo.toml`, etc.) and no matching wiki project exists, Hypomnema offers to scaffold one.
 - Session-close cleanup and `/clear` recovery. After a non-trivial session, a "save a minimal session-close note?" prompt appears automatically; a `/clear` after a forgotten close is detected and recovered at the next session start.
 
-What changed per version lives in the [CHANGELOG](CHANGELOG.md). One policy worth knowing up front: `hypomnema upgrade --apply` never overwrites a `SCHEMA.md` you have edited. When the schema bumps, upgrade writes a migration report into the wiki root and leaves the actual changes for you to apply (the policy the code calls _Option C_).
+What changed per version lives in the [CHANGELOG](CHANGELOG.md).
+
+One upgrade policy worth knowing up front: `hypomnema upgrade --apply` never overwrites a `SCHEMA.md` you have edited. When the schema bumps, upgrade writes a migration report into the wiki root and leaves the actual changes for you to apply (the policy the code calls Option C).
 
 ---
 
@@ -74,6 +80,8 @@ hypomnema
 ```
 
 Hooks handle the rest: auto-staging, auto-commit/push, session-state injection, and lookup signals.
+
+> You don't have to memorize the commands. Describe what you want in plain language and the matching skill fires with no slash command: "save this article to the wiki" triggers `ingest`, "what do I know about X?" triggers `query`, "let's wrap up this session" triggers `crystallize`. See [Claude Agent Skills](#claude-agent-skills) for how it works.
 
 > Sync across machines: the wiki is already a git repo. Add a remote, push once, and the `Stop` hook keeps every machine in sync afterwards.
 
@@ -219,7 +227,7 @@ Nine commands cover the full capture → retrieval → consolidation cycle.
 |---|---|---|
 | `/hypo:ingest` | Saves the raw source under `sources/`; Claude synthesizes a structured page under `pages/`. The shell helper (`scripts/ingest.mjs`) is read-only and only _lists_ pending sources | Anytime you read something worth keeping |
 | `/hypo:query` | BM25 retrieval + LLM synthesis with `[[wikilink]]` citations | When you need an answer grounded in your own notes |
-| `/hypo:crystallize` | Runs the session-close checklist (steps 1~6) and, on request, synthesizes drafts (steps 7~11) | End of a non-trivial session |
+| `/hypo:crystallize` | Runs the session-close checklist (steps 1-6) and, on request, synthesizes drafts (steps 7-11) | End of a non-trivial session |
 | `/hypo:resume` | Loads the most recent session state for an active project | Coming back to a paused project |
 | `/hypo:feedback` | Records an AI behavior correction; eligible for promotion to permanent rules | When Claude gets something wrong, or gets it exactly right |
 | `/hypo:verify` | Audits pages with `verify_by` frontmatter | When time-bound knowledge might have aged out |
@@ -248,8 +256,6 @@ Nine commands cover the full capture → retrieval → consolidation cycle.
 
 All hooks resolve the wiki root via `HYPO_DIR` env → `hypo-config.md` scan → `~/hypomnema` default, and share `hypo-shared.mjs` (declared via `hooks.json`'s `shared` field).
 
-The `SessionStart` hook also runs a non-blocking background check against npm and the Claude Code plugin marketplace, and prints an "Update available!" banner the next time a newer version has been published. Opt out with `HYPO_NO_UPDATE_CHECK=1`, `NO_UPDATE_NOTIFIER=1`, or by running under `CI=true`.
-
 ### Setup & maintenance
 
 | Command | Purpose |
@@ -261,9 +267,20 @@ The `SessionStart` hook also runs a non-blocking background check against npm an
 | `/hypo:stats` | Wiki statistics |
 | `/hypo:audit` | Observability audit (per-session metrics, weekly report) |
 
+> Update notice: the `SessionStart` hook runs a non-blocking background check against npm and the Claude Code plugin marketplace, and prints an "Update available!" banner the next time a newer version has been published. Opt out with `HYPO_NO_UPDATE_CHECK=1`, `NO_UPDATE_NOTIFIER=1`, or by running under `CI=true`.
+
 ### Claude Agent Skills
 
-The synthesis-heavy commands (`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`) are also exposed as Claude Agent Skills in `skills/<name>/SKILL.md`, so they auto-trigger when the conversation matches their description, with no slash command required.
+The synthesis-heavy commands (`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`) are also exposed as Claude Agent Skills in `skills/<name>/SKILL.md`, so they auto-trigger when the conversation matches their description, with no slash command required. You don't need to know the exact command; just say what you want.
+
+| Say this | Skill it triggers |
+|---|---|
+| "save this link/article to the wiki" | `ingest` |
+| "what do I know about X?", "find that decision I made" | `query` |
+| "let's wrap up this session", "save what we did today" | `crystallize` |
+| "check these pages for broken links" | `lint` |
+
+Use the slash command when you want to be explicit, plain language when you don't want to break your flow. Both reach the same skill.
 
 ---
 
