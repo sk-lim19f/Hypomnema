@@ -5,6 +5,49 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-07-04
+
+### New Features
+
+#### English
+
+- Lookup and session-start now flag an injected page whose `verify_by_date` has passed with a `[STALE verify_by_date=...]` marker, so a stale answer is visibly dated at the point of use instead of trusted silently. Lookup usage is also tracked locally (fail-closed, git-ignored) so crystallize can surface a linked-but-never-injected page as a cold candidate. ([#164](https://github.com/sk-lim19f/Hypomnema/pull/164))
+
+#### 한국어
+
+- lookup과 session-start가 `verify_by_date`가 지난 주입 페이지에 `[STALE verify_by_date=...]` 마커를 붙여, 낡은 답을 조용히 신뢰하는 대신 사용하는 지점에서 날짜를 눈에 띄게 표시합니다. lookup 사용도 로컬에서(fail-closed, git 제외) 추적해, 링크됐지만 한 번도 주입되지 않은 페이지를 crystallize가 cold 후보로 표면화합니다. ([#164](https://github.com/sk-lim19f/Hypomnema/pull/164))
+
+### Bug Fixes
+
+#### English
+
+- Fixed a non-deterministic session-close failure: `/hypo:crystallize` reported log.md and the session-log as "stale" (exit 1) even when both carried today's entry, because the freshness gate did not recognize the standard `## [date] session | <project>: title` colon delimiter. The gate now accepts it, and a malformed close payload is rejected before any file is written instead of being written and then misdiagnosed downstream. ([#166](https://github.com/sk-lim19f/Hypomnema/pull/166))
+
+#### 한국어
+
+- 비결정적 session-close 실패를 고쳤습니다: `/hypo:crystallize`가 log.md와 session-log를 둘 다 오늘 엔트리를 가졌는데도 "stale"로 보고하며 exit 1 하던 문제인데, 신선도 게이트가 표준 `## [date] session | <project>: title` 콜론 구분자를 인식하지 못한 탓이었습니다. 이제 게이트가 이를 수용하고, malformed close payload는 파일을 쓰기 전에 거부합니다(예전처럼 일단 쓴 뒤 downstream에서 오진하지 않음). ([#166](https://github.com/sk-lim19f/Hypomnema/pull/166))
+
+### Chores
+
+#### English
+
+- Corrected docs (skill footers, README, ARCHITECTURE, the audit report) that wrongly claimed the observability audit counts inline citations toward the autonomy score; the score is based on search / ingest / feedback activity. ([#165](https://github.com/sk-lim19f/Hypomnema/pull/165))
+- Fixed README rendering traps in both languages (step ranges rendered as strikethrough, Korean underscore emphasis leaking as literal underscores, run-on version-history paragraphs) and added natural-language / keyword trigger examples to the usage sections. ([#163](https://github.com/sk-lim19f/Hypomnema/pull/163))
+
+#### 한국어
+
+- 관측성 audit이 인라인 citation을 autonomy score에 집계한다고 잘못 서술한 문서(skill footer, README, ARCHITECTURE, audit 리포트)를 정정했습니다. 점수는 search / ingest / feedback 활동을 기반으로 합니다. ([#165](https://github.com/sk-lim19f/Hypomnema/pull/165))
+- 양쪽 언어 README의 렌더링 문제(단계 범위가 취소선으로 표시, 한국어 밑줄 강조가 리터럴로 노출, 뒤엉킨 버전 이력 문단)를 고치고, 사용법 섹션에 자연어·키워드 트리거 예시를 추가했습니다. ([#163](https://github.com/sk-lim19f/Hypomnema/pull/163))
+
+### Changelog
+
+- [#166](https://github.com/sk-lim19f/Hypomnema/pull/166) fix(session-close): recognize colon log entries, reject malformed payloads pre-apply
+- [#165](https://github.com/sk-lim19f/Hypomnema/pull/165) docs: correct false citation-counting claims (skills, guide, architecture, readme, audit)
+- [#164](https://github.com/sk-lim19f/Hypomnema/pull/164) feat(freshness): STALE injection markers + page-usage logging
+- [#163](https://github.com/sk-lim19f/Hypomnema/pull/163) docs(readme): fix Markdown rendering traps and add keyword-trigger usage
+
+Contributors: @sk-lim19f
+
 ## [1.5.0] - 2026-06-29
 
 ### New Features
