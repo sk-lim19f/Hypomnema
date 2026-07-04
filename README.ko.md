@@ -156,7 +156,7 @@ Hypomnema         ───►  합성 · 마크다운 · git · 훅 · 로컬
 | `hot.md` | 프로젝트별 캐시. "방금 무엇을 했는지"(직전 세션의 핵심) |
 | `session-state.md` | 프로젝트별 캐시. "다음에 무엇을 할지"(다음 세션 시작 때 주입되는 이어받기 데이터) |
 | `.hypoignore` | 모든 콘텐츠 주입 훅과 `ingest`에서 제외할 경로(글롭 패턴) |
-| 관측성 점수(observability score) | 세션별 측정값(ingest·query·session-close·citation 비율). 위키가 실제로 쓰였는지 보여줍니다 |
+| 관측성 점수(observability score) | 세션별 측정값(search·ingest·feedback 활동). 위키가 실제로 쓰였는지 보여줍니다 |
 | manifest | 설치 스크립트가 쓰는 작은 JSON. 어떤 파일을 어떤 SHA로 설치했는지 기록 |
 | `additionalContext` | Claude Code 훅이 프롬프트에 컨텍스트를 끼워 넣는 필드. 콘텐츠 주입 훅의 출력 위치 |
 | 바이트 동일(byte-equal) | `--apply` 전후가 비트 단위로 같은 파일. "건드리지 않았다"의 가장 강한 보장 |

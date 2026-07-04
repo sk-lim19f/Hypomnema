@@ -225,7 +225,7 @@ ADRs are immutable once accepted. Mark deprecated/superseded but never edit cont
 
 Hypomnema v1.1.0 ships an **autonomy score** so you can see whether the wiki is actually being used per session, rather than just trusting that it is.
 
-- **Citation:** when a response uses a wiki page, link it inline as `[[page-slug]]`. The audit script counts citations as one signal of "the wiki was actually consulted".
+- **Citation:** when a response uses a wiki page, link it inline as `[[page-slug]]` to keep it connected in the graph. (The audit score is based on the tool and command usage below, not on these inline citations.)
 - **Tools that count:** `Grep`, `WebSearch`, `WebFetch`, and any `/hypo:query` / `/hypo:ingest` / `/hypo:feedback` invocation in the transcript.
 - **Classification (heuristic v0):**
   - `normal` — at least one search, no missed URL ingests

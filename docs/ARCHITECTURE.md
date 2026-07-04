@@ -379,7 +379,7 @@ If `git status` shows no `.md` changes, the diff step is skipped — Stop hook f
 
 ### Citation convention
 
-The six writer-side skills (`crystallize`, `query`, `ingest`, `verify`, `graph`, `lint`) carry an identical footer instructing Claude to cite wiki pages inline as `[[page-slug]]`. The audit script counts these citations as a "wiki was actually consulted" signal in future iterations.
+The six writer-side skills (`crystallize`, `query`, `ingest`, `verify`, `graph`, `lint`) carry an identical footer instructing Claude to cite wiki pages inline as `[[page-slug]]`, which keeps them connected in the graph. The observability audit does not scan for these inline citations: it scores sessions on tool and command usage recorded by `hypo-session-record` (search / ingest / feedback counts). Counting citations as a signal is a possible future iteration, not current behavior.
 
 ---
 

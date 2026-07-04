@@ -156,7 +156,7 @@ These are the recurring terms used in the rest of the README. Keep this table op
 | `hot.md` | Per-project cache: "what just happened" (most recent session highlights) |
 | `session-state.md` | Per-project cache: "what's next" (the resume payload for the next session) |
 | `.hypoignore` | Glob patterns that exclude paths from every content-injection hook and from `ingest` |
-| observability score | A per-session metric (ingest / query / session-close / citation rates) that measures whether the wiki is actually being used |
+| observability score | A per-session metric (search / ingest / feedback activity) that measures whether the wiki is actually being used |
 | manifest | A small JSON the install scripts write to track exactly which files were installed and at what SHA |
 | `additionalContext` | The Claude Code hook field that injects extra context into the prompt: where content-injection hooks emit |
 | byte-equal | A file that comes out of `--apply` bit-for-bit identical to before: the strongest "we did not touch this" guarantee |
