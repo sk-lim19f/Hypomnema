@@ -29,6 +29,9 @@ import { fileURLToPath } from 'node:url';
 // static import (no top-level await) — feedback-sync.mjs guards main() behind an
 // entry check, so importing it for unit tests does not run the CLI.
 import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync.mjs';
+// crystallize.mjs guards its CLI dispatch behind isMain(), so importing these
+// pure close-pipeline functions does not run the CLI.
+import { planMarkerDecision, closeResultContradiction } from '../scripts/crystallize.mjs';
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
 import { buildProjectSuggestionLine, resolveActiveProject } from '../hooks/hypo-shared.mjs';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
@@ -21771,6 +21774,238 @@ test('prompt surfaces: bundled-script references resolve via CLAUDE_PLUGIN_ROOT/
     missingFallback.length,
     0,
     `surfaces invoking a bundled script but missing the hypo-pkg.json resolution fallback: ${missingFallback.join(', ')}`,
+  );
+});
+
+// ── close-pipeline state machine: planMarkerDecision + closeResultContradiction ─
+// Deterministic table tests for the two pure close-pipeline functions. The close
+// marker decision is deterministic given its input signals; these tables exercise
+// that state machine directly (no CLI spawn). Fixtures are distilled from the
+// real session-close failures that motivated the safety net:
+//   ISSUE-27 (git-dirty self-block)   → commit-failed skip
+//   ISSUE-28 (cross-block bookkeeping) → compact-gate-not-ok skip
+//   ISSUE-33 (wrong --session-id)      → transcript-unresolved / no-user-close-signal
+//   ISSUE-1/7/12 (project resolution)  → upstream of gateOk (which project the gate scores)
+suite('close-pipeline: planMarkerDecision (deterministic state machine)');
+
+// [label, input, expected]
+const MARKER_DECISION_CASES = [
+  [
+    'apply not ok → not a marker path (no reason)',
+    {
+      ok: false,
+      hasSessionId: true,
+      committed: true,
+      gateOk: true,
+      transcriptResolved: true,
+      hasUserSignal: true,
+    },
+    { write: false, skipReason: null },
+  ],
+  [
+    'no session id → not a marker path (no reason)',
+    {
+      ok: true,
+      hasSessionId: false,
+      committed: true,
+      gateOk: true,
+      transcriptResolved: true,
+      hasUserSignal: true,
+    },
+    { write: false, skipReason: null },
+  ],
+  [
+    'ISSUE-27: commit failed → commit-failed skip',
+    {
+      ok: true,
+      hasSessionId: true,
+      committed: false,
+      commitReason: 'uncommitted',
+      gateOk: false,
+      transcriptResolved: false,
+      hasUserSignal: false,
+    },
+    { write: false, skipReason: 'commit-failed: uncommitted' },
+  ],
+  [
+    'ISSUE-28: compact gate not ok → compact-gate-not-ok',
+    {
+      ok: true,
+      hasSessionId: true,
+      committed: true,
+      gateOk: false,
+      transcriptResolved: true,
+      hasUserSignal: true,
+    },
+    { write: false, skipReason: 'compact-gate-not-ok' },
+  ],
+  [
+    'ISSUE-33: transcript unresolved → transcript-unresolved',
+    {
+      ok: true,
+      hasSessionId: true,
+      committed: true,
+      gateOk: true,
+      transcriptResolved: false,
+      hasUserSignal: false,
+    },
+    { write: false, skipReason: 'transcript-unresolved' },
+  ],
+  [
+    'ISSUE-33: transcript resolved but no user signal → no-user-close-signal',
+    {
+      ok: true,
+      hasSessionId: true,
+      committed: true,
+      gateOk: true,
+      transcriptResolved: true,
+      hasUserSignal: false,
+    },
+    { write: false, skipReason: 'no-user-close-signal' },
+  ],
+  [
+    'all clear → write the marker',
+    {
+      ok: true,
+      hasSessionId: true,
+      committed: true,
+      gateOk: true,
+      transcriptResolved: true,
+      hasUserSignal: true,
+    },
+    { write: true, skipReason: null },
+  ],
+];
+
+for (const [label, input, expected] of MARKER_DECISION_CASES) {
+  test(label, () => {
+    assert.deepEqual(planMarkerDecision(input), expected);
+  });
+}
+
+test('branch priority: commit-failed wins over a would-be gate/signal skip', () => {
+  // Even with gateOk:false and no signal, a commit failure is reported FIRST
+  // (the tree was never committed, so the downstream gate never ran).
+  assert.deepEqual(
+    planMarkerDecision({
+      ok: true,
+      hasSessionId: true,
+      committed: false,
+      commitReason: 'not a repo',
+      gateOk: false,
+      transcriptResolved: false,
+      hasUserSignal: false,
+    }),
+    { write: false, skipReason: 'commit-failed: not a repo' },
+  );
+});
+
+suite('close-pipeline: closeResultContradiction (runtime invariant self-check)');
+
+// Every legitimate withhold (marker not written, but a real reason recorded) is
+// a VALID outcome, not a contradiction → null.
+const LEGIT_WITHHOLDS = [
+  'commit-failed: uncommitted',
+  'compact-gate-not-ok',
+  'transcript-unresolved',
+  'no-user-close-signal',
+  'marker-did-not-land',
+];
+for (const reason of LEGIT_WITHHOLDS) {
+  test(`legit withhold (${reason}) → no contradiction`, () => {
+    assert.equal(
+      closeResultContradiction({ ok: true, markerWritten: false, markerSkipReason: reason }),
+      null,
+    );
+  });
+}
+
+test('normal write (marker written, no reason) → no contradiction', () => {
+  assert.equal(
+    closeResultContradiction({ ok: true, markerWritten: true, markerSkipReason: null }),
+    null,
+  );
+});
+
+test('apply failed (ok:false, no marker, no reason) → no contradiction', () => {
+  // ok is already false for a file/lint reason; a withheld marker with no reason
+  // is expected here (the marker block never ran), so this is NOT the invariant's
+  // target — it only fires on ok:true.
+  assert.equal(
+    closeResultContradiction({ ok: false, markerWritten: false, markerSkipReason: null }),
+    null,
+  );
+});
+
+test('contradiction A: ok:true, marker withheld, no reason → flagged', () => {
+  assert.equal(
+    closeResultContradiction({ ok: true, markerWritten: false, markerSkipReason: null }),
+    'internal-contradiction:marker-withheld-without-reason',
+  );
+});
+
+for (const blank of ['', '   ']) {
+  test(`contradiction A: a blank-string reason (${JSON.stringify(blank)}) counts as reasonless`, () => {
+    // The stderr warning path gates on truthiness, so a blank reason would evade
+    // a naive `== null` check while surfacing nothing to the reader.
+    assert.equal(
+      closeResultContradiction({ ok: true, markerWritten: false, markerSkipReason: blank }),
+      'internal-contradiction:marker-withheld-without-reason',
+    );
+  });
+}
+
+for (const bogus of [false, 0, [], {}]) {
+  test(`contradiction A: a non-string reason (${JSON.stringify(bogus)}) does not count as a real reason`, () => {
+    // A real reason is a non-blank string; a future bad assignment must not be
+    // able to hide a withheld marker behind a bogus non-string value.
+    assert.equal(
+      closeResultContradiction({ ok: true, markerWritten: false, markerSkipReason: bogus }),
+      'internal-contradiction:marker-withheld-without-reason',
+    );
+  });
+}
+
+test('contradiction B: marker written AND a skip reason set → flagged', () => {
+  assert.equal(
+    closeResultContradiction({
+      ok: true,
+      markerWritten: true,
+      markerSkipReason: 'no-user-close-signal',
+    }),
+    'internal-contradiction:marker-written-with-skip-reason',
+  );
+});
+
+test('marker written with a blank reason → not contradiction B (blank is no reason)', () => {
+  assert.equal(
+    closeResultContradiction({ ok: true, markerWritten: true, markerSkipReason: '' }),
+    null,
+  );
+});
+
+suite('crystallize.mjs entry guard (import must not run the CLI)');
+
+test('importing crystallize.mjs runs no CLI and exposes exactly the pure exports', () => {
+  // The pure close-pipeline exports are usable only because the CLI dispatch is
+  // guarded behind isMain(). A regressed guard that let the CLI run on import
+  // would either crash (process.exit) or leak crystallize output here — assert
+  // the import is silent and yields exactly the two exported names.
+  const script = join(REPO, 'scripts', 'crystallize.mjs');
+  const r = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import(${JSON.stringify(script)}).then((m) => process.stdout.write(Object.keys(m).sort().join(',')))`,
+    ],
+    { encoding: 'utf-8' },
+  );
+  assert.equal(r.status, 0, `import must exit 0, got ${r.status}: ${r.stderr}`);
+  assert.equal(
+    r.stdout,
+    'closeResultContradiction,planMarkerDecision',
+    `import must print only the pure exports (no CLI output): ${JSON.stringify(r.stdout)}`,
   );
 });
 
