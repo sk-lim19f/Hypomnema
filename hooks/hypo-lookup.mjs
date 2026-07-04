@@ -11,7 +11,15 @@
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join, basename } from 'path';
-import { HYPO_DIR, buildOutput, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
+import {
+  HYPO_DIR,
+  buildOutput,
+  loadHypoIgnore,
+  isIgnored,
+  staleMarkerFor,
+  pageUsageLoggingAllowed,
+  recordLookupUsage,
+} from './hypo-shared.mjs';
 
 const INDEX_PATH = join(HYPO_DIR, 'index.md');
 const MAX_HITS = 3;
@@ -178,6 +186,8 @@ process.stdin.on('end', () => {
   try {
     const data = JSON.parse(input);
     const prompt = (data.prompt || '').trim();
+    // Runtime sends a session UUID; older payloads may omit it (parse defensively).
+    const sessionId = data.session_id || null;
 
     if (!prompt || !existsSync(INDEX_PATH)) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
@@ -235,14 +245,32 @@ process.stdin.on('end', () => {
       ),
     };
 
+    // UTC to match doctor.mjs' overdue set (D1/D2). STALE is advisory, so a
+    // one-day UTC/local skew never misleads.
+    const TODAY = new Date().toISOString().slice(0, 10);
+
     const injected = [];
+    const injectedSlugs = [];
     for (const { slug } of matched.slice(0, MAX_HITS)) {
       const path =
         pageMap[slug] ??
         pageMap[slug.replace(/^(pages|projects)\//, '')] ??
         pageMap[basename(slug)];
       if (path && existsSync(path)) {
-        injected.push(`=== [[${slug}]] ===\n${readFileSync(path, 'utf-8').slice(0, MAX_CHARS)}`);
+        const raw = readFileSync(path, 'utf-8');
+        // Compute the marker on raw (pre-slice) so a long body can't truncate
+        // frontmatter out of reach. fail-open: a marker failure drops the marker,
+        // never the page.
+        let marker = '';
+        try {
+          marker = staleMarkerFor(raw, TODAY);
+        } catch {
+          marker = '';
+        }
+        injected.push(
+          `=== [[${slug}]] ===\n${marker ? marker + '\n' : ''}${raw.slice(0, MAX_CHARS)}`,
+        );
+        injectedSlugs.push(slug);
       }
     }
 
@@ -260,6 +288,13 @@ process.stdin.on('end', () => {
         ),
       );
       return;
+    }
+
+    // Page-usage logging (B): observability only, gated fail-closed on commit
+    // coverage, and fail-open so it never disturbs the injection above. Only the
+    // real HIT branch reaches here (miss / index-hit-but-missing returned early).
+    if (pageUsageLoggingAllowed(HYPO_DIR, sessionId)) {
+      recordLookupUsage(HYPO_DIR, { sessionId, slugs: injectedSlugs });
     }
 
     const overflow =

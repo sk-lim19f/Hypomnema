@@ -352,6 +352,139 @@ function parseFrontmatterField(content, key) {
     .replace(/^['"]|['"]$/g, '');
 }
 
+// ── freshness: overdue verify_by_date predicate + STALE injection marker ─────
+// Authority is doctor.mjs:487-491 (D1). Same characters, same meaning: only a
+// well-formed ISO date strictly before `today` is overdue. verify_by (the
+// natural-language question) is never a date and is never consulted here.
+// today is caller-supplied and must use the UTC convention (new Date()
+// .toISOString().slice(0,10)) so this set matches doctor's.
+export function isOverdueDate(dateStr, today) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(dateStr) && dateStr < today;
+}
+
+// Compute the injection marker for a page's raw content. Returns
+// `[STALE verify_by_date=YYYY-MM-DD]` when overdue, otherwise an empty string
+// (so non-targets pass through unchanged). Callers prepend the non-empty result
+// at injection time.
+//
+// The value read here must be normalized exactly as scripts/lib/frontmatter.mjs
+// does (doctor's parser), so the overdue set stays char-identical to doctor.mjs.
+// In particular it strips a trailing YAML inline comment (`2020-01-01 # note`):
+// the plain parseFrontmatterField does not, which would silently miss dates
+// doctor flags overdue. Top-level line only (skip indented / list entries),
+// first-wins, strip comment, then strip surrounding quotes.
+export function staleMarkerFor(rawContent, today) {
+  const m = rawContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return '';
+  let value = null;
+  for (const line of m[1].split(/\r?\n/)) {
+    if (/^\s/.test(line) || /^-(\s|$)/.test(line)) continue; // nested / list item
+    const idx = line.indexOf(':');
+    if (idx < 0) continue;
+    if (line.slice(0, idx).trim() !== 'verify_by_date') continue; // key match (idx: tolerates `key : v`)
+    value = line
+      .slice(idx + 1)
+      .trim()
+      .replace(/\s+#.*$/, '')
+      .replace(/^["']|["']$/g, '');
+    break; // first-wins
+  }
+  return value && isOverdueDate(value, today) ? `[STALE verify_by_date=${value}]` : '';
+}
+
+// ── page-usage logging: commit-coverage guard + append (B, D6) ───────────────
+// Logging which pages lookup injects is observability, never an injection path.
+// The log lives at .cache/page-usage.jsonl and must never be committed. Before
+// any append, prove that file cannot be staged/committed: it must be covered by
+// BOTH git's ignore rules (check-ignore) AND .hypoignore (which is what gates
+// hypo-auto-stage and commitWikiChanges). Missing either signal, or any error
+// (no git, timeout, non-repo), returns false so nothing is written (fail-closed
+// logging). Injection stays fail-open and is unaffected. The verdict is cached
+// per session (keyed by session_id plus a vault-path hash so two vaults in one
+// session can't cross-contaminate) so git runs at most once per session.
+export const PAGE_USAGE_REL = '.cache/page-usage.jsonl';
+
+export function pageUsageGuardCachePath(sessionId, hypoDir) {
+  const safe = String(sessionId || 'default').replace(/[^A-Za-z0-9._-]/g, '_') || 'default';
+  // djb2 over the vault path so the cache key is per-(session, vault).
+  let h = 5381;
+  const s = String(hypoDir || '');
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return join(tmpdir(), `hypo-pageusage-guard-${safe}-${h.toString(36)}.json`);
+}
+
+export function pageUsageLoggingAllowed(hypoDir, sessionId) {
+  // The load-bearing commit gate is .hypoignore: it is what hypo-auto-stage and
+  // commitWikiChanges actually filter on. Re-check it FRESH on every call (it is
+  // cheap, no subprocess) so that if coverage is removed mid-session the guard
+  // flips closed immediately and can never leave logging armed against a
+  // now-committable file. Only the expensive git check-ignore probe is cached
+  // per session. Any error on either signal fails closed.
+  let hypoIgnored = false;
+  try {
+    const target = join(hypoDir, PAGE_USAGE_REL);
+    const patterns = loadHypoIgnore(hypoDir);
+    hypoIgnored = patterns.length > 0 && isIgnored(target, hypoDir, patterns);
+  } catch {
+    hypoIgnored = false;
+  }
+  if (!hypoIgnored) return false;
+
+  return gitIgnoresPageUsageCached(hypoDir, sessionId);
+}
+
+// git check-ignore is the belt signal (defends a manual `git add`); it spawns a
+// subprocess, so cache its result per session. The verdict cached here is only
+// the git signal, never the composite allow decision, so the fresh .hypoignore
+// re-check above always still runs.
+function gitIgnoresPageUsageCached(hypoDir, sessionId) {
+  const cachePath = pageUsageGuardCachePath(sessionId, hypoDir);
+  try {
+    if (existsSync(cachePath)) {
+      const cached = JSON.parse(readFileSync(cachePath, 'utf-8'));
+      if (typeof cached.gitIgnored === 'boolean') return cached.gitIgnored;
+    }
+  } catch {
+    // corrupt cache → recompute below
+  }
+
+  let gitIgnored = false;
+  try {
+    gitIgnored =
+      spawnSync('git', ['-C', hypoDir, 'check-ignore', '-q', '--', PAGE_USAGE_REL], {
+        timeout: 2000,
+      }).status === 0;
+  } catch {
+    gitIgnored = false;
+  }
+
+  try {
+    writeFileSync(cachePath, JSON.stringify({ gitIgnored }));
+  } catch {
+    // cache write failure is non-fatal; the git probe just reruns next prompt
+  }
+  return gitIgnored;
+}
+
+// Append one JSONL record per injected slug to .cache/page-usage.jsonl. Callers
+// MUST gate this behind pageUsageLoggingAllowed first. Fully fail-open: any error
+// (mkdir, disk, serialization) is swallowed so a logging failure never disturbs
+// the lookup injection that already happened (mirrors hypo-session-record).
+export function recordLookupUsage(hypoDir, { sessionId = null, slugs = [] } = {}) {
+  try {
+    if (!Array.isArray(slugs) || slugs.length === 0) return;
+    const target = join(hypoDir, PAGE_USAGE_REL);
+    mkdirSync(join(hypoDir, '.cache'), { recursive: true });
+    const ts = new Date().toISOString();
+    const lines = slugs
+      .map((slug) => JSON.stringify({ ts, session_id: sessionId ?? null, slug, source: 'lookup' }))
+      .join('\n');
+    appendFileSync(target, lines + '\n');
+  } catch {
+    // logging is observability; never let it break injection (fail-open)
+  }
+}
+
 // ── cwd ↔ project matcher ────────────────────────────────────────────────────
 // Hand-synced with scripts/lib/wd-match.mjs: hooks deploy to ~/.claude/hooks/
 // without scripts/, so this cannot import the lib and must mirror it. Keep the

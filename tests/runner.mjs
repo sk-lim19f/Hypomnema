@@ -33,6 +33,7 @@ import { buildProjectSuggestionLine, resolveActiveProject } from '../hooks/hypo-
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
 import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
+import { readPageUsage, aggregateColdCandidates } from '../scripts/lib/page-usage.mjs';
 import {
   validateChangelog,
   validateTagBody,
@@ -1053,6 +1054,12 @@ const {
   precompactGateStatus,
   commitWikiChanges,
   syncRemote,
+  isOverdueDate,
+  staleMarkerFor,
+  pageUsageLoggingAllowed,
+  pageUsageGuardCachePath,
+  recordLookupUsage,
+  PAGE_USAGE_REL,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -1642,6 +1649,142 @@ test('merges extra fields alongside additionalContext', () => {
   const out = buildOutput('ctx', { continue: true });
   assert.equal(out.continue, true);
   assert.equal(out.additionalContext, 'ctx');
+});
+
+// ── A1: overdue verify_by_date predicate + STALE marker (freshness) ──────────
+suite('hypo-shared.mjs — overdue predicate + STALE marker (A1)');
+
+test('isOverdueDate: past ISO date is overdue', () => {
+  assert.equal(isOverdueDate('2020-01-01', '2026-07-02'), true);
+});
+
+test('isOverdueDate: future and today are not overdue', () => {
+  assert.equal(isOverdueDate('2030-01-01', '2026-07-02'), false);
+  assert.equal(isOverdueDate('2026-07-02', '2026-07-02'), false);
+});
+
+test('isOverdueDate: malformed date is not overdue', () => {
+  assert.equal(isOverdueDate('2020-1-1', '2026-07-02'), false);
+  assert.equal(isOverdueDate('not-a-date', '2026-07-02'), false);
+  assert.equal(isOverdueDate('', '2026-07-02'), false);
+  assert.equal(isOverdueDate(null, '2026-07-02'), false);
+});
+
+test('staleMarkerFor: overdue verify_by_date yields marker', () => {
+  const raw = '---\ntype: page\nverify_by_date: 2020-01-01\n---\n# body';
+  assert.equal(staleMarkerFor(raw, '2026-07-02'), '[STALE verify_by_date=2020-01-01]');
+});
+
+test('staleMarkerFor: future/absent/malformed verify_by_date yields empty', () => {
+  assert.equal(staleMarkerFor('---\nverify_by_date: 2030-01-01\n---\nx', '2026-07-02'), '');
+  assert.equal(staleMarkerFor('---\ntype: page\n---\nx', '2026-07-02'), '');
+  assert.equal(staleMarkerFor('---\nverify_by_date: 2020-1-1\n---\nx', '2026-07-02'), '');
+  assert.equal(staleMarkerFor('no frontmatter at all', '2026-07-02'), '');
+});
+
+test('staleMarkerFor: legacy date in verify_by (not verify_by_date) yields empty', () => {
+  // verify_by holds the question, never a date. A date parked there must not
+  // trigger STALE (D1: only verify_by_date is a deadline).
+  const raw = '---\ntype: page\nverify_by: 2020-01-01\n---\n# body';
+  assert.equal(staleMarkerFor(raw, '2026-07-02'), '');
+});
+
+test('staleMarkerFor: strips a trailing YAML comment (doctor parity)', () => {
+  // doctor parses via frontmatter.mjs, which strips `\s+#.*`. staleMarkerFor must
+  // match, or an overdue page with an inline comment silently loses its marker.
+  const raw = '---\ntype: page\nverify_by_date: 2020-01-01 # yearly recheck\n---\n# body';
+  assert.equal(staleMarkerFor(raw, '2026-07-02'), '[STALE verify_by_date=2020-01-01]');
+  const quoted = '---\nverify_by_date: "2020-01-01" # note\n---\nx';
+  assert.equal(staleMarkerFor(quoted, '2026-07-02'), '[STALE verify_by_date=2020-01-01]');
+  // doctor's parser splits on the first colon, so `key : value` is tolerated.
+  const spaced = '---\nverify_by_date : 2020-01-01\n---\nx';
+  assert.equal(staleMarkerFor(spaced, '2026-07-02'), '[STALE verify_by_date=2020-01-01]');
+});
+
+test('verify.mjs stays independent of the shared predicate (A1 invariant)', () => {
+  // The shared predicate must not be silently unified into verify.mjs, whose
+  // missing-short-circuit (verify_by absent → missing) is a distinct contract.
+  const verifySrc = readFileSync(join(REPO, 'scripts', 'verify.mjs'), 'utf-8');
+  assert.ok(
+    !/hypo-shared/.test(verifySrc),
+    'verify.mjs must not import hypo-shared (overdue set stays distinct)',
+  );
+});
+
+// ── B1: page-usage logging coverage guard (fail-closed) ──────────────────────
+suite('hypo-shared.mjs — page-usage logging guard (B1)');
+
+function gitRepo(dir) {
+  const opts = { cwd: dir, encoding: 'utf-8' };
+  spawnSync('git', ['init', '-q'], opts);
+  spawnSync('git', ['config', 'user.email', 't@t.test'], opts);
+  spawnSync('git', ['config', 'user.name', 'test'], opts);
+}
+
+test('guard true when both .gitignore and .hypoignore cover .cache/', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+    writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-both'), true);
+  });
+});
+
+test('guard false when only .gitignore covers .cache/ (both signals required)', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-git-only'), false);
+  });
+});
+
+test('guard false when only .hypoignore covers .cache/', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-hypo-only'), false);
+  });
+});
+
+test('guard false in a non-git vault (fail-closed)', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+    writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-nogit'), false);
+  });
+});
+
+test('git probe is cached per session (no recompute of the git signal)', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+    writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-cache'), true);
+    const cachePath = pageUsageGuardCachePath('b1-cache', dir);
+    assert.ok(existsSync(cachePath), 'guard must write a session cache file');
+    // Remove .gitignore coverage. A fresh git probe would now say "not ignored",
+    // but the git signal is cached, so with .hypoignore still present the verdict
+    // stays true, proving the 2nd call skipped the git subprocess.
+    rmSync(join(dir, '.gitignore'));
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-cache'), true, 'git signal must be cached');
+  });
+});
+
+test('privacy: removing .hypoignore mid-session flips the guard closed', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+    writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-privacy'), true);
+    // .hypoignore is the load-bearing commit gate and is re-checked fresh every
+    // call: dropping it must immediately deny logging even within the session.
+    rmSync(join(dir, '.hypoignore'));
+    assert.equal(
+      pageUsageLoggingAllowed(dir, 'b1-privacy'),
+      false,
+      'a mid-session .hypoignore removal must fail closed',
+    );
+  });
 });
 
 suite('hypo-shared.mjs — session-scoped lint (Bug A/B)');
@@ -3665,6 +3808,90 @@ test('--apply .hypoignore migration appends .cache/ and is idempotent', () => {
         afterFirst,
         '.hypoignore content drifted across idempotent --apply',
       );
+    });
+  });
+});
+
+// ── B5: .gitignore migration mirrors .cache/ (page-usage privacy) ────────────
+test('--apply .gitignore migration appends .cache/, git-ignores the log, idempotent', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // Simulate a legacy vault: a .gitignore that predates the .cache/ entry.
+      const gitignorePath = join(hypoDir, '.gitignore');
+      const original = (existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf-8') : '')
+        .split('\n')
+        .filter((line) => line.trim() !== '.cache/')
+        .join('\n');
+      writeFileSync(gitignorePath, original || '# legacy\nnode_modules/\n');
+      // Make it a git repo so we can prove the log ends up ignored.
+      const gopts = { cwd: hypoDir, encoding: 'utf-8' };
+      spawnSync('git', ['init', '-q'], gopts);
+      spawnSync('git', ['config', 'user.email', 't@t.test'], gopts);
+      spawnSync('git', ['config', 'user.name', 'test'], gopts);
+
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r1.status, 0, `first --apply failed: ${r1.stderr}`);
+      const out1 = JSON.parse(r1.stdout);
+      assert.deepEqual(
+        out1.applied.gitignore,
+        ['.cache/'],
+        'expected .cache/ appended to .gitignore',
+      );
+      const afterFirst = readFileSync(gitignorePath, 'utf-8');
+      assert.equal(
+        (afterFirst.match(/^\.cache\/$/gm) || []).length,
+        1,
+        '.cache/ should appear exactly once in .gitignore',
+      );
+      // Privacy: the page-usage log is now git-ignored.
+      const ci = spawnSync(
+        'git',
+        ['-C', hypoDir, 'check-ignore', '-q', '--', '.cache/page-usage.jsonl'],
+        { encoding: 'utf-8' },
+      );
+      assert.equal(ci.status, 0, 'page-usage.jsonl must be git-ignored after migration');
+
+      // Idempotent second run.
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second --apply failed: ${r2.stderr}`);
+      const out2 = JSON.parse(r2.stdout);
+      assert.deepEqual(out2.applied.gitignore, [], 'second --apply must not re-append');
+      assert.equal(out2.gitignore.status, 'up-to-date', 'gitignore status should be up-to-date');
+      assert.equal(
+        readFileSync(gitignorePath, 'utf-8'),
+        afterFirst,
+        '.gitignore drifted across idempotent --apply',
+      );
+    });
+  });
+});
+
+test('--apply text report lists the appended .gitignore entry and counts it', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const gitignorePath = join(hypoDir, '.gitignore');
+      const stripped = (existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf-8') : '')
+        .split('\n')
+        .filter((line) => line.trim() !== '.cache/')
+        .join('\n');
+      writeFileSync(gitignorePath, stripped || '# legacy\n');
+      // Text mode (no --json): the applied-actions block and the count must
+      // include the gitignore migration, not silently omit it.
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r.status, 0, `text --apply failed: ${r.stderr}`);
+      assert.ok(
+        /Appended \.gitignore entries/.test(r.stdout),
+        `report must list gitignore: ${r.stdout}`,
+      );
+      const m = r.stdout.match(/Result: (\d+) update\(s\) applied/);
+      assert.ok(m && Number(m[1]) >= 1, `applied count must include gitignore: ${r.stdout}`);
     });
   });
 });
@@ -8445,6 +8672,74 @@ test('session-start still injects non-ignored project hot/state', () => {
   });
 });
 
+// ── A3: STALE marker on project hot/state (session-start) ────────────────────
+suite('hypo-session-start.mjs — STALE marker on project hot/state (A3)');
+
+function withDatedProject(hotBody, fn) {
+  withGrowthWiki((dir) => {
+    const work = mkdtempSync(join(tmpdir(), 'hypo-dated-work-'));
+    const projDir = join(dir, 'projects', 'dated');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      `---\ntitle: dated\ntype: project-index\nupdated: 2026-07-04\nworking_dir: "${work}"\n---\n# Dated\n`,
+    );
+    writeFileSync(join(projDir, 'hot.md'), hotBody);
+    writeFileSync(join(projDir, 'session-state.md'), '# state\n## 다음 작업\nDATED_STATE_VALUE\n');
+    try {
+      fn(dir, work);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+}
+
+test('project hot with overdue verify_by_date gets STALE marker', () => {
+  const hot = '---\ntype: page\nverify_by_date: 2020-01-01\n---\n# hot\nDATED_HOT_VALUE\n';
+  withDatedProject(hot, (dir, work) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: work, session_id: 'test-a3-stale' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(/DATED_HOT_VALUE/.test(r.stdout), `expected hot injection: ${r.stdout}`);
+    assert.ok(
+      r.stdout.includes('[STALE verify_by_date=2020-01-01]'),
+      `expected STALE marker on overdue project hot: ${r.stdout}`,
+    );
+  });
+});
+
+test('derived project hot without verify_by_date gets no STALE marker', () => {
+  // The realistic case: hot/state are derived summaries with no frontmatter.
+  const hot = '# hot\nDATED_HOT_VALUE\n';
+  withDatedProject(hot, (dir, work) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: work, session_id: 'test-a3-nostale' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(/DATED_HOT_VALUE/.test(r.stdout), `expected hot injection: ${r.stdout}`);
+    assert.ok(!/\[STALE/.test(r.stdout), `derived hot must not be STALE: ${r.stdout}`);
+  });
+});
+
+test('root/global hot injection path carries no STALE marker logic', () => {
+  // Global hot is a derived pointer table (hypo-hot-rebuild) with no per-page
+  // frontmatter, so A3 deliberately leaves its injection path untouched. Pin
+  // that scope: staleMarkerForPath is only wired to the project hot/state block.
+  const src = readFileSync(join(HOOKS, 'hypo-session-start.mjs'), 'utf-8');
+  const markerCount = (src.match(/staleMarkerForPath\(/g) || []).length;
+  // one definition + two call sites (hotPath, statePath); nothing on global hot.
+  assert.equal(
+    markerCount,
+    3,
+    `staleMarkerForPath must be scoped to project hot/state, found ${markerCount} refs`,
+  );
+});
+
 // ── vault orientation (IMPR-19) ─────────────────────────────────────
 // When cwd is a project working_dir distinct from the vault, the hooks surface
 // a one-line "[WIKI VAULT: <path>]" orientation so the AI does not re-discover
@@ -10312,6 +10607,360 @@ test('ADR entry ranked above plain entry with same keyword', () => {
     const plainPos = ctx.indexOf('bm25-notes');
     assert.ok(adrPos !== -1, 'ADR entry should appear in context');
     assert.ok(adrPos < plainPos || plainPos === -1, 'ADR should rank before plain entry');
+  });
+});
+
+// ── A2: STALE marker at lookup injection ─────────────────────────────────────
+suite('hypo-lookup.mjs — STALE marker at injection (A2)');
+
+function stalePageVault(dir, verifyByDateLine) {
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  const fm = ['---', 'type: page', 'title: Overdue Notes', verifyByDateLine, '---']
+    .filter(Boolean)
+    .join('\n');
+  writeFileSync(
+    join(dir, 'pages', 'freshness-notes.md'),
+    `${fm}\n# body about widget calibration\n`,
+  );
+  writeFileSync(
+    join(dir, 'index.md'),
+    ['# Index', '- [[freshness-notes]] — widget calibration freshness notes'].join('\n'),
+  );
+}
+
+test('overdue verify_by_date page gets STALE marker injected', () => {
+  withTmpDir((dir) => {
+    stalePageVault(dir, 'verify_by_date: 2020-01-01');
+    const r = runHook('hypo-lookup.mjs', { prompt: 'widget calibration' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext ?? '';
+    assert.ok(ctx.includes('freshness-notes'), `page should be a HIT: ${ctx}`);
+    assert.ok(
+      ctx.includes('[STALE verify_by_date=2020-01-01]'),
+      `expected STALE marker in injection: ${ctx}`,
+    );
+  });
+});
+
+test('future verify_by_date page gets no STALE marker', () => {
+  withTmpDir((dir) => {
+    stalePageVault(dir, 'verify_by_date: 2099-01-01');
+    const r = runHook('hypo-lookup.mjs', { prompt: 'widget calibration' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext ?? '';
+    assert.ok(ctx.includes('freshness-notes'), `page should be a HIT: ${ctx}`);
+    assert.ok(!/\[STALE/.test(ctx), `future date must not be STALE: ${ctx}`);
+  });
+});
+
+test('legacy date in verify_by (not verify_by_date) gets no STALE marker', () => {
+  withTmpDir((dir) => {
+    // verify_by holds the question, never a date (D1). A date parked there must
+    // not trigger STALE at injection.
+    stalePageVault(dir, 'verify_by: 2020-01-01');
+    const r = runHook('hypo-lookup.mjs', { prompt: 'widget calibration' }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    const ctx = out.additionalContext ?? '';
+    assert.ok(ctx.includes('freshness-notes'), `page should be a HIT: ${ctx}`);
+    assert.ok(!/\[STALE/.test(ctx), `verify_by date must not be STALE: ${ctx}`);
+  });
+});
+
+// ── B2: page-usage logging at lookup injection ───────────────────────────────
+suite('hypo-lookup.mjs — page-usage logging at injection (B2)');
+
+function usageVault(dir, { git = true, gitignore = true, hypoignore = true } = {}) {
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  writeFileSync(
+    join(dir, 'pages', 'freshness-notes.md'),
+    '---\ntype: page\ntitle: Notes\n---\n# body about widget calibration\n',
+  );
+  writeFileSync(
+    join(dir, 'index.md'),
+    ['# Index', '- [[freshness-notes]] — widget calibration freshness notes'].join('\n'),
+  );
+  if (git) {
+    const opts = { cwd: dir, encoding: 'utf-8' };
+    spawnSync('git', ['init', '-q'], opts);
+    spawnSync('git', ['config', 'user.email', 't@t.test'], opts);
+    spawnSync('git', ['config', 'user.name', 'test'], opts);
+  }
+  if (gitignore) writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+  if (hypoignore) writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+}
+
+test('HIT in a guard-passing vault appends a well-formed page-usage record', () => {
+  withTmpDir((dir) => {
+    usageVault(dir);
+    const r = runHook(
+      'hypo-lookup.mjs',
+      { prompt: 'widget calibration', session_id: 'b2-hit' },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.ok((out.additionalContext ?? '').includes('freshness-notes'), 'expected HIT');
+    const logPath = join(dir, '.cache', 'page-usage.jsonl');
+    assert.ok(existsSync(logPath), 'page-usage.jsonl must be written on guarded HIT');
+    const lines = readFileSync(logPath, 'utf-8').trim().split('\n');
+    const rec = JSON.parse(lines[lines.length - 1]);
+    assert.equal(rec.slug, 'freshness-notes');
+    assert.equal(rec.source, 'lookup');
+    assert.equal(rec.session_id, 'b2-hit');
+    assert.ok(/^\d{4}-\d{2}-\d{2}T/.test(rec.ts), `ts must be ISO: ${rec.ts}`);
+  });
+});
+
+test('fail-closed logging: no coverage → no log, injection still succeeds', () => {
+  withTmpDir((dir) => {
+    // git repo but .gitignore does NOT cover .cache/ → guard denies logging.
+    usageVault(dir, { gitignore: false });
+    const r = runHook(
+      'hypo-lookup.mjs',
+      { prompt: 'widget calibration', session_id: 'b2-closed' },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    assert.ok(
+      (out.additionalContext ?? '').includes('freshness-notes'),
+      'injection must still work',
+    );
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'page-usage.jsonl')),
+      'no log may be written without commit coverage',
+    );
+  });
+});
+
+test('fail-open injection: append failure does not break the HIT', () => {
+  withTmpDir((dir) => {
+    usageVault(dir);
+    // Make the append target a directory so appendFileSync throws (EISDIR).
+    mkdirSync(join(dir, '.cache', 'page-usage.jsonl'), { recursive: true });
+    const r = runHook(
+      'hypo-lookup.mjs',
+      { prompt: 'widget calibration', session_id: 'b2-open' },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    assert.ok(
+      (out.additionalContext ?? '').includes('freshness-notes'),
+      'injection must survive a logging failure',
+    );
+  });
+});
+
+// ── B3: read-only page-usage aggregation (cold-start guard) ──────────────────
+suite('page-usage.mjs — cold-candidate aggregation (B3)');
+
+const B3_NOW = Date.parse('2026-07-04T00:00:00Z');
+const B3_DAY = 86400000;
+
+function coldVault(dir, logLines) {
+  mkdirSync(join(dir, 'pages', 'learnings'), { recursive: true });
+  // hub links out to a nested page (bare/prefix mismatch) and a flat page.
+  writeFileSync(
+    join(dir, 'pages', 'hub.md'),
+    '---\ntype: page\ntitle: Hub\n---\n# Hub\n[[cold-page]] and [[learnings/warm-page]]\n',
+  );
+  writeFileSync(join(dir, 'pages', 'cold-page.md'), '---\ntype: page\ntitle: Cold\n---\n# Cold\n');
+  writeFileSync(
+    join(dir, 'pages', 'learnings', 'warm-page.md'),
+    '---\ntype: page\ntitle: Warm\n---\n# Warm\n',
+  );
+  mkdirSync(join(dir, '.cache'), { recursive: true });
+  writeFileSync(join(dir, '.cache', 'page-usage.jsonl'), logLines.join('\n') + '\n');
+}
+
+test('readPageUsage skips malformed lines, keeps valid records', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'page-usage.jsonl'),
+      [
+        '{"ts":"2026-07-01T00:00:00Z","slug":"a","source":"lookup"}',
+        'not json',
+        '',
+        '{"slug":"b"}',
+      ].join('\n') + '\n',
+    );
+    const recs = readPageUsage(dir);
+    assert.equal(recs.length, 2);
+    assert.equal(recs[0].slug, 'a');
+  });
+});
+
+test('readPageUsage drops non-object JSON values (null/number/array)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'page-usage.jsonl'),
+      ['null', '42', '["x"]', '{"slug":"ok","ts":"2026-07-01T00:00:00Z"}'].join('\n') + '\n',
+    );
+    const recs = readPageUsage(dir);
+    assert.equal(recs.length, 1, 'only the object record survives');
+    assert.equal(recs[0].slug, 'ok');
+  });
+});
+
+test('aggregateColdCandidates does not crash on a poisoned null record', () => {
+  withTmpDir((dir) => {
+    coldVault(dir, [
+      'null',
+      JSON.stringify({
+        ts: new Date(B3_NOW - 20 * B3_DAY).toISOString(),
+        slug: 'hub',
+        source: 'lookup',
+      }),
+      JSON.stringify({
+        ts: new Date(B3_NOW - 1 * B3_DAY).toISOString(),
+        slug: 'warm-page',
+        source: 'lookup',
+      }),
+    ]);
+    const out = aggregateColdCandidates(dir, { now: B3_NOW });
+    assert.equal(out.status, 'ok', 'a null line must be skipped, not crash aggregation');
+  });
+});
+
+test('insufficient-data when the observed log span is under minLogSpanDays', () => {
+  withTmpDir((dir) => {
+    coldVault(dir, [
+      JSON.stringify({
+        ts: new Date(B3_NOW - 2 * B3_DAY).toISOString(),
+        slug: 'hub',
+        source: 'lookup',
+      }),
+      JSON.stringify({
+        ts: new Date(B3_NOW - 1 * B3_DAY).toISOString(),
+        slug: 'warm-page',
+        source: 'lookup',
+      }),
+    ]);
+    const out = aggregateColdCandidates(dir, { now: B3_NOW });
+    assert.equal(out.status, 'insufficient-data');
+  });
+});
+
+test('ok: inbound-but-unlogged page is a candidate, recently-logged is not', () => {
+  withTmpDir((dir) => {
+    coldVault(dir, [
+      // 20-day span clears the 14-day cold-start guard.
+      JSON.stringify({
+        ts: new Date(B3_NOW - 20 * B3_DAY).toISOString(),
+        slug: 'hub',
+        source: 'lookup',
+      }),
+      // Logged as the BARE form 'warm-page' though the page is pages/learnings/warm-page:
+      // slugForms normalization must still treat it as logged (excluded).
+      JSON.stringify({
+        ts: new Date(B3_NOW - 1 * B3_DAY).toISOString(),
+        slug: 'warm-page',
+        source: 'lookup',
+      }),
+    ]);
+    const out = aggregateColdCandidates(dir, { now: B3_NOW });
+    assert.equal(out.status, 'ok');
+    const slugs = out.candidates.map((c) => c.slug);
+    // slug is the hypoDir-relative path (pages/...), matching crystallize's convention.
+    assert.ok(slugs.includes('pages/cold-page'), `cold-page must be a candidate: ${slugs}`);
+    assert.ok(
+      !slugs.some((s) => s.endsWith('warm-page')),
+      `recently-logged warm-page must be excluded (slugForms normalization): ${slugs}`,
+    );
+    assert.ok(
+      !slugs.some((s) => s.endsWith('hub')),
+      `hub has no inbound link, must be excluded: ${slugs}`,
+    );
+  });
+});
+
+// ── B4: crystallize surfaces cold candidates (advisory, non-gating) ──────────
+suite('crystallize.mjs — lookup-cold advisory (B4)');
+
+test('scan surfaces cold candidates and exits 0', () => {
+  withTmpDir((dir) => {
+    const now = Date.now();
+    coldVault(dir, [
+      JSON.stringify({
+        ts: new Date(now - 20 * B3_DAY).toISOString(),
+        slug: 'hub',
+        source: 'lookup',
+      }),
+      JSON.stringify({
+        ts: new Date(now - 1 * B3_DAY).toISOString(),
+        slug: 'warm-page',
+        source: 'lookup',
+      }),
+    ]);
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`]);
+    assert.equal(r.status, 0, `scan must stay non-blocking: ${r.stderr}`);
+    assert.ok(/Lookup-cold pages/.test(r.stdout), `expected advisory section: ${r.stdout}`);
+    assert.ok(/cold-page/.test(r.stdout), `expected cold-page candidate: ${r.stdout}`);
+  });
+});
+
+test('--json carries coldCandidates status=ok with the candidate', () => {
+  withTmpDir((dir) => {
+    const now = Date.now();
+    coldVault(dir, [
+      JSON.stringify({
+        ts: new Date(now - 20 * B3_DAY).toISOString(),
+        slug: 'hub',
+        source: 'lookup',
+      }),
+      JSON.stringify({
+        ts: new Date(now - 1 * B3_DAY).toISOString(),
+        slug: 'warm-page',
+        source: 'lookup',
+      }),
+    ]);
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--json']);
+    assert.equal(r.status, 0);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.coldCandidates.status, 'ok');
+    assert.ok(
+      out.coldCandidates.candidates.some((c) => c.slug === 'pages/cold-page'),
+      `expected cold-page in json: ${r.stdout}`,
+    );
+  });
+});
+
+test('cold-start vault shows held advisory, still exits 0', () => {
+  withTmpDir((dir) => {
+    const now = Date.now();
+    coldVault(dir, [
+      JSON.stringify({
+        ts: new Date(now - 2 * B3_DAY).toISOString(),
+        slug: 'hub',
+        source: 'lookup',
+      }),
+      JSON.stringify({
+        ts: new Date(now - 1 * B3_DAY).toISOString(),
+        slug: 'warm-page',
+        source: 'lookup',
+      }),
+    ]);
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`]);
+    assert.equal(r.status, 0);
+    assert.ok(/held/.test(r.stdout), `expected held advisory: ${r.stdout}`);
+    const rj = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--json']);
+    assert.equal(JSON.parse(rj.stdout).coldCandidates.status, 'insufficient-data');
+  });
+});
+
+test('vault with no page-usage log stays silent (no held noise)', () => {
+  withTmpDir((dir) => {
+    // No .cache/page-usage.jsonl at all (every current vault). The held advisory
+    // must NOT print, or it becomes permanent noise on every crystallize run.
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'p.md'), '---\ntype: page\ntitle: P\n---\n# P\n');
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`]);
+    assert.equal(r.status, 0);
+    assert.ok(!/Lookup-cold scan held/.test(r.stdout), `no-log vault must be silent: ${r.stdout}`);
+    const rj = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--json']);
+    assert.equal(JSON.parse(rj.stdout).coldCandidates.status, 'insufficient-data');
   });
 });
 

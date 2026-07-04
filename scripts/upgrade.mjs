@@ -465,6 +465,49 @@ function applyHypoignoreMigration(result) {
   return appended;
 }
 
+// ── .gitignore migration: mirror .cache/ into .gitignore (page-usage privacy) ─
+//
+// Legacy vaults may have a .gitignore that predates .cache/ (init now scaffolds
+// it, but old vaults were migrated only in .hypoignore). Without .cache/ in
+// .gitignore, the page-usage log could be committed. This mirrors the hypoignore
+// migration: idempotent append of the missing entry, no-op when already present
+// or when there is no .gitignore (the runtime logging guard fails closed for the
+// no-file case, so nothing leaks in the meantime).
+
+const GITIGNORE_REQUIRED_ENTRIES = [
+  {
+    pattern: '.cache/',
+    comment: '# Hypomnema runtime cache (page-usage log, session growth metrics)',
+  },
+];
+
+function checkGitignore(hypoDir) {
+  const path = join(hypoDir, '.gitignore');
+  if (!existsSync(path)) return { status: 'no-file', missing: [], path };
+  const content = readFileSync(path, 'utf-8');
+  const entries = new Set(
+    content
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#')),
+  );
+  const missing = GITIGNORE_REQUIRED_ENTRIES.filter((e) => !entries.has(e.pattern));
+  return { status: missing.length === 0 ? 'up-to-date' : 'needs-migration', missing, path };
+}
+
+function applyGitignoreMigration(result) {
+  if (result.status !== 'needs-migration') return [];
+  let content = readFileSync(result.path, 'utf-8');
+  if (!content.endsWith('\n')) content += '\n';
+  const appended = [];
+  for (const entry of result.missing) {
+    content += `\n${entry.comment}\n${entry.pattern}\n`;
+    appended.push(entry.pattern);
+  }
+  writeFileSync(result.path, content);
+  return appended;
+}
+
 function writeMigrationReport(hypoDir, fromVersion, toVersion, { pluginMode = false } = {}) {
   const today = new Date().toISOString().slice(0, 10);
   const filename = `MIGRATION-v${toVersion}.md`;
@@ -849,6 +892,7 @@ const pkgJson = checkPkgJson();
 const commands = checkCommands();
 const oldHookRefs = checkOldHookNames(claudeSettingsPath);
 const hypoignore = checkHypoignore(args.hypoDir);
+const gitignore = checkGitignore(args.hypoDir);
 
 // when --codex is set, mirror the same core-hook checks against ~/.codex/
 // so `hypomnema upgrade --codex` reports drift symmetrically and `--apply --codex`
@@ -930,6 +974,7 @@ let appliedSettingsCodex = [];
 let appliedHookNameRenamesCodex = [];
 let appliedCommands = [];
 let appliedHypoignore = [];
+let appliedGitignore = [];
 let appliedExtensions = null;
 let appliedExtensionsCodex = null;
 
@@ -1014,6 +1059,7 @@ if (args.apply) {
     }
   }
   appliedHypoignore = applyHypoignoreMigration(hypoignore);
+  appliedGitignore = applyGitignoreMigration(gitignore);
   // codex core hooks + settings + wiki-*→hypo-* rename mirror. Same order
   // as the claude side (rename first so subsequent hook copy can find renamed targets).
   if (args.codex) {
@@ -1089,6 +1135,7 @@ const hasDrift =
   pkgJsonDrift ||
   schemaDrift ||
   hypoignore.status === 'needs-migration' ||
+  gitignore.status === 'needs-migration' ||
   extDrift ||
   codexCoreDrift;
 
@@ -1109,6 +1156,7 @@ if (args.json) {
         commands,
         oldHookRefs,
         hypoignore,
+        gitignore,
         extensions: extCheck,
         extensionsCodex: extCheckCodex,
         // codex core mirror (null when --codex absent).
@@ -1122,6 +1170,7 @@ if (args.json) {
           hookNameRenames: appliedHookNameRenames,
           commands: appliedCommands,
           hypoignore: appliedHypoignore,
+          gitignore: appliedGitignore,
           extensions: appliedExtensions,
           extensionsCodex: appliedExtensionsCodex,
           hooksCodex: appliedHooksCodex,
@@ -1369,6 +1418,18 @@ if (hypoignore.status === 'no-file') {
   for (const e of hypoignore.missing) lines.push(`    + ${e.pattern}`);
 }
 
+// .gitignore migration (page-usage privacy: mirror .cache/ into .gitignore)
+if (gitignore.status === 'no-file') {
+  lines.push(`⚠ .gitignore        not found at ${gitignore.path} (init.mjs scaffolds this)`);
+} else if (gitignore.status === 'up-to-date') {
+  lines.push(`✓ .gitignore        required entries present`);
+} else {
+  lines.push(
+    `⚠ .gitignore        ${gitignore.missing.length} missing entry(s), run --apply to append:`,
+  );
+  for (const e of gitignore.missing) lines.push(`    + ${e.pattern}`);
+}
+
 // Extensions companion (conflict/drift gating E3, #31). Shared by the
 // claude target and, under --codex, the codex target (E4, #32) — the label keeps
 // the two blocks distinguishable in the report.
@@ -1424,6 +1485,7 @@ if (
   appliedHookNameRenames.length > 0 ||
   appliedCommands.length > 0 ||
   appliedHypoignore.length > 0 ||
+  appliedGitignore.length > 0 ||
   appliedHooksCodex.length > 0 ||
   appliedSettingsCodex.length > 0 ||
   appliedHookNameRenamesCodex.length > 0
@@ -1451,6 +1513,10 @@ if (
   if (appliedHypoignore.length > 0) {
     lines.push(`✓ Appended .hypoignore entries (${appliedHypoignore.length}):`);
     for (const e of appliedHypoignore) lines.push(`    → ${e}`);
+  }
+  if (appliedGitignore.length > 0) {
+    lines.push(`✓ Appended .gitignore entries (${appliedGitignore.length}):`);
+    for (const e of appliedGitignore) lines.push(`    → ${e}`);
   }
   // codex-target applied actions (mirrors claude blocks above).
   if (appliedHookNameRenamesCodex.length > 0) {
@@ -1507,6 +1573,7 @@ const totalDrift =
   (pkgJsonDrift ? 1 : 0) +
   (schemaDrift ? 1 : 0) +
   (hypoignore.status === 'needs-migration' ? hypoignore.missing.length : 0) +
+  (gitignore.status === 'needs-migration' ? gitignore.missing.length : 0) +
   extCheck.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
   ).length +
@@ -1544,6 +1611,7 @@ if (totalDrift === 0) {
     (appliedPkgJson ? 1 : 0) +
     appliedHookNameRenames.length +
     appliedHypoignore.length +
+    appliedGitignore.length +
     appliedExtCount +
     appliedHooksCodex.length +
     appliedSettingsCodex.length +
