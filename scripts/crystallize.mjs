@@ -89,6 +89,8 @@ import {
   sessionLogReadCandidates,
   sessionLogScopePath,
   rootLogEntry,
+  hasSessionLogHeading,
+  hasLogEntry,
   resolveTranscriptBySessionId,
   hasUserCloseSignal,
   commitWikiChanges,
@@ -754,21 +756,49 @@ function applySessionClose(args) {
   }
   const date = payload.date || todayLocal();
 
-  // B-1 derive precondition: when `log` is omitted, apply reconstructs the root
-  // log.md entry from THIS close's sessionLog heading. If sessionLog.entry has no
-  // `## [<date>] …` heading there is nothing to derive — and on a same-day SECOND
-  // close the date-level freshness verifier would still pass on the earlier
-  // close's entry, so the no-write would slip through as ok:true. Fail loud here,
-  // before any writes (codex pre-commit review).
-  if (
-    !payload.log &&
-    !new RegExp(`^#{1,6} \\[${date}\\]`, 'm').test(payload.sessionLog.entry || '')
-  ) {
-    const msg =
-      `payload.sessionLog.entry has no "## [${date}] …" heading to derive the log.md ` +
-      `entry from. Give it a dated heading, or supply payload.log explicitly.`;
-    console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
+  // Pre-apply freshness-contract gate: the post-apply verification holds
+  // sessionCloseFileStatus's hasSessionLogHeading / hasLogEntry as the
+  // definition of "closed today". Enforce that SAME contract on the payload
+  // BEFORE writing a byte, so a heading the gate won't recognize is rejected
+  // here as a format mismatch — not written and then misdiagnosed downstream as
+  // "stale" (the "not updated" vs "format mismatch" conflation). All checks
+  // exit 1 with stage='pre-apply-verification' and leave the tree untouched.
+  const failPreApply = (msg) => {
+    console.log(
+      args.json
+        ? JSON.stringify({ ok: false, stage: 'pre-apply-verification', error: msg }, null, 2)
+        : `✗ ${msg}`,
+    );
     process.exit(1);
+  };
+  // (a) The session-log entry must carry a dated `## [<date>] …` ATX heading. The
+  // post-apply gate checks the session-log file for exactly this heading, so a
+  // headingless entry would write then false-fail as "stale". This also doubles
+  // as the B-1 derive precondition: when `log` is omitted the root log.md entry
+  // is reconstructed from THIS heading, and on a same-day SECOND close the
+  // date-level verifier would still pass on the earlier entry, so a no-derive
+  // would slip through as ok:true. The `!payload.log` branch keeps the original
+  // derive-specific wording (a test asserts it).
+  if (!hasSessionLogHeading(payload.sessionLog.entry || '', date)) {
+    failPreApply(
+      !payload.log
+        ? `payload.sessionLog.entry has no "## [${date}] …" heading to derive the log.md ` +
+            `entry from. Give it a dated heading, or supply payload.log explicitly.`
+        : `payload.sessionLog.entry has no "## [${date}] …" heading. The close gate ` +
+            `identifies a session-log by its dated ATX heading; give the entry a ` +
+            `"## [${date}] <title>" heading (the brackets are required).`,
+    );
+  }
+  // (b) An explicit payload.log entry must match the canonical
+  // `## [<date>] session | <project>` line the gate looks for (colon or space
+  // delimiter after the slug). Otherwise the write lands but post-apply
+  // verification reports log.md as stale. When `log` is omitted the line is
+  // derived canonically (rootLogEntry) so this cannot mismatch.
+  if (payload.log && !hasLogEntry(payload.log.entry || '', date, project)) {
+    failPreApply(
+      `payload.log.entry has no "## [${date}] session | ${project}" heading that the ` +
+        `close gate recognizes. Fix the entry heading, or omit payload.log to derive it.`,
+    );
   }
 
   // Preflight: lint the wiki BEFORE writing any payload bytes. If lint

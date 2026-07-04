@@ -12,6 +12,7 @@ import {
   mkdirSync,
   rmSync,
   writeFileSync,
+  appendFileSync,
   readFileSync,
   readdirSync,
   existsSync,
@@ -1050,6 +1051,7 @@ const {
   sessionLogShardPath,
   sessionLogReadCandidates,
   sessionCloseFileStatus,
+  hasLogEntry,
   hypoIsClean,
   precompactGateStatus,
   commitWikiChanges,
@@ -3368,6 +3370,136 @@ test('hasLogEntry: project "foo" must NOT match "foo-bar" (W2 boundary regressio
       );
     },
   );
+});
+
+// ── ISSUE-42: freshness gate write/verify format contract ────────────────────
+suite('ISSUE-42: colon-delimiter log entries + pre-apply format gate');
+
+test('ISSUE-42a: a colon-delimiter log.md entry ALONE satisfies the close gate (2026-07-01 repro)', () => {
+  // The dominant hand-written log convention is `## [date] session | <project>: title`
+  // (colon, since the tone rule banned the em dash). Before the fix hasLogEntry
+  // required whitespace/eol after the slug, so a close whose ONLY log.md evidence
+  // used the colon form false-failed as "stale". Replace log.md with a single
+  // colon-form entry (no space-form sibling to mask it) and require exit 0.
+  withWiki(
+    (dir, today) => {
+      writeFileSync(
+        join(dir, 'log.md'),
+        `## [${today}] session | test-project: real work this session\n`,
+      );
+    },
+    (dir) => {
+      const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
+      assert.equal(
+        r.status,
+        0,
+        `colon-form log entry must satisfy the gate, got status=${r.status}\n${r.stdout}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        !out.stale.includes('log.md') && !out.missing.includes('log.md'),
+        `log.md must not be flagged stale/missing for a colon entry: ${JSON.stringify(out)}`,
+      );
+    },
+  );
+});
+
+test('ISSUE-42b: colon delimiter must NOT loosen the slug-prefix guard (foo vs foo-bar: title)', () => {
+  const today = '2026-07-04';
+  // Space form (derive path) — accepted.
+  assert.ok(
+    hasLogEntry(`## [${today}] session | foo — title\n`, today, 'foo'),
+    'space/em-dash form must match',
+  );
+  // Colon form — accepted.
+  assert.ok(
+    hasLogEntry(`## [${today}] session | foo: title\n`, today, 'foo'),
+    'colon form must match',
+  );
+  // Bare slug at EOL — accepted.
+  assert.ok(hasLogEntry(`## [${today}] session | foo\n`, today, 'foo'), 'bare slug must match');
+  // Look-alike longer slug must NOT satisfy "foo", with a colon after the tail.
+  assert.ok(
+    !hasLogEntry(`## [${today}] session | foo-bar: title\n`, today, 'foo'),
+    'foo-bar: title must NOT match the "foo" gate (colon did not loosen the prefix guard)',
+  );
+});
+
+test('ISSUE-42c: headingless sessionLog entry is rejected pre-apply, no bytes written', () => {
+  withWiki(null, (dir, today) => {
+    const before = {
+      log: readFileSync(join(dir, 'log.md'), 'utf-8'),
+      state: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+    };
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `no dated heading at all\n` };
+    // Keep payload.log present so the payload.log branch message fires (not the
+    // derive-precondition wording).
+    payload.log = { entry: `## [${today}] session | test-project: x\n` };
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `headingless sessionLog must fail pre-apply: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.stage, 'pre-apply-verification', `stage must be pre-apply: ${r.stdout}`);
+    // No bytes written: the append targets are byte-identical to before.
+    assert.equal(
+      readFileSync(join(dir, 'log.md'), 'utf-8'),
+      before.log,
+      'log.md must be untouched',
+    );
+    assert.equal(
+      readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      before.state,
+      'session-state.md must be untouched',
+    );
+  });
+});
+
+test('ISSUE-42d: non-canonical explicit payload.log is rejected pre-apply, no bytes written', () => {
+  withWiki(null, (dir, today) => {
+    const beforeLog = readFileSync(join(dir, 'log.md'), 'utf-8');
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] valid dated heading\n` };
+    payload.log = { entry: `## [${today}] not a canonical session line\n` };
+    const r = runApply(dir, payload);
+    assert.equal(r.status, 1, `non-canonical payload.log must fail pre-apply: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.stage, 'pre-apply-verification', `stage must be pre-apply: ${r.stdout}`);
+    assert.equal(readFileSync(join(dir, 'log.md'), 'utf-8'), beforeLog, 'log.md must be untouched');
+  });
+});
+
+test('ISSUE-42 F1: a colon-form log entry is the sole today signal → dangling close still blocks', () => {
+  // closeCandidateSlugs must extract the BARE slug from a colon entry (not `beta:`),
+  // or a project whose only today evidence is a colon-form log line escapes the
+  // dangling-close scan. beta has a real dir but stale own files and is absent from
+  // the hot table, so its ONLY today signal is the colon log.md line.
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'alpha', date: today }, // fully closed today
+      {
+        slug: 'beta',
+        date: today,
+        sessionState: '2020-01-01', // stale own files → incomplete close
+        projectHot: '2020-01-01',
+        sessionLog: false, // no today session-log heading
+        hotRow: false, // not in today's hot table
+        logEntry: false, // suppress the default space-form line; we write our own
+      },
+    ]);
+    // beta's only today signal: a colon-delimiter log.md entry with a title.
+    writeFileSync(
+      join(dir, 'log.md'),
+      `## [${today}] session | alpha\n## [${today}] session | beta: some real title\n`,
+    );
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, false, `beta's colon-form dangling close must block: ${JSON.stringify(s)}`);
+    const beta = s.projects.find((p) => p.project === 'beta');
+    assert.ok(
+      beta && !beta.ok,
+      `beta must be a detected today-active candidate: ${JSON.stringify(s.projects)}`,
+    );
+  });
 });
 
 // ── fix #39: probe early-exit (option D) ─────────────────────────────────────
@@ -13140,6 +13272,109 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
       'marker file must exist after a verified close with a user-close signal',
     );
   });
+});
+
+test('IMPR-15: no-user-close-signal → after an AskUserQuestion 세션 마무리 answer, a re-run lands the marker', () => {
+  // The documented recovery (crystallize.md Step 4): when apply is ok:true but the
+  // marker is withheld as `no-user-close-signal` (the transcript resolves but the
+  // user's close wording evaded the close-signal set), confirming once with
+  // AskUserQuestion [세션 마무리] injects a recognized close answer, so re-running
+  // the SAME idempotent apply lands the marker — no script change, no matcher edit.
+  const sid = 's-impr15-rerun';
+  const projDir = join(SESSION_TMP_HOME, '.claude', 'projects', 'hypo-test-proj');
+  const tpath = join(projDir, `${sid}.jsonl`);
+  mkdirSync(projDir, { recursive: true });
+  try {
+    withWiki(null, (dir, today) => {
+      const payload = {
+        project: 'test-project',
+        date: today,
+        sessionState: {
+          content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+        },
+        projectHot: {
+          content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+        },
+        rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+        sessionLog: { entry: `## [${today}] impr15 rerun test\n` },
+        log: { entry: `## [${today}] session | test-project: impr15 rerun\n` },
+      };
+      const payloadPath = join(dir, '.payload.json');
+      writeFileSync(payloadPath, JSON.stringify(payload));
+      const args = [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        `--payload=${payloadPath}`,
+        `--session-id=${sid}`,
+        '--json',
+      ];
+
+      // (1) Transcript resolves but carries NO close signal → marker withheld.
+      writeFileSync(
+        tpath,
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: '코드 리뷰 계속 부탁해' },
+        }) + '\n',
+      );
+      const r1 = run('crystallize.mjs', args);
+      assert.equal(r1.status, 0, `apply must exit 0: ${r1.stdout}\n${r1.stderr}`);
+      const o1 = JSON.parse(r1.stdout);
+      assert.equal(o1.ok, true, `apply ok expected: ${r1.stdout}`);
+      assert.equal(
+        o1.markerSkipReason,
+        'no-user-close-signal',
+        `expected the no-signal skip (not transcript-unresolved): ${JSON.stringify(o1)}`,
+      );
+      assert.equal(o1.markerWritten, false, 'marker must be withheld on the first run');
+
+      // (2) The user picks [세션 마무리] in an AskUserQuestion; that answer value
+      // lands in the transcript as a correlated tool_result. Append it and re-run.
+      const askLines = [
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'tool_use', name: 'AskUserQuestion', id: 'ask-1' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'ask-1',
+                content: 'Your questions have been answered: "세션?"="세션 마무리".',
+              },
+            ],
+          },
+        }),
+      ];
+      appendFileSync(tpath, askLines.join('\n') + '\n');
+      const r2 = run('crystallize.mjs', args);
+      assert.equal(r2.status, 0, `re-run must exit 0: ${r2.stdout}\n${r2.stderr}`);
+      const o2 = JSON.parse(r2.stdout);
+      assert.equal(o2.ok, true, `re-run ok expected: ${r2.stdout}`);
+      assert.equal(
+        o2.markerWritten,
+        true,
+        `marker must land after the close answer: ${JSON.stringify(o2)}`,
+      );
+      assert.equal(
+        o2.markerSkipReason,
+        null,
+        `no skip reason on the re-run: ${o2.markerSkipReason}`,
+      );
+      assert.ok(
+        existsSync(join(dir, '.cache', `session-closed-${sid}.marker`)),
+        'marker file must exist after the AskUserQuestion close answer + re-run',
+      );
+    });
+  } finally {
+    rmSync(tpath, { force: true });
+  }
 });
 
 // ── feedback-sync.mjs (ADR 0031) ─────────────────────────────

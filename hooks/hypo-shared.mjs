@@ -284,17 +284,22 @@ export function sessionLogScopePath(hypoDir, project, date) {
  * True if `content` carries a today-dated `## [date] session | <project>` entry
  * in log.md.
  *
- * Bounded with an explicit `(?=\s|$)` lookahead, NOT `\b`: a regex word boundary
- * matches between word and non-word chars, so `\b` after "foo" still matches in
- * "foo-bar" (hyphen is non-word). The canonical log format always separates the
- * project slug from anything that follows by whitespace or end-of-line, so the
- * lookahead correctly rejects "session | foo-bar" when looking for "foo".
- * (Was a pre-existing bug in sessionCloseFileStatus that the helper extraction
- * inherited.)
+ * Bounded with an explicit `(?=[\s:]|$)` lookahead, NOT `\b`: a regex word
+ * boundary matches between word and non-word chars, so `\b` after "foo" still
+ * matches in "foo-bar" (hyphen is non-word). The canonical log format separates
+ * the project slug from anything that follows by whitespace, a colon, or
+ * end-of-line, so the lookahead correctly rejects "session | foo-bar" when
+ * looking for "foo". Both delimiters are canonical: the derive path
+ * (rootLogEntry) emits `<project> — <title>` (space), while the dominant
+ * hand-written convention is `<project>: <title>` (colon, since the tone rule
+ * banned the em dash). The colon must be accepted: without it, a close whose
+ * only log.md evidence used the colon form was misread as "stale" and blocked
+ * non-deterministically. (Was a pre-existing boundary bug in
+ * sessionCloseFileStatus that the helper extraction inherited.)
  */
 export function hasLogEntry(content, date, project) {
   return new RegExp(
-    '^## \\[' + escapeRegExp(date) + '\\] session \\| ' + escapeRegExp(project) + '(?=\\s|$)',
+    '^## \\[' + escapeRegExp(date) + '\\] session \\| ' + escapeRegExp(project) + '(?=[\\s:]|$)',
     'm',
   ).test(content || '');
 }
@@ -920,13 +925,20 @@ function closeCandidateSlugs(hypoDir, dates) {
       content = '';
     }
     for (const d of dates) {
-      const re = new RegExp('^## \\[' + escapeRegExp(d) + '\\] session \\| (\\S+)', 'gm');
+      // Capture the slug up to the first whitespace OR colon so both canonical
+      // log delimiters resolve to the same bare slug: `session | beta — t` and
+      // `session | beta: t` both yield `beta`. This parser shares the
+      // colon-delimiter contract with hasLogEntry, so a colon-form entry for a
+      // real project is a close candidate, not a ghost. `[^\s:]+` cannot span
+      // the colon, so a stale/typo heading still yields a token that fails the
+      // on-disk directory gate below.
+      const re = new RegExp('^## \\[' + escapeRegExp(d) + '\\] session \\| ([^\\s:]+)', 'gm');
       for (const m of content.matchAll(re)) {
-        // B-1: only real projects are close candidates. A malformed log heading
-        // (`## [d] session | hypomnema:`) or a stale slug yields a ghost token
-        // that no longer maps to a `projects/<slug>/` directory — gating on disk
-        // keeps it out of the dangling-close set. Directory (not bare-exists)
-        // mirrors the apply-path project check (crystallize.mjs:193).
+        // B-1: only real projects are close candidates. A stale or misspelled
+        // slug yields a token that no longer maps to a `projects/<slug>/`
+        // directory — gating on disk keeps it out of the dangling-close set.
+        // Directory (not bare-exists) mirrors the apply-path project check
+        // (crystallize.mjs:193).
         const dir = join(projectsDir, m[1]);
         if (existsSync(dir) && statSync(dir).isDirectory()) slugs.add(m[1]);
       }
