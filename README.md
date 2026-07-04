@@ -25,7 +25,7 @@ New to the terms below? Keep the [Term decoder](#term-decoder) open in another t
 
 ### Where automation stands today
 
-The current release is v1.5.0. It turns to cross-machine reliability and everyday friction. On a git-synced vault shared across machines, `cwd`-first resume finds the right project; a session working in a code repo is told where the wiki lives instead of re-discovering it each time; and session close no longer re-lists unrelated lint debt or dumps hundreds of warnings into context. The v1.4.x line hardened the session-close path before it.
+The current release is v1.6.0. It sharpens how the wiki signals its own freshness: a page whose `verify_by_date` has passed is flagged `[STALE ...]` at the moment it is injected, so a dated answer is visible instead of trusted silently, and lookup usage is tracked locally so crystallize can surface a linked-but-never-injected page as a cold candidate. The same release makes session close robust to the standard `session | project: title` colon log format that had been misread as stale. The v1.5.0 line turned to cross-machine reliability and everyday friction before it: `cwd`-first resume on a git-synced vault, a code-repo session told where the wiki lives, and session close no longer re-listing unrelated lint debt.
 
 Wiki work (ingest, query, session-close) still starts from an explicit `/hypo:*` command or plain language. The v2 goal is full autonomy: Claude reading, writing, and synthesizing the wiki without being asked, which is the direction this is heading.
 
