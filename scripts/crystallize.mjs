@@ -65,11 +65,19 @@
  *     hard-fails regardless of scope.
  */
 
-import { existsSync, statSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import {
+  existsSync,
+  statSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  renameSync,
+  realpathSync,
+} from 'fs';
 import { join, dirname } from 'path';
 import { hostname } from 'os';
 import { spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
 import { collectPagesCrystallize, extractWikilinks } from './lib/wikilink.mjs';
@@ -645,6 +653,67 @@ function runMarkSessionClosed(args) {
   process.exit(0);
 }
 
+// The close pipeline's marker decision as a PURE function of pre-resolved
+// signals. The caller (applySessionClose) keeps the IO lazy (commit first, then
+// transcript resolve, then gate, then user-signal scan only once the gate
+// passes) and feeds the resulting booleans here; this function owns only the
+// branch PRIORITY and the reason strings, so a deterministic table test can
+// exercise the state machine without spawning the
+// CLI. Returns { write, skipReason }: `write` true means the caller should
+// attempt writeSessionClosedMarker; `skipReason` (non-null on every non-write
+// branch) is the surfaced reason the marker was withheld.
+//   - !ok / no session id     → not a marker-write path (skipReason null)
+//   - commit failed           → commit-failed: <reason>
+//   - compact gate not ok     → compact-gate-not-ok
+//   - no transcript           → transcript-unresolved
+//   - transcript, no signal   → no-user-close-signal
+//   - all clear               → write:true
+export function planMarkerDecision({
+  ok,
+  hasSessionId,
+  committed,
+  commitReason,
+  gateOk,
+  transcriptResolved,
+  hasUserSignal,
+}) {
+  if (!ok || !hasSessionId) return { write: false, skipReason: null };
+  if (!committed) return { write: false, skipReason: `commit-failed: ${commitReason}` };
+  if (!gateOk) return { write: false, skipReason: 'compact-gate-not-ok' };
+  if (!transcriptResolved || !hasUserSignal) {
+    return {
+      write: false,
+      skipReason: transcriptResolved ? 'no-user-close-signal' : 'transcript-unresolved',
+    };
+  }
+  return { write: true, skipReason: null };
+}
+
+// The runtime close-result invariant self-check. Given
+// the settled marker fields, return a non-null contradiction tag when the result
+// is internally inconsistent, else null. This is a REGRESSION GUARD: every
+// non-write branch of planMarkerDecision already records a reason today, so the
+// contradictions below are unreachable — the seam exists so a future branch that
+// forgets to record a reason (or double-sets a written marker with a skip
+// reason) fails LOUDLY (ok flipped false, exit 1) instead of silently emitting a
+// misleading ok:true that a skill-following model reads as "session closed".
+// A "real reason" is a non-blank STRING — every legitimate skip reason is one.
+// Anything else (null, a blank string, or a non-string like false/0/{}) is not a
+// surfaced reason and must not suppress the check, so a future bad assignment
+// cannot hide a withheld marker behind a bogus value.
+//   A: ok:true but the marker was withheld with no reason recorded.
+//   B: a marker was written AND a skip reason was also set (mutually exclusive).
+export function closeResultContradiction({ ok, markerWritten, markerSkipReason }) {
+  const hasRealReason = typeof markerSkipReason === 'string' && markerSkipReason.trim() !== '';
+  if (ok === true && markerWritten === false && !hasRealReason) {
+    return 'internal-contradiction:marker-withheld-without-reason';
+  }
+  if (markerWritten === true && hasRealReason) {
+    return 'internal-contradiction:marker-written-with-skip-reason';
+  }
+  return null;
+}
+
 function applySessionClose(args) {
   // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
@@ -1067,7 +1136,9 @@ function applySessionClose(args) {
     ));
   }
   const postLintOk = !postApplyCrashed && postBlocking.length === 0;
-  const ok = verification.ok && postLintOk;
+  // `let` (not const): the close-result invariant self-check below may flip this
+  // to false when the settled close result is internally contradictory.
+  let ok = verification.ok && postLintOk;
 
   // Scope the non-blocking notice to the close-target project: debt under
   // projects/<project>/ stays listed; debt elsewhere folds to a count so the
@@ -1100,47 +1171,77 @@ function applySessionClose(args) {
   let markerWritten = false;
   let markerSkipReason = null;
   if (ok && args.sessionId) {
+    // IO stays lazy so this preserves the exact side-effect order (codex design
+    // review): commit first (the only mutation), then resolve the
+    // transcript, then run the compact gate with that transcript, then scan the
+    // user-close signal ONLY once the gate passes. planMarkerDecision owns the
+    // branch priority + reason strings; the booleans below are computed in that
+    // same short-circuiting order so no read runs earlier than it does today.
     const commitOutcome = commitWikiChanges(args.hypoDir);
-    if (!commitOutcome.committed) {
-      markerSkipReason = `commit-failed: ${commitOutcome.reason}`;
-    } else {
-      const closeTranscript = resolveTranscriptBySessionId(args.sessionId);
-      const markerGate = precompactGateStatus(
+    let closeTranscript = null;
+    let gateOk = false;
+    if (commitOutcome.committed) {
+      closeTranscript = resolveTranscriptBySessionId(args.sessionId);
+      gateOk = precompactGateStatus(
         args.hypoDir,
         closeTranscript ? { transcriptPath: closeTranscript } : {},
-      );
-      if (!markerGate.ok) {
-        // compact gate not ok → skip. Caller's `result.ok` already reflects the
-        // file/lint state; next Stop re-blocks until the remaining blocker
-        // (feedback/W8/hot/lint — git is now committed) is resolved.
-        markerSkipReason = 'compact-gate-not-ok';
-      } else if (!closeTranscript || !hasUserCloseSignal(closeTranscript)) {
-        // User-close hard gate: apply succeeded (payload files written)
-        // but the user never signalled session close, so the marker — which attests
-        // "user closed" — is withheld. The wiki record stands; the session is simply
-        // not marked closed. Surfaced (not silent) so the caller knows.
-        markerSkipReason = closeTranscript ? 'no-user-close-signal' : 'transcript-unresolved';
+      ).ok;
+    }
+    const decision = planMarkerDecision({
+      ok,
+      hasSessionId: true,
+      committed: commitOutcome.committed,
+      commitReason: commitOutcome.reason,
+      gateOk,
+      transcriptResolved: !!closeTranscript,
+      // Scan the signal only when the gate passed AND a transcript resolved —
+      // hasUserCloseSignal never runs earlier than the original nested `else if`.
+      hasUserSignal: gateOk && !!closeTranscript && hasUserCloseSignal(closeTranscript),
+    });
+    markerSkipReason = decision.skipReason;
+    if (decision.write) {
+      writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
+      // Codex CONCERN: the writer swallows IO errors (best-effort).
+      // Verify the file actually landed — mirroring the standalone path — instead of
+      // asserting markerWritten=true, so a .cache permission/disk problem surfaces
+      // rather than the caller reporting "closed" while the next Stop re-blocks.
+      if (existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
+        markerWritten = true;
       } else {
-        writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
-        // Codex CONCERN: the writer swallows IO errors (best-effort).
-        // Verify the file actually landed — mirroring the standalone path — instead of
-        // asserting markerWritten=true, so a .cache permission/disk problem surfaces
-        // rather than the caller reporting "closed" while the next Stop re-blocks.
-        if (existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
-          markerWritten = true;
-        } else {
-          markerSkipReason = 'marker-did-not-land';
-        }
+        markerSkipReason = 'marker-did-not-land';
       }
     }
   }
-  const stage = ok
+  let stage = ok
     ? null
     : !verification.ok && !postLintOk
       ? 'post-apply-verification+lint'
       : !verification.ok
         ? 'post-apply-verification'
         : 'post-apply-lint';
+  // Runtime close-result invariant self-check. When a
+  // marker-write path (args.sessionId present) settles into an internally
+  // contradictory shape — ok:true with the marker silently withheld and no
+  // reason, or a written marker that also carries a skip reason — flip ok:false
+  // and stage-tag it so the existing `process.exit(ok ? 0 : 1)` yields exit 1.
+  // That non-zero exit is the discriminator that separates a genuine
+  // contradiction (a code bug) from a legitimate withhold (exit 0, e.g.
+  // no-user-close-signal). apply is idempotent, so a non-zero re-run is safe.
+  // Unreachable today; this is a regression guard for future refactors.
+  if (args.sessionId) {
+    const contradiction = closeResultContradiction({ ok, markerWritten, markerSkipReason });
+    if (contradiction) {
+      ok = false;
+      stage = contradiction;
+      process.stderr.write(
+        `\n🛑 INTERNAL CONTRADICTION in session-close result: ${contradiction}\n` +
+          `    markerWritten=${markerWritten}, markerSkipReason=${JSON.stringify(markerSkipReason)}.\n` +
+          `    This is a close-pipeline bug, not a normal withhold. Exiting non-zero so it\n` +
+          `    cannot masquerade as a successful close. The applied payload files stand;\n` +
+          `    re-running apply is idempotent once the pipeline is fixed.\n`,
+      );
+    }
+  }
   const result = {
     ok,
     stage,
@@ -1189,9 +1290,11 @@ function applySessionClose(args) {
     // When ok:true but the session-close marker was NOT written, the Stop-chain
     // still sees an open session and will re-prompt at the next Stop. Surface this
     // loudly so neither the human nor a skill-following model reads "ok:true" as
-    // "session fully closed". Gate on markerSkipReason (non-null exactly when
-    // args.sessionId is present and the marker was withheld).
-    if (markerSkipReason) {
+    // "session fully closed". Gate on `!markerWritten` too so this "marker NOT
+    // written" line cannot fire on the contradiction-B path (a written marker that
+    // also carried a skip reason) — there the invariant's own 🛑 line already
+    // explains the failure, and this message would contradict markerWritten:true.
+    if (markerSkipReason && !markerWritten) {
       process.stderr.write(
         `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
           `    The 5 mandatory files were applied and verified (ok:true), but the\n` +
@@ -1287,119 +1390,133 @@ function parseTags(fm) {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
-const args = parseArgs(process.argv);
-
-if (args.markSessionClosed) {
-  runMarkSessionClosed(args); // exits
+// Guard the CLI dispatch behind an entry check: the module now exports
+// pure functions (planMarkerDecision / closeResultContradiction) that the test
+// runner imports, and importing must NOT execute the CLI (its process.exit would
+// kill the runner). Mirror feedback-sync.mjs's realpath + pathToFileURL guard so
+// `node crystallize.mjs …` still runs main() while `import` does not.
+function isMain() {
+  if (!process.argv[1]) return false;
+  return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
 }
 
-if (args.applySessionClose) {
-  applySessionClose(args); // exits
-}
+function main() {
+  const args = parseArgs(process.argv);
 
-if (args.checkSessionClose) {
-  runSessionCloseCheck(args); // exits
-}
-
-const ignorePatterns = loadHypoIgnore(args.hypoDir);
-const pagesDir = join(args.hypoDir, 'pages');
-const pages = collectPagesCrystallize(pagesDir, args.hypoDir, ignorePatterns);
-
-const tagGroups = {}; // tag → [{ slug, title }]
-const unlinked = []; // pages with no outbound wikilinks
-const drafts = []; // pages tagged draft
-
-for (const { path, rel } of pages) {
-  let content;
-  try {
-    content = readFileSync(path, 'utf-8');
-  } catch {
-    continue;
-  }
-  const fm = parseFrontmatter(content);
-  if (!fm) continue;
-
-  const slug = rel.replace(/\.md$/, '');
-  const title = fm.title || slug;
-  const tags = parseTags(fm);
-
-  // tag groups
-  for (const tag of tags) {
-    if (!tagGroups[tag]) tagGroups[tag] = [];
-    tagGroups[tag].push({ slug, title });
+  if (args.markSessionClosed) {
+    runMarkSessionClosed(args); // exits
   }
 
-  // draft detection
-  if (tags.includes('draft') || fm.confidence === 'speculative') {
-    drafts.push({ slug, title, confidence: fm.confidence });
+  if (args.applySessionClose) {
+    applySessionClose(args); // exits
   }
 
-  // unlinked (no outbound wikilinks in body)
-  const body = content.replace(/^---[\s\S]*?---/, '');
-  const links = extractWikilinks(body);
-  if (links.length === 0) unlinked.push({ slug, title });
-}
-
-// filter tag groups by min-group
-const synthesisGroups = Object.entries(tagGroups)
-  .filter(([, pages]) => pages.length >= args.minGroup)
-  .sort((a, b) => b[1].length - a[1].length)
-  .map(([tag, pages]) => ({ tag, pages }));
-
-// Lookup-cold candidates (B): pages with inbound wikilinks that lookup has not
-// injected within the recency window. Advisory only, never gates, never mutates.
-const coldCandidates = aggregateColdCandidates(args.hypoDir, { ignorePatterns });
-
-if (args.json) {
-  console.log(JSON.stringify({ synthesisGroups, unlinked, drafts, coldCandidates }, null, 2));
-  process.exit(0);
-}
-
-let found = false;
-
-if (synthesisGroups.length > 0) {
-  found = true;
-  console.log(`Synthesis candidates by tag (${synthesisGroups.length} group(s)):\n`);
-  for (const { tag, pages: grp } of synthesisGroups) {
-    console.log(`  [${tag}] (${grp.length} pages):`);
-    for (const p of grp) console.log(`    [[${p.slug}]] — ${p.title}`);
+  if (args.checkSessionClose) {
+    runSessionCloseCheck(args); // exits
   }
-  console.log('');
+
+  const ignorePatterns = loadHypoIgnore(args.hypoDir);
+  const pagesDir = join(args.hypoDir, 'pages');
+  const pages = collectPagesCrystallize(pagesDir, args.hypoDir, ignorePatterns);
+
+  const tagGroups = {}; // tag → [{ slug, title }]
+  const unlinked = []; // pages with no outbound wikilinks
+  const drafts = []; // pages tagged draft
+
+  for (const { path, rel } of pages) {
+    let content;
+    try {
+      content = readFileSync(path, 'utf-8');
+    } catch {
+      continue;
+    }
+    const fm = parseFrontmatter(content);
+    if (!fm) continue;
+
+    const slug = rel.replace(/\.md$/, '');
+    const title = fm.title || slug;
+    const tags = parseTags(fm);
+
+    // tag groups
+    for (const tag of tags) {
+      if (!tagGroups[tag]) tagGroups[tag] = [];
+      tagGroups[tag].push({ slug, title });
+    }
+
+    // draft detection
+    if (tags.includes('draft') || fm.confidence === 'speculative') {
+      drafts.push({ slug, title, confidence: fm.confidence });
+    }
+
+    // unlinked (no outbound wikilinks in body)
+    const body = content.replace(/^---[\s\S]*?---/, '');
+    const links = extractWikilinks(body);
+    if (links.length === 0) unlinked.push({ slug, title });
+  }
+
+  // filter tag groups by min-group
+  const synthesisGroups = Object.entries(tagGroups)
+    .filter(([, pages]) => pages.length >= args.minGroup)
+    .sort((a, b) => b[1].length - a[1].length)
+    .map(([tag, pages]) => ({ tag, pages }));
+
+  // Lookup-cold candidates (B): pages with inbound wikilinks that lookup has not
+  // injected within the recency window. Advisory only, never gates, never mutates.
+  const coldCandidates = aggregateColdCandidates(args.hypoDir, { ignorePatterns });
+
+  if (args.json) {
+    console.log(JSON.stringify({ synthesisGroups, unlinked, drafts, coldCandidates }, null, 2));
+    process.exit(0);
+  }
+
+  let found = false;
+
+  if (synthesisGroups.length > 0) {
+    found = true;
+    console.log(`Synthesis candidates by tag (${synthesisGroups.length} group(s)):\n`);
+    for (const { tag, pages: grp } of synthesisGroups) {
+      console.log(`  [${tag}] (${grp.length} pages):`);
+      for (const p of grp) console.log(`    [[${p.slug}]] — ${p.title}`);
+    }
+    console.log('');
+  }
+
+  if (unlinked.length > 0) {
+    found = true;
+    console.log(`Unlinked pages (no outbound [[wikilinks]]) — ${unlinked.length}:`);
+    for (const p of unlinked) console.log(`  [[${p.slug}]] — ${p.title}`);
+    console.log('');
+  }
+
+  if (drafts.length > 0) {
+    found = true;
+    console.log(`Draft/speculative pages ready to crystallize — ${drafts.length}:`);
+    for (const p of drafts) console.log(`  [[${p.slug}]] — ${p.title}`);
+    console.log('');
+  }
+
+  // Advisory (non-gating): pages the graph treats as live but lookup has not
+  // injected recently. Held until enough page-usage history accrues.
+  if (coldCandidates.status === 'ok' && coldCandidates.candidates.length > 0) {
+    found = true;
+    console.log(
+      `Lookup-cold pages (${coldCandidates.candidates.length}), inbound links but not injected recently:`,
+    );
+    for (const p of coldCandidates.candidates) console.log(`  [[${p.slug}]] (${p.title})`);
+    console.log('');
+  } else if (
+    coldCandidates.status === 'insufficient-data' &&
+    coldCandidates.reason === 'span-too-short'
+  ) {
+    // Only surface the "held" notice once a log is actually accruing (span under
+    // the cold-start window). A vault with no log at all stays silent so this
+    // advisory never becomes permanent noise on every crystallize run.
+    console.log('Lookup-cold scan held: not enough page-usage history yet (advisory).\n');
+  }
+
+  if (!found) {
+    console.log('✓ No crystallization candidates found — Hypomnema looks well-connected.');
+  }
 }
 
-if (unlinked.length > 0) {
-  found = true;
-  console.log(`Unlinked pages (no outbound [[wikilinks]]) — ${unlinked.length}:`);
-  for (const p of unlinked) console.log(`  [[${p.slug}]] — ${p.title}`);
-  console.log('');
-}
-
-if (drafts.length > 0) {
-  found = true;
-  console.log(`Draft/speculative pages ready to crystallize — ${drafts.length}:`);
-  for (const p of drafts) console.log(`  [[${p.slug}]] — ${p.title}`);
-  console.log('');
-}
-
-// Advisory (non-gating): pages the graph treats as live but lookup has not
-// injected recently. Held until enough page-usage history accrues.
-if (coldCandidates.status === 'ok' && coldCandidates.candidates.length > 0) {
-  found = true;
-  console.log(
-    `Lookup-cold pages (${coldCandidates.candidates.length}), inbound links but not injected recently:`,
-  );
-  for (const p of coldCandidates.candidates) console.log(`  [[${p.slug}]] (${p.title})`);
-  console.log('');
-} else if (
-  coldCandidates.status === 'insufficient-data' &&
-  coldCandidates.reason === 'span-too-short'
-) {
-  // Only surface the "held" notice once a log is actually accruing (span under
-  // the cold-start window). A vault with no log at all stays silent so this
-  // advisory never becomes permanent noise on every crystallize run.
-  console.log('Lookup-cold scan held: not enough page-usage history yet (advisory).\n');
-}
-
-if (!found) {
-  console.log('✓ No crystallization candidates found — Hypomnema looks well-connected.');
-}
+if (isMain()) main();
