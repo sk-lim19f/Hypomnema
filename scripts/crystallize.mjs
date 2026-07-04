@@ -73,6 +73,7 @@ import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
 import { collectPagesCrystallize, extractWikilinks } from './lib/wikilink.mjs';
+import { aggregateColdCandidates } from './lib/page-usage.mjs';
 import { isValidProjectName } from './lib/project-create.mjs';
 import { appendPendingTags, checkForbidden } from './lib/schema-vocab.mjs';
 import {
@@ -1315,8 +1316,12 @@ const synthesisGroups = Object.entries(tagGroups)
   .sort((a, b) => b[1].length - a[1].length)
   .map(([tag, pages]) => ({ tag, pages }));
 
+// Lookup-cold candidates (B): pages with inbound wikilinks that lookup has not
+// injected within the recency window. Advisory only, never gates, never mutates.
+const coldCandidates = aggregateColdCandidates(args.hypoDir, { ignorePatterns });
+
 if (args.json) {
-  console.log(JSON.stringify({ synthesisGroups, unlinked, drafts }, null, 2));
+  console.log(JSON.stringify({ synthesisGroups, unlinked, drafts, coldCandidates }, null, 2));
   process.exit(0);
 }
 
@@ -1344,6 +1349,25 @@ if (drafts.length > 0) {
   console.log(`Draft/speculative pages ready to crystallize — ${drafts.length}:`);
   for (const p of drafts) console.log(`  [[${p.slug}]] — ${p.title}`);
   console.log('');
+}
+
+// Advisory (non-gating): pages the graph treats as live but lookup has not
+// injected recently. Held until enough page-usage history accrues.
+if (coldCandidates.status === 'ok' && coldCandidates.candidates.length > 0) {
+  found = true;
+  console.log(
+    `Lookup-cold pages (${coldCandidates.candidates.length}), inbound links but not injected recently:`,
+  );
+  for (const p of coldCandidates.candidates) console.log(`  [[${p.slug}]] (${p.title})`);
+  console.log('');
+} else if (
+  coldCandidates.status === 'insufficient-data' &&
+  coldCandidates.reason === 'span-too-short'
+) {
+  // Only surface the "held" notice once a log is actually accruing (span under
+  // the cold-start window). A vault with no log at all stays silent so this
+  // advisory never becomes permanent noise on every crystallize run.
+  console.log('Lookup-cold scan held: not enough page-usage history yet (advisory).\n');
 }
 
 if (!found) {

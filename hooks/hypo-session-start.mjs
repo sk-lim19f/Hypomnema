@@ -31,6 +31,7 @@ import {
   pickProjectByCwd,
   collectProjectWorkingDirs,
   buildVaultOrientation,
+  staleMarkerFor,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -54,6 +55,21 @@ function readIfNotIgnored(path, maxChars, patterns) {
   if (!path) return null;
   if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return null;
   return readFileSync(path, 'utf-8').slice(0, maxChars);
+}
+
+// Compute the STALE marker for a hot/state file from its RAW content (readIfNotIgnored
+// already slices, which could truncate frontmatter). Honors the same .hypoignore
+// privacy guard, and returns '' for any miss (no path, ignored, absent, no
+// verify_by_date, or error) so derived summaries pass through unchanged.
+function staleMarkerForPath(path, patterns, today) {
+  try {
+    if (!path) return '';
+    if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return '';
+    if (!existsSync(path)) return '';
+    return staleMarkerFor(readFileSync(path, 'utf-8'), today);
+  } catch {
+    return '';
+  }
 }
 
 // Directory of the running hook, and the install root one level up
@@ -372,8 +388,18 @@ process.stdin.on('end', () => {
     const hitPrefix = vaultOrientation ? `${vaultOrientation}\n\n` : '';
 
     if (hit) {
-      const hotContent = readIfNotIgnored(hit.hotPath, HOT_CHARS, ignorePatterns);
-      const stateContent = readIfNotIgnored(hit.statePath, STATE_CHARS, ignorePatterns);
+      // project hot/state only. root/global hot (below) is a derived pointer
+      // table with no per-page frontmatter, so it is never a STALE target and
+      // gets no marker logic. TODAY is UTC to match doctor.mjs (D1/D2). The
+      // marker is computed on raw content (staleMarkerForPath), then prepended
+      // onto the sliced display content; a no-op when there is no verify_by_date.
+      const TODAY = new Date().toISOString().slice(0, 10);
+      let hotContent = readIfNotIgnored(hit.hotPath, HOT_CHARS, ignorePatterns);
+      let stateContent = readIfNotIgnored(hit.statePath, STATE_CHARS, ignorePatterns);
+      const hotMarker = staleMarkerForPath(hit.hotPath, ignorePatterns, TODAY);
+      const stateMarker = staleMarkerForPath(hit.statePath, ignorePatterns, TODAY);
+      if (hotContent && hotMarker) hotContent = `${hotMarker}\n${hotContent}`;
+      if (stateContent && stateMarker) stateContent = `${stateMarker}\n${stateContent}`;
 
       if (hotContent || stateContent) {
         printTerminalSummary(hit.proj, hotContent, stateContent);

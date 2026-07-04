@@ -110,7 +110,7 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 |---|---|
 | `hypo-session-start` | Inject `index.md`, root `hot.md`, project `hot.md`/`session-state.md`. Run `git pull --ff-only` (silent fail on missing remote) |
 | `hypo-first-prompt` | Marker-based one-shot `hot.md` injection on first user prompt (10-min TTL) — for sessions that bypass `SessionStart` |
-| `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each, with verify-by-date warnings). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
+| `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each; a page whose `verify_by_date` is overdue gets a `[STALE verify_by_date=…]` marker prepended). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
 | `hypo-compact-guard` | Detect `/compact` invocations → enforce session-close checklist before allowing compact |
 | `hypo-personal-check` | PreCompact validation: lint blockers, uncommitted changes, missing session-log entries → block compact |
 | `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`) |
