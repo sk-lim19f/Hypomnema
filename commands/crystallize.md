@@ -32,7 +32,7 @@ These are judgment calls; when uncertain, surface the question rather than skip 
 
 The session-close path is **payload-driven**. Instead of writing the 5 mandatory files one-by-one, you compose a single JSON payload that describes the full session-close state, then hand it to the `--apply-session-close` apply path (the Step 3 command), which performs idempotent atomic writes and gates the result with lint.
 
-Payload shape (`project` + 5 content fields required, 1 conditional, per Spec §5.2.7 / §8.3):
+Payload shape (`project` + 4 content fields required; `log` optional/derived; `openQuestions` conditional, per Spec §5.2.7 / §8.3):
 
 ```json
 {
@@ -54,7 +54,8 @@ Field rules:
 - `project`: **required**. Slug of the project being closed (matches a `projects/<slug>/` directory). Must be a single path segment, charset `A-Za-z0-9._-`, with at least one alphanumeric and not a dot-only name (`.`, `..`, `...`). Apply never infers the target from recency; a same-date pointer-table tie could otherwise write the close into the wrong project (B-3). A missing, malformed, or non-existent value fails the apply before any write.
 - `date` — optional. Defaults to today (local). Must be `YYYY-MM-DD` if supplied.
 - `openQuestions` — optional. Include only when `pages/open-questions.md` exists and changed this session.
-- All other top-level fields are required.
+- `log`: optional. Omit it by default (apply derives the canonical `## [date] session | <project>` line from your `sessionLog` heading). Supply it only for a custom log.md line, which must still be a canonical `session | <project>` heading, or the apply fails at `stage='pre-apply-verification'`.
+- The remaining fields (`sessionState`, `projectHot`, `rootHot`, `sessionLog`) are required.
 
 Notes:
 
@@ -68,7 +69,7 @@ Content guidance for each slot:
 2. **projectHot** — session snapshot under 500 words: what changed and decisions made. Do **not** put next-step tasks here; those belong in `sessionState`.
 3. **rootHot** — active-projects pointer table with this project's `Last Session` date set to today.
 4. **sessionLog** — one session entry to append to `projects/<name>/session-log/YYYY-MM-DD.md` (daily shard).
-5. **log** — one `session` entry to append to `<hypo-root>/log.md`.
+5. **log** (optional): a custom `session` entry for `<hypo-root>/log.md`. Omit it to let apply derive the canonical line from `sessionLog`.
 6. **openQuestions** (conditional) — only if `pages/open-questions.md` exists and questions were raised or resolved this session.
 
 ---
@@ -96,7 +97,9 @@ so it stops re-prompting. Omit it only when running crystallize purely for
 synthesis (no session-close intent) — the marker is then simply not written.
 
 > **Source rule for `--session-id`:** use only the main conversation's session id
-> (the id shown in the `[WIKI_AUTOCLOSE]` block reason, or `$CLAUDE_SESSION_ID`).
+> (the id shown in the `[WIKI_AUTOCLOSE]` block reason, or the injected
+> `$CLAUDE_CODE_SESSION_ID`; accept the legacy spelling via
+> `${CLAUDE_CODE_SESSION_ID:-$CLAUDE_SESSION_ID}`).
 > Do NOT extract it from a background task output path or Agent thread (e.g.,
 > `/tmp/.../<uuid>/tasks/...`). A UUID from such a path is a background task id,
 > not the main conversation id. Passing it causes `markerSkipReason:
@@ -129,7 +132,8 @@ The result JSON includes a `stage` field when `ok: false`. Branch on it:
 
 | `stage` | What broke | How to recover |
 |---|---|---|
-| `preflight-lint` | A payload file (append target — session-log / log.md) has a pre-existing blocking lint error. | Fix the lint error in that file, then re-run. No payload bytes were written. (Debt outside the payload files is a non-blocking notice, not this stage.) |
+| `pre-apply-verification` | A payload heading does not match the freshness contract the close gate enforces: `sessionLog.entry` has no dated `## [YYYY-MM-DD] …` heading, or an explicit `log.entry` is not the canonical `## [date] session | <project>` line. Caught **before** any write. | Fix the heading in the payload (the session-log entry needs a bracketed dated heading; the log line needs `session \| <project>` after the date, colon or space delimiter), then re-run. No payload bytes were written. |
+| `preflight-lint` | A payload file (append target: session-log / log.md) has a pre-existing blocking lint error. | Fix the lint error in that file, then re-run. No payload bytes were written. (Debt outside the payload files is a non-blocking notice, not this stage.) |
 | `post-apply-verification` | A mandatory file's `updated:` frontmatter is stale (≠ today) after apply. | Edit the payload's stale `content` (or supply correct `date`), then re-run. Writes are idempotent — re-applying a corrected payload is safe. |
 | `post-apply-lint` | The payload introduced an error-level lint blocker in a payload file (malformed body / bad frontmatter), or lint crashed. | Fix the offending content in the payload, then re-run. (Broken wikilinks are W4 warnings — not gated.) |
 | `post-apply-verification+lint` | Both above. | Fix both; re-run. |
@@ -142,11 +146,15 @@ Once `ok: true`, report:
 - ✓ open-questions applied (or skipped if unchanged)
 - ✓ log.md entry appended
 - ✓ post-apply lint clean
-- **marker written?** (required check): if `markerWritten: true`, report "session-close marker written"; if `markerWritten: false`, report "session-close marker NOT written (reason: `<markerSkipReason>`)" and do NOT declare the session "closed" or "complete". A missing marker means the Stop-chain is still open. Instruct the user to re-run with the correct main-conversation `--session-id`.
+- **marker written?** (required check): if `markerWritten: true`, report "session-close marker written"; if `markerWritten: false`, report "session-close marker NOT written (reason: `<markerSkipReason>`)" and do NOT declare the session "closed" or "complete". A missing marker means the Stop-chain is still open; recover per the `markerSkipReason` branch below.
 
 If `markerWritten: true` (or `--session-id` was not passed): ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
 
-If `markerWritten: false`: do NOT say "session closed." Say instead: "Files applied and verified (ok: true), but the session-close marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. To fully close: re-run with the correct main-conversation `--session-id`."
+If `markerWritten: false`, do NOT say "session closed." Branch on `markerSkipReason`:
+
+- `no-user-close-signal`: the files applied cleanly and the `--session-id` resolved a transcript, but that transcript carries no close phrase the gate recognizes (the user asked to close in wording that fell outside the close-signal set, e.g. "세션 마무리까지 진행해줘" or "세션 마무리 진행"). Re-running with the same id will not help, since the transcript is unchanged. Instead, confirm intent once with `AskUserQuestion`, header "세션", a single option labelled **세션 마무리** (설명: "이 세션을 마무리하고 close 마커를 기록"). If the user picks 세션 마무리, that answer becomes a recognized close signal in the transcript, so re-run the exact same `--apply-session-close … --session-id` command (the writes are idempotent no-ops; the marker now lands). If the user declines, leave the session unmarked: the wiki record stands, but the session is not closed. Do NOT touch the close-signal matcher itself.
+- `transcript-unresolved` (or a background / agent id was passed): say "Files applied and verified (ok: true), but the session-close marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. To fully close: re-run with the correct main-conversation `--session-id`."
+- any other reason (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface the reason verbatim and address it (resolve the compact blocker, fix the git / disk issue) before re-running.
 
 If the user says stop, end here. Otherwise continue to Step 5.
 

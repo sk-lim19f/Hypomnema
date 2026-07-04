@@ -92,7 +92,9 @@ main conversation id. Passing the wrong id causes `markerWritten: false` with
 `markerSkipReason: "transcript-unresolved"` or `"no-user-close-signal"`: the
 5 mandatory files are written (ok: true) but the Stop-chain marker is withheld,
 so the session is not actually closed and the Stop hook re-prompts. The correct
-id comes from the `[WIKI_AUTOCLOSE]` block reason or `$CLAUDE_SESSION_ID`.
+id comes from the `[WIKI_AUTOCLOSE]` block reason or the injected
+`$CLAUDE_CODE_SESSION_ID` (accept the legacy spelling via
+`${CLAUDE_CODE_SESSION_ID:-$CLAUDE_SESSION_ID}`).
 
 Once it passes, report each item with ✓:
 - ✓ session-state.md
@@ -100,11 +102,15 @@ Once it passes, report each item with ✓:
 - ✓ session-log entry
 - ✓ open-questions (or skipped if unchanged)
 - ✓ log.md entry
-- **marker written?** (required, if `--apply-session-close --session-id` was used): check `markerWritten` in the JSON output. If `true`, report "session-close marker written." If `false`, do NOT declare the session closed or complete. Instead report: "Files applied and verified (ok: true), but the session-close marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. Re-run with the correct main-conversation `--session-id`."
+- **marker written?** (required, if `--apply-session-close --session-id` was used): check `markerWritten` in the JSON output. If `true`, report "session-close marker written." If `false`, do NOT declare the session closed or complete; recover per the `markerSkipReason` branch below.
 
 If `markerWritten: true` (or `--session-id` was not passed), ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
 
-If `markerWritten: false`, do NOT say "session closed." Surface the skip reason and instruct a re-run with the correct main-conversation `--session-id` (see the bullet above) before treating the session as closed.
+If `markerWritten: false`, do NOT say "session closed." Branch on `markerSkipReason`:
+
+- `no-user-close-signal`: files applied cleanly and the transcript resolved, but it carries no close phrase the gate recognizes (the user's close wording fell outside the close-signal set, e.g. "세션 마무리까지 진행해줘" / "세션 마무리 진행"). Re-running the same id will not help. Confirm intent once with `AskUserQuestion` (header "세션", one option **세션 마무리**); if the user picks it, that answer is a recognized close signal, so re-run the same `--apply-session-close … --session-id` command (idempotent no-op writes; the marker lands). If the user declines, leave the session unmarked. Do NOT change the close-signal matcher.
+- `transcript-unresolved` (wrong / background id): report "Files applied and verified (ok: true), but the marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. Re-run with the correct main-conversation `--session-id`."
+- any other reason (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface it verbatim and resolve the underlying blocker before re-running.
 
 ---
 
