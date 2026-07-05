@@ -85,7 +85,14 @@ function sha256(buf) {
 // keeps running init for backwards compatibility — that's the documented
 // Path-B onboarding command. An explicit `hypomnema init` is accepted too,
 // and is stripped before flag parsing so the rest of this file is unchanged.
-const KNOWN_SUBCOMMANDS = new Set(['init', 'upgrade', 'doctor', 'uninstall', 'feedback-sync']);
+const KNOWN_SUBCOMMANDS = new Set([
+  'init',
+  'upgrade',
+  'doctor',
+  'uninstall',
+  'feedback-sync',
+  'capture',
+]);
 const _verb = process.argv[2];
 if (_verb && KNOWN_SUBCOMMANDS.has(_verb) && _verb !== 'init') {
   const _target = join(SCRIPT_DIR, `${_verb}.mjs`);

@@ -38,6 +38,7 @@ import {
   EXT_TYPES,
   CODEX_TYPES,
   readExtensionPkgStateNoMutate,
+  parseExtKey,
 } from './lib/extensions.mjs';
 
 const HOME = homedir();
@@ -138,13 +139,23 @@ function stripExtensionsFromPkg(pkgPath, target, removedKeys, apply) {
   return changed;
 }
 
-// Remove hypo-ext-* hard-copies for one target (claude | codex). Mirrors
-// removeCommands' 3-way model: filesystem scan + per-target recorded SHA from
-// hypo-pkg.json#extensions[target] decides ownership. A file we never installed
-// (no recorded SHA) is left alone — that may be a foreign hypo-ext-* file the
-// user created by hand, never ours to delete. A user-modified file is preserved
-// unless --force-extensions; a symlink/non-regular target is always preserved
-// (force does not follow them, matching install/upgrade E3's guard).
+// Remove Hypomnema-installed extension hard-copies for one target (claude |
+// codex). Ownership is decided by the per-target recorded SHA map in
+// hypo-pkg.json#extensions[target]: we iterate the RECORDED KEYS (not a
+// filesystem+prefix scan) because the reverse-capture design decoupled the install filename from
+// the wiki `hypo-ext-*` storage name — a reverse-captured command installs as
+// `commands/mycmd.md`, which a prefix scan would never reach. The SHA map key
+// IS the install path relative to the target root, so it names every file we
+// own regardless of its filename.
+//
+// Safety (capture design §8): a recorded key comes from an on-disk JSON we do not
+// fully control, so each key is validated by `parseExtKey` to a single covered
+// `<type>/<safe-basename>` segment (no separators / traversal) before any
+// join/rm — a corrupt or malicious key can never delete outside the extension
+// directory. "Never delete unowned" holds via SHA MATCHING, not the prefix: a
+// file whose on-disk SHA differs from the recorded one is user-modified and
+// preserved unless --force-extensions; a symlink/non-regular target is always
+// preserved (force does not follow them, matching install/upgrade E3's guard).
 function removeExtensions(target, apply, force) {
   const targetRoot = target === 'codex' ? join(HOME, '.codex') : join(HOME, '.claude');
   const types = target === 'codex' ? CODEX_TYPES : EXT_TYPES;
@@ -158,37 +169,27 @@ function removeExtensions(target, apply, force) {
   const skippedUserModified = [];
   const skippedNonRegular = [];
 
-  for (const type of types) {
-    const typeDir = join(targetRoot, type);
-    if (!existsSync(typeDir)) continue;
-    let entries;
-    try {
-      entries = readdirSync(typeDir);
-    } catch {
+  for (const [key, recordedSHA] of Object.entries(recorded)) {
+    if (!recordedSHA) continue; // no ownership baseline → nothing to remove
+    const parsed = parseExtKey(key, types);
+    if (!parsed) continue; // untrusted / cross-target key → never join+rm
+    const fullPath = join(targetRoot, parsed.type, parsed.installFile);
+    if (!existsSync(fullPath)) continue; // already gone
+
+    if (!isRegularFile(fullPath)) {
+      // Refuse to follow symlinks/sockets even under --force-extensions.
+      skippedNonRegular.push(fullPath);
       continue;
     }
-    for (const fname of entries) {
-      if (!fname.startsWith(EXT_PREFIX)) continue;
-      const key = `${type}/${fname}`;
-      const recordedSHA = recorded[key];
-      if (!recordedSHA) continue; // not tracked by us → leave alone
-      const fullPath = join(typeDir, fname);
+    const buf = readFileIfRegular(fullPath);
+    const sha = buf ? sha256(buf) : null;
 
-      if (!isRegularFile(fullPath)) {
-        // Refuse to follow symlinks/sockets even under --force-extensions.
-        skippedNonRegular.push(fullPath);
-        continue;
-      }
-      const buf = readFileIfRegular(fullPath);
-      const sha = buf ? sha256(buf) : null;
-
-      if (sha === recordedSHA || force) {
-        if (apply) rmSync(fullPath);
-        removed.push(fullPath);
-        removedKeys.push(key);
-      } else {
-        skippedUserModified.push(fullPath);
-      }
+    if (sha === recordedSHA || force) {
+      if (apply) rmSync(fullPath);
+      removed.push(fullPath);
+      removedKeys.push(key);
+    } else {
+      skippedUserModified.push(fullPath);
     }
   }
   return { target, removed, removedKeys, skippedUserModified, skippedNonRegular };
