@@ -33,6 +33,7 @@ The lanes that already run on their own: v1.1.0 shipped the observability score 
 
 - Edit feedback in one place and the rest follows. `pages/feedback/` is the single source of truth for behavior corrections, and Hypomnema derives `MEMORY.md` and the `<learned_behaviors>` block inside `~/.claude/CLAUDE.md` from it automatically.
 - Extensions sync alongside. Anything under `~/hypomnema/extensions/{agents,commands,hooks,skills}/` is mirrored into `~/.claude/` automatically. The `--codex` flag also mirrors `hooks` and `commands` into `~/.codex/`; `agents` and `skills` are Claude-only and skipped on purpose.
+- Reverse capture goes the other way. `hypomnema capture` (or `/hypo:capture`) pulls a command or agent you made the normal way under `~/.claude/{commands,agents}/` into the wiki, so it then syncs to your other machines under its original name. Capture is explicit and never overwrites a differing wiki file. Hooks and skills are not captured yet.
 - Auto-project creation. When you `cd` into a git repo with a project marker (`package.json`, `Cargo.toml`, etc.) and no matching wiki project exists, Hypomnema offers to scaffold one.
 - Session-close cleanup and `/clear` recovery. After a non-trivial session, a "save a minimal session-close note?" prompt appears automatically; a `/clear` after a forgotten close is detected and recovered at the next session start.
 

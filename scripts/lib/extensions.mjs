@@ -49,6 +49,138 @@ export const CODEX_TYPES = ['hooks', 'commands'];
 // Per-type expected file extension. Hooks are executable .mjs; the rest are .md.
 const TYPE_FILE_EXT = { hooks: '.mjs', commands: '.md', skills: '.md', agents: '.md' };
 
+// Singular manifest `type` value per directory (capture design §3). A captured
+// extension's sidecar manifest must declare a `type` matching its parent dir
+// before its `installName` is honored (guards against a mislabelled manifest
+// retargeting an install path).
+const TYPE_SINGULAR = { hooks: 'hook', commands: 'command', skills: 'skill', agents: 'agent' };
+
+// installName carrier (capture design §3): reverse-captured commands/agents install
+// under the user's ORIGINAL name, not the wiki `hypo-ext-*` storage name. Only
+// commands/agents opt in — hooks keep the wiki name (their settings.json command
+// string is prefix-derived) and skills are not captured in the MVP.
+const INSTALLNAME_TYPES = new Set(['commands', 'agents']);
+
+// A valid installName stem: same conservative charset as SAFE_EXT_STEM but
+// WITHOUT the required hypo-ext- prefix (the whole point of C is to restore the
+// user's own name). Rejects path separators, traversal (leading dot blocks `..`
+// and `.`), and anything outside the charset.
+const SAFE_INSTALL_STEM = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+// Windows reserved device names (capture design §5 — the extensions-companion design chose hard-copy partly
+// for Windows compatibility, so an installName must never resolve to one).
+const WINDOWS_RESERVED = new Set([
+  'con',
+  'prn',
+  'aux',
+  'nul',
+  'com1',
+  'com2',
+  'com3',
+  'com4',
+  'com5',
+  'com6',
+  'com7',
+  'com8',
+  'com9',
+  'lpt1',
+  'lpt2',
+  'lpt3',
+  'lpt4',
+  'lpt5',
+  'lpt6',
+  'lpt7',
+  'lpt8',
+  'lpt9',
+]);
+
+/**
+ * True iff `stem` is a syntactically valid, non-reserved installName (the reverse-capture design
+ * §5). Case-insensitive on the reservations so `Hypo-x` cannot slip past on a
+ * case-insensitive filesystem. Does NOT append an extension — callers add
+ * TYPE_FILE_EXT in code so a manifest can never inject the extension.
+ */
+export function isValidInstallStem(stem) {
+  if (typeof stem !== 'string' || !SAFE_INSTALL_STEM.test(stem)) return false;
+  // Reject `..` anywhere, not just a leading dot: an internal `a..b` passes the
+  // charset but parseExtKey (uninstall) rejects it, which would strand a captured
+  // file it can never remove. Keep the two validators in agreement.
+  if (stem.includes('..')) return false;
+  const lower = stem.toLowerCase();
+  if (lower === 'hypo' || lower.startsWith('hypo-')) return false; // reserved namespace
+  // Windows treats a device name reserved even WITH an extension (`con.v1`), so
+  // test the segment before the first dot, not just the whole stem.
+  const base = lower.split('.')[0];
+  if (WINDOWS_RESERVED.has(base)) return false;
+  return true;
+}
+
+/**
+ * Resolve the install filename for a discovered extension (capture design §3).
+ * Returns `{ installFile }` — the basename under `~/.claude/<type>/`. Defaults
+ * to `ext.file` (the wiki storage name) so existing hypo-ext-* extensions are
+ * untouched (backward compatible). Only commands/agents with a sidecar manifest
+ * whose `type` matches the directory AND whose `installName` is valid install
+ * under the user's original name. A present-but-invalid installName yields
+ * `{ skip, warn }` — the extension is dropped rather than silently installed
+ * under a surprising name.
+ */
+export function resolveInstallFile(ext) {
+  if (!INSTALLNAME_TYPES.has(ext.type) || !ext.manifestPath) {
+    return { installFile: ext.file };
+  }
+  const parsed = parseManifest(ext.manifestPath);
+  // Non-hook manifests are always ok:true (parseManifest only fails hook ones),
+  // so a malformed non-hook manifest is not reachable here; be defensive anyway.
+  if (!parsed.ok) return { installFile: ext.file };
+  const m = parsed.manifest;
+  if (!m || m.type !== TYPE_SINGULAR[ext.type] || m.installName === undefined) {
+    return { installFile: ext.file };
+  }
+  if (!isValidInstallStem(m.installName)) {
+    return {
+      skip: true,
+      warn: `${ext.type}/${ext.file}: invalid installName "${m.installName}" — extension skipped`,
+    };
+  }
+  return { installFile: m.installName + TYPE_FILE_EXT[ext.type] };
+}
+
+/**
+ * Parse + validate a recorded pkg-json extension key `${type}/${installFile}`
+ * for destructive use (capture design §8 — uninstall traverses recorded keys, which
+ * come from an on-disk JSON we do not fully control). Returns
+ * `{ type, installFile }` only when the key is exactly one covered type, a
+ * single path segment for the filename (no separators / traversal), and the
+ * expected extension. Returns null otherwise so the caller skips it — never
+ * `join`s an untrusted key that could escape the extension directory.
+ */
+export function parseExtKey(key, coveredTypes) {
+  if (typeof key !== 'string') return null;
+  const slash = key.indexOf('/');
+  if (slash === -1) return null;
+  const type = key.slice(0, slash);
+  const installFile = key.slice(slash + 1);
+  if (!coveredTypes.includes(type)) return null;
+  // The filename portion must be a single safe segment: no further separators,
+  // no traversal, and it must end in the type's expected extension. Only HOOKS
+  // additionally track a `.manifest.json` sidecar copy in the SHA map, so the
+  // manifest suffix is accepted for hooks alone — accepting it for every type
+  // would let a forged `commands/x.manifest.json` key name a removable file that
+  // sync never owns (codex pre-commit CONCERN).
+  if (installFile.includes('/') || installFile.includes('\\')) return null;
+  if (installFile.includes('..') || installFile.startsWith('.')) return null;
+  const MANIFEST_SUFFIX = '.manifest.json';
+  const suffix =
+    type === 'hooks' && installFile.endsWith(MANIFEST_SUFFIX)
+      ? MANIFEST_SUFFIX
+      : TYPE_FILE_EXT[type];
+  if (!installFile.endsWith(suffix)) return null;
+  const stem = installFile.slice(0, -suffix.length);
+  if (stem.length === 0) return null;
+  return { type, installFile };
+}
+
 // Claude Code hook events (D3 allowlist). A manifest with an event outside this
 // set is malformed → the whole extension is skipped (no copy, no registration).
 export const HOOK_EVENT_ALLOWLIST = new Set([
@@ -387,9 +519,57 @@ export function syncExtensions({
 
   const expectedHookExts = [];
 
+  // capture design §3/§3a: resolve each extension's install filename (installName
+  // decoupling) and detect duplicate install targets BEFORE any hard-copy. A
+  // case-folded collision on `${type}/${installFile}` (two wiki files mapping to
+  // the same install path, or a case-only clash on macOS/Windows) skips the
+  // WHOLE group — otherwise file traversal order would decide ownership and
+  // overwrite/skip unpredictably. Keyed by ext object identity.
+  const installFileByExt = new Map();
+  const dupSkip = new Set();
+  for (const type of types) {
+    const seen = new Map(); // case-folded `${type}/${installFile}` → first ext
+    for (const ext of discovered[type]) {
+      const res = resolveInstallFile(ext);
+      if (res.skip) {
+        dupSkip.add(ext);
+        result.warnings.push(res.warn);
+        continue;
+      }
+      installFileByExt.set(ext, res.installFile);
+      const norm = `${type}/${res.installFile.toLowerCase()}`;
+      const first = seen.get(norm);
+      if (first !== undefined) {
+        dupSkip.add(ext);
+        dupSkip.add(first);
+        result.warnings.push(
+          `${type}/${res.installFile} install target claimed by multiple extensions — all skipped (rename installName)`,
+        );
+      } else {
+        seen.set(norm, ext);
+      }
+    }
+  }
+
+  // Preserve the ownership record of an already-installed file whose extension we
+  // now skip on a duplicate-target collision. Without this, the newSHAs map (which
+  // replaces the target map wholesale) would drop the recorded SHA and orphan the
+  // previously-owned installed copy — it would linger on disk, untracked by doctor
+  // and unreachable by uninstall (codex pre-commit BLOCKER).
+  for (const ext of dupSkip) {
+    const inst = installFileByExt.get(ext);
+    if (!inst) continue; // invalid-installName skip: never owned
+    const key = `${ext.type}/${inst}`;
+    if (recorded[key] !== undefined && newSHAs[key] === undefined) newSHAs[key] = recorded[key];
+  }
+
   for (const type of types) {
     const typeDir = join(targetRoot, type);
     for (const ext of discovered[type]) {
+      if (dupSkip.has(ext)) continue;
+      // Install under the manifest-declared installName (capture design §3) or, by
+      // default, the wiki storage name (backward compatible).
+      const installFile = installFileByExt.get(ext) ?? ext.file;
       // D3: validate the manifest before touching the filesystem.
       let manifestParsed = null;
       if (type === 'hooks') {
@@ -408,11 +588,12 @@ export function syncExtensions({
 
       if (apply) mkdirSync(typeDir, { recursive: true });
 
-      // (2) hard-copy the main file.
-      const fileKey = `${type}/${ext.file}`;
+      // (2) hard-copy the main file. Key + destPath use installFile so the
+      // recorded SHA map, doctor, and uninstall all agree on the install path.
+      const fileKey = `${type}/${installFile}`;
       const fileRes = copyOne({
         srcPath: ext.srcPath,
-        destPath: join(typeDir, ext.file),
+        destPath: join(typeDir, installFile),
         key: fileKey,
         recordedSHA: recorded[fileKey],
         apply,

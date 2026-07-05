@@ -22009,6 +22009,406 @@ test('importing crystallize.mjs runs no CLI and exposes exactly the pure exports
   );
 });
 
+// ── reverse extension capture (ADR 0061) ────────────────────────
+
+const { isValidInstallStem, resolveInstallFile, parseExtKey } = await import(
+  `${SCRIPTS}/lib/extensions.mjs`
+);
+const { planCapture, isCaptureCandidate } = await import(`${SCRIPTS}/capture.mjs`);
+
+suite('capture: isValidInstallStem (ADR 0061 §5)');
+
+test('accepts a plain user name', () => {
+  assert.ok(isValidInstallStem('mycmd'));
+  assert.ok(isValidInstallStem('my-cmd.v2'));
+});
+test('rejects the reserved hypo namespace case-insensitively', () => {
+  assert.ok(!isValidInstallStem('hypo'));
+  assert.ok(!isValidInstallStem('hypo-foo'));
+  assert.ok(!isValidInstallStem('Hypo-foo'));
+  assert.ok(!isValidInstallStem('HYPO-foo'));
+});
+test('rejects Windows reserved device stems, including dot-suffixed, case-insensitively', () => {
+  assert.ok(!isValidInstallStem('con'));
+  assert.ok(!isValidInstallStem('CON'));
+  assert.ok(!isValidInstallStem('com1'));
+  assert.ok(!isValidInstallStem('LPT9'));
+  assert.ok(!isValidInstallStem('con.v1')); // reserved even with an extension
+  assert.ok(!isValidInstallStem('AUX.backup'));
+  assert.ok(isValidInstallStem('com0')); // not a real device
+  assert.ok(isValidInstallStem('console')); // not a device name
+});
+test('rejects path separators, traversal (leading and internal), leading dot, empty', () => {
+  assert.ok(!isValidInstallStem('a/b'));
+  assert.ok(!isValidInstallStem('a\\b'));
+  assert.ok(!isValidInstallStem('..'));
+  assert.ok(!isValidInstallStem('a..b')); // internal traversal must match parseExtKey
+  assert.ok(!isValidInstallStem('.hidden'));
+  assert.ok(!isValidInstallStem(''));
+  assert.ok(!isValidInstallStem(42));
+});
+
+suite('capture: resolveInstallFile (ADR 0061 §3 installName decoupling)');
+
+// Build a discovered-ext shape with a real on-disk manifest for parseManifest.
+function extWithManifest(dir, type, file, manifest) {
+  const stem = file.replace(/\.[^.]+$/, '');
+  const manifestName = `${stem}.manifest.json`;
+  let manifestPath = null;
+  if (manifest !== undefined) {
+    manifestPath = join(dir, manifestName);
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+  }
+  return { type, name: stem, file, srcPath: join(dir, file), manifestName, manifestPath };
+}
+
+test('defaults to the wiki filename when no manifest (backward compatible)', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'commands', 'hypo-ext-legacy.md', undefined);
+    assert.deepEqual(resolveInstallFile(ext), { installFile: 'hypo-ext-legacy.md' });
+  });
+});
+test('honors installName when manifest.type matches the directory', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'commands', 'hypo-ext-new.md', {
+      type: 'command',
+      installName: 'newcmd',
+    });
+    assert.deepEqual(resolveInstallFile(ext), { installFile: 'newcmd.md' });
+  });
+});
+test('ignores installName when manifest.type mismatches the directory', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'commands', 'hypo-ext-x.md', {
+      type: 'agent',
+      installName: 'x',
+    });
+    assert.deepEqual(resolveInstallFile(ext), { installFile: 'hypo-ext-x.md' });
+  });
+});
+test('skips (not installs under wiki name) an invalid installName', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'commands', 'hypo-ext-bad.md', {
+      type: 'command',
+      installName: '../evil',
+    });
+    const res = resolveInstallFile(ext);
+    assert.equal(res.skip, true);
+    assert.ok(/invalid installName/.test(res.warn));
+  });
+});
+test('hooks keep the wiki name even with a hook manifest (installName is commands/agents only)', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
+      type: 'hook',
+      event: 'Stop',
+    });
+    assert.deepEqual(resolveInstallFile(ext), { installFile: 'hypo-ext-h.mjs' });
+  });
+});
+
+suite('capture: parseExtKey (ADR 0061 §8 uninstall key safety)');
+
+const COVERED = ['hooks', 'commands', 'skills', 'agents'];
+test('accepts a well-formed key', () => {
+  assert.deepEqual(parseExtKey('commands/mycmd.md', COVERED), {
+    type: 'commands',
+    installFile: 'mycmd.md',
+  });
+});
+test('rejects traversal / separators / wrong extension / unknown type', () => {
+  assert.equal(parseExtKey('commands/../evil.md', COVERED), null);
+  assert.equal(parseExtKey('commands/a/b.md', COVERED), null);
+  assert.equal(parseExtKey('commands/a..b.md', COVERED), null);
+  assert.equal(parseExtKey('commands/mycmd.txt', COVERED), null);
+  assert.equal(parseExtKey('hooks/x.md', COVERED), null); // hooks want .mjs
+  assert.equal(parseExtKey('unknown/x.md', COVERED), null);
+  assert.equal(parseExtKey('commands/.hidden.md', COVERED), null);
+  assert.equal(parseExtKey('nokey', COVERED), null);
+  assert.equal(parseExtKey('commands/', COVERED), null);
+});
+test('accepts the hook manifest sidecar but only for hooks', () => {
+  assert.deepEqual(parseExtKey('hooks/hypo-ext-x.manifest.json', COVERED), {
+    type: 'hooks',
+    installFile: 'hypo-ext-x.manifest.json',
+  });
+  // Only hooks record a manifest copy — a non-hook manifest key must not name a
+  // removable file (widened destructive surface).
+  assert.equal(parseExtKey('commands/x.manifest.json', COVERED), null);
+  assert.equal(parseExtKey('agents/x.manifest.json', COVERED), null);
+});
+test('respects the covered-types scope (codex excludes skills/agents)', () => {
+  assert.equal(parseExtKey('agents/x.md', ['hooks', 'commands']), null);
+  assert.deepEqual(parseExtKey('commands/x.md', ['hooks', 'commands']), {
+    type: 'commands',
+    installFile: 'x.md',
+  });
+});
+
+suite('capture: isCaptureCandidate + planCapture (ADR 0061 §6/§7)');
+
+test('candidate filter excludes hypo-*, non-.md, and already-owned', () => {
+  assert.ok(isCaptureCandidate('commands', 'mycmd.md', {}).ok);
+  assert.ok(!isCaptureCandidate('commands', 'hypo-core.md', {}).ok);
+  assert.ok(!isCaptureCandidate('commands', 'Hypo-core.md', {}).ok);
+  assert.ok(!isCaptureCandidate('commands', 'readme.txt', {}).ok);
+  assert.ok(!isCaptureCandidate('commands', 'owned.md', { 'commands/owned.md': 'sha' }).ok);
+});
+test('planCapture: ready when no wiki file exists', () => {
+  const p = planCapture({
+    type: 'commands',
+    stem: 'x',
+    srcSha: 'A',
+    existingMdSha: null,
+    existingManifestRaw: null,
+  });
+  assert.equal(p.status, 'ready');
+  assert.deepEqual(p.manifest, { type: 'command', installName: 'x' });
+});
+test('planCapture: invalid stem', () => {
+  const p = planCapture({
+    type: 'commands',
+    stem: 'hypo-x',
+    srcSha: 'A',
+    existingMdSha: null,
+    existingManifestRaw: null,
+  });
+  assert.equal(p.status, 'invalid');
+});
+test('planCapture: conflict when wiki .md differs', () => {
+  const p = planCapture({
+    type: 'commands',
+    stem: 'x',
+    srcSha: 'A',
+    existingMdSha: 'B',
+    existingManifestRaw: null,
+  });
+  assert.equal(p.status, 'conflict');
+});
+test('planCapture: conflict when .md matches but manifest missing', () => {
+  const p = planCapture({
+    type: 'commands',
+    stem: 'x',
+    srcSha: 'A',
+    existingMdSha: 'A',
+    existingManifestRaw: null,
+  });
+  assert.equal(p.status, 'conflict');
+});
+test('planCapture: conflict when manifest declares a different installName', () => {
+  const raw = JSON.stringify({ type: 'command', installName: 'other' });
+  const p = planCapture({
+    type: 'commands',
+    stem: 'x',
+    srcSha: 'A',
+    existingMdSha: 'A',
+    existingManifestRaw: raw,
+  });
+  assert.equal(p.status, 'conflict');
+});
+test('planCapture: already when .md + manifest both match', () => {
+  const raw = JSON.stringify({ type: 'command', installName: 'x' });
+  const p = planCapture({
+    type: 'commands',
+    stem: 'x',
+    srcSha: 'A',
+    existingMdSha: 'A',
+    existingManifestRaw: raw,
+  });
+  assert.equal(p.status, 'already');
+});
+test('planCapture: conflict on a stray manifest with a different mapping', () => {
+  const raw = JSON.stringify({ type: 'command', installName: 'other' });
+  const p = planCapture({
+    type: 'commands',
+    stem: 'x',
+    srcSha: 'A',
+    existingMdSha: null,
+    existingManifestRaw: raw,
+  });
+  assert.equal(p.status, 'conflict');
+});
+
+suite('capture: forward-sync installFile integration (backward compat + adopt)');
+
+test('installName-less command installs under the wiki name (no regression)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeExt(hypoDir, 'commands', 'hypo-ext-legacy.md', '# legacy\n');
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(existsSync(join(home, '.claude', 'commands', 'hypo-ext-legacy.md')));
+    });
+  });
+});
+test('installName manifest installs under the original name', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeExt(hypoDir, 'commands', 'hypo-ext-new.md', '# new\n', {
+        type: 'command',
+        installName: 'newcmd',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(
+        existsSync(join(home, '.claude', 'commands', 'newcmd.md')),
+        'installed under installName',
+      );
+      assert.ok(
+        !existsSync(join(home, '.claude', 'commands', 'hypo-ext-new.md')),
+        'wiki storage name NOT installed',
+      );
+    });
+  });
+});
+test('duplicate installName skips the whole group (no partial install)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeExt(hypoDir, 'commands', 'hypo-ext-a.md', '# a\n', {
+        type: 'command',
+        installName: 'dup',
+      });
+      writeExt(hypoDir, 'commands', 'hypo-ext-b.md', '# b\n', {
+        type: 'command',
+        installName: 'dup',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(
+        !existsSync(join(home, '.claude', 'commands', 'dup.md')),
+        'no file installed on collision',
+      );
+    });
+  });
+});
+test('a later duplicate does not orphan an already-owned installed file', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      // A owns commands/dup.md after the first sync.
+      writeExt(hypoDir, 'commands', 'hypo-ext-a.md', '# a\n', {
+        type: 'command',
+        installName: 'dup',
+      });
+      assert.equal(
+        runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home).status,
+        0,
+      );
+      let pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(pkg.extensions.claude['commands/dup.md'], 'A owns dup.md after first sync');
+      // Now a colliding B appears; the group is skipped but A's ownership record
+      // must survive so the installed file is not orphaned.
+      writeExt(hypoDir, 'commands', 'hypo-ext-b.md', '# b\n', {
+        type: 'command',
+        installName: 'dup',
+      });
+      assert.equal(
+        runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home).status,
+        0,
+      );
+      pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions.claude['commands/dup.md'],
+        'ownership of the already-installed file is preserved on a later collision',
+      );
+    });
+  });
+});
+test('capture refuses a wiki target that is a symlink (no follow, no overwrite)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      mkdirSync(join(home, '.claude', 'commands'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'commands', 'mycmd.md'), '# mine\n');
+      // Plant a symlink at the wiki storage path pointing outside the wiki.
+      const outside = join(dir, 'secret.txt');
+      writeFileSync(outside, 'ORIGINAL SECRET\n');
+      const wikiCmds = join(hypoDir, 'extensions', 'commands');
+      mkdirSync(wikiCmds, { recursive: true });
+      symlinkSync(outside, join(wikiCmds, 'hypo-ext-mycmd.md'));
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      // Refused as a conflict: the symlink is never followed or overwritten, and
+      // nothing is adopted (no ownership recorded for the install path).
+      assert.match(r.stdout, /not a regular file/);
+      assert.equal(readFileSync(outside, 'utf-8'), 'ORIGINAL SECRET\n', 'symlink target untouched');
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const owned = existsSync(pkgPath)
+        ? (JSON.parse(readFileSync(pkgPath, 'utf-8')).extensions?.claude ?? {})
+        : {};
+      assert.ok(!owned['commands/mycmd.md'], 'nothing adopted on conflict');
+    });
+  });
+});
+
+suite('capture: end-to-end adopt + uninstall by key');
+
+test('capture --all adopts into wiki and records ownership under the install path', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      mkdirSync(join(home, '.claude', 'commands'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'commands', 'mycmd.md'), '# My Command\n');
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(existsSync(join(hypoDir, 'extensions', 'commands', 'hypo-ext-mycmd.md')));
+      assert.ok(
+        existsSync(join(hypoDir, 'extensions', 'commands', 'hypo-ext-mycmd.manifest.json')),
+      );
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions.claude['commands/mycmd.md'],
+        'ownership recorded under install path',
+      );
+    });
+  });
+});
+test('uninstall --apply removes the captured install-path file and preserves unowned', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      mkdirSync(join(home, '.claude', 'commands'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'commands', 'mycmd.md'), '# owned\n');
+      assert.equal(runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home).status, 0);
+      writeFileSync(join(home, '.claude', 'commands', 'foreign.md'), '# foreign\n');
+      const r = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(!existsSync(join(home, '.claude', 'commands', 'mycmd.md')), 'owned removed');
+      assert.ok(existsSync(join(home, '.claude', 'commands', 'foreign.md')), 'unowned preserved');
+    });
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
