@@ -412,7 +412,9 @@ export function parseCapturableHookCommand(command) {
 /**
  * Pure, defensive walk of `settings.hooks[event][group].hooks[]` (capture design
  * F4). Yields one record per hook entry:
- * `{ event, matcher, timeout, command, hookKeys, groupKeys }`. `matcher` is taken
+ * `{ event, matcher, type, timeout, command, hookKeys, groupKeys }`. `type` is the
+ * raw `entry.type` value (reverse-capture requires `'command'`, distinct from the
+ * `type` KEY that hookKeys reports). `matcher` is taken
  * verbatim from the parent group with `''` normalized to absent (undefined),
  * matching `parseManifest`/`registerSettings`. Any malformed rung (non-array
  * event list, non-object group, non-array hook list, non-object hook) is skipped
@@ -437,6 +439,7 @@ export function scanSettingsHooks(settings) {
         records.push({
           event,
           matcher,
+          type: entry.type,
           timeout: entry.timeout,
           command: entry.command,
           hookKeys: Object.keys(entry),
