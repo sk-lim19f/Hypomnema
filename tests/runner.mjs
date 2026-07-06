@@ -22172,9 +22172,14 @@ test('importing crystallize.mjs runs no CLI and exposes exactly the pure exports
 
 // ── reverse extension capture (ADR 0061) ────────────────────────
 
-const { isValidInstallStem, resolveInstallFile, parseExtKey } = await import(
-  `${SCRIPTS}/lib/extensions.mjs`
-);
+const {
+  isValidInstallStem,
+  resolveInstallFile,
+  parseExtKey,
+  buildHookCommand,
+  parseCapturableHookCommand,
+  scanSettingsHooks,
+} = await import(`${SCRIPTS}/lib/extensions.mjs`);
 const { planCapture, isCaptureCandidate } = await import(`${SCRIPTS}/capture.mjs`);
 
 suite('capture: isValidInstallStem (ADR 0061 §5)');
@@ -22568,6 +22573,203 @@ test('uninstall --apply removes the captured install-path file and preserves uno
       assert.ok(existsSync(join(home, '.claude', 'commands', 'foreign.md')), 'unowned preserved');
     });
   });
+});
+
+// ── reverse hook capture: command builder + strict parser + settings scanner ──
+
+suite('capture: buildHookCommand / parseCapturableHookCommand round-trip');
+
+test('round-trip accept: a HOME-relative dir builds a command the parser restores', () => {
+  const hooksDir = join(HOME, '.claude', 'hooks');
+  for (const stem of ['mycmd', 'my-hook.v2', 'a_b.c']) {
+    const command = buildHookCommand(hooksDir, `${stem}.mjs`);
+    assert.equal(command, `node $HOME/.claude/hooks/${stem}.mjs`);
+    const parsed = parseCapturableHookCommand(command);
+    assert.ok(parsed.ok, `${stem} should round-trip`);
+    assert.equal(parsed.stem, stem);
+    assert.equal(parsed.basename, `${stem}.mjs`);
+  }
+});
+test('round-trip reject: a dir outside HOME builds an absolute command the parser rejects', () => {
+  withTmpDir((dir) => {
+    // withTmpDir lives under tmpdir(), outside HOME — .replace(HOME,'$HOME') is a
+    // no-op so the builder emits an absolute path the strict parser must refuse
+    // (proves no silent accept of a non-canonical registration).
+    const hooksDir = join(dir, 'hooks');
+    const command = buildHookCommand(hooksDir, 'x.mjs');
+    assert.ok(command.startsWith(`node ${hooksDir}/`), 'builder kept the absolute path');
+    const parsed = parseCapturableHookCommand(command);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.reason, 'path-not-under-home-hooks');
+  });
+});
+
+suite('capture: parseCapturableHookCommand strict axes');
+
+test('accepts the exact canonical form', () => {
+  const parsed = parseCapturableHookCommand('node $HOME/.claude/hooks/mycmd.mjs');
+  assert.deepEqual(parsed, { ok: true, stem: 'mycmd', basename: 'mycmd.mjs' });
+});
+test('rejects a non-string with a distinct reason', () => {
+  assert.deepEqual(parseCapturableHookCommand(42), { ok: false, reason: 'not-a-string' });
+  assert.deepEqual(parseCapturableHookCommand(null), { ok: false, reason: 'not-a-string' });
+  assert.deepEqual(parseCapturableHookCommand(undefined), { ok: false, reason: 'not-a-string' });
+});
+test('rejects CR/LF', () => {
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/x.mjs\n').reason,
+    'contains-newline',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/x.mjs\r').reason,
+    'contains-newline',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/a\nb.mjs').reason,
+    'contains-newline',
+  );
+});
+test('rejects a bad node prefix, including double space and tab', () => {
+  assert.equal(
+    parseCapturableHookCommand('nodex $HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  );
+  assert.equal(
+    parseCapturableHookCommand('/usr/bin/node $HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node  $HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  ); // double space
+  assert.equal(
+    parseCapturableHookCommand('node\t$HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  ); // tab for space
+  assert.equal(
+    parseCapturableHookCommand('node \t$HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  ); // space then tab
+  assert.equal(parseCapturableHookCommand('node ').reason, 'bad-node-prefix');
+});
+test('rejects a path not under $HOME/.claude/hooks (tilde, relative, env prefix, absolute)', () => {
+  assert.equal(
+    parseCapturableHookCommand('node ~/.claude/hooks/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node .claude/hooks/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+  assert.equal(parseCapturableHookCommand('node hooks/x.mjs').reason, 'path-not-under-home-hooks');
+  assert.equal(
+    parseCapturableHookCommand('node FOO=1 $HOME/.claude/hooks/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node /Users/foo/.claude/hooks/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/agents/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+});
+test('rejects a nested segment or traversal in the tail', () => {
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/sub/x.mjs').reason,
+    'nested-segment',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/../x.mjs').reason,
+    'nested-segment',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/a..b.mjs').reason,
+    'nested-segment',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/a\\b.mjs').reason,
+    'nested-segment',
+  );
+});
+test('rejects a non-.mjs tail', () => {
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x.js').reason, 'not-mjs');
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x').reason, 'not-mjs');
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x.mjs.bak').reason, 'not-mjs');
+});
+test('rejects a stem that fails isValidInstallStem, including the reserved hypo namespace', () => {
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/hypo-core.mjs').reason,
+    'invalid-stem',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/Hypo-x.mjs').reason,
+    'invalid-stem',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/con.mjs').reason,
+    'invalid-stem',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/.hidden.mjs').reason,
+    'invalid-stem',
+  );
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/.mjs').reason, 'invalid-stem'); // empty stem
+});
+
+suite('capture: scanSettingsHooks defensive walk');
+
+test('yields one record per hook with matcher attribution and event/group keys', () => {
+  const settings = {
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: 'Bash',
+          hooks: [
+            { type: 'command', command: 'node $HOME/.claude/hooks/a.mjs', timeout: 5 },
+            { type: 'command', command: 'node $HOME/.claude/hooks/b.mjs' },
+          ],
+        },
+      ],
+      Stop: [{ hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/c.mjs' }] }],
+    },
+  };
+  const records = scanSettingsHooks(settings);
+  assert.equal(records.length, 3);
+  const a = records.find((r) => r.command.endsWith('a.mjs'));
+  assert.equal(a.event, 'PreToolUse');
+  assert.equal(a.matcher, 'Bash');
+  assert.equal(a.timeout, 5);
+  assert.deepEqual(a.hookKeys, ['type', 'command', 'timeout']);
+  assert.deepEqual(a.groupKeys, ['matcher', 'hooks']);
+  const b = records.find((r) => r.command.endsWith('b.mjs'));
+  assert.equal(b.matcher, 'Bash'); // attributed verbatim from the shared parent group
+  assert.equal(b.timeout, undefined);
+  const c = records.find((r) => r.command.endsWith('c.mjs'));
+  assert.equal(c.event, 'Stop');
+  assert.equal(c.matcher, undefined); // no matcher on the group
+});
+test('normalizes an empty-string matcher to absent', () => {
+  const records = scanSettingsHooks({
+    hooks: {
+      Stop: [
+        { matcher: '', hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/x.mjs' }] },
+      ],
+    },
+  });
+  assert.equal(records.length, 1);
+  assert.equal(records[0].matcher, undefined);
+});
+test('skips malformed rungs without throwing', () => {
+  assert.deepEqual(scanSettingsHooks(null), []);
+  assert.deepEqual(scanSettingsHooks(42), []);
+  assert.deepEqual(scanSettingsHooks({}), []);
+  assert.deepEqual(scanSettingsHooks({ hooks: [] }), []); // hooks must be an object map
+  assert.deepEqual(scanSettingsHooks({ hooks: { Stop: {} } }), []); // event value must be an array
+  assert.deepEqual(scanSettingsHooks({ hooks: { Stop: ['notgroup'] } }), []); // group must be an object
+  assert.deepEqual(scanSettingsHooks({ hooks: { Stop: [{ hooks: 'x' }] } }), []); // hook list must be an array
+  assert.deepEqual(scanSettingsHooks({ hooks: { Stop: [{ hooks: ['notobj', null, 42] }] } }), []); // hook entries must be objects
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────

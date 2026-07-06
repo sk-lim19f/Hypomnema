@@ -339,6 +339,109 @@ export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
   return entries;
 }
 
+/**
+ * The single source of the settings.json hook command string (capture design
+ * F4). Both the forward path (`buildExpectedSettingsEntries`) and the reverse
+ * strict parser (`parseCapturableHookCommand`) mirror this one shape so the two
+ * directions can never drift. `hooksDir` is `<HOME>/.claude/hooks`, rewritten to
+ * a `$HOME` literal so a captured registration stays portable across machines.
+ */
+export function buildHookCommand(hooksDir, installFile) {
+  return `node ${hooksDir.replace(HOME, '$HOME')}/${installFile}`;
+}
+
+// The exact canonical hook path prefix that `buildHookCommand` emits for a dir
+// under HOME. The strict parser accepts only this literal — an absolute path, a
+// `~`, or an env prefix all diverge and are rejected with a visible reason.
+const CAPTURABLE_HOOK_PATH_PREFIX = '$HOME/.claude/hooks/';
+const CAPTURABLE_NODE_PREFIX = 'node ';
+const MJS_EXT = '.mjs';
+
+/**
+ * Strict, fs-free parser for a capturable hook command (capture design F4). It
+ * accepts ONLY the byte-for-byte shape `buildHookCommand` produces for a dir
+ * under HOME: `node $HOME/.claude/hooks/<stem>.mjs`. Returns
+ * `{ ok:true, stem, basename }` on a match, else `{ ok:false, reason }` with a
+ * distinct reason per rejection axis so a caller can surface why a hook was not
+ * captured (never a silent drop). This is deliberately NOT the lenient
+ * `_extractCommandFileName` used by init: capture eligibility must be exact.
+ */
+export function parseCapturableHookCommand(command) {
+  if (typeof command !== 'string') return { ok: false, reason: 'not-a-string' };
+  // A newline in a command would break the one-line canonical shape and could
+  // smuggle a second statement past a prefix check.
+  if (/[\r\n]/.test(command)) return { ok: false, reason: 'contains-newline' };
+  if (!command.startsWith(CAPTURABLE_NODE_PREFIX)) {
+    return { ok: false, reason: 'bad-node-prefix' };
+  }
+  const rest = command.slice(CAPTURABLE_NODE_PREFIX.length);
+  // Reject extra leading whitespace (a double space or a tab after `node`): the
+  // builder emits exactly one space, so anything more is a lossy divergence.
+  if (rest.length === 0 || rest[0] === ' ' || rest[0] === '\t') {
+    return { ok: false, reason: 'bad-node-prefix' };
+  }
+  if (!rest.startsWith(CAPTURABLE_HOOK_PATH_PREFIX)) {
+    // Covers `~`, a relative path, an env prefix, and an absolute path — none
+    // start with the `$HOME/.claude/hooks/` literal.
+    return { ok: false, reason: 'path-not-under-home-hooks' };
+  }
+  const tail = rest.slice(CAPTURABLE_HOOK_PATH_PREFIX.length);
+  // The tail must be a single filename segment: no further separators (no
+  // subdirectory) and no traversal.
+  if (tail.includes('/') || tail.includes('\\') || tail.includes('..')) {
+    return { ok: false, reason: 'nested-segment' };
+  }
+  if (!tail.endsWith(MJS_EXT)) {
+    return { ok: false, reason: 'not-mjs' };
+  }
+  const stem = tail.slice(0, -MJS_EXT.length);
+  // Same stem gate as install (rejects the reserved hypo-* namespace, Windows
+  // device names, and out-of-charset names) so parse and install agree.
+  if (!isValidInstallStem(stem)) {
+    return { ok: false, reason: 'invalid-stem' };
+  }
+  return { ok: true, stem, basename: tail };
+}
+
+/**
+ * Pure, defensive walk of `settings.hooks[event][group].hooks[]` (capture design
+ * F4). Yields one record per hook entry:
+ * `{ event, matcher, timeout, command, hookKeys, groupKeys }`. `matcher` is taken
+ * verbatim from the parent group with `''` normalized to absent (undefined),
+ * matching `parseManifest`/`registerSettings`. Any malformed rung (non-array
+ * event list, non-object group, non-array hook list, non-object hook) is skipped
+ * rather than throwing, so a hand-edited settings.json cannot crash the caller.
+ */
+export function scanSettingsHooks(settings) {
+  const records = [];
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return records;
+  const hooks = settings.hooks;
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return records;
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!group || typeof group !== 'object' || Array.isArray(group)) continue;
+      const groupKeys = Object.keys(group);
+      let matcher = group.matcher;
+      if (matcher === '') matcher = undefined; // empty matcher === absent matcher
+      const hookList = group.hooks;
+      if (!Array.isArray(hookList)) continue;
+      for (const entry of hookList) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        records.push({
+          event,
+          matcher,
+          timeout: entry.timeout,
+          command: entry.command,
+          hookKeys: Object.keys(entry),
+          groupKeys,
+        });
+      }
+    }
+  }
+  return records;
+}
+
 /** Read the full hypo-pkg.json without any side effect (cf. pkg-json.readPkgJson,
  * which renames a corrupt file — unsafe for read-only callers, plan §5 #3). */
 function readFullPkgNoMutate(pkgPath) {
