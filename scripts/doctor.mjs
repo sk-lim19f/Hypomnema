@@ -886,6 +886,30 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
       if (!parsed.ok || !parsed.registrable) {
         const cmd = cmdFor(ext);
         if (cmd) unregistrableCmds.add(cmd);
+        // Manifest-invalid fallback (codex pre-commit CONCERN): when the manifest
+        // is unparseable, resolveInstallFile falls back to the wiki storage name,
+        // so cmdFor no longer reproduces the command this hook was actually
+        // registered under (its installName). Recover the real registered command
+        // by matching the wiki source SHA against the recorded owned-set: forward
+        // sync records each install `.mjs` key under the SHA of its wiki source, so
+        // an equal SHA identifies the true install path even after the manifest
+        // breaks. Without this the lingering installName entry is misreported as
+        // "source extension removed" though the source is present. Guarded on
+        // `!sourceCmds.has` so a command a healthy source already owns is never
+        // reclassified as unregistrable.
+        if (!parsed.ok) {
+          const srcBuf = readFileIfRegular(ext.srcPath);
+          if (srcBuf) {
+            const srcSha = sha256(srcBuf);
+            for (const [key, sha] of Object.entries(recorded)) {
+              if (sha !== srcSha) continue;
+              const pk = parseExtKey(key, types);
+              if (!pk || pk.type !== 'hooks' || !pk.installFile.endsWith('.mjs')) continue;
+              const realCmd = buildHookCommand(hooksDir, pk.installFile);
+              if (!sourceCmds.has(realCmd)) unregistrableCmds.add(realCmd);
+            }
+          }
+        }
       }
     }
     // Owned-command set for the orphan prefilter (P2): the hypo-ext-* regex below

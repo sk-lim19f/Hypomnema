@@ -38,7 +38,13 @@ import {
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { pathToFileURL, fileURLToPath } from 'url';
-import { sha256, isRegularFile, readFileIfRegular } from './lib/pkg-json.mjs';
+import {
+  sha256,
+  isRegularFile,
+  readFileIfRegular,
+  readPkgJson,
+  writePkgJsonAtomic,
+} from './lib/pkg-json.mjs';
 import { resolveHypoRoot } from './lib/hypo-root.mjs';
 import {
   syncExtensions,
@@ -399,6 +405,30 @@ function rollbackRec(rec) {
   }
 }
 
+// Remove specific per-target ownership keys from hypo-pkg.json (codex pre-commit
+// CONCERN). A partial adopt can leave forward-sync having recorded SOME of a
+// capture's install keys (e.g. the byte-identical `.mjs` was owned but its sidecar
+// manifest could not be), and the wiki-file rollback alone would leave that
+// ownership stranded: a later capture would skip the hook as already-managed and
+// uninstall would trust the recorded SHA and delete the user's ORIGINAL hook.
+// Reads the freshly-written pkg, drops only the given keys, and rewrites atomically.
+function purgeOwnedKeys(pkgPath, target, keys) {
+  if (keys.size === 0) return;
+  const pkg = readPkgJson(pkgPath);
+  const ext = pkg.extensions;
+  if (!ext || typeof ext !== 'object' || Array.isArray(ext)) return;
+  const perTarget = ext[target];
+  if (!perTarget || typeof perTarget !== 'object' || Array.isArray(perTarget)) return;
+  let changed = false;
+  for (const k of keys) {
+    if (perTarget[k] !== undefined) {
+      delete perTarget[k];
+      changed = true;
+    }
+  }
+  if (changed) writePkgJsonAtomic(pkgPath, pkg);
+}
+
 function run(args, { claudeHome = join(HOME, '.claude') } = {}) {
   const extDir = join(args.hypoDir, 'extensions');
   const settingsPath = join(claudeHome, 'settings.json');
@@ -587,6 +617,11 @@ function run(args, { claudeHome = join(HOME, '.claude') } = {}) {
   // not take (e.g. the install target changed between copy and sync → skip-conflict
   // with a null SHA) so the wiki does not keep an un-adopted file. Hooks require
   // BOTH the `.mjs` and the sidecar `.manifest.json` keys (success criterion d).
+  // Ownership keys that this run's sync newly recorded for a capture whose adoption
+  // then failed. `recorded` is the pre-sync owned map, so a key absent there but
+  // present in newSHAs is new THIS run: safe to strip. A key already owned before
+  // this run is preserved (never touched here).
+  const strayOwnedKeys = new Set();
   for (const c of toAdopt) {
     if (c.requiredKeys.every((k) => newSHAs[k])) {
       c.status = 'captured';
@@ -595,8 +630,18 @@ function run(args, { claudeHome = join(HOME, '.claude') } = {}) {
       failed.push(c);
       const rec = created.find((r) => r.type === c.type && r.stem === c.stem);
       if (rec) rollbackRec(rec);
+      for (const k of c.requiredKeys) {
+        if (recorded[k] === undefined && newSHAs[k] !== undefined) strayOwnedKeys.add(k);
+      }
     }
   }
+  // Never strip a key a successful capture still depends on (distinct install
+  // stems make this impossible in practice, but the guard keeps the rollback
+  // strictly scoped to failed captures).
+  for (const c of toAdopt) {
+    if (c.status === 'captured') for (const k of c.requiredKeys) strayOwnedKeys.delete(k);
+  }
+  purgeOwnedKeys(pkgJsonPath(), 'claude', strayOwnedKeys);
   const okCaptured = captured.filter((c) => c.status === 'captured' || c.status === 'already');
   for (const w of sync.warnings || []) log(`  sync: ${w}`);
   report(okCaptured, skipped, failed, args.dryRun);

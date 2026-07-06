@@ -18,9 +18,9 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 node ${CLAUDE_PLUGIN_ROOT}/scripts/capture.mjs [--hypo-dir="<path>"]
 ```
 
-With no names and no `--all`, the script lists capturable candidates and stops. It excludes anything already managed by the wiki, the reserved `hypo-*` namespace, symlinks, and non-`.md` files.
+With no names and no `--all`, the script lists capturable candidates and stops. Candidates come from two sources: commands and agents are the unowned regular `.md` files under `~/.claude/{commands,agents}/`, and hooks are the canonical `node $HOME/.claude/hooks/<name>.mjs` entries registered in `~/.claude/settings.json`. It excludes anything already managed by the wiki, the reserved `hypo-*` namespace, symlinks and other non-regular files, core hooks, and any hook whose registration would not round-trip losslessly. Every exclusion is printed with a reason.
 
-Show the list. Note that these are every unowned regular `.md` under the top-level directories, not a provenance check: explicit selection is the trust boundary. A third-party tool's file could appear here, so let the user pick deliberately.
+Show the list. Note that these are unowned candidates, not a provenance check: explicit selection is the trust boundary. A third-party tool's command, agent, or hook could appear here, so let the user pick deliberately.
 
 ## Step 3: Capture the user's selection
 
@@ -31,7 +31,7 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/capture.mjs [--hypo-dir="<path>"] <name> [<na
 node ${CLAUDE_PLUGIN_ROOT}/scripts/capture.mjs [--hypo-dir="<path>"] --all
 ```
 
-A name is the filename (`mycmd.md`), its stem (`mycmd`), or the `type/file` form (`commands/mycmd.md`). Add `--dry-run` to preview without writing.
+A name is the filename (`mycmd.md`, or `myhook.mjs` for a hook), its stem (`mycmd`), or the `type/file` form (`commands/mycmd.md`, `hooks/myhook.mjs`). Add `--dry-run` to preview without writing.
 
 Each capture stores the file in the wiki as `extensions/<type>/hypo-ext-<name>.<ext>` (`.md` for commands and agents, `.mjs` for hooks) with a sidecar `hypo-ext-<name>.manifest.json` that records the original install name (and, for a hook, its event, matcher, and timeout), then adopts it so the currently-installed copy is left in place and tracked. A wiki file that already exists with different content (or a mismatched manifest) is refused, not overwritten.
 

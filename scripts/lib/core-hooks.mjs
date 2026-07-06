@@ -58,6 +58,39 @@ export function readCoreHooksConfig(pkgRoot) {
   if (!Array.isArray(cfg.shared)) {
     return { ok: false, error: 'hooks/hooks.json must contain a "shared" array', cfg };
   }
+  // Nested shape: a structurally odd rung (event not an array, a group without a
+  // hooks array, a hook entry with no string command, a non-string shared element)
+  // is silently skipped by deriveCoreHookBasenames, yielding a THIN reserved set.
+  // That is the gap through which a core hook could leak into reverse-capture, so
+  // validate every rung and fail closed. cfg is still attached so init can run its
+  // own detailed validation and emit its own specific error.
+  for (const groups of Object.values(cfg.hooks)) {
+    if (!Array.isArray(groups)) {
+      return { ok: false, error: 'each hooks event must map to an array of groups', cfg };
+    }
+    for (const group of groups) {
+      if (typeof group === 'string') continue; // legacy bare-filename group
+      if (!group || typeof group !== 'object' || Array.isArray(group)) {
+        return { ok: false, error: 'each hook group must be an object or a filename string', cfg };
+      }
+      if (!Array.isArray(group.hooks)) {
+        return { ok: false, error: 'each hook group must contain a "hooks" array', cfg };
+      }
+      for (const hook of group.hooks) {
+        if (!hook || typeof hook !== 'object' || Array.isArray(hook)) {
+          return { ok: false, error: 'each hook entry must be an object', cfg };
+        }
+        if (typeof hook.command !== 'string') {
+          return { ok: false, error: 'each hook entry must have a string command', cfg };
+        }
+      }
+    }
+  }
+  for (const file of cfg.shared) {
+    if (typeof file !== 'string') {
+      return { ok: false, error: 'each "shared" entry must be a string', cfg };
+    }
+  }
   return { ok: true, cfg };
 }
 

@@ -671,8 +671,18 @@ export function syncExtensions({
   for (const ext of dupSkip) {
     const inst = installFileByExt.get(ext);
     if (!inst) continue; // invalid-installName skip: never owned
-    const key = `${ext.type}/${inst}`;
-    if (recorded[key] !== undefined && newSHAs[key] === undefined) newSHAs[key] = recorded[key];
+    // Preserve BOTH ownership keys a hook records: the main `.mjs` AND its paired
+    // `.manifest.json` sidecar. Preserving only the main key (codex pre-commit
+    // CONCERN) would drop the sidecar SHA on a duplicate-target collision, leaving
+    // the installed manifest copy on disk untracked by doctor and unreachable by
+    // uninstall. commands/agents have no sidecar, so their single key is preserved.
+    const keys = [`${ext.type}/${inst}`];
+    if (ext.type === 'hooks') {
+      keys.push(`${ext.type}/${inst.replace(/\.mjs$/, '.manifest.json')}`);
+    }
+    for (const key of keys) {
+      if (recorded[key] !== undefined && newSHAs[key] === undefined) newSHAs[key] = recorded[key];
+    }
   }
 
   for (const type of types) {
