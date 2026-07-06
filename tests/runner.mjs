@@ -615,6 +615,167 @@ test('pre-commit hook blocks staged .env file via git commit', () => {
   });
 });
 
+// ── lib/core-hooks.mjs (exit-free hooks.json loader) ─────────────────────────
+
+const { readCoreHooksConfig, deriveCoreHookBasenames } = await import(
+  `${SCRIPTS}/lib/core-hooks.mjs`
+);
+
+// Write a hooks.json into a temp package root and return that root.
+function withPkgHooksJson(content, fn) {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'hooks'), { recursive: true });
+    writeFileSync(join(dir, 'hooks', 'hooks.json'), content);
+    fn(dir);
+  });
+}
+
+suite('readCoreHooksConfig()');
+
+test('missing hooks.json → ok:false, does not throw, no cfg key', () => {
+  const missing = join(tmpdir(), `hypo-no-pkg-${process.pid}-${Date.now()}`);
+  let res;
+  assert.doesNotThrow(() => {
+    res = readCoreHooksConfig(missing);
+  });
+  assert.equal(res.ok, false);
+  assert.ok(typeof res.error === 'string' && res.error.length > 0, 'expected an error string');
+  assert.ok(!('cfg' in res), 'read failure must not attach cfg');
+});
+
+test('invalid JSON → ok:false, no cfg key (parse failure)', () => {
+  withPkgHooksJson('{ not: valid json', (dir) => {
+    const res = readCoreHooksConfig(dir);
+    assert.equal(res.ok, false);
+    assert.ok(!('cfg' in res), 'parse failure must not attach cfg');
+  });
+});
+
+test('real packaged hooks.json → ok:true with cfg', () => {
+  const res = readCoreHooksConfig(REPO);
+  assert.equal(res.ok, true, `expected real hooks.json to load: ${res.error}`);
+  assert.ok(res.cfg && typeof res.cfg === 'object', 'cfg should be an object');
+});
+
+test('fail-closed: parses to a non-object shape → ok:false but cfg attached', () => {
+  // A parsed-but-wrong shape is a fail (capture must skip hooks), yet init needs
+  // the parsed value to run its own validation, so cfg is attached.
+  for (const raw of ['null', '[]', '"str"', '42']) {
+    withPkgHooksJson(raw, (dir) => {
+      const res = readCoreHooksConfig(dir);
+      assert.equal(res.ok, false, `${raw} must be fail-closed`);
+      assert.ok('cfg' in res, `${raw} parsed, so cfg must be attached for init`);
+    });
+  }
+});
+
+test('fail-closed: object missing hooks map → ok:false', () => {
+  withPkgHooksJson('{"shared":["hypo-shared.mjs"]}', (dir) => {
+    const res = readCoreHooksConfig(dir);
+    assert.equal(res.ok, false);
+    assert.ok('cfg' in res);
+  });
+});
+
+test('fail-closed: hooks not an object → ok:false', () => {
+  withPkgHooksJson('{"hooks":[],"shared":[]}', (dir) => {
+    const res = readCoreHooksConfig(dir);
+    assert.equal(res.ok, false);
+  });
+});
+
+test('fail-closed: missing/non-array shared → ok:false', () => {
+  withPkgHooksJson('{"hooks":{}}', (dir) => {
+    assert.equal(readCoreHooksConfig(dir).ok, false);
+  });
+  withPkgHooksJson('{"hooks":{},"shared":"x"}', (dir) => {
+    assert.equal(readCoreHooksConfig(dir).ok, false);
+  });
+});
+
+suite('deriveCoreHookBasenames()');
+
+test('real hooks.json: union of event-command and shared basenames, lowercased', () => {
+  const res = readCoreHooksConfig(REPO);
+  assert.equal(res.ok, true, `real hooks.json should load: ${res.error}`);
+  const names = deriveCoreHookBasenames(res.cfg);
+  assert.ok(names instanceof Set, 'must return a Set');
+  // event-command basename (proves the registration walk)
+  assert.ok(names.has('hypo-session-start.mjs'), 'expected an event-command basename');
+  // non-hypo shared basename (proves the shared union, not just the event walk)
+  assert.ok(names.has('version-check.mjs'), 'expected a non-hypo shared basename');
+});
+
+test('strict last-segment extraction + lowercasing from command shape', () => {
+  const cfg = {
+    hooks: {
+      SessionStart: [
+        { hooks: [{ type: 'command', command: 'node ${CLAUDE_PLUGIN_ROOT}/hooks/Hypo-Up.MJS' }] },
+      ],
+    },
+    shared: ['Nested/Path/Shared-One.mjs'],
+  };
+  const names = deriveCoreHookBasenames(cfg);
+  assert.ok(names.has('hypo-up.mjs'), 'command basename should be last segment, lowercased');
+  assert.ok(names.has('shared-one.mjs'), 'shared basename should be last segment, lowercased');
+  assert.equal(names.size, 2, 'no extra entries from path prefixes');
+});
+
+test('defensive: odd cfg does not throw, yields a (possibly partial) Set', () => {
+  assert.doesNotThrow(() => deriveCoreHookBasenames(null));
+  assert.doesNotThrow(() => deriveCoreHookBasenames({}));
+  assert.doesNotThrow(() =>
+    deriveCoreHookBasenames({ hooks: { E: ['not-a-group', 42, {}] }, shared: [1, null, 'ok.mjs'] }),
+  );
+  const names = deriveCoreHookBasenames({ hooks: {}, shared: ['ok.mjs', 'no-ext'] });
+  assert.ok(names.has('ok.mjs') && !names.has('no-ext'), 'only .mjs names admitted');
+});
+
+// ── init.mjs still exits 1 on a malformed hooks.json (loader routed via helper) ─
+// loadHookMap now reads+parses through readCoreHooksConfig but keeps init's own
+// validation + process.exit(1). Copy the package, corrupt hooks.json, and run
+// init with hooks enabled so line ~837 (HOOK_MAP = loadHookMap()) is reached.
+
+suite('init.mjs — malformed hooks.json still exits 1');
+
+function runInitFromPkg(hooksJson, home, hypoDir) {
+  let result;
+  withTmpDir((base) => {
+    const pkg = join(base, 'pkg');
+    mkdirSync(pkg, { recursive: true });
+    cpSync(SCRIPTS, join(pkg, 'scripts'), { recursive: true });
+    cpSync(join(REPO, 'hooks'), join(pkg, 'hooks'), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(pkg, 'package.json'));
+    writeFileSync(join(pkg, 'hooks', 'hooks.json'), hooksJson);
+    result = spawnSync(
+      process.execPath,
+      [join(pkg, 'scripts', 'init.mjs'), `--hypo-dir=${hypoDir}`, '--no-git-init', '--dry-run'],
+      { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: home } },
+    );
+  });
+  return result;
+}
+
+test('unparseable hooks.json → exit 1 (read/parse path)', () => {
+  withTmpHome((home) => {
+    withTmpDir((hypoDir) => {
+      const r = runInitFromPkg('{ this is : not json', home, hypoDir);
+      assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /cannot read hooks\/hooks\.json/);
+    });
+  });
+});
+
+test('parses but hooks is not an object → exit 1 (init validation retained)', () => {
+  withTmpHome((home) => {
+    withTmpDir((hypoDir) => {
+      const r = runInitFromPkg('{"hooks":[],"shared":[]}', home, hypoDir);
+      assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /hooks/);
+    });
+  });
+});
+
 // ── test-hermeticity guard (Stage 2 #3) ──────────────────────────────────────
 // Regression guard: tests must never write to the real ~/.claude/. Snapshot
 // the real-HOME paths init.mjs would touch, invoke init.mjs via the default
