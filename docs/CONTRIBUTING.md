@@ -331,6 +331,17 @@ from being dropped.
 Prerequisite: the changelog collector in step 2 reads merged-PR data through the GitHub CLI, so have `gh` installed and authenticated (`gh auth status`) before you start. It is a maintainer-only release script and is not shipped to npm.
 
 ```bash
+# 0. (minor+ releases only) Ensure the wiki vault carries this release's version
+#    spec. Convention (version-plan lifecycle: born-at-stable-path, flip-in-place,
+#    recorded in the vault's decisions log): a minor-or-higher release has
+#    projects/hypomnema/specs/spec-v<version>.md with status: active and
+#    version: <version>. If it is missing, create it from the vault's minimal spec
+#    shape (omit patch-only fields for a minor/major). If you created or changed
+#    it, run the wiki lint and commit + push the vault before bumping, so the
+#    active pre-ship state is recorded remotely. Patch releases are exempt: the
+#    CHANGELOG section and PR body cover them, no spec doc required.
+$EDITOR ~/hypomnema/projects/hypomnema/specs/spec-v<version>.md
+
 # 1. Bump the version across package.json, plugin.json, marketplace.json,
 #    and templates/hypo-config.md. Takes a concrete semver (not patch/minor/major).
 node scripts/bump-version.mjs <new-semver>   # e.g. 1.2.2 or 1.3.0-rc.1
@@ -397,6 +408,13 @@ npm publish --dry-run --access public   # packs + prepublishOnly, NO registry PU
 # 8. Push the SPECIFIC tag alone — NOT --tags (that would push stale local tags
 #    and could trigger releases for versions you did not intend).
 git push origin v<version>
+
+# 9. (minor+ releases only) After the release workflow succeeds, close the spec
+#    lifecycle IN PLACE (no path move): set status: archived and
+#    archived_date: <release date> in the same spec, run the wiki lint, then
+#    commit and push the vault. Do this only after the release is green, never at
+#    tag time: a failed release must not leave an archived spec behind.
+$EDITOR ~/hypomnema/projects/hypomnema/specs/spec-v<version>.md
 ```
 
 The `release.yml` workflow then:
