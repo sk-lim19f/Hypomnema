@@ -38,6 +38,7 @@ import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import { expandHome, resolveHypoRoot } from './lib/hypo-root.mjs';
+import { readCoreHooksConfig } from './lib/core-hooks.mjs';
 import {
   readPkgJson as readPkgJsonSafe,
   writePkgJsonAtomic,
@@ -303,14 +304,17 @@ function writeGitignore(hypoDir, dryRun) {
 // ── hook installation ────────────────────────────────────────────────────────
 
 function loadHookMap() {
-  let cfg;
-  try {
-    cfg = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
-  } catch {
+  // Read + parse via the exit-free shared helper; keep init's own validation and
+  // exit(1) behavior below. The helper omits `cfg` only on read/parse failure
+  // (JSON.parse never yields undefined), so key presence discriminates a
+  // read/parse failure from a parsed-but-malformed shape.
+  const res = readCoreHooksConfig(PKG_ROOT);
+  if (!('cfg' in res)) {
     console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
     console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
+  const cfg = res.cfg;
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
     console.error('Error: hooks/hooks.json must be a JSON object');
     console.error(PKG_INTEGRITY_HINT);

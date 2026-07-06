@@ -39,6 +39,7 @@ import {
   CODEX_TYPES,
   readExtensionPkgStateNoMutate,
   parseExtKey,
+  buildHookCommand,
 } from './lib/extensions.mjs';
 
 const HOME = homedir();
@@ -227,12 +228,39 @@ function unprocessedExtensionTargetRemains(pkgPath, processedTargets) {
   return false;
 }
 
-// settings.json: strip groups whose command points to a hypo-ext-* path under
-// the target's hooks dir. Identity is path-based (plan §0 D1) — no hookMap needed
+// Build the set of settings.json commands owned by reverse-captured hooks that
+// install under their ORIGINAL name (not the hypo-ext-* storage name). The prefix
+// scan below only reaches hypo-ext-* commands; a captured hook registers as
+// `node $HOME/.claude/hooks/foo.mjs`, which no prefix would ever match. The
+// recorded per-target SHA map names every file we own, so its hooks `.mjs` keys
+// reconstruct exactly the commands we registered. Read WITHOUT mutation and while
+// the map is still whole. stripExtensionsFromPkg (which clears it) runs later.
+// Only `.mjs` keys are commands; the paired `.manifest.json` sidecar keys (which
+// parseExtKey also admits for hooks) are dropped by the extension check.
+function ownedHookCommands(pkgPath, target, hooksDir) {
+  const types = target === 'codex' ? CODEX_TYPES : EXT_TYPES;
+  const recorded = readExtensionPkgStateNoMutate(pkgPath, target);
+  const commands = new Set();
+  for (const key of Object.keys(recorded)) {
+    const parsed = parseExtKey(key, types);
+    if (!parsed || parsed.type !== 'hooks') continue;
+    if (!parsed.installFile.endsWith('.mjs')) continue;
+    commands.add(buildHookCommand(hooksDir, parsed.installFile));
+  }
+  return commands;
+}
+
+// settings.json: strip groups whose command is one of ours under the target's
+// hooks dir. Ownership is the UNION of two path-based signals (plan §0 D1, P2):
+// the hypo-ext-* command prefix (catches wiki-authored hooks and hypo-ext-*
+// leftovers whose recorded key was already cleared by a partial uninstall) and
+// the recorded owned-command set (`ownedCommands`, catches reverse-captured hooks
+// registered under their original name, which carry no hypo-ext-* marker). Both
+// branches are needed, so this is a union, not a replacement. No hookMap needed
 // because ext hooks are never enumerated there. Mixed groups (foreign hook +
 // ours) keep the foreign hook; ours-only groups are dropped entirely. Mirrors
 // stripSettingsJson's flatMap pattern so other-plugin invariants (§7.3) hold.
-function stripExtensionSettings(settingsPath, hooksDir, apply) {
+function stripExtensionSettings(settingsPath, hooksDir, apply, ownedCommands = new Set()) {
   if (!existsSync(settingsPath)) return { stripped: [] };
   let settings;
   try {
@@ -244,7 +272,10 @@ function stripExtensionSettings(settingsPath, hooksDir, apply) {
 
   const cmdPrefix = `node ${hooksDir.replace(HOME, '$HOME')}/${EXT_PREFIX}`;
   const isExtHook = (h) =>
-    h && h.type === 'command' && typeof h.command === 'string' && h.command.startsWith(cmdPrefix);
+    h &&
+    h.type === 'command' &&
+    typeof h.command === 'string' &&
+    (h.command.startsWith(cmdPrefix) || ownedCommands.has(h.command));
 
   const stripped = [];
   let changed = false;
@@ -433,7 +464,12 @@ const commandResult = removeCommands(args.apply, args.forceCommands);
 // hook copy was deleted by hand (force-commands legacy state).
 const pkgJsonPath = join(HOME, '.claude', 'hypo-pkg.json');
 const claudeExtResult = removeExtensions('claude', args.apply, args.forceExtensions);
-const claudeExtSettings = stripExtensionSettings(claudeSettings, claudeHooksDir, args.apply);
+const claudeExtSettings = stripExtensionSettings(
+  claudeSettings,
+  claudeHooksDir,
+  args.apply,
+  ownedHookCommands(pkgJsonPath, 'claude', claudeHooksDir),
+);
 
 let codexHookResult = { removed: [], missing: [] };
 let codexSettingsResult = { stripped: [] };
@@ -453,7 +489,12 @@ if (args.codex) {
   codexHookResult = removeHookFiles(codexHooksDir, hookFiles, args.apply);
   codexSettingsResult = stripSettingsJson(codexSettings, codexHooksDir, hookMap, args.apply);
   codexExtResult = removeExtensions('codex', args.apply, args.forceExtensions);
-  codexExtSettings = stripExtensionSettings(codexSettings, codexHooksDir, args.apply);
+  codexExtSettings = stripExtensionSettings(
+    codexSettings,
+    codexHooksDir,
+    args.apply,
+    ownedHookCommands(pkgJsonPath, 'codex', codexHooksDir),
+  );
 }
 
 // Surgical per-target ext SHA strip — only for files we actually removed.

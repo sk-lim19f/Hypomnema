@@ -615,6 +615,211 @@ test('pre-commit hook blocks staged .env file via git commit', () => {
   });
 });
 
+// ── lib/core-hooks.mjs (exit-free hooks.json loader) ─────────────────────────
+
+const { readCoreHooksConfig, deriveCoreHookBasenames } = await import(
+  `${SCRIPTS}/lib/core-hooks.mjs`
+);
+
+// Write a hooks.json into a temp package root and return that root.
+function withPkgHooksJson(content, fn) {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'hooks'), { recursive: true });
+    writeFileSync(join(dir, 'hooks', 'hooks.json'), content);
+    fn(dir);
+  });
+}
+
+suite('readCoreHooksConfig()');
+
+test('missing hooks.json → ok:false, does not throw, no cfg key', () => {
+  const missing = join(tmpdir(), `hypo-no-pkg-${process.pid}-${Date.now()}`);
+  let res;
+  assert.doesNotThrow(() => {
+    res = readCoreHooksConfig(missing);
+  });
+  assert.equal(res.ok, false);
+  assert.ok(typeof res.error === 'string' && res.error.length > 0, 'expected an error string');
+  assert.ok(!('cfg' in res), 'read failure must not attach cfg');
+});
+
+test('invalid JSON → ok:false, no cfg key (parse failure)', () => {
+  withPkgHooksJson('{ not: valid json', (dir) => {
+    const res = readCoreHooksConfig(dir);
+    assert.equal(res.ok, false);
+    assert.ok(!('cfg' in res), 'parse failure must not attach cfg');
+  });
+});
+
+test('real packaged hooks.json → ok:true with cfg', () => {
+  const res = readCoreHooksConfig(REPO);
+  assert.equal(res.ok, true, `expected real hooks.json to load: ${res.error}`);
+  assert.ok(res.cfg && typeof res.cfg === 'object', 'cfg should be an object');
+});
+
+test('fail-closed: parses to a non-object shape → ok:false but cfg attached', () => {
+  // A parsed-but-wrong shape is a fail (capture must skip hooks), yet init needs
+  // the parsed value to run its own validation, so cfg is attached.
+  for (const raw of ['null', '[]', '"str"', '42']) {
+    withPkgHooksJson(raw, (dir) => {
+      const res = readCoreHooksConfig(dir);
+      assert.equal(res.ok, false, `${raw} must be fail-closed`);
+      assert.ok('cfg' in res, `${raw} parsed, so cfg must be attached for init`);
+    });
+  }
+});
+
+test('fail-closed: object missing hooks map → ok:false', () => {
+  withPkgHooksJson('{"shared":["hypo-shared.mjs"]}', (dir) => {
+    const res = readCoreHooksConfig(dir);
+    assert.equal(res.ok, false);
+    assert.ok('cfg' in res);
+  });
+});
+
+test('fail-closed: hooks not an object → ok:false', () => {
+  withPkgHooksJson('{"hooks":[],"shared":[]}', (dir) => {
+    const res = readCoreHooksConfig(dir);
+    assert.equal(res.ok, false);
+  });
+});
+
+test('fail-closed: missing/non-array shared → ok:false', () => {
+  withPkgHooksJson('{"hooks":{}}', (dir) => {
+    assert.equal(readCoreHooksConfig(dir).ok, false);
+  });
+  withPkgHooksJson('{"hooks":{},"shared":"x"}', (dir) => {
+    assert.equal(readCoreHooksConfig(dir).ok, false);
+  });
+});
+
+// A parsed-but-nested-malformed hooks.json would make deriveCoreHookBasenames
+// silently skip the odd rung and return a THIN reserved set, letting a core hook
+// leak into reverse-capture. Each nested malformation must be fail-closed
+// (ok:false) with cfg still attached for init's own validation.
+test('fail-closed nested: event value not an array -> ok:false, cfg attached', () => {
+  withPkgHooksJson('{"hooks":{"SessionStart":"notarray"},"shared":[]}', (dir) => {
+    const res = readCoreHooksConfig(dir);
+    assert.equal(res.ok, false);
+    assert.ok('cfg' in res, 'parsed shape-off input must still attach cfg for init');
+  });
+});
+test('fail-closed nested: group hooks not an array -> ok:false', () => {
+  withPkgHooksJson('{"hooks":{"E":[{"hooks":"notarray"}]},"shared":[]}', (dir) => {
+    assert.equal(readCoreHooksConfig(dir).ok, false);
+  });
+});
+test('fail-closed nested: hook entry has no string command -> ok:false', () => {
+  withPkgHooksJson('{"hooks":{"E":[{"hooks":[{"type":"command"}]}]},"shared":[]}', (dir) => {
+    assert.equal(readCoreHooksConfig(dir).ok, false);
+  });
+  withPkgHooksJson('{"hooks":{"E":[{"hooks":[42]}]},"shared":[]}', (dir) => {
+    assert.equal(readCoreHooksConfig(dir).ok, false);
+  });
+});
+test('fail-closed nested: non-string shared element -> ok:false', () => {
+  withPkgHooksJson(
+    '{"hooks":{"E":[{"hooks":[{"type":"command","command":"node $HOME/.claude/hooks/x.mjs"}]}]},"shared":[1]}',
+    (dir) => {
+      assert.equal(readCoreHooksConfig(dir).ok, false);
+    },
+  );
+});
+test('nested valid: well-formed groups + hooks + shared -> ok:true, complete basenames', () => {
+  const json =
+    '{"hooks":{"SessionStart":[{"hooks":[{"type":"command",' +
+    '"command":"node $HOME/.claude/hooks/core-a.mjs"}]}]},"shared":["core-b.mjs"]}';
+  withPkgHooksJson(json, (dir) => {
+    const res = readCoreHooksConfig(dir);
+    assert.equal(res.ok, true, `well-formed nested config should load: ${res.error}`);
+    const names = deriveCoreHookBasenames(res.cfg);
+    assert.ok(names.has('core-a.mjs') && names.has('core-b.mjs'), 'expected complete basename set');
+  });
+});
+
+suite('deriveCoreHookBasenames()');
+
+test('real hooks.json: union of event-command and shared basenames, lowercased', () => {
+  const res = readCoreHooksConfig(REPO);
+  assert.equal(res.ok, true, `real hooks.json should load: ${res.error}`);
+  const names = deriveCoreHookBasenames(res.cfg);
+  assert.ok(names instanceof Set, 'must return a Set');
+  // event-command basename (proves the registration walk)
+  assert.ok(names.has('hypo-session-start.mjs'), 'expected an event-command basename');
+  // non-hypo shared basename (proves the shared union, not just the event walk)
+  assert.ok(names.has('version-check.mjs'), 'expected a non-hypo shared basename');
+});
+
+test('strict last-segment extraction + lowercasing from command shape', () => {
+  const cfg = {
+    hooks: {
+      SessionStart: [
+        { hooks: [{ type: 'command', command: 'node ${CLAUDE_PLUGIN_ROOT}/hooks/Hypo-Up.MJS' }] },
+      ],
+    },
+    shared: ['Nested/Path/Shared-One.mjs'],
+  };
+  const names = deriveCoreHookBasenames(cfg);
+  assert.ok(names.has('hypo-up.mjs'), 'command basename should be last segment, lowercased');
+  assert.ok(names.has('shared-one.mjs'), 'shared basename should be last segment, lowercased');
+  assert.equal(names.size, 2, 'no extra entries from path prefixes');
+});
+
+test('defensive: odd cfg does not throw, yields a (possibly partial) Set', () => {
+  assert.doesNotThrow(() => deriveCoreHookBasenames(null));
+  assert.doesNotThrow(() => deriveCoreHookBasenames({}));
+  assert.doesNotThrow(() =>
+    deriveCoreHookBasenames({ hooks: { E: ['not-a-group', 42, {}] }, shared: [1, null, 'ok.mjs'] }),
+  );
+  const names = deriveCoreHookBasenames({ hooks: {}, shared: ['ok.mjs', 'no-ext'] });
+  assert.ok(names.has('ok.mjs') && !names.has('no-ext'), 'only .mjs names admitted');
+});
+
+// ── init.mjs still exits 1 on a malformed hooks.json (loader routed via helper) ─
+// loadHookMap now reads+parses through readCoreHooksConfig but keeps init's own
+// validation + process.exit(1). Copy the package, corrupt hooks.json, and run
+// init with hooks enabled so line ~837 (HOOK_MAP = loadHookMap()) is reached.
+
+suite('init.mjs — malformed hooks.json still exits 1');
+
+function runInitFromPkg(hooksJson, home, hypoDir) {
+  let result;
+  withTmpDir((base) => {
+    const pkg = join(base, 'pkg');
+    mkdirSync(pkg, { recursive: true });
+    cpSync(SCRIPTS, join(pkg, 'scripts'), { recursive: true });
+    cpSync(join(REPO, 'hooks'), join(pkg, 'hooks'), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(pkg, 'package.json'));
+    writeFileSync(join(pkg, 'hooks', 'hooks.json'), hooksJson);
+    result = spawnSync(
+      process.execPath,
+      [join(pkg, 'scripts', 'init.mjs'), `--hypo-dir=${hypoDir}`, '--no-git-init', '--dry-run'],
+      { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: home } },
+    );
+  });
+  return result;
+}
+
+test('unparseable hooks.json → exit 1 (read/parse path)', () => {
+  withTmpHome((home) => {
+    withTmpDir((hypoDir) => {
+      const r = runInitFromPkg('{ this is : not json', home, hypoDir);
+      assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /cannot read hooks\/hooks\.json/);
+    });
+  });
+});
+
+test('parses but hooks is not an object → exit 1 (init validation retained)', () => {
+  withTmpHome((home) => {
+    withTmpDir((hypoDir) => {
+      const r = runInitFromPkg('{"hooks":[],"shared":[]}', home, hypoDir);
+      assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /hooks/);
+    });
+  });
+});
+
 // ── test-hermeticity guard (Stage 2 #3) ──────────────────────────────────────
 // Regression guard: tests must never write to the real ~/.claude/. Snapshot
 // the real-HOME paths init.mjs would touch, invoke init.mjs via the default
@@ -6755,6 +6960,216 @@ test('doctor-extensions: non-hook manifest + lingering settings entry → unregi
   });
 });
 
+// P2/F1: doctor must recognize a reverse-captured hook registered under its
+// ORIGINAL name (installName) as healthy. Its command carries no hypo-ext-*
+// marker, so the orphan prefilter widens via the recorded owned-command set,
+// while the resolved sourceCmds (cmdFor now uses resolveInstallFile +
+// buildHookCommand) must exclude it. If sourceCmds and the widened prefilter ever
+// slip out of sync, a perfectly healthy captured hook is false-flagged as a
+// source-removed orphan; this positive case pins them together.
+test('doctor-extensions: healthy installName-captured hook is not flagged', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/orphan settings entry/i.test(detail),
+        `must not orphan a healthy captured hook: ${detail}`,
+      );
+      assert.equal(ext.status, 'pass', `expected clean extensions check: ${detail}`);
+    });
+  });
+});
+
+// A captured installName hook whose manifest is later corrupted still has its wiki
+// SOURCE present, so doctor must classify the lingering settings entry as
+// unregistrable, not "source extension removed" (codex pre-commit CONCERN).
+// resolveInstallFile falls back to the wiki name on a broken manifest, so the fix
+// recovers the real registered command by matching the source SHA against the
+// recorded owned-set (the wiki storage stem `hypo-ext-cap` deliberately differs
+// from the installName `mycap`, so a name-convention shortcut would not suffice).
+test('doctor-extensions: manifest-invalid installName hook is unregistrable, not source-removed', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      // Sync healthy so the installName command + recorded ownership exist.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      // Corrupt the manifest after the settings entry + recorded keys exist.
+      writeFileSync(
+        join(hypoDir, 'extensions', 'hooks', 'hypo-ext-cap.manifest.json'),
+        JSON.stringify({ type: 'hook', event: 'NotARealEvent' }),
+      );
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/orphan settings entry .*mycap\.mjs.*source extension removed/i.test(detail),
+        `must not use source-removed phrasing when source is present: ${detail}`,
+      );
+      assert.ok(
+        /orphan settings entry .*mycap\.mjs.*manifest unregistrable/i.test(detail),
+        `expected unregistrable-orphan warn for the installName command: ${detail}`,
+      );
+    });
+  });
+});
+
+// P2: a reverse-captured hook whose wiki source is gone but whose settings entry
+// and recorded SHA key remain must be caught as a source-removed orphan under its
+// ORIGINAL name: the recorded owned-command set drives the prefilter, the
+// resolved sourceCmds (now empty) drives the classification.
+test('doctor-extensions: source-removed installName-captured hook → orphan warn', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      // Remove the wiki source (+ manifest) so the settings entry and recorded SHA
+      // key are the only trace left, the source-removed orphan case.
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      rmSync(join(extHooks, 'hypo-ext-cap.mjs'));
+      rmSync(join(extHooks, 'hypo-ext-cap.manifest.json'));
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /orphan settings entry .*mycap\.mjs.*source extension removed/i.test(detail),
+        `expected source-removed orphan naming the original-name command: ${detail}`,
+      );
+    });
+  });
+});
+
+// The source-SHA linkage that recovers a malformed hook's real registered command
+// must only fire when the SHA uniquely names one recorded install key. The pkg map
+// stores the source SHA but not the source identity, so a source-removed hook and a
+// malformed hook whose `.mjs` bytes are IDENTICAL share one SHA. Applying the
+// linkage to that ambiguous pair would misreport the source-removed hook as
+// "manifest unregistrable" (codex fix re-review CONCERN). Assert the source-removed
+// hook stays classified as source-removed and never leaks into unregistrable.
+test('doctor-extensions: identical-content source-removed + malformed hooks keep distinct classes', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      // Two hooks with byte-identical .mjs source but different installNames, so
+      // their recorded `.mjs` keys carry the same SHA.
+      const body = '#!/usr/bin/env node\n';
+      writeExt(hypoDir, 'hooks', 'hypo-ext-gone.mjs', body, {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'gonehook',
+      });
+      writeExt(hypoDir, 'hooks', 'hypo-ext-bad.mjs', body, {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'badhook',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      // Hook A: source removed (settings entry + recorded key remain).
+      rmSync(join(extHooks, 'hypo-ext-gone.mjs'));
+      rmSync(join(extHooks, 'hypo-ext-gone.manifest.json'));
+      // Hook B: source present, manifest corrupted → drives the SHA-linkage scan.
+      writeFileSync(
+        join(extHooks, 'hypo-ext-bad.manifest.json'),
+        JSON.stringify({ type: 'hook', event: 'NotARealEvent' }),
+      );
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /orphan settings entry .*gonehook\.mjs.*source extension removed/i.test(detail),
+        `source-removed hook must stay source-removed: ${detail}`,
+      );
+      assert.ok(
+        !/orphan settings entry .*gonehook\.mjs.*manifest unregistrable/i.test(detail),
+        `ambiguous SHA must not reclassify the source-removed hook as unregistrable: ${detail}`,
+      );
+    });
+  });
+});
+
+// Accepted boundary (plan §"리스크"): a captured hook carries no in-command
+// ownership marker (unlike hypo-ext-*). Once BOTH the source and the recorded SHA
+// key are hand-removed, the lingering settings entry can no longer be classified.
+// This mirrors the pre-existing hand-edited-state limit and is fixed as an
+// accepted behavior: capture always leaves a recorded key, so the normal path
+// still detects it. No fabricated marker.
+test('doctor-extensions: captured hook entry unclassified when source + key both gone', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      rmSync(join(extHooks, 'hypo-ext-cap.mjs'));
+      rmSync(join(extHooks, 'hypo-ext-cap.manifest.json'));
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      delete pkg.extensions.claude['hooks/mycap.mjs'];
+      delete pkg.extensions.claude['hooks/mycap.manifest.json'];
+      writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/orphan settings entry .*mycap/i.test(detail),
+        `accepted boundary: without the recorded key the entry is not classified: ${detail}`,
+      );
+    });
+  });
+});
+
 // Orphan duplicate scan. A single
 // hypo-ext-* command can appear in multiple groups/events when settings.json
 // was hand-edited. Pre-fix the orphan loop deduped by command and emitted a
@@ -7063,6 +7478,54 @@ test('uninstall-removes-extensions-copy-preserves-source', () => {
           'command SHA must be stripped from pkg.extensions.claude',
         );
       }
+    });
+  });
+});
+
+// P2: a reverse-captured hook registered under its ORIGINAL name (no hypo-ext-*
+// prefix) must still be fully uninstalled. The settings entry is caught by the
+// recorded owned-command union (not the prefix), the file by its recorded SHA key.
+test('uninstall-removes-installName-captured-hook-settings-and-file', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `upgrade --apply failed: ${up.stderr}`);
+
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const hookCopy = join(home, '.claude', 'hooks', 'mycap.mjs');
+      const capCommand = 'node $HOME/.claude/hooks/mycap.mjs';
+
+      // Pre-state: installed under the original name, registered with no prefix.
+      assert.ok(existsSync(hookCopy), 'pre-state: captured hook copy must exist');
+      assert.ok(
+        JSON.stringify(JSON.parse(readFileSync(settingsPath, 'utf-8')).hooks).includes(capCommand),
+        'pre-state: original-name command must be registered',
+      );
+
+      // Foreign entry that uninstall MUST preserve.
+      const seed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      seed.hooks.PostToolUse.push({
+        hooks: [{ type: 'command', command: 'node /opt/other/foo.mjs' }],
+      });
+      writeFileSync(settingsPath, JSON.stringify(seed, null, 2) + '\n');
+
+      const un = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(un.status, 0, `uninstall failed: ${un.stderr}\n${un.stdout}`);
+
+      // File removed (recorded key), settings entry stripped (owned-command union).
+      assert.ok(!existsSync(hookCopy), 'captured hook file must be removed');
+      const post = JSON.stringify(JSON.parse(readFileSync(settingsPath, 'utf-8')).hooks || {});
+      assert.ok(!post.includes('mycap.mjs'), 'original-name settings entry must be stripped');
+      assert.ok(post.includes('/opt/other/foo.mjs'), 'foreign entry must be preserved');
     });
   });
 });
@@ -22011,10 +22474,17 @@ test('importing crystallize.mjs runs no CLI and exposes exactly the pure exports
 
 // ── reverse extension capture (ADR 0061) ────────────────────────
 
-const { isValidInstallStem, resolveInstallFile, parseExtKey } = await import(
-  `${SCRIPTS}/lib/extensions.mjs`
+const {
+  isValidInstallStem,
+  resolveInstallFile,
+  parseExtKey,
+  buildHookCommand,
+  parseCapturableHookCommand,
+  scanSettingsHooks,
+} = await import(`${SCRIPTS}/lib/extensions.mjs`);
+const { planCapture, isCaptureCandidate, scanHookCandidates } = await import(
+  `${SCRIPTS}/capture.mjs`
 );
-const { planCapture, isCaptureCandidate } = await import(`${SCRIPTS}/capture.mjs`);
 
 suite('capture: isValidInstallStem (ADR 0061 §5)');
 
@@ -22097,13 +22567,35 @@ test('skips (not installs under wiki name) an invalid installName', () => {
     assert.ok(/invalid installName/.test(res.warn));
   });
 });
-test('hooks keep the wiki name even with a hook manifest (installName is commands/agents only)', () => {
+test('hooks without installName keep the wiki name (wiki-authored, backward compatible)', () => {
   withTmpDir((dir) => {
     const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
       type: 'hook',
       event: 'Stop',
     });
     assert.deepEqual(resolveInstallFile(ext), { installFile: 'hypo-ext-h.mjs' });
+  });
+});
+test('hooks honor a valid installName from a hook manifest (installName decoupling)', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
+      type: 'hook',
+      event: 'Stop',
+      installName: 'myhook',
+    });
+    assert.deepEqual(resolveInstallFile(ext), { installFile: 'myhook.mjs' });
+  });
+});
+test('hooks skip an invalid installName rather than install under the wiki name', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
+      type: 'hook',
+      event: 'Stop',
+      installName: 'hypo-reserved',
+    });
+    const res = resolveInstallFile(ext);
+    assert.equal(res.skip, true);
+    assert.ok(/invalid installName/.test(res.warn));
   });
 });
 
@@ -22156,10 +22648,9 @@ test('candidate filter excludes hypo-*, non-.md, and already-owned', () => {
 });
 test('planCapture: ready when no wiki file exists', () => {
   const p = planCapture({
-    type: 'commands',
-    stem: 'x',
+    wantManifest: { type: 'command', installName: 'x' },
     srcSha: 'A',
-    existingMdSha: null,
+    existingFileSha: null,
     existingManifestRaw: null,
   });
   assert.equal(p.status, 'ready');
@@ -22167,63 +22658,98 @@ test('planCapture: ready when no wiki file exists', () => {
 });
 test('planCapture: invalid stem', () => {
   const p = planCapture({
-    type: 'commands',
-    stem: 'hypo-x',
+    wantManifest: { type: 'command', installName: 'hypo-x' },
     srcSha: 'A',
-    existingMdSha: null,
+    existingFileSha: null,
     existingManifestRaw: null,
   });
   assert.equal(p.status, 'invalid');
 });
-test('planCapture: conflict when wiki .md differs', () => {
+test('planCapture: conflict when wiki file differs', () => {
   const p = planCapture({
-    type: 'commands',
-    stem: 'x',
+    wantManifest: { type: 'command', installName: 'x' },
     srcSha: 'A',
-    existingMdSha: 'B',
+    existingFileSha: 'B',
     existingManifestRaw: null,
   });
   assert.equal(p.status, 'conflict');
 });
-test('planCapture: conflict when .md matches but manifest missing', () => {
+test('planCapture: conflict when file matches but manifest missing', () => {
   const p = planCapture({
-    type: 'commands',
-    stem: 'x',
+    wantManifest: { type: 'command', installName: 'x' },
     srcSha: 'A',
-    existingMdSha: 'A',
+    existingFileSha: 'A',
     existingManifestRaw: null,
   });
   assert.equal(p.status, 'conflict');
 });
-test('planCapture: conflict when manifest declares a different installName', () => {
+test('planCapture: conflict when manifest declares a different mapping', () => {
   const raw = JSON.stringify({ type: 'command', installName: 'other' });
   const p = planCapture({
-    type: 'commands',
-    stem: 'x',
+    wantManifest: { type: 'command', installName: 'x' },
     srcSha: 'A',
-    existingMdSha: 'A',
+    existingFileSha: 'A',
     existingManifestRaw: raw,
   });
   assert.equal(p.status, 'conflict');
 });
-test('planCapture: already when .md + manifest both match', () => {
-  const raw = JSON.stringify({ type: 'command', installName: 'x' });
+test('planCapture: already when file + manifest both match (deep-equal, order-independent)', () => {
+  // Keys are deliberately reordered vs the want-manifest to prove deep-equality is
+  // not key-order sensitive.
+  const raw = JSON.stringify({ installName: 'x', type: 'command' });
   const p = planCapture({
-    type: 'commands',
-    stem: 'x',
+    wantManifest: { type: 'command', installName: 'x' },
     srcSha: 'A',
-    existingMdSha: 'A',
+    existingFileSha: 'A',
     existingManifestRaw: raw,
   });
   assert.equal(p.status, 'already');
 });
+test('planCapture: already for a full hook manifest (deep-equal of event/matcher/timeout)', () => {
+  const want = {
+    type: 'hook',
+    installName: 'h',
+    event: 'PostToolUse',
+    matcher: 'Write|Edit',
+    timeout: 5000,
+  };
+  const raw = JSON.stringify({
+    event: 'PostToolUse',
+    installName: 'h',
+    timeout: 5000,
+    type: 'hook',
+    matcher: 'Write|Edit',
+  });
+  const p = planCapture({
+    wantManifest: want,
+    srcSha: 'A',
+    existingFileSha: 'A',
+    existingManifestRaw: raw,
+  });
+  assert.equal(p.status, 'already');
+});
+test('planCapture: conflict when a hook manifest differs by one field', () => {
+  const want = { type: 'hook', installName: 'h', event: 'PostToolUse', timeout: 5000 };
+  const raw = JSON.stringify({
+    type: 'hook',
+    installName: 'h',
+    event: 'PostToolUse',
+    timeout: 9999,
+  });
+  const p = planCapture({
+    wantManifest: want,
+    srcSha: 'A',
+    existingFileSha: 'A',
+    existingManifestRaw: raw,
+  });
+  assert.equal(p.status, 'conflict');
+});
 test('planCapture: conflict on a stray manifest with a different mapping', () => {
   const raw = JSON.stringify({ type: 'command', installName: 'other' });
   const p = planCapture({
-    type: 'commands',
-    stem: 'x',
+    wantManifest: { type: 'command', installName: 'x' },
     srcSha: 'A',
-    existingMdSha: null,
+    existingFileSha: null,
     existingManifestRaw: raw,
   });
   assert.equal(p.status, 'conflict');
@@ -22267,6 +22793,78 @@ test('installName manifest installs under the original name', () => {
       assert.ok(
         !existsSync(join(home, '.claude', 'commands', 'hypo-ext-new.md')),
         'wiki storage name NOT installed',
+      );
+    });
+  });
+});
+// P1/F1: a hook manifest with a valid installName installs the `.mjs`, its sidecar
+// manifest, and its settings.json command all under the ORIGINAL name, and both SHA
+// keys are owned. Success criterion (d) checks the SHA KEY, not just disk presence.
+test('installName hook installs mjs, sidecar, and command under the original name', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeExt(hypoDir, 'hooks', 'hypo-ext-h.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write|Edit',
+        timeout: 10000,
+        installName: 'myhook',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      const copyDir = join(home, '.claude', 'hooks');
+      // (1) `.mjs` and sidecar install under the original name; wiki names are not.
+      assert.ok(existsSync(join(copyDir, 'myhook.mjs')), 'hook not installed under installName');
+      assert.ok(
+        existsSync(join(copyDir, 'myhook.manifest.json')),
+        'sidecar not installed under installName (P1)',
+      );
+      assert.ok(
+        !existsSync(join(copyDir, 'hypo-ext-h.mjs')),
+        'wiki storage name .mjs must NOT be installed',
+      );
+      assert.ok(
+        !existsSync(join(copyDir, 'hypo-ext-h.manifest.json')),
+        'wiki storage name sidecar must NOT be installed (P1)',
+      );
+
+      // (2) settings.json command is reconstructed under the original name.
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const groups = (settings.hooks?.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('myhook.mjs')),
+      );
+      assert.equal(groups.length, 1, 'exactly one PostToolUse entry expected');
+      assert.equal(
+        groups[0].hooks[0].command,
+        'node $HOME/.claude/hooks/myhook.mjs',
+        'command must be reconstructed under installName',
+      );
+      assert.equal(groups[0].matcher, 'Write|Edit');
+      assert.equal(groups[0].hooks[0].timeout, 10000);
+
+      // (3) BOTH SHA keys are owned under the original name (success criterion d).
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions.claude['hooks/myhook.mjs'],
+        'hook SHA key not owned under installName',
+      );
+      assert.ok(
+        pkg.extensions.claude['hooks/myhook.manifest.json'],
+        'sidecar SHA key not owned under installName (P1)',
+      );
+      assert.ok(
+        !pkg.extensions.claude['hooks/hypo-ext-h.mjs'],
+        'wiki-name hook SHA key must not be recorded',
+      );
+      assert.ok(
+        !pkg.extensions.claude['hooks/hypo-ext-h.manifest.json'],
+        'wiki-name sidecar SHA key must not be recorded',
       );
     });
   });
@@ -22329,6 +22927,58 @@ test('a later duplicate does not orphan an already-owned installed file', () => 
       assert.ok(
         pkg.extensions.claude['commands/dup.md'],
         'ownership of the already-installed file is preserved on a later collision',
+      );
+    });
+  });
+});
+// A hook records TWO ownership keys (the `.mjs` and its `.manifest.json` sidecar).
+// When a later same-installName hook forces a duplicate-target skip, BOTH keys of
+// the already-owned hook must be preserved; preserving only the `.mjs` (codex
+// pre-commit CONCERN) would drop the sidecar SHA and leave the installed manifest
+// copy untracked and unreachable by uninstall.
+test('a later duplicate hook preserves BOTH the mjs and the sidecar ownership keys', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      // A owns hooks/dup.mjs + hooks/dup.manifest.json after the first sync.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-a.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'dup',
+      });
+      assert.equal(
+        runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home).status,
+        0,
+      );
+      let pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(pkg.extensions.claude['hooks/dup.mjs'], 'A owns dup.mjs after first sync');
+      assert.ok(
+        pkg.extensions.claude['hooks/dup.manifest.json'],
+        'A owns dup.manifest.json after first sync',
+      );
+      // A colliding B appears; the group is skipped but A's ownership of BOTH keys
+      // must survive so neither installed copy is orphaned.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-b.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'dup',
+      });
+      assert.equal(
+        runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home).status,
+        0,
+      );
+      pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions.claude['hooks/dup.mjs'],
+        'mjs ownership preserved on a later collision',
+      );
+      assert.ok(
+        pkg.extensions.claude['hooks/dup.manifest.json'],
+        'sidecar ownership preserved on a later collision',
       );
     });
   });
@@ -22405,6 +23055,807 @@ test('uninstall --apply removes the captured install-path file and preserves uno
       assert.equal(r.status, 0, r.stderr);
       assert.ok(!existsSync(join(home, '.claude', 'commands', 'mycmd.md')), 'owned removed');
       assert.ok(existsSync(join(home, '.claude', 'commands', 'foreign.md')), 'unowned preserved');
+    });
+  });
+});
+
+// A partial adopt (forward-sync owns the byte-identical `.mjs` but cannot own its
+// sidecar manifest because the install-path sidecar is a non-regular file) must NOT
+// leave stray `.mjs` ownership recorded in hypo-pkg.json. Left behind, a later
+// capture would skip the hook as already-managed and uninstall would trust the
+// recorded SHA and delete the user's ORIGINAL hook (codex pre-commit CONCERN).
+test('capture: partial hook adopt rolls back stray ownership, uninstall spares the original', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const hooksDir = join(home, '.claude', 'hooks');
+      mkdirSync(hooksDir, { recursive: true });
+      const original = '#!/usr/bin/env node\n// user hook\n';
+      writeFileSync(join(hooksDir, 'myhook.mjs'), original);
+      // Canonical settings registration so the hook is a capture candidate.
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const settings = {
+        hooks: {
+          Stop: [{ hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/myhook.mjs' }] }],
+        },
+      };
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+      // Block sidecar adoption: a directory sits where the install-path sidecar
+      // would go, so forward-sync's copyOne returns skip-non-regular (it does NOT
+      // throw). The `.mjs` is byte-identical so its key IS recorded -> partial adopt.
+      mkdirSync(join(hooksDir, 'myhook.manifest.json'), { recursive: true });
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 1, 'a partial adopt must report failure (exit 1)');
+
+      // The install-path `.mjs` still exists byte-identical (proves sync reached the
+      // up-to-date branch and the partial-adopt path, not the throw/catch rollback).
+      assert.equal(
+        readFileSync(join(hooksDir, 'myhook.mjs'), 'utf-8'),
+        original,
+        'user original untouched',
+      );
+      // No stray ownership left in the pkg map.
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const owned = existsSync(pkgPath)
+        ? (JSON.parse(readFileSync(pkgPath, 'utf-8')).extensions?.claude ?? {})
+        : {};
+      assert.ok(!owned['hooks/myhook.mjs'], 'stray .mjs ownership must be rolled back');
+      assert.ok(!owned['hooks/myhook.manifest.json'], 'sidecar was never owned');
+      // Wiki files rolled back.
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-myhook.mjs')),
+        'wiki storage file rolled back',
+      );
+
+      // Since nothing was adopted, uninstall must NOT delete the user's original.
+      const u = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(u.status, 0, u.stderr);
+      assert.ok(
+        existsSync(join(hooksDir, 'myhook.mjs')),
+        'uninstall must not delete the un-adopted original hook',
+      );
+    });
+  });
+});
+
+// ── reverse hook capture: command builder + strict parser + settings scanner ──
+
+suite('capture: buildHookCommand / parseCapturableHookCommand round-trip');
+
+test('round-trip accept: a HOME-relative dir builds a command the parser restores', () => {
+  const hooksDir = join(HOME, '.claude', 'hooks');
+  for (const stem of ['mycmd', 'my-hook.v2', 'a_b.c']) {
+    const command = buildHookCommand(hooksDir, `${stem}.mjs`);
+    assert.equal(command, `node $HOME/.claude/hooks/${stem}.mjs`);
+    const parsed = parseCapturableHookCommand(command);
+    assert.ok(parsed.ok, `${stem} should round-trip`);
+    assert.equal(parsed.stem, stem);
+    assert.equal(parsed.basename, `${stem}.mjs`);
+  }
+});
+test('round-trip reject: a dir outside HOME builds an absolute command the parser rejects', () => {
+  withTmpDir((dir) => {
+    // withTmpDir lives under tmpdir(), outside HOME — .replace(HOME,'$HOME') is a
+    // no-op so the builder emits an absolute path the strict parser must refuse
+    // (proves no silent accept of a non-canonical registration).
+    const hooksDir = join(dir, 'hooks');
+    const command = buildHookCommand(hooksDir, 'x.mjs');
+    assert.ok(command.startsWith(`node ${hooksDir}/`), 'builder kept the absolute path');
+    const parsed = parseCapturableHookCommand(command);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.reason, 'path-not-under-home-hooks');
+  });
+});
+
+suite('capture: parseCapturableHookCommand strict axes');
+
+test('accepts the exact canonical form', () => {
+  const parsed = parseCapturableHookCommand('node $HOME/.claude/hooks/mycmd.mjs');
+  assert.deepEqual(parsed, { ok: true, stem: 'mycmd', basename: 'mycmd.mjs' });
+});
+test('rejects a non-string with a distinct reason', () => {
+  assert.deepEqual(parseCapturableHookCommand(42), { ok: false, reason: 'not-a-string' });
+  assert.deepEqual(parseCapturableHookCommand(null), { ok: false, reason: 'not-a-string' });
+  assert.deepEqual(parseCapturableHookCommand(undefined), { ok: false, reason: 'not-a-string' });
+});
+test('rejects CR/LF', () => {
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/x.mjs\n').reason,
+    'contains-newline',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/x.mjs\r').reason,
+    'contains-newline',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/a\nb.mjs').reason,
+    'contains-newline',
+  );
+});
+test('rejects a bad node prefix, including double space and tab', () => {
+  assert.equal(
+    parseCapturableHookCommand('nodex $HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  );
+  assert.equal(
+    parseCapturableHookCommand('/usr/bin/node $HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node  $HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  ); // double space
+  assert.equal(
+    parseCapturableHookCommand('node\t$HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  ); // tab for space
+  assert.equal(
+    parseCapturableHookCommand('node \t$HOME/.claude/hooks/x.mjs').reason,
+    'bad-node-prefix',
+  ); // space then tab
+  assert.equal(parseCapturableHookCommand('node ').reason, 'bad-node-prefix');
+});
+test('rejects a path not under $HOME/.claude/hooks (tilde, relative, env prefix, absolute)', () => {
+  assert.equal(
+    parseCapturableHookCommand('node ~/.claude/hooks/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node .claude/hooks/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+  assert.equal(parseCapturableHookCommand('node hooks/x.mjs').reason, 'path-not-under-home-hooks');
+  assert.equal(
+    parseCapturableHookCommand('node FOO=1 $HOME/.claude/hooks/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node /Users/foo/.claude/hooks/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/agents/x.mjs').reason,
+    'path-not-under-home-hooks',
+  );
+});
+test('rejects a nested segment or traversal in the tail', () => {
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/sub/x.mjs').reason,
+    'nested-segment',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/../x.mjs').reason,
+    'nested-segment',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/a..b.mjs').reason,
+    'nested-segment',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/a\\b.mjs').reason,
+    'nested-segment',
+  );
+});
+test('rejects a non-.mjs tail', () => {
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x.js').reason, 'not-mjs');
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x').reason, 'not-mjs');
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x.mjs.bak').reason, 'not-mjs');
+});
+test('rejects a stem that fails isValidInstallStem, including the reserved hypo namespace', () => {
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/hypo-core.mjs').reason,
+    'invalid-stem',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/Hypo-x.mjs').reason,
+    'invalid-stem',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/con.mjs').reason,
+    'invalid-stem',
+  );
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/.hidden.mjs').reason,
+    'invalid-stem',
+  );
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/.mjs').reason, 'invalid-stem'); // empty stem
+});
+
+suite('capture: scanSettingsHooks defensive walk');
+
+test('yields one record per hook with matcher attribution and event/group keys', () => {
+  const settings = {
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: 'Bash',
+          hooks: [
+            { type: 'command', command: 'node $HOME/.claude/hooks/a.mjs', timeout: 5 },
+            { type: 'command', command: 'node $HOME/.claude/hooks/b.mjs' },
+          ],
+        },
+      ],
+      Stop: [{ hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/c.mjs' }] }],
+    },
+  };
+  const records = scanSettingsHooks(settings);
+  assert.equal(records.length, 3);
+  const a = records.find((r) => r.command.endsWith('a.mjs'));
+  assert.equal(a.event, 'PreToolUse');
+  assert.equal(a.matcher, 'Bash');
+  assert.equal(a.timeout, 5);
+  assert.deepEqual(a.hookKeys, ['type', 'command', 'timeout']);
+  assert.deepEqual(a.groupKeys, ['matcher', 'hooks']);
+  const b = records.find((r) => r.command.endsWith('b.mjs'));
+  assert.equal(b.matcher, 'Bash'); // attributed verbatim from the shared parent group
+  assert.equal(b.timeout, undefined);
+  const c = records.find((r) => r.command.endsWith('c.mjs'));
+  assert.equal(c.event, 'Stop');
+  assert.equal(c.matcher, undefined); // no matcher on the group
+});
+test('normalizes an empty-string matcher to absent', () => {
+  const records = scanSettingsHooks({
+    hooks: {
+      Stop: [
+        { matcher: '', hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/x.mjs' }] },
+      ],
+    },
+  });
+  assert.equal(records.length, 1);
+  assert.equal(records[0].matcher, undefined);
+});
+test('skips malformed rungs without throwing', () => {
+  assert.deepEqual(scanSettingsHooks(null), []);
+  assert.deepEqual(scanSettingsHooks(42), []);
+  assert.deepEqual(scanSettingsHooks({}), []);
+  assert.deepEqual(scanSettingsHooks({ hooks: [] }), []); // hooks must be an object map
+  assert.deepEqual(scanSettingsHooks({ hooks: { Stop: {} } }), []); // event value must be an array
+  assert.deepEqual(scanSettingsHooks({ hooks: { Stop: ['notgroup'] } }), []); // group must be an object
+  assert.deepEqual(scanSettingsHooks({ hooks: { Stop: [{ hooks: 'x' }] } }), []); // hook list must be an array
+  assert.deepEqual(scanSettingsHooks({ hooks: { Stop: [{ hooks: ['notobj', null, 42] }] } }), []); // hook entries must be objects
+});
+test('surfaces the raw entry.type value (needed for the command-type gate)', () => {
+  const records = scanSettingsHooks({
+    hooks: {
+      Stop: [{ hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/x.mjs' }] }],
+    },
+  });
+  assert.equal(records.length, 1);
+  assert.equal(records[0].type, 'command');
+});
+
+// ── reverse hook capture: scanHookCandidates (T4, F3/F4/F6 + exclusions) ───────
+
+// Build a throwaway ~/.claude with a hooks/ dir + settings.json for the pure
+// scanHookCandidates walk. `hookFiles` are created as real regular .mjs sources so
+// the resolved-source existence check passes; omit a name to exercise a missing
+// source. Returns via callback so the temp dir is cleaned up.
+function withHookEnv(hookFiles, settings, fn) {
+  withTmpDir((dir) => {
+    const claudeHome = join(dir, '.claude');
+    const hooksDir = join(claudeHome, 'hooks');
+    mkdirSync(hooksDir, { recursive: true });
+    for (const name of hookFiles) writeFileSync(join(hooksDir, name), '#!/usr/bin/env node\n');
+    const settingsPath = join(claudeHome, 'settings.json');
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    fn({ claudeHome, settingsPath });
+  });
+}
+
+function oneHook(command, extra = {}) {
+  return { hooks: { PostToolUse: [{ hooks: [{ type: 'command', command, ...extra }] }] } };
+}
+
+suite('capture: scanHookCandidates candidate + exclusions (T4)');
+
+test('a canonical hook with a real source becomes a candidate with restored fields', () => {
+  const settings = {
+    hooks: {
+      PostToolUse: [
+        {
+          matcher: 'Write',
+          hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/goodh.mjs', timeout: 5 }],
+        },
+      ],
+    },
+  };
+  withHookEnv(['goodh.mjs'], settings, ({ claudeHome, settingsPath }) => {
+    const { candidates, skipped } = scanHookCandidates(claudeHome, settingsPath, {}, new Set());
+    assert.equal(candidates.length, 1);
+    assert.equal(skipped.length, 0);
+    const c = candidates[0];
+    assert.equal(c.type, 'hooks');
+    assert.equal(c.stem, 'goodh');
+    assert.equal(c.file, 'goodh.mjs');
+    assert.equal(c.event, 'PostToolUse');
+    assert.equal(c.matcher, 'Write');
+    assert.equal(c.timeout, 5);
+    assert.equal(c.label, 'hooks/goodh.mjs');
+  });
+});
+test('no-ops cleanly on an absent or invalid settings.json (keeps commands/agents green)', () => {
+  withTmpDir((dir) => {
+    const claudeHome = join(dir, '.claude');
+    mkdirSync(claudeHome, { recursive: true });
+    const missing = join(claudeHome, 'settings.json');
+    assert.deepEqual(scanHookCandidates(claudeHome, missing, {}, new Set()), {
+      candidates: [],
+      skipped: [],
+    });
+    writeFileSync(missing, '{ not json');
+    assert.deepEqual(scanHookCandidates(claudeHome, missing, {}, new Set()), {
+      candidates: [],
+      skipped: [],
+    });
+  });
+});
+test('lossy command axes each skip with a visible reason and yield no candidate', () => {
+  // Each axis uses a UNIQUE basename so the F6 duplicate check never shadows the
+  // per-axis reason. None of these is capturable, so nothing is written anywhere.
+  const axes = [
+    { command: 'node $HOME/.claude/hooks/argh.mjs --flag', reason: 'not-mjs' }, // extra CLI arg
+    { command: 'FOO=1 node $HOME/.claude/hooks/envh.mjs', reason: 'bad-node-prefix' }, // env prefix
+    { command: 'node $HOME/.claude/hooks/shellh.mjs && echo hi', reason: 'not-mjs' }, // inline shell
+    { command: '/usr/bin/node $HOME/.claude/hooks/absnodeh.mjs', reason: 'bad-node-prefix' }, // non-bare node
+    { command: 'node $HOME/.claude/hooks/ghosth.mjs', reason: 'unresolved-source' }, // .mjs missing
+    { command: 'node $HOME/.config/hooks/outh.mjs', reason: 'path-not-under-home-hooks' }, // path outside
+    { command: 'node hooks/relh.mjs', reason: 'path-not-under-home-hooks' }, // relative
+    { command: 'node ~/.claude/hooks/tildeh.mjs', reason: 'path-not-under-home-hooks' }, // tilde
+    { command: 'node  $HOME/.claude/hooks/dblh.mjs', reason: 'bad-node-prefix' }, // double space
+    { command: 'node $HOME/.claude/hooks/crh.mjs\n', reason: 'contains-newline' }, // CRLF
+  ];
+  const settings = {
+    hooks: { PostToolUse: axes.map((a) => ({ hooks: [{ type: 'command', command: a.command }] })) },
+  };
+  // Deliberately do NOT create ghosth.mjs (unresolved-source axis).
+  withHookEnv([], settings, ({ claudeHome, settingsPath }) => {
+    const { candidates, skipped } = scanHookCandidates(claudeHome, settingsPath, {}, new Set());
+    assert.equal(candidates.length, 0, 'no lossy command becomes a candidate');
+    for (const a of axes) {
+      assert.ok(
+        skipped.some((s) => s.command === a.command && s.reason === a.reason),
+        `${JSON.stringify(a.command)} should skip as ${a.reason}`,
+      );
+    }
+  });
+});
+test('F3: an extra hook key skips as unpreservable-shape', () => {
+  withHookEnv(
+    ['shapeh.mjs'],
+    oneHook('node $HOME/.claude/hooks/shapeh.mjs', { run: 'x' }),
+    (env) => {
+      const { candidates, skipped } = scanHookCandidates(
+        env.claudeHome,
+        env.settingsPath,
+        {},
+        new Set(),
+      );
+      assert.equal(candidates.length, 0);
+      assert.ok(skipped.some((s) => s.reason === 'unpreservable-shape'));
+    },
+  );
+});
+test('F3: an extra group key skips as unpreservable-shape', () => {
+  const settings = {
+    hooks: {
+      Stop: [
+        {
+          description: 'nope',
+          hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/grph.mjs' }],
+        },
+      ],
+    },
+  };
+  withHookEnv(['grph.mjs'], settings, (env) => {
+    const { candidates, skipped } = scanHookCandidates(
+      env.claudeHome,
+      env.settingsPath,
+      {},
+      new Set(),
+    );
+    assert.equal(candidates.length, 0);
+    assert.ok(skipped.some((s) => s.reason === 'unpreservable-shape'));
+  });
+});
+test('F3: a non-positive-integer timeout skips as unpreservable-shape', () => {
+  for (const timeout of [0, -5, 1.5, 'x']) {
+    withHookEnv(['toh.mjs'], oneHook('node $HOME/.claude/hooks/toh.mjs', { timeout }), (env) => {
+      const { candidates, skipped } = scanHookCandidates(
+        env.claudeHome,
+        env.settingsPath,
+        {},
+        new Set(),
+      );
+      assert.equal(candidates.length, 0, `timeout ${timeout} must not capture`);
+      assert.ok(
+        skipped.some((s) => s.reason === 'unpreservable-shape'),
+        `timeout ${timeout}`,
+      );
+    });
+  }
+});
+test('F6: a case-folded duplicate basename skips every registration', () => {
+  const settings = {
+    hooks: {
+      PostToolUse: [{ hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/dup.mjs' }] }],
+      Stop: [{ hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/DUP.mjs' }] }],
+    },
+  };
+  withHookEnv(['dup.mjs', 'DUP.mjs'], settings, (env) => {
+    const { candidates, skipped } = scanHookCandidates(
+      env.claudeHome,
+      env.settingsPath,
+      {},
+      new Set(),
+    );
+    assert.equal(candidates.length, 0);
+    const dups = skipped.filter((s) => s.reason === 'duplicate-registration');
+    assert.equal(dups.length, 2, 'both registrations of the case-folded basename are skipped');
+  });
+});
+test('an event outside HOOK_EVENT_ALLOWLIST skips', () => {
+  const settings = {
+    hooks: {
+      NotARealEvent: [
+        { hooks: [{ type: 'command', command: 'node $HOME/.claude/hooks/evh.mjs' }] },
+      ],
+    },
+  };
+  withHookEnv(['evh.mjs'], settings, (env) => {
+    const { candidates, skipped } = scanHookCandidates(
+      env.claudeHome,
+      env.settingsPath,
+      {},
+      new Set(),
+    );
+    assert.equal(candidates.length, 0);
+    assert.ok(skipped.some((s) => s.reason === 'event-not-allowlisted'));
+  });
+});
+test('a non-command hook type skips', () => {
+  withHookEnv(['ph.mjs'], oneHook('node $HOME/.claude/hooks/ph.mjs', {}), (env) => {
+    // Overwrite type to a non-command value.
+    const s = JSON.parse(readFileSync(env.settingsPath, 'utf-8'));
+    s.hooks.PostToolUse[0].hooks[0].type = 'prompt';
+    writeFileSync(env.settingsPath, JSON.stringify(s));
+    const { candidates, skipped } = scanHookCandidates(
+      env.claudeHome,
+      env.settingsPath,
+      {},
+      new Set(),
+    );
+    assert.equal(candidates.length, 0);
+    assert.ok(skipped.some((s2) => s2.reason === 'non-command-type'));
+  });
+});
+test('a core hook basename (from hooks.json) is excluded', () => {
+  // Use the REAL derived core basenames so this pins the F5 hooks.json reservation.
+  const cfg = readCoreHooksConfig(REPO);
+  assert.ok(cfg.ok, 'repo hooks.json must load');
+  const coreBasenames = deriveCoreHookBasenames(cfg.cfg);
+  assert.ok(
+    coreBasenames.has('version-check.mjs'),
+    'version-check.mjs must be a reserved shared name',
+  );
+  const settings = oneHook('node $HOME/.claude/hooks/version-check.mjs');
+  withHookEnv(['version-check.mjs'], settings, (env) => {
+    const { candidates, skipped } = scanHookCandidates(
+      env.claudeHome,
+      env.settingsPath,
+      {},
+      coreBasenames,
+    );
+    assert.equal(candidates.length, 0);
+    assert.ok(skipped.some((s) => s.reason === 'core-hook'));
+  });
+});
+test('an already-owned hook (recorded install-path key) is excluded', () => {
+  withHookEnv(['ownedh.mjs'], oneHook('node $HOME/.claude/hooks/ownedh.mjs'), (env) => {
+    const recorded = { 'hooks/ownedh.mjs': 'somesha' };
+    const { candidates, skipped } = scanHookCandidates(
+      env.claudeHome,
+      env.settingsPath,
+      recorded,
+      new Set(),
+    );
+    assert.equal(candidates.length, 0);
+    assert.ok(skipped.some((s) => s.reason.startsWith('already-managed')));
+  });
+});
+test('a hypo-* namespaced command is excluded at parse (invalid-stem)', () => {
+  withHookEnv([], oneHook('node $HOME/.claude/hooks/hypo-ext-x.mjs'), (env) => {
+    const { candidates, skipped } = scanHookCandidates(
+      env.claudeHome,
+      env.settingsPath,
+      {},
+      new Set(),
+    );
+    assert.equal(candidates.length, 0);
+    assert.ok(skipped.some((s) => s.reason === 'invalid-stem'));
+  });
+});
+test('a symlinked source (non-regular) is refused as unresolved-source', () => {
+  withTmpDir((dir) => {
+    const claudeHome = join(dir, '.claude');
+    const hooksDir = join(claudeHome, 'hooks');
+    mkdirSync(hooksDir, { recursive: true });
+    const outside = join(dir, 'evil.mjs');
+    writeFileSync(outside, '#!/usr/bin/env node\n');
+    symlinkSync(outside, join(hooksDir, 'symh.mjs'));
+    const settingsPath = join(claudeHome, 'settings.json');
+    writeFileSync(settingsPath, JSON.stringify(oneHook('node $HOME/.claude/hooks/symh.mjs')));
+    const { candidates, skipped } = scanHookCandidates(claudeHome, settingsPath, {}, new Set());
+    assert.equal(candidates.length, 0);
+    assert.ok(skipped.some((s) => s.reason === 'unresolved-source'));
+  });
+});
+
+// ── reverse hook capture: end-to-end CLI (success criteria a-e + adopt) ────────
+
+// Register one canonical hook (a real .mjs source + the exact settings.json form
+// forward-sync emits) so the capture → adopt round-trip can be observed whole.
+function seedCanonicalHook(home, { stem, event = 'PostToolUse', matcher, timeout, body }) {
+  const hooksDir = join(home, '.claude', 'hooks');
+  mkdirSync(hooksDir, { recursive: true });
+  writeFileSync(join(hooksDir, `${stem}.mjs`), body);
+  const settingsPath = join(home, '.claude', 'settings.json');
+  const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf-8')) : {};
+  settings.hooks = settings.hooks || {};
+  const hookEntry = { type: 'command', command: `node $HOME/.claude/hooks/${stem}.mjs` };
+  if (timeout !== undefined) hookEntry.timeout = timeout;
+  const group = { hooks: [hookEntry] };
+  if (matcher !== undefined) group.matcher = matcher;
+  settings.hooks[event] = (settings.hooks[event] || []).concat([group]);
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  return settingsPath;
+}
+
+suite('capture: reverse hook capture end-to-end (T4, success criteria a-e)');
+
+test('captures a canonical hook losslessly and adopts it under the original name', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const body = '#!/usr/bin/env node\nprocess.exit(0)\n';
+      const settingsPath = seedCanonicalHook(home, {
+        stem: 'myhook',
+        matcher: 'Write|Edit',
+        timeout: 10000,
+        body,
+      });
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      // (a) wiki .mjs is byte-identical and the manifest carries every field.
+      const wikiDir = join(hypoDir, 'extensions', 'hooks');
+      assert.equal(readFileSync(join(wikiDir, 'hypo-ext-myhook.mjs'), 'utf-8'), body);
+      const manifest = JSON.parse(
+        readFileSync(join(wikiDir, 'hypo-ext-myhook.manifest.json'), 'utf-8'),
+      );
+      assert.deepEqual(manifest, {
+        type: 'hook',
+        installName: 'myhook',
+        event: 'PostToolUse',
+        matcher: 'Write|Edit',
+        timeout: 10000,
+      });
+
+      // (d) BOTH SHA keys are owned under the install path; wiki-storage keys are not.
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(pkg.extensions.claude['hooks/myhook.mjs'], 'mjs key owned');
+      assert.ok(pkg.extensions.claude['hooks/myhook.manifest.json'], 'sidecar key owned');
+      assert.ok(!pkg.extensions.claude['hooks/hypo-ext-myhook.mjs'], 'wiki-name key not recorded');
+
+      // (b)(c)(e) exactly one registration, command char-identical, fields restored,
+      // no hypo-ext-* name leaked into settings.
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const groups = (after.hooks.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('myhook.mjs')),
+      );
+      assert.equal(groups.length, 1, 'no duplicate registration (e)');
+      assert.equal(
+        groups[0].hooks[0].command,
+        'node $HOME/.claude/hooks/myhook.mjs',
+        'command char-identical (b)',
+      );
+      assert.equal(groups[0].matcher, 'Write|Edit', 'matcher restored (c)');
+      assert.equal(groups[0].hooks[0].timeout, 10000, 'timeout restored (c)');
+      assert.ok(
+        !/hypo-ext-myhook/.test(readFileSync(settingsPath, 'utf-8')),
+        'no wiki name in settings',
+      );
+    });
+  });
+});
+test('omits an empty matcher from the reverse-generated manifest', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      seedCanonicalHook(home, { stem: 'nomatch', matcher: '', body: '#!/usr/bin/env node\n' });
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+      const manifest = JSON.parse(
+        readFileSync(
+          join(hypoDir, 'extensions', 'hooks', 'hypo-ext-nomatch.manifest.json'),
+          'utf-8',
+        ),
+      );
+      assert.deepEqual(manifest, { type: 'hook', installName: 'nomatch', event: 'PostToolUse' });
+    });
+  });
+});
+test('--dry-run writes nothing to the wiki and does not adopt', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      seedCanonicalHook(home, { stem: 'dryh', body: '#!/usr/bin/env node\n' });
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all', '--dry-run'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /Would capture/);
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-dryh.mjs')),
+        'dry-run must not write the wiki .mjs',
+      );
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const owned = existsSync(pkgPath)
+        ? (JSON.parse(readFileSync(pkgPath, 'utf-8')).extensions?.claude ?? {})
+        : {};
+      assert.ok(!owned['hooks/dryh.mjs'], 'dry-run must not adopt');
+    });
+  });
+});
+test('a lossy hook writes nothing to the wiki and surfaces a skip reason', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      // Absolute-path registration is legal but non-canonical → visible skip.
+      const hooksDir = join(home, '.claude', 'hooks');
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, 'abs.mjs'), '#!/usr/bin/env node\n');
+      writeFileSync(
+        join(home, '.claude', 'settings.json'),
+        JSON.stringify({
+          hooks: {
+            Stop: [{ hooks: [{ type: 'command', command: `node ${home}/.claude/hooks/abs.mjs` }] }],
+          },
+        }),
+      );
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.match(r.stdout, /path-not-under-home-hooks/, 'absolute path is a visible skip');
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-abs.mjs')),
+        'nothing written to the wiki for a lossy hook',
+      );
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-abs.manifest.json')),
+        'no manifest written for a lossy hook',
+      );
+    });
+  });
+});
+test('--type=hooks captures only hooks; --all and [names] select as expected', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      // One command extension + two hooks.
+      mkdirSync(join(home, '.claude', 'commands'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'commands', 'mycmd.md'), '# cmd\n');
+      seedCanonicalHook(home, { stem: 'hookone', body: '#!/usr/bin/env node\n// one\n' });
+      seedCanonicalHook(home, {
+        stem: 'hooktwo',
+        event: 'Stop',
+        body: '#!/usr/bin/env node\n// two\n',
+      });
+
+      // --type=hooks: only the hooks are captured, not the command.
+      const rt = runWithHome(
+        'capture.mjs',
+        [`--hypo-dir=${hypoDir}`, '--type=hooks', '--all'],
+        home,
+      );
+      assert.equal(rt.status, 0, rt.stderr);
+      assert.ok(existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-hookone.mjs')));
+      assert.ok(existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-hooktwo.mjs')));
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'commands', 'hypo-ext-mycmd.md')),
+        '--type=hooks must not capture the command',
+      );
+    });
+  });
+});
+test('[names] captures only the named hook stem', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      seedCanonicalHook(home, { stem: 'keepme', body: '#!/usr/bin/env node\n// keep\n' });
+      seedCanonicalHook(home, {
+        stem: 'skipme',
+        event: 'Stop',
+        body: '#!/usr/bin/env node\n// skip\n',
+      });
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, 'keepme'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-keepme.mjs')));
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-skipme.mjs')),
+        'only the named stem is captured',
+      );
+    });
+  });
+});
+test('--all also includes hooks alongside commands', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      mkdirSync(join(home, '.claude', 'commands'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'commands', 'bothcmd.md'), '# cmd\n');
+      seedCanonicalHook(home, { stem: 'bothhook', body: '#!/usr/bin/env node\n' });
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(existsSync(join(hypoDir, 'extensions', 'commands', 'hypo-ext-bothcmd.md')));
+      assert.ok(existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-bothhook.mjs')));
+    });
+  });
+});
+test('adopt failure rolls back the wiki hook writes (sidecar install path blocked)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      seedCanonicalHook(home, { stem: 'failh', body: '#!/usr/bin/env node\n' });
+      // Plant a symlink at the sidecar install path so forward-sync cannot own the
+      // manifest: the `.mjs` key is owned but the sidecar key is not, so the dual-key
+      // adopt verification fails and rollbackRec must undo the wiki writes.
+      const outside = join(dir, 'not-a-manifest');
+      writeFileSync(outside, 'x');
+      symlinkSync(outside, join(home, '.claude', 'hooks', 'failh.manifest.json'));
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 1, 'a failed adopt exits non-zero');
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-failh.mjs')),
+        'wiki .mjs rolled back',
+      );
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-failh.manifest.json')),
+        'wiki manifest rolled back',
+      );
     });
   });
 });

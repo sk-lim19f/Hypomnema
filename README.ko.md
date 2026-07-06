@@ -33,7 +33,7 @@ Andrej Karpathy의 "LLM 네이티브 위키" 스케치에서 출발했습니다.
 
 - 피드백 한 곳만 고치면 나머지는 따라옵니다. `pages/feedback/`에 한 번 적으면 위키가 `MEMORY.md`와 `~/.claude/CLAUDE.md`의 `<learned_behaviors>` 블록을 자동으로 갱신합니다(단방향 projection).
 - 확장 파일도 함께 동기화. 위키 안 `~/hypomnema/extensions/{agents,commands,hooks,skills}/`에 둔 파일을 `~/.claude/`에 자동 반영합니다. `--codex`를 붙이면 `hooks`·`commands`는 `~/.codex/`에도 반영하지만, `agents`와 `skills`는 Claude 전용이라 건너뜁니다.
-- 역방향 capture는 반대로 갑니다. `hypomnema capture`(또는 `/hypo:capture`)는 `~/.claude/{commands,agents}/`에 보통 방식으로 만든 command·agent를 위키로 끌어와, 이후 다른 머신에 원래 이름 그대로 동기화되게 합니다. capture는 명시적이며 내용이 다른 위키 파일은 덮어쓰지 않습니다. hook과 skill은 아직 capture 대상이 아닙니다.
+- 역방향 capture는 반대로 갑니다. `hypomnema capture`(또는 `/hypo:capture`)는 `~/.claude/{commands,agents}/`에 보통 방식으로 만든 command·agent나 `~/.claude/settings.json`에 등록한 정규형 hook을 위키로 끌어와, 이후 다른 머신에 원래 이름 그대로 동기화되게 합니다. hook은 정규형으로 무손실 라운드트립되는 것만 capture하고, 나머지는 이유와 함께 건너뜁니다. capture는 명시적이며 내용이 다른 위키 파일은 덮어쓰지 않습니다. skill은 아직 capture 대상이 아닙니다.
 - 프로젝트 자동 생성. 프로젝트 표식(`package.json`·`Cargo.toml` 등)이 있는 git 저장소로 `cd` 했는데 대응하는 위키 프로젝트가 없으면 만들지 물어봅니다.
 - 세션 종료 자동 정리와 `/clear` 복구. 의미 있는 세션이 끝나면 "마무리 메모를 짧게 남길까요?"가 자동으로 뜹니다. 마무리하지 않은 채 `/clear`를 입력해도 다음 세션 시작 때 이어서 정리할 수 있습니다.
 

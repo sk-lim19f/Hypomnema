@@ -1,10 +1,10 @@
 ---
-description: Pull extensions you made the normal way under ~/.claude/{commands,agents} into the wiki so they sync to your other machines. Use when the user wants to capture, adopt, or back up a locally-authored slash command or agent into Hypomnema.
+description: Pull extensions you made the normal way under ~/.claude/{commands,agents}, or a canonical hook registered in ~/.claude/settings.json, into the wiki so they sync to your other machines. Use when the user wants to capture, adopt, or back up a locally-authored slash command, agent, or hook into Hypomnema.
 ---
 
-You are running `/hypo:capture`. Bring a command or agent that the user created the normal way (directly under `~/.claude/commands/` or `~/.claude/agents/`) into the wiki `extensions/` tree so the existing forward-sync propagates it to their other machines.
+You are running `/hypo:capture`. Bring a command or agent that the user created the normal way (directly under `~/.claude/commands/` or `~/.claude/agents/`), or a hook they registered in `~/.claude/settings.json`, into the wiki `extensions/` tree so the existing forward-sync propagates it to their other machines under its original name.
 
-Scope: commands and agents only. Hooks and skills are not captured yet.
+Scope: commands, agents, and hooks. Commands and agents are enumerated from `~/.claude/{commands,agents}/`; hooks are read from the `~/.claude/settings.json` registration. A hook is captured only when its command is the canonical `node $HOME/.claude/hooks/<name>.mjs` form and it round-trips losslessly (original event, matcher, and timeout preserved); non-canonical or lossy registrations are skipped with a reason instead of being rewritten. Skills are not captured yet.
 
 ## Step 1: Resolve the package root
 
@@ -18,9 +18,9 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 node ${CLAUDE_PLUGIN_ROOT}/scripts/capture.mjs [--hypo-dir="<path>"]
 ```
 
-With no names and no `--all`, the script lists capturable candidates and stops. It excludes anything already managed by the wiki, the reserved `hypo-*` namespace, symlinks, and non-`.md` files.
+With no names and no `--all`, the script lists capturable candidates and stops. Candidates come from two sources: commands and agents are the unowned regular `.md` files under `~/.claude/{commands,agents}/`, and hooks are the canonical `node $HOME/.claude/hooks/<name>.mjs` entries registered in `~/.claude/settings.json`. It excludes anything already managed by the wiki, the reserved `hypo-*` namespace, symlinks and other non-regular files, core hooks, and any hook whose registration would not round-trip losslessly. Skipped hook registrations are printed with the reason; unowned commands and agents that fail these filters are simply omitted from the list, without a per-item reason.
 
-Show the list. Note that these are every unowned regular `.md` under the top-level directories, not a provenance check: explicit selection is the trust boundary. A third-party tool's file could appear here, so let the user pick deliberately.
+Show the list. Note that these are unowned candidates, not a provenance check: explicit selection is the trust boundary. A third-party tool's command, agent, or hook could appear here, so let the user pick deliberately.
 
 ## Step 3: Capture the user's selection
 
@@ -31,9 +31,9 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/capture.mjs [--hypo-dir="<path>"] <name> [<na
 node ${CLAUDE_PLUGIN_ROOT}/scripts/capture.mjs [--hypo-dir="<path>"] --all
 ```
 
-A name is the filename (`mycmd.md`), its stem (`mycmd`), or the `type/file` form (`commands/mycmd.md`). Add `--dry-run` to preview without writing.
+A name is the filename (`mycmd.md`, or `myhook.mjs` for a hook), its stem (`mycmd`), or the `type/file` form (`commands/mycmd.md`, `hooks/myhook.mjs`). Add `--dry-run` to preview without writing.
 
-Each capture stores the file in the wiki as `extensions/<type>/hypo-ext-<name>.md` with a sidecar `hypo-ext-<name>.manifest.json` that records the original install name, then adopts it so the currently-installed copy is left in place and tracked. A wiki file that already exists with different content (or a mismatched manifest) is refused, not overwritten.
+Each capture stores the file in the wiki as `extensions/<type>/hypo-ext-<name>.<ext>` (`.md` for commands and agents, `.mjs` for hooks) with a sidecar `hypo-ext-<name>.manifest.json` that records the original install name (and, for a hook, its event, matcher, and timeout), then adopts it so the currently-installed copy is left in place and tracked. A wiki file that already exists with different content (or a mismatched manifest) is refused, not overwritten.
 
 ## Step 4: Commit the wiki, then sync elsewhere
 

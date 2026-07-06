@@ -55,11 +55,12 @@ const TYPE_FILE_EXT = { hooks: '.mjs', commands: '.md', skills: '.md', agents: '
 // retargeting an install path).
 const TYPE_SINGULAR = { hooks: 'hook', commands: 'command', skills: 'skill', agents: 'agent' };
 
-// installName carrier (capture design §3): reverse-captured commands/agents install
-// under the user's ORIGINAL name, not the wiki `hypo-ext-*` storage name. Only
-// commands/agents opt in — hooks keep the wiki name (their settings.json command
-// string is prefix-derived) and skills are not captured in the MVP.
-const INSTALLNAME_TYPES = new Set(['commands', 'agents']);
+// installName carrier (capture design §3): reverse-captured commands/agents/hooks
+// install under the user's ORIGINAL name, not the wiki `hypo-ext-*` storage name.
+// For hooks the installName also drives the reconstructed settings.json command
+// (buildHookCommand) and the sidecar manifest install name (P1), so all three
+// ownership paths stay aligned. Skills are not captured in the MVP.
+const INSTALLNAME_TYPES = new Set(['commands', 'agents', 'hooks']);
 
 // A valid installName stem: same conservative charset as SAFE_EXT_STEM but
 // WITHOUT the required hypo-ext- prefix (the whole point of C is to restore the
@@ -130,8 +131,9 @@ export function resolveInstallFile(ext) {
     return { installFile: ext.file };
   }
   const parsed = parseManifest(ext.manifestPath);
-  // Non-hook manifests are always ok:true (parseManifest only fails hook ones),
-  // so a malformed non-hook manifest is not reachable here; be defensive anyway.
+  // A malformed hook manifest is reachable here (parseManifest validates hooks);
+  // fall back to the wiki storage name so the later sync loop, which re-parses and
+  // skips the malformed hook, still finds a consistent install path.
   if (!parsed.ok) return { installFile: ext.file };
   const m = parsed.manifest;
   if (!m || m.type !== TYPE_SINGULAR[ext.type] || m.installName === undefined) {
@@ -316,9 +318,11 @@ export function parseManifest(path) {
 
 /**
  * Build the settings.json entries expected for the discovered hook extensions.
- * The command string is constructed here (never from the manifest) as
- * `node $HOME/.claude/hooks/<basename>`. Extensions whose manifest is missing or
- * not registrable yield no entry.
+ * The command string is constructed here (never from the manifest) via the shared
+ * `buildHookCommand`, using the installName-resolved install filename so a captured
+ * hook registers under its original name and its command matches the installed
+ * `.mjs`. Extensions whose manifest is missing, not registrable, or whose
+ * installName is invalid (resolveInstallFile skip) yield no entry.
  */
 export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
   const entries = [];
@@ -326,7 +330,9 @@ export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
     if (!ext.manifestPath) continue;
     const parsed = parseManifest(ext.manifestPath);
     if (!parsed.ok || !parsed.registrable) continue;
-    const command = `node ${targetHooksDir.replace(HOME, '$HOME')}/${ext.file}`;
+    const resolved = resolveInstallFile(ext);
+    if (resolved.skip) continue;
+    const command = buildHookCommand(targetHooksDir, resolved.installFile);
     entries.push({
       name: ext.name,
       file: ext.file,
@@ -337,6 +343,112 @@ export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
     });
   }
   return entries;
+}
+
+/**
+ * The single source of the settings.json hook command string (capture design
+ * F4). Both the forward path (`buildExpectedSettingsEntries`) and the reverse
+ * strict parser (`parseCapturableHookCommand`) mirror this one shape so the two
+ * directions can never drift. `hooksDir` is `<HOME>/.claude/hooks`, rewritten to
+ * a `$HOME` literal so a captured registration stays portable across machines.
+ */
+export function buildHookCommand(hooksDir, installFile) {
+  return `node ${hooksDir.replace(HOME, '$HOME')}/${installFile}`;
+}
+
+// The exact canonical hook path prefix that `buildHookCommand` emits for a dir
+// under HOME. The strict parser accepts only this literal — an absolute path, a
+// `~`, or an env prefix all diverge and are rejected with a visible reason.
+const CAPTURABLE_HOOK_PATH_PREFIX = '$HOME/.claude/hooks/';
+const CAPTURABLE_NODE_PREFIX = 'node ';
+const MJS_EXT = '.mjs';
+
+/**
+ * Strict, fs-free parser for a capturable hook command (capture design F4). It
+ * accepts ONLY the byte-for-byte shape `buildHookCommand` produces for a dir
+ * under HOME: `node $HOME/.claude/hooks/<stem>.mjs`. Returns
+ * `{ ok:true, stem, basename }` on a match, else `{ ok:false, reason }` with a
+ * distinct reason per rejection axis so a caller can surface why a hook was not
+ * captured (never a silent drop). This is deliberately NOT the lenient
+ * `_extractCommandFileName` used by init: capture eligibility must be exact.
+ */
+export function parseCapturableHookCommand(command) {
+  if (typeof command !== 'string') return { ok: false, reason: 'not-a-string' };
+  // A newline in a command would break the one-line canonical shape and could
+  // smuggle a second statement past a prefix check.
+  if (/[\r\n]/.test(command)) return { ok: false, reason: 'contains-newline' };
+  if (!command.startsWith(CAPTURABLE_NODE_PREFIX)) {
+    return { ok: false, reason: 'bad-node-prefix' };
+  }
+  const rest = command.slice(CAPTURABLE_NODE_PREFIX.length);
+  // Reject extra leading whitespace (a double space or a tab after `node`): the
+  // builder emits exactly one space, so anything more is a lossy divergence.
+  if (rest.length === 0 || rest[0] === ' ' || rest[0] === '\t') {
+    return { ok: false, reason: 'bad-node-prefix' };
+  }
+  if (!rest.startsWith(CAPTURABLE_HOOK_PATH_PREFIX)) {
+    // Covers `~`, a relative path, an env prefix, and an absolute path — none
+    // start with the `$HOME/.claude/hooks/` literal.
+    return { ok: false, reason: 'path-not-under-home-hooks' };
+  }
+  const tail = rest.slice(CAPTURABLE_HOOK_PATH_PREFIX.length);
+  // The tail must be a single filename segment: no further separators (no
+  // subdirectory) and no traversal.
+  if (tail.includes('/') || tail.includes('\\') || tail.includes('..')) {
+    return { ok: false, reason: 'nested-segment' };
+  }
+  if (!tail.endsWith(MJS_EXT)) {
+    return { ok: false, reason: 'not-mjs' };
+  }
+  const stem = tail.slice(0, -MJS_EXT.length);
+  // Same stem gate as install (rejects the reserved hypo-* namespace, Windows
+  // device names, and out-of-charset names) so parse and install agree.
+  if (!isValidInstallStem(stem)) {
+    return { ok: false, reason: 'invalid-stem' };
+  }
+  return { ok: true, stem, basename: tail };
+}
+
+/**
+ * Pure, defensive walk of `settings.hooks[event][group].hooks[]` (capture design
+ * F4). Yields one record per hook entry:
+ * `{ event, matcher, type, timeout, command, hookKeys, groupKeys }`. `type` is the
+ * raw `entry.type` value (reverse-capture requires `'command'`, distinct from the
+ * `type` KEY that hookKeys reports). `matcher` is taken
+ * verbatim from the parent group with `''` normalized to absent (undefined),
+ * matching `parseManifest`/`registerSettings`. Any malformed rung (non-array
+ * event list, non-object group, non-array hook list, non-object hook) is skipped
+ * rather than throwing, so a hand-edited settings.json cannot crash the caller.
+ */
+export function scanSettingsHooks(settings) {
+  const records = [];
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return records;
+  const hooks = settings.hooks;
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return records;
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!group || typeof group !== 'object' || Array.isArray(group)) continue;
+      const groupKeys = Object.keys(group);
+      let matcher = group.matcher;
+      if (matcher === '') matcher = undefined; // empty matcher === absent matcher
+      const hookList = group.hooks;
+      if (!Array.isArray(hookList)) continue;
+      for (const entry of hookList) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        records.push({
+          event,
+          matcher,
+          type: entry.type,
+          timeout: entry.timeout,
+          command: entry.command,
+          hookKeys: Object.keys(entry),
+          groupKeys,
+        });
+      }
+    }
+  }
+  return records;
 }
 
 /** Read the full hypo-pkg.json without any side effect (cf. pkg-json.readPkgJson,
@@ -559,8 +671,18 @@ export function syncExtensions({
   for (const ext of dupSkip) {
     const inst = installFileByExt.get(ext);
     if (!inst) continue; // invalid-installName skip: never owned
-    const key = `${ext.type}/${inst}`;
-    if (recorded[key] !== undefined && newSHAs[key] === undefined) newSHAs[key] = recorded[key];
+    // Preserve BOTH ownership keys a hook records: the main `.mjs` AND its paired
+    // `.manifest.json` sidecar. Preserving only the main key (codex pre-commit
+    // CONCERN) would drop the sidecar SHA on a duplicate-target collision, leaving
+    // the installed manifest copy on disk untracked by doctor and unreachable by
+    // uninstall. commands/agents have no sidecar, so their single key is preserved.
+    const keys = [`${ext.type}/${inst}`];
+    if (ext.type === 'hooks') {
+      keys.push(`${ext.type}/${inst.replace(/\.mjs$/, '.manifest.json')}`);
+    }
+    for (const key of keys) {
+      if (recorded[key] !== undefined && newSHAs[key] === undefined) newSHAs[key] = recorded[key];
+    }
   }
 
   for (const type of types) {
@@ -619,10 +741,15 @@ export function syncExtensions({
         manifestParsed &&
         manifestParsed.ok
       ) {
-        const mKey = `${type}/${ext.manifestName}`;
+        // P1: derive the sidecar install name from the sibling `.mjs` installFile
+        // so the manifest copy + SHA key follow installName exactly as the hook
+        // file does. For a wiki-authored hook (no installName) installFile is
+        // `ext.file`, so this equals the old `ext.manifestName` (no regression).
+        const installManifestName = installFile.replace(/\.mjs$/, '.manifest.json');
+        const mKey = `${type}/${installManifestName}`;
         const mRes = copyOne({
           srcPath: ext.manifestPath,
-          destPath: join(typeDir, ext.manifestName),
+          destPath: join(typeDir, installManifestName),
           key: mKey,
           recordedSHA: recorded[mKey],
           apply,
