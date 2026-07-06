@@ -901,12 +901,23 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
           const srcBuf = readFileIfRegular(ext.srcPath);
           if (srcBuf) {
             const srcSha = sha256(srcBuf);
+            // The pkg map stores only the source SHA, not the source identity, so
+            // this linkage is trustworthy ONLY when the SHA uniquely names one
+            // recorded install key. If two or more recorded `.mjs` keys carry this
+            // same SHA (e.g. a source-removed hook and a malformed hook with
+            // byte-identical content), the match is ambiguous: reclassifying it
+            // would misreport the source-removed hook as "manifest unregistrable".
+            // Collect the matching commands first and only reclassify when exactly
+            // one exists; leave the ambiguous case to the source-removed path.
+            const matched = [];
             for (const [key, sha] of Object.entries(recorded)) {
               if (sha !== srcSha) continue;
               const pk = parseExtKey(key, types);
               if (!pk || pk.type !== 'hooks' || !pk.installFile.endsWith('.mjs')) continue;
-              const realCmd = buildHookCommand(hooksDir, pk.installFile);
-              if (!sourceCmds.has(realCmd)) unregistrableCmds.add(realCmd);
+              matched.push(buildHookCommand(hooksDir, pk.installFile));
+            }
+            if (matched.length === 1 && !sourceCmds.has(matched[0])) {
+              unregistrableCmds.add(matched[0]);
             }
           }
         }

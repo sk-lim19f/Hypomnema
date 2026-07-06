@@ -7074,6 +7074,61 @@ test('doctor-extensions: source-removed installName-captured hook → orphan war
   });
 });
 
+// The source-SHA linkage that recovers a malformed hook's real registered command
+// must only fire when the SHA uniquely names one recorded install key. The pkg map
+// stores the source SHA but not the source identity, so a source-removed hook and a
+// malformed hook whose `.mjs` bytes are IDENTICAL share one SHA. Applying the
+// linkage to that ambiguous pair would misreport the source-removed hook as
+// "manifest unregistrable" (codex fix re-review CONCERN). Assert the source-removed
+// hook stays classified as source-removed and never leaks into unregistrable.
+test('doctor-extensions: identical-content source-removed + malformed hooks keep distinct classes', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      // Two hooks with byte-identical .mjs source but different installNames, so
+      // their recorded `.mjs` keys carry the same SHA.
+      const body = '#!/usr/bin/env node\n';
+      writeExt(hypoDir, 'hooks', 'hypo-ext-gone.mjs', body, {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'gonehook',
+      });
+      writeExt(hypoDir, 'hooks', 'hypo-ext-bad.mjs', body, {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'badhook',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      // Hook A: source removed (settings entry + recorded key remain).
+      rmSync(join(extHooks, 'hypo-ext-gone.mjs'));
+      rmSync(join(extHooks, 'hypo-ext-gone.manifest.json'));
+      // Hook B: source present, manifest corrupted → drives the SHA-linkage scan.
+      writeFileSync(
+        join(extHooks, 'hypo-ext-bad.manifest.json'),
+        JSON.stringify({ type: 'hook', event: 'NotARealEvent' }),
+      );
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /orphan settings entry .*gonehook\.mjs.*source extension removed/i.test(detail),
+        `source-removed hook must stay source-removed: ${detail}`,
+      );
+      assert.ok(
+        !/orphan settings entry .*gonehook\.mjs.*manifest unregistrable/i.test(detail),
+        `ambiguous SHA must not reclassify the source-removed hook as unregistrable: ${detail}`,
+      );
+    });
+  });
+});
+
 // Accepted boundary (plan §"리스크"): a captured hook carries no in-command
 // ownership marker (unlike hypo-ext-*). Once BOTH the source and the recorded SHA
 // key are hand-removed, the lingering settings entry can no longer be classified.

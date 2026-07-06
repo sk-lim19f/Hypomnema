@@ -18,7 +18,7 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 node ${CLAUDE_PLUGIN_ROOT}/scripts/capture.mjs [--hypo-dir="<path>"]
 ```
 
-With no names and no `--all`, the script lists capturable candidates and stops. Candidates come from two sources: commands and agents are the unowned regular `.md` files under `~/.claude/{commands,agents}/`, and hooks are the canonical `node $HOME/.claude/hooks/<name>.mjs` entries registered in `~/.claude/settings.json`. It excludes anything already managed by the wiki, the reserved `hypo-*` namespace, symlinks and other non-regular files, core hooks, and any hook whose registration would not round-trip losslessly. Every exclusion is printed with a reason.
+With no names and no `--all`, the script lists capturable candidates and stops. Candidates come from two sources: commands and agents are the unowned regular `.md` files under `~/.claude/{commands,agents}/`, and hooks are the canonical `node $HOME/.claude/hooks/<name>.mjs` entries registered in `~/.claude/settings.json`. It excludes anything already managed by the wiki, the reserved `hypo-*` namespace, symlinks and other non-regular files, core hooks, and any hook whose registration would not round-trip losslessly. Skipped hook registrations are printed with the reason; unowned commands and agents that fail these filters are simply omitted from the list, without a per-item reason.
 
 Show the list. Note that these are unowned candidates, not a provenance check: explicit selection is the trust boundary. A third-party tool's command, agent, or hook could appear here, so let the user pick deliberately.
 
