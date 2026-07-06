@@ -22263,13 +22263,35 @@ test('skips (not installs under wiki name) an invalid installName', () => {
     assert.ok(/invalid installName/.test(res.warn));
   });
 });
-test('hooks keep the wiki name even with a hook manifest (installName is commands/agents only)', () => {
+test('hooks without installName keep the wiki name (wiki-authored, backward compatible)', () => {
   withTmpDir((dir) => {
     const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
       type: 'hook',
       event: 'Stop',
     });
     assert.deepEqual(resolveInstallFile(ext), { installFile: 'hypo-ext-h.mjs' });
+  });
+});
+test('hooks honor a valid installName from a hook manifest (installName decoupling)', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
+      type: 'hook',
+      event: 'Stop',
+      installName: 'myhook',
+    });
+    assert.deepEqual(resolveInstallFile(ext), { installFile: 'myhook.mjs' });
+  });
+});
+test('hooks skip an invalid installName rather than install under the wiki name', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
+      type: 'hook',
+      event: 'Stop',
+      installName: 'hypo-reserved',
+    });
+    const res = resolveInstallFile(ext);
+    assert.equal(res.skip, true);
+    assert.ok(/invalid installName/.test(res.warn));
   });
 });
 
@@ -22433,6 +22455,78 @@ test('installName manifest installs under the original name', () => {
       assert.ok(
         !existsSync(join(home, '.claude', 'commands', 'hypo-ext-new.md')),
         'wiki storage name NOT installed',
+      );
+    });
+  });
+});
+// P1/F1: a hook manifest with a valid installName installs the `.mjs`, its sidecar
+// manifest, and its settings.json command all under the ORIGINAL name, and both SHA
+// keys are owned. Success criterion (d) checks the SHA KEY, not just disk presence.
+test('installName hook installs mjs, sidecar, and command under the original name', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeExt(hypoDir, 'hooks', 'hypo-ext-h.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write|Edit',
+        timeout: 10000,
+        installName: 'myhook',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      const copyDir = join(home, '.claude', 'hooks');
+      // (1) `.mjs` and sidecar install under the original name; wiki names are not.
+      assert.ok(existsSync(join(copyDir, 'myhook.mjs')), 'hook not installed under installName');
+      assert.ok(
+        existsSync(join(copyDir, 'myhook.manifest.json')),
+        'sidecar not installed under installName (P1)',
+      );
+      assert.ok(
+        !existsSync(join(copyDir, 'hypo-ext-h.mjs')),
+        'wiki storage name .mjs must NOT be installed',
+      );
+      assert.ok(
+        !existsSync(join(copyDir, 'hypo-ext-h.manifest.json')),
+        'wiki storage name sidecar must NOT be installed (P1)',
+      );
+
+      // (2) settings.json command is reconstructed under the original name.
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const groups = (settings.hooks?.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('myhook.mjs')),
+      );
+      assert.equal(groups.length, 1, 'exactly one PostToolUse entry expected');
+      assert.equal(
+        groups[0].hooks[0].command,
+        'node $HOME/.claude/hooks/myhook.mjs',
+        'command must be reconstructed under installName',
+      );
+      assert.equal(groups[0].matcher, 'Write|Edit');
+      assert.equal(groups[0].hooks[0].timeout, 10000);
+
+      // (3) BOTH SHA keys are owned under the original name (success criterion d).
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions.claude['hooks/myhook.mjs'],
+        'hook SHA key not owned under installName',
+      );
+      assert.ok(
+        pkg.extensions.claude['hooks/myhook.manifest.json'],
+        'sidecar SHA key not owned under installName (P1)',
+      );
+      assert.ok(
+        !pkg.extensions.claude['hooks/hypo-ext-h.mjs'],
+        'wiki-name hook SHA key must not be recorded',
+      );
+      assert.ok(
+        !pkg.extensions.claude['hooks/hypo-ext-h.manifest.json'],
+        'wiki-name sidecar SHA key must not be recorded',
       );
     });
   });

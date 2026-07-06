@@ -55,11 +55,12 @@ const TYPE_FILE_EXT = { hooks: '.mjs', commands: '.md', skills: '.md', agents: '
 // retargeting an install path).
 const TYPE_SINGULAR = { hooks: 'hook', commands: 'command', skills: 'skill', agents: 'agent' };
 
-// installName carrier (capture design §3): reverse-captured commands/agents install
-// under the user's ORIGINAL name, not the wiki `hypo-ext-*` storage name. Only
-// commands/agents opt in — hooks keep the wiki name (their settings.json command
-// string is prefix-derived) and skills are not captured in the MVP.
-const INSTALLNAME_TYPES = new Set(['commands', 'agents']);
+// installName carrier (capture design §3): reverse-captured commands/agents/hooks
+// install under the user's ORIGINAL name, not the wiki `hypo-ext-*` storage name.
+// For hooks the installName also drives the reconstructed settings.json command
+// (buildHookCommand) and the sidecar manifest install name (P1), so all three
+// ownership paths stay aligned. Skills are not captured in the MVP.
+const INSTALLNAME_TYPES = new Set(['commands', 'agents', 'hooks']);
 
 // A valid installName stem: same conservative charset as SAFE_EXT_STEM but
 // WITHOUT the required hypo-ext- prefix (the whole point of C is to restore the
@@ -130,8 +131,9 @@ export function resolveInstallFile(ext) {
     return { installFile: ext.file };
   }
   const parsed = parseManifest(ext.manifestPath);
-  // Non-hook manifests are always ok:true (parseManifest only fails hook ones),
-  // so a malformed non-hook manifest is not reachable here; be defensive anyway.
+  // A malformed hook manifest is reachable here (parseManifest validates hooks);
+  // fall back to the wiki storage name so the later sync loop, which re-parses and
+  // skips the malformed hook, still finds a consistent install path.
   if (!parsed.ok) return { installFile: ext.file };
   const m = parsed.manifest;
   if (!m || m.type !== TYPE_SINGULAR[ext.type] || m.installName === undefined) {
@@ -316,9 +318,11 @@ export function parseManifest(path) {
 
 /**
  * Build the settings.json entries expected for the discovered hook extensions.
- * The command string is constructed here (never from the manifest) as
- * `node $HOME/.claude/hooks/<basename>`. Extensions whose manifest is missing or
- * not registrable yield no entry.
+ * The command string is constructed here (never from the manifest) via the shared
+ * `buildHookCommand`, using the installName-resolved install filename so a captured
+ * hook registers under its original name and its command matches the installed
+ * `.mjs`. Extensions whose manifest is missing, not registrable, or whose
+ * installName is invalid (resolveInstallFile skip) yield no entry.
  */
 export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
   const entries = [];
@@ -326,7 +330,9 @@ export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
     if (!ext.manifestPath) continue;
     const parsed = parseManifest(ext.manifestPath);
     if (!parsed.ok || !parsed.registrable) continue;
-    const command = `node ${targetHooksDir.replace(HOME, '$HOME')}/${ext.file}`;
+    const resolved = resolveInstallFile(ext);
+    if (resolved.skip) continue;
+    const command = buildHookCommand(targetHooksDir, resolved.installFile);
     entries.push({
       name: ext.name,
       file: ext.file,
@@ -722,10 +728,15 @@ export function syncExtensions({
         manifestParsed &&
         manifestParsed.ok
       ) {
-        const mKey = `${type}/${ext.manifestName}`;
+        // P1: derive the sidecar install name from the sibling `.mjs` installFile
+        // so the manifest copy + SHA key follow installName exactly as the hook
+        // file does. For a wiki-authored hook (no installName) installFile is
+        // `ext.file`, so this equals the old `ext.manifestName` (no regression).
+        const installManifestName = installFile.replace(/\.mjs$/, '.manifest.json');
+        const mKey = `${type}/${installManifestName}`;
         const mRes = copyOne({
           srcPath: ext.manifestPath,
-          destPath: join(typeDir, ext.manifestName),
+          destPath: join(typeDir, installManifestName),
           key: mKey,
           recordedSHA: recorded[mKey],
           apply,
