@@ -6916,6 +6916,117 @@ test('doctor-extensions: non-hook manifest + lingering settings entry → unregi
   });
 });
 
+// P2/F1: doctor must recognize a reverse-captured hook registered under its
+// ORIGINAL name (installName) as healthy. Its command carries no hypo-ext-*
+// marker, so the orphan prefilter widens via the recorded owned-command set,
+// while the resolved sourceCmds (cmdFor now uses resolveInstallFile +
+// buildHookCommand) must exclude it. If sourceCmds and the widened prefilter ever
+// slip out of sync, a perfectly healthy captured hook is false-flagged as a
+// source-removed orphan; this positive case pins them together.
+test('doctor-extensions: healthy installName-captured hook is not flagged', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/orphan settings entry/i.test(detail),
+        `must not orphan a healthy captured hook: ${detail}`,
+      );
+      assert.equal(ext.status, 'pass', `expected clean extensions check: ${detail}`);
+    });
+  });
+});
+
+// P2: a reverse-captured hook whose wiki source is gone but whose settings entry
+// and recorded SHA key remain must be caught as a source-removed orphan under its
+// ORIGINAL name: the recorded owned-command set drives the prefilter, the
+// resolved sourceCmds (now empty) drives the classification.
+test('doctor-extensions: source-removed installName-captured hook → orphan warn', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      // Remove the wiki source (+ manifest) so the settings entry and recorded SHA
+      // key are the only trace left, the source-removed orphan case.
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      rmSync(join(extHooks, 'hypo-ext-cap.mjs'));
+      rmSync(join(extHooks, 'hypo-ext-cap.manifest.json'));
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        /orphan settings entry .*mycap\.mjs.*source extension removed/i.test(detail),
+        `expected source-removed orphan naming the original-name command: ${detail}`,
+      );
+    });
+  });
+});
+
+// Accepted boundary (plan §"리스크"): a captured hook carries no in-command
+// ownership marker (unlike hypo-ext-*). Once BOTH the source and the recorded SHA
+// key are hand-removed, the lingering settings entry can no longer be classified.
+// This mirrors the pre-existing hand-edited-state limit and is fixed as an
+// accepted behavior: capture always leaves a recorded key, so the normal path
+// still detects it. No fabricated marker.
+test('doctor-extensions: captured hook entry unclassified when source + key both gone', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `apply: ${up.stderr}`);
+
+      const extHooks = join(hypoDir, 'extensions', 'hooks');
+      rmSync(join(extHooks, 'hypo-ext-cap.mjs'));
+      rmSync(join(extHooks, 'hypo-ext-cap.manifest.json'));
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      delete pkg.extensions.claude['hooks/mycap.mjs'];
+      delete pkg.extensions.claude['hooks/mycap.manifest.json'];
+      writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const checks = JSON.parse(r.stdout);
+      const ext = checks.find((c) => c.label === 'Extensions integrity');
+      const detail = (ext.detail || '').toString();
+      assert.ok(
+        !/orphan settings entry .*mycap/i.test(detail),
+        `accepted boundary: without the recorded key the entry is not classified: ${detail}`,
+      );
+    });
+  });
+});
+
 // Orphan duplicate scan. A single
 // hypo-ext-* command can appear in multiple groups/events when settings.json
 // was hand-edited. Pre-fix the orphan loop deduped by command and emitted a
@@ -7224,6 +7335,54 @@ test('uninstall-removes-extensions-copy-preserves-source', () => {
           'command SHA must be stripped from pkg.extensions.claude',
         );
       }
+    });
+  });
+});
+
+// P2: a reverse-captured hook registered under its ORIGINAL name (no hypo-ext-*
+// prefix) must still be fully uninstalled. The settings entry is caught by the
+// recorded owned-command union (not the prefix), the file by its recorded SHA key.
+test('uninstall-removes-installName-captured-hook-settings-and-file', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cap.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mycap',
+      });
+      const up = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(up.status, 0, `upgrade --apply failed: ${up.stderr}`);
+
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const hookCopy = join(home, '.claude', 'hooks', 'mycap.mjs');
+      const capCommand = 'node $HOME/.claude/hooks/mycap.mjs';
+
+      // Pre-state: installed under the original name, registered with no prefix.
+      assert.ok(existsSync(hookCopy), 'pre-state: captured hook copy must exist');
+      assert.ok(
+        JSON.stringify(JSON.parse(readFileSync(settingsPath, 'utf-8')).hooks).includes(capCommand),
+        'pre-state: original-name command must be registered',
+      );
+
+      // Foreign entry that uninstall MUST preserve.
+      const seed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      seed.hooks.PostToolUse.push({
+        hooks: [{ type: 'command', command: 'node /opt/other/foo.mjs' }],
+      });
+      writeFileSync(settingsPath, JSON.stringify(seed, null, 2) + '\n');
+
+      const un = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(un.status, 0, `uninstall failed: ${un.stderr}\n${un.stdout}`);
+
+      // File removed (recorded key), settings entry stripped (owned-command union).
+      assert.ok(!existsSync(hookCopy), 'captured hook file must be removed');
+      const post = JSON.stringify(JSON.parse(readFileSync(settingsPath, 'utf-8')).hooks || {});
+      assert.ok(!post.includes('mycap.mjs'), 'original-name settings entry must be stripped');
+      assert.ok(post.includes('/opt/other/foo.mjs'), 'foreign entry must be preserved');
     });
   });
 });

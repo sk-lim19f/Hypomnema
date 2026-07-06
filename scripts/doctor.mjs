@@ -28,6 +28,9 @@ import {
   readExtensionPkgStateNoMutate,
   collectOurOccurrences,
   pickCanonicalOccurrence,
+  resolveInstallFile,
+  buildHookCommand,
+  parseExtKey,
   EXT_TYPES,
   CODEX_TYPES,
 } from './lib/extensions.mjs';
@@ -865,13 +868,41 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
     //                     manifest itself, never naming the stale settings entry.
     //                     Surfaced separately so the user knows the lingering
     //                     entry needs cleanup independent of the manifest fix.
-    const cmdFor = (ext) => `node ${hooksDir.replace(HOME, '$HOME')}/${ext.file}`;
-    const sourceCmds = new Set(discovered.hooks.map(cmdFor));
+    // Reconstruct each discovered hook's registered command through the SAME
+    // installName-aware path the forward sync uses (resolveInstallFile +
+    // buildHookCommand), so a reverse-captured hook registered under its original
+    // name is matched here too, not just wiki hooks. A wiki hook (no installName)
+    // resolves back to `ext.file`, so this is byte-identical to the old shape (no
+    // regression). An invalid installName resolves to `{skip}` → no command.
+    const cmdFor = (ext) => {
+      const resolved = resolveInstallFile(ext);
+      return resolved.skip ? null : buildHookCommand(hooksDir, resolved.installFile);
+    };
+    const sourceCmds = new Set(discovered.hooks.map(cmdFor).filter(Boolean));
     const unregistrableCmds = new Set();
     for (const ext of discovered.hooks) {
       if (!ext.manifestPath) continue; // (c-warn) already names this case
       const parsed = parseManifest(ext.manifestPath);
-      if (!parsed.ok || !parsed.registrable) unregistrableCmds.add(cmdFor(ext));
+      if (!parsed.ok || !parsed.registrable) {
+        const cmd = cmdFor(ext);
+        if (cmd) unregistrableCmds.add(cmd);
+      }
+    }
+    // Owned-command set for the orphan prefilter (P2): the hypo-ext-* regex below
+    // only recognizes wiki-storage-name commands. A reverse-captured hook registers
+    // under its original name and carries no hypo-ext-* marker, so widen the
+    // prefilter with the recorded per-target owned commands (regex OR owned-set).
+    // Reuses the already-loaded `recorded` map, no second read. Only `.mjs` keys
+    // are commands; the paired `.manifest.json` sidecar keys are dropped. Known
+    // boundary (plan): if the user hand-removes both the source and the recorded
+    // key, the lingering entry is no longer classifiable: an accepted limit, not
+    // a fabricated marker.
+    const ownedHookCmds = new Set();
+    for (const key of Object.keys(recorded)) {
+      const parsed = parseExtKey(key, types);
+      if (!parsed || parsed.type !== 'hooks') continue;
+      if (!parsed.installFile.endsWith('.mjs')) continue;
+      ownedHookCmds.add(buildHookCommand(hooksDir, parsed.installFile));
     }
     // A single hypo-ext-* command can appear
     // in multiple groups/events when settings.json was hand-edited or migrated
@@ -891,7 +922,8 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
         if (!Array.isArray(g.hooks)) continue;
         for (const h of g.hooks) {
           if (typeof h.command !== 'string') continue;
-          if (!/(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(h.command)) continue;
+          const isHypoExt = /(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(h.command);
+          if (!isHypoExt && !ownedHookCmds.has(h.command)) continue;
           let kind = null;
           if (unregistrableCmds.has(h.command)) kind = 'unregistrable';
           else if (!sourceCmds.has(h.command)) kind = 'source-removed';
