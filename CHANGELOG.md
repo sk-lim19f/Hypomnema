@@ -5,6 +5,30 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-07-06
+
+### New Features
+
+#### English
+
+- Reverse extension capture: a new `hypomnema capture` subcommand and `/hypo:capture` slash command pull a command or agent you created the normal way under `~/.claude/{commands,agents}/` into the wiki, so the existing forward-sync propagates it to your other machines under its original install name. A synced command stays `/mycmd` instead of becoming `/hypo-ext-mycmd`, which closes the "register on one machine, sync on another" gap for extensions you author by hand. ([#170](https://github.com/sk-lim19f/Hypomnema/pull/170))
+- Capture now covers hooks as well: a hook you registered by hand in `settings.json`, with its script under `~/.claude/hooks/`, is captured into the wiki and re-registered on your other machines under its original name and event. Only a hook that round-trips losslessly is captured; anything non-canonical is left untouched with a visible skip reason. ([#172](https://github.com/sk-lim19f/Hypomnema/pull/172))
+
+#### 한국어
+
+- 역방향 확장 capture: `hypomnema capture` 서브커맨드와 `/hypo:capture` 슬래시 커맨드가 `~/.claude/{commands,agents}/`에 보통 방식으로 만든 command·agent를 위키로 끌어와, 기존 forward-sync가 다른 머신에 원래 설치 이름 그대로 전파합니다. 동기화된 커맨드가 `/hypo-ext-mycmd`가 아니라 `/mycmd`로 유지돼, 손으로 만든 확장의 "한 머신에서 등록, 다른 머신에서 동기화" 갭을 메웁니다. ([#170](https://github.com/sk-lim19f/Hypomnema/pull/170))
+- capture가 hooks까지 지원합니다: `settings.json`에 손으로 등록한 훅(스크립트가 `~/.claude/hooks/` 아래)을 위키에 담아 다른 머신에 원래 이름과 event로 재등록합니다. 무손실로 라운드트립되는 정규형 훅만 대상이고, 그 밖의 형태는 건드리지 않고 보이는 skip 사유로 남깁니다. ([#172](https://github.com/sk-lim19f/Hypomnema/pull/172))
+
+### Chores
+
+#### English
+
+- Documented the version-spec lifecycle (born at a stable path, flipped in place, minor-and-up scope) in the maintainer release checklist. ([#171](https://github.com/sk-lim19f/Hypomnema/pull/171))
+
+#### 한국어
+
+- 버전 spec 라이프사이클(안정 경로에서 태어나 제자리에서 flip, minor 이상 범위)을 메인테이너 릴리스 체크리스트에 문서화했습니다. ([#171](https://github.com/sk-lim19f/Hypomnema/pull/171))
+
 ## [1.5.1] - 2026-07-04
 
 ### New Features
