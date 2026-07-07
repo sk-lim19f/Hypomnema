@@ -16,6 +16,9 @@ import {
   sessionMarkerPath,
   shouldSuggestProjectCreation,
   buildProjectSuggestionLine,
+  shouldSuggestBackfill,
+  buildBackfillSuggestionLine,
+  findBackfillCandidate,
   recordSuggestionCooldown,
   sanitizeProjForPrompt,
   pickProjectByCwd,
@@ -127,10 +130,25 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // MISS: cwd matches no project. Offer to create one
-    // when the trigger conditions hold. Same nudge-only model as session-start.
+    // MISS: cwd matches no project's working_dir. Two distinct causes surface
+    // two distinct offers:
+    //   - cwd's leaf directory name already IS an existing projects/<slug>/
+    //     with session artifacts but no working_dir anchor → offer to
+    //     BACKFILL the anchor (a duplicate new-project offer would be wrong).
+    //   - otherwise, the usual create-a-new-project nudge, same as before.
+    // Same nudge-only model as session-start either way.
     let suggestPrefix = '';
-    if (shouldSuggestProjectCreation(newCwd, HYPO_DIR)) {
+    const backfillCandidate = findBackfillCandidate(newCwd, HYPO_DIR);
+    if (backfillCandidate && shouldSuggestBackfill(newCwd, HYPO_DIR)) {
+      const suggestLine = buildBackfillSuggestionLine(
+        backfillCandidate.slug,
+        newCwd,
+        backfillCandidate.hasIndex,
+      );
+      suggestPrefix = `${suggestLine}\n\n`;
+      recordSuggestionCooldown(HYPO_DIR, newCwd);
+      process.stderr.write(`\n\x1b[33m${suggestLine}\x1b[0m\n`);
+    } else if (shouldSuggestProjectCreation(newCwd, HYPO_DIR)) {
       const suggestLine = buildProjectSuggestionLine(newCwd);
       suggestPrefix = `${suggestLine}\n\n`;
       recordSuggestionCooldown(HYPO_DIR, newCwd);

@@ -26,6 +26,7 @@ import {
 import { join, dirname, basename } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 // static import (no top-level await) — feedback-sync.mjs guards main() behind an
 // entry check, so importing it for unit tests does not run the CLI.
 import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync.mjs';
@@ -33,7 +34,13 @@ import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync
 // pure close-pipeline functions does not run the CLI.
 import { planMarkerDecision, closeResultContradiction } from '../scripts/crystallize.mjs';
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
-import { buildProjectSuggestionLine, resolveActiveProject } from '../hooks/hypo-shared.mjs';
+import {
+  buildProjectSuggestionLine,
+  resolveActiveProject,
+  findBackfillCandidate,
+  buildBackfillSuggestionLine,
+  shouldSuggestBackfill,
+} from '../hooks/hypo-shared.mjs';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
 import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
@@ -1103,6 +1110,124 @@ test('doctor-sync-state-warn: conflict entry → manual-merge guidance, not gene
   });
 });
 
+suite('doctor.mjs — per-project index.md working_dir anchor coverage');
+
+function doctorAnchorCheck(dir) {
+  const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  return out.find((c) => c.label === 'Project index anchors');
+}
+
+test('doctor-project-anchors: no projects/ dir → check absent (not reported)', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const check = doctorAnchorCheck(dir);
+    assert.equal(check, undefined, 'anchor check should not run without projects/');
+  });
+});
+
+test('doctor-project-anchors: project with working_dir index.md → pass', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: demo\ntype: project-index\nupdated: 2026-06-01\nworking_dir: /repo/demo\n---\n# demo\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+  });
+});
+
+test('doctor-project-anchors: session artifacts but no index.md → warn', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const projDir = join(dir, 'projects', 'legacy');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(join(projDir, 'session-state.md'), '## Next\nbody\n');
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(check.detail.includes('legacy'), `expected slug named: ${check.detail}`);
+    assert.ok(check.detail.includes('no index.md'), `expected reason named: ${check.detail}`);
+  });
+});
+
+test('doctor-project-anchors: index.md present but missing working_dir → warn', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const projDir = join(dir, 'projects', 'no-anchor');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: no-anchor\ntype: project-index\nupdated: 2026-06-01\n---\n# no-anchor\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(check.detail.includes('no-anchor'), `expected slug named: ${check.detail}`);
+    assert.ok(
+      check.detail.includes('missing working_dir'),
+      `expected reason named: ${check.detail}`,
+    );
+  });
+});
+
+// The runtime hooks (hooks/hypo-shared.mjs collectProjectWorkingDirs) only
+// recognize the exact `working_dir:` form (no space before the colon) — a
+// lenient parseFrontmatter-style reader would accept `working_dir : /repo`
+// and wrongly report this project as anchored, even though cwd-first resume
+// still can't match it. Doctor must agree with the runtime matcher, not the
+// lenient one.
+test('doctor-project-anchors: `working_dir :` (space before colon) is NOT recognized as an anchor → warn', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const projDir = join(dir, 'projects', 'space-colon');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: space-colon\ntype: project-index\nupdated: 2026-06-01\nworking_dir : /repo/space-colon\n---\n# space-colon\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `space-before-colon working_dir must not false-pass as anchored: ${check.detail}`,
+    );
+    assert.ok(check.detail.includes('space-colon'), `expected slug named: ${check.detail}`);
+  });
+});
+
+test('doctor-project-anchors: bare scaffold (no session artifacts) is not flagged', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    // A freshly-scaffolded project dir with no session-state.md/hot.md/session-log
+    // yet has nothing for cwd-first resume to lose — must not be flagged.
+    mkdirSync(join(dir, 'projects', 'empty'), { recursive: true });
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(check.status, 'pass', `expected pass (nothing to anchor yet): ${check.detail}`);
+  });
+});
+
 // fix #23: doctor-project-suggestions skip-persistence schema check
 suite('doctor.mjs — fix #23: auto-project skip-persistence');
 
@@ -1246,6 +1371,9 @@ const {
   isClosePattern,
   extractUserMessages,
   hasUserCloseSignal,
+  hasInFlightSubagent,
+  isCloseReconfirmDeclined,
+  CLOSE_RECONFIRM_MARK,
   resolveTranscriptBySessionId,
   hasMutatingTranscriptActivity,
   isSubstantialSession,
@@ -1509,6 +1637,31 @@ test('혼합 텍스트(트랜스크립트)에서도 패턴 감지', () => {
   assert.equal(isClosePattern(transcript), true);
 });
 
+// conditional-close-reconfirm reworks the block-reason wording (emitBlock's
+// reconfirm branch) but must NOT touch isClosePattern's decision surface —
+// narrowing it risks reopening the over-close regression it already guards
+// against. The JSDoc's own match/no-match examples are the first-line guard;
+// a byte-level snapshot of the function source is the stronger, second-line
+// guard (a semantically-equivalent rewrite could still pass the corpus
+// above while being a different regex than what was reviewed).
+test('isClosePattern JSDoc examples: match/no-match corpus is exact', () => {
+  for (const s of ['세션 마무리하자', '오늘 여기까지', 'wrap up', 'signing off']) {
+    assert.equal(isClosePattern(s), true, `JSDoc match example should be true: ${s}`);
+  }
+  for (const s of ['이 함수 마무리하자', 'wrap up this PR']) {
+    assert.equal(isClosePattern(s), false, `JSDoc no-match example should be false: ${s}`);
+  }
+});
+
+test('isClosePattern source is byte-unchanged by this feature (function.toString() snapshot)', () => {
+  const digest = createHash('sha256').update(isClosePattern.toString()).digest('hex');
+  assert.equal(
+    digest,
+    '9b882b618b31833f268ac2c6e05693352044c526f7f70344e3fa0981520cdc53',
+    'isClosePattern source changed — conditional-close-reconfirm must not touch this regex',
+  );
+});
+
 // ── ISSUE-29: extractUserMessages must not slurp tool_result content ──
 suite('extractUserMessages() — tool_result exclusion');
 
@@ -1730,6 +1883,297 @@ test('unreadable / missing transcript → false (fail-closed)', () => {
   assert.equal(hasUserCloseSignal(null), false);
 });
 
+// ── hasInFlightSubagent — read-only in-flight delegation check ──
+suite('hasInFlightSubagent()');
+
+test('a subagent task with a non-terminal status → true', () => {
+  assert.equal(
+    hasInFlightSubagent({ background_tasks: [{ type: 'subagent', status: 'running' }] }),
+    true,
+  );
+});
+
+test('a subagent task with a terminal status → false', () => {
+  assert.equal(
+    hasInFlightSubagent({ background_tasks: [{ type: 'subagent', status: 'completed' }] }),
+    false,
+  );
+});
+
+test('a subagent task with no status field → true (unknown = not yet terminal)', () => {
+  assert.equal(
+    hasInFlightSubagent({ background_tasks: [{ type: 'subagent' }] }),
+    true,
+  );
+});
+
+test('a non-subagent task (any status) → false', () => {
+  assert.equal(
+    hasInFlightSubagent({ background_tasks: [{ type: 'other', status: 'running' }] }),
+    false,
+  );
+});
+
+test('missing/non-array background_tasks → false (fail-open)', () => {
+  assert.equal(hasInFlightSubagent({}), false);
+  assert.equal(hasInFlightSubagent({ background_tasks: 'not-an-array' }), false);
+  assert.equal(hasInFlightSubagent(null), false);
+});
+
+// ── isCloseReconfirmDeclined — order-sensitive decline detection ──
+suite('isCloseReconfirmDeclined()');
+
+test('a correlated "아직" AskUserQuestion answer → true (declined)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), true);
+  });
+});
+
+test('decline followed by a NEW user close signal → false (re-arm)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+      toolUse('Edit'),
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), false);
+  });
+});
+
+test('an uncorrelated tool_result containing "아직" (no matching AskUserQuestion) → false', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'read-1',
+              content: 'file.md: "아직"="맞음" (quoted, not a real answer)',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), false);
+  });
+});
+
+test('decline label variants ("나중에" / "later") also suppress (label-drift defense)', () => {
+  withTmpDir((dir) => {
+    const p1 = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="나중에". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p1), true);
+  });
+  withTmpDir((dir) => {
+    const p2 = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "close now?"="later". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p2), true);
+  });
+});
+
+// BLOCKER fix (codex pre-commit review): re-arm must fire ONLY on a genuine
+// USER-authored close signal, mirroring extractUserMessages' input boundary
+// (isMeta / promptSource / tool_result exclusion) — never on the model's own
+// reasoning text, which can itself say "세션 마무리".
+test('decline, then an ASSISTANT text block saying "세션 마무리" → still declined (no false re-arm)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: '알겠습니다, 아직 세션 마무리는 하지 않고 계속 진행하겠습니다.' }],
+        },
+      },
+    ]);
+    assert.equal(
+      isCloseReconfirmDeclined(p),
+      true,
+      'assistant reasoning text must not re-arm a recorded decline',
+    );
+  });
+});
+
+test('decline, then a tool_result containing a close phrase → still declined (no false re-arm)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'read-2',
+              content: 'file.md: 예시 문구 "세션 마무리하자" 발견',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(
+      isCloseReconfirmDeclined(p),
+      true,
+      'tool_result content must not re-arm a recorded decline',
+    );
+  });
+});
+
+// MEDIUM fix (codex pre-commit review): only OUR close-reconfirm prompt (the
+// AskUserQuestion whose input carries the reconfirm reason's "지금 닫기"
+// option label) may correlate — an unrelated AskUserQuestion answered with a
+// decline-shaped word ("나중"/"later") must not falsely suppress.
+test('an UNRELATED AskUserQuestion answered with "나중" → false (does not correlate)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askUnrelatedToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "어떤 색을 원하세요?"="나중에 정할게요". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(
+      isCloseReconfirmDeclined(p),
+      false,
+      'a non-close-reconfirm AskUserQuestion must not suppress the reconfirm',
+    );
+  });
+});
+
+test('the real close-reconfirm prompt ("지금 닫기" in input) + "아직, 계속" answer → true', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 세션을 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), true);
+  });
+});
+
+test('no AskUserQuestion answer at all → false (not declined, keep reconfirming)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+      toolUse('Edit'),
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), false);
+  });
+});
+
+test('unreadable / missing transcript → false (fail-open, keep reconfirming)', () => {
+  assert.equal(isCloseReconfirmDeclined('/no/such/transcript.jsonl'), false);
+  assert.equal(isCloseReconfirmDeclined(null), false);
+});
+
 // ── ADR 0055: resolveTranscriptBySessionId — session-id glob, fail-closed ──
 suite('resolveTranscriptBySessionId() (ADR 0055)');
 
@@ -1773,6 +2217,46 @@ function writeJsonl(dir, entries) {
 }
 function toolUse(name) {
   return { type: 'assistant', message: { content: [{ type: 'tool_use', name, input: {} }] } };
+}
+// An AskUserQuestion tool_use whose input carries the reconfirm reason's
+// distinctive close-now option label ("지금 닫기") — this is how
+// isCloseReconfirmDeclined correlates an answer to OUR close-reconfirm
+// prompt specifically, not just any AskUserQuestion.
+function askCloseReconfirmToolUse(id) {
+  return {
+    type: 'assistant',
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          name: 'AskUserQuestion',
+          id,
+          input: {
+            questions: [
+              { question: '지금 세션을 닫을까요?', options: ['지금 닫기', '아직, 계속'] },
+            ],
+          },
+        },
+      ],
+    },
+  };
+}
+// An unrelated AskUserQuestion (no close-reconfirm label) — used to prove a
+// random question's decline-shaped answer must NOT correlate.
+function askUnrelatedToolUse(id) {
+  return {
+    type: 'assistant',
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          name: 'AskUserQuestion',
+          id,
+          input: { questions: [{ question: '어떤 색을 원하세요?', options: ['빨강', '파랑'] }] },
+        },
+      ],
+    },
+  };
 }
 
 test('mutation tool → substantial AND mutating', () => {
@@ -8155,6 +8639,63 @@ test('feedback missing targets → error', () => {
   );
 });
 
+// working_dir/project are legitimate only on project-index (index.md);
+// session-state.md pages have been observed picking up a stray copy from
+// unvalidated crystallize output, planting a wrong path that pollutes
+// injected context. Lint must flag (not silently accept) either key on
+// session-state.
+suite('lint.mjs forbidden frontmatter fields on session-state');
+
+const SS_FM_OK =
+  '---\ntitle: T\ntype: session-state\nupdated: 2026-05-18\ntags: [project]\n---\n## Next\nbody\n';
+
+test('session-state with a stray working_dir → warn, not error', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/session-state.md',
+    SS_FM_OK.replace('updated: 2026-05-18', 'updated: 2026-05-18\nworking_dir: /repo/p'),
+  );
+  assert.equal(r.status, 0, `forbidden-field must be a warn, not a lint failure: ${r.stdout}`);
+  assert.ok(
+    out.warns.some(
+      (w) => w.message.includes('working_dir') && w.message.includes('session-state'),
+    ),
+    `expected working_dir forbidden-field warn: ${r.stdout}`,
+  );
+});
+
+test('session-state with a stray project field → warn', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/session-state.md',
+    SS_FM_OK.replace('updated: 2026-05-18', 'updated: 2026-05-18\nproject: p'),
+  );
+  assert.equal(r.status, 0);
+  assert.ok(
+    out.warns.some((w) => w.message.includes('project') && w.message.includes('session-state')),
+    `expected project forbidden-field warn: ${r.stdout}`,
+  );
+});
+
+test('session-state without working_dir/project → no forbidden-field warn', () => {
+  const { r, out } = lintWithSchema('projects/p/session-state.md', SS_FM_OK);
+  assert.equal(r.status, 0);
+  assert.ok(
+    !out.warns.some((w) => w.message.includes('Forbidden frontmatter field')),
+    `unexpected forbidden-field warn on a clean page: ${r.stdout}`,
+  );
+});
+
+test('project-index carrying working_dir is unaffected (field is legitimate there)', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/index.md',
+    '---\ntitle: T\ntype: project-index\nstatus: active\nstarted: 2026-05-18\nupdated: 2026-05-18\nworking_dir: /repo/p\ntags: [project]\n---\nbody\n',
+  );
+  assert.equal(r.status, 0, `project-index working_dir must stay clean: ${r.stdout}`);
+  assert.ok(
+    !(out.warns || []).some((w) => w.message.includes('Forbidden frontmatter field')),
+    `project-index must never trip the forbidden-field check: ${r.stdout}`,
+  );
+});
+
 // ── lint.mjs frontmatter hardening (IMPR-3) ─────────────────────────────────
 // A: top-level-only field extraction (nested `type:` no longer clobbers).
 // B: W9 invalid-YAML detector (colon-space / tab-indent / dup-key) + strict.
@@ -9010,6 +9551,11 @@ function withGrowthWiki(fn) {
       join(dir, 'hot.md'),
       '---\ntitle: Hot\nupdated: today\n---\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
     );
+    // Match real init (see "init creates .gitignore with .cache/ entry" above):
+    // without this, a test that writes a transcript under dir/.cache/ (as the
+    // auto-minimal-crystallize replay tests do) makes the tree dirty by the
+    // fixture's own bookkeeping — a phantom git blocker no real session has.
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
     spawnSync('git', ['add', '-A'], { cwd: dir });
     spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
     fn(dir);
@@ -9607,6 +10153,223 @@ test('buildProjectSuggestionLine strips control chars from the cwd basename', ()
   assert.ok(!line.includes('\n'), 'newline must be stripped');
   assert.ok(line.startsWith('[WIKI: cwd '), 'prefix intact');
   assert.ok(line.includes('자동 생성할까요'), 'offer text intact');
+});
+
+// ── working_dir backfill offer: cwd names an EXISTING project that has no
+// working_dir anchor (no index.md, or an index.md missing the field) ────────
+suite('hypo-cwd-change.mjs — working_dir backfill offer (anchorless project)');
+
+const BACKFILL_OFFER_RE = /working_dir 앵커가 없습니다/;
+
+function runCwdChange(dir, newCwd, oldCwd = '/tmp/elsewhere-no-proj') {
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+    input: JSON.stringify({ new_cwd: newCwd, old_cwd: oldCwd }),
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: dir, HOME: SESSION_TMP_HOME },
+  });
+}
+
+test('findBackfillCandidate: cwd basename matches an anchorless project (no index.md)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'legacy', 'session-state.md'), '## Next\nbody\n');
+    const hit = findBackfillCandidate('/Users/dev/legacy', dir);
+    assert.ok(hit, 'expected a backfill candidate');
+    assert.equal(hit.slug, 'legacy');
+    assert.equal(hit.hasIndex, false);
+  });
+});
+
+test('findBackfillCandidate: index.md present but missing working_dir → hasIndex true', () => {
+  withTmpDir((dir) => {
+    const projDir = join(dir, 'projects', 'legacy');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: legacy\ntype: project-index\nupdated: 2026-06-01\n---\n# legacy\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    const hit = findBackfillCandidate('/Users/dev/legacy', dir);
+    assert.ok(hit, 'expected a backfill candidate');
+    assert.equal(hit.hasIndex, true);
+  });
+});
+
+test('findBackfillCandidate: project already anchored (working_dir present) → null', () => {
+  withTmpDir((dir) => {
+    const projDir = join(dir, 'projects', 'legacy');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: legacy\ntype: project-index\nupdated: 2026-06-01\nworking_dir: /Users/dev/legacy\n---\n# legacy\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    assert.equal(findBackfillCandidate('/Users/dev/legacy', dir), null);
+  });
+});
+
+test('findBackfillCandidate: no matching slug → null', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'other', 'session-state.md'), '## Next\nbody\n');
+    assert.equal(findBackfillCandidate('/Users/dev/legacy', dir), null);
+  });
+});
+
+test('findBackfillCandidate: matching slug but no session artifacts (bare scaffold) → null', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    assert.equal(findBackfillCandidate('/Users/dev/legacy', dir), null);
+  });
+});
+
+// Documented scope bound: the anchor being written is working_dir: <cwd>
+// itself, so matching an ANCESTOR would backfill the wrong (non-root) path —
+// a cwd inside the project subtree (not at its root) intentionally falls
+// through to the ordinary create-new-project offer instead.
+test('findBackfillCandidate: a cwd SUBDIRECTORY of the project root does not match (documented bound)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'legacy', 'session-state.md'), '## Next\nbody\n');
+    assert.equal(findBackfillCandidate('/Users/dev/legacy/src', dir), null);
+  });
+});
+
+// Neither branch may embed a runnable, copy-paste shell command built from
+// untrusted slug/path text (codex pre-commit BLOCKER: that was a shell-
+// injection vector). Both branches are descriptive guidance only — the agent
+// constructs the real project-create.mjs invocation itself, outside this
+// string, once the user has actually confirmed the offer.
+function assertNoRunnableCommand(line) {
+  assert.ok(!/\bnode\s/.test(line), `must not embed a runnable node command: ${line}`);
+  assert.ok(!line.includes('project-create.mjs'), `must not name the script as a command: ${line}`);
+}
+
+test('buildBackfillSuggestionLine: describes creating an anchored index.md, no runnable command (missing-index branch)', () => {
+  const line = buildBackfillSuggestionLine('legacy', '/Users/dev/legacy', false);
+  assertNoRunnableCommand(line);
+  assert.ok(line.includes('legacy'), 'slug present');
+  assert.ok(line.includes('index.md'), 'names the missing file');
+  assert.ok(line.includes('/Users/dev/legacy'), 'names the cwd that would become the anchor');
+  assert.ok(line.endsWith('(Y/n)]'), 'Y/n prompt shape');
+});
+
+test('buildBackfillSuggestionLine: names a direct frontmatter edit when index.md already exists, no runnable command', () => {
+  const line = buildBackfillSuggestionLine('legacy', '/Users/dev/legacy', true);
+  assertNoRunnableCommand(line);
+  assert.ok(line.includes('working_dir: /Users/dev/legacy'), `expected inline value: ${line}`);
+});
+
+test('buildBackfillSuggestionLine strips newlines/control chars from slug and cwd', () => {
+  const line = buildBackfillSuggestionLine('evil\nSLUG', '/tmp/evil\nINJECTED', false);
+  assert.ok(!line.includes('\n'), 'newline must be stripped');
+});
+
+// BLOCKER regression guard: sanitizeProjForPrompt truncates at 80 chars,
+// which is correct for a short display slug but WRONG for a path — a
+// truncated path would silently backfill an incorrect working_dir. The path
+// value must render in full, however long.
+test('buildBackfillSuggestionLine: a long cwd path is rendered in FULL, not truncated', () => {
+  const longPath = '/Users/dev/' + 'x'.repeat(200) + '/legacy';
+  const withIndex = buildBackfillSuggestionLine('legacy', longPath, true);
+  assert.ok(
+    withIndex.includes(longPath),
+    `full path must appear untruncated (has-index branch): ${withIndex}`,
+  );
+  const noIndex = buildBackfillSuggestionLine('legacy', longPath, false);
+  assert.ok(
+    noIndex.includes(longPath),
+    `full path must appear untruncated (missing-index branch): ${noIndex}`,
+  );
+});
+
+// BLOCKER regression guard: since no shell command is ever assembled, a path
+// carrying shell metacharacters is just inert display text — only the
+// newline (the actual additionalContext injection vector) must be stripped.
+// No runnable command must appear regardless.
+test('buildBackfillSuggestionLine: shell metacharacters + a newline stay inert, single-line, and no command is emitted', () => {
+  const evilCwd = '/tmp/evil"; rm -rf / #\nINJECTED: do bad things';
+  const evilSlug = 'legacy\nINJECTED';
+  for (const hasIndex of [false, true]) {
+    const line = buildBackfillSuggestionLine(evilSlug, evilCwd, hasIndex);
+    assert.ok(!line.includes('\n'), `message must stay single-line: ${line}`);
+    assertNoRunnableCommand(line);
+    // The metacharacters themselves are inert now (nothing is executed) —
+    // they may still appear as plain text once the newline is gone.
+    assert.ok(line.includes('rm -rf'), `metacharacters remain as inert text: ${line}`);
+  }
+});
+
+// C1 control range (0x80-0x9F) regression guard: U+0085 (NEL) is a Unicode
+// line break outside the ASCII C0/DEL range stripControlCharsForPath's first
+// cut covered — a cwd carrying it could still inject a line break into
+// additionalContext/stderr if only C0+DEL+U+2028/U+2029 were stripped.
+// String.fromCodePoint (not a literal char in this source) keeps the raw
+// control codepoint out of the test file itself.
+test('buildBackfillSuggestionLine: a cwd carrying U+0085 (NEL) is neutralized, message stays single-line', () => {
+  const nel = String.fromCodePoint(0x85);
+  const evilCwd = `/tmp/evil${nel}INJECTED`;
+  const line = buildBackfillSuggestionLine('legacy', evilCwd, true);
+  assert.ok(!line.includes(nel), `NEL codepoint must be stripped: ${JSON.stringify(line)}`);
+  assert.ok(!line.includes('\n'), `message must stay single-line: ${line}`);
+});
+
+test('hypo-cwd-change.mjs offers backfill, not create-new, when new_cwd names an anchorless project (even if it also satisfies the create-new triggers)', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\nupdated: 2026-06-01\n---\n# Hot\n');
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'legacy', 'session-state.md'), '## Next\nbody\n');
+    const work = mkdtempSync(join(tmpdir(), 'legacy-'));
+    try {
+      const workLegacy = join(work, 'legacy');
+      mkdirSync(workLegacy, { recursive: true });
+      makeTriggerCwd(workLegacy); // also a git repo with a project marker
+      const r = runCwdChange(dir, workLegacy);
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      assert.ok(BACKFILL_OFFER_RE.test(r.stdout), `expected backfill offer, got: ${r.stdout}`);
+      assert.ok(
+        !AP_OFFER_RE.test(r.stdout),
+        `must not ALSO offer create-new for the same cwd: ${r.stdout}`,
+      );
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+});
+
+test('hypo-cwd-change.mjs suppresses a repeat backfill offer within the cooldown window', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'legacy', 'session-state.md'), '## Next\nbody\n');
+    const work = mkdtempSync(join(tmpdir(), 'legacy-'));
+    try {
+      const workLegacy = join(work, 'legacy');
+      mkdirSync(workLegacy, { recursive: true });
+      const first = runCwdChange(dir, workLegacy);
+      assert.ok(BACKFILL_OFFER_RE.test(first.stdout), 'first run should offer backfill');
+      const second = runCwdChange(dir, workLegacy);
+      assert.ok(
+        !BACKFILL_OFFER_RE.test(second.stdout),
+        `second run within cooldown should be silent: ${second.stdout}`,
+      );
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+});
+
+// Regression guard: when no anchorless project matches, cwd-change must still
+// fall through to the pre-existing create-new-project offer unchanged.
+test('hypo-cwd-change.mjs still offers create-new when no anchorless project matches', () => {
+  withAutoProjectEnv((dir, work) => {
+    makeTriggerCwd(work);
+    const r = runCwdChange(dir, work);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(AP_OFFER_RE.test(r.stdout), `expected create-new offer, got: ${r.stdout}`);
+    assert.ok(!BACKFILL_OFFER_RE.test(r.stdout), `unexpected backfill offer: ${r.stdout}`);
+  });
 });
 
 // ── project-create helper ──────────────────────────────────
@@ -13396,6 +14159,277 @@ function seedCloseTranscript(sessionId, { home = SESSION_TMP_HOME, toolUseLines 
   );
   return () => rmSync(p, { force: true });
 }
+
+// ── conditional-close-reconfirm ──────────────────────────────────────────
+// The close-intent gate above (step 4) can't tell "close now" from
+// "close once X is done" by regex alone — same sentence shape either way
+// (see the hook's file-header note). When a close signal fires AND the
+// session has a work-incomplete signal (uncommitted wiki changes, or an
+// in-flight delegated subagent), the block reason is replaced with an
+// AskUserQuestion instruction instead of a silent crystallize nudge.
+
+suite('hypo-auto-minimal-crystallize.mjs — conditional close reconfirm');
+
+test('uncommitted wiki + conditional close phrase, no decline → reconfirm block (not a silent nag)', () => {
+  withGrowthWiki((dir) => {
+    // Leave a real uncommitted change so the `git` blocker fires (not the
+    // .cache phantom the fixture no longer produces).
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      {
+        type: 'user',
+        message: { role: 'user', content: '구현 완료하면 세션 마무리하자' },
+      },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-reconfirm',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `must still block, got: ${JSON.stringify(out)}`);
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `reason must instruct AskUserQuestion: ${out.reason}`,
+    );
+    assert.ok(
+      !/crystallize/.test(out.reason),
+      `reason must NOT name a crystallize recovery command before the user picks close-now: ${out.reason}`,
+    );
+    assert.ok(
+      !/--mark-session-closed/.test(out.reason),
+      `reason must NOT offer the marker-write command before the user picks close-now: ${out.reason}`,
+    );
+    assert.ok(out.reason.includes('s-reconfirm'), 'reason must embed the session_id');
+    // Coupling guard: the reason's close-now option label and
+    // isCloseReconfirmDeclined's correlation mark must be the SAME exported
+    // constant, not two independently-hardcoded literals that could drift.
+    assert.ok(
+      out.reason.includes(CLOSE_RECONFIRM_MARK),
+      `reason must use the exported CLOSE_RECONFIRM_MARK label, not a duplicated literal: ${out.reason}`,
+    );
+  });
+});
+
+test('a correlated "아직, 계속" decline suppresses the reconfirm → continue', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-declined',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `must suppress after decline, got: ${JSON.stringify(out)}`);
+    assert.equal(out.decision, undefined);
+  });
+});
+
+test('a NEW user close signal after a decline re-arms the reconfirm → block again', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 진짜 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-rearm',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.decision,
+      'block',
+      `a new close signal after the decline must re-arm reconfirm: ${JSON.stringify(out)}`,
+    );
+  });
+});
+
+test('decline label variants ("나중에" / "later") also suppress (label-drift defense)', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "close now?"="later". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-label-drift',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `label variant must still suppress: ${JSON.stringify(out)}`);
+  });
+});
+
+test('genuine close-now + uncommitted, no decline → still reconfirm block (no over-suppress)', () => {
+  // "다 끝났으면 세션 마무리하자" is an unambiguous close-now signal, not a
+  // conditional one — but the hook can't tell that apart from the reported
+  // conditional case by regex, so it must still reconfirm rather than
+  // silently allow a close over uncommitted work. There is no decline
+  // anywhere in this transcript, so suppression must not kick in either.
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '다 끝났으면 세션 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-close-now',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `close-now with uncommitted work must still reconfirm: ${JSON.stringify(out)}`);
+    assert.ok(/AskUserQuestion/.test(out.reason), `must still instruct AskUserQuestion: ${out.reason}`);
+  });
+});
+
+test('non-work-incomplete blocker only (git-clean, close blocker) → existing crystallize wording, no reconfirm', () => {
+  withGrowthWiki((dir) => {
+    // git-clean tree (fixture is committed at init and nothing new is
+    // written to it), no in-flight subagent. A close signal fires, and the
+    // read-only precompact gate will surface SOME blocker (e.g. `close`,
+    // since sessionCloseGlobalStatus has no fresh close files here) — but
+    // that is not a work-incomplete (git/in-flight) signal, so the existing
+    // crystallize wording must be preserved, not the reconfirm branch.
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-non-workincomplete',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/crystallize/.test(out.reason), `must keep the crystallize recovery command: ${out.reason}`);
+    assert.ok(!/AskUserQuestion/.test(out.reason), `must NOT reconfirm on a non-work-incomplete blocker: ${out.reason}`);
+  });
+});
+
+test('git-clean + in-flight subagent in background_tasks → reconfirm block', () => {
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-inflight',
+      transcript_path: transcript,
+      stop_hook_active: false,
+      background_tasks: [{ type: 'subagent', status: 'running' }],
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/AskUserQuestion/.test(out.reason), `in-flight subagent must trigger reconfirm: ${out.reason}`);
+    assert.ok(!/crystallize/.test(out.reason), `reconfirm must not name crystallize: ${out.reason}`);
+  });
+});
+
+test('absent background_tasks + uncommitted → in-flight fails open, git alone still reconfirms', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    // No background_tasks key at all in the payload.
+    const r = runAutoMinimal(dir, {
+      session_id: 's-no-bg-tasks',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}\nstdout: ${r.stdout}`);
+    assert.equal(r.stderr, '', `no exception expected on absent background_tasks: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/AskUserQuestion/.test(out.reason), `uncommitted alone must still reconfirm: ${out.reason}`);
+  });
+});
+
+test('absent background_tasks + git-clean + close blocker only → existing crystallize wording', () => {
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-no-bg-tasks-clean',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}\nstdout: ${r.stdout}`);
+    assert.equal(r.stderr, '', `no exception expected on absent background_tasks: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/crystallize/.test(out.reason), `git-clean + absent background_tasks must keep crystallize wording: ${out.reason}`);
+  });
+});
 
 suite('crystallize.mjs --mark-session-closed');
 

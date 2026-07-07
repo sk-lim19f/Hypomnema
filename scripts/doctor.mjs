@@ -20,7 +20,11 @@ import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
-import { readSyncState, projectSuggestionsPath } from '../hooks/hypo-shared.mjs';
+import {
+  readSyncState,
+  projectSuggestionsPath,
+  collectProjectWorkingDirs,
+} from '../hooks/hypo-shared.mjs';
 import {
   discoverExtensions,
   parseManifest,
@@ -514,6 +518,73 @@ function checkVerifyBy(hypoDir, ignorePatterns = []) {
     );
   } else {
     pass('verify_by coverage', 'All tracked pages have verify_by question');
+  }
+}
+
+// ── per-project index.md working_dir anchor coverage ─────────────────────────
+//
+// cwd-first resume (scripts/lib/wd-match.mjs + hooks/hypo-shared.mjs
+// collectProjectWorkingDirs) anchors each project to a cwd via the
+// `working_dir` field in projects/<slug>/index.md. A project born before an
+// index.md was filled in (or one whose index.md never got the field) carries
+// no anchor, so cwd matching silently degrades to recency for it. This is
+// hygiene reporting, never a hard-fail: recency fallback still resolves
+// something, just less precisely.
+//
+// Anchor status is read via hooks/hypo-shared.mjs collectProjectWorkingDirs —
+// the SAME function the deployed CwdChanged/SessionStart hooks use at
+// runtime — rather than the generic (lenient) parseFrontmatter. That matters:
+// parseFrontmatter accepts `working_dir : /repo` (space before the colon),
+// but the runtime hook matcher only recognizes the exact `working_dir:` form
+// (no space). Using parseFrontmatter here would report a project as anchored
+// when cwd-first resume still can't actually match it — a false pass this
+// check exists specifically to prevent.
+function checkProjectIndexAnchors(hypoDir) {
+  const projectsDir = join(hypoDir, 'projects');
+  if (!existsSync(projectsDir)) return;
+
+  const anchoredWorkingDir = new Map(
+    collectProjectWorkingDirs(hypoDir).map((p) => [p.slug, p.workingDir]),
+  );
+
+  const unanchored = [];
+  for (const slug of readdirSync(projectsDir)) {
+    if (slug === '_template') continue;
+    const dir = join(projectsDir, slug);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+
+    // Only a project that actually HAS session activity is worth anchoring —
+    // a bare scaffold (e.g. mid-creation) has nothing yet for cwd-first
+    // resume to lose.
+    const hasArtifacts =
+      existsSync(join(dir, 'session-state.md')) ||
+      existsSync(join(dir, 'hot.md')) ||
+      existsSync(join(dir, 'session-log'));
+    if (!hasArtifacts) continue;
+
+    const indexPath = join(dir, 'index.md');
+    if (!existsSync(indexPath)) {
+      unanchored.push(`${slug} (no index.md)`);
+      continue;
+    }
+    if (!anchoredWorkingDir.get(slug)) {
+      unanchored.push(`${slug} (index.md missing working_dir)`);
+    }
+  }
+
+  if (unanchored.length === 0) {
+    pass('Project index anchors', 'All session-bearing projects carry a working_dir anchor');
+  } else {
+    const sample = unanchored.slice(0, 5).join(', ');
+    const extra = unanchored.length > 5 ? ` (+${unanchored.length - 5} more)` : '';
+    warn(
+      'Project index anchors',
+      `${unanchored.length} project(s) cwd-first resume can't anchor: ${sample}${extra}`,
+    );
   }
 }
 
@@ -1135,6 +1206,7 @@ checkStaleSibling();
 if (args.codex) checkCodexPaths();
 if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
+if (rootOk) checkProjectIndexAnchors(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkFeedbackProjection(args.hypoDir, args.claudeHome, args.projectId);

@@ -132,6 +132,20 @@ const TYPE_CONDITIONAL_FIELDS = {
   'weekly-journal': ['week'],
 };
 
+// type-conditional FORBIDDEN fields: a field that is legitimate on one type
+// only, but has been observed leaking into another via an unvalidated writer.
+// `working_dir` (and its companion `project`) belong solely on
+// `project-index` (index.md) — TYPE_CONDITIONAL_FIELDS above requires it
+// there. Unvalidated crystallize output has planted a stray `working_dir` /
+// `project` key on session-state.md instead, silently pointing injected
+// context at a wrong or stale path. Warn-only (not promoted via
+// STRICT_PROMOTE_IDS): this guards against a writer bug, not confirmed-bad
+// content a real YAML/type check would reject, so an existing vault carrying
+// the stray field is not hard-blocked.
+const TYPE_FORBIDDEN_FIELDS = {
+  'session-state': ['working_dir', 'project'],
+};
+
 const TYPE_ENUM_FIELDS = {
   prd: { status: ['draft', 'active', 'completed', 'cancelled', 'archived'] },
   adr: { status: ['proposed', 'accepted', 'deprecated', 'superseded'] },
@@ -375,6 +389,24 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
     for (const field of TYPE_CONDITIONAL_FIELDS[fm.type]) {
       if (!fm[field]) {
         issue('error', rel, `Missing required field for type "${fm.type}": ${field}`);
+      }
+    }
+  }
+
+  // type-conditional forbidden fields (W11): a field valid only on a
+  // DIFFERENT type planted here by an unvalidated writer. Object.hasOwn
+  // (not `fm[field]`) so a present-but-empty `working_dir:` still flags —
+  // the bug is the key's presence, not its value.
+  if (fm.type && TYPE_FORBIDDEN_FIELDS[fm.type]) {
+    for (const field of TYPE_FORBIDDEN_FIELDS[fm.type]) {
+      if (Object.hasOwn(fm, field)) {
+        issue(
+          'warn',
+          rel,
+          `Forbidden frontmatter field for type "${fm.type}": "${field}" (only valid on project-index)`,
+          null,
+          'W11',
+        );
       }
     }
   }

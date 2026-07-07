@@ -624,6 +624,80 @@ export function collectProjectWorkingDirs(hypoDir) {
   return out;
 }
 
+// A project without a working_dir anchor (no index.md, or an index.md missing
+// the field) never enters collectProjectWorkingDirs' universe, so cwd-first
+// resume always MISSes for it — the SessionStart/CwdChanged MISS branch would
+// otherwise only ever offer to create a brand-new (duplicate) project. Match
+// the cwd's LEAF basename only (not every ancestor): the anchor being written
+// is `working_dir: <cwd>` itself, so matching an ancestor directory would
+// backfill the wrong (parent) path. Since projects/<slug>/ names are unique on
+// disk, a leaf-basename match identifies at most one project — no separate
+// uniqueness gate is needed here (unlike pickProjectByCwd's cross-machine tier
+// 2, which reasons over synced *paths* that can collide).
+//
+// Known bound: a session whose cwd is a SUBDIRECTORY of the anchorless
+// project's root (rather than the root itself) will not match — this is a
+// deliberate scope limit, not a bug: guessing the project from a mid-tree cwd
+// would risk writing an anchor to the wrong (non-root) path.
+//
+// @param {string} cwd
+// @param {string} [hypoDir=HYPO_DIR]
+// @returns {{slug: string, hasIndex: boolean}|null} the anchorless project
+//   this cwd's leaf basename names, or null when there is no match, no
+//   session artifacts, or the project already carries a working_dir.
+export function findBackfillCandidate(cwd, hypoDir = HYPO_DIR) {
+  const n = normalizeWorkingDir(cwd);
+  if (!n) return null;
+  const projectsDir = join(hypoDir, 'projects');
+  if (!existsSync(projectsDir)) return null;
+  const leaf = _lastSeg(n);
+  if (!leaf) return null;
+
+  const ci = isCaseInsensitiveFs();
+  let entries;
+  try {
+    entries = readdirSync(projectsDir);
+  } catch {
+    return null;
+  }
+  const slug = entries.find((e) => e !== '_template' && _fold(e, ci) === _fold(leaf, ci));
+  if (!slug) return null;
+
+  const dir = join(projectsDir, slug);
+  try {
+    if (!statSync(dir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const hasArtifacts =
+    existsSync(join(dir, 'session-state.md')) ||
+    existsSync(join(dir, 'hot.md')) ||
+    existsSync(join(dir, 'session-log'));
+  if (!hasArtifacts) return null;
+
+  const indexPath = join(dir, 'index.md');
+  const hasIndex = existsSync(indexPath);
+  let workingDir = null;
+  if (hasIndex) {
+    try {
+      const fmBlock = readFileSync(indexPath, 'utf-8').match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      const line = fmBlock && fmBlock[1].split(/\r?\n/).find((l) => /^working_dir:/.test(l));
+      if (line) {
+        workingDir = line
+          .slice('working_dir:'.length)
+          .trim()
+          .replace(/\s+#.*$/, '')
+          .replace(/^['"]|['"]$/g, '');
+      }
+    } catch {
+      workingDir = null;
+    }
+  }
+  if (hasIndex && workingDir) return null; // already anchored — not a backfill case
+
+  return { slug, hasIndex };
+}
+
 /**
  * When the session cwd is a project working_dir distinct from the vault root,
  * the wiki/knowledge files live in the VAULT, not in this cwd. SessionStart and
@@ -1461,6 +1535,23 @@ export function cwdHasProjectMarker(cwd) {
   return PROJECT_MARKERS.some((m) => existsSync(join(cwd, m)));
 }
 
+// Shared cooldown/skip gate for BOTH the new-project offer and the backfill
+// offer below — same store (.cache/project-suggestions.json), same key (cwd),
+// so a user who just answered one kind of offer for a cwd doesn't immediately
+// get re-prompted with the other. A corrupt store stays silent (doctor
+// surfaces the malformation separately).
+function suggestionNotSuppressed(cwd, hypoDir, now) {
+  const { skips, cooldowns, parseError } = readProjectSuggestions(hypoDir);
+  if (parseError) return false;
+  if (skips.some((s) => s && s.cwd === cwd)) return false;
+  const ts = cooldowns[cwd];
+  if (ts) {
+    const t = Date.parse(ts);
+    if (Number.isFinite(t) && now - t < SUGGESTION_COOLDOWN_MS) return false;
+  }
+  return true;
+}
+
 /**
  * Decide whether SessionStart/CwdChanged should offer to create a project for
  * `cwd`. The caller MUST have already confirmed `cwd` matches no project's
@@ -1478,15 +1569,25 @@ export function shouldSuggestProjectCreation(cwd, hypoDir = HYPO_DIR, now = Date
   if (!cwd) return false;
   if (!existsSync(join(cwd, '.git'))) return false;
   if (!cwdHasProjectMarker(cwd)) return false;
-  const { skips, cooldowns, parseError } = readProjectSuggestions(hypoDir);
-  if (parseError) return false;
-  if (skips.some((s) => s && s.cwd === cwd)) return false;
-  const ts = cooldowns[cwd];
-  if (ts) {
-    const t = Date.parse(ts);
-    if (Number.isFinite(t) && now - t < SUGGESTION_COOLDOWN_MS) return false;
-  }
-  return true;
+  return suggestionNotSuppressed(cwd, hypoDir, now);
+}
+
+/**
+ * Decide whether SessionStart/CwdChanged should offer to BACKFILL a
+ * working_dir anchor for `cwd`. The caller MUST have already located a
+ * findBackfillCandidate() match; this only applies the same cooldown/skip
+ * gate shouldSuggestProjectCreation uses, so the two offers share one
+ * suppression store. No git/marker gate here — the project directory
+ * already existing is itself the trigger condition.
+ *
+ * @param {string} cwd
+ * @param {string} [hypoDir]
+ * @param {number} [now] epoch ms, injectable for tests
+ * @returns {boolean}
+ */
+export function shouldSuggestBackfill(cwd, hypoDir = HYPO_DIR, now = Date.now()) {
+  if (!cwd) return false;
+  return suggestionNotSuppressed(cwd, hypoDir, now);
 }
 
 /**
@@ -1507,6 +1608,64 @@ export function buildProjectSuggestionLine(cwd) {
     .join('');
   const safe = sanitized.slice(0, 80).trim() || 'project';
   return `[WIKI: cwd '${safe}'에 매칭되는 프로젝트가 없습니다. 자동 생성할까요? (Y/n)]`;
+}
+
+// Neutralize a PATH value for additionalContext injection without truncating
+// it — unlike sanitizeProjForPrompt (built for a short display name), a path
+// must render in full or the backfilled working_dir would be wrong. Only
+// newline/control chars are stripped (the injection vector); everything else,
+// including shell metacharacters, passes through untouched because this value
+// is NEVER assembled into a runnable command (see buildBackfillSuggestionLine)
+// — it is purely descriptive text for the LLM/user to read.
+function stripControlCharsForPath(raw) {
+  // Per-codepoint (not a regex escape range) so no control byte is written
+  // literally into this source file (the source-corruption trap hit earlier
+  // in this same change). Mirrors sanitizeProjForPrompt's coverage EXACTLY —
+  // C0 (0x00-0x1F), DEL+C1 (0x7F-0x9F, which folds in U+0085 NEL), and the
+  // U+2028/U+2029 line separators. Deliberately does NOT strip bidi format
+  // controls: sanitizeProjForPrompt doesn't either, and matching its exact
+  // decision (rather than inventing a wider one here) is the principled
+  // choice so the two sanitizers never silently diverge in coverage.
+  return Array.from(String(raw == null ? '' : raw))
+    .map((ch) => {
+      const code = ch.codePointAt(0);
+      const isC0OrDelOrC1 = code < 0x20 || (code >= 0x7f && code <= 0x9f);
+      const isLineSep = code === 0x2028 || code === 0x2029;
+      return isC0OrDelOrC1 || isLineSep ? ' ' : ch;
+    })
+    .join('');
+}
+
+/**
+ * Build the working_dir-backfill offer line for a cwd that names an EXISTING
+ * `projects/<slug>/` directory (findBackfillCandidate already confirmed it
+ * carries session artifacts but no anchor). `slug` (short, display-only)
+ * routes through sanitizeProjForPrompt; `cwd` (a real path that must not be
+ * corrupted) routes through stripControlCharsForPath instead — truncating a
+ * path would silently backfill the WRONG working_dir. Neither branch
+ * assembles a runnable shell command from either value (codex pre-commit
+ * review: embedding untrusted path/slug text into a copy-paste `node ...`
+ * invocation is a shell-injection vector); both branches are purely
+ * descriptive guidance for the LLM/user to act on.
+ *
+ * The two cases still need different WORDING: a MISSING index.md has nothing
+ * to edit yet, so the offer describes creating a fresh one anchored to the
+ * current cwd (the agent constructs the actual project-create.mjs invocation
+ * itself, safely, outside this string). An index.md that already EXISTS but
+ * simply omits working_dir needs a direct frontmatter addition instead.
+ *
+ * @param {string} slug the matching projects/<slug>/ directory name
+ * @param {string} cwd the session cwd (the value that would become working_dir)
+ * @param {boolean} hasIndex whether projects/<slug>/index.md already exists
+ * @returns {string}
+ */
+export function buildBackfillSuggestionLine(slug, cwd, hasIndex) {
+  const safeSlug = sanitizeProjForPrompt(slug);
+  const safeCwd = stripControlCharsForPath(cwd);
+  const action = hasIndex
+    ? `projects/${safeSlug}/index.md의 frontmatter에 working_dir: ${safeCwd}를 추가할까요?`
+    : `projects/${safeSlug}/index.md가 없습니다. 현재 세션의 cwd(${safeCwd})를 working_dir로 삼아 index.md를 새로 만들까요?`;
+  return `[WIKI: cwd가 기존 프로젝트 'projects/${safeSlug}/'와 이름이 일치하지만 working_dir 앵커가 없습니다. ${action} (Y/n)]`;
 }
 
 // ── clear-marker (amendment 2026-05-14) ──────────────────────
@@ -2596,6 +2755,141 @@ export function hasUserCloseSignal(transcriptPath) {
     }
   }
   return false;
+}
+
+/**
+ * True iff the Stop payload's `background_tasks` names an in-flight (not yet
+ * terminal) delegated subagent. Read-only: used to widen the autoclose
+ * reconfirm trigger (see hypo-auto-minimal-crystallize.mjs) to "work is
+ * demonstrably still running", not just "the wiki has uncommitted changes".
+ *
+ * Defined as the NEGATION of a terminal status, not an enumeration of
+ * "running" states — this repo has no `background_tasks` type definition
+ * (grep turns up nothing), so the real status vocabulary is unverified. An
+ * unrecognized/absent status is treated as in-flight; only a recognized
+ * terminal status clears it.
+ *
+ * Fail-open: a missing or non-array `background_tasks` is treated as "no
+ * in-flight subagent" (the field may simply not be sent by this Stop event),
+ * so in-flight detection degrades gracefully to the git-uncommitted signal
+ * alone rather than spuriously blocking.
+ */
+export function hasInFlightSubagent(payload) {
+  const tasks = payload && payload.background_tasks;
+  if (!Array.isArray(tasks)) return false;
+  const TERMINAL = /^(completed|complete|done|finished|failed|error|errored|cancelled|canceled)$/i;
+  return tasks.some(
+    (t) => t && t.type === 'subagent' && (t.status == null || !TERMINAL.test(String(t.status))),
+  );
+}
+
+// The reconfirm reason (hypo-auto-minimal-crystallize.mjs emitBlock's
+// reconfirm branch) instructs the close-now option under this exact label —
+// used below to correlate an AskUserQuestion tool_use to OUR close-reconfirm
+// prompt specifically, not just any AskUserQuestion the model happens to ask.
+// Exported so the hook builds its reason text off this SAME literal instead
+// of a second hardcoded copy: two independent literals would let a reworded
+// reason silently break this correlation with no test to catch it.
+export const CLOSE_RECONFIRM_MARK = '지금 닫기';
+
+/**
+ * True iff the LATEST correlated AskUserQuestion answer in the transcript
+ * declined an autoclose reconfirm prompt ("아직" / "나중" / "not yet" /
+ * "later") — order-sensitive so a decline is suppressed again once the user
+ * signals a NEW close intent afterward (re-arm).
+ *
+ * Read-only, forward scan over the FULL transcript (no tail truncation — a
+ * decline can precede the next Stop by any number of turns). Reuses the same
+ * askIds + tool_use_id correlation `hasUserCloseSignal` (above) uses to bind
+ * an AskUserQuestion answer to its own tool_use, so an unrelated tool_result
+ * string can't forge a decline. Unlike `hasUserCloseSignal` (which is a
+ * "any evidence, ever" OR), this tracks a single latest-wins boolean as it
+ * scans: a decline answer sets it true, and any later GENUINE USER close
+ * signal resets it to false — the user asked to close again, so the prior
+ * decline no longer applies.
+ *
+ * Two correlation guards (the same input-boundary concern class as
+ * extractUserMessages' tool_result/injection exclusion above):
+ *
+ *  1. Re-arm is gated to a real user-typed close signal ONLY — mirrors
+ *     extractUserMessages' own boundary filter (isMeta / promptSource
+ *     system|sdk / tool_result exclusion, see extractUserMessages above)
+ *     instead of re-deriving a separate policy. Without this, the MODEL'S
+ *     OWN assistant reasoning text (which can itself contain "세션 마무리"),
+ *     or a tool_result (e.g. a Read of a file that happens to quote a close
+ *     phrase), could silently clear a recorded decline and re-nag the user
+ *     who already said "아직" — the opposite of what a decline means.
+ *  2. The AskUserQuestion tool_use is only added to `askIds` when its input
+ *     carries CLOSE_RECONFIRM_MARK — i.e. it IS the close-reconfirm prompt,
+ *     not some unrelated question the model asked around the same time. An
+ *     unrelated question whose answer happens to contain a decline word
+ *     ("나중"/"later") must not correlate.
+ *
+ * Fail-open: a missing/unreadable transcript → false (do not suppress; keep
+ * reconfirming) — the caller stays on the safe (nag, not silent-close) side.
+ */
+export function isCloseReconfirmDeclined(transcriptPath) {
+  if (!transcriptPath) return false;
+  let lines;
+  try {
+    lines = readFileSync(transcriptPath, 'utf-8').split('\n');
+  } catch {
+    return false;
+  }
+  const DECLINE = /(아직|나중|not\s?yet|later)/i;
+  const askIds = new Set();
+  let declined = false;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const msg = obj.message ?? obj;
+    const content = msg.content ?? obj.content;
+
+    // Re-arm boundary (guard 1): only a genuine user-typed close signal may
+    // re-arm. Same exclusions as extractUserMessages — isMeta injection,
+    // system/sdk synthetic prompts, and (via the array-content branch below)
+    // tool_result blocks, which are role:'user' in the transcript but are NOT
+    // user-typed text.
+    const isInjected = obj.isMeta === true || obj.promptSource === 'system' || obj.promptSource === 'sdk';
+    const role = msg.role ?? obj.role ?? obj.type;
+    if (!isInjected && role === 'user') {
+      if (typeof content === 'string') {
+        if (!content.startsWith('Stop hook feedback') && isClosePattern(content)) declined = false;
+      } else if (Array.isArray(content)) {
+        for (const b of content) {
+          // Only type:'text' blocks are genuine user-typed text — a
+          // tool_result block (also role:'user') is tool output, not
+          // something the user typed, and must not re-arm.
+          if (b && b.type === 'text' && typeof b.text === 'string' && isClosePattern(b.text)) {
+            declined = false;
+          }
+        }
+      }
+    }
+
+    if (!Array.isArray(content)) continue;
+    for (const b of content) {
+      if (!b || typeof b !== 'object') continue;
+      if (b.type === 'tool_use' && b.name === 'AskUserQuestion' && b.id) {
+        // Correlation guard 2: only OUR close-reconfirm prompt counts.
+        const inputStr = JSON.stringify(b.input ?? null);
+        if (inputStr.includes(CLOSE_RECONFIRM_MARK)) askIds.add(b.id);
+        continue;
+      }
+      if (b.type === 'tool_result' && b.tool_use_id && askIds.has(b.tool_use_id)) {
+        const s = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+        for (const m of s.matchAll(/="([^"]*)"/g)) {
+          if (DECLINE.test(m[1])) declined = true;
+        }
+      }
+    }
+  }
+  return declined;
 }
 
 /**
