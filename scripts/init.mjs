@@ -132,6 +132,9 @@ Commands:
   uninstall               Remove hooks and registrations (dry-run by default; pass --apply)
   feedback-sync           Project feedback (SoT) → MEMORY.md / CLAUDE.md learned-behaviors
                           projection (--check default, --write to apply)
+  capture                 Reverse-capture ~/.claude/{commands,agents} extensions and
+                          settings.json hooks into the wiki for cross-machine sync
+                          (pass names or --all; --dry-run to preview)
 
   Running \`hypomnema\` with no command is equivalent to \`hypomnema init\`.
 
@@ -152,8 +155,8 @@ Init options:
   --dry-run              Show what would be done without making changes
   --help, -h             Show this help message
 
-Subcommand-specific flags (upgrade/doctor/uninstall) live in the
-docstring at the top of scripts/<command>.mjs.`);
+Subcommand-specific flags (upgrade/doctor/uninstall/capture) live in the
+docstring at the top of scripts/<command>.mjs; capture also accepts \`--help\`.`);
       process.exit(0);
     } else if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--no-hooks') args.hooks = false;
