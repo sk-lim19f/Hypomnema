@@ -36,8 +36,9 @@
  * gate above was found to be unable to distinguish "close now" from "close
  * once X is done" by regex alone — same sentence shape either way). When the
  * close-intent gate above fires AND the session has a work-incomplete signal
- * (an uncommitted wiki, or an in-flight delegated subagent per
- * hasInFlightSubagent), step 6's block reason is replaced with an
+ * (an uncommitted wiki, or pending background work — a non-terminal
+ * background task or a scheduled cron wake — per hasPendingBackgroundWork),
+ * step 6's block reason is replaced with an
  * AskUserQuestion instruction instead of a crystallize command — the model
  * asks the user "close now?" rather than deciding for them. A correlated
  * "아직"/"나중"/"not yet"/"later" answer (isCloseReconfirmDeclined) suppresses
@@ -65,7 +66,7 @@ import {
   isClosePattern,
   isGateSkipped,
   precompactGateStatus,
-  hasInFlightSubagent,
+  hasPendingBackgroundWork,
   isCloseReconfirmDeclined,
   CLOSE_RECONFIRM_MARK,
 } from './hypo-shared.mjs';
@@ -95,8 +96,8 @@ function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
       JSON.stringify({
         decision: 'block',
         reason:
-          `[WIKI_AUTOCLOSE] close 신호가 잡혔지만 아직 커밋되지 않은 변경(또는 진행 중인 ` +
-          `위임 작업)이 있어 지금 닫을지 뒤로 미룰지 모호합니다 (session_id=${sessionId}). ` +
+          `[WIKI_AUTOCLOSE] close 신호가 잡혔지만 아직 커밋되지 않은 변경 또는 진행 중인 ` +
+          `백그라운드·위임 작업이 있어 지금 닫을지 뒤로 미룰지 모호합니다 (session_id=${sessionId}). ` +
           `임의로 닫지 말고 AskUserQuestion으로 사용자에게 지금 세션을 닫을지 물어보세요. ` +
           `선택지는 "${CLOSE_RECONFIRM_MARK}"와 "아직, 계속"으로 제시합니다. 사용자가 ` +
           `"${CLOSE_RECONFIRM_MARK}"를 고른 뒤에만 세션 마무리를 진행하세요. 그전에는 ` +
@@ -250,14 +251,16 @@ process.stdin.on('end', () => {
     // "work-incomplete" together are exactly the case where the transcript's
     // NL close phrase can't tell "close now" from "close once X is done" —
     // regex can't disambiguate this (see spec background). Narrowed to the
-    // two work-incomplete signals only: an uncommitted wiki (`git` blocker;
-    // real unsaved work) OR an in-flight delegated subagent. `hot` / `lint` /
-    // `close` / `design-history` / `feedback` blockers are real close
-    // blockers but not evidence of "later" intent, so they keep the existing
-    // wording (unchanged from before this feature).
+    // work-incomplete signals only: an uncommitted wiki (`git` blocker; real
+    // unsaved work) OR pending background work — a non-terminal background task
+    // (delegated subagent OR shell, e.g. a deferred push/CI wait) or a
+    // scheduled cron wake (hasPendingBackgroundWork). `hot` / `lint` / `close`
+    // / `design-history` / `feedback` blockers are real close blockers but not
+    // evidence of "later" intent, so they keep the existing wording (unchanged
+    // from before this feature).
     const workIncomplete =
       (gate && gate.blockers && gate.blockers.some((b) => b.type === 'git')) ||
-      hasInFlightSubagent(payload);
+      hasPendingBackgroundWork(payload);
     if (workIncomplete && isCloseReconfirmDeclined(transcriptPath)) {
       // The user already answered "아직" to the ambiguous close signal that
       // triggered this Stop turn — suppressing is a continue, not a
