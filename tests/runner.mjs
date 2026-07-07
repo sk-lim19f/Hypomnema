@@ -1371,7 +1371,7 @@ const {
   isClosePattern,
   extractUserMessages,
   hasUserCloseSignal,
-  hasInFlightSubagent,
+  hasPendingBackgroundWork,
   isCloseReconfirmDeclined,
   CLOSE_RECONFIRM_MARK,
   resolveTranscriptBySessionId,
@@ -1883,41 +1883,66 @@ test('unreadable / missing transcript → false (fail-closed)', () => {
   assert.equal(hasUserCloseSignal(null), false);
 });
 
-// ── hasInFlightSubagent — read-only in-flight delegation check ──
-suite('hasInFlightSubagent()');
+// ── hasPendingBackgroundWork — read-only pending-work check ──
+suite('hasPendingBackgroundWork()');
 
 test('a subagent task with a non-terminal status → true', () => {
   assert.equal(
-    hasInFlightSubagent({ background_tasks: [{ type: 'subagent', status: 'running' }] }),
+    hasPendingBackgroundWork({ background_tasks: [{ type: 'subagent', status: 'running' }] }),
     true,
   );
 });
 
-test('a subagent task with a terminal status → false', () => {
+test('a shell background task with a running status → true', () => {
   assert.equal(
-    hasInFlightSubagent({ background_tasks: [{ type: 'subagent', status: 'completed' }] }),
-    false,
-  );
-});
-
-test('a subagent task with no status field → true (unknown = not yet terminal)', () => {
-  assert.equal(
-    hasInFlightSubagent({ background_tasks: [{ type: 'subagent' }] }),
+    hasPendingBackgroundWork({ background_tasks: [{ type: 'shell', status: 'running' }] }),
     true,
   );
 });
 
-test('a non-subagent task (any status) → false', () => {
+test('a task with a terminal status → false', () => {
   assert.equal(
-    hasInFlightSubagent({ background_tasks: [{ type: 'other', status: 'running' }] }),
+    hasPendingBackgroundWork({ background_tasks: [{ type: 'subagent', status: 'completed' }] }),
+    false,
+  );
+  assert.equal(
+    hasPendingBackgroundWork({ background_tasks: [{ type: 'shell', status: 'failed' }] }),
     false,
   );
 });
 
-test('missing/non-array background_tasks → false (fail-open)', () => {
-  assert.equal(hasInFlightSubagent({}), false);
-  assert.equal(hasInFlightSubagent({ background_tasks: 'not-an-array' }), false);
-  assert.equal(hasInFlightSubagent(null), false);
+test('a task with no status field → true (unknown = not yet terminal)', () => {
+  assert.equal(
+    hasPendingBackgroundWork({ background_tasks: [{ type: 'subagent' }] }),
+    true,
+  );
+});
+
+test('a non-subagent (shell) task counts too → true (widened past subagent-only)', () => {
+  assert.equal(
+    hasPendingBackgroundWork({ background_tasks: [{ type: 'other', status: 'running' }] }),
+    true,
+  );
+});
+
+test('missing/non-array/empty background_tasks → false (fail-open)', () => {
+  assert.equal(hasPendingBackgroundWork({}), false);
+  assert.equal(hasPendingBackgroundWork({ background_tasks: 'not-an-array' }), false);
+  assert.equal(hasPendingBackgroundWork({ background_tasks: [] }), false);
+  assert.equal(hasPendingBackgroundWork(null), false);
+});
+
+test('a non-empty session_crons → true (scheduled wake is pending work)', () => {
+  // No background_tasks key at all — must fire off the session_crons branch.
+  assert.equal(
+    hasPendingBackgroundWork({ session_crons: [{ id: 'c1', schedule: '* * * * *' }] }),
+    true,
+  );
+});
+
+test('an empty / non-array session_crons → false (fail-open, ignored)', () => {
+  assert.equal(hasPendingBackgroundWork({ session_crons: [] }), false);
+  assert.equal(hasPendingBackgroundWork({ session_crons: 'not-an-array' }), false);
 });
 
 // ── isCloseReconfirmDeclined — order-sensitive decline detection ──
@@ -14387,6 +14412,74 @@ test('git-clean + in-flight subagent in background_tasks → reconfirm block', (
     assert.equal(out.decision, 'block');
     assert.ok(/AskUserQuestion/.test(out.reason), `in-flight subagent must trigger reconfirm: ${out.reason}`);
     assert.ok(!/crystallize/.test(out.reason), `reconfirm must not name crystallize: ${out.reason}`);
+  });
+});
+
+test('git-clean + running shell background task → reconfirm block', () => {
+  // The reported failure mode: "publish then wrap up" defers the close behind
+  // a background Bash (e.g. a CI wait). Local tree is clean and there is no
+  // delegated subagent, yet work is still pending — the shell task must be
+  // recognized so this reconfirms instead of re-nagging with the plain marker
+  // wording every Stop turn.
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '퍼블리시 하고 세션 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-shell-bg',
+      transcript_path: transcript,
+      stop_hook_active: false,
+      background_tasks: [
+        { id: 'b1', type: 'shell', status: 'running', description: 'ci', command: 'gh run watch' },
+      ],
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/AskUserQuestion/.test(out.reason), `running shell task must trigger reconfirm: ${out.reason}`);
+    assert.ok(!/crystallize/.test(out.reason), `reconfirm must not name crystallize: ${out.reason}`);
+  });
+});
+
+test('git-clean + non-empty session_crons → reconfirm block', () => {
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-cron',
+      transcript_path: transcript,
+      stop_hook_active: false,
+      session_crons: [{ id: 'c1', schedule: '0 9 * * *' }],
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/AskUserQuestion/.test(out.reason), `scheduled cron wake must trigger reconfirm: ${out.reason}`);
+  });
+});
+
+test('git-clean + only terminal shell background task → existing crystallize wording (no reconfirm)', () => {
+  // A finished task normally drops out of the array, but if a terminal-status
+  // entry is still present it must NOT be read as pending work.
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-shell-done',
+      transcript_path: transcript,
+      stop_hook_active: false,
+      background_tasks: [{ id: 'b1', type: 'shell', status: 'completed', command: 'gh run watch' }],
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/crystallize/.test(out.reason), `terminal shell task must keep crystallize wording: ${out.reason}`);
+    assert.ok(!/AskUserQuestion/.test(out.reason), `terminal shell task must NOT reconfirm: ${out.reason}`);
   });
 });
 

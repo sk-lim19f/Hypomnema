@@ -2758,29 +2758,50 @@ export function hasUserCloseSignal(transcriptPath) {
 }
 
 /**
- * True iff the Stop payload's `background_tasks` names an in-flight (not yet
- * terminal) delegated subagent. Read-only: used to widen the autoclose
- * reconfirm trigger (see hypo-auto-minimal-crystallize.mjs) to "work is
- * demonstrably still running", not just "the wiki has uncommitted changes".
+ * True iff the Stop payload shows work still pending in the background —
+ * either a non-terminal `background_tasks` entry OR a scheduled `session_crons`
+ * wake. Read-only: used to widen the autoclose reconfirm trigger (see
+ * hypo-auto-minimal-crystallize.mjs) to "work is demonstrably still running",
+ * not just "the wiki has uncommitted changes".
+ *
+ * ANY non-terminal `background_tasks` entry counts, not just delegated
+ * subagents. A Stop payload captured from a real session confirmed the field
+ * is genuinely sent (the older "grep turns up nothing / may not be sent" note
+ * is retired): a background Bash appears as
+ * `{id, type:'shell', status:'running', description, command}`, alongside
+ * `type:'subagent'` for delegations. Restricting to `type==='subagent'` missed
+ * shell background work (e.g. a `git push` / CI wait deferred behind a close
+ * signal), letting the reconfirm branch mis-classify the session as idle and
+ * re-nag every Stop turn.
  *
  * Defined as the NEGATION of a terminal status, not an enumeration of
- * "running" states — this repo has no `background_tasks` type definition
- * (grep turns up nothing), so the real status vocabulary is unverified. An
- * unrecognized/absent status is treated as in-flight; only a recognized
- * terminal status clears it.
+ * "running" states: the observed non-terminal status is "running", and a
+ * finished task is removed from the array entirely (it does NOT linger in a
+ * terminal state — the next Stop simply reports `background_tasks:[]`). An
+ * unrecognized/absent status is therefore treated as in-flight; only a
+ * recognized terminal status clears an entry that is still present.
  *
- * Fail-open: a missing or non-array `background_tasks` is treated as "no
- * in-flight subagent" (the field may simply not be sent by this Stop event),
- * so in-flight detection degrades gracefully to the git-uncommitted signal
- * alone rather than spuriously blocking.
+ * `session_crons`: a non-empty array means the session is waiting on a
+ * scheduled wake, which is itself pending work. A missing / non-array
+ * `session_crons` is ignored (fail-open).
+ *
+ * Fail-open overall: a missing or non-array `background_tasks` contributes no
+ * pending signal, so detection degrades gracefully to the git-uncommitted
+ * signal alone rather than spuriously blocking.
  */
-export function hasInFlightSubagent(payload) {
-  const tasks = payload && payload.background_tasks;
-  if (!Array.isArray(tasks)) return false;
+export function hasPendingBackgroundWork(payload) {
+  if (!payload || typeof payload !== 'object') return false;
   const TERMINAL = /^(completed|complete|done|finished|failed|error|errored|cancelled|canceled)$/i;
-  return tasks.some(
-    (t) => t && t.type === 'subagent' && (t.status == null || !TERMINAL.test(String(t.status))),
-  );
+  const tasks = payload.background_tasks;
+  if (
+    Array.isArray(tasks) &&
+    tasks.some((t) => t && (t.status == null || !TERMINAL.test(String(t.status))))
+  ) {
+    return true;
+  }
+  const crons = payload.session_crons;
+  if (Array.isArray(crons) && crons.length > 0) return true;
+  return false;
 }
 
 // The reconfirm reason (hypo-auto-minimal-crystallize.mjs emitBlock's
