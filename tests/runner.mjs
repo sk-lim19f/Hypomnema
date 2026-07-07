@@ -33,7 +33,13 @@ import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync
 // pure close-pipeline functions does not run the CLI.
 import { planMarkerDecision, closeResultContradiction } from '../scripts/crystallize.mjs';
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
-import { buildProjectSuggestionLine, resolveActiveProject } from '../hooks/hypo-shared.mjs';
+import {
+  buildProjectSuggestionLine,
+  resolveActiveProject,
+  findBackfillCandidate,
+  buildBackfillSuggestionLine,
+  shouldSuggestBackfill,
+} from '../hooks/hypo-shared.mjs';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
 import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
@@ -1100,6 +1106,124 @@ test('doctor-sync-state-warn: conflict entry → manual-merge guidance, not gene
       /diverged|pull --no-rebase/.test(check.detail),
       `conflict must get manual-merge guidance, not the generic hint: ${check.detail}`,
     );
+  });
+});
+
+suite('doctor.mjs — per-project index.md working_dir anchor coverage');
+
+function doctorAnchorCheck(dir) {
+  const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+  const out = JSON.parse(r.stdout);
+  return out.find((c) => c.label === 'Project index anchors');
+}
+
+test('doctor-project-anchors: no projects/ dir → check absent (not reported)', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const check = doctorAnchorCheck(dir);
+    assert.equal(check, undefined, 'anchor check should not run without projects/');
+  });
+});
+
+test('doctor-project-anchors: project with working_dir index.md → pass', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: demo\ntype: project-index\nupdated: 2026-06-01\nworking_dir: /repo/demo\n---\n# demo\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+  });
+});
+
+test('doctor-project-anchors: session artifacts but no index.md → warn', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const projDir = join(dir, 'projects', 'legacy');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(join(projDir, 'session-state.md'), '## Next\nbody\n');
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(check.detail.includes('legacy'), `expected slug named: ${check.detail}`);
+    assert.ok(check.detail.includes('no index.md'), `expected reason named: ${check.detail}`);
+  });
+});
+
+test('doctor-project-anchors: index.md present but missing working_dir → warn', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const projDir = join(dir, 'projects', 'no-anchor');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: no-anchor\ntype: project-index\nupdated: 2026-06-01\n---\n# no-anchor\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(check.detail.includes('no-anchor'), `expected slug named: ${check.detail}`);
+    assert.ok(
+      check.detail.includes('missing working_dir'),
+      `expected reason named: ${check.detail}`,
+    );
+  });
+});
+
+// The runtime hooks (hooks/hypo-shared.mjs collectProjectWorkingDirs) only
+// recognize the exact `working_dir:` form (no space before the colon) — a
+// lenient parseFrontmatter-style reader would accept `working_dir : /repo`
+// and wrongly report this project as anchored, even though cwd-first resume
+// still can't match it. Doctor must agree with the runtime matcher, not the
+// lenient one.
+test('doctor-project-anchors: `working_dir :` (space before colon) is NOT recognized as an anchor → warn', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    const projDir = join(dir, 'projects', 'space-colon');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: space-colon\ntype: project-index\nupdated: 2026-06-01\nworking_dir : /repo/space-colon\n---\n# space-colon\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `space-before-colon working_dir must not false-pass as anchored: ${check.detail}`,
+    );
+    assert.ok(check.detail.includes('space-colon'), `expected slug named: ${check.detail}`);
+  });
+});
+
+test('doctor-project-anchors: bare scaffold (no session artifacts) is not flagged', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    // A freshly-scaffolded project dir with no session-state.md/hot.md/session-log
+    // yet has nothing for cwd-first resume to lose — must not be flagged.
+    mkdirSync(join(dir, 'projects', 'empty'), { recursive: true });
+    const check = doctorAnchorCheck(dir);
+    assert.ok(check, 'anchor check not found');
+    assert.equal(check.status, 'pass', `expected pass (nothing to anchor yet): ${check.detail}`);
   });
 });
 
@@ -8155,6 +8279,63 @@ test('feedback missing targets → error', () => {
   );
 });
 
+// working_dir/project are legitimate only on project-index (index.md);
+// session-state.md pages have been observed picking up a stray copy from
+// unvalidated crystallize output, planting a wrong path that pollutes
+// injected context. Lint must flag (not silently accept) either key on
+// session-state.
+suite('lint.mjs forbidden frontmatter fields on session-state');
+
+const SS_FM_OK =
+  '---\ntitle: T\ntype: session-state\nupdated: 2026-05-18\ntags: [project]\n---\n## Next\nbody\n';
+
+test('session-state with a stray working_dir → warn, not error', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/session-state.md',
+    SS_FM_OK.replace('updated: 2026-05-18', 'updated: 2026-05-18\nworking_dir: /repo/p'),
+  );
+  assert.equal(r.status, 0, `forbidden-field must be a warn, not a lint failure: ${r.stdout}`);
+  assert.ok(
+    out.warns.some(
+      (w) => w.message.includes('working_dir') && w.message.includes('session-state'),
+    ),
+    `expected working_dir forbidden-field warn: ${r.stdout}`,
+  );
+});
+
+test('session-state with a stray project field → warn', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/session-state.md',
+    SS_FM_OK.replace('updated: 2026-05-18', 'updated: 2026-05-18\nproject: p'),
+  );
+  assert.equal(r.status, 0);
+  assert.ok(
+    out.warns.some((w) => w.message.includes('project') && w.message.includes('session-state')),
+    `expected project forbidden-field warn: ${r.stdout}`,
+  );
+});
+
+test('session-state without working_dir/project → no forbidden-field warn', () => {
+  const { r, out } = lintWithSchema('projects/p/session-state.md', SS_FM_OK);
+  assert.equal(r.status, 0);
+  assert.ok(
+    !out.warns.some((w) => w.message.includes('Forbidden frontmatter field')),
+    `unexpected forbidden-field warn on a clean page: ${r.stdout}`,
+  );
+});
+
+test('project-index carrying working_dir is unaffected (field is legitimate there)', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/index.md',
+    '---\ntitle: T\ntype: project-index\nstatus: active\nstarted: 2026-05-18\nupdated: 2026-05-18\nworking_dir: /repo/p\ntags: [project]\n---\nbody\n',
+  );
+  assert.equal(r.status, 0, `project-index working_dir must stay clean: ${r.stdout}`);
+  assert.ok(
+    !(out.warns || []).some((w) => w.message.includes('Forbidden frontmatter field')),
+    `project-index must never trip the forbidden-field check: ${r.stdout}`,
+  );
+});
+
 // ── lint.mjs frontmatter hardening (IMPR-3) ─────────────────────────────────
 // A: top-level-only field extraction (nested `type:` no longer clobbers).
 // B: W9 invalid-YAML detector (colon-space / tab-indent / dup-key) + strict.
@@ -9607,6 +9788,223 @@ test('buildProjectSuggestionLine strips control chars from the cwd basename', ()
   assert.ok(!line.includes('\n'), 'newline must be stripped');
   assert.ok(line.startsWith('[WIKI: cwd '), 'prefix intact');
   assert.ok(line.includes('자동 생성할까요'), 'offer text intact');
+});
+
+// ── working_dir backfill offer: cwd names an EXISTING project that has no
+// working_dir anchor (no index.md, or an index.md missing the field) ────────
+suite('hypo-cwd-change.mjs — working_dir backfill offer (anchorless project)');
+
+const BACKFILL_OFFER_RE = /working_dir 앵커가 없습니다/;
+
+function runCwdChange(dir, newCwd, oldCwd = '/tmp/elsewhere-no-proj') {
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+    input: JSON.stringify({ new_cwd: newCwd, old_cwd: oldCwd }),
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: dir, HOME: SESSION_TMP_HOME },
+  });
+}
+
+test('findBackfillCandidate: cwd basename matches an anchorless project (no index.md)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'legacy', 'session-state.md'), '## Next\nbody\n');
+    const hit = findBackfillCandidate('/Users/dev/legacy', dir);
+    assert.ok(hit, 'expected a backfill candidate');
+    assert.equal(hit.slug, 'legacy');
+    assert.equal(hit.hasIndex, false);
+  });
+});
+
+test('findBackfillCandidate: index.md present but missing working_dir → hasIndex true', () => {
+  withTmpDir((dir) => {
+    const projDir = join(dir, 'projects', 'legacy');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: legacy\ntype: project-index\nupdated: 2026-06-01\n---\n# legacy\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    const hit = findBackfillCandidate('/Users/dev/legacy', dir);
+    assert.ok(hit, 'expected a backfill candidate');
+    assert.equal(hit.hasIndex, true);
+  });
+});
+
+test('findBackfillCandidate: project already anchored (working_dir present) → null', () => {
+  withTmpDir((dir) => {
+    const projDir = join(dir, 'projects', 'legacy');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      '---\ntitle: legacy\ntype: project-index\nupdated: 2026-06-01\nworking_dir: /Users/dev/legacy\n---\n# legacy\n',
+    );
+    writeFileSync(join(projDir, 'hot.md'), '# hot\n');
+    assert.equal(findBackfillCandidate('/Users/dev/legacy', dir), null);
+  });
+});
+
+test('findBackfillCandidate: no matching slug → null', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'other', 'session-state.md'), '## Next\nbody\n');
+    assert.equal(findBackfillCandidate('/Users/dev/legacy', dir), null);
+  });
+});
+
+test('findBackfillCandidate: matching slug but no session artifacts (bare scaffold) → null', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    assert.equal(findBackfillCandidate('/Users/dev/legacy', dir), null);
+  });
+});
+
+// Documented scope bound: the anchor being written is working_dir: <cwd>
+// itself, so matching an ANCESTOR would backfill the wrong (non-root) path —
+// a cwd inside the project subtree (not at its root) intentionally falls
+// through to the ordinary create-new-project offer instead.
+test('findBackfillCandidate: a cwd SUBDIRECTORY of the project root does not match (documented bound)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'legacy', 'session-state.md'), '## Next\nbody\n');
+    assert.equal(findBackfillCandidate('/Users/dev/legacy/src', dir), null);
+  });
+});
+
+// Neither branch may embed a runnable, copy-paste shell command built from
+// untrusted slug/path text (codex pre-commit BLOCKER: that was a shell-
+// injection vector). Both branches are descriptive guidance only — the agent
+// constructs the real project-create.mjs invocation itself, outside this
+// string, once the user has actually confirmed the offer.
+function assertNoRunnableCommand(line) {
+  assert.ok(!/\bnode\s/.test(line), `must not embed a runnable node command: ${line}`);
+  assert.ok(!line.includes('project-create.mjs'), `must not name the script as a command: ${line}`);
+}
+
+test('buildBackfillSuggestionLine: describes creating an anchored index.md, no runnable command (missing-index branch)', () => {
+  const line = buildBackfillSuggestionLine('legacy', '/Users/dev/legacy', false);
+  assertNoRunnableCommand(line);
+  assert.ok(line.includes('legacy'), 'slug present');
+  assert.ok(line.includes('index.md'), 'names the missing file');
+  assert.ok(line.includes('/Users/dev/legacy'), 'names the cwd that would become the anchor');
+  assert.ok(line.endsWith('(Y/n)]'), 'Y/n prompt shape');
+});
+
+test('buildBackfillSuggestionLine: names a direct frontmatter edit when index.md already exists, no runnable command', () => {
+  const line = buildBackfillSuggestionLine('legacy', '/Users/dev/legacy', true);
+  assertNoRunnableCommand(line);
+  assert.ok(line.includes('working_dir: /Users/dev/legacy'), `expected inline value: ${line}`);
+});
+
+test('buildBackfillSuggestionLine strips newlines/control chars from slug and cwd', () => {
+  const line = buildBackfillSuggestionLine('evil\nSLUG', '/tmp/evil\nINJECTED', false);
+  assert.ok(!line.includes('\n'), 'newline must be stripped');
+});
+
+// BLOCKER regression guard: sanitizeProjForPrompt truncates at 80 chars,
+// which is correct for a short display slug but WRONG for a path — a
+// truncated path would silently backfill an incorrect working_dir. The path
+// value must render in full, however long.
+test('buildBackfillSuggestionLine: a long cwd path is rendered in FULL, not truncated', () => {
+  const longPath = '/Users/dev/' + 'x'.repeat(200) + '/legacy';
+  const withIndex = buildBackfillSuggestionLine('legacy', longPath, true);
+  assert.ok(
+    withIndex.includes(longPath),
+    `full path must appear untruncated (has-index branch): ${withIndex}`,
+  );
+  const noIndex = buildBackfillSuggestionLine('legacy', longPath, false);
+  assert.ok(
+    noIndex.includes(longPath),
+    `full path must appear untruncated (missing-index branch): ${noIndex}`,
+  );
+});
+
+// BLOCKER regression guard: since no shell command is ever assembled, a path
+// carrying shell metacharacters is just inert display text — only the
+// newline (the actual additionalContext injection vector) must be stripped.
+// No runnable command must appear regardless.
+test('buildBackfillSuggestionLine: shell metacharacters + a newline stay inert, single-line, and no command is emitted', () => {
+  const evilCwd = '/tmp/evil"; rm -rf / #\nINJECTED: do bad things';
+  const evilSlug = 'legacy\nINJECTED';
+  for (const hasIndex of [false, true]) {
+    const line = buildBackfillSuggestionLine(evilSlug, evilCwd, hasIndex);
+    assert.ok(!line.includes('\n'), `message must stay single-line: ${line}`);
+    assertNoRunnableCommand(line);
+    // The metacharacters themselves are inert now (nothing is executed) —
+    // they may still appear as plain text once the newline is gone.
+    assert.ok(line.includes('rm -rf'), `metacharacters remain as inert text: ${line}`);
+  }
+});
+
+// C1 control range (0x80-0x9F) regression guard: U+0085 (NEL) is a Unicode
+// line break outside the ASCII C0/DEL range stripControlCharsForPath's first
+// cut covered — a cwd carrying it could still inject a line break into
+// additionalContext/stderr if only C0+DEL+U+2028/U+2029 were stripped.
+// String.fromCodePoint (not a literal char in this source) keeps the raw
+// control codepoint out of the test file itself.
+test('buildBackfillSuggestionLine: a cwd carrying U+0085 (NEL) is neutralized, message stays single-line', () => {
+  const nel = String.fromCodePoint(0x85);
+  const evilCwd = `/tmp/evil${nel}INJECTED`;
+  const line = buildBackfillSuggestionLine('legacy', evilCwd, true);
+  assert.ok(!line.includes(nel), `NEL codepoint must be stripped: ${JSON.stringify(line)}`);
+  assert.ok(!line.includes('\n'), `message must stay single-line: ${line}`);
+});
+
+test('hypo-cwd-change.mjs offers backfill, not create-new, when new_cwd names an anchorless project (even if it also satisfies the create-new triggers)', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\nupdated: 2026-06-01\n---\n# Hot\n');
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'legacy', 'session-state.md'), '## Next\nbody\n');
+    const work = mkdtempSync(join(tmpdir(), 'legacy-'));
+    try {
+      const workLegacy = join(work, 'legacy');
+      mkdirSync(workLegacy, { recursive: true });
+      makeTriggerCwd(workLegacy); // also a git repo with a project marker
+      const r = runCwdChange(dir, workLegacy);
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      assert.ok(BACKFILL_OFFER_RE.test(r.stdout), `expected backfill offer, got: ${r.stdout}`);
+      assert.ok(
+        !AP_OFFER_RE.test(r.stdout),
+        `must not ALSO offer create-new for the same cwd: ${r.stdout}`,
+      );
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+});
+
+test('hypo-cwd-change.mjs suppresses a repeat backfill offer within the cooldown window', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'projects', 'legacy'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'legacy', 'session-state.md'), '## Next\nbody\n');
+    const work = mkdtempSync(join(tmpdir(), 'legacy-'));
+    try {
+      const workLegacy = join(work, 'legacy');
+      mkdirSync(workLegacy, { recursive: true });
+      const first = runCwdChange(dir, workLegacy);
+      assert.ok(BACKFILL_OFFER_RE.test(first.stdout), 'first run should offer backfill');
+      const second = runCwdChange(dir, workLegacy);
+      assert.ok(
+        !BACKFILL_OFFER_RE.test(second.stdout),
+        `second run within cooldown should be silent: ${second.stdout}`,
+      );
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+});
+
+// Regression guard: when no anchorless project matches, cwd-change must still
+// fall through to the pre-existing create-new-project offer unchanged.
+test('hypo-cwd-change.mjs still offers create-new when no anchorless project matches', () => {
+  withAutoProjectEnv((dir, work) => {
+    makeTriggerCwd(work);
+    const r = runCwdChange(dir, work);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(AP_OFFER_RE.test(r.stdout), `expected create-new offer, got: ${r.stdout}`);
+    assert.ok(!BACKFILL_OFFER_RE.test(r.stdout), `unexpected backfill offer: ${r.stdout}`);
+  });
 });
 
 // ── project-create helper ──────────────────────────────────

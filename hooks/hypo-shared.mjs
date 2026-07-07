@@ -624,6 +624,80 @@ export function collectProjectWorkingDirs(hypoDir) {
   return out;
 }
 
+// A project without a working_dir anchor (no index.md, or an index.md missing
+// the field) never enters collectProjectWorkingDirs' universe, so cwd-first
+// resume always MISSes for it — the SessionStart/CwdChanged MISS branch would
+// otherwise only ever offer to create a brand-new (duplicate) project. Match
+// the cwd's LEAF basename only (not every ancestor): the anchor being written
+// is `working_dir: <cwd>` itself, so matching an ancestor directory would
+// backfill the wrong (parent) path. Since projects/<slug>/ names are unique on
+// disk, a leaf-basename match identifies at most one project — no separate
+// uniqueness gate is needed here (unlike pickProjectByCwd's cross-machine tier
+// 2, which reasons over synced *paths* that can collide).
+//
+// Known bound: a session whose cwd is a SUBDIRECTORY of the anchorless
+// project's root (rather than the root itself) will not match — this is a
+// deliberate scope limit, not a bug: guessing the project from a mid-tree cwd
+// would risk writing an anchor to the wrong (non-root) path.
+//
+// @param {string} cwd
+// @param {string} [hypoDir=HYPO_DIR]
+// @returns {{slug: string, hasIndex: boolean}|null} the anchorless project
+//   this cwd's leaf basename names, or null when there is no match, no
+//   session artifacts, or the project already carries a working_dir.
+export function findBackfillCandidate(cwd, hypoDir = HYPO_DIR) {
+  const n = normalizeWorkingDir(cwd);
+  if (!n) return null;
+  const projectsDir = join(hypoDir, 'projects');
+  if (!existsSync(projectsDir)) return null;
+  const leaf = _lastSeg(n);
+  if (!leaf) return null;
+
+  const ci = isCaseInsensitiveFs();
+  let entries;
+  try {
+    entries = readdirSync(projectsDir);
+  } catch {
+    return null;
+  }
+  const slug = entries.find((e) => e !== '_template' && _fold(e, ci) === _fold(leaf, ci));
+  if (!slug) return null;
+
+  const dir = join(projectsDir, slug);
+  try {
+    if (!statSync(dir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const hasArtifacts =
+    existsSync(join(dir, 'session-state.md')) ||
+    existsSync(join(dir, 'hot.md')) ||
+    existsSync(join(dir, 'session-log'));
+  if (!hasArtifacts) return null;
+
+  const indexPath = join(dir, 'index.md');
+  const hasIndex = existsSync(indexPath);
+  let workingDir = null;
+  if (hasIndex) {
+    try {
+      const fmBlock = readFileSync(indexPath, 'utf-8').match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      const line = fmBlock && fmBlock[1].split(/\r?\n/).find((l) => /^working_dir:/.test(l));
+      if (line) {
+        workingDir = line
+          .slice('working_dir:'.length)
+          .trim()
+          .replace(/\s+#.*$/, '')
+          .replace(/^['"]|['"]$/g, '');
+      }
+    } catch {
+      workingDir = null;
+    }
+  }
+  if (hasIndex && workingDir) return null; // already anchored — not a backfill case
+
+  return { slug, hasIndex };
+}
+
 /**
  * When the session cwd is a project working_dir distinct from the vault root,
  * the wiki/knowledge files live in the VAULT, not in this cwd. SessionStart and
@@ -1461,6 +1535,23 @@ export function cwdHasProjectMarker(cwd) {
   return PROJECT_MARKERS.some((m) => existsSync(join(cwd, m)));
 }
 
+// Shared cooldown/skip gate for BOTH the new-project offer and the backfill
+// offer below — same store (.cache/project-suggestions.json), same key (cwd),
+// so a user who just answered one kind of offer for a cwd doesn't immediately
+// get re-prompted with the other. A corrupt store stays silent (doctor
+// surfaces the malformation separately).
+function suggestionNotSuppressed(cwd, hypoDir, now) {
+  const { skips, cooldowns, parseError } = readProjectSuggestions(hypoDir);
+  if (parseError) return false;
+  if (skips.some((s) => s && s.cwd === cwd)) return false;
+  const ts = cooldowns[cwd];
+  if (ts) {
+    const t = Date.parse(ts);
+    if (Number.isFinite(t) && now - t < SUGGESTION_COOLDOWN_MS) return false;
+  }
+  return true;
+}
+
 /**
  * Decide whether SessionStart/CwdChanged should offer to create a project for
  * `cwd`. The caller MUST have already confirmed `cwd` matches no project's
@@ -1478,15 +1569,25 @@ export function shouldSuggestProjectCreation(cwd, hypoDir = HYPO_DIR, now = Date
   if (!cwd) return false;
   if (!existsSync(join(cwd, '.git'))) return false;
   if (!cwdHasProjectMarker(cwd)) return false;
-  const { skips, cooldowns, parseError } = readProjectSuggestions(hypoDir);
-  if (parseError) return false;
-  if (skips.some((s) => s && s.cwd === cwd)) return false;
-  const ts = cooldowns[cwd];
-  if (ts) {
-    const t = Date.parse(ts);
-    if (Number.isFinite(t) && now - t < SUGGESTION_COOLDOWN_MS) return false;
-  }
-  return true;
+  return suggestionNotSuppressed(cwd, hypoDir, now);
+}
+
+/**
+ * Decide whether SessionStart/CwdChanged should offer to BACKFILL a
+ * working_dir anchor for `cwd`. The caller MUST have already located a
+ * findBackfillCandidate() match; this only applies the same cooldown/skip
+ * gate shouldSuggestProjectCreation uses, so the two offers share one
+ * suppression store. No git/marker gate here — the project directory
+ * already existing is itself the trigger condition.
+ *
+ * @param {string} cwd
+ * @param {string} [hypoDir]
+ * @param {number} [now] epoch ms, injectable for tests
+ * @returns {boolean}
+ */
+export function shouldSuggestBackfill(cwd, hypoDir = HYPO_DIR, now = Date.now()) {
+  if (!cwd) return false;
+  return suggestionNotSuppressed(cwd, hypoDir, now);
 }
 
 /**
@@ -1507,6 +1608,64 @@ export function buildProjectSuggestionLine(cwd) {
     .join('');
   const safe = sanitized.slice(0, 80).trim() || 'project';
   return `[WIKI: cwd '${safe}'에 매칭되는 프로젝트가 없습니다. 자동 생성할까요? (Y/n)]`;
+}
+
+// Neutralize a PATH value for additionalContext injection without truncating
+// it — unlike sanitizeProjForPrompt (built for a short display name), a path
+// must render in full or the backfilled working_dir would be wrong. Only
+// newline/control chars are stripped (the injection vector); everything else,
+// including shell metacharacters, passes through untouched because this value
+// is NEVER assembled into a runnable command (see buildBackfillSuggestionLine)
+// — it is purely descriptive text for the LLM/user to read.
+function stripControlCharsForPath(raw) {
+  // Per-codepoint (not a regex escape range) so no control byte is written
+  // literally into this source file (the source-corruption trap hit earlier
+  // in this same change). Mirrors sanitizeProjForPrompt's coverage EXACTLY —
+  // C0 (0x00-0x1F), DEL+C1 (0x7F-0x9F, which folds in U+0085 NEL), and the
+  // U+2028/U+2029 line separators. Deliberately does NOT strip bidi format
+  // controls: sanitizeProjForPrompt doesn't either, and matching its exact
+  // decision (rather than inventing a wider one here) is the principled
+  // choice so the two sanitizers never silently diverge in coverage.
+  return Array.from(String(raw == null ? '' : raw))
+    .map((ch) => {
+      const code = ch.codePointAt(0);
+      const isC0OrDelOrC1 = code < 0x20 || (code >= 0x7f && code <= 0x9f);
+      const isLineSep = code === 0x2028 || code === 0x2029;
+      return isC0OrDelOrC1 || isLineSep ? ' ' : ch;
+    })
+    .join('');
+}
+
+/**
+ * Build the working_dir-backfill offer line for a cwd that names an EXISTING
+ * `projects/<slug>/` directory (findBackfillCandidate already confirmed it
+ * carries session artifacts but no anchor). `slug` (short, display-only)
+ * routes through sanitizeProjForPrompt; `cwd` (a real path that must not be
+ * corrupted) routes through stripControlCharsForPath instead — truncating a
+ * path would silently backfill the WRONG working_dir. Neither branch
+ * assembles a runnable shell command from either value (codex pre-commit
+ * review: embedding untrusted path/slug text into a copy-paste `node ...`
+ * invocation is a shell-injection vector); both branches are purely
+ * descriptive guidance for the LLM/user to act on.
+ *
+ * The two cases still need different WORDING: a MISSING index.md has nothing
+ * to edit yet, so the offer describes creating a fresh one anchored to the
+ * current cwd (the agent constructs the actual project-create.mjs invocation
+ * itself, safely, outside this string). An index.md that already EXISTS but
+ * simply omits working_dir needs a direct frontmatter addition instead.
+ *
+ * @param {string} slug the matching projects/<slug>/ directory name
+ * @param {string} cwd the session cwd (the value that would become working_dir)
+ * @param {boolean} hasIndex whether projects/<slug>/index.md already exists
+ * @returns {string}
+ */
+export function buildBackfillSuggestionLine(slug, cwd, hasIndex) {
+  const safeSlug = sanitizeProjForPrompt(slug);
+  const safeCwd = stripControlCharsForPath(cwd);
+  const action = hasIndex
+    ? `projects/${safeSlug}/index.md의 frontmatter에 working_dir: ${safeCwd}를 추가할까요?`
+    : `projects/${safeSlug}/index.md가 없습니다. 현재 세션의 cwd(${safeCwd})를 working_dir로 삼아 index.md를 새로 만들까요?`;
+  return `[WIKI: cwd가 기존 프로젝트 'projects/${safeSlug}/'와 이름이 일치하지만 working_dir 앵커가 없습니다. ${action} (Y/n)]`;
 }
 
 // ── clear-marker (amendment 2026-05-14) ──────────────────────
