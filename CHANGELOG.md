@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changelog
 
-- (PR 링크는 머지 시점에 배정합니다.) session-close 조건부 재확인, working_dir provenance 강화(doctor 앵커 검사 + cwd-change backfill 제안), session-state 금지 필드 lint.
+- [#174](https://github.com/sk-lim19f/Hypomnema/pull/174) v1.6.1: session-close conditional reconfirm, working_dir provenance hardening (doctor anchor check + cwd-change backfill offer), session-state forbidden-field lint
+
+Contributors: @sk-lim19f
 
 ## [1.6.0] - 2026-07-06
 
