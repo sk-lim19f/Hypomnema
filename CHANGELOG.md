@@ -5,6 +5,24 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-07-07
+
+### Bug Fixes
+
+#### English
+
+- Session-close reconfirm now recognizes a background shell task or scheduled wake as in-flight work, so a deferred close ("publish, then wrap up") no longer nags for the marker on every turn. ([#175](https://github.com/sk-lim19f/Hypomnema/pull/175))
+
+#### 한국어
+
+- 세션종료 재확인이 백그라운드 셸 작업이나 예약된 wake도 진행 중 작업으로 인식해, 유예된 close("퍼블리시 하고 세션 마무리")가 매 턴 마커를 조르지 않습니다. ([#175](https://github.com/sk-lim19f/Hypomnema/pull/175))
+
+### Changelog
+
+- [#175](https://github.com/sk-lim19f/Hypomnema/pull/175) v1.6.2: session-close reconfirm counts a background shell task or scheduled wake as in-flight work
+
+Contributors: @sk-lim19f
+
 ## [1.6.1] - 2026-07-07
 
 ### Bug Fixes
