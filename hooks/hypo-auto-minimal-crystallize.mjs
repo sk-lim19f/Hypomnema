@@ -32,6 +32,19 @@
  * "오늘 여기까지", "wrap up", "session close"). last_assistant_message is NOT
  * used — "커밋했습니다"/"작업 완료" type phrases produce false positives.
  *
+ * Reconfirm branch (conditional-close-reconfirm, added after the close-intent
+ * gate above was found to be unable to distinguish "close now" from "close
+ * once X is done" by regex alone — same sentence shape either way). When the
+ * close-intent gate above fires AND the session has a work-incomplete signal
+ * (an uncommitted wiki, or an in-flight delegated subagent per
+ * hasInFlightSubagent), step 6's block reason is replaced with an
+ * AskUserQuestion instruction instead of a crystallize command — the model
+ * asks the user "close now?" rather than deciding for them. A correlated
+ * "아직"/"나중"/"not yet"/"later" answer (isCloseReconfirmDeclined) suppresses
+ * the NEXT such block via `continue`, until a new user close signal re-arms
+ * it. This does not touch step 4's isClosePattern gate itself, and does not
+ * change the marker-writer's own close-file-status gate.
+ *
  * The hook NEVER writes the marker — even in the loop-guard branch. Writer
  * authority lives in `scripts/crystallize.mjs` (`--apply-session-close
  * --session-id=X` or standalone `--mark-session-closed --session-id=X`),
@@ -52,13 +65,47 @@ import {
   isClosePattern,
   isGateSkipped,
   precompactGateStatus,
+  hasInFlightSubagent,
+  isCloseReconfirmDeclined,
+  CLOSE_RECONFIRM_MARK,
 } from './hypo-shared.mjs';
 
 function emitContinue() {
   console.log(JSON.stringify({ continue: true, suppressOutput: true }));
 }
 
-function emitBlock(sessionId, transcriptPath, gate = null) {
+function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
+  // Reconfirm branch (work-incomplete + close-intent, ambiguous "now" vs
+  // "later"): the model must NOT decide unilaterally. Ask the user via
+  // AskUserQuestion instead of naming a marker/crystallize command — doing
+  // so here would let the model "resolve" the ambiguity by just running the
+  // close, which is exactly the silent-close-on-uncommitted-work failure
+  // mode this branch exists to stop. See spec/plan
+  // (specs/conditional-close-reconfirm/). The close-now option label below
+  // (CLOSE_RECONFIRM_MARK) must stay in sync with hypo-shared.mjs
+  // isCloseReconfirmDeclined's correlation check — that coupling is
+  // load-bearing (a differently-labeled option would leave the model's
+  // AskUserQuestion uncorrelated, so even an explicit user decline could not
+  // be recognized as such). Both sides import the same constant so a reworded
+  // label can't drift out of sync silently. The decline label ("아직, 계속")
+  // stays a literal here — it is matched by the tolerant DECLINE regex in
+  // isCloseReconfirmDeclined, not by an exact-mark check.
+  if (opts.reconfirm) {
+    console.log(
+      JSON.stringify({
+        decision: 'block',
+        reason:
+          `[WIKI_AUTOCLOSE] close 신호가 잡혔지만 아직 커밋되지 않은 변경(또는 진행 중인 ` +
+          `위임 작업)이 있어 지금 닫을지 뒤로 미룰지 모호합니다 (session_id=${sessionId}). ` +
+          `임의로 닫지 말고 AskUserQuestion으로 사용자에게 지금 세션을 닫을지 물어보세요. ` +
+          `선택지는 "${CLOSE_RECONFIRM_MARK}"와 "아직, 계속"으로 제시합니다. 사용자가 ` +
+          `"${CLOSE_RECONFIRM_MARK}"를 고른 뒤에만 세션 마무리를 진행하세요. 그전에는 ` +
+          `마커를 쓰거나 종료 명령을 실행하지 마세요.`,
+        stopReason: 'session-close incomplete (Layer 3, reconfirm)',
+      }),
+    );
+    return;
+  }
   // One-line recovery action. The gate-precise branches below name an EXACT
   // command so "only the marker is missing" stays a one-shot fix — but that
   // command must be a runnable `node <pkg>/scripts/crystallize.mjs` invocation,
@@ -199,7 +246,27 @@ process.stdin.on('end', () => {
       gate = null;
     }
 
-    emitBlock(sessionId, transcriptPath, gate);
+    // Reconfirm decision (conditional-close-reconfirm): "close" and
+    // "work-incomplete" together are exactly the case where the transcript's
+    // NL close phrase can't tell "close now" from "close once X is done" —
+    // regex can't disambiguate this (see spec background). Narrowed to the
+    // two work-incomplete signals only: an uncommitted wiki (`git` blocker;
+    // real unsaved work) OR an in-flight delegated subagent. `hot` / `lint` /
+    // `close` / `design-history` / `feedback` blockers are real close
+    // blockers but not evidence of "later" intent, so they keep the existing
+    // wording (unchanged from before this feature).
+    const workIncomplete =
+      (gate && gate.blockers && gate.blockers.some((b) => b.type === 'git')) ||
+      hasInFlightSubagent(payload);
+    if (workIncomplete && isCloseReconfirmDeclined(transcriptPath)) {
+      // The user already answered "아직" to the ambiguous close signal that
+      // triggered this Stop turn — suppressing is a continue, not a
+      // (differently-worded) block, so it cannot live inside emitBlock.
+      emitContinue();
+      return;
+    }
+
+    emitBlock(sessionId, transcriptPath, gate, { reconfirm: workIncomplete });
   } catch (err) {
     // Fail-open on any unexpected error.
     process.stderr.write(`[hypo-auto-minimal-crystallize] error: ${err?.message ?? String(err)}\n`);

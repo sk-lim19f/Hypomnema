@@ -2758,6 +2758,141 @@ export function hasUserCloseSignal(transcriptPath) {
 }
 
 /**
+ * True iff the Stop payload's `background_tasks` names an in-flight (not yet
+ * terminal) delegated subagent. Read-only: used to widen the autoclose
+ * reconfirm trigger (see hypo-auto-minimal-crystallize.mjs) to "work is
+ * demonstrably still running", not just "the wiki has uncommitted changes".
+ *
+ * Defined as the NEGATION of a terminal status, not an enumeration of
+ * "running" states — this repo has no `background_tasks` type definition
+ * (grep turns up nothing), so the real status vocabulary is unverified. An
+ * unrecognized/absent status is treated as in-flight; only a recognized
+ * terminal status clears it.
+ *
+ * Fail-open: a missing or non-array `background_tasks` is treated as "no
+ * in-flight subagent" (the field may simply not be sent by this Stop event),
+ * so in-flight detection degrades gracefully to the git-uncommitted signal
+ * alone rather than spuriously blocking.
+ */
+export function hasInFlightSubagent(payload) {
+  const tasks = payload && payload.background_tasks;
+  if (!Array.isArray(tasks)) return false;
+  const TERMINAL = /^(completed|complete|done|finished|failed|error|errored|cancelled|canceled)$/i;
+  return tasks.some(
+    (t) => t && t.type === 'subagent' && (t.status == null || !TERMINAL.test(String(t.status))),
+  );
+}
+
+// The reconfirm reason (hypo-auto-minimal-crystallize.mjs emitBlock's
+// reconfirm branch) instructs the close-now option under this exact label —
+// used below to correlate an AskUserQuestion tool_use to OUR close-reconfirm
+// prompt specifically, not just any AskUserQuestion the model happens to ask.
+// Exported so the hook builds its reason text off this SAME literal instead
+// of a second hardcoded copy: two independent literals would let a reworded
+// reason silently break this correlation with no test to catch it.
+export const CLOSE_RECONFIRM_MARK = '지금 닫기';
+
+/**
+ * True iff the LATEST correlated AskUserQuestion answer in the transcript
+ * declined an autoclose reconfirm prompt ("아직" / "나중" / "not yet" /
+ * "later") — order-sensitive so a decline is suppressed again once the user
+ * signals a NEW close intent afterward (re-arm).
+ *
+ * Read-only, forward scan over the FULL transcript (no tail truncation — a
+ * decline can precede the next Stop by any number of turns). Reuses the same
+ * askIds + tool_use_id correlation `hasUserCloseSignal` (above) uses to bind
+ * an AskUserQuestion answer to its own tool_use, so an unrelated tool_result
+ * string can't forge a decline. Unlike `hasUserCloseSignal` (which is a
+ * "any evidence, ever" OR), this tracks a single latest-wins boolean as it
+ * scans: a decline answer sets it true, and any later GENUINE USER close
+ * signal resets it to false — the user asked to close again, so the prior
+ * decline no longer applies.
+ *
+ * Two correlation guards (the same input-boundary concern class as
+ * extractUserMessages' tool_result/injection exclusion above):
+ *
+ *  1. Re-arm is gated to a real user-typed close signal ONLY — mirrors
+ *     extractUserMessages' own boundary filter (isMeta / promptSource
+ *     system|sdk / tool_result exclusion, see extractUserMessages above)
+ *     instead of re-deriving a separate policy. Without this, the MODEL'S
+ *     OWN assistant reasoning text (which can itself contain "세션 마무리"),
+ *     or a tool_result (e.g. a Read of a file that happens to quote a close
+ *     phrase), could silently clear a recorded decline and re-nag the user
+ *     who already said "아직" — the opposite of what a decline means.
+ *  2. The AskUserQuestion tool_use is only added to `askIds` when its input
+ *     carries CLOSE_RECONFIRM_MARK — i.e. it IS the close-reconfirm prompt,
+ *     not some unrelated question the model asked around the same time. An
+ *     unrelated question whose answer happens to contain a decline word
+ *     ("나중"/"later") must not correlate.
+ *
+ * Fail-open: a missing/unreadable transcript → false (do not suppress; keep
+ * reconfirming) — the caller stays on the safe (nag, not silent-close) side.
+ */
+export function isCloseReconfirmDeclined(transcriptPath) {
+  if (!transcriptPath) return false;
+  let lines;
+  try {
+    lines = readFileSync(transcriptPath, 'utf-8').split('\n');
+  } catch {
+    return false;
+  }
+  const DECLINE = /(아직|나중|not\s?yet|later)/i;
+  const askIds = new Set();
+  let declined = false;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const msg = obj.message ?? obj;
+    const content = msg.content ?? obj.content;
+
+    // Re-arm boundary (guard 1): only a genuine user-typed close signal may
+    // re-arm. Same exclusions as extractUserMessages — isMeta injection,
+    // system/sdk synthetic prompts, and (via the array-content branch below)
+    // tool_result blocks, which are role:'user' in the transcript but are NOT
+    // user-typed text.
+    const isInjected = obj.isMeta === true || obj.promptSource === 'system' || obj.promptSource === 'sdk';
+    const role = msg.role ?? obj.role ?? obj.type;
+    if (!isInjected && role === 'user') {
+      if (typeof content === 'string') {
+        if (!content.startsWith('Stop hook feedback') && isClosePattern(content)) declined = false;
+      } else if (Array.isArray(content)) {
+        for (const b of content) {
+          // Only type:'text' blocks are genuine user-typed text — a
+          // tool_result block (also role:'user') is tool output, not
+          // something the user typed, and must not re-arm.
+          if (b && b.type === 'text' && typeof b.text === 'string' && isClosePattern(b.text)) {
+            declined = false;
+          }
+        }
+      }
+    }
+
+    if (!Array.isArray(content)) continue;
+    for (const b of content) {
+      if (!b || typeof b !== 'object') continue;
+      if (b.type === 'tool_use' && b.name === 'AskUserQuestion' && b.id) {
+        // Correlation guard 2: only OUR close-reconfirm prompt counts.
+        const inputStr = JSON.stringify(b.input ?? null);
+        if (inputStr.includes(CLOSE_RECONFIRM_MARK)) askIds.add(b.id);
+        continue;
+      }
+      if (b.type === 'tool_result' && b.tool_use_id && askIds.has(b.tool_use_id)) {
+        const s = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+        for (const m of s.matchAll(/="([^"]*)"/g)) {
+          if (DECLINE.test(m[1])) declined = true;
+        }
+      }
+    }
+  }
+  return declined;
+}
+
+/**
  * Build hook output for Claude Code (additionalContext channel).
  * Codex hooks write systemMessage directly in their own files.
  */

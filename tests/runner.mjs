@@ -26,6 +26,7 @@ import {
 import { join, dirname, basename } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 // static import (no top-level await) — feedback-sync.mjs guards main() behind an
 // entry check, so importing it for unit tests does not run the CLI.
 import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync.mjs';
@@ -1370,6 +1371,9 @@ const {
   isClosePattern,
   extractUserMessages,
   hasUserCloseSignal,
+  hasInFlightSubagent,
+  isCloseReconfirmDeclined,
+  CLOSE_RECONFIRM_MARK,
   resolveTranscriptBySessionId,
   hasMutatingTranscriptActivity,
   isSubstantialSession,
@@ -1633,6 +1637,31 @@ test('혼합 텍스트(트랜스크립트)에서도 패턴 감지', () => {
   assert.equal(isClosePattern(transcript), true);
 });
 
+// conditional-close-reconfirm reworks the block-reason wording (emitBlock's
+// reconfirm branch) but must NOT touch isClosePattern's decision surface —
+// narrowing it risks reopening the over-close regression it already guards
+// against. The JSDoc's own match/no-match examples are the first-line guard;
+// a byte-level snapshot of the function source is the stronger, second-line
+// guard (a semantically-equivalent rewrite could still pass the corpus
+// above while being a different regex than what was reviewed).
+test('isClosePattern JSDoc examples: match/no-match corpus is exact', () => {
+  for (const s of ['세션 마무리하자', '오늘 여기까지', 'wrap up', 'signing off']) {
+    assert.equal(isClosePattern(s), true, `JSDoc match example should be true: ${s}`);
+  }
+  for (const s of ['이 함수 마무리하자', 'wrap up this PR']) {
+    assert.equal(isClosePattern(s), false, `JSDoc no-match example should be false: ${s}`);
+  }
+});
+
+test('isClosePattern source is byte-unchanged by this feature (function.toString() snapshot)', () => {
+  const digest = createHash('sha256').update(isClosePattern.toString()).digest('hex');
+  assert.equal(
+    digest,
+    '9b882b618b31833f268ac2c6e05693352044c526f7f70344e3fa0981520cdc53',
+    'isClosePattern source changed — conditional-close-reconfirm must not touch this regex',
+  );
+});
+
 // ── ISSUE-29: extractUserMessages must not slurp tool_result content ──
 suite('extractUserMessages() — tool_result exclusion');
 
@@ -1854,6 +1883,297 @@ test('unreadable / missing transcript → false (fail-closed)', () => {
   assert.equal(hasUserCloseSignal(null), false);
 });
 
+// ── hasInFlightSubagent — read-only in-flight delegation check ──
+suite('hasInFlightSubagent()');
+
+test('a subagent task with a non-terminal status → true', () => {
+  assert.equal(
+    hasInFlightSubagent({ background_tasks: [{ type: 'subagent', status: 'running' }] }),
+    true,
+  );
+});
+
+test('a subagent task with a terminal status → false', () => {
+  assert.equal(
+    hasInFlightSubagent({ background_tasks: [{ type: 'subagent', status: 'completed' }] }),
+    false,
+  );
+});
+
+test('a subagent task with no status field → true (unknown = not yet terminal)', () => {
+  assert.equal(
+    hasInFlightSubagent({ background_tasks: [{ type: 'subagent' }] }),
+    true,
+  );
+});
+
+test('a non-subagent task (any status) → false', () => {
+  assert.equal(
+    hasInFlightSubagent({ background_tasks: [{ type: 'other', status: 'running' }] }),
+    false,
+  );
+});
+
+test('missing/non-array background_tasks → false (fail-open)', () => {
+  assert.equal(hasInFlightSubagent({}), false);
+  assert.equal(hasInFlightSubagent({ background_tasks: 'not-an-array' }), false);
+  assert.equal(hasInFlightSubagent(null), false);
+});
+
+// ── isCloseReconfirmDeclined — order-sensitive decline detection ──
+suite('isCloseReconfirmDeclined()');
+
+test('a correlated "아직" AskUserQuestion answer → true (declined)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), true);
+  });
+});
+
+test('decline followed by a NEW user close signal → false (re-arm)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+      toolUse('Edit'),
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), false);
+  });
+});
+
+test('an uncorrelated tool_result containing "아직" (no matching AskUserQuestion) → false', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'read-1',
+              content: 'file.md: "아직"="맞음" (quoted, not a real answer)',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), false);
+  });
+});
+
+test('decline label variants ("나중에" / "later") also suppress (label-drift defense)', () => {
+  withTmpDir((dir) => {
+    const p1 = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="나중에". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p1), true);
+  });
+  withTmpDir((dir) => {
+    const p2 = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "close now?"="later". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p2), true);
+  });
+});
+
+// BLOCKER fix (codex pre-commit review): re-arm must fire ONLY on a genuine
+// USER-authored close signal, mirroring extractUserMessages' input boundary
+// (isMeta / promptSource / tool_result exclusion) — never on the model's own
+// reasoning text, which can itself say "세션 마무리".
+test('decline, then an ASSISTANT text block saying "세션 마무리" → still declined (no false re-arm)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: '알겠습니다, 아직 세션 마무리는 하지 않고 계속 진행하겠습니다.' }],
+        },
+      },
+    ]);
+    assert.equal(
+      isCloseReconfirmDeclined(p),
+      true,
+      'assistant reasoning text must not re-arm a recorded decline',
+    );
+  });
+});
+
+test('decline, then a tool_result containing a close phrase → still declined (no false re-arm)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'read-2',
+              content: 'file.md: 예시 문구 "세션 마무리하자" 발견',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(
+      isCloseReconfirmDeclined(p),
+      true,
+      'tool_result content must not re-arm a recorded decline',
+    );
+  });
+});
+
+// MEDIUM fix (codex pre-commit review): only OUR close-reconfirm prompt (the
+// AskUserQuestion whose input carries the reconfirm reason's "지금 닫기"
+// option label) may correlate — an unrelated AskUserQuestion answered with a
+// decline-shaped word ("나중"/"later") must not falsely suppress.
+test('an UNRELATED AskUserQuestion answered with "나중" → false (does not correlate)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askUnrelatedToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "어떤 색을 원하세요?"="나중에 정할게요". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(
+      isCloseReconfirmDeclined(p),
+      false,
+      'a non-close-reconfirm AskUserQuestion must not suppress the reconfirm',
+    );
+  });
+});
+
+test('the real close-reconfirm prompt ("지금 닫기" in input) + "아직, 계속" answer → true', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 세션을 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), true);
+  });
+});
+
+test('no AskUserQuestion answer at all → false (not declined, keep reconfirming)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+      toolUse('Edit'),
+    ]);
+    assert.equal(isCloseReconfirmDeclined(p), false);
+  });
+});
+
+test('unreadable / missing transcript → false (fail-open, keep reconfirming)', () => {
+  assert.equal(isCloseReconfirmDeclined('/no/such/transcript.jsonl'), false);
+  assert.equal(isCloseReconfirmDeclined(null), false);
+});
+
 // ── ADR 0055: resolveTranscriptBySessionId — session-id glob, fail-closed ──
 suite('resolveTranscriptBySessionId() (ADR 0055)');
 
@@ -1897,6 +2217,46 @@ function writeJsonl(dir, entries) {
 }
 function toolUse(name) {
   return { type: 'assistant', message: { content: [{ type: 'tool_use', name, input: {} }] } };
+}
+// An AskUserQuestion tool_use whose input carries the reconfirm reason's
+// distinctive close-now option label ("지금 닫기") — this is how
+// isCloseReconfirmDeclined correlates an answer to OUR close-reconfirm
+// prompt specifically, not just any AskUserQuestion.
+function askCloseReconfirmToolUse(id) {
+  return {
+    type: 'assistant',
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          name: 'AskUserQuestion',
+          id,
+          input: {
+            questions: [
+              { question: '지금 세션을 닫을까요?', options: ['지금 닫기', '아직, 계속'] },
+            ],
+          },
+        },
+      ],
+    },
+  };
+}
+// An unrelated AskUserQuestion (no close-reconfirm label) — used to prove a
+// random question's decline-shaped answer must NOT correlate.
+function askUnrelatedToolUse(id) {
+  return {
+    type: 'assistant',
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          name: 'AskUserQuestion',
+          id,
+          input: { questions: [{ question: '어떤 색을 원하세요?', options: ['빨강', '파랑'] }] },
+        },
+      ],
+    },
+  };
 }
 
 test('mutation tool → substantial AND mutating', () => {
@@ -9191,6 +9551,11 @@ function withGrowthWiki(fn) {
       join(dir, 'hot.md'),
       '---\ntitle: Hot\nupdated: today\n---\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
     );
+    // Match real init (see "init creates .gitignore with .cache/ entry" above):
+    // without this, a test that writes a transcript under dir/.cache/ (as the
+    // auto-minimal-crystallize replay tests do) makes the tree dirty by the
+    // fixture's own bookkeeping — a phantom git blocker no real session has.
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
     spawnSync('git', ['add', '-A'], { cwd: dir });
     spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
     fn(dir);
@@ -13794,6 +14159,277 @@ function seedCloseTranscript(sessionId, { home = SESSION_TMP_HOME, toolUseLines 
   );
   return () => rmSync(p, { force: true });
 }
+
+// ── conditional-close-reconfirm ──────────────────────────────────────────
+// The close-intent gate above (step 4) can't tell "close now" from
+// "close once X is done" by regex alone — same sentence shape either way
+// (see the hook's file-header note). When a close signal fires AND the
+// session has a work-incomplete signal (uncommitted wiki changes, or an
+// in-flight delegated subagent), the block reason is replaced with an
+// AskUserQuestion instruction instead of a silent crystallize nudge.
+
+suite('hypo-auto-minimal-crystallize.mjs — conditional close reconfirm');
+
+test('uncommitted wiki + conditional close phrase, no decline → reconfirm block (not a silent nag)', () => {
+  withGrowthWiki((dir) => {
+    // Leave a real uncommitted change so the `git` blocker fires (not the
+    // .cache phantom the fixture no longer produces).
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      {
+        type: 'user',
+        message: { role: 'user', content: '구현 완료하면 세션 마무리하자' },
+      },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-reconfirm',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `must still block, got: ${JSON.stringify(out)}`);
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `reason must instruct AskUserQuestion: ${out.reason}`,
+    );
+    assert.ok(
+      !/crystallize/.test(out.reason),
+      `reason must NOT name a crystallize recovery command before the user picks close-now: ${out.reason}`,
+    );
+    assert.ok(
+      !/--mark-session-closed/.test(out.reason),
+      `reason must NOT offer the marker-write command before the user picks close-now: ${out.reason}`,
+    );
+    assert.ok(out.reason.includes('s-reconfirm'), 'reason must embed the session_id');
+    // Coupling guard: the reason's close-now option label and
+    // isCloseReconfirmDeclined's correlation mark must be the SAME exported
+    // constant, not two independently-hardcoded literals that could drift.
+    assert.ok(
+      out.reason.includes(CLOSE_RECONFIRM_MARK),
+      `reason must use the exported CLOSE_RECONFIRM_MARK label, not a duplicated literal: ${out.reason}`,
+    );
+  });
+});
+
+test('a correlated "아직, 계속" decline suppresses the reconfirm → continue', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-declined',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `must suppress after decline, got: ${JSON.stringify(out)}`);
+    assert.equal(out.decision, undefined);
+  });
+});
+
+test('a NEW user close signal after a decline re-arms the reconfirm → block again', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+            },
+          ],
+        },
+      },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 진짜 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-rearm',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.decision,
+      'block',
+      `a new close signal after the decline must re-arm reconfirm: ${JSON.stringify(out)}`,
+    );
+  });
+});
+
+test('decline label variants ("나중에" / "later") also suppress (label-drift defense)', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+      askCloseReconfirmToolUse('q1'),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q1',
+              content: 'Your questions have been answered: "close now?"="later". continue.',
+            },
+          ],
+        },
+      },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-label-drift',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `label variant must still suppress: ${JSON.stringify(out)}`);
+  });
+});
+
+test('genuine close-now + uncommitted, no decline → still reconfirm block (no over-suppress)', () => {
+  // "다 끝났으면 세션 마무리하자" is an unambiguous close-now signal, not a
+  // conditional one — but the hook can't tell that apart from the reported
+  // conditional case by regex, so it must still reconfirm rather than
+  // silently allow a close over uncommitted work. There is no decline
+  // anywhere in this transcript, so suppression must not kick in either.
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '다 끝났으면 세션 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-close-now',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `close-now with uncommitted work must still reconfirm: ${JSON.stringify(out)}`);
+    assert.ok(/AskUserQuestion/.test(out.reason), `must still instruct AskUserQuestion: ${out.reason}`);
+  });
+});
+
+test('non-work-incomplete blocker only (git-clean, close blocker) → existing crystallize wording, no reconfirm', () => {
+  withGrowthWiki((dir) => {
+    // git-clean tree (fixture is committed at init and nothing new is
+    // written to it), no in-flight subagent. A close signal fires, and the
+    // read-only precompact gate will surface SOME blocker (e.g. `close`,
+    // since sessionCloseGlobalStatus has no fresh close files here) — but
+    // that is not a work-incomplete (git/in-flight) signal, so the existing
+    // crystallize wording must be preserved, not the reconfirm branch.
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-non-workincomplete',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/crystallize/.test(out.reason), `must keep the crystallize recovery command: ${out.reason}`);
+    assert.ok(!/AskUserQuestion/.test(out.reason), `must NOT reconfirm on a non-work-incomplete blocker: ${out.reason}`);
+  });
+});
+
+test('git-clean + in-flight subagent in background_tasks → reconfirm block', () => {
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-inflight',
+      transcript_path: transcript,
+      stop_hook_active: false,
+      background_tasks: [{ type: 'subagent', status: 'running' }],
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/AskUserQuestion/.test(out.reason), `in-flight subagent must trigger reconfirm: ${out.reason}`);
+    assert.ok(!/crystallize/.test(out.reason), `reconfirm must not name crystallize: ${out.reason}`);
+  });
+});
+
+test('absent background_tasks + uncommitted → in-flight fails open, git alone still reconfirms', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    // No background_tasks key at all in the payload.
+    const r = runAutoMinimal(dir, {
+      session_id: 's-no-bg-tasks',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}\nstdout: ${r.stdout}`);
+    assert.equal(r.stderr, '', `no exception expected on absent background_tasks: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/AskUserQuestion/.test(out.reason), `uncommitted alone must still reconfirm: ${out.reason}`);
+  });
+});
+
+test('absent background_tasks + git-clean + close blocker only → existing crystallize wording', () => {
+  withGrowthWiki((dir) => {
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-no-bg-tasks-clean',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}\nstdout: ${r.stdout}`);
+    assert.equal(r.stderr, '', `no exception expected on absent background_tasks: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.ok(/crystallize/.test(out.reason), `git-clean + absent background_tasks must keep crystallize wording: ${out.reason}`);
+  });
+});
 
 suite('crystallize.mjs --mark-session-closed');
 
