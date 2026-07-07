@@ -5,6 +5,34 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-07-07
+
+### Bug Fixes
+
+#### English
+
+- Session close no longer nags prematurely on a conditional or deferred wrap-up. When you signal a close but the session still has uncommitted wiki changes or an in-flight delegated subagent, and the phrasing is ambiguous ("once X is done, wrap up"), the autoclose prompt now asks you via a question whether to close now instead of silently reporting an incomplete close. A "not yet" answer is remembered until you signal a fresh close, so you are not re-asked every turn.
+- `cwd`-first resume can now anchor a project that was missing its `working_dir`. `doctor` warns when a project with session history has no `index.md` `working_dir` anchor, and a session whose directory name matches an existing anchorless project offers to backfill the anchor instead of creating a duplicate project.
+
+#### 한국어
+
+- 조건부나 유예된 세션 마무리에서 조기 nag가 사라졌습니다. close를 신호했지만 위키에 커밋되지 않은 변경이나 진행 중인 위임 작업이 남아 있고 문구가 모호할 때("~하면 마무리"), autoclose가 조용히 미완료를 보고하는 대신 지금 닫을지 질문으로 되묻습니다. "아직" 응답은 새 close 신호가 나올 때까지 기억되어 매 턴 다시 묻지 않습니다.
+- `working_dir`이 없던 프로젝트도 `cwd`-first resume이 앵커할 수 있습니다. `doctor`가 세션 기록은 있는데 `index.md` `working_dir` 앵커가 없는 프로젝트를 경고하고, 디렉터리 이름이 앵커 없는 기존 프로젝트와 일치하는 세션에서는 중복 생성 대신 앵커 backfill을 제안합니다.
+
+### Chores
+
+#### English
+
+- Lint flags a stray `working_dir` or `project` field on a session-state page (those belong only on a project index), catching an unvalidated writer that had been planting a wrong path into injected session context.
+
+#### 한국어
+
+- lint이 session-state 페이지에 잘못 들어간 `working_dir`·`project` 필드를 표시합니다(이 필드는 프로젝트 인덱스에만 유효). 무검증 writer가 주입되는 세션 컨텍스트에 잘못된 경로를 심던 문제를 잡습니다.
+
+### Changelog
+
+- (PR 링크는 머지 시점에 배정합니다.) session-close 조건부 재확인, working_dir provenance 강화(doctor 앵커 검사 + cwd-change backfill 제안), session-state 금지 필드 lint.
+
 ## [1.6.0] - 2026-07-06
 
 ### New Features
