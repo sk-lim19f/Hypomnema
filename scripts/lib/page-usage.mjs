@@ -11,6 +11,7 @@ import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { collectPagesCrystallize, extractWikilinks, slugForms } from './wikilink.mjs';
 import { parseFrontmatter } from './frontmatter.mjs';
+import { currentDevice, scopeVisible, readVisibilityScope } from '../../hooks/hypo-shared.mjs';
 
 const PAGE_USAGE_REL = '.cache/page-usage.jsonl';
 const DAY_MS = 86400000;
@@ -69,7 +70,13 @@ export function readPageUsage(hypoDir) {
 // within the last thresholdDays.
 export function aggregateColdCandidates(
   hypoDir,
-  { thresholdDays = 90, minLogSpanDays = 14, now = Date.now(), ignorePatterns = [] } = {},
+  {
+    thresholdDays = 90,
+    minLogSpanDays = 14,
+    now = Date.now(),
+    ignorePatterns = [],
+    device = currentDevice(),
+  } = {},
 ) {
   const records = readPageUsage(hypoDir);
   if (records.length === 0) return { status: 'insufficient-data', reason: 'no-records' };
@@ -110,6 +117,7 @@ export function aggregateColdCandidates(
       title: fm.title || slug,
       forms: formSet(slug),
       links: extractWikilinks(body),
+      scope: readVisibilityScope(content),
     });
   }
 
@@ -134,7 +142,10 @@ export function aggregateColdCandidates(
   }
 
   const candidates = pageList
-    .filter((p) => hasInbound.has(p.slug) && !intersects(p.forms, recentForms))
+    .filter(
+      (p) =>
+        hasInbound.has(p.slug) && !intersects(p.forms, recentForms) && scopeVisible(p.scope, device),
+    )
     .map((p) => ({ slug: p.slug, title: p.title }));
 
   return { status: 'ok', candidates };

@@ -102,6 +102,8 @@ import {
   hasUserCloseSignal,
   commitWikiChanges,
   currentDevice,
+  scopeVisible,
+  readVisibilityScope,
 } from '../hooks/hypo-shared.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
@@ -1430,6 +1432,7 @@ function main() {
     } catch {
       continue;
     }
+    if (!scopeVisible(readVisibilityScope(content), currentDevice())) continue;
     const fm = parseFrontmatter(content);
     if (!fm) continue;
 

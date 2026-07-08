@@ -19,6 +19,9 @@ import {
   staleMarkerFor,
   pageUsageLoggingAllowed,
   recordLookupUsage,
+  currentDevice,
+  scopeVisible,
+  readVisibilityScope,
 } from './hypo-shared.mjs';
 
 const INDEX_PATH = join(HYPO_DIR, 'index.md');
@@ -208,25 +211,6 @@ process.stdin.on('end', () => {
     const topScore = scored[0]?.score ?? 0;
     const matched = scored.filter((e) => e.score >= topScore * 0.5);
 
-    if (matched.length === 0) {
-      const topic = keywords.slice(0, 5).join(', ');
-      const closest = bm25Score(keywords, entries)
-        .map((e) => ({ ...e, score: e.score * typePrior(e.slug) }))
-        .sort((a, c) => c.score - a.score)
-        .slice(0, 3)
-        .map((e) => `[[${e.slug}]]`)
-        .join(', ');
-      console.log(
-        JSON.stringify(
-          buildOutput(`[WIKI LOOKUP: miss] "${topic}" — no match. Closest: ${closest || 'none'}`, {
-            continue: true,
-            suppressOutput: true,
-          }),
-        ),
-      );
-      return;
-    }
-
     const ignorePatterns = loadHypoIgnore(HYPO_DIR);
     const pageMap = {
       ...buildPageMap(
@@ -245,19 +229,81 @@ process.stdin.on('end', () => {
       ),
     };
 
+    // Single device snapshot for the whole prompt (currentDevice() itself stays
+    // uncached upstream so tests can override via HYPO_DEVICE; this hook only
+    // needs one read per lookup, not one per candidate).
+    const device = currentDevice();
+
+    // Resolve a slug to its on-disk path the same way the injection loop does.
+    const resolveSlugPath = (slug) =>
+      pageMap[slug] ?? pageMap[slug.replace(/^(pages|projects)\//, '')] ?? pageMap[basename(slug)];
+
+    // Read a page's raw content at most once per lookup: the visibility gate and
+    // the injection loop both need it, so memoize to avoid a double read.
+    const rawCache = new Map();
+    const readRaw = (path) => {
+      if (rawCache.has(path)) return rawCache.get(path);
+      let raw = null;
+      try {
+        raw = readFileSync(path, 'utf-8');
+      } catch {
+        raw = null;
+      }
+      rawCache.set(path, raw);
+      return raw;
+    };
+
+    // Visibility gate: MUST read raw content and go through readVisibilityScope
+    // (never a local frontmatter parser) so first-wins + comment-strip stay in
+    // step with the write side — a local last-wins/no-comment parser would miss
+    // `machine:devA # note` on devA itself. An unresolved/unreadable slug passes
+    // through (nothing to leak; the missing-file paths handle it downstream).
+    const isSlugVisible = (slug) => {
+      const path = resolveSlugPath(slug);
+      if (!path || !existsSync(path)) return true;
+      const raw = readRaw(path);
+      if (raw === null) return true;
+      return scopeVisible(readVisibilityScope(raw), device);
+    };
+
+    // Filter BEFORE the miss decision so a device that matches only machine-other
+    // pages takes the clean miss path (with closest VISIBLE suggestions), not the
+    // "index hit but files missing" branch. Hidden pages never reach injection,
+    // the empty-injection slug branch, or the "+N more" count — all read only
+    // visibleMatched, so no machine-other slug can leak through any path.
+    const visibleMatched = matched.filter((e) => isSlugVisible(e.slug));
+
+    if (visibleMatched.length === 0) {
+      const topic = keywords.slice(0, 5).join(', ');
+      const closest = bm25Score(keywords, entries)
+        .map((e) => ({ ...e, score: e.score * typePrior(e.slug) }))
+        .sort((a, c) => c.score - a.score)
+        .filter((e) => isSlugVisible(e.slug))
+        .slice(0, 3)
+        .map((e) => `[[${e.slug}]]`)
+        .join(', ');
+      console.log(
+        JSON.stringify(
+          buildOutput(`[WIKI LOOKUP: miss] "${topic}" — no match. Closest: ${closest || 'none'}`, {
+            continue: true,
+            suppressOutput: true,
+          }),
+        ),
+      );
+      return;
+    }
+
     // UTC to match doctor.mjs' overdue set (D1/D2). STALE is advisory, so a
     // one-day UTC/local skew never misleads.
     const TODAY = new Date().toISOString().slice(0, 10);
 
     const injected = [];
     const injectedSlugs = [];
-    for (const { slug } of matched.slice(0, MAX_HITS)) {
-      const path =
-        pageMap[slug] ??
-        pageMap[slug.replace(/^(pages|projects)\//, '')] ??
-        pageMap[basename(slug)];
+    for (const { slug } of visibleMatched.slice(0, MAX_HITS)) {
+      const path = resolveSlugPath(slug);
       if (path && existsSync(path)) {
-        const raw = readFileSync(path, 'utf-8');
+        const raw = readRaw(path);
+        if (raw === null) continue;
         // Compute the marker on raw (pre-slice) so a long body can't truncate
         // frontmatter out of reach. fail-open: a marker failure drops the marker,
         // never the page.
@@ -275,7 +321,7 @@ process.stdin.on('end', () => {
     }
 
     if (injected.length === 0) {
-      const slugs = matched
+      const slugs = visibleMatched
         .slice(0, MAX_HITS)
         .map((e) => e.slug)
         .join(', ');
@@ -297,9 +343,11 @@ process.stdin.on('end', () => {
       recordLookupUsage(HYPO_DIR, { sessionId, slugs: injectedSlugs });
     }
 
+    // visibleMatched (not matched): a hidden count would still name a "+N more"
+    // total that includes machine-other pages this device can never see.
     const overflow =
-      matched.length > MAX_HITS
-        ? `\n(+${matched.length - MAX_HITS} more matches — search wiki index for more)`
+      visibleMatched.length > MAX_HITS
+        ? `\n(+${visibleMatched.length - MAX_HITS} more matches — search wiki index for more)`
         : '';
 
     console.log(

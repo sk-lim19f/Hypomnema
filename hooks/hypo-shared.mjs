@@ -3089,7 +3089,15 @@ export function isIgnored(filePath, hypoDir, patterns) {
 // (os.hostname is not mockable). CR/LF are stripped so the value stays a single
 // frontmatter token.
 export function currentDevice() {
-  return String(process.env.HYPO_DEVICE || hostname() || 'unknown').replace(/[\r\n]/g, '');
+  // Strip CR/LF BEFORE the fallback chain, not after: a HYPO_DEVICE of only
+  // CR/LF is truthy, so stripping after `||` would yield '' and make
+  // scopeVisible('machine:', '') pass — the empty-owner page must hide
+  // everywhere. Stripping first collapses such a value to '' so it falls through
+  // to hostname, keeping the result non-empty on every path.
+  const env = String(process.env.HYPO_DEVICE || '').replace(/[\r\n]/g, '');
+  if (env) return env;
+  const host = String(hostname() || '').replace(/[\r\n]/g, '');
+  return host || 'unknown';
 }
 
 // Extract the top-level `visibility_scope` from a page's raw content. Mirrors

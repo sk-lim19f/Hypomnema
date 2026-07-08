@@ -8,7 +8,14 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { HYPO_DIR, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
+import {
+  HYPO_DIR,
+  loadHypoIgnore,
+  isIgnored,
+  currentDevice,
+  scopeVisible,
+  readVisibilityScope,
+} from './hypo-shared.mjs';
 
 const MAX_CHARS = 2000;
 
@@ -43,7 +50,19 @@ process.stdin.on('end', () => {
       return;
     }
 
-    const content = readFileSync(filePath, 'utf-8').slice(0, MAX_CHARS);
+    const fileRaw = readFileSync(filePath, 'utf-8');
+
+    // Visibility guard: a machine-scoped page (visibility_scope: machine:<owner>)
+    // must not be re-injected on a machine other than its owner. Read the scope
+    // from the raw, unsliced content — slicing to MAX_CHARS first could cut the
+    // frontmatter off and silently make every scoped page pass fail-open.
+    const scope = readVisibilityScope(fileRaw);
+    if (!scopeVisible(scope, currentDevice())) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    const content = fileRaw.slice(0, MAX_CHARS);
     const relPath = filePath.replace(HYPO_DIR + '/', '');
 
     console.log(
