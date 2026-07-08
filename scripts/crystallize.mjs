@@ -105,6 +105,7 @@ import {
   scopeVisible,
   readVisibilityScope,
 } from '../hooks/hypo-shared.mjs';
+import { hashContent, readBaseEntry, advanceBase } from '../hooks/base-store.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
 // commands as `node <SELF_SCRIPT> ...` rather than a bare `crystallize` bin,
@@ -422,17 +423,51 @@ function atomicWrite(path, content) {
   renameSync(tmp, path);
 }
 
-/** Atomic write that skips when on-disk bytes already match `content`. */
-function writeIfChanged(path, content) {
-  if (existsSync(path)) {
-    try {
-      if (readFileSync(path, 'utf-8') === content) return false; // idempotent skip
-    } catch {
-      /* fall through to overwrite */
-    }
+/**
+ * Read a target's current bytes, distinguishing "absent" from "unreadable" the
+ * same way base-store's hashFile does. The overwrite guard needs all three
+ * answers: content to compare, `null` to know creating is safe, `undefined` to
+ * refuse to guess.
+ * @returns {string|null|undefined} bytes, `null` if absent, `undefined` if unreadable
+ */
+function readTarget(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return readFileSync(path, 'utf-8');
+  } catch {
+    return undefined;
   }
-  atomicWrite(path, content);
-  return true;
+}
+
+/**
+ * Has the target drifted away from what this session observed at start?
+ *
+ * Branches on base-store's `state` discriminator, never on the truthiness of
+ * `hash`: 'absent' and 'unknown' both carry `hash: null`, and collapsing them
+ * would read never-observed as safe-to-write, defeating the guard entirely.
+ *
+ * @param {{state: 'hash'|'absent'|'unknown', hash: string|null}} entry
+ * @param {string|null|undefined} disk current bytes / absent / unreadable
+ * @returns {string|null} a conflict reason, or null when this session may write
+ */
+function overwriteConflictReason(entry, disk) {
+  // Cannot read what we are about to replace: fail safe, never assume unchanged.
+  if (disk === undefined) return 'target-unreadable';
+  switch (entry.state) {
+    case 'unknown':
+      // No snapshot for this (session, target). Someone else's edits could be
+      // sitting on disk and we would have no way to tell.
+      return 'base-unknown';
+    case 'absent':
+      // We observed no file. Creating it is safe; finding one now means another
+      // writer got there first.
+      return disk === null ? null : 'base-absent-target-exists';
+    case 'hash':
+      if (disk === null) return 'base-hash-target-missing';
+      return hashContent(disk) === entry.hash ? null : 'base-mismatch';
+    default:
+      return 'base-unknown';
+  }
 }
 
 /**
@@ -719,7 +754,7 @@ export function closeResultContradiction({ ok, markerWritten, markerSkipReason }
 function applySessionClose(args) {
   // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
-  // the full apply path — the per-entry idempotency (writeIfChanged +
+  // the full apply path — the per-entry idempotency (overwrite's step-1 skip +
   // exact-entry append dedup) keeps re-apply cheap without short-circuiting,
   // and avoids silent-success when a same-day second close brings new bytes.
   // Payload-less invocation is treated as a cheap "already complete?" probe.
@@ -885,6 +920,10 @@ function applySessionClose(args) {
   // Append targets (session-log, log.md) are NOT filtered: appending can't
   // repair existing corruption, so a corrupt session-log must still block.
   // Warns are informational (not gated) in either pass.
+  //
+  // The filter says "about to be replaced", and the observed-base guard can later
+  // decline to replace one of these. Preflight runs before the guard, so it cannot
+  // know. Harmless: post-apply lint re-scopes the same file and blocks on it there.
   const overwriteTargets = new Set();
   if (payload.sessionState) overwriteTargets.add(join('projects', project, 'session-state.md'));
   if (payload.projectHot) overwriteTargets.add(join('projects', project, 'hot.md'));
@@ -954,11 +993,63 @@ function applySessionClose(args) {
 
   const applied = [];
   const skipped = [];
+  // Overwrite targets this apply refused to write because the page moved under
+  // it. T6 turns these into `.cache/proposals/` artifacts; here they are already
+  // enough to withhold the bytes and fail the close.
+  const conflicts = [];
 
+  /**
+   * Replace a whole page, guarded by the base this session observed at start.
+   *
+   * The step order is load-bearing, not stylistic:
+   *
+   *   1. idempotent skip (disk already equals the payload)
+   *   2. conflict (base unknown, or disk drifted away from base)
+   *   3. direct write, then advance the base
+   *
+   * Step 1 must come first for two reasons. It keeps every existing
+   * `--apply-session-close --session-id` test green (they read the payload
+   * straight off disk, so they land here before any base lookup). And it breaks
+   * the apply-then-reclose loop: once a human applies proposal P, disk == proposed
+   * == payload.content, so the next close skips before it can re-raise a conflict.
+   *
+   * Callers without `--session-id` (legacy / manual apply) sit outside the guard
+   * lifecycle: they never observed a base, so there is nothing to keep honest and
+   * they keep writing directly.
+   */
   const overwrite = (key, relPath, field) => {
     if (!field || typeof field.content !== 'string') return; // optional / absent
-    const wrote = writeIfChanged(join(args.hypoDir, relPath), field.content);
-    (wrote ? applied : skipped).push(`${key} (${relPath})`);
+    const full = join(args.hypoDir, relPath);
+    const disk = readTarget(full);
+
+    // (1) idempotent skip — preserves writeIfChanged's contract
+    if (disk === field.content) {
+      skipped.push(`${key} (${relPath})`);
+      return;
+    }
+
+    // (2) conflict, only where a session context makes a base observable
+    if (args.sessionId) {
+      const entry = readBaseEntry(args.hypoDir, args.sessionId, relPath);
+      const reason = overwriteConflictReason(entry, disk);
+      if (reason) {
+        conflicts.push({
+          key,
+          target: relPath,
+          reason,
+          baseHash: entry.hash,
+          currentHash: typeof disk === 'string' ? hashContent(disk) : null,
+          proposedContent: field.content,
+        });
+        return; // target bytes untouched
+      }
+    }
+
+    // (3) write, then the content we just wrote IS this session's new base
+    atomicWrite(full, field.content);
+    if (args.sessionId)
+      advanceBase(args.hypoDir, args.sessionId, relPath, hashContent(field.content));
+    applied.push(`${key} (${relPath})`);
   };
 
   overwrite('sessionState', join('projects', project, 'session-state.md'), payload.sessionState);
@@ -1101,7 +1192,16 @@ function applySessionClose(args) {
     const m = unknownTagRe.exec(w.message || '');
     if (m && !checkForbidden(m[1])) pendingTags.push(m[1]);
   }
-  if (pendingTags.length > 0) appendPendingTags(args.hypoDir, pendingTags);
+  // Withheld a target? Then register nothing. This close is going to be re-run
+  // once a human resolves the conflict, and its `ok:false` skips the commit below
+  // (`if (ok && args.sessionId)`) — so registering here would leave SCHEMA.md
+  // mutated, uncommitted, and absent from `applied`, i.e. a silent side effect of
+  // a close whose whole point was to write nothing. Registration is
+  // eventually-consistent by design, so deferring it to the next close costs
+  // nothing (codex W2 CONCERN).
+  if (pendingTags.length > 0 && conflicts.length === 0) {
+    appendPendingTags(args.hypoDir, pendingTags);
+  }
 
   // Post-apply lint: payload may have introduced a malformed body or
   // bad frontmatter. Surface as a distinct `stage` so caller can tell "lint
@@ -1140,7 +1240,12 @@ function applySessionClose(args) {
   const postLintOk = !postApplyCrashed && postBlocking.length === 0;
   // `let` (not const): the close-result invariant self-check below may flip this
   // to false when the settled close result is internally contradictory.
-  let ok = verification.ok && postLintOk;
+  //
+  // A withheld conflict target must fail the close on its own, not merely via the
+  // freshness gate. If the other session already touched that page TODAY, freshness
+  // sees a fresh file and passes — and the close would report ok:true, write the
+  // marker, and drop this session's payload silently. `conflicts` closes that hole.
+  let ok = verification.ok && postLintOk && conflicts.length === 0;
 
   // Scope the non-blocking notice to the close-target project: debt under
   // projects/<project>/ stays listed; debt elsewhere folds to a count so the
@@ -1214,13 +1319,18 @@ function applySessionClose(args) {
       }
     }
   }
+  // A conflict outranks the downstream gates: verification and lint both describe
+  // a tree this apply declined to finish writing, so naming them would point the
+  // reader at the wrong repair.
   let stage = ok
     ? null
-    : !verification.ok && !postLintOk
-      ? 'post-apply-verification+lint'
-      : !verification.ok
-        ? 'post-apply-verification'
-        : 'post-apply-lint';
+    : conflicts.length > 0
+      ? 'proposal-pending'
+      : !verification.ok && !postLintOk
+        ? 'post-apply-verification+lint'
+        : !verification.ok
+          ? 'post-apply-verification'
+          : 'post-apply-lint';
   // Runtime close-result invariant self-check. When a
   // marker-write path (args.sessionId present) settles into an internally
   // contradictory shape — ok:true with the marker silently withheld and no
@@ -1251,6 +1361,10 @@ function applySessionClose(args) {
     date,
     applied,
     skipped,
+    // Targets withheld because the page drifted from this session's observed base.
+    // `proposedContent` is dropped from the reported shape (it is the whole payload
+    // field, and T6 parks it in the proposal artifact instead).
+    conflicts: conflicts.map(({ proposedContent: _drop, ...rest }) => rest),
     verification,
     // Surface the marker outcome instead of skipping silently, so the
     // caller can tell "closed" from "applied but not marked".
@@ -1276,6 +1390,13 @@ function applySessionClose(args) {
     console.log(`Session-close apply (project: ${project}, date: ${date}):`);
     for (const a of applied) console.log(`  ✓ wrote ${a}`);
     for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
+    // Never let a withheld target read as a skip: `skipped` means "already current",
+    // this means "your bytes are NOT on disk and someone else's are".
+    for (const c of conflicts) {
+      console.log(
+        `  ⚠ WITHHELD ${c.key} (${c.target}) — ${c.reason}; the page changed since this session read it`,
+      );
+    }
     if (ok) {
       // When the marker was withheld, qualify the success line so a reader scanning
       // stdout alone cannot mistake "verified" for "fully closed". markerSkipReason
