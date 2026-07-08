@@ -3079,3 +3079,57 @@ export function isIgnored(filePath, hypoDir, patterns) {
   }
   return false;
 }
+
+// ── visibility scope ─────────────────────────────────────────────────────────
+// The machine-scoped visibility namespace (`visibility_scope: machine:<device>`)
+// requires that the SAME device string is produced at write time (audit device
+// stamps) and at lookup time (the visibility filter) — otherwise a page never
+// matches its own machine. So this is the single source for both. NOT cached:
+// each call reads env fresh so in-process tests can override via HYPO_DEVICE
+// (os.hostname is not mockable). CR/LF are stripped so the value stays a single
+// frontmatter token.
+export function currentDevice() {
+  return String(process.env.HYPO_DEVICE || hostname() || 'unknown').replace(/[\r\n]/g, '');
+}
+
+// Extract the top-level `visibility_scope` from a page's raw content. Mirrors
+// scripts/lib/frontmatter.mjs normalization (top-level only, first-wins, strip a
+// whitespace-led trailing YAML comment, strip surrounding quotes) rather than
+// importing it: hooks deploy to ~/.claude/hooks/ with no external imports. The
+// five consumers must call this instead of a local last-wins/no-comment parser,
+// else a `machine:devA # note` value fails to match on its own machine. Returns
+// '' when absent (which scopeVisible treats as shared).
+export function readVisibilityScope(raw) {
+  const m = String(raw || '').match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return '';
+  for (const line of m[1].split(/\r?\n/)) {
+    if (/^\s/.test(line) || /^-(\s|$)/.test(line)) continue; // nested / list item
+    const idx = line.indexOf(':');
+    if (idx < 0) continue;
+    if (line.slice(0, idx).trim() !== 'visibility_scope') continue;
+    return line
+      .slice(idx + 1)
+      .trim()
+      .replace(/\s+#.*$/, '')
+      .replace(/^["']|["']$/g, '');
+  }
+  return '';
+}
+
+// The single visibility decision, shared by lookup / query / file-watch /
+// page-usage / crystallize. `scopeValue` is a readVisibilityScope() output,
+// `device` a currentDevice() output. Prefix dispatch, fail-open on anything
+// unrecognized so the field is purely additive:
+//   ''/'shared'       → visible (the implicit default of every pre-existing page)
+//   'machine:<owner>' → visible only on the owning machine. Empty owner
+//                       (`machine:`) hides everywhere: '' can never equal
+//                       currentDevice()'s non-empty fallback.
+//   'agent:<id>'      → visible; value space reserved, no writer yet (forward-compat)
+//   anything else     → visible (fail-open)
+export function scopeVisible(scopeValue, device) {
+  const v = String(scopeValue || '').trim();
+  if (v === '' || v === 'shared') return true;
+  if (v.startsWith('machine:')) return v.slice('machine:'.length) === device;
+  if (v.startsWith('agent:')) return true;
+  return true;
+}

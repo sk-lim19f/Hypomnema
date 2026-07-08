@@ -75,7 +75,6 @@ import {
   realpathSync,
 } from 'fs';
 import { join, dirname } from 'path';
-import { hostname } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
@@ -102,6 +101,7 @@ import {
   resolveTranscriptBySessionId,
   hasUserCloseSignal,
   commitWikiChanges,
+  currentDevice,
 } from '../hooks/hypo-shared.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
@@ -1014,7 +1014,7 @@ function applySessionClose(args) {
       // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
       // `session_id` is honest naming: the value is the Claude session UUID, and
       // it is present only on the Stop-chain close path that passes --session-id.
-      const device = String(hostname() || 'unknown').replace(/[\r\n]/g, '');
+      const device = currentDevice();
       const auditFm =
         (args.sessionId ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n` : '') +
         `device: ${device}\n`;

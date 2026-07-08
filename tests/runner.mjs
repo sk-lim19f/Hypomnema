@@ -1398,6 +1398,9 @@ const {
   pageUsageGuardCachePath,
   recordLookupUsage,
   PAGE_USAGE_REL,
+  currentDevice,
+  scopeVisible,
+  readVisibilityScope,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -3563,6 +3566,52 @@ test('PRAC-17: hypo-session-record stamps device on the index.jsonl entry', () =
       typeof entry.device === 'string' && entry.device.length > 0,
       `device must be recorded on the index entry: ${JSON.stringify(entry)}`,
     );
+  });
+});
+
+// currentDevice() routing: both audit write sites must now emit the SAME device
+// string that the visibility filter reads at lookup time. Proven by overriding
+// HYPO_DEVICE and asserting the written stamp equals it — one assert per write
+// site so a divergence on either path is caught.
+test('scope: index.jsonl device stamp is routed through currentDevice (HYPO_DEVICE honored)', () => {
+  withTmpDir((dir) => {
+    const r = runHook(
+      'hypo-session-record.mjs',
+      { session_id: 'rec-dev', transcript_path: '/tmp/t.jsonl', cwd: '/tmp/work' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'dev-index' },
+    );
+    assert.equal(r.status, 0, `hook failed: ${r.stderr}`);
+    const idx = join(dir, '.cache', 'sessions', 'index.jsonl');
+    const entry = JSON.parse(readFileSync(idx, 'utf-8').trim().split('\n').pop());
+    assert.equal(
+      entry.device,
+      'dev-index',
+      `currentDevice() must route the index device stamp: ${JSON.stringify(entry)}`,
+    );
+  });
+});
+
+test('scope: daily shard device stamp is routed through currentDevice (HYPO_DEVICE honored)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] scope device entry\n\nbody\n` };
+    // run() inherits process.env (only HYPO_DIR/HOME are overridden), so the
+    // spawned crystallize sees this HYPO_DEVICE. Save/restore to keep it hermetic.
+    const prev = process.env.HYPO_DEVICE;
+    try {
+      process.env.HYPO_DEVICE = 'dev-shard';
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+      const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+      const fm = readFileSync(shard, 'utf-8');
+      assert.ok(
+        /^device: dev-shard$/m.test(fm),
+        `currentDevice() must route the shard device stamp: ${fm}`,
+      );
+    } finally {
+      if (prev === undefined) delete process.env.HYPO_DEVICE;
+      else process.env.HYPO_DEVICE = prev;
+    }
   });
 });
 
@@ -24985,6 +25034,86 @@ test('adopt failure rolls back the wiki hook writes (sidecar install path blocke
       );
     });
   });
+});
+
+// ── visibility scope: currentDevice / predicate / reader ─────────────────────
+
+suite('scope: currentDevice source');
+
+test('currentDevice reads HYPO_DEVICE override', () => {
+  const prev = process.env.HYPO_DEVICE;
+  try {
+    process.env.HYPO_DEVICE = 'dev-a';
+    assert.equal(currentDevice(), 'dev-a');
+  } finally {
+    if (prev === undefined) delete process.env.HYPO_DEVICE;
+    else process.env.HYPO_DEVICE = prev;
+  }
+});
+
+test('currentDevice strips CR/LF from the device token', () => {
+  const prev = process.env.HYPO_DEVICE;
+  try {
+    process.env.HYPO_DEVICE = 'x\ny';
+    assert.equal(currentDevice(), 'xy');
+  } finally {
+    if (prev === undefined) delete process.env.HYPO_DEVICE;
+    else process.env.HYPO_DEVICE = prev;
+  }
+});
+
+test('currentDevice falls back to a non-empty string without HYPO_DEVICE', () => {
+  const prev = process.env.HYPO_DEVICE;
+  try {
+    delete process.env.HYPO_DEVICE;
+    const d = currentDevice();
+    assert.equal(typeof d, 'string');
+    assert.ok(d.length > 0, 'fallback device is non-empty');
+  } finally {
+    if (prev === undefined) delete process.env.HYPO_DEVICE;
+    else process.env.HYPO_DEVICE = prev;
+  }
+});
+
+suite('scope: scopeVisible predicate');
+
+test('scopeVisible: no field and shared are visible', () => {
+  assert.equal(scopeVisible('', 'a'), true);
+  assert.equal(scopeVisible('shared', 'a'), true);
+});
+
+test('scopeVisible: machine matches only the owning device', () => {
+  assert.equal(scopeVisible('machine:a', 'a'), true);
+  assert.equal(scopeVisible('machine:b', 'a'), false);
+});
+
+test('scopeVisible: agent prefix is reserved and passes (forward-compat)', () => {
+  assert.equal(scopeVisible('agent:x', 'a'), true);
+});
+
+test('scopeVisible: empty owner (machine:) hides everywhere', () => {
+  assert.equal(scopeVisible('machine:', 'a'), false);
+});
+
+suite('scope: readVisibilityScope reader');
+
+test('readVisibilityScope strips an inline YAML comment', () => {
+  assert.equal(
+    readVisibilityScope('---\nvisibility_scope: machine:a # note\n---\n'),
+    'machine:a',
+  );
+});
+
+test('readVisibilityScope is first-wins on a repeated key', () => {
+  assert.equal(
+    readVisibilityScope('---\nvisibility_scope: machine:a\nvisibility_scope: machine:b\n---\n'),
+    'machine:a',
+  );
+});
+
+test('readVisibilityScope returns empty when the field is absent', () => {
+  assert.equal(readVisibilityScope('---\ntype: note\n---\nbody'), '');
+  assert.equal(readVisibilityScope('no frontmatter at all'), '');
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────
