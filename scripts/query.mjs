@@ -20,6 +20,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { currentDevice, scopeVisible, readVisibilityScope } from '../hooks/hypo-shared.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -101,6 +102,7 @@ const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
 const files = scanDirs.flatMap((d) => collectMdFiles(d, args.hypoDir, [], ignorePatterns));
 
 const results = [];
+const device = currentDevice();
 
 for (const { path, rel } of files) {
   let content;
@@ -112,6 +114,7 @@ for (const { path, rel } of files) {
   const { score, excerpt } = scoreAndExcerpt(content, terms);
   if (score === 0) continue;
   const fm = parseFrontmatter(content);
+  if (!scopeVisible(readVisibilityScope(content), device)) continue;
   results.push({
     slug: rel.replace(/\.md$/, ''),
     title: fm.title || rel,

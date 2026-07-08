@@ -12,8 +12,7 @@
 
 import { existsSync, mkdirSync, appendFileSync } from 'fs';
 import { dirname, join } from 'path';
-import { hostname } from 'os';
-import { HYPO_DIR } from './hypo-shared.mjs';
+import { HYPO_DIR, currentDevice } from './hypo-shared.mjs';
 
 const INDEX_PATH = join(HYPO_DIR, '.cache', 'sessions', 'index.jsonl');
 
@@ -54,7 +53,7 @@ process.stdin.on('end', () => {
       // machine identity for multi-machine audit. index.jsonl lives
       // under .cache/ (gitignored in a normal vault), so this is a LOCAL-only
       // per-session record — accurate for every session, no sync/privacy cost.
-      device: hostname() || 'unknown',
+      device: currentDevice(),
     };
     appendFileSync(INDEX_PATH, JSON.stringify(entry) + '\n');
   } catch (err) {
