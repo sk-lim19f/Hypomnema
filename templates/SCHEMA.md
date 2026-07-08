@@ -91,10 +91,22 @@ Optional fields (add as needed):
 confidence: high | medium | low | speculative
 evidence_strength: direct | inferred | hearsay
 scope: always | project | session
+visibility_scope: shared | machine:<device>
 source: <slug or URL>
 verify_by: <question to re-check at next review>
 verify_by_date: YYYY-MM-DD
 ```
+
+`visibility_scope` is a different axis from `scope`: `scope` is memory lifetime,
+`visibility_scope` is where a page may surface. Omitting it means `shared` (the
+implicit default of every pre-existing page), so lookup/query/injection stay
+unchanged. `machine:<device>` hides the page from every machine except the one
+whose `currentDevice()` output equals `<device>`. Copy that exact string from the
+newest `device` value in `.cache/sessions/index.jsonl`, or from a recent
+session-log shard's `device:` frontmatter (both are `currentDevice()` outputs); a
+hand-typed value that does not match will hide the page on its own machine too.
+An empty owner (`machine:`) hides the page everywhere. `agent:<id>` is a reserved
+forward-compat value that is not filtered yet.
 
 ### 3.1. `feedback` type — projection fields
 
