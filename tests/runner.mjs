@@ -25233,6 +25233,24 @@ test('owning device whose only match is machine-scoped: page is injected', () =>
   });
 });
 
+test('miss path survives an unstat-able entry in the page tree (buildPageMap skips it)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'index.md'), '# Index\n- [[real-note]] — apple banana cherry\n');
+    writeFileSync(join(dir, 'pages', 'real-note.md'), '---\ntype: page\ntitle: Real\n---\n# apple banana cherry\n');
+    // A dangling symlink makes statSync throw. Because the page tree is now
+    // scanned BEFORE the miss branch, an unguarded throw would sink the whole
+    // lookup into the silent outer catch instead of the clean miss message.
+    symlinkSync(join(dir, 'pages', 'nonexistent-target.md'), join(dir, 'pages', 'dangling.md'));
+    const r = runHook('hypo-lookup.mjs', { prompt: 'zzqqxx nomatch' }, { HYPO_DIR: dir, HYPO_DEVICE: 'devB' });
+    const ctx = JSON.parse(r.stdout).additionalContext ?? '';
+    assert.ok(
+      ctx.includes('LOOKUP: miss'),
+      `a dangling symlink must not suppress the clean miss message: ${JSON.stringify(ctx)}`,
+    );
+  });
+});
+
 // ── query.mjs — visibility_scope filtering ──────────────────────────────────
 // query.mjs must gate results through readVisibilityScope(raw) + scopeVisible()
 // (the shared frontmatter reader, not a local last-wins parser) so a

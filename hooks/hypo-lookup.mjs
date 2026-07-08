@@ -35,7 +35,16 @@ function buildPageMap(dir, root = dir, map = {}, ignorePatterns = [], hypoDir = 
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
     if (isIgnored(full, hypoDir, ignorePatterns)) continue;
-    if (statSync(full).isDirectory()) {
+    // Skip an entry we can't stat (dangling symlink, race, permission) instead
+    // of throwing: the map is now built before the miss branch too, so one bad
+    // entry must not sink the whole lookup into the silent outer catch.
+    let st;
+    try {
+      st = statSync(full);
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) {
       buildPageMap(full, root, map, ignorePatterns, hypoDir);
     } else if (entry.endsWith('.md')) {
       const rel = full.slice(root.length + 1).replace(/\.md$/, '');
