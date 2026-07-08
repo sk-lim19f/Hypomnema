@@ -46,6 +46,15 @@ import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmat
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import { readPageUsage, aggregateColdCandidates } from '../scripts/lib/page-usage.mjs';
 import {
+  hashContent as bsHashContent,
+  hashFile as bsHashFile,
+  basePath as bsBasePath,
+  snapshotBase,
+  readBaseEntry,
+  advanceBase,
+  overwriteTargets,
+} from '../hooks/base-store.mjs';
+import {
   validateChangelog,
   validateTagBody,
   countHangul,
@@ -1915,10 +1924,7 @@ test('a task with a terminal status → false', () => {
 });
 
 test('a task with no status field → true (unknown = not yet terminal)', () => {
-  assert.equal(
-    hasPendingBackgroundWork({ background_tasks: [{ type: 'subagent' }] }),
-    true,
-  );
+  assert.equal(hasPendingBackgroundWork({ background_tasks: [{ type: 'subagent' }] }), true);
 });
 
 test('a non-subagent (shell) task counts too → true (widened past subagent-only)', () => {
@@ -1963,7 +1969,8 @@ test('a correlated "아직" AskUserQuestion answer → true (declined)', () => {
             {
               type: 'tool_result',
               tool_use_id: 'q1',
-              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+              content:
+                'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
             },
           ],
         },
@@ -1985,7 +1992,8 @@ test('decline followed by a NEW user close signal → false (re-arm)', () => {
             {
               type: 'tool_result',
               tool_use_id: 'q1',
-              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+              content:
+                'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
             },
           ],
         },
@@ -2075,7 +2083,8 @@ test('decline, then an ASSISTANT text block saying "세션 마무리" → still 
             {
               type: 'tool_result',
               tool_use_id: 'q1',
-              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+              content:
+                'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
             },
           ],
         },
@@ -2084,7 +2093,9 @@ test('decline, then an ASSISTANT text block saying "세션 마무리" → still 
         type: 'assistant',
         message: {
           role: 'assistant',
-          content: [{ type: 'text', text: '알겠습니다, 아직 세션 마무리는 하지 않고 계속 진행하겠습니다.' }],
+          content: [
+            { type: 'text', text: '알겠습니다, 아직 세션 마무리는 하지 않고 계속 진행하겠습니다.' },
+          ],
         },
       },
     ]);
@@ -2108,7 +2119,8 @@ test('decline, then a tool_result containing a close phrase → still declined (
             {
               type: 'tool_result',
               tool_use_id: 'q1',
-              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+              content:
+                'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
             },
           ],
         },
@@ -2151,7 +2163,8 @@ test('an UNRELATED AskUserQuestion answered with "나중" → false (does not co
             {
               type: 'tool_result',
               tool_use_id: 'q1',
-              content: 'Your questions have been answered: "어떤 색을 원하세요?"="나중에 정할게요". continue.',
+              content:
+                'Your questions have been answered: "어떤 색을 원하세요?"="나중에 정할게요". continue.',
             },
           ],
         },
@@ -2177,7 +2190,8 @@ test('the real close-reconfirm prompt ("지금 닫기" in input) + "아직, 계�
             {
               type: 'tool_result',
               tool_use_id: 'q1',
-              content: 'Your questions have been answered: "지금 세션을 닫을까요?"="아직, 계속". continue.',
+              content:
+                'Your questions have been answered: "지금 세션을 닫을까요?"="아직, 계속". continue.',
             },
           ],
         },
@@ -8730,9 +8744,7 @@ test('session-state with a stray working_dir → warn, not error', () => {
   );
   assert.equal(r.status, 0, `forbidden-field must be a warn, not a lint failure: ${r.stdout}`);
   assert.ok(
-    out.warns.some(
-      (w) => w.message.includes('working_dir') && w.message.includes('session-state'),
-    ),
+    out.warns.some((w) => w.message.includes('working_dir') && w.message.includes('session-state')),
     `expected working_dir forbidden-field warn: ${r.stdout}`,
   );
 });
@@ -14304,7 +14316,8 @@ test('a correlated "아직, 계속" decline suppresses the reconfirm → continu
             {
               type: 'tool_result',
               tool_use_id: 'q1',
-              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+              content:
+                'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
             },
           ],
         },
@@ -14338,7 +14351,8 @@ test('a NEW user close signal after a decline re-arms the reconfirm → block ag
             {
               type: 'tool_result',
               tool_use_id: 'q1',
-              content: 'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
+              content:
+                'Your questions have been answered: "지금 닫을까요?"="아직, 계속". continue.',
             },
           ],
         },
@@ -14414,8 +14428,15 @@ test('genuine close-now + uncommitted, no decline → still reconfirm block (no 
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
-    assert.equal(out.decision, 'block', `close-now with uncommitted work must still reconfirm: ${JSON.stringify(out)}`);
-    assert.ok(/AskUserQuestion/.test(out.reason), `must still instruct AskUserQuestion: ${out.reason}`);
+    assert.equal(
+      out.decision,
+      'block',
+      `close-now with uncommitted work must still reconfirm: ${JSON.stringify(out)}`,
+    );
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `must still instruct AskUserQuestion: ${out.reason}`,
+    );
   });
 });
 
@@ -14439,8 +14460,14 @@ test('non-work-incomplete blocker only (git-clean, close blocker) → existing c
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block');
-    assert.ok(/crystallize/.test(out.reason), `must keep the crystallize recovery command: ${out.reason}`);
-    assert.ok(!/AskUserQuestion/.test(out.reason), `must NOT reconfirm on a non-work-incomplete blocker: ${out.reason}`);
+    assert.ok(
+      /crystallize/.test(out.reason),
+      `must keep the crystallize recovery command: ${out.reason}`,
+    );
+    assert.ok(
+      !/AskUserQuestion/.test(out.reason),
+      `must NOT reconfirm on a non-work-incomplete blocker: ${out.reason}`,
+    );
   });
 });
 
@@ -14459,8 +14486,14 @@ test('git-clean + in-flight subagent in background_tasks → reconfirm block', (
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block');
-    assert.ok(/AskUserQuestion/.test(out.reason), `in-flight subagent must trigger reconfirm: ${out.reason}`);
-    assert.ok(!/crystallize/.test(out.reason), `reconfirm must not name crystallize: ${out.reason}`);
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `in-flight subagent must trigger reconfirm: ${out.reason}`,
+    );
+    assert.ok(
+      !/crystallize/.test(out.reason),
+      `reconfirm must not name crystallize: ${out.reason}`,
+    );
   });
 });
 
@@ -14486,8 +14519,14 @@ test('git-clean + running shell background task → reconfirm block', () => {
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block');
-    assert.ok(/AskUserQuestion/.test(out.reason), `running shell task must trigger reconfirm: ${out.reason}`);
-    assert.ok(!/crystallize/.test(out.reason), `reconfirm must not name crystallize: ${out.reason}`);
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `running shell task must trigger reconfirm: ${out.reason}`,
+    );
+    assert.ok(
+      !/crystallize/.test(out.reason),
+      `reconfirm must not name crystallize: ${out.reason}`,
+    );
   });
 });
 
@@ -14506,7 +14545,10 @@ test('git-clean + non-empty session_crons → reconfirm block', () => {
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block');
-    assert.ok(/AskUserQuestion/.test(out.reason), `scheduled cron wake must trigger reconfirm: ${out.reason}`);
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `scheduled cron wake must trigger reconfirm: ${out.reason}`,
+    );
   });
 });
 
@@ -14527,8 +14569,14 @@ test('git-clean + only terminal shell background task → existing crystallize w
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block');
-    assert.ok(/crystallize/.test(out.reason), `terminal shell task must keep crystallize wording: ${out.reason}`);
-    assert.ok(!/AskUserQuestion/.test(out.reason), `terminal shell task must NOT reconfirm: ${out.reason}`);
+    assert.ok(
+      /crystallize/.test(out.reason),
+      `terminal shell task must keep crystallize wording: ${out.reason}`,
+    );
+    assert.ok(
+      !/AskUserQuestion/.test(out.reason),
+      `terminal shell task must NOT reconfirm: ${out.reason}`,
+    );
   });
 });
 
@@ -14550,7 +14598,10 @@ test('absent background_tasks + uncommitted → in-flight fails open, git alone 
     assert.equal(r.stderr, '', `no exception expected on absent background_tasks: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block');
-    assert.ok(/AskUserQuestion/.test(out.reason), `uncommitted alone must still reconfirm: ${out.reason}`);
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `uncommitted alone must still reconfirm: ${out.reason}`,
+    );
   });
 });
 
@@ -14569,7 +14620,10 @@ test('absent background_tasks + git-clean + close blocker only → existing crys
     assert.equal(r.stderr, '', `no exception expected on absent background_tasks: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.decision, 'block');
-    assert.ok(/crystallize/.test(out.reason), `git-clean + absent background_tasks must keep crystallize wording: ${out.reason}`);
+    assert.ok(
+      /crystallize/.test(out.reason),
+      `git-clean + absent background_tasks must keep crystallize wording: ${out.reason}`,
+    );
   });
 });
 
@@ -25082,8 +25136,15 @@ test('currentDevice: a CR/LF-only HYPO_DEVICE collapses to fallback, never empty
     // scopeVisible('machine:', device) pass and unhide the empty-owner page).
     process.env.HYPO_DEVICE = '\r\n';
     const d = currentDevice();
-    assert.ok(d.length > 0, `CR/LF-only device must fall back to non-empty, got ${JSON.stringify(d)}`);
-    assert.equal(scopeVisible('machine:', d), false, 'empty-owner machine: must stay hidden under the fallback device');
+    assert.ok(
+      d.length > 0,
+      `CR/LF-only device must fall back to non-empty, got ${JSON.stringify(d)}`,
+    );
+    assert.equal(
+      scopeVisible('machine:', d),
+      false,
+      'empty-owner machine: must stay hidden under the fallback device',
+    );
   } finally {
     if (prev === undefined) delete process.env.HYPO_DEVICE;
     else process.env.HYPO_DEVICE = prev;
@@ -25113,10 +25174,7 @@ test('scopeVisible: empty owner (machine:) hides everywhere', () => {
 suite('scope: readVisibilityScope reader');
 
 test('readVisibilityScope strips an inline YAML comment', () => {
-  assert.equal(
-    readVisibilityScope('---\nvisibility_scope: machine:a # note\n---\n'),
-    'machine:a',
-  );
+  assert.equal(readVisibilityScope('---\nvisibility_scope: machine:a # note\n---\n'), 'machine:a');
 });
 
 test('readVisibilityScope is first-wins on a repeated key', () => {
@@ -25215,8 +25273,14 @@ test('non-owning device whose only match is machine-scoped: clean miss, no leak,
     const out = JSON.parse(r.stdout);
     const ctx = out.additionalContext ?? '';
     assert.ok(!ctx.includes('devA-only'), `machine:devA slug must not leak: ${ctx}`);
-    assert.ok(!ctx.includes('files missing'), `a hidden-only match must not report "files missing": ${ctx}`);
-    assert.ok(ctx.includes('LOOKUP: miss'), `a hidden-only match must take the clean miss path: ${ctx}`);
+    assert.ok(
+      !ctx.includes('files missing'),
+      `a hidden-only match must not report "files missing": ${ctx}`,
+    );
+    assert.ok(
+      ctx.includes('LOOKUP: miss'),
+      `a hidden-only match must take the clean miss path: ${ctx}`,
+    );
   });
 });
 
@@ -25237,12 +25301,19 @@ test('miss path survives an unstat-able entry in the page tree (buildPageMap ski
   withTmpDir((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'index.md'), '# Index\n- [[real-note]] — apple banana cherry\n');
-    writeFileSync(join(dir, 'pages', 'real-note.md'), '---\ntype: page\ntitle: Real\n---\n# apple banana cherry\n');
+    writeFileSync(
+      join(dir, 'pages', 'real-note.md'),
+      '---\ntype: page\ntitle: Real\n---\n# apple banana cherry\n',
+    );
     // A dangling symlink makes statSync throw. Because the page tree is now
     // scanned BEFORE the miss branch, an unguarded throw would sink the whole
     // lookup into the silent outer catch instead of the clean miss message.
     symlinkSync(join(dir, 'pages', 'nonexistent-target.md'), join(dir, 'pages', 'dangling.md'));
-    const r = runHook('hypo-lookup.mjs', { prompt: 'zzqqxx nomatch' }, { HYPO_DIR: dir, HYPO_DEVICE: 'devB' });
+    const r = runHook(
+      'hypo-lookup.mjs',
+      { prompt: 'zzqqxx nomatch' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+    );
     const ctx = JSON.parse(r.stdout).additionalContext ?? '';
     assert.ok(
       ctx.includes('LOOKUP: miss'),
@@ -25312,10 +25383,7 @@ test('hypo-file-watch: machine-scoped page is not injected on a non-owning devic
   const dir = mkdtempSync(join(tmpdir(), 'hypo-fw-'));
   try {
     const filePath = join(dir, 'hot.md');
-    writeFileSync(
-      filePath,
-      '---\nvisibility_scope: machine:devA\n---\n\n# hot\n\nbody text\n',
-    );
+    writeFileSync(filePath, '---\nvisibility_scope: machine:devA\n---\n\n# hot\n\nbody text\n');
     const r = runHook(
       'hypo-file-watch.mjs',
       { file_path: filePath },
@@ -25333,10 +25401,7 @@ test('hypo-file-watch: machine-scoped page is injected on its owning device', ()
   const dir = mkdtempSync(join(tmpdir(), 'hypo-fw-'));
   try {
     const filePath = join(dir, 'hot.md');
-    writeFileSync(
-      filePath,
-      '---\nvisibility_scope: machine:devA\n---\n\n# hot\n\nbody text\n',
-    );
+    writeFileSync(filePath, '---\nvisibility_scope: machine:devA\n---\n\n# hot\n\nbody text\n');
     const r = runHook(
       'hypo-file-watch.mjs',
       { file_path: filePath },
@@ -25450,7 +25515,10 @@ test('graph invariant: a shared page whose sole inbound link comes from a machin
     assert.equal(asDevB.status, 'ok');
     const inA = asDevA.candidates.some((c) => c.slug === 'pages/shared-target');
     const inB = asDevB.candidates.some((c) => c.slug === 'pages/shared-target');
-    assert.ok(inA, `shared-target must be a cold candidate on devA: ${JSON.stringify(asDevA.candidates)}`);
+    assert.ok(
+      inA,
+      `shared-target must be a cold candidate on devA: ${JSON.stringify(asDevA.candidates)}`,
+    );
     assert.equal(
       inA,
       inB,
@@ -25535,7 +25603,11 @@ function scopeVaultX10(dir, { withMachine = true } = {}) {
 }
 
 function lookupCtxX10(dir, device) {
-  const r = runHook('hypo-lookup.mjs', { prompt: 'xyzzy plover' }, { HYPO_DIR: dir, HYPO_DEVICE: device });
+  const r = runHook(
+    'hypo-lookup.mjs',
+    { prompt: 'xyzzy plover' },
+    { HYPO_DIR: dir, HYPO_DEVICE: device },
+  );
   return JSON.parse(r.stdout).additionalContext ?? '';
 }
 
@@ -25552,7 +25624,9 @@ function withDeviceX10(device, fn) {
 
 function querySlugsX10(dir, device, q = 'xyzzy') {
   return withDeviceX10(device, () =>
-    JSON.parse(run('query.mjs', [`--hypo-dir=${dir}`, `--q=${q}`, '--json']).stdout).map((x) => x.slug),
+    JSON.parse(run('query.mjs', [`--hypo-dir=${dir}`, `--q=${q}`, '--json']).stdout).map(
+      (x) => x.slug,
+    ),
   );
 }
 
@@ -25578,17 +25652,31 @@ test('injection surfaces (lookup + query + file-watch) withhold machine:devA fro
     const ctxB = lookupCtxX10(dir, 'devB');
     assert.ok(!ctxB.includes('devA-note'), `lookup must not inject machine:devA on devB: ${ctxB}`);
     assert.ok(ctxB.includes('shared-note'), 'lookup must still inject the fieldless page on devB');
-    assert.ok(lookupCtxX10(dir, 'devA').includes('devA-note'), 'lookup must inject machine:devA on devA');
+    assert.ok(
+      lookupCtxX10(dir, 'devA').includes('devA-note'),
+      'lookup must inject machine:devA on devA',
+    );
     const qB = querySlugsX10(dir, 'devB');
     assert.ok(!qB.includes('pages/devA-note'), `query must hide machine:devA on devB: ${qB}`);
     assert.ok(qB.includes('pages/shared-note'), 'query must keep the fieldless page on devB');
-    assert.ok(querySlugsX10(dir, 'devA').includes('pages/devA-note'), 'query must show machine:devA on devA');
+    assert.ok(
+      querySlugsX10(dir, 'devA').includes('pages/devA-note'),
+      'query must show machine:devA on devA',
+    );
     const fwB = JSON.parse(
-      runHook('hypo-file-watch.mjs', { file_path: join(dir, 'pages', 'devA-note.md') }, { HYPO_DIR: dir, HYPO_DEVICE: 'devB' }).stdout,
+      runHook(
+        'hypo-file-watch.mjs',
+        { file_path: join(dir, 'pages', 'devA-note.md') },
+        { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+      ).stdout,
     );
     assert.ok(!('additionalContext' in fwB), 'file-watch must not inject machine:devA on devB');
     const fwA = JSON.parse(
-      runHook('hypo-file-watch.mjs', { file_path: join(dir, 'pages', 'devA-note.md') }, { HYPO_DIR: dir, HYPO_DEVICE: 'devA' }).stdout,
+      runHook(
+        'hypo-file-watch.mjs',
+        { file_path: join(dir, 'pages', 'devA-note.md') },
+        { HYPO_DIR: dir, HYPO_DEVICE: 'devA' },
+      ).stdout,
     );
     assert.ok('additionalContext' in fwA, 'file-watch must inject machine:devA on devA');
   });
@@ -25599,19 +25687,32 @@ test('aggregation surfaces (crystallize candidate + cold) withhold machine:devA 
     // hub gives the machine page an inbound link (cold candidacy) while the
     // machine page keeps no outbound links (crystallize `unlinked` candidacy).
     mkdirSync(join(dir, 'pages'), { recursive: true });
-    writeFileSync(join(dir, 'pages', 'hub.md'), '---\ntype: page\ntitle: Hub\n---\n# Hub\n[[machine-page]]\n');
+    writeFileSync(
+      join(dir, 'pages', 'hub.md'),
+      '---\ntype: page\ntitle: Hub\n---\n# Hub\n[[machine-page]]\n',
+    );
     writeFileSync(
       join(dir, 'pages', 'machine-page.md'),
       '---\ntype: page\ntitle: Machine Page\nvisibility_scope: machine:devA\n---\n# Machine Page body\n',
     );
     const unlinkedB = withDeviceX10('devB', () =>
-      JSON.parse(run('crystallize.mjs', [`--hypo-dir=${dir}`, '--json']).stdout).unlinked.map((p) => p.slug),
+      JSON.parse(run('crystallize.mjs', [`--hypo-dir=${dir}`, '--json']).stdout).unlinked.map(
+        (p) => p.slug,
+      ),
     );
-    assert.ok(!unlinkedB.includes('pages/machine-page'), `crystallize must not surface machine:devA on devB: ${unlinkedB}`);
+    assert.ok(
+      !unlinkedB.includes('pages/machine-page'),
+      `crystallize must not surface machine:devA on devB: ${unlinkedB}`,
+    );
     const unlinkedA = withDeviceX10('devA', () =>
-      JSON.parse(run('crystallize.mjs', [`--hypo-dir=${dir}`, '--json']).stdout).unlinked.map((p) => p.slug),
+      JSON.parse(run('crystallize.mjs', [`--hypo-dir=${dir}`, '--json']).stdout).unlinked.map(
+        (p) => p.slug,
+      ),
     );
-    assert.ok(unlinkedA.includes('pages/machine-page'), `crystallize must surface machine:devA on devA: ${unlinkedA}`);
+    assert.ok(
+      unlinkedA.includes('pages/machine-page'),
+      `crystallize must surface machine:devA on devA: ${unlinkedA}`,
+    );
     const nowX10 = Date.parse('2026-07-04T00:00:00Z');
     mkdirSync(join(dir, '.cache'), { recursive: true });
     writeFileSync(
@@ -25621,10 +25722,20 @@ test('aggregation surfaces (crystallize candidate + cold) withhold machine:devA 
         JSON.stringify({ ts: new Date(nowX10 - 86400000).toISOString(), slug: 'anchor2' }) +
         '\n',
     );
-    const coldB = aggregateColdCandidates(dir, { now: nowX10, device: 'devB' }).candidates.map((c) => c.slug);
-    assert.ok(!coldB.includes('pages/machine-page'), `cold aggregation must exclude machine:devA on devB: ${coldB}`);
-    const coldA = aggregateColdCandidates(dir, { now: nowX10, device: 'devA' }).candidates.map((c) => c.slug);
-    assert.ok(coldA.includes('pages/machine-page'), `cold aggregation must include machine:devA on devA: ${coldA}`);
+    const coldB = aggregateColdCandidates(dir, { now: nowX10, device: 'devB' }).candidates.map(
+      (c) => c.slug,
+    );
+    assert.ok(
+      !coldB.includes('pages/machine-page'),
+      `cold aggregation must exclude machine:devA on devB: ${coldB}`,
+    );
+    const coldA = aggregateColdCandidates(dir, { now: nowX10, device: 'devA' }).candidates.map(
+      (c) => c.slug,
+    );
+    assert.ok(
+      coldA.includes('pages/machine-page'),
+      `cold aggregation must include machine:devA on devA: ${coldA}`,
+    );
   });
 });
 
@@ -25643,6 +25754,277 @@ test('inline-comment machine:devA # note is honored on its own machine and hidde
       !querySlugsX10(dir, 'devB', 'grault').includes('pages/commented'),
       'inline-comment machine:devA must hide on devB',
     );
+  });
+});
+
+// ── hooks.json shared coverage ───────────────────────────────────────────────
+
+suite('hooks/hooks.json — "shared" covers every intra-hooks import');
+
+test('every relative import of a registered hook resolves to a file upgrade actually copies', () => {
+  // `init.mjs installHooks` readdir-copies every hooks/*.mjs, but `upgrade.mjs
+  // checkHookFiles` only walks HOOK_MAP command targets + hooks.json "shared".
+  // A helper missing from "shared" therefore installs fine on a FRESH vault and
+  // breaks only on `upgrade --apply` for existing users: the refreshed hook lands
+  // without its import and Node dies on module resolution, before any best-effort
+  // guard can run. The list is hand-maintained, so pin it mechanically.
+  const cfg = JSON.parse(readFileSync(join(HOOKS, 'hooks.json'), 'utf-8'));
+  const commandFiles = new Set();
+  for (const groups of Object.values(cfg.hooks)) {
+    for (const group of groups) {
+      const hooks = typeof group === 'string' ? [{ command: group }] : group.hooks;
+      for (const h of hooks) {
+        const m = String(h.command).match(/([\w.-]+\.mjs)/);
+        if (m) commandFiles.add(m[1]);
+      }
+    }
+  }
+  const covered = new Set([...commandFiles, ...cfg.shared]);
+  const missing = [];
+  for (const file of covered) {
+    const src = join(HOOKS, file);
+    if (!existsSync(src)) continue;
+    const text = readFileSync(src, 'utf-8');
+    for (const m of text.matchAll(/from\s+'\.\/([\w.-]+\.mjs)'/g)) {
+      if (!covered.has(m[1])) missing.push(`${file} imports ./${m[1]}`);
+    }
+  }
+  assert.deepEqual(
+    missing,
+    [],
+    `intra-hooks imports not covered by hooks.json (add to "shared"): ${missing.join(', ')}`,
+  );
+});
+
+// ── FEAT-11 base-store (T2) ──────────────────────────────────────────────────
+
+suite('base-store.mjs — per-session observed-base snapshot (FEAT-11 T2)');
+
+function withBaseWiki(fn) {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'p1'), { recursive: true });
+    writeFileSync(join(dir, 'hypo-config.md'), '# config\n');
+    writeFileSync(join(dir, 'hot.md'), '# root hot\n');
+    writeFileSync(join(dir, 'pages', 'open-questions.md'), '# open questions\n');
+    writeFileSync(join(dir, 'projects', 'p1', 'hot.md'), '# p1 hot\n');
+    writeFileSync(join(dir, 'projects', 'p1', 'session-state.md'), '# p1 state\n');
+    fn(dir);
+  });
+}
+
+test('hashContent is stable and hashFile returns null for an absent file', () => {
+  assert.equal(bsHashContent('abc'), bsHashContent('abc'));
+  assert.notEqual(bsHashContent('abc'), bsHashContent('abd'));
+  withBaseWiki((dir) => {
+    assert.equal(bsHashFile(join(dir, 'nope.md')), null, 'absent file must hash to null');
+    assert.equal(bsHashFile(join(dir, 'hot.md')), bsHashContent('# root hot\n'));
+  });
+});
+
+test('overwriteTargets covers the four overwrite pages, and omits project pages with no project', () => {
+  assert.deepEqual(overwriteTargets('p1').sort(), [
+    'hot.md',
+    join('pages', 'open-questions.md'),
+    join('projects', 'p1', 'hot.md'),
+    join('projects', 'p1', 'session-state.md'),
+  ]);
+  assert.deepEqual(overwriteTargets(null), ['hot.md', join('pages', 'open-questions.md')]);
+});
+
+test('snapshotBase records a hash per target and an observed-absent target as null', () => {
+  withBaseWiki((dir) => {
+    rmSync(join(dir, 'pages', 'open-questions.md'));
+    const r = snapshotBase(dir, 's1', overwriteTargets('p1'));
+    assert.equal(r.created, true);
+    const parsed = JSON.parse(readFileSync(bsBasePath(dir, 's1'), 'utf-8'));
+    assert.equal(parsed.session_id, 's1');
+    assert.equal(parsed.targets['hot.md'], bsHashContent('# root hot\n'));
+    assert.equal(
+      parsed.targets[join('pages', 'open-questions.md')],
+      null,
+      'observed-absent target must be recorded as null, not omitted',
+    );
+  });
+});
+
+test('snapshotBase is existence-checked: a second call does not move the base (정합성 요건)', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const before = readBaseEntry(dir, 's1', 'hot.md').hash;
+    // another session (or another machine's pull) rewrites the page
+    writeFileSync(join(dir, 'hot.md'), '# rewritten by someone else\n');
+    const r = snapshotBase(dir, 's1', overwriteTargets('p1'));
+    assert.equal(r.created, false);
+    assert.equal(r.reason, 'already-snapshotted');
+    assert.equal(
+      readBaseEntry(dir, 's1', 'hot.md').hash,
+      before,
+      'resume/compact must NOT re-snapshot: doing so silently clobbers the other writer',
+    );
+  });
+});
+
+test('snapshotBase with no session id is a no-op', () => {
+  withBaseWiki((dir) => {
+    const r = snapshotBase(dir, '', overwriteTargets('p1'));
+    assert.equal(r.created, false);
+    assert.equal(r.reason, 'no-session-id');
+    assert.equal(existsSync(join(dir, '.cache', 'sessions')), false);
+  });
+});
+
+test('readBaseEntry discriminates hash / absent / unknown so consumers cannot collapse them', () => {
+  withBaseWiki((dir) => {
+    rmSync(join(dir, 'pages', 'open-questions.md'));
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    assert.deepEqual(readBaseEntry(dir, 's1', join('pages', 'open-questions.md')), {
+      state: 'absent',
+      hash: null,
+    });
+    assert.equal(readBaseEntry(dir, 's1', join('projects', 'p1', 'hot.md')).state, 'hash');
+    assert.equal(readBaseEntry(dir, 's1', 'projects/other/hot.md').state, 'unknown');
+    assert.equal(readBaseEntry(dir, 'no-such-session', 'hot.md').state, 'unknown');
+    assert.equal(readBaseEntry(dir, '', 'hot.md').state, 'unknown');
+    // the whole point of the discriminator: both non-'hash' states carry
+    // hash === null, so a consumer must never branch on hash truthiness
+    assert.equal(readBaseEntry(dir, 's1', join('pages', 'open-questions.md')).hash, null);
+    assert.equal(readBaseEntry(dir, 's1', 'projects/other/hot.md').hash, null);
+  });
+});
+
+test('readBaseEntry treats a malformed base.json as unknown, not as unchanged', () => {
+  withBaseWiki((dir) => {
+    const p = bsBasePath(dir, 's1');
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, 'not json at all');
+    assert.equal(readBaseEntry(dir, 's1', 'hot.md').state, 'unknown');
+    // a structurally valid file whose entry is not a hash is equally untrusted
+    writeFileSync(p, JSON.stringify({ targets: { 'hot.md': 42, 'log.md': '' } }));
+    assert.equal(readBaseEntry(dir, 's1', 'hot.md').state, 'unknown');
+    assert.equal(readBaseEntry(dir, 's1', 'log.md').state, 'unknown');
+  });
+});
+
+test('advanceBase moves one target and no-ops when the session has no snapshot', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const next = bsHashContent('# written by this session\n');
+    assert.equal(advanceBase(dir, 's1', 'hot.md', next), true);
+    assert.equal(readBaseEntry(dir, 's1', 'hot.md').hash, next);
+    assert.equal(
+      readBaseEntry(dir, 's1', join('projects', 'p1', 'hot.md')).hash,
+      bsHashContent('# p1 hot\n'),
+      'advancing one target must not disturb the others',
+    );
+    assert.equal(advanceBase(dir, 'no-snapshot-session', 'hot.md', next), false);
+  });
+});
+
+// ── FEAT-11 SessionStart base snapshot (T3) ──────────────────────────────────
+
+suite('hypo-session-start.mjs — observed-base snapshot once per session (FEAT-11 T3)');
+
+function withBaseProject(fn) {
+  withBaseWiki((dir) => {
+    const work = mkdtempSync(join(tmpdir(), 'hypo-base-work-'));
+    writeFileSync(
+      join(dir, 'projects', 'p1', 'index.md'),
+      `---\ntitle: p1\ntype: project-index\nupdated: 2026-07-08\nworking_dir: "${work}"\n---\n# P1\n`,
+    );
+    try {
+      fn(dir, work);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+}
+
+test('first SessionStart snapshots all four overwrite targets', () => {
+  withBaseProject((dir, work) => {
+    const r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'ss-1' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const parsed = JSON.parse(readFileSync(bsBasePath(dir, 'ss-1'), 'utf-8'));
+    assert.deepEqual(Object.keys(parsed.targets).sort(), [
+      'hot.md',
+      join('pages', 'open-questions.md'),
+      join('projects', 'p1', 'hot.md'),
+      join('projects', 'p1', 'session-state.md'),
+    ]);
+    assert.equal(parsed.targets[join('projects', 'p1', 'hot.md')], bsHashContent('# p1 hot\n'));
+  });
+});
+
+test('resume (same session_id) after an external write does NOT re-snapshot the base', () => {
+  // The whole gate hinges on this. T1's spike showed SessionStart fires again on
+  // resume AND on compact with the same session_id; re-snapshotting there would
+  // adopt the other writer's content as this session's base, so close would see
+  // no drift and overwrite it. A single-session test passes either way, which is
+  // why this regression exists.
+  withBaseProject((dir, work) => {
+    runHook('hypo-session-start.mjs', { cwd: work, session_id: 'ss-2' }, { HYPO_DIR: dir });
+    const before = readBaseEntry(dir, 'ss-2', 'hot.md').hash;
+    writeFileSync(join(dir, 'hot.md'), '# the OTHER session wrote this\n');
+    const r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'ss-2', source: 'resume' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(
+      readBaseEntry(dir, 'ss-2', 'hot.md').hash,
+      before,
+      'resume must not move the base',
+    );
+    assert.notEqual(
+      readBaseEntry(dir, 'ss-2', 'hot.md').hash,
+      bsHashContent('# the OTHER session wrote this\n'),
+    );
+  });
+});
+
+test('a NEW session_id (what /clear mints) snapshots fresh from disk', () => {
+  withBaseProject((dir, work) => {
+    runHook('hypo-session-start.mjs', { cwd: work, session_id: 'ss-3a' }, { HYPO_DIR: dir });
+    writeFileSync(join(dir, 'hot.md'), '# post-clear disk state\n');
+    runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'ss-3b', source: 'clear' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(
+      readBaseEntry(dir, 'ss-3b', 'hot.md').hash,
+      bsHashContent('# post-clear disk state\n'),
+      'a cleared session restarts its observation from disk',
+    );
+  });
+});
+
+test('SessionStart with no session_id writes no base and still succeeds', () => {
+  withBaseProject((dir, work) => {
+    const r = runHook('hypo-session-start.mjs', { cwd: work }, { HYPO_DIR: dir });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(existsSync(join(dir, '.cache', 'sessions')), false);
+  });
+});
+
+test('SessionStart outside any project still snapshots the two global targets', () => {
+  withBaseProject((dir) => {
+    const outside = mkdtempSync(join(tmpdir(), 'hypo-base-nowhere-'));
+    try {
+      runHook('hypo-session-start.mjs', { cwd: outside, session_id: 'ss-4' }, { HYPO_DIR: dir });
+      const parsed = JSON.parse(readFileSync(bsBasePath(dir, 'ss-4'), 'utf-8'));
+      assert.deepEqual(Object.keys(parsed.targets).sort(), [
+        'hot.md',
+        join('pages', 'open-questions.md'),
+      ]);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });
 

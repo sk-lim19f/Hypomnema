@@ -46,6 +46,7 @@ import {
   siblingAlreadyNotified,
   markSiblingNotified,
 } from './version-check.mjs';
+import { snapshotBase, overwriteTargets } from './base-store.mjs';
 
 // Privacy guard: refuse to read+inject .hypoignore-matched
 // wiki files into additionalContext. Without this, a user who lists
@@ -378,6 +379,18 @@ process.stdin.on('end', () => {
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = sessionMarkerPath(sessionId);
     const hit = findProjectFiles(cwd);
+
+    // Observed-base snapshot for the write=proposal gate. Deliberately AFTER gitPull: the base must
+    // describe the tree this session actually starts from, remote merges
+    // included, or the first close would raise a proposal against content the
+    // session never had a chance to conflict with. Once per session
+    // (existence-check inside snapshotBase), so resume and compact leave it
+    // alone. `data.session_id` is used raw rather than the 'default' fallback
+    // above. A session with no id has no base and closes down the legacy
+    // direct-write path.
+    if (data.session_id) {
+      snapshotBase(HYPO_DIR, data.session_id, overwriteTargets(hit ? hit.proj : null));
+    }
 
     const ignorePatterns = loadHypoIgnore(HYPO_DIR);
 
