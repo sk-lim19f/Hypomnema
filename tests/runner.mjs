@@ -26028,6 +26028,212 @@ test('SessionStart outside any project still snapshots the two global targets', 
   });
 });
 
+// ── FEAT-11 overwrite observed-base guard (T4) ───────────────────────────────
+
+suite('crystallize.mjs — overwrite observed-base guard (FEAT-11 T4)');
+
+const T4_PROJECT = 'test-project';
+const t4ProjectHot = (dir) => join(dir, 'projects', T4_PROJECT, 'hot.md');
+const t4Rel = join('projects', T4_PROJECT, 'hot.md');
+
+/**
+ * An apply payload whose sessionState / rootHot mirror disk (so they hit the
+ * idempotent skip and stay out of the way) and whose projectHot carries
+ * `projectHotContent` — the single target each T4 test exercises.
+ */
+function t4Payload(dir, today, projectHotContent, tag) {
+  return {
+    project: T4_PROJECT,
+    date: today,
+    sessionState: {
+      content: readFileSync(join(dir, 'projects', T4_PROJECT, 'session-state.md'), 'utf-8'),
+    },
+    projectHot: { content: projectHotContent },
+    rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+    sessionLog: { entry: `## [${today}] ${tag}\n` },
+    log: { entry: `## [${today}] session | ${T4_PROJECT} — ${tag}\n` },
+  };
+}
+
+function t4Apply(dir, payload, sessionId) {
+  const payloadPath = join(dir, `.payload-${sessionId || 'none'}.json`);
+  writeFileSync(payloadPath, JSON.stringify(payload));
+  const argv = [`--hypo-dir=${dir}`, '--apply-session-close', `--payload=${payloadPath}`, '--json'];
+  if (sessionId) argv.push(`--session-id=${sessionId}`);
+  const r = run('crystallize.mjs', argv);
+  return { r, out: JSON.parse(r.stdout) };
+}
+
+test('base matches disk → direct write, no conflict, and the base advances', () => {
+  withWiki(null, (dir, today) => {
+    snapshotBase(dir, 's-clean', overwriteTargets(T4_PROJECT));
+    const next = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nthis session wrote this.\n`;
+    const { out } = t4Apply(dir, t4Payload(dir, today, next, 'clean write'), 's-clean');
+
+    assert.deepEqual(out.conflicts, [], `no drift → no conflict: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), next, 'payload bytes must land');
+    assert.equal(
+      readBaseEntry(dir, 's-clean', t4Rel).hash,
+      bsHashContent(next),
+      'a successful direct write becomes the new observed base',
+    );
+  });
+});
+
+test('base snapshotted, then another session writes the page → conflict, target untouched', () => {
+  withWiki(null, (dir, today) => {
+    snapshotBase(dir, 's-conf', overwriteTargets(T4_PROJECT));
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+    const otherSession = `${observed}\nthe OTHER session wrote this.\n`;
+    writeFileSync(t4ProjectHot(dir), otherSession);
+
+    const mine = `${observed}\nMY payload, built from the stale read.\n`;
+    const { r, out } = t4Apply(dir, t4Payload(dir, today, mine, 'conflict'), 's-conf');
+
+    assert.notEqual(r.status, 0, 'a withheld target must fail the close');
+    assert.equal(
+      readFileSync(t4ProjectHot(dir), 'utf-8'),
+      otherSession,
+      "the other session's edit must survive",
+    );
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c, `conflicts must name the target: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.reason, 'base-mismatch');
+    assert.ok(!('proposedContent' in c), 'the reported shape must not echo the whole payload');
+    assert.equal(
+      existsSync(join(dir, '.cache', 'session-closed-s-conf.marker')),
+      false,
+      'a conflicted close must not mark the session closed',
+    );
+  });
+});
+
+test('session-id present but NO snapshot → fail-safe conflict (base-unknown, not "no base = safe")', () => {
+  // Guards the discriminated union. `readBaseEntry` returns hash:null for BOTH
+  // observed-absent and never-observed; a consumer branching on `if (!entry.hash)`
+  // would treat never-observed as safe-to-write and silently defeat the gate.
+  withWiki(null, (dir, today) => {
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+    const mine = `${observed}\nwritten with no base on record.\n`;
+    const { r, out } = t4Apply(dir, t4Payload(dir, today, mine, 'no base'), 's-nobase');
+
+    assert.notEqual(r.status, 0);
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), observed, 'target must stay untouched');
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c, `an unobserved base must fail safe: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.reason, 'base-unknown');
+  });
+});
+
+test('idempotent-first: payload equals disk → no write, no conflict, even with no base', () => {
+  // Pins the guard ORDER. The six existing --apply-session-close --session-id tests
+  // read their payload straight off disk and carry no base, so they only stay green
+  // while the idempotent skip runs BEFORE the base check. It also breaks the
+  // apply-then-reclose loop: after a human applies a proposal, disk == payload.
+  withWiki(null, (dir, today) => {
+    const onDisk = readFileSync(t4ProjectHot(dir), 'utf-8');
+    const { out } = t4Apply(dir, t4Payload(dir, today, onDisk, 'idempotent'), 's-idem');
+
+    assert.deepEqual(out.conflicts, [], 'identical bytes are not a conflict');
+    assert.ok(
+      out.skipped.some((s) => s.includes('projectHot')),
+      `projectHot must be skipped as already-current: ${JSON.stringify(out.skipped)}`,
+    );
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), onDisk);
+  });
+});
+
+test('same session closing twice does not raise a false-positive against its own first write', () => {
+  // The ONLY test that fails when advanceBase is removed. A single apply passes
+  // either way, which is exactly why this exists:
+  // [[pages/learnings/mutation-check-invariants-a-passing-suite-cannot-see]]
+  withWiki(null, (dir, today) => {
+    snapshotBase(dir, 's-twice', overwriteTargets(T4_PROJECT));
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+
+    const first = `${observed}\nfirst close.\n`;
+    const a = t4Apply(dir, t4Payload(dir, today, first, 'first close'), 's-twice');
+    assert.deepEqual(a.out.conflicts, [], 'first close writes cleanly');
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), first);
+
+    const second = `${observed}\nsecond close, same session.\n`;
+    const b = t4Apply(dir, t4Payload(dir, today, second, 'second close'), 's-twice');
+    assert.deepEqual(
+      b.out.conflicts,
+      [],
+      'without advanceBase the session diffs against its own stale base and self-conflicts',
+    );
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), second);
+  });
+});
+
+test('no --session-id → legacy direct write, outside the guard lifecycle', () => {
+  // Plan risk #70: a caller that never had a session could not have observed a
+  // base, so there is nothing to keep honest. Manual/legacy apply keeps writing.
+  withWiki(null, (dir, today) => {
+    snapshotBase(dir, 's-unused', overwriteTargets(T4_PROJECT));
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+    writeFileSync(t4ProjectHot(dir), `${observed}\nsomeone else.\n`);
+
+    const mine = `${observed}\nlegacy manual apply.\n`;
+    const { out } = t4Apply(dir, t4Payload(dir, today, mine, 'legacy'), null);
+
+    assert.deepEqual(out.conflicts, [], 'no session id → no guard');
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), mine, 'legacy path writes directly');
+  });
+});
+
+test('a conflicted close registers no pending tags — no silent SCHEMA.md side effect', () => {
+  // codex W2 CONCERN: a withheld close skips commitWikiChanges (ok:false), so any
+  // SCHEMA.md write it made would sit mutated, uncommitted, and unlisted in
+  // `applied`. The control arm proves the fixture really does drive a registration,
+  // so this cannot pass by simply never registering.
+  const seedUnknownTag = (dir, today) => {
+    writeFileSync(
+      join(dir, 'SCHEMA.md'),
+      `---\ntitle: Wiki Schema\ntype: schema\nupdated: ${today}\nversion: 2.1\n---\n\n` +
+        '## 3. Tag Taxonomy\n\n### Domain — Test\n`concept`\n\n### Forbidden Patterns\n',
+    );
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(
+      join(dir, 'pages', 'x.md'),
+      `---\ntitle: X\ntype: concept\ntags: [zzz-unregistered-tag]\nupdated: ${today}\n---\n\n# X\n`,
+    );
+  };
+
+  // control: a clean close DOES register the tag
+  withWiki(seedUnknownTag, (dir, today) => {
+    snapshotBase(dir, 's-tag-ok', overwriteTargets(T4_PROJECT));
+    const next = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nclean.\n`;
+    t4Apply(dir, t4Payload(dir, today, next, 'tag control'), 's-tag-ok');
+    assert.ok(
+      readFileSync(join(dir, 'SCHEMA.md'), 'utf-8').includes('zzz-unregistered-tag'),
+      'control arm must actually register, else the assertion below is vacuous',
+    );
+  });
+
+  // conflicted close: registers nothing
+  withWiki(seedUnknownTag, (dir, today) => {
+    snapshotBase(dir, 's-tag-conf', overwriteTargets(T4_PROJECT));
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+    writeFileSync(t4ProjectHot(dir), `${observed}\nthe OTHER session.\n`);
+    const schemaBefore = readFileSync(join(dir, 'SCHEMA.md'), 'utf-8');
+
+    const { out } = t4Apply(
+      dir,
+      t4Payload(dir, today, `${observed}\nmine.\n`, 'tag'),
+      's-tag-conf',
+    );
+
+    assert.equal(out.conflicts.length, 1, 'fixture must actually conflict');
+    assert.equal(
+      readFileSync(join(dir, 'SCHEMA.md'), 'utf-8'),
+      schemaBefore,
+      'a withheld close must not mutate SCHEMA.md behind the caller’s back',
+    );
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);
