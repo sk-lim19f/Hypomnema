@@ -479,6 +479,10 @@ const GITIGNORE_REQUIRED_ENTRIES = [
     pattern: '.cache/',
     comment: '# Hypomnema runtime cache (page-usage log, session growth metrics)',
   },
+  {
+    pattern: '*.lock',
+    comment: '# Append-lock files (transient <target>.lock; a crashed holder can leave a stale one)',
+  },
 ];
 
 function checkGitignore(hypoDir) {

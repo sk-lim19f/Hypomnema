@@ -3,3 +3,8 @@
 
 # Runtime cache: sync-state.json contains hostname() and timestamps
 .cache/
+
+# Append-lock files: transient <target>.lock guards around session-log / log.md
+# writes (crystallize apply, deriveRootLogEntries). Normally deleted immediately;
+# a crashed holder can leave a stale one, which must never be committed.
+*.lock

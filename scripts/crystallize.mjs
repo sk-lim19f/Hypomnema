@@ -104,6 +104,7 @@ import {
   currentDevice,
   scopeVisible,
   readVisibilityScope,
+  withFileLock,
 } from '../hooks/hypo-shared.mjs';
 import { hashContent, readBaseEntry, advanceBase } from '../hooks/base-store.mjs';
 
@@ -413,6 +414,12 @@ function readPayload(source) {
     throw new Error(`payload is not valid JSON: ${e.message}`);
   }
 }
+
+// How long an append waits for its per-target lock before withholding to the
+// proposal gate (see withFileLock). Default 5s is generous for a real close;
+// the env override exists ONLY so tests can force a fast timeout instead of
+// spinning the full 5s. Not a documented production knob.
+const APPEND_LOCK_TIMEOUT_MS = Number(process.env.HYPO_APPEND_LOCK_TIMEOUT_MS) || 5000;
 
 /** Atomic write via tmp+rename. `<path>.<pid>.<rand>.tmp` so concurrent helpers
  * don't fight over the same shared `<path>.tmp` slot. */
@@ -1069,59 +1076,83 @@ function applySessionClose(args) {
     const rel = join('projects', project, 'session-log', `${date}.md`);
     const full = join(args.hypoDir, rel);
     const isPresent = entryAlreadyPresent(payload.sessionLog.entry);
-    // Fallback-aware idempotency (hybrid cutover): during the month the
-    // shard takes over, today's entry may already live in the legacy monthly
-    // file from an earlier (pre-cutover) close. Treat presence in EITHER the
-    // daily shard or the legacy monthly file as "already written" so a same-day
-    // second close does not duplicate an identical entry across both files —
-    // and so an idempotent re-apply stays a true no-op (no shard is created).
-    let alreadyThere = false;
-    for (const cand of sessionLogReadCandidates(project, date)) {
-      const cf = join(args.hypoDir, cand);
-      if (!existsSync(cf)) continue;
-      try {
-        if (isPresent(readFileSync(cf, 'utf-8'))) {
-          alreadyThere = true;
-          break;
+    // Serialize dedup + create/append on the daily shard so two concurrent
+    // closes never lose an entry: the second closer takes the lock only after
+    // the first committed, re-reads the shard under the lock, and appends onto
+    // the committed bytes (temp+rename write-isolation is preserved — a partial
+    // write never tears the target). Create and append share ONE lock, so the
+    // "seed a new shard" and "append to an existing shard" branches can't race
+    // each other — only one closer is ever in the create path (closes the
+    // wx-window a bare exclusive-create would leave open).
+    try {
+      const outcome = withFileLock(full, () => {
+        // Fallback-aware idempotency (hybrid cutover): during the month the
+        // shard takes over, today's entry may already live in the legacy monthly
+        // file from an earlier (pre-cutover) close. Treat presence in EITHER the
+        // daily shard or the legacy monthly file as "already written" so a same-day
+        // second close does not duplicate an identical entry across both files —
+        // and so an idempotent re-apply stays a true no-op (no shard is created).
+        for (const cand of sessionLogReadCandidates(project, date)) {
+          const cf = join(args.hypoDir, cand);
+          if (!existsSync(cf)) continue;
+          try {
+            if (isPresent(readFileSync(cf, 'utf-8'))) return 'skipped';
+          } catch {
+            /* unreadable candidate — fall through to the write path */
+          }
         }
-      } catch {
-        /* unreadable candidate — fall through to the write path */
-      }
-    }
-    if (alreadyThere) {
-      skipped.push(`sessionLog (${rel})`);
-    } else if (!existsSync(full)) {
-      // A daily shard is a new file most days. Seed minimal valid frontmatter
-      // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
-      // wiki page rather than a W1 "no frontmatter" warning, and write the header
-      // AND the first entry in ONE atomic write — never leave a header-only shard
-      // on disk, which freshness would skip (no dated heading) while derive could
-      // otherwise mistake it for the evidence file. The dated `## [date] ...`
-      // heading lives inside the entry, so freshness / derive / design-history
-      // are unchanged.
-      // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
-      // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
-      // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
-      // machine that first seeds the daily shard is recorded; later same-day
-      // appends do not touch it. The per-session-accurate store is the LOCAL
-      // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
-      // `session_id` is honest naming: the value is the Claude session UUID, and
-      // it is present only on the Stop-chain close path that passes --session-id.
-      const device = currentDevice();
-      const auditFm =
-        (args.sessionId ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n` : '') +
-        `device: ${device}\n`;
-      const header =
-        `---\ntitle: Session Log ${date} (${project})\n` +
-        `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
-        `# Session Log ${date} (${project})\n`;
-      const entry = payload.sessionLog.entry;
-      const body = entry.endsWith('\n') ? entry : `${entry}\n`;
-      atomicWrite(full, `${header}\n${body}`);
-      applied.push(`sessionLog (${rel})`);
-    } else {
-      const wrote = appendIfAbsent(full, payload.sessionLog.entry, isPresent);
-      (wrote ? applied : skipped).push(`sessionLog (${rel})`);
+        if (!existsSync(full)) {
+          // A daily shard is a new file most days. Seed minimal valid frontmatter
+          // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
+          // wiki page rather than a W1 "no frontmatter" warning, and write the header
+          // AND the first entry in ONE atomic write — never leave a header-only shard
+          // on disk, which freshness would skip (no dated heading) while derive could
+          // otherwise mistake it for the evidence file. The dated `## [date] ...`
+          // heading lives inside the entry, so freshness / derive / design-history
+          // are unchanged.
+          // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
+          // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
+          // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
+          // machine that first seeds the daily shard is recorded; later same-day
+          // appends do not touch it. The per-session-accurate store is the LOCAL
+          // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
+          // `session_id` is honest naming: the value is the Claude session UUID, and
+          // it is present only on the Stop-chain close path that passes --session-id.
+          const device = currentDevice();
+          const auditFm =
+            (args.sessionId ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n` : '') +
+            `device: ${device}\n`;
+          const header =
+            `---\ntitle: Session Log ${date} (${project})\n` +
+            `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
+            `# Session Log ${date} (${project})\n`;
+          const entry = payload.sessionLog.entry;
+          const body = entry.endsWith('\n') ? entry : `${entry}\n`;
+          atomicWrite(full, `${header}\n${body}`);
+          return 'created';
+        }
+        return appendIfAbsent(full, payload.sessionLog.entry, isPresent) ? 'appended' : 'skipped';
+      }, { timeoutMs: APPEND_LOCK_TIMEOUT_MS });
+      (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
+    } catch (err) {
+      // Only a lock-TIMEOUT is withheld as a conflict. A real fn() write error
+      // (disk-full, EACCES, mkdir failure) must NOT be masked as a proposal-
+      // pending timeout — rethrow so it hard-fails like the overwrite path does.
+      if (err?.code !== 'ELOCKTIMEOUT') throw err;
+      // Lock-timeout: withhold rather than lose the entry. Recorded as a conflict
+      // so the close goes proposal-pending (ok:false, no marker) and the next
+      // close re-applies. `kind: 'append'` marks it for T6's append-proposal
+      // handling — proposedContent is the entry to append, not a whole-file
+      // replacement.
+      conflicts.push({
+        key: 'sessionLog',
+        target: rel,
+        reason: 'append-lock-timeout',
+        kind: 'append',
+        baseHash: null,
+        currentHash: null,
+        proposedContent: payload.sessionLog.entry,
+      });
     }
   }
 
@@ -1139,29 +1170,68 @@ function applySessionClose(args) {
   // append onto a deliberately custom payload.log (codex pre-commit review). The
   // two payload paths are mutually exclusive: deriving on top of a present-but-
   // malformed payload.log would mask it and weaken the verifier's fail-loud.
+  // log.md is shared across projects and also written by deriveRootLogEntries
+  // (the Stop-hook backfill in hypo-shared.mjs). Both take the SAME lock on
+  // log.md, so a concurrent close's append and this close's append serialize
+  // instead of overwriting each other.
+  const logFull = join(args.hypoDir, 'log.md');
   if (payload.log) {
-    const wrote = appendIfAbsent(
-      join(args.hypoDir, 'log.md'),
-      payload.log.entry,
-      entryAlreadyPresent(payload.log.entry),
-    );
-    (wrote ? applied : skipped).push('log (log.md)');
+    try {
+      const wrote = withFileLock(
+        logFull,
+        () => appendIfAbsent(logFull, payload.log.entry, entryAlreadyPresent(payload.log.entry)),
+        { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
+      );
+      (wrote ? applied : skipped).push('log (log.md)');
+    } catch (err) {
+      if (err?.code !== 'ELOCKTIMEOUT') throw err;
+      // proposedContent is append-ready root-log bytes (the custom log line).
+      conflicts.push({
+        key: 'log',
+        target: 'log.md',
+        reason: 'append-lock-timeout',
+        kind: 'append',
+        baseHash: null,
+        currentHash: null,
+        proposedContent: payload.log.entry,
+      });
+    }
   } else {
     // matchAll (not exec) mirrors deriveRootLogEntries: a payload that carried
     // more than one dated heading derives one canonical line each, symmetric with
     // the global path. Exact-line dedup on the heading keeps a second apply (or a
     // titleless vs titled same-day pair) from duplicating.
-    const logFull = join(args.hypoDir, 'log.md');
     const headingRe = new RegExp(`^#{1,6} \\[${date}\\]\\s*(.*)$`, 'gm');
-    let wroteAny = false;
-    for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
-      const { heading, block } = rootLogEntry(project, date, m[1]);
-      const wrote = appendIfAbsent(logFull, block, (c) =>
-        (c || '').split(/\r?\n/).includes(heading),
-      );
-      wroteAny = wroteAny || wrote;
+    try {
+      const wroteAny = withFileLock(logFull, () => {
+        let w = false;
+        for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
+          const { heading, block } = rootLogEntry(project, date, m[1]);
+          const wrote = appendIfAbsent(logFull, block, (c) =>
+            (c || '').split(/\r?\n/).includes(heading),
+          );
+          w = w || wrote;
+        }
+        return w;
+      }, { timeoutMs: APPEND_LOCK_TIMEOUT_MS });
+      (wroteAny ? applied : skipped).push('log (log.md, derived)');
+    } catch (err) {
+      if (err?.code !== 'ELOCKTIMEOUT') throw err;
+      // `derived: true` discriminates this from the payload.log conflict above:
+      // here proposedContent is the session-log entry to RE-DERIVE root-log lines
+      // from (via rootLogEntry over its dated headings), NOT append-ready bytes.
+      // T6 must branch on this to know how to turn proposedContent into log.md.
+      conflicts.push({
+        key: 'log',
+        target: 'log.md',
+        reason: 'append-lock-timeout',
+        kind: 'append',
+        derived: true,
+        baseHash: null,
+        currentHash: null,
+        proposedContent: payload.sessionLog.entry,
+      });
     }
-    (wroteAny ? applied : skipped).push('log (log.md, derived)');
   }
 
   // Same-date-tie fix: verify against the SAME project this apply just wrote
@@ -1361,9 +1431,10 @@ function applySessionClose(args) {
     date,
     applied,
     skipped,
-    // Targets withheld because the page drifted from this session's observed base.
+    // Targets withheld: an overwrite drifted from this session's observed base, or
+    // an append could not take the file lock in time (`kind: 'append'`).
     // `proposedContent` is dropped from the reported shape (it is the whole payload
-    // field, and T6 parks it in the proposal artifact instead).
+    // field / the entry to append, and T6 parks it in the proposal artifact instead).
     conflicts: conflicts.map(({ proposedContent: _drop, ...rest }) => rest),
     verification,
     // Surface the marker outcome instead of skipping silently, so the
@@ -1391,11 +1462,15 @@ function applySessionClose(args) {
     for (const a of applied) console.log(`  ✓ wrote ${a}`);
     for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
     // Never let a withheld target read as a skip: `skipped` means "already current",
-    // this means "your bytes are NOT on disk and someone else's are".
+    // this means "your bytes are NOT on disk". Overwrite conflicts drifted from base;
+    // an append conflict is a lock-timeout (someone else held the file's lock), which
+    // is transient — the next close re-applies.
     for (const c of conflicts) {
-      console.log(
-        `  ⚠ WITHHELD ${c.key} (${c.target}) — ${c.reason}; the page changed since this session read it`,
-      );
+      const why =
+        c.kind === 'append'
+          ? 'could not acquire the append lock in time; the next close re-applies'
+          : 'the page changed since this session read it';
+      console.log(`  ⚠ WITHHELD ${c.key} (${c.target}) — ${c.reason}; ${why}`);
     }
     if (ok) {
       // When the marker was withheld, qualify the success line so a reader scanning
