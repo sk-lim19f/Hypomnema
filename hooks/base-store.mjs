@@ -194,6 +194,63 @@ export function advanceBase(hypoDir, sessionId, relPath, hash) {
 }
 
 /**
+ * Advance a target's base to its current on-disk bytes after the session edited
+ * it DIRECTLY (Write/Edit tool), not through crystallize. Invariant 2 covers
+ * crystallize's own overwrites; this covers the other way a session legitimately
+ * changes a guarded target.
+ *
+ * Without it, a direct edit looks — at close time — exactly like a DIFFERENT
+ * session having written the page: base != disk, so the guard fails safe into a
+ * false proposal against the session's own work. `open-questions.md` is the most
+ * exposed target, because `/hypo:crystallize` tells the model to fold same-session
+ * edits into the close payload. A PostToolUse hook calls this after each wiki
+ * write to give the session's own edits provenance.
+ *
+ * Scoped by tracked-ness, NOT by a target list: `relPath` advances only when the
+ * session already has a base entry for it (one of the four overwrite targets
+ * snapshotted at start, for the active project). A write to any other wiki file
+ * is a no-op, so this never mints a new base key and cannot widen the guard's
+ * surface. The file is hashed only once the target is confirmed tracked, so an
+ * unrelated write costs one small base.json read and no content hash.
+ *
+ * An absent or unreadable post-write file leaves the base untouched (returns
+ * false) rather than advancing it to null: a target that vanished is a real
+ * divergence the close should still fail safe on, not a provenance claim.
+ *
+ * `knownHash`: when the caller already has the exact bytes the tool wrote (the
+ * Write tool carries its full `content`), pass their hash. The base then advances
+ * to what the SESSION wrote, not to a fresh disk read — race-safe: if another
+ * session overwrote the target in the window between the tool and this call,
+ * base = my-bytes ≠ disk, so the close still sees drift and preserves the other
+ * write. Callers without the full bytes (Edit/MultiEdit) pass null and take a
+ * post-write disk read, which carries a narrow tool→hook race (documented
+ * residual in the spec's 보증 범위).
+ *
+ * This does not weaken the base contract's "no read-just-before-write as base"
+ * rule (spec line 40): only the session's OWN writes advance, so a concurrent
+ * writer's change to the same target is still observed as drift.
+ *
+ * @returns {boolean} true when the base file was updated
+ */
+export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownHash = null) {
+  if (!sessionId) return false;
+  const parsed = readBaseFile(hypoDir, sessionId);
+  if (!parsed) return false;
+  // Only a tracked target advances. hasOwnProperty, not truthiness: an
+  // observed-absent entry is `null` but still a legitimate key to advance from.
+  if (!Object.prototype.hasOwnProperty.call(parsed.targets, relPath)) return false;
+  const hash = typeof knownHash === 'string' ? knownHash : hashFile(absPath);
+  if (typeof hash !== 'string') return false; // absent/unreadable → leave base as-is
+  parsed.targets[relPath] = hash;
+  try {
+    atomicWrite(basePath(hypoDir, sessionId), JSON.stringify(parsed, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The four overwrite targets crystallize replaces wholesale. `project` may be
  * null when cwd resolves to no project; the two project-scoped paths are then
  * omitted and close falls back to proposal for them.
