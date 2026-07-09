@@ -3509,6 +3509,62 @@ test('append lock-timeout → proposal-pending, shard byte-untouched (FEAT-11 T5
   });
 });
 
+// appendIfAbsent data-loss fix: a PERSISTENT read error (EACCES/EISDIR/...) on an
+// append target that already has content must hard-fail the close, not silently
+// fall back to content='' and let atomicWrite's rename replace the file with just
+// the new entry. Unlike the lock-timeout case above (transient — the next close
+// retries), a persistent read error never resolves on retry, so this must throw
+// past the ELOCKTIMEOUT-only catch and crash the close instead of masking data
+// loss as success. root ignores the file's own permission bits (can still read
+// with mode 0), so this repro is skipped there — same rationale as the
+// withFileLock un-removable-stale-lock test above.
+test('append read failure (EACCES) hard-fails the close, log.md bytes preserved (FEAT-11 T5)', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const logPath = join(dir, 'log.md');
+    const before = readFileSync(logPath, 'utf-8');
+    chmodSync(logPath, 0o000); // unreadable, but the parent dir stays writable
+    let r;
+    try {
+      r = runApply(dir, payload, { sessionId: 's-unreadable-log' });
+    } finally {
+      chmodSync(logPath, 0o644); // restore so cleanup (rmSync) can remove the tree
+    }
+    assert.notEqual(
+      r.status,
+      0,
+      `an unreadable log.md must hard-fail, not exit 0: ${r.stdout}\n${r.stderr}`,
+    );
+    const after = readFileSync(logPath, 'utf-8');
+    assert.equal(
+      after,
+      before,
+      'log.md must be byte-untouched — a swallowed read error must not let atomicWrite replace it with just the new entry',
+    );
+  });
+});
+
+// Sibling regression pin for the ENOENT branch of the same catch: a target that
+// simply does not exist yet (the common case, not the read-failure case above)
+// must still be created normally — the fix must not turn "no file yet" into a
+// hard-fail.
+test('append target absent (no prior log.md) → close still creates it (ENOENT stays tolerated)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    rmSync(join(dir, 'log.md'));
+    const r = runApply(dir, payload, { sessionId: 's-absent-log' });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `expected ok:true: ${r.stdout}`);
+    assert.ok(existsSync(join(dir, 'log.md')), 'log.md must be created fresh when absent');
+    assert.ok(
+      readFileSync(join(dir, 'log.md'), 'utf-8').includes(payload.log.entry.trim()),
+      'the freshly created log.md must carry the new entry',
+    );
+  });
+});
+
 test('clean-wiki payload → ok:true, new entries appended (apply dedup is exact-entry, not date-based)', () => {
   withWiki(null, (dir, today) => {
     // payloadForCleanWiki uses NEW entry text ("re-applied"), not the fixture's

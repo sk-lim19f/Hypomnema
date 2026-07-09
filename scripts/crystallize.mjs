@@ -488,8 +488,16 @@ function appendIfAbsent(path, entry, alreadyPresent) {
   if (existsSync(path)) {
     try {
       content = readFileSync(path, 'utf-8');
-    } catch {
-      content = '';
+    } catch (err) {
+      // ENOENT here is a narrow existsSync-then-readFileSync race (the file
+      // vanished between the two calls) — content='' is safe, we would create
+      // it fresh anyway. Anything else (EACCES/EISDIR/...) is a PERSISTENT
+      // read failure: retrying (the caller's lock-timeout conflict path) would
+      // never fix it, and swallowing it here would fall through to the
+      // atomicWrite below and silently replace the existing file's bytes with
+      // just this one entry — a data-loss overwrite. So rethrow and let the
+      // withFileLock/call-site catch hard-fail the close instead.
+      if (err?.code !== 'ENOENT') throw err;
     }
   }
   if (alreadyPresent(content)) return false;
