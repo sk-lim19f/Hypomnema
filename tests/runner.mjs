@@ -52,6 +52,7 @@ import {
   snapshotBase,
   readBaseEntry,
   advanceBase,
+  advanceBaseForWrite,
   overwriteTargets,
 } from '../hooks/base-store.mjs';
 import {
@@ -25921,6 +25922,102 @@ test('advanceBase moves one target and no-ops when the session has no snapshot',
   });
 });
 
+test('advanceBaseForWrite advances a tracked target to its current on-disk bytes', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const oq = join(dir, 'pages', 'open-questions.md');
+    writeFileSync(oq, '# open questions\n\n## edited directly by this session\n');
+    assert.equal(
+      advanceBaseForWrite(dir, 's1', join('pages', 'open-questions.md'), oq),
+      true,
+    );
+    assert.equal(
+      readBaseEntry(dir, 's1', join('pages', 'open-questions.md')).hash,
+      bsHashFile(oq),
+      "the session's own direct edit becomes the new observed base",
+    );
+    assert.equal(
+      readBaseEntry(dir, 's1', 'hot.md').hash,
+      bsHashContent('# root hot\n'),
+      'advancing one target must not disturb the others',
+    );
+  });
+});
+
+test('advanceBaseForWrite no-ops for an untracked path — it never mints a new base key', () => {
+  // The scoping guard. A write to any wiki file that is NOT one of the four
+  // snapshotted targets must leave the base map exactly as it was, so this can
+  // never widen the guard's surface. Mutation target: dropping the hasOwnProperty
+  // check makes this fail.
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const before = readFileSync(bsBasePath(dir, 's1'), 'utf-8');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const other = join(dir, 'pages', 'some-note.md');
+    writeFileSync(other, '# an unrelated page\n');
+    assert.equal(advanceBaseForWrite(dir, 's1', join('pages', 'some-note.md'), other), false);
+    assert.equal(
+      readFileSync(bsBasePath(dir, 's1'), 'utf-8'),
+      before,
+      'an untracked write must not touch base.json at all',
+    );
+  });
+});
+
+test('advanceBaseForWrite no-ops with no session, no snapshot, or a vanished target', () => {
+  withBaseWiki((dir) => {
+    const oq = join(dir, 'pages', 'open-questions.md');
+    // no session id → outside the guard lifecycle
+    assert.equal(advanceBaseForWrite(dir, '', join('pages', 'open-questions.md'), oq), false);
+    // session with no snapshot on record
+    assert.equal(
+      advanceBaseForWrite(dir, 'no-snap', join('pages', 'open-questions.md'), oq),
+      false,
+    );
+
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const before = readBaseEntry(dir, 's1', join('pages', 'open-questions.md')).hash;
+    rmSync(oq);
+    // a tracked target that is absent post-write must NOT advance the base to
+    // null — a vanished file is a real divergence the close should still see
+    assert.equal(
+      advanceBaseForWrite(dir, 's1', join('pages', 'open-questions.md'), oq),
+      false,
+    );
+    assert.equal(
+      readBaseEntry(dir, 's1', join('pages', 'open-questions.md')).hash,
+      before,
+      'an absent post-write file must leave the base untouched, not advance to null',
+    );
+  });
+});
+
+test('advanceBaseForWrite with a knownHash advances to it, ignoring on-disk bytes', () => {
+  // The Write race-safe path: the caller supplies the hash of the exact bytes the
+  // tool wrote, so the base tracks those even if disk already drifted.
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const oq = join(dir, 'pages', 'open-questions.md');
+    writeFileSync(oq, '# a concurrent write already on disk\n');
+    const intended = bsHashContent('# what my Write actually wrote\n');
+    assert.equal(
+      advanceBaseForWrite(dir, 's1', join('pages', 'open-questions.md'), oq, intended),
+      true,
+    );
+    assert.equal(
+      readBaseEntry(dir, 's1', join('pages', 'open-questions.md')).hash,
+      intended,
+      'knownHash wins over the on-disk hash',
+    );
+    // untracked scoping still applies even with a knownHash
+    assert.equal(
+      advanceBaseForWrite(dir, 's1', join('pages', 'nope.md'), oq, intended),
+      false,
+      'a knownHash must not let an untracked path mint a base key',
+    );
+  });
+});
+
 // ── FEAT-11 SessionStart base snapshot (T3) ──────────────────────────────────
 
 suite('hypo-session-start.mjs — observed-base snapshot once per session (FEAT-11 T3)');
@@ -26230,6 +26327,164 @@ test('a conflicted close registers no pending tags — no silent SCHEMA.md side 
       readFileSync(join(dir, 'SCHEMA.md'), 'utf-8'),
       schemaBefore,
       'a withheld close must not mutate SCHEMA.md behind the caller’s back',
+    );
+  });
+});
+
+// ── FEAT-11 self-edit provenance seam (PostToolUse → crystallize) ────────────
+//
+// The self-conflict a session hits when it edits an overwrite target DIRECTLY
+// (Write/Edit tool) and then closes. SessionStart snapshots the base; the direct
+// edit moves disk away from it; without provenance the close guard reads the
+// session's own edit as another writer's and fails safe into a false proposal.
+//
+// This crosses the REAL process seam the unit tests skip: the actual
+// hypo-auto-stage PostToolUse hook, invoked as a subprocess, is what must read
+// `session_id` + `tool_input.file_path` from the payload and advance the base.
+// The control arm (no hook run) reproduces the bug first, so the fix arm cannot
+// pass for an unrelated reason.
+// [[pages/learnings/mutation-check-invariants-a-passing-suite-cannot-see]]
+
+suite('crystallize.mjs — self-edit provenance via PostToolUse hook (FEAT-11)');
+
+// Run the real auto-stage hook the way Claude Code does: a subprocess fed a
+// PostToolUse payload on stdin, with HYPO_DIR pinned to the test vault. toolName
+// and content mirror what the real Write/Edit/Read payloads carry.
+function runAutoStageHook(dir, sessionId, filePath, toolName = 'Edit', content = null) {
+  const tool_input = { file_path: filePath };
+  if (content !== null) tool_input.content = content;
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+    input: JSON.stringify({ session_id: sessionId, tool_name: toolName, tool_input }),
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: dir },
+  });
+}
+
+test('session directly edits a target, the hook advances its base, close writes cleanly', () => {
+  withWiki(null, (dir, today) => {
+    snapshotBase(dir, 's-selfedit', overwriteTargets(T4_PROJECT));
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+
+    // the session edits the target itself, mid-session, with the Edit tool
+    const edited = `${observed}\ndirectly edited by this session.\n`;
+    writeFileSync(t4ProjectHot(dir), edited);
+    const hook = runAutoStageHook(dir, 's-selfedit', t4ProjectHot(dir), 'Edit');
+    assert.equal(hook.status, 0, `hook must not fail: ${hook.stderr}`);
+    assert.equal(
+      readBaseEntry(dir, 's-selfedit', t4Rel).hash,
+      bsHashContent(edited),
+      'the PostToolUse hook must advance the base to the bytes the session just wrote',
+    );
+
+    // close folds a further line onto that edit, so the payload differs from disk
+    // and the guard is actually consulted (not short-circuited by idempotent skip)
+    const closed = `${edited}\nand the close adds this.\n`;
+    const { r, out } = t4Apply(dir, t4Payload(dir, today, closed, 'self-edit close'), 's-selfedit');
+
+    assert.equal(r.status, 0, `a provenance-backed close must succeed: ${JSON.stringify(out.conflicts)}`);
+    assert.deepEqual(out.conflicts, [], 'the session must not conflict against its own edit');
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), closed, 'the close payload must land');
+  });
+});
+
+test('control: WITHOUT the hook the very same flow self-conflicts (bug reproduced)', () => {
+  // Proves the hook subprocess is what prevents the conflict. Identical to the
+  // test above except the auto-stage step is omitted, so the base never advances.
+  withWiki(null, (dir, today) => {
+    snapshotBase(dir, 's-noprov', overwriteTargets(T4_PROJECT));
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+
+    const edited = `${observed}\ndirectly edited by this session.\n`;
+    writeFileSync(t4ProjectHot(dir), edited); // no hook → base stays at the pre-edit bytes
+
+    const closed = `${edited}\nand the close adds this.\n`;
+    const { r, out } = t4Apply(dir, t4Payload(dir, today, closed, 'no-prov close'), 's-noprov');
+
+    assert.notEqual(r.status, 0, 'without provenance the close must fail safe');
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c, `the self-edit must be misread as drift: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.reason, 'base-mismatch');
+    assert.equal(
+      readFileSync(t4ProjectHot(dir), 'utf-8'),
+      edited,
+      'a withheld close leaves the target at the session-edited bytes',
+    );
+  });
+});
+
+test('the hook does not advance the base for a write to a non-target wiki page', () => {
+  // Scoping across the real process boundary: a Write/Edit to an ordinary wiki
+  // page must not touch base.json, so the hook cannot widen the guard's surface.
+  withWiki(null, (dir) => {
+    snapshotBase(dir, 's-scope', overwriteTargets(T4_PROJECT));
+    const before = readFileSync(bsBasePath(dir, 's-scope'), 'utf-8');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const note = join(dir, 'pages', 'a-random-note.md');
+    writeFileSync(note, '# just a note\n');
+    const hook = runAutoStageHook(dir, 's-scope', note, 'Edit');
+    assert.equal(hook.status, 0, `hook must not fail: ${hook.stderr}`);
+    assert.equal(
+      readFileSync(bsBasePath(dir, 's-scope'), 'utf-8'),
+      before,
+      'a write to a non-target page must leave base.json byte-for-byte unchanged',
+    );
+  });
+});
+
+test('a NON-write tool (Read) on a drifted target must NOT advance the base', () => {
+  // The guard-defeating path codex found: the hook has no matcher, so it fires on
+  // every tool — including Read, whose tool_input also carries file_path. If Read
+  // advanced the base, merely LOOKING at a page another session wrote would adopt
+  // that other session's bytes as ours, and the close would clobber it with no
+  // conflict. Only Write/Edit/MultiEdit may advance.
+  withWiki(null, (dir, today) => {
+    snapshotBase(dir, 's-read', overwriteTargets(T4_PROJECT));
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+    const otherSession = `${observed}\nthe OTHER session wrote this.\n`;
+    writeFileSync(t4ProjectHot(dir), otherSession); // B's write drifts disk from base
+
+    // this session merely READS the drifted target
+    const hook = runAutoStageHook(dir, 's-read', t4ProjectHot(dir), 'Read');
+    assert.equal(hook.status, 0, `hook must not fail: ${hook.stderr}`);
+    assert.equal(
+      readBaseEntry(dir, 's-read', t4Rel).hash,
+      bsHashContent(observed),
+      'Read must leave the base at the pre-drift bytes — it is not a write',
+    );
+
+    // and the close must therefore still fail safe against B's write
+    const mine = `${observed}\nmy stale payload.\n`;
+    const { r, out } = t4Apply(dir, t4Payload(dir, today, mine, 'read-then-close'), 's-read');
+    assert.notEqual(r.status, 0, 'a Read must not have licensed a clobber of B');
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c && c.reason === 'base-mismatch', `B's write must still be protected: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), otherSession, "B's write survives");
+  });
+});
+
+test('a Write advances the base to the bytes it wrote, not a racy disk re-read', () => {
+  // Race-safety: the Write tool carries its full content, so the hook advances to
+  // THAT, not to whatever is on disk when the subprocess gets around to reading.
+  // Simulated by handing the hook a payload whose content differs from the bytes
+  // currently on disk (as if a concurrent write landed in between). The base must
+  // track the payload content, so a close still detects the concurrent bytes.
+  withWiki(null, (dir) => {
+    snapshotBase(dir, 's-write', overwriteTargets(T4_PROJECT));
+    const myContent = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nwhat THIS session's Write wrote.\n`;
+    const raced = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\na concurrent write that landed first.\n`;
+    writeFileSync(t4ProjectHot(dir), raced); // disk != my Write's content
+
+    const hook = runAutoStageHook(dir, 's-write', t4ProjectHot(dir), 'Write', myContent);
+    assert.equal(hook.status, 0, `hook must not fail: ${hook.stderr}`);
+    assert.equal(
+      readBaseEntry(dir, 's-write', t4Rel).hash,
+      bsHashContent(myContent),
+      'Write must advance to its own content hash, never to the raced disk bytes',
+    );
+    assert.notEqual(
+      readBaseEntry(dir, 's-write', t4Rel).hash,
+      bsHashContent(raced),
+      'the concurrent bytes must not become our base',
     );
   });
 });
