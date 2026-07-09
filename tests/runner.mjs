@@ -57,6 +57,14 @@ import {
   overwriteTargets,
 } from '../hooks/base-store.mjs';
 import {
+  writeProposal as psWriteProposal,
+  listProposals as psListProposals,
+  readProposal as psReadProposal,
+  deleteProposal as psDeleteProposal,
+  makeProposalId as psMakeProposalId,
+  proposalsDir as psProposalsDir,
+} from '../hooks/proposal-store.mjs';
+import {
   validateChangelog,
   validateTagBody,
   countHangul,
@@ -3506,6 +3514,380 @@ test('append lock-timeout → proposal-pending, shard byte-untouched (FEAT-11 T5
     if (shardAfter) {
       assert.ok(!shardAfter.includes('locked-out entry'), 'the withheld entry must not be written');
     }
+  });
+});
+
+// ── FEAT-11 T6: proposal artifacts + proposal-pending close contract ──────────
+// These drive the REAL close path. An OVERWRITE drift withholds the target AND
+// parks its bytes in `.cache/proposals/`; an APPEND conflict withholds but parks
+// NOTHING (transient — the next close re-appends).
+
+// The direct unit surface of the store: round-trip, supersede-by-target (matched
+// on the parsed `target` field, not the filename slug), idempotent reuse, delete,
+// and malformed-artifact tolerance on the read side.
+test('FEAT-11 T6: proposal-store round-trip, supersede-by-target, idempotent reuse, delete', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-ps-'));
+  try {
+    const a = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'c1',
+      proposedContent: 'AAA',
+      sessionId: 's1',
+      device: 'dev1',
+    });
+    assert.ok(a.id && a.path, 'writeProposal returns an id + path');
+    assert.equal(psListProposals(dir).length, 1);
+    const read = psReadProposal(dir, a.id);
+    assert.equal(read.proposedContent, 'AAA');
+    assert.equal(read.target, 'hot.md');
+    assert.equal(read.baseHash, 'b1');
+
+    // Same target, NEW bytes → the old artifact is superseded (one remains).
+    const b = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'c2',
+      proposedContent: 'BBB',
+      sessionId: 's1',
+      device: 'dev1',
+    });
+    assert.notEqual(b.id, a.id, 'a genuinely different withhold mints a new id');
+    const list2 = psListProposals(dir);
+    assert.equal(list2.length, 1, 'same-target supersede keeps exactly one artifact');
+    assert.equal(list2[0].proposedContent, 'BBB');
+
+    // A DIFFERENT target coexists — supersede is per-target, not global.
+    psWriteProposal(dir, {
+      target: join('pages', 'open-questions.md'),
+      baseHash: null,
+      currentAtProposalHash: 'x',
+      proposedContent: 'Q',
+      sessionId: 's1',
+      device: 'dev1',
+    });
+    assert.equal(psListProposals(dir).length, 2, 'a different target is not superseded');
+
+    // Identical fields → id reuse, no second artifact.
+    const b2 = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'c2',
+      proposedContent: 'BBB',
+      sessionId: 's1',
+      device: 'dev1',
+    });
+    assert.equal(b2.id, b.id, 'identical re-write reuses the existing id');
+    assert.equal(psListProposals(dir).length, 2, 'idempotent re-write adds no artifact');
+
+    assert.equal(psDeleteProposal(dir, b.id), true);
+    assert.equal(psReadProposal(dir, b.id), null);
+    assert.equal(psListProposals(dir).length, 1);
+
+    // A corrupt artifact is skipped by listing, never fatal.
+    writeFileSync(join(psProposalsDir(dir), 'junk.json'), '{ not json');
+    assert.equal(psListProposals(dir).length, 1, 'malformed artifact is skipped, not fatal');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('FEAT-11 T6: readProposal/deleteProposal reject path-traversal ids (no escape from the store)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-ps-'));
+  try {
+    // A sentinel two levels above the proposals dir: `../../hot` from
+    // <dir>/.cache/proposals resolves to <dir>/hot.json. The T7 CLI takes an id
+    // straight off the command line, so an unvalidated id here would read or
+    // unlink this file outside the store.
+    const sentinel = join(dir, 'hot.json');
+    writeFileSync(sentinel, 'DO NOT DELETE');
+    for (const bad of ['../../hot', '../hot', '..', '/etc/passwd', 'a/b', '']) {
+      assert.equal(psReadProposal(dir, bad), null, `readProposal rejects ${JSON.stringify(bad)}`);
+      assert.equal(psDeleteProposal(dir, bad), false, `deleteProposal rejects ${JSON.stringify(bad)}`);
+    }
+    assert.ok(existsSync(sentinel), 'a file outside the store is never unlinked');
+    assert.equal(readFileSync(sentinel, 'utf-8'), 'DO NOT DELETE', 'sentinel bytes untouched');
+    // A normally generated id still round-trips (no regression on the happy path).
+    const saved = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'x',
+      sessionId: 's',
+      device: 'd',
+    });
+    assert.ok(psReadProposal(dir, saved.id), 'a valid generated id still reads back');
+    assert.equal(psDeleteProposal(dir, saved.id), true, 'a valid generated id still deletes');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('FEAT-11 T6: a symlinked proposals dir cannot escape the vault (read/delete)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-ps-'));
+  const outside = mkdtempSync(join(tmpdir(), 'hypo-outside-'));
+  try {
+    // Point .cache/proposals at a directory OUTSIDE the vault and drop a
+    // validly-named artifact inside it. A lexical guard would let a valid id
+    // read/delete through the symlink; realpath containment must reject it.
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    symlinkSync(outside, join(dir, '.cache', 'proposals'));
+    const sentinel = join(outside, 'safeid.json');
+    writeFileSync(sentinel, JSON.stringify({ id: 'safeid', target: 'x' }));
+    assert.equal(psReadProposal(dir, 'safeid'), null, 'no read through a symlinked store');
+    assert.equal(psDeleteProposal(dir, 'safeid'), false, 'no delete through a symlinked store');
+    assert.ok(existsSync(sentinel), 'the file outside the vault survives');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('FEAT-11 T6: makeProposalId is filename-safe and carries the target slug', () => {
+  const id = psMakeProposalId('2026-07-09T12:34:56.789Z', join('projects', 'p', 'hot.md'));
+  assert.ok(/^[A-Za-z0-9-]+$/.test(id), `id must be filename-safe: ${id}`);
+  assert.ok(id.includes('projects-p-hot-md'), `id must carry the target slug: ${id}`);
+});
+
+// spec success criterion: an overwrite conflict parks a `.cache/proposals/`
+// artifact carrying every required field, the close reports proposal-pending, and
+// the marker is NOT written.
+test('FEAT-11 T6: overwrite conflict parks an artifact with all required fields, marker withheld', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    // No base snapshot for this session → the overwrite guard sees base-unknown and
+    // withholds rootHot (hot.md) rather than clobber. Only rootHot differs from disk;
+    // the other overwrite fields are byte-identical (idempotent skip, no conflict).
+    payload.rootHot = { content: `---\ntitle: Hot\nupdated: ${today}\n---\n# Hot DRIFTED\n` };
+    const r = runApply(dir, payload, { sessionId: 's-t6-artifact' });
+    assert.notEqual(
+      r.status,
+      0,
+      `a withheld overwrite must exit non-zero: ${r.stdout}\n${r.stderr}`,
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.stage, 'proposal-pending');
+    assert.equal(out.markerWritten, false, 'the marker must NOT be written on a withheld close');
+    assert.equal(
+      out.proposals.length,
+      1,
+      `exactly one proposal expected: ${JSON.stringify(out.proposals)}`,
+    );
+    assert.equal(out.proposals[0].target, 'hot.md');
+
+    const dirp = join(dir, '.cache', 'proposals');
+    const files = readdirSync(dirp).filter((f) => f.endsWith('.json'));
+    assert.equal(files.length, 1, `exactly one artifact on disk: ${files}`);
+    const art = JSON.parse(readFileSync(join(dirp, files[0]), 'utf-8'));
+    for (const k of [
+      'id',
+      'target',
+      'baseHash',
+      'currentAtProposalHash',
+      'proposedContent',
+      'sessionId',
+      'device',
+      'createdAt',
+    ]) {
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(art, k),
+        `artifact must carry ${k}: ${JSON.stringify(art)}`,
+      );
+    }
+    assert.equal(art.target, 'hot.md');
+    assert.equal(art.sessionId, 's-t6-artifact');
+    assert.ok(art.device, 'device must be stamped from currentDevice()');
+    assert.ok(art.proposedContent.includes('DRIFTED'), 'proposedContent holds the withheld bytes');
+    assert.ok(
+      !readFileSync(join(dir, 'hot.md'), 'utf-8').includes('DRIFTED'),
+      'the withheld target must stay unclobbered on disk',
+    );
+  });
+});
+
+// spec success criterion: partial conflict is per-target — non-drifted overwrites
+// write directly, only the drifted one parks, and the result says so honestly.
+test('FEAT-11 T6: partial conflict — non-drifted overwrites write, drifted one parks', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 's-t6-partial';
+    // Snapshot the base from the committed clean tree.
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+    // Another writer drifts ONE target (project hot.md) AFTER the snapshot.
+    const projHot = join(dir, 'projects', 'test-project', 'hot.md');
+    writeFileSync(
+      projHot,
+      `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot DRIFTED BY OTHER\n`,
+    );
+    const driftedBytes = readFileSync(projHot, 'utf-8');
+
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionState = {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- new next\n`,
+    };
+    payload.rootHot = {
+      content: readFileSync(join(dir, 'hot.md'), 'utf-8').replace('# Hot', '# Hot UPDATED'),
+    };
+    payload.projectHot = {
+      content: `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot FROM PAYLOAD\n`,
+    };
+    const r = runApply(dir, payload, { sessionId: sid });
+    assert.notEqual(r.status, 0, `a partial conflict must exit non-zero: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.stage, 'proposal-pending');
+    assert.equal(out.partialConflict, true, `partialConflict expected: ${r.stdout}`);
+    assert.ok(
+      Array.isArray(out.appliedUncommitted) && out.appliedUncommitted.length > 0,
+      'appliedUncommitted lists the writes that landed but are not committed',
+    );
+    assert.equal(out.proposals.length, 1, `exactly one proposal: ${JSON.stringify(out.proposals)}`);
+    assert.equal(out.proposals[0].target, join('projects', 'test-project', 'hot.md'));
+    assert.ok(
+      readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8').includes(
+        'new next',
+      ),
+      'the non-drifted sessionState was written directly',
+    );
+    assert.ok(
+      readFileSync(join(dir, 'hot.md'), 'utf-8').includes('UPDATED'),
+      'the non-drifted rootHot was written directly',
+    );
+    assert.equal(
+      readFileSync(projHot, 'utf-8'),
+      driftedBytes,
+      'the drifted target keeps the other writer bytes — the payload must not clobber it',
+    );
+    assert.equal(out.markerWritten, false);
+  });
+});
+
+// spec success criterion (fail-closed): a proposal-store WRITE failure must not
+// write the target, must surface loudly, and must stage proposal-store-failed.
+test('FEAT-11 T6: proposal-store write failure → proposal-store-failed, fail-loud, target unwritten', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.rootHot = { content: `---\ntitle: Hot\nupdated: ${today}\n---\n# Hot DRIFTED\n` };
+    // Occupy `.cache/proposals` with a regular FILE so writeProposal's mkdir fails.
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'proposals'), 'blocker');
+    const r = runApply(dir, payload, { sessionId: 's-t6-failloud' });
+    assert.notEqual(r.status, 0, `store failure must exit non-zero: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.stage, 'proposal-store-failed');
+    assert.ok(
+      Array.isArray(out.proposalStoreFailures) && out.proposalStoreFailures.length === 1,
+      `proposalStoreFailures expected: ${r.stdout}`,
+    );
+    assert.equal(out.proposalStoreFailures[0].target, 'hot.md');
+    assert.equal(out.proposals.length, 0, 'no proposal is recorded when the store write fails');
+    assert.ok(/PROPOSAL STORE FAILED/.test(r.stderr), `loud stderr expected: ${r.stderr}`);
+    assert.ok(
+      !readFileSync(join(dir, 'hot.md'), 'utf-8').includes('DRIFTED'),
+      'the target must stay unwritten when its proposal could not be parked',
+    );
+  });
+});
+
+// supersede across closes: a drift BETWEEN two closes changes currentAtProposalHash,
+// forcing a genuinely new artifact that must supersede (not accumulate beside) the
+// first — otherwise every close would leave a stale artifact and inflate the count.
+test('FEAT-11 T6: repeated closes on a re-drifting target keep exactly one artifact', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 's-t6-supersede';
+    const rootHotPath = join(dir, 'hot.md');
+    const dirp = join(dir, '.cache', 'proposals');
+
+    const p1 = payloadForCleanWiki(dir, today);
+    p1.rootHot = { content: `${readFileSync(rootHotPath, 'utf-8')}\n<!-- close1 -->\n` };
+    const r1 = runApply(dir, p1, { sessionId: sid });
+    assert.notEqual(r1.status, 0);
+    assert.equal(
+      readdirSync(dirp).filter((f) => f.endsWith('.json')).length,
+      1,
+      'one artifact after close 1',
+    );
+    const id1 = JSON.parse(r1.stdout).proposals[0].id;
+
+    // Another writer drifts the disk so the next close withholds FRESH bytes.
+    writeFileSync(rootHotPath, `${readFileSync(rootHotPath, 'utf-8')}\n<!-- other drift -->\n`);
+    const p2 = payloadForCleanWiki(dir, today);
+    p2.rootHot = { content: `${readFileSync(rootHotPath, 'utf-8')}\n<!-- close2 -->\n` };
+    const r2 = runApply(dir, p2, { sessionId: sid });
+    assert.notEqual(r2.status, 0);
+    const files2 = readdirSync(dirp).filter((f) => f.endsWith('.json'));
+    assert.equal(files2.length, 1, `still one artifact after close 2 (supersede): ${files2}`);
+    const art = JSON.parse(readFileSync(join(dirp, files2[0]), 'utf-8'));
+    assert.ok(
+      art.proposedContent.includes('close2'),
+      'the surviving artifact is the newest withhold',
+    );
+    assert.notEqual(
+      JSON.parse(r2.stdout).proposals[0].id,
+      id1,
+      'a genuinely new withhold gets a new id (supersede, not reuse)',
+    );
+  });
+});
+
+// idempotent-reuse (the OTHER supersede path): an identical re-close — same base,
+// same disk, same bytes — reuses the existing id and writes no second artifact.
+test('FEAT-11 T6: identical re-close reuses the artifact id (idempotent, one file)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 's-t6-idem';
+    const payload = payloadForCleanWiki(dir, today);
+    payload.rootHot = {
+      content: readFileSync(join(dir, 'hot.md'), 'utf-8').replace('# Hot', '# Hot DRIFT'),
+    };
+    const r1 = runApply(dir, payload, { sessionId: sid });
+    const r2 = runApply(dir, payload, { sessionId: sid });
+    const dirp = join(dir, '.cache', 'proposals');
+    assert.equal(
+      readdirSync(dirp).filter((f) => f.endsWith('.json')).length,
+      1,
+      'an identical re-close must not add a second artifact',
+    );
+    assert.equal(
+      JSON.parse(r1.stdout).proposals[0].id,
+      JSON.parse(r2.stdout).proposals[0].id,
+      'the same id is reused for an identical withhold',
+    );
+  });
+});
+
+// D1: an append lock-timeout blocks the close (proposal-pending) but parks NO
+// artifact — proposals stays empty and `.cache/proposals/` has no files.
+test('FEAT-11 T6: append lock-timeout makes NO artifact (proposals empty, still pending)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] append-only lockout\n\nbody\n` };
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    mkdirSync(dirname(shard), { recursive: true });
+    writeFileSync(`${shard}.lock`, '');
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300';
+    let r;
+    try {
+      r = runApply(dir, payload, { sessionId: 's-t6-append-only' });
+    } finally {
+      delete process.env.HYPO_APPEND_LOCK_TIMEOUT_MS;
+      try {
+        unlinkSync(`${shard}.lock`);
+      } catch {
+        /* already gone */
+      }
+    }
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.stage, 'proposal-pending');
+    assert.deepEqual(
+      out.proposals,
+      [],
+      `an append conflict must not create a proposal: ${JSON.stringify(out.proposals)}`,
+    );
+    const dirp = join(dir, '.cache', 'proposals');
+    const files = existsSync(dirp) ? readdirSync(dirp).filter((f) => f.endsWith('.json')) : [];
+    assert.equal(files.length, 0, `no artifact must be written for an append conflict: ${files}`);
   });
 });
 

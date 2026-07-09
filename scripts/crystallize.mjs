@@ -107,6 +107,7 @@ import {
   withFileLock,
 } from '../hooks/hypo-shared.mjs';
 import { hashContent, readBaseEntry, advanceBase } from '../hooks/base-store.mjs';
+import { writeProposal } from '../hooks/proposal-store.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
 // commands as `node <SELF_SCRIPT> ...` rather than a bare `crystallize` bin,
@@ -416,7 +417,9 @@ function readPayload(source) {
 }
 
 // How long an append waits for its per-target lock before withholding to the
-// proposal gate (see withFileLock). Default 5s is generous for a real close;
+// proposal-pending gate (see withFileLock). A withheld append blocks the close but
+// is NOT parked as a proposal artifact — the next close re-appends. Default 5s is
+// generous for a real close;
 // the env override exists ONLY so tests can force a fast timeout instead of
 // spinning the full 5s. Not a documented production knob.
 const APPEND_LOCK_TIMEOUT_MS = Number(process.env.HYPO_APPEND_LOCK_TIMEOUT_MS) || 5000;
@@ -1149,9 +1152,11 @@ function applySessionClose(args) {
       if (err?.code !== 'ELOCKTIMEOUT') throw err;
       // Lock-timeout: withhold rather than lose the entry. Recorded as a conflict
       // so the close goes proposal-pending (ok:false, no marker) and the next
-      // close re-applies. `kind: 'append'` marks it for T6's append-proposal
-      // handling — proposedContent is the entry to append, not a whole-file
-      // replacement.
+      // close re-applies. `kind: 'append'` is what T6 branches on to SKIP parking
+      // this: an append conflict never becomes a `.cache/proposals/` artifact —
+      // the lock-timeout is transient and the next close self-heals by
+      // re-appending, whereas a whole-file re-apply would drop this shard's other
+      // entries. It still blocks the close; it just gets no artifact.
       conflicts.push({
         key: 'sessionLog',
         target: rel,
@@ -1228,7 +1233,9 @@ function applySessionClose(args) {
       // `derived: true` discriminates this from the payload.log conflict above:
       // here proposedContent is the session-log entry to RE-DERIVE root-log lines
       // from (via rootLogEntry over its dated headings), NOT append-ready bytes.
-      // T6 must branch on this to know how to turn proposedContent into log.md.
+      // Like every `kind: 'append'` conflict, this is NOT parked as an artifact —
+      // it blocks the close and the next close re-derives + re-appends. The derived
+      // shape only matters to the retry, never to T6's overwrite proposal store.
       conflicts.push({
         key: 'log',
         target: 'log.md',
@@ -1241,6 +1248,56 @@ function applySessionClose(args) {
       });
     }
   }
+
+  // T6: park drifted OVERWRITE targets as `.cache/proposals/` artifacts.
+  //
+  // Runs regardless of --json AND regardless of args.sessionId: writing the
+  // artifact is a SIDE EFFECT, not output, so it is conditioned on neither the
+  // report format nor a session context. (In practice an overwrite conflict only
+  // arises with a session id, so a session-less apply just finds no overwrite
+  // conflicts to park — but the loop is unconditional to match that contract.)
+  // Only overwrite conflicts (`kind !== 'append'`) become artifacts. An append
+  // conflict is a transient lock-timeout the NEXT close self-heals by
+  // re-appending; parking it as a whole-file artifact and later re-applying it
+  // (T7 replaces the whole target) would drop every OTHER entry in that
+  // append-only history file. Append conflicts still sit in `conflicts`, so the
+  // close still goes proposal-pending — they just get no artifact and no
+  // human-apply step.
+  const proposals = [];
+  const proposalStoreFailures = [];
+  const device = currentDevice();
+  for (const c of conflicts) {
+    if (c.kind === 'append') continue; // append conflicts are never parked (see above)
+    try {
+      const saved = writeProposal(args.hypoDir, {
+        target: c.target,
+        baseHash: c.baseHash,
+        currentAtProposalHash: c.currentHash,
+        proposedContent: c.proposedContent, // internal (pre-drop) full page bytes
+        sessionId: args.sessionId, // may be null; writeProposal coerces it
+        device,
+      });
+      proposals.push({ id: saved.id, target: saved.target, path: saved.path });
+      // Supersede-delete failure is NON-fatal: the new artifact IS parked, only
+      // a stale sibling lingers (superseded next close). Surface it, don't fail.
+      for (const w of saved.supersedeWarnings) {
+        process.stderr.write(`\n⚠️  ${w} (stale artifact left behind, not fatal)\n`);
+      }
+    } catch (err) {
+      // fail-loud: the target was withheld AND its bytes are now on neither disk
+      // NOR a proposal artifact — a genuine data-loss risk. Never swallow this.
+      const error = (err && err.message) || String(err);
+      proposalStoreFailures.push({ target: c.target, key: c.key, error });
+      process.stderr.write(
+        `\n🛑 PROPOSAL STORE FAILED for ${c.key} (${c.target}): ${error}\n` +
+          `    This close WITHHELD the target (it drifted from your observed base) but\n` +
+          `    could NOT write the .cache/proposals/ artifact either. The payload bytes\n` +
+          `    are on NEITHER disk NOR a proposal — re-run the close once the .cache/\n` +
+          `    directory is writable so the withheld content is not lost.\n`,
+      );
+    }
+  }
+  const proposalStoreFailed = proposalStoreFailures.length > 0;
 
   // Same-date-tie fix: verify against the SAME project this apply just wrote
   // (`project` = payload.project || probe.project, resolved at the top). Without
@@ -1399,16 +1456,19 @@ function applySessionClose(args) {
   }
   // A conflict outranks the downstream gates: verification and lint both describe
   // a tree this apply declined to finish writing, so naming them would point the
-  // reader at the wrong repair.
+  // reader at the wrong repair. A proposal-STORE failure outranks even that: the
+  // withheld bytes never reached an artifact, so it is the most urgent repair.
   let stage = ok
     ? null
-    : conflicts.length > 0
-      ? 'proposal-pending'
-      : !verification.ok && !postLintOk
-        ? 'post-apply-verification+lint'
-        : !verification.ok
-          ? 'post-apply-verification'
-          : 'post-apply-lint';
+    : proposalStoreFailed
+      ? 'proposal-store-failed'
+      : conflicts.length > 0
+        ? 'proposal-pending'
+        : !verification.ok && !postLintOk
+          ? 'post-apply-verification+lint'
+          : !verification.ok
+            ? 'post-apply-verification'
+            : 'post-apply-lint';
   // Runtime close-result invariant self-check. When a
   // marker-write path (args.sessionId present) settles into an internally
   // contradictory shape — ok:true with the marker silently withheld and no
@@ -1440,10 +1500,28 @@ function applySessionClose(args) {
     applied,
     skipped,
     // Targets withheld: an overwrite drifted from this session's observed base, or
-    // an append could not take the file lock in time (`kind: 'append'`).
-    // `proposedContent` is dropped from the reported shape (it is the whole payload
-    // field / the entry to append, and T6 parks it in the proposal artifact instead).
+    // an append could not take the file lock in time (`kind: 'append'`). Two
+    // channels resolve these, and `proposals` vs `conflicts[].kind` are the sole
+    // discriminators: an OVERWRITE conflict is parked as a `.cache/proposals/`
+    // artifact (below) for a human to review and re-apply; an APPEND conflict gets
+    // NO artifact and is re-tried automatically by the next close. `proposedContent`
+    // is dropped from the reported shape either way (the artifact / the next close
+    // holds the bytes; a whole page or an append entry does not belong in the JSON).
     conflicts: conflicts.map(({ proposedContent: _drop, ...rest }) => rest),
+    // Parked overwrite proposals (id/target/path), one per drifted overwrite
+    // target. Empty when only append conflicts (or none) occurred. The T7 CLI
+    // lists and applies these; append conflicts never appear here.
+    proposals,
+    ...(proposalStoreFailed ? { proposalStoreFailures } : {}),
+    // Partial close: some overwrite direct-writes (and/or appends) already landed
+    // on disk while at least one conflict withheld the rest. Because the close is
+    // ok:false, commitWikiChanges + the marker are skipped — so those written
+    // files sit on disk UNCOMMITTED until the conflict is resolved and the close
+    // re-runs. Named honestly: `appliedUncommitted` covers every write that landed
+    // (overwrite or append), not overwrites alone.
+    ...(applied.length > 0 && conflicts.length > 0
+      ? { partialConflict: true, appliedUncommitted: [...applied] }
+      : {}),
     verification,
     // Surface the marker outcome instead of skipping silently, so the
     // caller can tell "closed" from "applied but not marked".
@@ -1479,6 +1557,18 @@ function applySessionClose(args) {
           ? 'could not acquire the append lock in time; the next close re-applies'
           : 'the page changed since this session read it';
       console.log(`  ⚠ WITHHELD ${c.key} (${c.target}) — ${c.reason}; ${why}`);
+    }
+    for (const p of proposals) {
+      console.log(
+        `  · parked proposal ${p.id} for ${p.target} (review with \`hypomnema proposal\`)`,
+      );
+    }
+    if (applied.length > 0 && conflicts.length > 0) {
+      console.log(
+        '\n· partial close: the writes above ARE on disk but NOT committed — this close is\n' +
+          '  ok:false, so no commit and no session-close marker run until the withheld\n' +
+          '  target(s) are resolved and the close re-runs.',
+      );
     }
     if (ok) {
       // When the marker was withheld, qualify the success line so a reader scanning

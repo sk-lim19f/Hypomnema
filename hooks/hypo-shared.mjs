@@ -1260,8 +1260,9 @@ function atomicWriteShared(path, content) {
  * the `unlinkSync`, the holder can release and a fresh holder grab the same path,
  * whose lock we then remove. `staleMs` is set well above a normal close (seconds)
  * to make both extreme-low-probability. If the lock cannot be acquired within
- * `timeoutMs`, throw so the caller can fall back to the write=proposal gate
- * (architecturally consistent with the existing fail-safe).
+ * `timeoutMs`, throw so the caller can fall back to the write=proposal gate — for
+ * an append that means blocking the close (proposal-pending) with no artifact; the
+ * next close re-appends (architecturally consistent with the existing fail-safe).
  *
  * @param {string} targetPath file being guarded (lock is a sibling `.lock`)
  * @param {() => T} fn critical section
