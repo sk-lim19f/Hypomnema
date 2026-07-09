@@ -143,5 +143,11 @@
       }
     ]
   },
-  "shared": ["hypo-shared.mjs", "version-check.mjs", "version-check-fetch.mjs", "base-store.mjs"]
+  "shared": [
+    "hypo-shared.mjs",
+    "version-check.mjs",
+    "version-check-fetch.mjs",
+    "base-store.mjs",
+    "proposal-store.mjs"
+  ]
 }
