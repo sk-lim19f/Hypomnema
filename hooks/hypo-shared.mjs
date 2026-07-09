@@ -16,8 +16,12 @@ import {
   rmSync,
   readdirSync,
   realpathSync,
+  openSync,
+  closeSync,
+  unlinkSync,
+  renameSync,
 } from 'fs';
-import { join, relative, basename } from 'path';
+import { join, relative, basename, dirname } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 
@@ -1203,6 +1207,132 @@ export function rootLogEntry(slug, date, headingTail) {
  * @param {string} hypoDir
  * @returns {number} count of entries appended to log.md
  */
+// ── append-only file lock ───────────────────────────────────────────────────
+// Serializes the read → dedup → rebuild → temp+rename sequence on append-only
+// history files (session-log shards, log.md) so two concurrent session closes
+// never lose an entry. The lock does NOT replace the existing write-isolation:
+// each writer still rebuilds the full content and commits via atomicWrite
+// (temp write + rename), so a partial write lands on a throwaway temp and the
+// target is never torn. The lock only makes the read-modify-write exclusive, so
+// the second closer re-reads the first's committed bytes and appends onto them
+// (last-writer-wins can no longer drop the earlier entry), and exact-entry dedup
+// becomes precise rather than best-effort.
+//
+// Why not O_APPEND: an in-place append that short-writes (ENOSPC / EDQUOT /
+// RLIMIT_FSIZE / a split write() killed mid-loop) leaves a torn dated heading on
+// the real file that the freshness gate mis-reads as valid close evidence, and
+// it cannot be rolled back once a concurrent appender has written past it. That
+// is a normal-operation regression temp+rename does not have (a failed temp
+// write never runs the rename, so the target stays untouched). Confirmed against
+// Node/libuv write-loop behavior and POSIX write(2) partial-write semantics.
+//
+// Local-FS only: `openSync(lock, 'wx')` is not atomic on NFS — the same caveat
+// the vault already carries. Power-loss durability is unchanged from today
+// (atomicWrite never fsync'd), so it is out of scope here.
+function sleepSync(ms) {
+  // Synchronous sleep with no busy-spin: block this thread on an Atomics.wait
+  // against a private SharedArrayBuffer that is never signaled, so it always
+  // times out after `ms`. Hooks run in a short-lived sync context.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms | 0));
+}
+
+// Commit `content` via temp write + rename so a partial/failed write lands on a
+// throwaway temp and the target is never torn (mirrors crystallize.mjs's
+// atomicWrite). Rename atomicity swaps the directory entry; it is NOT power-loss
+// durable (no fsync) — same as everything else in the vault.
+function atomicWriteShared(path, content) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  writeFileSync(tmp, content);
+  renameSync(tmp, path);
+}
+
+/**
+ * Run `fn` while holding an exclusive lock on `<targetPath>.lock`.
+ *
+ * Acquire is a spin on `openSync(lock, 'wx')`: EEXIST means another writer holds
+ * it, so poll until it frees. A lock whose holder looks dead (mtime older than
+ * `staleMs`) is stolen. Steal is recoverable friction in the normal case (the
+ * stealer re-reads the committed bytes before writing), but NOT loss-free in two
+ * edge cases, both requiring the lock to sit untouched for `staleMs`: (1) a LIVE
+ * holder preempted past `staleMs` gets stolen from, so two writers run the
+ * critical section and one update is lost; (2) between the stale `statSync` and
+ * the `unlinkSync`, the holder can release and a fresh holder grab the same path,
+ * whose lock we then remove. `staleMs` is set well above a normal close (seconds)
+ * to make both extreme-low-probability. If the lock cannot be acquired within
+ * `timeoutMs`, throw so the caller can fall back to the write=proposal gate
+ * (architecturally consistent with the existing fail-safe).
+ *
+ * @param {string} targetPath file being guarded (lock is a sibling `.lock`)
+ * @param {() => T} fn critical section
+ * @param {{timeoutMs?: number, staleMs?: number, pollMs?: number}} [opts]
+ * @returns {T} whatever `fn` returns
+ * @template T
+ */
+export function withFileLock(targetPath, fn, opts = {}) {
+  const { timeoutMs = 5000, staleMs = 30000, pollMs = 50 } = opts;
+  const lockPath = `${targetPath}.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true });
+  const start = Date.now();
+  let fd;
+  for (;;) {
+    try {
+      fd = openSync(lockPath, 'wx');
+      break;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      // Held by another writer. Steal ONLY a demonstrably stale lock; otherwise
+      // wait and eventually time out. The stat and the unlink are handled
+      // separately on purpose: an un-removable stale lock (EACCES/EPERM/EBUSY)
+      // and a fresh lock must both fall through to the timeout check — never
+      // `continue` past it, or an un-unlinkable lock spins forever and violates
+      // the timeoutMs → ELOCKTIMEOUT contract (caller falls to the proposal gate).
+      let stale = false;
+      try {
+        // Steal a lock whose holder looks dead. Loss-free unless the holder is
+        // actually live-but-preempted past staleMs (see JSDoc edge cases).
+        stale = Date.now() - statSync(lockPath).mtimeMs > staleMs;
+      } catch (statErr) {
+        if (statErr.code === 'ENOENT') continue; // lock vanished; retry create now
+        throw statErr; // unexpected stat failure — surface it, don't mask
+      }
+      if (stale) {
+        try {
+          unlinkSync(lockPath);
+          continue; // stole it; retry the create immediately
+        } catch (unlinkErr) {
+          if (unlinkErr.code === 'ENOENT') continue; // another stealer won; retry
+          // Cannot remove it: do NOT spin — fall through to timeout/sleep so
+          // acquisition eventually throws ELOCKTIMEOUT instead of hanging.
+        }
+      }
+      if (Date.now() - start > timeoutMs) {
+        // Tagged so callers can distinguish "could not get the lock" (fall to the
+        // proposal gate) from a real fn() write error (mkdir/openSync/disk-full),
+        // which must NOT be masked as a timeout.
+        const e = new Error(`lock-timeout: ${lockPath}`);
+        e.code = 'ELOCKTIMEOUT';
+        throw e;
+      }
+      sleepSync(pollMs);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      /* fd already gone */
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* lock already stolen/removed */
+    }
+  }
+}
+
 export function deriveRootLogEntries(hypoDir) {
   const logPath = join(hypoDir, 'log.md');
   if (!existsSync(logPath)) return 0;
@@ -1259,19 +1389,44 @@ export function deriveRootLogEntries(hypoDir) {
         const { heading, block } = rootLogEntry(slug, date, m[1]);
         if (seenHeadings.has(heading)) continue; // exact-line dedup (log.md + queued)
         seenHeadings.add(heading);
-        additions.push(block);
+        additions.push({ heading, block });
       }
     }
   }
 
   if (additions.length === 0) return 0;
-  const sep = logContent.endsWith('\n') ? '\n' : '\n\n';
+
+  // Serialize the read-modify-write on log.md: a concurrent session close (its
+  // own crystallize apply, or another project's derive) may commit between the
+  // read above and the write below. Under the lock we RE-READ the latest
+  // committed log.md and re-run exact-heading dedup, so this derive appends onto
+  // the other writer's entry instead of a full-file overwrite dropping it. The
+  // same lock guards crystallize.mjs's per-close log.md append, so the two
+  // paths never race. On lock-timeout, skip (best-effort backfill; the next
+  // close re-derives) rather than risk a lost update.
   try {
-    writeFileSync(logPath, logContent + sep + additions.join('\n\n') + '\n');
+    return withFileLock(logPath, () => {
+      let current;
+      try {
+        current = readFileSync(logPath, 'utf-8');
+      } catch {
+        return 0;
+      }
+      const seen = new Set((current || '').split(/\r?\n/));
+      const fresh = additions.filter(({ heading }) => {
+        if (seen.has(heading)) return false;
+        seen.add(heading);
+        return true;
+      });
+      if (fresh.length === 0) return 0;
+      const sep = current.endsWith('\n') ? '\n' : '\n\n';
+      atomicWriteShared(logPath, current + sep + fresh.map((a) => a.block).join('\n\n') + '\n');
+      return fresh.length;
+    });
   } catch {
+    // lock-timeout or unexpected lock error: skip this backfill pass.
     return 0;
   }
-  return additions.length;
 }
 
 // ── sync-state ────────────────────────────────────────────

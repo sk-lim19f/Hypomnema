@@ -6,7 +6,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import {
   mkdtempSync,
   mkdirSync,
@@ -20,6 +20,7 @@ import {
   statSync,
   unlinkSync,
   utimesSync,
+  chmodSync,
   cpSync,
   realpathSync,
 } from 'node:fs';
@@ -3466,6 +3467,47 @@ function runApply(dir, payload, { force = false, sessionId = null } = {}) {
   if (sessionId) flags.push(`--session-id=${sessionId}`);
   return run('crystallize.mjs', flags);
 }
+
+// FEAT-11 T5 fail-safe: drives the REAL close path (not a worker reimplementation
+// of append). Pre-hold a fresh lock on the daily shard so crystallize's append
+// cannot acquire it → the close must withhold to proposal-pending WITHOUT touching
+// the shard, and the conflict must carry the T6 seam fields (kind:'append').
+test('append lock-timeout → proposal-pending, shard byte-untouched (FEAT-11 T5)', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] locked-out entry\n\nbody\n` };
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    const shardLock = `${shard}.lock`;
+    mkdirSync(dirname(shard), { recursive: true });
+    const shardBefore = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
+    writeFileSync(shardLock, ''); // fresh lock "held" by another writer, never released
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300'; // fast timeout instead of the 5s default
+    let r;
+    try {
+      r = runApply(dir, payload, { sessionId: 's-lockout' });
+    } finally {
+      delete process.env.HYPO_APPEND_LOCK_TIMEOUT_MS;
+      try {
+        unlinkSync(shardLock);
+      } catch {
+        /* already gone */
+      }
+    }
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false, `lock-timeout must withhold (ok:false): ${r.stdout}`);
+    assert.equal(out.stage, 'proposal-pending', `stage must be proposal-pending: ${r.stdout}`);
+    const c = (out.conflicts || []).find((x) => x.key === 'sessionLog');
+    assert.ok(c, `a sessionLog conflict is expected: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.kind, 'append', 'conflict.kind must be "append"');
+    assert.equal(c.reason, 'append-lock-timeout', 'conflict.reason must be append-lock-timeout');
+    assert.equal(c.proposedContent, undefined, 'proposedContent must be dropped from the reported shape');
+    const shardAfter = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
+    assert.equal(shardAfter, shardBefore, 'the shard must be byte-untouched when the append is withheld');
+    if (shardAfter) {
+      assert.ok(!shardAfter.includes('locked-out entry'), 'the withheld entry must not be written');
+    }
+  });
+});
 
 test('clean-wiki payload → ok:true, new entries appended (apply dedup is exact-entry, not date-based)', () => {
   withWiki(null, (dir, today) => {
@@ -26487,6 +26529,158 @@ test('a Write advances the base to the bytes it wrote, not a racy disk re-read',
       'the concurrent bytes must not become our base',
     );
   });
+});
+
+// ── hypo-shared.mjs — withFileLock (FEAT-11 T5) ──────────────────────────────
+// The lock's guarantee is mutual exclusion (mechanism), not a green test. These
+// deterministic unit tests pin acquire/release/steal/timeout; the concurrent
+// smoke below exercises no-loss + exact-dedup across real processes.
+
+suite('hypo-shared.mjs — withFileLock (FEAT-11 T5)');
+
+const { withFileLock: wfl } = await import(`${REPO}/hooks/hypo-shared.mjs`);
+
+test('holds the lock during the critical section and removes it after', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'log.md');
+    const lockPath = `${target}.lock`;
+    let lockedDuring = false;
+    const ret = wfl(target, () => {
+      lockedDuring = existsSync(lockPath);
+      return 'done';
+    });
+    assert.equal(ret, 'done', 'returns the critical section result');
+    assert.equal(lockedDuring, true, 'lock file exists while fn runs');
+    assert.equal(existsSync(lockPath), false, 'lock file removed after release');
+  });
+});
+
+test('steals a stale lock whose holder died (mtime older than staleMs)', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'log.md');
+    const lockPath = `${target}.lock`;
+    writeFileSync(lockPath, ''); // a dead holder's leftover lock
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, old, old); // backdate well past the stale threshold
+    let ran = false;
+    wfl(
+      target,
+      () => {
+        ran = true;
+      },
+      { staleMs: 1000, timeoutMs: 500 },
+    );
+    assert.equal(ran, true, 'stole the stale lock and ran');
+    assert.equal(existsSync(lockPath), false, 'lock cleaned up after the run');
+  });
+});
+
+test('throws lock-timeout when a fresh lock is held past timeoutMs', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'log.md');
+    const lockPath = `${target}.lock`;
+    writeFileSync(lockPath, ''); // fresh mtime, never released
+    assert.throws(
+      () => wfl(target, () => {}, { timeoutMs: 200, staleMs: 60_000, pollMs: 20 }),
+      /lock-timeout/,
+      'gives up after timeoutMs instead of blocking forever (caller falls to proposal)',
+    );
+    assert.equal(existsSync(lockPath), true, 'the held lock is left intact, not stolen');
+  });
+});
+
+test('does not hang when a STALE lock cannot be removed — times out instead', () => {
+  // root ignores directory perms, and Windows chmod-on-dir doesn't block unlink,
+  // so the unlink would succeed and there'd be nothing to time out against —
+  // skip rather than assert a false negative.
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withTmpDir((dir) => {
+    const sub = join(dir, 'sub');
+    mkdirSync(sub);
+    const target = join(sub, 'log.md');
+    const lockPath = `${target}.lock`;
+    writeFileSync(lockPath, '');
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, old, old); // make it stale (steal-eligible)
+    chmodSync(sub, 0o555); // dir non-writable → unlinkSync(lockPath) fails EACCES
+    try {
+      // Before the fix this spun forever (the broad catch swallowed the unlink
+      // failure and `continue`d past the timeout check). It must now fall through
+      // to the timeout and throw ELOCKTIMEOUT.
+      assert.throws(
+        () => wfl(target, () => {}, { staleMs: 1000, timeoutMs: 300, pollMs: 20 }),
+        /lock-timeout/,
+        'an un-removable stale lock must time out, not hang',
+      );
+    } finally {
+      chmodSync(sub, 0o755); // restore so withTmpDir cleanup can remove it
+    }
+  });
+});
+
+// ── crystallize — concurrent append no-loss + exact-dedup (FEAT-11 T5) ────────
+// Barrier-synchronized real processes: N workers each take the SAME file lock
+// and append a distinct entry, plus one duplicate to prove dedup. Under the lock
+// every distinct entry survives (no last-writer-wins drop) and the duplicate
+// collapses to one. This is a smoke check — the no-loss guarantee rests on the
+// lock's serialization, not on this test always tripping the race.
+const T5_WORKER_SRC = `
+import { withFileLock } from ${JSON.stringify(join(REPO, 'hooks', 'hypo-shared.mjs'))};
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+const [, , target, entry, barrier] = process.argv;
+const t0 = Date.now();
+while (!existsSync(barrier) && Date.now() - t0 < 10000) { /* spin to the barrier */ }
+withFileLock(target, () => {
+  const cur = existsSync(target) ? readFileSync(target, 'utf-8') : '';
+  if (cur.includes(entry)) return; // exact-entry dedup (matches appendIfAbsent)
+  const sep = cur === '' ? '' : cur.endsWith('\\n') ? '' : '\\n';
+  writeFileSync(target, cur + sep + entry + '\\n');
+});
+`;
+
+function spawnT5Worker(workerPath, target, entry, barrier) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [workerPath, target, entry, barrier], { stdio: 'ignore' });
+    p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`worker exit ${code}`))));
+    p.on('error', reject);
+  });
+}
+
+suite('crystallize — concurrent append (FEAT-11 T5)');
+
+await testAsync('N concurrent appends lose nothing and dedup an exact duplicate', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t5-'));
+  try {
+    const workerPath = join(dir, 'worker.mjs');
+    writeFileSync(workerPath, T5_WORKER_SRC);
+    const target = join(dir, 'session-log.md');
+    const N = 12;
+    const ROUNDS = 3;
+    for (let r = 0; r < ROUNDS; r++) {
+      // Alternate the starting state so BOTH races run: an absent target makes
+      // workers contend on create-under-lock; an existing (empty) target makes
+      // them contend on append-under-lock.
+      if (r % 2 === 0) rmSync(target, { force: true });
+      else writeFileSync(target, '');
+      const barrier = join(dir, `barrier-${r}`);
+      // Entries are [[e0]]..[[eN-1]] (none a substring of another) plus a repeat
+      // of [[e0]] to exercise dedup under contention.
+      const entries = [];
+      for (let i = 0; i < N; i++) entries.push(`[[e${i}]]`);
+      entries.push('[[e0]]');
+      const procs = entries.map((e) => spawnT5Worker(workerPath, target, e, barrier));
+      writeFileSync(barrier, 'go'); // release all workers together
+      await Promise.all(procs);
+      const content = readFileSync(target, 'utf-8');
+      for (let i = 0; i < N; i++) {
+        assert.ok(content.includes(`[[e${i}]]`), `round ${r}: [[e${i}]] must survive (no-loss)`);
+      }
+      const dupCount = content.split('[[e0]]').length - 1;
+      assert.equal(dupCount, 1, `round ${r}: duplicate [[e0]] deduped to exactly one`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────

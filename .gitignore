@@ -12,6 +12,9 @@ specs/
 # live in the maintainer's own ~/.claude/commands/, not here.
 .claude/
 
+# Append-lock files (transient <target>.lock around session-log / log.md writes)
+*.lock
+
 # Node
 node_modules/
 dist/
