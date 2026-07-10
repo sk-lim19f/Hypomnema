@@ -63,7 +63,18 @@ import {
   deleteProposal as psDeleteProposal,
   makeProposalId as psMakeProposalId,
   proposalsDir as psProposalsDir,
+  hashProposalContent,
 } from '../hooks/proposal-store.mjs';
+// proposal.mjs guards its CLI dispatch behind isMain(), so importing these pure
+// functions + result-returning actors for unit tests does not run the CLI.
+import {
+  planApplyAction,
+  classifyFreshness,
+  resolveTargetPath as propResolveTargetPath,
+  applyProposal,
+  discardProposal,
+  listPending,
+} from '../scripts/proposal.mjs';
 import {
   validateChangelog,
   validateTagBody,
@@ -3508,9 +3519,17 @@ test('append lock-timeout → proposal-pending, shard byte-untouched (FEAT-11 T5
     assert.ok(c, `a sessionLog conflict is expected: ${JSON.stringify(out.conflicts)}`);
     assert.equal(c.kind, 'append', 'conflict.kind must be "append"');
     assert.equal(c.reason, 'append-lock-timeout', 'conflict.reason must be append-lock-timeout');
-    assert.equal(c.proposedContent, undefined, 'proposedContent must be dropped from the reported shape');
+    assert.equal(
+      c.proposedContent,
+      undefined,
+      'proposedContent must be dropped from the reported shape',
+    );
     const shardAfter = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
-    assert.equal(shardAfter, shardBefore, 'the shard must be byte-untouched when the append is withheld');
+    assert.equal(
+      shardAfter,
+      shardBefore,
+      'the shard must be byte-untouched when the append is withheld',
+    );
     if (shardAfter) {
       assert.ok(!shardAfter.includes('locked-out entry'), 'the withheld entry must not be written');
     }
@@ -3603,7 +3622,11 @@ test('FEAT-11 T6: readProposal/deleteProposal reject path-traversal ids (no esca
     writeFileSync(sentinel, 'DO NOT DELETE');
     for (const bad of ['../../hot', '../hot', '..', '/etc/passwd', 'a/b', '']) {
       assert.equal(psReadProposal(dir, bad), null, `readProposal rejects ${JSON.stringify(bad)}`);
-      assert.equal(psDeleteProposal(dir, bad), false, `deleteProposal rejects ${JSON.stringify(bad)}`);
+      assert.equal(
+        psDeleteProposal(dir, bad),
+        false,
+        `deleteProposal rejects ${JSON.stringify(bad)}`,
+      );
     }
     assert.ok(existsSync(sentinel), 'a file outside the store is never unlinked');
     assert.equal(readFileSync(sentinel, 'utf-8'), 'DO NOT DELETE', 'sentinel bytes untouched');
@@ -3890,6 +3913,641 @@ test('FEAT-11 T6: append lock-timeout makes NO artifact (proposals empty, still 
     assert.equal(files.length, 0, `no artifact must be written for an append conflict: ${files}`);
   });
 });
+
+// ── FEAT-11 T7: proposal CLI (list / apply / discard) ────────────────────────
+// The human-in-the-loop gate. Every path to a target write runs through a fresh
+// diff, a TTY gate, an explicit confirm, and a post-confirm re-read. The pure
+// decision functions are table-tested; the actors are driven in-process with
+// injected TTY / prompt / clock seams.
+
+// A stream stand-in that accumulates writes, so a test can assert on what the
+// actor emitted without a real stdout/stderr.
+function capStream() {
+  const chunks = [];
+  return { write: (s) => chunks.push(String(s)), text: () => chunks.join('') };
+}
+
+test('FEAT-11 T7: planApplyAction table (unreadable aborts regardless of confirm)', () => {
+  assert.deepEqual(planApplyAction({ confirmed: true, freshness: 'unreadable' }), {
+    action: 'abort',
+    reason: 'target-unreadable',
+  });
+  assert.deepEqual(planApplyAction({ confirmed: false, freshness: 'unreadable' }), {
+    action: 'abort',
+    reason: 'target-unreadable',
+  });
+  assert.deepEqual(planApplyAction({ confirmed: false, freshness: 'fresh' }), {
+    action: 'abort',
+    reason: 'not-confirmed',
+  });
+  assert.deepEqual(planApplyAction({ confirmed: true, freshness: 'fresh' }), {
+    action: 'apply',
+    reason: null,
+    warned: false,
+  });
+  assert.deepEqual(planApplyAction({ confirmed: true, freshness: 'drifted' }), {
+    action: 'apply',
+    reason: null,
+    warned: true,
+  });
+});
+
+test('FEAT-11 T7: classifyFreshness (fresh / drifted / unreadable / absent-null / absent-nonnull)', () => {
+  const h = bsHashContent('AAA');
+  assert.equal(classifyFreshness({ current: 'AAA', currentAtProposalHash: h }), 'fresh');
+  assert.equal(classifyFreshness({ current: 'BBB', currentAtProposalHash: h }), 'drifted');
+  assert.equal(classifyFreshness({ current: undefined, currentAtProposalHash: h }), 'unreadable');
+  // absent now + null at park → fresh (nothing on disk to clobber).
+  assert.equal(classifyFreshness({ current: null, currentAtProposalHash: null }), 'fresh');
+  // absent now + a real park hash → drifted (the file was there at park, gone now).
+  assert.equal(classifyFreshness({ current: null, currentAtProposalHash: h }), 'drifted');
+});
+
+test('FEAT-11 T7: resolveTargetPath rejects traversal, absolute, empty, non-string; passes a clean rel path', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const ok = propResolveTargetPath(dir, join('pages', 'note.md'));
+    assert.ok(ok && ok.endsWith(join('pages', 'note.md')), `clean rel path resolves: ${ok}`);
+    assert.equal(
+      propResolveTargetPath(dir, join('..', '..', '.zshrc')),
+      null,
+      'traversal rejected',
+    );
+    assert.equal(propResolveTargetPath(dir, join('pages', '..', '..', 'x')), null, '.. segment');
+    assert.equal(propResolveTargetPath(dir, '/etc/passwd'), null, 'absolute rejected');
+    assert.equal(propResolveTargetPath(dir, ''), null, 'empty rejected');
+    assert.equal(propResolveTargetPath(dir, 123), null, 'non-string rejected');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('FEAT-11 T7: resolveTargetPath fails closed on a symlinked target and a vault-escaping ancestor', () => {
+  if (process.platform === 'win32') return;
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  const outside = mkdtempSync(join(tmpdir(), 'hypo-t7-out-'));
+  try {
+    // Target file itself a symlink (pointing INSIDE the vault so the ancestor
+    // check passes and the lstat branch is what rejects it): the diff would
+    // follow the link but atomicWrite would replace it, so refuse.
+    writeFileSync(join(dir, 'real.md'), 'real');
+    symlinkSync(join(dir, 'real.md'), join(dir, 'link.md'));
+    assert.equal(propResolveTargetPath(dir, 'link.md'), null, 'symlinked target rejected');
+
+    // A parent dir that is a symlink OUT of the vault: a rename would land
+    // outside, so the nearest-ancestor realpath check must reject it.
+    symlinkSync(outside, join(dir, 'sub'));
+    assert.equal(
+      propResolveTargetPath(dir, join('sub', 'note.md')),
+      null,
+      'escaping-ancestor symlink rejected',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('FEAT-11 T7: no bypass tokens in scripts/proposal.mjs (no auto-apply, no env override)', () => {
+  const src = readFileSync(join(SCRIPTS, 'proposal.mjs'), 'utf-8');
+  const hits = src.match(/--yes|process\.env/g);
+  assert.equal(hits, null, `proposal.mjs must carry no bypass token, found: ${hits}`);
+});
+
+test('FEAT-11 T7: no hook imports the apply path (no unattended auto-apply)', () => {
+  const importers = readdirSync(HOOKS)
+    .filter((f) => f.endsWith('.mjs'))
+    .filter((f) => /proposal\.mjs/.test(readFileSync(join(HOOKS, f), 'utf-8')));
+  assert.deepEqual(
+    importers,
+    [],
+    `hooks must never reach the apply path (fires unattended): ${importers.join(', ')}`,
+  );
+});
+
+await testAsync(
+  'FEAT-11 T7: non-TTY apply is refused: target bytes unchanged, proposal preserved',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      const target = join(dir, 'pages', 'note.md');
+      writeFileSync(target, 'ORIGINAL');
+      const saved = psWriteProposal(dir, {
+        target: join('pages', 'note.md'),
+        baseHash: null,
+        currentAtProposalHash: bsHashContent('ORIGINAL'),
+        proposedContent: 'PROPOSED',
+        sessionId: 's7',
+        device: 'd7',
+      });
+      const out = capStream();
+      const err = capStream();
+      const r = await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        { isTTY: false, stdout: out, stderr: err, prompt: async () => `apply ${saved.id}` },
+      );
+      assert.equal(r.ok, false);
+      assert.notEqual(r.code, 0, 'non-TTY apply exits non-zero');
+      assert.equal(readFileSync(target, 'utf-8'), 'ORIGINAL', 'target bytes untouched');
+      assert.ok(psReadProposal(dir, saved.id), 'proposal preserved');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+await testAsync(
+  'FEAT-11 T7: apply success: whole-file replace, proposal removed, one audit line with pre-apply hash',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      const target = join(dir, 'pages', 'note.md');
+      writeFileSync(target, 'ORIGINAL');
+      const saved = psWriteProposal(dir, {
+        target: join('pages', 'note.md'),
+        baseHash: null,
+        currentAtProposalHash: bsHashContent('ORIGINAL'),
+        proposedContent: 'PROPOSED CONTENT',
+        sessionId: 's7',
+        device: 'd7',
+      });
+      const out = capStream();
+      const r = await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        {
+          isTTY: true,
+          stdout: out,
+          stderr: capStream(),
+          prompt: async () => `apply ${saved.id}`,
+          now: () => '2026-07-10T00:00:00.000Z',
+        },
+      );
+      assert.equal(r.ok, true, `apply should succeed: ${JSON.stringify(r)}`);
+      assert.equal(r.code, 0);
+      assert.equal(readFileSync(target, 'utf-8'), 'PROPOSED CONTENT', 'target replaced wholesale');
+      assert.equal(psReadProposal(dir, saved.id), null, 'proposal artifact removed');
+
+      const logPath = join(psProposalsDir(dir), 'applied.log');
+      const lines = readFileSync(logPath, 'utf-8').trim().split('\n');
+      assert.equal(lines.length, 1, 'exactly one audit line');
+      const rec = JSON.parse(lines[0]);
+      assert.equal(rec.id, saved.id);
+      assert.equal(rec.target, join('pages', 'note.md'));
+      assert.equal(
+        rec.currentHash,
+        bsHashContent('ORIGINAL'),
+        'currentHash is the pre-apply disk hash',
+      );
+      assert.equal(rec.appliedAt, '2026-07-10T00:00:00.000Z', 'appliedAt from injected clock');
+      // The audit log must NOT leak into the proposal listing (.json filter).
+      assert.equal(listProposalsCount(dir), 0, 'applied.log is not counted as a proposal');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+await testAsync(
+  'FEAT-11 T7: freshness warning path: a re-drifted target warns, then applies on confirm',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      const target = join(dir, 'pages', 'note.md');
+      writeFileSync(target, 'ORIGINAL');
+      const saved = psWriteProposal(dir, {
+        target: join('pages', 'note.md'),
+        baseHash: null,
+        currentAtProposalHash: bsHashContent('ORIGINAL'),
+        proposedContent: 'PROPOSED',
+        sessionId: 's7',
+        device: 'd7',
+      });
+      // Someone drifts the target AFTER it was parked.
+      writeFileSync(target, 'DRIFTED SINCE PARK');
+      const out = capStream();
+      const r = await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        {
+          isTTY: true,
+          stdout: out,
+          stderr: capStream(),
+          prompt: async () => `apply ${saved.id}`,
+          now: () => '2026-07-10T00:00:00.000Z',
+        },
+      );
+      assert.equal(r.ok, true, 'a confirmed drift still applies');
+      assert.equal(r.warned, true, 'the result records that a drift warning was surfaced');
+      assert.match(out.text(), /changed since this proposal was parked/, 'drift warning printed');
+      assert.equal(readFileSync(target, 'utf-8'), 'PROPOSED', 'target replaced after review');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+await testAsync(
+  'FEAT-11 T7: concurrent mutation during the prompt aborts: target keeps its bytes, proposal preserved',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      const target = join(dir, 'pages', 'note.md');
+      writeFileSync(target, 'ORIGINAL');
+      const saved = psWriteProposal(dir, {
+        target: join('pages', 'note.md'),
+        baseHash: null,
+        currentAtProposalHash: bsHashContent('ORIGINAL'),
+        proposedContent: 'PROPOSED',
+        sessionId: 's7',
+        device: 'd7',
+      });
+      const err = capStream();
+      const r = await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        {
+          isTTY: true,
+          stdout: capStream(),
+          stderr: err,
+          // A concurrent close writes the target while the human is at the prompt.
+          prompt: async () => {
+            writeFileSync(target, 'CONCURRENT WRITE');
+            return `apply ${saved.id}`;
+          },
+        },
+      );
+      assert.equal(r.ok, false, 'apply must abort on a post-confirm change');
+      assert.equal(r.reason, 'concurrent-mutation');
+      assert.equal(
+        readFileSync(target, 'utf-8'),
+        'CONCURRENT WRITE',
+        'the concurrent bytes are preserved, not overwritten',
+      );
+      assert.ok(psReadProposal(dir, saved.id), 'proposal preserved for re-apply');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+await testAsync(
+  'FEAT-11 T7: apply abort (no confirm) preserves target and proposal, exits non-zero',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      const target = join(dir, 'pages', 'note.md');
+      writeFileSync(target, 'ORIGINAL');
+      const saved = psWriteProposal(dir, {
+        target: join('pages', 'note.md'),
+        baseHash: null,
+        currentAtProposalHash: bsHashContent('ORIGINAL'),
+        proposedContent: 'PROPOSED',
+        sessionId: 's7',
+        device: 'd7',
+      });
+      const r = await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        { isTTY: true, stdout: capStream(), stderr: capStream(), prompt: async () => 'no' },
+      );
+      assert.equal(r.ok, false);
+      assert.notEqual(r.code, 0);
+      assert.equal(r.reason, 'not-confirmed');
+      assert.equal(readFileSync(target, 'utf-8'), 'ORIGINAL', 'target preserved');
+      assert.ok(psReadProposal(dir, saved.id), 'proposal preserved');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test('FEAT-11 T7: discard removes the proposal and leaves the target unchanged', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const target = join(dir, 'pages', 'note.md');
+    writeFileSync(target, 'ORIGINAL');
+    const saved = psWriteProposal(dir, {
+      target: join('pages', 'note.md'),
+      baseHash: null,
+      currentAtProposalHash: bsHashContent('ORIGINAL'),
+      proposedContent: 'PROPOSED',
+      sessionId: 's7',
+      device: 'd7',
+    });
+    const r = discardProposal(
+      { hypoDir: dir, id: saved.id },
+      { stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(r.ok, true);
+    assert.equal(psReadProposal(dir, saved.id), null, 'proposal removed');
+    assert.equal(readFileSync(target, 'utf-8'), 'ORIGINAL', 'target unchanged');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('FEAT-11 T7: list is oldest-first and reports the empty case', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  try {
+    const empty = capStream();
+    const r0 = listPending({ hypoDir: dir }, { stdout: empty });
+    assert.equal(r0.count, 0);
+    assert.match(empty.text(), /no pending proposals/);
+
+    psWriteProposal(dir, {
+      target: 'a.md',
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'A',
+      sessionId: 's7',
+      device: 'd7',
+      createdAt: '2026-07-01T00:00:00.000Z',
+    });
+    psWriteProposal(dir, {
+      target: 'b.md',
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'B',
+      sessionId: 's7',
+      device: 'd7',
+      createdAt: '2026-06-01T00:00:00.000Z',
+    });
+    const j = capStream();
+    const r = listPending({ hypoDir: dir }, { stdout: j, json: true });
+    assert.equal(r.count, 2);
+    const arr = JSON.parse(j.text());
+    assert.deepEqual(
+      arr.map((x) => x.target),
+      ['b.md', 'a.md'],
+      'sorted oldest createdAt first',
+    );
+    // Assert the identifying fields too: a listing that dropped `id` or `createdAt`
+    // would still satisfy a target-only check while being useless to `apply`.
+    for (const entry of arr) {
+      assert.ok(entry.id && typeof entry.id === 'string', 'each entry carries its id');
+      assert.ok(entry.createdAt, 'each entry carries its createdAt');
+    }
+    assert.deepEqual(
+      arr.map((x) => x.createdAt),
+      ['2026-06-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z'],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await testAsync('FEAT-11 T7: a successful apply leaves the session base untouched', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const rel = join('pages', 'note.md');
+    const target = join(dir, rel);
+    writeFileSync(target, 'ORIGINAL');
+    const sessionId = 'sess-apply-base';
+    snapshotBase(dir, sessionId, [rel]);
+    const before = readBaseEntry(dir, sessionId, rel);
+    assert.equal(before.hash, bsHashContent('ORIGINAL'), 'base captured the pre-apply bytes');
+
+    const saved = psWriteProposal(dir, {
+      target: rel,
+      baseHash: bsHashContent('ORIGINAL'),
+      currentAtProposalHash: hashProposalContent('ORIGINAL'),
+      proposedContent: 'PROPOSED',
+      sessionId,
+      device: 'd',
+    });
+    const res = await applyProposal(
+      { hypoDir: dir, id: saved.id },
+      {
+        isTTY: true,
+        stdout: capStream(),
+        stderr: capStream(),
+        now: () => '2026-07-10T00:00:00.000Z',
+        prompt: () => `apply ${saved.id}`,
+      },
+    );
+    assert.equal(res.ok, true);
+    assert.equal(readFileSync(target, 'utf-8'), 'PROPOSED');
+
+    // apply is an out-of-band human override, not a session write, so the base
+    // this session observed at start must not move. Advancing it would let the
+    // same session's next close overwrite the page without ever re-checking it.
+    // Breaking the apply-then-reclose loop is crystallize's idempotent-skip
+    // (disk === payload), not a base advance here.
+    assert.deepEqual(readBaseEntry(dir, sessionId, rel), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The three attacks a pre-commit review reproduced against the first cut of this
+// CLI. Each one exited 0 while either destroying the withheld bytes or writing
+// outside the vault, so each is pinned here rather than only fixed.
+
+test('FEAT-11 T7: a target pointing back into the proposal store is refused', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  try {
+    const saved = psWriteProposal(dir, {
+      target: join('pages', 'note.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'WITHHELD',
+      sessionId: 's',
+      device: 'd',
+    });
+    // Applying this would write the bytes over the artifact, then unlink it.
+    assert.equal(propResolveTargetPath(dir, join('.cache', 'proposals', `${saved.id}.json`)), null);
+    assert.equal(propResolveTargetPath(dir, join('.cache', 'proposals', 'applied.log')), null);
+    assert.equal(propResolveTargetPath(dir, join('.cache', 'proposals')), null);
+    // A normal target is unaffected by the store guard.
+    assert.ok(propResolveTargetPath(dir, join('pages', 'note.md')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await testAsync(
+  'FEAT-11 T7: an ancestor that becomes a symlink during the prompt aborts the write',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    const outside = mkdtempSync(join(tmpdir(), 'hypo-t7-outside-'));
+    try {
+      const saved = psWriteProposal(dir, {
+        target: join('new', 'leaf.md'),
+        baseHash: null,
+        currentAtProposalHash: null, // target absent at park time
+        proposedContent: 'WITHHELD',
+        sessionId: 's',
+        device: 'd',
+      });
+      const err = capStream();
+      const res = await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        {
+          isTTY: true,
+          stdout: capStream(),
+          stderr: err,
+          now: () => '2026-07-10T00:00:00.000Z',
+          // A concurrent process plants the escape while the human reads the diff.
+          prompt: () => {
+            symlinkSync(outside, join(dir, 'new'), 'dir');
+            return `apply ${saved.id}`;
+          },
+        },
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, 'unsafe-target');
+      assert.equal(
+        existsSync(join(outside, 'leaf.md')),
+        false,
+        'nothing written outside the vault',
+      );
+      assert.equal(psReadProposal(dir, saved.id)?.id, saved.id, 'proposal preserved');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+await testAsync(
+  'FEAT-11 T7: a symlinked audit log is refused and the proposal survives',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    const outside = mkdtempSync(join(tmpdir(), 'hypo-t7-outside-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'note.md'), 'ORIGINAL');
+      const saved = psWriteProposal(dir, {
+        target: join('pages', 'note.md'),
+        baseHash: null,
+        currentAtProposalHash: hashProposalContent('ORIGINAL'),
+        proposedContent: 'PROPOSED',
+        sessionId: 's',
+        device: 'd',
+      });
+      const sentinel = join(outside, 'stolen.log');
+      symlinkSync(sentinel, join(dir, '.cache', 'proposals', 'applied.log'));
+
+      const err = capStream();
+      const res = await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        {
+          isTTY: true,
+          stdout: capStream(),
+          stderr: err,
+          now: () => '2026-07-10T00:00:00.000Z',
+          prompt: () => `apply ${saved.id}`,
+        },
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, 'log-failed');
+      assert.equal(existsSync(sentinel), false, 'audit record never left the vault');
+      assert.equal(psReadProposal(dir, saved.id)?.id, saved.id, 'proposal kept for a retry');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+await testAsync(
+  'FEAT-11 T7: the diff is rendered against current disk bytes, not the parked base',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      const target = join(dir, 'pages', 'note.md');
+      writeFileSync(target, 'BASE_BYTES');
+      const saved = psWriteProposal(dir, {
+        target: join('pages', 'note.md'),
+        baseHash: hashProposalContent('BASE_BYTES'),
+        currentAtProposalHash: hashProposalContent('BASE_BYTES'),
+        proposedContent: 'PROPOSED_BYTES',
+        sessionId: 's',
+        device: 'd',
+      });
+      // Someone else wrote the page after the artifact was parked.
+      writeFileSync(target, 'OTHER_SESSION_BYTES');
+
+      const out = capStream();
+      await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        { isTTY: false, stdout: out, stderr: capStream() },
+      );
+      const shown = out.text();
+      assert.match(shown, /- OTHER_SESSION_BYTES/, 'removed side is the CURRENT disk bytes');
+      assert.match(shown, /\+ PROPOSED_BYTES/);
+      assert.doesNotMatch(shown, /BASE_BYTES$/m, 'the parked base is never the diff baseline');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+await testAsync(
+  'FEAT-11 T7: terminal control characters in the artifact never reach the diff output',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'note.md'), 'ORIGINAL');
+      const esc = String.fromCharCode(27);
+      // U+009B is the C1 CSI: a single byte that introduces a control sequence
+      // exactly like ESC-[ does. A C0-only sanitizer would let it through.
+      const c1csi = String.fromCharCode(0x9b);
+      const saved = psWriteProposal(dir, {
+        target: join('pages', 'note.md'),
+        baseHash: null,
+        currentAtProposalHash: hashProposalContent('ORIGINAL'),
+        proposedContent: `${esc}[2J${esc}[H${c1csi}2J SPOOFED`,
+        sessionId: 's',
+        device: 'd',
+      });
+      const out = capStream();
+      await applyProposal(
+        { hypoDir: dir, id: saved.id },
+        { isTTY: false, stdout: out, stderr: capStream() },
+      );
+      assert.doesNotMatch(out.text(), new RegExp(esc), 'no ESC byte reaches the terminal');
+      assert.doesNotMatch(out.text(), new RegExp(c1csi), 'no C1 CSI byte reaches the terminal');
+      assert.match(out.text(), /SPOOFED/, 'the text itself is still shown, just neutralized');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test('FEAT-11 T7: an in-vault symlink alias into the store is refused', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  try {
+    const saved = psWriteProposal(dir, {
+      target: join('pages', 'note.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'WITHHELD',
+      sessionId: 's',
+      device: 'd',
+    });
+    // `alias/` resolves to the store, so `alias/<id>.json` is lexically outside the
+    // store yet the real write lands on the artifact itself and would destroy it.
+    symlinkSync(join(dir, '.cache', 'proposals'), join(dir, 'alias'), 'dir');
+    assert.equal(propResolveTargetPath(dir, join('alias', `${saved.id}.json`)), null);
+    assert.equal(propResolveTargetPath(dir, join('alias', 'applied.log')), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Count proposals via the store the CLI reads through, so the assertion tracks the
+// exact `.json`-only scan (applied.log's `.log` suffix must never inflate it).
+function listProposalsCount(dir) {
+  return psListProposals(dir).length;
+}
 
 // appendIfAbsent data-loss fix: a PERSISTENT read error (EACCES/EISDIR/...) on an
 // append target that already has content must hard-fail the close, not silently
@@ -26407,10 +27065,7 @@ test('advanceBaseForWrite advances a tracked target to its current on-disk bytes
     snapshotBase(dir, 's1', overwriteTargets('p1'));
     const oq = join(dir, 'pages', 'open-questions.md');
     writeFileSync(oq, '# open questions\n\n## edited directly by this session\n');
-    assert.equal(
-      advanceBaseForWrite(dir, 's1', join('pages', 'open-questions.md'), oq),
-      true,
-    );
+    assert.equal(advanceBaseForWrite(dir, 's1', join('pages', 'open-questions.md'), oq), true);
     assert.equal(
       readBaseEntry(dir, 's1', join('pages', 'open-questions.md')).hash,
       bsHashFile(oq),
@@ -26460,10 +27115,7 @@ test('advanceBaseForWrite no-ops with no session, no snapshot, or a vanished tar
     rmSync(oq);
     // a tracked target that is absent post-write must NOT advance the base to
     // null — a vanished file is a real divergence the close should still see
-    assert.equal(
-      advanceBaseForWrite(dir, 's1', join('pages', 'open-questions.md'), oq),
-      false,
-    );
+    assert.equal(advanceBaseForWrite(dir, 's1', join('pages', 'open-questions.md'), oq), false);
     assert.equal(
       readBaseEntry(dir, 's1', join('pages', 'open-questions.md')).hash,
       before,
@@ -26861,7 +27513,11 @@ test('session directly edits a target, the hook advances its base, close writes 
     const closed = `${edited}\nand the close adds this.\n`;
     const { r, out } = t4Apply(dir, t4Payload(dir, today, closed, 'self-edit close'), 's-selfedit');
 
-    assert.equal(r.status, 0, `a provenance-backed close must succeed: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(
+      r.status,
+      0,
+      `a provenance-backed close must succeed: ${JSON.stringify(out.conflicts)}`,
+    );
     assert.deepEqual(out.conflicts, [], 'the session must not conflict against its own edit');
     assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), closed, 'the close payload must land');
   });
@@ -26937,7 +27593,10 @@ test('a NON-write tool (Read) on a drifted target must NOT advance the base', ()
     const { r, out } = t4Apply(dir, t4Payload(dir, today, mine, 'read-then-close'), 's-read');
     assert.notEqual(r.status, 0, 'a Read must not have licensed a clobber of B');
     const c = out.conflicts.find((x) => x.target === t4Rel);
-    assert.ok(c && c.reason === 'base-mismatch', `B's write must still be protected: ${JSON.stringify(out.conflicts)}`);
+    assert.ok(
+      c && c.reason === 'base-mismatch',
+      `B's write must still be protected: ${JSON.stringify(out.conflicts)}`,
+    );
     assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), otherSession, "B's write survives");
   });
 });

@@ -93,6 +93,7 @@ const KNOWN_SUBCOMMANDS = new Set([
   'uninstall',
   'feedback-sync',
   'capture',
+  'proposal',
 ]);
 const _verb = process.argv[2];
 if (_verb && KNOWN_SUBCOMMANDS.has(_verb) && _verb !== 'init') {
