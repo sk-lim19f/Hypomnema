@@ -5,6 +5,11 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
+# Least privilege by default. A job that needs more must declare its own
+# `permissions:` block, which REPLACES this default rather than merging with it.
+permissions:
+  contents: read
+
 jobs:
   verify-pages:
     # Checks verify_by / verify_by_date frontmatter fields only.

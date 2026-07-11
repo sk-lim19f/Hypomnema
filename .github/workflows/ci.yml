@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege by default. A job that needs more must declare its own
+# `permissions:` block, which REPLACES this default rather than merging with it.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test (Node ${{ matrix.node-version }})
