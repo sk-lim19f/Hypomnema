@@ -10,6 +10,12 @@ on:
   # BEFORE a real tag depends on it. Use it after rotating NPM_TOKEN.
   workflow_dispatch:
 
+# Least privilege by default. Both jobs below declare their own `permissions:`
+# block, which REPLACES this default rather than merging with it; this line only
+# governs any job added later that forgets to.
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: Publish to npm
