@@ -3612,6 +3612,106 @@ test('FEAT-11 T6: proposal-store round-trip, supersede-by-target, idempotent reu
   }
 });
 
+// Supersede is scoped to the writing session. Two concurrent sessions that both
+// withhold bytes for ONE target each hold a distinct payload, and the artifact is
+// its only durable copy (crystallize never puts withheld bytes on disk). Deleting
+// across sessions destroys the first session's work — the very clobber this gate
+// exists to prevent. Regression for the target-only supersede that shipped in T6.
+test('FEAT-11 T6: a concurrent session does not supersede another session proposal', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-ps-'));
+  try {
+    // Session A and session B both drift off the same base for the same target.
+    const a = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'cX',
+      proposedContent: 'A-BYTES',
+      sessionId: 's-A',
+      device: 'dev1',
+    });
+    const b = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'cX',
+      proposedContent: 'B-BYTES',
+      sessionId: 's-B',
+      device: 'dev1',
+    });
+
+    assert.notEqual(b.id, a.id, 'a different session mints its own artifact');
+    assert.equal(psListProposals(dir).length, 2, "session B must not delete session A's payload");
+    assert.equal(psReadProposal(dir, a.id)?.proposedContent, 'A-BYTES', "A's bytes survive");
+    assert.equal(psReadProposal(dir, b.id)?.proposedContent, 'B-BYTES', "B's bytes survive");
+
+    // Session A re-closes with new bytes: it replaces its OWN earlier attempt only.
+    const a2 = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'cY',
+      proposedContent: 'A-BYTES-2',
+      sessionId: 's-A',
+      device: 'dev1',
+    });
+    assert.equal(psReadProposal(dir, a.id), null, "A's own earlier attempt is superseded");
+    assert.equal(psReadProposal(dir, b.id)?.proposedContent, 'B-BYTES', "B survives A's re-close");
+    assert.equal(psListProposals(dir).length, 2, 'one artifact per (target, session)');
+    assert.equal(psReadProposal(dir, a2.id)?.proposedContent, 'A-BYTES-2');
+
+    // An unknown session id proves ownership of nothing, so it deletes nothing.
+    const anon = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'cZ',
+      proposedContent: 'ANON',
+      sessionId: null,
+      device: 'dev1',
+    });
+    assert.equal(psListProposals(dir).length, 3, 'a null session id supersedes nothing');
+    assert.equal(psReadProposal(dir, anon.id)?.proposedContent, 'ANON');
+    assert.equal(psReadProposal(dir, a2.id)?.proposedContent, 'A-BYTES-2');
+    assert.equal(psReadProposal(dir, b.id)?.proposedContent, 'B-BYTES');
+
+    // The artifact body is hand-editable and only its `id` is validated, so a
+    // non-string owner must not coerce into a match: `["s-B"]` stringifies to
+    // "s-B" and would otherwise let session s-B delete it.
+    const spoofPath = psReadProposal(dir, b.id) && join(psProposalsDir(dir), `${b.id}.json`);
+    const spoofBody = JSON.parse(readFileSync(spoofPath, 'utf-8'));
+    spoofBody.sessionId = ['s-B'];
+    writeFileSync(spoofPath, JSON.stringify(spoofBody, null, 2));
+    psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'cW',
+      proposedContent: 'B-BYTES-3',
+      sessionId: 's-B',
+      device: 'dev1',
+    });
+    assert.equal(
+      psReadProposal(dir, b.id)?.proposedContent,
+      'B-BYTES',
+      'a non-string owner is unidentifiable, so it is never superseded',
+    );
+
+    // The reverse of the null case above: a KNOWN session writing the same target
+    // must not sweep up the anonymous artifact either. Ownership runs both ways.
+    psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b1',
+      currentAtProposalHash: 'cV',
+      proposedContent: 'A-BYTES-3',
+      sessionId: 's-A',
+      device: 'dev1',
+    });
+    assert.equal(
+      psReadProposal(dir, anon.id)?.proposedContent,
+      'ANON',
+      'a named session does not supersede an artifact with no owner',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('FEAT-11 T6: readProposal/deleteProposal reject path-traversal ids (no escape from the store)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-ps-'));
   try {
@@ -4026,6 +4126,63 @@ test('FEAT-11 T7: no hook imports the apply path (no unattended auto-apply)', ()
     `hooks must never reach the apply path (fires unattended): ${importers.join(', ')}`,
   );
 });
+
+// Applying one id no longer empties the target's queue: a concurrent session's
+// proposal for the same file survives (one artifact per (target, session)), and the
+// write we just made drifted it. A silent "✓ applied" would read as done.
+await testAsync(
+  'FEAT-11 T7: apply warns that a concurrent session proposal still targets the file, and keeps it',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+    try {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      const target = join(dir, 'pages', 'note.md');
+      writeFileSync(target, 'ORIGINAL');
+      const rel = join('pages', 'note.md');
+      const mine = psWriteProposal(dir, {
+        target: rel,
+        baseHash: null,
+        currentAtProposalHash: bsHashContent('ORIGINAL'),
+        proposedContent: 'FROM SESSION A',
+        sessionId: 's-A',
+        device: 'd7',
+      });
+      const theirs = psWriteProposal(dir, {
+        target: rel,
+        baseHash: null,
+        currentAtProposalHash: bsHashContent('ORIGINAL'),
+        proposedContent: 'FROM SESSION B',
+        sessionId: 's-B',
+        device: 'd7',
+      });
+
+      const err = capStream();
+      const r = await applyProposal(
+        { hypoDir: dir, id: mine.id },
+        {
+          isTTY: true,
+          stdout: capStream(),
+          stderr: err,
+          prompt: async () => `apply ${mine.id}`,
+          now: () => '2026-07-12T00:00:00.000Z',
+        },
+      );
+
+      assert.equal(r.ok, true, `apply should succeed: ${JSON.stringify(r)}`);
+      assert.equal(r.siblingsPending, 1, "session B's proposal is still pending");
+      assert.equal(readFileSync(target, 'utf-8'), 'FROM SESSION A', 'the applied bytes landed');
+      assert.equal(
+        psReadProposal(dir, theirs.id)?.proposedContent,
+        'FROM SESSION B',
+        'apply never deletes another session payload',
+      );
+      assert.match(err.text(), /still target/, 'the leftover is announced, not silent');
+      assert.ok(err.text().includes(theirs.id), 'the warning names the leftover id');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 await testAsync(
   'FEAT-11 T7: non-TTY apply is refused: target bytes unchanged, proposal preserved',

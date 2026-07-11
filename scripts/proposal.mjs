@@ -475,7 +475,30 @@ export async function applyProposal({ hypoDir, id }, { isTTY, prompt, stdout, st
   }
 
   out.write(`✓ applied proposal ${id} to ${shownTarget}\n`);
-  return { ok: true, code: 0, id, target: proposal.target, warned: decision.warned };
+
+  // (13) A target can carry one parked payload per session (plus any whose owner is
+  // unidentifiable), so applying this id may leave another proposal for the same
+  // file still pending. Say so, or the human reads "✓ applied" as done and meets the
+  // leftover only via the next pending count. Never auto-delete it: destroying a
+  // payload nobody reviewed is the clobber this store exists to prevent.
+  const siblings = listProposals(hypoDir).filter((p) => p.target === proposal.target);
+  if (siblings.length > 0) {
+    const ids = siblings.map((p) => p.id).join(', ');
+    err.write(
+      `⚠️  ${siblings.length} other proposal(s) still target ${shownTarget}: ${ids}\n` +
+        `    The write above changed that file, so each one now needs a fresh look. ` +
+        `\`hypomnema proposal apply <id>\` re-reads the file and diffs against it; discard the ones you do not want.\n`,
+    );
+  }
+
+  return {
+    ok: true,
+    code: 0,
+    id,
+    target: proposal.target,
+    warned: decision.warned,
+    siblingsPending: siblings.length,
+  };
 }
 
 /**
