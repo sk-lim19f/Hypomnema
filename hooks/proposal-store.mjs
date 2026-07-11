@@ -22,13 +22,24 @@
 //      whole target, which for an append-only history file would drop every other
 //      entry. crystallize filters `kind: 'append'` out before it ever calls here.
 //
-//   2. One artifact per target. Each close re-derives the same drifted target, so
-//      without supersede a fresh random id would accumulate a stale artifact on
-//      every close and inflate the pending count. writeProposal writes the new
-//      artifact durably FIRST, then deletes any older same-target sibling — so a
-//      crash between the two leaves an extra artifact (harmless, superseded next
-//      time), never zero. A same-target close that is byte-identical reuses the
-//      existing id instead of writing at all (idempotent).
+//   2. One artifact per (target, SESSION). Each close re-derives the same drifted
+//      target, so without supersede a fresh random id would accumulate a stale
+//      artifact on every close and inflate the pending count. But supersede is
+//      scoped to the writing session: a LATER close only replaces that same
+//      session's own earlier attempt at the target. Two concurrent sessions that
+//      both withhold bytes for one target keep BOTH artifacts, because each holds
+//      a distinct payload and this artifact is its only durable copy (crystallize
+//      never puts withheld bytes on disk and drops them from its reported shape).
+//      Deleting across sessions would silently destroy the first session's work,
+//      which is exactly the clobber this gate exists to prevent. A session id we
+//      cannot match (null on either side) supersedes nothing: never delete a
+//      payload we cannot prove is our own earlier attempt.
+//      writeProposal writes the new artifact durably FIRST, then deletes the older
+//      same-session sibling — so a crash between the two leaves an extra artifact
+//      (harmless, superseded next time), never zero. A same-target close that is
+//      byte-identical reuses the existing id instead of writing at all (idempotent,
+//      and session-agnostic: identical bytes are one payload, so reusing another
+//      session's artifact drops nothing).
 //
 // Everything is best-effort on the read side (a malformed artifact is skipped, not
 // fatal) and atomic on the write side (tmp+rename), mirroring base-store.
@@ -261,8 +272,19 @@ export function writeProposal(hypoDir, fields) {
   atomicWrite(path, JSON.stringify(body, null, 2));
 
   const supersedeWarnings = [];
+  const mine = body.sessionId;
   for (const p of sameTarget) {
     if (p.id === id) continue; // never delete what we just wrote
+    // Same target is NOT enough: a sibling written by a DIFFERENT session holds
+    // that session's only copy of its withheld bytes (invariant 2). Supersede
+    // only our own earlier attempt, and only when both ids are known.
+    //
+    // `typeof === 'string'` before comparing, never String(p.sessionId): the body
+    // is hand-editable and listProposals validates only `id`, so a field like
+    // `["s-A"]` would coerce to a matching primitive. writeProposal always stores
+    // a string, so a non-string id belongs to no session we can identify — and an
+    // unidentifiable owner is exactly the case that must not be deleted.
+    if (mine === null || typeof p.sessionId !== 'string' || p.sessionId !== mine) continue;
     if (!deleteProposal(hypoDir, p.id)) {
       supersedeWarnings.push(`could not supersede stale proposal ${p.id} for ${target}`);
     }
