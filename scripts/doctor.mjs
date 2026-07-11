@@ -25,6 +25,7 @@ import {
   projectSuggestionsPath,
   collectProjectWorkingDirs,
 } from '../hooks/hypo-shared.mjs';
+import { listProposals } from '../hooks/proposal-store.mjs';
 import {
   discoverExtensions,
   parseManifest,
@@ -669,6 +670,24 @@ function checkProjectSuggestions(hypoDir) {
   }
 }
 
+function checkProposals(hypoDir) {
+  // Vault-wide count of parked write-proposals (T8). listProposals is the
+  // count source rather than a raw readdir: it already skips malformed and
+  // spoofed-id artifacts, so the number matches exactly what `hypomnema proposal
+  // list/apply/discard` can act on. Surface only: warn (never fail), pass at 0,
+  // because a pending proposal is a normal state awaiting review, not a broken
+  // install, and the check discovers without changing any state.
+  const count = listProposals(hypoDir).length;
+  if (count === 0) {
+    pass('Pending proposals', 'No parked write-proposals');
+  } else {
+    warn(
+      'Pending proposals',
+      `${count} parked write-proposal(s) awaiting review; inspect with \`hypomnema proposal list\``,
+    );
+  }
+}
+
 function checkCodexPaths() {
   const codexHooks = join(HOME, '.codex', 'hooks');
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
@@ -1209,6 +1228,7 @@ if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex'
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
+if (rootOk) checkProposals(args.hypoDir);
 if (rootOk) checkFeedbackProjection(args.hypoDir, args.claudeHome, args.projectId);
 checkGit(args.hypoDir);
 
