@@ -18,6 +18,7 @@ import {
   existsSync,
   symlinkSync,
   statSync,
+  lstatSync,
   unlinkSync,
   utimesSync,
   chmodSync,
@@ -27018,6 +27019,395 @@ test('adopt failure rolls back the wiki hook writes (sidecar install path blocke
         !existsSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-failh.manifest.json')),
         'wiki manifest rolled back',
       );
+    });
+  });
+});
+
+// ── directory skills: reverse capture (skills-capture design) ────────────────
+//
+// A skill is a DIRECTORY, and capture must put into the wiki exactly what the far
+// machine will install back. These drive the real CLI end to end.
+
+const { ownedSkillDirs, planSkillCapture, scanSkillCandidates } = await import(
+  `${SCRIPTS}/capture.mjs`
+);
+
+suite('capture: directory skills (scan + plan)');
+
+test('ownedSkillDirs trusts only validly recorded skill keys', () => {
+  const owned = ownedSkillDirs({
+    'skills/good': { 'SKILL.md': 'a'.repeat(64) },
+    'skills/corrupt': 'not-a-nested-map', // shape mismatch → not ownership
+    'skills/empty': {}, // owns nothing → not ownership
+    'skills/../escape': { 'SKILL.md': 'b'.repeat(64) }, // unparseable key
+    'commands/x.md': 'c'.repeat(64), // flat key, not a skill
+  });
+  assert.deepEqual([...owned], ['good']);
+});
+
+// A corrupt pkg-json must not lock a skill out of capture forever by reading as
+// "already managed" (codex design review W2-6).
+test('a corrupt skills/<name> record does not mark the skill as already-managed', () => {
+  withTmpHome((home) => {
+    const skill = join(home, '.claude', 'skills', 'mine');
+    mkdirSync(skill, { recursive: true });
+    writeFileSync(join(skill, 'SKILL.md'), '# mine\n');
+    const owned = ownedSkillDirs({ 'skills/mine': 'not-a-nested-map' });
+    const { candidates } = scanSkillCandidates(join(home, '.claude'), owned);
+    assert.deepEqual(
+      candidates.map((c) => c.file),
+      ['mine'],
+    );
+  });
+});
+
+test('planSkillCapture: ready only when the wiki directory is wholly absent', () => {
+  const wantManifest = { type: 'skill', installName: 'mine' };
+  const srcShas = { 'SKILL.md': 'a'.repeat(64) };
+  assert.equal(
+    planSkillCapture({ wantManifest, srcShas, wikiPresent: false, wikiShas: null }).status,
+    'ready',
+  );
+  // Present + identical + matching manifest → already (no-op).
+  assert.equal(
+    planSkillCapture({
+      wantManifest,
+      srcShas,
+      wikiPresent: true,
+      wikiShas: { 'SKILL.md': 'a'.repeat(64) },
+      existingManifestRaw: JSON.stringify(wantManifest),
+    }).status,
+    'already',
+  );
+  // Present + different content → conflict, never a silent overwrite.
+  assert.equal(
+    planSkillCapture({
+      wantManifest,
+      srcShas,
+      wikiPresent: true,
+      wikiShas: { 'SKILL.md': 'b'.repeat(64) },
+      existingManifestRaw: JSON.stringify(wantManifest),
+    }).status,
+    'conflict',
+  );
+  // Present but unreadable as a skill (crash-truncated, symlinked, a plain file):
+  // conflict, so the rollback is never handed a directory it did not create.
+  assert.equal(
+    planSkillCapture({ wantManifest, srcShas, wikiPresent: true, wikiShas: null }).status,
+    'conflict',
+  );
+  // Identical content but no sidecar → conflict: install semantics would differ.
+  assert.equal(
+    planSkillCapture({
+      wantManifest,
+      srcShas,
+      wikiPresent: true,
+      wikiShas: { 'SKILL.md': 'a'.repeat(64) },
+      existingManifestRaw: null,
+    }).status,
+    'conflict',
+  );
+});
+
+// Everything that cannot round-trip through the wiki refuses the WHOLE skill: a
+// lossy wiki copy is what the far machine would install (design §2).
+test('a subtree that cannot round-trip refuses the whole skill, with a reason', () => {
+  withTmpHome((home) => {
+    const skills = join(home, '.claude', 'skills');
+    const mk = (name) => {
+      const d = join(skills, name);
+      mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, 'SKILL.md'), `# ${name}\n`);
+      return d;
+    };
+    const link = mk('haslink');
+    symlinkSync('/etc/hosts', join(link, 'evil.md'));
+    const empty = mk('hasempty');
+    mkdirSync(join(empty, 'templates'));
+    const vcs = mk('hasvcs');
+    mkdirSync(join(vcs, '.git'));
+    writeFileSync(join(vcs, '.git', 'config'), '[core]\n');
+    const nosk = join(skills, 'noskill');
+    mkdirSync(nosk, { recursive: true });
+    writeFileSync(join(nosk, 'README.md'), '# not a skill\n');
+    mk('clean');
+
+    const { candidates, skipped } = scanSkillCandidates(join(home, '.claude'), new Set());
+    assert.deepEqual(
+      candidates.map((c) => c.file),
+      ['clean'],
+      'only the clean skill is capturable',
+    );
+    const reasons = Object.fromEntries(skipped.map((s) => [s.file, s.reason]));
+    assert.match(reasons.haslink, /not a regular file/);
+    assert.match(reasons.hasempty, /empty directory/);
+    assert.match(reasons.hasvcs, /VCS control directory/);
+    assert.match(reasons.noskill, /SKILL\.md/);
+  });
+});
+
+// The ceiling is what stops a vendored skill (gstack: 14k files / 1.1GB) from being
+// copied into a git vault. It must land BEFORE any file is read.
+test('a skill over the file ceiling is refused with the measured count', () => {
+  withTmpHome((home) => {
+    const d = join(home, '.claude', 'skills', 'huge');
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'SKILL.md'), '# huge\n');
+    for (let i = 0; i < 520; i++) writeFileSync(join(d, `f${i}.md`), 'x\n');
+    const { candidates, skipped } = scanSkillCandidates(join(home, '.claude'), new Set());
+    assert.equal(candidates.length, 0, 'an oversized skill is not a candidate');
+    assert.match(skipped[0].reason, /over 500 files/);
+  });
+});
+
+suite('capture: directory skills end-to-end (adopt + round-trip)');
+
+// Success criterion 1 + 2. The round-trip check MUST use a SECOND home: for skills the
+// capture source and the install target are the SAME directory, so re-syncing onto the
+// source only proves adopt is a no-op and would hide a broken far machine.
+test('captures a directory skill, adopts it, and reinstalls it on a second machine', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(join(src, 'references'), { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      writeFileSync(join(src, 'references', 'a.md'), 'ref a\n');
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      const wikiSkill = join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine');
+      assert.ok(existsSync(join(wikiSkill, 'SKILL.md')), 'SKILL.md stored in the wiki');
+      assert.ok(existsSync(join(wikiSkill, 'references', 'a.md')), 'subtree stored in the wiki');
+      const manifest = JSON.parse(
+        readFileSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine.manifest.json'), 'utf-8'),
+      );
+      assert.deepEqual(manifest, { type: 'skill', installName: 'mine' });
+
+      const owned = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'))
+        .extensions.claude['skills/mine'];
+      assert.equal(typeof owned, 'object', 'ownership is a nested per-relpath map');
+      assert.deepEqual(Object.keys(owned).sort(), ['SKILL.md', 'references/a.md']);
+
+      // Second machine: a fresh HOME pointed at the same wiki must reproduce the skill.
+      withTmpHome((home2) => {
+        const up = runWithHome('upgrade.mjs', ['--apply', `--hypo-dir=${hypoDir}`], home2);
+        assert.equal(up.status, 0, up.stderr);
+        const far = join(home2, '.claude', 'skills', 'mine');
+        assert.equal(readFileSync(join(far, 'SKILL.md'), 'utf-8'), '# mine\n');
+        assert.equal(readFileSync(join(far, 'references', 'a.md'), 'utf-8'), 'ref a\n');
+        assert.ok(
+          !existsSync(join(home2, '.claude', 'skills', 'hypo-ext-mine')),
+          'installs under the original name, not the wiki storage name',
+        );
+      });
+    });
+  });
+});
+
+test('--dry-run writes nothing to the wiki and does not adopt a skill', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all', '--dry-run'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(!existsSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine')));
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(!pkg.extensions.claude['skills/mine'], 'dry-run records no ownership');
+    });
+  });
+});
+
+// A second capture of the same skill is a no-op, not a conflict and not a rewrite.
+test('re-capturing an unchanged skill reports already, and a changed wiki copy refuses', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      assert.equal(runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home).status, 0);
+
+      // Now owned: the skill is no longer even a candidate.
+      const again = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, 'mine'], home);
+      assert.equal(again.status, 0, again.stderr);
+      assert.match(again.stdout, /no capturable candidate/);
+
+      // Drop the ownership record but leave a DIFFERENT wiki copy: capture must refuse
+      // rather than silently overwrite what the wiki already carries.
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      delete pkg.extensions.claude['skills/mine'];
+      writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+      writeFileSync(
+        join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine', 'SKILL.md'),
+        '# edited in the wiki\n',
+      );
+      const conflict = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, 'mine'], home);
+      assert.match(conflict.stdout, /different content/);
+      assert.equal(
+        readFileSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine', 'SKILL.md'), 'utf-8'),
+        '# edited in the wiki\n',
+        'the wiki copy is left alone',
+      );
+    });
+  });
+});
+
+// A bare name that matches both a command and a skill must not silently pick one
+// (codex design review W2-7).
+test('an ambiguous bare name is refused and nothing is captured', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      mkdirSync(join(home, '.claude', 'commands'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'commands', 'mine.md'), '# cmd\n');
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# skill\n');
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, 'mine'], home);
+      assert.match(r.stdout, /ambiguous/);
+      assert.ok(!existsSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine')));
+      assert.ok(!existsSync(join(hypoDir, 'extensions', 'commands', 'hypo-ext-mine.md')));
+
+      // Qualifying by type resolves it.
+      const q = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, 'skills/mine'], home);
+      assert.equal(q.status, 0, q.stderr);
+      assert.ok(existsSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine', 'SKILL.md')));
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'commands', 'hypo-ext-mine.md')),
+        'the command was not captured',
+      );
+    });
+  });
+});
+
+// The rollback ledger is authoritative. A refused write must not delete a wiki path the
+// run never touched: a DANGLING sidecar symlink is invisible to existsSync, the boundary
+// guard refuses the write, and the old rollback then unlinked the symlink anyway (codex
+// pre-commit BLOCKER, reproduced).
+test('a refused skill write never deletes a wiki path the run did not create', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      const sidecar = join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine.manifest.json');
+      symlinkSync(join(dir, 'no-such-target'), sidecar);
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, 'skills/mine'], home);
+      assert.match(r.stdout, /symlinked directory/);
+      assert.ok(lstatSync(sidecar).isSymbolicLink(), 'the pre-existing symlink is left alone');
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine')),
+        'nothing was written',
+      );
+    });
+  });
+});
+
+// A file legitimately named `__proto__` must be tracked as an own key, not assigned
+// through the prototype setter (codex pre-commit CONCERN; forward-sync already guards
+// this, so capture must too or the two disagree about what was captured).
+test('a skill file named __proto__ is captured and owned like any other', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      writeFileSync(join(src, '__proto__'), 'polluted?\n');
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(existsSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine', '__proto__')));
+      const owned = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'))
+        .extensions.claude['skills/mine'];
+      assert.deepEqual(Object.keys(owned).sort(), ['SKILL.md', '__proto__']);
+    });
+  });
+});
+
+// Capture must judge a source file by the rule that will apply AFTER it lands in the
+// wiki. forward-sync discovers the wiki subtree through the vault's .hypoignore, so a
+// file the vault ignores would be written, then dropped from discovery, and the adopt
+// check would fail with nothing a user could act on. Refuse it up front, naming the file.
+test('a skill holding a file the vault ignores is refused up front, not at adopt time', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeFileSync(join(hypoDir, '.hypoignore'), '*.pdf\n');
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(join(src, 'references'), { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      writeFileSync(join(src, 'references', 'spec.pdf'), '%PDF-1.4\n');
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.match(r.stdout, /references\/spec\.pdf matches the vault \.hypoignore/);
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine')),
+        'nothing is written to the wiki',
+      );
+      assert.doesNotMatch(r.stdout, /Failed to adopt/, 'refused at scan time, not at adopt');
+    });
+  });
+});
+
+// Success criterion 10: uninstall reaches a captured skill through its SHA-map key.
+test('uninstall removes a captured skill and preserves an unowned file inside it', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(join(src, 'references'), { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      writeFileSync(join(src, 'references', 'a.md'), 'ref a\n');
+      assert.equal(runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home).status, 0);
+
+      writeFileSync(join(src, 'notes.md'), 'my own notes\n'); // unowned
+      const r = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(!existsSync(join(src, 'SKILL.md')), 'owned SKILL.md removed');
+      assert.ok(!existsSync(join(src, 'references', 'a.md')), 'owned subtree file removed');
+      assert.equal(readFileSync(join(src, 'notes.md'), 'utf-8'), 'my own notes\n', 'unowned kept');
     });
   });
 });
