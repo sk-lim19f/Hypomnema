@@ -393,6 +393,20 @@ No external services. No API keys. No vector databases.
 
 ---
 
+## For AI assistants
+
+If you are Claude (or another coding agent) operating a Hypomnema wiki, these are the ground rules.
+
+The wiki is the single source of truth. Everything the user asked you to remember about their work is markdown under the wiki root, and you read it before answering from recollection. `projects/<name>/hot.md` holds the background for one project, `projects/<name>/session-state.md` holds what to do next, and `/hypo:resume` loads both. The `hot.md` at the wiki root is a different file: a pointer table of which projects are active.
+
+Keep no second copy of that state. `MEMORY.md` and the `<learned_behaviors>` block inside `~/.claude/CLAUDE.md` look like your own memory, but they are one-way projections that Hypomnema derives from `pages/feedback/`. Record a correction with `/hypo:feedback` and let the sync regenerate them. Edit a projection by hand and the next sync stops on it as a conflict instead of merging it, because nothing can tell which side is now the truth; reconciling it back into the feedback page becomes your job. And a wiki fact you stash somewhere only you can see never reaches the user's other machines at all.
+
+Captured sources are immutable. Never edit anything under `sources/`. Synthesize into `pages/` instead, and link back to the source.
+
+The operating procedure ships inside the wiki, so you do not have to fetch anything. `hypo-guide.md` at the wiki root is the operations guide, `SCHEMA.md` defines the page types and frontmatter, and `hypo-help.md` lists the commands. Read `SCHEMA.md` then `hypo-guide.md` on your first wiki task of a session.
+
+---
+
 ## Docs
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md): internals, component map, data flows
