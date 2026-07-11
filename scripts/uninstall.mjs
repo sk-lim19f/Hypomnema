@@ -39,6 +39,12 @@ import {
   CODEX_TYPES,
   readExtensionPkgStateNoMutate,
   parseExtKey,
+  parseSkillKey,
+  parseSkillShaValue,
+  isFlatShaValue,
+  emptyShaMap,
+  isContainedUnder,
+  hasSymlinkAncestor,
   buildHookCommand,
 } from './lib/extensions.mjs';
 
@@ -105,8 +111,8 @@ function removeCommands(apply, force) {
 // map empties out, drop the target key; when the whole `extensions` object empties,
 // drop it too. Other targets' records (e.g. codex map during a Claude-only uninstall)
 // are never touched.
-function stripExtensionsFromPkg(pkgPath, target, removedKeys, apply) {
-  if (!existsSync(pkgPath) || removedKeys.length === 0) return false;
+function stripExtensionsFromPkg(pkgPath, target, removedKeys, apply, rewrittenKeys = new Map()) {
+  if (!existsSync(pkgPath) || (removedKeys.length === 0 && rewrittenKeys.size === 0)) return false;
   let pkg;
   try {
     pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
@@ -123,6 +129,15 @@ function stripExtensionsFromPkg(pkgPath, target, removedKeys, apply) {
   for (const key of removedKeys) {
     if (key in perTarget) {
       delete perTarget[key];
+      changed = true;
+    }
+  }
+  // A partially-uninstalled skill keeps only the files it still owns. Leaving the
+  // removed paths in the map would let a later --force run delete whatever the user
+  // has since put back at those paths.
+  for (const [key, nested] of rewrittenKeys) {
+    if (key in perTarget) {
+      perTarget[key] = nested;
       changed = true;
     }
   }
@@ -157,6 +172,46 @@ function stripExtensionsFromPkg(pkgPath, target, removedKeys, apply) {
 // file whose on-disk SHA differs from the recorded one is user-modified and
 // preserved unless --force-extensions; a symlink/non-regular target is always
 // preserved (force does not follow them, matching install/upgrade E3's guard).
+// Remove the directories a skill removal emptied, deepest first, and finally the
+// skill root itself. Anything still holding files (user-added, or copies we
+// refused to remove) is left standing — rmdir on a non-empty directory throws and
+// we swallow it, which is exactly the "never destroy what we don't own" behavior.
+//
+// Every rmdir is guarded by the same containment + symlink-ancestor walk the file
+// removals use. Without it, a corrupt `"skills/x": {}` record plus a symlinked
+// skill dir was enough to rmdir empty directories anywhere on disk: the record
+// granted no file ownership, yet the prune still ran (codex pre-commit BLOCKER).
+function pruneSkillDirs(skillsRoot, skillRoot) {
+  if (hasSymlinkAncestor(skillsRoot, skillRoot)) return;
+  const dirs = [];
+  const collect = (dir, depth) => {
+    if (depth > 16) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue; // isDirectory() is false for a symlink here
+      const full = join(dir, e.name);
+      collect(full, depth + 1);
+      dirs.push(full);
+    }
+  };
+  collect(skillRoot, 1);
+  dirs.push(skillRoot);
+  for (const dir of dirs) {
+    if (!isContainedUnder(skillsRoot, dir)) continue;
+    if (hasSymlinkAncestor(skillsRoot, dir)) continue;
+    try {
+      rmdirSync(dir);
+    } catch {
+      // not empty (or gone) — leave it
+    }
+  }
+}
+
 function removeExtensions(target, apply, force) {
   const targetRoot = target === 'codex' ? join(HOME, '.codex') : join(HOME, '.claude');
   const types = target === 'codex' ? CODEX_TYPES : EXT_TYPES;
@@ -167,11 +222,77 @@ function removeExtensions(target, apply, force) {
 
   const removed = [];
   const removedKeys = [];
+  // Skill keys that survive in reduced form: key → the nested map of files we still
+  // own after this run.
+  const rewrittenKeys = new Map();
   const skippedUserModified = [];
   const skippedNonRegular = [];
 
   for (const [key, recordedSHA] of Object.entries(recorded)) {
     if (!recordedSHA) continue; // no ownership baseline → nothing to remove
+
+    // A directory skill records one key (`skills/<name>`) whose value is a map of
+    // per-file SHAs. parseExtKey rejects that key by design (it demands the type's
+    // file extension), so without this branch every installed skill file would be
+    // silently stranded: owned on paper, unreachable by uninstall.
+    const skillKey = types.includes('skills') ? parseSkillKey(key) : null;
+    if (skillKey) {
+      const nested = parseSkillShaValue(recordedSHA);
+      // A corrupt value grants no ownership: remove nothing, and do NOT prune —
+      // pruning on an empty/invalid record is destructive power the record never
+      // earned.
+      if (!nested || Object.keys(nested).length === 0) continue;
+      const skillsRoot = join(targetRoot, 'skills');
+      const skillRoot = join(skillsRoot, skillKey.installDir);
+      // What the record must still claim after this run. A file we removed drops
+      // out; a file we preserved stays. Keeping a removed path in the record is not
+      // cosmetic: a later --force run deletes whatever now sits at that path,
+      // including a brand-new file the user created there (codex fix-verify BLOCKER).
+      const remaining = emptyShaMap();
+      let removedAny = false;
+      const preserve = (rel, sha, path, bucket) => {
+        remaining[rel] = sha;
+        bucket.push(path);
+      };
+      for (const [rel, sha] of Object.entries(nested)) {
+        const fullPath = join(skillRoot, ...rel.split('/'));
+        // Same containment + symlink-ancestor guard the sync path uses: a lexical
+        // check alone cannot see a symlinked directory in the middle of the path.
+        if (!isContainedUnder(skillRoot, fullPath) || hasSymlinkAncestor(skillsRoot, fullPath)) {
+          preserve(rel, sha, fullPath, skippedNonRegular);
+          continue;
+        }
+        if (!existsSync(fullPath)) continue; // already gone: the claim goes too
+        if (!isRegularFile(fullPath)) {
+          preserve(rel, sha, fullPath, skippedNonRegular);
+          continue;
+        }
+        const buf = readFileIfRegular(fullPath);
+        const fileSha = buf ? sha256(buf) : null;
+        if (fileSha === sha || force) {
+          if (apply) rmSync(fullPath);
+          removed.push(fullPath);
+          removedAny = true;
+        } else {
+          preserve(rel, sha, fullPath, skippedUserModified);
+        }
+      }
+      // Prune the directories we emptied, deepest first. A skill dir still holding
+      // user files (or files we refused to remove) is left in place.
+      if (apply && removedAny) pruneSkillDirs(skillsRoot, skillRoot);
+      // Retire the key outright only when nothing is left to claim. Otherwise rewrite
+      // it down to just the preserved files: dropping the whole key would disown them
+      // forever, and keeping the whole key would leave stale claims on paths we no
+      // longer own.
+      if (Object.keys(remaining).length === 0) removedKeys.push(key);
+      else rewrittenKeys.set(key, remaining);
+      continue;
+    }
+
+    // A flat key's value must be a plain hex SHA. Anything else (an object parked
+    // there by a corrupt pkg-json) grants no ownership — otherwise --force would
+    // remove the file on the strength of a value we never wrote.
+    if (!isFlatShaValue(recordedSHA)) continue;
     const parsed = parseExtKey(key, types);
     if (!parsed) continue; // untrusted / cross-target key → never join+rm
     const fullPath = join(targetRoot, parsed.type, parsed.installFile);
@@ -193,7 +314,7 @@ function removeExtensions(target, apply, force) {
       skippedUserModified.push(fullPath);
     }
   }
-  return { target, removed, removedKeys, skippedUserModified, skippedNonRegular };
+  return { target, removed, removedKeys, rewrittenKeys, skippedUserModified, skippedNonRegular };
 }
 
 // True iff `pkg.json` still holds extensions state for a target the current
@@ -478,6 +599,7 @@ let codexExtResult = {
   target: 'codex',
   removed: [],
   removedKeys: [],
+  rewrittenKeys: new Map(),
   skippedUserModified: [],
   skippedNonRegular: [],
 };
@@ -497,10 +619,23 @@ if (args.codex) {
   );
 }
 
-// Surgical per-target ext SHA strip — only for files we actually removed.
-stripExtensionsFromPkg(pkgJsonPath, 'claude', claudeExtResult.removedKeys, args.apply);
+// Surgical per-target ext SHA strip — only for files we actually removed. A skill
+// we uninstalled only partway is rewritten down to the files we still own.
+stripExtensionsFromPkg(
+  pkgJsonPath,
+  'claude',
+  claudeExtResult.removedKeys,
+  args.apply,
+  claudeExtResult.rewrittenKeys,
+);
 if (args.codex) {
-  stripExtensionsFromPkg(pkgJsonPath, 'codex', codexExtResult.removedKeys, args.apply);
+  stripExtensionsFromPkg(
+    pkgJsonPath,
+    'codex',
+    codexExtResult.removedKeys,
+    args.apply,
+    codexExtResult.rewrittenKeys,
+  );
 }
 
 // pkg.json metadata file removal — only when no user-tracked state remains.
