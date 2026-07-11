@@ -432,7 +432,7 @@ function pkgRootDir(target) {
  * the wiki subtree (`references -> /etc`) would otherwise let the walker copy
  * files from outside the vault into the install target.
  */
-function isRealDir(p) {
+export function isRealDir(p) {
   try {
     return lstatSync(p).isDirectory();
   } catch {
@@ -440,19 +440,53 @@ function isRealDir(p) {
   }
 }
 
+// Directory names that must never be captured into the wiki: the wiki is itself a
+// git repo, so a `.git` under a skill would nest one repo inside another. Strict
+// (capture) mode only.
+const VCS_DIRS = new Set(['.git', '.hg', '.svn']);
+
 /**
- * Walk a wiki skill directory and collect its owned files. lstat-based: symlinked
+ * Walk a skill directory and collect its owned files. lstat-based: symlinked
  * files and symlinked directories are skipped with a warning, never followed.
  *
- * Returns `{ files: [{ rel, srcPath }], warnings, skip }`. `skip` is set when the
- * whole skill must be dropped: no regular SKILL.md at the root, or two source
+ * Returns `{ files: [{ rel, srcPath, size }], warnings, skip }`. `skip` is set when
+ * the whole skill must be dropped: no regular SKILL.md at the root, or two source
  * paths that canonicalize to the same destination (case-fold aliasing), which
  * would make ownership order-dependent.
+ *
+ * `opts` is empty for forward-sync, which keeps its tolerant behavior verbatim.
+ * Reverse capture passes:
+ *   - `strict`: any per-file skip reason poisons the WHOLE skill instead of
+ *     dropping that one file. Capture must never write a lossy copy into the
+ *     wiki, because what lands there is what the far machine installs. It also
+ *     turns on the checks that only matter for content coming INTO the wiki:
+ *     empty directories (git cannot carry them), VCS control dirs, and hardlinks
+ *     (link identity does not round-trip).
+ *   - `maxFiles` / `maxBytes`: cumulative ceilings, checked during the walk so a
+ *     vendored skill (gstack: 14k files / 1.1GB) aborts early instead of being
+ *     enumerated in full on every candidate listing. Sizes come from lstat, so
+ *     the verdict lands before anything is read.
  */
-function walkSkillSubtree(skillDir, label, hypoDir, hypoignorePatterns) {
+export function walkSkillSubtree(skillDir, label, hypoDir, hypoignorePatterns, opts = {}) {
+  const { strict = false, maxFiles = Infinity, maxBytes = Infinity } = opts;
   const files = [];
   const warnings = [];
   const seen = new Map(); // case-folded canonical rel -> first rel that claimed it
+  let bytes = 0;
+  // Set once the whole skill is doomed; unwinds the recursion immediately.
+  let fatal = null;
+  const poison = (reason) => {
+    fatal = reason;
+    warnings.push(`${label} skipped (${reason})`);
+    files.length = 0;
+    return { fatal: true };
+  };
+  // A per-file problem: tolerated (skip the file) by forward-sync, fatal in strict.
+  const reject = (rel, reason) => {
+    if (strict) return poison(`${rel}: ${reason}`);
+    warnings.push(`${label}/${rel} skipped (${reason})`);
+    return null;
+  };
 
   const rootFile = join(skillDir, SKILL_ROOT_FILE);
   if (!isRegularFile(rootFile)) {
@@ -465,65 +499,100 @@ function walkSkillSubtree(skillDir, label, hypoDir, hypoignorePatterns) {
 
   const walk = (dir, prefix, depth) => {
     if (depth > SKILL_MAX_DEPTH) {
-      warnings.push(`${label}/${prefix} skipped (subtree deeper than ${SKILL_MAX_DEPTH})`);
-      return;
+      return reject(prefix, `subtree deeper than ${SKILL_MAX_DEPTH}`);
     }
     let entries;
     try {
       entries = readdirSync(dir);
     } catch {
-      warnings.push(`${label}/${prefix} skipped (unreadable directory)`);
-      return;
+      return reject(prefix, 'unreadable directory');
+    }
+    // git cannot carry an empty directory, so a skill that needs one cannot be
+    // reproduced through the wiki. Refuse rather than capture a subset.
+    if (strict && entries.length === 0 && depth > 1) {
+      return poison(`${prefix}: empty directory (add a .gitkeep to carry it)`);
     }
     for (const name of entries) {
       const full = join(dir, name);
       const rel = prefix ? `${prefix}/${name}` : name;
       if (isIgnored(full, hypoDir, hypoignorePatterns)) continue;
       if (isRealDir(full)) {
+        if (strict && VCS_DIRS.has(name)) {
+          return poison(`${rel}: VCS control directory cannot be nested in the wiki`);
+        }
         // Propagate a collision found further down: ignoring this return value let a
         // deep `references/A.md` vs `references/a.md` clash through while only the
         // root level was poisoned (codex pre-commit NIT).
         const sub = walk(full, rel, depth + 1);
-        if (sub && sub.collision) return sub;
+        if (sub && (sub.collision || sub.fatal)) return sub;
         continue;
       }
       if (!isRegularFile(full)) {
         // Symlink, socket, or a symlinked dir: never followed, never owned.
-        warnings.push(`${label}/${rel} skipped (not a regular file)`);
+        const r = reject(rel, 'not a regular file');
+        if (r) return r;
         continue;
       }
       // A sidecar manifest lives NEXT TO the skill dir, not inside it. Reserve the
       // name inside the subtree so skill content can never be confused for install
       // metadata later.
       if (name.endsWith('.manifest.json')) {
-        warnings.push(`${label}/${rel} skipped (reserved manifest name inside a skill)`);
+        const r = reject(rel, 'reserved manifest name inside a skill');
+        if (r) return r;
         continue;
       }
       const norm = normalizeSkillRelPath(rel);
       if (norm === null) {
-        warnings.push(`${label}/${rel} skipped (unsafe path)`);
+        const r = reject(rel, 'unsafe path');
+        if (r) return r;
         continue;
       }
       // NFD and NFC spellings of the same name are one file on macOS, so collapse
       // the unicode form before case-folding or the alias check misses them.
       const fold = norm.normalize('NFC').toLowerCase();
       if (seen.has(fold)) {
-        warnings.push(
-          `${label} skipped (${norm} and ${seen.get(fold)} collide on a case-insensitive filesystem)`,
-        );
-        // Poison the whole skill: which file wins would depend on readdir order.
+        // Poison the whole skill: which file wins would depend on readdir order. `fatal`
+        // carries the reason out so a caller (capture) reports THIS, not the fallback
+        // "no SKILL.md" (codex pre-commit CONCERN).
+        fatal = `${norm} and ${seen.get(fold)} collide on a case-insensitive filesystem`;
+        warnings.push(`${label} skipped (${fatal})`);
         files.length = 0;
         return { collision: true };
       }
+      let st = null;
+      if (strict || maxBytes !== Infinity) {
+        try {
+          st = lstatSync(full);
+        } catch {
+          const r = reject(rel, 'unreadable file');
+          if (r) return r;
+          continue;
+        }
+        // A hardlink is a regular file, so nothing above catches it, and copying it
+        // silently flattens a link the far machine cannot reconstruct.
+        if (strict && st.nlink !== 1) {
+          return poison(`${rel}: hardlink (nlink=${st.nlink}) does not round-trip`);
+        }
+      }
       seen.set(fold, norm);
-      files.push({ rel: norm, srcPath: full });
+      files.push({ rel: norm, srcPath: full, size: st ? st.size : undefined });
+      if (files.length > maxFiles) {
+        return poison(`over ${maxFiles} files (aborted while walking)`);
+      }
+      if (st) {
+        bytes += st.size;
+        if (bytes > maxBytes) {
+          const mib = (n) => `${Math.round(n / (1024 * 1024))} MiB`;
+          return poison(`over ${mib(maxBytes)} (${mib(bytes)}+ so far, aborted while walking)`);
+        }
+      }
     }
     return null;
   };
 
   const res = walk(skillDir, '', 1);
-  if (res && res.collision) return { files: [], warnings, skip: true };
-  return { files, warnings, skip: false };
+  if (res && (res.collision || res.fatal)) return { files: [], warnings, skip: true, fatal };
+  return { files, warnings, skip: false, bytes };
 }
 
 /**
