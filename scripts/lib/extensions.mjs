@@ -27,8 +27,10 @@ import {
   renameSync,
   unlinkSync,
   mkdirSync,
+  lstatSync,
+  rmdirSync,
 } from 'fs';
-import { join } from 'path';
+import { join, dirname, relative, resolve, posix, sep } from 'path';
 import { homedir } from 'os';
 import { sha256, isRegularFile, readFileIfRegular, writePkgJsonAtomic } from './pkg-json.mjs';
 import { loadHypoIgnore, isIgnored } from './hypo-ignore.mjs';
@@ -149,6 +151,46 @@ export function resolveInstallFile(ext) {
 }
 
 /**
+ * Resolve the install DIRECTORY segment for a directory skill. Deliberately NOT
+ * resolveInstallFile: that one appends TYPE_FILE_EXT (`foo.md`), which would both
+ * miss the directory key and regress the flat hypo-ext-*.md skills.
+ *
+ * Default: strip the `hypo-ext-` wiki storage prefix, so a skill keeps the name it
+ * is actually invoked by (`skills/gstack/`, not `skills/hypo-ext-gstack/`). Unlike
+ * commands/agents there is no shipped directory-skill behavior to stay compatible
+ * with — none were ever discovered — so the clean name is free to be the default.
+ * A sidecar manifest `installName` (with a matching `type`) overrides it.
+ *
+ * The resolved segment becomes a directory we create and delete under, so it gets
+ * the same injection defenses as a flat installName plus a trailing-dot rejection.
+ */
+export function resolveSkillInstallDir(ext) {
+  if (ext.manifestPath) {
+    const parsed = parseManifest(ext.manifestPath);
+    if (parsed.ok) {
+      const m = parsed.manifest;
+      if (m && m.type === TYPE_SINGULAR.skills && m.installName !== undefined) {
+        if (!isValidSkillDirSegment(m.installName)) {
+          return {
+            skip: true,
+            warn: `skills/${ext.file}: invalid installName "${m.installName}" — skill skipped`,
+          };
+        }
+        return { installDir: m.installName };
+      }
+    }
+  }
+  const stem = ext.file.startsWith(EXT_PREFIX) ? ext.file.slice(EXT_PREFIX.length) : ext.file;
+  if (!isValidSkillDirSegment(stem)) {
+    return {
+      skip: true,
+      warn: `skills/${ext.file} skipped (unsafe install directory name "${stem}")`,
+    };
+  }
+  return { installDir: stem };
+}
+
+/**
  * Parse + validate a recorded pkg-json extension key `${type}/${installFile}`
  * for destructive use (capture design §8 — uninstall traverses recorded keys, which
  * come from an on-disk JSON we do not fully control). Returns
@@ -183,6 +225,179 @@ export function parseExtKey(key, coveredTypes) {
   return { type, installFile };
 }
 
+// ── directory skills (skills-dir design) ─────────────────────────────────────
+//
+// A real Claude Code skill is a DIRECTORY (`skills/<name>/SKILL.md` + an
+// arbitrary subtree), not the flat single `.md` the rest of this module assumes.
+// The SHA map keeps its single-segment top-level key (`skills/<name>`) so
+// parseExtKey's no-slash rule — the capture design §8 traversal fix — stays shut;
+// only the VALUE widens to a per-relpath map. Everything below validates that
+// widened shape: a corrupt hypo-pkg.json can now express many paths under one key.
+
+// The file that makes a directory a skill. Absent (or not a regular file) → not a skill.
+export const SKILL_ROOT_FILE = 'SKILL.md';
+
+// Depth/length ceilings. A pathological subtree is skipped with a warning rather
+// than crashing the sync.
+const SKILL_MAX_DEPTH = 16;
+const SKILL_MAX_RELPATH_LEN = 400;
+
+const HEX_SHA = /^[0-9a-f]{64}$/;
+
+/**
+ * True iff `seg` is safe to use as an install DIRECTORY segment for a skill.
+ * Reuses the flat installName defenses (charset, `..`, reserved `hypo`
+ * namespace, Windows device names) and adds a trailing-dot rejection: Windows
+ * strips trailing dots from directory names, so `foo.` and `foo` alias.
+ */
+export function isValidSkillDirSegment(seg) {
+  if (!isValidInstallStem(seg)) return false;
+  if (seg.endsWith('.')) return false;
+  return true;
+}
+
+/**
+ * Parse a recorded pkg-json key for a DIRECTORY skill. parseExtKey rejects
+ * `skills/foo` outright (it demands the type's file extension), so a skill key
+ * must never be routed through it — uninstall validates every recorded key and
+ * would silently drop the record. Returns `{ type, installDir }` or null.
+ */
+export function parseSkillKey(key) {
+  if (typeof key !== 'string') return null;
+  const slash = key.indexOf('/');
+  if (slash === -1) return null;
+  if (key.slice(0, slash) !== 'skills') return null;
+  const installDir = key.slice(slash + 1);
+  if (installDir.includes('/') || installDir.includes('\\')) return null;
+  if (!isValidSkillDirSegment(installDir)) return null;
+  return { type: 'skills', installDir };
+}
+
+/**
+ * Validate one subtree-relative path (`SKILL.md`, `references/x.md`). Returns the
+ * canonical posix relpath, or null when unsafe. Rejects traversal, absolute and
+ * Windows-absolute forms, backslash separators, `.` segments, NUL, and anything
+ * past the depth/length ceiling. The canonical return value is what callers must
+ * key on: `references/./x.md` and `references/x.md` are the same destination, and
+ * treating them as distinct would manufacture a phantom orphan.
+ */
+export function normalizeSkillRelPath(rel) {
+  if (typeof rel !== 'string' || rel.length === 0) return null;
+  if (rel.length > SKILL_MAX_RELPATH_LEN) return null;
+  if (rel.includes('\0')) return null;
+  // Backslash is a separator on Windows; treat it as unsafe everywhere rather
+  // than letting `a\..\b` mean different things per platform.
+  if (rel.includes('\\')) return null;
+  if (rel.startsWith('/')) return null;
+  // Windows drive (`C:x`, `C:/x`) and UNC (`//host/share`) forms.
+  if (/^[A-Za-z]:/.test(rel)) return null;
+  if (rel.startsWith('//')) return null;
+  const segs = rel.split('/');
+  if (segs.length > SKILL_MAX_DEPTH) return null;
+  for (const s of segs) {
+    if (s === '' || s === '.' || s === '..') return null;
+    if (s.endsWith('.')) return null; // Windows directory-name aliasing
+  }
+  const norm = posix.normalize(rel);
+  // normalize() cannot escape given the segment checks above, but re-assert:
+  // a caller-supplied relpath must never resolve outside its own subtree.
+  if (norm.startsWith('..') || norm.startsWith('/')) return null;
+  return norm;
+}
+
+/**
+ * True iff `target` resolves strictly inside `root`. Boundary-aware: a raw
+ * `startsWith` would accept `/a/bc` as living under `/a/b`.
+ */
+export function isContainedUnder(root, target) {
+  const rel = relative(resolve(root), resolve(target));
+  if (rel === '' || rel.startsWith('..')) return false;
+  return !rel.split(sep).includes('..');
+}
+
+/**
+ * True iff `root` itself, or any path segment from `root` down to `target`
+ * (inclusive), is a symlink. Lexical containment alone cannot see this: a hostile
+ * `references -> /outside` directory symlink lets `references/x.md` pass every
+ * string check while the write or unlink lands outside the skill entirely.
+ * copyOne's leaf check (`isRegularFile`) only guards the FINAL component.
+ *
+ * `root` is checked too, not just what is below it. Skipping it left the whole
+ * guard bypassable by symlinking the boundary directory itself (`~/.claude/skills`),
+ * which is the one ancestor every install path shares (codex pre-commit BLOCKER).
+ *
+ * Callers must re-run this immediately before EVERY mutation (mkdir, copy,
+ * unlink, rmdir). The residual TOCTOU window between this check and the syscall
+ * is accepted (skills-dir design §7); re-checking per mutation keeps it from widening.
+ */
+export function hasSymlinkAncestor(root, target) {
+  const rootAbs = resolve(root);
+  const targetAbs = resolve(target);
+  if (!isContainedUnder(rootAbs, targetAbs)) return true; // treat as unsafe
+  try {
+    if (lstatSync(rootAbs).isSymbolicLink()) return true;
+  } catch {
+    // The boundary dir does not exist yet: nothing to escape through.
+  }
+  const rel = relative(rootAbs, targetAbs);
+  const segs = rel.split(sep).filter(Boolean);
+  let cur = rootAbs;
+  // Walk every intermediate segment AND the leaf: a symlinked leaf must not be
+  // written through or unlinked either.
+  for (const s of segs) {
+    cur = join(cur, s);
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch {
+      continue; // does not exist yet (fresh install) — nothing to escape through
+    }
+    if (st.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
+/**
+ * True iff `value` is a plain hex SHA — the only shape a FLAT extension key may
+ * carry. A corrupt pkg-json that parks an object (or any other type) under a flat
+ * key must not be treated as ownership: under --force-extensions that would remove
+ * a file on the strength of a value we never wrote (codex pre-commit CONCERN).
+ */
+export function isFlatShaValue(value) {
+  return typeof value === 'string' && HEX_SHA.test(value);
+}
+
+/**
+ * A nested SHA map keyed by relpath. Null-prototype on purpose: relpaths come from
+ * the filesystem, so a file named `__proto__` would otherwise assign through the
+ * prototype setter instead of creating an own key (installed but never recorded,
+ * hence unowned and unreachable by uninstall), and a file named `constructor` would
+ * read back a truthy inherited value as if it were a recorded SHA. Codex found the
+ * `__proto__` case with a working repro.
+ */
+export function emptyShaMap() {
+  return Object.create(null);
+}
+
+/**
+ * Validate a recorded skill SHA value: a plain object mapping canonical relpaths
+ * to hex SHAs. Returns a clean map containing only the entries that pass; a
+ * corrupt or malicious entry is dropped rather than trusted. Returns null when
+ * the value is not a plain object at all (shape mismatch — e.g. a flat string
+ * SHA parked under a skill key).
+ */
+export function parseSkillShaValue(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const out = emptyShaMap();
+  for (const [rel, sha] of Object.entries(value)) {
+    if (typeof sha !== 'string' || !HEX_SHA.test(sha)) continue;
+    const norm = normalizeSkillRelPath(rel);
+    if (norm === null || norm !== rel) continue; // only canonical keys are trusted
+    out[norm] = sha;
+  }
+  return out;
+}
+
 // Claude Code hook events (D3 allowlist). A manifest with an event outside this
 // set is malformed → the whole extension is skipped (no copy, no registration).
 export const HOOK_EVENT_ALLOWLIST = new Set([
@@ -213,10 +428,113 @@ function pkgRootDir(target) {
 // ── read-only helpers ─────────────────────────────────────────────────────────
 
 /**
+ * True iff `p` is a directory and NOT a symlink to one. A symlinked directory in
+ * the wiki subtree (`references -> /etc`) would otherwise let the walker copy
+ * files from outside the vault into the install target.
+ */
+function isRealDir(p) {
+  try {
+    return lstatSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Walk a wiki skill directory and collect its owned files. lstat-based: symlinked
+ * files and symlinked directories are skipped with a warning, never followed.
+ *
+ * Returns `{ files: [{ rel, srcPath }], warnings, skip }`. `skip` is set when the
+ * whole skill must be dropped: no regular SKILL.md at the root, or two source
+ * paths that canonicalize to the same destination (case-fold aliasing), which
+ * would make ownership order-dependent.
+ */
+function walkSkillSubtree(skillDir, label, hypoDir, hypoignorePatterns) {
+  const files = [];
+  const warnings = [];
+  const seen = new Map(); // case-folded canonical rel -> first rel that claimed it
+
+  const rootFile = join(skillDir, SKILL_ROOT_FILE);
+  if (!isRegularFile(rootFile)) {
+    return {
+      files: [],
+      warnings: [`${label} skipped (no regular ${SKILL_ROOT_FILE} at the skill root)`],
+      skip: true,
+    };
+  }
+
+  const walk = (dir, prefix, depth) => {
+    if (depth > SKILL_MAX_DEPTH) {
+      warnings.push(`${label}/${prefix} skipped (subtree deeper than ${SKILL_MAX_DEPTH})`);
+      return;
+    }
+    let entries;
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      warnings.push(`${label}/${prefix} skipped (unreadable directory)`);
+      return;
+    }
+    for (const name of entries) {
+      const full = join(dir, name);
+      const rel = prefix ? `${prefix}/${name}` : name;
+      if (isIgnored(full, hypoDir, hypoignorePatterns)) continue;
+      if (isRealDir(full)) {
+        // Propagate a collision found further down: ignoring this return value let a
+        // deep `references/A.md` vs `references/a.md` clash through while only the
+        // root level was poisoned (codex pre-commit NIT).
+        const sub = walk(full, rel, depth + 1);
+        if (sub && sub.collision) return sub;
+        continue;
+      }
+      if (!isRegularFile(full)) {
+        // Symlink, socket, or a symlinked dir: never followed, never owned.
+        warnings.push(`${label}/${rel} skipped (not a regular file)`);
+        continue;
+      }
+      // A sidecar manifest lives NEXT TO the skill dir, not inside it. Reserve the
+      // name inside the subtree so skill content can never be confused for install
+      // metadata later.
+      if (name.endsWith('.manifest.json')) {
+        warnings.push(`${label}/${rel} skipped (reserved manifest name inside a skill)`);
+        continue;
+      }
+      const norm = normalizeSkillRelPath(rel);
+      if (norm === null) {
+        warnings.push(`${label}/${rel} skipped (unsafe path)`);
+        continue;
+      }
+      // NFD and NFC spellings of the same name are one file on macOS, so collapse
+      // the unicode form before case-folding or the alias check misses them.
+      const fold = norm.normalize('NFC').toLowerCase();
+      if (seen.has(fold)) {
+        warnings.push(
+          `${label} skipped (${norm} and ${seen.get(fold)} collide on a case-insensitive filesystem)`,
+        );
+        // Poison the whole skill: which file wins would depend on readdir order.
+        files.length = 0;
+        return { collision: true };
+      }
+      seen.set(fold, norm);
+      files.push({ rel: norm, srcPath: full });
+    }
+    return null;
+  };
+
+  const res = walk(skillDir, '', 1);
+  if (res && res.collision) return { files: [], warnings, skip: true };
+  return { files, warnings, skip: false };
+}
+
+/**
  * Discover sync-eligible extensions under `extDir`. Returns a per-type map plus a
  * `warnings` array. Applies the `.hypoignore` filter, the basename
  * whitelist (plan §5 #9), and pairs each file with its optional `<name>.manifest.json`.
  * No-ops gracefully when extDir is absent (e.g. --from-remote clones, plan §5 #8).
+ *
+ * Skills come in two shapes. A directory (`skills/hypo-ext-<name>/SKILL.md` + a
+ * subtree) is the real Claude Code layout and carries a `files[]` list; a flat
+ * `hypo-ext-<name>.md` keeps working exactly as before (backward compatible).
  */
 export function discoverExtensions(extDir, hypoignorePatterns, hypoDir) {
   const result = { hooks: [], commands: [], skills: [], agents: [], warnings: [] };
@@ -238,6 +556,39 @@ export function discoverExtensions(extDir, hypoignorePatterns, hypoDir) {
       if (fname.endsWith('.manifest.json')) continue;
       const srcPath = join(typeDir, fname);
       if (isIgnored(srcPath, hypoDir, hypoignorePatterns)) continue;
+
+      // A directory under skills/ is the real skill layout. Everything else falls
+      // through to the flat single-file path below.
+      if (type === 'skills' && isRealDir(srcPath)) {
+        if (!SAFE_EXT_STEM.test(fname)) {
+          result.warnings.push(
+            `skills/${fname} skipped (extensions must use a 'hypo-ext-<name>' directory name)`,
+          );
+          continue;
+        }
+        const label = `skills/${fname}`;
+        const walked = walkSkillSubtree(srcPath, label, hypoDir, hypoignorePatterns);
+        result.warnings.push(...walked.warnings);
+        if (walked.skip) continue;
+        const manifestName = `${fname}.manifest.json`;
+        const manifestPath = join(typeDir, manifestName);
+        const hasSkillManifest =
+          existsSync(manifestPath) &&
+          isRegularFile(manifestPath) &&
+          !isIgnored(manifestPath, hypoDir, hypoignorePatterns);
+        result.skills.push({
+          type,
+          name: fname,
+          file: fname,
+          srcPath,
+          isDir: true,
+          files: walked.files,
+          manifestName,
+          manifestPath: hasSkillManifest ? manifestPath : null,
+        });
+        continue;
+      }
+
       if (!isRegularFile(srcPath)) continue;
       if (!fname.endsWith(fileExt)) continue;
       const stem = fname.slice(0, -fileExt.length);
@@ -563,6 +914,190 @@ function recordCopyOutcome(result, name, key, action, apply) {
   }
 }
 
+/** Join a canonical posix relpath onto a native base path. */
+function joinRel(base, rel) {
+  return join(base, ...rel.split('/'));
+}
+
+/**
+ * Sync one DIRECTORY skill: mirror its wiki subtree into the install directory and
+ * remove the files we own that the wiki no longer has.
+ *
+ * This is the only place forward-sync deletes anything. The gate is the same
+ * ownership rule the rest of the module uses for overwrite: a file is removed only
+ * when its on-disk SHA still matches the SHA we recorded when we installed it. A
+ * user-modified copy, an unowned file the user dropped in, and anything that is not
+ * a regular file are all preserved. The recorded SHA of a PRESERVED orphan is kept,
+ * not dropped — without it the file becomes unowned and --force-extensions could
+ * never clean it up.
+ *
+ * Every mutation (mkdir, copy, unlink, rmdir) re-runs the symlink-ancestor walk
+ * first: lexical containment alone cannot see a `references -> /outside` directory
+ * symlink, and both the write and the unlink would land outside the skill.
+ */
+function syncOneSkill({
+  ext,
+  installDir,
+  typeDir,
+  recorded,
+  newSHAs,
+  result,
+  target,
+  apply,
+  force,
+}) {
+  const key = `skills/${installDir}`;
+  const skillRoot = join(typeDir, installDir);
+  // A recorded value of the wrong shape (e.g. a flat string SHA parked under a
+  // skill key by a corrupt pkg-json) is not trusted as ownership of anything.
+  const recordedNested = parseSkillShaValue(recorded[key]) ?? emptyShaMap();
+  const newNested = emptyShaMap();
+
+  const unsafe = (destPath) =>
+    !isContainedUnder(skillRoot, destPath) || hasSymlinkAncestor(typeDir, destPath);
+
+  // (1) install / update every file the wiki subtree currently has.
+  const desired = new Set();
+  // A path we refuse to touch must KEEP whatever ownership it already had. Dropping
+  // the record here would silently disown a file we installed on an earlier run,
+  // putting it beyond doctor and uninstall (codex pre-commit CONCERN).
+  const refuse = (fileKey, rel) => {
+    result.conflicts.push({ name: ext.name, file: fileKey, action: 'skip-unsafe-path' });
+    result.warnings.push(`${fileKey} (skip-unsafe-path) — left untouched`);
+    if (recordedNested[rel] !== undefined) newNested[rel] = recordedNested[rel];
+  };
+  for (const f of ext.files) {
+    desired.add(f.rel);
+    const destPath = joinRel(skillRoot, f.rel);
+    const fileKey = `${key}/${f.rel}`; // display only — never a pkg-json key
+    if (unsafe(destPath)) {
+      refuse(fileKey, f.rel);
+      continue;
+    }
+    if (apply) {
+      const parent = dirname(destPath);
+      if (hasSymlinkAncestor(typeDir, parent)) {
+        refuse(fileKey, f.rel);
+        continue;
+      }
+      mkdirSync(parent, { recursive: true });
+    }
+    const res = copyOne({
+      srcPath: f.srcPath,
+      destPath,
+      key: fileKey,
+      recordedSHA: recordedNested[f.rel],
+      apply,
+      force,
+    });
+    if (res.sha != null) newNested[f.rel] = res.sha;
+    result.actions.push({ target, file: fileKey, action: res.action });
+    recordCopyOutcome(result, ext.name, fileKey, res.action, apply);
+  }
+
+  // (2) orphans: recorded, but the wiki subtree no longer carries them.
+  for (const [rel, sha] of Object.entries(recordedNested)) {
+    if (desired.has(rel)) continue;
+    const destPath = joinRel(skillRoot, rel);
+    const fileKey = `${key}/${rel}`;
+    const keep = (reason) => {
+      // Preserving the record is the point: drop it and the file goes unowned,
+      // which puts it beyond --force-extensions forever.
+      newNested[rel] = sha;
+      result.warnings.push(`${fileKey} (${reason}) — left untouched`);
+    };
+    if (unsafe(destPath)) {
+      keep('skip-unsafe-path');
+      continue;
+    }
+    if (!existsSync(destPath)) continue; // already gone: the record can go too
+    if (!isRegularFile(destPath)) {
+      keep('skip-non-regular');
+      continue;
+    }
+    const onDisk = readFileIfRegular(destPath);
+    if (onDisk === null) {
+      keep('skip-unreadable');
+      continue;
+    }
+    const onDiskSHA = sha256(onDisk);
+    if (onDiskSHA !== sha && !force) {
+      // Owned once, edited since. Same call as an overwrite drift: warn, preserve.
+      result.drifts.push({ name: ext.name, file: fileKey });
+      result.needsWork = true;
+      newNested[rel] = sha;
+      result.warnings.push(`${fileKey} (drift — user-modified orphan) — left untouched`);
+      continue;
+    }
+    if (!apply) {
+      // Check mode: the deletion is pending work, and nothing is written yet.
+      newNested[rel] = sha;
+      result.needsWork = true;
+      result.actions.push({ target, file: fileKey, action: 'delete' });
+      continue;
+    }
+    // CAS: re-read immediately before unlink. A save between the hash above and
+    // this syscall must not lose the user's bytes.
+    const verify = readFileIfRegular(destPath);
+    if (verify === null || (sha256(verify) !== sha && !force)) {
+      keep('skip-changed');
+      continue;
+    }
+    if (hasSymlinkAncestor(typeDir, destPath)) {
+      keep('skip-unsafe-path');
+      continue;
+    }
+    if (force && sha256(verify) !== sha) writeFreshAtomic(`${destPath}.bak`, verify);
+    try {
+      unlinkSync(destPath);
+    } catch {
+      keep('skip-unlink-failed');
+      continue;
+    }
+    result.actions.push({ target, file: fileKey, action: 'delete' });
+  }
+
+  // (3) prune directories the orphan removal emptied. The skill root itself stays:
+  // removing it is uninstall's job, not sync's.
+  if (apply) pruneEmptyDirs(skillRoot, typeDir, result);
+
+  if (Object.keys(newNested).length > 0) newSHAs[key] = newNested;
+}
+
+/**
+ * Remove now-empty directories under `skillRoot` (exclusive of the root itself),
+ * deepest first. Skips anything reachable through a symlinked ancestor.
+ */
+function pruneEmptyDirs(skillRoot, typeDir, result) {
+  const dirs = [];
+  const collect = (dir, depth) => {
+    if (depth > SKILL_MAX_DEPTH) return;
+    let entries;
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const full = join(dir, name);
+      if (!isRealDir(full)) continue;
+      collect(full, depth + 1);
+      dirs.push(full);
+    }
+  };
+  if (!isRealDir(skillRoot)) return;
+  collect(skillRoot, 1);
+  // Deepest first, so a parent emptied by its children is caught in the same pass.
+  for (const dir of dirs.reverse()) {
+    if (!isContainedUnder(skillRoot, dir) || hasSymlinkAncestor(typeDir, dir)) continue;
+    try {
+      if (readdirSync(dir).length === 0) rmdirSync(dir);
+    } catch {
+      result.warnings.push(`skills: could not prune empty directory ${dir}`);
+    }
+  }
+}
+
 /**
  * Sync all discovered extensions for one target ('claude' | 'codex').
  *
@@ -638,10 +1173,33 @@ export function syncExtensions({
   // WHOLE group — otherwise file traversal order would decide ownership and
   // overwrite/skip unpredictably. Keyed by ext object identity.
   const installFileByExt = new Map();
+  // Directory skills resolve to an install DIRECTORY segment, not a filename.
+  const installDirByExt = new Map();
   const dupSkip = new Set();
   for (const type of types) {
     const seen = new Map(); // case-folded `${type}/${installFile}` → first ext
     for (const ext of discovered[type]) {
+      if (ext.isDir) {
+        const dirRes = resolveSkillInstallDir(ext);
+        if (dirRes.skip) {
+          dupSkip.add(ext);
+          result.warnings.push(dirRes.warn);
+          continue;
+        }
+        installDirByExt.set(ext, dirRes.installDir);
+        const dirNorm = `skills/${dirRes.installDir.toLowerCase()}`;
+        const firstDir = seen.get(dirNorm);
+        if (firstDir !== undefined) {
+          dupSkip.add(ext);
+          dupSkip.add(firstDir);
+          result.warnings.push(
+            `skills/${dirRes.installDir} install target claimed by multiple extensions — all skipped (rename installName)`,
+          );
+        } else {
+          seen.set(dirNorm, ext);
+        }
+        continue;
+      }
       const res = resolveInstallFile(ext);
       if (res.skip) {
         dupSkip.add(ext);
@@ -669,6 +1227,15 @@ export function syncExtensions({
   // previously-owned installed copy — it would linger on disk, untracked by doctor
   // and unreachable by uninstall (codex pre-commit BLOCKER).
   for (const ext of dupSkip) {
+    if (ext.isDir) {
+      // Same reasoning for a directory skill: keep its whole nested record so the
+      // installed subtree stays owned (doctor sees it, uninstall can remove it).
+      const dir = installDirByExt.get(ext);
+      if (!dir) continue; // invalid installName: never owned
+      const key = `skills/${dir}`;
+      if (recorded[key] !== undefined && newSHAs[key] === undefined) newSHAs[key] = recorded[key];
+      continue;
+    }
     const inst = installFileByExt.get(ext);
     if (!inst) continue; // invalid-installName skip: never owned
     // Preserve BOTH ownership keys a hook records: the main `.mjs` AND its paired
@@ -689,6 +1256,25 @@ export function syncExtensions({
     const typeDir = join(targetRoot, type);
     for (const ext of discovered[type]) {
       if (dupSkip.has(ext)) continue;
+
+      // A directory skill mirrors a subtree (and prunes what the wiki dropped)
+      // rather than copying one file.
+      if (ext.isDir) {
+        if (apply) mkdirSync(typeDir, { recursive: true });
+        syncOneSkill({
+          ext,
+          installDir: installDirByExt.get(ext),
+          typeDir,
+          recorded,
+          newSHAs,
+          result,
+          target,
+          apply,
+          force,
+        });
+        continue;
+      }
+
       // Install under the manifest-declared installName (capture design §3) or, by
       // default, the wiki storage name (backward compatible).
       const installFile = installFileByExt.get(ext) ?? ext.file;

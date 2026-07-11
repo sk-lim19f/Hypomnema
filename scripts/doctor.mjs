@@ -36,6 +36,9 @@ import {
   resolveInstallFile,
   buildHookCommand,
   parseExtKey,
+  parseSkillKey,
+  parseSkillShaValue,
+  isFlatShaValue,
   EXT_TYPES,
   CODEX_TYPES,
 } from './lib/extensions.mjs';
@@ -824,6 +827,58 @@ function checkExtensions(hypoDir, claudeHome, target = 'claude') {
     // Skip keys outside this target's covered types (defensive: a Claude run records
     // skills/agents that a codex target never installs — don't false-flag them).
     if (!types.includes(key.split('/')[0])) continue;
+
+    // A directory skill records one key whose value is a per-file SHA map. Joining
+    // that key straight onto root would land on the skill DIRECTORY and report it
+    // as "not a regular file" on every run. Check the subtree file by file instead.
+    const skillKey = parseSkillKey(key);
+    if (skillKey) {
+      const nested = parseSkillShaValue(recSHA);
+      if (!nested) {
+        problems.push({
+          severity: 'warn',
+          msg: `${key} has a corrupt ownership record — run upgrade --apply`,
+        });
+        continue;
+      }
+      const skillRoot = join(root, 'skills', skillKey.installDir);
+      for (const [rel, sha] of Object.entries(nested)) {
+        const filePath = join(skillRoot, ...rel.split('/'));
+        const label = `${key}/${rel}`;
+        if (!existsSync(filePath)) {
+          problems.push({
+            severity: 'warn',
+            msg: `${label} recorded but not installed — run upgrade --apply`,
+          });
+          continue;
+        }
+        const buf = readFileIfRegular(filePath);
+        if (buf === null) {
+          problems.push({
+            severity: 'warn',
+            msg: `${label} is not a regular file — left untouched`,
+          });
+          continue;
+        }
+        if (sha256(buf) !== sha) {
+          problems.push({
+            severity: 'warn',
+            msg: `${label} modified since install (drift) — use --force-extensions`,
+          });
+        }
+      }
+      continue;
+    }
+
+    // A flat key must carry a plain hex SHA; a wrong-shaped value is a corrupt
+    // record, not a drifted file.
+    if (!isFlatShaValue(recSHA)) {
+      problems.push({
+        severity: 'warn',
+        msg: `${key} has a corrupt ownership record — run upgrade --apply`,
+      });
+      continue;
+    }
     const destPath = join(root, key);
     if (!existsSync(destPath)) {
       problems.push({

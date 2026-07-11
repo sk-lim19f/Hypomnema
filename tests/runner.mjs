@@ -7978,6 +7978,689 @@ test('doctor-extensions-integrity: --codex target', () => {
   });
 });
 
+// ── directory skills: forward-sync (ADR 0063, T2-T5) ──────────────────────────
+//
+// A real skill is skills/<name>/SKILL.md + a subtree, not a flat .md. These drive
+// the whole install → orphan-delete → preserve loop through the real upgrade CLI.
+
+suite('directory skills: forward-sync install + orphan removal');
+
+function writeSkillTree(hypoDir, dirName, files, manifest) {
+  const root = join(hypoDir, 'extensions', 'skills', dirName);
+  for (const [rel, content] of Object.entries(files)) {
+    const full = join(root, ...rel.split('/'));
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, content);
+  }
+  if (manifest !== undefined) {
+    mkdirSync(join(hypoDir, 'extensions', 'skills'), { recursive: true });
+    writeFileSync(
+      join(hypoDir, 'extensions', 'skills', `${dirName}.manifest.json`),
+      JSON.stringify(manifest, null, 2),
+    );
+  }
+  return root;
+}
+
+function withSkillWiki(fn) {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const sync = () => {
+        const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+        return r;
+      };
+      const pkgExt = () => {
+        const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+        return (pkg.extensions && pkg.extensions.claude) || {};
+      };
+      fn({ home, hypoDir, sync, pkgExt, skillsDir: join(home, '.claude', 'skills') });
+    });
+  });
+}
+
+test('a directory skill installs its whole subtree under its own name', () => {
+  withSkillWiki(({ hypoDir, sync, pkgExt, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+      'scripts/deep/run.sh': 'echo hi\n',
+    });
+    const r = sync();
+    assert.equal(r.status, 0, `sync failed: ${r.stderr}`);
+
+    // The wiki storage prefix is stripped: the skill installs as the name it is invoked by.
+    assert.ok(existsSync(join(skillsDir, 'demo', 'SKILL.md')), 'SKILL.md must install');
+    assert.ok(existsSync(join(skillsDir, 'demo', 'references', 'bar.md')), 'subtree must install');
+    assert.ok(existsSync(join(skillsDir, 'demo', 'scripts', 'deep', 'run.sh')), 'deep file');
+    assert.ok(
+      !existsSync(join(skillsDir, 'hypo-ext-demo')),
+      'must not install under the wiki name',
+    );
+
+    // One single-segment top-level key; the per-file SHAs live in the nested value.
+    const ext = pkgExt();
+    const val = ext['skills/demo'];
+    assert.equal(typeof val, 'object', 'skill value must be a nested map, not a string SHA');
+    assert.deepEqual(Object.keys(val).sort(), [
+      'SKILL.md',
+      'references/bar.md',
+      'scripts/deep/run.sh',
+    ]);
+    assert.ok(/^[0-9a-f]{64}$/.test(val['SKILL.md']));
+  });
+});
+
+test('a file dropped from the wiki subtree is removed from the install (owned + unmodified)', () => {
+  withSkillWiki(({ hypoDir, sync, pkgExt, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+    assert.ok(existsSync(join(skillsDir, 'demo', 'references', 'bar.md')));
+
+    rmSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-demo', 'references'), {
+      recursive: true,
+    });
+    const r = sync();
+    assert.equal(r.status, 0, `re-sync failed: ${r.stderr}`);
+
+    assert.ok(
+      !existsSync(join(skillsDir, 'demo', 'references', 'bar.md')),
+      'the orphan must be deleted',
+    );
+    assert.ok(existsSync(join(skillsDir, 'demo', 'SKILL.md')), 'SKILL.md must survive');
+    assert.ok(
+      !existsSync(join(skillsDir, 'demo', 'references')),
+      'the emptied directory must be pruned',
+    );
+    assert.deepEqual(Object.keys(pkgExt()['skills/demo']), ['SKILL.md']);
+  });
+});
+
+test('a user-modified orphan is preserved AND stays owned (so --force can still clean it)', () => {
+  withSkillWiki(({ hypoDir, sync, pkgExt, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+
+    // The user edits the installed copy, then the wiki drops the file.
+    writeFileSync(join(skillsDir, 'demo', 'references', 'bar.md'), 'MY EDITS\n');
+    rmSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-demo', 'references'), {
+      recursive: true,
+    });
+    sync();
+
+    assert.equal(
+      readFileSync(join(skillsDir, 'demo', 'references', 'bar.md'), 'utf-8'),
+      'MY EDITS\n',
+      'a user-modified orphan must never be deleted',
+    );
+    // Dropping the record would make the file unowned — beyond --force-extensions forever.
+    assert.ok(
+      pkgExt()['skills/demo']['references/bar.md'],
+      'the preserved orphan must keep its ownership record',
+    );
+  });
+});
+
+test('a file the user added to the install directory is never touched (unowned)', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir, pkgExt }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', { 'SKILL.md': '# demo\n' });
+    sync();
+
+    writeFileSync(join(skillsDir, 'demo', 'notes.md'), 'my own notes\n');
+    sync();
+
+    assert.equal(
+      readFileSync(join(skillsDir, 'demo', 'notes.md'), 'utf-8'),
+      'my own notes\n',
+      'an unowned file is not an orphan and must survive',
+    );
+    assert.ok(!pkgExt()['skills/demo']['notes.md'], 'and we must not claim ownership of it');
+  });
+});
+
+test('a symlinked directory in the wiki subtree is never followed', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir, pkgExt }) => {
+    const root = writeSkillTree(hypoDir, 'hypo-ext-demo', { 'SKILL.md': '# demo\n' });
+    // references -> a directory outside the vault holding a secret.
+    const outside = join(hypoDir, '..', 'outside');
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'secret.md'), 'SECRET\n');
+    symlinkSync(outside, join(root, 'references'));
+
+    const r = sync();
+    assert.equal(r.status, 0, `sync failed: ${r.stderr}`);
+    assert.ok(existsSync(join(skillsDir, 'demo', 'SKILL.md')), 'the real file still installs');
+    assert.ok(
+      !existsSync(join(skillsDir, 'demo', 'references', 'secret.md')),
+      'a symlinked source directory must not be copied through',
+    );
+    assert.ok(!pkgExt()['skills/demo']['references/secret.md']);
+  });
+});
+
+test('a directory without a regular SKILL.md is not a skill (skipped, not installed)', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir, pkgExt }) => {
+    const root = join(hypoDir, 'extensions', 'skills', 'hypo-ext-nope');
+    mkdirSync(join(root, 'references'), { recursive: true });
+    writeFileSync(join(root, 'references', 'x.md'), 'x\n');
+
+    const r = sync();
+    assert.equal(r.status, 0, `sync failed: ${r.stderr}`);
+    assert.ok(!existsSync(join(skillsDir, 'nope')), 'no SKILL.md → not a skill');
+    assert.ok(!pkgExt()['skills/nope']);
+  });
+});
+
+// The headline destructive guard: lexical containment cannot see a symlink in the
+// MIDDLE of an install path. Without the lstat ancestor walk, an orphan unlink
+// would follow `~/.claude/skills/demo/references -> /outside` and delete a file
+// that was never ours. The SHA is made to MATCH on purpose — that is precisely the
+// case where every other gate (ownership, containment) says "safe to delete".
+test('an orphan is NOT unlinked through a symlinked ancestor in the install path', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+
+    // The wiki drops the file → it becomes an orphan we own and would delete.
+    rmSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-demo', 'references'), {
+      recursive: true,
+    });
+
+    // Swap the installed subdir for a symlink to somewhere outside, holding a file
+    // whose bytes hash to the SHA we recorded.
+    const outside = join(hypoDir, '..', 'outside-del');
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'bar.md'), 'bar\n');
+    rmSync(join(skillsDir, 'demo', 'references'), { recursive: true });
+    symlinkSync(outside, join(skillsDir, 'demo', 'references'));
+
+    const r = sync();
+    assert.equal(r.status, 0, `sync failed: ${r.stderr}`);
+    assert.ok(
+      existsSync(join(outside, 'bar.md')),
+      'the unlink must not escape through the symlinked ancestor',
+    );
+  });
+});
+
+test('a copy is NOT written through a symlinked ancestor in the install path', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+
+    // Point the installed subdir at an outside directory, then change the wiki file
+    // so sync wants to write it again.
+    const outside = join(hypoDir, '..', 'outside-write');
+    mkdirSync(outside, { recursive: true });
+    rmSync(join(skillsDir, 'demo', 'references'), { recursive: true });
+    symlinkSync(outside, join(skillsDir, 'demo', 'references'));
+    writeFileSync(
+      join(hypoDir, 'extensions', 'skills', 'hypo-ext-demo', 'references', 'bar.md'),
+      'CHANGED\n',
+    );
+
+    const r = sync();
+    assert.ok(
+      !existsSync(join(outside, 'bar.md')),
+      'the copy must not be written out through the symlinked ancestor',
+    );
+    // A path we cannot safely write is a hard conflict, exactly like a symlinked
+    // leaf: it blocks the install loudly rather than being skipped in silence.
+    assert.notEqual(r.status, 0, 'an unsafe install path must block, not pass quietly');
+    assert.ok(
+      (r.stdout + r.stderr).includes('skip-unsafe-path'),
+      `the refusal must be reported: ${r.stdout}${r.stderr}`,
+    );
+  });
+});
+
+test('uninstall does not delete through a symlinked ancestor either', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+
+    const outside = join(hypoDir, '..', 'outside-uninstall');
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'bar.md'), 'bar\n');
+    rmSync(join(skillsDir, 'demo', 'references'), { recursive: true });
+    symlinkSync(outside, join(skillsDir, 'demo', 'references'));
+
+    const r = runWithHome('uninstall.mjs', ['--apply', '--yes'], home);
+    assert.equal(r.status, 0, `uninstall failed: ${r.stderr}`);
+    assert.ok(
+      existsSync(join(outside, 'bar.md')),
+      'uninstall must not follow a symlinked ancestor out of the skill dir',
+    );
+  });
+});
+
+test('--force-extensions cleans up a preserved (user-modified) orphan', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir, pkgExt }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+
+    writeFileSync(join(skillsDir, 'demo', 'references', 'bar.md'), 'MY EDITS\n');
+    rmSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-demo', 'references'), {
+      recursive: true,
+    });
+    sync(); // preserved, still owned
+
+    const r = runWithHome(
+      'upgrade.mjs',
+      [`--hypo-dir=${hypoDir}`, '--apply', '--force-extensions'],
+      home,
+    );
+    assert.equal(r.status, 0, `force sync failed: ${r.stderr}`);
+    assert.ok(
+      !existsSync(join(skillsDir, 'demo', 'references', 'bar.md')),
+      '--force-extensions must be able to reach the orphan the record kept alive',
+    );
+    assert.ok(!pkgExt()['skills/demo']['references/bar.md'], 'and drop its record once removed');
+  });
+});
+
+test('a flat hypo-ext-*.md skill keeps its old install path (no regression)', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir, pkgExt }) => {
+    const dir = join(hypoDir, 'extensions', 'skills');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'hypo-ext-flat.md'), '# flat\n');
+
+    const r = sync();
+    assert.equal(r.status, 0, `sync failed: ${r.stderr}`);
+    // The flat shape predates directory skills; its install path must not move.
+    assert.ok(existsSync(join(skillsDir, 'hypo-ext-flat.md')), 'flat skill keeps the wiki name');
+    assert.equal(
+      typeof pkgExt()['skills/hypo-ext-flat.md'],
+      'string',
+      'a flat key keeps its plain string SHA',
+    );
+  });
+});
+
+test('a sidecar installName overrides the install directory name', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir, pkgExt }) => {
+    writeSkillTree(
+      hypoDir,
+      'hypo-ext-demo',
+      { 'SKILL.md': '# demo\n' },
+      {
+        type: 'skill',
+        installName: 'renamed',
+      },
+    );
+    const r = sync();
+    assert.equal(r.status, 0, `sync failed: ${r.stderr}`);
+    assert.ok(existsSync(join(skillsDir, 'renamed', 'SKILL.md')));
+    assert.ok(!existsSync(join(skillsDir, 'demo')));
+    assert.ok(pkgExt()['skills/renamed']);
+  });
+});
+
+test('an installName in the reserved hypo namespace is refused, not installed', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir, pkgExt }) => {
+    writeSkillTree(
+      hypoDir,
+      'hypo-ext-demo',
+      { 'SKILL.md': '# demo\n' },
+      {
+        type: 'skill',
+        installName: 'hypo-evil',
+      },
+    );
+    sync();
+    assert.ok(!existsSync(join(skillsDir, 'hypo-evil')), 'reserved namespace must be refused');
+    assert.ok(!existsSync(join(skillsDir, 'demo')), 'and it must not silently fall back');
+    assert.deepEqual(
+      Object.keys(pkgExt()).filter((k) => k.startsWith('skills/')),
+      [],
+    );
+  });
+});
+
+test('a corrupt recorded value (string SHA under a skill key) is ignored, not trusted', () => {
+  withSkillWiki(({ home, hypoDir, sync, pkgExt, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', { 'SKILL.md': '# demo\n' });
+    sync();
+
+    // Park a flat string SHA under the skill key, as a corrupt pkg-json would.
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    pkg.extensions.claude['skills/demo'] = 'f'.repeat(64);
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+
+    const r = sync();
+    assert.equal(r.status, 0, `sync must not crash on a corrupt value: ${r.stderr}`);
+    // The bogus value grants no ownership, so nothing is deleted and the map re-forms.
+    assert.ok(existsSync(join(skillsDir, 'demo', 'SKILL.md')));
+    assert.equal(typeof pkgExt()['skills/demo'], 'object');
+  });
+});
+
+suite('directory skills: doctor + uninstall see the nested record');
+
+test('doctor reports a healthy skill as clean, and flags a drifted subtree file', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+
+    const check = () => {
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      return JSON.parse(r.stdout).find((c) => c.label === 'Extensions integrity');
+    };
+
+    // Before this branch existed, doctor joined `skills/demo` onto the root, hit a
+    // DIRECTORY, and warned "not a regular file" on every healthy run.
+    assert.equal(check().status, 'pass', `healthy skill must be clean: ${check().detail}`);
+
+    writeFileSync(join(skillsDir, 'demo', 'references', 'bar.md'), 'user edit\n');
+    const drifted = check();
+    assert.equal(drifted.status, 'warn', 'an edited subtree file must surface as drift');
+    assert.ok(
+      drifted.detail.includes('references/bar.md'),
+      `drift must name the file: ${drifted.detail}`,
+    );
+  });
+});
+
+test('uninstall removes the owned subtree but preserves what it does not own', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+      'references/keep.md': 'keep\n',
+    });
+    sync();
+
+    // One file the user edited, one they added themselves.
+    writeFileSync(join(skillsDir, 'demo', 'references', 'keep.md'), 'MY EDITS\n');
+    writeFileSync(join(skillsDir, 'demo', 'mine.md'), 'mine\n');
+
+    const r = runWithHome('uninstall.mjs', ['--apply', '--yes'], home);
+    assert.equal(r.status, 0, `uninstall failed: ${r.stderr}\n${r.stdout}`);
+
+    assert.ok(!existsSync(join(skillsDir, 'demo', 'SKILL.md')), 'owned + unmodified → removed');
+    assert.ok(
+      !existsSync(join(skillsDir, 'demo', 'references', 'bar.md')),
+      'owned subtree file → removed',
+    );
+    assert.equal(
+      readFileSync(join(skillsDir, 'demo', 'references', 'keep.md'), 'utf-8'),
+      'MY EDITS\n',
+      'user-modified → preserved',
+    );
+    assert.equal(
+      readFileSync(join(skillsDir, 'demo', 'mine.md'), 'utf-8'),
+      'mine\n',
+      'unowned → preserved',
+    );
+    // The skill root cannot be pruned while it still holds the files we preserved.
+    assert.ok(existsSync(join(skillsDir, 'demo')), 'a dir holding preserved files stays');
+  });
+});
+
+// codex pre-commit BLOCKER: the guard skipped the boundary dir itself, so
+// symlinking ~/.claude/skills — the one ancestor every install path shares —
+// bypassed it entirely.
+test('a symlinked skills/ boundary directory is itself refused (guard covers the root)', () => {
+  withSkillWiki(({ hypoDir, sync, home }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+
+    const skillsDir = join(home, '.claude', 'skills');
+    const outside = join(hypoDir, '..', 'outside-boundary');
+    mkdirSync(outside, { recursive: true });
+    // Move the real tree out and point skills/ at it: every install path now runs
+    // through a symlinked ancestor.
+    mkdirSync(join(outside, 'demo', 'references'), { recursive: true });
+    writeFileSync(join(outside, 'demo', 'SKILL.md'), '# demo\n');
+    writeFileSync(join(outside, 'demo', 'references', 'bar.md'), 'bar\n');
+    rmSync(skillsDir, { recursive: true });
+    symlinkSync(outside, skillsDir);
+
+    rmSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-demo', 'references'), {
+      recursive: true,
+    });
+    sync();
+
+    assert.ok(
+      existsSync(join(outside, 'demo', 'references', 'bar.md')),
+      'a symlinked skills/ boundary must not let the orphan unlink through',
+    );
+  });
+});
+
+// codex pre-commit BLOCKER (with a working repro): a corrupt `"skills/x": {}`
+// record granted no file ownership, yet uninstall still ran the directory prune —
+// which, through a symlinked skill dir, rmdir'd empty directories outside the tree.
+test('a corrupt empty skill record grants no pruning power (uninstall)', () => {
+  withSkillWiki(({ home, hypoDir, sync }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', { 'SKILL.md': '# demo\n' });
+    sync();
+
+    const skillsDir = join(home, '.claude', 'skills');
+    const outside = join(hypoDir, '..', 'outside-prune');
+    mkdirSync(join(outside, 'victim'), { recursive: true }); // empty → rmdir-able
+    rmSync(join(skillsDir, 'demo'), { recursive: true });
+    symlinkSync(outside, join(skillsDir, 'demo'));
+
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    pkg.extensions.claude['skills/demo'] = {}; // owns nothing
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+
+    const r = runWithHome('uninstall.mjs', ['--apply', '--yes'], home);
+    assert.equal(r.status, 0, `uninstall failed: ${r.stderr}`);
+    assert.ok(
+      existsSync(join(outside, 'victim')),
+      'an empty record must not let uninstall rmdir outside the skill tree',
+    );
+  });
+});
+
+// A partial uninstall must rewrite the record down to exactly what it still owns:
+// keep the preserved file (dropping it disowns the file forever) but DROP the files
+// it removed. Keeping a removed path is a live data-loss path — see the next test.
+test('a partial uninstall rewrites the record to exactly the files it still owns', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/keep.md': 'keep\n',
+    });
+    sync();
+    writeFileSync(join(skillsDir, 'demo', 'references', 'keep.md'), 'MY EDITS\n');
+
+    const r = runWithHome('uninstall.mjs', ['--apply', '--yes'], home);
+    assert.equal(r.status, 0, `uninstall failed: ${r.stderr}`);
+    assert.ok(existsSync(join(skillsDir, 'demo', 'references', 'keep.md')), 'edited file survives');
+    assert.ok(!existsSync(join(skillsDir, 'demo', 'SKILL.md')), 'owned file removed');
+
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    assert.ok(existsSync(pkgPath), 'the pkg must survive: a preserved file still needs its record');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    const rec = pkg.extensions.claude['skills/demo'];
+    assert.deepEqual(
+      Object.keys(rec),
+      ['references/keep.md'],
+      'the record must claim the preserved file and ONLY that',
+    );
+  });
+});
+
+// codex fix-verify BLOCKER (with a working repro): the record kept a stale claim on
+// a path uninstall had already removed. Put a NEW file at that path and --force
+// deletes it, because --force bypasses the SHA gate and the stale claim points there.
+test('a stale record claim cannot make --force delete a file the user later created', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/keep.md': 'keep\n',
+    });
+    sync();
+
+    // Edit one file so uninstall preserves it and the skill is only partly removed.
+    writeFileSync(join(skillsDir, 'demo', 'references', 'keep.md'), 'MY EDITS\n');
+    runWithHome('uninstall.mjs', ['--apply', '--yes'], home);
+    assert.ok(!existsSync(join(skillsDir, 'demo', 'SKILL.md')), 'SKILL.md was removed');
+
+    // The user writes their OWN file at the path we used to own.
+    writeFileSync(join(skillsDir, 'demo', 'SKILL.md'), 'USER NEW FILE\n');
+
+    const r = runWithHome('uninstall.mjs', ['--apply', '--yes', '--force-extensions'], home);
+    assert.equal(r.status, 0, `force uninstall failed: ${r.stderr}`);
+    assert.equal(
+      readFileSync(join(skillsDir, 'demo', 'SKILL.md'), 'utf-8'),
+      'USER NEW FILE\n',
+      'a path we no longer own must not be deletable through a stale record claim',
+    );
+  });
+});
+
+test('a refused (unsafe-path) file keeps the ownership record it already had', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir, pkgExt }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+    const before = pkgExt()['skills/demo']['references/bar.md'];
+    assert.ok(before, 'precondition: the file is owned');
+
+    // Make the install path unsafe, then re-sync: the copy is refused.
+    const outside = join(hypoDir, '..', 'outside-refuse');
+    mkdirSync(outside, { recursive: true });
+    rmSync(join(skillsDir, 'demo', 'references'), { recursive: true });
+    symlinkSync(outside, join(skillsDir, 'demo', 'references'));
+    runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+
+    assert.equal(
+      pkgExt()['skills/demo']['references/bar.md'],
+      before,
+      'refusing to touch a path must not disown what we already installed there',
+    );
+  });
+});
+
+// codex final-review BLOCKER (with a working repro): the nested SHA maps were plain
+// objects, so a file literally named `__proto__` assigned through the prototype
+// setter instead of creating an own key. The file installed but was never recorded —
+// unowned, and uninstall could never remove it. `constructor` had the mirror problem:
+// a lookup returned a truthy inherited value as if it were a recorded SHA.
+test('a skill file named __proto__ or constructor is tracked, not swallowed by the prototype', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir, pkgExt }) => {
+    // Built with a null prototype on purpose: in an object LITERAL, `__proto__:`
+    // sets the prototype instead of creating an own key, so the fixture would
+    // silently not contain the file we mean to test.
+    const files = Object.create(null);
+    files['SKILL.md'] = '# demo\n';
+    files['__proto__'] = 'proto\n';
+    files['constructor'] = 'ctor\n';
+    writeSkillTree(hypoDir, 'hypo-ext-demo', files);
+    const r = sync();
+    assert.equal(r.status, 0, `sync failed: ${r.stderr}`);
+
+    assert.ok(existsSync(join(skillsDir, 'demo', '__proto__')), '__proto__ installs');
+    const rec = pkgExt()['skills/demo'];
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(rec, '__proto__'),
+      '__proto__ must be recorded as an OWN key, or the file is installed but unowned',
+    );
+    assert.ok(Object.prototype.hasOwnProperty.call(rec, 'constructor'));
+
+    // Being owned is what makes it removable.
+    const u = runWithHome('uninstall.mjs', ['--apply', '--yes'], home);
+    assert.equal(u.status, 0, `uninstall failed: ${u.stderr}`);
+    assert.ok(
+      !existsSync(join(skillsDir, 'demo', '__proto__')),
+      'uninstall must be able to reach a file it recorded',
+    );
+  });
+});
+
+test('a case-fold collision DEEP in the subtree still poisons the whole skill', () => {
+  withSkillWiki(({ hypoDir, sync, skillsDir, pkgExt }) => {
+    const root = writeSkillTree(hypoDir, 'hypo-ext-demo', { 'SKILL.md': '# demo\n' });
+    mkdirSync(join(root, 'references'), { recursive: true });
+    writeFileSync(join(root, 'references', 'A.md'), 'A\n');
+    try {
+      writeFileSync(join(root, 'references', 'a.md'), 'a\n');
+    } catch {
+      return; // case-insensitive FS: the clash cannot even be authored here
+    }
+    // On a case-insensitive FS the two names are one file — nothing to test.
+    if (readdirSync(join(root, 'references')).length < 2) return;
+
+    const r = sync();
+    assert.equal(r.status, 0, `sync failed: ${r.stderr}`);
+    assert.ok(
+      !pkgExt()['skills/demo'],
+      'a collision below the root must skip the whole skill, not just the root level',
+    );
+    assert.ok(!existsSync(join(skillsDir, 'demo')), 'and nothing may be installed');
+  });
+});
+
+test('a corrupt object value under a FLAT key grants no ownership (--force cannot use it)', () => {
+  withSkillWiki(({ home, hypoDir, sync }) => {
+    const dir = join(hypoDir, 'extensions', 'skills');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'hypo-ext-flat.md'), '# flat\n');
+    sync();
+
+    const flatPath = join(home, '.claude', 'skills', 'hypo-ext-flat.md');
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    pkg.extensions.claude['skills/hypo-ext-flat.md'] = { 'x.md': 'f'.repeat(64) };
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+
+    const r = runWithHome('uninstall.mjs', ['--apply', '--yes', '--force-extensions'], home);
+    assert.equal(r.status, 0, `uninstall failed: ${r.stderr}`);
+    assert.ok(
+      existsSync(flatPath),
+      'a wrong-shaped flat value must not authorize removal, even under --force',
+    );
+  });
+});
+
+test('uninstall prunes the skill directory when nothing is left to preserve', () => {
+  withSkillWiki(({ home, hypoDir, sync, skillsDir }) => {
+    writeSkillTree(hypoDir, 'hypo-ext-demo', {
+      'SKILL.md': '# demo\n',
+      'references/bar.md': 'bar\n',
+    });
+    sync();
+
+    const r = runWithHome('uninstall.mjs', ['--apply', '--yes'], home);
+    assert.equal(r.status, 0, `uninstall failed: ${r.stderr}`);
+    assert.ok(!existsSync(join(skillsDir, 'demo')), 'a fully-owned skill dir is pruned');
+  });
+});
+
 // ── extensions settings.json mixed-group surgical write (ADR 0024 amend 2026-05-23) ──
 //
 // registerSettings used to ignore mixed-group occurrences of our command (any
@@ -24850,6 +25533,12 @@ const {
   buildHookCommand,
   parseCapturableHookCommand,
   scanSettingsHooks,
+  isValidSkillDirSegment,
+  parseSkillKey,
+  normalizeSkillRelPath,
+  isContainedUnder,
+  hasSymlinkAncestor,
+  parseSkillShaValue,
 } = await import(`${SCRIPTS}/lib/extensions.mjs`);
 const { planCapture, isCaptureCandidate, scanHookCandidates } = await import(
   `${SCRIPTS}/capture.mjs`
@@ -25004,6 +25693,110 @@ test('respects the covered-types scope (codex excludes skills/agents)', () => {
     type: 'commands',
     installFile: 'x.md',
   });
+});
+
+// ── directory skills: key + path validators (ADR 0063, T1) ──────────────
+
+suite('skills-dir: isValidSkillDirSegment');
+
+test('accepts a plain skill dir name, rejects the flat installName escapes', () => {
+  assert.ok(isValidSkillDirSegment('gstack'));
+  assert.ok(isValidSkillDirSegment('my-skill.v2'));
+  assert.ok(!isValidSkillDirSegment('hypo'));
+  assert.ok(!isValidSkillDirSegment('Hypo-x'));
+  assert.ok(!isValidSkillDirSegment('con'));
+  assert.ok(!isValidSkillDirSegment('COM1'));
+  assert.ok(!isValidSkillDirSegment('a/b'));
+  assert.ok(!isValidSkillDirSegment('a..b'));
+  assert.ok(!isValidSkillDirSegment('.hidden'));
+});
+test('rejects a trailing dot (Windows strips it, so foo. aliases foo)', () => {
+  assert.ok(!isValidSkillDirSegment('foo.'));
+  assert.ok(isValidSkillDirSegment('foo.bar'));
+});
+
+suite('skills-dir: parseSkillKey (recorded pkg-json key)');
+
+test('accepts skills/<safe-dir> only', () => {
+  assert.deepEqual(parseSkillKey('skills/foo'), { type: 'skills', installDir: 'foo' });
+  assert.equal(parseSkillKey('commands/foo.md'), null); // flat key is not a skill key
+  assert.equal(parseSkillKey('skills/foo/SKILL.md'), null); // sub-path never a top-level key
+  assert.equal(parseSkillKey('skills/../evil'), null);
+  assert.equal(parseSkillKey('skills/hypo-x'), null);
+  assert.equal(parseSkillKey('skills/'), null);
+  assert.equal(parseSkillKey('skills'), null);
+  assert.equal(parseSkillKey(42), null);
+});
+test('a skill key must not survive parseExtKey (the no-slash rule stays shut)', () => {
+  // The regression this guards: routing skills/foo through parseExtKey silently
+  // drops the record in uninstall, stranding installed files we own.
+  assert.equal(parseExtKey('skills/foo', ['skills']), null);
+});
+
+suite('skills-dir: normalizeSkillRelPath');
+
+test('accepts canonical subtree paths', () => {
+  assert.equal(normalizeSkillRelPath('SKILL.md'), 'SKILL.md');
+  assert.equal(normalizeSkillRelPath('references/x.md'), 'references/x.md');
+  assert.equal(normalizeSkillRelPath('a/b/c/d.txt'), 'a/b/c/d.txt');
+});
+test('rejects traversal, absolute, backslash, Windows drive/UNC, NUL', () => {
+  assert.equal(normalizeSkillRelPath('../x.md'), null);
+  assert.equal(normalizeSkillRelPath('references/../../x.md'), null);
+  assert.equal(normalizeSkillRelPath('/etc/passwd'), null);
+  assert.equal(normalizeSkillRelPath('refs\\x.md'), null);
+  assert.equal(normalizeSkillRelPath('C:/x.md'), null);
+  assert.equal(normalizeSkillRelPath('C:x.md'), null);
+  assert.equal(normalizeSkillRelPath('//host/share/x.md'), null);
+  assert.equal(normalizeSkillRelPath('a/\0b.md'), null);
+});
+test('rejects dot segments and empty segments (they alias a real destination)', () => {
+  assert.equal(normalizeSkillRelPath('references/./x.md'), null);
+  assert.equal(normalizeSkillRelPath('./x.md'), null);
+  assert.equal(normalizeSkillRelPath('a//b.md'), null);
+  assert.equal(normalizeSkillRelPath(''), null);
+});
+test('rejects a trailing-dot segment and a pathological depth/length', () => {
+  assert.equal(normalizeSkillRelPath('refs./x.md'), null);
+  assert.equal(normalizeSkillRelPath(Array(20).fill('a').join('/') + '/x.md'), null);
+  assert.equal(normalizeSkillRelPath('a/' + 'x'.repeat(500) + '.md'), null);
+});
+
+suite('skills-dir: isContainedUnder (boundary-aware, not startsWith)');
+
+test('a sibling whose name merely shares a prefix is NOT contained', () => {
+  assert.ok(isContainedUnder('/a/b', '/a/b/c.md'));
+  assert.ok(!isContainedUnder('/a/b', '/a/bc/c.md')); // raw startsWith would say yes
+  assert.ok(!isContainedUnder('/a/b', '/a/b')); // the root itself is not "under" itself
+  assert.ok(!isContainedUnder('/a/b', '/a/x.md'));
+});
+
+suite('skills-dir: parseSkillShaValue (corrupt pkg-json cannot be trusted)');
+
+test('keeps only canonical relpaths mapped to hex SHAs', () => {
+  const good = 'a'.repeat(64);
+  // The returned map is null-prototype (a relpath may legitimately be `__proto__`),
+  // so compare own entries rather than deep-equal against a plain object literal.
+  assert.deepEqual(Object.entries(parseSkillShaValue({ 'SKILL.md': good })), [['SKILL.md', good]]);
+  // dropped: non-hex, wrong length, non-string, traversal key, non-canonical key
+  assert.deepEqual(
+    Object.entries(
+      parseSkillShaValue({
+        'SKILL.md': good,
+        'bad.md': 'nothex',
+        'short.md': 'abc',
+        'obj.md': { nested: 1 },
+        '../escape.md': good,
+        'refs/./x.md': good,
+      }),
+    ),
+    [['SKILL.md', good]],
+  );
+});
+test('a shape mismatch (string SHA under a skill key) yields null, not a crash', () => {
+  assert.equal(parseSkillShaValue('a'.repeat(64)), null);
+  assert.equal(parseSkillShaValue(null), null);
+  assert.equal(parseSkillShaValue(['a']), null);
 });
 
 suite('capture: isCaptureCandidate + planCapture (ADR 0061 §6/§7)');
