@@ -393,6 +393,20 @@ E. 멈춘 프로젝트 재개.
 
 ---
 
+## AI 어시스턴트에게
+
+Claude(또는 다른 코딩 에이전트)로서 Hypomnema 위키를 운영한다면 아래가 기본 규칙입니다.
+
+위키가 단일 SoT입니다. 사용자가 기억해 달라고 한 것은 전부 위키 루트 아래 마크다운으로 있고, 기억에 의존해 답하기 전에 그것부터 읽습니다. 한 프로젝트의 배경은 `projects/<name>/hot.md`에, 다음에 할 일은 `projects/<name>/session-state.md`에 있으며 `/hypo:resume`이 둘 다 불러옵니다. 위키 루트의 `hot.md`는 다른 파일입니다. 어떤 프로젝트가 활성인지 가리키는 포인터 테이블입니다.
+
+그 상태를 위키 밖에 또 두지 마세요. `MEMORY.md`와 `~/.claude/CLAUDE.md`의 `<learned_behaviors>` 블록은 당신의 메모리처럼 보이지만, Hypomnema가 `pages/feedback/`에서 뽑아내는 단방향 projection입니다. 교정은 `/hypo:feedback`으로 적고 동기화가 다시 만들게 두면 됩니다. projection을 손으로 고치면 다음 동기화가 그것을 병합하지 않고 conflict로 멈춥니다. 어느 쪽이 진실인지 판단할 근거가 없기 때문이고, 그때부터 feedback 페이지로 되돌려 정리하는 일은 당신 몫이 됩니다. 위키 사실을 당신만 보는 곳에 챙겨두면 사용자의 다른 머신에는 아예 닿지 않습니다.
+
+`sources/`는 불변입니다. 그 아래는 무엇도 고치지 않습니다. 대신 `pages/`로 합성하고 출처를 링크로 되짚습니다.
+
+운영 절차는 위키 안에 함께 깔리므로 따로 받아올 필요가 없습니다. 위키 루트의 `hypo-guide.md`가 운영 가이드이고, `SCHEMA.md`가 페이지 타입과 frontmatter를 정의하며, `hypo-help.md`가 명령어 목록입니다. 세션에서 첫 위키 작업을 할 때 `SCHEMA.md`, `hypo-guide.md` 순으로 읽습니다.
+
+---
+
 ## 문서
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md): 내부 구조, 컴포넌트 맵, 데이터 흐름
