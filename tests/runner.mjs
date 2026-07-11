@@ -27358,6 +27358,35 @@ test('a skill file named __proto__ is captured and owned like any other', () => 
   });
 });
 
+// Capture must judge a source file by the rule that will apply AFTER it lands in the
+// wiki. forward-sync discovers the wiki subtree through the vault's .hypoignore, so a
+// file the vault ignores would be written, then dropped from discovery, and the adopt
+// check would fail with nothing a user could act on. Refuse it up front, naming the file.
+test('a skill holding a file the vault ignores is refused up front, not at adopt time', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeFileSync(join(hypoDir, '.hypoignore'), '*.pdf\n');
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(join(src, 'references'), { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      writeFileSync(join(src, 'references', 'spec.pdf'), '%PDF-1.4\n');
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.match(r.stdout, /references\/spec\.pdf matches the vault \.hypoignore/);
+      assert.ok(
+        !existsSync(join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine')),
+        'nothing is written to the wiki',
+      );
+      assert.doesNotMatch(r.stdout, /Failed to adopt/, 'refused at scan time, not at adopt');
+    });
+  });
+});
+
 // Success criterion 10: uninstall reaches a captured skill through its SHA-map key.
 test('uninstall removes a captured skill and preserves an unowned file inside it', () => {
   withTmpHome((home) => {

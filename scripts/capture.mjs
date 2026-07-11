@@ -58,6 +58,7 @@ import {
   writePkgJsonAtomic,
 } from './lib/pkg-json.mjs';
 import { resolveHypoRoot } from './lib/hypo-root.mjs';
+import { loadHypoIgnore, isIgnored } from './lib/hypo-ignore.mjs';
 import {
   syncExtensions,
   readExtensionPkgStateNoMutate,
@@ -319,8 +320,15 @@ function buildWantManifest(c) {
  * A flat `.md` under `skills/` is not a candidate: the directory is the real Claude
  * Code layout, and the flat form only exists as a backward-compatible wiki storage
  * shape. A symlinked directory is not a candidate either (never followed).
+ *
+ * `vault` is `{ hypoDir, patterns }` — the vault's `.hypoignore`. Capture must judge a
+ * source file by the rule that will apply to it AFTER it lands in the wiki: forward-sync
+ * discovers the wiki subtree through that filter, so a file the vault ignores (a `.pdf`
+ * reference, a `.cache/` directory) would be written here and then dropped from
+ * discovery, leaving the adopt check short one relpath and failing with no reason a user
+ * could act on. Refuse it up front instead, with the pattern named.
  */
-export function scanSkillCandidates(claudeHome, ownedDirs) {
+export function scanSkillCandidates(claudeHome, ownedDirs, vault = null) {
   const candidates = [];
   const skipped = [];
   const dir = join(claudeHome, 'skills');
@@ -342,9 +350,9 @@ export function scanSkillCandidates(claudeHome, ownedDirs) {
       skipped.push({ type: 'skills', file: name, reason: `unsafe skill directory name "${name}"` });
       continue;
     }
-    // hypoignore is not in play for a source under ~/.claude, so pass an empty pattern
-    // list. The dir argument still has to be a string: isIgnored() calls relative() on
-    // it before it ever looks at the (empty) patterns.
+    // The SOURCE walk applies no ignore filter (the patterns are the vault's, and the
+    // source lives under ~/.claude). The dir argument still has to be a string: isIgnored()
+    // calls relative() on it before it ever looks at the (empty) patterns.
     const walked = walkSkillSubtree(srcPath, label, dir, [], SKILL_LIMITS);
     if (walked.skip) {
       skipped.push({
@@ -353,6 +361,21 @@ export function scanSkillCandidates(claudeHome, ownedDirs) {
         reason: walked.fatal || `no regular ${SKILL_ROOT_FILE} at the skill root`,
       });
       continue;
+    }
+    // Would any of these files be invisible to forward-sync once they are in the wiki?
+    if (vault && vault.patterns.length > 0) {
+      const wikiRootForSkill = join(vault.hypoDir, 'extensions', 'skills', `${EXT_PREFIX}${name}`);
+      const ignored = walked.files.find((f) =>
+        isIgnored(join(wikiRootForSkill, ...f.rel.split('/')), vault.hypoDir, vault.patterns),
+      );
+      if (ignored) {
+        skipped.push({
+          type: 'skills',
+          file: name,
+          reason: `${ignored.rel} matches the vault .hypoignore and would not sync back`,
+        });
+        continue;
+      }
     }
     candidates.push({
       type: 'skills',
@@ -862,7 +885,10 @@ function run(args, { claudeHome = join(HOME, '.claude') } = {}) {
 
   const scanSkipped = [];
   if (args.types.includes('skills')) {
-    const skillScan = scanSkillCandidates(claudeHome, ownedSkillDirs(recorded));
+    const skillScan = scanSkillCandidates(claudeHome, ownedSkillDirs(recorded), {
+      hypoDir: wikiRoot,
+      patterns: loadHypoIgnore(wikiRoot),
+    });
     candidates.push(...skillScan.candidates);
     scanSkipped.push(...skillScan.skipped);
   }
