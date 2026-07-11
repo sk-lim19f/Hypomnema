@@ -27780,6 +27780,116 @@ await testAsync('N concurrent appends lose nothing and dedup an exact duplicate'
   }
 });
 
+// ── FEAT-11 pending-proposal surface (T8) ────────────────────────────────────
+
+suite('doctor.mjs / hypo-session-start.mjs — pending-proposal surface (FEAT-11 T8)');
+
+// A valid vault root (config + the three scanned dirs) so rootOk=true and
+// checkProposals actually runs — otherwise the check is silently skipped and the
+// assertion passes vacuously.
+function scaffoldVaultRoot(dir) {
+  writeFileSync(join(dir, 'hypo-config.md'), '# config');
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  mkdirSync(join(dir, 'projects'), { recursive: true });
+  mkdirSync(join(dir, 'sources'), { recursive: true });
+}
+
+test('FEAT-11 T8: doctor passes when no proposals are parked', () => {
+  withTmpDir((dir) => {
+    scaffoldVaultRoot(dir);
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Pending proposals');
+    assert.ok(check, 'Pending proposals check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+  });
+});
+
+test('FEAT-11 T8: doctor warns with the count when proposals are parked', () => {
+  withTmpDir((dir) => {
+    scaffoldVaultRoot(dir);
+    psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: 'b',
+      currentAtProposalHash: 'c',
+      proposedContent: 'A',
+      sessionId: 's',
+      device: 'd',
+    });
+    psWriteProposal(dir, {
+      target: join('pages', 'open-questions.md'),
+      baseHash: 'b',
+      currentAtProposalHash: 'c',
+      proposedContent: 'Q',
+      sessionId: 's',
+      device: 'd',
+    });
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Pending proposals');
+    assert.ok(check, 'Pending proposals check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(/\b2\b/.test(check.detail), `count 2 should appear: ${check.detail}`);
+    // Surface only — doctor must not change the store.
+    assert.equal(psListProposals(dir).length, 2, 'doctor must not change the proposal count');
+  });
+});
+
+test('FEAT-11 T8: session-start surfaces the count on stderr and mutates nothing', () => {
+  withTmpDir((dir) => {
+    scaffoldVaultRoot(dir);
+    const targetRel = join('pages', 'open-questions.md');
+    const targetAbs = join(dir, targetRel);
+    writeFileSync(targetAbs, '# open questions original\n');
+    psWriteProposal(dir, {
+      target: targetRel,
+      baseHash: 'b',
+      currentAtProposalHash: 'c',
+      proposedContent: '# proposed replacement\n',
+      sessionId: 's',
+      device: 'd',
+    });
+    const beforeStore = JSON.stringify(
+      psListProposals(dir).map((p) => ({ id: p.id, content: p.proposedContent })),
+    );
+    // A cwd that matches no project → MISS path, which exercises the same
+    // path-independent stderr write as HIT. No session_id, so snapshotBase is a
+    // no-op and the invariance assertion stays honest.
+    const outside = mkdtempSync(join(tmpdir(), 'hypo-t8-cwd-'));
+    try {
+      const r = runHook('hypo-session-start.mjs', { cwd: outside }, { HYPO_DIR: dir });
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      assert.ok(/대기 proposal 1건/.test(r.stderr), `expected the count line: ${r.stderr}`);
+      assert.equal(
+        readFileSync(targetAbs, 'utf-8'),
+        '# open questions original\n',
+        'surface must not touch the target page',
+      );
+      assert.equal(
+        JSON.stringify(psListProposals(dir).map((p) => ({ id: p.id, content: p.proposedContent }))),
+        beforeStore,
+        'surface must not change the proposal store',
+      );
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+test('FEAT-11 T8: session-start emits no proposal line when none are parked', () => {
+  withTmpDir((dir) => {
+    scaffoldVaultRoot(dir);
+    const outside = mkdtempSync(join(tmpdir(), 'hypo-t8-cwd-'));
+    try {
+      const r = runHook('hypo-session-start.mjs', { cwd: outside }, { HYPO_DIR: dir });
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      assert.ok(!/대기 proposal/.test(r.stderr), `no proposal line expected: ${r.stderr}`);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

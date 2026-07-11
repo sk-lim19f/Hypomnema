@@ -47,6 +47,7 @@ import {
   markSiblingNotified,
 } from './version-check.mjs';
 import { snapshotBase, overwriteTargets } from './base-store.mjs';
+import { listProposals } from './proposal-store.mjs';
 
 // Privacy guard: refuse to read+inject .hypoignore-matched
 // wiki files into additionalContext. Without this, a user who lists
@@ -272,6 +273,24 @@ function syncStateNotice(pullOk) {
   }
   return `[WIKI: last sync failed: ${last.op || '?'} — ${last.error || 'unknown'}]`;
 }
+/**
+ * Surface the vault-wide count of parked write-proposals (T8). Routed
+ * exactly like syncStateNotice: the line joins the `notices` array (→
+ * additionalContext) and is also written to stderr, so both the model and the
+ * user's transcript see it. NOT a systemMessage banner (that channel is
+ * reserved for the update/sibling notices). Pure read (listProposals never
+ * mutates); best-effort so a store read failure never breaks SessionStart. '' when
+ * there are no pending proposals, so nothing surfaces on the empty path.
+ */
+function pendingProposalNotice() {
+  try {
+    const n = listProposals(HYPO_DIR).length;
+    if (n === 0) return '';
+    return `[WIKI: 대기 proposal ${n}건 (검토: hypomnema proposal list)]`;
+  } catch {
+    return '';
+  }
+}
 const GLOBAL_HOT = join(HYPO_DIR, 'hot.md');
 const HOT_CHARS = 2000;
 const STATE_CHARS = 2000;
@@ -347,6 +366,7 @@ process.stdin.on('end', () => {
 
     const pullOk = gitPull(HYPO_DIR);
     const syncLine = syncStateNotice(pullOk);
+    const proposalLine = pendingProposalNotice();
     const growthLine = readLastGrowthLine();
     // On source='clear', surface the dying
     // session's identity that hypo-session-end stashed so Claude can recover
@@ -365,11 +385,17 @@ process.stdin.on('end', () => {
     // transcript/--verbose only and out of this banner's scope.)
     const userMessage = [updateLine, siblingLine].filter(Boolean).join('\n\n');
     if (userMessage) outExtra = { ...outExtra, systemMessage: userMessage };
-    const notices = [syncLine, growthLine, clearRecoveryLine, updateLine, siblingLine].filter(
-      Boolean,
-    );
+    const notices = [
+      syncLine,
+      proposalLine,
+      growthLine,
+      clearRecoveryLine,
+      updateLine,
+      siblingLine,
+    ].filter(Boolean);
     let noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
     if (syncLine) process.stderr.write(`\n\x1b[33m${syncLine}\x1b[0m\n`);
+    if (proposalLine) process.stderr.write(`\n\x1b[33m${proposalLine}\x1b[0m\n`);
     if (growthLine) process.stderr.write(`\n\x1b[36m${growthLine}\x1b[0m\n`);
     if (clearRecoveryLine)
       process.stderr.write(`\n\x1b[33m${clearRecoveryLine.split('\n')[0]}\x1b[0m\n`);
