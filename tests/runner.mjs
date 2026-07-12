@@ -29230,6 +29230,401 @@ test('FEAT-11 T8: session-start emits no proposal line when none are parked', ()
   });
 });
 
+// ── FEAT-5 T11: visibility_scope on the session-resume paths ─────────────────
+// T4-T8 wired the five content-injection consumers. The session-resume paths
+// (session-start, cwd-change, resume.mjs) read the SAME projects/<p>/hot.md and
+// session-state.md that hypo-file-watch already filters, so leaving them
+// unfiltered made one file behave differently depending on which path opened it:
+// the user sets visibility_scope, watches file-watch honor it, and never learns
+// session start still ships the body. That is a false guarantee, not a fail-open.
+suite('FEAT-5 T11 — session-resume paths honor visibility_scope');
+
+// Same shape as withPrivateProject, but hot/state carry a scope line. The body
+// markers are exactly what must not reach a foreign device.
+function withScopedProject(scopeLine, fn) {
+  withGrowthWiki((dir) => {
+    const work = mkdtempSync(join(tmpdir(), 'hypo-scope-work-'));
+    const projDir = join(dir, 'projects', 'scoped');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'index.md'),
+      `---\ntitle: scoped\ntype: project-index\nupdated: 2026-07-12\nworking_dir: "${work}"\n---\n# Scoped\n`,
+    );
+    const fm = scopeLine ? `---\n${scopeLine}\n---\n` : '';
+    writeFileSync(join(projDir, 'hot.md'), `${fm}# hot\nSCOPED_HOT_BODY\n`);
+    writeFileSync(join(projDir, 'session-state.md'), `${fm}# state\nSCOPED_STATE_BODY\n`);
+    try {
+      fn(dir, work);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+}
+
+const SCOPED_BODIES = /SCOPED_HOT_BODY|SCOPED_STATE_BODY/;
+
+test('session-start hides a machine-scoped project hot/state on a foreign device', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'test-t11-ss-foreign' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !SCOPED_BODIES.test(r.stdout),
+      `machine:devA body leaked into session-start on devB: ${r.stdout}`,
+    );
+  });
+});
+
+test('session-start still injects a machine-scoped project hot/state on its own device', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'test-t11-ss-own' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'devA' },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      /SCOPED_HOT_BODY/.test(r.stdout) && /SCOPED_STATE_BODY/.test(r.stdout),
+      `expected hot+state injection on the owning device: ${r.stdout}`,
+    );
+  });
+});
+
+test('session-start leaves an unscoped project unchanged on every device', () => {
+  for (const device of ['devA', 'devB']) {
+    withScopedProject('', (dir, work) => {
+      const r = runHook(
+        'hypo-session-start.mjs',
+        { cwd: work, session_id: `test-t11-ss-plain-${device}` },
+        { HYPO_DIR: dir, HYPO_DEVICE: device },
+      );
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      assert.ok(
+        /SCOPED_HOT_BODY/.test(r.stdout) && /SCOPED_STATE_BODY/.test(r.stdout),
+        `a field-less project must inject on ${device}: ${r.stdout}`,
+      );
+    });
+  }
+});
+
+test('cwd-change hides a machine-scoped project hot on a foreign device', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = runHook(
+      'hypo-cwd-change.mjs',
+      { new_cwd: work, old_cwd: '/tmp', session_id: 'test-t11-cwd-foreign' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !SCOPED_BODIES.test(r.stdout),
+      `machine:devA hot leaked into cwd-change on devB: ${r.stdout}`,
+    );
+  });
+});
+
+test('cwd-change still injects a machine-scoped project hot on its own device', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = runHook(
+      'hypo-cwd-change.mjs',
+      { new_cwd: work, old_cwd: '/tmp', session_id: 'test-t11-cwd-own' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'devA' },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      /SCOPED_HOT_BODY/.test(r.stdout),
+      `expected hot injection on the owning device: ${r.stdout}`,
+    );
+  });
+});
+
+test('resume.mjs hides a machine-scoped session-state on a foreign device and says why', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=scoped'],
+      { cwd: work, encoding: 'utf-8', env: { ...process.env, HYPO_DEVICE: 'devB' } },
+    );
+    assert.ok(
+      !SCOPED_BODIES.test(r.stdout),
+      `machine:devA body leaked through resume stdout on devB: ${r.stdout}`,
+    );
+    // A scoped-out state file is not a missing one. Reporting "no session-state.md
+    // found" would read as a broken vault, so the reason must be explicit.
+    assert.ok(
+      /scoped to another machine/.test(r.stderr),
+      `expected an explicit scoped-out reason, got: ${r.stderr}`,
+    );
+  });
+});
+
+test('resume.mjs still returns a machine-scoped session-state on its own device', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=scoped'],
+      { cwd: work, encoding: 'utf-8', env: { ...process.env, HYPO_DEVICE: 'devA' } },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      /SCOPED_STATE_BODY/.test(r.stdout) && /SCOPED_HOT_BODY/.test(r.stdout),
+      `expected state+hot on the owning device: ${r.stdout}`,
+    );
+  });
+});
+
+// --json serializes the bodies through a different branch than the text output,
+// so it needs its own foreign-device assertion.
+test('resume.mjs --json does not serialize a machine-scoped body on a foreign device', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=scoped', '--json'],
+      { cwd: work, encoding: 'utf-8', env: { ...process.env, HYPO_DEVICE: 'devB' } },
+    );
+    assert.ok(
+      !SCOPED_BODIES.test(r.stdout),
+      `machine:devA body leaked through the --json branch on devB: ${r.stdout}`,
+    );
+  });
+});
+
+// The two files are scoped independently, so a visible state must still come
+// through when only hot.md is scoped out (and hot's body must not).
+test('resume.mjs returns a visible session-state while hiding a scoped-out hot.md', () => {
+  withScopedProject('', (dir, work) => {
+    writeFileSync(
+      join(dir, 'projects', 'scoped', 'hot.md'),
+      '---\nvisibility_scope: machine:devA\n---\n# hot\nSCOPED_HOT_BODY\n',
+    );
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=scoped'],
+      { cwd: work, encoding: 'utf-8', env: { ...process.env, HYPO_DEVICE: 'devB' } },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      /SCOPED_STATE_BODY/.test(r.stdout),
+      `the unscoped session-state must still surface: ${r.stdout}`,
+    );
+    assert.ok(
+      !/SCOPED_HOT_BODY/.test(r.stdout),
+      `the scoped-out hot body must not surface: ${r.stdout}`,
+    );
+  });
+});
+
+// Scoped-out must not be reported as absent. "no snapshot yet" would make the
+// model treat a resumed project as a first session. The fix says which it is,
+// while naming nothing from the withheld body.
+test('session-start reports a scoped-out snapshot as scoped, not as "no snapshot yet"', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'test-t11-ss-reason' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      /scoped to another machine/.test(r.stdout),
+      `expected the scoped-out reason in additionalContext: ${r.stdout}`,
+    );
+    assert.ok(
+      !/no snapshot yet/.test(r.stdout),
+      `a scoped-out snapshot must not be reported as absent: ${r.stdout}`,
+    );
+    assert.ok(
+      !SCOPED_BODIES.test(r.stdout),
+      `the explanation must not re-leak the body: ${r.stdout}`,
+    );
+  });
+});
+
+test('cwd-change reports a scoped-out hot as scoped, not as "will be created"', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const r = runHook(
+      'hypo-cwd-change.mjs',
+      { new_cwd: work, old_cwd: '/tmp', session_id: 'test-t11-cwd-reason' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      /scoped to another machine/.test(r.stdout),
+      `expected the scoped-out placeholder: ${r.stdout}`,
+    );
+    assert.ok(
+      !/will be created at session close/.test(r.stdout),
+      `an existing scoped hot.md must not be advertised as creatable: ${r.stdout}`,
+    );
+    assert.ok(
+      !SCOPED_BODIES.test(r.stdout),
+      `the placeholder must not re-leak the body: ${r.stdout}`,
+    );
+  });
+});
+
+// The lie also travels through the marker: hypo-first-prompt builds its resume
+// line from the marker alone, so fixing only session-start's own output would
+// still let the NEXT prompt announce "first session" for a project that merely
+// lives on another machine. That is the announcement that invites the model to
+// author a fresh hot.md over the owning machine's copy.
+test('first-prompt does not call a scoped-out project a first session', () => {
+  const sid = `fp-scoped-${process.pid}-${Date.now()}`;
+  writeMarker(sid, { proj: 'demo', hotPath: null, scopedOut: true });
+  try {
+    const r = runFirstPrompt(sid);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout).additionalContext || '';
+    assert.match(out, /scoped to another machine/, 'must name the scope as the reason');
+    assert.doesNotMatch(out, /first session/, 'a scoped-out project is not a first session');
+  } finally {
+    if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+  }
+});
+
+test('first-prompt still calls a genuinely snapshot-less project a first session', () => {
+  const sid = `fp-absent-${process.pid}-${Date.now()}`;
+  writeMarker(sid, { proj: 'demo', hotPath: null });
+  try {
+    const r = runFirstPrompt(sid);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout).additionalContext || '';
+    assert.match(
+      out,
+      /first session/,
+      'a genuinely absent snapshot must still read as first session',
+    );
+    assert.doesNotMatch(out, /scoped to another machine/, 'must not claim a scope that is not set');
+  } finally {
+    if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+  }
+});
+
+// The two files are scoped independently. When hot is hidden but state is shared,
+// session-start must take the CONTENT branch: inject the state, withhold the hot
+// body, and report hasSnapshot truthfully (a snapshot really was injected). The
+// marker then carries a hotPath pointing at a hidden file, so nothing downstream
+// may read that path for content. first-prompt only existsSync's it.
+test('session-start injects a shared state while withholding a scoped-out hot, and stays truthful', () => {
+  withScopedProject('', (dir, work) => {
+    writeFileSync(
+      join(dir, 'projects', 'scoped', 'hot.md'),
+      '---\nvisibility_scope: machine:devA\n---\n# hot\nSCOPED_HOT_BODY\n',
+    );
+    const sid = `t11-mixed-${process.pid}-${Date.now()}`;
+    try {
+      const r = runHook(
+        'hypo-session-start.mjs',
+        { cwd: work, session_id: sid },
+        { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+      );
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      assert.ok(
+        !/SCOPED_HOT_BODY/.test(r.stdout),
+        `the hidden hot body must not surface: ${r.stdout}`,
+      );
+      assert.ok(
+        /SCOPED_STATE_BODY/.test(r.stdout),
+        `the shared state must still surface: ${r.stdout}`,
+      );
+
+      // hasSnapshot: true is the honest answer here, a snapshot WAS injected.
+      const marker = JSON.parse(readFileSync(markerPath(sid), 'utf-8'));
+      assert.equal(marker.hasSnapshot, true, 'a partially visible snapshot is still a snapshot');
+
+      const fp = runFirstPrompt(sid);
+      const out = JSON.parse(fp.stdout).additionalContext || '';
+      assert.ok(
+        !/SCOPED_HOT_BODY/.test(out),
+        `first-prompt must not read the hidden hotPath for content: ${out}`,
+      );
+    } finally {
+      if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+    }
+  });
+});
+
+// cwd-change deliberately arms the first-prompt marker only when real content was
+// injected (a forced "Resuming" line with nothing to summarize is empty noise).
+// A scoped-out hot takes that same path, which is correct precisely because the
+// additionalContext placeholder already states the fact: the model is not left
+// silent, it is told the snapshot lives elsewhere.
+test('cwd-change does not arm the resume marker for a scoped-out hot', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const sid = `t11-cc-marker-${process.pid}-${Date.now()}`;
+    try {
+      const r = runHook(
+        'hypo-cwd-change.mjs',
+        { new_cwd: work, old_cwd: '/tmp', session_id: sid },
+        { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+      );
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      assert.ok(
+        /scoped to another machine/.test(r.stdout),
+        `the placeholder must state the fact: ${r.stdout}`,
+      );
+      assert.ok(
+        !existsSync(markerPath(sid)),
+        'no forced resume line when there is nothing visible to summarize',
+      );
+    } finally {
+      if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+    }
+  });
+});
+
+// End to end: the marker session-start actually writes must carry the fact.
+test('session-start stamps scopedOut on the marker it hands to first-prompt', () => {
+  withScopedProject('visibility_scope: machine:devA', (dir, work) => {
+    const sid = `t11-e2e-${process.pid}-${Date.now()}`;
+    try {
+      const r = runHook(
+        'hypo-session-start.mjs',
+        { cwd: work, session_id: sid },
+        { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+      );
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const marker = JSON.parse(readFileSync(markerPath(sid), 'utf-8'));
+      assert.equal(
+        marker.scopedOut,
+        true,
+        `marker must record the scope hide: ${JSON.stringify(marker)}`,
+      );
+
+      const fp = runFirstPrompt(sid);
+      const out = JSON.parse(fp.stdout).additionalContext || '';
+      assert.doesNotMatch(
+        out,
+        /first session/,
+        'the hand-off must not degrade into "first session"',
+      );
+      assert.ok(!SCOPED_BODIES.test(out), `first-prompt must not surface the body either: ${out}`);
+    } finally {
+      if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+    }
+  });
+});
+
+// The scoped-out branch must not swallow the genuine first-session signal.
+test('session-start still says "no snapshot yet" when the files are genuinely absent', () => {
+  withScopedProject('', (dir, work) => {
+    rmSync(join(dir, 'projects', 'scoped', 'hot.md'));
+    rmSync(join(dir, 'projects', 'scoped', 'session-state.md'));
+    const r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'test-t11-ss-absent' },
+      { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      /no snapshot yet/.test(r.stdout),
+      `a genuinely absent snapshot must still read as absent: ${r.stdout}`,
+    );
+  });
+});
+
 // ── summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${'─'.repeat(40)}`);

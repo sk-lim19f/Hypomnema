@@ -24,6 +24,9 @@ import {
   pickProjectByCwd,
   collectProjectWorkingDirs,
   buildVaultOrientation,
+  currentDevice,
+  scopeVisible,
+  readVisibilityScope,
 } from './hypo-shared.mjs';
 
 const PROJECTS_DIR = join(HYPO_DIR, 'projects');
@@ -32,10 +35,32 @@ const MAX_CHARS = 3000;
 
 // Privacy guard: a .hypoignore-matched hot.md must not be
 // re-emitted into additionalContext on cwd change.
+//
+// Visibility guard: same contract as hypo-file-watch and hypo-session-start. A
+// machine-scoped hot.md stays off every machine but its owner. Scope is read
+// from the RAW content before the MAX_CHARS slice, since slicing first could cut
+// the frontmatter off and fail open. The root hot.md carries no frontmatter, so
+// it reads as '' and passes as shared.
 function readIfNotIgnored(path, patterns) {
   if (!path) return null;
   if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return null;
-  return readFileSync(path, 'utf-8').slice(0, MAX_CHARS);
+  const raw = readFileSync(path, 'utf-8');
+  if (!scopeVisible(readVisibilityScope(raw), currentDevice())) return null;
+  return raw.slice(0, MAX_CHARS);
+}
+
+// Scoped-out is not absent. Both make readIfNotIgnored return null, but the
+// absent-case placeholder tells the model the file "will be created at session
+// close". On a foreign machine that invites it to author over a hot.md that
+// exists and belongs elsewhere. Report the fact, never the withheld body.
+function isScopedOut(path, patterns) {
+  try {
+    if (!path || !existsSync(path)) return false;
+    if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return false;
+    return !scopeVisible(readVisibilityScope(readFileSync(path, 'utf-8')), currentDevice());
+  } catch {
+    return false;
+  }
 }
 
 function findProjectHot(cwd) {
@@ -87,7 +112,11 @@ process.stdin.on('end', () => {
 
     if (newHit) {
       const fromFile = readIfNotIgnored(newHit.hotPath, ignorePatterns);
-      const content = fromFile ?? '(no hot.md yet — will be created at session close)';
+      const content =
+        fromFile ??
+        (isScopedOut(newHit.hotPath, ignorePatterns)
+          ? '(hot.md for this project is scoped to another machine and is not visible here)'
+          : '(no hot.md yet — will be created at session close)');
       // arm the first-prompt marker so the NEXT user prompt re-triggers
       // hypo-first-prompt, which forces a "Resuming <project>" summary line.
       // Only arm when real hot content was actually injected — if hot.md is
