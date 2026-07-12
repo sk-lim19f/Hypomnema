@@ -48,7 +48,17 @@ process.stdin.on('end', () => {
     }
 
     const hasSnapshot = marker.hasSnapshot ?? (marker.hotPath && existsSync(marker.hotPath));
-    const snapshotNote = hasSnapshot ? '' : ' (no snapshot yet — first session)';
+    // A snapshot withheld by visibility_scope is NOT an absent one. session-start
+    // stamps the marker so this hook can tell them apart: without it, a project
+    // resumed on a foreign machine is announced as a first session, and the model
+    // then has every reason to author a fresh hot.md over the one that exists on
+    // the owning machine. Never name the withheld contents, only the fact.
+    const scopedOut = marker.scopedOut === true;
+    const snapshotNote = hasSnapshot
+      ? ''
+      : scopedOut
+        ? ' (snapshot scoped to another machine)'
+        : ' (no snapshot yet — first session)';
     // a cwd-change re-trigger says "Resuming"; a fresh session start
     // (default source) says "Previously working on".
     const verb = marker.source === 'cwd-change' ? 'Resuming' : 'Previously working on';
@@ -63,11 +73,17 @@ process.stdin.on('end', () => {
     // first-ever session (codex v2 review 2026-05-26).
     const exampleLine = hasSnapshot
       ? `${verb} ${projSafe}: [one-line summary]. Continue with [next task]?`
-      : `${verb} ${projSafe}: no prior snapshot yet — first session. What would you like to start with?`;
+      : scopedOut
+        ? `${projSafe}: this project has a prior snapshot, but it is scoped to another machine and is not visible here. What would you like to work on?`
+        : `${verb} ${projSafe}: no prior snapshot yet — first session. What would you like to start with?`;
     const fillNote = hasSnapshot
       ? `Replace the bracketed placeholders using the [HOT] / [SESSION STATE] ` +
         `context already injected this session — do NOT emit the literal brackets.`
-      : `Use the line above verbatim — there is no prior snapshot to summarize.`;
+      : scopedOut
+        ? `Use the line above verbatim. The project has prior work; its snapshot ` +
+          `simply belongs to another machine, so treat it as an existing project ` +
+          `whose history you cannot see from here.`
+        : `Use the line above verbatim — there is no prior snapshot to summarize.`;
 
     console.log(
       JSON.stringify(

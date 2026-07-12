@@ -30,6 +30,7 @@ import { existsSync, readFileSync, readdirSync, statSync, realpathSync } from 'f
 import { join } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { pickProjectByCwd, collectProjectWorkingDirs } from './lib/wd-match.mjs';
+import { currentDevice, scopeVisible, readVisibilityScope } from '../hooks/hypo-shared.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -189,16 +190,27 @@ function resolveActiveProject(hypoDir, cwd = null) {
 
 // ── read session state ────────────────────────────────────────────────────────
 
-function readSessionState(hypoDir, project) {
-  const ssPath = join(hypoDir, 'projects', project, 'session-state.md');
-  if (!existsSync(ssPath)) return null;
-  return readFileSync(ssPath, 'utf-8');
+// Visibility guard: same contract as hypo-file-watch / hypo-session-start /
+// hypo-cwd-change. A machine-scoped page (visibility_scope: machine:<owner>) is
+// not surfaced on any machine but its owner, and /hypo:resume feeds its stdout
+// straight into the model, so it is one of those injection paths.
+//
+// `hidden` is kept distinct from "file absent" on purpose: reporting a scoped-out
+// state file as "no session-state.md found" would read as a broken vault. The
+// caller says which one it was.
+function readVisible(path, device) {
+  if (!existsSync(path)) return { content: null, hidden: false };
+  const raw = readFileSync(path, 'utf-8');
+  if (!scopeVisible(readVisibilityScope(raw), device)) return { content: null, hidden: true };
+  return { content: raw, hidden: false };
 }
 
-function readHot(hypoDir, project) {
-  const hotPath = join(hypoDir, 'projects', project, 'hot.md');
-  if (!existsSync(hotPath)) return null;
-  return readFileSync(hotPath, 'utf-8');
+function readSessionState(hypoDir, project, device) {
+  return readVisible(join(hypoDir, 'projects', project, 'session-state.md'), device);
+}
+
+function readHot(hypoDir, project, device) {
+  return readVisible(join(hypoDir, 'projects', project, 'hot.md'), device);
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -212,13 +224,23 @@ if (!project) {
   process.exit(1);
 }
 
-const sessionState = readSessionState(args.hypoDir, project);
-if (!sessionState) {
-  console.error(`Error: no session-state.md found for project "${project}"`);
+const device = currentDevice();
+
+const state = readSessionState(args.hypoDir, project, device);
+if (!state.content) {
+  if (state.hidden) {
+    console.error(
+      `Error: session-state.md for "${project}" is scoped to another machine ` +
+        `(visibility_scope). Nothing to resume on this machine (${device}).`,
+    );
+  } else {
+    console.error(`Error: no session-state.md found for project "${project}"`);
+  }
   process.exit(1);
 }
+const sessionState = state.content;
 
-const hotContent = readHot(args.hypoDir, project);
+const hotContent = readHot(args.hypoDir, project, device).content;
 
 if (args.json) {
   console.log(JSON.stringify({ project, sessionState, hot: hotContent }, null, 2));

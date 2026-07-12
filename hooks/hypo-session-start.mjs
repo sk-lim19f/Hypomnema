@@ -32,6 +32,9 @@ import {
   collectProjectWorkingDirs,
   buildVaultOrientation,
   staleMarkerFor,
+  currentDevice,
+  scopeVisible,
+  readVisibilityScope,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -53,10 +56,38 @@ import { listProposals } from './proposal-store.mjs';
 // wiki files into additionalContext. Without this, a user who lists
 // `projects/private/hot.md` in .hypoignore would still see SECRET emit because
 // session-start reads hot/state paths directly.
+//
+// Visibility guard: a machine-scoped page (visibility_scope: machine:<owner>)
+// must not be injected on a machine other than its owner. hypo-file-watch
+// already filters these very files, so leaving session start unfiltered made the
+// SAME file behave differently depending on which path opened it: the user sets
+// the field, sees it honored on edit, and never learns that session start still
+// ships the body. Read the scope from the RAW content before the maxChars slice:
+// slicing first could cut the frontmatter off and silently fail open.
+// The root hot.md is a frontmatter-less pointer table, so it reads as '' and
+// passes (shared) unchanged.
 function readIfNotIgnored(path, maxChars, patterns) {
   if (!path) return null;
   if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return null;
-  return readFileSync(path, 'utf-8').slice(0, maxChars);
+  const raw = readFileSync(path, 'utf-8');
+  if (!scopeVisible(readVisibilityScope(raw), currentDevice())) return null;
+  return raw.slice(0, maxChars);
+}
+
+// Scoped-out is not the same as absent. Both make readIfNotIgnored return null,
+// but telling the model "no snapshot yet / first session" when the snapshot merely
+// belongs to another machine is a lie it will act on. Returns false for an ignored
+// or missing file so only a real machine-scope hide reports true.
+// The caller may name the project and the fact, never the withheld body: a message
+// explaining the hide must not re-leak what it hid.
+function isScopedOut(path, patterns) {
+  try {
+    if (!path || !existsSync(path)) return false;
+    if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return false;
+    return !scopeVisible(readVisibilityScope(readFileSync(path, 'utf-8')), currentDevice());
+  } catch {
+    return false;
+  }
 }
 
 // Compute the STALE marker for a hot/state file from its RAW content (readIfNotIgnored
@@ -464,17 +495,29 @@ process.stdin.on('end', () => {
           ),
         );
       } else {
+        // A snapshot that exists but is scoped to another machine must not be
+        // reported as "no snapshot yet": the model would treat a resumed project
+        // as a first session. Say which it is, and say nothing of the contents.
+        const scopedOut =
+          isScopedOut(hit.hotPath, ignorePatterns) || isScopedOut(hit.statePath, ignorePatterns);
+        const reason = scopedOut ? 'snapshot scoped to another machine' : 'no snapshot yet';
         process.stderr.write(
-          `\n\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${hit.proj}\x1b[0m (no snapshot yet)\n\n`,
+          `\n\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${hit.proj}\x1b[0m (${reason})\n\n`,
         );
+        // Carry the reason into the marker, not just this hook's output.
+        // hypo-first-prompt derives its resume line from the marker alone, so a
+        // marker that says only `hotPath: null` makes the NEXT prompt announce
+        // "first session" for a project that merely belongs to another machine.
+        // That lie is what invites the model to author a fresh hot.md over one
+        // that already exists elsewhere.
         writeFileSync(
           MARKER_FILE,
-          JSON.stringify({ proj: hit.proj, hotPath: null, ts: Date.now() }),
+          JSON.stringify({ proj: hit.proj, hotPath: null, scopedOut, ts: Date.now() }),
         );
         console.log(
           JSON.stringify(
             buildOutput(
-              `${noticePrefix}${hitPrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}, no snapshot yet]`,
+              `${noticePrefix}${hitPrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}, ${reason}]`,
               outExtra,
             ),
           ),
