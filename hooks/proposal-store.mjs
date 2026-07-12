@@ -296,3 +296,125 @@ export function writeProposal(hypoDir, fields) {
 export function hashProposalContent(content) {
   return createHash('sha256').update(content, 'utf-8').digest('hex');
 }
+
+// ── approval challenges ───────────────────────────────────────────────────────
+//
+// A challenge is the record a `proposal challenge` run leaves behind so a later
+// `proposal resolve` can prove FOUR things about a batch the user approved in
+// conversation: that the approval postdates the diff (the nonce did not exist
+// before), that it is spent once (resolve deletes the record), that the bytes on
+// disk are still the bytes whose diff was shown, and that the set being applied
+// is the set that was approved.
+//
+// Challenges live in a SUBDIRECTORY, not beside the artifacts. listProposals
+// readdir-scans `<store>/*.json` and would otherwise have to reason about which
+// `.json` files are proposals and which are not; a directory entry never ends in
+// `.json`, so the scan skips it structurally rather than by convention.
+//
+// The record binds `target` per item, not just the id and the content hash. The
+// artifact body's `target` is UNTRUSTED and apply writes to whatever it says at
+// apply time, so binding id+content alone would let the same id, carrying the same
+// approved bytes, land on a DIFFERENT in-vault path than the one the user reviewed.
+
+/** `<hypoDir>/.cache/proposals/challenges/`. */
+export function challengesDir(hypoDir) {
+  return join(proposalsDir(hypoDir), 'challenges');
+}
+
+// A session id reaches this module straight from `--session-id`, so it is subject
+// to the same treatment the proposal id gets: it becomes a FILENAME. Reject
+// anything that is not the transcript-resolver's own id shape.
+const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+/** True only for a session id shape that is safe to use as a filename. */
+export function isValidSessionId(sessionId) {
+  return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId);
+}
+
+/**
+ * Resolve `challenges/<sessionId>.json` and confirm it sits DIRECTLY inside the
+ * challenges dir, with the same symlinked-store defense `resolvedProposalPath`
+ * applies. Returns null (fail CLOSED) on a malformed id or an escaping path.
+ */
+function resolvedChallengePath(hypoDir, sessionId) {
+  if (!isValidSessionId(sessionId)) return null;
+  const p = resolve(join(challengesDir(hypoDir), `${sessionId}.json`));
+  if (dirname(p) !== resolve(challengesDir(hypoDir))) return null;
+  try {
+    if (
+      realpathSync(challengesDir(hypoDir)) !==
+      join(realpathSync(proposalsDir(hypoDir)), 'challenges')
+    ) {
+      return null;
+    }
+  } catch {
+    /* challenges dir or store not present yet — nothing to escape to */
+  }
+  return p;
+}
+
+/**
+ * Persist a challenge for one session, replacing any earlier one it had. A session
+ * holds at most one live challenge: re-running `challenge` re-reads disk and mints
+ * a fresh nonce, and the previous nonce must stop working the moment it does (an
+ * un-superseded old nonce would be a second, unreviewed key to the same write).
+ *
+ * @param {string} hypoDir
+ * @param {{nonce: string, sessionId: string, mintedAt: string,
+ *          items: Array<{id: string, target: string, proposedHash: string,
+ *                        freshness: {state: 'hash'|'absent', hash: string|null}}>}} record
+ * @returns {string|null} the artifact path, or null when the session id is unsafe
+ */
+export function writeChallenge(hypoDir, record) {
+  const path = resolvedChallengePath(hypoDir, record.sessionId);
+  if (!path) return null;
+  atomicWrite(path, `${JSON.stringify(record, null, 2)}\n`);
+  return path;
+}
+
+/**
+ * Read a session's challenge. Returns null when the id is unsafe, or the record is
+ * absent, unreadable, or malformed — all of which the caller must treat as "no
+ * approval exists", never as "approval not required". A corrupt record is a REMINT,
+ * not a bypass.
+ */
+export function readChallenge(hypoDir, sessionId) {
+  const path = resolvedChallengePath(hypoDir, sessionId);
+  if (!path || !existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    if (typeof parsed.nonce !== 'string' || !parsed.nonce) return null;
+    if (parsed.sessionId !== sessionId) return null; // record must own itself
+    if (!Array.isArray(parsed.items) || parsed.items.length === 0) return null;
+    for (const it of parsed.items) {
+      if (!it || typeof it !== 'object') return null;
+      if (!isValidProposalId(it.id)) return null;
+      if (typeof it.target !== 'string' || !it.target) return null;
+      if (typeof it.proposedHash !== 'string' || !it.proposedHash) return null;
+      const f = it.freshness;
+      if (!f || (f.state !== 'hash' && f.state !== 'absent')) return null;
+      if (f.state === 'hash' && typeof f.hash !== 'string') return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Spend a challenge. Returns true when the record is gone afterwards (this call
+ * removed it, or it was already absent), false when the id is unsafe or the unlink
+ * failed for another reason. The caller treats false as FATAL: a challenge that
+ * survives its own resolve is a nonce that can be spent twice.
+ */
+export function deleteChallenge(hypoDir, sessionId) {
+  const path = resolvedChallengePath(hypoDir, sessionId);
+  if (!path) return false;
+  try {
+    unlinkSync(path);
+    return true;
+  } catch (e) {
+    return e && e.code === 'ENOENT';
+  }
+}

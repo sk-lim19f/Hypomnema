@@ -112,6 +112,39 @@ If `markerWritten: false`, do NOT say "session closed." Branch on `markerSkipRea
 - `transcript-unresolved` (wrong / background id): report "Files applied and verified (ok: true), but the marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. Re-run with the correct main-conversation `--session-id`."
 - any other reason (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface it verbatim and resolve the underlying blocker before re-running.
 
+### If the close came back `ok: false, stage: "proposal-pending"`
+
+A concurrent session wrote one of the pages this close wants to replace, so the close
+withheld the bytes rather than clobber that session's work, and parked them. Nothing is
+lost and nothing is broken. The close is waiting on a decision only the user makes:
+whether to replace the other session's bytes.
+
+Do NOT write the pages with the Write tool and mark the session closed. That path skips
+the store entirely and silently destroys the other session's edits. Drive it out properly:
+
+1. **Look at `proposals`.** If the array is EMPTY, no page was parked. The only conflicts
+   were append-lock timeouts, which the next close re-reads and re-appends by itself. Just
+   re-run the same close command.
+2. **`hypomnema proposal challenge --session-id <id> --ids <id,...>`** with the ids from
+   `proposals`. It re-reads each page from disk and prints the diff between what is there
+   now and what this close wants to write.
+3. **Show the user those diffs** and tell them plainly what would be overwritten. Then give
+   them the approval line the command printed, and ask them to type it:
+
+       apply-proposals <nonce>
+
+   They have to TYPE it. A click on `AskUserQuestion` does not approve an overwrite (you
+   author the option labels, so a click cannot prove they approved this specific write),
+   and the command refuses it. If they would rather keep the other session's page, run
+   `hypomnema proposal discard <id>` instead and re-run the close.
+4. **`hypomnema proposal resolve --session-id <id>`** once they have typed it. It verifies
+   the approval in the transcript, checks the pages have not moved since they saw the diff,
+   and writes them.
+5. **Re-run the close.** `resolve` writes the pages; it does NOT close the session. The
+   re-run skips what already landed and finishes the close.
+6. **Check `markerWritten` again** before you say the session is closed. It is never
+   automatic.
+
 ---
 
 ## Step 4 — Pick a synthesis target

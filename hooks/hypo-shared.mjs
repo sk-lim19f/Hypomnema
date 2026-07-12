@@ -3036,6 +3036,59 @@ export function hasUserCloseSignal(transcriptPath) {
   return false;
 }
 
+/** The literal the user must type to approve a parked-overwrite batch. */
+export const APPROVAL_PHRASE = 'apply-proposals';
+
+/**
+ * True iff the transcript carries a user's TYPED approval of the batch this nonce
+ * was minted for — the authorization gate for a transcript-approved apply.
+ *
+ * Deliberately NOT hasUserCloseSignal. That function answers "did the user want to
+ * end the session", and it accepts a correlated AskUserQuestion answer as evidence
+ * (see above). Reusing it here would let a SESSION-CLOSE approval spend itself as an
+ * OVERWRITE approval: different authority, different question. Two gates, two
+ * matchers.
+ *
+ * Typed text only, and an AskUserQuestion click is refused ON PURPOSE. The model
+ * authors the option labels, and it authors them AFTER it has seen the nonce — so
+ * it could place `apply-proposals <nonce>` on a "no" option, on every option, or
+ * under a question that asks something else entirely. A click would prove a click.
+ * Typing the nonce proves the user produced THIS phrase.
+ *
+ * The nonce carries the freshness: it is minted (crypto-random) only once the diff
+ * has been re-read from disk and shown, so a turn that predates the diff cannot
+ * contain it, and `resolve` spends the challenge on success so it cannot be
+ * replayed. That is what makes a plain substring match sufficient here.
+ *
+ * extractUserMessages does the de-pollution: it drops `isMeta` bodies (slash-command
+ * and skill text, so a doc that quotes this phrase cannot satisfy the gate),
+ * `promptSource: system|sdk`, Stop-hook feedback, and `tool_result` blocks (so
+ * neither a tool's output nor a Read of a file that contains the phrase counts).
+ * The model's own words are role:assistant and never reach it.
+ *
+ * Fail-closed: no path, a nonce that is not the minted shape, or an unreadable
+ * transcript all return false.
+ *
+ * @param {string} transcriptPath
+ * @param {string} nonce hex, as minted by `proposal challenge`
+ */
+export function hasTypedUserApproval(transcriptPath, nonce) {
+  if (!transcriptPath || typeof nonce !== 'string') return false;
+  // Pin the shape rather than accept any string: a caller that passed '' or a
+  // regex-ish value would otherwise turn the match into a wildcard.
+  if (!/^[a-f0-9]{32,}$/.test(nonce)) return false;
+  const text = extractUserMessages(transcriptPath, Infinity);
+  if (!text) return false;
+  // A LINE that IS the phrase, not a line that CONTAINS it. Containment would read
+  // "do not apply-proposals <nonce>" and "why would I type apply-proposals <nonce>?"
+  // as approvals: the user would have authorized an overwrite by refusing one. The
+  // TTY channel has always demanded an exact `apply <id>` and nothing else on the
+  // line; this is the same bar, and the two channels must not disagree about what
+  // consent looks like.
+  const want = `${APPROVAL_PHRASE} ${nonce}`;
+  return text.split('\n').some((line) => line.trim() === want);
+}
+
 /**
  * True iff the Stop payload shows work still pending in the background —
  * either a non-terminal `background_tasks` entry OR a scheduled `session_crons`

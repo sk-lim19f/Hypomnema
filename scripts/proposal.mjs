@@ -1,25 +1,43 @@
 #!/usr/bin/env node
 /**
- * proposal.mjs: `hypomnema proposal list|apply|discard`, the human-in-the-loop
- * gate for parked overwrite-conflict artifacts (the write=proposal store).
+ * proposal.mjs: `hypomnema proposal list|apply|discard|challenge|resolve`, the
+ * human-in-the-loop gate for parked overwrite-conflict artifacts (the write=proposal
+ * store).
  *
  * When crystallize's close path finds an OVERWRITE target drifted from the base
  * this session observed, it withholds the bytes and parks them under
  * `.cache/proposals/<id>.json` rather than clobber the other writer. This CLI is
- * the only sanctioned way those bytes ever reach the target again, and every path
- * to a write runs through an interactive human confirm: there is no
- * confirmation-bypass flag, no environment-variable override, and no background
- * auto-apply. `apply` is a WHOLE-FILE replacement, so the human reviews a fresh
- * current-vs-proposed diff (that review IS the merge) before typing the confirm.
+ * the only sanctioned way those bytes ever reach the target again, and no path to a
+ * write skips a human approval: there is no confirmation-bypass flag, no
+ * environment-variable override, and no background auto-apply. An apply is a
+ * WHOLE-FILE replacement, so the human reviews a fresh current-vs-proposed diff
+ * (that review IS the merge) before approving.
+ *
+ * The approval reaches us over TWO channels, and both are a human:
+ *
+ *   • `apply <id>` — a person at a shell types the confirm phrase on a TTY.
+ *   • `challenge` → the user types `apply-proposals <nonce>` in the conversation →
+ *     `resolve` — the approval is verified in the session TRANSCRIPT.
+ *
+ * The second channel exists because an AGENT has no TTY, so a drifted close used to
+ * dead-end: the only way to finish was to bypass this store entirely with a direct
+ * write, which taught the model that the gate is optional. The transcript channel
+ * does not weaken the gate, it RELOCATES it: a hook cannot forge a user turn, and
+ * the model's own words are role:assistant and are never counted (see
+ * hasTypedUserApproval). A click is refused on purpose — the model authors the
+ * option labels, so a click proves a click, not approval of this phrase.
+ *
+ * Every byte that reaches a target goes through writeApprovedProposal(), which does
+ * NOT decide authorization; its two callers do, and they pass the outcome in. That
+ * is what keeps the two channels from drifting apart.
  *
  * The decision helpers (planApplyAction, classifyFreshness, renderDiff are pure;
  * resolveTargetPath touches the filesystem to resolve symlinks) and the
- * result-returning actors (applyProposal, discardProposal, listPending) are
- * exported so the runner can drive them in-process with injected TTY / prompt /
- * clock seams. Injecting those seams is a TEST convention, not a supported way to
- * apply unattended: the shipped CLI path carries no bypass, and a regression test
- * pins that no hook reaches this module. main() sits behind an isMain() guard so a
- * static import never runs the CLI (feedback-sync precedent).
+ * result-returning actors are exported so the runner can drive them in-process with
+ * injected TTY / prompt / clock seams. Injecting those seams is a TEST convention,
+ * not a supported way to apply unattended: the shipped CLI path carries no bypass,
+ * and a regression test pins that no hook reaches this module. main() sits behind an
+ * isMain() guard so a static import never runs the CLI (feedback-sync precedent).
  */
 
 import {
@@ -42,9 +60,18 @@ import {
   readProposal,
   deleteProposal,
   isValidProposalId,
+  isValidSessionId,
   hashProposalContent,
   proposalsDir,
+  writeChallenge,
+  readChallenge,
+  deleteChallenge,
 } from '../hooks/proposal-store.mjs';
+import {
+  APPROVAL_PHRASE,
+  hasTypedUserApproval,
+  resolveTranscriptBySessionId,
+} from '../hooks/hypo-shared.mjs';
 
 // ── target-path hardening ─────────────────────────────────────────────────────
 
@@ -392,7 +419,57 @@ export async function applyProposal({ hypoDir, id }, { isTTY, prompt, stdout, st
     return { ok: false, code: 1, reason: decision.reason };
   }
 
-  // (9) POST-CONFIRM RE-VALIDATION. Nothing is locked while the human reads, so
+  // (9+) the write itself, shared with the transcript-approved path. The approval
+  // JUST established above is the only thing this path contributes; every byte that
+  // reaches disk goes through the one primitive.
+  return writeApprovedProposal(
+    {
+      hypoDir,
+      id,
+      proposal,
+      full,
+      displayedHash: current === null ? null : hashProposalContent(current),
+    },
+    {
+      approval: { via: 'tty', nonce: null },
+      warned: decision.warned,
+      stdout: out,
+      stderr: err,
+      now: clock,
+    },
+  );
+}
+
+/**
+ * Write ONE approved proposal to its target: the hardened write body, extracted so
+ * the TTY path and the transcript-approved path cannot drift apart.
+ *
+ * This function does NOT decide whether the write is authorized. Its callers do, by
+ * two different means (a typed `apply <id>` at a TTY; a typed, nonce-bound user turn
+ * in the transcript), and they pass the outcome in as `approval`. What lives here is
+ * everything that must hold no matter WHO approved: the post-approval re-validation,
+ * the ordered write → audit-log → delete, and the sibling warning.
+ *
+ * The seams (`stdout`/`stderr`/`now`) stay injectable for tests, as before. They are
+ * NOT an unattended-apply path: nothing here relaxes a check, and the callers are the
+ * only authorization sites.
+ *
+ * @param {{hypoDir: string, id: string, proposal: object, full: string,
+ *          displayedHash: string|null}} sel  `displayedHash` is the hash of the bytes
+ *          whose diff the approver saw (null when the target was absent).
+ * @param {{approval: {via: 'tty'|'transcript', nonce: string|null},
+ *          warned?: boolean, stdout?: object, stderr?: object, now?: () => string}} io
+ */
+export function writeApprovedProposal(
+  { hypoDir, id, proposal, full, displayedHash },
+  { approval, warned, stdout, stderr, now } = {},
+) {
+  const out = stdout ?? process.stdout;
+  const err = stderr ?? process.stderr;
+  const clock = now ?? (() => new Date().toISOString());
+  const shownTarget = sanitizeForDisplay(proposal.target, { allowNewlines: false });
+
+  // (9) POST-APPROVAL RE-VALIDATION. Nothing is locked while the approver reads, so
   // BOTH the path and the bytes can move between step 2/3 and the write. Checking
   // only the bytes would leave the path check stale: an ancestor that becomes a
   // symlink out of the vault during the prompt would still be walked by the write
@@ -414,7 +491,6 @@ export async function applyProposal({ hypoDir, id }, { isTTY, prompt, stdout, st
   }
 
   const afterConfirm = readTarget(full);
-  const displayedHash = current === null ? null : hashProposalContent(current);
   const afterHash =
     afterConfirm === undefined
       ? undefined
@@ -458,6 +534,12 @@ export async function applyProposal({ hypoDir, id }, { isTTY, prompt, stdout, st
       appliedAt: clock(),
       sessionId: proposal.sessionId ?? null,
       device: proposal.device ?? null,
+      // Which authority approved this write, and (for the transcript channel) the
+      // one-time nonce the user typed. The audit trail is the only place an
+      // unattended apply, if one ever slipped in, would become visible — so the
+      // channel is recorded on EVERY entry, not just the new one.
+      via: approval?.via ?? 'tty',
+      nonce: approval?.nonce ?? null,
     });
   } catch (e) {
     const why = sanitizeForDisplay(e.message, { allowNewlines: false });
@@ -496,9 +578,264 @@ export async function applyProposal({ hypoDir, id }, { isTTY, prompt, stdout, st
     code: 0,
     id,
     target: proposal.target,
-    warned: decision.warned,
+    warned: Boolean(warned),
     siblingsPending: siblings.length,
   };
+}
+
+// ── transcript-approved batch (challenge → user types → resolve) ──────────────
+
+/**
+ * Mint an approval challenge for a batch of parked proposals: show the diffs the
+ * user is being asked to approve, and record exactly what an approval would buy.
+ *
+ * The ids come from the CALLER (the close result), never from a scan of the store
+ * by session. `writeProposal` reuses a byte-identical artifact across sessions and
+ * the body's `sessionId` may then name a different session, so "the proposals of
+ * this close" is not something the store can be asked for — only the close knows.
+ *
+ * The record binds, per item, the id AND the target path AND the proposed bytes AND
+ * the target's current freshness. Binding fewer of those leaves a hole: the artifact
+ * body is hand-editable and apply writes to whatever `target` says AT APPLY TIME, so
+ * id+content alone would let the approved bytes land on a path the user never saw.
+ *
+ * An unreadable target refuses the whole batch rather than mint a challenge for a
+ * diff nobody can be shown.
+ *
+ * @param {{hypoDir: string, sessionId: string, ids: string[]}} sel
+ */
+export function challengeProposals(
+  { hypoDir, sessionId, ids },
+  { stdout, stderr, now, nonce } = {},
+) {
+  const out = stdout ?? process.stdout;
+  const err = stderr ?? process.stderr;
+  const clock = now ?? (() => new Date().toISOString());
+
+  if (!isValidSessionId(sessionId)) {
+    err.write(`✗ invalid --session-id\n`);
+    return { ok: false, code: 2, reason: 'invalid-session-id' };
+  }
+  if (!Array.isArray(ids) || ids.length === 0) {
+    err.write(`✗ challenge needs --ids=<id,...> (the proposal ids the close reported)\n`);
+    return { ok: false, code: 2, reason: 'no-ids' };
+  }
+
+  const items = [];
+  for (const id of ids) {
+    if (!isValidProposalId(id)) {
+      err.write(`✗ invalid proposal id: ${id}\n`);
+      return { ok: false, code: 2, reason: 'invalid-id' };
+    }
+    const proposal = readProposal(hypoDir, id);
+    if (!proposal) {
+      err.write(`✗ no such proposal: ${id}\n`);
+      return { ok: false, code: 2, reason: 'not-found' };
+    }
+    const full = resolveTargetPath(hypoDir, proposal.target);
+    if (!full) {
+      const shown = sanitizeForDisplay(proposal.target, { allowNewlines: false });
+      err.write(`✗ proposal target is unsafe or escapes the vault: ${shown}\n`);
+      return { ok: false, code: 2, reason: 'unsafe-target' };
+    }
+    const current = readTarget(full);
+    if (current === undefined) {
+      const shown = sanitizeForDisplay(proposal.target, { allowNewlines: false });
+      err.write(`✗ target is unreadable, refusing to mint a challenge for it: ${shown}\n`);
+      return { ok: false, code: 1, reason: 'target-unreadable' };
+    }
+
+    const shownTarget = sanitizeForDisplay(proposal.target, { allowNewlines: false });
+    if (current === null) out.write(`(target absent, will be created: ${shownTarget})\n`);
+    out.write(`--- diff (current to proposed) for ${shownTarget} ---\n`);
+    out.write(`${sanitizeForDisplay(renderDiff(current ?? '', proposal.proposedContent))}\n`);
+
+    items.push({
+      id,
+      target: proposal.target,
+      proposedHash: hashProposalContent(proposal.proposedContent),
+      freshness:
+        current === null
+          ? { state: 'absent', hash: null }
+          : { state: 'hash', hash: hashProposalContent(current) },
+    });
+  }
+
+  // crypto-random, never Math.random: an approval token a hook could PREDICT would
+  // let it pre-plant the phrase and spend an approval the user never gave.
+  const minted = nonce ?? randomBytes(16).toString('hex');
+  const record = { nonce: minted, sessionId, mintedAt: clock(), items };
+  if (!writeChallenge(hypoDir, record)) {
+    err.write(`✗ failed to store the approval challenge; nothing to approve.\n`);
+    return { ok: false, code: 1, reason: 'challenge-store-failed' };
+  }
+
+  out.write(
+    `\nTo approve the ${items.length} overwrite(s) above, the USER must type this line in the conversation:\n\n` +
+      `    ${APPROVAL_PHRASE} ${minted}\n\n` +
+      `Then run: hypomnema proposal resolve --session-id=${sessionId}\n`,
+  );
+  return {
+    ok: true,
+    code: 0,
+    nonce: minted,
+    items: items.map(({ id, target }) => ({ id, target })),
+  };
+}
+
+/**
+ * Apply a batch of parked proposals that the user approved by typing the challenge
+ * phrase in the conversation.
+ *
+ * The authorization is the transcript, not this process's stdin: `hasTypedUserApproval`
+ * requires a genuine user-typed turn carrying the nonce minted for THIS challenge. A
+ * hook cannot forge a user turn, and the model's own output is role:assistant and is
+ * never counted. That is the whole of the human gate; it is not weakened here, it is
+ * relocated.
+ *
+ * Everything is preflighted before ANY byte is written, so a refusal is total. The
+ * one partial case left is a failure part-way through the writes, and that is
+ * reported per target rather than swallowed: a re-close idempotent-skips whatever
+ * landed and re-parks the rest, so silence would be the only unrecoverable part.
+ *
+ * @param {{hypoDir: string, sessionId: string}} sel
+ */
+export function resolveProposals(
+  { hypoDir, sessionId },
+  { stdout, stderr, now, transcriptPath, hasApproval } = {},
+) {
+  const out = stdout ?? process.stdout;
+  const err = stderr ?? process.stderr;
+  const clock = now ?? (() => new Date().toISOString());
+  const approves = hasApproval ?? hasTypedUserApproval;
+
+  if (!isValidSessionId(sessionId)) {
+    err.write(`✗ invalid --session-id\n`);
+    return { ok: false, code: 2, reason: 'invalid-session-id' };
+  }
+
+  // (1) the challenge. Absent / corrupt / not-owned all mean "no approval exists",
+  // which is a REMINT, never a bypass.
+  const challenge = readChallenge(hypoDir, sessionId);
+  if (!challenge) {
+    err.write(
+      `✗ no valid approval challenge for this session. Run \`hypomnema proposal challenge\` first.\n`,
+    );
+    return { ok: false, code: 1, reason: 'no-challenge' };
+  }
+
+  // (2) the transcript approval. Resolve the transcript from the session id (fail-closed
+  // on zero or multiple matches), then require the user's typed, nonce-bearing turn.
+  const tPath = transcriptPath ?? resolveTranscriptBySessionId(sessionId);
+  if (!tPath) {
+    err.write(`✗ cannot resolve a transcript for session ${sessionId}; approval unverifiable.\n`);
+    return { ok: false, code: 1, reason: 'transcript-unresolved' };
+  }
+  if (!approves(tPath, challenge.nonce)) {
+    err.write(
+      `✗ no user approval in this session's transcript.\n` +
+        `    The user must TYPE this line in the conversation (a click does not count):\n` +
+        `        ${APPROVAL_PHRASE} ${challenge.nonce}\n` +
+        `    Nothing written; the proposals are preserved.\n`,
+    );
+    return { ok: false, code: 1, reason: 'not-approved' };
+  }
+
+  // (3) PREFLIGHT every item against what was approved. Any drift refuses the WHOLE
+  // batch: the user approved a set, not a subset, and a partial write of a set they
+  // reviewed as a unit is not what they said yes to.
+  const plan = [];
+  for (const item of challenge.items) {
+    const proposal = readProposal(hypoDir, item.id);
+    if (!proposal) {
+      err.write(`✗ approved proposal ${item.id} is gone; re-run challenge. Nothing written.\n`);
+      return { ok: false, code: 1, reason: 'proposal-missing' };
+    }
+    // The artifact body is untrusted and hand-editable. The user approved THESE bytes
+    // going to THIS path; a body that changed either since the diff is a different
+    // write than the one that was approved.
+    if (proposal.target !== item.target) {
+      err.write(
+        `✗ proposal ${item.id} now targets a different path than the one approved; nothing written.\n`,
+      );
+      return { ok: false, code: 1, reason: 'target-changed' };
+    }
+    if (hashProposalContent(proposal.proposedContent) !== item.proposedHash) {
+      err.write(`✗ proposal ${item.id} content changed since it was approved; nothing written.\n`);
+      return { ok: false, code: 1, reason: 'content-changed' };
+    }
+    const full = resolveTargetPath(hypoDir, proposal.target);
+    if (!full) {
+      err.write(`✗ proposal ${item.id} target is unsafe or escapes the vault; nothing written.\n`);
+      return { ok: false, code: 1, reason: 'unsafe-target' };
+    }
+    // Freshness: the bytes on disk must still be the bytes whose diff was shown.
+    // absent and empty are DIFFERENT states and are not collapsed.
+    const current = readTarget(full);
+    const state = current === undefined ? 'unreadable' : current === null ? 'absent' : 'hash';
+    const hash = state === 'hash' ? hashProposalContent(current) : null;
+    if (state !== item.freshness.state || hash !== (item.freshness.hash ?? null)) {
+      const shown = sanitizeForDisplay(proposal.target, { allowNewlines: false });
+      err.write(
+        `✗ ${shown} changed since you were shown its diff; nothing written.\n` +
+          `    Re-run \`hypomnema proposal challenge\` to review the fresh bytes.\n`,
+      );
+      return { ok: false, code: 1, reason: 'stale-approval' };
+    }
+    plan.push({ item, proposal, full, displayedHash: hash });
+  }
+
+  // (4) write. Preflight passed for every item, so the only failure left is a write
+  // that breaks mid-batch. Report exactly what landed: a re-close idempotent-skips
+  // the written targets and re-parks the rest, so a reported partial recovers and a
+  // SILENT one does not.
+  const written = [];
+  const failed = [];
+  for (const { item, proposal, full, displayedHash } of plan) {
+    const res = writeApprovedProposal(
+      { hypoDir, id: item.id, proposal, full, displayedHash },
+      {
+        approval: { via: 'transcript', nonce: challenge.nonce },
+        warned: false,
+        stdout: out,
+        stderr: err,
+        now: clock,
+      },
+    );
+    if (res.ok) written.push(item.target);
+    else failed.push({ target: item.target, reason: res.reason, applied: Boolean(res.applied) });
+  }
+
+  // (5) spend the challenge. Single-use is not a nicety here: the nonce IS the
+  // approval, so one that outlives its own resolve is a second key to a write the
+  // user authorized once. A delete failure therefore FAILS the run (non-zero) even
+  // when every byte landed — "the pages are written" and "the approval is spent" are
+  // different claims, and exiting 0 would assert both while only the first is true.
+  const spent = deleteChallenge(hypoDir, sessionId);
+  if (!spent) {
+    err.write(
+      `🛑 applied, but the approval challenge for ${sessionId} could NOT be removed.\n` +
+        `    The nonce is still spendable. Delete it by hand:\n` +
+        `        ${join(proposalsDir(hypoDir), 'challenges', `${sessionId}.json`)}\n`,
+    );
+  }
+
+  if (failed.length > 0) {
+    err.write(
+      `\n✗ batch partially applied. Written: ${written.length ? written.join(', ') : '(none)'}. ` +
+        `Failed: ${failed.map((f) => `${f.target} (${f.reason})`).join(', ')}.\n` +
+        `    Re-run the session close: it skips what already landed and re-parks the rest.\n`,
+    );
+    return { ok: false, code: 1, reason: 'partial-apply', written, failed, challengeSpent: spent };
+  }
+
+  if (!spent) {
+    return { ok: false, code: 1, reason: 'challenge-not-consumed', written, challengeSpent: false };
+  }
+
+  out.write(`✓ applied ${written.length} approved proposal(s).\n`);
+  out.write(`  The session is NOT closed yet: re-run the close and check markerWritten.\n`);
+  return { ok: true, code: 0, written, challengeSpent: true };
 }
 
 /**
@@ -567,7 +904,7 @@ export function listPending({ hypoDir }, { stdout, json } = {}) {
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, cmd: null, id: null, json: false };
+  const args = { hypoDir: null, cmd: null, id: null, json: false, sessionId: null, ids: [] };
   const positionals = [];
   const rest = argv.slice(2);
   for (let i = 0; i < rest.length; i++) {
@@ -575,12 +912,24 @@ function parseArgs(argv) {
     if (a === '--hypo-dir') args.hypoDir = expandHome(rest[++i] ?? '');
     else if (a.startsWith('--hypo-dir=')) args.hypoDir = expandHome(a.slice('--hypo-dir='.length));
     else if (a === '--json') args.json = true;
+    else if (a === '--session-id') args.sessionId = rest[++i] ?? null;
+    else if (a.startsWith('--session-id=')) args.sessionId = a.slice('--session-id='.length);
+    else if (a === '--ids') args.ids = splitIds(rest[++i] ?? '');
+    else if (a.startsWith('--ids=')) args.ids = splitIds(a.slice('--ids='.length));
     else positionals.push(a);
   }
   args.cmd = positionals[0] ?? null;
   args.id = positionals[1] ?? null;
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
+}
+
+/** `--ids=a,b,c` → ['a','b','c']; blanks dropped so a trailing comma is not an id. */
+function splitIds(raw) {
+  return String(raw)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 async function main() {
@@ -597,6 +946,15 @@ async function main() {
       }
       result = await applyProposal({ hypoDir: args.hypoDir, id: args.id }, {});
       break;
+    case 'challenge':
+      result = challengeProposals(
+        { hypoDir: args.hypoDir, sessionId: args.sessionId, ids: args.ids },
+        {},
+      );
+      break;
+    case 'resolve':
+      result = resolveProposals({ hypoDir: args.hypoDir, sessionId: args.sessionId }, {});
+      break;
     case 'discard':
       if (!args.id) {
         process.stderr.write('✗ usage: hypomnema proposal discard <id>\n');
@@ -606,7 +964,9 @@ async function main() {
       break;
     default:
       process.stderr.write(
-        'usage: hypomnema proposal <list|apply|discard> [id] [--json] [--hypo-dir <path>]\n',
+        'usage: hypomnema proposal <list|apply|discard> [id] [--json] [--hypo-dir <path>]\n' +
+          '       hypomnema proposal challenge --session-id <id> --ids <id,...>\n' +
+          '       hypomnema proposal resolve --session-id <id>\n',
       );
       process.exit(2);
   }
