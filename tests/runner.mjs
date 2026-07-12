@@ -29708,7 +29708,11 @@ test('IMPR-34: foreign incomplete close is a notice, not a blocker, when scope n
 // and W8 design-history ownership is still global. Same defect shape, tracked as
 // sibling IMPRs. If a later change fixes them, this test is what should be updated
 // to say so — and the fix's claim must not run ahead of it.
-test('IMPR-34 (boundary): a lint error in a FOREIGN close file still blocks (not yet attributed)', () => {
+// Asserted on the lint SCOPE rather than on a lint blocker: whether the gate can
+// actually run lint depends on the package being resolvable (it fails open and skips
+// otherwise), which is an environment fact, not the coupling under test. The scope is
+// the coupling — a foreign close file inside it is what a lint error there would block on.
+test('IMPR-34 (boundary): the lint scope still seeds foreign close files (not yet attributed)', () => {
   const today = todayLocal();
   withClosePartitionWiki(
     [
@@ -29717,18 +29721,23 @@ test('IMPR-34 (boundary): a lint error in a FOREIGN close file still blocks (not
     ],
     [],
     (dir) => {
-      // Break lint (not the close) in the foreign project's own close file.
-      const ss = join(dir, 'projects', 'foreign', 'session-state.md');
-      writeFileSync(ss, readFileSync(ss, 'utf-8').replace('## 다음 작업', '## next'));
-      spawnSync('git', ['-C', dir, 'commit', '-qam', 'break foreign lint']);
       const gate = precompactGateStatus(dir, {
         closeScope: ['mine'],
         claudeHome: join(dir, '.claude-none'),
       });
-      assert.equal(
-        gate.blockers.some((b) => b.type === 'lint'),
-        true,
-        'lint on a foreign close file is still a blocker — the fix does not claim otherwise',
+      assert.deepEqual(gate.close.scope, ['mine'], 'the CLOSE scope is attributed to this session');
+
+      const lintScope = closeFileTargetsGlobal(dir);
+      assert.ok(
+        [...lintScope].some((f) => f.startsWith('projects/foreign/')),
+        'but the LINT scope still seeds every today-active project, foreign included — a lint ' +
+          'error there would still block, and the fix does not claim otherwise',
+      );
+      // Same shape for W8: design-history ownership is derived from the full
+      // today-active list, which the partition deliberately leaves global.
+      assert.ok(
+        gate.close.projects.some((p) => p.project === 'foreign'),
+        'close.projects stays global, so foreign W8 ownership is unchanged too',
       );
     },
   );
