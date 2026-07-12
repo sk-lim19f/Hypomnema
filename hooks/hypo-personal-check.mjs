@@ -179,6 +179,18 @@ process.stdin.on('end', () => {
     const fold = `+${otherDebtCount} pre-existing lint issue(s) elsewhere in the vault (other projects / shared pages, not blocking) — run \`/hypo:lint\` for the full list.`;
     noticeText = noticeText ? `${noticeText}\n${fold}` : `[WIKI CHECK] ${fold}`;
   }
+  // A demoted close: some OTHER session left a project's close incomplete. It no
+  // longer blocks this compact, but it must still be SEEN — a notice list that the
+  // gate silently swallows (suppressOutput when nothing else surfaced) would turn the
+  // demotion into a disappearance, and nobody would ever fix the dangling close
+  // (codex design BLOCKER).
+  const closeDebt = gate.notices.filter((n) => n.type === 'close-debt');
+  if (closeDebt.length > 0) {
+    const line = `[WIKI CHECK] ${closeDebt.length} project(s) with an incomplete session close from another session (not blocking this compact): ${closeDebt
+      .map((n) => n.project)
+      .join(', ')} — each is fixed by that project's next close.`;
+    noticeText = noticeText ? `${noticeText}\n${line}` : line;
+  }
   // Surface the self-heal so a re-synced projection is not a silent mutation of
   // the user's MEMORY.md / CLAUDE.md (transparency).
   if (feedbackHealed) noticeText = noticeText ? `${noticeText}\n${feedbackHealed}` : feedbackHealed;

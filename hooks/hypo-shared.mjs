@@ -2326,6 +2326,53 @@ export function isUnderProjectDirs(file, slugs) {
   return (slugs || []).some((s) => s && (f === `projects/${s}` || f.startsWith(`projects/${s}/`)));
 }
 
+/**
+ * The session-close FILES of some project, as a path matcher. Used to attribute a
+ * close to a session: a transcript that edited `projects/<slug>/session-state.md`
+ * (or that project's hot.md / a session-log shard) is evidence THIS session was
+ * closing <slug>. Any other file under `projects/<slug>/` is NOT evidence — merely
+ * editing a page or an ADR there says nothing about whose close is whose, and
+ * treating it as attribution would re-block a session for a project it only read
+ * around in (codex design review).
+ */
+const CLOSE_FILE_RE = /^projects\/([^/]+)\/(session-state\.md|hot\.md|session-log\/[^/]+\.md)$/;
+
+/** Slugs whose close files this session edited directly (Write/Edit tool_use). */
+function projectsFromTouchedCloseFiles(transcriptPath, hypoDir) {
+  const out = new Set();
+  if (!transcriptPath) return out;
+  for (const f of extractTouchedWikiFiles(transcriptPath, hypoDir)) {
+    const m = posixPath(f).match(CLOSE_FILE_RE);
+    if (m) out.add(m[1]);
+  }
+  return out;
+}
+
+/**
+ * closeScope: the projects THIS session is accountable for closing. The union of
+ * three signals, because no single one covers every close path:
+ *
+ *   1. `opts.closeScope` — the caller states it outright. `--apply-session-close`
+ *      passes `payload.project` (it is the authority on what it just closed) and
+ *      `--mark-session-closed --project=<slug>` passes its attribution slug. This
+ *      signal is LOAD-BEARING, not a convenience: the documented close path writes
+ *      its files from inside a Bash call, so they never surface as Edit/Write
+ *      `file_path`s and signal 2 cannot see them (the same blind spot that forces
+ *      closeFileTargets() to seed the lint scope explicitly).
+ *   2. close files the transcript shows this session editing — the hand-written
+ *      close, which bypasses the script entirely.
+ *   3. `marker.project` — after a scripted close marked, this is how a later reader
+ *      (PreCompact) recovers signal 1. It is what keeps the marker == compact-ready
+ *      invariant: the writer scopes by `payload.project`, PreCompact re-scopes by
+ *      the `project` that same writer recorded, so the two can never disagree.
+ */
+export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
+  const scope = new Set(opts.closeScope || []);
+  for (const p of projectsFromTouchedCloseFiles(opts.transcriptPath, hypoDir)) scope.add(p);
+  if (marker?.project) scope.add(marker.project);
+  return scope;
+}
+
 // ── PreCompact gate — single source of truth ────────────────────────────────
 /**
  * The full PreCompact gate decision as a READ-ONLY status. This is the single
@@ -2423,6 +2470,72 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     // projectOverride narrows the close status to one project (check-only); a
     // marker-writing caller never sets it, so the marker path stays global.
     close = sessionCloseGlobalStatus(hypoDir, { projectOverride: opts.projectOverride });
+
+    // Attribute the close debt before blocking on it. An incomplete close belongs
+    // to whichever session performed it; charging it to an unrelated session is the
+    // false block this partition exists to stop. The gate already draws exactly this
+    // line for LINT debt (partitionLintScope: errors in files THIS session touched
+    // block, pre-existing debt elsewhere is a notice) — close-file debt was the one
+    // check still hard-blocking globally on another session's work.
+    //
+    // Two fail-closed guards keep the partition from eating a real blocker:
+    //   - close.fallback: no project closed today, so this is the "you have not
+    //     closed this session AT ALL" path. It must block unconditionally; demoting
+    //     it would gut the gate's whole purpose.
+    //   - empty scope: no positive attribution signal, so we cannot tell whose debt
+    //     it is. Never demote on a guess — fall back to today's global block.
+    //   - projectOverride: the caller asked "is THIS project close-complete?".
+    //     Demoting the very project it named would answer a question nobody asked.
+    //
+    // Bounded tradeoff (codex design review, accepted rather than closed). A
+    // scripted close that CRASHES mid-write leaves no marker and no transcript trace
+    // (it writes from inside a Bash call), so its own project carries no attribution.
+    // If that same session had also hand-edited SOME OTHER project's close files, the
+    // scope is non-empty but omits the torn project, and its debt is demoted. The
+    // window is narrow and self-limiting: apply writes the project files, then the
+    // session-log, then the root log entry, so the only torn state that reaches this
+    // partition at all is a missing log.md entry — which deriveRootLogEntries
+    // regenerates from the session-log heading. A crash before the session-log is not
+    // detected as today-active by hasTodayCloseActivity in the first place (the
+    // pre-existing tradeoff documented there). And the marker is never written, so the
+    // Stop hook still refuses to end the session. Closing this properly needs a
+    // durable close-attempt record; it is not worth a new state-file lifecycle here.
+    const scopeSet = resolveCloseScope(hypoDir, opts, marker);
+    const failed = (close.projects || []).filter((p) => !p.ok);
+    const partition =
+      !close.fallback && !opts.projectOverride && scopeSet.size > 0 && failed.length > 0;
+
+    close.scope = [...scopeSet];
+    close.debt = [];
+    // Re-project the flat aliases onto what actually BLOCKS, so `ok` and
+    // `stale`/`missing` can never contradict each other (a reader that treats a
+    // non-empty `missing` as failure stays correct). Demoted debt moves to its own
+    // `debt` field instead of masquerading as this session's unfinished work.
+    //
+    // ONLY when partitioning. Deriving `ok` from the per-project rows unconditionally
+    // would silently drop the failures that have NO project row to be derived from:
+    // an unresolvable active project yields `projects: []` with
+    // `missing: ['hot.md (no active project in pointer table)']`, so an empty `failed`
+    // would read as "nothing failed" and flip a red gate green (codex pre-commit
+    // BLOCKER, reproduced on a vault with no active-project row). Outside the
+    // partition the close status stands exactly as sessionCloseGlobalStatus computed it.
+    if (partition) {
+      const mine = failed.filter((p) => scopeSet.has(p.project));
+      const foreign = failed.filter((p) => !scopeSet.has(p.project));
+      close.debt = foreign.map((p) => ({ project: p.project, stale: p.stale, missing: p.missing }));
+      close.stale = [...new Set(mine.flatMap((p) => p.stale))];
+      close.missing = [...new Set(mine.flatMap((p) => p.missing))];
+      close.ok = mine.length === 0;
+      // The flat `project` alias must follow the scope too: it names the project the
+      // rest of this status describes, and every consumer that renders a per-file
+      // checklist builds it from that name. Left as the global `primary` it can point
+      // at a DEMOTED foreign project, and the checklist then reports ✓ for files the
+      // debt list simultaneously calls missing (codex pre-commit CONCERN).
+      if (!scopeSet.has(close.project)) {
+        close.project = mine[0]?.project ?? [...scopeSet][0] ?? close.project;
+      }
+    }
+
     if (!close.ok) {
       blockers.push({
         type: 'close',
@@ -2430,6 +2543,16 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           ...close.missing.map((f) => `${f} (missing)`),
           ...close.stale.map((f) => `${f} (stale)`),
         ].join(', ')}`,
+      });
+    }
+    for (const p of close.debt) {
+      notices.push({
+        type: 'close-debt',
+        project: p.project,
+        reason: `${p.project}: incomplete session close from another session (${[
+          ...p.missing.map((f) => `${f} (missing)`),
+          ...p.stale.map((f) => `${f} (stale)`),
+        ].join(', ')}) — not blocking; that project's next close will fix it`,
       });
     }
   }
@@ -3032,7 +3155,8 @@ export function isCloseReconfirmDeclined(transcriptPath) {
     // system/sdk synthetic prompts, and (via the array-content branch below)
     // tool_result blocks, which are role:'user' in the transcript but are NOT
     // user-typed text.
-    const isInjected = obj.isMeta === true || obj.promptSource === 'system' || obj.promptSource === 'sdk';
+    const isInjected =
+      obj.isMeta === true || obj.promptSource === 'system' || obj.promptSource === 'sdk';
     const role = msg.role ?? obj.role ?? obj.type;
     if (!isInjected && role === 'user') {
       if (typeof content === 'string') {

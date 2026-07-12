@@ -245,11 +245,22 @@ function runSessionCloseCheck(args) {
   // would re-add that project's files to the lint scope and re-block the scoped
   // check, defeating the point. The global (no --project) check keeps widening.
   if (args.project) requireProjectDir(args, args.project);
+  // Resolve the transcript from --session-id when --transcript-path was not given,
+  // exactly as --mark and the apply auto-marker already do. The transcript is what
+  // attributes the close as well as widening the lint scope, and PreCompact
+  // always has one from its hook payload. A check without it would compute an EMPTY
+  // close scope, fall back to the global block, and report RED for debt that /compact
+  // demotes. Checklist step 14 tells the model to trust this command, so an over-red
+  // check is as harmful as an over-green one.
+  const checkTranscript =
+    args.transcriptPath ||
+    (args.sessionId ? resolveTranscriptBySessionId(args.sessionId) : null) ||
+    null;
   const status = precompactGateStatus(args.hypoDir, {
     ...(args.project
       ? { projectOverride: args.project }
-      : args.transcriptPath
-        ? { transcriptPath: args.transcriptPath }
+      : checkTranscript
+        ? { transcriptPath: checkTranscript }
         : {}),
     ...(args.sessionId ? { sessionId: args.sessionId } : {}),
   });
@@ -286,11 +297,17 @@ function runSessionCloseCheck(args) {
       JSON.stringify(
         {
           ok: status.ok,
-          // flat close fields preserved for back-compat with prior readers
+          // flat close fields preserved for back-compat with prior readers. They now
+          // describe what BLOCKS: a foreign project's incomplete close is demoted out
+          // of stale/missing into close_debt, so a reader that treats a
+          // non-empty `missing` as failure still agrees with `ok` instead of
+          // contradicting it.
           project: close.project,
           dates: close.dates,
           stale: close.stale,
           missing: close.missing,
+          ...(close.debt?.length ? { close_debt: close.debt } : {}),
+          ...(close.scope ? { close_scope: close.scope } : {}),
           blockers: status.blockers,
           notices: status.notices,
           skipped: status.skipped,
@@ -584,11 +601,14 @@ function runMarkSessionClosed(args) {
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
-  // --project=<slug> on --mark is ATTRIBUTION ONLY (the marker's `project` field).
-  // The gate stays GLOBAL — never narrowed — because a marker that narrowed its
-  // gate could attest compact-ready while PreCompact re-checks all of today's
-  // projects and stays red (the marker == compact-ready invariant,
-  // codex design finding 1/2). Validate the attribution slug exists as a
+  // --project=<slug> on --mark names the project THIS session closed. It sets the
+  // marker's `project` field AND enters the close scope, so an incomplete close in a
+  // project this session did not touch is demoted to a notice instead of refusing the
+  // marker. It is NOT a gate narrow in the old sense: the marker records the same slug
+  // it scoped by, and PreCompact re-derives its own scope FROM that marker — so the
+  // two can never disagree, which is what the earlier "attribution only, gate stays
+  // global" rule was protecting (it assumed PreCompact stayed global; it no longer
+  // does). Everything else the gate checks stays global. Validate the slug exists as a
   // directory, exactly as --check does, but only when it is actually used (a
   // --log-only mark attributes to no project, so --project is moot there).
   if (args.project && !args.logOnly) requireProjectDir(args, args.project);
@@ -613,6 +633,7 @@ function runMarkSessionClosed(args) {
   // source for the user-close hard gate below.
   const closeTranscript = resolveTranscriptBySessionId(args.sessionId);
   const gate = precompactGateStatus(args.hypoDir, {
+    ...(args.project && !args.logOnly ? { closeScope: [args.project] } : {}),
     ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
     ...(args.logOnly ? { logOnly: true } : {}),
   });
@@ -657,10 +678,19 @@ function runMarkSessionClosed(args) {
     console.log(args.json ? JSON.stringify(result, null, 2) : `✗ ${reason}`);
     process.exit(1);
   }
-  // --project attributes the marker to that slug (gate stayed global); falls back
-  // to the gate's resolved primary. log-only marks attribute to no project. Used
-  // for the marker, the JSON result, and the success message so all three agree.
-  const markerProject = !args.logOnly && args.project ? args.project : status.project;
+  // Marker attribution comes from the CLOSE SCOPE, never from the gate's
+  // global `primary`. The marker is what PreCompact later re-derives its own scope
+  // from, so attributing it to a project this session did not close hands PreCompact a
+  // scope the marker never cleared: `primary` can be a FOREIGN today-active project
+  // whose debt this gate demoted, and PreCompact would union it back in and re-block.
+  // Marker green, /compact red — the exact invariant PR #110 closed (codex design
+  // review, both workers). Explicit --project wins; else the scope's own project
+  // (preferring `primary` when it is itself in scope); else `primary`, which is only
+  // reachable when the scope was empty and the gate therefore stayed global anyway.
+  const closeScope = status.scope || [];
+  const scopeProject = closeScope.includes(status.project) ? status.project : closeScope[0];
+  const markerProject =
+    !args.logOnly && args.project ? args.project : (scopeProject ?? status.project);
   writeSessionClosedMarker(args.hypoDir, args.sessionId, {
     project: markerProject,
     ...(args.logOnly ? { scope: 'log-only' } : {}),
@@ -1096,54 +1126,59 @@ function applySessionClose(args) {
     // each other — only one closer is ever in the create path (closes the
     // wx-window a bare exclusive-create would leave open).
     try {
-      const outcome = withFileLock(full, () => {
-        // Fallback-aware idempotency (hybrid cutover): during the month the
-        // shard takes over, today's entry may already live in the legacy monthly
-        // file from an earlier (pre-cutover) close. Treat presence in EITHER the
-        // daily shard or the legacy monthly file as "already written" so a same-day
-        // second close does not duplicate an identical entry across both files —
-        // and so an idempotent re-apply stays a true no-op (no shard is created).
-        for (const cand of sessionLogReadCandidates(project, date)) {
-          const cf = join(args.hypoDir, cand);
-          if (!existsSync(cf)) continue;
-          try {
-            if (isPresent(readFileSync(cf, 'utf-8'))) return 'skipped';
-          } catch {
-            /* unreadable candidate — fall through to the write path */
+      const outcome = withFileLock(
+        full,
+        () => {
+          // Fallback-aware idempotency (hybrid cutover): during the month the
+          // shard takes over, today's entry may already live in the legacy monthly
+          // file from an earlier (pre-cutover) close. Treat presence in EITHER the
+          // daily shard or the legacy monthly file as "already written" so a same-day
+          // second close does not duplicate an identical entry across both files —
+          // and so an idempotent re-apply stays a true no-op (no shard is created).
+          for (const cand of sessionLogReadCandidates(project, date)) {
+            const cf = join(args.hypoDir, cand);
+            if (!existsSync(cf)) continue;
+            try {
+              if (isPresent(readFileSync(cf, 'utf-8'))) return 'skipped';
+            } catch {
+              /* unreadable candidate — fall through to the write path */
+            }
           }
-        }
-        if (!existsSync(full)) {
-          // A daily shard is a new file most days. Seed minimal valid frontmatter
-          // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
-          // wiki page rather than a W1 "no frontmatter" warning, and write the header
-          // AND the first entry in ONE atomic write — never leave a header-only shard
-          // on disk, which freshness would skip (no dated heading) while derive could
-          // otherwise mistake it for the evidence file. The dated `## [date] ...`
-          // heading lives inside the entry, so freshness / derive / design-history
-          // are unchanged.
-          // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
-          // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
-          // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
-          // machine that first seeds the daily shard is recorded; later same-day
-          // appends do not touch it. The per-session-accurate store is the LOCAL
-          // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
-          // `session_id` is honest naming: the value is the Claude session UUID, and
-          // it is present only on the Stop-chain close path that passes --session-id.
-          const device = currentDevice();
-          const auditFm =
-            (args.sessionId ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n` : '') +
-            `device: ${device}\n`;
-          const header =
-            `---\ntitle: Session Log ${date} (${project})\n` +
-            `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
-            `# Session Log ${date} (${project})\n`;
-          const entry = payload.sessionLog.entry;
-          const body = entry.endsWith('\n') ? entry : `${entry}\n`;
-          atomicWrite(full, `${header}\n${body}`);
-          return 'created';
-        }
-        return appendIfAbsent(full, payload.sessionLog.entry, isPresent) ? 'appended' : 'skipped';
-      }, { timeoutMs: APPEND_LOCK_TIMEOUT_MS });
+          if (!existsSync(full)) {
+            // A daily shard is a new file most days. Seed minimal valid frontmatter
+            // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
+            // wiki page rather than a W1 "no frontmatter" warning, and write the header
+            // AND the first entry in ONE atomic write — never leave a header-only shard
+            // on disk, which freshness would skip (no dated heading) while derive could
+            // otherwise mistake it for the evidence file. The dated `## [date] ...`
+            // heading lives inside the entry, so freshness / derive / design-history
+            // are unchanged.
+            // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
+            // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
+            // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
+            // machine that first seeds the daily shard is recorded; later same-day
+            // appends do not touch it. The per-session-accurate store is the LOCAL
+            // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
+            // `session_id` is honest naming: the value is the Claude session UUID, and
+            // it is present only on the Stop-chain close path that passes --session-id.
+            const device = currentDevice();
+            const auditFm =
+              (args.sessionId
+                ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n`
+                : '') + `device: ${device}\n`;
+            const header =
+              `---\ntitle: Session Log ${date} (${project})\n` +
+              `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
+              `# Session Log ${date} (${project})\n`;
+            const entry = payload.sessionLog.entry;
+            const body = entry.endsWith('\n') ? entry : `${entry}\n`;
+            atomicWrite(full, `${header}\n${body}`);
+            return 'created';
+          }
+          return appendIfAbsent(full, payload.sessionLog.entry, isPresent) ? 'appended' : 'skipped';
+        },
+        { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
+      );
       (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
     } catch (err) {
       // Only a lock-TIMEOUT is withheld as a conflict. A real fn() write error
@@ -1216,17 +1251,21 @@ function applySessionClose(args) {
     // titleless vs titled same-day pair) from duplicating.
     const headingRe = new RegExp(`^#{1,6} \\[${date}\\]\\s*(.*)$`, 'gm');
     try {
-      const wroteAny = withFileLock(logFull, () => {
-        let w = false;
-        for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
-          const { heading, block } = rootLogEntry(project, date, m[1]);
-          const wrote = appendIfAbsent(logFull, block, (c) =>
-            (c || '').split(/\r?\n/).includes(heading),
-          );
-          w = w || wrote;
-        }
-        return w;
-      }, { timeoutMs: APPEND_LOCK_TIMEOUT_MS });
+      const wroteAny = withFileLock(
+        logFull,
+        () => {
+          let w = false;
+          for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
+            const { heading, block } = rootLogEntry(project, date, m[1]);
+            const wrote = appendIfAbsent(logFull, block, (c) =>
+              (c || '').split(/\r?\n/).includes(heading),
+            );
+            w = w || wrote;
+          }
+          return w;
+        },
+        { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
+      );
       (wroteAny ? applied : skipped).push('log (log.md, derived)');
     } catch (err) {
       if (err?.code !== 'ELOCKTIMEOUT') throw err;
@@ -1424,10 +1463,15 @@ function applySessionClose(args) {
     let gateOk = false;
     if (commitOutcome.committed) {
       closeTranscript = resolveTranscriptBySessionId(args.sessionId);
-      gateOk = precompactGateStatus(
-        args.hypoDir,
-        closeTranscript ? { transcriptPath: closeTranscript } : {},
-      ).ok;
+      // closeScope: apply KNOWS which project it just closed, and it wrote
+      // that project's files from inside this process — they never appear in the
+      // transcript as Edit/Write, so `payload.project` is the only signal that puts
+      // this close in scope. Without it, apply's own incomplete close could be demoted
+      // to a foreign-debt notice and marked green.
+      gateOk = precompactGateStatus(args.hypoDir, {
+        closeScope: [project],
+        ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
+      }).ok;
     }
     const decision = planMarkerDecision({
       ok,
