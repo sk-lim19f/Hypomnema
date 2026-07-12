@@ -243,4 +243,6 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --check-session-close [--hypo
 
 It reports any file as `missing` or `stale`. For an actual close, prefer `--apply-session-close --payload=<path>` (Step 3) — it bundles freshness + lint into one gate and is the documented dogfood path. (`parseArgs` only accepts the `--payload=<path>` spelling; a space-separated `--payload <path>` is silently ignored and triggers "payload is required".)
 
-Add `--project=<slug>` to scope the check to one project (close status + lint scope) when recency picks the wrong one. This is a project-scoped diagnostic only: a green scoped result (JSON `scope: "project"`) attests that slug is close-complete, **not** that `/compact` is unblocked globally. The marker writer (`--mark-session-closed --project=<slug>`) keeps a **global** gate; there `--project` only sets the marker's attribution slug.
+Add `--project=<slug>` to scope the check to one project (close status + lint scope) when recency picks the wrong one. This is a project-scoped diagnostic only: a green scoped result (JSON `scope: "project"`) attests that slug is close-complete, **not** that `/compact` is unblocked globally.
+
+On the marker writer (`--mark-session-closed --project=<slug>`), `--project` names the project this session closed: it sets the marker's attribution slug and enters the close scope, so another session's incomplete close is reported as `close_debt` (a notice) instead of refusing your marker. Every other gate check stays global.

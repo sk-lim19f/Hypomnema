@@ -1421,6 +1421,7 @@ const {
   hasLogEntry,
   hypoIsClean,
   precompactGateStatus,
+  writeSessionClosedMarker,
   commitWikiChanges,
   syncRemote,
   isOverdueDate,
@@ -29621,6 +29622,354 @@ test('session-start still says "no snapshot yet" when the files are genuinely ab
     assert.ok(
       /no snapshot yet/.test(r.stdout),
       `a genuinely absent snapshot must still read as absent: ${r.stdout}`,
+    );
+  });
+});
+
+// ── IMPR-34 — close-debt attribution (foreign incomplete close must not block) ──
+suite('IMPR-34 — close-debt attribution');
+
+// A git-clean vault with two projects and a transcript. `projects` is passed
+// straight to makeMultiProjectWiki; `touched` is the list of repo-relative files
+// the fake transcript shows this session editing via Write.
+function withClosePartitionWiki(projects, touched, fn) {
+  withSyncedWiki((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, projects);
+    // makeMultiProjectWiki writes `## next`, which is not one of lint's required
+    // session-state headings. Left as-is it puts a lint ERROR in EVERY project's
+    // close files, so the gate would never be green and `gate.ok` could not be
+    // asserted — the close partition would look proven while the marker still never
+    // lands. Rewrite the heading so the close axis is the only thing under test.
+    for (const p of projects) {
+      const ss = join(dir, 'projects', p.slug, 'session-state.md');
+      if (existsSync(ss))
+        writeFileSync(ss, readFileSync(ss, 'utf-8').replace('## next', '## 다음 작업'));
+    }
+    const transcript = join(dir, '.cache', 'transcript.jsonl');
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: touched.map((f) => ({
+            type: 'tool_use',
+            name: 'Write',
+            input: { file_path: join(dir, f) },
+          })),
+        },
+      }) + '\n',
+    );
+    // Commit so the gate's git axis is clean and only the close axis is under test.
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'close state']);
+    spawnSync('git', ['-C', dir, 'push', '-q', 'origin', 'HEAD']);
+    fn(dir, transcript, today);
+  });
+}
+
+// The incident: `mine` is fully closed, `foreign` was closed today by ANOTHER
+// session and left its session-log without the dated heading the gate requires.
+// Before the partition this refused `mine`'s marker with compact-gate-not-ok.
+const INCIDENT = (today) => [
+  { slug: 'mine', date: today },
+  { slug: 'foreign', date: today, sessionLog: false },
+];
+
+test('IMPR-34: foreign incomplete close is a notice, not a blocker, when scope names mine', () => {
+  withClosePartitionWiki(INCIDENT(todayLocal()), [], (dir) => {
+    const gate = precompactGateStatus(dir, {
+      closeScope: ['mine'],
+      claudeHome: join(dir, '.claude-none'),
+    });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      false,
+      `mine is complete → no close blocker. got ${JSON.stringify(gate.blockers)}`,
+    );
+    const debt = gate.notices.filter((n) => n.type === 'close-debt');
+    assert.deepEqual(
+      debt.map((n) => n.project),
+      ['foreign'],
+      'foreign debt is surfaced as a notice, never silently dropped',
+    );
+    assert.deepEqual(gate.close.missing, [], 'flat missing describes what BLOCKS, not the debt');
+    assert.equal(gate.close.ok, true, 'close.ok cannot contradict the absence of a close blocker');
+    // The actual win. Asserting only "no close blocker" would pass while the gate
+    // stayed red for some other reason and the marker still never landed.
+    assert.equal(gate.ok, true, `the gate is GREEN → the marker lands: ${JSON.stringify(gate)}`);
+  });
+});
+
+// The boundary of this fix, locked in on purpose. Close COMPLETENESS debt is now
+// attributed to a session; a lint error in those same foreign close files is NOT —
+// closeFileTargetsGlobal still seeds the lint scope from every today-active project,
+// and W8 design-history ownership is still global. Same defect shape, tracked as
+// sibling IMPRs. If a later change fixes them, this test is what should be updated
+// to say so — and the fix's claim must not run ahead of it.
+test('IMPR-34 (boundary): a lint error in a FOREIGN close file still blocks (not yet attributed)', () => {
+  const today = todayLocal();
+  withClosePartitionWiki(
+    [
+      { slug: 'mine', date: today },
+      { slug: 'foreign', date: today },
+    ],
+    [],
+    (dir) => {
+      // Break lint (not the close) in the foreign project's own close file.
+      const ss = join(dir, 'projects', 'foreign', 'session-state.md');
+      writeFileSync(ss, readFileSync(ss, 'utf-8').replace('## 다음 작업', '## next'));
+      spawnSync('git', ['-C', dir, 'commit', '-qam', 'break foreign lint']);
+      const gate = precompactGateStatus(dir, {
+        closeScope: ['mine'],
+        claudeHome: join(dir, '.claude-none'),
+      });
+      assert.equal(
+        gate.blockers.some((b) => b.type === 'lint'),
+        true,
+        'lint on a foreign close file is still a blocker — the fix does not claim otherwise',
+      );
+    },
+  );
+});
+
+// Same wiki, attribution removed. If this passes, the test above proves nothing.
+test('IMPR-34 (revert check): with NO attribution signal the foreign close still blocks', () => {
+  withClosePartitionWiki(INCIDENT(todayLocal()), [], (dir) => {
+    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      true,
+      'empty scope → fail closed → global block (today’s behavior, unchanged)',
+    );
+  });
+});
+
+test('IMPR-34: a hand-written close attributes via the transcript, not just opts', () => {
+  withClosePartitionWiki(
+    INCIDENT(todayLocal()),
+    ['projects/mine/session-state.md'],
+    (dir, transcript) => {
+      const gate = precompactGateStatus(dir, {
+        transcriptPath: transcript,
+        claudeHome: join(dir, '.claude-none'),
+      });
+      assert.equal(
+        gate.blockers.some((b) => b.type === 'close'),
+        false,
+        'editing mine’s close files puts mine (and only mine) in scope',
+      );
+    },
+  );
+});
+
+// Over-attribution guard: touching some ordinary page under foreign/ says nothing
+// about whose close is whose. If any path under projects/foreign/ counted, this
+// session would be re-blocked for a close it never performed.
+test('IMPR-34: a non-close file under the foreign project does NOT put it in scope', () => {
+  withClosePartitionWiki(
+    INCIDENT(todayLocal()),
+    ['projects/mine/session-state.md', 'projects/foreign/design-history.md'],
+    (dir, transcript) => {
+      const gate = precompactGateStatus(dir, {
+        transcriptPath: transcript,
+        claudeHome: join(dir, '.claude-none'),
+      });
+      assert.equal(
+        gate.close.scope.includes('foreign'),
+        false,
+        'only close files attribute a close',
+      );
+      assert.equal(
+        gate.blockers.some((b) => b.type === 'close'),
+        false,
+        'so the foreign debt stays demoted',
+      );
+    },
+  );
+});
+
+// The session's OWN incomplete close must still hard-block. This is the guard that
+// keeps the partition from becoming a bypass.
+test('IMPR-34: my own incomplete close blocks even while a foreign one is demoted', () => {
+  const today = todayLocal();
+  withClosePartitionWiki(
+    [
+      { slug: 'mine', date: today, sessionLog: false },
+      { slug: 'foreign', date: today, logEntry: false },
+    ],
+    [],
+    (dir) => {
+      const gate = precompactGateStatus(dir, {
+        closeScope: ['mine'],
+        claudeHome: join(dir, '.claude-none'),
+      });
+      const close = gate.blockers.find((b) => b.type === 'close');
+      assert.ok(close, 'mine is incomplete → close blocker');
+      assert.match(close.reason, /projects\/mine\//, 'and it names MY files');
+      assert.doesNotMatch(close.reason, /foreign/, 'not the foreign debt');
+    },
+  );
+});
+
+// "You have not closed this session at all" must never be demoted.
+test('IMPR-34: the no-activity fallback still blocks unconditionally', () => {
+  withClosePartitionWiki([{ slug: 'mine', date: '2020-01-01' }], [], (dir) => {
+    const gate = precompactGateStatus(dir, {
+      closeScope: ['mine'],
+      claudeHome: join(dir, '.claude-none'),
+    });
+    assert.equal(gate.close.fallback, true, 'no project closed today → fallback path');
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      true,
+      'the fallback is what forces the initial close — never partition it',
+    );
+  });
+});
+
+// marker == compact-ready: the marker must be attributed to a project the gate
+// actually cleared, or PreCompact re-derives a scope the marker never covered.
+test('IMPR-34: marker attribution comes from the close scope, not the global primary', () => {
+  const today = todayLocal();
+  withClosePartitionWiki(
+    // `foreign` is the top hot.md row, so the global primary resolves to it while
+    // its own close is incomplete. Attributing the marker to `primary` here would
+    // hand PreCompact a scope that re-promotes foreign to a blocker.
+    [
+      { slug: 'foreign', date: today, sessionLog: false },
+      { slug: 'mine', date: today },
+    ],
+    [],
+    (dir) => {
+      const gate = precompactGateStatus(dir, {
+        closeScope: ['mine'],
+        claudeHome: join(dir, '.claude-none'),
+      });
+      assert.equal(gate.close.primary, 'foreign', 'the global primary IS the foreign project');
+      const scopeProject = gate.close.scope.includes(gate.close.primary)
+        ? gate.close.primary
+        : gate.close.scope[0];
+      assert.equal(scopeProject, 'mine', 'marker must be attributed to mine, not the primary');
+    },
+  );
+});
+
+// The failure with NO project row to derive from. sessionCloseGlobalStatus reports
+// `projects: []` + `missing: ['hot.md (no active project…)']`, so a partition that
+// derived `ok` from the per-project rows unconditionally would see "nothing failed"
+// and flip this red gate green. Reproduced by codex pre-commit review as a BLOCKER.
+test('IMPR-34: an unresolvable active project still blocks (no rows to derive ok from)', () => {
+  withSyncedWiki((dir) => {
+    // withSyncedWiki's hot.md carries the Active Projects table with NO project row.
+    const gate = precompactGateStatus(dir, {
+      closeScope: ['whatever'],
+      claudeHome: join(dir, '.claude-none'),
+    });
+    assert.equal(gate.close.ok, false, 'no active project → close is NOT ok');
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      true,
+      'and it must still block — an empty projects[] is not "nothing failed"',
+    );
+  });
+});
+
+// The flat `project` alias names whatever the rest of the status describes. Left as
+// the global primary it can name a DEMOTED project, and every consumer that renders a
+// per-file checklist from it then prints ✓ for files close.debt calls missing (codex
+// pre-commit CONCERN).
+test('IMPR-34: close.project follows the scope, never a demoted primary', () => {
+  const today = todayLocal();
+  withClosePartitionWiki(
+    [
+      { slug: 'foreign', date: today, sessionLog: false }, // top hot.md row → global primary
+      { slug: 'mine', date: today },
+    ],
+    [],
+    (dir) => {
+      const gate = precompactGateStatus(dir, {
+        closeScope: ['mine'],
+        claudeHome: join(dir, '.claude-none'),
+      });
+      assert.equal(gate.close.primary, 'foreign', 'primary is still the global pick');
+      assert.equal(gate.close.project, 'mine', 'but `project` names what this status describes');
+      assert.deepEqual(
+        gate.close.debt.map((d) => d.project),
+        ['foreign'],
+        'and foreign is the demoted debt',
+      );
+    },
+  );
+});
+
+// End to end through the CLI: the command the close checklist tells the model to trust
+// must not print a per-file ✓ for a file it simultaneously reports as debt.
+test('IMPR-34: --check-session-close renders demoted debt without contradicting itself', () => {
+  const today = todayLocal();
+  withClosePartitionWiki(
+    [
+      { slug: 'foreign', date: today, sessionLog: false },
+      { slug: 'mine', date: today },
+    ],
+    ['projects/mine/session-state.md'],
+    (dir, transcript) => {
+      const r = spawnSync(
+        process.execPath,
+        [
+          join(SCRIPTS, 'crystallize.mjs'),
+          '--check-session-close',
+          '--json',
+          `--hypo-dir=${dir}`,
+          `--transcript-path=${transcript}`,
+        ],
+        { encoding: 'utf-8' },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.project, 'mine', 'the checklist is rendered for the project in scope');
+      assert.deepEqual(out.missing, [], 'flat missing carries only what blocks');
+      assert.deepEqual(
+        (out.close_debt || []).map((d) => d.project),
+        ['foreign'],
+        'the demoted close is reported as close_debt, not silently dropped',
+      );
+      assert.equal(out.ok, true, 'and ok never contradicts an empty missing');
+    },
+  );
+});
+
+// The reader that recovers the scope after a scripted close: marker.project.
+test('IMPR-34: marker.project re-derives the same scope PreCompact needs', () => {
+  withClosePartitionWiki(INCIDENT(todayLocal()), [], (dir) => {
+    const sid = 'impr34-session';
+    writeSessionClosedMarker(dir, sid, { project: 'mine' });
+    const gate = precompactGateStatus(dir, {
+      sessionId: sid,
+      claudeHome: join(dir, '.claude-none'),
+    });
+    assert.ok(gate.close.scope.includes('mine'), 'the marker carries the attribution forward');
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      false,
+      'so PreCompact reaches the same verdict the marker attested',
+    );
+  });
+});
+
+// --project is a "is THIS project close-complete?" diagnostic. Demoting the very
+// project it named would answer a question nobody asked.
+test('IMPR-34: --project override is never partitioned away', () => {
+  withClosePartitionWiki(INCIDENT(todayLocal()), [], (dir) => {
+    const gate = precompactGateStatus(dir, {
+      projectOverride: 'foreign',
+      closeScope: ['mine'],
+      claudeHome: join(dir, '.claude-none'),
+    });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      true,
+      'the named project is checked, not demoted',
     );
   });
 });
