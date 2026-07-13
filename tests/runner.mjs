@@ -3620,7 +3620,17 @@ function payloadForCleanWiki(dir, today) {
   };
 }
 
-function runApply(dir, payload, { force = false, sessionId = null } = {}) {
+// Apply a close payload. A payload-bearing apply now REQUIRES close authority
+// (a --session-id whose transcript carries a user close signal) BEFORE it writes
+// anything, so the default here seeds exactly that: a throwaway session whose
+// transcript says the user asked to close. Without it every apply test would be
+// testing the refusal path instead of the thing it means to test.
+//
+// The refusal path has its own tests. They opt out with `sessionId: false`
+// (no --session-id at all) or name an id that resolves to nothing / to a
+// transcript with no close signal.
+let applySeq = 0;
+function runApply(dir, payload, { force = false, sessionId = undefined } = {}) {
   // Fix #39 (option D): payload presence = explicit close intent → always runs
   // full apply. --force only matters for the no-payload probe path, so tests
   // that supply a payload do NOT need --force.
@@ -3633,8 +3643,27 @@ function runApply(dir, payload, { force = false, sessionId = null } = {}) {
     '--json',
   ];
   if (force) flags.push('--force');
-  if (sessionId) flags.push(`--session-id=${sessionId}`);
-  return run('crystallize.mjs', flags);
+
+  // sessionId: false      → omit --session-id entirely (the refusal tests).
+  // sessionId: '<id>'     → use that id AND seed an authorized transcript for it,
+  //                         unless one already exists (callers that name an id do
+  //                         so for marker attribution or a lockout scenario, not to
+  //                         test authority).
+  // sessionId: undefined  → seed a throwaway authorized session.
+  // A caller testing an id that must NOT resolve seeds nothing and passes
+  // `noSeed: true` via the id itself (see the transcript-unresolved tests).
+  let cleanup = null;
+  let id = sessionId;
+  if (id === undefined) id = `apply-auth-${process.pid}-${applySeq++}`;
+  if (id && !resolveTranscriptBySessionId(id, join(SESSION_TMP_HOME, '.claude', 'projects'))) {
+    cleanup = seedCloseTranscript(id);
+  }
+  if (id) flags.push(`--session-id=${id}`);
+  try {
+    return run('crystallize.mjs', flags);
+  } finally {
+    if (cleanup) cleanup();
+  }
 }
 
 // FEAT-11 T5 fail-safe: drives the REAL close path (not a worker reimplementation

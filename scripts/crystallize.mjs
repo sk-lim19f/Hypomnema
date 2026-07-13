@@ -799,6 +799,72 @@ export function closeResultContradiction({ ok, markerWritten, markerSkipReason }
   return null;
 }
 
+// What the model should do when the close is refused. Deliberately does NOT name
+// a flag: the way out of this gate cannot be an argument the model can add, or
+// the gate is decorative. The way out is the user, which is the one input the
+// model does not author.
+const CLOSE_REFUSAL_HELP = [
+  'Nothing was written and nothing was committed.',
+  '',
+  'Do NOT add a bypass flag, and do NOT write the close files directly with an editor',
+  'or a shell — that is the same close without the check, and it is the thing this gate',
+  'exists to stop.',
+  '',
+  'If the user has not asked to close: do not close. Session-close is not a reward for',
+  'finishing a task, and a long session is not a close signal. Keep working, or ask ONCE',
+  'whether to wrap up, and take no for an answer.',
+  '',
+  'If the user HAS asked: pass the current main-conversation --session-id (not a',
+  'background-task or agent uuid from a /tmp path) and re-run this exact payload. The',
+  'writes are idempotent.',
+].join('\n');
+
+/**
+ * May this session apply a close at all?
+ *
+ * Authority comes from the transcript, because the transcript is the one input the
+ * model cannot author: the user's own words are in it, and nothing the model says
+ * counts (extractUserMessages drops injected, tool, and hook-feedback text).
+ *
+ *   { ok: true }
+ *   { ok: false, reason, error }   reason: session-id-required | transcript-unresolved
+ *                                          | no-user-close-signal
+ */
+function verifyCloseAuthority(sessionId) {
+  if (!sessionId) {
+    return {
+      ok: false,
+      reason: 'session-id-required',
+      error:
+        'session-close apply refused before any wiki write or commit: --session-id is required, ' +
+        "because the close signal is verified against that session's transcript. Omitting it does " +
+        'not skip the check, it fails it.',
+    };
+  }
+  const transcript = resolveTranscriptBySessionId(sessionId);
+  if (!transcript) {
+    return {
+      ok: false,
+      reason: 'transcript-unresolved',
+      error:
+        `session-close apply refused before any wiki write or commit: no transcript resolves for ` +
+        `session ${sessionId}. Pass the MAIN conversation's session id — a uuid taken from a ` +
+        `background-task output path or an agent thread is not it, and --transcript-path is not ` +
+        `authority here.`,
+    };
+  }
+  if (!hasUserCloseSignal(transcript)) {
+    return {
+      ok: false,
+      reason: 'no-user-close-signal',
+      error:
+        "session-close apply refused before any wiki write or commit: this session's transcript " +
+        'carries no user close signal. The user did not ask to close.',
+    };
+  }
+  return { ok: true };
+}
+
 function applySessionClose(args) {
   // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
@@ -831,6 +897,51 @@ function applySessionClose(args) {
     }
     // gate not ok → fall through to readPayload, which surfaces
     // "payload is required" with the same error shape as before.
+  }
+
+  // ── close authority: BEFORE any write ──────────────────────────────────────
+  // A payload is a claim that the user asked to close. Verify it here, ahead of
+  // readPayload and every byte that follows, because everything after this point
+  // is authoritative: session-state.md and the hot files are overwritten, the
+  // session-log and log.md are appended, and hypo-auto-commit lands the lot in git
+  // on the next Stop whether or not this command commits.
+  //
+  // The gate used to stand at the END, next to the marker (planMarkerDecision).
+  // It refused the MARKER on a close the user never asked for, and let the writes
+  // and the commit through. Worse, it was opt-in BY THE CALLER: with no
+  // --session-id there was no transcript to check, so the check simply did not
+  // run, and the apply reported ok:true with no skip reason at all. The model
+  // chose whether the model got checked. A model that has already decided to close
+  // does not reach for the flag that would stop it.
+  //
+  // So: no verifiable close signal, no close. Zero bytes, no commit, exit 1.
+  //
+  // What this does and does not promise. It promises that THIS entrypoint refuses
+  // a close with no recognized transcript evidence behind it. It does not promise
+  // the model cannot write these files at all: Write and Bash remain outside this
+  // gate, and the evidence predicate itself is coarse (any close signal anywhere in
+  // the transcript counts, so a stale one from earlier in a long session still
+  // passes, and it is the model that authors the AskUserQuestion option labels the
+  // user picks from). Narrowing that (current-turn binding, revocation, consent
+  // that the model did not word) is the follow-up this ADR names; it is not a
+  // reason to leave the default open in the meantime.
+  // Only a payload-bearing call can write. A payload-less one falls through to the
+  // "payload is required" error below without touching a byte, so gating it here
+  // would just replace one refusal with a less accurate one.
+  const closeAuth = args.payload ? verifyCloseAuthority(args.sessionId) : { ok: true };
+  if (!closeAuth.ok) {
+    const out = {
+      ok: false,
+      stage: 'no-user-close-signal',
+      reason: closeAuth.reason,
+      applied: [],
+      committed: false,
+      error: closeAuth.error,
+    };
+    console.log(
+      args.json ? JSON.stringify(out, null, 2) : `✗ ${closeAuth.error}\n\n${CLOSE_REFUSAL_HELP}`,
+    );
+    process.exit(1);
   }
 
   let payload;
