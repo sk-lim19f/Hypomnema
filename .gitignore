@@ -12,6 +12,12 @@ specs/
 # live in the maintainer's own ~/.claude/commands/, not here.
 .claude/
 
+# CLAUDE.md is the maintainer's agent guide, not product documentation. It names
+# the wiki, the tracker, and the maintainer's own review workflow, which is the
+# same reason .claude/ and specs/ are excluded: this repo carries user-facing
+# docs only. It is carried across machines by the wiki, not by this repo.
+CLAUDE.md
+
 # Append-lock files (transient <target>.lock around session-log / log.md writes)
 *.lock
 

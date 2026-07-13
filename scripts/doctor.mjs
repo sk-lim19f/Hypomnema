@@ -1203,9 +1203,44 @@ function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
       `${name}: ${reason} — run \`hypomnema feedback-sync --import-target-change\` to reconcile`,
     );
   } else {
-    // 2) build error → WARN
-    const buildErr = targets.find(([, t]) => t.buildError);
-    if (buildErr) {
+    // 2) build error. Split by kind:
+    //
+    //    'build-failed' → FAIL. The target file EXISTS but its
+    //      <learned_behaviors> container is gone, so the projection cannot be
+    //      built: NOT ONE L1 rule is loaded on that machine and every later sync
+    //      is a silent no-op. This was a warn, which made a structurally broken
+    //      projection near-invisible — nothing else reported it either (the
+    //      PreCompact gate classified it as "nothing to do" and failed open), and
+    //      it went unnoticed on a real machine. A projection that cannot be built
+    //      is a failure, not a note.
+    //
+    //    'target-missing' → WARN, as before. No ~/.claude/CLAUDE.md yet is the
+    //      ordinary first-run state, not a broken one; failing here would fail
+    //      every new user's doctor run.
+    //
+    // Select the build-failed target SPECIFICALLY rather than taking the first
+    // buildError of any kind: with more than one container target, a
+    // 'target-missing' one earlier in iteration order would otherwise mask a
+    // structurally broken one behind a warn — the exact invisibility this check
+    // exists to end. Only `claude` carries a container today, so that masking is
+    // latent, not live; the precompact gate filters the same way.
+    const failedErr = targets.find(([, t]) => t.buildErrorKind === 'build-failed');
+    const buildErr = failedErr || targets.find(([, t]) => t.buildError);
+    if (failedErr) {
+      const [name, t] = failedErr;
+      // Name the remedy for THIS cause, not a fixed one. `--ensure-container`
+      // restores a MISSING container; it cannot chmod an unreadable file, cannot
+      // repoint a dangling symlink, and refuses a corrupt container outright — so
+      // printing it for those causes hands the reader a command that does nothing
+      // and teaches them to ignore the next failure too. feedback-sync decides the
+      // remedy where it detects the cause and ships it as `buildErrorRemedy`; this
+      // just prints it (one judgment, several consumers).
+      fail(
+        'Feedback projection',
+        `${name}: ${t.buildError} — the projection cannot be built, so NO rules are loaded from it ` +
+          `and every sync is a silent no-op. ${t.buildErrorRemedy || ''}`.trimEnd(),
+      );
+    } else if (buildErr) {
       warn('Feedback projection', buildErr[1].buildError);
     } else if (targets.find(([, t]) => t.overCap)) {
       warn('Feedback projection', 'projection over cap — demote/archive feedback pages');
@@ -1218,7 +1253,23 @@ function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
     }
   }
 
-  // 3) unresolved project-id is a separate, non-fatal concern (MEMORY skipped)
+  // 3) side-file I/O problems: a WARN, and additive rather than part of the
+  //    if/else chain above — an unreadable feedback_<slug>.md copy is orthogonal
+  //    to the primary target's health. It must not fail: the index line still
+  //    projects, every rule still loads, and the remedy is a permission bit on a
+  //    named path — nothing `--ensure-container` (the build-failed remedy) can
+  //    touch. feedback-sync already put the path in the message.
+  for (const [name, t] of targets) {
+    for (const w of t.sideWarnings || []) {
+      warn(
+        'Feedback projection side file',
+        `${name}: ${w} — fix the permissions on that path; the primary projection still loads ` +
+          `(\`--ensure-container\` does not fix this)`,
+      );
+    }
+  }
+
+  // 4) unresolved project-id is a separate, non-fatal concern (MEMORY skipped)
   if (report.projectIdResolved === false) {
     warn(
       'Feedback projection',

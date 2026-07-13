@@ -9,7 +9,7 @@ PR title: Conventional Commits plus a scope, e.g.
 Body language: write the full body TWICE, once under `# English` and once
 under `# 한국어` (this repo ships bilingual docs). The `## Changelog` and
 `## Checklist` blocks are language-neutral, so they appear once, after both
-blocks. Do NOT add any "Generated with ..." / tool-attribution footer.
+blocks. Do NOT add a tool-attribution footer or a session URL of any kind.
 -->
 
 # English

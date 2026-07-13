@@ -2704,8 +2704,55 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           .map(([n]) => n);
         const overCapT = entries.filter(([, t]) => t.overCap).map(([n]) => n);
         const driftedT = entries.filter(([, t]) => t.dirty).map(([n]) => n);
-        if (!report || !(conflictedT.length || overCapT.length || driftedT.length)) {
-          skipped.feedback = true; // buildError / unparseable / non-actionable → fail-open
+        // A target whose file EXISTS but cannot be projected into (its
+        // <learned_behaviors> container is gone) reports dirty:false with no
+        // conflict flag — it cannot be built, so nothing "would change". That
+        // shape used to fall into the non-actionable branch below and fail OPEN,
+        // the worst possible reading: a projection that loads ZERO rules on this
+        // machine was classified as "nothing to do" and waved through. It is a
+        // blocker, not a shrug.
+        //
+        // ONLY kind 'build-failed'. A 'target-missing' buildError (no ~/.claude/
+        // CLAUDE.md yet) is the ordinary first-run state and must keep failing
+        // OPEN, or the gate blocks every new user on their first /compact.
+        const buildErrT = entries
+          .filter(([, t]) => t.buildError && t.buildErrorKind === 'build-failed')
+          .map(([n]) => n);
+        // Side-file I/O trouble (an unreadable feedback_<slug>.md under the
+        // project memory dir) is a NOTICE, never a blocker: the primary
+        // projection still loads every rule, and the only fix is a permission
+        // bit on that path — `--ensure-container` cannot touch it. A gate that
+        // blocks on a condition its own named remedy cannot clear is a gate that
+        // gets bypassed.
+        const sideWarnT = entries.filter(([, t]) => (t.sideWarnings || []).length);
+        if (
+          !report ||
+          !(
+            conflictedT.length ||
+            overCapT.length ||
+            driftedT.length ||
+            buildErrT.length ||
+            sideWarnT.length
+          )
+        ) {
+          skipped.feedback = true; // unparseable / non-actionable → fail-open
+        } else if (buildErrT.length) {
+          // Name the EXACT target file and the remedy for THIS cause. "Restore
+          // the managed container" with no path is a dead end, and so is naming
+          // `--ensure-container` for a permission error or a dangling symlink,
+          // which it cannot fix — a blocker with no way through gets bypassed
+          // rather than obeyed. t.buildError carries the target's absolute path
+          // and t.buildErrorRemedy the cause-specific way out; feedback-sync
+          // makes that judgment once, at the branch that detects the cause.
+          const failed = entries.filter(([n]) => buildErrT.includes(n));
+          const details = failed.map(([n, t]) => `${n}: ${t.buildError}`).join('; ');
+          const remedies = [
+            ...new Set(failed.map(([, t]) => t.buildErrorRemedy).filter(Boolean)),
+          ].join(' ');
+          blockers.push({
+            type: 'feedback',
+            reason: `feedback projection cannot be built — ${details} — no rules are loaded from it. ${remedies}`,
+          });
         } else if (conflictedT.length) {
           blockers.push({
             type: 'feedback',
@@ -2716,11 +2763,21 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             type: 'feedback',
             reason: `feedback projection over cap (${overCapT.join(', ')}) — demote/archive feedback pages`,
           });
-        } else {
+        } else if (driftedT.length) {
           driftTargets.push(...driftedT); // pure drift → self-healable, not a blocker
           notices.push({
             type: 'feedback',
             reason: `feedback projection drift (${driftedT.join(', ')}) — will self-heal at /compact`,
+          });
+        }
+        // Additive, and deliberately outside the chain above: a side-file I/O
+        // problem is orthogonal to the primary target's health, so it is a notice
+        // whatever else is (or is not) going on. It names the path and the
+        // permission fix, because that — not a command — is the way out.
+        for (const [n, t] of sideWarnT) {
+          notices.push({
+            type: 'feedback',
+            reason: `feedback projection side file unreadable (${n}): ${t.sideWarnings.join('; ')} — fix the permissions on that path; the primary projection still loads every rule (\`--ensure-container\` does not fix this)`,
           });
         }
       }

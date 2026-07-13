@@ -100,7 +100,15 @@ TRK="$HYPOMNEMA_ROOT/scripts/check-tracker-ids.mjs"
 [ -f "$TRK" ] && { node "$TRK" --staged || exit 1; }
 exit 0`;
   }
-  // commit-msg: scan the message file (passed as $1) for wiki tracker ids.
+  // commit-msg: scan the message file (passed as $1) for wiki tracker ids AND
+  // tool-attribution trailers. No shim change was needed to add the second check
+  // — check-tracker-ids.mjs --commit-msg scans both — so the deployed v2 shim in
+  // an existing checkout picks it up with no reinstall.
+  //
+  // This hook is FAST LOCAL FEEDBACK, not the guarantee. Every guard above fails
+  // OPEN (CI, no .git, foreign toplevel, symlinked hook, missing script), and
+  // `--no-verify` skips it outright. The real gates are in CI: the tracker-id job
+  // for files, the pr-surface job for the PR title/body.
   return `${unsetSeam}
 TRK="$HYPOMNEMA_ROOT/scripts/check-tracker-ids.mjs"
 [ -f "$TRK" ] || exit 0
@@ -278,8 +286,9 @@ async function main() {
     }
 
     // (7) Install both hooks: pre-commit (format + tracker-id gate on staged
-    //     blobs) and commit-msg (tracker-id gate on the message). Each is
-    //     independently marker-detected so a user's own hook is never clobbered.
+    //     blobs) and commit-msg (tracker-id + tool-attribution gate on the
+    //     message). Each is independently marker-detected so a user's own hook is
+    //     never clobbered.
     const results = [
       installHook('pre-commit', absHooksDir, expectedRoot, absGitDir),
       installHook('commit-msg', absHooksDir, expectedRoot, absGitDir),
