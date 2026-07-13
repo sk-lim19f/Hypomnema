@@ -122,9 +122,11 @@ process.stdin.on('end', () => {
   // turn the (otherwise non-blocking) drift into a blocker, since real drift is
   // confirmed and silently passing it would defeat the gate. --write only applies
   // when no target conflicts/over-caps (code===0 across ALL targets), so a late
-  // race exits non-zero and blocks here. It is semantic-preflight atomic but not
-  // filesystem-atomic (concurrent edit / mid-write I/O fault is best-effort) —
-  // pre-existing engine behavior, not introduced by the self-heal.
+  // race exits non-zero and blocks here. Each FILE it writes is atomic (tmp+
+  // rename, see feedback-sync's atomicWrite), so a mid-write fault can no longer
+  // truncate a target; what is still not atomic is the write ACROSS targets (one
+  // file can land before another fails), which the preflight narrows to genuine
+  // fs errors and no further.
   let feedbackHealed = '';
   if (gate.ok && gate.driftTargets.length > 0) {
     const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;

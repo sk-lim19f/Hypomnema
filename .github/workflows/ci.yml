@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `edited` is NOT in the default type set ([opened, synchronize, reopened]).
+    # Without it, the pr-surface gate below would only ever see the body a PR was
+    # OPENED with: open clean, then edit in an attribution footer or a tracker id,
+    # and nothing re-runs. The gate would be bypassable by a two-step edit.
+    types: [opened, edited, reopened, synchronize]
 
 # Least privilege by default. A job that needs more must declare its own
 # `permissions:` block, which REPLACES this default rather than merging with it.
@@ -47,6 +52,77 @@ jobs:
           node-version: 20
       - name: No wiki-internal tracker ids in public artifacts
         run: npm run check:tracker-ids
+
+  push-commit-messages:
+    name: Commit message gate (push)
+    # The hole the pr-surface job below cannot see. That job scans
+    # `base.sha..head.sha` — the PR BRANCH's commits. This repo merges with
+    # SQUASH: the message that actually lands on `main` is composed in the merge
+    # dialog, never existed on the branch, and was never in that range. An
+    # attribution trailer typed there ships to a public `main` with every check
+    # green. Nothing else looks at it — the push workflow only ran file scanners.
+    #
+    # LIMITATION, on purpose and out loud: this runs on `push`, i.e. AFTER the
+    # merge. It DETECTS, it does not PREVENT. The remedy when it goes red is the
+    # one CLAUDE.md already prescribes — `git commit --amend`, strip the trailer,
+    # `git push --force-with-lease`. A red build a minute after the merge beats a
+    # leak nobody ever looks for.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # `before..after` must resolve locally; the default shallow clone does
+          # not have `before`.
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: No tracker ids or tool attribution in the commit messages this push added
+        # --push-range (not --commit-range) because `before` is all-zeros on a
+        # first push and points into discarded history after a force-push; the
+        # script resolves that and falls back to the tip commit rather than
+        # failing for the wrong reason. Same judgeMessage() the commit-msg hook
+        # and the PR range scan use — one judgment, several entry points.
+        run: |
+          node scripts/check-tracker-ids.mjs --push-range \
+            "${{ github.event.before }}..${{ github.event.after }}"
+
+  pr-surface:
+    name: PR surface gate
+    # The PR title/body is a public artifact that is NOT a file in the repo, so
+    # the tracker-ids job above (which scans the checkout) cannot see it. This job
+    # is the only thing that reads it. Skipped on push events, where there is no
+    # PR to check.
+    #
+    # The title and body arrive in the event payload, so the default
+    # `permissions: contents: read` is enough — no token scope, no API call, and
+    # deliberately NOT `pull_request_target` (that would run fork code with write
+    # scope for zero benefit here).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history, not the default shallow clone: the commit-range step
+          # below needs `base.sha..head.sha` to resolve, and a shallow checkout
+          # would not have the base commit locally.
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: No tracker ids or tool attribution in the PR title/body; template filled
+        run: node scripts/check-pr-surface.mjs --github-event="$GITHUB_EVENT_PATH"
+      - name: No tracker ids or tool attribution in the PR's commit messages
+        # The commit-msg hook (scripts/install-git-hooks.mjs) is local-only,
+        # fails open on tooling problems, and is bypassable with --no-verify — an
+        # attribution trailer landed on `main` on 8 commits this way while the PR
+        # body itself stayed clean. This is the CI backstop: it scans every
+        # commit in the PR's range with the SAME judgment check-tracker-ids.mjs
+        # uses locally (judgeMessage(), reused, not reimplemented).
+        run: |
+          node scripts/check-tracker-ids.mjs --commit-range \
+            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
 
   plugin-channel:
     name: Plugin channel (versions + smoke)

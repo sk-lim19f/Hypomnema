@@ -12,13 +12,17 @@
  * --check / --write engine: per-slug managed blocks + sha256 idempotency +
  * conflict (exit 3) + over-cap (exit 2) [Phase A]. --bootstrap / --import-target-
  * change: reverse one-time helpers that scaffold pages/feedback/_drafts/ for human
- * review — never write pages/feedback/<slug>.md directly [Phase D].
+ * review — never write pages/feedback/<slug>.md directly [Phase D]. --ensure-
+ * container: provisions the ONE thing --write can never create on its own — the
+ * `<learned_behaviors>` container itself is a precondition for --write, not
+ * something it can bootstrap into existence (that would mean guessing WHERE in
+ * an arbitrary, possibly hand-authored CLAUDE.md to insert it).
  *
  * Contract: projects/hypomnema/fix-37-contract.md (per-slug managed block model,
  * sha256 over normalized inner content, sort key, exit matrix, project-id rule).
  *
  * Usage:
- *   node scripts/feedback-sync.mjs [--check|--write|--bootstrap|--import-target-change --from=<memory|claude>]
+ *   node scripts/feedback-sync.mjs [--check|--write|--bootstrap|--import-target-change --from=<memory|claude>|--ensure-container]
  *     --hypo-dir=<path>      Hypomnema root (default: HYPO_DIR / hypo-config.md / ~/hypomnema)
  *     --claude-home=<path>   Claude Code home (default: ~/.claude)
  *     --project-id=<id>      Override derived project-id (§5; always wins, no prompt)
@@ -26,6 +30,23 @@
  *     --strict               Promote warnings to failures (PreCompact gate)
  *     --json                 Machine-readable output
  *     --dry-run              (bootstrap/import) report planned drafts, write nothing
+ *
+ * --ensure-container: the remedy for a 'build-failed' target (its
+ * `<learned_behaviors>` container is gone, so NOT ONE L1 rule loads and every
+ * --write is a silent no-op — see doctor's "Feedback projection" fail and the
+ * PreCompact gate's "feedback projection cannot be built" blocker). If
+ * `<claude-home>/CLAUDE.md` EXISTS and has no container, appends a short
+ * guidance comment plus an empty `<learned_behaviors></learned_behaviors>`
+ * pair to the end of the file — the existing bytes are re-written verbatim ahead
+ * of the addition, through an ATOMIC tmp+rename (see atomicWrite), so a crash or
+ * a full disk mid-write leaves the user's file exactly as it was. If the
+ * container is already there, it is a no-op (idempotent, safe to re-run). If
+ * the file does not exist at all, it is ALSO a no-op ('target-missing' is the
+ * ordinary first-run state, not something to provision here). If the file
+ * carries a CORRUPT container (inverted / duplicated / unpaired tags), it
+ * REFUSES and says what is wrong: appending a valid pair on top of a broken one
+ * produces a file this tool can never repair (the predicate keeps reading "no
+ * container", every re-run appends another pair, --write keeps failing).
  *
  * Project-id fallback (§5 step 4): when the derived project-id directory does not
  * exist AND stdin is an interactive TTY AND --no-input is not set, prompt the user
@@ -49,8 +70,12 @@ import {
   mkdirSync,
   rmSync,
   realpathSync,
+  lstatSync,
+  statSync,
+  chmodSync,
+  renameSync,
 } from 'node:fs';
-import { join, basename, resolve, sep } from 'node:path';
+import { join, basename, dirname, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
@@ -63,7 +88,7 @@ const HOME = homedir();
 
 function parseArgs(argv) {
   const args = {
-    mode: 'check', // check | write | bootstrap | import
+    mode: 'check', // check | write | bootstrap | import | ensure-container
     from: null,
     hypoDir: null,
     claudeHome: null,
@@ -80,6 +105,7 @@ function parseArgs(argv) {
     else if (arg === '--write') args.mode = 'write';
     else if (arg === '--bootstrap') args.mode = 'bootstrap';
     else if (arg === '--import-target-change') args.mode = 'import';
+    else if (arg === '--ensure-container') args.mode = 'ensure-container';
     else if (arg.startsWith('--from=')) args.from = arg.slice(7);
     else if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--claude-home=')) args.claudeHome = expandHome(arg.slice(14));
@@ -94,6 +120,72 @@ function parseArgs(argv) {
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   if (!args.claudeHome) args.claudeHome = join(HOME, '.claude');
   return args;
+}
+
+// ── atomic write (tmp + rename) ──────────────────────────────────────────────
+//
+// `writeFileSync(file, content)` truncates first and writes second: a crash, a
+// full disk, or a kill between the two leaves the file cut in half. Every file
+// this tool touches is a file it does NOT own — `~/.claude/CLAUDE.md` is
+// hand-authored global config, and --ensure-container advertises "existing
+// content is never touched" while doing a whole-file overwrite. So writes go
+// through tmp+rename: rename(2) is atomic within a filesystem, so the target
+// holds either every old byte or every new byte, never a truncated mix. Same
+// shape as hooks/base-store.mjs and hooks/proposal-store.mjs (kept local rather
+// than imported: those live behind the hooks/ boundary and this file owns its
+// own fs layer).
+//
+// A SYMLINKED target (a dotfile repo that links ~/.claude/CLAUDE.md into a git
+// checkout is a common setup) is resolved with realpathSync FIRST, so the tmp
+// file lands beside the REAL file — same directory, therefore same filesystem,
+// therefore an atomic rename — and the rename replaces the real file instead of
+// clobbering the link itself with a regular file.
+function atomicWrite(file, content) {
+  let real = file;
+  try {
+    real = realpathSync(file);
+  } catch {
+    // not there yet (a first-write side-file): write it where it was requested
+  }
+  const dir = dirname(real);
+  mkdirSync(dir, { recursive: true });
+  // Carry the existing mode across: a bare rename would silently relax a 0600
+  // CLAUDE.md to whatever the process umask hands the tmp file.
+  let mode = null;
+  try {
+    mode = statSync(real).mode & 0o777;
+  } catch {
+    /* new file → default mode */
+  }
+  const tmp = join(
+    dir,
+    `.${basename(real)}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`,
+  );
+  try {
+    writeFileSync(tmp, content);
+    if (mode !== null) chmodSync(tmp, mode);
+    renameSync(tmp, real);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort: an orphan tmp is inert, the original file is intact either way */
+    }
+    throw err;
+  }
+}
+
+// Is `file` a symlink whose target does not exist? existsSync FOLLOWS the link,
+// so a dangling one reads as "no file at all" — the ordinary, benign first-run
+// state — and a target that is configured but broken would be waved through with
+// zero rules loaded. lstat sees the link itself.
+function isDanglingSymlink(file) {
+  if (existsSync(file)) return false;
+  try {
+    return lstatSync(file).isSymbolicLink();
+  } catch {
+    return false; // genuinely absent
+  }
 }
 
 // ── frontmatter helpers ──────────────────────────────────────────────────────
@@ -287,33 +379,165 @@ function buildRegion(desired) {
   return desired.map((d) => renderBlock(d.slug, d.inner)).join('\n');
 }
 
+// ── the <learned_behaviors> container: ONE judgment, one view ────────────────
+
+const LB_OPEN = '<learned_behaviors>';
+const LB_CLOSE = '</learned_behaviors>';
+
+// Replace every character of `match` with a space, newlines excepted.
+function blank(match) {
+  return match.replace(/[^\n]/g, ' ');
+}
+
+// Mask the spans a markdown reader does NOT read as live text — HTML comments,
+// fenced code blocks, inline code spans — so a tag inside one of them cannot be
+// mistaken for the container. Masked characters become spaces and newlines are
+// kept, so the masked view has EXACTLY the same length and line structure as the
+// input: an index found here is a valid index into the original content, which
+// is what lets placement splice on it.
+//
+// Why this exists: a plain indexOf() said "container present" for
+// `<!-- <learned_behaviors></learned_behaviors> -->` and for a pair inside a code
+// fence. --ensure-container then no-op'd while placement wrote the managed region
+// INSIDE the comment/fence, where it is inert — and the hook read that as ordinary
+// drift and kept rewriting it. Inline code matters just as much: a CLAUDE.md that
+// merely MENTIONS `<learned_behaviors>` in prose (this repo's own does) would
+// otherwise read as an unpaired open tag.
+function maskInertSpans(content) {
+  const lines = content.replace(/<!--[\s\S]*?-->/g, blank).split('\n');
+  let fence = null;
+  return lines
+    .map((line) => {
+      const delim = /^[ \t]*(`{3,}|~{3,})/.exec(line);
+      if (fence) {
+        if (delim && delim[1][0] === fence.char && delim[1].length >= fence.len) fence = null;
+        return blank(line); // every line inside the fence, close delimiter included
+      }
+      if (delim) {
+        fence = { char: delim[1][0], len: delim[1].length };
+        return blank(line);
+      }
+      return line.replace(/`[^`\n]*`/g, blank);
+    })
+    .join('\n');
+}
+
+function indicesOf(text, needle) {
+  const out = [];
+  for (let i = text.indexOf(needle); i !== -1; i = text.indexOf(needle, i + needle.length)) {
+    out.push(i);
+  }
+  return out;
+}
+
+/**
+ * The ONE definition of "the container is there", over the masked view above:
+ *
+ *   { state: 'present', open, close }  exactly one pair, open BEFORE close
+ *   { state: 'absent',  ... }          no tag at all → --ensure-container provisions it
+ *   { state: 'corrupt', reason, ... }  inverted / duplicated / unpaired tags
+ *
+ * 'corrupt' is its own state because the alternative — folding it into "absent" —
+ * built a trap: with `</learned_behaviors>` sitting before `<learned_behaviors>`,
+ * a first-occurrence predicate reads false forever, so --ensure-container appends
+ * a fresh pair, the inverted tags stay, the predicate STILL reads false, and every
+ * --write keeps failing. The tool manufactured a state it could not repair. A
+ * corrupt container is damage a human fixes; the tool says so and stops.
+ *
+ * buildNextContent's placement, --ensure-container's idempotency check and
+ * evaluateTarget's out-of-container check all call this, so they cannot drift
+ * apart on what counts as a container — and they are wrong together or right
+ * together, never half of each.
+ */
+function classifyContainer(content) {
+  const view = maskInertSpans(content);
+  const opens = indicesOf(view, LB_OPEN);
+  const closes = indicesOf(view, LB_CLOSE);
+  if (!opens.length && !closes.length) return { state: 'absent', open: -1, close: -1 };
+  if (opens.length === 1 && closes.length === 1 && opens[0] < closes[0]) {
+    return { state: 'present', open: opens[0], close: closes[0] };
+  }
+  let reason;
+  if (!opens.length) reason = `a closing ${LB_CLOSE} with no opening ${LB_OPEN}`;
+  else if (!closes.length) reason = `an opening ${LB_OPEN} with no closing ${LB_CLOSE}`;
+  else if (opens.length > 1 || closes.length > 1)
+    reason = `${opens.length} opening and ${closes.length} closing tags (exactly one pair is required)`;
+  else reason = `the closing ${LB_CLOSE} appears BEFORE the opening ${LB_OPEN}`;
+  return {
+    state: 'corrupt',
+    reason,
+    open: opens.length ? opens[0] : -1,
+    close: closes.length ? closes[0] : -1,
+  };
+}
+
+// ── remedies (one way out per CAUSE) ─────────────────────────────────────────
+//
+// A blocker that names a command which cannot possibly fix the condition it
+// reports teaches the reader to ignore blockers. `--ensure-container` only ever
+// touches CLAUDE.md's container: it cannot chmod an unreadable file, cannot
+// repoint a dangling symlink, and must not append onto a corrupt container. The
+// remedy is decided ONCE, here, next to the branch that detects the cause, and
+// rides along in the JSON report (`buildErrorRemedy`) so doctor and the PreCompact
+// gate print the same way out instead of each guessing one.
+const REMEDY = {
+  containerMissing: (file) =>
+    'Run `hypomnema feedback-sync --ensure-container` to add the missing ' +
+    `<learned_behaviors></learned_behaviors> pair to ${file} (existing content is untouched), ` +
+    'then `hypomnema feedback-sync --write`.',
+  containerCorrupt: (file, reason) =>
+    `Repair ${file} BY HAND so it holds exactly one <learned_behaviors></learned_behaviors> pair ` +
+    `with the opening tag first — found ${reason}. \`--ensure-container\` refuses to append here: ` +
+    'a second pair stacked on a broken one leaves the file unprojectable forever.',
+  io: (file) =>
+    `Fix the permissions on ${file} so this user can read and write it (e.g. \`chmod u+rw\`), then ` +
+    're-run `hypomnema feedback-sync --write`. `--ensure-container` cannot fix a permission bit.',
+  danglingSymlink: (file) =>
+    `${file} is a symlink whose target does not exist (\`ls -l\` it). Repoint or remove the link, ` +
+    'then re-run `hypomnema feedback-sync --write`.',
+};
+
 // Compute the next file content for a target. Returns { content } on success or
-// { error } when the region cannot be placed (e.g. missing container). Pure — no
-// disk writes — so run() can preflight every target before any write (atomicity).
+// { error, remedy } when the region cannot be placed (missing / corrupt
+// container). Pure — no disk writes — so run() can preflight every target before
+// any write (atomicity).
 function buildNextContent(content, region, target) {
   const { firstStart, lastEnd } = findBlocks(content);
-  if (firstStart >= 0) {
-    // replace the contiguous managed span (region may be '' to clear it)
-    return { content: content.slice(0, firstStart) + region + content.slice(lastEnd) };
-  }
-  // no existing blocks
-  if (region === '') return { content }; // nothing to place → no-op (idempotent)
+  // replace the contiguous managed span (region may be '' to clear it)
+  const replaceSpan = () => ({
+    content: content.slice(0, firstStart) + region + content.slice(lastEnd),
+  });
   if (target.container === 'learned_behaviors') {
-    const open = content.indexOf('<learned_behaviors>');
-    const close = content.indexOf('</learned_behaviors>');
-    if (open < 0 || close < 0 || close < open) {
-      return { error: `<learned_behaviors> container not found in ${target.file}` };
+    const c = classifyContainer(content);
+    // Checked BEFORE the existing-blocks fast path: rewriting a managed span
+    // inside a file whose container tags are broken just re-lands the region in a
+    // structure nothing reads.
+    if (c.state === 'corrupt') {
+      return {
+        error: `<learned_behaviors> container in ${target.file} is corrupt: ${c.reason}`,
+        remedy: REMEDY.containerCorrupt(target.file, c.reason),
+      };
+    }
+    if (firstStart >= 0) return replaceSpan();
+    if (region === '') return { content }; // nothing to place → no-op (idempotent)
+    if (c.state === 'absent') {
+      return {
+        error: `<learned_behaviors></learned_behaviors> container not found in ${target.file}`,
+        remedy: REMEDY.containerMissing(target.file),
+      };
     }
     // an anchor is honored ONLY when it sits inside the container span
     const anchorIdx = content.indexOf(MARK_ANCHOR);
-    if (anchorIdx > open && anchorIdx < close) {
+    if (anchorIdx > c.open && anchorIdx < c.close) {
       return {
         content:
           content.slice(0, anchorIdx) + region + content.slice(anchorIdx + MARK_ANCHOR.length),
       };
     }
-    return { content: content.slice(0, close) + region + '\n' + content.slice(close) };
+    return { content: content.slice(0, c.close) + region + '\n' + content.slice(c.close) };
   }
+  if (firstStart >= 0) return replaceSpan();
+  if (region === '') return { content };
   // memory index: anchor (anywhere) or append
   const anchorIdx = content.indexOf(MARK_ANCHOR);
   if (anchorIdx >= 0) {
@@ -327,6 +551,10 @@ function buildNextContent(content, region, target) {
 
 // sync-owned full-copy files (feedback_<slug>.md) no longer backed by an active
 // candidate → must be removed so deletions/demotions propagate (MEDIUM-1).
+// readdirSync MAY THROW (e.g. EACCES on target.dir) — deliberately NOT caught
+// here. The caller (evaluateTarget) catches it and classifies it exactly like a
+// primary-target read failure ('build-failed'), so a directory permission
+// problem cannot silently masquerade as "no stale side-files to clean up".
 function staleSideFiles(target, desired) {
   if (!target.dir || !existsSync(target.dir)) return [];
   const keep = new Set(desired.map((d) => `feedback_${d.slug}.md`));
@@ -335,7 +563,11 @@ function staleSideFiles(target, desired) {
     .map((f) => join(target.dir, f))
     .filter((p) => {
       // only delete files THIS tool generated (provenance header on line 1) —
-      // never a user's hand-written feedback_*.md memory file
+      // never a user's hand-written feedback_*.md memory file. Unreadable here
+      // just means "don't delete it" (a safe, non-destructive default) — this
+      // per-file check was already caught before this fix and stays that way;
+      // it is the DIRECTORY listing and the PRIMARY target read that used to
+      // throw uncaught, not this narrow provenance probe.
       try {
         return readFileSync(p, 'utf-8').startsWith(SIDE_MARKER_PREFIX);
       } catch {
@@ -349,7 +581,24 @@ function staleSideFiles(target, desired) {
 function evaluateTarget(pages, target) {
   const desired = computeDesired(pages, target);
   const fileExists = existsSync(target.file);
-  const content = fileExists ? readFileSync(target.file, 'utf-8') : '';
+  const dangling = isDanglingSymlink(target.file);
+  // The FILE existing does not mean it is READABLE. A permission error here
+  // (mode 000, an ACL change mid-session, ...) used to throw uncaught: the
+  // whole --check/--write run crashed, no JSON report was produced, and every
+  // downstream consumer (doctor's "no JSON" branch, the PreCompact gate's
+  // unparseable-stdout branch) reads "no report" as "nothing to project" and
+  // fails OPEN — reproducing, via an ordinary filesystem error, the exact
+  // failure mode ("rules not loaded, gate stays green") this whole projection
+  // system exists to prevent. Caught and classified as 'build-failed' instead.
+  let content = '';
+  let ioError = null;
+  if (fileExists) {
+    try {
+      content = readFileSync(target.file, 'utf-8');
+    } catch (err) {
+      ioError = `cannot read target file ${target.file}: ${err.message}`;
+    }
+  }
   const { blocks } = findBlocks(content);
   const { starts, ends } = countMarkers(content);
 
@@ -361,12 +610,16 @@ function evaluateTarget(pages, target) {
   const intruder = regionHasIntruders(content);
   // out-of-container: an existing managed block sitting outside <learned_behaviors>
   // (drifted/hand-moved) — replacing it in place would leave it outside the
-  // required region, so refuse and require import.
+  // required region, so refuse and require import. A CORRUPT container is
+  // deliberately NOT reported here: it is a build failure with its own remedy
+  // (repair by hand), and routing it through the conflict path would print
+  // "run --import-target-change", which reconciles nothing.
   let outOfContainer = false;
-  if (target.container === 'learned_behaviors' && blocks.length) {
-    const open = content.indexOf('<learned_behaviors>');
-    const close = content.indexOf('</learned_behaviors>');
-    outOfContainer = open < 0 || close < 0 || blocks.some((b) => b.start < open || b.end > close);
+  const container = target.container === 'learned_behaviors' ? classifyContainer(content) : null;
+  if (container && container.state !== 'corrupt' && blocks.length) {
+    outOfContainer =
+      container.state !== 'present' ||
+      blocks.some((b) => b.start < container.open || b.end > container.close);
   }
 
   const region = buildRegion(desired);
@@ -378,28 +631,97 @@ function evaluateTarget(pages, target) {
     overCap = desired.reduce((n, d) => n + d.inner.split('\n').length, 0) > target.cap;
 
   // build the next content (validation happens here, before any write)
+  //
+  // buildErrorKind splits the two very different reasons a build fails, because
+  // consumers must treat them differently and the string alone does not say which
+  // is which:
+  //
+  //   'target-missing'   The target FILE is not there at all (no ~/.claude/
+  //                      CLAUDE.md yet). That is the ordinary first-run state, so
+  //                      the PreCompact gate and doctor must NOT block on it — a
+  //                      block here would hit every new user (same reasoning that
+  //                      keeps this out of strictWarnings below).
+  //   'build-failed'     The file EXISTS but cannot be projected into — e.g. its
+  //                      <learned_behaviors> container is gone. Nothing is broken
+  //                      about the user's setup EXCEPT that not one L1 rule loads
+  //                      on this machine, and every sync is a silent no-op. That
+  //                      is a hard failure and must be surfaced as one.
   let nextContent = null;
   let buildError = null;
-  if (!fileExists && target.container) {
+  let buildErrorKind = null;
+  let buildErrorRemedy = null;
+  if (ioError) {
+    // The target file exists but could not be read (permissions, a mid-session
+    // ACL change, ...). Structurally identical to a missing container: nothing
+    // is projected, and the difference from a fresh install matters, so this
+    // gets the SAME 'build-failed' kind as a missing container, not
+    // 'target-missing' (the file is right there, just unreadable).
+    buildError = ioError;
+    buildErrorKind = 'build-failed';
+    buildErrorRemedy = REMEDY.io(target.file);
+  } else if (dangling) {
+    // A dangling symlink is NOT 'target-missing'. existsSync follows the link and
+    // sees nothing, so this used to be classified as the benign first-run state:
+    // the gate stayed green while the configured target was broken and zero rules
+    // loaded — and a --write would have replaced the link with a regular file,
+    // silently detaching it from whatever it was meant to point at.
+    buildError = `target file ${target.file} is a dangling symlink (its link target does not exist)`;
+    buildErrorKind = 'build-failed';
+    buildErrorRemedy = REMEDY.danglingSymlink(target.file);
+  } else if (!fileExists && target.container) {
     buildError = `target file missing: ${target.file}`;
+    buildErrorKind = 'target-missing';
   } else {
     const r = buildNextContent(fileExists ? content : '', region, target);
-    if (r.error) buildError = r.error;
-    else nextContent = r.content;
+    if (r.error) {
+      buildError = r.error;
+      buildErrorKind = 'build-failed';
+      buildErrorRemedy = r.remedy;
+    } else nextContent = r.content;
   }
 
-  // side-files: writes (current candidates) + deletes (stale sync-owned copies)
+  // side-files: writes (current candidates) + deletes (stale sync-owned copies).
+  // An I/O error on a SIDE file (the directory listing, or one feedback_<slug>.md
+  // copy) is a WARNING, not a build failure — the split matters:
+  //
+  //   PRIMARY target (CLAUDE.md's container, MEMORY.md's index) unreadable ⇒ the
+  //     projection cannot be built at all, no rule loads, hard-fail ('build-failed').
+  //   SIDE file unreadable ⇒ the index line still projects and every rule still
+  //     loads; one full-copy convenience file is stale. Blocking /compact on that
+  //     — with a message naming `--ensure-container`, which only ever touches
+  //     CLAUDE.md and could not chmod a file if it tried — is a gate whose own
+  //     named remedy cannot open it. Warn, name the path, name the permission fix.
+  //
+  // They are NOT swallowed (that was the original bug: a silent "nothing to clean
+  // up" default) — they ride out in the report as `sideWarnings` and reach the
+  // human through doctor and the PreCompact gate's notices.
+  const sideWarnings = [];
   const sideWrites = [];
   for (const d of desired) {
     for (const sf of target.sideFiles(d.page)) sideWrites.push(sf);
   }
-  const sideDeletes = staleSideFiles(target, desired);
+  let sideDeletes = [];
+  if (!buildError) {
+    try {
+      sideDeletes = staleSideFiles(target, desired);
+    } catch (err) {
+      sideWarnings.push(`cannot read side-file directory ${target.dir}: ${err.message}`);
+    }
+  }
 
   // dirty: main content would change OR any side-file would change/be removed
   let dirty = nextContent !== null && nextContent !== (fileExists ? content : '');
   if (sideDeletes.length) dirty = true;
   for (const sf of sideWrites) {
-    const cur = existsSync(sf.path) ? readFileSync(sf.path, 'utf-8') : null;
+    let cur = null;
+    if (existsSync(sf.path)) {
+      try {
+        cur = readFileSync(sf.path, 'utf-8');
+      } catch (err) {
+        sideWarnings.push(`cannot read side file ${sf.path}: ${err.message}`);
+        cur = null; // unreadable → treat as needing a (re)write, the safe default
+      }
+    }
     if (cur !== sf.content) dirty = true;
   }
 
@@ -415,28 +737,40 @@ function evaluateTarget(pages, target) {
     fileExists,
     nextContent,
     buildError,
+    buildErrorKind,
+    buildErrorRemedy,
     sideWrites,
     sideDeletes,
+    sideWarnings,
   };
 }
 
-// Pure writer: applies a fully-validated plan. No validation here.
+// Writer: applies a fully-validated plan. No validation here. Every write is
+// atomic (tmp+rename), so an interrupted run leaves each file at its previous
+// content rather than truncated. Returns the (non-fatal) side-file warnings it
+// collected; a PRIMARY-target write failure is NOT swallowed — it throws, and
+// run() turns it into a reported error with the permission remedy.
 function applyTarget(target, res) {
+  const warnings = [];
   if (target.dir) mkdirSync(target.dir, { recursive: true });
   for (const sf of res.sideWrites) {
-    mkdirSync(join(sf.path, '..'), { recursive: true });
-    writeFileSync(sf.path, sf.content);
+    try {
+      atomicWrite(sf.path, sf.content);
+    } catch (err) {
+      warnings.push(`cannot write side file ${sf.path}: ${err.message}`);
+    }
   }
   for (const p of res.sideDeletes) {
     try {
       rmSync(p);
-    } catch {
-      /* best-effort */
+    } catch (err) {
+      warnings.push(`cannot remove stale side file ${p}: ${err.message}`);
     }
   }
   if (res.nextContent !== null && res.nextContent !== (res.fileExists ? res.content : '')) {
-    writeFileSync(target.file, res.nextContent);
+    atomicWrite(target.file, res.nextContent);
   }
+  return warnings;
 }
 
 // ── project-id derivation ─────────────────────────────────────────────────────
@@ -563,10 +897,12 @@ function oneLineSummary(text, max = 100) {
 // HYPO:FEEDBACK-SYNC managed block are skipped — those already have a wiki SoT
 // and are not legacy entries to migrate.
 function parseLearnedBehaviors(content) {
-  const open = content.indexOf('<learned_behaviors>');
-  const close = content.indexOf('</learned_behaviors>');
-  if (open < 0 || close < 0 || close < open) return [];
-  const inner = content.slice(open + '<learned_behaviors>'.length, close);
+  // Same container judgment placement uses (classifyContainer): a pair quoted in
+  // an HTML comment / a code fence / inline code is not a container to read
+  // legacy rules out of, and a corrupt one has no unambiguous inner span at all.
+  const c = classifyContainer(content);
+  if (c.state !== 'present') return [];
+  const inner = content.slice(c.open + LB_OPEN.length, c.close);
   const scrubbed = inner.replace(BLOCK_RE, ''); // blank out already-projected blocks
   const out = [];
   for (const line of scrubbed.split('\n')) {
@@ -813,12 +1149,89 @@ function runImport(args) {
   return { code: 0, report, warnings };
 }
 
+// The provisioning step --write can never do on its own: --write only ever
+// PLACES a region INSIDE an existing `<learned_behaviors>` container (it has
+// no way to guess where in an arbitrary, possibly hand-authored CLAUDE.md a
+// container belongs — that would risk corrupting content it does not own).
+// When the container is simply gone (deleted by hand, a bad merge, ...),
+// --write's only recourse is the 'build-failed' error, and a gate that reports
+// a failure with no way through gets bypassed rather than obeyed — this is the
+// way through.
+//
+//   file MISSING entirely → no-op ('target-missing' is the ordinary first-run
+//     state; --ensure-container repairs an EXISTING file, it does not create
+//     one out of nothing).
+//   file is a DANGLING symlink → fail. It is not missing, it is broken, and the
+//     fix is on the link, not here.
+//   file exists, container ALREADY present → no-op (idempotent: safe to run
+//     from a blocker message without checking state first).
+//   file exists, container CORRUPT → fail, and say what is wrong. A blind append
+//     onto inverted/duplicated tags is how this command would manufacture a state
+//     it can never repair: the pair it adds does not fix the broken one, the
+//     predicate still reads "no container", the next run appends ANOTHER pair, and
+//     --write fails forever. Refusing is the only honest move.
+//   file exists, no container → append a short guidance comment plus an empty
+//     `<learned_behaviors></learned_behaviors>` pair to the END of the file. The
+//     existing bytes are re-written verbatim ahead of the addition through
+//     atomicWrite (tmp+rename), so a crash or a full disk mid-write cannot leave
+//     the user's global config truncated — the file is either wholly old or
+//     wholly new. (The previous writeFileSync(file, content + addition) truncated
+//     first and wrote second: the one command that promises "existing content is
+//     never touched" was the one that could shred it.)
+function runEnsureContainer(args) {
+  const target = claudeTarget(args);
+  const file = target.file;
+  if (!existsSync(file)) {
+    if (isDanglingSymlink(file)) {
+      return {
+        code: 1,
+        error:
+          `${file} is a dangling symlink (its link target does not exist) — nothing to provision. ` +
+          REMEDY.danglingSymlink(file),
+      };
+    }
+    return { code: 0, report: { mode: 'ensure-container', file, action: 'target-missing' } };
+  }
+  let content;
+  try {
+    content = readFileSync(file, 'utf-8');
+  } catch (err) {
+    return { code: 1, error: `cannot read ${file}: ${err.message} — ${REMEDY.io(file)}` };
+  }
+  const c = classifyContainer(content);
+  if (c.state === 'present') {
+    return { code: 0, report: { mode: 'ensure-container', file, action: 'noop-already-present' } };
+  }
+  if (c.state === 'corrupt') {
+    return {
+      code: 1,
+      error:
+        `refusing to append to ${file}: it already carries a corrupt <learned_behaviors> ` +
+        `container — ${c.reason}. ${REMEDY.containerCorrupt(file, c.reason)}`,
+    };
+  }
+  const sep = content.endsWith('\n') ? '' : '\n';
+  const addition =
+    `${sep}\n` +
+    '<!-- Added by `hypomnema feedback-sync --ensure-container`: this pair is the managed\n' +
+    'region feedback-sync projects wiki-sourced learned behaviors into. Do not hand-edit its\n' +
+    'contents — a hand-edit becomes a sync conflict. -->\n' +
+    '<learned_behaviors>\n</learned_behaviors>\n';
+  try {
+    atomicWrite(file, content + addition);
+  } catch (err) {
+    return { code: 1, error: `cannot write ${file}: ${err.message} — ${REMEDY.io(file)}` };
+  }
+  return { code: 0, report: { mode: 'ensure-container', file, action: 'created' } };
+}
+
 // ── modes ─────────────────────────────────────────────────────────────────────
 
 function run(args, resolvedPid = null) {
   if (!existsSync(args.hypoDir)) {
     return { code: 1, error: `wiki not found: ${args.hypoDir}` };
   }
+  if (args.mode === 'ensure-container') return runEnsureContainer(args);
   if (args.mode === 'bootstrap') return runBootstrap(args);
   if (args.mode === 'import') return runImport(args);
 
@@ -888,8 +1301,25 @@ function run(args, resolvedPid = null) {
       outOfContainer: res.outOfContainer,
       overCap: res.overCap,
       dirty: res.dirty,
-      ...(res.buildError ? { buildError: res.buildError } : {}),
+      // buildErrorKind rides along with buildError so a consumer (doctor, the
+      // PreCompact gate) can tell a first-run missing file from a structurally
+      // broken one WITHOUT re-deriving that judgment by string-matching the
+      // message. The judgment is made once, here, where the branch is taken —
+      // and buildErrorRemedy carries the way OUT for that exact cause, so no
+      // consumer has to guess one (a permission error advised to run
+      // `--ensure-container` is a blocker its own remedy cannot open).
+      ...(res.buildError
+        ? {
+            buildError: res.buildError,
+            buildErrorKind: res.buildErrorKind,
+            ...(res.buildErrorRemedy ? { buildErrorRemedy: res.buildErrorRemedy } : {}),
+          }
+        : {}),
+      // Non-fatal: a side-file I/O problem degrades the projection, it does not
+      // break it. Reported (never swallowed), but it must not block /compact.
+      ...(res.sideWarnings.length ? { sideWarnings: res.sideWarnings } : {}),
     };
+    for (const w of res.sideWarnings) warnings.push(`${target.name}: ${w}`);
     if (res.conflicts.length || res.intruder || res.unpaired || res.outOfContainer)
       code = Math.max(code, 3);
     else if (res.overCap) code = Math.max(code, 2);
@@ -906,7 +1336,26 @@ function run(args, resolvedPid = null) {
   // so writes stay byte-idempotent.
   if (args.mode === 'write' && code === 0 && !strictFail) {
     for (const { target, res } of evals) {
-      if (res.dirty) applyTarget(target, res);
+      if (!res.dirty) continue;
+      try {
+        warnings.push(...applyTarget(target, res).map((w) => `${target.name}: ${w}`));
+      } catch (err) {
+        // A PRIMARY-target write failure (ENOSPC, EACCES, a read-only mount).
+        // Reported, not thrown: an uncaught throw prints no JSON, and every
+        // consumer reads "no report" as "nothing to project" and fails OPEN —
+        // the exact silent-green failure this projection system exists to stop.
+        // The preflight already ruled out every failure it CAN see; an fs error
+        // at write time is the one thing it cannot, so the cross-target atomicity
+        // contract holds up to that point and no further (documented, not fixed
+        // here: a two-phase commit across two independent files is a different
+        // change).
+        return {
+          code: 1,
+          error: `cannot write ${target.file}: ${err.message} — ${REMEDY.io(target.file)}`,
+          report,
+          warnings,
+        };
+      }
     }
   }
 
@@ -922,7 +1371,12 @@ async function main() {
   // exactly once. resolveProjectId only touches stdin when stdin.isTTY is truthy
   // and --no-input is unset → hooks/CI/pipes never block here.
   let resolvedPid = null;
-  if (existsSync(args.hypoDir) && args.mode !== 'bootstrap' && args.mode !== 'import') {
+  if (
+    existsSync(args.hypoDir) &&
+    args.mode !== 'bootstrap' &&
+    args.mode !== 'import' &&
+    args.mode !== 'ensure-container' // no MEMORY/project-id involvement at all
+  ) {
     resolvedPid = await resolveProjectId(args);
   }
   const out = run(args, resolvedPid);
@@ -931,6 +1385,23 @@ async function main() {
     console.log(JSON.stringify(out.error ? { error: out.error } : out.report, null, 2));
   } else if (out.error) {
     console.error(`[feedback-sync] ${out.error}`);
+  } else if (out.report.mode === 'ensure-container') {
+    const { action, file } = out.report;
+    if (action === 'target-missing') {
+      console.error(
+        `[feedback-sync] ensure-container: ${file} does not exist yet — nothing to provision ` +
+          `(this is the ordinary first-run state, not something --ensure-container creates).`,
+      );
+    } else if (action === 'noop-already-present') {
+      console.error(
+        `[feedback-sync] ensure-container: ${file} already has a <learned_behaviors> container — no changes made.`,
+      );
+    } else {
+      console.error(
+        `[feedback-sync] ensure-container: appended an empty <learned_behaviors></learned_behaviors> ` +
+          `container to ${file} (existing content untouched). Run \`hypomnema feedback-sync --write\` next.`,
+      );
+    }
   } else if (out.report.mode === 'bootstrap') {
     for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
     const verb = out.report.dryRun ? 'would create' : 'created';

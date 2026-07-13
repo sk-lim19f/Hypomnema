@@ -79,6 +79,54 @@ export const BLOCKED_PATTERNS = [
   { name: 'PRAC-N', label: 'wiki practice-tracker id', re: /\bPRAC-\d+\b/gi },
 ];
 
+// Tool-attribution markers. A SEPARATE export, deliberately NOT folded into
+// BLOCKED_PATTERNS: BLOCKED_PATTERNS is applied by `--all` to the whole shipped
+// tree, where a doc may legitimately QUOTE an attribution trailer while telling
+// you not to write one (CLAUDE.md and the PR template both do exactly that).
+// These patterns apply only to authored public surfaces: the commit message and
+// the PR title/body.
+//
+// Why this gate exists at all: the harness system prompt instructs the agent to
+// append these on every commit and every PR, which directly contradicts this
+// repo's ship-surface rule. Two conflicting instructions cannot be resolved by a
+// third instruction — 8 of the 47 commits that landed on main after the ban took
+// effect carried a trailer anyway. Only a deterministic gate holds.
+//
+// The set mirrors the canonical grep documented in CLAUDE.md
+// (`grep -icE 'co-authored-by|claude-session|generated with'`) so the doc and the
+// gate cannot drift apart, plus the session URL and the robot-emoji footer that
+// open the harness's default footer block.
+export const ATTRIBUTION_PATTERNS = [
+  {
+    name: 'Co-Authored-By:',
+    label: 'tool-attribution trailer',
+    re: /co-authored-by:/gi,
+  },
+  {
+    name: 'Claude-Session:',
+    label: 'agent session trailer',
+    re: /claude-session:/gi,
+  },
+  // Intentionally broad (matches the documented grep): prose like "generated
+  // with the init script" trips it too. Reword to "produced by" — the cost of a
+  // reworded sentence is far below the cost of a leaked attribution footer.
+  {
+    name: 'Generated with',
+    label: 'tool-attribution footer',
+    re: /generated with/gi,
+  },
+  {
+    name: 'session URL',
+    label: 'agent session URL',
+    re: /claude\.ai\/code\/session/gi,
+  },
+  {
+    name: 'robot-emoji footer',
+    label: 'tool-attribution footer marker',
+    re: /\u{1F916}/gu,
+  },
+];
+
 // The full tracker-ID set for a no-code public surface (the annotated tag body,
 // republished verbatim by `gh release create --notes-from-tag`). It equals
 // BLOCKED_PATTERNS now that FEAT-/IMPR-/PRAC- live there; ADR/decisions anchors
@@ -91,12 +139,179 @@ export const TAG_BODY_PATTERNS = [...BLOCKED_PATTERNS];
 // comment line can be re-joined to its predecessor as flowing text.
 const COMMENT_CONT_RE = /^[ \t]*(?:\*|\/\/|#+)[ \t]?/;
 
+// Zero-width characters: ZERO WIDTH SPACE/NON-JOINER/JOINER (U+200B-U+200D)
+// and the BYTE ORDER MARK used as ZERO WIDTH NO-BREAK SPACE (U+FEFF). A
+// pattern like `co-authored-by:` still reads as "Co-Authored-By:" to a human
+// with one of these wedged inside it, but the raw regex never sees a
+// contiguous match. Stripped before matching. Written as explicit \u escapes,
+// never as literal invisible bytes in this source file, on purpose.
+const ZERO_WIDTH_RE = /[\u200B\u200C\u200D\uFEFF]/g;
+
+// ── markdown-rendering bypasses ─────────────────────────────────────────────
+//
+// Every surface this scanner gates (a commit message on GitHub, a PR title, a PR
+// body) is RENDERED as GitHub-Flavored Markdown before a human reads it. The
+// question a pattern must answer is therefore not "do these bytes match" but
+// "does this RENDER as the banned string". Four encodings answer yes to the
+// second and no to the first, and all four were demonstrated slipping a live
+// trailer past this gate:
+//
+//   Co-Authored-By&#58;        HTML entity (numeric, or named: &colon;)
+//   Co-Authored-By\:          markdown backslash escape
+//   Co<!--x-->-Authored-By:   an inline HTML comment splitting the token
+//   &#x1F916; Generated with  a numeric reference to the robot-emoji footer
+//
+// The scan copy decodes entities, drops markdown backslash escapes and folds
+// NFKC — and scanText additionally scans a SECOND view with inline HTML removed.
+// Two views, not one, because the two needs conflict: a trailer hidden INSIDE
+// `<!-- ... -->` must still be caught (a comment does not render, but it does
+// ship in the body text `gh pr create --body-file` submits), while a trailer
+// SPLIT BY a comment is only visible once the comment is gone. Keeping the
+// comment catches the first, removing it catches the second, the union catches
+// both.
+//
+// This is not a markdown renderer and does not try to be. It covers the
+// encodings that reconstruct a banned literal, and it errs toward catching.
+
+// The HTML named entities that could rebuild a banned literal. CommonMark accepts
+// the whole HTML5 name list; only names that decode to a character appearing in a
+// pattern (or that could glue one back together) are worth carrying.
+const NAMED_ENTITIES = {
+  amp: '&',
+  apos: "'",
+  ast: '*',
+  colon: ':',
+  comma: ',',
+  commat: '@',
+  dash: '-',
+  dollar: '$',
+  equals: '=',
+  excl: '!',
+  grave: '`',
+  gt: '>',
+  hyphen: '-',
+  lowbar: '_',
+  lpar: '(',
+  lsqb: '[',
+  lt: '<',
+  minus: '-',
+  nbsp: ' ',
+  num: '#',
+  period: '.',
+  plus: '+',
+  quest: '?',
+  quot: '"',
+  rpar: ')',
+  rsqb: ']',
+  semi: ';',
+  sol: '/',
+  sp: ' ',
+  Tab: '\t',
+  verbar: '|',
+};
+
+const ENTITY_RE = /&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});/g;
+
+function decodeEntities(text) {
+  return text.replace(ENTITY_RE, (m, body) => {
+    if (body[0] === '#') {
+      const hex = body[1] === 'x' || body[1] === 'X';
+      const code = Number.parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
+      if (!Number.isInteger(code) || code <= 0 || code > 0x10ffff) return m;
+      try {
+        return String.fromCodePoint(code);
+      } catch {
+        return m; // lone surrogate / invalid code point → leave the source text
+      }
+    }
+    const named = NAMED_ENTITIES[body];
+    return named === undefined ? m : named;
+  });
+}
+
+// Inline HTML: a comment, or a single tag. GFM renders NEITHER as text, so
+// `Co<!--x-->-Authored-By:` reads to a human as exactly the banned trailer.
+// REMOVED (not blanked) in the second scan view, so the neighbours join up.
+const INLINE_HTML_RE = /<!--[\s\S]*?-->|<\/?[a-zA-Z][^<>]*>/g;
+
+// Markdown backslash escapes: `\:` renders as `:`. Only ASCII punctuation is
+// escapable in CommonMark, so restricting the class to it leaves `\d` / `\b`
+// inside a regex literal (this repo's own sources are in scope for --all) alone.
+const MD_ESCAPE_RE = /\\([!"#$%&'()*+,\-./:;<=>?@[\]^_`{|}~\\])/g;
+
+// Normalize a copy of `line` for MATCHING ONLY: strip zero-width characters,
+// optionally remove inline HTML, decode HTML entities, drop markdown backslash
+// escapes, then NFKC-fold confusable/compatibility forms (e.g. the full-width
+// colon "：" U+FF1A folds to the ASCII ":" a pattern like `co-authored-by:`
+// requires). This is the scan's own internal copy — the caller's original
+// text is never touched, and `report()` output for a file/commit-msg gate
+// always names the FILE and the matched TOKEN, not this function's line
+// indexing, so a normalization-shifted column is a cosmetic, not a
+// correctness, concern (documented rather than chased further).
+//
+// A decoded `&#10;` would inject a newline into a line and desync every line
+// number below it, so any newline the decode produces collapses to a space:
+// normalization never adds or removes a LINE.
+function normalizeForScan(line, { stripHtml = false } = {}) {
+  let s = line.replace(ZERO_WIDTH_RE, '');
+  if (stripHtml) s = s.replace(INLINE_HTML_RE, '');
+  s = decodeEntities(s).replace(/[\r\n]/g, ' ');
+  s = s.replace(MD_ESCAPE_RE, '$1');
+  return s.normalize('NFKC');
+}
+
+// Every match of `patterns` in one ALREADY-normalized line. `lineNo` is 1-based.
+function scanLine(lineText, patterns, lineNo) {
+  const hits = [];
+  for (const { name, label, re } of patterns) {
+    re.lastIndex = 0; // reset shared /g regex between lines
+    let m;
+    while ((m = re.exec(lineText)) !== null) {
+      hits.push({ pattern: name, label, match: m[0], line: lineNo, col: m.index + 1, lineText });
+      if (m.index === re.lastIndex) re.lastIndex++; // never-zero-width guard
+    }
+  }
+  return hits;
+}
+
+// The hits from the second (HTML-removed) view that the first view did not
+// already find. Keyed by pattern + matched text and COUNTED, not set-deduped, so
+// a line carrying the same token twice keeps both hits while a token found in
+// both views is still reported once.
+function extraHits(primary, secondary) {
+  const key = (h) => `${h.pattern}|${h.match}`;
+  const budget = new Map();
+  for (const h of primary) budget.set(key(h), (budget.get(key(h)) || 0) + 1);
+  const out = [];
+  for (const h of secondary) {
+    const k = key(h);
+    const left = budget.get(k) || 0;
+    if (left > 0) budget.set(k, left - 1);
+    else out.push(h);
+  }
+  return out;
+}
+
 /**
  * Scan a blob of text against `patterns` (default BLOCKED_PATTERNS). Returns hits:
  *   { pattern, label, match, line, col, lineText }
  * `line`/`col` are 1-based. Empty array => clean. The CLI passes the broader
  * [...BLOCKED_PATTERNS, ...DECISION_PATTERNS] set for every in-scope file but the
  * CHANGELOG.
+ *
+ * Both the per-line scan and the line-wrap join below run over a NORMALIZED
+ * copy of the text (see `normalizeForScan`): zero-width characters removed,
+ * HTML entities decoded, markdown backslash escapes dropped, NFKC-folded. Every
+ * one of those hides `Co-Authored-By:` from a raw regex while still RENDERING as
+ * the banned trailer to a human on GitHub — the rendered string is what ships, so
+ * the rendered string is what is gated. Each line is scanned twice: once in that
+ * view, and once more with inline HTML removed (which reconstructs a token split
+ * by `Co<!--x-->-Authored-By:`); only the second view's EXTRA hits are kept, so a
+ * trailer hidden inside a comment is still caught and nothing is double-reported.
+ * `line` numbers stay accurate (normalization never adds or removes a line);
+ * `lineText` reflects the NORMALIZED line, which is intentional — reporting the
+ * obfuscated bytes back verbatim would be less legible, not more, to whoever
+ * reads the violation.
  *
  * Tracker tokens also line-wrap inside comments (`... continuing (ADR\n * 0045)`).
  * A pure per-line scan misses those, so each line is ALSO scanned joined to the
@@ -108,23 +323,19 @@ const COMMENT_CONT_RE = /^[ \t]*(?:\*|\/\/|#+)[ \t]?/;
 export function scanText(text, patterns = BLOCKED_PATTERNS) {
   if (typeof text !== 'string' || text.length === 0) return [];
   const hits = [];
-  const lines = text.split(/\r?\n/);
+  const rawLines = text.split(/\r?\n/);
+  const lines = rawLines.map((l) => normalizeForScan(l));
+  // Second view, inline HTML removed. Only its EXTRA hits are kept (extraHits),
+  // so a token the primary view already found is not double-reported, and a
+  // trailer hiding inside an HTML comment — which this view deletes — is still
+  // caught by the primary view, which keeps it.
+  const noHtml = rawLines.map((l) => normalizeForScan(l, { stripHtml: true }));
   for (let i = 0; i < lines.length; i++) {
     const lineText = lines[i];
-    for (const { name, label, re } of patterns) {
-      re.lastIndex = 0; // reset shared /g regex between lines
-      let m;
-      while ((m = re.exec(lineText)) !== null) {
-        hits.push({
-          pattern: name,
-          label,
-          match: m[0],
-          line: i + 1,
-          col: m.index + 1,
-          lineText,
-        });
-        if (m.index === re.lastIndex) re.lastIndex++; // never-zero-width guard
-      }
+    const lineHits = scanLine(lineText, patterns, i + 1);
+    hits.push(...lineHits);
+    if (noHtml[i] !== lineText) {
+      hits.push(...extraHits(lineHits, scanLine(noHtml[i], patterns, i + 1)));
     }
     // Wrapped-token guard: a token can line-wrap at two points — between its
     // prefix WORD and its number (`ADR\n0045`, where the break stands in for a

@@ -18,12 +18,42 @@
  *                          formatter's name-status/-z/diff-filter plumbing so
  *                          deletes, type-changes, symlinks and submodules are
  *                          skipped. Used by the pre-commit hook.
- *   --commit-msg <file>    Scan a commit message. Drops the --verbose scissors
- *                          diff, then strips comment lines ONLY when git added
- *                          its template (editor/strip mode); for `commit -m` /
- *                          whitespace / verbatim (no template) it scans comment
- *                          lines too, since git keeps them. Used by the
- *                          commit-msg hook.
+ *   --commit-msg <file>    Scan a commit message for tracker ids AND for tool-
+ *                          attribution trailers (ATTRIBUTION_PATTERNS: the
+ *                          harness system prompt instructs the agent to append a
+ *                          `Co-Authored-By:` / `Claude-Session:` trailer that
+ *                          this repo bans, and 8 of 47 post-ban commits carried
+ *                          one to main). Drops the --verbose scissors diff, then
+ *                          strips comment lines ONLY when git added its template
+ *                          (editor/strip mode); for `commit -m` / whitespace /
+ *                          verbatim (no template) it scans comment lines too,
+ *                          since git keeps them. Used by the commit-msg hook,
+ *                          which is FAST FEEDBACK, not a guarantee: the hook
+ *                          installer fails open at every guard (and --no-verify
+ *                          skips it outright), so CI is the real gate.
+ *   --commit-range <a..b>  CI backstop for the exact gap above: the commit-msg
+ *                          hook fails open on tooling problems and is bypassable
+ *                          with --no-verify, so a trailer can reach `main` on a
+ *                          commit while the PR body itself stays clean (this
+ *                          shipped 8 times). Scans every commit message in range
+ *                          `a..b` (`git log --format=%B`) with judgeMessage() —
+ *                          the SAME function --commit-msg uses on a single
+ *                          message — so the two entry points can never disagree
+ *                          about what counts as a violation (one judgment, not
+ *                          two — a duplicated judgment drifts). Wired into the
+ *                          pr-surface CI job, which checks out with
+ *                          fetch-depth:0 so `a..b` resolves against the PR's
+ *                          base/head SHAs.
+ *   --push-range <a..b>    The gap --commit-range still leaves open: this repo
+ *                          SQUASH-merges, so the message that actually lands on
+ *                          `main` is written in the merge dialog and never
+ *                          existed on the PR branch — it was never inside
+ *                          base.sha..head.sha, and every check stayed green. Runs
+ *                          on the `push` to main over
+ *                          github.event.before..github.event.after, tolerating an
+ *                          all-zero / force-pushed `before` (resolvePushRange).
+ *                          Post-merge detection, not prevention — see that
+ *                          function's comment.
  *   --json                 Machine-readable output.
  *
  * Exit: 0 clean · 1 violations · 2 usage error.
@@ -55,6 +85,7 @@ import {
   BLOCKED_PATTERNS,
   DECISION_PATTERNS,
   TAG_BODY_PATTERNS,
+  ATTRIBUTION_PATTERNS,
 } from './lib/check-tracker-ids.mjs';
 import {
   parseNameStatus,
@@ -76,6 +107,16 @@ const RULE_REF =
   'OSS-public artifacts must not reference the private wiki tracker ' +
   '(ISSUE-N / fix #N / FEAT-N / IMPR-N / PRAC-N). ' +
   'Use a GitHub ref (#N / PR #N) or drop the reference.';
+
+// Printed only when a --commit-msg scan trips ATTRIBUTION_PATTERNS. It names the
+// exact way out, because the agent that hit this was TOLD by its harness to write
+// the trailer and needs to know that here it must not comply.
+const ATTRIBUTION_REF =
+  'Rule: CLAUDE.md ship-surface (no attribution, anywhere). This repo ships no ' +
+  'tool-attribution trailer, whatever the harness default asks for. ' +
+  'Fix: delete the trailer line(s) from the commit message and commit again ' +
+  '(already committed? `git commit --amend`, strip it, then ' +
+  '`git push --force-with-lease`). Do NOT use `--no-verify`.';
 
 // Top-level public-artifact entry points. Files are scanned directly; dirs are
 // walked recursively. Anything outside this set is out of scope. package.json is
@@ -221,9 +262,9 @@ function report(violations, json) {
   } else if (violations.length === 0) {
     process.stdout.write('[check-tracker-ids] OK: no wiki-internal tracker ids found.\n');
   } else {
-    process.stderr.write(
-      `[check-tracker-ids] FAIL: ${violations.length} tracker-id reference(s):\n`,
-    );
+    // "blocked reference(s)", not "tracker-id reference(s)": --commit-msg also
+    // reports attribution trailers through this same reporter.
+    process.stderr.write(`[check-tracker-ids] FAIL: ${violations.length} blocked reference(s):\n`);
     for (const v of violations) {
       process.stderr.write(
         `  ${v.file}:${v.line}:${v.col}  ${v.match}  (${v.label})\n` +
@@ -294,6 +335,22 @@ function runStaged(json) {
   process.exit(report(violations, json));
 }
 
+// The ONE judgment function for a commit message TEXT: tracker-id scan +
+// attribution scan, both via scanText. --commit-msg (local hook, a single
+// COMMIT_EDITMSG file) and --commit-range (CI backstop, every already-recorded
+// message in a range) both call this and NOTHING ELSE decides the verdict —
+// this repo's rule against implementing the same judgment in two places (a
+// duplicated judgment drifts) applies here, and this is exactly the kind of
+// judgment that drifted before: a local-only check with no CI backstop let an
+// attribution trailer land on `main` on 8 separate commits while the PR body
+// itself stayed clean.
+function judgeMessage(text) {
+  return [
+    ...scanText(text).map((h) => ({ ...h })),
+    ...scanText(text, ATTRIBUTION_PATTERNS).map((h) => ({ ...h, attribution: true })),
+  ];
+}
+
 function runCommitMsg(file, json) {
   let raw;
   try {
@@ -323,7 +380,7 @@ function runCommitMsg(file, json) {
   // `#` lines, so a tracker id sitting in a comment line there is not caught.
   // This needs a non-default flag AND a `#`-prefixed id; the prose path (the real
   // risk) is always caught, and the file gate (--all/--staged/CI) is the hard
-  // guarantee. commit-msg is best-effort.
+  // guarantee. commit-msg is best-effort — --commit-range below is the real one.
   let text;
   if (messageHasGitTemplate(raw)) {
     const noScissors = stripScissors(raw);
@@ -332,8 +389,114 @@ function runCommitMsg(file, json) {
   } else {
     text = raw;
   }
-  const violations = scanText(text).map((h) => ({ file: relative(REPO_ROOT, file) || file, ...h }));
-  process.exit(report(violations, json));
+  const rel = relative(REPO_ROOT, file) || file;
+  // The commit message is where the harness/repo conflict actually bites: the
+  // system prompt tells the agent to append `Co-Authored-By:` / `Claude-Session:`
+  // on every commit, and 8 of the 47 commits that reached main after the ban did.
+  //
+  // Reminder on how much this is worth: install-git-hooks.mjs fails OPEN at every
+  // identity guard (CI, no .git, symlinked hook, missing script) and --no-verify
+  // skips it outright, so this hook is FAST LOCAL FEEDBACK, never the guarantee.
+  // The guarantee is CI — the tracker-id job for files, the pr-surface job for the
+  // PR title/body, and --commit-range below for the commit messages themselves.
+  const violations = judgeMessage(text).map((h) => ({ file: rel, ...h }));
+  const code = report(violations, json);
+  if (code !== 0 && !json && violations.some((v) => v.attribution)) {
+    process.stderr.write(`${ATTRIBUTION_REF}\n`);
+  }
+  process.exit(code);
+}
+
+// CI backstop for the gap above: --commit-msg only ever runs locally (fails
+// open on tooling problems, skippable with --no-verify), so a commit with an
+// attribution trailer can reach `main` while the PR body itself is clean — this
+// happened 8 times. Scans every commit message in `range` (`a..b`, resolved by
+// `git log`) with the SAME judgeMessage() --commit-msg uses.
+//
+// Commit messages read via `git log --format=%B` are already-recorded: git
+// itself stripped any editor template / --verbose scissors diff at commit time,
+// so unlike --commit-msg (which reads a live COMMIT_EDITMSG file) no
+// messageHasGitTemplate/stripScissors preprocessing applies or is needed here.
+function runCommitRange(range, json) {
+  const listRes = git(['log', '--format=%H', range, '--']);
+  if (listRes.status !== 0) {
+    process.stderr.write(
+      `[check-tracker-ids] --commit-range: git log failed for "${range}": ${(listRes.stderr || '').trim()}\n`,
+    );
+    process.exit(2);
+  }
+  const shas = (listRes.stdout || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const violations = [];
+  for (const sha of shas) {
+    const msgRes = git(['log', '-1', '--format=%B', sha]);
+    if (msgRes.status !== 0) continue; // sha came from the same git log call above
+    const short = sha.slice(0, 7);
+    violations.push(
+      ...judgeMessage(msgRes.stdout || '').map((h) => ({ file: `commit:${short}`, ...h })),
+    );
+  }
+  const code = report(violations, json);
+  if (code !== 0 && !json && violations.some((v) => v.attribution)) {
+    process.stderr.write(`${ATTRIBUTION_REF}\n`);
+  }
+  process.exit(code);
+}
+
+// The all-zero SHA GitHub sends as `github.event.before` for a branch's first push.
+const ZERO_SHA_RE = /^0{40}$/;
+
+/**
+ * Resolve the commit range a `push` event actually ADDED to the branch.
+ *
+ * Why a push scan exists at all: this repo merges with SQUASH. The message that
+ * lands on `main` is composed in the merge dialog, so it never existed on the PR
+ * branch and was never inside the pr-surface job's `base.sha..head.sha` range —
+ * every check could be green while the public commit on `main` carries an
+ * attribution trailer. That is not theoretical; it is the only path left open.
+ *
+ * KNOWN LIMITATION, stated plainly: this runs on `push`, i.e. AFTER the merge. It
+ * DETECTS, it cannot PREVENT. The commit is already on `main` when the job goes
+ * red — the remedy is `git commit --amend` + `git push --force-with-lease`, which
+ * is exactly what CLAUDE.md prescribes. A red build a minute after the merge beats
+ * a leak nobody ever looks for.
+ *
+ * `before` cannot be trusted blindly: it is all-zeros on a first push and points
+ * into discarded history after a force-push, so `before..after` would fail to
+ * resolve (exit 2, a red build for the wrong reason) or silently scan nothing.
+ *   before resolvable          → before..after  (exactly the commits this push added)
+ *   otherwise, after has a parent → after^1..after (the tip alone — less, never nothing)
+ *   after is a root commit     → after (that single commit)
+ */
+function resolvePushRange(before, after) {
+  const usable =
+    before &&
+    !ZERO_SHA_RE.test(before) &&
+    git(['cat-file', '-e', `${before}^{commit}`]).status === 0;
+  if (usable) return `${before}..${after}`;
+  if (git(['rev-parse', '-q', '--verify', `${after}^1`]).status === 0)
+    return `${after}^1..${after}`;
+  return after;
+}
+
+function runPushRange(spec, json) {
+  const idx = String(spec).indexOf('..');
+  if (idx < 0) {
+    process.stderr.write(
+      '[check-tracker-ids] --push-range requires a "<before>..<after>" argument\n',
+    );
+    usage(2);
+  }
+  const before = String(spec).slice(0, idx);
+  const after = String(spec).slice(idx + 2);
+  if (!after) {
+    process.stderr.write('[check-tracker-ids] --push-range: the <after> sha is required\n');
+    usage(2);
+  }
+  // Same judgment as every other entry point: runCommitRange → judgeMessage.
+  runCommitRange(resolvePushRange(before, after), json);
 }
 
 // Scan an annotated tag's body for ALL wiki tracker prefixes (TAG_BODY_PATTERNS:
@@ -390,6 +553,12 @@ function usage(code) {
       '  node scripts/check-tracker-ids.mjs [--all] [--json]\n' +
       '  node scripts/check-tracker-ids.mjs --staged [--json]\n' +
       '  node scripts/check-tracker-ids.mjs --commit-msg <file> [--json]\n' +
+      '  node scripts/check-tracker-ids.mjs --commit-range <base>..<head> [--json]\n' +
+      '      CI backstop: scan every commit message in the range for tracker ids\n' +
+      '      and attribution trailers (the local commit-msg hook is bypassable).\n' +
+      '  node scripts/check-tracker-ids.mjs --push-range <before>..<after> [--json]\n' +
+      '      Same scan for a `push` event, tolerating an all-zero / force-pushed\n' +
+      '      <before>. This is the ONLY thing that sees a squash-merge message.\n' +
       '  node scripts/check-tracker-ids.mjs --tag <ref|-> [--json]\n' +
       '      Scan an annotated tag body (or stdin via "-") for ALL tracker\n' +
       '      prefixes; the public release surface must be tracker-ID-0.\n',
@@ -409,6 +578,26 @@ if (argv.includes('--commit-msg')) {
     usage(2);
   }
   runCommitMsg(file, json);
+} else if (argv.includes('--commit-range')) {
+  const i = argv.indexOf('--commit-range');
+  const range = argv[i + 1];
+  if (!range || range.startsWith('--')) {
+    process.stderr.write(
+      '[check-tracker-ids] --commit-range requires a "<base>..<head>" argument\n',
+    );
+    usage(2);
+  }
+  runCommitRange(range, json);
+} else if (argv.includes('--push-range')) {
+  const i = argv.indexOf('--push-range');
+  const spec = argv[i + 1];
+  if (!spec || spec.startsWith('--')) {
+    process.stderr.write(
+      '[check-tracker-ids] --push-range requires a "<before>..<after>" argument\n',
+    );
+    usage(2);
+  }
+  runPushRange(spec, json);
 } else if (argv.includes('--tag')) {
   const i = argv.indexOf('--tag');
   const ref = argv[i + 1];

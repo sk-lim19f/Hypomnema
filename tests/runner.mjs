@@ -104,7 +104,9 @@ import {
   BLOCKED_PATTERNS,
   DECISION_PATTERNS,
   TAG_BODY_PATTERNS,
+  ATTRIBUTION_PATTERNS,
 } from '../scripts/lib/check-tracker-ids.mjs';
+import { checkPrSurface } from '../scripts/lib/check-pr-surface.mjs';
 import {
   collectPagesLint,
   collectPagesGraph,
@@ -17282,6 +17284,131 @@ test('feedback projection over cap → still blocks, never auto-writes (ADR 0045
   );
 });
 
+test('feedback gate: CLAUDE.md present but WITHOUT its container → BLOCKS (was a silent fail-open)', () => {
+  // The projection cannot be built, so NOT ONE L1 rule is loaded on this machine
+  // and every sync is a silent no-op. The buildError shape is dirty:false with no
+  // conflict flag, so the gate used to classify it as "nothing to do" and fail
+  // OPEN — structurally broken, and nothing anywhere said so. It must block.
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-nocontainer-'));
+      try {
+        mkdirSync(join(home, '.claude'), { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        // The file EXISTS (so this is NOT the benign first-run case) but the
+        // managed <learned_behaviors> container is gone.
+        writeFileSync(join(home, '.claude', 'CLAUDE.md'), '# Global\n\nNo container here.\n');
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const out = JSON.parse(r.stdout);
+        assert.equal(out.decision, 'block', `unbuildable projection must block: ${r.stdout}`);
+        assert.ok(
+          /cannot be built/.test(out.reason || ''),
+          `block reason must name the build failure: ${r.stdout}`,
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('feedback gate: CLAUDE.md exists but is UNREADABLE → BLOCKS, not fail-open (BLOCKER 5)', () => {
+  // BLOCKER 5: existsSync sees the file, readFileSync throws (mode 000), and an
+  // uncaught throw used to crash feedback-sync entirely — no JSON report at all.
+  // The PreCompact gate's "unparseable stdout" branch then read that as
+  // "nothing to project" and failed OPEN: an ordinary filesystem error
+  // reproduced the exact failure mode (rules not loaded, gate stays green) this
+  // whole system exists to prevent. It must block, the same as a missing
+  // container.
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-unreadable-'));
+      try {
+        mkdirSync(join(home, '.claude'), { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        const claudeMdPath = join(home, '.claude', 'CLAUDE.md');
+        writeFileSync(claudeMdPath, '# Global\n<learned_behaviors>\n</learned_behaviors>\n');
+        chmodSync(claudeMdPath, 0o000);
+        try {
+          const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+          const out = JSON.parse(r.stdout);
+          assert.equal(
+            out.decision,
+            'block',
+            `unreadable target must block, not fail-open: ${r.stdout}`,
+          );
+          assert.ok(
+            /cannot be built/.test(out.reason || ''),
+            `block reason must name the build failure: ${r.stdout}`,
+          );
+        } finally {
+          chmodSync(claudeMdPath, 0o644); // restore so cleanup (rmSync) can remove the tree
+        }
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('feedback gate: CLAUDE.md file absent entirely → still fail-open (first-run, not a break)', () => {
+  // Counterpart of the unreadable-target test above: a file that does not
+  // exist AT ALL is the ordinary first-run state, not a broken one, and must
+  // keep failing open — 'target-missing' stays distinct from 'build-failed'.
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-missing-'));
+      try {
+        mkdirSync(join(home, '.claude'), { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        // No CLAUDE.md at all.
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const out = JSON.parse(r.stdout);
+        assert.equal(
+          out.continue,
+          true,
+          `a missing (not unreadable) target must still fail-open: ${r.stdout}`,
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('feedback gate: no container AND no feedback pages → still fail-open (nothing to project)', () => {
+  // The other side of the promotion above: a user whose CLAUDE.md has no managed
+  // container and who has no feedback pages yet has NOTHING to project, so there
+  // is no build error and nothing to block on. A gate that blocked here would hit
+  // every user who keeps a plain global CLAUDE.md.
+  withWiki(null, (dir) => {
+    const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-nocontainer-empty-'));
+    try {
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+      writeFileSync(join(home, '.claude', 'CLAUDE.md'), '# Global\n\nNo container here.\n');
+      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.continue, true, `no candidates must not block: ${r.stdout}`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 test('feedback gate: memory clean + missing CLAUDE.md → fail-open (no false block)', () => {
   // Regression: the prior `every(buildError)` predicate blocked
   // when the memory target was clean but the claude target only had a buildError
@@ -18061,6 +18188,45 @@ test('feedback-sync-project-id-unknown-skips-memory: derived dir missing → no 
   });
 });
 
+test('feedback-sync --check --json: an UNREADABLE target file reports build-failed, no crash (BLOCKER 5)', () => {
+  // existsSync sees the file; readFileSync throws (mode 000). This used to be
+  // an UNCAUGHT exception: the process crashed before writing any JSON to
+  // stdout, so every downstream consumer (doctor, the PreCompact gate) saw "no
+  // report" and treated it as "nothing to project" — fail OPEN on an ordinary
+  // filesystem error. Caught now and reported like any other structural
+  // failure: valid JSON, buildErrorKind 'build-failed'.
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runFb }) => {
+    const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+    chmodSync(claudeMdPath, 0o000);
+    try {
+      const r = runFb(['--check', '--json']);
+      const rep = JSON.parse(r.stdout); // must not throw: a report must still come out
+      assert.equal(
+        rep.targets.claude.buildErrorKind,
+        'build-failed',
+        `an unreadable (not missing) target must be 'build-failed': ${r.stdout}`,
+      );
+      assert.match(rep.targets.claude.buildError, /cannot read target file/);
+      assert.notEqual(r.status, 0, 'an unreadable target must not exit clean');
+    } finally {
+      chmodSync(claudeMdPath, 0o644); // restore so withFeedbackEnv cleanup can remove it
+    }
+  });
+});
+
+test('feedback-sync --check --json: a target file that is simply MISSING stays target-missing', () => {
+  // The counterpart of the unreadable case above: no file at all is the
+  // ordinary first-run state and must keep its own distinct classification, not
+  // collapse into 'build-failed'.
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runFb }) => {
+    rmSync(join(claudeHome, 'CLAUDE.md'), { force: true });
+    const r = runFb(['--check', '--json']);
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.targets.claude.buildErrorKind, 'target-missing');
+  });
+});
+
 // ── feedback-sync hardening regressions ──────────────────────────────────────
 
 test('feedback-sync-crlf-block-idempotent: CRLF managed block is recognized, no duplicate region', () => {
@@ -18353,6 +18519,88 @@ test('tampered managed block (conflict) → fail Feedback projection integrity',
       `conflict must fail: ${JSON.stringify(fb)}`,
     );
     assert.equal(r.status, 1, 'doctor exits 1 when any check fails');
+  });
+});
+
+test('CLAUDE.md without its <learned_behaviors> container → FAIL, not warn (no rules load)', () => {
+  // Was a warn. A target that cannot be built loads ZERO L1 rules on that machine
+  // and every sync is a silent no-op — nothing else in the system reports it, and
+  // it went unnoticed on a real machine. doctor must fail, not murmur.
+  withDoctorFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runDoctor }) => {
+      const { r, fb } = runDoctor();
+      assert.ok(
+        fb.some((c) => c.status === 'fail' && /container not found/.test(c.detail)),
+        `unbuildable projection must fail: ${JSON.stringify(fb)}`,
+      );
+      assert.ok(
+        fb.some((c) => c.status === 'fail' && /feedback-sync --write/.test(c.detail)),
+        `the fail must name the way out: ${JSON.stringify(fb)}`,
+      );
+      assert.equal(r.status, 1, 'doctor exits 1 when any check fails');
+    },
+    { claudeMd: '# Global\n\nSomeone deleted the managed container.\n' },
+  );
+});
+
+test('a build-failed target is never masked by a target-missing one (fail wins over warn)', () => {
+  // doctor used to take the FIRST buildError of any kind. With more than one
+  // container target, a benign 'target-missing' earlier in iteration order would
+  // downgrade a structurally broken target to a warn — re-hiding exactly what this
+  // check exists to surface. Latent today (only `claude` has a container), so this
+  // pins the selection rule before a second container target makes it live.
+  withDoctorFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runDoctor }) => {
+      const { fb } = runDoctor();
+      assert.ok(
+        fb.some((c) => c.status === 'fail' && /container not found/.test(c.detail)),
+        `a build-failed target must fail even alongside other buildErrors: ${JSON.stringify(fb)}`,
+      );
+    },
+    { claudeMd: '# Global\n\nNo container.\n' },
+  );
+});
+
+test('CLAUDE.md file absent entirely → still a WARN (first-run state, not a break)', () => {
+  // The counterpart of the promotion above: no ~/.claude/CLAUDE.md yet is the
+  // ordinary first-run state. Failing here would fail every new user's doctor run,
+  // so buildErrorKind splits it from the structural 'build-failed' case.
+  withDoctorFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runDoctor }) => {
+    rmSync(join(claudeHome, 'CLAUDE.md'), { force: true });
+    const { fb } = runDoctor();
+    assert.ok(
+      fb.every((c) => c.status !== 'fail'),
+      `a missing target file must not fail doctor: ${JSON.stringify(fb)}`,
+    );
+    assert.ok(
+      fb.some((c) => c.status === 'warn' && /target file missing/.test(c.detail)),
+      `expected a target-missing warn: ${JSON.stringify(fb)}`,
+    );
+  });
+});
+
+test('CLAUDE.md exists but is UNREADABLE (mode 000) → doctor FAILS as build-failed (BLOCKER 5)', () => {
+  // existsSync sees the file; readFileSync throws. That used to be an uncaught
+  // exception inside feedback-sync.mjs, so `--check --json` produced NO stdout
+  // at all — doctor's "feedback-sync produced no JSON report" branch then only
+  // warned. An unreadable target must be treated exactly like a missing
+  // container: a hard doctor failure, not a shrug.
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withDoctorFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runDoctor }) => {
+    const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+    chmodSync(claudeMdPath, 0o000);
+    try {
+      const { r, fb } = runDoctor();
+      assert.ok(
+        fb.some((c) => c.status === 'fail' && /cannot read target file/.test(c.detail)),
+        `unreadable target must fail as build-failed: ${JSON.stringify(fb)}`,
+      );
+      assert.equal(r.status, 1, 'doctor exits 1 when any check fails');
+    } finally {
+      chmodSync(claudeMdPath, 0o644); // restore so withDoctorFeedbackEnv cleanup can remove it
+    }
   });
 });
 
@@ -18984,6 +19232,578 @@ imported_from: claude
 
 - [2026-05-20] HAND EDITED — 근거: [[rule-a]]
 `;
+
+// ── CONCERN 6: --ensure-container — the provisioning path a blocker can
+// actually name. A gate that detects a missing container but names no way to
+// create one gets bypassed, not obeyed; --ensure-container is that way.
+suite('feedback-sync.mjs — --ensure-container (CONCERN 6 provisioning path)');
+
+test('--ensure-container: file exists WITHOUT a container → appends an empty pair, preserves content', () => {
+  withFeedbackEnv(
+    {},
+    ({ claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      const before = '# Global\n\nSome hand-written prose the user cares about.\n';
+      writeFileSync(claudeMdPath, before);
+      const r = runFb(['--ensure-container', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      const rep = JSON.parse(r.stdout);
+      assert.equal(rep.action, 'created');
+      const after = readFileSync(claudeMdPath, 'utf-8');
+      assert.ok(after.startsWith(before), 'existing content must be preserved verbatim, untouched');
+      assert.ok(after.includes('<learned_behaviors>'));
+      assert.ok(after.includes('</learned_behaviors>'));
+      assert.ok(
+        after.indexOf('<learned_behaviors>') < after.indexOf('</learned_behaviors>'),
+        'open tag must precede close tag',
+      );
+    },
+    { claudeMd: '# placeholder' }, // overwritten before --ensure-container runs
+  );
+});
+
+test('--ensure-container: a container the file ALREADY has → no-op (idempotent, byte-identical)', () => {
+  withFeedbackEnv({}, ({ claudeHome, runFb }) => {
+    const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+    const before = readFileSync(claudeMdPath, 'utf-8'); // withFeedbackEnv default already has a container
+    const r = runFb(['--ensure-container', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.action, 'noop-already-present');
+    assert.equal(readFileSync(claudeMdPath, 'utf-8'), before, 'no bytes must change');
+  });
+});
+
+test('--ensure-container: file does not exist at all → no-op, no file created (first-run stays first-run)', () => {
+  withFeedbackEnv({}, ({ claudeHome, runFb }) => {
+    const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+    rmSync(claudeMdPath, { force: true });
+    const r = runFb(['--ensure-container', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.action, 'target-missing');
+    assert.ok(
+      !existsSync(claudeMdPath),
+      '--ensure-container must not create the file from nothing',
+    );
+  });
+});
+
+test('--ensure-container is idempotent across TWO real runs (created, then no-op, same bytes)', () => {
+  withFeedbackEnv(
+    {},
+    ({ claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      writeFileSync(claudeMdPath, '# Global\n\nprose\n');
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      const afterFirst = readFileSync(claudeMdPath, 'utf-8');
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      assert.equal(
+        readFileSync(claudeMdPath, 'utf-8'),
+        afterFirst,
+        'a second run must change nothing',
+      );
+    },
+    { claudeMd: '# placeholder' },
+  );
+});
+
+test('--ensure-container then --write succeeds (the container it created is a valid placement target)', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      writeFileSync(claudeMdPath, '# Global\n\nprose\n');
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      assert.equal(
+        runFb(['--write']).status,
+        0,
+        'write must succeed into the just-created container',
+      );
+      const content = readFileSync(claudeMdPath, 'utf-8');
+      assert.ok(content.includes('HYPO:FEEDBACK-SYNC:START'));
+      assert.ok(
+        content.includes('prose'),
+        'original content must survive the whole ensure+write flow',
+      );
+    },
+    { claudeMd: '# placeholder' },
+  );
+});
+
+test('the hook blocker for a build-failed target names --ensure-container and the exact path/tag', () => {
+  // CONCERN 6: "restore the managed container in the target file" alone names
+  // neither WHICH file nor WHAT tag — this pins that the reason string a real
+  // session sees carries both, plus the executable remedy command.
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-ensure-msg-'));
+      try {
+        mkdirSync(join(home, '.claude'), { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        const claudeMdPath = join(home, '.claude', 'CLAUDE.md');
+        writeFileSync(claudeMdPath, '# Global\n\nNo container here.\n');
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const out = JSON.parse(r.stdout);
+        assert.equal(out.decision, 'block');
+        assert.ok(
+          out.reason.includes(claudeMdPath),
+          `blocker reason must name the exact target path: ${out.reason}`,
+        );
+        assert.ok(
+          out.reason.includes('<learned_behaviors></learned_behaviors>'),
+          `blocker reason must name the literal container tag pair: ${out.reason}`,
+        );
+        assert.match(
+          out.reason,
+          /--ensure-container/,
+          'blocker reason must name the remedy command',
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('doctor names --ensure-container and the exact path for a build-failed target', () => {
+  withDoctorFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runDoctor }) => {
+      const { fb } = runDoctor();
+      const hit = fb.find((c) => c.status === 'fail' && /container not found/.test(c.detail));
+      assert.ok(hit, `expected a build-failed fail entry: ${JSON.stringify(fb)}`);
+      assert.ok(
+        hit.detail.includes(join(claudeHome, 'CLAUDE.md')),
+        `doctor detail must name the exact target path: ${hit.detail}`,
+      );
+      assert.match(hit.detail, /--ensure-container/, 'doctor remedy must name the command');
+    },
+    { claudeMd: '# Global\n\nNo container.\n' },
+  );
+});
+
+// ── BLOCKER 1: --ensure-container overwrote the user's global config with a
+// truncating writeFileSync. The ONE command that promises "existing content is
+// never touched" was the one that could shred it: a crash / a full disk between
+// the truncate and the write leaves ~/.claude/CLAUDE.md cut in half. Every write
+// goes through tmp+rename now.
+suite('feedback-sync.mjs — atomic writes + symlink safety (BLOCKER 1)');
+
+test('--ensure-container writes via tmp+rename (the target inode CHANGES, no tmp left behind)', () => {
+  // The direct, unfakeable signature of tmp+rename: rename(2) swaps a NEW inode
+  // into the path. An in-place writeFileSync keeps the old inode. Turn atomicWrite
+  // back into writeFileSync and this assertion goes red immediately.
+  if (process.platform === 'win32') return;
+  withFeedbackEnv(
+    {},
+    ({ claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      const before = '# Global\n\nProse the user cares about.\n';
+      writeFileSync(claudeMdPath, before);
+      const inoBefore = statSync(claudeMdPath).ino;
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      const after = readFileSync(claudeMdPath, 'utf-8');
+      assert.ok(after.startsWith(before), 'every existing byte must survive verbatim');
+      assert.notEqual(
+        statSync(claudeMdPath).ino,
+        inoBefore,
+        'a tmp+rename write replaces the inode; an in-place overwrite would keep it',
+      );
+      assert.deepEqual(
+        readdirSync(claudeHome).filter((f) => f.endsWith('.tmp')),
+        [],
+        'no tmp file may be left behind',
+      );
+    },
+    { claudeMd: '# placeholder' },
+  );
+});
+
+test('--write writes the projection via tmp+rename too (inode changes, content correct)', () => {
+  if (process.platform === 'win32') return;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, memDir, runFb }) => {
+    const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+    const inoBefore = statSync(claudeMdPath).ino;
+    assert.equal(runFb(['--write']).status, 0);
+    assert.notEqual(statSync(claudeMdPath).ino, inoBefore, 'projection write must be atomic too');
+    assert.ok(readFileSync(claudeMdPath, 'utf-8').includes('HYPO:FEEDBACK-SYNC:START'));
+    assert.deepEqual(
+      readdirSync(claudeHome).filter((f) => f.endsWith('.tmp')),
+      [],
+      'no tmp file left in the claude home',
+    );
+    assert.deepEqual(
+      readdirSync(memDir).filter((f) => f.endsWith('.tmp')),
+      [],
+      'no tmp file left in the memory dir',
+    );
+  });
+});
+
+test('--ensure-container: a FAILED write leaves the original file byte-identical', () => {
+  // The whole point of tmp+rename. The tmp write fails (read-only directory), so
+  // the rename never runs and the target keeps every byte it had. The old
+  // writeFileSync path would have opened the EXISTING file for writing (the
+  // directory mode does not gate that), truncated it, and written the new content.
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv(
+    {},
+    ({ claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      const before = '# Global\n\nIrreplaceable hand-written prose.\n';
+      writeFileSync(claudeMdPath, before);
+      chmodSync(claudeHome, 0o500); // dir not writable → the tmp file cannot be created
+      try {
+        const r = runFb(['--ensure-container']);
+        assert.notEqual(r.status, 0, 'a write that cannot complete must fail loudly');
+        assert.equal(
+          readFileSync(claudeMdPath, 'utf-8'),
+          before,
+          'a failed atomic write must not have touched the original file',
+        );
+      } finally {
+        chmodSync(claudeHome, 0o700);
+      }
+    },
+    { claudeMd: '# placeholder' },
+  );
+});
+
+test('--ensure-container follows a SYMLINKED CLAUDE.md and writes the real file (link survives)', () => {
+  // A dotfile repo linking ~/.claude/CLAUDE.md into a git checkout is a common
+  // setup. The tmp must land beside the REAL file (same filesystem → the rename is
+  // atomic) and must replace the real file, not clobber the link with a regular one.
+  if (process.platform === 'win32') return;
+  withFeedbackEnv(
+    {},
+    ({ base, claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      const realPath = join(base, 'dotfiles-CLAUDE.md');
+      const before = '# Global (kept in a dotfile repo)\n';
+      writeFileSync(realPath, before);
+      rmSync(claudeMdPath, { force: true });
+      symlinkSync(realPath, claudeMdPath);
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      assert.ok(lstatSync(claudeMdPath).isSymbolicLink(), 'the symlink must still be a symlink');
+      const real = readFileSync(realPath, 'utf-8');
+      assert.ok(real.startsWith(before), 'the real file keeps its content');
+      assert.ok(real.includes('<learned_behaviors>'), 'the container lands in the REAL file');
+    },
+    { claudeMd: '# placeholder' },
+  );
+});
+
+test('a DANGLING symlink target is build-failed, not target-missing (existsSync lies about it)', () => {
+  // existsSync FOLLOWS the link and finds nothing, so a broken link read as the
+  // benign first-run state: the gate stayed green with zero rules loaded, and a
+  // --write would have replaced the link with a regular file.
+  if (process.platform === 'win32') return;
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ base, claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      rmSync(claudeMdPath, { force: true });
+      symlinkSync(join(base, 'no-such-file.md'), claudeMdPath);
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.equal(
+        rep.targets.claude.buildErrorKind,
+        'build-failed',
+        `a dangling symlink must not pass as the benign first-run state: ${JSON.stringify(rep.targets.claude)}`,
+      );
+      assert.match(rep.targets.claude.buildError, /dangling symlink/);
+      // and --ensure-container must not silently no-op on it either
+      const ens = runFb(['--ensure-container']);
+      assert.notEqual(ens.status, 0, '--ensure-container must fail on a dangling symlink');
+      assert.match(ens.stderr, /dangling symlink/);
+      assert.ok(
+        !existsSync(join(base, 'no-such-file.md')),
+        '--ensure-container must not materialize the missing link target',
+      );
+    },
+    { claudeMd: '# placeholder' },
+  );
+});
+
+// ── BLOCKER 2: the container predicate was a first-occurrence substring search.
+// Inverted tags made it read false FOREVER (so --ensure-container appended pair
+// after pair and --write never succeeded — a state the tool created and could not
+// leave), and a pair inside a comment or a fence made it read true (so the region
+// was written into inert text).
+suite('feedback-sync.mjs — container classification (BLOCKER 2)');
+
+const LB_PAIR = '<learned_behaviors>\n</learned_behaviors>';
+
+test('INVERTED tags (close before open) are build-failed, and --ensure-container REFUSES to append', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      const before = readFileSync(claudeMdPath, 'utf-8');
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.equal(
+        rep.targets.claude.buildErrorKind,
+        'build-failed',
+        `inverted tags are corruption, not "no container": ${JSON.stringify(rep.targets.claude)}`,
+      );
+      assert.match(rep.targets.claude.buildError, /corrupt/i);
+      const ens = runFb(['--ensure-container']);
+      assert.notEqual(ens.status, 0, '--ensure-container must FAIL rather than append');
+      assert.match(ens.stderr, /refusing to append/i);
+      assert.match(ens.stderr, /BY HAND/);
+      assert.equal(
+        readFileSync(claudeMdPath, 'utf-8'),
+        before,
+        'a refusing --ensure-container must not add a single byte (a blind append is unfixable)',
+      );
+    },
+    { claudeMd: '# Global\n</learned_behaviors>\n<learned_behaviors>\n' },
+  );
+});
+
+test('the corrupt-container remedy is a HAND repair, never `--ensure-container` (it refuses)', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runFb }) => {
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      const remedy = rep.targets.claude.buildErrorRemedy || '';
+      assert.match(remedy, /BY HAND/, `remedy must send the human to a hand repair: ${remedy}`);
+      assert.ok(
+        !/Run `hypomnema feedback-sync --ensure-container`/.test(remedy),
+        `remedy must not name a command that refuses this exact case: ${remedy}`,
+      );
+    },
+    { claudeMd: '# Global\n</learned_behaviors>\n<learned_behaviors>\n' },
+  );
+});
+
+test('DUPLICATE container pairs are build-failed (which pair owns the region is unanswerable)', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runFb }) => {
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.equal(rep.targets.claude.buildErrorKind, 'build-failed');
+      assert.match(rep.targets.claude.buildError, /2 opening and 2 closing/);
+    },
+    { claudeMd: `# Global\n${LB_PAIR}\n\n## Later\n${LB_PAIR}\n` },
+  );
+});
+
+test('an UNPAIRED open tag is build-failed (a CLAUDE.md that merely quotes the tag in prose)', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runFb }) => {
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.equal(rep.targets.claude.buildErrorKind, 'build-failed');
+      assert.match(rep.targets.claude.buildError, /no closing/);
+    },
+    { claudeMd: '# Global\n<learned_behaviors>\n- a rule with no closing tag\n' },
+  );
+});
+
+test('a container inside an HTML COMMENT does not count as present (scenario B)', () => {
+  // --ensure-container used to no-op ("already there") and placement wrote the
+  // managed region INSIDE the comment, where nothing reads it — and the hook then
+  // saw that as ordinary drift and kept rewriting it, forever.
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runFb }) => {
+      const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.equal(
+        rep.targets.claude.buildErrorKind,
+        'build-failed',
+        'a commented-out pair is not a container',
+      );
+      assert.match(rep.targets.claude.buildError, /container not found/);
+      // ensure-container must PROVISION a real one, not no-op
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      const after = readFileSync(claudeMdPath, 'utf-8');
+      assert.equal(runFb(['--write']).status, 0, 'the provisioned container must be writable');
+      const written = readFileSync(claudeMdPath, 'utf-8');
+      const block = written.indexOf('HYPO:FEEDBACK-SYNC:START');
+      const commentEnd = written.indexOf('-->');
+      assert.ok(block > commentEnd, 'the managed region must land OUTSIDE the HTML comment');
+      assert.ok(after.includes('<!-- example:'), 'the example comment itself is left alone');
+    },
+    {
+      claudeMd:
+        '# Global\n<!-- example: <learned_behaviors></learned_behaviors> goes here -->\n\nprose\n',
+    },
+  );
+});
+
+test('a container inside a CODE FENCE does not count as present', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runFb }) => {
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.equal(rep.targets.claude.buildErrorKind, 'build-failed');
+      assert.match(rep.targets.claude.buildError, /container not found/);
+    },
+    { claudeMd: `# Global\n\n\`\`\`md\n${LB_PAIR}\n\`\`\`\n` },
+  );
+});
+
+test('a container quoted in INLINE CODE does not make a real container look duplicated', () => {
+  // A CLAUDE.md that mentions the tag in prose (`<learned_behaviors>`) alongside
+  // the real container must still be PRESENT, not corrupt — otherwise documenting
+  // the mechanism breaks it.
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0, 'a prose mention must not break the container');
+      const c = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      const open = c.indexOf('\n<learned_behaviors>');
+      const block = c.indexOf('HYPO:FEEDBACK-SYNC:START');
+      assert.ok(
+        block > open,
+        'the region lands inside the REAL container, not at the prose mention',
+      );
+    },
+    {
+      claudeMd:
+        '# Global\n\nNever hand-edit `<learned_behaviors>` or `</learned_behaviors>` — it is a projection.\n\n<learned_behaviors>\n</learned_behaviors>\n',
+    },
+  );
+});
+
+// ── CONCERN 7: a side-file I/O error hard-blocked /compact and the blocker named
+// `--ensure-container`, a command that only ever touches CLAUDE.md and could not
+// fix a permission bit if it tried. A gate whose own named remedy cannot open it.
+suite('feedback-sync.mjs — side-file I/O is a warning, not a blocker (CONCERN 7)');
+
+test('an unreadable side file is a sideWarning, NOT build-failed', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const side = join(memDir, 'feedback_rule-a.md');
+    chmodSync(side, 0o000);
+    try {
+      const r = runFb(['--check', '--json']);
+      const rep = JSON.parse(r.stdout);
+      assert.equal(
+        rep.targets.memory.buildError,
+        undefined,
+        `a side-file permission error must not be a build failure: ${r.stdout}`,
+      );
+      assert.ok(
+        (rep.targets.memory.sideWarnings || []).some((w) => /cannot read side file/.test(w)),
+        `it must still be REPORTED, never swallowed: ${r.stdout}`,
+      );
+      assert.match(
+        rep.targets.memory.sideWarnings.join(' '),
+        /feedback_rule-a\.md/,
+        'the warning must name the exact path whose permissions need fixing',
+      );
+    } finally {
+      chmodSync(side, 0o644);
+    }
+  });
+});
+
+test('an unreadable side file does NOT block /compact (the hook reports a notice)', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-sidefile-'));
+      const projectId = process.cwd().replace(/[/.]/g, '-');
+      const memDir = join(home, '.claude', 'projects', projectId, 'memory');
+      try {
+        mkdirSync(memDir, { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        writeFileSync(
+          join(home, '.claude', 'CLAUDE.md'),
+          '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+        );
+        writeFileSync(join(memDir, 'MEMORY.md'), '# Memory Index\n');
+        // a sync-owned side file the process cannot read
+        const side = join(memDir, 'feedback_rule-a.md');
+        writeFileSync(side, '<!-- HYPO:FEEDBACK-SYNC source=rule-a -->\nstale\n');
+        chmodSync(side, 0o000);
+        try {
+          const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+          const out = JSON.parse(r.stdout);
+          assert.notEqual(
+            out.decision,
+            'block',
+            `a side-file permission error must not block /compact: ${r.stdout}`,
+          );
+          // Non-vacuity: prove the MEMORY target really was evaluated here (a
+          // skipped target would make the assertion above pass for free). The
+          // unreadable side file reads as drift, so the gate's self-heal --write
+          // rewrites it — atomically, over a file it could not even read.
+          chmodSync(side, 0o644);
+          assert.match(
+            readFileSync(side, 'utf-8'),
+            /HYPO:FEEDBACK-SYNC source=rule-a/,
+            'the memory target must actually have been evaluated and re-synced',
+          );
+        } finally {
+          chmodSync(side, 0o644);
+        }
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('a PRIMARY target I/O error still BLOCKS, and its remedy is the permission fix (not --ensure-container)', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runFb }) => {
+    const claudeMdPath = join(claudeHome, 'CLAUDE.md');
+    chmodSync(claudeMdPath, 0o000);
+    try {
+      const rep = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.equal(
+        rep.targets.claude.buildErrorKind,
+        'build-failed',
+        'the primary target still hard-fails',
+      );
+      const remedy = rep.targets.claude.buildErrorRemedy || '';
+      assert.match(remedy, /permissions/i, `remedy must be the permission fix: ${remedy}`);
+      assert.match(remedy, /chmod/, 'remedy must name the concrete command');
+      assert.ok(
+        !/Run `hypomnema feedback-sync --ensure-container`/.test(remedy),
+        `remedy must not prescribe a command that cannot fix a permission bit: ${remedy}`,
+      );
+    } finally {
+      chmodSync(claudeMdPath, 0o644);
+    }
+  });
+});
+
+test('doctor WARNS (never fails) on a side-file permission error and names the path', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withDoctorFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ memDir, runFb, runDoctor }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const side = join(memDir, 'feedback_rule-a.md');
+    chmodSync(side, 0o000);
+    try {
+      const { fb } = runDoctor();
+      const hit = fb.find((c) => /side file/i.test(c.label));
+      assert.ok(hit, `expected a side-file entry: ${JSON.stringify(fb)}`);
+      assert.equal(hit.status, 'warn', 'a side-file I/O error must warn, not fail');
+      assert.match(hit.detail, /feedback_rule-a\.md/, 'the exact path must be named');
+      assert.match(hit.detail, /permissions/i, 'the permission fix must be named');
+      assert.ok(
+        !fb.some((c) => c.status === 'fail'),
+        `a side-file error must not produce a doctor FAIL: ${JSON.stringify(fb)}`,
+      );
+    } finally {
+      chmodSync(side, 0o644);
+    }
+  });
+});
 
 suite('feedback-sync.mjs — Track B source-loader golden (byte-identical)');
 
@@ -23305,6 +24125,187 @@ test('stripScissors drops the --verbose diff from the >8 line onward', () => {
   assert.ok(out.includes('body clean'));
   assert.ok(!out.includes('fix #9'));
   assert.equal(stripScissors('plain\nmessage'), 'plain\nmessage'); // no scissors → unchanged
+});
+
+// ── CONCERN 4: unicode bypass tricks (zero-width chars, full-width confusables)
+// must not slip an attribution trailer past the regex. Every fixture below is
+// built from explicit \u escapes, never typed as a literal invisible/confusable
+// byte in this source file — a copy-pasted zero-width character in a test
+// fixture is invisible in a diff review, which is exactly the property this
+// regression exists to catch, so the test itself must not rely on it either.
+suite('scanText — unicode-bypass normalization (CONCERN 4)');
+
+test('a zero-width character wedged inside "Co-Authored-By:" is still caught', () => {
+  const withZWJ = 'Co\u200D-Authored-By: Claude <noreply@anthropic.com>';
+  const hits = scanText(withZWJ, ATTRIBUTION_PATTERNS);
+  assert.ok(
+    hits.some((h) => h.pattern === 'Co-Authored-By:'),
+    `zero-width-joiner bypass must still be caught: ${JSON.stringify(hits)}`,
+  );
+});
+
+test('every zero-width character in the stripped set is defeated (U+200B/U+200C/U+200D/U+FEFF)', () => {
+  for (const zw of ['\u200B', '\u200C', '\u200D', '\uFEFF']) {
+    const trailer = `Co-${zw}Authored-By: Claude`;
+    const hits = scanText(trailer, ATTRIBUTION_PATTERNS);
+    assert.ok(
+      hits.some((h) => h.pattern === 'Co-Authored-By:'),
+      `U+${zw.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')} must not defeat the scan`,
+    );
+  }
+});
+
+test('a full-width colon confusable ("Co-Authored-By\uFF1A") is still caught (NFKC fold)', () => {
+  const fullwidth = 'Co-Authored-By\uFF1A Claude <noreply@anthropic.com>';
+  const hits = scanText(fullwidth, ATTRIBUTION_PATTERNS);
+  assert.ok(
+    hits.some((h) => h.pattern === 'Co-Authored-By:'),
+    `full-width colon confusable must NFKC-fold and still be caught: ${JSON.stringify(hits)}`,
+  );
+});
+
+test('normalization adds no false positive on ordinary ASCII prose', () => {
+  assert.equal(scanText('normal prose about co-authoring a book', ATTRIBUTION_PATTERNS).length, 0);
+  assert.equal(scanText('see PR #50 and ADR 0040', BLOCKED_PATTERNS).length, 0);
+});
+
+test('a zero-width character inside a tracker id (ISSUE-N) is still caught', () => {
+  // The bypass is not attribution-specific: scanText normalizes for every
+  // caller, tracker-ids included, since both share the same function.
+  const hits = scanText('see ISSUE\u200B-49 in the wiki');
+  assert.ok(
+    hits.some((h) => h.pattern === 'ISSUE-N'),
+    `zero-width bypass inside a tracker id must still be caught: ${JSON.stringify(hits)}`,
+  );
+});
+
+test('CLI --commit-msg: a zero-width-obfuscated attribution trailer is still rejected', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    writeFileSync(
+      f,
+      Buffer.from(
+        `feat(gate): thing\n\nCo\u200D-Authored-By: Claude <noreply@anthropic.com>\n`,
+        'utf-8',
+      ),
+    );
+    const r = runChecker(['--commit-msg', f]);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /Co-Authored-By:/i);
+  });
+});
+
+// ── BLOCKER: markdown-ENCODING bypasses. Every surface this gate reads is
+// rendered as GFM before a human sees it, so the test is "does it RENDER as the
+// banned string", not "do the bytes match". All five encodings below rendered as
+// a live trailer / tracker id and walked straight through the raw regex.
+suite('scanText — markdown-encoding bypasses (entities, escapes, inline HTML)');
+
+test('a NUMERIC HTML entity cannot hide the trailing colon (Co-Authored-By&#58;)', () => {
+  const hits = scanText('Co-Authored-By&#58; Claude <noreply@anthropic.com>', ATTRIBUTION_PATTERNS);
+  assert.ok(
+    hits.some((h) => h.pattern === 'Co-Authored-By:'),
+    `&#58; renders as ":" — the trailer ships: ${JSON.stringify(hits)}`,
+  );
+});
+
+test('a HEX entity cannot hide the robot-emoji footer marker (&#x1F916;)', () => {
+  const hits = scanText('&#x1F916; Generated with [Claude Code]', ATTRIBUTION_PATTERNS);
+  assert.ok(
+    hits.some((h) => h.pattern === 'robot-emoji footer'),
+    `&#x1F916; renders as the robot emoji: ${JSON.stringify(hits)}`,
+  );
+});
+
+test('a NAMED HTML entity cannot hide a colon or a hash (&colon; / &num;)', () => {
+  assert.ok(
+    scanText('Co-Authored-By&colon; Claude', ATTRIBUTION_PATTERNS).length > 0,
+    '&colon; must decode',
+  );
+  assert.ok(scanText('closes fix &num;37 now').length > 0, '&num; must decode to #');
+});
+
+test('an entity cannot hide a tracker id separator (ISSUE&#45;49)', () => {
+  const hits = scanText('closes ISSUE&#45;49 in the wiki');
+  assert.ok(
+    hits.some((h) => h.pattern === 'ISSUE-N'),
+    `&#45; renders as "-": ${JSON.stringify(hits)}`,
+  );
+});
+
+test('an entity cannot hide a word gap (Generated&#32;with)', () => {
+  assert.ok(
+    scanText('Generated&#32;with [Claude Code]', ATTRIBUTION_PATTERNS).some(
+      (h) => h.pattern === 'Generated with',
+    ),
+    '&#32; renders as a space',
+  );
+});
+
+test('a markdown BACKSLASH escape cannot hide the colon (Co-Authored-By\\:)', () => {
+  const hits = scanText('Co-Authored-By\\: Claude <noreply@anthropic.com>', ATTRIBUTION_PATTERNS);
+  assert.ok(
+    hits.some((h) => h.pattern === 'Co-Authored-By:'),
+    `\\: renders as ":" in GFM: ${JSON.stringify(hits)}`,
+  );
+});
+
+test('an inline HTML comment cannot SPLIT a trailer (Co<!--x-->-Authored-By:)', () => {
+  const hits = scanText('Co<!--x-->-Authored-By: Claude', ATTRIBUTION_PATTERNS);
+  assert.ok(
+    hits.some((h) => h.pattern === 'Co-Authored-By:'),
+    `a comment renders as nothing, so the trailer is contiguous to a reader: ${JSON.stringify(hits)}`,
+  );
+});
+
+test('an inline HTML TAG cannot split a trailer or a tracker id (<span>, <b>)', () => {
+  assert.ok(
+    scanText('Co<span></span>-Authored-By: Claude', ATTRIBUTION_PATTERNS).length > 0,
+    'a tag renders as nothing between the two halves',
+  );
+  assert.ok(scanText('closes ISSUE-<b></b>49 here').length > 0, 'same for a tracker id');
+});
+
+test('a trailer hidden INSIDE an HTML comment is STILL caught (the two views do not cancel)', () => {
+  // The HTML-removed view deletes the comment — but the primary view keeps it, and
+  // the union is what is reported. Deleting comments outright (a one-view fix)
+  // would have re-opened the exact hole the PR-surface gate closed earlier.
+  const hits = scanText(
+    '<!-- Co-Authored-By: Claude <noreply@anthropic.com> -->',
+    ATTRIBUTION_PATTERNS,
+  );
+  assert.ok(
+    hits.some((h) => h.pattern === 'Co-Authored-By:'),
+    `a comment does not render, but it still ships: ${JSON.stringify(hits)}`,
+  );
+});
+
+test('the two views never double-report the same hit', () => {
+  // `Co<!--x-->-Authored-By:` is found once (in the HTML-removed view); a plain
+  // trailer is found once (in the primary view). Neither is counted twice.
+  assert.equal(scanText('Co<!--x-->-Authored-By: Claude', ATTRIBUTION_PATTERNS).length, 1);
+  assert.equal(scanText('Co-Authored-By: Claude', ATTRIBUTION_PATTERNS).length, 1);
+  // two genuine hits on one line stay two
+  assert.equal(scanText('ISSUE-1 and ISSUE-2 here').length, 2);
+  assert.equal(scanText('ISSUE-1 and ISSUE-1 twice').length, 2);
+});
+
+test('the new normalization adds no false positive on ordinary prose or code', () => {
+  assert.equal(scanText('A&B, 100% &amp; more — see PR #50 and (#9)').length, 0);
+  assert.equal(scanText('const re = /\\bISSUE-\\d+\\b/gi; // matcher, no literal id').length, 0);
+  assert.equal(scanText('<https://example.com/issues> and <br/> line break').length, 0);
+  assert.equal(scanText('an unknown &entity; stays put').length, 0);
+  assert.equal(scanText('prose about co-authoring a book', ATTRIBUTION_PATTERNS).length, 0);
+});
+
+test('CLI --commit-msg: an entity-encoded attribution trailer is rejected', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    writeFileSync(f, 'feat(gate): thing\n\nCo-Authored-By&#58; Claude <noreply@anthropic.com>\n');
+    const r = runChecker(['--commit-msg', f]);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /Co-Authored-By:/i);
+  });
 });
 
 function runChecker(args, env = {}) {
@@ -30661,6 +31662,205 @@ test('package.json files: every listed scripts/ path exists on disk', () => {
   }
 });
 
+// ── PR surface gate ──────────────────────────────────────────────────────────
+// The PR title/body is a public artifact that is not a file in the repo, so no
+// file-scanning gate ever saw it: a tracker id shipped in a PR title past a green
+// Tracker-id gate, and 8 of 47 post-ban commits carried an attribution trailer.
+suite('PR surface gate (check-pr-surface)');
+
+// The template's OWN instructional comment used to quote a "Generated with"
+// footer, which is why the reworded version below carries NO banned literal:
+// the attribution scan now reads the RAW body (comments included, BLOCKER 1),
+// so a fixture that still quoted the old phrasing would self-trip.
+const PR_TEMPLATE_COMMENT = [
+  '<!--',
+  'PR title: Conventional Commits plus a scope. Keep any internal tracker id',
+  '(FEAT-/IMPR-/ISSUE-/PRAC-) out of the title and body.',
+  '',
+  'Body language: write the full body TWICE, once under `# English` and once',
+  'under `# 한국어`. Do NOT add a tool-attribution footer or a session URL of',
+  'any kind.',
+  '-->',
+].join('\n');
+
+// Every required subheading per .github/PULL_REQUEST_TEMPLATE.md, matched by
+// checkPrSurface's own EN_SUBHEADINGS/KO_SUBHEADINGS lists.
+const EN_SUBHEADINGS = ['What changed', 'Why', 'How', 'Manual verification', 'Migration notes'];
+const KO_SUBHEADINGS = ['변경 내용', '이유', '방법', '수동 검증', '마이그레이션 노트'];
+
+// A single language block, fully filled by default (every required subheading,
+// each with real content) — a fixture built from this is what "actually filled
+// the template" means, not just "carries the H1". `omit` drops named
+// subheadings; `empty` keeps every subheading but writes no content under any
+// of them (the unfilled-template shape).
+function languageBlock(h1, subheadings, { omit = [], empty = false } = {}) {
+  const lines = [`# ${h1}`, ''];
+  for (const s of subheadings) {
+    if (omit.includes(s)) continue;
+    lines.push(`## ${s}`, '');
+    if (!empty) lines.push(`Detail for ${s}.`, '');
+  }
+  return lines;
+}
+
+function changelogBlock(changelog) {
+  return changelog === null ? [] : ['## Changelog', '', ...changelog, ''];
+}
+
+function checklistBlock(checklist) {
+  return checklist ? ['## Checklist', '', '- [x] `npm test` passes locally', ''] : [];
+}
+
+// Compose a PR body from named blocks, in a given ORDER — the default order
+// matches the template exactly. Passing a reordered `order` array is how the
+// section-order regression tests build an out-of-order body without
+// duplicating the whole block-construction logic.
+function prBody({
+  english = true,
+  korean = true,
+  changelog = null,
+  checklist = true,
+  engOpts = {},
+  korOpts = {},
+  order = ['english', 'korean', 'changelog', 'checklist'],
+} = {}) {
+  const blocks = {
+    english: english ? languageBlock('English', EN_SUBHEADINGS, engOpts) : [],
+    korean: korean ? languageBlock('한국어', KO_SUBHEADINGS, korOpts) : [],
+    changelog: changelogBlock(changelog),
+    checklist: checklistBlock(checklist),
+  };
+  const lines = [PR_TEMPLATE_COMMENT, ''];
+  for (const key of order) lines.push(...blocks[key]);
+  return lines.join('\n');
+}
+
+const GOOD_CHANGELOG = ['- EN: Add a PR surface gate.', '- KO: PR 표면 게이트를 추가한다.'];
+const GOOD_TITLE = 'feat(ci): gate the PR title and body';
+// A body that is ACTUALLY a filled template: both language blocks carry every
+// required subheading with real content, in the right order.
+const goodBody = () => prBody({ changelog: GOOD_CHANGELOG });
+
+function rulesOf(res) {
+  return res.violations.map((v) => v.rule);
+}
+
+test('PR surface: a template-compliant title/body passes (no false positive)', () => {
+  const res = checkPrSurface({ title: GOOD_TITLE, body: goodBody() });
+  assert.equal(
+    res.ok,
+    true,
+    `expected clean, got: ${res.violations.map((v) => `${v.rule}/${v.detail}`).join(' | ')}`,
+  );
+  assert.equal(res.violations.length, 0);
+});
+
+test('PR surface: the reworded template instructional comment does not self-trip any rule', () => {
+  // The comment used to quote "Generated with ..." and relied on a
+  // comment-stripping exemption to avoid tripping the attribution scan
+  // (BLOCKER 1). The exemption is gone; the fix is that the comment no longer
+  // carries any banned literal, so the RAW scan finds nothing here.
+  const res = checkPrSurface({ title: GOOD_TITLE, body: goodBody() });
+  assert.equal(
+    res.violations.filter((v) => v.rule === 'attribution').length,
+    0,
+    'reworded template instructional comment must not self-trip the attribution scan',
+  );
+});
+
+test('PR surface: an attribution trailer hidden inside an HTML comment is REJECTED (BLOCKER 1)', () => {
+  // The exact hole that shipped: comment-stripping the body before the
+  // attribution scan let `<!-- Co-Authored-By: ... -->` through clean, because
+  // GitHub does not RENDER an HTML comment — but the raw body text (what
+  // `gh pr create --body-file` actually submits) still carries it.
+  const body = goodBody() + '\n<!-- Co-Authored-By: Claude <noreply@anthropic.com> -->\n';
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(
+    res.ok,
+    false,
+    'an attribution trailer inside an HTML comment must still be rejected',
+  );
+  const hit = res.violations.find((v) => v.rule === 'attribution');
+  assert.ok(hit, 'expected an attribution violation even though the trailer is commented out');
+  assert.equal(hit.surface, 'body');
+});
+
+test('PR surface: Co-Authored-By trailer in the body is caught', () => {
+  const body = goodBody() + '\nCo-Authored-By: Claude <noreply@anthropic.com>\n';
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'attribution');
+  assert.ok(hit, 'expected an attribution violation');
+  assert.equal(hit.surface, 'body');
+  assert.match(hit.detail, /Co-Authored-By:/i);
+});
+
+test('PR surface: a full-width-colon confusable attribution trailer (CONCERN 4) is still rejected', () => {
+  // \uFF1A (fullwidth colon) NFKC-folds to ASCII ':' — written as an explicit
+  // escape, never a literal confusable byte, in this source file.
+  const body = goodBody() + `\nCo-Authored-By\uFF1A Claude <noreply@anthropic.com>\n`;
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false, 'full-width colon confusable must not bypass the PR-surface gate');
+  assert.ok(res.violations.some((v) => v.rule === 'attribution'));
+});
+
+test('PR surface: Claude-Session trailer in the body is caught', () => {
+  const body = goodBody() + '\nClaude-Session: https://claude.ai/code/session_01Urs3\n';
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false);
+  const attribution = res.violations.filter((v) => v.rule === 'attribution');
+  // Trips two patterns: the trailer key and the session URL.
+  assert.ok(attribution.some((v) => /Claude-Session:/i.test(v.detail)));
+  assert.ok(attribution.some((v) => /claude\.ai\/code\/session/i.test(v.detail)));
+});
+
+test('PR surface: the robot-emoji "Generated with" footer is caught (both patterns)', () => {
+  const body = goodBody() + '\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n';
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false);
+  const attribution = res.violations.filter((v) => v.rule === 'attribution');
+  assert.ok(
+    attribution.some((v) => /Generated with/i.test(v.detail)),
+    'expected "Generated with"',
+  );
+  assert.ok(
+    attribution.some((v) => /🤖/.test(v.detail)),
+    'expected the robot-emoji marker',
+  );
+});
+
+test('PR surface: attribution in the TITLE is caught', () => {
+  const res = checkPrSurface({
+    title: 'feat(ci): gate the PR surface 🤖 Generated with [Claude Code]',
+    body: goodBody(),
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.rule === 'attribution' && v.surface === 'title'));
+});
+
+test('PR surface: a tracker id in the PR TITLE is caught (the hole that shipped)', () => {
+  // This exact shape passed CI: the Tracker-id gate scans the checkout, and a PR
+  // title is not a file in the checkout.
+  const res = checkPrSurface({ title: 'feat(gate): close ISSUE-49', body: goodBody() });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'tracker-ids');
+  assert.ok(hit, 'expected a tracker-id violation');
+  assert.equal(hit.surface, 'title');
+  assert.match(hit.detail, /ISSUE-49/);
+});
+
+test('PR surface: tracker ids in the body are caught (all wiki prefixes)', () => {
+  for (const id of ['ISSUE-49', 'FEAT-12', 'IMPR-3', 'PRAC-7', 'fix #37']) {
+    const body = goodBody() + `\nImplements ${id} from the wiki.\n`;
+    const res = checkPrSurface({ title: GOOD_TITLE, body });
+    assert.equal(res.ok, false, `${id} should be blocked`);
+    assert.ok(
+      res.violations.some((v) => v.rule === 'tracker-ids' && v.surface === 'body'),
+      `${id} should be a body tracker-id violation`,
+    );
+  }
+});
+
 test('package.json files: no shipped script imports a script that is not shipped', () => {
   const root = new URL('../', import.meta.url);
   const pkg = JSON.parse(readFileSync(new URL('package.json', root), 'utf-8'));
@@ -30676,6 +31876,756 @@ test('package.json files: no shipped script imports a script that is not shipped
     [],
     `shipped modules import unshipped files (they would crash on npm install):\n` +
       v.map((x) => `  ${x.from} → ${x.resolved}`).join('\n'),
+  );
+});
+
+test('PR surface: a legitimate GitHub ref (#123 / PR #50) is NOT flagged', () => {
+  const body = goodBody() + '\nFollows up on #123 and PR #50.\n';
+  const res = checkPrSurface({ title: 'feat(ci): gate the PR surface (#194)', body });
+  assert.equal(res.ok, true, 'GitHub refs are legitimate and must never be flagged');
+});
+
+test('PR surface: a CRLF body (GitHub web-UI edit) still passes — no false positive', () => {
+  // The `edited` trigger fires on web-UI edits, whose bodies come back CRLF, so
+  // CRLF is a COMMON input to this gate rather than an edge case. A compliant body
+  // must pass whatever the line endings are, and a dirty one must still be caught.
+  const crlf = (s) => s.replace(/\n/g, '\r\n');
+  const clean = checkPrSurface({ title: GOOD_TITLE, body: crlf(goodBody()) });
+  assert.equal(
+    clean.ok,
+    true,
+    `CRLF body must not false-positive: ${clean.violations.map((v) => v.rule).join(', ')}`,
+  );
+  const dirty = checkPrSurface({
+    title: GOOD_TITLE,
+    body: crlf(goodBody() + '\nCo-Authored-By: Claude\n'),
+  });
+  assert.equal(dirty.ok, false, 'CRLF must not smuggle an attribution trailer through');
+});
+
+test('PR surface: a missing `# English` block is caught', () => {
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ english: false, changelog: GOOD_CHANGELOG }),
+  });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'bilingual');
+  assert.ok(hit);
+  assert.match(hit.detail, /English/);
+});
+
+test('PR surface: a missing `# 한국어` block is caught', () => {
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ korean: false, changelog: GOOD_CHANGELOG }),
+  });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'bilingual');
+  assert.ok(hit);
+  assert.match(hit.detail, /한국어/);
+});
+
+test('PR surface: a missing `## Changelog` section is caught', () => {
+  const res = checkPrSurface({ title: GOOD_TITLE, body: prBody({ changelog: null }) });
+  assert.equal(res.ok, false);
+  assert.ok(rulesOf(res).includes('changelog'));
+});
+
+test('PR surface: `## Changelog` with an unfilled `- EN:` / `- KO:` is caught', () => {
+  // The template ships these lines EMPTY; an unedited template must not pass.
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ changelog: ['- EN:', '- KO:'] }),
+  });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'changelog');
+  assert.ok(hit);
+  assert.match(hit.detail, /EN:/);
+  assert.match(hit.detail, /KO:/);
+});
+
+test('PR surface: `## Changelog` missing only the KO line is caught', () => {
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ changelog: ['- EN: Add a PR surface gate.'] }),
+  });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'changelog');
+  assert.ok(hit);
+  assert.match(hit.detail, /KO:/);
+});
+
+test('PR surface: `## Changelog` of `None` passes (internal-only change)', () => {
+  assert.equal(
+    checkPrSurface({ title: GOOD_TITLE, body: prBody({ changelog: ['None'] }) }).ok,
+    true,
+  );
+  assert.equal(
+    checkPrSurface({ title: GOOD_TITLE, body: prBody({ changelog: ['- None'] }) }).ok,
+    true,
+  );
+});
+
+test('PR surface: a missing `## Checklist` section is caught', () => {
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ changelog: GOOD_CHANGELOG, checklist: false }),
+  });
+  assert.equal(res.ok, false);
+  assert.ok(rulesOf(res).includes('checklist'));
+});
+
+// ── BLOCKER 2: template compliance was a heading-existence check, not a
+// structure check ─────────────────────────────────────────────────────────
+
+test('PR surface: headings that exist ONLY inside a code fence are rejected (not real headings)', () => {
+  // A body that wraps its entire structure in a fenced code block used to pass:
+  // hasHeading() scanned raw text and did not know it was looking at example
+  // text inside ``` fences.
+  const fenced = ['```', goodBody(), '```'].join('\n');
+  const res = checkPrSurface({ title: GOOD_TITLE, body: fenced });
+  assert.equal(res.ok, false, 'fenced-only headings must not satisfy the template check');
+  assert.ok(
+    rulesOf(res).includes('bilingual'),
+    'a fence-only body has no REAL # English / # 한국어',
+  );
+});
+
+test('PR surface: a body with sections out of order is rejected', () => {
+  // # 한국어 before # English.
+  const swapped = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({
+      changelog: GOOD_CHANGELOG,
+      order: ['korean', 'english', 'changelog', 'checklist'],
+    }),
+  });
+  assert.equal(swapped.ok, false);
+  assert.ok(rulesOf(swapped).includes('order'), 'Korean-before-English must be an order violation');
+
+  // ## Changelog before # 한국어.
+  const changelogFirst = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({
+      changelog: GOOD_CHANGELOG,
+      order: ['english', 'changelog', 'korean', 'checklist'],
+    }),
+  });
+  assert.equal(changelogFirst.ok, false);
+  assert.ok(rulesOf(changelogFirst).includes('order'));
+
+  // ## Checklist before ## Changelog.
+  const checklistFirst = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({
+      changelog: GOOD_CHANGELOG,
+      order: ['english', 'korean', 'checklist', 'changelog'],
+    }),
+  });
+  assert.equal(checklistFirst.ok, false);
+  assert.ok(rulesOf(checklistFirst).includes('order'));
+});
+
+test('PR surface: correctly-ordered sections do not trip the order rule', () => {
+  assert.ok(!rulesOf(checkPrSurface({ title: GOOD_TITLE, body: goodBody() })).includes('order'));
+});
+
+test('PR surface: a language block missing a required subheading is rejected', () => {
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ changelog: GOOD_CHANGELOG, engOpts: { omit: ['Why'] } }),
+  });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'template-sections');
+  assert.ok(hit, 'expected a template-sections violation');
+  assert.match(hit.detail, /English/);
+  assert.match(hit.detail, /Why/);
+});
+
+test('PR surface: the Korean block missing a required subheading is rejected', () => {
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ changelog: GOOD_CHANGELOG, korOpts: { omit: ['이유'] } }),
+  });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'template-sections');
+  assert.ok(hit, 'expected a template-sections violation');
+  assert.match(hit.detail, /한국어/);
+  assert.match(hit.detail, /이유/);
+});
+
+test('PR surface: a language block with every subheading but NO content is rejected (empty)', () => {
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ changelog: GOOD_CHANGELOG, engOpts: { empty: true } }),
+  });
+  assert.equal(res.ok, false);
+  const hit = res.violations.find((v) => v.rule === 'template-sections');
+  assert.ok(hit, 'headings-only English block must be rejected as empty');
+  assert.match(hit.detail, /no content/);
+});
+
+test('PR surface: a fully filled template (every subheading, real content, correct order) passes', () => {
+  const res = checkPrSurface({ title: GOOD_TITLE, body: goodBody() });
+  assert.equal(
+    res.ok,
+    true,
+    `expected clean: ${res.violations.map((v) => `${v.rule}/${v.detail}`).join(' | ')}`,
+  );
+});
+
+test('PR surface: an empty body reports the structural rules, does not throw', () => {
+  for (const body of ['', null, undefined]) {
+    const res = checkPrSurface({ title: GOOD_TITLE, body });
+    assert.equal(res.ok, false);
+    for (const rule of ['bilingual', 'changelog', 'checklist']) {
+      assert.ok(rulesOf(res).includes(rule), `empty body should report ${rule}`);
+    }
+  }
+});
+
+test('PR surface: EVERY violation carries a non-empty, actionable fix', () => {
+  // A gate that reports a violation with no way through gets worked around
+  // instead of obeyed, so the fix field is load-bearing, not decoration.
+  const res = checkPrSurface({
+    title: 'feat(gate): close ISSUE-49 🤖 Generated with [Claude Code]',
+    body: 'Co-Authored-By: Claude <noreply@anthropic.com>\n',
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.length >= 5, 'fixture should trip every rule');
+  for (const v of res.violations) {
+    assert.equal(typeof v.fix, 'string', `${v.rule}: fix must be a string`);
+    assert.ok(v.fix.trim().length > 0, `${v.rule}: fix must not be empty`);
+    assert.ok(typeof v.detail === 'string' && v.detail.length > 0, `${v.rule}: detail required`);
+    assert.ok(['title', 'body'].includes(v.surface), `${v.rule}: surface must be title|body`);
+    // Every fix names a concrete command the author can run.
+    assert.match(v.fix, /gh pr edit/, `${v.rule}: fix must name the command that resolves it`);
+  }
+});
+
+test('ATTRIBUTION_PATTERNS is a separate export, NOT merged into BLOCKED_PATTERNS', () => {
+  // BLOCKED_PATTERNS is applied by `--all` to the whole shipped tree, where docs
+  // (CLAUDE.md, the PR template) legitimately QUOTE an attribution trailer while
+  // telling you not to write one. Merging the two sets would fail the repo scan.
+  const blockedNames = new Set(BLOCKED_PATTERNS.map((p) => p.name));
+  for (const p of ATTRIBUTION_PATTERNS) {
+    assert.ok(!blockedNames.has(p.name), `${p.name} must not leak into BLOCKED_PATTERNS`);
+  }
+  assert.ok(!TAG_BODY_PATTERNS.some((p) => ATTRIBUTION_PATTERNS.includes(p)));
+  // The doc line that QUOTES a trailer stays clean under the file-scan patterns.
+  const doc = 'Do NOT add any "Generated with ..." footer, no Co-Authored-By: line.';
+  assert.equal(scanText(doc, BLOCKED_PATTERNS).length, 0);
+  assert.equal(scanText(doc, [...BLOCKED_PATTERNS, ...DECISION_PATTERNS]).length, 0);
+  // ...and is caught by the attribution set, which only authored surfaces use.
+  assert.ok(scanText(doc, ATTRIBUTION_PATTERNS).length > 0);
+});
+
+test('ATTRIBUTION_PATTERNS: every regex is global (a non-global re hangs scanText)', () => {
+  // scanText drives re.exec() in a while loop with manual lastIndex handling: a
+  // non-global regex never advances, so the loop spins forever — the suite hangs
+  // instead of failing.
+  for (const p of ATTRIBUTION_PATTERNS) {
+    assert.ok(p.re.global, `${p.name}: regex must carry the /g flag`);
+    assert.equal(typeof p.name, 'string');
+    assert.equal(typeof p.label, 'string');
+  }
+});
+
+test('CLI --commit-msg: rejects an attribution trailer (exit 1)', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    writeFileSync(
+      f,
+      'feat(gate): add the PR surface gate\n\nBody prose.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n',
+    );
+    const r = runChecker(['--commit-msg', f]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Co-Authored-By:/i);
+    assert.match(r.stderr, /no attribution/i); // the way out is printed
+  });
+});
+
+test('CLI --commit-msg: rejects a Claude-Session trailer and a robot footer (exit 1)', () => {
+  withTmpDir((dir) => {
+    for (const trailer of [
+      'Claude-Session: https://claude.ai/code/session_01Urs3',
+      '🤖 Generated with [Claude Code](https://claude.com/claude-code)',
+    ]) {
+      const f = join(dir, 'MSG');
+      writeFileSync(f, `feat(gate): thing\n\nBody prose.\n\n${trailer}\n`);
+      assert.equal(runChecker(['--commit-msg', f]).status, 1, `${trailer} must be rejected`);
+    }
+  });
+});
+
+test('CLI --commit-msg: a clean message still passes (attribution scan adds no false positive)', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    writeFileSync(f, 'feat(ci): gate the PR title and body (#194)\n\nSee PR #50. ADR 0040.\n');
+    const r = runChecker(['--commit-msg', f]);
+    assert.equal(r.status, 0, r.stderr);
+  });
+});
+
+// ── --commit-range: the CI backstop (BLOCKER: commit-msg hook has no CI
+// counterpart, so --no-verify + a clean PR body let a trailer reach `main`) ──
+function commitIn(dir, msg) {
+  const opts = { cwd: dir, encoding: 'utf-8' };
+  spawnSync('git', ['add', '-A'], opts);
+  spawnSync('git', ['commit', '-q', '-m', msg], opts);
+  return spawnSync('git', ['rev-parse', 'HEAD'], opts).stdout.trim();
+}
+
+test('CLI --commit-range: rejects an attribution trailer on ANY commit in the range', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const base = commitIn(dir, 'chore: base');
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    commitIn(dir, 'feat: clean commit');
+    writeFileSync(join(dir, 'c.txt'), 'three\n');
+    // The dirty commit sits in the MIDDLE of the range, not just at HEAD — the
+    // range scan must not stop at the tip.
+    commitIn(dir, 'feat: dirty commit\n\nCo-Authored-By: Claude <noreply@anthropic.com>');
+    writeFileSync(join(dir, 'd.txt'), 'four\n');
+    const trueHead = commitIn(dir, 'chore: trailing clean commit');
+    const r = runChecker(['--commit-range', `${base}..${trueHead}`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /Co-Authored-By:/i);
+    assert.match(r.stderr, /no attribution/i); // the way out is printed
+  });
+});
+
+test('CLI --commit-range: a tracker id in a commit message anywhere in the range is caught', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const base = commitIn(dir, 'chore: base');
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    const head = commitIn(dir, 'feat: thing\n\nImplements fix #99.');
+    const r = runChecker(['--commit-range', `${base}..${head}`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /fix #99/);
+  });
+});
+
+test('CLI --commit-range: a clean range passes (exit 0)', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const base = commitIn(dir, 'chore: base');
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    const head = commitIn(dir, 'feat: thing (#101)\n\nSee PR #50. ADR 0040.');
+    const r = runChecker(['--commit-range', `${base}..${head}`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 0, r.stderr);
+  });
+});
+
+test('--commit-msg and --commit-range agree on the SAME message (one judgment, ADR 0046)', () => {
+  // Proves the two entry points cannot drift: both must reject (or both must
+  // accept) the identical message text, because both call judgeMessage().
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const base = commitIn(dir, 'chore: base');
+    const msg = 'feat: thing\n\nCo-Authored-By: Claude <noreply@anthropic.com>';
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    const head = commitIn(dir, msg);
+
+    const msgFile = join(dir, 'MSG');
+    writeFileSync(msgFile, msg + '\n');
+    const single = runChecker(['--commit-msg', msgFile], { CHECK_TRACKER_ROOT: dir });
+    const range = runChecker(['--commit-range', `${base}..${head}`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(single.status, 1, single.stderr);
+    assert.equal(range.status, 1, range.stderr);
+    assert.match(single.stderr, /Co-Authored-By:/i);
+    assert.match(range.stderr, /Co-Authored-By:/i);
+  });
+});
+
+test('CLI --commit-range: an unresolvable range exits 2 (git error), not a crash', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    commitIn(dir, 'chore: base');
+    const r = runChecker(['--commit-range', 'deadbeefdead..cafebabecafe'], {
+      CHECK_TRACKER_ROOT: dir,
+    });
+    assert.equal(r.status, 2);
+  });
+});
+
+test('CLI --commit-range: missing range argument exits with usage (2)', () => {
+  assert.equal(runChecker(['--commit-range']).status, 2);
+});
+
+// ── BLOCKER: SQUASH merge. The pr-surface job scans base.sha..head.sha — the PR
+// BRANCH's commits. The message that actually lands on `main` is composed in the
+// merge dialog, never existed on the branch, and was in NO range any job scanned.
+// A trailer typed there ships to a public `main` with every check green.
+test('CLI --push-range: an attribution trailer in the pushed (squash) commit is caught', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const before = commitIn(dir, 'chore: base');
+    // the squash commit: its message exists ONLY on main, never on the PR branch
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    const after = commitIn(
+      dir,
+      'feat: squashed (#194)\n\nCo-Authored-By: Claude <noreply@anthropic.com>',
+    );
+    const r = runChecker(['--push-range', `${before}..${after}`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /Co-Authored-By:/i);
+    assert.match(r.stderr, /no attribution/i); // the way out is printed
+  });
+});
+
+test('CLI --push-range: a tracker id in the pushed commit is caught', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const before = commitIn(dir, 'chore: base');
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    const after = commitIn(dir, 'feat: thing\n\nCloses ISSUE-49.');
+    const r = runChecker(['--push-range', `${before}..${after}`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /ISSUE-49/);
+  });
+});
+
+test('CLI --push-range: an all-zero `before` (first push / force-push) falls back to the tip, not to nothing', () => {
+  // GitHub sends 40 zeros as github.event.before on a branch's first push, and a
+  // stale sha after a force-push. `before..after` would blow up (exit 2 — red for
+  // the wrong reason) or scan nothing at all. Scanning the tip is less than the
+  // full range and infinitely more than zero.
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    commitIn(dir, 'chore: base');
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    const after = commitIn(
+      dir,
+      'feat: dirty tip\n\nCo-Authored-By: Claude <noreply@anthropic.com>',
+    );
+    const r = runChecker(['--push-range', `${'0'.repeat(40)}..${after}`], {
+      CHECK_TRACKER_ROOT: dir,
+    });
+    assert.equal(r.status, 1, `the tip must still be scanned: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /Co-Authored-By:/i);
+  });
+});
+
+test('CLI --push-range: an unresolvable `before` (discarded by a force-push) falls back to the tip', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    commitIn(dir, 'chore: base');
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    const after = commitIn(dir, 'feat: dirty tip\n\nCo-Authored-By: Claude');
+    const r = runChecker(['--push-range', `deadbeefdeadbeefdeadbeefdeadbeefdeadbeef..${after}`], {
+      CHECK_TRACKER_ROOT: dir,
+    });
+    assert.equal(r.status, 1, `a stale before must not swallow the scan: ${r.stdout}${r.stderr}`);
+  });
+});
+
+test('CLI --push-range: a ROOT commit (no parent) is scanned as a single commit, not a crash', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const root = commitIn(dir, 'chore: root\n\nCo-Authored-By: Claude');
+    const r = runChecker(['--push-range', `${'0'.repeat(40)}..${root}`], {
+      CHECK_TRACKER_ROOT: dir,
+    });
+    assert.equal(r.status, 1, `a root commit has no ^1 to fall back to: ${r.stdout}${r.stderr}`);
+  });
+});
+
+test('CLI --push-range: a clean push passes (exit 0)', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const before = commitIn(dir, 'chore: base');
+    writeFileSync(join(dir, 'b.txt'), 'two\n');
+    const after = commitIn(dir, 'feat: thing (#101)\n\nSee PR #50. ADR 0040.');
+    const r = runChecker(['--push-range', `${before}..${after}`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 0, r.stderr);
+  });
+});
+
+test('CLI --push-range: missing / malformed argument exits with usage (2)', () => {
+  assert.equal(runChecker(['--push-range']).status, 2);
+  assert.equal(runChecker(['--push-range', 'not-a-range']).status, 2);
+});
+
+test('CI: a push to main scans the commit messages the push ADDED (squash-merge hole)', () => {
+  // Without this job the squash-merge message — the one that actually lands on
+  // `main` — is scanned by nothing at all: the pr-surface job only sees the PR
+  // branch's own commits, and the push workflow only ran file scanners.
+  const ci = readFileSync(join(REPO, '.github', 'workflows', 'ci.yml'), 'utf-8');
+  assert.match(
+    ci,
+    /check-tracker-ids\.mjs --push-range/,
+    'ci.yml must scan the commit messages a push to main adds',
+  );
+  assert.match(ci, /github\.event\.before/, 'the push range starts at github.event.before');
+  assert.match(ci, /github\.event\.after/, 'the push range ends at github.event.after');
+  // The job must actually run on push (the pr-surface job is skipped there).
+  assert.match(
+    ci,
+    /if:\s*github\.event_name == 'push'/,
+    'the commit-message scan must be gated on the push event',
+  );
+});
+
+test('CI: pr-surface job checks out fetch-depth:0 and scans the PR commit range', () => {
+  // Regression for BLOCKER 3: a shallow checkout (the default) does not have the
+  // base commit locally, so `base..head` cannot resolve without fetch-depth:0.
+  const ci = readFileSync(join(REPO, '.github', 'workflows', 'ci.yml'), 'utf-8');
+  assert.match(
+    ci,
+    /fetch-depth:\s*0/,
+    'pr-surface checkout must use fetch-depth: 0 to resolve base..head',
+  );
+  assert.match(
+    ci,
+    /check-tracker-ids\.mjs --commit-range/,
+    'ci.yml must scan the PR commit range, not just the title/body',
+  );
+  assert.match(ci, /base\.sha/);
+  assert.match(ci, /head\.sha/);
+});
+
+function runPrSurface(args, env = {}) {
+  return spawnSync(process.execPath, [join(SCRIPTS, 'check-pr-surface.mjs'), ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, GITHUB_EVENT_PATH: '', ...env },
+  });
+}
+
+test('CLI --github-event: a dirty PR payload exits 1 and prints every fix', () => {
+  withTmpDir((dir) => {
+    const ev = join(dir, 'event.json');
+    writeFileSync(
+      ev,
+      JSON.stringify({
+        pull_request: {
+          title: 'feat(gate): close ISSUE-49',
+          body: 'no template here\n\n🤖 Generated with [Claude Code]\n',
+        },
+      }),
+    );
+    const r = runPrSurface([`--github-event=${ev}`]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /ISSUE-49/);
+    assert.match(r.stderr, /Generated with/i);
+    assert.match(r.stderr, /fix:/); // the resolution path is printed, not just the verdict
+    assert.match(r.stderr, /gh pr edit/);
+  });
+});
+
+test('CLI --github-event: a compliant PR payload exits 0', () => {
+  withTmpDir((dir) => {
+    const ev = join(dir, 'event.json');
+    writeFileSync(ev, JSON.stringify({ pull_request: { title: GOOD_TITLE, body: goodBody() } }));
+    const r = runPrSurface([`--github-event=${ev}`]);
+    assert.equal(r.status, 0, r.stderr);
+  });
+});
+
+test('CLI --github-event: a null body (empty PR) is a violation, not a crash', () => {
+  withTmpDir((dir) => {
+    const ev = join(dir, 'event.json');
+    writeFileSync(ev, JSON.stringify({ pull_request: { title: GOOD_TITLE, body: null } }));
+    const r = runPrSurface([`--github-event=${ev}`, '--json']);
+    assert.equal(r.status, 1);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(out.violations.some((v) => v.rule === 'bilingual'));
+  });
+});
+
+test('CLI --github-event: a non-pull_request payload passes through (push events)', () => {
+  withTmpDir((dir) => {
+    const ev = join(dir, 'event.json');
+    writeFileSync(ev, JSON.stringify({ ref: 'refs/heads/main' }));
+    assert.equal(runPrSurface([`--github-event=${ev}`]).status, 0);
+  });
+});
+
+test('CLI --title/--body-file: local pre-flight mode works', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'BODY.md');
+    writeFileSync(f, goodBody());
+    assert.equal(runPrSurface([`--title=${GOOD_TITLE}`, `--body-file=${f}`]).status, 0);
+    writeFileSync(f, goodBody() + '\nCo-Authored-By: Claude\n');
+    assert.equal(runPrSurface([`--title=${GOOD_TITLE}`, `--body-file=${f}`]).status, 1);
+  });
+});
+
+test('CI: the pull_request trigger lists `edited` (else a body edit bypasses the gate)', () => {
+  // Default types are [opened, synchronize, reopened]. Without `edited`, an author
+  // opens a clean PR, then edits an attribution footer into the body and NO job
+  // re-runs. The gate would be a two-step bypass.
+  const ci = readFileSync(join(REPO, '.github', 'workflows', 'ci.yml'), 'utf-8');
+  const types = ci.match(/^\s*types:\s*\[(.+)\]\s*$/m);
+  assert.ok(types, 'ci.yml pull_request trigger must declare types:');
+  for (const t of ['opened', 'edited', 'reopened', 'synchronize']) {
+    assert.match(types[1], new RegExp(`\\b${t}\\b`), `pull_request types must include ${t}`);
+  }
+  assert.match(ci, /check-pr-surface\.mjs/, 'ci.yml must run the pr-surface gate');
+  // As a TRIGGER KEY (a prose mention in a comment explaining why it is not used
+  // is fine). pull_request_target would run fork code with a write-scoped token
+  // for no benefit: the title and body are already in the event payload.
+  assert.ok(!/^\s*pull_request_target:/m.test(ci), 'pull_request_target must not be a trigger');
+});
+
+// ── BLOCKER: ADR / decisions pointers were left out of the PR-surface scan
+// entirely, so the one rule that names `decisions/NNNN` had no enforcement on the
+// one surface an agent writes by hand. The `## Changelog` block keeps the same
+// exemption CHANGELOG.md has in the file gate — and only that block.
+suite('PR surface gate — ADR pointers (BLOCKER 4)');
+
+test('PR surface: `ADR NNNN` in the PR BODY is rejected', () => {
+  const body = goodBody() + '\nRationale lives in ADR 0031.\n';
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false, 'an ADR pointer resolves to nothing outside the private wiki');
+  const hit = res.violations.find((v) => v.rule === 'tracker-ids' && /ADR/.test(v.detail));
+  assert.ok(hit, `expected an ADR violation: ${JSON.stringify(res.violations)}`);
+  assert.equal(hit.surface, 'body');
+});
+
+test('PR surface: `ADR-NNNN` and `decisions/NNNN` in the body are rejected', () => {
+  for (const ref of ['ADR-0031', 'decisions/0031-foo.md']) {
+    const res = checkPrSurface({ title: GOOD_TITLE, body: goodBody() + `\nSee ${ref}.\n` });
+    assert.equal(res.ok, false, `${ref} must be blocked`);
+    assert.ok(res.violations.some((v) => v.rule === 'tracker-ids' && v.surface === 'body'));
+  }
+});
+
+test('PR surface: an ADR pointer in the TITLE is rejected', () => {
+  const res = checkPrSurface({ title: 'feat(sync): implement ADR 0031', body: goodBody() });
+  assert.equal(res.ok, false);
+  assert.ok(
+    res.violations.some((v) => v.rule === 'tracker-ids' && v.surface === 'title'),
+    'the title has no changelog exemption',
+  );
+});
+
+test('PR surface: an ADR pointer INSIDE the `## Changelog` block is ALLOWED', () => {
+  // The release collector copies this block verbatim into CHANGELOG.md, which is
+  // itself ADR-exempt in the file gate. Blocking it here would make a line the
+  // file gate explicitly allows unwritable through the only path that writes it.
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({
+      changelog: ['- EN: Adopt the projection model from ADR 0031.', '- KO: ADR 0031 반영.'],
+    }),
+  });
+  assert.equal(
+    res.ok,
+    true,
+    `the changelog block keeps CHANGELOG.md's ADR exemption: ${res.violations.map((v) => v.detail).join(' | ')}`,
+  );
+});
+
+test('PR surface: the changelog exemption does NOT leak past the section boundary', () => {
+  // Only the `## Changelog` body is exempt. The section ends at the next heading;
+  // an ADR ref under `## Checklist` is as public as one anywhere else.
+  const body = prBody({ changelog: GOOD_CHANGELOG }) + '\n- [x] filed ADR 0031\n';
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false, 'the exemption must stop at the Changelog section boundary');
+  assert.ok(res.violations.some((v) => /ADR/.test(v.detail)));
+});
+
+test('PR surface: a tracker id inside `## Changelog` is STILL rejected (only ADR is exempt)', () => {
+  const res = checkPrSurface({
+    title: GOOD_TITLE,
+    body: prBody({ changelog: ['- EN: Close ISSUE-49.', '- KO: ISSUE-49 종료.'] }),
+  });
+  assert.equal(res.ok, false, 'the CHANGELOG exemption covers ADR refs only, never tracker ids');
+  assert.ok(res.violations.some((v) => v.rule === 'tracker-ids' && /ISSUE-49/.test(v.detail)));
+});
+
+test('commit messages still ALLOW `ADR NNNN` (this change does not touch that judgment)', () => {
+  withTmpDir((dir) => {
+    const f = join(dir, 'MSG');
+    writeFileSync(f, 'feat: thing (#101)\n\nImplements ADR 0040.\n');
+    assert.equal(
+      runChecker(['--commit-msg', f]).status,
+      0,
+      'the commit-msg gate has always let ADR refs through — that stays true',
+    );
+  });
+});
+
+// ── BLOCKER: a raw HTML block fooled the structural view. `<pre>` + a perfect
+// template + `</pre>` passed every heading check while GitHub rendered a code
+// listing with no headings in it at all.
+suite('PR surface gate — raw HTML blocks and indented code (BLOCKER 6)');
+
+test('PR surface: a body wrapped in <pre> does NOT satisfy the template check', () => {
+  const body = '<pre>\n' + goodBody() + '\n</pre>';
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false, 'inside <pre>, a `#` line is preformatted text, not a heading');
+  assert.ok(rulesOf(res).includes('bilingual'), 'no REAL # English / # 한국어 heading renders');
+  assert.ok(rulesOf(res).includes('changelog'));
+  assert.ok(rulesOf(res).includes('checklist'));
+});
+
+test('PR surface: <code> / <div> blocks do not satisfy the template check either', () => {
+  // GFM type 6/7 blocks end at a BLANK line, so the fixture carries none — that is
+  // the only shape in which these tags actually hide the whole template, and it is
+  // the shape the check has to catch. (`<pre>` above is type 1: blank lines do not
+  // end it, which is why it is the dangerous one.)
+  const contiguous = [
+    ...languageBlock('English', EN_SUBHEADINGS),
+    ...languageBlock('한국어', KO_SUBHEADINGS),
+    ...changelogBlock(GOOD_CHANGELOG),
+    ...checklistBlock(true),
+  ].filter((l) => l.trim() !== '');
+  for (const tag of ['code', 'div']) {
+    const body = `<${tag}>\n${contiguous.join('\n')}\n</${tag}>`;
+    const res = checkPrSurface({ title: GOOD_TITLE, body });
+    assert.equal(res.ok, false, `<${tag}> block content must not count as structure`);
+    assert.ok(rulesOf(res).includes('bilingual'), `<${tag}>: headings inside are not headings`);
+  }
+});
+
+test('PR surface: a 4-space-indented body does NOT satisfy the template check', () => {
+  const indented = goodBody()
+    .split('\n')
+    .map((l) => (l.trim() === '' ? l : '    ' + l))
+    .join('\n');
+  const res = checkPrSurface({ title: GOOD_TITLE, body: indented });
+  assert.equal(res.ok, false, 'a 4-space indent makes it a code block, not headings');
+  assert.ok(rulesOf(res).includes('bilingual'));
+});
+
+test('PR surface: an attribution trailer inside <pre> is STILL rejected (structure ≠ scan)', () => {
+  // Stripping HTML blocks is a STRUCTURAL concern only. The attribution/tracker
+  // scan still reads the RAW body: hiding a trailer in a <pre> block does not
+  // un-ship it.
+  const body = goodBody() + '\n<pre>\nCo-Authored-By: Claude <noreply@anthropic.com>\n</pre>\n';
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.rule === 'attribution'));
+});
+
+test('PR surface: a compliant body that MENTIONS html/indentation still passes (no false positive)', () => {
+  // The stripping must not eat real content: an indented continuation line inside
+  // a paragraph is a lazy continuation, not a code block, and an inline `<br>` in
+  // prose does not open a block.
+  const body = prBody({ changelog: GOOD_CHANGELOG }).replace(
+    'Detail for Why.',
+    'Detail for Why,\n    wrapped and indented as a lazy continuation with a <br> in it.',
+  );
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(
+    res.ok,
+    true,
+    `a compliant body must survive the block stripping: ${res.violations.map((v) => `${v.rule}/${v.detail}`).join(' | ')}`,
   );
 });
 
