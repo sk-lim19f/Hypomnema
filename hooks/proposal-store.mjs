@@ -331,26 +331,78 @@ export function isValidSessionId(sessionId) {
   return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId);
 }
 
+// The nonce is the approval, so it is also the challenge's IDENTITY — and the record
+// is stored under it: `challenges/<sessionId>.<nonce>.json`.
+//
+// A path keyed by the session alone (`<sessionId>.json`) cannot be claimed safely. To
+// consume such a record a resolver unlinks the PATH, which claims whatever happens to
+// be sitting there — not the record it actually read and verified. A `challenge` that
+// remints mid-flight replaces that file, and a resolver still authorized by the OLD
+// nonce would then unlink the NEW record and go on to write the old batch: one typed
+// approval buys two write batches, and the new nonce is spent without its own approval.
+// Naming the file after the nonce makes the unlink claim an identity instead of an
+// address, so a resolver can only ever consume the exact approval it holds.
+const NONCE_RE = /^[a-f0-9]{32,}$/;
+
 /**
- * Resolve `challenges/<sessionId>.json` and confirm it sits DIRECTLY inside the
- * challenges dir, with the same symlinked-store defense `resolvedProposalPath`
- * applies. Returns null (fail CLOSED) on a malformed id or an escaping path.
+ * The challenges dir, ABSOLUTE, or null if it is not really inside the store — the
+ * symlinked-store defense `resolvedProposalPath` applies, hoisted here so it runs BEFORE
+ * anything reads the directory rather than after. A scan that lists and parses files out
+ * of a redirected dir and only then rejects them has already read what it promised not to.
+ *
+ * Absolute is not cosmetic: `hypoDir` reaches this module straight from `--hypo-dir` and
+ * may be relative (`.`). Every challenge path must be produced the same way or the same
+ * file gets two names, and a record minted under one is invisible to the other.
  */
-function resolvedChallengePath(hypoDir, sessionId) {
-  if (!isValidSessionId(sessionId)) return null;
-  const p = resolve(join(challengesDir(hypoDir), `${sessionId}.json`));
-  if (dirname(p) !== resolve(challengesDir(hypoDir))) return null;
+function safeChallengesDir(hypoDir) {
+  const dir = resolve(challengesDir(hypoDir));
+  // Anchor to the VAULT, exactly as `resolvedProposalPath` does — not to the store, which
+  // is the thing that might be redirected. Comparing the real challenges dir against
+  // `realpath(proposalsDir) + '/challenges'` follows a symlinked `.cache/proposals` right
+  // out of the vault and then agrees with itself, so the check passes and the escape holds.
   try {
-    if (
-      realpathSync(challengesDir(hypoDir)) !==
-      join(realpathSync(proposalsDir(hypoDir)), 'challenges')
-    ) {
+    if (realpathSync(dir) !== join(realpathSync(hypoDir), '.cache', 'proposals', 'challenges')) {
       return null;
     }
   } catch {
-    /* challenges dir or store not present yet — nothing to escape to */
+    /* challenges dir or store not present yet — nothing to read, unlink, or escape to */
   }
+  return dir;
+}
+
+/**
+ * Resolve `challenges/<sessionId>.<nonce>.json` and confirm it sits DIRECTLY inside the
+ * challenges dir. Returns null (fail CLOSED) on a malformed id or nonce, or an escaping
+ * path.
+ */
+function resolvedChallengePath(hypoDir, sessionId, nonce) {
+  if (!isValidSessionId(sessionId)) return null;
+  if (typeof nonce !== 'string' || !NONCE_RE.test(nonce)) return null;
+  const dir = safeChallengesDir(hypoDir);
+  if (!dir) return null;
+  const p = resolve(join(dir, `${sessionId}.${nonce}.json`));
+  if (dirname(p) !== dir) return null;
   return p;
+}
+
+/**
+ * Every challenge file currently held by this session (there must be at most one), as
+ * absolute paths from the same resolution `resolvedChallengePath` uses.
+ *
+ * The session id cannot contain a dot (`isValidSessionId`), so matching on `<sessionId>.`
+ * cannot reach across sessions: `sess-1.` does not prefix `sess-10.<nonce>.json`.
+ */
+function sessionChallengeFiles(hypoDir, sessionId) {
+  if (!isValidSessionId(sessionId)) return [];
+  const dir = safeChallengesDir(hypoDir);
+  if (!dir) return [];
+  try {
+    return readdirSync(dir)
+      .filter((f) => f.startsWith(`${sessionId}.`) && f.endsWith('.json'))
+      .map((f) => join(dir, f));
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -366,8 +418,27 @@ function resolvedChallengePath(hypoDir, sessionId) {
  * @returns {string|null} the artifact path, or null when the session id is unsafe
  */
 export function writeChallenge(hypoDir, record) {
-  const path = resolvedChallengePath(hypoDir, record.sessionId);
+  const path = resolvedChallengePath(hypoDir, record.sessionId, record.nonce);
   if (!path) return null;
+  // Supersede BEFORE minting, not after: an old record that outlives the start of a remint
+  // can still be consumed by a resolver holding the old nonce, landing a batch the user is
+  // at that very moment being asked to re-approve. Removing it first makes any such consume
+  // hit ENOENT and refuse. (The window is not zero — a resolver can still consume the old
+  // record in the instant between this scan and this unlink — but that batch is the one the
+  // old nonce legitimately bought, and its write revalidates the target before touching it.)
+  //
+  // A record that will NOT go is FATAL to the mint, not a warning. Leaving it behind puts
+  // two files under one session, which `readChallenge` reads as no approval at all — so
+  // announcing a fresh nonce anyway would hand the user a nonce that can never be spent,
+  // and every later remint would strand the session deeper.
+  for (const old of sessionChallengeFiles(hypoDir, record.sessionId)) {
+    if (old === path) continue; // reminting onto the same nonce: atomicWrite replaces it
+    try {
+      unlinkSync(old);
+    } catch (e) {
+      if (!e || e.code !== 'ENOENT') return null; // already gone is fine; anything else is not
+    }
+  }
   atomicWrite(path, `${JSON.stringify(record, null, 2)}\n`);
   return path;
 }
@@ -379,13 +450,21 @@ export function writeChallenge(hypoDir, record) {
  * not a bypass.
  */
 export function readChallenge(hypoDir, sessionId) {
-  const path = resolvedChallengePath(hypoDir, sessionId);
-  if (!path || !existsSync(path)) return null;
+  // A session holds at most one live challenge. Two would mean a remint raced its own
+  // supersession, and there is no way to tell which nonce the user was shown — so it is
+  // read as NO approval (a remint), never as "pick one".
+  const files = sessionChallengeFiles(hypoDir, sessionId);
+  if (files.length !== 1) return null;
+  const path = files[0];
+  if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     if (typeof parsed.nonce !== 'string' || !parsed.nonce) return null;
     if (parsed.sessionId !== sessionId) return null; // record must own itself
+    // The record must live under its OWN nonce, or the filename is not the identity the
+    // consume claims. A hand-edited body that swaps the nonce is a remint, not a bypass.
+    if (resolvedChallengePath(hypoDir, sessionId, parsed.nonce) !== path) return null;
     if (!Array.isArray(parsed.items) || parsed.items.length === 0) return null;
     for (const it of parsed.items) {
       if (!it || typeof it !== 'object') return null;
@@ -403,18 +482,32 @@ export function readChallenge(hypoDir, sessionId) {
 }
 
 /**
- * Spend a challenge. Returns true when the record is gone afterwards (this call
- * removed it, or it was already absent), false when the id is unsafe or the unlink
- * failed for another reason. The caller treats false as FATAL: a challenge that
- * survives its own resolve is a nonce that can be spent twice.
+ * Spend the challenge for THIS EXACT NONCE, and report whether THIS CALL is the one
+ * that spent it.
+ *
+ * Both halves of that sentence are the security property.
+ *
+ * "This call": `unlink` is atomic, so when two resolvers race the same nonce exactly one
+ * wins and the loser gets ENOENT. Reading ENOENT as success would tell BOTH they had
+ * consumed the approval, and both would write — one typed approval, two write batches.
+ * The unlink IS the mutual exclusion; the return value is how the winner learns it won.
+ *
+ * "This exact nonce": the caller passes the nonce it actually read and verified, and the
+ * record lives under that nonce's filename. So a resolver cannot consume a record it was
+ * never authorized against — including a FRESHER one that a concurrent `challenge` just
+ * minted in its place.
+ *
+ * False means "do not proceed", whether the record was already gone (someone else took
+ * it, or a remint superseded it) or the unlink failed outright (it is still spendable).
+ * The caller must write nothing in either case.
  */
-export function deleteChallenge(hypoDir, sessionId) {
-  const path = resolvedChallengePath(hypoDir, sessionId);
+export function consumeChallenge(hypoDir, sessionId, nonce) {
+  const path = resolvedChallengePath(hypoDir, sessionId, nonce);
   if (!path) return false;
   try {
     unlinkSync(path);
     return true;
-  } catch (e) {
-    return e && e.code === 'ENOENT';
+  } catch {
+    return false;
   }
 }

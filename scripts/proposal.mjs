@@ -65,7 +65,7 @@ import {
   proposalsDir,
   writeChallenge,
   readChallenge,
-  deleteChallenge,
+  consumeChallenge,
 } from '../hooks/proposal-store.mjs';
 import {
   APPROVAL_PHRASE,
@@ -666,7 +666,11 @@ export function challengeProposals(
   const minted = nonce ?? randomBytes(16).toString('hex');
   const record = { nonce: minted, sessionId, mintedAt: clock(), items };
   if (!writeChallenge(hypoDir, record)) {
-    err.write(`✗ failed to store the approval challenge; nothing to approve.\n`);
+    err.write(
+      `✗ failed to store the approval challenge; nothing to approve.\n` +
+        `    A stale challenge for this session may be undeletable. Check and clear:\n` +
+        `        ${join(proposalsDir(hypoDir), 'challenges')}/${sessionId}.*.json\n`,
+    );
     return { ok: false, code: 1, reason: 'challenge-store-failed' };
   }
 
@@ -785,7 +789,47 @@ export function resolveProposals(
     plan.push({ item, proposal, full, displayedHash: hash });
   }
 
-  // (4) write. Preflight passed for every item, so the only failure left is a write
+  // (4) SPEND THE CHALLENGE, THEN WRITE. The order is the security property, not a
+  // style choice. The approval lives in the transcript, which is append-only: the
+  // user's typed line never expires, so `hasTypedUserApproval` keeps returning true
+  // for the rest of the session. Deleting the challenge is therefore the ONLY thing
+  // that makes the approval single-use — and a delete that runs AFTER the writes has
+  // already lost. If it failed there, the nonce stayed spendable and the model (whom
+  // this whole gate exists not to trust) could re-run `resolve` on a later turn and
+  // write again with no fresh human turn. Exiting non-zero announced that hole; it
+  // did not close it.
+  //
+  // Spending first closes it: on any later failure the challenge is already gone, so
+  // a re-run hits `no-challenge`, remints, and asks the user again. The cost is that
+  // a transient write failure now costs a re-approval instead of a silent retry. For
+  // a gate that guards someone's file, that is the right direction to fail.
+  //
+  // Nothing downstream reads the challenge: `plan` is fully resolved in memory above.
+  //
+  // consumeChallenge answers "did I spend THIS nonce", not "is the session's challenge
+  // file gone" — the unlink is what makes concurrent resolvers mutually exclusive, and
+  // only the one whose unlink SUCCEEDED may write. It is handed the nonce this run
+  // actually read and verified, so it can never consume a fresher record that a
+  // concurrent `challenge` minted in its place.
+  if (!consumeChallenge(hypoDir, sessionId, challenge.nonce)) {
+    err.write(
+      `✗ could not consume the approval challenge for ${sessionId}; nothing written.\n` +
+        `    Either it was already spent (or superseded by a newer challenge), or it could\n` +
+        `    not be removed and would stay replayable. Either way this run has no approval\n` +
+        `    to write against. If the file is still there, remove it by hand and re-run the\n` +
+        `    close:\n` +
+        `        ${join(proposalsDir(hypoDir), 'challenges', `${sessionId}.${challenge.nonce}.json`)}\n`,
+    );
+    return {
+      ok: false,
+      code: 1,
+      reason: 'challenge-not-consumed',
+      written: [],
+      challengeSpent: false,
+    };
+  }
+
+  // (5) write. Preflight passed for every item, so the only failure left is a write
   // that breaks mid-batch. Report exactly what landed: a re-close idempotent-skips
   // the written targets and re-parks the rest, so a reported partial recovers and a
   // SILENT one does not.
@@ -806,31 +850,32 @@ export function resolveProposals(
     else failed.push({ target: item.target, reason: res.reason, applied: Boolean(res.applied) });
   }
 
-  // (5) spend the challenge. Single-use is not a nicety here: the nonce IS the
-  // approval, so one that outlives its own resolve is a second key to a write the
-  // user authorized once. A delete failure therefore FAILS the run (non-zero) even
-  // when every byte landed — "the pages are written" and "the approval is spent" are
-  // different claims, and exiting 0 would assert both while only the first is true.
-  const spent = deleteChallenge(hypoDir, sessionId);
-  if (!spent) {
-    err.write(
-      `🛑 applied, but the approval challenge for ${sessionId} could NOT be removed.\n` +
-        `    The nonce is still spendable. Delete it by hand:\n` +
-        `        ${join(proposalsDir(hypoDir), 'challenges', `${sessionId}.json`)}\n`,
-    );
-  }
-
+  // The challenge is already spent, so a partial batch cannot be finished by re-running
+  // `resolve` — and it should not be. Re-running the CLOSE is the recovery path: it
+  // idempotent-skips whatever landed and re-parks the rest for a fresh approval.
   if (failed.length > 0) {
+    // Report by what HIT THE PAGE, not by what returned ok. A write can land and then
+    // have its audit-log append or its artifact removal fail (`applied: true, ok: false`),
+    // and reporting that item as unwritten would tell the user their file is untouched
+    // when it has already been overwritten. This tool must never understate a write.
+    const landed = [...written, ...failed.filter((f) => f.applied).map((f) => f.target)];
     err.write(
-      `\n✗ batch partially applied. Written: ${written.length ? written.join(', ') : '(none)'}. ` +
-        `Failed: ${failed.map((f) => `${f.target} (${f.reason})`).join(', ')}.\n` +
-        `    Re-run the session close: it skips what already landed and re-parks the rest.\n`,
+      `\n✗ batch partially applied.\n` +
+        `    Landed on the page: ${landed.length ? landed.join(', ') : '(none)'}\n` +
+        `    Failed: ${failed.map((f) => `${f.target} (${f.reason})`).join(', ')}\n` +
+        `    A page can appear in both: its bytes landed, then a post-write step failed.\n` +
+        `    The approval is spent. Re-run the session close: it skips what already landed\n` +
+        `    and re-parks the rest, which mints a fresh challenge to approve.\n`,
     );
-    return { ok: false, code: 1, reason: 'partial-apply', written, failed, challengeSpent: spent };
-  }
-
-  if (!spent) {
-    return { ok: false, code: 1, reason: 'challenge-not-consumed', written, challengeSpent: false };
+    return {
+      ok: false,
+      code: 1,
+      reason: 'partial-apply',
+      written,
+      landed,
+      failed,
+      challengeSpent: true,
+    };
   }
 
   out.write(`✓ applied ${written.length} approved proposal(s).\n`);

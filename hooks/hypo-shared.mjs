@@ -2795,6 +2795,29 @@ export function isCompactOrClearCommand(prompt) {
  * @returns {string} newline-joined user text, or '' on any failure (fail-open)
  */
 export function extractUserMessages(transcriptPath, tailN = 30) {
+  return extractUserMessageRecords(transcriptPath, tailN, { keepEmpty: true }).join('\n');
+}
+
+/**
+ * Same extraction as {@link extractUserMessages}, but ONE STRING PER TRANSCRIPT
+ * RECORD instead of one flat blob. The message boundary is the point: a gate that
+ * asks "did the user say exactly X" cannot ask it of text that has been joined
+ * across turns, because any line of any message then looks like a whole message.
+ * {@link hasTypedUserApproval} needs that boundary; the close-intent readers, which
+ * only ever ask "does this text contain a close phrase", do not.
+ *
+ * @param {string} transcriptPath
+ * @param {number} tailN  how many trailing lines to scan (Infinity → whole file)
+ * @param {{keepEmpty?: boolean}} [opts]  keepEmpty preserves a '' per dropped record,
+ *   so the joined form stays byte-identical to what extractUserMessages always returned.
+ * @returns {string[]} user-typed text per record, or [] on any failure (fail-open)
+ */
+export function extractUserMessageRecords(transcriptPath, tailN = 30, { keepEmpty } = {}) {
+  const records = extractUserRecordTexts(transcriptPath, tailN);
+  return keepEmpty ? records : records.filter((t) => t !== '');
+}
+
+function extractUserRecordTexts(transcriptPath, tailN) {
   try {
     const lines = readFileSync(transcriptPath, 'utf-8').split('\n');
     // tailN === Infinity → whole transcript (the marker-write hard gate needs the
@@ -2802,51 +2825,49 @@ export function extractUserMessages(transcriptPath, tailN = 30) {
     // checklist). The Stop hook keeps the 30-line default so a stale old close
     // signal doesn't re-trigger every turn.
     const tail = Number.isFinite(tailN) ? lines.slice(-tailN) : lines;
-    return tail
-      .map((line) => {
-        try {
-          const obj = JSON.parse(line);
-          // Skill-injection vector: drop system-injected role:user
-          // messages before they pollute the close-intent signal.
-          //  • isMeta:true   — slash-command bodies, skill bodies, local-command
-          //    caveats. Their text is docs/specs, often full of close vocabulary
-          //    (e.g. the /hypo:crystallize spec literally contains close phrases),
-          //    which would let the gate self-satisfy the moment the model invokes
-          //    a close command. Confirmed isMeta:true in the transcript.
-          //  • promptSource system|sdk — task-notifications (system) and
-          //    SDK / QA-harness synthetic prompts (sdk). Neither is user-typed.
-          if (obj.isMeta === true) return '';
-          if (obj.promptSource === 'system' || obj.promptSource === 'sdk') return '';
-          const msg = obj.message ?? obj;
-          const role = msg.role ?? obj.role ?? obj.type;
-          if (role !== 'user') return '';
-          const content = msg.content ?? obj.content;
-          if (typeof content === 'string') {
-            // Stop-hook block feedback is recorded as a role:user string. It is
-            // the hook's OWN nudge ("[WIKI_AUTOCLOSE] … Run crystallize …"), not
-            // user intent — counting it would be circular (the hook that prods the
-            // model to close would become proof the user wanted to close).
-            return content.startsWith('Stop hook feedback') ? '' : content;
-          }
-          if (Array.isArray(content)) {
-            // Only genuine user-typed text blocks. tool_result blocks are also
-            // recorded with role:'user' in the Claude Code transcript; slurping
-            // them via JSON.stringify let tool output (e.g. close-pattern example
-            // strings read out of code/docs) trip the close-intent gate.
-            // Do NOT recurse into tool_result.content, or the pollution returns.
-            return content
-              .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
-              .map((b) => b.text)
-              .join('\n');
-          }
-          return '';
-        } catch {
-          return '';
+    return tail.map((line) => {
+      try {
+        const obj = JSON.parse(line);
+        // Skill-injection vector: drop system-injected role:user
+        // messages before they pollute the close-intent signal.
+        //  • isMeta:true   — slash-command bodies, skill bodies, local-command
+        //    caveats. Their text is docs/specs, often full of close vocabulary
+        //    (e.g. the /hypo:crystallize spec literally contains close phrases),
+        //    which would let the gate self-satisfy the moment the model invokes
+        //    a close command. Confirmed isMeta:true in the transcript.
+        //  • promptSource system|sdk — task-notifications (system) and
+        //    SDK / QA-harness synthetic prompts (sdk). Neither is user-typed.
+        if (obj.isMeta === true) return '';
+        if (obj.promptSource === 'system' || obj.promptSource === 'sdk') return '';
+        const msg = obj.message ?? obj;
+        const role = msg.role ?? obj.role ?? obj.type;
+        if (role !== 'user') return '';
+        const content = msg.content ?? obj.content;
+        if (typeof content === 'string') {
+          // Stop-hook block feedback is recorded as a role:user string. It is
+          // the hook's OWN nudge ("[WIKI_AUTOCLOSE] … Run crystallize …"), not
+          // user intent — counting it would be circular (the hook that prods the
+          // model to close would become proof the user wanted to close).
+          return content.startsWith('Stop hook feedback') ? '' : content;
         }
-      })
-      .join('\n');
+        if (Array.isArray(content)) {
+          // Only genuine user-typed text blocks. tool_result blocks are also
+          // recorded with role:'user' in the Claude Code transcript; slurping
+          // them via JSON.stringify let tool output (e.g. close-pattern example
+          // strings read out of code/docs) trip the close-intent gate.
+          // Do NOT recurse into tool_result.content, or the pollution returns.
+          return content
+            .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+            .map((b) => b.text)
+            .join('\n');
+        }
+        return '';
+      } catch {
+        return '';
+      }
+    });
   } catch {
-    return '';
+    return [];
   }
 }
 
@@ -3057,12 +3078,12 @@ export const APPROVAL_PHRASE = 'apply-proposals';
  *
  * The nonce carries the freshness: it is minted (crypto-random) only once the diff
  * has been re-read from disk and shown, so a turn that predates the diff cannot
- * contain it, and `resolve` spends the challenge on success so it cannot be
- * replayed. That is what makes a plain substring match sufficient here.
+ * contain it, and `resolve` spends the challenge BEFORE it writes, so it cannot be
+ * replayed.
  *
- * extractUserMessages does the de-pollution: it drops `isMeta` bodies (slash-command
- * and skill text, so a doc that quotes this phrase cannot satisfy the gate),
- * `promptSource: system|sdk`, Stop-hook feedback, and `tool_result` blocks (so
+ * extractUserMessageRecords does the de-pollution: it drops `isMeta` bodies
+ * (slash-command and skill text, so a doc that quotes this phrase cannot satisfy the
+ * gate), `promptSource: system|sdk`, Stop-hook feedback, and `tool_result` blocks (so
  * neither a tool's output nor a Read of a file that contains the phrase counts).
  * The model's own words are role:assistant and never reach it.
  *
@@ -3077,16 +3098,27 @@ export function hasTypedUserApproval(transcriptPath, nonce) {
   // Pin the shape rather than accept any string: a caller that passed '' or a
   // regex-ish value would otherwise turn the match into a wildcard.
   if (!/^[a-f0-9]{32,}$/.test(nonce)) return false;
-  const text = extractUserMessages(transcriptPath, Infinity);
-  if (!text) return false;
-  // A LINE that IS the phrase, not a line that CONTAINS it. Containment would read
-  // "do not apply-proposals <nonce>" and "why would I type apply-proposals <nonce>?"
-  // as approvals: the user would have authorized an overwrite by refusing one. The
-  // TTY channel has always demanded an exact `apply <id>` and nothing else on the
-  // line; this is the same bar, and the two channels must not disagree about what
-  // consent looks like.
+  // A MESSAGE that IS the phrase, not a message that has the phrase somewhere in it.
+  // Line-exactness is not enough, because the user is TOLD to type this phrase and so
+  // it is natural to quote it back while hesitating:
+  //
+  //     I do not consent; I am only quoting the command:
+  //         apply-proposals <nonce>
+  //
+  // Every line-level matcher reads that as approval, and the user has authorized an
+  // overwrite by refusing one. The whole eligible message must be the phrase and
+  // nothing else, which is the bar the TTY channel has always held (`apply <id>`,
+  // alone, on the prompt). The two channels must not disagree about what consent
+  // looks like.
+  //
+  // Measured, not assumed: across 468 eligible user records in this project's
+  // transcripts, none carried a second text block and none carried injected
+  // system-reminder text, so a turn whose only content is the phrase survives
+  // extraction as exactly the phrase. A false negative costs a retype; a false
+  // positive costs the user's file.
   const want = `${APPROVAL_PHRASE} ${nonce}`;
-  return text.split('\n').some((line) => line.trim() === want);
+  const records = extractUserMessageRecords(transcriptPath, Infinity);
+  return records.some((msg) => msg.trim() === want);
 }
 
 /**
