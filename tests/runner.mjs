@@ -30679,7 +30679,28 @@ function withClosePartitionWiki(projects, touched, fn) {
     spawnSync('git', ['-C', dir, 'add', '-A']);
     spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'close state']);
     spawnSync('git', ['-C', dir, 'push', '-q', 'origin', 'HEAD']);
-    fn(dir, transcript, today);
+    // A controlled HOME for the children these tests spawn. crystallize runs the
+    // full gate, which resolves PKG_ROOT from <home>/.claude/hypo-pkg.json and the
+    // feedback projection from <home>/.claude. Left ambient, the child reads the
+    // DEVELOPER's real ~/.claude, and a close assertion then turns on whatever state
+    // that happens to be in: an unreadable CLAUDE.md there is a feedback blocker, so
+    // `ok` goes false while `missing` stays empty, which is the exact contradiction
+    // the CLI test below exists to rule out. CI never catches it (no hypo-pkg.json
+    // there, so PKG_ROOT is null and both axes skip), so it can only ever fail on a
+    // maintainer's machine.
+    //
+    // hypo-pkg.json is present so lint still runs against the wiki under test;
+    // CLAUDE.md is absent so the feedback axis fails open on target-missing. Same
+    // neutralization the in-process tests take from `claudeHome: '.claude-none'`,
+    // which a spawned child cannot be handed.
+    const home = mkdtempSync(join(tmpdir(), 'hypo-close-home-'));
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+    try {
+      fn(dir, transcript, home, today);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 }
 
@@ -30937,17 +30958,11 @@ test('IMPR-34: --check-session-close renders demoted debt without contradicting 
       { slug: 'mine', date: today },
     ],
     ['projects/mine/session-state.md'],
-    (dir, transcript) => {
-      const r = spawnSync(
-        process.execPath,
-        [
-          join(SCRIPTS, 'crystallize.mjs'),
-          '--check-session-close',
-          '--json',
-          `--hypo-dir=${dir}`,
-          `--transcript-path=${transcript}`,
-        ],
-        { encoding: 'utf-8' },
+    (dir, transcript, home) => {
+      const r = runWithHome(
+        'crystallize.mjs',
+        ['--check-session-close', '--json', `--hypo-dir=${dir}`, `--transcript-path=${transcript}`],
+        home,
       );
       const out = JSON.parse(r.stdout);
       assert.equal(out.project, 'mine', 'the checklist is rendered for the project in scope');
@@ -31662,6 +31677,24 @@ test('package.json files: every listed scripts/ path exists on disk', () => {
   }
 });
 
+test('package.json files: no shipped script imports a script that is not shipped', () => {
+  const root = new URL('../', import.meta.url);
+  const pkg = JSON.parse(readFileSync(new URL('package.json', root), 'utf-8'));
+  // hooks/ ships as a whole directory and reaches into scripts/lib, so it counts
+  // as an importer even though it is not enumerated file-by-file.
+  const hookFiles = readdirSync(new URL('hooks/', root))
+    .filter((f) => f.endsWith('.mjs'))
+    .map((f) => `hooks/${f}`);
+  const shipped = [...pkg.files.filter((f) => f.endsWith('.mjs')), ...hookFiles];
+  const v = closureViolations(shipped, (p) => readFileSync(new URL(p, root), 'utf-8'));
+  assert.deepEqual(
+    v,
+    [],
+    `shipped modules import unshipped files (they would crash on npm install):\n` +
+      v.map((x) => `  ${x.from} → ${x.resolved}`).join('\n'),
+  );
+});
+
 // ── PR surface gate ──────────────────────────────────────────────────────────
 // The PR title/body is a public artifact that is not a file in the repo, so no
 // file-scanning gate ever saw it: a tracker id shipped in a PR title past a green
@@ -31859,24 +31892,6 @@ test('PR surface: tracker ids in the body are caught (all wiki prefixes)', () =>
       `${id} should be a body tracker-id violation`,
     );
   }
-});
-
-test('package.json files: no shipped script imports a script that is not shipped', () => {
-  const root = new URL('../', import.meta.url);
-  const pkg = JSON.parse(readFileSync(new URL('package.json', root), 'utf-8'));
-  // hooks/ ships as a whole directory and reaches into scripts/lib, so it counts
-  // as an importer even though it is not enumerated file-by-file.
-  const hookFiles = readdirSync(new URL('hooks/', root))
-    .filter((f) => f.endsWith('.mjs'))
-    .map((f) => `hooks/${f}`);
-  const shipped = [...pkg.files.filter((f) => f.endsWith('.mjs')), ...hookFiles];
-  const v = closureViolations(shipped, (p) => readFileSync(new URL(p, root), 'utf-8'));
-  assert.deepEqual(
-    v,
-    [],
-    `shipped modules import unshipped files (they would crash on npm install):\n` +
-      v.map((x) => `  ${x.from} → ${x.resolved}`).join('\n'),
-  );
 });
 
 test('PR surface: a legitimate GitHub ref (#123 / PR #50) is NOT flagged', () => {
