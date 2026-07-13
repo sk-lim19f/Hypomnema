@@ -48,6 +48,14 @@ import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmat
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import { readPageUsage, aggregateColdCandidates } from '../scripts/lib/page-usage.mjs';
 import {
+  moduleImports,
+  relativeImports,
+  resolveFrom,
+  surfaceDiff,
+  closureViolations,
+  parsePackJson,
+} from '../scripts/lib/pack-surface.mjs';
+import {
   hashContent as bsHashContent,
   hashFile as bsHashFile,
   basePath as bsBasePath,
@@ -30527,6 +30535,148 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
       `${name} must not call an apply actor`,
     );
   }
+});
+
+suite('Ship surface gate (pack-surface)');
+
+test('relativeImports finds static, re-export, side-effect, and literal dynamic imports', () => {
+  const src = [
+    `import { a } from './lib/one.mjs';`,
+    `import {`,
+    `  b,`,
+    `} from '../scripts/lib/two.mjs';`,
+    `export * from './three.mjs';`,
+    `const m = await import('./lib/four.mjs');`,
+    `import './five.mjs';`,
+    `import pkg from 'node:fs';`, // bare specifier: not ours
+    `const s = './lib/not-an-import.mjs';`, // a path in a string is not an import
+  ].join('\n');
+  assert.deepEqual(relativeImports(src).sort(), [
+    '../scripts/lib/two.mjs',
+    './five.mjs',
+    './lib/four.mjs',
+    './lib/one.mjs',
+    './three.mjs',
+  ]);
+});
+
+// A regex over raw text cannot tell code from prose. Both of these would have been
+// reported as real imports, and each false positive blocks an honest PR.
+test('the scanner ignores imports written inside comments and strings', () => {
+  assert.deepEqual(relativeImports(`// import './ghost.mjs'\nconst a = 1;`), []);
+  assert.deepEqual(relativeImports(`/* import './ghost.mjs' */`), []);
+  assert.deepEqual(relativeImports("const doc = `import './ghost.mjs'`;"), []);
+});
+
+// The hole that makes "closure integrity" a lie if left open: the module is loaded
+// for real at runtime, but no static reading of the source can say which one.
+test('a dynamic import with a computed target is reported, not silently skipped', () => {
+  const tpl = moduleImports('const n = k;\nawait import(`./lib/${n}.mjs`);');
+  assert.equal(tpl.unanalyzable.length, 1);
+  assert.equal(tpl.specifiers.length, 0);
+
+  const variable = moduleImports('await import(target);');
+  assert.equal(variable.unanalyzable.length, 1);
+
+  // A literal is analyzable, template quotes or not.
+  assert.deepEqual(moduleImports('await import(`./lib/ok.mjs`);').unanalyzable, []);
+  assert.deepEqual(moduleImports("await import('node:fs');").specifiers, ['node:fs']);
+});
+
+test('resolveFrom walks . and .. relative to the importer', () => {
+  assert.equal(resolveFrom('scripts/a.mjs', './lib/x.mjs'), 'scripts/lib/x.mjs');
+  assert.equal(resolveFrom('scripts/lib/a.mjs', './b.mjs'), 'scripts/lib/b.mjs');
+  assert.equal(resolveFrom('hooks/h.mjs', '../scripts/lib/x.mjs'), 'scripts/lib/x.mjs');
+  assert.equal(resolveFrom('scripts/lib/a.mjs', '../b.mjs'), 'scripts/b.mjs');
+});
+
+// Climbing past the package root can never resolve inside a tarball. Normalizing it
+// to a bare filename would invent a path that happens to be in the shipped set.
+test('resolveFrom returns null when the specifier escapes the package root', () => {
+  assert.equal(resolveFrom('scripts/lib/a.mjs', '../../../escape.mjs'), null);
+  assert.equal(resolveFrom('scripts/a.mjs', '../../x.mjs'), null);
+});
+
+test('closureViolations flags an import that escapes the package root', () => {
+  const v = closureViolations(['scripts/lib/a.mjs'], () => `import x from '../../../out.mjs';`);
+  assert.equal(v.length, 1);
+  assert.equal(v[0].kind, 'escapes-root');
+});
+
+test('parsePackJson survives a lifecycle line printing a stray bracket first', () => {
+  const noisy = `> hypomnema@1.0.0 prepare\n[some hook] ok\n[{"files":[{"path":"a"}],"entryCount":1}]`;
+  assert.deepEqual(parsePackJson(noisy).files, [{ path: 'a' }]);
+});
+
+test('surfaceDiff reports both drift directions', () => {
+  const d = surfaceDiff(['a', 'b', 'leaked'], ['a', 'b', 'dropped']);
+  assert.deepEqual(d.added, ['leaked']);
+  assert.deepEqual(d.removed, ['dropped']);
+});
+
+test('surfaceDiff is clean when the sets match regardless of order', () => {
+  const d = surfaceDiff(['b', 'a'], ['a', 'b']);
+  assert.deepEqual(d.added, []);
+  assert.deepEqual(d.removed, []);
+});
+
+test('closureViolations catches a shipped module importing an unshipped file', () => {
+  const sources = {
+    'scripts/product.mjs': `import { x } from './lib/secret.mjs';`,
+  };
+  const v = closureViolations(Object.keys(sources), (p) => sources[p]);
+  assert.equal(v.length, 1);
+  assert.equal(v[0].from, 'scripts/product.mjs');
+  assert.equal(v[0].resolved, 'scripts/lib/secret.mjs');
+});
+
+test('closureViolations passes when every import is itself shipped', () => {
+  const sources = {
+    'scripts/product.mjs': `import { x } from './lib/dep.mjs';`,
+    'scripts/lib/dep.mjs': `export const x = 1;`,
+  };
+  const v = closureViolations(Object.keys(sources), (p) => sources[p]);
+  assert.deepEqual(v, []);
+});
+
+test('closureViolations skips non-.mjs shipped files (docs, templates)', () => {
+  const sources = { 'docs/GUIDE.md': `see ./lib/nope.mjs` };
+  const v = closureViolations(Object.keys(sources), (p) => sources[p]);
+  assert.deepEqual(v, []);
+});
+
+// The invariant the gate exists to protect: package.json's `files` is an
+// allow-list, so a product script left off it silently vanishes from the tarball.
+// These two read the real manifest and the real import graph, so they fail the
+// moment the two disagree — no snapshot to regenerate, nothing to remember.
+test('package.json files: every listed scripts/ path exists on disk', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
+  const listed = pkg.files.filter((f) => f.startsWith('scripts/'));
+  assert.ok(listed.length > 0, 'files must enumerate scripts/ explicitly, not glob the directory');
+  for (const rel of listed) {
+    assert.ok(
+      existsSync(new URL(`../${rel}`, import.meta.url)),
+      `package.json "files" lists a script that does not exist: ${rel}`,
+    );
+  }
+});
+
+test('package.json files: no shipped script imports a script that is not shipped', () => {
+  const root = new URL('../', import.meta.url);
+  const pkg = JSON.parse(readFileSync(new URL('package.json', root), 'utf-8'));
+  // hooks/ ships as a whole directory and reaches into scripts/lib, so it counts
+  // as an importer even though it is not enumerated file-by-file.
+  const hookFiles = readdirSync(new URL('hooks/', root))
+    .filter((f) => f.endsWith('.mjs'))
+    .map((f) => `hooks/${f}`);
+  const shipped = [...pkg.files.filter((f) => f.endsWith('.mjs')), ...hookFiles];
+  const v = closureViolations(shipped, (p) => readFileSync(new URL(p, root), 'utf-8'));
+  assert.deepEqual(
+    v,
+    [],
+    `shipped modules import unshipped files (they would crash on npm install):\n` +
+      v.map((x) => `  ${x.from} → ${x.resolved}`).join('\n'),
+  );
 });
 
 console.log(`\n${'─'.repeat(40)}`);
