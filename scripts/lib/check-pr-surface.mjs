@@ -32,6 +32,16 @@ import {
   DECISION_PATTERNS,
   ATTRIBUTION_PATTERNS,
 } from './check-tracker-ids.mjs';
+import {
+  heading,
+  stripHtmlComments,
+  changelogSection,
+  parseChangelogBody,
+  H1_ENGLISH,
+  H1_KOREAN,
+  H2_CHANGELOG,
+  H2_CHECKLIST,
+} from './pr-body.mjs';
 
 // Wiki tracker ids (`ISSUE-N`, `fix #N`, `FEAT-N`, ...): blocked on the whole
 // title and the whole body, no exemption.
@@ -78,13 +88,6 @@ const PR_DECISION_PATTERNS = DECISION_PATTERNS;
 // heading that only exists inside a code fence (```# English```) is example
 // text, not a real section, and must not satisfy the template-compliance check.
 
-// Newlines inside the comment are preserved so any position-sensitive caller
-// downstream keeps consistent line counts even though this module no longer
-// scans this view for attribution.
-function stripHtmlComments(text) {
-  return text.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ''));
-}
-
 // Remove fenced code blocks (``` or ~~~, 3+ chars, matching the same char at
 // the close) from a STRUCTURAL view. A heading-like line inside a fence
 // (```# English```) is example text, not a real section boundary, so the whole
@@ -127,95 +130,34 @@ function stripInlineCode(text) {
   return text.replace(/`[^`\n]*`/g, '');
 }
 
-// Raw HTML BLOCKS. Inside one, GFM parses NO markdown: a `#` line inside
-// `<pre> ... </pre>` is preformatted text, not a heading. The structural view was
-// blind to this, so a body of `<pre>` + a perfectly-shaped template + `</pre>`
-// passed every heading, subheading, changelog and checklist check while GitHub
-// rendered not one of those headings — the whole template check satisfied by text
-// that is, to a reader, a code listing.
+// The STRUCTURAL view: HTML comments, fenced code, and inline code spans are
+// gone. Order matters: comments first (they can wrap anything), then fences,
+// then inline spans.
 //
-// Two of GFM's seven block kinds cover this:
-//   type 1   <pre|script|style|textarea ...> → runs to the matching CLOSE TAG
-//            line. A blank line does NOT end it.
-//   type 6/7 a known block tag (<div>, <table>, <details>, ...) or any complete
-//            standalone tag on its own line (<code>) → runs to the next BLANK line.
-// An unterminated block eats the rest of the text — the same fail-toward-more-
-// stripping direction stripCodeBlocks takes (toward reporting a violation, never
-// toward accepting content that never rendered).
-const HTML_BLOCK_1_OPEN = /^ {0,3}<(?:pre|script|style|textarea)\b/i;
-const HTML_BLOCK_1_CLOSE = /<\/(?:pre|script|style|textarea)>/i;
-const HTML_BLOCK_TAGS =
-  'address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|' +
-  'dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|' +
-  'head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|' +
-  'p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul';
-const HTML_BLOCK_6_OPEN = new RegExp(`^ {0,3}</?(?:${HTML_BLOCK_TAGS})(?:[ \\t/>]|$)`, 'i');
-// A complete open/close tag alone on its line (GFM type 7) — this is what makes
-// `<code>` / `<span>` / any custom element behave as a block opener.
-const HTML_BLOCK_7_OPEN = /^ {0,3}<\/?[a-zA-Z][a-zA-Z0-9-]*(?:[ \t][^<>]*)?\/?>[ \t]*$/;
-
-function stripHtmlBlocks(text) {
-  const lines = text.split('\n');
-  const out = [];
-  let until = null; // 'close-tag' | 'blank'
-  for (const line of lines) {
-    if (until === 'close-tag') {
-      if (HTML_BLOCK_1_CLOSE.test(line)) until = null;
-      continue;
-    }
-    if (until === 'blank') {
-      if (line.trim() === '') {
-        until = null;
-        out.push(line);
-      }
-      continue;
-    }
-    if (HTML_BLOCK_1_OPEN.test(line)) {
-      until = HTML_BLOCK_1_CLOSE.test(line) ? null : 'close-tag'; // may open and close on one line
-      continue;
-    }
-    if (HTML_BLOCK_6_OPEN.test(line) || HTML_BLOCK_7_OPEN.test(line)) {
-      until = 'blank';
-      continue;
-    }
-    out.push(line);
-  }
-  return out.join('\n');
-}
-
-// 4-space (or tab) indented code blocks: `    # English` is preformatted text,
-// not a heading, for the same reason a fenced one is not. A block can only START
-// where a paragraph could not be continued (top of the text, or after a blank
-// line) — an indented line INSIDE a paragraph is a lazy continuation, not code,
-// so the `prevBlank` guard is load-bearing rather than defensive.
-function stripIndentedCode(text) {
-  const lines = text.split('\n');
-  const out = [];
-  let prevBlank = true;
-  let inCode = false;
-  for (const line of lines) {
-    const blank = line.trim() === '';
-    const indented = /^(?: {4}|\t)/.test(line);
-    if (inCode) {
-      if (indented || blank) continue; // a blank line does not close an indented block
-      inCode = false;
-    } else if (indented && prevBlank) {
-      inCode = true;
-      continue;
-    }
-    out.push(line);
-    prevBlank = blank;
-  }
-  return out.join('\n');
-}
-
-// The full STRUCTURAL view: everything GFM does not render as live markdown is
-// gone. Order matters — comments first (they can wrap anything), then fences,
-// then HTML blocks, then indented code, then inline code spans.
+// This view deliberately does NOT model raw HTML blocks or 4-space indented code
+// blocks, and that is a reversal. Earlier rounds grew a GFM block parser here (a
+// 60-tag list, HTML block types 1/6/7, an indented-code state machine with a
+// lazy-continuation guard) chasing rendering fidelity: a body wrapped in `<pre>`
+// renders as a code listing, so its `#` lines are not really headings, so the
+// template check should not count them. Every round of that produced a new edge
+// case (block types 3-5, `&Tab;`, entity-encoded tags) and no round ended.
+//
+// It was aimed at the wrong actor. This gate is maintainer-only tooling (it does
+// not ship — see package.json `files`), and it runs on trusted input: this repo's
+// CI and the maintainer's local hooks. The thing it exists to stop is an agent
+// obeying its harness and appending an attribution trailer, or pasting a private
+// wiki tracker id. Nobody is trying to evade it. A PR body wrapped in `<div>`
+// therefore now SATISFIES the template check, and that is fine: it is self-harm,
+// not a failure mode, and no agent does it by accident. The banned-string scan is
+// unaffected, because it reads the RAW body — an attribution trailer inside
+// `<pre>` is still rejected.
+//
+// What replaced the indented-code machine is the ` {0,3}` bound on every heading
+// matcher below, which is where GFM actually draws the line: 0-3 spaces is an ATX
+// heading, 4+ is code. That bound is load-bearing in the OTHER direction too. See
+// the note on H1_ENGLISH.
 function structuralView(rawBody) {
-  return stripInlineCode(
-    stripIndentedCode(stripHtmlBlocks(stripCodeBlocks(stripHtmlComments(rawBody)))),
-  );
+  return stripInlineCode(stripCodeBlocks(stripHtmlComments(rawBody)));
 }
 
 // A `## Changelog` / `## Checklist` heading, exactly two hashes (`### Changelog`
@@ -224,12 +166,12 @@ function hasHeading(text, re) {
   return re.test(text);
 }
 
-// Non-global on purpose: a /g regex carries lastIndex across .test() calls and
-// would alternate true/false on repeated use.
-const H1_ENGLISH = /^#[ \t]+English[ \t]*$/im;
-const H1_KOREAN = /^#[ \t]+한국어[ \t]*$/m;
-const H2_CHANGELOG = /^##[ \t]+Changelog[ \t]*$/im;
-const H2_CHECKLIST = /^##[ \t]+Checklist[ \t]*$/im;
+// The heading matchers, the live-line view, and the changelog parse all come from
+// lib/pr-body.mjs, because the release collector asks the same questions of the
+// same text and its answers must be THESE answers. When the two had their own
+// copies they drifted, and the drift was silent: the gate went green on a body
+// whose changelog block the collector then failed to find (or found in a code
+// fence, and shipped the example). See that module's header.
 
 // The line index (0-based) of the first line matching `re` in `text`, or -1.
 // Reuses the SAME heading regex as `hasHeading` (single-line `.test()` on an
@@ -260,49 +202,15 @@ function sectionBody(text, startRe, isBoundary) {
   return lines.slice(start + 1, end).join('\n');
 }
 
-// Any ATX heading of any level (`#` through `######`) ends a section that has
-// no nested structure of its own — used for `## Changelog`, whose body is a
-// flat two-line list with no subheadings.
-const ANY_HEADING = (line) => /^#{1,6}[ \t]+\S/.test(line);
-
 // A language block (`# English` / `# 한국어`) DOES have nested structure — its
 // own required `##` subheadings — so those must NOT end the section (that was
 // the bug: treating "any heading" as the boundary truncated every language
 // block down to its first blank line, before its first subheading). Only the
 // NEXT top-level heading, or the language-neutral `## Changelog` / `##
 // Checklist` that follow both language blocks, closes it.
-const ANY_H1 = /^#[ \t]+\S/;
+const ANY_H1 = /^ {0,3}#[ \t]+\S/;
 const isLanguageBlockBoundary = (line) =>
   ANY_H1.test(line) || H2_CHANGELOG.test(line) || H2_CHECKLIST.test(line);
-
-// The `## Changelog` section body: everything from its heading to the next ATX
-// heading of any level (in the template, `## Checklist`) or end of text.
-function changelogSection(text) {
-  return sectionBody(text, H2_CHANGELOG, ANY_HEADING);
-}
-
-// A LINE-PRESERVING structural view: HTML comments and fenced code blocks are
-// blanked IN PLACE (the line stays, its content is emptied) instead of removed,
-// so line index i here is line index i in the RAW body. `structuralView` above
-// drops lines, which is fine where only relative ORDER matters (heading checks)
-// and useless where raw positions do (the changelog carve-out below).
-function maskedLines(rawBody) {
-  const lines = stripHtmlComments(rawBody).split('\n');
-  let fence = null;
-  return lines.map((line) => {
-    const delim = /^[ \t]*(`{3,}|~{3,})[ \t]*/.exec(line);
-    if (fence) {
-      if (delim && delim[1][0] === fence.char && delim[1].length >= fence.len) fence = null;
-      return '';
-    }
-    if (/^[ \t]*(`{3,}|~{3,})/.test(line)) {
-      const open = /^[ \t]*(`{3,}|~{3,})/.exec(line);
-      fence = { char: open[1][0], len: open[1].length };
-      return '';
-    }
-    return line;
-  });
-}
 
 // Blank out the BODY of the `## Changelog` section (the heading line stays, its
 // content lines become empty) so the ADR scan can read everything ELSE in the PR
@@ -310,32 +218,17 @@ function maskedLines(rawBody) {
 // points at the line the author wrote.
 //
 // This is the ADR carve-out, and it is exactly the file gate's: CHANGELOG.md is
-// ADR-exempt there, and this block IS CHANGELOG.md's source text. A `## Changelog`
-// heading that only exists inside a code fence is not the real section, so the
-// heading is located on the masked view, not the raw one.
+// ADR-exempt there, and this block IS CHANGELOG.md's source text. Its boundaries
+// come from the shared reader, so the span exempted here is EXACTLY the span the
+// collector will publish — no more (an ADR pointer outside the block would escape
+// the scan) and no less.
 function maskChangelogSection(rawBody) {
-  const view = maskedLines(rawBody);
-  const start = view.findIndex((l) => H2_CHANGELOG.test(l));
-  if (start === -1) return rawBody;
-  let end = view.length;
-  for (let i = start + 1; i < view.length; i++) {
-    if (ANY_HEADING(view[i])) {
-      end = i;
-      break;
-    }
-  }
+  const sec = changelogSection(rawBody);
+  if (sec === null) return rawBody;
   const raw = rawBody.split('\n');
-  for (let i = start + 1; i < end; i++) raw[i] = '';
+  for (let i = sec.start + 1; i < sec.end; i++) raw[i] = '';
   return raw.join('\n');
 }
-
-// `- EN: <something>` with actual content after the colon. The unfilled template
-// ships a bare `- EN:` line, which must NOT count as filled.
-const EN_LINE = /^[ \t]*-[ \t]*EN:[ \t]*(\S.*)$/im;
-const KO_LINE = /^[ \t]*-[ \t]*KO:[ \t]*(\S.*)$/im;
-// "None" on its own line (optionally as a list item) = an explicit, deliberate
-// "this change is not user-visible", which the template blesses.
-const NONE_LINE = /^[ \t]*(?:[-*][ \t]*)?None[.!]?[ \t]*$/im;
 
 // The required `##` subheadings inside each language block, per
 // .github/PULL_REQUEST_TEMPLATE.md. A body that carries the H1 but skips a
@@ -357,7 +250,7 @@ function escapeRegExp(s) {
 function blockHasContent(sectionText) {
   return sectionText
     .split(/\r?\n/)
-    .filter((l) => !/^#{1,6}[ \t]+\S/.test(l))
+    .filter((l) => !/^ {0,3}#{1,6}[ \t]+\S/.test(l))
     .some((l) => l.trim().length > 0);
 }
 
@@ -372,9 +265,7 @@ const TITLE_FIX = 'Re-set the title: `gh pr edit <N> --title "<corrected title>"
 function checkLanguageBlock(structuralBody, h1Re, h1Label, requiredSubs, violations) {
   const sec = sectionBody(structuralBody, h1Re, isLanguageBlockBoundary);
   if (sec === null) return;
-  const missingSubs = requiredSubs.filter(
-    (name) => !new RegExp(`^##[ \\t]+${escapeRegExp(name)}[ \\t]*$`, 'm').test(sec),
-  );
+  const missingSubs = requiredSubs.filter((name) => !heading('##', escapeRegExp(name)).test(sec));
   const empty = !blockHasContent(sec);
   if (missingSubs.length === 0 && !empty) return;
   const parts = [];
@@ -416,11 +307,12 @@ export function checkPrSurface({ title, body } = {}) {
   // the body the author submitted.
   const rawTitle = (typeof title === 'string' ? title : '').replace(/\r/g, '');
   const rawBody = (typeof body === 'string' ? body : '').replace(/\r\n/g, '\n');
-  // Structural view ONLY (headings, subheadings, changelog, checklist): drop
-  // everything GFM does not render as live markdown — HTML comments, fenced code,
-  // raw HTML blocks, indented code, inline code. Tracker-ids and attribution scan
-  // the RAW body/title — see the comment above `PR_TRACKER_PATTERNS` and the block
-  // comment before `stripHtmlComments`.
+  // Structural view ONLY (headings, subheadings, changelog, checklist): HTML
+  // comments, fenced code and inline code spans dropped, so a heading that only
+  // exists as an EXAMPLE is not mistaken for a real section. Raw HTML blocks and
+  // indented code are deliberately NOT modeled — see the note on `structuralView`.
+  // Tracker-ids and attribution scan the RAW body/title instead, so nothing hidden
+  // in a comment or a code block escapes them.
   const structuralBody = structuralView(rawBody);
   const violations = [];
 
@@ -518,8 +410,14 @@ export function checkPrSurface({ title, body } = {}) {
   }
 
   // ── changelog block ────────────────────────────────────────────────────────
-  const section = changelogSection(structuralBody);
-  if (section === null) {
+  // Judged with the release collector's OWN parse, on the RAW body, so a green
+  // gate means exactly "the collector will publish this". The gate used to apply
+  // its own, looser rules here, and the two disagreed: `None.` with a period, a
+  // duplicated `- EN:` line — the gate waved them through and the collector then
+  // called them malformed, at release time, when the PR could no longer be edited.
+  // The author is told now, while it is still one `gh pr edit` away.
+  const changelog = parseChangelogBody(rawBody);
+  if (changelog === null) {
     violations.push({
       rule: 'changelog',
       surface: 'body',
@@ -531,25 +429,20 @@ export function checkPrSurface({ title, body } = {}) {
         `the change is missing from the next release notes. Never edit CHANGELOG.md directly in a feature PR. ` +
         BODY_FIX,
     });
-  } else if (!NONE_LINE.test(section)) {
-    const hasEn = EN_LINE.test(section);
-    const hasKo = KO_LINE.test(section);
-    if (!hasEn || !hasKo) {
-      const missing = [!hasEn && '`- EN:`', !hasKo && '`- KO:`'].filter(Boolean);
-      violations.push({
-        rule: 'changelog',
-        surface: 'body',
-        detail: `\`## Changelog\` present but ${missing.join(' and ')} ${
-          missing.length > 1 ? 'lines are' : 'line is'
-        } missing or empty`,
-        fix:
-          `Fill both lines under \`## Changelog\` with real text, e.g. "- EN: Add a PR surface gate." and ` +
-          `"- KO: PR 표면 게이트를 추가한다." (an empty \`- EN:\` from the template does not count). If the ` +
-          `change is internal only (refactor, test, CI plumbing), replace both lines with the single word ` +
-          `\`None\`. No em dashes, and cite PRs by number only (e.g. #123). ` +
-          BODY_FIX,
-      });
-    }
+  } else if (changelog.malformed) {
+    violations.push({
+      rule: 'changelog',
+      surface: 'body',
+      detail: `\`## Changelog\` is present but the release collector cannot read it: ${changelog.reason}`,
+      fix:
+        `Fix the block so it holds exactly one \`- EN:\` line and one \`- KO:\` line, each with real text — ` +
+        `e.g. "- EN: Add a PR surface gate." and "- KO: PR 표면 게이트를 추가한다." (an empty \`- EN:\` from ` +
+        `the template does not count). If the change is internal only (refactor, test, CI plumbing), the whole ` +
+        `block is the single word \`None\` instead, with no EN/KO lines beside it. This is the same parse the ` +
+        `release collector runs, so what passes here is what lands in CHANGELOG.md. No em dashes, and cite PRs ` +
+        `by number only (e.g. #123). ` +
+        BODY_FIX,
+    });
   }
 
   // ── checklist block ────────────────────────────────────────────────────────

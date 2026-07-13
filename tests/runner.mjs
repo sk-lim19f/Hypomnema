@@ -31955,8 +31955,7 @@ test('PR surface: `## Changelog` with an unfilled `- EN:` / `- KO:` is caught', 
   assert.equal(res.ok, false);
   const hit = res.violations.find((v) => v.rule === 'changelog');
   assert.ok(hit);
-  assert.match(hit.detail, /EN:/);
-  assert.match(hit.detail, /KO:/);
+  assert.match(hit.detail, /empty EN line/);
 });
 
 test('PR surface: `## Changelog` missing only the KO line is caught', () => {
@@ -31967,7 +31966,7 @@ test('PR surface: `## Changelog` missing only the KO line is caught', () => {
   assert.equal(res.ok, false);
   const hit = res.violations.find((v) => v.rule === 'changelog');
   assert.ok(hit);
-  assert.match(hit.detail, /KO:/);
+  assert.match(hit.detail, /missing or empty KO line/);
 });
 
 test('PR surface: `## Changelog` of `None` passes (internal-only change)', () => {
@@ -32578,22 +32577,34 @@ test('commit messages still ALLOW `ADR NNNN` (this change does not touch that ju
 // ── BLOCKER: a raw HTML block fooled the structural view. `<pre>` + a perfect
 // template + `</pre>` passed every heading check while GitHub rendered a code
 // listing with no headings in it at all.
-suite('PR surface gate — raw HTML blocks and indented code (BLOCKER 6)');
+// The structural check does NOT model raw HTML blocks, and these two tests pin
+// that as a decision rather than leaving a silent gap for a later round to
+// "fix". Wrapping a PR body in <pre> or <div> makes GitHub render it as a code
+// listing, so strictly its `#` lines are not headings and the template check
+// should reject it. An earlier round built a GFM block parser to say so, and
+// paid for it with an unbounded stream of edge cases (block types 3-5, entity-
+// encoded tags, `&Tab;`).
+//
+// It is not worth it, because it defends against nobody. This gate is
+// maintainer-only tooling on trusted input; the actor is an agent following its
+// harness, and no agent wraps a PR body in a div by accident. Someone who does
+// it deliberately has only fooled themselves into an unreadable PR — self-harm,
+// not a failure mode. The rule that actually matters survives untouched, and the
+// third test here is what proves it: the banned-string scan reads the RAW body,
+// so an attribution trailer inside <pre> is still rejected.
+suite('PR surface gate — HTML blocks are not modeled (accepted, by design)');
 
-test('PR surface: a body wrapped in <pre> does NOT satisfy the template check', () => {
+test('PR surface: a body wrapped in <pre> SATISFIES the template check (accepted self-harm)', () => {
   const body = '<pre>\n' + goodBody() + '\n</pre>';
   const res = checkPrSurface({ title: GOOD_TITLE, body });
-  assert.equal(res.ok, false, 'inside <pre>, a `#` line is preformatted text, not a heading');
-  assert.ok(rulesOf(res).includes('bilingual'), 'no REAL # English / # 한국어 heading renders');
-  assert.ok(rulesOf(res).includes('changelog'));
-  assert.ok(rulesOf(res).includes('checklist'));
+  assert.equal(
+    res.ok,
+    true,
+    'the structural check reads the text, not GitHub rendering: an agent does not do this by accident',
+  );
 });
 
-test('PR surface: <code> / <div> blocks do not satisfy the template check either', () => {
-  // GFM type 6/7 blocks end at a BLANK line, so the fixture carries none — that is
-  // the only shape in which these tags actually hide the whole template, and it is
-  // the shape the check has to catch. (`<pre>` above is type 1: blank lines do not
-  // end it, which is why it is the dangerous one.)
+test('PR surface: <code> / <div> blocks are likewise not modeled', () => {
   const contiguous = [
     ...languageBlock('English', EN_SUBHEADINGS),
     ...languageBlock('한국어', KO_SUBHEADINGS),
@@ -32603,8 +32614,7 @@ test('PR surface: <code> / <div> blocks do not satisfy the template check either
   for (const tag of ['code', 'div']) {
     const body = `<${tag}>\n${contiguous.join('\n')}\n</${tag}>`;
     const res = checkPrSurface({ title: GOOD_TITLE, body });
-    assert.equal(res.ok, false, `<${tag}> block content must not count as structure`);
-    assert.ok(rulesOf(res).includes('bilingual'), `<${tag}>: headings inside are not headings`);
+    assert.equal(res.ok, true, `<${tag}>: no GFM block parser, by design`);
   }
 });
 
@@ -32629,9 +32639,9 @@ test('PR surface: an attribution trailer inside <pre> is STILL rejected (structu
 });
 
 test('PR surface: a compliant body that MENTIONS html/indentation still passes (no false positive)', () => {
-  // The stripping must not eat real content: an indented continuation line inside
-  // a paragraph is a lazy continuation, not a code block, and an inline `<br>` in
-  // prose does not open a block.
+  // Prose an author really writes: a wrapped line that happens to be indented, and
+  // an inline `<br>`. Neither is structure, and neither may cost the author a
+  // violation.
   const body = prBody({ changelog: GOOD_CHANGELOG }).replace(
     'Detail for Why.',
     'Detail for Why,\n    wrapped and indented as a lazy continuation with a <br> in it.',
@@ -32640,7 +32650,172 @@ test('PR surface: a compliant body that MENTIONS html/indentation still passes (
   assert.equal(
     res.ok,
     true,
-    `a compliant body must survive the block stripping: ${res.violations.map((v) => `${v.rule}/${v.detail}`).join(' | ')}`,
+    `a compliant body must not trip the structural check: ${res.violations.map((v) => `${v.rule}/${v.detail}`).join(' | ')}`,
+  );
+});
+
+// GFM renders an ATX heading indented 0-3 spaces and treats 4+ as code. The gate
+// used to anchor every heading at column 0, so a body whose headings carried a
+// single stray space was rejected for `bilingual`, `changelog` and `checklist` at
+// once — a legitimate, correctly-rendering PR blocked outright, which is the worst
+// failure a gate has. The ` {0,3}` bound on every heading matcher is what fixes it,
+// and it is also what lets the indented-code stripper go: at 4 spaces the matchers
+// simply stop matching, so the heading is code again with no state machine to
+// maintain.
+suite('PR surface gate — GFM heading indent (0-3 renders, 4+ is code)');
+
+test('PR surface: headings indented 0-3 spaces are headings (a stray space must not block a PR)', () => {
+  for (const n of [0, 1, 2, 3]) {
+    const indent = ' '.repeat(n);
+    const body = goodBody()
+      .split('\n')
+      .map((l) => (/^#/.test(l) ? indent + l : l))
+      .join('\n');
+    const res = checkPrSurface({ title: GOOD_TITLE, body });
+    assert.equal(
+      res.ok,
+      true,
+      `${n}-space indent renders as a heading on GitHub, so it must pass: ${res.violations.map((v) => v.rule).join(',')}`,
+    );
+  }
+});
+
+// The other half of the ATX shape. A closing run of `#` is optional and means
+// nothing to GFM, so `## Changelog ##` is the same H2 — and rejecting it is the
+// same false positive as rejecting a one-space indent, wearing a different hat.
+test('PR surface: optional closing hashes (`## Changelog ##`) are a heading, not a violation', () => {
+  const body = goodBody()
+    .split('\n')
+    .map((l) => (/^#/.test(l) ? `${l} ${l.match(/^#+/)[0]}` : l))
+    .join('\n');
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(
+    res.ok,
+    true,
+    `GFM renders these as ordinary headings: ${res.violations.map((v) => v.rule).join(',')}`,
+  );
+  assert.deepEqual(
+    parseChangelogBlock(body),
+    { en: 'Add a PR surface gate.', ko: 'PR 표면 게이트를 추가한다.' },
+    'and the collector reads the same heading',
+  );
+});
+
+test('PR surface: a 4-space heading indent is code, not a heading (no stripper needed)', () => {
+  const body = goodBody()
+    .split('\n')
+    .map((l) => (/^#/.test(l) ? '    ' + l : l))
+    .join('\n');
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, false, '4 spaces makes it an indented code block');
+  assert.ok(rulesOf(res).includes('bilingual'));
+});
+
+// The gate is what PROMISES the release collector will find the changelog block.
+// If the two disagree about what counts as a `## Changelog` heading, the gate goes
+// green and the change then vanishes from the release notes — the exact silent
+// accident the gate exists to prevent. So they read the body through one shared
+// parser (lib/pr-body.mjs), and these tests are what keep them in step.
+//
+// `usable` is deliberately strict: a `malformed` result is NOT a collected entry.
+// An earlier version of this test asked only `!== null`, which counted every
+// malformed object as a success and hid a whole class of disagreement.
+const collectorUsable = (body) => {
+  const r = parseChangelogBlock(body);
+  return r !== null && r !== undefined && !r.malformed;
+};
+
+test('PR surface: the gate and the release collector agree on an indented `## Changelog`', () => {
+  for (const n of [0, 1, 2, 3, 4]) {
+    const indent = ' '.repeat(n);
+    const body = goodBody()
+      .split('\n')
+      .map((l) => (/^#/.test(l) ? indent + l : l))
+      .join('\n');
+    const gateOk = checkPrSurface({ title: GOOD_TITLE, body }).ok;
+    const usable = collectorUsable(body);
+    assert.equal(
+      gateOk,
+      usable,
+      `${n}-space indent: gate ${gateOk ? 'accepts' : 'rejects'} but the collector ` +
+        `${usable ? 'reads' : 'CANNOT read'} the changelog — a green gate whose entry never reaches CHANGELOG.md`,
+    );
+  }
+});
+
+// The shapes the gate used to wave through and the collector then choked on at
+// release time, when the PR could no longer be edited. The gate now runs the
+// collector's own parse, so the author hears about it while it is still one
+// `gh pr edit` away.
+test('PR surface: a changelog block the collector calls malformed is rejected AT THE PR', () => {
+  const malformed = [
+    ['None with a period', ['None.']],
+    ['a duplicated EN line', ['- EN: a', '- EN: b', '- KO: 가']],
+    ['None mixed with EN/KO', ['None', '- EN: a', '- KO: 가']],
+  ];
+  for (const [what, changelog] of malformed) {
+    const body = prBody({ changelog });
+    const res = checkPrSurface({ title: GOOD_TITLE, body });
+    assert.equal(
+      res.ok,
+      false,
+      `${what}: the collector cannot read this, so the gate must not pass it`,
+    );
+    assert.ok(
+      res.violations.some((v) => v.rule === 'changelog'),
+      `${what}: reported as a changelog violation`,
+    );
+    assert.equal(
+      collectorUsable(body),
+      false,
+      `${what}: (and the collector really does reject it)`,
+    );
+  }
+});
+
+test('PR surface: the shapes that DO collect still pass (- EN/- KO, None, - None, * None)', () => {
+  for (const changelog of [['- EN: a thing', '- KO: 어떤 것'], ['None'], ['- None'], ['* None']]) {
+    const body = prBody({ changelog });
+    const res = checkPrSurface({ title: GOOD_TITLE, body });
+    assert.equal(
+      res.ok,
+      true,
+      `${JSON.stringify(changelog)} must pass: ${res.violations.map((v) => `${v.rule}/${v.detail}`).join(' | ')}`,
+    );
+    assert.equal(collectorUsable(body), true, `${JSON.stringify(changelog)}: and it collects`);
+  }
+});
+
+// The bug that made the shared parser necessary. A PR whose body SHOWS a changelog
+// block inside a fence — a PR about the template, or about the collector itself —
+// used to hand the collector the EXAMPLE, which then shipped in CHANGELOG.md while
+// the real note was never seen. The gate passed it, because the gate masks fences
+// and found the real heading further down. Nobody was attacking anything; someone
+// wrote documentation.
+test('PR surface: a fenced changelog EXAMPLE does not become the release note', () => {
+  const body = [
+    ...languageBlock('English', EN_SUBHEADINGS),
+    ...languageBlock('한국어', KO_SUBHEADINGS),
+    '## How the block looks',
+    '',
+    '```markdown',
+    '## Changelog',
+    '- EN: Example only.',
+    '- KO: 예시일 뿐.',
+    '```',
+    '',
+    '## Changelog',
+    '- EN: the real note',
+    '- KO: 진짜 노트',
+    '',
+    ...checklistBlock(true),
+  ].join('\n');
+  const res = checkPrSurface({ title: GOOD_TITLE, body });
+  assert.equal(res.ok, true, 'the real section is there, so the gate passes');
+  assert.deepEqual(
+    parseChangelogBlock(body),
+    { en: 'the real note', ko: '진짜 노트' },
+    'the collector must publish the REAL note, not the fenced example above it',
   );
 });
 

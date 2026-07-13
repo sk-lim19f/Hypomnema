@@ -18,6 +18,8 @@ import {
   SECTION,
   SECTION_TITLE,
 } from './changelog-classify.mjs';
+// One reading of a PR body, shared with the PR gate — see lib/pr-body.mjs.
+import { parseChangelogBody } from './pr-body.mjs';
 
 // Derive the `…/pull` base URL for inline PR links from a package.json
 // repository URL (`https://github.com/owner/repo.git`, `git+https://…`, or the
@@ -84,64 +86,14 @@ export function normalizeIndexTitle(subject) {
 //   null                    the `## Changelog` heading is absent
 //   { malformed, reason }   present but invalid (missing EN/KO, empty value,
 //                           duplicate line, or None mixed with EN/KO)
-// HTML comments (the template's instructions) are stripped before parsing.
-export function parseChangelogBlock(body) {
-  const text = String(body ?? '').replace(/\r\n/g, '\n');
-  const lines = text.split('\n');
-  let start = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^##\s+Changelog\s*$/i.test(lines[i])) {
-      start = i + 1;
-      break;
-    }
-  }
-  if (start === -1) return null; // heading absent
-
-  // Collect the section body until the next `## ` heading or EOF, with HTML
-  // comments removed (they may span multiple lines).
-  const body_lines = [];
-  for (let i = start; i < lines.length; i++) {
-    if (/^##\s+\S/.test(lines[i])) break;
-    body_lines.push(lines[i]);
-  }
-  const cleaned = body_lines.join('\n').replace(/<!--[\s\S]*?-->/g, '');
-
-  const enLines = [];
-  const koLines = [];
-  let noneSeen = false;
-  for (const raw of cleaned.split('\n')) {
-    const line = raw.trim();
-    if (!line) continue;
-    const en = /^-?\s*EN\s*:\s*(.*)$/i.exec(line);
-    const ko = /^-?\s*KO\s*:\s*(.*)$/i.exec(line);
-    if (en) {
-      enLines.push(en[1].trim());
-    } else if (ko) {
-      koLines.push(ko[1].trim());
-    } else if (/^-?\s*None\s*$/i.test(line)) {
-      noneSeen = true;
-    }
-    // other prose lines are tolerated and ignored
-  }
-
-  if (noneSeen && (enLines.length || koLines.length)) {
-    return { malformed: true, reason: 'None mixed with EN/KO lines' };
-  }
-  if (noneSeen) return 'none';
-  if (enLines.length > 1 || koLines.length > 1) {
-    return { malformed: true, reason: 'duplicate EN or KO line' };
-  }
-  if (enLines.length === 0 && koLines.length === 0) {
-    return { malformed: true, reason: 'empty Changelog block (no EN/KO/None)' };
-  }
-  if (enLines.length === 0 || !enLines[0]) {
-    return { malformed: true, reason: 'missing or empty EN line' };
-  }
-  if (koLines.length === 0 || !koLines[0]) {
-    return { malformed: true, reason: 'missing or empty KO line' };
-  }
-  return { en: enLines[0], ko: koLines[0] };
-}
+//
+// The reading itself lives in lib/pr-body.mjs, shared with the PR gate. It used
+// to live here, and drifted from the gate's: this parser read the RAW body, so a
+// PR whose body DEMONSTRATED a changelog block inside a code fence handed it the
+// example, and the example shipped in CHANGELOG.md while the real note was never
+// seen. The gate passed that PR, because the gate masks fences and found the real
+// heading further down. A green gate has to mean the entry will be found here.
+export const parseChangelogBlock = parseChangelogBody;
 
 // Assemble classified, API-enriched entries into a structured draft. Pure: takes
 // the already-collected entry list, returns sections + index + contributors +
