@@ -1,0 +1,510 @@
+[
+  {
+    "path": ".claude-plugin/marketplace.json",
+    "exec": false
+  },
+  {
+    "path": ".claude-plugin/plugin.json",
+    "exec": false
+  },
+  {
+    "path": "LICENSE",
+    "exec": false
+  },
+  {
+    "path": "README.ko.md",
+    "exec": false
+  },
+  {
+    "path": "README.md",
+    "exec": false
+  },
+  {
+    "path": "commands/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "commands/audit.md",
+    "exec": false
+  },
+  {
+    "path": "commands/capture.md",
+    "exec": false
+  },
+  {
+    "path": "commands/crystallize.md",
+    "exec": false
+  },
+  {
+    "path": "commands/doctor.md",
+    "exec": false
+  },
+  {
+    "path": "commands/feedback.md",
+    "exec": false
+  },
+  {
+    "path": "commands/graph.md",
+    "exec": false
+  },
+  {
+    "path": "commands/ingest.md",
+    "exec": false
+  },
+  {
+    "path": "commands/init.md",
+    "exec": false
+  },
+  {
+    "path": "commands/lint.md",
+    "exec": false
+  },
+  {
+    "path": "commands/query.md",
+    "exec": false
+  },
+  {
+    "path": "commands/rename.md",
+    "exec": false
+  },
+  {
+    "path": "commands/resume.md",
+    "exec": false
+  },
+  {
+    "path": "commands/stats.md",
+    "exec": false
+  },
+  {
+    "path": "commands/uninstall.md",
+    "exec": false
+  },
+  {
+    "path": "commands/upgrade.md",
+    "exec": false
+  },
+  {
+    "path": "commands/verify.md",
+    "exec": false
+  },
+  {
+    "path": "docs/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "docs/ARCHITECTURE.md",
+    "exec": false
+  },
+  {
+    "path": "docs/CONTRIBUTING.md",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/apple-touch-icon.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/cover-devto.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/cover-devto.svg",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/favicon-16.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/favicon-32.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/favicon-64.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/icon-192.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/icon-512.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/logo.svg",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/social-card.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/social-card.svg",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/wordmark.png",
+    "exec": false
+  },
+  {
+    "path": "docs/assets/logo/wordmark.svg",
+    "exec": false
+  },
+  {
+    "path": "hooks/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "hooks/base-store.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hooks.json",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-auto-commit.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-auto-minimal-crystallize.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-auto-stage.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-compact-guard.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-cwd-change.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-file-watch.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-first-prompt.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-hot-rebuild.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-lookup.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-personal-check.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-pre-commit.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-session-end.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-session-record.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-session-start.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-shared.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/hypo-web-fetch-ingest.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/proposal-store.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/version-check-fetch.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/version-check.mjs",
+    "exec": false
+  },
+  {
+    "path": "package.json",
+    "exec": false
+  },
+  {
+    "path": "scripts/capture.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/crystallize.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/doctor.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/feedback-sync.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/feedback.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/graph.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/ingest.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/init.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/core-hooks.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/design-history-stale.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/extensions.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/failure-type.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/feedback-scope.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/frontmatter.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/hypo-ignore.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/hypo-root.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/page-usage.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/pkg-json.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/plugin-detect.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/project-create.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/schema-vocab.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/template-schema-version.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/wd-match.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/wikilink.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lint.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/proposal.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/query.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/rename.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/resume.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/session-audit.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/stats.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/uninstall.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/upgrade.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/verify.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/weekly-report.mjs",
+    "exec": false
+  },
+  {
+    "path": "skills/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "skills/crystallize/SKILL.md",
+    "exec": false
+  },
+  {
+    "path": "skills/graph/SKILL.md",
+    "exec": false
+  },
+  {
+    "path": "skills/ingest/SKILL.md",
+    "exec": false
+  },
+  {
+    "path": "skills/lint/SKILL.md",
+    "exec": false
+  },
+  {
+    "path": "skills/query/SKILL.md",
+    "exec": false
+  },
+  {
+    "path": "skills/verify/SKILL.md",
+    "exec": false
+  },
+  {
+    "path": "templates/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "templates/.hypoignore",
+    "exec": false
+  },
+  {
+    "path": "templates/Home.md",
+    "exec": false
+  },
+  {
+    "path": "templates/Overview.md",
+    "exec": false
+  },
+  {
+    "path": "templates/SCHEMA.md",
+    "exec": false
+  },
+  {
+    "path": "templates/extensions/agents/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "templates/extensions/commands/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "templates/extensions/hooks/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "templates/extensions/skills/.gitkeep",
+    "exec": false
+  },
+  {
+    "path": "templates/gitignore",
+    "exec": false
+  },
+  {
+    "path": "templates/hot.md",
+    "exec": false
+  },
+  {
+    "path": "templates/hypo-automation.md",
+    "exec": false
+  },
+  {
+    "path": "templates/hypo-config.md",
+    "exec": false
+  },
+  {
+    "path": "templates/hypo-guide.md",
+    "exec": false
+  },
+  {
+    "path": "templates/hypo-help.md",
+    "exec": false
+  },
+  {
+    "path": "templates/index.md",
+    "exec": false
+  },
+  {
+    "path": "templates/log.md",
+    "exec": false
+  },
+  {
+    "path": "templates/pages/_index.md",
+    "exec": false
+  },
+  {
+    "path": "templates/pages/observability/_index.md",
+    "exec": false
+  },
+  {
+    "path": "templates/projects/_template/hot.md",
+    "exec": false
+  },
+  {
+    "path": "templates/projects/_template/index.md",
+    "exec": false
+  },
+  {
+    "path": "templates/projects/_template/prd.md",
+    "exec": false
+  },
+  {
+    "path": "templates/projects/_template/session-state.md",
+    "exec": false
+  },
+  {
+    "path": "templates/session-state.md",
+    "exec": false
+  }
+]

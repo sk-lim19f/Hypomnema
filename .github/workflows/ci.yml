@@ -63,6 +63,19 @@ jobs:
       - name: Plugin surfaces load-valid (manifest, hooks, commands/skills)
         run: npm run smoke:plugin
 
+  ship-surface:
+    name: Ship surface gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      # Invoked by path, never `npm run`: a PR that edits package.json's `scripts`
+      # could otherwise redefine this gate to a no-op in the very commit it blocks.
+      - name: npm pack ships exactly the approved product files, and nothing they import is missing
+        run: node scripts/check-pack-surface.mjs
+
   init-snapshot:
     name: Init snapshot
     runs-on: ubuntu-latest
