@@ -65,6 +65,8 @@ import {
   makeProposalId as psMakeProposalId,
   proposalsDir as psProposalsDir,
   hashProposalContent,
+  consumeChallenge,
+  readChallenge as psReadChallenge,
 } from '../hooks/proposal-store.mjs';
 // proposal.mjs guards its CLI dispatch behind isMain(), so importing these pure
 // functions + result-returning actors for unit tests does not run the CLI.
@@ -73,6 +75,8 @@ import {
   classifyFreshness,
   resolveTargetPath as propResolveTargetPath,
   applyProposal,
+  challengeProposals,
+  resolveProposals,
   discardProposal,
   listPending,
 } from '../scripts/proposal.mjs';
@@ -1402,6 +1406,7 @@ const {
   isClosePattern,
   extractUserMessages,
   hasUserCloseSignal,
+  hasTypedUserApproval,
   hasPendingBackgroundWork,
   isCloseReconfirmDeclined,
   CLOSE_RECONFIRM_MARK,
@@ -29983,7 +29988,546 @@ test('IMPR-34: --project override is never partitioned away', () => {
   });
 });
 
-// ── summary ──────────────────────────────────────────────────────────────────
+// ── ISSUE-49: transcript-approved apply ──────────────────────────────────────
+//
+// A parked proposal could only be resolved on a TTY, so an agent-driven close
+// dead-ended and the only way to finish was to bypass the store with a direct
+// write. The approval now travels over the TRANSCRIPT instead of stdin. These
+// tests pin the thing that makes that safe: the ONLY accepted approval is a turn
+// the USER typed. Every other way the phrase can appear in a transcript — the
+// model's own words, an injected skill body, a click — must refuse.
+suite('ISSUE-49 — transcript-approved apply');
+
+// One parked proposal + a challenge, with the transcript shapes each test needs.
+function withParkedProposal(fn) {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'demo', 'session-state.md');
+    const target = join(dir, rel);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, 'THEIR bytes\n');
+    const parked = psWriteProposal(dir, {
+      target: rel,
+      baseHash: null,
+      currentAtProposalHash: hashProposalContent('THEIR bytes\n'),
+      proposedContent: 'MY merged handoff\n',
+      sessionId: 'sess-1',
+      device: 'd7',
+    });
+    const ch = challengeProposals(
+      { hypoDir: dir, sessionId: 'sess-1', ids: [parked.id] },
+      { stdout: capStream(), stderr: capStream(), now: () => '2026-07-13T00:00:00.000Z' },
+    );
+    // The phrase reaches the transcript in five shapes; only one is a real user turn.
+    const line = (o) => `${JSON.stringify(o)}\n`;
+    const phrase = `apply-proposals ${ch.nonce}`;
+    const transcripts = {
+      user: line({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: phrase }] },
+      }),
+      // The model tells the user WHAT to type. Its own message carries the phrase.
+      assistant: line({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: `Please type ${phrase}` }] },
+      }),
+      // A skill / slash-command body that quotes the phrase (isMeta).
+      meta: line({
+        type: 'user',
+        isMeta: true,
+        message: { role: 'user', content: [{ type: 'text', text: `docs: ${phrase}` }] },
+      }),
+      // An AskUserQuestion answer. The model authors the option labels AFTER seeing
+      // the nonce, so a click is not approval of this phrase.
+      click:
+        line({
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'tu_1', name: 'AskUserQuestion', input: {} }],
+          },
+        }) +
+        line({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'tu_1',
+                content: `Your questions have been answered: "Approve?"="${phrase}".`,
+              },
+            ],
+          },
+        }),
+      // A tool_result that merely CONTAINS the phrase (e.g. a Read of a file).
+      toolResult: line({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'tu_9', content: phrase }],
+        },
+      }),
+      // A REFUSAL that quotes the phrase on its own line. The user is told to type this
+      // phrase, so quoting it back while hesitating is the natural thing to do — and any
+      // line-level matcher reads the indented line as consent, which turns a refusal into
+      // an authorization. String content: the shape a genuinely typed turn actually takes.
+      quoted: line({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: `I do not consent; I am only quoting the command:\n    ${phrase}`,
+        },
+      }),
+      // The same hole reached by asking rather than refusing. Block content, so both
+      // extraction paths are covered.
+      asking: line({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: `Is this the command you mean?\n\n${phrase}` }],
+        },
+      }),
+    };
+    const paths = {};
+    for (const [k, v] of Object.entries(transcripts)) {
+      paths[k] = join(dir, `t-${k}.jsonl`);
+      writeFileSync(paths[k], v);
+    }
+    const resolve = (tPath) =>
+      resolveProposals(
+        { hypoDir: dir, sessionId: 'sess-1' },
+        { transcriptPath: tPath, stdout: capStream(), stderr: capStream() },
+      );
+    fn({ dir, rel, target, parked, nonce: ch.nonce, t: paths, resolve });
+  });
+}
+
+test('ISSUE-49: a user-typed approval applies the batch (the dead-end is gone)', () => {
+  withParkedProposal(({ target, parked, t, resolve, dir }) => {
+    const r = resolve(t.user);
+    assert.equal(r.ok, true, `should apply: ${JSON.stringify(r)}`);
+    assert.equal(readFileSync(target, 'utf-8'), 'MY merged handoff\n', 'the approved bytes landed');
+    assert.equal(psReadProposal(dir, parked.id), null, 'the artifact is consumed');
+  });
+});
+
+// The gate's whole safety rests on this: every OTHER way the phrase can reach a
+// transcript must refuse. If any of these ever flips to `true`, an unattended
+// process (or the model itself) can approve its own overwrite.
+for (const [shape, why] of [
+  ['assistant', "the model's own words are not the user's"],
+  ['meta', 'an injected skill/command body cannot self-satisfy the gate'],
+  ['click', 'a click is not approval of a phrase the model authored'],
+  ['toolResult', 'tool output that merely contains the phrase is not approval'],
+  ['quoted', 'a refusal that quotes the phrase on its own line is not approval'],
+  ['asking', 'a question whose body is the phrase is not approval'],
+]) {
+  test(`ISSUE-49: ${shape} phrase is refused — ${why}`, () => {
+    withParkedProposal(({ target, t, resolve }) => {
+      const r = resolve(t[shape]);
+      assert.equal(r.ok, false, `${shape} must not approve`);
+      assert.equal(r.reason, 'not-approved');
+      assert.equal(
+        readFileSync(target, 'utf-8'),
+        'THEIR bytes\n',
+        'the other session is preserved',
+      );
+    });
+  });
+}
+
+// The challenge for sess-1 EXISTS, so this reaches transcript resolution and fails
+// there — the point of the test. (Naming an unknown session would have bailed at
+// `no-challenge` and proved nothing about the transcript path.)
+test('ISSUE-49: an unresolvable transcript refuses (never assumes approval)', () => {
+  withParkedProposal(({ dir, target }) => {
+    const r = resolveProposals(
+      { hypoDir: dir, sessionId: 'sess-1' },
+      // No transcriptPath, and the real resolver globs a ~/.claude/projects that has
+      // no sess-1.jsonl, so it returns null.
+      { stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'transcript-unresolved', 'it failed AT transcript resolution');
+    assert.equal(readFileSync(target, 'utf-8'), 'THEIR bytes\n');
+  });
+});
+
+test('ISSUE-49: the approval is spent once (replay of the same turn refuses)', () => {
+  withParkedProposal(({ t, resolve, target }) => {
+    assert.equal(resolve(t.user).ok, true, 'first resolve applies');
+    const again = resolve(t.user);
+    assert.equal(again.ok, false, 'the same transcript cannot buy a second write');
+    assert.equal(again.reason, 'no-challenge', 'because the challenge was consumed');
+    assert.equal(readFileSync(target, 'utf-8'), 'MY merged handoff\n');
+  });
+});
+
+// Drive the REAL matcher (no injected hasApproval): a transcript where the user
+// typed a perfectly well-formed approval line for a DIFFERENT challenge.
+test('ISSUE-49: a nonce from another challenge does not approve this one', () => {
+  withParkedProposal(({ dir, target }) => {
+    const foreign = join(dir, 't-foreign.jsonl');
+    writeFileSync(
+      foreign,
+      `${JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: `apply-proposals ${'f'.repeat(32)}` }],
+        },
+      })}\n`,
+    );
+    const r = resolveProposals(
+      { hypoDir: dir, sessionId: 'sess-1' },
+      { transcriptPath: foreign, stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(r.ok, false, 'only THIS challenge’s nonce counts');
+    assert.equal(r.reason, 'not-approved');
+    assert.equal(readFileSync(target, 'utf-8'), 'THEIR bytes\n');
+  });
+});
+
+// Containment would turn a REFUSAL into an approval. The TTY channel has always
+// demanded an exact `apply <id>`; the transcript channel must not be looser.
+test('ISSUE-49: a line that merely CONTAINS the phrase is not approval', () => {
+  withParkedProposal(({ dir, nonce, target }) => {
+    for (const said of [
+      `do not apply-proposals ${nonce}`,
+      `why would I type apply-proposals ${nonce}?`,
+      `apply-proposals ${nonce} is the thing I am NOT doing`,
+    ]) {
+      const p = join(dir, `t-said-${said.length}.jsonl`);
+      writeFileSync(
+        p,
+        `${JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: [{ type: 'text', text: said }] },
+        })}\n`,
+      );
+      assert.equal(
+        hasTypedUserApproval(p, nonce),
+        false,
+        `"${said}" must not read as consent to overwrite`,
+      );
+      const r = resolveProposals(
+        { hypoDir: dir, sessionId: 'sess-1' },
+        { transcriptPath: p, stdout: capStream(), stderr: capStream() },
+      );
+      assert.equal(r.ok, false);
+      assert.equal(readFileSync(target, 'utf-8'), 'THEIR bytes\n');
+    }
+  });
+});
+
+// The nonce IS the approval, so one that outlives its own resolve is a second key.
+// "The pages are written" and "the approval is spent" are different claims; exiting
+// 0 would assert both while only the first is true.
+// The approval lives in an append-only transcript, so the user's typed line never
+// expires: deleting the challenge is the ONLY thing that makes the approval single-use.
+// Spending it AFTER the write would already have lost — a failed delete left a live
+// nonce behind, and the model could re-run resolve later and write again with no fresh
+// human turn. So the challenge is spent BEFORE the write, and a challenge that cannot
+// be spent writes NOTHING.
+test('ISSUE-49: a challenge that cannot be consumed writes nothing at all', () => {
+  withParkedProposal(({ dir, t, target }) => {
+    // Make the challenge undeletable by turning its parent into a read-only dir.
+    const chDir = join(psProposalsDir(dir), 'challenges');
+    chmodSync(chDir, 0o500);
+    try {
+      const r = resolveProposals(
+        { hypoDir: dir, sessionId: 'sess-1' },
+        { transcriptPath: t.user, stdout: capStream(), stderr: capStream() },
+      );
+      assert.equal(r.ok, false);
+      assert.equal(r.reason, 'challenge-not-consumed');
+      assert.equal(r.challengeSpent, false);
+      assert.deepEqual(r.written, [], 'nothing was written');
+      assert.equal(
+        readFileSync(target, 'utf-8'),
+        'THEIR bytes\n',
+        'the page is untouched: an approval that cannot be spent does not authorize a write',
+      );
+    } finally {
+      chmodSync(chDir, 0o700);
+    }
+  });
+});
+
+// Isolates WHY a replay refuses. The spent-once test above leaves BOTH the target holding
+// the applied bytes AND the artifact consumed, so freshness or a missing proposal would
+// refuse a second apply even if the challenge had survived. Put the whole world back —
+// target bytes and artifact — so every other check would PASS, leaving the spent challenge
+// as the only thing between the append-only approval line and a second write. It has to be
+// enough on its own.
+test('ISSUE-49: a spent challenge refuses a replay even when the world is put back', () => {
+  withParkedProposal(({ dir, parked, t, target, resolve }) => {
+    const artifact = join(psProposalsDir(dir), `${parked.id}.json`);
+    const artifactBytes = readFileSync(artifact, 'utf-8');
+
+    const r = resolve(t.user);
+    assert.equal(r.ok, true);
+    assert.equal(readFileSync(target, 'utf-8'), 'MY merged handoff\n');
+
+    writeFileSync(target, 'THEIR bytes\n');
+    writeFileSync(artifact, artifactBytes);
+    const again = resolveProposals(
+      { hypoDir: dir, sessionId: 'sess-1' },
+      { transcriptPath: t.user, stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(again.ok, false);
+    assert.equal(again.reason, 'no-challenge', 'the nonce is spent; a second apply must remint');
+    assert.equal(readFileSync(target, 'utf-8'), 'THEIR bytes\n', 'no second write');
+  });
+});
+
+// `unlink` is the mutual exclusion between concurrent resolvers: exactly one wins, the
+// loser gets ENOENT. Reading "already gone" as a successful spend would tell BOTH they held
+// the approval, and the user's single yes would buy two write batches. Only the caller
+// whose unlink SUCCEEDED may write.
+test('ISSUE-49: consuming a challenge twice succeeds once — ENOENT is a loss, not a win', () => {
+  withParkedProposal(({ dir, nonce }) => {
+    assert.equal(consumeChallenge(dir, 'sess-1', nonce), true, 'the winner spends it');
+    assert.equal(
+      consumeChallenge(dir, 'sess-1', nonce),
+      false,
+      'the loser must NOT read an absent challenge as its own successful spend',
+    );
+  });
+});
+
+// The consume must claim the NONCE it was authorized against, not whatever record happens
+// to occupy the session's path. Keying the file by session alone, a resolver holding N1
+// could unlink the record a concurrent `challenge` had just minted (N2) and then write the
+// N1 batch anyway: one typed approval buys two write batches, and N2 is spent without ever
+// being approved. It also has to honour supersession — the moment a fresh challenge is
+// minted, the old nonce must stop working.
+test('ISSUE-49: a superseded nonce cannot consume the challenge that replaced it', () => {
+  withParkedProposal(({ dir, parked, nonce, target, t }) => {
+    // A resolver is mid-flight holding N1 when `challenge` remints. N2 now stands.
+    const second = challengeProposals(
+      { hypoDir: dir, sessionId: 'sess-1', ids: [parked.id] },
+      { stdout: capStream(), stderr: capStream(), now: () => '2026-07-13T01:00:00.000Z' },
+    );
+    assert.notEqual(second.nonce, nonce, 'a remint mints a different nonce');
+
+    assert.equal(
+      consumeChallenge(dir, 'sess-1', nonce),
+      false,
+      'the stale nonce must not consume the record that superseded it',
+    );
+    assert.equal(
+      psReadChallenge(dir, 'sess-1')?.nonce,
+      second.nonce,
+      'and the fresh challenge is still standing, unspent',
+    );
+
+    // End to end: the old approval line in the transcript is now worthless.
+    const r = resolveProposals(
+      { hypoDir: dir, sessionId: 'sess-1' },
+      { transcriptPath: t.user, stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(r.ok, false, 'the superseded approval buys nothing');
+    assert.equal(readFileSync(target, 'utf-8'), 'THEIR bytes\n', 'the page is untouched');
+  });
+});
+
+// `hypoDir` arrives straight from `--hypo-dir` and may be relative (`.`). Every challenge
+// path must be produced by one resolution or the same file gets two names: minted under the
+// absolute path, looked for under the relative one, found nowhere. The gate then refuses a
+// real approval forever — safe, but the feature is dead.
+test('ISSUE-49: a relative --hypo-dir can still mint, read, and spend a challenge', () => {
+  withParkedProposal(({ dir, parked, t }) => {
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      const ch = challengeProposals(
+        { hypoDir: '.', sessionId: 'sess-1', ids: [parked.id] },
+        { stdout: capStream(), stderr: capStream(), now: () => '2026-07-13T02:00:00.000Z' },
+      );
+      assert.equal(ch.ok, true, 'the mint works');
+      assert.equal(psReadChallenge('.', 'sess-1')?.nonce, ch.nonce, 'and it can be read back');
+      assert.equal(consumeChallenge('.', 'sess-1', ch.nonce), true, 'and spent');
+    } finally {
+      process.chdir(cwd);
+    }
+    // The original absolute-path challenge is unaffected by any of that.
+    assert.equal(psReadChallenge(dir, 'sess-1'), null, 'the remint superseded the first one');
+    assert.ok(t.user);
+  });
+});
+
+// Two records under one session read as NO approval (readChallenge cannot know which nonce
+// the user was shown). So a mint that cannot remove the record it supersedes must FAIL:
+// announcing a fresh nonce on top of a stale one hands the user a nonce that can never be
+// spent, and every later remint strands the session deeper.
+test('ISSUE-49: a mint that cannot supersede the old record fails instead of stranding', () => {
+  withParkedProposal(({ dir, parked, nonce }) => {
+    // An undeletable stale record: a DIRECTORY where the old challenge file was.
+    const chDir = join(psProposalsDir(dir), 'challenges');
+    rmSync(join(chDir, `sess-1.${nonce}.json`));
+    mkdirSync(join(chDir, `sess-1.${nonce}.json`), { recursive: true });
+
+    const r = challengeProposals(
+      { hypoDir: dir, sessionId: 'sess-1', ids: [parked.id] },
+      { stdout: capStream(), stderr: capStream(), now: () => '2026-07-13T03:00:00.000Z' },
+    );
+    assert.equal(r.ok, false, 'the mint must not claim success');
+    assert.equal(r.reason, 'challenge-store-failed');
+  });
+});
+
+// The symlinked-store defense has to run BEFORE the scan reads the directory, not after it
+// has already listed and parsed what it found there. And it must anchor to the VAULT, not
+// to the store: a check that resolves the challenges dir against `realpath(proposalsDir)`
+// follows a redirected `.cache/proposals` out of the vault and then agrees with itself.
+for (const [what, redirect] of [
+  ['challenges', (dir) => join(psProposalsDir(dir), 'challenges')],
+  ['.cache/proposals', (dir) => psProposalsDir(dir)],
+]) {
+  test(`ISSUE-49: a redirected ${what} dir is never read from or consumed`, () => {
+    withParkedProposal(({ dir, nonce }) => {
+      const link = redirect(dir);
+      const elsewhere = join(dir, 'elsewhere');
+      // Stage a challenge that WOULD authorize the write, if the escape were followed.
+      const planted = what === 'challenges' ? elsewhere : join(elsewhere, 'challenges');
+      mkdirSync(planted, { recursive: true });
+      writeFileSync(
+        join(planted, `sess-1.${nonce}.json`),
+        JSON.stringify({ nonce, sessionId: 'sess-1', items: [{ id: 'x' }] }),
+      );
+      rmSync(link, { recursive: true, force: true });
+      symlinkSync(elsewhere, link);
+
+      assert.equal(psReadChallenge(dir, 'sess-1'), null, 'nothing is read out of the redirect');
+      assert.equal(
+        consumeChallenge(dir, 'sess-1', nonce),
+        false,
+        'and nothing out there is consumed',
+      );
+      assert.equal(
+        existsSync(join(planted, `sess-1.${nonce}.json`)),
+        true,
+        'the planted record is left untouched — it was never ours to unlink',
+      );
+    });
+  });
+}
+
+// A write can land and then have its audit append or its artifact removal fail. Reporting
+// that item as unwritten would tell the user their page is untouched when it has already
+// been overwritten. Understating a write is the one lie this tool must never tell.
+test('ISSUE-49: a post-write failure still reports the bytes as landed', () => {
+  withParkedProposal(({ dir, t, target }) => {
+    // Make the audit log unwritable: the target write lands, the log append does not.
+    const log = join(psProposalsDir(dir), 'applied.log');
+    mkdirSync(log, { recursive: true }); // a directory where a file must be appended
+
+    const r = resolveProposals(
+      { hypoDir: dir, sessionId: 'sess-1' },
+      { transcriptPath: t.user, stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(readFileSync(target, 'utf-8'), 'MY merged handoff\n', 'the bytes DID land');
+    assert.equal(r.ok, false, 'and the run is not clean');
+    assert.deepEqual(r.landed, ['projects/demo/session-state.md'], 'the report says so');
+  });
+});
+
+// The artifact body is hand-editable and apply writes to whatever `target` says AT
+// APPLY TIME. Binding only the id and the bytes would let the approved payload land
+// on a path the user never reviewed.
+test('ISSUE-49: swapping the artifact target after approval refuses the batch', () => {
+  withParkedProposal(({ dir, parked, t, resolve, target }) => {
+    const artifact = join(psProposalsDir(dir), `${parked.id}.json`);
+    const body = JSON.parse(readFileSync(artifact, 'utf-8'));
+    body.target = 'hot.md'; // same id, same approved bytes, DIFFERENT page
+    writeFileSync(artifact, JSON.stringify(body));
+
+    const r = resolve(t.user);
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'target-changed');
+    assert.equal(existsSync(join(dir, 'hot.md')), false, 'the unapproved page was never created');
+    assert.equal(readFileSync(target, 'utf-8'), 'THEIR bytes\n');
+  });
+});
+
+test('ISSUE-49: swapping the artifact content after approval refuses the batch', () => {
+  withParkedProposal(({ dir, parked, t, resolve, target }) => {
+    const artifact = join(psProposalsDir(dir), `${parked.id}.json`);
+    const body = JSON.parse(readFileSync(artifact, 'utf-8'));
+    body.proposedContent = 'BYTES THE USER NEVER SAW\n';
+    writeFileSync(artifact, JSON.stringify(body));
+
+    const r = resolve(t.user);
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'content-changed');
+    assert.equal(readFileSync(target, 'utf-8'), 'THEIR bytes\n');
+  });
+});
+
+// The approval names the bytes it was shown. If the page moves between the diff and
+// the resolve, the approval no longer describes the write.
+test('ISSUE-49: a target that moved after the diff refuses (stale approval)', () => {
+  withParkedProposal(({ target, t, resolve }) => {
+    writeFileSync(target, 'a THIRD session wrote here\n');
+    const r = resolve(t.user);
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'stale-approval');
+    assert.equal(
+      readFileSync(target, 'utf-8'),
+      'a THIRD session wrote here\n',
+      'the newest writer is preserved, not clobbered by a stale approval',
+    );
+  });
+});
+
+test('ISSUE-49: a missing or corrupt challenge is a remint, never a bypass', () => {
+  withParkedProposal(({ dir, t, target }) => {
+    const chPath = join(psProposalsDir(dir), 'challenges', 'sess-1.json');
+    writeFileSync(chPath, '{ not json');
+    const r = resolveProposals(
+      { hypoDir: dir, sessionId: 'sess-1' },
+      { transcriptPath: t.user, stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'no-challenge');
+    assert.equal(readFileSync(target, 'utf-8'), 'THEIR bytes\n');
+  });
+});
+
+// hasTypedUserApproval must not become a wildcard when handed a degenerate nonce.
+test('ISSUE-49: hasTypedUserApproval pins the nonce shape (no wildcard match)', () => {
+  withParkedProposal(({ t, nonce }) => {
+    assert.equal(hasTypedUserApproval(t.user, nonce), true, 'the real nonce matches');
+    assert.equal(hasTypedUserApproval(t.user, ''), false, 'an empty nonce is not a wildcard');
+    assert.equal(hasTypedUserApproval(t.user, 'short'), false, 'a non-nonce string is refused');
+    assert.equal(hasTypedUserApproval(t.assistant, nonce), false, 'assistant text never counts');
+  });
+});
+
+// The gate is only as good as the promise that nothing automated reaches it. Scan
+// EXECUTABLE code, not prose: a doc comment naming the command is documentation, a
+// call is a bypass. (hypo-shared legitimately DEFINES the approval matcher; what it
+// must never do is drive an apply.)
+test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never a hook’s', () => {
+  const hooksDir = join(REPO, 'hooks');
+  for (const name of readdirSync(hooksDir)) {
+    if (!name.endsWith('.mjs')) continue;
+    const code = readFileSync(join(hooksDir, name), 'utf-8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    assert.equal(
+      /scripts\/proposal\.mjs/.test(code),
+      false,
+      `${name} must not reach into the apply CLI`,
+    );
+    assert.equal(
+      /\b(resolveProposals|challengeProposals|applyProposal|writeApprovedProposal)\s*\(/.test(code),
+      false,
+      `${name} must not call an apply actor`,
+    );
+  }
+});
 
 console.log(`\n${'─'.repeat(40)}`);
 console.log(`  ${passed} passed, ${failed} failed`);
