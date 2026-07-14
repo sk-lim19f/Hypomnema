@@ -109,6 +109,7 @@ import {
 import { checkPrSurface } from '../scripts/lib/check-pr-surface.mjs';
 import {
   collectPagesLint,
+  collectPagesLinkable,
   collectPagesGraph,
   collectPagesRename,
   collectPagesCrystallize,
@@ -11784,6 +11785,62 @@ test('genuinely missing links are still W4 broken (no false negative)', () => {
   assert.ok(
     broken.includes('nope'),
     `missing bare slug must stay broken: ${JSON.stringify(broken)}`,
+  );
+});
+
+// ── `_`-dir pages: not linted, but still linkable (ISSUE-57) ─────────────────
+// The `_`-dir skip keeps draft/spec scaffolds out of the lint set. It used to
+// also drop them from the link-target catalog, so a link to a file that plainly
+// exists was reported broken — and under --strict that error made a green gate
+// unreachable. Scanning and referencing are now separate.
+
+test('a page under a `_`-dir is a valid link target (not a false broken link)', () => {
+  const { broken } = lintWiki({
+    'projects/p/_specs/freshness/spec.md': '# spec (no frontmatter: `_`-dir is not linted)\n',
+    'pages/index.md': wlPage('reference', 'see [[projects/p/_specs/freshness/spec]]'),
+  });
+  assert.ok(
+    !broken.includes('projects/p/_specs/freshness/spec'),
+    `a live file under a _-dir must resolve: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('a page under a `_`-dir is still NOT linted (the skip itself survives)', () => {
+  // No frontmatter at all. If the `_`-dir page had entered the lint set this
+  // would raise W1/no-frontmatter, which is exactly what the skip prevents.
+  const { errors, broken } = lintWiki({
+    'projects/p/_specs/freshness/spec.md': '# bare spec, no frontmatter\n',
+    'pages/index.md': wlPage('reference', 'see [[projects/p/_specs/freshness/spec]]'),
+  });
+  assert.equal(broken.length, 0);
+  assert.ok(
+    !errors.some((e) => e.file.includes('_specs')),
+    `_-dir pages must stay out of the lint set: ${JSON.stringify(errors)}`,
+  );
+});
+
+test('a missing page under a `_`-dir is still W4 broken (no false negative)', () => {
+  const { broken } = lintWiki({
+    'projects/p/_specs/freshness/spec.md': '# real one\n',
+    'pages/index.md': wlPage('reference', 'ghost [[projects/p/_specs/not-here/spec]]'),
+  });
+  assert.ok(
+    broken.includes('projects/p/_specs/not-here/spec'),
+    `a _-dir path that does not exist must stay broken: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('`_`-dir link targets get NO bare alias (they cannot mask unrelated links)', () => {
+  // Every spec lives at _specs/<name>/spec.md, so a derived bare `spec` alias
+  // would resolve any stray [[spec]] and swallow real broken links. Link targets
+  // are added verbatim — full slug only.
+  const { broken } = lintWiki({
+    'projects/p/_specs/freshness/spec.md': '# spec\n',
+    'pages/index.md': wlPage('reference', 'bare [[spec]]'),
+  });
+  assert.ok(
+    broken.includes('spec'),
+    `bare [[spec]] must NOT resolve to a _-dir page: ${JSON.stringify(broken)}`,
   );
 });
 
@@ -25961,6 +26018,16 @@ test('collectPages presets enforce distinct traversal policy', () => {
 
     // lint: `_`-dir skipped (no c), `_`-file kept, symlink + `.`-dir followed
     assert.deepEqual(names(collectPagesLint(dir, dir, [])), ['_keep', 'a', 'b', 'h', 'link']);
+    // linkable: lint's set PLUS `_`-dir pages (c) — they are not linted but are
+    // still real files, so a wikilink to one is not broken.
+    assert.deepEqual(names(collectPagesLinkable(dir, dir, [])), [
+      '_keep',
+      'a',
+      'b',
+      'c',
+      'h',
+      'link',
+    ]);
     // graph: most permissive — `_`-dir and `.`-dir and symlink all followed
     assert.deepEqual(names(collectPagesGraph(dir, dir, [])), ['_keep', 'a', 'b', 'c', 'h', 'link']);
     // rename: symlink skipped (security boundary), no link

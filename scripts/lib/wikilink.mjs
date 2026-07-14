@@ -8,21 +8,24 @@
 //   - scripts/crystallize.mjs (page collection, link extraction)
 //
 // Shared-resolver consolidation. Before this lib, each script carried its own copy of
-// collectPages + a slug-form deriver, drifting in subtle ways. The four
+// collectPages + a slug-form deriver, drifting in subtle ways. The five
 // collectPages variants are NOT interchangeable — they differ deliberately in
 // traversal/security/output-shape policy (codex design review, CONCERN):
 //
 //   - rename uses lstat + skips symlinks   → a vault scan can never escape via a
 //     symlinked dir/file (security boundary).
 //   - lint skips `_`-prefixed DIRECTORIES  → pages/feedback/_drafts scaffolds
-//     stay out of the lint set, while `_`-prefixed FILES (e.g. _index.md) lint.
+//     stay out of the lint SET, while `_`-prefixed FILES (e.g. _index.md) lint.
+//   - linkable is lint WITHOUT that dir skip → the same pages stay reachable as
+//     wikilink destinations. Not linting a page and not being able to link to it
+//     are separate policies; lint feeds this into its link-target catalog only.
 //   - crystallize skips ANY `.`-prefixed entry (dir AND file).
-//   - graph/lint/rename skip only `.`-prefixed FILES.
-//   - graph/crystallize emit raw `rel`/`slug`; lint keeps OS-native `rel`
-//     (its own buildSlugMap POSIX-normalizes downstream); rename/graph
+//   - graph/lint/linkable/rename skip only `.`-prefixed FILES.
+//   - graph/crystallize emit raw `rel`/`slug`; lint/linkable keep OS-native `rel`
+//     (lint's buildSlugMap POSIX-normalizes downstream); rename/graph
 //     POSIX-normalize the slug at scan time.
 //
-// So this lib exposes ONE walker core plus four NAMED PRESETS, not a pile of
+// So this lib exposes ONE walker core plus five NAMED PRESETS, not a pile of
 // boolean flags — each preset pins exactly one caller's historical behavior and
 // is fixed by a unit test. readdirSync order is preserved verbatim (NO sort):
 // graph's bare-first slug index is order-sensitive (first page wins a shared
@@ -75,6 +78,29 @@ export function collectPagesLint(dir, root, ignorePatterns = []) {
     {
       skipDotFile: true,
       skipUnderscoreDir: true,
+      shape: (full) => ({ path: full, rel: relative(root, full) }),
+    },
+    [],
+  );
+}
+
+// lint link-target catalog: collectPagesLint WITHOUT the `_`-dir skip.
+//
+// Not linting a page and not being able to link to it are different things. The
+// `_`-dir skip exists so draft/spec scaffolds don't have to satisfy the schema —
+// it was never meant to make them unreachable. Sharing one list for both jobs
+// made lint report a live file as a broken wikilink, and under --strict that is
+// an error, so a vault could not reach a green gate no matter how clean it was.
+// lint feeds this into buildSlugMap's extraTargets (verbatim full slugs, no bare
+// or dir-relative aliases): `_specs/<name>/spec.md` repeats across specs, and a
+// bare `spec` alias would swallow unrelated broken links.
+export function collectPagesLinkable(dir, root, ignorePatterns = []) {
+  return walkMarkdown(
+    dir,
+    root,
+    ignorePatterns,
+    {
+      skipDotFile: true,
       shape: (full) => ({ path: full, rel: relative(root, full) }),
     },
     [],
