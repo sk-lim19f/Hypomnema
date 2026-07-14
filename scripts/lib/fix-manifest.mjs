@@ -10,8 +10,10 @@
  * Shape (ADR 0036 decision 2 — NO `status` field):
  *   { fixId:number, testNames:string[], adrPath:string|null, adrKeyLine:string }
  *
- *  - testNames: MUST set-equal the `// @fix #N:` anchors in tests/runner.mjs
- *    (drift is an error — MANIFEST_TEST_DRIFT). Multiple anchors → multiple
+ *  - testNames: MUST set-equal the `// @fix #N:` anchors across tests/*.mjs
+ *    (drift is an error — MANIFEST_TEST_DRIFT). The anchors are spread over the
+ *    per-area test files and read as a union, so the file an anchor lives in
+ *    does not matter. Multiple anchors → multiple
  *    names. The NO_AUTO_TEST sentinel is the ONLY allowed lone entry; it may
  *    not be mixed with real test names.
  *  - adrPath: path (relative to the wiki root) of the ADR whose core decision
@@ -24,7 +26,7 @@
  *    fixes that have an ADR but whose evidence lives outside the corpus.
  *
  * Coverage contract: every fix that is BOTH claimed-merged in the spec AND
- * anchored in the runner must have exactly one row here (MANIFEST_MISSING_ROW
+ * anchored in the tests must have exactly one row here (MANIFEST_MISSING_ROW
  * is an error). Fixes anchored but not claimed (e.g. #18) are ORPHAN_ANCHOR
  * warnings and need no row.
  *

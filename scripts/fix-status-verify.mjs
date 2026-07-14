@@ -18,7 +18,7 @@
  * Exit 0 if no error-level findings, 1 otherwise.
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -46,11 +46,24 @@ const CORPUS_DIRS = ['scripts', 'hooks', 'commands', 'skills', 'templates'];
 // would self-match, making ADR_LINE_MISSING impossible to ever fire.
 const CORPUS_EXCLUDE = ['scripts/lib/fix-manifest.mjs'];
 
+// The anchors used to live in one file. They now sit next to the assertions
+// they name, spread across tests/<area>.test.mjs, so the default is the
+// DIRECTORY and every .mjs in it is read. Point --runner at a single file and
+// that still works — the fixture specs do exactly that.
+function readAnchorSource(target) {
+  if (!statSync(target).isDirectory()) return readFileSync(target, 'utf-8');
+  return readdirSync(target)
+    .filter((f) => f.endsWith('.mjs'))
+    .sort()
+    .map((f) => readFileSync(join(target, f), 'utf-8'))
+    .join('\n');
+}
+
 function parseArgs(argv) {
   const out = {
     hypoDir: process.env.HYPO_DIR || join(homedir(), 'hypomnema'),
     spec: null,
-    runner: join(REPO, 'tests/runner.mjs'),
+    runner: join(REPO, 'tests'),
     testCommand: 'npm test',
     json: false,
     manifest: null,
@@ -85,7 +98,8 @@ function printHelp() {
       'Options:',
       '  --hypo-dir <path>        Wiki root (default: $HYPO_DIR or ~/hypomnema)',
       '  --spec <path>            Override spec-v1.2.md path',
-      '  --runner <path>          Override tests/runner.mjs path',
+      '  --runner <path>          Override the anchor source: a tests/ directory',
+      '                           (every .mjs in it, unioned) or a single file',
       '  --test-command "<cmd>"   Test invocation (default: "npm test")',
       '  --json                   Emit machine-readable JSON report',
       '',
@@ -156,7 +170,7 @@ async function main() {
   }
 
   const specText = readFileSync(opts.spec, 'utf-8');
-  const runnerText = readFileSync(opts.runner, 'utf-8');
+  const runnerText = readAnchorSource(opts.runner);
 
   const anchors = parseAnchors(runnerText);
   const status = parseStatus(specText);
@@ -165,7 +179,7 @@ async function main() {
   if (!opts.json) {
     console.log(`fix-status-verify (Phase 1)`);
     console.log(`  spec:   ${opts.spec}`);
-    console.log(`  runner: ${opts.runner}`);
+    console.log(`  anchors: ${opts.runner}`);
     console.log(`  ${status.size} positive status claim(s), ${anchors.size} anchor(s)`);
     console.log(`  running: ${opts.testCommand}`);
   }

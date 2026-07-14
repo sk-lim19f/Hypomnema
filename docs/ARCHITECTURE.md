@@ -54,8 +54,11 @@ hypomnema/
 │   ├── pages/_index.md
 │   └── projects/_template/
 ├── tests/
-│   ├── runner.mjs                ← no-dependency test runner (one flat script)
-│   └── parallel.mjs              ← runs the runner as N sharded processes (`npm test`)
+│   ├── harness.mjs               ← test()/testAsync()/suite(), selection, reporting
+│   ├── helpers.mjs               ← fixtures shared by more than one area file
+│   ├── runner.mjs                ← entry: imports every *.test.mjs, owns no tests
+│   ├── parallel.mjs              ← runs the entry as N processes (`npm test`)
+│   └── <area>.test.mjs           ← one file per production area (26)
 ├── docs/                     ← ARCHITECTURE.md, CONTRIBUTING.md
 ├── .claude-plugin/plugin.json← plugin manifest
 └── package.json              ← npm metadata, no runtime deps
@@ -397,21 +400,49 @@ Default patterns: `*.pdf`, `*.zip`, `*.pem`, `*.env`, `*.key`, `*.crt`, `*creden
 
 ## Testing
 
-| Layer | Coverage |
+```
+tests/
+├── harness.mjs          ← test() / testAsync() / suite(), and how a run is selected
+├── helpers.mjs          ← fixtures used by more than one area file
+├── runner.mjs           ← the entry: imports every *.test.mjs, owns no tests itself
+├── parallel.mjs         ← runs the entry as N concurrent processes (`npm test`)
+└── <area>.test.mjs      ← one file per production area (26 of them)
+```
+
+Tests live next to the thing they test: `extensions.test.mjs`, `lint.test.mjs`,
+`proposal-base.test.mjs`, and so on. Two branches adding tests to different areas never touch
+the same file, which is the point of the layout. It is not about speed.
+
+Everything uses Node built-ins only. Fixtures are built in code with scoped helpers
+(`withTmpDir`, `withWiki`, `withCleanWiki`, `gitRepo`, …), each cleaning up in a `finally`.
+
+**Selection is by suite, never by test.** `suite(label)` opens a selection unit, and
+`--shard=i/n` keeps a whole suite in one process, in order. So tests inside one suite may build
+on each other, and suites may not build on each other. `node tests/parallel.mjs --shards=220`
+runs every suite alone in a fresh process and is the proof of that invariant. Run it whenever
+you add or split a suite.
+
+| Command | What it does |
 |---|---|
-| `hypo-shared.mjs` utilities | 7 unit tests |
-| `hypo-compact-guard.mjs` contract | 8 input/output tests |
-| `hypo-personal-check.mjs` contract | 6 input/output tests |
-| `init.mjs` smoke | ~6 (idempotency, dry-run, hook merge) |
-| `doctor.mjs` smoke | ~5 |
-| `upgrade.mjs` regression | ~10 (includes migration fixture) |
-| `lint.mjs` (fix / json / session-state) | ~10 |
-| Misc (`expandHome`, `resolveHypoRoot`, …) | ~remainder |
-| **Total** | Run `npm test` for the live count |
+| `npm test` | `parallel.mjs`, cpu-count processes, suites round-robined across them |
+| `npm run test:serial` | the whole suite in one process; verdict-identical |
+| `node tests/runner.mjs --grep=<regex>` | just the matching tests, in seconds |
+| `node tests/runner.mjs --file=lint` | one area file |
+| `node tests/parallel.mjs --by-file` | one process per area file |
+| `node tests/parallel.mjs --shards=220` | every suite alone: the order-independence proof |
 
-Run with `npm test`. The runner uses only Node.js built-ins; tests create scoped temp dirs and clean up after themselves. The count above is a layout sketch — exact totals shift as lanes ship, so `npm test` is the source of truth.
+Round-robin is the default rather than one-process-per-file, and the reason is measured, not
+assumed: on a 2026 laptop the whole suite runs in about 70s round-robined and about 100s
+`--by-file`. The areas differ by an order of magnitude in size, and `--by-file` starts all 26
+at once, which oversubscribes the cores. The big files (`extensions`, `proposal-base`,
+`close-global`) then finish last under contention while the small ones exit in seconds and
+leave the tail of the run half idle. Reach for `--by-file` to read one area's output, not to go
+fast.
 
-`npm test` shards `tests/runner.mjs` across processes via `tests/parallel.mjs` (one suite goes to exactly one shard, in order) and merges the shard reports. `npm run test:serial` runs the whole suite in one process; the two are verdict-identical. While iterating, `node tests/runner.mjs --grep=<regex>` runs just the matching tests.
+`  ✓ name` and `  ✗ name` are a contract, not decoration.
+`scripts/lib/fix-status-verify.mjs` parses them to map a fix number to its verdict, and reads
+the `// @fix #N:` anchors as a union across every `tests/*.mjs`, so the file an anchor sits in
+does not matter.
 
 ---
 
@@ -480,4 +511,4 @@ Requires `NPM_TOKEN` secret.
 
 Hypomnema follows semver. The release tooling (`scripts/bump-version.mjs`, `CHANGELOG.md`, `release.yml`) is documented in [CONTRIBUTING.md](CONTRIBUTING.md#release-process).
 
-Breaking schema or hook-format changes require a major bump and a corresponding `upgrade.mjs` migration fixture in `tests/runner.mjs`.
+Breaking schema or hook-format changes require a major bump and a corresponding `upgrade.mjs` migration fixture in `tests/upgrade.test.mjs`.
