@@ -30,7 +30,7 @@ import {
 import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
 import { FAILURE_TYPE_ENUM } from './lib/failure-type.mjs';
-import { collectPagesLint, slugForms } from './lib/wikilink.mjs';
+import { collectPagesLint, collectPagesLinkable, slugForms } from './lib/wikilink.mjs';
 import { parseFrontmatter, SEQUENCE_ENTRY_RE } from './lib/frontmatter.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
@@ -487,8 +487,17 @@ const args = parseArgs(process.argv);
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects', 'journal'].map((d) => join(args.hypoDir, d));
 const pages = scanDirs.flatMap((d) => collectPagesLint(d, args.hypoDir, ignorePatterns));
+// Pages under `_`-prefixed dirs are deliberately not linted, but they are real
+// files and a link to one is not broken. Catalog them as link targets only, as
+// verbatim full slugs (extraTargets gets no derived aliases — a bare `spec` from
+// every `_specs/<name>/spec.md` would mask unrelated broken links).
+const lintedRels = new Set(pages.map((p) => p.rel));
+const underscoreDirTargets = scanDirs
+  .flatMap((d) => collectPagesLinkable(d, args.hypoDir, ignorePatterns))
+  .filter((p) => !lintedRels.has(p.rel))
+  .map((p) => p.rel.replace(/\.md$/, '').replace(/\\/g, '/'));
 const linkTargets = collectLinkTargets(args.hypoDir, ignorePatterns);
-const slugMap = buildSlugMap(pages, linkTargets);
+const slugMap = buildSlugMap(pages, [...linkTargets, ...underscoreDirTargets]);
 const tagVocab = parseSchemaVocab(args.hypoDir);
 const pageDirs = parseSchemaPageDirs(args.hypoDir);
 // Accepted page types = hardcoded core ∪ the vault SCHEMA's taxonomy. Union (not
