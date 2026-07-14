@@ -1172,9 +1172,9 @@ function applySessionClose(args) {
    * the apply-then-reclose loop: once a human applies proposal P, disk == proposed
    * == payload.content, so the next close skips before it can re-raise a conflict.
    *
-   * Callers without `--session-id` (legacy / manual apply) sit outside the guard
-   * lifecycle: they never observed a base, so there is nothing to keep honest and
-   * they keep writing directly.
+   * There is no caller here without a `--session-id`. verifyCloseAuthority refuses
+   * that at the door, before a byte is written, so a session id is always present
+   * by the time this runs and the base lookup always has something to look up.
    */
   const overwrite = (key, relPath, field) => {
     if (!field || typeof field.content !== 'string') return; // optional / absent
