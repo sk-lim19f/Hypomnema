@@ -53,7 +53,9 @@ hypomnema/
 │   ├── Home.md, Overview.md, hypo-automation.md, hypo-help.md
 │   ├── pages/_index.md
 │   └── projects/_template/
-├── tests/runner.mjs          ← no-dependency test runner
+├── tests/
+│   ├── runner.mjs                ← no-dependency test runner (one flat script)
+│   └── parallel.mjs              ← runs the runner as N sharded processes (`npm test`)
 ├── docs/                     ← ARCHITECTURE.md, CONTRIBUTING.md
 ├── .claude-plugin/plugin.json← plugin manifest
 └── package.json              ← npm metadata, no runtime deps
@@ -408,6 +410,8 @@ Default patterns: `*.pdf`, `*.zip`, `*.pem`, `*.env`, `*.key`, `*.crt`, `*creden
 | **Total** | Run `npm test` for the live count |
 
 Run with `npm test`. The runner uses only Node.js built-ins; tests create scoped temp dirs and clean up after themselves. The count above is a layout sketch — exact totals shift as lanes ship, so `npm test` is the source of truth.
+
+`npm test` shards `tests/runner.mjs` across processes via `tests/parallel.mjs` (one suite goes to exactly one shard, in order) and merges the shard reports. `npm run test:serial` runs the whole suite in one process; the two are verdict-identical. While iterating, `node tests/runner.mjs --grep=<regex>` runs just the matching tests.
 
 ---
 
