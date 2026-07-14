@@ -240,6 +240,12 @@ let skipped = 0;
 const failures = [];
 const timings = [];
 
+// runApply's per-process session-id counter. Declared here (not next to runApply
+// itself) because tests defined earlier in the file already call runApply, and this
+// file executes top to bottom — a `let` declared at its point of use is in the TDZ
+// for every call site above it.
+let applySeq = 0;
+
 let suiteIndex = -1;
 // A test declared before the first suite() belongs to shard 1, so that a
 // sharded run covers it exactly once rather than once per shard.
@@ -2628,6 +2634,13 @@ function gitRepo(dir) {
   spawnSync('git', ['config', 'user.name', 'test'], opts);
 }
 
+// The commit tip. A refusal test asserts against this rather than a clean working
+// tree, because the fixture drops its own payload file into the wiki and would
+// otherwise be measuring itself.
+function gitHead(dir) {
+  return spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf-8' }).stdout.trim();
+}
+
 test('guard true when both .gitignore and .hypoignore cover .cache/', () => {
   withTmpDir((dir) => {
     gitRepo(dir);
@@ -3620,7 +3633,16 @@ function payloadForCleanWiki(dir, today) {
   };
 }
 
-function runApply(dir, payload, { force = false, sessionId = null } = {}) {
+// Apply a close payload. A payload-bearing apply now REQUIRES close authority
+// (a --session-id whose transcript carries a user close signal) BEFORE it writes
+// anything, so the default here seeds exactly that: a throwaway session whose
+// transcript says the user asked to close. Without it every apply test would be
+// testing the refusal path instead of the thing it means to test.
+//
+// The refusal path has its own tests. They opt out with `sessionId: false`
+// (no --session-id at all) or name an id that resolves to nothing / to a
+// transcript with no close signal.
+function runApply(dir, payload, { force = false, sessionId = undefined } = {}) {
   // Fix #39 (option D): payload presence = explicit close intent → always runs
   // full apply. --force only matters for the no-payload probe path, so tests
   // that supply a payload do NOT need --force.
@@ -3633,8 +3655,27 @@ function runApply(dir, payload, { force = false, sessionId = null } = {}) {
     '--json',
   ];
   if (force) flags.push('--force');
-  if (sessionId) flags.push(`--session-id=${sessionId}`);
-  return run('crystallize.mjs', flags);
+
+  // sessionId: false      → omit --session-id entirely (the refusal tests).
+  // sessionId: '<id>'     → use that id AND seed an authorized transcript for it,
+  //                         unless one already exists (callers that name an id do
+  //                         so for marker attribution or a lockout scenario, not to
+  //                         test authority).
+  // sessionId: undefined  → seed a throwaway authorized session.
+  // A caller testing an id that must NOT resolve seeds nothing and passes
+  // `noSeed: true` via the id itself (see the transcript-unresolved tests).
+  let cleanup = null;
+  let id = sessionId;
+  if (id === undefined) id = `apply-auth-${process.pid}-${applySeq++}`;
+  if (id && !resolveTranscriptBySessionId(id, join(SESSION_TMP_HOME, '.claude', 'projects'))) {
+    cleanup = seedCloseTranscript(id);
+  }
+  if (id) flags.push(`--session-id=${id}`);
+  try {
+    return run('crystallize.mjs', flags);
+  } finally {
+    if (cleanup) cleanup();
+  }
 }
 
 // FEAT-11 T5 fail-safe: drives the REAL close path (not a worker reimplementation
@@ -4973,9 +5014,10 @@ test('PRAC-17: daily shard seeds device frontmatter once + byte-equal on re-appl
     // device is always seeded; appears exactly once (in the seeded header).
     assert.ok(/\ndevice: \S+\n/.test(fm1), `shard frontmatter must carry device: ${fm1}`);
     assert.equal((fm1.match(/^device: /gm) || []).length, 1, 'device must appear exactly once');
-    // runApply does not pass --session-id, so session_id must be absent (not a
-    // dead/empty field) on the manual close path.
-    assert.ok(!/^session_id:/m.test(fm1), `session_id must be absent without --session-id: ${fm1}`);
+    // The close-authority gate now requires --session-id on every apply (runApply's
+    // default seeds a throwaway authorized one), so the shard always carries a
+    // session_id — unlike the old legacy path where omitting it left the field absent.
+    assert.ok(/^session_id: \S+$/m.test(fm1), `shard frontmatter must carry a session_id: ${fm1}`);
     // Post-apply lint stays clean with the extra fields (lint requires only title+type).
     assert.equal(JSON.parse(r1.stdout).ok, true, `post-apply lint must be clean: ${r1.stdout}`);
 
@@ -5079,14 +5121,19 @@ test('--hypo-dir isolation: overwrite fields land in the supplied dir', () => {
   // run() forces HYPO_DIR='' in env, so any write that lands inside `dir` is
   // proof --hypo-dir was honored. Use an overwrite field (sessionState) with a
   // unique sentinel — append fields are per-day deduped so they're a poor
-  // isolation probe.
+  // isolation probe. An overwrite field only writes cleanly when its base is
+  // observed and matches disk (FEAT-11 T4), so snapshot that base first under
+  // the same session-id the apply uses — otherwise this hits base-unknown and
+  // never exercises the isolation this test is actually about.
   withWiki(null, (dir, today) => {
+    const sid = 'isolation-probe-session';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
     const sentinel = `<!-- isolation-probe-${Date.now()} -->`;
     const payload = payloadForCleanWiki(dir, today);
     payload.sessionState = {
       content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
     };
-    const r = runApply(dir, payload);
+    const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
     const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
     assert.ok(onDisk.includes(sentinel), 'sentinel must land in --hypo-dir, proving isolation');
@@ -5128,13 +5175,18 @@ test('open-questions stale on disk → still passes (apply does not gate it)', (
 
 test('payload with stale `updated:` → exit 1, no auto-fix (advisor rule)', () => {
   withWiki(null, (dir, today) => {
+    // The stale content must actually LAND on disk for verification to flag it,
+    // so the overwrite base must be observed and match disk first (FEAT-11 T4) —
+    // otherwise the write is refused as base-unknown before it ever gets stale.
+    const sid = 'stale-updated-session';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
     const payload = payloadForCleanWiki(dir, today);
     // Inject a stale-dated session-state. Helper must NOT silently rewrite it.
     payload.sessionState = {
       content:
         '---\ntitle: session-state\ntype: session-state\nupdated: 2020-01-01\n---\n\n## 다음 작업\n\n- next\n',
     };
-    const r = runApply(dir, payload);
+    const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(
       r.status,
       1,
@@ -5811,21 +5863,29 @@ test('probe (#39): gate NOT ok + no payload → falls through to payload-require
 test('payload via stdin (`--payload=-`) works the same as a file', () => {
   withWiki(null, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
-    const r = spawnSync(
-      process.execPath,
-      [
-        join(REPO, 'scripts', 'crystallize.mjs'),
-        `--hypo-dir=${dir}`,
-        '--apply-session-close',
-        '--payload=-',
-        '--json',
-      ],
-      {
-        input: JSON.stringify(payload),
-        encoding: 'utf-8',
-        env: { ...process.env, HOME: SESSION_TMP_HOME },
-      },
-    );
+    const sid = `stdin-apply-${process.pid}`;
+    const cleanup = seedCloseTranscript(sid);
+    let r;
+    try {
+      r = spawnSync(
+        process.execPath,
+        [
+          join(REPO, 'scripts', 'crystallize.mjs'),
+          `--hypo-dir=${dir}`,
+          '--apply-session-close',
+          '--payload=-',
+          `--session-id=${sid}`,
+          '--json',
+        ],
+        {
+          input: JSON.stringify(payload),
+          encoding: 'utf-8',
+          env: { ...process.env, HOME: SESSION_TMP_HOME },
+        },
+      );
+    } finally {
+      cleanup();
+    }
     assert.equal(r.status, 0, `stdin apply failed: ${r.stdout}\n${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, true);
@@ -5846,12 +5906,18 @@ test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT
       );
     },
     (dir, today) => {
+      // Overwrite fields only write cleanly with an observed, matching base
+      // (FEAT-11 T4); seed it under the session-id this apply uses, or the
+      // sentinel write is refused as base-unknown before it reaches the
+      // out-of-scope-debt logic this test is actually about.
+      const sid = 'preflight-bug-b-session';
+      snapshotBase(dir, sid, overwriteTargets('test-project'));
       const sentinel = `<!-- preflight-sentinel-${Date.now()} -->`;
       const payload = payloadForCleanWiki(dir, today);
       payload.sessionState = {
         content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
       };
-      const r = runApply(dir, payload);
+      const r = runApply(dir, payload, { sessionId: sid });
       assert.equal(
         r.status,
         0,
@@ -5981,12 +6047,17 @@ test('post-apply (#40): payload introduces lint blocker → exit 1 stage=post-ap
   // ok:false with stage=post-apply-lint so caller distinguishes "wiki was
   // damaged" from "frontmatter stale".
   withWiki(null, (dir, today) => {
+    // Overwrite fields only write cleanly with an observed, matching base
+    // (FEAT-11 T4); seed it under the session-id this apply uses, or the write
+    // is refused as base-unknown before it ever reaches post-apply lint.
+    const sid = 'post-apply-lint-session';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
     const sentinel = `<!-- post-apply-sentinel-${Date.now()} -->`;
     const payload = payloadForCleanWiki(dir, today);
     payload.sessionState = {
       content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## random heading without required label\n\n- next\n`,
     };
-    const r = runApply(dir, payload);
+    const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(r.status, 1, `post-apply lint must fail, got ${r.status}\n${r.stdout}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
@@ -6004,12 +6075,18 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
   // impossible. Preflight must filter errors in files this apply will
   // overwrite. Lock the documented recovery path.
   withWiki(null, (dir, today) => {
+    // Same session-id across both calls: the first write becomes this session's
+    // new observed base (FEAT-11 T4 advanceBase), so the retry's overwrite still
+    // sees a matching base instead of base-unknown.
+    const sid = 'post-apply-retry-session';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+
     // 1. Apply a bad payload (session-state missing required heading)
     const bad = payloadForCleanWiki(dir, today);
     bad.sessionState = {
       content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## wrong heading\n\n- next\n`,
     };
-    const r1 = runApply(dir, bad);
+    const r1 = runApply(dir, bad, { sessionId: sid });
     assert.equal(r1.status, 1, `bad payload must fail: ${r1.stdout}`);
     assert.equal(JSON.parse(r1.stdout).stage, 'post-apply-lint');
 
@@ -6020,7 +6097,7 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
     };
     good.sessionLog.entry = `## [${today}] retry after fix\n`;
     good.log.entry = `## [${today}] session | test-project — retry\n`;
-    const r2 = runApply(dir, good);
+    const r2 = runApply(dir, good, { sessionId: sid });
     assert.equal(
       r2.status,
       0,
@@ -16965,11 +17042,12 @@ test('--mark-session-closed --transcript-path: lint error only in an UNTOUCHED f
   );
 });
 
-test('--apply-session-close --session-id with NO user-close signal → commits payload, marker withheld (ADR 0055/0056)', () => {
-  // ADR 0056: apply now commits its own payload before the marker gate, so the git
-  // axis no longer blocks. The marker is still withheld here — but because there is
-  // no resolvable close transcript (no user-close signal, ADR 0055 hard gate), NOT
-  // because the tree is dirty. The skip is surfaced, not silent.
+test('--apply-session-close --session-id with an unresolvable transcript → refused before any write (no partial commit)', () => {
+  // ADR 0056 used to let apply commit its own payload first and only withhold the
+  // marker on a bad transcript. The fix that closed the gate (verifyCloseAuthority,
+  // this PR's subject) moved the check BEFORE any write: a session-id that resolves
+  // to no transcript now refuses the WHOLE apply — no commit, no partial write, and
+  // definitely no marker. The refusal is surfaced (reason, not a silent no-op).
   withWiki(null, (dir, today) => {
     const payload = {
       project: 'test-project',
@@ -16986,78 +17064,34 @@ test('--apply-session-close --session-id with NO user-close signal → commits p
     };
     const payloadPath = join(dir, '.payload.json');
     writeFileSync(payloadPath, JSON.stringify(payload));
+    const sessionStateBefore = readFileSync(
+      join(dir, 'projects', 'test-project', 'session-state.md'),
+      'utf-8',
+    );
+    const headBefore = gitHead(dir);
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--apply-session-close',
       `--payload=${payloadPath}`,
-      '--session-id=s-apply',
+      '--session-id=s-apply-unresolved', // never seeded — no transcript will resolve
       '--json',
     ]);
-    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    assert.notEqual(r.status, 0, 'an unresolvable transcript must refuse the apply');
     const out = JSON.parse(r.stdout);
-    assert.equal(out.ok, true);
-    // The payload was committed by apply (the .hypoignore-aware helper) — the tree
-    // has no uncommitted work left (the git axis is satisfied, ADR 0056).
-    assert.equal(hypoIsClean(dir).uncommitted, false, 'apply must commit its own payload');
-    // Marker withheld: no user-close signal, surfaced as markerSkipReason.
-    assert.equal(out.markerWritten, false, 'no close signal → marker not written');
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, 'transcript-unresolved');
+    assert.deepEqual(out.applied, []);
+    assert.equal(out.committed, false);
+    assert.equal(gitHead(dir), headBefore, 'refused before any write → no new commit');
     assert.equal(
-      out.markerSkipReason,
-      'transcript-unresolved',
-      `skip reason must be the ADR 0055 user-close gate, not git: ${out.markerSkipReason}`,
+      readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      sessionStateBefore,
+      'refused before any write — session-state.md bytes must be untouched',
     );
     assert.equal(
-      existsSync(join(dir, '.cache', 'session-closed-s-apply.marker')),
+      existsSync(join(dir, '.cache', 'session-closed-s-apply-unresolved.marker')),
       false,
-      'marker must not land without a user-close signal',
-    );
-  });
-});
-
-test('--apply-session-close text output: markerWritten:false prints loud stderr warning (not silent)', () => {
-  // When the marker gate is withheld (no resolvable transcript), the human-facing
-  // text output (no --json) must print a loud warning to stderr so neither the
-  // user nor a model mis-reads "ok:true" as "session fully closed". This locks in
-  // the observability fix: a missing marker must never be silent.
-  withWiki(null, (dir, today) => {
-    const payload = {
-      project: 'test-project',
-      date: today,
-      sessionState: {
-        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
-      },
-      projectHot: {
-        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
-      },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
-      sessionLog: { entry: `## [${today}] marker-warning text test\n` },
-      log: { entry: `## [${today}] session | test-project: marker-warning text\n` },
-    };
-    const payloadPath = join(dir, '.payload.json');
-    writeFileSync(payloadPath, JSON.stringify(payload));
-    // Run WITHOUT --json so the human text path is exercised.
-    const r = run('crystallize.mjs', [
-      `--hypo-dir=${dir}`,
-      '--apply-session-close',
-      `--payload=${payloadPath}`,
-      '--session-id=s-text-warn',
-    ]);
-    assert.equal(r.status, 0, `apply must exit 0 even when marker is withheld: ${r.stderr}`);
-    assert.ok(
-      r.stderr.includes('session-close marker NOT written'),
-      `stderr must contain the marker-not-written warning: ${JSON.stringify(r.stderr)}`,
-    );
-    // The exact skip reason depends on which gate fires first (compact-gate-not-ok
-    // when the precompact gate has a blocker, or transcript-unresolved when the
-    // gate is clean but no transcript is seeded). Both are valid -- what matters
-    // is that any reason is surfaced, not which one.
-    assert.ok(
-      /reason: \w/.test(r.stderr),
-      `stderr must include a non-empty skip reason: ${JSON.stringify(r.stderr)}`,
-    );
-    assert.ok(
-      r.stderr.includes('Stop-chain'),
-      `stderr must mention Stop-chain so the reader knows the session is not closed: ${JSON.stringify(r.stderr)}`,
+      'marker must not land on a refused apply',
     );
   });
 });
@@ -17104,11 +17138,14 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
 });
 
 test('IMPR-15: no-user-close-signal → after an AskUserQuestion 세션 마무리 answer, a re-run lands the marker', () => {
-  // The documented recovery (crystallize.md Step 4): when apply is ok:true but the
-  // marker is withheld as `no-user-close-signal` (the transcript resolves but the
-  // user's close wording evaded the close-signal set), confirming once with
-  // AskUserQuestion [세션 마무리] injects a recognized close answer, so re-running
-  // the SAME idempotent apply lands the marker — no script change, no matcher edit.
+  // The documented recovery (crystallize.md Step 4) still exists, but its shape
+  // changed with the close-authority gate (this PR's subject): a transcript that
+  // resolves but carries no close signal used to let apply write everything and
+  // withhold only the marker. Now verifyCloseAuthority refuses the WHOLE apply —
+  // no write, no commit, no marker — for that same reason. Confirming once with
+  // AskUserQuestion [세션 마무리] still injects a recognized close answer into the
+  // transcript, so re-running the SAME idempotent apply now succeeds FULLY (not
+  // just the marker) — no script change, no matcher edit.
   const sid = 's-impr15-rerun';
   const projDir = join(SESSION_TMP_HOME, '.claude', 'projects', 'hypo-test-proj');
   const tpath = join(projDir, `${sid}.jsonl`);
@@ -17137,8 +17174,13 @@ test('IMPR-15: no-user-close-signal → after an AskUserQuestion 세션 마무�
         `--session-id=${sid}`,
         '--json',
       ];
+      const sessionStateBefore = readFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
+        'utf-8',
+      );
 
-      // (1) Transcript resolves but carries NO close signal → marker withheld.
+      // (1) Transcript resolves but carries NO close signal → the whole apply is
+      // refused before any write, not just the marker.
       writeFileSync(
         tpath,
         JSON.stringify({
@@ -17146,16 +17188,24 @@ test('IMPR-15: no-user-close-signal → after an AskUserQuestion 세션 마무�
           message: { role: 'user', content: '코드 리뷰 계속 부탁해' },
         }) + '\n',
       );
+      const headBefore = gitHead(dir);
       const r1 = run('crystallize.mjs', args);
-      assert.equal(r1.status, 0, `apply must exit 0: ${r1.stdout}\n${r1.stderr}`);
+      assert.notEqual(r1.status, 0, `first run must be refused: ${r1.stdout}\n${r1.stderr}`);
       const o1 = JSON.parse(r1.stdout);
-      assert.equal(o1.ok, true, `apply ok expected: ${r1.stdout}`);
+      assert.equal(o1.ok, false, `apply must not proceed without a close signal: ${r1.stdout}`);
       assert.equal(
-        o1.markerSkipReason,
+        o1.reason,
         'no-user-close-signal',
-        `expected the no-signal skip (not transcript-unresolved): ${JSON.stringify(o1)}`,
+        `expected the no-signal reason (not transcript-unresolved): ${JSON.stringify(o1)}`,
       );
-      assert.equal(o1.markerWritten, false, 'marker must be withheld on the first run');
+      assert.deepEqual(o1.applied, []);
+      assert.equal(o1.committed, false);
+      assert.equal(gitHead(dir), headBefore, 'refused before any write → no new commit');
+      assert.equal(
+        readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+        sessionStateBefore,
+        'refused before any write — session-state.md bytes must be untouched',
+      );
 
       // (2) The user picks [세션 마무리] in an AskUserQuestion; that answer value
       // lands in the transcript as a correlated tool_result. Append it and re-run.
@@ -17707,6 +17757,73 @@ test('--mark-session-closed refuses the marker on a feedback over-cap even when 
   });
 });
 
+test('--apply-session-close text output: markerWritten:false prints loud stderr warning (not silent)', () => {
+  // The close-authority gate now refuses the WHOLE apply (before any write) for
+  // session-id-required / transcript-unresolved / no-user-close-signal, so those
+  // three reasons can no longer reach this later "apply succeeded, marker withheld"
+  // path — see the rewritten "NO user-close signal" tests below. What still reaches
+  // it is a gate failure INDEPENDENT of close authority: an authorized transcript
+  // with a real close signal, but a feedback-over-cap blocker that fails the
+  // precompact gate (compact-gate-not-ok). The human-facing text output (no --json)
+  // must still print a loud warning to stderr so neither the user nor a model
+  // mis-reads "ok:true" as "session fully closed".
+  withTmpDir((dir) => {
+    const wiki = join(dir, 'wiki');
+    const today = todayLocal();
+    mkdirSync(wiki, { recursive: true });
+    buildCleanWikiTree(wiki, today);
+    adr47SeedFeedback(wiki, 11); // over the 10-entry cap → compact-gate-not-ok
+    adr47CommitWiki(wiki);
+    const home = adr47ControlledHome(dir);
+    const closeCleanup = seedCloseTranscript('s-text-warn', { home });
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(wiki, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(wiki, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] marker-warning text test\n` },
+      log: { entry: `## [${today}] session | test-project: marker-warning text\n` },
+    };
+    const payloadPath = join(dir, '.payload.json'); // outside the wiki git tree
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    // Run WITHOUT --json so the human text path is exercised.
+    let r;
+    try {
+      r = spawnSync(
+        process.execPath,
+        [
+          join(SCRIPTS, 'crystallize.mjs'),
+          `--hypo-dir=${wiki}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          '--session-id=s-text-warn',
+        ],
+        { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
+      );
+    } finally {
+      closeCleanup();
+    }
+    assert.equal(r.status, 0, `apply must exit 0 even when marker is withheld: ${r.stderr}`);
+    assert.ok(
+      r.stderr.includes('session-close marker NOT written'),
+      `stderr must contain the marker-not-written warning: ${JSON.stringify(r.stderr)}`,
+    );
+    assert.ok(
+      r.stderr.includes('reason: compact-gate-not-ok'),
+      `stderr must include the surfaced skip reason: ${JSON.stringify(r.stderr)}`,
+    );
+    assert.ok(
+      r.stderr.includes('Stop-chain'),
+      `stderr must mention Stop-chain so the reader knows the session is not closed: ${JSON.stringify(r.stderr)}`,
+    );
+  });
+});
+
 test('--apply-session-close routes the marker write through the full gate — refuses on feedback over-cap', () => {
   withTmpDir((dir) => {
     const wiki = join(dir, 'wiki');
@@ -17735,18 +17852,27 @@ test('--apply-session-close routes the marker write through the full gate — re
     };
     const payloadPath = join(dir, 'payload.json'); // outside the wiki git tree
     writeFileSync(payloadPath, JSON.stringify(payload));
-    const r = spawnSync(
-      process.execPath,
-      [
-        join(SCRIPTS, 'crystallize.mjs'),
-        '--apply-session-close',
-        `--payload=${payloadPath}`,
-        '--session-id=s-apply-oc',
-        `--hypo-dir=${wiki}`,
-        '--json',
-      ],
-      { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
-    );
+    // The close-authority gate runs before the feedback-cap gate this test is
+    // about, so the session-id needs a resolvable, authorized transcript in the
+    // controlled home or the apply is refused for the wrong reason.
+    const closeCleanup = seedCloseTranscript('s-apply-oc', { home });
+    let r;
+    try {
+      r = spawnSync(
+        process.execPath,
+        [
+          join(SCRIPTS, 'crystallize.mjs'),
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          '--session-id=s-apply-oc',
+          `--hypo-dir=${wiki}`,
+          '--json',
+        ],
+        { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
+      );
+    } finally {
+      closeCleanup();
+    }
     assert.equal(
       r.status,
       0,
@@ -29779,13 +29905,27 @@ function t4Payload(dir, today, projectHotContent, tag) {
   };
 }
 
+// A payload-bearing apply requires close authority before it writes anything
+// (see runApply's comment above), so any t4Apply call that passes a sessionId
+// must have an authorized transcript for it to resolve, or the gate refuses
+// before the base-store logic these tests actually exercise ever runs.
 function t4Apply(dir, payload, sessionId) {
   const payloadPath = join(dir, `.payload-${sessionId || 'none'}.json`);
   writeFileSync(payloadPath, JSON.stringify(payload));
   const argv = [`--hypo-dir=${dir}`, '--apply-session-close', `--payload=${payloadPath}`, '--json'];
-  if (sessionId) argv.push(`--session-id=${sessionId}`);
-  const r = run('crystallize.mjs', argv);
-  return { r, out: JSON.parse(r.stdout) };
+  let cleanup = null;
+  if (sessionId) {
+    argv.push(`--session-id=${sessionId}`);
+    if (!resolveTranscriptBySessionId(sessionId, join(SESSION_TMP_HOME, '.claude', 'projects'))) {
+      cleanup = seedCloseTranscript(sessionId);
+    }
+  }
+  try {
+    const r = run('crystallize.mjs', argv);
+    return { r, out: JSON.parse(r.stdout) };
+  } finally {
+    if (cleanup) cleanup();
+  }
 }
 
 test('base matches disk → direct write, no conflict, and the base advances', () => {
@@ -29891,19 +30031,34 @@ test('same session closing twice does not raise a false-positive against its own
   });
 });
 
-test('no --session-id → legacy direct write, outside the guard lifecycle', () => {
-  // Plan risk #70: a caller that never had a session could not have observed a
-  // base, so there is nothing to keep honest. Manual/legacy apply keeps writing.
+test('no --session-id → apply is refused before any write (no legacy escape hatch)', () => {
+  // The legacy path this used to pin is gone: verifyCloseAuthority now runs
+  // BEFORE any wiki write or commit, and refuses outright when --session-id is
+  // absent. A caller can no longer opt out of the base-store guard by omitting
+  // the flag; that omission is itself the thing that gets refused.
   withWiki(null, (dir, today) => {
     snapshotBase(dir, 's-unused', overwriteTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
-    writeFileSync(t4ProjectHot(dir), `${observed}\nsomeone else.\n`);
+    const otherWrote = `${observed}\nsomeone else.\n`;
+    writeFileSync(t4ProjectHot(dir), otherWrote);
 
     const mine = `${observed}\nlegacy manual apply.\n`;
-    const { out } = t4Apply(dir, t4Payload(dir, today, mine, 'legacy'), null);
+    // `applied: []` is the apply path's own account of itself, and the bug this
+    // guards was a write that happened anyway. Pin the two things the process
+    // cannot talk its way out of: the bytes on disk and the commit tip.
+    const headBefore = gitHead(dir);
+    const { r, out } = t4Apply(dir, t4Payload(dir, today, mine, 'legacy'), null);
 
-    assert.deepEqual(out.conflicts, [], 'no session id → no guard');
-    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), mine, 'legacy path writes directly');
+    assert.notEqual(r.status, 0, 'omitting --session-id must not succeed');
+    assert.equal(out.reason, 'session-id-required');
+    assert.deepEqual(out.applied, []);
+    assert.equal(out.committed, false);
+    assert.equal(gitHead(dir), headBefore, 'refused before any write → no new commit');
+    assert.equal(
+      readFileSync(t4ProjectHot(dir), 'utf-8'),
+      otherWrote,
+      "refused before any write — the other writer's bytes must be untouched",
+    );
   });
 });
 

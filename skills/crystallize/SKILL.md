@@ -11,7 +11,7 @@ When invoked to close a session — via an explicit close signal ("세션 종료
 
 ## What this does
 
-- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `/hypo:crystallize` in `--apply-session-close --payload=<path>` mode — which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). `--check-session-close` is a read-only dry-run of the **full** PreCompact gate: close files + scoped lint + design-history + feedback projection, sharing one function (`precompactGateStatus`) with the gate. A green check means no gate blocker needs a human fix, so it is the signal to declare the session closed (pass `--transcript-path` to widen the lint scope to this session's edited files exactly as the interactive hook does). It is not a hard guarantee: the live `/compact` can still differ on a context-≥70% prompt, `HYPO_SKIP_GATE`, or a transcript-scoped lint error the check did not see.
+- **Close mode**: walks the checklist (session-state, project hot.md, root hot.md, session-log, open-questions(변경 시), log.md) plus a lint step, then writes via `/hypo:crystallize` in `--apply-session-close --payload=<path> --session-id=<id>` mode, which runs the lint gate automatically, **scoped to the files it writes** (debt elsewhere is a non-blocking notice). **`--session-id` is required.** Before writing a byte, the apply resolves that session's transcript and refuses the whole close, exit 1 and nothing on disk, unless the **user** asked for it (`session-id-required` / `transcript-unresolved` / `no-user-close-signal`). A refusal is the answer, not an obstacle: ask the user, and re-run only if they say yes. `--check-session-close` is a read-only dry-run of the **full** PreCompact gate: close files + scoped lint + design-history + feedback projection, sharing one function (`precompactGateStatus`) with the gate. A green check means no gate blocker needs a human fix, so it is the signal to declare the session closed (pass `--transcript-path` to widen the lint scope to this session's edited files exactly as the interactive hook does). It is not a hard guarantee: the live `/compact` can still differ on a context-≥70% prompt, `HYPO_SKIP_GATE`, or a transcript-scoped lint error the check did not see.
 - **Synthesis mode**: finds tag clusters (≥ N pages), orphan pages (no outbound `[[wikilinks]]`), and draft / stub pages, then guides consolidation into `pages/syntheses/<topic>.md` with back-links and `index.md` updates.
 
 ---
@@ -102,15 +102,17 @@ Once it passes, report each item with ✓:
 - ✓ session-log entry
 - ✓ open-questions (or skipped if unchanged)
 - ✓ log.md entry
-- **marker written?** (required, if `--apply-session-close --session-id` was used): check `markerWritten` in the JSON output. If `true`, report "session-close marker written." If `false`, do NOT declare the session closed or complete; recover per the `markerSkipReason` branch below.
+- **marker written?** (required): check `markerWritten` in the JSON output. If `true`, report "session-close marker written." If `false`, do NOT declare the session closed or complete; recover per the branches below.
 
-If `markerWritten: true` (or `--session-id` was not passed), ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+If `markerWritten: true`, ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
 
-If `markerWritten: false`, do NOT say "session closed." Branch on `markerSkipReason`:
+**If `ok: false` with an authority `reason`, the close did not happen at all.** No file was written, nothing was committed. Do not report a partial close, and do not write the files by hand to get around it.
 
-- `no-user-close-signal`: files applied cleanly and the transcript resolved, but it carries no close phrase the gate recognizes (the user's close wording fell outside the close-signal set, e.g. "세션 마무리까지 진행해줘" / "세션 마무리 진행"). Re-running the same id will not help. Confirm intent once with `AskUserQuestion` (header "세션", one option **세션 마무리**); if the user picks it, that answer is a recognized close signal, so re-run the same `--apply-session-close … --session-id` command (idempotent no-op writes; the marker lands). If the user declines, leave the session unmarked. Do NOT change the close-signal matcher.
-- `transcript-unresolved` (wrong / background id): report "Files applied and verified (ok: true), but the marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. Re-run with the correct main-conversation `--session-id`."
-- any other reason (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface it verbatim and resolve the underlying blocker before re-running.
+- `session-id-required`: `--session-id` was omitted. Pass the main conversation's id and re-run.
+- `transcript-unresolved`: the id resolved no transcript, so it is most likely a background-task or Agent-thread uuid rather than the main conversation's. Get the right one and re-run.
+- `no-user-close-signal`: the transcript is this session's, and the user never asked to close in wording the gate recognizes (e.g. "세션 마무리까지 진행해줘" falls outside the close-signal set). Re-running the same id changes nothing. Confirm intent once with `AskUserQuestion` (header "세션", one option **세션 마무리**); if the user picks it, that answer becomes a recognized close signal, so the same command now applies everything: writes, commit, and marker. If the user declines, the session stays open and nothing is written. Do NOT change the close-signal matcher.
+
+If the apply succeeded but `markerWritten: false`, branch on `markerSkipReason` (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface it verbatim and resolve the underlying blocker before re-running.
 
 ### If the close came back `ok: false, stage: "proposal-pending"`
 

@@ -87,14 +87,26 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs \
   --json
 ```
 
-**`--session-id`:** pass the current session's id whenever you
-know it — most importantly when this close was triggered by a `[WIKI_AUTOCLOSE]`
-Stop-hook block (the block reason prints the exact `--session-id` to use). On a
-verified close (`ok: true` + clean git tree), it writes the per-session marker
-`HYPO_DIR/.cache/session-closed-<id>.marker`. That marker is what tells the
-Stop-chain Layer 3 hook (`hypo-auto-minimal-crystallize`) the session is closed,
-so it stops re-prompting. Omit it only when running crystallize purely for
-synthesis (no session-close intent) — the marker is then simply not written.
+**`--session-id` is required for any close that carries a `--payload`.** It is not a
+switch that turns a check on; omitting it fails the check. Before a single byte is
+written or committed, the apply resolves that session's transcript and looks for
+evidence the **user** asked to close. It refuses outright, exit 1 with `applied: []`
+and nothing on disk, in three cases:
+
+| `reason` | Meaning |
+|---|---|
+| `session-id-required` | No `--session-id` was passed. |
+| `transcript-unresolved` | The id resolves to no transcript under `~/.claude/projects/`. |
+| `no-user-close-signal` | The transcript exists, and the user never asked to close. |
+
+A refusal is not a failure to route around. It means the close should not happen: ask
+the user, and re-run only after they say so.
+
+On a verified close (`ok: true` + clean git tree) the apply also writes the per-session
+marker `HYPO_DIR/.cache/session-closed-<id>.marker`, which tells the Stop-chain Layer 3
+hook (`hypo-auto-minimal-crystallize`) that the session is closed so it stops
+re-prompting. Running crystallize purely for **synthesis** carries no payload and needs
+no session id.
 
 > **Source rule for `--session-id`:** use only the main conversation's session id
 > (the id shown in the `[WIKI_AUTOCLOSE]` block reason, or the injected
@@ -110,10 +122,10 @@ synthesis (no session-close intent) — the marker is then simply not written.
 
 | Invocation | Behavior |
 |---|---|
-| `--apply-session-close` (no `--payload`) | **Probe mode** — exits 0 with "오늘 이미 close 완료로 보임" if all 5 files are fresh today; exits 1 with "payload is required" otherwise. Cheap "already complete?" check. |
-| `--apply-session-close --payload=<path>` | **Always-apply** — payload presence = explicit close intent. Per-field idempotent writes (no-op when bytes match), then strict verification + lint gate. Safe to re-run. |
-| `--apply-session-close --payload=<path> --session-id=<id>` | Same as above, **plus** writes the per-session closed marker on success (clean git required). The Stop-chain Layer 3 path. |
-| `--apply-session-close --force` | Skips the probe early-exit. `--payload` still required for any actual apply work. |
+| `--apply-session-close` (no `--payload`) | **Probe mode** — exits 0 with "오늘 이미 close 완료로 보임" if all 5 files are fresh today; exits 1 with "payload is required" otherwise. Writes nothing, so it needs no session id. |
+| `--apply-session-close --payload=<path>` | **Refused**, exit 1, `reason: 'session-id-required'`. Nothing is written and nothing is committed. |
+| `--apply-session-close --payload=<path> --session-id=<id>` | The only apply path. Verifies close authority against that session's transcript **first**; on a refusal nothing is written. On success: per-field idempotent writes (no-op when bytes match), strict verification, lint gate, commit, and the per-session closed marker. Safe to re-run. |
+| `--apply-session-close --force` | Skips the probe early-exit. It does **not** skip the authority check, and `--payload` plus `--session-id` are still required to apply anything. |
 
 **Two lint gates run automatically, scoped to the files this close writes:**
 
@@ -148,13 +160,15 @@ Once `ok: true`, report:
 - ✓ post-apply lint clean
 - **marker written?** (required check): if `markerWritten: true`, report "session-close marker written"; if `markerWritten: false`, report "session-close marker NOT written (reason: `<markerSkipReason>`)" and do NOT declare the session "closed" or "complete". A missing marker means the Stop-chain is still open; recover per the `markerSkipReason` branch below.
 
-If `markerWritten: true` (or `--session-id` was not passed): ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+If `markerWritten: true`: ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
 
-If `markerWritten: false`, do NOT say "session closed." Branch on `markerSkipReason`:
+**If `ok: false` with an authority `reason`, the close did not happen at all.** Nothing was written, nothing was committed. Do not report a partial close, and do not go looking for another way in.
 
-- `no-user-close-signal`: the files applied cleanly and the `--session-id` resolved a transcript, but that transcript carries no close phrase the gate recognizes (the user asked to close in wording that fell outside the close-signal set, e.g. "세션 마무리까지 진행해줘" or "세션 마무리 진행"). Re-running with the same id will not help, since the transcript is unchanged. Instead, confirm intent once with `AskUserQuestion`, header "세션", a single option labelled **세션 마무리** (설명: "이 세션을 마무리하고 close 마커를 기록"). If the user picks 세션 마무리, that answer becomes a recognized close signal in the transcript, so re-run the exact same `--apply-session-close … --session-id` command (the writes are idempotent no-ops; the marker now lands). If the user declines, leave the session unmarked: the wiki record stands, but the session is not closed. Do NOT touch the close-signal matcher itself.
-- `transcript-unresolved` (or a background / agent id was passed): say "Files applied and verified (ok: true), but the session-close marker was not written (reason: `<markerSkipReason>`). The Stop-chain is still active. To fully close: re-run with the correct main-conversation `--session-id`."
-- any other reason (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface the reason verbatim and address it (resolve the compact blocker, fix the git / disk issue) before re-running.
+- `session-id-required`: you omitted `--session-id`. Pass the main conversation's id and re-run.
+- `transcript-unresolved`: the id resolved no transcript, so it is almost certainly not the main conversation's (a background-task or Agent-thread uuid, most often). Get the right one and re-run.
+- `no-user-close-signal`: the transcript is this session's, and the user never asked to close in wording the gate recognizes (e.g. "세션 마무리까지 진행해줘" falls outside the close-signal set). Re-running the same id changes nothing, because the transcript is unchanged. Confirm intent once with `AskUserQuestion`, header "세션", a single option labelled **세션 마무리** (설명: "이 세션을 마무리하고 close 마커를 기록"). If the user picks it, that answer lands in the transcript as a recognized close signal, so re-running the exact same command now applies **everything**: the writes, the commit, and the marker. If the user declines, the session stays open and nothing is written. Do NOT touch the close-signal matcher itself, and do not hand-write the files to work around the refusal.
+
+If the apply succeeded but `markerWritten: false`, do NOT say "session closed." Branch on `markerSkipReason` (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface the reason verbatim and address it (resolve the compact blocker, fix the git / disk issue) before re-running.
 
 If the user says stop, end here. Otherwise continue to Step 5.
 
