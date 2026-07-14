@@ -148,40 +148,173 @@ process.on('exit', () => {
   } catch {}
 });
 
+// Seed the session HOME with the one file the hooks need to find this checkout.
+// hypo-shared reads `pkgRoot` out of it and hands back null without it, and a
+// null PKG_ROOT makes hypo-personal-check skip lint entirely and report a clean
+// gate. Until this was written here, the file existed only as a side effect of
+// whichever init.mjs test happened to have run first in the same process, so
+// the PreCompact tests passed by luck of ordering: they went green under
+// --shards=8 and red under --shards=12, and red on their own under --grep.
+mkdirSync(join(SESSION_TMP_HOME, '.claude'), { recursive: true });
+writeFileSync(
+  join(SESSION_TMP_HOME, '.claude', 'hypo-pkg.json'),
+  JSON.stringify({ pkgRoot: REPO }),
+);
+
+// ── selection: shard / grep ──────────────────────────────────────────────────
+// This file is one flat script: every test body carries its own fixture cost
+// (a tmp dir, a git repo, a spawned child). Skipping a test body therefore
+// skips its cost, which is what makes both sharding and --grep worth anything.
+// Selection is per-SUITE, never per-test, so a suite whose tests build on each
+// other always lands in one shard, in order.
+
+const ARGV = process.argv.slice(2);
+
+function die(msg) {
+  console.error(msg);
+  process.exit(2);
+}
+
+// Every malformed flag exits 2. The failure mode being bought off here is not
+// a crash, it is a green: `--grepp=close` or a bare `--grep` would select
+// everything, run for minutes, and answer a question nobody asked.
+const VALUE_FLAGS = new Set(['shard', 'grep', 'json']);
+const BOOL_FLAGS = new Set(['timing', 'child']);
+const ARGS = parseFlags(ARGV, VALUE_FLAGS, BOOL_FLAGS, die);
+
+function parseFlags(argv, valueFlags, boolFlags, fail) {
+  const known = [...valueFlags, ...boolFlags];
+  const out = new Map();
+  for (const arg of argv) {
+    const m = /^--([a-zA-Z-]+)(?:=([\s\S]*))?$/.exec(arg);
+    const name = m?.[1];
+    if (!name || !known.includes(name)) {
+      fail(`unknown argument: ${arg}\nknown: ${known.map((f) => `--${f}`).join(' ')}`);
+    }
+    const value = m[2];
+    if (valueFlags.has(name) && !value) fail(`--${name} needs a value: --${name}=<value>`);
+    if (boolFlags.has(name) && value !== undefined) fail(`--${name} takes no value`);
+    if (out.has(name)) fail(`--${name} given more than once`);
+    out.set(name, valueFlags.has(name) ? value : true);
+  }
+  return out;
+}
+
+function argValue(name) {
+  const v = ARGS.get(name);
+  return typeof v === 'string' ? v : undefined;
+}
+
+const SHARD = (() => {
+  const raw = argValue('shard');
+  if (raw === undefined) return { index: 0, total: 1 };
+  const m = /^(\d+)\/(\d+)$/.exec(raw);
+  if (!m) die(`--shard expects i/n (1-based), got: ${raw}`);
+  const index = Number(m[1]) - 1;
+  const total = Number(m[2]);
+  if (total < 1 || index < 0 || index >= total) die(`--shard out of range: ${raw}`);
+  return { index, total };
+})();
+
+const GREP = (() => {
+  const raw = argValue('grep');
+  if (raw === undefined) return null;
+  try {
+    return new RegExp(raw, 'i');
+  } catch (err) {
+    die(`--grep is not a valid regex: ${err.message}`);
+  }
+})();
+
+const TIMING = ARGS.has('timing');
+const JSON_OUT = argValue('json');
+// Set by tests/parallel.mjs: our per-test lines still print (fix-status-verify
+// parses them), but the parent owns the one summary the reader should trust.
+const CHILD = ARGS.has('child');
+
 // ── minimal test harness ─────────────────────────────────────────────────────
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 const failures = [];
+const timings = [];
 
-function test(name, fn) {
-  try {
-    fn();
-    console.log(`  ✓ ${name}`);
-    passed++;
-  } catch (err) {
+let suiteIndex = -1;
+// A test declared before the first suite() belongs to shard 1, so that a
+// sharded run covers it exactly once rather than once per shard.
+let suiteSelected = SHARD.index === 0;
+
+// Headings are printed lazily, on the suite's first selected test, so a --grep
+// run is a list of what ran rather than 216 headings over three results.
+let pendingHeading = null;
+
+function selected(name) {
+  if (!suiteSelected) return false;
+  if (GREP && !GREP.test(name)) return false;
+  if (pendingHeading !== null) {
+    console.log(`\n${pendingHeading}`);
+    pendingHeading = null;
+  }
+  return true;
+}
+
+function record(name, err, ms) {
+  timings.push({ name, ms });
+  if (err) {
     console.error(`  ✗ ${name}`);
     console.error(`    ${err.message}`);
     failures.push({ name, err });
     failed++;
+  } else {
+    console.log(`  ✓ ${name}`);
+    passed++;
+  }
+}
+
+function test(name, fn) {
+  if (!selected(name)) {
+    skipped++;
+    return;
+  }
+  const t0 = performance.now();
+  try {
+    const result = fn();
+    // test() cannot await. Hand it an async body and the promise is dropped:
+    // every assertion inside runs after this checkmark is printed, and a
+    // rejection can never fail the test. There are ~1500 test() calls next to
+    // 19 testAsync() ones, so the wrong one is always right there to copy.
+    // Fail loudly instead of passing vacuously.
+    if (result !== null && typeof result?.then === 'function') {
+      result.catch(() => {}); // the body still runs; do not surface it as an unhandled rejection
+      throw new Error(
+        'async body passed to test() — its assertions are never awaited; use await testAsync(...)',
+      );
+    }
+    record(name, null, performance.now() - t0);
+  } catch (err) {
+    record(name, err, performance.now() - t0);
   }
 }
 
 async function testAsync(name, fn) {
+  if (!selected(name)) {
+    skipped++;
+    return;
+  }
+  const t0 = performance.now();
   try {
     await fn();
-    console.log(`  ✓ ${name}`);
-    passed++;
+    record(name, null, performance.now() - t0);
   } catch (err) {
-    console.error(`  ✗ ${name}`);
-    console.error(`    ${err.message}`);
-    failures.push({ name, err });
-    failed++;
+    record(name, err, performance.now() - t0);
   }
 }
 
 function suite(label) {
-  console.log(`\n${label}`);
+  suiteIndex++;
+  suiteSelected = suiteIndex % SHARD.total === SHARD.index;
+  pendingHeading = suiteSelected ? label : null;
 }
 
 // ── fix-status-verify anchors (Phase 1, learned_behavior #6 half) ────────────
@@ -5687,7 +5820,11 @@ test('payload via stdin (`--payload=-`) works the same as a file', () => {
         '--payload=-',
         '--json',
       ],
-      { input: JSON.stringify(payload), encoding: 'utf-8' },
+      {
+        input: JSON.stringify(payload),
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      },
     );
     assert.equal(r.status, 0, `stdin apply failed: ${r.stdout}\n${r.stderr}`);
     const out = JSON.parse(r.stdout);
@@ -6076,7 +6213,7 @@ test('--apply .gitignore migration appends .cache/, git-ignores the log, idempot
       const ci = spawnSync(
         'git',
         ['-C', hypoDir, 'check-ignore', '-q', '--', '.cache/page-usage.jsonl'],
-        { encoding: 'utf-8' },
+        { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
       );
       assert.equal(ci.status, 0, 'page-usage.jsonl must be git-ignored after migration');
 
@@ -11650,7 +11787,7 @@ function runStop(hookFile, dir) {
   return spawnSync(process.execPath, [join(HOOKS, hookFile)], {
     input: '{}',
     encoding: 'utf-8',
-    env: { ...process.env, HYPO_DIR: dir },
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
   });
 }
 
@@ -11790,7 +11927,7 @@ test('auto-stage skips .hypoignore-listed file_path', () => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
       input: JSON.stringify({ tool_input: { file_path: join(dir, '.cache', 'a.json') } }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0);
     const staged = spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], {
@@ -11810,7 +11947,7 @@ test('file-watch refuses to inject .hypoignore-matched file (e.g. .env)', () => 
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
       input: JSON.stringify({ file_path: secretPath }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
@@ -11832,7 +11969,7 @@ test('file-watch still injects non-ignored wiki file (e.g. hot.md)', () => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
       input: JSON.stringify({ file_path: hotPath }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
@@ -11873,7 +12010,7 @@ test('session-start refuses to inject .hypoignore-matched project hot/state', ()
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
       input: JSON.stringify({ cwd: work, session_id: 'test-fix48-ss' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(
@@ -11888,7 +12025,7 @@ test('session-start still injects non-ignored project hot/state', () => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
       input: JSON.stringify({ cwd: work, session_id: 'test-fix48-ss-ok' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0);
     assert.ok(
@@ -11926,7 +12063,7 @@ test('project hot with overdue verify_by_date gets STALE marker', () => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
       input: JSON.stringify({ cwd: work, session_id: 'test-a3-stale' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(/DATED_HOT_VALUE/.test(r.stdout), `expected hot injection: ${r.stdout}`);
@@ -11944,7 +12081,7 @@ test('derived project hot without verify_by_date gets no STALE marker', () => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
       input: JSON.stringify({ cwd: work, session_id: 'test-a3-nostale' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(/DATED_HOT_VALUE/.test(r.stdout), `expected hot injection: ${r.stdout}`);
@@ -11977,7 +12114,7 @@ test('session-start injects vault orientation when cwd is a project HIT ≠ vaul
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
       input: JSON.stringify({ cwd: work, session_id: 'test-impr19-ss' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.match(r.stdout, /\[WIKI VAULT:/, `expected vault orientation, got: ${r.stdout}`);
@@ -12000,7 +12137,7 @@ test('session-start omits vault orientation when cwd IS the vault root', () => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
       input: JSON.stringify({ cwd: dir, session_id: 'test-impr19-ss-vault' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(
@@ -12027,7 +12164,7 @@ test('session-start omits vault orientation when cwd is a vault SUBDIR (working_
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
       input: JSON.stringify({ cwd: subdir, session_id: 'test-impr19-ss-subdir' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(
@@ -12042,7 +12179,7 @@ test('cwd-change injects vault orientation when new cwd is a project HIT ≠ vau
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
       input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other', session_id: 'test-impr19-cc' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.match(r.stdout, /\[WIKI VAULT:/, `expected vault orientation, got: ${r.stdout}`);
@@ -12055,7 +12192,7 @@ test('cwd-change refuses to inject .hypoignore-matched project hot.md', () => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
       input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(!/SECRET_HOT_VALUE/.test(r.stdout), `secret leaked through cwd-change: ${r.stdout}`);
@@ -12069,7 +12206,7 @@ test('cwd-change refuses to inject .hypoignore-matched global hot.md', () => {
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
       input: JSON.stringify({ new_cwd: '/tmp/nowhere-no-project', old_cwd: '/tmp/other' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(
@@ -12597,7 +12734,7 @@ function runFirstPrompt(sessionId) {
   return spawnSync(process.execPath, [join(HOOKS, 'hypo-first-prompt.mjs')], {
     input: JSON.stringify({ session_id: sessionId, prompt: 'unrelated weather question' }),
     encoding: 'utf-8',
-    env: { ...process.env, HYPO_DIR: '/tmp/nonexistent-hypo-99999' },
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: '/tmp/nonexistent-hypo-99999' },
   });
 }
 
@@ -12658,7 +12795,7 @@ test('replay-cwd-change-triggers-first-prompt: entering a project arms the marke
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
       input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other-nonproject', session_id: sid }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     try {
@@ -12822,7 +12959,7 @@ test('replay-cwd-change-triggers-first-prompt: ignored hot.md does NOT arm the m
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
       input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other-nonproject', session_id: sid }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     if (existsSync(markerPath(sid))) {
@@ -12840,7 +12977,7 @@ test('replay-cwd-change-triggers-first-prompt: same-project move does NOT arm th
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
       input: JSON.stringify({ new_cwd: sub, old_cwd: work, session_id: sid }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     if (existsSync(markerPath(sid))) {
@@ -12855,7 +12992,7 @@ test('file-watch ignores file outside HYPO_DIR even without .hypoignore', () => 
     const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
       input: JSON.stringify({ file_path: '/etc/passwd' }),
       encoding: 'utf-8',
-      env: { ...process.env, HYPO_DIR: dir },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
     });
     assert.equal(r.status, 0);
     const out = JSON.parse(r.stdout);
@@ -12945,7 +13082,7 @@ function runStart(dir, cwd) {
   return spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
     input: JSON.stringify({ cwd: cwd || dir, session_id: 'test-growth' }),
     encoding: 'utf-8',
-    env: { ...process.env, HYPO_DIR: dir },
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
   });
 }
 
@@ -17214,7 +17351,7 @@ test('feedback projection conflict (hand-edited block) → still blocks, no auto
             `--hypo-dir=${dir}`,
             `--claude-home=${join(home, '.claude')}`,
           ],
-          { encoding: 'utf-8' },
+          { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
         );
         writeFileSync(
           claudePath,
@@ -21353,7 +21490,7 @@ function runWebFetchHook(payload, env = {}) {
   return spawnSync(process.execPath, [join(HOOKS, 'hypo-web-fetch-ingest.mjs')], {
     input: typeof payload === 'string' ? payload : JSON.stringify(payload),
     encoding: 'utf-8',
-    env: { ...process.env, HYPO_DIR: '', ...env },
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: '', ...env },
   });
 }
 
@@ -22514,7 +22651,7 @@ function runShim(dir, extraEnv = {}) {
   return spawnSync(process.execPath, [join(dir, 'scripts', 'pre-commit-format.mjs')], {
     cwd: dir,
     encoding: 'utf-8',
-    env: { ...process.env, ...extraEnv },
+    env: { ...process.env, HOME: SESSION_TMP_HOME, ...extraEnv },
   });
 }
 
@@ -22660,6 +22797,7 @@ test('shim: invocation WITH sentinel honours GIT_INDEX_FILE (legitimate commit -
       encoding: 'utf-8',
       env: {
         ...process.env,
+        HOME: SESSION_TMP_HOME,
         GIT_INDEX_FILE: indexLock,
         HYPOMNEMA_HOOK_INVOCATION: '1',
       },
@@ -22699,7 +22837,7 @@ test('shim: direct invocation drops inherited GIT_INDEX_FILE (closes alternate-i
       encoding: 'utf-8',
       // Note: no HYPOMNEMA_HOOK_INVOCATION. Direct invocation must drop the
       // attacker-controlled GIT_INDEX_FILE.
-      env: { ...process.env, GIT_INDEX_FILE: attackIdx },
+      env: { ...process.env, HOME: SESSION_TMP_HOME, GIT_INDEX_FILE: attackIdx },
     });
     assert.equal(r.status, 0);
     const after = readFileSync(join(real, 'victim.txt'), 'utf-8');
@@ -22732,6 +22870,7 @@ test('shim: mixed-env (foreign GIT_DIR + real GIT_WORK_TREE + foreign GIT_INDEX_
       encoding: 'utf-8',
       env: {
         ...process.env,
+        HOME: SESSION_TMP_HOME,
         GIT_DIR: join(foreign, '.git'),
         GIT_WORK_TREE: real,
         GIT_INDEX_FILE: join(foreign, '.git', 'index'),
@@ -22789,6 +22928,7 @@ test('shim: foreign hypomnema-named repo via GIT_DIR/GIT_WORK_TREE → does NOT 
       encoding: 'utf-8',
       env: {
         ...process.env,
+        HOME: SESSION_TMP_HOME,
         GIT_DIR: join(foreign, '.git'),
         GIT_WORK_TREE: foreign,
       },
@@ -22818,7 +22958,7 @@ function runInstaller(dir, extraEnv = {}) {
   return spawnSync(process.execPath, [join(dir, 'scripts', 'install-git-hooks.mjs')], {
     cwd: dir,
     encoding: 'utf-8',
-    env: { ...cleanParent, ...extraEnv },
+    env: { ...cleanParent, HOME: SESSION_TMP_HOME, ...extraEnv },
   });
 }
 
@@ -22975,7 +23115,7 @@ test('installer: linked worktree → skips', () => {
     const r = spawnSync(process.execPath, [join(wt, 'scripts', 'install-git-hooks.mjs')], {
       cwd: wt,
       encoding: 'utf-8',
-      env: { ...cleanParent, HYPOMNEMA_HOOK_VERBOSE: '1' },
+      env: { ...cleanParent, HOME: SESSION_TMP_HOME, HYPOMNEMA_HOOK_VERBOSE: '1' },
     });
     assert.equal(r.status, 0);
     assert.match(r.stderr, /linked worktree|toplevel != expectedRoot/);
@@ -23529,7 +23669,7 @@ test('CLI: green fixture → exit 0', () => {
         '--test-command',
         `${process.execPath} ${runnerPath}`,
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
     assert.match(r.stdout, /verified/);
@@ -23566,7 +23706,7 @@ test('CLI: type:reference stub spec → exit 1 with STUB_SPEC', () => {
         `${process.execPath} ${runnerPath}`,
         '--json',
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
     const j = JSON.parse(r.stdout);
@@ -23604,7 +23744,7 @@ test('CLI: vacuous spec (anchors but 0 claims) → exit 1 with STUB_SPEC', () =>
         `${process.execPath} ${runnerPath}`,
         '--json',
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 1);
     const j = JSON.parse(r.stdout);
@@ -23634,7 +23774,7 @@ test('CLI: missing anchor → exit 1 with NO_ANCHOR finding', () => {
         '--test-command',
         `${process.execPath} ${runnerPath}`,
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 1);
     assert.match(r.stdout, /NO_ANCHOR/);
@@ -23672,7 +23812,7 @@ test('CLI: anchor names test that does not run → exit 1 with MISSING_TEST', ()
         '--test-command',
         `${process.execPath} ${runnerPath}`,
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 1);
     assert.match(r.stdout, /MISSING_TEST/);
@@ -23707,7 +23847,7 @@ test('CLI: --json emits machine-readable report with ok flag', () => {
         `${process.execPath} ${runnerPath}`,
         '--json',
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 0);
     const j = JSON.parse(r.stdout);
@@ -23751,7 +23891,7 @@ test('CLI: anchored test fails → exit 1 with FAILING_TEST', () => {
         '--test-command',
         `${process.execPath} ${runnerPath}`,
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 1);
     assert.match(r.stdout, /FAILING_TEST/);
@@ -23784,7 +23924,7 @@ test('CLI: test command exits nonzero → exit 1 with TEST_RUN_NONZERO_EXIT', ()
         `${process.execPath} ${runnerPath}`,
         '--json',
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 1);
     const j = JSON.parse(r.stdout);
@@ -23831,7 +23971,7 @@ test('CLI: manifest adrKeyLine absent from corpus → exit 1 with ADR_LINE_MISSI
         `${process.execPath} ${runnerPath}`,
         '--json',
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
     const j = JSON.parse(r.stdout);
@@ -23868,7 +24008,7 @@ test('CLI: claimed+anchored fix with no manifest row → exit 1 with MANIFEST_MI
         `${process.execPath} ${runnerPath}`,
         '--json',
       ],
-      { encoding: 'utf-8', cwd: REPO },
+      { encoding: 'utf-8', cwd: REPO, env: { ...process.env, HOME: SESSION_TMP_HOME } },
     );
     assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
     const j = JSON.parse(r.stdout);
@@ -26193,7 +26333,7 @@ function runCollect(args, extraEnv = {}) {
   return spawnSync(process.execPath, [COLLECT, ...args], {
     cwd: REPO,
     encoding: 'utf-8',
-    env: { ...process.env, ...extraEnv },
+    env: { ...process.env, HOME: SESSION_TMP_HOME, ...extraEnv },
   });
 }
 
@@ -26687,7 +26827,7 @@ test('importing crystallize.mjs runs no CLI and exposes exactly the pure exports
       '-e',
       `import(${JSON.stringify(script)}).then((m) => process.stdout.write(Object.keys(m).sort().join(',')))`,
     ],
-    { encoding: 'utf-8' },
+    { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
   );
   assert.equal(r.status, 0, `import must exit 0, got ${r.status}: ${r.stderr}`);
   assert.equal(
@@ -29843,7 +29983,7 @@ function runAutoStageHook(dir, sessionId, filePath, toolName = 'Edit', content =
   return spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
     input: JSON.stringify({ session_id: sessionId, tool_name: toolName, tool_input }),
     encoding: 'utf-8',
-    env: { ...process.env, HYPO_DIR: dir },
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
   });
 }
 
@@ -30360,7 +30500,11 @@ test('resume.mjs hides a machine-scoped session-state on a foreign device and sa
     const r = spawnSync(
       process.execPath,
       [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=scoped'],
-      { cwd: work, encoding: 'utf-8', env: { ...process.env, HYPO_DEVICE: 'devB' } },
+      {
+        cwd: work,
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DEVICE: 'devB' },
+      },
     );
     assert.ok(
       !SCOPED_BODIES.test(r.stdout),
@@ -30380,7 +30524,11 @@ test('resume.mjs still returns a machine-scoped session-state on its own device'
     const r = spawnSync(
       process.execPath,
       [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=scoped'],
-      { cwd: work, encoding: 'utf-8', env: { ...process.env, HYPO_DEVICE: 'devA' } },
+      {
+        cwd: work,
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DEVICE: 'devA' },
+      },
     );
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(
@@ -30397,7 +30545,11 @@ test('resume.mjs --json does not serialize a machine-scoped body on a foreign de
     const r = spawnSync(
       process.execPath,
       [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=scoped', '--json'],
-      { cwd: work, encoding: 'utf-8', env: { ...process.env, HYPO_DEVICE: 'devB' } },
+      {
+        cwd: work,
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DEVICE: 'devB' },
+      },
     );
     assert.ok(
       !SCOPED_BODIES.test(r.stdout),
@@ -30417,7 +30569,11 @@ test('resume.mjs returns a visible session-state while hiding a scoped-out hot.m
     const r = spawnSync(
       process.execPath,
       [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=scoped'],
-      { cwd: work, encoding: 'utf-8', env: { ...process.env, HYPO_DEVICE: 'devB' } },
+      {
+        cwd: work,
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DEVICE: 'devB' },
+      },
     );
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(
@@ -32819,13 +32975,42 @@ test('PR surface: a fenced changelog EXAMPLE does not become the release note', 
   );
 });
 
-console.log(`\n${'─'.repeat(40)}`);
-console.log(`  ${passed} passed, ${failed} failed`);
+if (!CHILD) {
+  console.log(`\n${'─'.repeat(40)}`);
+  console.log(`  ${passed} passed, ${failed} failed${skipped ? `, ${skipped} not selected` : ''}`);
+}
+
+if (TIMING && !CHILD) {
+  const slowest = [...timings].sort((a, b) => b.ms - a.ms).slice(0, 25);
+  const total = timings.reduce((sum, t) => sum + t.ms, 0);
+  console.log(`\n  slowest 25 of ${timings.length} (${(total / 1000).toFixed(1)}s in test bodies)`);
+  for (const { name, ms } of slowest) {
+    console.log(`  ${(ms / 1000).toFixed(2).padStart(7)}s  ${name}`);
+  }
+}
+
+// The parent in tests/parallel.mjs merges these files rather than parsing our
+// stdout, so a shard's verdict survives interleaved output and truncation.
+if (JSON_OUT) {
+  writeFileSync(
+    JSON_OUT,
+    JSON.stringify({
+      shard: `${SHARD.index + 1}/${SHARD.total}`,
+      passed,
+      failed,
+      skipped,
+      failures: failures.map(({ name, err }) => ({ name, message: err.message })),
+      timings,
+    }),
+  );
+}
 
 if (failed > 0) {
-  console.error(`\nFailed tests:`);
-  for (const { name, err } of failures) {
-    console.error(`  ✗ ${name}: ${err.message}`);
+  if (!CHILD) {
+    console.error(`\nFailed tests:`);
+    for (const { name, err } of failures) {
+      console.error(`  ✗ ${name}: ${err.message}`);
+    }
   }
   process.exit(1);
 }

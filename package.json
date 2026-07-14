@@ -71,7 +71,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node tests/runner.mjs",
+    "test": "node tests/parallel.mjs",
+    "test:serial": "node tests/runner.mjs",
     "lint": "node scripts/lint.mjs",
     "fix:verify": "node scripts/fix-status-verify.mjs",
     "graph": "node scripts/graph.mjs",
