@@ -52,7 +52,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full breakdown. Short version:
 | `hooks/hypo-shared.mjs` | Shared hook utilities — read the deployment constraint below |
 | `skills/<name>/SKILL.md` | Agent Skills (auto-trigger via description match) |
 | `templates/` | Files copied into new wiki vaults on init |
-| `tests/runner.mjs` | Test runner (no external deps) |
+| `tests/` | Test suite (no external deps): `harness.mjs`, `helpers.mjs`, `runner.mjs` (entry), and one `<area>.test.mjs` per production area |
 | `docs/` | ARCHITECTURE, CONTRIBUTING |
 | `.claude-plugin/plugin.json` | Plugin manifest |
 
@@ -79,14 +79,14 @@ Scripts under `scripts/` are not deployed and may freely import from `scripts/li
 2. Edit `scripts/<name>.mjs` — the Node.js logic.
 3. If the command is new and synthesis-heavy, add `skills/<name>/SKILL.md`.
 4. Update the command table in `README.md` and `README.ko.md`.
-5. Add coverage to `tests/runner.mjs`.
+5. Add coverage to the matching `tests/<area>.test.mjs` (a new command usually means a new area file).
 
 ### Adding or modifying a hook
 
 1. Edit the hook file in `hooks/`.
 2. If it's new, register it in `hooks/hooks.json` under the correct event key.
 3. Shared utilities go in `hooks/hypo-shared.mjs`.
-4. Add a contract test in `tests/runner.mjs` (input → expected `additionalContext` shape).
+4. Add a contract test in the hook's area file, e.g. `tests/session-hooks.test.mjs` (input → expected `additionalContext` shape).
 5. After your change, run `/hypo:upgrade` in a real Claude Code session and verify the hook fires.
 
 ### Modifying `hypo-shared.mjs`
@@ -105,7 +105,7 @@ If you need to share new logic, prefer extending an existing helper over adding 
 1. Drop the file under `templates/`.
 2. Update `scripts/init.mjs` so `init` copies it.
 3. Update the templates section of [ARCHITECTURE.md](ARCHITECTURE.md#package-layout).
-4. Add a test in `tests/runner.mjs` that asserts the file lands in a freshly initialized vault.
+4. Add a test in `tests/init.test.mjs` that asserts the file lands in a freshly initialized vault.
 
 ### Adding an Agent Skill
 
@@ -119,13 +119,14 @@ If you need to share new logic, prefer extending an existing helper over adding 
 ## Testing
 
 ```bash
-npm test           # tests/runner.mjs — unit + smoke + contract tests
+npm test           # tests/*.test.mjs, sharded across processes — unit + smoke + contract
 npm run lint       # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale vs session-log)
 npm run fix:verify # Phase 1 of learned_behavior #6 — verifies fix #N status claims in
-                   # a wiki spec against `// @fix #N: <test-name>` anchors in
-                   # tests/runner.mjs. Maintainer dogfood; needs a local wiki at
+                   # a wiki spec against `// @fix #N: <test-name>` anchors, read as a
+                   # union across every tests/*.mjs. Maintainer dogfood; needs a wiki at
                    # $HYPO_DIR or ~/hypomnema (source checkout only; not shipped in
-                   # the npm package). Does NOT grep ADR core decision lines.
+                   # the npm package). Phase 2 also greps each manifest adrKeyLine
+                   # against the production corpus.
 ```
 
 > **`fix:verify` needs an explicit `--spec`.** The default path
@@ -446,7 +447,7 @@ token authenticates without publishing anything.
 | New `init` template file | minor |
 | Bug fix, doc-only change, internal refactor | patch |
 
-Major bumps must include an `upgrade.mjs` migration fixture in `tests/runner.mjs`.
+Major bumps must include an `upgrade.mjs` migration fixture in `tests/upgrade.test.mjs`.
 
 ---
 

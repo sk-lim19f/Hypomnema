@@ -52,7 +52,7 @@ In scope, please report:
 - Hook scripts that, when fired by Claude Code, read or transmit
   content outside the wiki vault and the explicit "additionalContext"
   payload (the privacy contract — see
-  `tests/runner.mjs` "weekly-report.mjs — privacy contract").
+  `tests/audit-report.test.mjs` "weekly-report.mjs — privacy contract").
 - Any flow where ingesting an untrusted URL or file path could cause
   Hypomnema to execute that content as code.
 

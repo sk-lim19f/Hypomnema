@@ -8,7 +8,7 @@
  *
  * SoT split (after codex 3-worker review 2026-05-27):
  *  - fix→test mapping SoT: `// @fix #N: <full test name>` anchor comments in
- *    tests/runner.mjs (sits next to the assertion that verifies the fix).
+ *    tests/<area>.test.mjs (sits next to the assertion that verifies the fix).
  *  - fix status SoT: wiki spec-v1.2.md word-boundary grep
  *    (\bfix\s*#N\b ... \b(TRUE_MERGED|merged|resolved)\b).
  *
@@ -25,7 +25,11 @@ const POSITIVE_STATUSES = new Set(['merged', 'TRUE_MERGED', 'resolved']);
 const NEGATIVE_STATUS_TOKENS = ['STALE_MERGED', 'partial', 'retired'];
 
 /**
- * Parse anchor comments out of runner.mjs source text.
+ * Parse anchor comments out of test source text.
+ *
+ * The caller hands over every tests/*.mjs concatenated, so an anchor is found
+ * wherever it lives — the anchors sit next to the assertions they name, and
+ * those are spread across the per-area files.
  *
  *   // @fix #N: all type-conditional fields present → green
  *   // @fix #N: another test name
@@ -119,7 +123,7 @@ export function parseStatus(specText) {
 }
 
 /**
- * Parse runner.mjs stdout to map test names → "pass" | "fail".
+ * Parse the test run's stdout to map test names → "pass" | "fail".
  *
  * The harness prints `  ✓ <name>` on pass and `  ✗ <name>` on fail.
  */
@@ -148,9 +152,9 @@ export function parseRunnerOutput(stdout) {
  * Cross-check anchors × status × test results.
  *
  * Finding classes:
- *   NO_ANCHOR       — fix claimed positive in spec, no anchor in runner.
- *   MISSING_TEST    — anchor names a test, runner output does not contain it.
- *   FAILING_TEST    — anchor names a test, runner output marks it failed.
+ *   NO_ANCHOR       — fix claimed positive in spec, no anchor in the tests.
+ *   MISSING_TEST    — anchor names a test, the test run does not contain it.
+ *   FAILING_TEST    — anchor names a test, the test run marks it failed.
  *   ORPHAN_ANCHOR   — anchor exists, no positive status claim in spec (warn).
  *   STUB_SPEC       — spec is unusable: a `type: reference` redirect stub, or
  *                     it parses zero positive status claims while anchors exist
@@ -188,7 +192,7 @@ export function verifyMatrix({ anchors, status, testResults, specIsStub = false 
         {
           level: 'error',
           class: 'STUB_SPEC',
-          detail: `${anchors.size} anchor(s) in runner but 0 positive status claims parsed from spec — gate would be vacuous`,
+          detail: `${anchors.size} anchor(s) in tests but 0 positive status claims parsed from spec — gate would be vacuous`,
         },
       ],
     };
@@ -204,7 +208,7 @@ export function verifyMatrix({ anchors, status, testResults, specIsStub = false 
         class: 'NO_ANCHOR',
         fixNum,
         status: statusValue,
-        detail: `claimed ${statusValue} in spec but no // fix #${fixNum}: anchor in runner.mjs`,
+        detail: `claimed ${statusValue} in spec but no // @fix #${fixNum}: anchor in tests/`,
       });
       continue;
     }
@@ -353,13 +357,13 @@ export function validateManifest(manifest = FIX_MANIFEST) {
 }
 
 /**
- * Coverage + drift between manifest, runner anchors, and spec status claims.
+ * Coverage + drift between manifest, test anchors, and spec status claims.
  *
  *   MANIFEST_MISSING_ROW  — a fix claimed-merged AND anchored has no manifest
  *                           row (its ADR-line check would be silently skipped).
  *                           Error: a missing row bypasses the whole gate.
  *   MANIFEST_TEST_DRIFT   — a manifest row's testNames do not set-equal the
- *                           runner anchors for that fix (stale evidence).
+ *                           test anchors for that fix (stale evidence).
  *
  * Both error-level. The claimed∩anchored requirement mirrors the manifest
  * scope (ADR 0036): rows exist to prove claims; anchors-without-claims are
@@ -392,7 +396,7 @@ export function checkManifestCoverage({ manifest = FIX_MANIFEST, anchors, status
         fixNum,
         detail:
           `fix #${fixNum} manifest testNames ${JSON.stringify(names)} ` +
-          `≠ runner anchors ${JSON.stringify(anchored)}`,
+          `≠ test anchors ${JSON.stringify(anchored)}`,
       });
     }
   }

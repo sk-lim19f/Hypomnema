@@ -1,27 +1,43 @@
 #!/usr/bin/env node
 /**
- * tests/parallel.mjs — run tests/runner.mjs as N concurrent shards.
+ * tests/parallel.mjs — run the tests as N concurrent processes.
  *
- * The runner is one flat script and every test body carries its own fixture
- * cost (tmp dirs, git repos, spawned children), so it is bound by process
- * startup and disk, not by anything a single Node process can overlap. Cutting
- * the suites across N processes is the only lever that moves wall clock.
+ * Every test body carries its own fixture cost (tmp dirs, git repos, spawned
+ * children), so the suite is bound by process startup and disk, not by anything
+ * one Node process can overlap. Cutting the work across processes is the only
+ * lever that moves wall clock.
  *
- * Shards do not share state: runner.mjs selects whole suites by index, and each
- * suite builds and tears down its own fixtures under a HOME pinned to a tmp dir.
- * Verdicts come back as JSON files rather than parsed stdout, so an interleaved
- * or truncated console cannot change a verdict.
+ * Two ways to cut it, and they answer different questions:
+ *
+ *   --shards=N   Round-robin whole SUITES across N processes. Balances well,
+ *                because a slow suite and a fast one land in different shards.
+ *                This is the default.
+ *
+ *   --by-file    One process per tests/<area>.test.mjs. Reads naturally and
+ *                names the file in each line of progress, but the areas differ
+ *                by an order of magnitude in size, so wall clock is whatever the
+ *                biggest file takes and the small processes idle.
+ *
+ *   --shards=220 Every suite alone in a fresh process. This is the proof that no
+ *                suite depends on another having run first — the thing that
+ *                licenses sharding at all. Run it when you add or split a suite.
+ *
+ * Shards never share state: each selects whole suites and builds its own
+ * fixtures under a HOME pinned to a tmp dir. Verdicts come back as JSON files
+ * rather than parsed stdout, so an interleaved or truncated console cannot
+ * change a verdict.
  *
  * Usage:
  *   node tests/parallel.mjs                  # cpu-count shards
  *   node tests/parallel.mjs --shards=4
+ *   node tests/parallel.mjs --by-file
  *   node tests/parallel.mjs --grep=proposal  # pass-through to the runner
  *   node tests/parallel.mjs --timing
  *   node tests/parallel.mjs --json=<path>    # merged machine-readable report
  */
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir, cpus } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -36,11 +52,11 @@ function die(msg) {
   process.exit(2);
 }
 
-// Same reasoning as the runner's own check: a silently ignored `--shardz=4` or
-// a bare `--grep` would run the default shape and report a green nobody asked
-// for. Value flags demand a value; boolean flags refuse one; nothing repeats.
+// Same reasoning as the runner's own check: a silently ignored `--shardz=4` or a
+// bare `--grep` would run the default shape and report a green nobody asked for.
+// Value flags demand a value; boolean flags refuse one; nothing repeats.
 const VALUE_FLAGS = new Set(['shards', 'grep', 'json']);
-const BOOL_FLAGS = new Set(['timing']);
+const BOOL_FLAGS = new Set(['timing', 'by-file']);
 const KNOWN = [...VALUE_FLAGS, ...BOOL_FLAGS];
 
 const ARGS = new Map();
@@ -62,7 +78,13 @@ function argValue(name) {
   return typeof v === 'string' ? v : undefined;
 }
 
+const BY_FILE = ARGS.has('by-file');
+if (BY_FILE && ARGS.has('shards')) die('--by-file and --shards choose different cuts; pick one');
+
+// Not consulted in --by-file mode, so a stale HYPO_TEST_SHARDS in the
+// environment must not fail a run that never reads it.
 const SHARDS = (() => {
+  if (BY_FILE) return 0;
   const raw = argValue('shards') ?? process.env.HYPO_TEST_SHARDS;
   if (raw === undefined) return Math.max(1, cpus().length);
   const n = Number(raw);
@@ -70,25 +92,40 @@ const SHARDS = (() => {
   return n;
 })();
 
-// --shards and --json are ours. --shard, --child and the report path are ours
-// to set, so a caller cannot fight us for them.
-const PASSTHROUGH = ARGV.filter((a) => !a.startsWith('--shards=') && !a.startsWith('--json='));
+const FILES = readdirSync(HERE)
+  .filter((f) => f.endsWith('.test.mjs'))
+  .sort();
+if (!FILES.length) die('no tests/*.test.mjs found');
+
+// Each unit is one child process. In shard mode it owns a slice of the suites;
+// in file mode it owns one area file.
+const UNITS = BY_FILE
+  ? FILES.map((f, i) => ({
+      label: f.replace(/\.test\.mjs$/, ''),
+      args: [`--file=${f.replace(/\.test\.mjs$/, '')}`],
+      index: i + 1,
+    }))
+  : Array.from({ length: SHARDS }, (_, i) => ({
+      label: `shard ${i + 1}/${SHARDS}`,
+      args: [`--shard=${i + 1}/${SHARDS}`],
+      index: i + 1,
+    }));
+
+// --shards, --by-file and --json are ours. --shard, --file, --child and the
+// report path are ours to set, so a caller cannot fight us for them.
+const PASSTHROUGH = ARGV.filter(
+  (a) => !a.startsWith('--shards=') && !a.startsWith('--json=') && a !== '--by-file',
+);
 const TIMING = ARGS.has('timing');
 const JSON_OUT = argValue('json');
 
 const tmp = mkdtempSync(join(tmpdir(), 'hypo-shards-'));
 
-function runShard(index) {
+function runUnit(unit) {
   return new Promise((resolve) => {
-    const report = join(tmp, `shard-${index}.json`);
-    const args = [
-      RUNNER,
-      `--shard=${index}/${SHARDS}`,
-      `--json=${report}`,
-      '--child',
-      ...PASSTHROUGH,
-    ];
-    // HOME is deliberately inherited, not pinned. A shard must see exactly what
+    const report = join(tmp, `unit-${unit.index}.json`);
+    const args = [RUNNER, ...unit.args, `--json=${report}`, '--child', ...PASSTHROUGH];
+    // HOME is deliberately inherited, not pinned. A child must see exactly what
     // `node tests/runner.mjs` sees, or the two stop being verdict-identical: the
     // hermeticity guard snapshots the real ~/.claude to prove no test wrote
     // there, and the manifest test reads the real wiki under ~/hypomnema. Pin
@@ -96,9 +133,9 @@ function runShard(index) {
     // HOME on the children *it* spawns, which is where the invariant belongs.
     const child = spawn(process.execPath, args);
 
-    // Kept apart. The runner prints passes to stdout and failures to stderr,
-    // and scripts/lib/fix-status-verify.mjs reads both; folding one into the
-    // other would quietly rewrite which stream a failure arrives on.
+    // Kept apart. The runner prints passes to stdout and failures to stderr, and
+    // scripts/lib/fix-status-verify.mjs reads both; folding one into the other
+    // would quietly rewrite which stream a failure arrives on.
     let out = '';
     let err = '';
     child.stdout.on('data', (d) => (out += d));
@@ -106,16 +143,16 @@ function runShard(index) {
 
     const started = Date.now();
     const finish = (fields) =>
-      resolve({ index, seconds: (Date.now() - started) / 1000, out, err, ...fields });
+      resolve({ ...unit, seconds: (Date.now() - started) / 1000, out, err, ...fields });
 
-    // A shard that cannot even be spawned resolves like a crash rather than
-    // rejecting: one dead shard must not take the whole run's report with it.
+    // A unit that cannot even be spawned resolves like a crash rather than
+    // rejecting: one dead process must not take the whole run's report with it.
     child.on('error', (e) => finish({ crashed: true, code: null, crashReason: e.message }));
 
     child.on('close', (code, signal) => {
       if (!existsSync(report)) {
-        // No report means the shard died before its summary: a crash, not a
-        // failing assertion. A silent zero here would read as "nothing to run".
+        // No report means it died before its summary: a crash, not a failing
+        // assertion. A silent zero here would read as "nothing to run".
         finish({ crashed: true, code, crashReason: `exit ${code}, no report written` });
         return;
       }
@@ -130,7 +167,7 @@ function runShard(index) {
       // exit 1 when it failed and exit 0 when it did not; anything else (a
       // signal, an exit code from somewhere past the summary) means the process
       // did not end the way it says it did, and trusting the file would turn a
-      // dead shard into a green one.
+      // dead unit into a green one.
       const expected = parsed.failed > 0 ? 1 : 0;
       if (signal || code !== expected) {
         finish({
@@ -151,17 +188,23 @@ function runShard(index) {
 const wall = Date.now();
 // Progress goes to stderr. It lands in completion order, which is inherently
 // nondeterministic, and stdout is a contract: fix-status-verify parses it.
-console.error(`running ${SHARDS} shards of tests/runner.mjs`);
+console.error(
+  BY_FILE
+    ? `running ${UNITS.length} test files, one process each`
+    : `running ${SHARDS} shards over ${FILES.length} test files`,
+);
 
 const results = await Promise.all(
-  Array.from({ length: SHARDS }, (_, i) =>
-    runShard(i + 1).then((r) => {
-      const label = `  shard ${r.index}/${SHARDS}`;
+  UNITS.map((u) =>
+    runUnit(u).then((r) => {
+      const label = `  ${r.label.padEnd(BY_FILE ? 20 : 14)}`;
       if (r.crashed) {
         console.error(`${label}  CRASHED (${r.crashReason}) after ${r.seconds.toFixed(1)}s`);
       } else {
         const verdict = r.failed > 0 ? `${r.failed} failed` : 'green';
-        console.error(`${label}  ${r.passed} passed, ${verdict}  (${r.seconds.toFixed(1)}s)`);
+        console.error(
+          `${label}  ${String(r.passed).padStart(4)} passed, ${verdict}  (${r.seconds.toFixed(1)}s)`,
+        );
       }
       return r;
     }),
@@ -172,8 +215,8 @@ rmSync(tmp, { recursive: true, force: true });
 
 results.sort((a, b) => a.index - b.index);
 
-// Replay every shard's console, in shard order, on the stream it came from.
-// This is not decoration: the `  ✓ name` / `  ✗ name` lines are a contract.
+// Replay every unit's console, in order, on the stream it came from. This is not
+// decoration: the `  ✓ name` / `  ✗ name` lines are a contract.
 // scripts/lib/fix-status-verify.mjs parses them out of `npm test` output to map
 // a fix number to its verdict, and swallowing them would make that tool see an
 // empty test run and mis-report every fix as untested.
@@ -208,17 +251,18 @@ if (JSON_OUT) {
   writeFileSync(
     JSON_OUT,
     JSON.stringify({
-      shards: SHARDS,
+      mode: BY_FILE ? 'by-file' : 'shards',
+      units: UNITS.length,
       passed,
       failed,
-      crashed: crashed.map((r) => ({ shard: r.index, code: r.code, reason: r.crashReason })),
+      crashed: crashed.map((r) => ({ unit: r.label, code: r.code, reason: r.crashReason })),
       failures: allFailures,
     }),
   );
 }
 
 for (const r of crashed) {
-  console.error(`\n─── shard ${r.index}/${SHARDS} crashed: ${r.crashReason} ───`);
+  console.error(`\n─── ${r.label} crashed: ${r.crashReason} ───`);
 }
 
 if (allFailures.length > 0) {
