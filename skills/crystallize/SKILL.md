@@ -112,6 +112,8 @@ If `markerWritten: true`, ask: "Session closed. Would you like to also run knowl
 - `transcript-unresolved`: the id resolved no transcript, so it is most likely a background-task or Agent-thread uuid rather than the main conversation's. Get the right one and re-run.
 - `no-user-close-signal`: the transcript is this session's, and the user never asked to close in wording the gate recognizes (e.g. "세션 마무리까지 진행해줘" falls outside the close-signal set). Re-running the same id changes nothing. Confirm intent once with `AskUserQuestion` (header "세션", one option **세션 마무리**); if the user picks it, that answer becomes a recognized close signal, so the same command now applies everything: writes, commit, and marker. If the user declines, the session stays open and nothing is written. Do NOT change the close-signal matcher.
 
+**If `ok: false` with `stage: "session-id-mismatch"`,** the payload carries a `sessionId` that is not the `--session-id` you passed, so this file was authored for a different session (a reused or overwritten temp path). Nothing was written. Do not force it: rebuild the payload for THIS session (write it to a session-scoped path, e.g. `/tmp/hypo-session-close-<session-id>.json`) and re-run.
+
 If the apply succeeded but `markerWritten: false`, branch on `markerSkipReason` (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface it verbatim and resolve the underlying blocker before re-running.
 
 ### If the close came back `ok: false, stage: "proposal-pending"`

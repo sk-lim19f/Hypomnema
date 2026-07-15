@@ -542,3 +542,119 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
     assert.equal(out.lint.postApply.ok, true, 'post-apply lint should now pass');
   });
 });
+
+// ── ISSUE-61: payload↔session binding (cross-session guard) ───────────────────
+// The session-close payload temp path used to be date-based, so two same-day
+// sessions clobbered each other's file; the winner's payload then applied under
+// the loser's --session-id marker, and the loser's record vanished. Part 1 moves
+// the documented path to a session-scoped name; this optional `sessionId` field
+// is the second line of defense: when present it must equal --session-id, so a
+// payload authored by another session is refused before any write. Absent → fail
+// open (older payloads; Part 1 already prevents the collision).
+
+suite('crystallize.mjs payload↔session binding (ISSUE-61)');
+
+test('payload.sessionId ≠ --session-id → session-id-mismatch, zero bytes', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionId = 'authored-by-another-session';
+    // A distinct entry a successful apply WOULD append. Its absence proves the
+    // guard blocked the write — and proves the test red: strip the guard and the
+    // unknown field is simply ignored, so this entry lands and the assert fails.
+    // The payload also rewrites overwrite targets (session-state, both hot files)
+    // that a successful apply touches BEFORE the shard append. Assert the whole
+    // committed tree is untouched — not just the shard — so a future guard misplaced
+    // after the overwrites but before the append can't pass this vacuously. `git
+    // diff --quiet` ignores the untracked .payload.json runApply drops in.
+    const marker = `MISMATCH-MUST-NOT-APPEAR-${today}`;
+    payload.sessionState = {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- ${marker}\n`,
+    };
+    payload.sessionLog = { entry: `## [${today}] ${marker}\n` };
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    const before = existsSync(shard) ? readFileSync(shard, 'utf-8') : '';
+
+    const r = runApply(dir, payload, { sessionId: 'this-real-session' });
+    assert.equal(r.status, 1, `mismatch must exit 1: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(
+      out.stage,
+      'session-id-mismatch',
+      `stage must be session-id-mismatch: ${r.stdout}`,
+    );
+    assert.deepEqual(out.applied, [], 'nothing may be reported applied');
+    assert.equal(out.committed, false, 'nothing may be committed');
+    const tracked = spawnSync('git', ['diff', '--quiet'], { cwd: dir });
+    assert.equal(tracked.status, 0, 'no committed file may be modified on reject');
+    const after = existsSync(shard) ? readFileSync(shard, 'utf-8') : '';
+    assert.equal(after, before, 'shard must be byte-untouched');
+    assert.ok(!after.includes(marker), 'the payload entry must not have been appended');
+  });
+});
+
+test('payload.sessionId == --session-id → proceeds past the guard', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 'matching-session';
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionId = sid;
+    payload.sessionLog = { entry: `## [${today}] match-entry\n` };
+    payload.log = { entry: `## [${today}] session | test-project — match\n` };
+    const r = runApply(dir, payload, { sessionId: sid });
+    assert.equal(r.status, 0, `matching id must succeed: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.notEqual(out.stage, 'session-id-mismatch');
+  });
+});
+
+test('payload without sessionId → guard fails open, apply proceeds', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    assert.equal(payload.sessionId, undefined, 'baseline payload carries no sessionId');
+    payload.sessionLog = { entry: `## [${today}] no-sessionid-entry\n` };
+    payload.log = { entry: `## [${today}] session | test-project — nosid\n` };
+    const r = runApply(dir, payload, { sessionId: 'any-session' });
+    assert.equal(r.status, 0, `absent sessionId must not block: ${r.stdout}`);
+    assert.equal(JSON.parse(r.stdout).ok, true);
+  });
+});
+
+test('payload.sessionId non-string → payload schema invalid', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionId = 12345;
+    const r = runApply(dir, payload, { sessionId: 'sid' });
+    assert.equal(r.status, 1, `non-string sessionId must fail: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.error, 'payload schema invalid');
+    assert.ok(
+      (out.details || []).some((d) => /sessionId/.test(d)),
+      `details must flag sessionId: ${r.stdout}`,
+    );
+  });
+});
+
+test('payload.sessionId null → treated as absent, guard fails open', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionId = null;
+    payload.sessionLog = { entry: `## [${today}] null-sessionid-entry\n` };
+    payload.log = { entry: `## [${today}] session | test-project — null\n` };
+    const r = runApply(dir, payload, { sessionId: 'any-session' });
+    assert.equal(r.status, 0, `null sessionId must fail open, not block: ${r.stdout}`);
+    assert.equal(JSON.parse(r.stdout).ok, true);
+  });
+});
+
+test('payload.sessionId empty string → mismatches any real id, refused', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    // "" is a valid string (passes schema) but equals no real --session-id, so it
+    // must reject rather than sneak through: an empty id is a bug, not a close.
+    payload.sessionId = '';
+    const r = runApply(dir, payload, { sessionId: 'real-session' });
+    assert.equal(r.status, 1, `empty-string sessionId must be refused: ${r.stdout}`);
+    assert.equal(JSON.parse(r.stdout).stage, 'session-id-mismatch');
+  });
+});

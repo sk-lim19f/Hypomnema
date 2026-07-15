@@ -37,6 +37,7 @@ Payload shape (`project` + 4 content fields required; `log` optional/derived; `o
 ```json
 {
   "project": "<project-name>",
+  "sessionId": "<current session id — the SAME value you pass to --session-id>",
   "date": "YYYY-MM-DD",
   "sessionState": { "content": "<full body of projects/<name>/session-state.md>" },
   "projectHot": { "content": "<full body of projects/<name>/hot.md>" },
@@ -52,6 +53,7 @@ Payload shape (`project` + 4 content fields required; `log` optional/derived; `o
 Field rules:
 
 - `project`: **required**. Slug of the project being closed (matches a `projects/<slug>/` directory). Must be a single path segment, charset `A-Za-z0-9._-`, with at least one alphanumeric and not a dot-only name (`.`, `..`, `...`). Apply never infers the target from recency; a same-date pointer-table tie could otherwise write the close into the wrong project (B-3). A missing, malformed, or non-existent value fails the apply before any write.
+- `sessionId`: recommended. The current session id, the same value you pass to `--session-id`. When present, apply refuses (`stage='session-id-mismatch'`, exit 1, nothing written) if it does not equal `--session-id`, so a payload file another session overwrote cannot be applied under this session's marker. It is a string self-check, not the transcript resolver; authority still comes from `--session-id`. Optional for backward-compat: omitting it or setting it to `null` skips the check (fail-open), but an empty string `""` counts as a mismatch and is refused. Omit only if you genuinely cannot determine the id.
 - `date` — optional. Defaults to today (local). Must be `YYYY-MM-DD` if supplied.
 - `openQuestions` — optional. Include only when `pages/open-questions.md` exists and changed this session.
 - `log`: optional. Omit it by default (apply derives the canonical `## [date] session | <project>` line from your `sessionLog` heading). Supply it only for a custom log.md line, which must still be a canonical `session | <project>` heading, or the apply fails at `stage='pre-apply-verification'`.
@@ -61,7 +63,7 @@ Notes:
 
 - `sessionState` / `projectHot` / `rootHot` / `openQuestions` are **overwrite** (full-file content). `sessionLog` / `log` are **append** (entry-level idempotency — exact-entry dedup, safe to re-run).
 - Frontmatter `updated:` is NOT auto-fixed. If your payload's `updated:` is stale, the post-apply verification gate will fail with `stage='post-apply-verification'` and you must fix the payload and retry.
-- Write the payload to a temp path, e.g. `/tmp/hypo-session-close-<YYYY-MM-DD>.json`.
+- Write the payload to a **session-scoped** temp path, e.g. `/tmp/hypo-session-close-<session-id>.json`, using the same `<session-id>` you pass below. A date-based path (`<YYYY-MM-DD>`) collides when two sessions close on the same day: the second write silently overwrites the first, and the wrong payload gets applied. The `sessionId` field above is the second line of defense if a path is ever reused anyway.
 
 Content guidance for each slot:
 
@@ -81,7 +83,7 @@ Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that p
 ```bash
 node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs \
   --apply-session-close \
-  --payload=/tmp/hypo-session-close-<YYYY-MM-DD>.json \
+  --payload=/tmp/hypo-session-close-<session-id>.json \
   --session-id=<current-session-id> \
   --hypo-dir="<path>" \
   --json
@@ -144,6 +146,7 @@ The result JSON includes a `stage` field when `ok: false`. Branch on it:
 
 | `stage` | What broke | How to recover |
 |---|---|---|
+| `session-id-mismatch` | The payload's `sessionId` is a non-empty string that does not equal `--session-id`, so this file was authored for a different session (a reused or overwritten temp path). Caught **before** any write. Absent or `null` `sessionId` fails open (no check); an empty string counts as a mismatch. | Rebuild the payload for THIS session and write it to a session-scoped path (`/tmp/hypo-session-close-<session-id>.json`), then re-run. No payload bytes were written. |
 | `pre-apply-verification` | A payload heading does not match the freshness contract the close gate enforces: `sessionLog.entry` has no dated `## [YYYY-MM-DD] …` heading, or an explicit `log.entry` is not the canonical `## [date] session | <project>` line. Caught **before** any write. | Fix the heading in the payload (the session-log entry needs a bracketed dated heading; the log line needs `session \| <project>` after the date, colon or space delimiter), then re-run. No payload bytes were written. |
 | `preflight-lint` | A payload file (append target: session-log / log.md) has a pre-existing blocking lint error. | Fix the lint error in that file, then re-run. No payload bytes were written. (Debt outside the payload files is a non-blocking notice, not this stage.) |
 | `post-apply-verification` | A mandatory file's `updated:` frontmatter is stale (≠ today) after apply. | Edit the payload's stale `content` (or supply correct `date`), then re-run. Writes are idempotent — re-applying a corrected payload is safe. |
