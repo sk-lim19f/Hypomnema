@@ -663,6 +663,7 @@ test('guard: does NOT derive when the session-log heading is the gap (T5 AC)', (
 });
 
 // ── B-1: closeCandidateSlugs disk-gates log.md slugs (ghost-slug fix) ──────────
+suite('B-1: closeCandidateSlugs disk-gates log.md slugs');
 test('B-1: a log.md slug with no projects/<slug>/ dir is not a close candidate', () => {
   withTmpDir((dir) => {
     const today = todayLocal();
@@ -1068,6 +1069,7 @@ test('replay-auto-minimal-crystallize-on-incomplete-close: HYPO_SKIP_GATE=1 → 
 // A read-only review/debug session (≥5 Read/Grep/Glob/Bash, no mutation) is now
 // "substantial". The block still requires a wrap-up signal; pure-volume alone
 // must NOT block (close-intent gate unchanged).
+suite('6a: read-only investigation sessions reach the close-intent gate');
 function readonlyInvestigationLines(n) {
   const tools = ['Read', 'Grep', 'Glob', 'Bash'];
   return Array.from({ length: n }, (_, i) => ({

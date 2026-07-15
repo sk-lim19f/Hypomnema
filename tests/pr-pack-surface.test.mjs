@@ -476,6 +476,7 @@ test('PR surface: a missing `## Checklist` section is caught', () => {
 
 // ── BLOCKER 2: template compliance was a heading-existence check, not a
 // structure check ─────────────────────────────────────────────────────────
+suite('BLOCKER 2: template compliance is a structure check, not heading-existence');
 
 test('PR surface: headings that exist ONLY inside a code fence are rejected (not real headings)', () => {
   // A body that wraps its entire structure in a fenced code block used to pass:
@@ -668,6 +669,7 @@ test('CLI --commit-msg: a clean message still passes (attribution scan adds no f
 
 // ── --commit-range: the CI backstop (BLOCKER: commit-msg hook has no CI
 // counterpart, so --no-verify + a clean PR body let a trailer reach `main`) ──
+suite('--commit-range: the CI backstop');
 function commitIn(dir, msg) {
   const opts = { cwd: dir, encoding: 'utf-8' };
   spawnSync('git', ['add', '-A'], opts);
@@ -762,6 +764,7 @@ test('CLI --commit-range: missing range argument exits with usage (2)', () => {
 // BRANCH's commits. The message that actually lands on `main` is composed in the
 // merge dialog, never existed on the branch, and was in NO range any job scanned.
 // A trailer typed there ships to a public `main` with every check green.
+suite('BLOCKER: squash-merge trailer escapes the branch-range scan (--push-range)');
 test('CLI --push-range: an attribution trailer in the pushed (squash) commit is caught', () => {
   withTmpDir((dir) => {
     gitRepo(dir);

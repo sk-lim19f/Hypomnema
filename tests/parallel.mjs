@@ -18,7 +18,7 @@
  *                by an order of magnitude in size, so wall clock is whatever the
  *                biggest file takes and the small processes idle.
  *
- *   --shards=220 Every suite alone in a fresh process. This is the proof that no
+ *   --shards=237 Every suite alone in a fresh process. This is the proof that no
  *                suite depends on another having run first — the thing that
  *                licenses sharding at all. Run it when you add or split a suite.
  *

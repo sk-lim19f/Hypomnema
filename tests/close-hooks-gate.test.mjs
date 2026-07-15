@@ -326,6 +326,7 @@ test('output is always valid JSON regardless of prompt', () => {
 
 // ── replay-compact-guard-detects-slash-clear (ADR 0022 Layer 2) ──
 // @fix #25: replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE
+suite('replay-compact-guard-detects-slash-clear (ADR 0022 Layer 2)');
 
 test('replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE', () => {
   const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear' });
@@ -774,6 +775,7 @@ test('HYPO_SKIP_GATE=1 bypasses an incomplete session close', () => {
 // @fix #26: replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (negative control)
 // Capacity bypass (wiki-context-critical.json ≥90%) was removed. Spec §7.5:
 // the only bypass paths are HYPO_SKIP_GATE env / transcript user-role message.
+suite('replay-personal-check-bypass-order (ADR 0022 amendment 2026-05-13)');
 
 test('replay-personal-check-bypass-order: wiki-context-critical.json does NOT bypass (negative control)', () => {
   withWiki(
