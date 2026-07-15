@@ -176,6 +176,7 @@ test('--apply .hypoignore migration appends .cache/ and is idempotent', () => {
 });
 
 // ── B5: .gitignore migration mirrors .cache/ (page-usage privacy) ────────────
+suite('B5: .gitignore migration mirrors .cache/ (page-usage privacy)');
 test('--apply .gitignore migration appends .cache/, git-ignores the log, idempotent', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {

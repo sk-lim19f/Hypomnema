@@ -586,6 +586,7 @@ test('feedback-sync --check --json: a target file that is simply MISSING stays t
 });
 
 // ── feedback-sync hardening regressions ──────────────────────────────────────
+suite('feedback-sync hardening regressions');
 
 test('feedback-sync-crlf-block-idempotent: CRLF managed block is recognized, no duplicate region', () => {
   withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runFb }) => {
@@ -691,6 +692,7 @@ test('feedback-sync-stale-side-file-removed: demoting a page deletes its feedbac
 });
 
 // ── second-pass review fixes (HIGH cap / HIGH provenance / MEDIUM container / LOW) ──
+suite('second-pass review fixes (HIGH cap / HIGH provenance / MEDIUM container / LOW)');
 
 test('feedback-sync-stale-skips-non-sync-file: hand-written feedback_*.md is NOT deleted', () => {
   withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ memDir, runFb }) => {
@@ -2504,6 +2506,7 @@ test('feedback.mjs create: invalid scope vocabulary (project:.) → exit 1 (Trac
 });
 
 // ── FEAT-1: --failure-type create + append rules ────────────────────────────
+suite('FEAT-1: --failure-type create + append rules');
 const FB_BASE_ARGS = (dir, topic) => [
   `--topic=${topic}`,
   '--entry=항상 X를 한다.',

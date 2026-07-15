@@ -1828,6 +1828,7 @@ test('payload schema: invalid date format → exit 1', () => {
 });
 
 // ── B-1: payload.log optional + apply auto-derives the root log.md entry ──────
+suite('B-1: payload.log optional + apply auto-derives the root log.md entry');
 test('B-1: apply without payload.log auto-derives the canonical log.md entry (exit 0)', () => {
   withWiki(
     (dir) => {

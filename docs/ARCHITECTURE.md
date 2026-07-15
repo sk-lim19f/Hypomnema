@@ -418,7 +418,7 @@ Everything uses Node built-ins only. Fixtures are built in code with scoped help
 
 **Selection is by suite, never by test.** `suite(label)` opens a selection unit, and
 `--shard=i/n` keeps a whole suite in one process, in order. So tests inside one suite may build
-on each other, and suites may not build on each other. `node tests/parallel.mjs --shards=220`
+on each other, and suites may not build on each other. `node tests/parallel.mjs --shards=237`
 runs every suite alone in a fresh process and is the proof of that invariant. Run it whenever
 you add or split a suite.
 
@@ -429,7 +429,7 @@ you add or split a suite.
 | `node tests/runner.mjs --grep=<regex>` | just the matching tests, in seconds |
 | `node tests/runner.mjs --file=lint` | one area file |
 | `node tests/parallel.mjs --by-file` | one process per area file |
-| `node tests/parallel.mjs --shards=220` | every suite alone: the order-independence proof |
+| `node tests/parallel.mjs --shards=237` | every suite alone: the order-independence proof |
 
 Round-robin is the default rather than one-process-per-file, and the reason is measured, not
 assumed: on a 2026 laptop the whole suite runs in about 70s round-robined and about 100s

@@ -294,6 +294,7 @@ test('feedback invalid scope → error', () => {
 // v1.2 regex `^project:[a-z0-9][a-z0-9-]*$` rejected them, forcing a
 // `--project-id=<slug>` override; v1.3 relaxes the shared FEEDBACK_SCOPE_RE to
 // `^(global|project:[A-Za-z0-9_-]+)$`. These cover the lint stage of the
+suite('Track D (OQ-34): scope regex accepts cwd-derived project-ids');
 // create → lint → projection consistency chain plus the hardening edges from
 // the codex design review (`.` excluded → no `project:.`/`project:..`; spaces
 // still rejected = documented limit).
@@ -371,6 +372,7 @@ test('feedback invalid tier → error', () => {
 });
 
 // ── FEAT-1: optional failure_type enum ──────────────────────────────────────
+suite('FEAT-1: optional failure_type enum');
 test('feedback failure_type valid value → no error', () => {
   const { r } = lintWithSchema(
     'pages/feedback/x.md',
@@ -1279,6 +1281,7 @@ test('genuinely missing links are still W4 broken (no false negative)', () => {
 // also drop them from the link-target catalog, so a link to a file that plainly
 // exists was reported broken — and under --strict that error made a green gate
 // unreachable. Scanning and referencing are now separate.
+suite('`_`-dir pages: not linted, but still linkable (ISSUE-57)');
 
 test('a page under a `_`-dir is a valid link target (not a false broken link)', () => {
   const { broken } = lintWiki({

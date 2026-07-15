@@ -213,6 +213,7 @@ test('ISSUE-42 F1: a colon-form log entry is the sole today signal → dangling 
 });
 
 // ── fix #39: probe early-exit (option D) ─────────────────────────────────────
+suite('fix #39: probe early-exit (option D)');
 
 test('probe (#39): no payload + gate ok → exit 0 with alreadyComplete', () => {
   // buildCleanWikiTree() leaves the wiki in a passing-gate state for `today`.
@@ -325,6 +326,7 @@ test('payload via stdin (`--payload=-`) works the same as a file', () => {
 });
 
 // ── fix #40: helper lint preflight + post-apply check ───────────────────────
+suite('fix #40: helper lint preflight + post-apply check');
 
 test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT abort, apply proceeds (scoped)', () => {
   // Bug B fix: lint debt OUTSIDE the files this close writes (here a malformed
