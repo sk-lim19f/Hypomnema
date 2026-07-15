@@ -244,7 +244,7 @@ After both blocks, language-neutral:
 
 - **PR title**: Conventional Commits plus a scope, e.g. `feat(feedback): add failure_type enum`. The type drives the CHANGELOG section (see the classification table below).
 - **Merge commit**: the squash-merge subject carries the PR number (`#123`). That is where `#N` comes from, not the PR title. The two conventions stay separate.
-- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`) may appear in your local notes and in `tests/` / `qa-runs/` (where they aid test-to-issue traceability and never reach an installed user), but not in shipped code or workflow comments, and never on the published changelog and release surface: not in the CHANGELOG body, not in the PR `## Changelog` block, not in a tag annotation, not in a GitHub Release. The only identifier that ships in those is the PR number `#N`. `check-tracker-ids` gates every surface (`--all`/`--staged` for files, `--commit-msg` for messages, `--tag` for the tag body); the migration keeps the CHANGELOG body clean.
+- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`, `fix #N`) may appear in your local notes and in `tests/` / `qa-runs/` (where they aid test-to-issue traceability and never reach an installed user), but not in shipped code or workflow comments, and never on the published changelog and release surface: not in the CHANGELOG body, not in the PR `## Changelog` block, not in a tag annotation, not in a GitHub Release. The only tracker identifier that ships in those is the PR number `#N`; the lone exception is the ADR carve-out noted below. `check-tracker-ids` gates the file, message, and tag surfaces (`--all`/`--staged` for files, `--commit-msg` for messages, `--tag` for the tag body), and `check-pr-surface` gates the PR title and body; the migration keeps the CHANGELOG body clean. `ADR NNNN` / `decisions/NNNN` are exempt on the changelog surfaces (the CHANGELOG body, the tag body, and the PR `## Changelog` block), where a release line legitimately cites the decision behind it.
 
 ### The `## Changelog` block
 
@@ -386,7 +386,9 @@ git commit -m "chore: release v<version>"
 #    Annotation body shape: English summary, then "---" on its own line,
 #    then a Korean summary block. The GitHub Release republishes this body
 #    verbatim, so keep it on the same public surface as the CHANGELOG: PR
-#    numbers (#N) only, no internal tracker ids (check-tracker-ids --tag gates it).
+#    numbers (#N) only, no `FEAT-`/`IMPR-`/`ISSUE-`/`PRAC-`/`fix #N` tracker
+#    ids (check-tracker-ids --tag gates it). Like the CHANGELOG, the tag body MAY cite
+#    `ADR NNNN` / `decisions/NNNN` for the decision behind a release.
 git tag -a v<version> -m "$(cat <<'EOF'
 Hypomnema v<version>: <one-line English summary>
 
