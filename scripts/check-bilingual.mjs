@@ -114,7 +114,9 @@ if (mode === '--changelog') {
   if (result.koreanExempt) {
     ok(`CHANGELOG.md [${version}] — pre-cutoff version, English-only (Korean exempt).`);
   } else {
-    ok(`CHANGELOG.md [${version}] — ${result.hangulCount} Hangul chars across "#### 한국어" sub-blocks.`);
+    ok(
+      `CHANGELOG.md [${version}] — ${result.hangulCount} Hangul chars across "#### 한국어" sub-blocks.`,
+    );
   }
 } else if (mode === '--tag') {
   const ref = args[1];
