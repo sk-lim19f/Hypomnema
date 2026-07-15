@@ -582,6 +582,13 @@ function validatePayloadShape(payload) {
   if (payload.date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(payload.date))) {
     errs.push('payload.date, when present, must be YYYY-MM-DD');
   }
+  if (
+    payload.sessionId !== undefined &&
+    payload.sessionId !== null &&
+    typeof payload.sessionId !== 'string'
+  ) {
+    errs.push('payload.sessionId, when present, must be a string');
+  }
   return errs;
 }
 
@@ -961,6 +968,43 @@ function applySessionClose(args) {
         ? JSON.stringify(out, null, 2)
         : `✗ payload schema invalid:\n  ${schemaErrs.join('\n  ')}`,
     );
+    process.exit(1);
+  }
+
+  // Payload↔session binding (cross-session payload collision). The payload temp
+  // file is now written to a session-scoped path (see commands/crystallize.md), so
+  // two same-day sessions no longer share a file. This is the belt to that
+  // suspenders: if the payload names
+  // the session it was authored for, it must be THIS one — the --session-id whose
+  // transcript already cleared close authority above. A mismatch means the file on
+  // disk is not this session's close (a stray or hand-reused path handed us another
+  // session's payload), and applying it would stamp that content with this session's
+  // marker while the original session's record vanishes — the exact loss this
+  // guard exists to prevent. Refuse before a byte is written.
+  //
+  // Absent field → fail open: older payloads predate this field, and Part 1's unique
+  // path already prevents the collision. So the check only ever tightens; it never
+  // rejects a close it would otherwise have allowed on a matching (or absent) id. It
+  // is deliberately identity-based, not cwd-based: closing project B from a session
+  // whose cwd is project A stays supported (payload.project is authoritative), so a
+  // legitimately cross-project close is untouched.
+  if (
+    payload.sessionId !== undefined &&
+    payload.sessionId !== null &&
+    payload.sessionId !== args.sessionId
+  ) {
+    const msg =
+      `payload.sessionId ${JSON.stringify(payload.sessionId)} does not match --session-id ` +
+      `${JSON.stringify(args.sessionId)}: this payload was authored for a different session, so ` +
+      `it is not this session's close. Refusing before any write (cross-session guard).`;
+    const out = {
+      ok: false,
+      stage: 'session-id-mismatch',
+      error: msg,
+      applied: [],
+      committed: false,
+    };
+    console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
 
