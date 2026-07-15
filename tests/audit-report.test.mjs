@@ -7,14 +7,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { test, suite } from './harness.mjs';
-import {
-  run,
-  runStop,
-  runWithHome,
-  withGrowthWiki,
-  withTmpDir,
-  withTmpHome,
-} from './helpers.mjs';
+import { run, runStop, runWithHome, withGrowthWiki, withTmpDir, withTmpHome } from './helpers.mjs';
 
 // ── weekly-report.mjs (Lane E) ───────────────────────────────────────────────
 

@@ -481,7 +481,8 @@ const GITIGNORE_REQUIRED_ENTRIES = [
   },
   {
     pattern: '*.lock',
-    comment: '# Append-lock files (transient <target>.lock; a crashed holder can leave a stale one)',
+    comment:
+      '# Append-lock files (transient <target>.lock; a crashed holder can leave a stale one)',
   },
 ];
 

@@ -48,7 +48,7 @@ export const SECTION = {
 export const SECTION_TITLE = {
   'new-features': 'New Features',
   'bug-fixes': 'Bug Fixes',
-  'chores': 'Chores',
+  chores: 'Chores',
 };
 
 // Tracker-ID -> section, in precedence order. A change carries one tracker in

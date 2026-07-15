@@ -144,7 +144,9 @@ export function aggregateColdCandidates(
   const candidates = pageList
     .filter(
       (p) =>
-        hasInbound.has(p.slug) && !intersects(p.forms, recentForms) && scopeVisible(p.scope, device),
+        hasInbound.has(p.slug) &&
+        !intersects(p.forms, recentForms) &&
+        scopeVisible(p.scope, device),
     )
     .map((p) => ({ slug: p.slug, title: p.title }));
 

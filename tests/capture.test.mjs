@@ -4,7 +4,14 @@
 // build on each other; suites may not — that is what lets the runner shard.
 
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, lstatSync } from 'node:fs';
+import {
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  symlinkSync,
+  lstatSync,
+} from 'node:fs';
 import { join, basename } from 'node:path';
 import { test, suite } from './harness.mjs';
 import {
