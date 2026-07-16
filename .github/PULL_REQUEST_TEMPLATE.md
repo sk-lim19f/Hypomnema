@@ -4,7 +4,11 @@ docs/CONTRIBUTING.md.
 
 PR title: Conventional Commits plus a scope, e.g.
 `feat(feedback): add failure_type enum`. Keep any internal tracker id
-(FEAT-/IMPR-/ISSUE-/PRAC-) out of the title and body.
+(FEAT-/IMPR-/ISSUE-/PRAC-N, or a `fix #N`) out of the title and body. A wiki
+ADR pointer (`ADR NNNN`, `decisions/NNNN`) is the one carve-out, and only
+inside the `## Changelog` block below; it stays banned everywhere else in the
+title and body. The `check-pr-surface` gate enforces all of this on the title
+and body (the `check:tracker-ids` file gate covers everything inside the repo).
 
 Body language: write the full body TWICE, once under `# English` and once
 under `# 한국어` (this repo ships bilingual docs). The `## Changelog` and
@@ -83,7 +87,12 @@ you do NOT edit CHANGELOG.md directly in this PR. Internal-only change
 
 Rules:
 - Reference the PR by number only (`#123`). No internal tracker ids
-  (FEAT-/IMPR-/ISSUE-/PRAC-) on this public surface.
+  (FEAT-/IMPR-/ISSUE-/PRAC-N) and no `fix #N` on this public surface.
+- One carve-out lives HERE: this `## Changelog` block, and only this block,
+  may cite a wiki decision pointer (`ADR NNNN`, `decisions/NNNN`) for the
+  decision behind a release. The release collector copies this block verbatim
+  into CHANGELOG.md, which is itself ADR-exempt. Anywhere else in the PR the
+  pointer stays banned.
 - No em dashes. Use a colon, comma, or parentheses.
 - The section is inferred from your Conventional Commit type: feat -> New
   Features, fix -> Bug Fixes, everything else (chore/refactor/docs/ci) ->
