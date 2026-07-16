@@ -16,7 +16,7 @@
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
 import { collectPagesGraph, extractWikilinks } from './lib/wikilink.mjs';
 
@@ -29,7 +29,11 @@ function parseArgs(argv) {
     else if (arg.startsWith('--format=')) args.format = arg.slice(9);
     else if (arg.startsWith('--min-edges=')) args.minEdges = parseInt(arg.slice(12), 10) || 0;
   }
-  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
+  if (!args.hypoDir) {
+    const info = resolveHypoRootInfo();
+    args.hypoDir = info.root;
+    args.hypoDirSource = info.source;
+  }
   return args;
 }
 
@@ -150,6 +154,9 @@ function formatDot(pages, graph, minEdges) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
+// Only validate the auto-resolved path (env/marker/default). An explicit
+// --hypo-dir=<path> (tests, other tooling) is trusted as-is, valid or not.
+if (args.hypoDirSource) checkVaultOrExit(args.hypoDir, args.hypoDirSource);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));

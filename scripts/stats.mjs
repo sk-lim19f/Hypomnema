@@ -15,7 +15,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, extname } from 'path';
-import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isIgnored, isScanIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
@@ -26,7 +26,11 @@ function parseArgs(argv) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--json') args.json = true;
   }
-  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
+  if (!args.hypoDir) {
+    const info = resolveHypoRootInfo();
+    args.hypoDir = info.root;
+    args.hypoDirSource = info.source;
+  }
   return args;
 }
 
@@ -88,6 +92,9 @@ function getLastActivity(hypoDir) {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
+// Only validate the auto-resolved path (env/marker/default). An explicit
+// --hypo-dir=<path> (tests, other tooling) is trusted as-is, valid or not.
+if (args.hypoDirSource) checkVaultOrExit(args.hypoDir, args.hypoDirSource);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const pageFiles = collectMdFiles(join(args.hypoDir, 'pages'), [], args.hypoDir, ignorePatterns);

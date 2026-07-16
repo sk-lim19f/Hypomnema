@@ -18,7 +18,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
-import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { currentDevice, scopeVisible, readVisibilityScope } from '../hooks/hypo-shared.mjs';
 
@@ -32,7 +32,11 @@ function parseArgs(argv) {
     else if (arg.startsWith('--limit=')) args.limit = parseInt(arg.slice(8), 10) || 10;
     else if (arg === '--json') args.json = true;
   }
-  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
+  if (!args.hypoDir) {
+    const info = resolveHypoRootInfo();
+    args.hypoDir = info.root;
+    args.hypoDirSource = info.source;
+  }
   return args;
 }
 
@@ -96,6 +100,12 @@ if (!args.query) {
   process.exit(1);
 }
 
+// Only validate the auto-resolved path (env/marker/default). An explicit
+// --hypo-dir=<path> (tests, other tooling) is trusted as-is, valid or not.
+const vaultMissing = args.hypoDirSource
+  ? checkVaultOrExit(args.hypoDir, args.hypoDirSource)
+  : false;
+
 const terms = args.query.toLowerCase().split(/\s+/).filter(Boolean);
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
@@ -131,8 +141,16 @@ if (args.json) {
   console.log(JSON.stringify(top, null, 2));
 } else {
   if (top.length === 0) {
-    console.log(`No results for: ${args.query}`);
-    console.log(`→ 관련 페이지가 없습니다. 새 지식이 있다면 /hypo:ingest 로 추가해 보세요.`);
+    // vaultMissing: nothing was actually scanned (no HYPO_DIR / no vault
+    // found). Both "No results for: …" and the "관련 페이지가 없습니다" CTA would
+    // misreport real knowledge as absent, so suppress the whole no-results
+    // block. The stderr notice from checkVaultOrExit already told the user why
+    // this run found nothing, and it did not search a vault to invite them to
+    // /hypo:ingest into one that may already hold the answer.
+    if (!vaultMissing) {
+      console.log(`No results for: ${args.query}`);
+      console.log(`→ 관련 페이지가 없습니다. 새 지식이 있다면 /hypo:ingest 로 추가해 보세요.`);
+    }
   } else {
     console.log(`Found ${results.length} result(s) for "${args.query}" (showing ${top.length}):\n`);
     for (const r of top) {
