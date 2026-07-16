@@ -44,10 +44,31 @@ import {
 } from './lib/extensions.mjs';
 import { sha256, readFileIfRegular, readPkgJson } from './lib/pkg-json.mjs';
 import { resolveCliOnPath, classifyInstall } from '../hooks/version-check.mjs';
+import { isHypomnemaPluginEnabled } from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const PKG_ROOT = join(SCRIPT_DIR, '..');
+
+// ── install channel ───────────────────────────────────────────────────────────
+//
+// A plugin-channel install registers its 14 core hooks straight out of the
+// package's own hooks/hooks.json (CLAUDE_PLUGIN_ROOT) — Claude Code auto-wires
+// them, they are never copied into ~/.claude/hooks and never listed in
+// ~/.claude/settings.json. checkHooks/checkSettingsJson used to treat that
+// empty state as "missing" and prescribe `/hypo:init`, which then copied +
+// registered the very same hooks a second time (every hook firing twice).
+//
+// `pluginMode` mirrors upgrade.mjs's own detector: this doctor.mjs is itself
+// running from a `.claude/plugins/…` root. `hypomnemaPluginEnabled` catches the
+// dual-install variant — a manual/npm doctor.mjs run while the plugin is ALSO
+// enabled in settings.json (see lib/plugin-detect.mjs; fails open on any
+// uncertainty). Either signal means Claude's core hook surface is
+// plugin-managed, not missing.
+const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
+const hypomnemaPluginEnabled =
+  !pluginMode && isHypomnemaPluginEnabled(join(HOME, '.claude', 'settings.json'));
+const coreManagedByPlugin = pluginMode || hypomnemaPluginEnabled;
 
 // Shown after every fatal package-integrity error. These conditions mean the
 // shipped hooks/hooks.json is missing or malformed — never a user mistake —
@@ -259,7 +280,7 @@ function checkFiles(hypoDir) {
   }
 }
 
-function checkHooks() {
+function checkHooks(coreManagedByPlugin) {
   const claudeHooks = join(HOME, '.claude', 'hooks');
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
 
@@ -270,6 +291,13 @@ function checkHooks() {
 
   if (missing === 0) {
     pass('Hook files installed', claudeHooks);
+  } else if (coreManagedByPlugin && missing === allFiles.length) {
+    // Plugin channel: an empty ~/.claude/hooks is the expected, healthy state
+    // (the plugin loader provides the hooks), not a missing install.
+    pass(
+      'Hook files installed',
+      `provided by the plugin loader (hooks/hooks.json) — none copied to ${claudeHooks} (expected)`,
+    );
   } else if (missing < allFiles.length) {
     warn('Hook files installed', `${missing}/${allFiles.length} missing in ${claudeHooks}`);
   } else {
@@ -277,10 +305,17 @@ function checkHooks() {
   }
 }
 
-function checkSettingsJson() {
+function checkSettingsJson(coreManagedByPlugin) {
   const settingsPath = join(HOME, '.claude', 'settings.json');
   if (!existsSync(settingsPath)) {
-    warn('settings.json hook registrations', 'settings.json not found');
+    if (coreManagedByPlugin) {
+      pass(
+        'settings.json hook registrations',
+        'provided by the plugin loader (hooks/hooks.json) — settings.json entries not required',
+      );
+    } else {
+      warn('settings.json hook registrations', 'settings.json not found');
+    }
     return;
   }
 
@@ -313,6 +348,13 @@ function checkSettingsJson() {
     warn(
       'settings.json hook registrations',
       `${registered}/${total} registered — run /hypo:init to merge missing entries`,
+    );
+  } else if (coreManagedByPlugin) {
+    // Same reasoning as checkHooks: the plugin loader never touches settings.json,
+    // so 0/total here is the expected plugin-channel state, not a missing install.
+    pass(
+      'settings.json hook registrations',
+      `0/${total} registered in settings.json — provided by the plugin loader (hooks/hooks.json) instead (expected)`,
     );
   } else {
     fail('settings.json hook registrations', `0/${total} registered — run /hypo:init`);
@@ -1312,6 +1354,121 @@ function checkStaleSibling() {
   }
 }
 
+// ── package integrity ─────────────────────────────────────────────────────────
+//
+// ~/.claude/hypo-pkg.json is a snapshot written once by init/upgrade and never
+// re-validated: nothing tracks whether pkgRoot still exists, whether its
+// package.json version still matches the recorded pkgVersion, or whether
+// pkgRoot points at a dev checkout instead of a distributed copy. Command and
+// skill script resolution was unified onto this one pointer, so a stale or
+// dev-pointing pkgRoot means the wiki silently runs uncommitted WIP.
+// All three checks are WARN, never FAIL — a dogfooding maintainer must be
+// able to ignore them on purpose.
+function checkPkgIntegrity(claudeHome) {
+  const pkgPath = join(claudeHome, 'hypo-pkg.json');
+  const meta = readPkgJson(pkgPath);
+  // Distinguish "no metadata file at all" (a fresh install — non-actionable, stay
+  // silent) from "a file is present but has no pkgRoot" (incomplete metadata that
+  // breaks runtime package resolution — warn rather than silently reading as OK).
+  // readPkgJson renames a corrupt file aside and returns {}, so after that the path
+  // no longer exists and this correctly falls into the silent fresh-install branch.
+  if (!existsSync(pkgPath)) return;
+  if (!meta || !meta.pkgRoot) {
+    warn(
+      'hypo-pkg.json pkgRoot',
+      `hypo-pkg.json has no pkgRoot field — metadata is incomplete; re-run /hypo:init or /hypo:upgrade`,
+    );
+    return;
+  }
+
+  const { pkgRoot, pkgVersion } = meta;
+
+  if (!existsSync(pkgRoot)) {
+    warn(
+      'hypo-pkg.json pkgRoot exists',
+      `${pkgRoot} does not exist — metadata is stale; re-run /hypo:init or /hypo:upgrade`,
+    );
+    return;
+  }
+  pass('hypo-pkg.json pkgRoot exists', pkgRoot);
+
+  let actualVersion = null;
+  let pkgJsonReadable = false;
+  try {
+    actualVersion = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8')).version;
+    pkgJsonReadable = true;
+  } catch {
+    warn('hypo-pkg.json version match', `${pkgRoot}/package.json is unreadable — cannot verify`);
+  }
+  // Every reachable state emits exactly one line: a silent skip here would read as
+  // "verified" on the health report when nothing was actually checked.
+  if (actualVersion) {
+    if (pkgVersion && actualVersion !== pkgVersion) {
+      warn(
+        'hypo-pkg.json version match',
+        `recorded pkgVersion is ${pkgVersion}, but pkgRoot's package.json is v${actualVersion} — ` +
+          `stale metadata; re-run /hypo:init or /hypo:upgrade`,
+      );
+    } else if (pkgVersion) {
+      pass('hypo-pkg.json version match', `v${actualVersion}`);
+    } else {
+      warn(
+        'hypo-pkg.json version match',
+        `metadata records no pkgVersion — cannot verify against pkgRoot's v${actualVersion}; ` +
+          `re-run /hypo:init or /hypo:upgrade`,
+      );
+    }
+  } else if (pkgJsonReadable) {
+    warn(
+      'hypo-pkg.json version match',
+      `${pkgRoot}/package.json has no "version" field — cannot verify`,
+    );
+  }
+
+  // dev-repo check: pkgRoot is a git working tree that is dirty or sits on a
+  // commit with no exact release tag. Normal users should point at a
+  // distributed copy (plugin cache or npm install), not a source checkout.
+  if (existsSync(join(pkgRoot, '.git'))) {
+    const status = spawnSync('git', ['-C', pkgRoot, 'status', '--porcelain'], {
+      encoding: 'utf-8',
+    });
+    const tag = spawnSync('git', ['-C', pkgRoot, 'describe', '--tags', '--exact-match'], {
+      encoding: 'utf-8',
+    });
+    // A non-zero `git describe` exit is the real "HEAD is not an exact tag" signal,
+    // but a spawn failure (git not installed, ENOENT) sets `.error` / a null status
+    // too. Treat those as "cannot classify" instead of silently mislabeling the
+    // pkgRoot as an untagged dev checkout. `git status --porcelain` must exit 0 on
+    // any real repo (clean OR dirty), so a non-zero status there means the repo is
+    // corrupt/inaccessible — also "cannot classify", not "untagged". `git describe`
+    // legitimately exits non-zero when HEAD carries no exact tag, so only its spawn
+    // (error/null status) disqualifies it, not a non-zero exit.
+    const gitUsable =
+      status.error == null && status.status === 0 && tag.error == null && tag.status != null;
+    if (!gitUsable) {
+      warn(
+        'hypo-pkg.json pkgRoot install kind',
+        `pkgRoot has a .git directory but git could not be run — cannot classify the install kind`,
+      );
+      return;
+    }
+    const dirty = status.stdout.trim().length > 0; // gitUsable already asserts status 0
+    const untagged = tag.status !== 0;
+    if (dirty || untagged) {
+      const reasons = [];
+      if (dirty) reasons.push('uncommitted changes');
+      if (untagged) reasons.push('HEAD is not an exact release tag');
+      warn(
+        'hypo-pkg.json pkgRoot install kind',
+        `pkgRoot looks like a development checkout (${reasons.join(', ')}) — normal users should ` +
+          `point at a distributed copy (plugin cache or npm install), not a source repo`,
+      );
+    } else {
+      pass('hypo-pkg.json pkgRoot install kind', 'pkgRoot is a clean, tagged checkout');
+    }
+  }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -1325,8 +1482,9 @@ if (rootOk) {
   checkBrokenLinks(args.hypoDir, ignorePatterns);
   checkVerifyBy(args.hypoDir, ignorePatterns);
 }
-checkHooks();
-checkSettingsJson();
+checkHooks(coreManagedByPlugin);
+checkSettingsJson(coreManagedByPlugin);
+checkPkgIntegrity(args.claudeHome);
 checkStaleSibling();
 if (args.codex) checkCodexPaths();
 if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');

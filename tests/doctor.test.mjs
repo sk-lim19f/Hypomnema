@@ -4,10 +4,29 @@
 // build on each other; suites may not — that is what lets the runner shard.
 
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  cpSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { test, suite } from './harness.mjs';
-import { NONEXISTENT_WIKI, run, runWithHome, withTmpDir, withTmpHome } from './helpers.mjs';
+import {
+  HOOKS,
+  NONEXISTENT_WIKI,
+  REPO,
+  SCRIPTS,
+  run,
+  runWithHome,
+  withTmpDir,
+  withTmpHome,
+} from './helpers.mjs';
 
 // ── doctor.mjs smoke tests ───────────────────────────────────────────────────
 
@@ -473,5 +492,421 @@ test('doctor-codex-paths: --codex flag triggers codex settings.json check', () =
     const out = JSON.parse(r.stdout);
     const settingsCheck = out.find((c) => c.label === 'Codex settings.json hook registrations');
     assert.ok(settingsCheck, 'Codex settings.json check not found');
+  });
+});
+
+// ── ISSUE-52: install-channel awareness (plugin channel false-negative) ───────
+// A plugin-channel install registers its core hooks straight out of the
+// package's own hooks/hooks.json — never into ~/.claude/hooks, never into
+// ~/.claude/settings.json. doctor used to treat that empty state as "missing"
+// and prescribe `/hypo:init`, which then double-registered every hook. Run a
+// COPY of doctor.mjs from a fake root whose path matches the plugin-cache
+// shape (`.claude/plugins/…`) so the channel detector (gated on doctor.mjs's
+// OWN script location, mirroring upgrade.mjs) actually fires.
+suite('doctor.mjs — plugin channel (ISSUE-52)');
+
+function withFakeDoctorInstall(underPlugins, fn) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-doc-'));
+  try {
+    const root = underPlugins
+      ? join(base, '.claude', 'plugins', 'cache', 'mp', 'hypomnema', '1.3.0')
+      : join(base, 'lib', 'node_modules', 'hypomnema');
+    mkdirSync(root, { recursive: true });
+    cpSync(SCRIPTS, join(root, 'scripts'), { recursive: true });
+    cpSync(HOOKS, join(root, 'hooks'), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(root, 'package.json'));
+    const home = join(base, 'home');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    const wiki = join(base, 'wiki');
+    mkdirSync(wiki, { recursive: true });
+    writeFileSync(join(wiki, 'hypo-config.md'), '---\ntitle: config\ntype: reference\n---\n');
+    fn({ doctor: join(root, 'scripts', 'doctor.mjs'), root, home, wiki });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+function runDoctorFrom(doctor, args, home) {
+  return spawnSync(process.execPath, [doctor, ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '', HOME: home },
+  });
+}
+
+test('plugin mode: empty ~/.claude/hooks passes, not fails', () => {
+  withFakeDoctorInstall(true, ({ doctor, home, wiki }) => {
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const hookCheck = out.find((c) => c.label === 'Hook files installed');
+    assert.ok(hookCheck, 'Hook files installed check not found');
+    assert.equal(
+      hookCheck.status,
+      'pass',
+      `plugin channel with empty ~/.claude/hooks must pass: ${JSON.stringify(hookCheck)}`,
+    );
+  });
+});
+
+test('plugin mode: 0/N settings.json registrations passes, not fails', () => {
+  withFakeDoctorInstall(true, ({ doctor, home, wiki }) => {
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const settingsCheck = out.find((c) => c.label === 'settings.json hook registrations');
+    assert.ok(settingsCheck, 'settings.json hook registrations check not found');
+    assert.equal(
+      settingsCheck.status,
+      'pass',
+      `plugin channel with 0 settings.json registrations must pass: ${JSON.stringify(settingsCheck)}`,
+    );
+  });
+});
+
+test('regression baseline: npm/manual channel with empty hooks still fails', () => {
+  withFakeDoctorInstall(false, ({ doctor, home, wiki }) => {
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const hookCheck = out.find((c) => c.label === 'Hook files installed');
+    const settingsCheck = out.find((c) => c.label === 'settings.json hook registrations');
+    assert.equal(
+      hookCheck.status,
+      'fail',
+      'npm/manual channel with empty ~/.claude/hooks must still fail (baseline unaffected)',
+    );
+    assert.notEqual(
+      settingsCheck.status,
+      'pass',
+      'npm/manual channel with 0 settings.json registrations must not silently pass',
+    );
+  });
+});
+
+// ── ISSUE-54: hypo-pkg.json integrity (stale / dev-repo pointer) ─────────────
+suite('doctor.mjs — hypo-pkg.json integrity (ISSUE-54)');
+
+test('no hypo-pkg.json yet → no integrity checks reported (fresh install, non-actionable)', () => {
+  withTmpHome((home) => {
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const anyPkgCheck = out.find((c) => c.label.startsWith('hypo-pkg.json'));
+    assert.equal(anyPkgCheck, undefined, 'a fresh install with no metadata must report nothing');
+  });
+});
+
+test('pkgRoot does not exist on disk → warn, not fail', () => {
+  withTmpHome((home) => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(
+      join(home, '.claude', 'hypo-pkg.json'),
+      JSON.stringify({ pkgRoot: '/nonexistent/hypo-pkg-root', pkgVersion: '9.9.9' }),
+    );
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const rootCheck = out.find((c) => c.label === 'hypo-pkg.json pkgRoot exists');
+    assert.ok(rootCheck, 'hypo-pkg.json pkgRoot exists check not found');
+    assert.equal(rootCheck.status, 'warn', `missing pkgRoot must warn, not fail: ${r.stdout}`);
+  });
+});
+
+test('pkgVersion mismatch vs pkgRoot package.json → warn', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-'));
+    try {
+      cpSync(join(REPO, 'package.json'), join(base, 'package.json'));
+      const actualVersion = JSON.parse(readFileSync(join(base, 'package.json'), 'utf-8')).version;
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base, pkgVersion: '0.0.1-definitely-stale' }),
+      );
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const versionCheck = out.find((c) => c.label === 'hypo-pkg.json version match');
+      assert.ok(versionCheck, 'hypo-pkg.json version match check not found');
+      assert.equal(
+        versionCheck.status,
+        'warn',
+        `version mismatch (recorded 0.0.1-definitely-stale vs actual ${actualVersion}) must warn: ${r.stdout}`,
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+test('pkgRoot is a dirty git working tree → warn about dev checkout', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-git-'));
+    try {
+      initGitRepo(base); // committed, clean, signing/hooks neutralized
+      // leave an uncommitted change → dirty working tree
+      writeFileSync(join(base, 'WIP.md'), 'work in progress');
+
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base, pkgVersion: '1.0.0' }),
+      );
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const kindCheck = out.find((c) => c.label === 'hypo-pkg.json pkgRoot install kind');
+      assert.ok(kindCheck, 'hypo-pkg.json pkgRoot install kind check not found');
+      assert.equal(
+        kindCheck.status,
+        'warn',
+        `dirty/untagged pkgRoot must warn as a dev checkout: ${r.stdout}`,
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+// The version-match check must emit a line in EVERY reachable state — a silent
+// skip reads as "verified" on the health report when nothing was checked.
+test('pkgRoot package.json has no version field → warn, not silence', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-nover-'));
+    try {
+      writeFileSync(join(base, 'package.json'), JSON.stringify({ name: 'hypomnema' }));
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base, pkgVersion: '1.0.0' }),
+      );
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const versionCheck = out.find((c) => c.label === 'hypo-pkg.json version match');
+      assert.ok(
+        versionCheck,
+        'a package.json with no version must still report a version-match line',
+      );
+      assert.equal(
+        versionCheck.status,
+        'warn',
+        `unverifiable version (no version field) must warn, not silently skip: ${r.stdout}`,
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+test('metadata records no pkgVersion → warn, not silence', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-nopkgver-'));
+    try {
+      writeFileSync(
+        join(base, 'package.json'),
+        JSON.stringify({ name: 'hypomnema', version: '1.0.0' }),
+      );
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base }), // pkgRoot present, pkgVersion absent
+      );
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const versionCheck = out.find((c) => c.label === 'hypo-pkg.json version match');
+      assert.ok(versionCheck, 'metadata with no pkgVersion must still report a version-match line');
+      assert.equal(
+        versionCheck.status,
+        'warn',
+        `unverifiable version (no recorded pkgVersion) must warn, not silently skip: ${r.stdout}`,
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+test('matching pkgVersion vs pkgRoot package.json → pass (no false warn)', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-match-'));
+    try {
+      writeFileSync(
+        join(base, 'package.json'),
+        JSON.stringify({ name: 'hypomnema', version: '2.3.4' }),
+      );
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base, pkgVersion: '2.3.4' }),
+      );
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const versionCheck = out.find((c) => c.label === 'hypo-pkg.json version match');
+      assert.ok(versionCheck, 'version match check not found');
+      assert.equal(versionCheck.status, 'pass', `a healthy version match must pass: ${r.stdout}`);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+// A hypo-pkg.json that is PRESENT but has no pkgRoot is incomplete metadata that
+// breaks runtime resolution — it must warn, not read as a healthy silent state.
+// (A wholly absent file is the fresh-install case and stays silent.)
+test('metadata file present but no pkgRoot field → warn (not silent)', () => {
+  withTmpHome((home) => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgVersion: '1.0.0' }));
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'hypo-pkg.json pkgRoot');
+    assert.ok(check, 'a present-but-incomplete hypo-pkg.json must report a pkgRoot line');
+    assert.equal(check.status, 'warn', `incomplete metadata (no pkgRoot) must warn: ${r.stdout}`);
+  });
+});
+
+// ── ISSUE-54 follow-up: dev-repo install-kind classification is locked per state.
+// The prior single dirty+untagged test could stay green even if untagged
+// classification regressed (dirtiness alone supplies the warn) or git failed to
+// run. These pin clean-tagged (pass), clean-untagged (warn, tag reason), and
+// git-unavailable (cannot classify) independently.
+function initGitRepo(base, { tag } = {}) {
+  writeFileSync(
+    join(base, 'package.json'),
+    JSON.stringify({ name: 'hypomnema', version: '1.0.0' }),
+  );
+  const q = { stdio: 'ignore' };
+  spawnSync('git', ['-C', base, 'init'], q);
+  spawnSync('git', ['-C', base, 'config', 'user.email', 'test@test.com'], q);
+  spawnSync('git', ['-C', base, 'config', 'user.name', 'Test'], q);
+  // Neutralize a host that globally sets commit/tag signing or a hooks path, so the
+  // fixture commit succeeds regardless of the maintainer's git config.
+  spawnSync('git', ['-C', base, 'config', 'commit.gpgsign', 'false'], q);
+  spawnSync('git', ['-C', base, 'config', 'tag.gpgsign', 'false'], q);
+  spawnSync('git', ['-C', base, 'config', 'core.hooksPath', '/dev/null'], q);
+  spawnSync('git', ['-C', base, 'add', '-A'], q);
+  const commit = spawnSync('git', ['-C', base, 'commit', '--no-verify', '-m', 'init'], {
+    encoding: 'utf-8',
+  });
+  assert.equal(commit.status, 0, `fixture commit must succeed: ${commit.stderr}`);
+  if (tag) {
+    const t = spawnSync('git', ['-C', base, 'tag', tag], { encoding: 'utf-8' });
+    assert.equal(t.status, 0, `fixture tag must succeed: ${t.stderr}`);
+  }
+}
+
+test('clean tagged pkgRoot → pass (not a dev checkout)', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-tagged-'));
+    try {
+      initGitRepo(base, { tag: 'v1.0.0' });
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base, pkgVersion: '1.0.0' }),
+      );
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const kindCheck = out.find((c) => c.label === 'hypo-pkg.json pkgRoot install kind');
+      assert.ok(kindCheck, 'install kind check not found');
+      assert.equal(kindCheck.status, 'pass', `a clean tagged checkout must pass: ${r.stdout}`);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+test('clean but untagged pkgRoot → warn on the tag reason alone (not dirtiness)', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-untagged-'));
+    try {
+      initGitRepo(base); // committed, clean tree, no tag
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base, pkgVersion: '1.0.0' }),
+      );
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const kindCheck = out.find((c) => c.label === 'hypo-pkg.json pkgRoot install kind');
+      assert.ok(kindCheck, 'install kind check not found');
+      assert.equal(kindCheck.status, 'warn', `a clean untagged checkout must warn: ${r.stdout}`);
+      assert.match(kindCheck.detail, /release tag/, 'the reason must be the missing tag');
+      assert.doesNotMatch(
+        kindCheck.detail,
+        /uncommitted/,
+        'a clean tree must not be reported as having uncommitted changes',
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+test('pkgRoot has .git but git cannot be run → warn "cannot classify" (not mislabeled untagged)', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-nogit-'));
+    try {
+      writeFileSync(
+        join(base, 'package.json'),
+        JSON.stringify({ name: 'hypomnema', version: '1.0.0' }),
+      );
+      mkdirSync(join(base, '.git')); // enters the dev-repo branch, but git can't run
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base, pkgVersion: '1.0.0' }),
+      );
+      // Empty PATH so the child's `git` spawn fails with ENOENT. doctor runs via an
+      // absolute node path, so it still starts; other external-dep probes just
+      // report missing without crashing.
+      const emptyPath = mkdtempSync(join(tmpdir(), 'hypo-emptypath-'));
+      const r = spawnSync(
+        process.execPath,
+        [join(SCRIPTS, 'doctor.mjs'), `--hypo-dir=${NONEXISTENT_WIKI}`, '--json'],
+        {
+          encoding: 'utf-8',
+          env: { ...process.env, HYPO_DIR: '', HOME: home, PATH: emptyPath },
+        },
+      );
+      rmSync(emptyPath, { recursive: true, force: true });
+      const out = JSON.parse(r.stdout);
+      const kindCheck = out.find((c) => c.label === 'hypo-pkg.json pkgRoot install kind');
+      assert.ok(kindCheck, 'install kind check not found');
+      assert.equal(kindCheck.status, 'warn', `git-unavailable must warn: ${r.stdout}`);
+      assert.match(
+        kindCheck.detail,
+        /cannot classify/,
+        'must say it cannot classify, not mislabel as untagged',
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+// The distinct branch from the ENOENT case above: git IS runnable, but `git status`
+// itself exits nonzero because the repo is corrupt/inaccessible (an invalid .git).
+// That must also be "cannot classify", not a mislabel as an untagged dev checkout.
+test('pkgRoot .git is corrupt so git status exits nonzero → warn "cannot classify"', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-corruptgit-'));
+    try {
+      writeFileSync(
+        join(base, 'package.json'),
+        JSON.stringify({ name: 'hypomnema', version: '1.0.0' }),
+      );
+      mkdirSync(join(base, '.git')); // an empty .git dir → `git status` exits 128
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: base, pkgVersion: '1.0.0' }),
+      );
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const kindCheck = out.find((c) => c.label === 'hypo-pkg.json pkgRoot install kind');
+      assert.ok(kindCheck, 'install kind check not found');
+      assert.equal(kindCheck.status, 'warn', `corrupt-repo git status must warn: ${r.stdout}`);
+      assert.match(
+        kindCheck.detail,
+        /cannot classify/,
+        'a nonzero git status (corrupt repo) must be cannot-classify, not untagged',
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
