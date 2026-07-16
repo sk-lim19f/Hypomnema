@@ -213,24 +213,56 @@ const SHARED_FILES = _hookConfig.shared ?? [];
 
 // ── checks ───────────────────────────────────────────────────────────────────
 
-function checkSchemaVersion(hypoDir) {
-  const pkgPath = join(TEMPLATES, 'SCHEMA.md');
-  const hypoPath = join(hypoDir, 'SCHEMA.md');
+// Shared by SCHEMA.md and hypo-guide.md: both templates carry a top-level
+// `version:` frontmatter stamp, and both are compared the same way — installed
+// copy vs. the package's own template — without ever writing to hypoPath. This
+// function is read-only; nothing downstream may use its return value to
+// overwrite the installed file (hand-authored wiki files are never
+// silently clobbered).
+function checkTemplateVersion(hypoDir, filename) {
+  const pkgPath = join(TEMPLATES, filename);
+  const hypoPath = join(hypoDir, filename);
 
   const pkgVersion = existsSync(pkgPath)
     ? parseVersion((parseFrontmatter(readFileSync(pkgPath, 'utf-8')) ?? {}).version)
     : null;
-  const hypoVersion = existsSync(hypoPath)
+
+  const hypoExists = existsSync(hypoPath);
+  const hypoVersion = hypoExists
     ? parseVersion((parseFrontmatter(readFileSync(hypoPath, 'utf-8')) ?? {}).version)
     : null;
+
+  // File present but carries no `version:` frontmatter field at all — a
+  // pre-versioning install (the file predates this stamp existing). This is
+  // deliberately distinguished from "file missing entirely" (still routed to
+  // bumpType's 'unknown' below): a bare `bumpType(null, pkgVersion)` cannot
+  // tell the two apart, and folding this case into plain 'unknown' is exactly
+  // what let an already-installed, unstamped hypo-guide.md report "up to
+  // date" — the file this check exists to catch. The caller decides whether
+  // 'unstamped' counts as drift; this helper only classifies.
+  const unstamped = hypoExists && !hypoVersion && !!pkgVersion;
 
   return {
     installed: hypoVersion?.raw ?? null,
     current: pkgVersion?.raw ?? null,
-    bump: bumpType(hypoVersion, pkgVersion),
+    bump: unstamped ? 'unstamped' : bumpType(hypoVersion, pkgVersion),
     hypoPath,
     pkgPath,
   };
+}
+
+function checkSchemaVersion(hypoDir) {
+  return checkTemplateVersion(hypoDir, 'SCHEMA.md');
+}
+
+// hypo-guide.md had no update channel at all — upgrade.mjs never
+// looked at it, and init.mjs only ever writes it once (skip if present), so an
+// installed vault's copy went permanently stale the moment the shipped template
+// changed, with no signal to the user. This check restores visibility (a warning
+// on drift) without adding a write path: --apply still never touches an
+// installed hypo-guide.md, exactly like SCHEMA.md's existing Option C contract.
+function checkGuideVersion(hypoDir) {
+  return checkTemplateVersion(hypoDir, 'hypo-guide.md');
 }
 
 // Target-aware: the same core-hook integrity check runs against ~/.claude/hooks/
@@ -891,6 +923,7 @@ const managesClaudeCore = !pluginMode && (!dualInstallCoreConflict || args.allow
 const dualSkip = dualInstallCoreConflict && !args.allowDualInstall;
 
 const schema = checkSchemaVersion(args.hypoDir);
+const guide = checkGuideVersion(args.hypoDir);
 const hooks = checkHookFiles(claudeHooksDir);
 const settings = checkSettingsJson(claudeSettingsPath, claudeHooksDir);
 const pkgJson = checkPkgJson();
@@ -953,7 +986,19 @@ const missingSettingsCodex = settingsCodex
 const invalidSettingsCodex = settingsCodex
   ? settingsCodex.some((s) => s.status === 'invalid-json')
   : false;
-const schemaDrift = schema.bump !== 'none' && schema.bump !== 'unknown' && schema.bump !== 'ahead';
+// SCHEMA.md keeps its pre-existing behavior: 'unstamped' is deliberately NOT
+// counted as drift here (SCHEMA.md is user-owned vocabulary, Option C — an
+// unstamped SCHEMA.md was already the "cannot compare" case before this
+// classification existed, and no SCHEMA test exercises it as actionable).
+const schemaDrift =
+  schema.bump !== 'none' &&
+  schema.bump !== 'unknown' &&
+  schema.bump !== 'ahead' &&
+  schema.bump !== 'unstamped';
+// hypo-guide.md: 'unstamped' DOES count as drift — this is the exact shape of
+// an already-installed pre-versioning vault, the population this change targets.
+// Excluding it (as the old unknown-only check did) is the bug this fixes.
+const guideDrift = guide.bump !== 'none' && guide.bump !== 'unknown' && guide.bump !== 'ahead';
 // Dual-install: when core is skipped, hypo-pkg.json is deliberately left
 // pointing at the PLUGIN's package root (preserved identity), so checkPkgJson()
 // reports it 'stale' relative to this npm/manual PKG_ROOT. That mismatch is
@@ -1139,6 +1184,7 @@ const hasDrift =
   (managesClaudeCore && claudeCoreDrift) ||
   pkgJsonDrift ||
   schemaDrift ||
+  guideDrift ||
   hypoignore.status === 'needs-migration' ||
   gitignore.status === 'needs-migration' ||
   extDrift ||
@@ -1155,6 +1201,7 @@ if (args.json) {
         coreManagedBy: managesClaudeCore ? 'self' : pluginMode ? 'plugin' : 'plugin-enabled',
         dualInstallOverride: args.allowDualInstall,
         schema,
+        guide,
         hooks,
         settings,
         pkgJson,
@@ -1254,6 +1301,12 @@ if (schema.bump === 'none') {
   lines.push(
     `⚠ SCHEMA version    ${schema.installed} (installed is ahead of package ${schema.current})`,
   );
+} else if (schema.bump === 'unstamped') {
+  // Not counted as drift for SCHEMA.md (Option C, unchanged) — still surfaced
+  // as advisory-only visibility, same spirit as the pre-existing 'unknown' text.
+  lines.push(
+    `⚠ SCHEMA version    installed has no version stamp (pre-versioning copy), package=${schema.current} (cannot compare automatically)`,
+  );
 } else if (schema.bump === 'major') {
   lines.push(
     `✗ SCHEMA version    ${schema.installed} → ${schema.current}  [MAJOR — --apply writes MIGRATION report; SCHEMA must be merged manually]`,
@@ -1261,6 +1314,33 @@ if (schema.bump === 'none') {
 } else {
   lines.push(
     `⚠ SCHEMA version    ${schema.installed} → ${schema.current}  [minor update — review and update SCHEMA.md manually]`,
+  );
+}
+
+// hypo-guide.md version stamp. Visibility only — a drift warning,
+// never a write: --apply must not overwrite an installed hypo-guide.md, since a
+// user may have customized it (same Option C contract as SCHEMA.md above).
+if (guide.bump === 'none') {
+  lines.push(`✓ hypo-guide.md     v${guide.installed} (up to date)`);
+} else if (guide.bump === 'unknown') {
+  lines.push(
+    `⚠ hypo-guide.md     installed=${guide.installed ?? 'not found (no version stamp)'}, package=${guide.current ?? 'not found'} (cannot compare)`,
+  );
+} else if (guide.bump === 'ahead') {
+  lines.push(
+    `⚠ hypo-guide.md     v${guide.installed} (installed is ahead of package v${guide.current})`,
+  );
+} else if (guide.bump === 'unstamped') {
+  // The target case: the file exists (this is not a fresh/missing
+  // install) but predates the version stamp entirely. Counted as drift above
+  // (guideDrift) — the message must be actionable, not "cannot compare",
+  // since a pre-versioning copy silently reporting "up to date" was the bug.
+  lines.push(
+    `⚠ hypo-guide.md     installed copy has no version stamp (pre-versioning stale copy; package=v${guide.current}) — review templates/hypo-guide.md and update your copy manually; --apply does not overwrite it`,
+  );
+} else {
+  lines.push(
+    `⚠ hypo-guide.md     v${guide.installed} → v${guide.current}  [package template changed — review templates/hypo-guide.md and update your copy manually; --apply does not overwrite it]`,
   );
 }
 
@@ -1577,6 +1657,7 @@ const totalDrift =
   claudeCoreCount +
   (pkgJsonDrift ? 1 : 0) +
   (schemaDrift ? 1 : 0) +
+  (guideDrift ? 1 : 0) +
   (hypoignore.status === 'needs-migration' ? hypoignore.missing.length : 0) +
   (gitignore.status === 'needs-migration' ? gitignore.missing.length : 0) +
   extCheck.actions.filter(
