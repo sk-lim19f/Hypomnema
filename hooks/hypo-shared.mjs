@@ -1557,16 +1557,34 @@ export function commitWikiChanges(hypoDir) {
     spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
   if (git('rev-parse', '--is-inside-work-tree').status !== 0)
     return { committed: false, reason: `not a git repository: ${hypoDir}` };
-  const porcelain = git('status', '--porcelain', '-uall');
+  // `-z`: NUL-separated records with verbatim paths — no surrounding quotes and
+  // no octal escaping, so non-ASCII paths (Korean page names are normal input
+  // here) survive intact. Without it, `core.quotepath=true` (the default) yields
+  // `"pages/\355\225\234\352\270\200.md"` and the old quote-strip parser fed that
+  // literal, non-existent path to `git add` — failing the whole commit.
+  // `-z`: NUL-separated records with verbatim paths — no surrounding quotes and
+  // no octal escaping, so non-ASCII paths (Korean page names are normal input
+  // here) survive intact. Without it, `core.quotepath=true` (the default) yields
+  // `"pages/\355\225\234\352\270\200.md"` and the old quote-strip parser fed that
+  // literal, non-existent path to `git add` — failing the whole commit.
+  const porcelain = git('status', '--porcelain', '-uall', '-z');
   if (porcelain.status !== 0)
     return { committed: false, reason: `git status failed in ${hypoDir}` };
   // `.hypoignore` is the project privacy boundary. `git add -A` ignores it, so
   // enumerate changed paths, drop ignored ones, then stage explicitly.
   const ignorePatterns = loadHypoIgnore(hypoDir);
   const paths = [];
-  for (const line of (porcelain.stdout || '').split('\n')) {
-    if (!line) continue;
-    const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
+  const records = (porcelain.stdout || '').split('\0');
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    if (!rec) continue;
+    const xy = rec.slice(0, 2);
+    const file = rec.slice(3); // `XY <path>`; the destination path for a rename/copy
+    // A rename OR copy emits two records (`to\0from`); consume the trailing
+    // `from`. Copy `C` records only appear under `status.renames=copies`, but
+    // when they do, missing this skip feeds the `from` path to `git add` as a
+    // bogus pathspec — the exact auto-commit failure this parser fixes.
+    if (xy[0] === 'R' || xy[1] === 'R' || xy[0] === 'C' || xy[1] === 'C') i++;
     if (!file) continue;
     if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns))
       continue;
@@ -3384,7 +3402,15 @@ export function computeSessionGrowth(hypoDir) {
     // more expensive `git diff HEAD --unified=0` — Stop hook P95 win.
     // `-uall` expands untracked directories so a brand-new `pages/new.md`
     // isn't hidden behind a single `?? pages/` line.
-    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall'], {
+    // `-z`: NUL-separated, verbatim paths (see commitWikiChanges). The old
+    // newline/quote-strip parser left octal escapes in place, so Korean page
+    // names silently failed the `pages/`·`projects/` scope match and dropped
+    // out of the growth count.
+    // `-z`: NUL-separated, verbatim paths (see commitWikiChanges). The old
+    // newline/quote-strip parser left octal escapes in place, so Korean page
+    // names silently failed the `pages/`·`projects/` scope match and dropped
+    // out of the growth count.
+    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall', '-z'], {
       encoding: 'utf-8',
       timeout: 5000,
     });
@@ -3398,10 +3424,14 @@ export function computeSessionGrowth(hypoDir) {
     // intentionally excluded — they're scaffolding, not page growth.
     const inPagesScope = (file) =>
       file.endsWith('.md') && (file.startsWith('pages/') || file.startsWith('projects/'));
-    for (const line of (porcelain.stdout || '').split('\n')) {
-      if (!line) continue;
-      const xy = line.slice(0, 2);
-      const file = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop().trim();
+    const records = (porcelain.stdout || '').split('\0');
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+      if (!rec) continue;
+      const xy = rec.slice(0, 2);
+      const file = rec.slice(3); // destination path for a rename/copy
+      // A rename OR copy emits two records (`to\0from`); consume the trailing `from`.
+      if (xy[0] === 'R' || xy[1] === 'R' || xy[0] === 'C' || xy[1] === 'C') i++;
       if (!inPagesScope(file)) continue;
       if (xy === '??') {
         untrackedMd.push(file);
@@ -3409,7 +3439,8 @@ export function computeSessionGrowth(hypoDir) {
         continue;
       }
       hasTrackedMdChange = true;
-      if (xy.includes('A')) addedPages++;
+      // A copy's destination is a brand-new page, so it counts as added like `A`.
+      if (xy.includes('A') || xy.includes('C')) addedPages++;
       else if (xy.includes('M') || xy.includes('R')) updatedPages++;
     }
     if (!hasTrackedMdChange && untrackedMd.length === 0) return empty;

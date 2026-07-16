@@ -22,6 +22,7 @@ import {
   buildProjectSuggestionLine,
   findBackfillCandidate,
   buildBackfillSuggestionLine,
+  computeSessionGrowth,
 } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import {
@@ -1704,6 +1705,128 @@ test('commitWikiChanges: respects .hypoignore (ignored file not staged)', () => 
     const tracked = spawnSync('git', ['-C', dir, 'ls-files'], { encoding: 'utf-8' }).stdout;
     assert.ok(!/secret\.md/.test(tracked), `secret.md must not be committed: ${tracked}`);
     assert.ok(/public\.md/.test(tracked), `public.md must be committed: ${tracked}`);
+  });
+});
+
+// ── ISSUE-50: porcelain `-z` parser — non-ASCII paths survive ──────────────
+
+suite('ISSUE-50 — porcelain -z parser: non-ASCII (Korean) paths');
+
+test('commitWikiChanges: a Korean filename commits under core.quotepath=true', () => {
+  withSyncedWiki((dir) => {
+    // Pin quotepath true (the git default) so the octal-escaping that breaks the
+    // old parser reproduces regardless of the developer's global config. Old
+    // parser: strips the outer quotes but leaves `\355\225...` → `git add` on a
+    // non-existent literal path fails → the whole commit fails, no marker.
+    spawnSync('git', ['-C', dir, 'config', 'core.quotepath', 'true']);
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', '한글.md'), '# 한글\n');
+    writeFileSync(join(dir, 'pages', 'ascii.md'), '# ascii\n');
+    const res = commitWikiChanges(dir);
+    assert.equal(
+      res.committed,
+      true,
+      `Korean filename must not break the commit: ${JSON.stringify(res)}`,
+    );
+    assert.equal(
+      hypoIsClean(dir).uncommitted,
+      false,
+      'the Korean page must be committed, leaving no uncommitted work',
+    );
+    // -z so ls-files reports the real name, not an escaped one
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', '-z'], {
+      encoding: 'utf-8',
+    }).stdout.split('\0');
+    assert.ok(
+      tracked.includes('pages/한글.md'),
+      `Korean page must be tracked: ${JSON.stringify(tracked)}`,
+    );
+  });
+});
+
+test('commitWikiChanges: a staged rename to a Korean name commits (the `from` record is consumed)', () => {
+  withSyncedWiki((dir) => {
+    spawnSync('git', ['-C', dir, 'config', 'core.quotepath', 'true']);
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(
+      join(dir, 'pages', 'old.md'),
+      '# seed page with enough body to be a clean rename\n',
+    );
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed']);
+    spawnSync('git', ['-C', dir, 'mv', 'pages/old.md', 'pages/새이름.md']);
+    const res = commitWikiChanges(dir);
+    assert.equal(res.committed, true, `rename must commit cleanly: ${JSON.stringify(res)}`);
+    assert.equal(hypoIsClean(dir).uncommitted, false, 'rename fully committed');
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', '-z'], {
+      encoding: 'utf-8',
+    }).stdout.split('\0');
+    assert.ok(
+      tracked.includes('pages/새이름.md') && !tracked.includes('pages/old.md'),
+      `rename must be applied: ${JSON.stringify(tracked)}`,
+    );
+  });
+});
+
+test('commitWikiChanges: a staged copy (status.renames=copies) commits, not a truncated pathspec', () => {
+  withSyncedWiki((dir) => {
+    // With copy detection on, staging a copy of a tracked file WHILE that source
+    // is itself modified makes `--porcelain -z` emit a `C  dest\0src` two-record
+    // entry (plus a separate `M src`). Git only reports the copy this way when the
+    // source appears in the same diff — a bare identical copy is just `A`. If the
+    // parser does not consume the `src` record (as it does for renames), it hands
+    // git a mangled pathspec (`es/source.md`) and the whole commit dies — the same
+    // failure `-z` fixes for renames.
+    spawnSync('git', ['-C', dir, 'config', 'core.quotepath', 'true']);
+    spawnSync('git', ['-C', dir, 'config', 'status.renames', 'copies']);
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'source.md'), 'line1\nline2\nline3\nline4\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed source']);
+    // copy the source, then modify the source, and stage both → `C dest\0src` + `M src`
+    writeFileSync(join(dir, 'pages', 'copied.md'), 'line1\nline2\nline3\nline4\n');
+    writeFileSync(join(dir, 'pages', 'source.md'), 'line1\nline2\nline3\nline4\nEXTRA\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    // sanity: the fixture really produces a `C` record (else this tests nothing)
+    const porcelain = spawnSync('git', ['-C', dir, 'status', '--porcelain', '-z'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      porcelain.split('\0')[0].startsWith('C'),
+      `fixture must emit a copy record: ${JSON.stringify(porcelain)}`,
+    );
+    const res = commitWikiChanges(dir);
+    assert.equal(
+      res.committed,
+      true,
+      `copy record must not break the commit: ${JSON.stringify(res)}`,
+    );
+    assert.equal(hypoIsClean(dir).uncommitted, false, 'copy fully committed');
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', '-z'], {
+      encoding: 'utf-8',
+    }).stdout.split('\0');
+    assert.ok(
+      tracked.includes('pages/copied.md') && tracked.includes('pages/source.md'),
+      `both source and copy must be tracked: ${JSON.stringify(tracked)}`,
+    );
+  });
+});
+
+test('computeSessionGrowth: a Korean untracked page contributes its wikilinks', () => {
+  withGrowthWiki((dir) => {
+    // The old parser leaves the path escaped, so `readFileSync(escaped)` throws
+    // and the page's wikilinks are silently dropped from the growth count. The
+    // page-scope prefix still matches the escaped path, so addedPages alone does
+    // NOT prove the fix — the wikilink body read is the discriminating signal.
+    spawnSync('git', ['-C', dir, 'config', 'core.quotepath', 'true']);
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', '한글.md'), '# 한글\n\n[[target-one]] and [[target-two]]\n');
+    const g = computeSessionGrowth(dir);
+    assert.ok(g.addedPages >= 1, `Korean page must count as added: ${JSON.stringify(g)}`);
+    assert.ok(
+      g.newWikilinks >= 2,
+      `wikilinks inside the Korean page must be counted (old parser reads an escaped path and finds none): ${JSON.stringify(g)}`,
+    );
   });
 });
 
