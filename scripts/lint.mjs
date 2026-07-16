@@ -18,7 +18,7 @@
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { join, extname, basename } from 'path';
-import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
 import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import {
@@ -43,7 +43,11 @@ function parseArgs(argv) {
     else if (arg === '--fix') args.fix = true;
     else if (arg === '--strict') args.strict = true;
   }
-  if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
+  if (!args.hypoDir) {
+    const info = resolveHypoRootInfo();
+    args.hypoDir = info.root;
+    args.hypoDirSource = info.source;
+  }
   return args;
 }
 
@@ -483,6 +487,9 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
+// Only validate the auto-resolved path (env/marker/default). An explicit
+// --hypo-dir=<path> (tests, other tooling) is trusted as-is, valid or not.
+if (args.hypoDirSource) checkVaultOrExit(args.hypoDir, args.hypoDirSource);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects', 'journal'].map((d) => join(args.hypoDir, d));

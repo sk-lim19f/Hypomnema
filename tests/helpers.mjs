@@ -103,7 +103,9 @@ function runWithHome(script, args = [], home) {
 
 // ── lib/hypo-root.mjs ────────────────────────────────────────────────────────
 
-const { expandHome, resolveHypoRoot } = await import(`${SCRIPTS}/lib/hypo-root.mjs`);
+const { expandHome, resolveHypoRoot, resolveHypoRootInfo, checkVaultOrExit } = await import(
+  `${SCRIPTS}/lib/hypo-root.mjs`
+);
 
 // ── lib/core-hooks.mjs (exit-free hooks.json loader) ─────────────────────────
 
@@ -689,6 +691,7 @@ export {
   buildCleanWikiTree,
   buildHookCommand,
   buildOutput,
+  checkVaultOrExit,
   closeFileTargets,
   closeFileTargetsForProject,
   closeFileTargetsGlobal,
@@ -755,6 +758,7 @@ export {
   readVisibilityScope,
   recordLookupUsage,
   resolveHypoRoot,
+  resolveHypoRootInfo,
   resolveInstallFile,
   resolveTranscriptBySessionId,
   run,
