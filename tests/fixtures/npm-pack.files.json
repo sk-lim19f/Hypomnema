@@ -392,6 +392,14 @@
     "exec": false
   },
   {
+    "path": "skills/debate/SKILL.md",
+    "exec": false
+  },
+  {
+    "path": "skills/debate/references/orchestration-patterns.md",
+    "exec": false
+  },
+  {
     "path": "skills/graph/SKILL.md",
     "exec": false
   },
