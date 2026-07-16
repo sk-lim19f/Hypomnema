@@ -2,6 +2,7 @@
 title: Wiki Operations Guide
 type: reference
 updated: YYYY-MM-DD
+version: 1
 tags: [wiki, guide, operations]
 ---
 

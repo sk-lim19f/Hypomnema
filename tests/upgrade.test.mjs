@@ -485,6 +485,194 @@ test('--apply migration report tags are all in installed SCHEMA vocab', () => {
   });
 });
 
+// ── ISSUE-55: hypo-guide.md version stamp / staleness warning ──────────────
+// hypo-guide.md previously had no update channel at all: upgrade.mjs never
+// checked it, and init.mjs only ever writes it once. These tests prove the
+// new drift check fires (red proof: same suite also proves it stays silent
+// when the stamps match, and that --apply never rewrites the installed file).
+suite('upgrade.mjs — hypo-guide.md version drift (ISSUE-55)');
+
+test('guide.bump is "none" when installed hypo-guide.md matches the package template', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      assert.ok('guide' in out, 'JSON output missing top-level guide field');
+      assert.equal(
+        out.guide.bump,
+        'none',
+        `freshly-init'd hypo-guide.md should match the package template: ${JSON.stringify(out.guide)}`,
+      );
+    });
+  });
+});
+
+// Red proof: roll the installed stamp back one version and confirm the drift
+// check actually distinguishes it from the matching case above — turning the
+// stamp-compare off (or leaving the stamps equal) would make this pass
+// silently too, which is exactly the ISSUE-55 regression this test is for.
+test('guide.bump is non-none and the report warns when installed hypo-guide.md is stale', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const guidePath = join(hypoDir, 'hypo-guide.md');
+      writeFileSync(
+        guidePath,
+        readFileSync(guidePath, 'utf-8').replace(/^version: .+$/m, 'version: 0'),
+      );
+
+      const jsonR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(jsonR.stdout);
+      // 0 → 1 is a major-shaped bump per bumpType(); ISSUE-55 only needs "not up
+      // to date", not a major/minor distinction (no migration-report behavior
+      // hangs off this one, unlike SCHEMA.md).
+      assert.equal(
+        out.guide.bump,
+        'major',
+        `expected a major-shaped bump from v0 to package v1: ${JSON.stringify(out.guide)}`,
+      );
+      assert.equal(jsonR.status, 1, 'stale hypo-guide.md must count as drift (non-zero exit)');
+
+      const textR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`], home);
+      assert.ok(
+        /hypo-guide\.md.*package template changed/.test(textR.stdout),
+        `text report must warn about stale hypo-guide.md: ${textR.stdout}`,
+      );
+    });
+  });
+});
+
+// ISSUE-19 guard: the drift warning must never come with a write path. Confirm
+// --apply leaves a customized hypo-guide.md byte-equal, exactly like the SCHEMA.md
+// Option C contract above.
+test('--apply never overwrites an installed hypo-guide.md, even when stale', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const guidePath = join(hypoDir, 'hypo-guide.md');
+      const customized =
+        readFileSync(guidePath, 'utf-8').replace(/^version: .+$/m, 'version: 0') +
+        '\n<!-- user note -->\n';
+      writeFileSync(guidePath, customized);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+
+      const after = readFileSync(guidePath, 'utf-8');
+      assert.equal(
+        after,
+        customized,
+        'user hypo-guide.md must be byte-equal after --apply (visibility only, no overwrite)',
+      );
+    });
+  });
+});
+
+// codex pre-commit review BLOCKER: an already-installed vault's hypo-guide.md
+// predates the version stamp entirely (no `version:` line at all, not merely
+// an old value) — that is the actual shape of every existing installed copy,
+// and it is exactly the case the v0-rollback test above does NOT cover (that
+// test only ever strips the VALUE, never the whole line). Before this fix,
+// stripping the line entirely made checkTemplateVersion() fall through to
+// bumpType(null, pkgVersion) === 'unknown', which was excluded from
+// guideDrift — so the file this feature exists to catch reported
+// "up to date" with exit 0.
+test('guide.bump is "unstamped" (counted as drift) when the version line is removed entirely', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const guidePath = join(hypoDir, 'hypo-guide.md');
+      // Remove the whole `version:` line — not just its value — to match a
+      // pre-versioning installed copy exactly.
+      const stripped = readFileSync(guidePath, 'utf-8')
+        .split('\n')
+        .filter((line) => !/^version:\s/.test(line))
+        .join('\n');
+      writeFileSync(guidePath, stripped);
+
+      const jsonR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(jsonR.stdout);
+      assert.equal(
+        out.guide.bump,
+        'unstamped',
+        `expected bump 'unstamped' for a version-line-less hypo-guide.md: ${JSON.stringify(out.guide)}`,
+      );
+      assert.equal(
+        jsonR.status,
+        1,
+        `an unstamped installed hypo-guide.md must count as drift (exit 1), not "up to date": ${jsonR.stdout}`,
+      );
+
+      const textR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`], home);
+      assert.ok(
+        !/Result: Hypomnema is up to date/.test(textR.stdout),
+        `must not report "up to date" for an unstamped hypo-guide.md: ${textR.stdout}`,
+      );
+      assert.ok(
+        /hypo-guide\.md\s+installed copy has no version stamp/.test(textR.stdout),
+        `text report must give an actionable "no version stamp" warning, not "cannot compare": ${textR.stdout}`,
+      );
+
+      // ISSUE-19: still no write path, even for the unstamped case.
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      assert.equal(
+        readFileSync(guidePath, 'utf-8'),
+        stripped,
+        'an unstamped hypo-guide.md must still be byte-equal after --apply (no overwrite)',
+      );
+    });
+  });
+});
+
+// SCHEMA.md interaction guard: checkTemplateVersion() is shared between
+// SCHEMA.md and hypo-guide.md, so the 'unstamped' classification must not
+// change SCHEMA.md's existing (pre-ISSUE-55) drift behavior — SCHEMA.md is
+// user-owned vocabulary (Option C) and an unstamped copy was already
+// non-actionable ("cannot compare") before this classification existed.
+test('an unstamped SCHEMA.md is classified but NOT counted as drift (SCHEMA behavior unchanged)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const schemaPath = join(hypoDir, 'SCHEMA.md');
+      const stripped = readFileSync(schemaPath, 'utf-8')
+        .split('\n')
+        .filter((line) => !/^version:\s/.test(line))
+        .join('\n');
+      writeFileSync(schemaPath, stripped);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.schema.bump,
+        'unstamped',
+        `expected the shared classifier to report 'unstamped' for SCHEMA.md too: ${JSON.stringify(out.schema)}`,
+      );
+      assert.equal(
+        r.status,
+        0,
+        `SCHEMA.md's unstamped case must stay non-actionable (exit 0, unchanged behavior): ${r.stdout}`,
+      );
+    });
+  });
+});
+
 // ── ISSUE-6: plugin-mode guard (upgrade.mjs) ───────────────────
 // When /hypo:upgrade runs as the Claude Code PLUGIN, the core hooks/commands/
 // settings are provided by the plugin loader, not ~/.claude/. The manual-model
