@@ -433,6 +433,618 @@ test('unreadable / missing transcript → false (fail-closed)', () => {
   assert.equal(hasUserCloseSignal(null), false);
 });
 
+// ── Measured transcript shapes (ADR 0075) ──────────────────────────────────
+//
+// The record FIELDS below are the ones the gate reads, taken from records that
+// occur in ~/.claude/projects. Text is anonymized and common metadata (uuid, cwd,
+// version, …) is omitted, so these are the gate-relevant projection of a real
+// shape, not a byte copy — but anonymizing must not change a verdict the fixture
+// asserts on, which is the line an earlier draft crossed by swapping a close
+// phrase into records whose real text the matcher rejects. Tests labelled
+// `acceptance:` go further: they compose measured operations into a sequence the
+// corpus does not happen to contain — including one that elides records sitting
+// between two real ones — to pin what MUST hold.
+//
+// Until ADR 0075 lands these are CHARACTERIZATION tests: they pin what the gate
+// does today, including where that is wrong. A test asserting `true` under a
+// DEFECT comment is pinning a fail-open, not blessing it — the event model is
+// expected to flip exactly those assertions, which is how the diff stays honest.
+//
+// TWO SNAPSHOTS, and mixing them would be its own error, so each count below says
+// which it came from. Snapshot A is 2026-07-16 morning: 220 files / 152,395
+// records. Snapshot B is the SAME DAY after the harness pruned old transcripts:
+// 203 files / 127,655 records. See the provenance note under the helpers.
+//
+// From SNAPSHOT A, for the classification the event model has to get right:
+//   queue-operation   enqueue 655 · dequeue 455 · remove 193 · popAll 7
+//   <task-notification>  547 of the 655 enqueues (and 61 of the removes) — i.e.
+//                        the queue is overwhelmingly MODEL-CAUSED, not user intent
+//   promptSource counts, whose denominator is not obvious: over user records only,
+//   and "absent" excludes tool_result-bearing records (18,367), which are replies
+//   rather than prompts. Counting those in yields 19,222 and measures nothing.
+//
+// From SNAPSHOT B (everything the pruning left, re-measured after it):
+//   producers on user records carrying `origin.kind`: human 312,
+//     task-notification 346, coordinator 4. Non-human producers are real, and
+//     `isMeta:true` does not mean "user" — the 4 coordinator records carry it.
+//   typed records: 320, all 320 with isSidechain:false + userType:"external".
+//   the USER-queued replay shape (isMeta:true + `system` + queuePriority): 10.
+//
+// The difficulty the GAP fixtures below circle is narrower than "the queue has no
+// origin": task-notification replays DO carry origin.kind, and are attributable.
+// It is specifically the replay of USER-queued text that carries no origin at all
+// — so the one path that needs attribution is the one path that lacks it.
+suite('hasUserCloseSignal() — measured transcript shapes (ADR 0075)');
+
+const QOP = (operation, content) => {
+  const r = {
+    type: 'queue-operation',
+    operation,
+    timestamp: '2026-07-14T00:00:00.000Z',
+    sessionId: 's1',
+  };
+  if (content !== undefined) r.content = content;
+  return r;
+};
+
+// Every main-chain user record in the corpus carries BOTH of these, without a
+// single exception: typed 320/320, interrupt companions 22/22, local-command
+// caveats 125/125 — `isSidechain: false` and `userType: "external"`, never
+// absent. They are defaults here rather than per-fixture fields because a
+// fixture that omits them is not the record it claims to model: an event model
+// keyed on their ABSENCE would satisfy the fixture and mishandle every real
+// record. Overridable for the sidechain shape, which is the one that differs.
+const USER = (fields) => ({ type: 'user', isSidechain: false, userType: 'external', ...fields });
+
+// The typed close that opens the grant-then-event fixtures below. Real ones carry
+// a human origin: of the corpus closes followed by a task-notification, /clear, or
+// more work, 13/13, 1/1 and 6/7 respectively have origin.kind:"human". Held in one
+// place because a fixture that drops it is not the record it models — an event
+// model keyed on origin being ABSENT would satisfy the fixture and reject every
+// real close. (The 7th, origin-absent, is why origin can corroborate a producer
+// but cannot be required as one; see the remove-path twins.)
+const CLOSE_TEXT = {
+  message: { role: 'user', content: '세션 마무리 해줘' },
+  promptSource: 'typed',
+};
+const CLOSE = { ...CLOSE_TEXT, origin: { kind: 'human' } };
+
+// PROVENANCE, and why `measured:` is a claim about a snapshot rather than a
+// re-runnable query. Snapshot A (2026-07-16, 220 files / 152,395 records) and
+// snapshot B (the same day, 203 files / 127,655 records) are hours apart: the
+// harness prunes old transcripts, and this pruning took with it the only /compact
+// enqueue in the corpus (1 → 0) and a third of the user-queued replay records
+// (15 → 10). So the shapes below cannot be re-derived from a live
+// ~/.claude/projects, and a reviewer who re-measures and finds nothing has not
+// caught an error. Each `measured:` fixture therefore names its snapshot and,
+// where the corpus is the only witness, cites the durable record in the wiki.
+//
+// The rotation is also the reason these fixtures exist at all: the corpus is the
+// evidence base for ADR 0075, and it is ephemeral. The test file is the archive.
+
+// The one /compact ever observed, pinned end to end. Order as recorded:
+//   enqueue "/compact"
+//   user   isMeta:true promptSource:"system" queuePriority:"later"  ← queue replay
+//   attachment edited_text_file
+//   attachment hook_success
+//   dequeue
+//   user   interruptedMessageId:"msg_…"  "[Request interrupted by user]"
+//   user   isMeta:true  "<local-command-caveat>…"
+// Only STRUCTURAL fields are pinned (attachment type, interruptedMessageId
+// presence, isMeta, producer fields) — not payloads or incidental metadata, which
+// would couple the test to harness internals that churn.
+//
+// The companions are not trivia once the event model classifies every record:
+// the attachments pin that known host records stay NEUTRAL rather than fatal,
+// [Request interrupted by user] is today extracted as user TEXT rather than
+// structurally ignored (so the event model must neutralize interruptedMessageId
+// explicitly), and the caveat record is gate-relevant because isMeta is read.
+test('measured: the one observed /compact lifecycle, through the caveat → true (must STAY granted)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      QOP('enqueue', '/compact'),
+      USER({
+        message: { role: 'user', content: '앞서 큐에 넣어둔 지시' },
+        isMeta: true,
+        promptSource: 'system',
+        queuePriority: 'later',
+      }),
+      { type: 'attachment', attachment: { type: 'edited_text_file' } },
+      { type: 'attachment', attachment: { type: 'hook_success' } },
+      QOP('dequeue'),
+      USER({
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: '[Request interrupted by user]' }],
+        },
+        interruptedMessageId: 'msg_1',
+      }),
+      USER({
+        message: { role: 'user', content: '<local-command-caveat>…</local-command-caveat>' },
+        isMeta: true,
+      }),
+    ]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// DEFECT (fail-open). A /compact sitting in the queue has not been delivered, so
+// under ADR 0075 it is PENDING and must not grant — only a delivered one should.
+// The gate matches on type + content and never reads the lifecycle, so it grants
+// on the enqueue alone. Composed: a lone enqueue is not a shape the corpus
+// contains (the one observed /compact was always followed by its delivery).
+test('acceptance: pending /compact enqueue, never delivered → true (DEFECT: must not grant until delivered)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER({ message: { role: 'user', content: '계속' }, promptSource: 'typed' }),
+      QOP('enqueue', '/compact'),
+    ]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// The delivered /compact, stripped to the companions that must not break it.
+// `dequeue` carries no content: the event model must treat it as NEUTRAL, a host
+// companion rather than a user event. Same for the interrupt — it is user-SHAPED
+// (the harness cutting the model off to run the compaction) but it is not a user
+// decision, so it must be neutralized structurally on interruptedMessageId. A
+// naive "any user event after the grant invalidates it" rule would reject the
+// only observed delivered /compact (n=1 — one observation proves no more).
+test('acceptance: delivered /compact with neutral companions → true (must STAY granted)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      QOP('enqueue', '/compact'),
+      QOP('dequeue'),
+      USER({
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: '[Request interrupted by user]' }],
+        },
+        interruptedMessageId: 'msg_1',
+      }),
+    ]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// A background task the MODEL launched reports completion through the same queue
+// channel — 547 of the 655 enqueues in the snapshot are these. So queue enqueue
+// is not a user-authored channel, and the event model must class this NEUTRAL:
+// treating it as an invalidator lets the model's own background work retract the
+// user's close.
+test('measured: <task-notification> enqueue (model-caused) → false', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER({ message: { role: 'user', content: '계속' }, promptSource: 'typed' }),
+      QOP(
+        'enqueue',
+        '<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>',
+      ),
+      QOP('dequeue'),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('measured: /clear enqueue → false (abandons context; not a close)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [QOP('enqueue', '/clear')]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// `remove` is DELIVERY, not cancellation. Measured: of 40 user enqueues whose
+// next queue-op was `remove`, all 40 were delivered — the item leaves the queue
+// precisely because it is being handed to the model, and the delivery lands as
+// an `attachment` of type `queued_command` (origin.kind "human" when present).
+// So granting here is CORRECT. Pinned because two review rounds asserted the
+// opposite ("cancelled close still grants") and a lifecycle that treats remove
+// as a cancellation would drop real user closes on the floor.
+//
+// The /compact + remove pairing is composed, not observed: the corpus's one real
+// /compact went down the dequeue path. The `remove` semantics it relies on are
+// measured; the combination is the acceptance case they imply.
+test('acceptance: /compact enqueue THEN remove → true (remove is delivery, so this SHOULD grant)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [QOP('enqueue', '/compact'), QOP('remove', '/compact')]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// DEFECT (fail-open). popAll is the op that actually cancels: measured 6 of 7
+// user enqueues followed by popAll were never delivered by any mechanism. Yet
+// the gate matches on `type` + `content` and never reads `operation`, so a
+// popAll carrying /compact grants anyway. popAll does carry content in the
+// corpus, so the shape is reachable — though this exact pairing, like the one
+// above, is composed rather than observed.
+test('acceptance: popAll carrying /compact → true (DEFECT: operation is never checked)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [QOP('popAll', '/compact')]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// GAP (false negative), and the sharpest one. This is the full measured sequence
+// for "user types a close while the model is busy": the text is enqueued, then
+// `remove`d as it is handed to the model, and the delivery lands as an
+// `attachment` of type "queued_command" carrying the prompt verbatim. Crucially
+// there is NO user-record replay on this path.
+//
+// The gate never reads attachments, and it only reads /compact out of a
+// queue-operation — so a natural-language close delivered this way is invisible
+// end to end. Measured: of the 40 user enqueues delivered via `remove`, 8 carried
+// text matching isClosePattern(). Every one of those real closes was dropped.
+//
+// Two fixtures, because the corpus has two variants and the difference is a
+// SCHEMA VERSION boundary, not a producer distinction. Of the 7 close-bearing
+// queued_command deliveries surviving at the snapshot, 5 carry origin
+// {kind:"human"} and 2 carry none — and the 2 are both 2.1.179, while the 5 span
+// 2.1.185–2.1.207. Widened to every user-originated queued_command attachment:
+// 2.1.177/179 have no origin (6 records), and 2.1.181 onward have human origin on
+// all 27, with no exceptions. origin.kind arrived in 2.1.181.
+//
+// So origin IS a usable producer signal on this path for current transcripts, and
+// the fixtures must not be read as saying otherwise. What is undecided is the
+// LEGACY policy: whether a pre-2.1.181 origin-absent delivery may be trusted at
+// all. Trusting it blindly means anything without an origin can open the gate, so
+// the version is pinned here rather than dropped as incidental metadata — it is
+// the field that tells the two fixtures apart. See ADR 0075's version table.
+//
+// Both are false today for the same reason (the gate never reads attachments), so
+// the human-origin one should flip once attachments are read. Whether the legacy
+// one flips with it is exactly the open policy question, so this suite does not
+// assert that they flip together.
+//
+// The lifecycle is measured, not idealized, down to the companions: no real
+// delivery is adjacent to its remove, and the records in between differ by
+// variant. All 5 current deliveries carry a `hook_success` attachment there (one
+// also a `hook_additional_context`); the 2 legacy ones carry assistant turns, a
+// tool_use, its tool_result, and then `hook_success`. Each fixture uses its own
+// variant's companions, because a correlator that only handles a bare gap would
+// pass an idealized fixture and break on the attachments present in every real
+// delivery. remove likewise carries content in only 3 of 7, both legacy cases
+// being content-less, so each fixture follows its own variant there too; and the
+// attachment record carries the outer isSidechain/userType in all 7.
+const REMOVE_DELIVERY = (dir, { origin, version, removeContent, companions }) => {
+  const close = '위키에도 저장해놓고 세션 마무리해줘';
+  assert.equal(isClosePattern(close), true); // the ONLY cause of false is the delivery path
+  return writeJsonl(dir, [
+    USER({ message: { role: 'user', content: '작업 계속' }, promptSource: 'typed' }),
+    QOP('enqueue', close),
+    removeContent ? QOP('remove', close) : QOP('remove'),
+    ...companions,
+    {
+      type: 'attachment',
+      isSidechain: false,
+      userType: 'external',
+      version,
+      attachment: { type: 'queued_command', prompt: close, commandMode: 'prompt', ...origin },
+    },
+  ]);
+};
+
+const HOOK_SUCCESS = { type: 'attachment', attachment: { type: 'hook_success' } };
+
+test('measured: NL close via the remove path, human origin (2.1.181+) → false (GAP: a real user close is invisible)', () => {
+  withTmpDir((dir) => {
+    const p = REMOVE_DELIVERY(dir, {
+      origin: { origin: { kind: 'human' } },
+      version: '2.1.207',
+      removeContent: true,
+      companions: [HOOK_SUCCESS],
+    });
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// The legacy variant: 2 of the 7 real close-bearing deliveries look like this, and
+// both are 2.1.179 — before origin.kind existed. Kept because it is the shape an
+// origin-keyed fix would silently leave behind, and because the legacy policy is
+// undecided: this fixture is the case that policy has to rule on.
+test('measured: NL close via the remove path, legacy 2.1.179 with no origin → false (GAP: legacy policy undecided)', () => {
+  withTmpDir((dir) => {
+    const p = REMOVE_DELIVERY(dir, {
+      origin: {},
+      version: '2.1.179',
+      removeContent: false,
+      // As recorded: two assistant records (a thinking turn, then a text turn)
+      // before the tool_use, and the tool_result correlated to it by id.
+      companions: [
+        { type: 'assistant', message: { content: [{ type: 'thinking', thinking: '…' }] } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: '…' }] } },
+        {
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Bash', id: 'tu_1', input: {} }] },
+        },
+        USER({
+          message: {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' }],
+          },
+        }),
+        HOOK_SUCCESS,
+      ],
+    });
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// promptSource names the producer, and the harness sets it: `typed` (375 in the
+// corpus) marks text the user typed directly; `queued` (23) text they typed into
+// the queue; `suggestion_accepted` (3) a suggestion they accepted; `system` (416)
+// / `sdk` (5) are injections, and it is ABSENT on slash-command bodies and
+// caveats (856). Under the ADR 0075 threat model (a model that drifts but does
+// not forge the transcript), `typed` is a signal the model cannot mint, which is
+// the producer contract the event model needs. Today the gate only uses
+// promptSource negatively, to drop system|sdk, so this grants for the weaker
+// reason that the text matches.
+//
+// The signal is only this clean on the typed path. `system` covers both harness
+// injections and the queue-replay of text a user really typed, which is why the
+// dequeue GAP below is still open.
+test('measured: promptSource "typed" close → true (the authorship signal the gate does not use)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER({ message: { role: 'user', content: '세션 마무리 해줘' }, promptSource: 'typed' }),
+    ]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// The counterexample that corrects the record, pinned at the ONLY layer that can
+// still carry it. An earlier draft of this suite claimed the replay-shape records
+// "all carry non-close text". That was wrong: one of them was the phrase below, a
+// genuine instruction to end the session that the matcher does not recognize.
+//
+// What is pinned here is only the matcher verdict, because that is all the
+// evidence supports. The record itself was observed once (snapshot 2026-07-16)
+// and the corpus has since pruned it, so its exact lifecycle can no longer be
+// verified by anyone — and a fixture that reconstructed that lifecycle would be
+// asserting a sequence nobody can check, under a `measured:` label that claims
+// somebody did. The durable citation for the phrase is the wiki: issue_detail
+// ISSUE-60, "곁가지: 매처도 진짜 close를 놓친다", which quotes it verbatim and
+// predates this suite.
+//
+// The matcher miss is a SEPARATE layer from the delivery GAP below. ADR 0072
+// rejects loosening the matcher as the fix for structured selections; it does not
+// forbid every extension, so this is an open question rather than a closed one.
+test('measured: a real user close phrase the matcher does not recognize (separate layer)', () => {
+  assert.equal(
+    isClosePattern('PR #110 CI green 확인 후 머지하고 세션 마무리(위키 저장)까지 진행'),
+    false,
+  );
+});
+
+// GAP (false negative), and an OPEN one — read the twin below before touching it.
+// The other queue delivery path: `dequeue` replays the user's text as a user
+// record, but stamps it isMeta:true + promptSource:"system", the two fields the
+// de-pollution layer uses to drop harness injections. So the replay of a close the
+// user really typed is dropped, and a real close is invisible.
+//
+// The text is matcher-visible, so the ONLY cause of false is that drop. The
+// isClosePattern guard is load-bearing: without it a matcher change could silently
+// turn this into a pass-for-the-wrong-reason, which is the exact defect that made
+// an earlier draft of this fixture worthless.
+//
+// This fixture must NOT be flipped to true on the strength of the lifecycle it
+// pins. ADR 0075 briefly carried a rule granting exactly this shape (correlated
+// enqueue → dequeue → replay) and withdrew it: the fields here do not attest
+// authorship, so granting on them lets the model open the gate itself. See the
+// negative twin below, and ADR 0075 "미결: dequeue 경로엔 producer 귀속 수단이
+// 없다". Making this true requires a producer signal that does not exist yet.
+test('acceptance: queued close, delivered via the correlated dequeue lifecycle → false (GAP: open, do not flip yet)', () => {
+  withTmpDir((dir) => {
+    const close = '세션 마무리 해줘';
+    assert.equal(isClosePattern(close), true); // the ONLY cause of false is the drop
+    const p = writeJsonl(dir, [
+      QOP('enqueue', close),
+      QOP('dequeue'),
+      USER({
+        message: { role: 'user', content: close },
+        isMeta: true,
+        promptSource: 'system',
+        queuePriority: 'later',
+      }),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// The negative twin, and the reason the fixture above must stay false. This is the
+// SAME correlated lifecycle — enqueue, dequeue, replay of the same text — with
+// every field held identical, including userType:"external", carrying a close the
+// user never typed. `origin.kind` is the ONLY difference, and that is deliberate:
+// the twins are worthless if any other field can be used to tell them apart, since
+// a rule could then reject this fixture while still granting a real peer replay.
+// userType in particular does not discriminate: at snapshot B every user record
+// carrying an origin.kind is userType:"external" (all 662 of them, human and
+// non-human alike).
+//
+// The corpus shows why none of the remaining fields can attest authorship either:
+// `isMeta:true` appears on non-human `coordinator` records, and `queuePriority` is
+// a scheduling priority. Model-caused work already traverses this exact lifecycle
+// (320 task-notifications with enqueue → dequeue → system replay of the same
+// text), and the harness has a `kind:"peer"` path by which an agent's message
+// reaches the same queue machinery.
+//
+// So any rule that grants the fixture above without checking the producer grants
+// this one too, and the model can then close its own session without forging
+// anything. Both must stay false until an audited producer signal exists — a rule
+// that flips the twin above and leaves this one false is the thing to build.
+test('acceptance: model-origin text on the same correlated lifecycle → false (must NEVER grant)', () => {
+  withTmpDir((dir) => {
+    const close = '세션 마무리 해줘';
+    const p = writeJsonl(dir, [
+      QOP('enqueue', close),
+      QOP('dequeue'),
+      USER({
+        message: { role: 'user', content: close },
+        isMeta: true,
+        promptSource: 'system',
+        queuePriority: 'later',
+        origin: { kind: 'peer' },
+      }),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// ── Grant-then-event shapes: what the event model must DISTINGUISH ──────────
+//
+// The shapes above mostly assert `false` with no prior grant, so they cannot tell
+// a NEUTRAL record from an INVALIDATING one — both read as false. These three put
+// a real grant first, so the two classes separate. Today's gate is an existence
+// predicate, so all three return true; under the event model the first must stay
+// true and the other two must flip to false. That gap IS the change.
+//
+// The RELATIONS are measured; the sequences are not, which is why these are all
+// `acceptance:`. A typed close followed later in the same transcript by the event
+// in question occurs 13 / 7 / 1 times at the 2026-07-16 snapshot — these are
+// things users really do after asking to close. (Scan definition, since the count
+// moves with it: a typed record whose text matches isClosePattern, then a forward
+// scan to the first task-notification enqueue / non-close typed record / `/clear`
+// enqueue.) But 18–83, 4–225 and 111 records respectively sit between the two in
+// the real transcripts, and the fixtures put them next to each other. No rule
+// should key on that distance, so padding with filler would buy nothing — but a
+// sequence with the middle removed was not observed, and calling it `measured:`
+// would claim it was.
+
+// NEUTRAL. The model launches a background task; its completion notification is
+// enqueued after the user's close. The user's decision must survive: if the model
+// can retract the user's close simply by doing work, the gate is unusable.
+//
+// The whole lifecycle is pinned, replay included, because the replay is the record
+// that would do the damage: it is a user-TYPE record carrying text, arriving after
+// the grant, and an event model that classed it as invalidating would revoke the
+// close on the model's own background work. Stopping at the dequeue would let such
+// a model pass this fixture. 320 complete enqueue → dequeue → system-replay
+// lifecycles were in the corpus at the 2026-07-16 snapshot, so this is the common
+// case, not a corner.
+//
+// origin.kind:"task-notification" is what marks it model-caused; note it is the
+// same promptSource:"system" the user's own queued text is replayed under, which
+// is exactly why the dequeue GAP above cannot be closed on promptSource alone.
+test('acceptance: close, then a model-caused <task-notification> lifecycle → true (must STAY granted)', () => {
+  withTmpDir((dir) => {
+    const notif =
+      '<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>';
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      QOP('enqueue', notif),
+      QOP('dequeue'),
+      USER({
+        message: { role: 'user', content: notif },
+        promptSource: 'system',
+        origin: { kind: 'task-notification' },
+      }),
+    ]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// The isolator for the pair below, and it has to come first. Those fixtures put an
+// assistant tool_use between the close and the user's next instruction, matching
+// the real transcripts — but that means "flipped to false" alone would not prove
+// the TYPED WORK did it: a model that wrongly invalidated on the model's own
+// tool_use would flip them too and never read the instruction. This fixture is the
+// same prefix with the instruction removed, and it must STAY true. The model
+// working is not the user changing their mind.
+test('acceptance: close, then the model works → true (must STAY granted: tool_use is not an invalidator)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [USER(CLOSE), toolUse('Write')]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// INVALIDATE. The user closes, then changes their mind and asks for more work.
+// The lease must expire. Today it does not: the stale close is still "somewhere
+// in the transcript", which is exactly Defect B.
+//
+// Twice, because the invalidator's own producer field is what a fix will reach
+// for. Of the 7 real close→more-work cases, 6 carry human origin on BOTH typed
+// records and 1 has origin absent on both (a legacy transcript, same 2.1.181
+// boundary as the remove path). A model that invalidates only on
+// origin.kind === "human" would pass the first fixture and keep the stale lease
+// alive in the seventh real case, which is the failure this pair exists to block.
+// Both must flip to false: `typed` is the ADR's producer contract, and it is
+// present on both variants.
+//
+// The distance is elided, not modelled: in the real cases 4–225 records separate
+// the close from the next instruction (18–83 for the task-notification fixture
+// above, 111 for /clear). What is pinned is the RELATION — a later typed
+// instruction expires the lease — not the gap, since no rule should key on it.
+const CLOSE_THEN_WORK = (dir, human) => {
+  const origin = human ? { origin: { kind: 'human' } } : {};
+  return writeJsonl(dir, [
+    USER({ ...CLOSE_TEXT, ...origin }),
+    toolUse('Write'),
+    USER({
+      message: { role: 'user', content: '아 잠깐, 이것도 고쳐줘' },
+      promptSource: 'typed',
+      ...origin,
+    }),
+  ]);
+};
+
+test('acceptance: close, then the user asks for more work → true (DEFECT: lease must expire)', () => {
+  withTmpDir((dir) => {
+    assert.equal(hasUserCloseSignal(CLOSE_THEN_WORK(dir, true)), true);
+  });
+});
+
+test('acceptance: close, then more work, both without origin → true (DEFECT: lease must expire here too)', () => {
+  withTmpDir((dir) => {
+    assert.equal(hasUserCloseSignal(CLOSE_THEN_WORK(dir, false)), true);
+  });
+});
+
+// INVALIDATE. /clear after a close abandons the context rather than preserving it.
+// It is a different intent, so it must retract the close rather than sit inert.
+test('acceptance: close, then /clear → true (DEFECT: /clear must invalidate the lease)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', '/clear')]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// DEFECT (fail-open), latent. Mixed text+tool_result user records DO exist (2 in
+// the corpus) but ONLY inside subagents/*.jsonl, which resolveTranscriptBySessionId
+// never selects — so this is a latent shape, not a live hole today. The gate reads
+// the text block alone, boilerplate and all, so the shape grants the moment
+// anything starts feeding it a sidechain file.
+//
+// COMPOSED, and the composition is the point. Both real records carry
+// <fork-boilerplate> text that isClosePattern() rejects, so neither grants as it
+// stands; swapping in a close phrase changes the matcher verdict, which is a
+// different record, not an anonymization of those two. What is measured is the
+// SHAPE (sidechain, mixed blocks, userType:"external"); the close text is the
+// acceptance case that shape implies.
+//
+// It must flip to false: this text is model-context, not a user decision, and a
+// subagent must never be able to close the session by quoting a close phrase.
+test('acceptance: sidechain mixed text+tool_result carrying a close → true (DEFECT: must never grant)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER({
+        isSidechain: true,
+        agentId: 'a1',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 't1',
+              content: [{ type: 'text', text: 'Fork started' }],
+            },
+            { type: 'text', text: '<fork-boilerplate> … 세션 마무리 해줘 … </fork-boilerplate>' },
+          ],
+        },
+      }),
+    ]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
 // ── hasPendingBackgroundWork — read-only pending-work check ──
 suite('hasPendingBackgroundWork()');
 
