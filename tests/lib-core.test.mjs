@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
+  HOOKS,
   SCRIPTS,
   SESSION_TMP_HOME,
   checkVaultOrExit,
@@ -292,6 +293,28 @@ test('valid vault via HYPO_DIR (marker present) → all 4 read CLIs behave as be
 // ── lib/wd-match.mjs (cross-machine project matcher) ─────────────────────────
 
 const { pickProjectByCwd, normalizeWorkingDir } = await import(`${SCRIPTS}/lib/wd-match.mjs`);
+const { resolveCloseScope } = await import(`${HOOKS}/hypo-shared.mjs`);
+
+suite('resolveCloseScope() — marker attribution (session-close attribution)');
+
+test('a v4 marker `projects` is trusted directly as scope', () => {
+  const scope = resolveCloseScope('/nonexistent-hypo', {}, { projects: ['alpha', 'beta'] });
+  assert.deepEqual([...scope].sort(), ['alpha', 'beta']);
+});
+
+test('an uncorroborated pre-v4 legacy marker.project is NOT partition-enabling scope', () => {
+  // Legacy marker carries only `project` (possibly recency-derived). With no
+  // direct signal corroborating the same slug, it must stay out of scope so a
+  // stale attribution cannot demote a real failure.
+  const scope = resolveCloseScope('/nonexistent-hypo', {}, { project: 'stale-recency' });
+  assert.equal(scope.has('stale-recency'), false, 'uncorroborated legacy project excluded');
+});
+
+test('explicit close scope is always honored regardless of marker shape', () => {
+  const scope = resolveCloseScope('/nonexistent-hypo', { closeScope: ['mine'] }, { project: 'x' });
+  assert.ok(scope.has('mine'));
+  assert.equal(scope.has('x'), false);
+});
 
 suite('normalizeWorkingDir()');
 
@@ -332,6 +355,28 @@ test('longest prefix wins (/repo/sub beats /repo)', () => {
 test('no false prefix match on sibling (Hypomnema vs Hypomnema-old)', () => {
   const sib = [{ slug: 'h', workingDir: '/Users/x/Hypomnema' }];
   assert.equal(pickProjectByCwd(sib, '/Users/x/Hypomnema-old'), null);
+});
+
+test('rejectAmbiguous declines a shared-working_dir tie (monorepo)', () => {
+  // Two DISTINCT projects mapped to the SAME working_dir: attributing a close to
+  // either would be a guess (session-close attribution P2). Default keeps the
+  // legacy first-match behavior; rejectAmbiguous declines to null.
+  const mono = [
+    { slug: 'api', workingDir: '/repo' },
+    { slug: 'web', workingDir: '/repo' },
+  ];
+  assert.ok(['api', 'web'].includes(pickProjectByCwd(mono, '/repo/src')), 'default breaks the tie');
+  assert.equal(
+    pickProjectByCwd(mono, '/repo/src', { rejectAmbiguous: true }),
+    null,
+    'rejectAmbiguous returns null on an equal-length tie',
+  );
+  // A unique longest match is still returned under rejectAmbiguous.
+  const uniq = [
+    { slug: 'api', workingDir: '/repo/api' },
+    { slug: 'web', workingDir: '/repo' },
+  ];
+  assert.equal(pickProjectByCwd(uniq, '/repo/api/src', { rejectAmbiguous: true }), 'api');
 });
 
 test('~ working_dir is expanded before compare', () => {

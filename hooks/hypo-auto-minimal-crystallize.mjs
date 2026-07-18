@@ -123,10 +123,20 @@ function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
   // an install/transcript path contains spaces (display text only — never exec'd
   // here).
   const transcriptHint = transcriptPath ? ` --transcript-path="${transcriptPath}"` : '';
+  // Recovery command carries EVIDENCE, never the recency-derived close.project.
+  // The evidence-backed attribution is a singleton close scope (transcript
+  // close-files ∪ this marker's projects); when it is unambiguous, embed it as
+  // --project so the re-run is one-shot instead of failing closed for lack of
+  // evidence. The session cwd (from the payload) rides along so the re-run's own
+  // session-cwd close check runs against the same project this Stop evaluated.
+  const scope = gate?.close?.scope || [];
+  const evidenceProject = scope.length === 1 ? scope[0] : null;
+  const projectHint = evidenceProject ? ` --project=${evidenceProject}` : '';
+  const cwdHint = opts.sessionCwd ? ` --session-cwd="${opts.sessionCwd}"` : '';
   const cliBase = PKG_ROOT ? `node "${join(PKG_ROOT, 'scripts', 'crystallize.mjs')}"` : null;
   const markCmd = cliBase
-    ? `${cliBase} --mark-session-closed --session-id=${sessionId}${transcriptHint}`
-    : `/hypo:crystallize (session_id=${sessionId}${transcriptHint})`;
+    ? `${cliBase} --mark-session-closed --session-id=${sessionId}${projectHint}${transcriptHint}${cwdHint}`
+    : `/hypo:crystallize (session_id=${sessionId}${projectHint}${transcriptHint})`;
   // The log-only escape hatch for a non-project (wiki/tooling-only)
   // session. Offered ONLY as an explicit alternative when a close blocker is
   // present — never as the default recovery, so a real project session is not
@@ -150,7 +160,9 @@ function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
     // Only when a project-close blocker is what's holding the session: a
     // non-project session has nothing to close, so offer log-only as the way out
     // (Claude decides whether this session is project-scoped — no auto-attribution).
-    if (gate.blockers.some((b) => b.type === 'close')) {
+    // A session-cwd close blocker (the session's own cwd project is unstarted) is
+    // the same kind of project-close hold, so it gets the same escape.
+    if (gate.blockers.some((b) => b.type === 'close' || b.type === 'close-cwd')) {
       reason += ` If this was a non-project (wiki/tooling-only) session with no project to close, run \`${logOnlyCmd}\` instead (log-only close, no project attribution).`;
     }
   } else {
@@ -202,6 +214,9 @@ process.stdin.on('end', () => {
 
     const sessionId = payload.session_id || payload.sessionId || null;
     const transcriptPath = payload.transcript_path || payload.transcriptPath || null;
+    // Authoritative session cwd (the one verified cwd source) for the session-cwd
+    // close check below. Absent on older Claude Code payloads → the check is skipped.
+    const sessionCwd = payload.cwd || null;
 
     // 3. substantial-session gate. Pure Q&A / incidental-lookup sessions skip
     // the block; mutating sessions AND high-volume read-only investigations
@@ -220,10 +235,49 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // 5. close already verified for this session_id.
-    if (sessionId && readSessionClosedMarker(HYPO_DIR, sessionId)) {
-      emitContinue();
-      return;
+    // Read-only /compact gate (same precompactGateStatus the real PreCompact hook
+    // uses) sharpens the block message and, with sessionCwd, backs the session-cwd
+    // close check below. The hook NEVER writes the marker here (file-header
+    // invariant); this is read-only. Any error → null → emitBlock falls back to the
+    // generic message (fail-open). Computed lazily: the common closed-session path
+    // (a project marker whose cwd project is complete) still short-circuits without
+    // paying the gate cost, unless a cwd signal makes the cwd check meaningful.
+    let gate = null;
+    const computeGate = () => {
+      try {
+        return precompactGateStatus(HYPO_DIR, {
+          ...(transcriptPath ? { transcriptPath } : {}),
+          ...(sessionCwd ? { sessionCwd } : {}),
+          ...(sessionId ? { sessionId } : {}),
+        });
+      } catch {
+        return null;
+      }
+    };
+
+    // 5. close already verified for this session_id — but a project marker only
+    // attests the project(s) it recorded. If THIS session's cwd project still has
+    // an unstarted close, honoring the marker would end the session green while
+    // that project stays open (the session-cwd false-green). So re-check the cwd
+    // project before accepting a project marker. A log-only marker (non-project
+    // session) is exempt, and without a cwd signal we accept the marker as before
+    // (back-compat with payloads that carry no cwd).
+    if (sessionId) {
+      const marker = readSessionClosedMarker(HYPO_DIR, sessionId);
+      if (marker) {
+        if (marker.scope === 'log-only' || !sessionCwd) {
+          emitContinue();
+          return;
+        }
+        gate = computeGate();
+        const cwdBlocked = !!gate?.blockers?.some((b) => b.type === 'close-cwd');
+        if (!cwdBlocked) {
+          emitContinue();
+          return;
+        }
+        // marker present but the session's cwd project close is incomplete: fall
+        // through to block, reusing the gate computed above.
+      }
     }
 
     // 6. block — but only when we have a session_id to address the recovery
@@ -234,18 +288,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // Read-only /compact gate (same precompactGateStatus the real
-    // PreCompact hook uses) sharpens the block message — distinguishes "close
-    // is compact-ready, only the marker is missing" from "there are real
-    // blockers". The hook NEVER writes the marker here (file-header invariant);
-    // this is read-only. Any error → null → emitBlock falls back to the generic
-    // message (fail-open).
-    let gate = null;
-    try {
-      gate = precompactGateStatus(HYPO_DIR, transcriptPath ? { transcriptPath } : {});
-    } catch {
-      gate = null;
-    }
+    if (!gate) gate = computeGate();
 
     // Reconfirm decision (conditional-close-reconfirm): "close" and
     // "work-incomplete" together are exactly the case where the transcript's
@@ -269,7 +312,7 @@ process.stdin.on('end', () => {
       return;
     }
 
-    emitBlock(sessionId, transcriptPath, gate, { reconfirm: workIncomplete });
+    emitBlock(sessionId, transcriptPath, gate, { reconfirm: workIncomplete, sessionCwd });
   } catch (err) {
     // Fail-open on any unexpected error.
     process.stderr.write(`[hypo-auto-minimal-crystallize] error: ${err?.message ?? String(err)}\n`);

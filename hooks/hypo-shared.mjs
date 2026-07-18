@@ -529,7 +529,12 @@ function _lastSeg(p) {
 // declines (null) so the caller falls back to recency. `projects` is the whole
 // universe (for the uniqueness gate); `eligible` restricts the answer.
 export function pickProjectByCwd(projects, cwd, opts = {}) {
-  const { eligible = null, realpathCwd = null, caseInsensitive = isCaseInsensitiveFs() } = opts;
+  const {
+    eligible = null,
+    realpathCwd = null,
+    caseInsensitive = isCaseInsensitiveFs(),
+    rejectAmbiguous = false,
+  } = opts;
   if (!cwd && !realpathCwd) return null;
   const eligibleSet = eligible ? new Set(eligible) : null;
   const isEligible = (slug) => !eligibleSet || eligibleSet.has(slug);
@@ -549,20 +554,35 @@ export function pickProjectByCwd(projects, cwd, opts = {}) {
     if (n && !cwds.includes(n)) cwds.push(n);
   }
 
-  // Tier 1: first cwd variant with any longest-prefix match wins.
+  // Tier 1: first cwd variant with any longest-prefix match wins. With
+  // rejectAmbiguous (session-cwd close check), two DISTINCT projects sharing the same
+  // longest matching working_dir (a monorepo config with no uniqueness invariant)
+  // is a genuine tie we must NOT break arbitrarily — silently picking the first
+  // would attribute a close to the wrong project and either mask a real failure
+  // (false-green) or block the wrong one (false-block). Decline the tie → null,
+  // so the caller degrades to the unresolved-cwd path instead of guessing.
   for (const c of cwds) {
     const cf = _fold(c, caseInsensitive);
     let bestSlug = null;
     let bestLen = -1;
+    let bestTied = false;
     for (const e of entries) {
       if (!isEligible(e.slug)) continue;
       const pf = _fold(e.path, caseInsensitive);
-      if ((cf === pf || cf.startsWith(`${pf}/`)) && e.path.length > bestLen) {
-        bestLen = e.path.length;
-        bestSlug = e.slug;
+      if (cf === pf || cf.startsWith(`${pf}/`)) {
+        if (e.path.length > bestLen) {
+          bestLen = e.path.length;
+          bestSlug = e.slug;
+          bestTied = false;
+        } else if (e.path.length === bestLen && e.slug !== bestSlug) {
+          bestTied = true;
+        }
       }
     }
-    if (bestSlug) return bestSlug;
+    if (bestSlug) {
+      if (bestTied && rejectAmbiguous) return null;
+      return bestSlug;
+    }
   }
 
   // Tier 2: unique-basename ancestor, but only when the chain points at exactly
@@ -1134,7 +1154,10 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
 
   // primary = the recency project when it is itself today-active, else the first
   // today-active slug (stable order from the candidate set). Used only as the
-  // single-slug alias (marker `project` field, message header) — never to gate.
+  // single-slug alias for the message header and the flat `close.project` field.
+  // It is NEVER an attribution source: the marker is stamped from close evidence
+  // (explicit --project, transcript close-files, apply's payload.project), so this
+  // recency-derived value cannot leak into a marker and back into the next gate.
   const primary = recency && todayActive.includes(recency) ? recency : todayActive[0];
   const ordered = [primary, ...todayActive.filter((p) => p !== primary)];
 
@@ -1973,9 +1996,22 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
     // attribution). Readers (precompactGateStatus / --check-session-close) key
     // the gate semantics on this field, so it must be recorded.
     const scope = info.scope === 'log-only' ? 'log-only' : 'project';
+    // v4 attribution discriminator (session-close attribution). `projects` is the evidence-based
+    // set this session actually closed — explicit --project ∪ transcript
+    // close-file edits ∪ apply's authoritative payload.project — and NEVER the
+    // recency primary. Its PRESENCE marks a v4 marker whose scope resolveCloseScope
+    // trusts directly; a pre-v4 marker carries only `project` and is treated as an
+    // uncorroborated legacy hint (see resolveCloseScope). `project` stays as
+    // projects[0] for back-compat with the flat-field readers.
+    const projects = Array.isArray(info.projects)
+      ? [...new Set(info.projects.filter(Boolean))]
+      : info.project
+        ? [info.project]
+        : [];
     const payload = {
       session_id: sessionId,
-      project: info.project || null,
+      project: info.project || projects[0] || null,
+      projects,
       scope,
       transcript_path: info.transcript_path || null,
       closed_at: new Date().toISOString(),
@@ -2387,7 +2423,18 @@ function projectsFromTouchedCloseFiles(transcriptPath, hypoDir) {
 export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
   const scope = new Set(opts.closeScope || []);
   for (const p of projectsFromTouchedCloseFiles(opts.transcriptPath, hypoDir)) scope.add(p);
-  if (marker?.project) scope.add(marker.project);
+  // Marker attribution (session-close attribution). A v4 marker carries `projects` — the
+  // evidence-based set it closed (never recency) — trusted directly. A pre-v4
+  // legacy marker carries only `project` with no provenance, and that value may be
+  // recency-derived (the P1 bug). An uncorroborated legacy attribution must NOT
+  // enable partitioning, or a stale/wrong slug could demote a real failure to
+  // foreign debt. So a legacy `project` enters scope only when the direct signals
+  // above (explicit close scope or transcript close-file edits) already corroborate
+  // the SAME slug; otherwise it stays a display hint. This narrow gap self-heals as
+  // pre-v4 markers expire (7-day TTL).
+  if (Array.isArray(marker?.projects)) {
+    for (const p of marker.projects) if (p) scope.add(p);
+  }
   return scope;
 }
 
@@ -2422,7 +2469,15 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * ignored.
  *
  * @param {string} hypoDir
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null}} [opts]
+ * opts.sessionCwd (session-cwd close check): the authoritative cwd of the session being
+ * gated (hook payload.cwd, or the CLI --session-cwd flag — never process.cwd(),
+ * which is post-`cd` non-authoritative). When set and not log-only, the project
+ * that owns this cwd is checked for close-completeness as an INDEPENDENT blocker,
+ * catching a session whose own project close was never started. Unmatched/ambiguous
+ * cwd yields a best-effort notice, not a block. apply never passes it (its launch
+ * cwd may differ from the authoritative payload.project).
+ *
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, sessionCwd?: string|null, sessionId?: string|null, logOnly?: boolean, closeScope?: string[]}} [opts]
  * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
@@ -2571,6 +2626,64 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           ...p.missing.map((f) => `${f} (missing)`),
           ...p.stale.map((f) => `${f} (stale)`),
         ].join(', ')}) — not blocking; that project's next close will fix it`,
+      });
+    }
+  }
+
+  // 3b. session-cwd close (session-cwd close check). The current session's cwd project is an
+  // INDEPENDENT close responsibility. sessionCloseGlobalStatus above only sees
+  // projects that left an authoritative close-activity trace (a session-log
+  // heading / log.md entry), so a project whose close was NEVER STARTED is
+  // invisible — and if the recency project was closed the same day, the gate would
+  // go green while this session's real project stays unclosed (the false-green this
+  // closes). Evaluate it here, AFTER the partition and OUTSIDE scopeSet /
+  // close.projects, so it can neither be demoted to foreign debt (partition) nor
+  // spawn a W8 design-history blocker (which derives from close.projects). log-only
+  // sessions are exempt (no project to close). apply never passes sessionCwd (its
+  // launch cwd may differ from the authoritative payload.project — a supported
+  // cross-project close), so this runs only on the read / mark paths.
+  if (!logOnly && opts.sessionCwd) {
+    const cwdProject = pickProjectByCwd(collectProjectWorkingDirs(hypoDir), opts.sessionCwd, {
+      rejectAmbiguous: true,
+    });
+    if (cwdProject) {
+      const s = sessionCloseFileStatus(hypoDir, { projectOverride: cwdProject });
+      if (!s.ok) {
+        // ALWAYS emit the typed close-cwd blocker when the cwd project's close is
+        // incomplete — never suppress it as a duplicate of the global `close`
+        // blocker. The Stop hook keys its marker re-check on this exact type, so
+        // hiding it (even when a `close` blocker names the same project) would let
+        // Stop honor a stale marker and end the session green (codex pre-commit
+        // BLOCKER). A second entry for the same slug is merely noisy, never wrong.
+        blockers.push({
+          type: 'close-cwd',
+          project: cwdProject,
+          reason: `session cwd project '${cwdProject}' has an incomplete session close: ${[
+            ...s.missing.map((f) => `${f} (missing)`),
+            ...s.stale.map((f) => `${f} (stale)`),
+          ].join(', ')}`,
+        });
+        // If the partition demoted this project to foreign debt, it is NOT another
+        // session's work — it is THIS session's, and we just BLOCKED on it. Remove
+        // it from BOTH the debt notice and close.debt so the status cannot report
+        // the same project as non-blocking debt and a blocker at once (codex
+        // pre-commit CONCERN: crystallize renders close_debt from close.debt).
+        for (let i = notices.length - 1; i >= 0; i--) {
+          if (notices[i].type === 'close-debt' && notices[i].project === cwdProject)
+            notices.splice(i, 1);
+        }
+        if (Array.isArray(close.debt))
+          close.debt = close.debt.filter((d) => d.project !== cwdProject);
+      }
+    } else {
+      // cwd is under no project working_dir, or ambiguously under several (a
+      // monorepo tie pickProjectByCwd declined): we cannot attribute a close
+      // responsibility, so we do NOT hard-block (nothing proves there is anything
+      // to close). Surface a best-effort notice so the coverage gap is visible.
+      notices.push({
+        type: 'close-cwd-unresolved',
+        reason:
+          'session cwd did not resolve to a unique project — the P2 cwd close check is best-effort here; pass --project or --log-only to be explicit',
       });
     }
   }

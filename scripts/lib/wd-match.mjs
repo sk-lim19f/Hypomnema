@@ -72,7 +72,12 @@ function lastSegment(p) {
  * @returns {string|null} matched slug, or null when nothing matches.
  */
 export function pickProjectByCwd(projects, cwd, opts = {}) {
-  const { eligible = null, realpathCwd = null, caseInsensitive = isCaseInsensitiveFs() } = opts;
+  const {
+    eligible = null,
+    realpathCwd = null,
+    caseInsensitive = isCaseInsensitiveFs(),
+    rejectAmbiguous = false,
+  } = opts;
   if (!cwd && !realpathCwd) return null;
 
   const eligibleSet = eligible ? new Set(eligible) : null;
@@ -98,19 +103,32 @@ export function pickProjectByCwd(projects, cwd, opts = {}) {
   // ── Tier 1: longest absolute prefix (the original behavior) ────────────────
   // cwd === path or cwd under path/. Longest path wins so /repo/sub beats /repo.
   // The FIRST cwd variant that yields any prefix match wins (raw before realpath).
+  // With rejectAmbiguous (session-cwd close check), two DISTINCT projects sharing the same
+  // longest matching working_dir (a monorepo config) is a real tie we must not
+  // break arbitrarily — decline to null so the caller degrades to the
+  // unresolved-cwd path instead of attributing the close to the wrong project.
   for (const c of cwds) {
     const cf = casefold(c, caseInsensitive);
     let bestSlug = null;
     let bestLen = -1;
+    let bestTied = false;
     for (const e of entries) {
       if (!isEligible(e.slug)) continue;
       const pf = casefold(e.path, caseInsensitive);
-      if ((cf === pf || cf.startsWith(`${pf}/`)) && e.path.length > bestLen) {
-        bestLen = e.path.length;
-        bestSlug = e.slug;
+      if (cf === pf || cf.startsWith(`${pf}/`)) {
+        if (e.path.length > bestLen) {
+          bestLen = e.path.length;
+          bestSlug = e.slug;
+          bestTied = false;
+        } else if (e.path.length === bestLen && e.slug !== bestSlug) {
+          bestTied = true;
+        }
       }
     }
-    if (bestSlug) return bestSlug;
+    if (bestSlug) {
+      if (bestTied && rejectAmbiguous) return null;
+      return bestSlug;
+    }
   }
 
   // ── Tier 2: globally-unique basename of a cwd ancestor (cross-machine) ─────
