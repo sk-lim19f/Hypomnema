@@ -32,7 +32,7 @@ import {
   renameSync,
   unlinkSync,
 } from 'fs';
-import { join, basename, dirname } from 'path';
+import { join, basename, dirname, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -49,6 +49,7 @@ import {
 import { syncExtensions } from './lib/extensions.mjs';
 import { templateSchemaVersion } from './lib/template-schema-version.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
+import { isHypomnemaPluginEnabled, enabledHypomnemaPluginKey } from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -472,34 +473,91 @@ function pkgJsonPath() {
  * install (no metadata), unparseable versions, the same package re-running itself,
  * --allow-downgrade, or --dry-run.
  */
-function maybeRefuseDowngrade(op, allowDowngrade, dryRun) {
-  if (allowDowngrade || dryRun) return;
+function maybeRefuseDowngrade(op, allowDowngrade, dryRun, durableRoot) {
+  if (allowDowngrade || dryRun || !PKG_VERSION) return;
   const active = readPkgJsonSafe(pkgJsonPath());
-  if (!active || !active.pkgVersion || !PKG_VERSION) return;
-  const verdict = classifyInstall(
-    { pkgRoot: PKG_ROOT, version: PKG_VERSION },
-    { pkgRoot: active.pkgRoot, version: active.pkgVersion },
-  );
-  if (verdict === 'downgrade') {
-    console.error(downgradeGuardMessage(PKG_VERSION, active.pkgVersion, op));
-    process.exit(2);
+  const candidates = [];
+  // The recorded metadata: catches a stale bin trying to downgrade a newer
+  // recorded install (the original guard).
+  if (active && active.pkgVersion) {
+    candidates.push({ pkgRoot: active.pkgRoot, version: active.pkgVersion });
+  }
+  // The positively-resolved durable (plugin) install, when it is a DIFFERENT root
+  // than this package. In an npm-first dual install the recorded pkgVersion is the
+  // stale npm one, so comparing only against it lets an OLDER npm init run against a
+  // NEWER plugin; also compare against the plugin's own version. readPkgVersionAt
+  // yields a version only for a usable root.
+  if (durableRoot && durableRoot !== PKG_ROOT) {
+    const durableVersion = readPkgVersionAt(durableRoot);
+    if (durableVersion) candidates.push({ pkgRoot: durableRoot, version: durableVersion });
+  }
+  for (const active of candidates) {
+    const verdict = classifyInstall(
+      { pkgRoot: PKG_ROOT, version: PKG_VERSION },
+      { pkgRoot: active.pkgRoot, version: active.version },
+    );
+    if (verdict === 'downgrade') {
+      console.error(downgradeGuardMessage(PKG_VERSION, active.version, op));
+      process.exit(2);
+    }
   }
 }
 
-function writePkgJson(dryRun, extraFields = {}) {
+function readPkgVersionAt(root) {
+  try {
+    const v = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
+    return typeof v === 'string' && v.length > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// A pkgRoot is "usable" as a DURABLE install root only if it is an ABSOLUTE path to
+// a real package directory whose package.json carries a version. A relative path
+// (e.g. installPath ".") would be resolved against the caller's cwd and break the
+// vault git hook from any other directory; a version-less package.json cannot be
+// attributed a version without lying (see writePkgJson). A bare path that merely
+// exists is a pointer the runtime cannot resolve scripts through. Shared by the
+// registry resolution and the durable-root fallback so they agree on what is real.
+function usablePkgRoot(pkgRoot) {
+  return (
+    typeof pkgRoot === 'string' &&
+    pkgRoot.length > 0 &&
+    isAbsolute(pkgRoot) &&
+    existsSync(join(pkgRoot, 'package.json')) &&
+    readPkgVersionAt(pkgRoot) !== null
+  );
+}
+
+function writePkgJson(dryRun, extraFields = {}, root = PKG_ROOT) {
   const dest = pkgJsonPath();
   const existing = readPkgJsonSafe(dest);
+  // `root` is the DURABLE install root the runtime resolves scripts through
+  // (hooks/hypo-shared.mjs reads pkgRoot): PKG_ROOT for a normal install, the
+  // positively-resolved plugin cache root for a dual install (see resolveDurableRoot).
+  // pkgVersion is read from `root` too — stamping a dual-install pointer at the
+  // plugin with THIS npm package's version would make doctor's own version-match
+  // check contradict itself. schemaVersion describes the templates init writes,
+  // which always come from PKG_ROOT regardless of where scripts resolve.
   const merged = {
     ...existing,
-    pkgRoot: PKG_ROOT,
-    pkgVersion: PKG_VERSION,
+    pkgRoot: root,
+    pkgVersion: readPkgVersionAt(root) ?? PKG_VERSION,
     schemaVersion: templateSchemaVersion(PKG_ROOT) ?? '2.1',
     ...extraFields,
   };
-  if (!dryRun) {
+  // Skip the write outright when the durable identity already matches what is on
+  // disk, rather than re-serialize an unchanged file. That keeps the dry-run and
+  // real write-sets identical: a real run must never silently rewrite a file a dry
+  // run reported as skipped. A genuine change (fresh identity, a version bump, or a
+  // dual-install correction from a stale npm pointer to the plugin root) is logged
+  // as "created" so it shows up in both write-sets. Log is emitted unconditionally
+  // (outside the dryRun guard) so a dry run previews exactly what a real run does.
+  const noWrite = JSON.stringify(merged) === JSON.stringify(existing);
+  if (!dryRun && !noWrite) {
     writePkgJsonAtomic(dest, merged);
-    log('created', dest);
   }
+  log(noWrite ? 'skipped' : 'created', noWrite ? `${dest} (durable pkgRoot unchanged)` : dest);
   return merged;
 }
 
@@ -642,19 +700,26 @@ function installPkgGitHook(dryRun) {
 const WIKI_PRE_COMMIT_MARKER_START = '# hypo-managed:pre-commit:start';
 const WIKI_PRE_COMMIT_MARKER_END = '# hypo-managed:pre-commit:end';
 
-function wikiPreCommitContent() {
-  const worker = join(PKG_ROOT, 'hooks', 'hypo-pre-commit.mjs');
+// `root` is the DURABLE install root the hook should resolve hypo-pre-commit.mjs
+// through — not necessarily PKG_ROOT. In a dual install (a manual/npm init while
+// the plugin is enabled) PKG_ROOT is the manual/npm checkout the dual-install
+// notice tells the user to uninstall; embedding it here would leave the vault's
+// git hook dangling the moment they do, breaking every wiki commit. The caller
+// passes the preserved plugin-owned root instead (see `durableRoot`), so the hook
+// points at the install that actually persists.
+function wikiPreCommitContent(root) {
+  const worker = join(root, 'hooks', 'hypo-pre-commit.mjs');
   // Single-quote escaping prevents shell expansion of special chars (e.g. $HOME, backticks) in path
   const escaped = worker.replace(/'/g, "'\\''");
   return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\nnode '${escaped}'\nexit $?\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
 }
 
-function installWikiPreCommitHook(hypoDir, dryRun, force) {
+function installWikiPreCommitHook(hypoDir, dryRun, force, root) {
   const gitDir = join(hypoDir, '.git');
   if (!existsSync(gitDir)) return; // no git repo — silently skip
   const hooksDir = join(gitDir, 'hooks');
   const hookPath = join(hooksDir, 'pre-commit');
-  const newContent = wikiPreCommitContent();
+  const newContent = wikiPreCommitContent(root);
 
   if (existsSync(hookPath)) {
     const existing = readFileSync(hookPath, 'utf-8');
@@ -841,6 +906,88 @@ function firstCommit(hypoDir, remote, dryRun) {
 
 const args = parseArgs(process.argv);
 
+// ── install channel ───────────────────────────────────────────────────────────
+//
+// A plugin-channel install already provides the 14 core hooks + slash commands
+// through the package's own hooks/hooks.json + commands/ (Claude Code auto-wires
+// them). Copying the same hooks into ~/.claude/hooks and registering the same
+// events in settings.json on top makes every core hook fire TWICE, the same
+// failure mode already fixed for `upgrade --apply`. `pluginMode` mirrors
+// upgrade.mjs's own detector (this init.mjs itself running from a
+// `.claude/plugins/…` root); `hypomnemaPluginEnabled` catches the dual-install
+// variant (a manual/npm init.mjs run while the plugin is ALSO enabled — see
+// lib/plugin-detect.mjs, fail-open on any uncertainty). Either signal means
+// Claude's core hook/command surface is plugin-managed already.
+const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
+const hypomnemaPluginEnabled =
+  !pluginMode && isHypomnemaPluginEnabled(join(HOME, '.claude', 'settings.json'));
+const coreManagedByPlugin = pluginMode || hypomnemaPluginEnabled;
+
+// Resolve the enabled Hypomnema plugin's REAL install root from the plugin
+// registry (~/.claude/plugins/installed_plugins.json). POSITIVE attribution: it
+// looks up the EXACT key that settings.json marks enabled (via
+// enabledHypomnemaPluginKey), not just any hypo-named entry — a disabled legacy or
+// other-marketplace entry must never be selected. Among that key's registry
+// entries it prefers the user-scope install (the one a plugin-enabled user runs),
+// falling back to any usable entry. Returns a usable absolute install root, or
+// null when the registry is absent/unreadable, names no entry for the enabled key,
+// or that entry is not a usable package dir.
+function resolveEnabledPluginRoot(settingsPath) {
+  const key = enabledHypomnemaPluginKey(settingsPath);
+  if (!key) return null;
+  let reg;
+  try {
+    reg = JSON.parse(
+      readFileSync(join(HOME, '.claude', 'plugins', 'installed_plugins.json'), 'utf-8'),
+    );
+  } catch {
+    return null;
+  }
+  const plugins =
+    reg && typeof reg.plugins === 'object' && !Array.isArray(reg.plugins) ? reg.plugins : null;
+  const entries = plugins && Array.isArray(plugins[key]) ? plugins[key] : null;
+  if (!entries) return null;
+  const paths = (scope) =>
+    entries
+      .filter((e) => e && (scope === undefined || e.scope === scope))
+      .map((e) => (typeof e.installPath === 'string' ? e.installPath : null))
+      .filter((p) => usablePkgRoot(p));
+  // Prefer the user-scope install, then any usable entry for this exact key.
+  return paths('user')[0] ?? paths(undefined)[0] ?? null;
+}
+
+// Non-mutating read of the recorded pkgRoot. resolveDurableRoot runs before init's
+// package validation and its "no writes before validation" guarantee, so it must
+// NOT use readPkgJsonSafe (which renames a corrupt hypo-pkg.json aside — a write).
+function recordedPkgRoot() {
+  try {
+    const v = JSON.parse(readFileSync(pkgJsonPath(), 'utf-8')).pkgRoot;
+    return typeof v === 'string' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// The durable install root that persistent artifacts (the vault's git pre-commit
+// hook, hypo-pkg.json) should point at. In a dual install PKG_ROOT is the
+// manual/npm checkout the dual-install notice tells the user to uninstall, so
+// point at the plugin's REAL cache root, positively resolved from the registry —
+// NOT at whatever pkgRoot is already recorded, which after an npm-first sequence
+// (npm init, enable plugin, npm init again) may itself be that soon-to-be-removed
+// npm root. Only if the registry cannot positively identify the plugin do we fall
+// back to a usable recorded pointer, then PKG_ROOT (never worse than pre-fix). In
+// true plugin mode PKG_ROOT already IS the plugin path; for npm-only it is the
+// only install.
+function resolveDurableRoot() {
+  if (!hypomnemaPluginEnabled) return PKG_ROOT;
+  const pluginRoot = resolveEnabledPluginRoot(join(HOME, '.claude', 'settings.json'));
+  if (pluginRoot) return pluginRoot;
+  const recorded = recordedPkgRoot();
+  if (usablePkgRoot(recorded)) return recorded;
+  return PKG_ROOT;
+}
+const durableRoot = resolveDurableRoot();
+
 // Validate hooks.json before any file writes so a bad package leaves no partial state
 const HOOK_MAP = args.hooks || args.codex ? loadHookMap() : null;
 
@@ -853,7 +1000,7 @@ const HOOK_MAP = args.hooks || args.codex ? loadHookMap() : null;
 // and, with `--codex`, writes ~/.codex hooks/settings. The guard no-ops on a fresh
 // install, same realpath'd pkgRoot (dev re-run / npm-link / post-commit sync),
 // --allow-downgrade, or --dry-run, so legitimate flows are unaffected.
-maybeRefuseDowngrade('init', args.allowDowngrade, args.dryRun);
+maybeRefuseDowngrade('init', args.allowDowngrade, args.dryRun, durableRoot);
 
 if (args.fromRemote) {
   // ── from-remote path: clone → read config → install hooks ──────────────────
@@ -929,16 +1076,29 @@ if (args.fromRemote) {
 
 // 4. hooks
 
+if (coreManagedByPlugin) {
+  log(
+    'skipped',
+    `Claude core hooks/settings/commands — provided by the plugin loader (${
+      pluginMode
+        ? 'this script is running from a Claude Code plugin install'
+        : 'the Hypomnema plugin is enabled in settings.json'
+    }); installing them here would register every hook twice. Use \`claude plugin update\` to upgrade instead.`,
+  );
+}
+
 let commandSHAs = null;
-if (args.commands) {
+if (args.commands && !coreManagedByPlugin) {
   const claudeCommands = join(HOME, '.claude', 'commands', 'hypo');
   commandSHAs = installCommands(claudeCommands, args.dryRun, args.forceCommands);
 }
 
 if (args.hooks) {
-  const claudeHooks = join(HOME, '.claude', 'hooks');
-  installHooks(claudeHooks, args.dryRun);
-  mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun, HOOK_MAP);
+  if (!coreManagedByPlugin) {
+    const claudeHooks = join(HOME, '.claude', 'hooks');
+    installHooks(claudeHooks, args.dryRun);
+    mergeSettingsJson(join(HOME, '.claude', 'settings.json'), claudeHooks, args.dryRun, HOOK_MAP);
+  }
 }
 
 // Always record the active install identity (pkgRoot + pkgVersion), even for a
@@ -947,7 +1107,9 @@ if (args.hooks) {
 // the downgrade guard has nothing to compare against, so a later stale
 // sibling could repoint those surfaces unguarded. writePkgJson merges (...existing),
 // so this never clobbers a commands/extensions map written elsewhere.
-writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {});
+// Record hypo-pkg.json against the durable root (the plugin's real cache root in a
+// dual install, PKG_ROOT otherwise), the same root the wiki pre-commit hook uses.
+writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {}, durableRoot);
 
 // 4b. user extensions companion sync. Runs after
 // writePkgJson so the per-target SHA map is merged into the same hypo-pkg.json
@@ -1037,8 +1199,10 @@ if (args.hooks) {
   installPkgGitHook(args.dryRun);
 }
 
-// 8b. wiki pre-commit hook (.hypoignore last-line-of-defence guard — §6.8)
-installWikiPreCommitHook(args.hypoDir, args.dryRun, args.forceCommands);
+// 8b. wiki pre-commit hook (.hypoignore last-line-of-defence guard — §6.8).
+// Point it at the durable install root, not PKG_ROOT, so a dual install does not
+// embed a manual/npm path that dangles once the user uninstalls it.
+installWikiPreCommitHook(args.hypoDir, args.dryRun, args.forceCommands, durableRoot);
 
 // 9. first commit + push (skip when cloned from remote — already has commits)
 if (args.gitInit && !args.fromRemote) {

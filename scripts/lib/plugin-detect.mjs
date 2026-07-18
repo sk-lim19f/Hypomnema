@@ -38,11 +38,18 @@ export function isHypomnemaPluginEnabled(settingsPath) {
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
 
-  const enabled = parsed.enabledPlugins;
+  return enabledKeyFrom(parsed.enabledPlugins) !== null;
+}
+
+// The exact enabledPlugins KEY (`hypo@<marketplace>` / legacy
+// `hypomnema@<marketplace>`) whose value is strictly true, or null. Same matching
+// rules as isHypomnemaPluginEnabled, but returns the identifier so a caller can
+// look that exact plugin up in the install registry rather than guessing among all
+// hypo-named entries.
+function enabledKeyFrom(enabled) {
   // enabledPlugins is an object map `{ "<name>@<marketplace>": true|false }`.
   // Anything else (absent, array, scalar) → not enabled.
-  if (!enabled || typeof enabled !== 'object' || Array.isArray(enabled)) return false;
-
+  if (!enabled || typeof enabled !== 'object' || Array.isArray(enabled)) return null;
   for (const [key, value] of Object.entries(enabled)) {
     if (value !== true) continue; // strictly true only — no truthy coercion
     // Require a real `name@marketplace` shape: an `@` that is neither the first
@@ -54,7 +61,29 @@ export function isHypomnemaPluginEnabled(settingsPath) {
     const name = key.slice(0, at);
     // Match the current plugin name and the legacy one (pre-rename) so the
     // guard holds across the migration window. Exact, case-sensitive.
-    if (name === 'hypo' || name === 'hypomnema') return true;
+    if (name === 'hypo' || name === 'hypomnema') return key;
   }
-  return false;
+  return null;
+}
+
+/**
+ * @param {string} settingsPath  path to a Claude Code settings.json
+ * @returns {string|null} the exact `enabledPlugins` key of the enabled Hypomnema
+ *   plugin (`hypo@<marketplace>` or legacy `hypomnema@<marketplace>`), or null.
+ */
+export function enabledHypomnemaPluginKey(settingsPath) {
+  let raw;
+  try {
+    raw = readFileSync(settingsPath, 'utf-8');
+  } catch {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  return enabledKeyFrom(parsed.enabledPlugins);
 }
