@@ -42,6 +42,7 @@ process.stdin.on('data', (chunk) => (raw += chunk));
 process.stdin.on('end', () => {
   let transcriptPath = null;
   let sessionId = null;
+  let sessionCwd = null;
   try {
     const input = JSON.parse(raw || '{}');
     transcriptPath = input.transcript_path ?? null;
@@ -49,6 +50,11 @@ process.stdin.on('end', () => {
     // semantics (no project attribution) so /compact does not block a closed
     // non-project session on the active/phantom project's files.
     sessionId = input.session_id ?? input.sessionId ?? null;
+    // Authoritative session cwd for the session-cwd close check. This is the one
+    // verified cwd source (mirrors hypo-session-record); it lets /compact block a
+    // session whose own project close was never started, which the recency-based
+    // global status cannot see.
+    sessionCwd = input.cwd ?? null;
   } catch {
     /* fail-open */
   }
@@ -107,6 +113,7 @@ process.stdin.on('end', () => {
     gate = precompactGateStatus(HYPO_DIR, {
       transcriptPath,
       ...(sessionId ? { sessionId } : {}),
+      ...(sessionCwd ? { sessionCwd } : {}),
     });
   } catch (err) {
     // Defense-in-depth: precompactGateStatus fails open per-check, but if it ever

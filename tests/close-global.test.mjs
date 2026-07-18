@@ -1610,10 +1610,13 @@ test('--mark-session-closed with ok gate but dirty git → exit 1, no marker (AD
 test('--mark-session-closed with ok gate + clean git → exit 0, marker created', () => {
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-success');
+    // close attribution: attribution comes from evidence, never recency. A standalone
+    // mark whose transcript touched no close file must name the project it closed.
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
       '--session-id=s-success',
+      '--project=test-project',
       '--json',
     ]);
     cleanup();
@@ -1627,6 +1630,62 @@ test('--mark-session-closed with ok gate + clean git → exit 0, marker created'
     assert.equal(marker.session_id, 's-success');
     assert.equal(marker.verification, 'session-close-file-status:ok');
     assert.ok(marker.closed_at, 'marker must carry closed_at timestamp');
+  });
+});
+
+// session-close attribution P1: recency is no longer an attribution source. A
+// standalone mark whose transcript touched no close file and names no --project
+// has NO evidence of which project it closed, so it must FAIL CLOSED (exit 1, no
+// marker) instead of silently attributing to the recency project. Old behavior
+// wrote a marker attributed to test-project (recency); this pins the fix.
+test('--mark-session-closed with no attribution evidence → fail closed, no marker', () => {
+  withWiki(null, (dir) => {
+    const cleanup = seedCloseTranscript('s-noevidence');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      '--session-id=s-noevidence',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 1, `no evidence must fail closed, got ${r.status}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.skipReason, 'no-attribution-evidence');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-noevidence.marker')),
+      'no marker may be attributed to the recency project',
+    );
+  });
+});
+
+// The v4 marker discriminator: an evidence-attributed marker carries `projects`,
+// which resolveCloseScope trusts directly (a pre-v4 marker has only `project`).
+test('--mark-session-closed stamps the v4 projects discriminator', () => {
+  withWiki(null, (dir) => {
+    const cleanup = seedCloseTranscript('s-disc');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      '--session-id=s-disc',
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+    const marker = JSON.parse(
+      readFileSync(join(dir, '.cache', 'session-closed-s-disc.marker'), 'utf-8'),
+    );
+    assert.deepEqual(
+      marker.projects,
+      ['test-project'],
+      'projects discriminator is the evidence set',
+    );
+    assert.equal(
+      marker.project,
+      'test-project',
+      'flat project stays as projects[0] for back-compat',
+    );
   });
 });
 
@@ -2251,6 +2310,7 @@ test('--mark-session-closed writes the marker on PURE feedback drift and surface
         join(SCRIPTS, 'crystallize.mjs'),
         '--mark-session-closed',
         '--session-id=s-drift',
+        '--project=test-project',
         `--hypo-dir=${wiki}`,
         '--json',
       ],
@@ -2904,6 +2964,157 @@ test('IMPR-34: foreign incomplete close is a notice, not a blocker, when scope n
     // The actual win. Asserting only "no close blocker" would pass while the gate
     // stayed red for some other reason and the marker still never landed.
     assert.equal(gate.ok, true, `the gate is GREEN → the marker lands: ${JSON.stringify(gate)}`);
+  });
+});
+
+// ── session-cwd close check (session-close attribution, P2) ──────────────────
+// The false-green this closes: a secondary project whose close was NEVER STARTED
+// leaves no today close-activity trace, so the recency-based global status can't
+// see it. When the recency project was closed the same day, the gate goes green
+// while the session's own project stays open. The independent cwd check catches it.
+suite('session-cwd close check (P2)');
+
+// Give a project an index.md working_dir so pickProjectByCwd can resolve a cwd.
+function setWorkingDir(dir, slug, workingDir) {
+  const idx = join(dir, 'projects', slug, 'index.md');
+  writeFileSync(
+    idx,
+    `---\ntitle: ${slug}\ntype: index\nworking_dir: ${workingDir}\n---\n\n# ${slug}\n`,
+  );
+  // Commit so the gate's git axis stays clean (ahead-of-remote is only a notice).
+  spawnSync('git', ['-C', dir, 'add', '-A']);
+  spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'idx']);
+}
+
+test('P2: a never-started cwd project close is caught even when recency is green', () => {
+  const CWD = '/tmp/cwdproj-workdir';
+  withClosePartitionWiki(
+    [
+      // recency-proj: fully closed today → the only today-active project.
+      { slug: 'recency-proj', date: todayLocal() },
+      // cwd-proj: session-state fresh (a real project) but its close was never
+      // started — stale session-log, no today log entry, no today hot row → it is
+      // INVISIBLE to the today-active global status.
+      { slug: 'cwd-proj', date: todayLocal(), sessionLog: false, logEntry: false, hotRow: false },
+    ],
+    [],
+    (dir) => {
+      setWorkingDir(dir, 'cwd-proj', CWD);
+      // Without the cwd signal: the classic false-green. recency-proj is complete
+      // and cwd-proj is invisible, so the global gate is green.
+      const green = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+      assert.equal(
+        green.blockers.some((b) => b.type === 'close-cwd'),
+        false,
+        'no cwd signal → no cwd check (documents the pre-fix false-green surface)',
+      );
+      // The baseline must actually BE green — otherwise an unrelated blocker could
+      // make both runs red while this test still "passes" (codex pre-commit CONCERN).
+      assert.equal(
+        green.ok,
+        true,
+        `baseline must be the genuine false-green: ${JSON.stringify(green.blockers)}`,
+      );
+      // With the authoritative session cwd: the independent check evaluates
+      // cwd-proj's close, finds it incomplete, and blocks — no longer green.
+      const gated = precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        sessionCwd: CWD,
+      });
+      const cwdBlocker = gated.blockers.find((b) => b.type === 'close-cwd');
+      assert.ok(
+        cwdBlocker,
+        `cwd-proj's unstarted close must block: ${JSON.stringify(gated.blockers)}`,
+      );
+      assert.equal(cwdBlocker.project, 'cwd-proj');
+      assert.equal(gated.ok, false, 'the gate is RED once the cwd project is checked');
+    },
+  );
+});
+
+test('P2: close-cwd is emitted even when the cwd project is also a normal close blocker', () => {
+  // The Stop hook keys its marker re-check on the close-cwd TYPE. If the cwd
+  // project is today-active AND incomplete it also shows up as an ordinary `close`
+  // blocker; the typed close-cwd must NOT be suppressed as a duplicate, or Stop
+  // would honor a stale marker (codex pre-commit BLOCKER).
+  const CWD = '/tmp/cwdproj-both';
+  withClosePartitionWiki(
+    // session-state stale → incomplete; session-log fresh → today-active.
+    [{ slug: 'cwd-proj', date: todayLocal(), sessionState: '2000-01-01' }],
+    [],
+    (dir) => {
+      setWorkingDir(dir, 'cwd-proj', CWD);
+      const gate = precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        sessionCwd: CWD,
+      });
+      assert.ok(
+        gate.blockers.some((b) => b.type === 'close'),
+        'the today-active incomplete project is a normal close blocker',
+      );
+      assert.ok(
+        gate.blockers.some((b) => b.type === 'close-cwd' && b.project === 'cwd-proj'),
+        'the typed close-cwd blocker is retained so Stop can key on it',
+      );
+    },
+  );
+});
+
+test('P2: a complete cwd project close adds no blocker', () => {
+  const CWD = '/tmp/cwdproj-done';
+  withClosePartitionWiki([{ slug: 'cwd-proj', date: todayLocal() }], [], (dir) => {
+    setWorkingDir(dir, 'cwd-proj', CWD);
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      sessionCwd: CWD,
+    });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close-cwd'),
+      false,
+      'a completed cwd project close gains no new blocker',
+    );
+  });
+});
+
+test('P2: log-only exempts the cwd check', () => {
+  const CWD = '/tmp/cwdproj-logonly';
+  withClosePartitionWiki(
+    [
+      { slug: 'recency-proj', date: todayLocal() },
+      { slug: 'cwd-proj', date: todayLocal(), sessionLog: false, logEntry: false, hotRow: false },
+    ],
+    [],
+    (dir) => {
+      setWorkingDir(dir, 'cwd-proj', CWD);
+      const gate = precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        sessionCwd: CWD,
+        logOnly: true,
+      });
+      assert.equal(
+        gate.blockers.some((b) => b.type === 'close-cwd'),
+        false,
+        'a non-project (log-only) session has nothing to close → cwd check is skipped',
+      );
+    },
+  );
+});
+
+test('P2: an unmatched cwd is a notice, never a block', () => {
+  withClosePartitionWiki([{ slug: 'recency-proj', date: todayLocal() }], [], (dir) => {
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      sessionCwd: '/nowhere/unmatched/path',
+    });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close-cwd'),
+      false,
+      'a cwd under no project working_dir must not hard-block',
+    );
+    assert.ok(
+      gate.notices.some((n) => n.type === 'close-cwd-unresolved'),
+      'the coverage gap surfaces as a best-effort notice',
+    );
   });
 });
 

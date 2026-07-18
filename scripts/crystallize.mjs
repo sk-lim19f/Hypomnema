@@ -174,6 +174,7 @@ function parseArgs(argv) {
     else if (arg.startsWith('--session-id=')) args.sessionId = arg.slice(13);
     else if (arg.startsWith('--payload=')) args.payload = arg.slice(10);
     else if (arg.startsWith('--transcript-path=')) args.transcriptPath = expandHome(arg.slice(18));
+    else if (arg.startsWith('--session-cwd=')) args.sessionCwd = expandHome(arg.slice(14));
     else if (arg.startsWith('--project=')) args.project = arg.slice(10);
     else if (arg === '--force') args.force = true;
     else if (arg === '--json') args.json = true;
@@ -263,6 +264,13 @@ function runSessionCloseCheck(args) {
         ? { transcriptPath: checkTranscript }
         : {}),
     ...(args.sessionId ? { sessionId: args.sessionId } : {}),
+    // The P2 cwd close check (session-close attribution) applies to the GLOBAL gate only. Under
+    // --project the check is a project-scoped diagnostic, so a cwd blocker for a
+    // DIFFERENT project would muddy that scoped answer — pass sessionCwd only for
+    // the global form. process.cwd() is deliberately NOT a fallback: a check run
+    // after `cd ~/hypomnema` would map to the vault, not the session (authoritative
+    // enforcement lives in the PreCompact/Stop hooks, which carry payload.cwd).
+    ...(args.sessionCwd && !args.project ? { sessionCwd: args.sessionCwd } : {}),
   });
   const close = status.close;
 
@@ -643,6 +651,9 @@ function runMarkSessionClosed(args) {
     ...(args.project && !args.logOnly ? { closeScope: [args.project] } : {}),
     ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
     ...(args.logOnly ? { logOnly: true } : {}),
+    // P2 (session-close attribution): the marker gate must refuse to attest compact-ready while the
+    // session's cwd project has an unstarted close. logOnly exempts it in-gate.
+    ...(args.sessionCwd ? { sessionCwd: args.sessionCwd } : {}),
   });
   const status = gate.close;
   if (!gate.ok) {
@@ -685,21 +696,43 @@ function runMarkSessionClosed(args) {
     console.log(args.json ? JSON.stringify(result, null, 2) : `✗ ${reason}`);
     process.exit(1);
   }
-  // Marker attribution comes from the CLOSE SCOPE, never from the gate's
-  // global `primary`. The marker is what PreCompact later re-derives its own scope
-  // from, so attributing it to a project this session did not close hands PreCompact a
-  // scope the marker never cleared: `primary` can be a FOREIGN today-active project
-  // whose debt this gate demoted, and PreCompact would union it back in and re-block.
-  // Marker green, /compact red — the exact invariant PR #110 closed (codex design
-  // review, both workers). Explicit --project wins; else the scope's own project
-  // (preferring `primary` when it is itself in scope); else `primary`, which is only
-  // reachable when the scope was empty and the gate therefore stayed global anyway.
+  // Marker attribution comes from EVIDENCE, never from the gate's global
+  // `primary` (which is recency-derived, hypo-shared.mjs). The marker is what
+  // PreCompact later re-derives its own scope from, so attributing it to a project
+  // this session did not close hands PreCompact a scope the marker never cleared.
+  // The evidence set is the close scope — explicit --project ∪ the transcript's
+  // touched close files ∪ any prior marker for this session — all of which
+  // resolveCloseScope already unioned into status.scope. The recency primary is
+  // deliberately excluded: an empty scope means this session has no proof it closed
+  // any project (evidence-based close attribution), so we FAIL CLOSED rather than misattribute to recency.
   const closeScope = status.scope || [];
-  const scopeProject = closeScope.includes(status.project) ? status.project : closeScope[0];
-  const markerProject =
-    !args.logOnly && args.project ? args.project : (scopeProject ?? status.project);
+  const markerProjects = [
+    ...new Set([...(!args.logOnly && args.project ? [args.project] : []), ...closeScope]),
+  ];
+  if (!args.logOnly && markerProjects.length === 0) {
+    const err =
+      'cannot attribute this close to a project — no evidence (no --project, no transcript close-file edits, no prior marker). ' +
+      'Pass --project=<slug> for the project this session closed, or --log-only for a non-project (tooling/wiki-only) session.';
+    console.log(
+      args.json
+        ? JSON.stringify(
+            {
+              ok: false,
+              session_id: args.sessionId,
+              skipReason: 'no-attribution-evidence',
+              error: err,
+            },
+            null,
+            2,
+          )
+        : `✗ ${err}`,
+    );
+    process.exit(1);
+  }
+  const markerProject = !args.logOnly && args.project ? args.project : markerProjects[0];
   writeSessionClosedMarker(args.hypoDir, args.sessionId, {
     project: markerProject,
+    projects: args.logOnly ? [] : markerProjects,
     ...(args.logOnly ? { scope: 'log-only' } : {}),
   });
   // Marker writer swallows IO errors (best-effort, see hypo-shared.mjs). Verify
@@ -1641,7 +1674,9 @@ function applySessionClose(args) {
     });
     markerSkipReason = decision.skipReason;
     if (decision.write) {
-      writeSessionClosedMarker(args.hypoDir, args.sessionId, { project });
+      // apply KNOWS its authoritative payload.project — stamp it as the v4
+      // evidence set so PreCompact trusts this marker's scope directly (session-close attribution).
+      writeSessionClosedMarker(args.hypoDir, args.sessionId, { project, projects: [project] });
       // Codex CONCERN: the writer swallows IO errors (best-effort).
       // Verify the file actually landed — mirroring the standalone path — instead of
       // asserting markerWritten=true, so a .cache permission/disk problem surfaces
