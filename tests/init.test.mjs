@@ -89,6 +89,34 @@ test('init creates pages/observability/_index.md stub', () => {
   });
 });
 
+test('init creates .hyposcanignore scaffold (scan-only sibling of .hypoignore, A안)', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const dest = join(hypoDir, '.hyposcanignore');
+    assert.ok(existsSync(dest), '.hyposcanignore should be created');
+    const content = readFileSync(dest, 'utf8');
+    assert.ok(/scan/i.test(content), 'header should describe scan-only scope');
+    assert.ok(
+      /NOT a privacy boundary|does NOT block commit/i.test(content),
+      'header should make clear this is not a commit-blocking privacy file, unlike .hypoignore',
+    );
+  });
+});
+
+test('init does not overwrite an existing .hyposcanignore', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(join(hypoDir, '.hyposcanignore'), 'custom-pattern/\n');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const content = readFileSync(join(hypoDir, '.hyposcanignore'), 'utf8');
+    assert.equal(content, 'custom-pattern/\n');
+  });
+});
+
 test('--no-hooks succeeds without touching hook config', () => {
   withTmpDir((dir) => {
     const hypoDir = join(dir, 'wiki');

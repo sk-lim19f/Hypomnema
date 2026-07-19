@@ -300,6 +300,74 @@ test('stats: omits failureTypes key when no page is classified (OQ-4)', () => {
   );
 });
 
+// ── stats.mjs — .hyposcanignore scan-only exclusion (A안) ────────────────────
+suite('stats.mjs — .hyposcanignore scan-only exclusion');
+
+function withScanIgnoreStatsWiki(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-stats-scanignore-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'kept'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'hidden'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'kept', 'decisions'), { recursive: true });
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const fbPage = '---\ntitle: T\ntype: feedback\nstatus: active\nupdated: 2026-06-23\n---\nbody\n';
+
+test('stats: .hyposcanignore-listed source drops from the source count', () => {
+  withScanIgnoreStatsWiki((dir) => {
+    writeFileSync(join(dir, '.hyposcanignore'), 'sources/hidden.md\n');
+    writeFileSync(join(dir, 'sources', 'hidden.md'), 'x');
+    writeFileSync(join(dir, 'sources', 'kept.md'), 'x');
+    const r = run('stats.mjs', ['--json', `--hypo-dir=${dir}`]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.sources, 1, `expected only kept.md counted: ${r.stdout}`);
+  });
+});
+
+test('stats: .hyposcanignore-listed project dir drops from the project count and its ADRs', () => {
+  withScanIgnoreStatsWiki((dir) => {
+    writeFileSync(join(dir, '.hyposcanignore'), 'projects/hidden/\n');
+    mkdirSync(join(dir, 'projects', 'hidden', 'decisions'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'hidden', 'decisions', '0001-x.md'), 'x');
+    writeFileSync(join(dir, 'projects', 'kept', 'decisions', '0001-y.md'), 'x');
+    const r = run('stats.mjs', ['--json', `--hypo-dir=${dir}`]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.projects, 1, `expected hidden/ excluded: ${r.stdout}`);
+    assert.equal(out.adrs, 1, `expected only kept's ADR counted: ${r.stdout}`);
+  });
+});
+
+test('stats: a matching path stays in the count when only .hypoignore lists it not .hyposcanignore, and the same path is still committable (scope boundary)', () => {
+  withScanIgnoreStatsWiki((dir) => {
+    // No .hyposcanignore at all — parity with today when the file is absent.
+    writeFileSync(join(dir, 'sources', 'plain.md'), 'x');
+    const r = run('stats.mjs', ['--json', `--hypo-dir=${dir}`]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.sources,
+      1,
+      `expected plain.md counted (no .hyposcanignore present): ${r.stdout}`,
+    );
+  });
+});
+
+test('stats: privacy .hypoignore match is still excluded (isScanIgnored widens, never narrows privacy)', () => {
+  withScanIgnoreStatsWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), 'sources/secret.md\n');
+    writeFileSync(join(dir, 'sources', 'secret.md'), 'x');
+    writeFileSync(join(dir, 'sources', 'kept.md'), 'x');
+    const r = run('stats.mjs', ['--json', `--hypo-dir=${dir}`]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.sources, 1, `expected secret.md still excluded: ${r.stdout}`);
+  });
+});
+
 // ── stale-sibling detection (ADR 0038) ────────────────────────────────────────
 // Two Hypomnema installs coexist; an OLDER one owns the `hypomnema` bin on PATH
 // while a newer one owns the active hooks. P = init/upgrade downgrade-guard,

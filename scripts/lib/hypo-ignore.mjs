@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'fs';
-import { join, relative, basename } from 'path';
+import { join, relative, basename, resolve } from 'path';
 
 export function loadHypoIgnore(hypoDir) {
   const ignorePath = join(hypoDir, '.hypoignore');
@@ -8,6 +8,46 @@ export function loadHypoIgnore(hypoDir) {
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'));
+}
+
+// .hyposcanignore: scan-only exclusions (lint/graph/stats/query/verify/doctor
+// catalog scans). Deliberately NOT a privacy boundary: a match here is still
+// committed and still readable by hooks. Only isScanIgnored() below reads this
+// file. loadHypoIgnore()/isIgnored() must never see it, that is the whole
+// point of the split, so do not thread it into the pre-commit gate or
+// ingest --check.
+export function loadScanIgnore(hypoDir) {
+  const ignorePath = join(resolve(hypoDir), '.hyposcanignore');
+  if (!existsSync(ignorePath)) return [];
+  return readFileSync(ignorePath, 'utf-8')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+}
+
+// Parsed .hyposcanignore patterns, cached per vault for the process lifetime.
+// The shared walker (wikilink.mjs) calls isScanIgnored() once per directory
+// entry, so re-reading this file on every call would turn a vault scan into
+// O(files) filesystem reads for one small file. Nothing writes
+// .hyposcanignore mid-process, so a stale cache is not a real scenario.
+//
+// Keyed on path.resolve(hypoDir), NOT the raw argument: a raw-string key lets
+// two different relative spellings of the SAME vault ('.', './') miss each
+// other (harmless, just a wasted read), but it also lets a relative key like
+// '.' collide ACROSS vaults when the caller cd's between them between calls —
+// vault B would silently reuse vault A's scan patterns. Resolving to an
+// absolute path first makes the key vault-identity-stable regardless of cwd
+// or spelling.
+const scanIgnoreCache = new Map();
+
+function cachedScanIgnore(hypoDir) {
+  const key = resolve(hypoDir);
+  let patterns = scanIgnoreCache.get(key);
+  if (patterns === undefined) {
+    patterns = loadScanIgnore(key);
+    scanIgnoreCache.set(key, patterns);
+  }
+  return patterns;
 }
 
 function globToRegex(glob) {
@@ -39,12 +79,20 @@ export function isGeneratedArtifact(filePath, hypoDir) {
 }
 
 // Catalog/scan exclusion = privacy/.hypoignore patterns PLUS generated root
-// artifacts. Use this in tools that build the knowledge catalog (lint, graph,
-// stats, query, verify, crystallize, rename, doctor broken-links). Do NOT use it
-// in the pre-commit gate or ingest --check, which are privacy boundaries that
-// must stay on isIgnored()/.hypoignore alone.
+// artifacts PLUS scan-only/.hyposcanignore patterns (loaded and cached
+// internally, so callers keep passing only their privacy `patterns` array).
+// Use this in tools that build the knowledge catalog (lint, graph, stats,
+// query, verify, crystallize, rename, doctor broken-links). Do NOT use it in
+// the pre-commit gate or ingest --check, which are privacy boundaries that
+// must stay on isIgnored()/.hypoignore alone — OR-ing in .hyposcanignore here
+// only ever WIDENS what a scan skips, it can never make an .hypoignore match
+// committable, so that separation holds by construction.
 export function isScanIgnored(filePath, hypoDir, patterns) {
-  return isIgnored(filePath, hypoDir, patterns) || isGeneratedArtifact(filePath, hypoDir);
+  return (
+    isIgnored(filePath, hypoDir, patterns) ||
+    isGeneratedArtifact(filePath, hypoDir) ||
+    isIgnored(filePath, hypoDir, cachedScanIgnore(hypoDir))
+  );
 }
 
 export function isIgnored(filePath, hypoDir, patterns) {

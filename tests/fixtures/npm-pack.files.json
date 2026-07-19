@@ -428,6 +428,10 @@
     "exec": false
   },
   {
+    "path": "templates/.hyposcanignore",
+    "exec": false
+  },
+  {
     "path": "templates/Home.md",
     "exec": false
   },
