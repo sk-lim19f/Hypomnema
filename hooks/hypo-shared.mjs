@@ -3166,83 +3166,231 @@ export function resolveTranscriptBySessionId(
 }
 
 /**
- * Returns true iff the transcript carries a genuine USER session-close signal —
- * the hard gate for the session-closed marker writers. Scans the FULL
- * transcript: a close request can precede the marker write by the entire close
- * checklist, so the Stop hook's 30-line tail would miss it.
+ * Returns true iff the transcript's LATEST live user decision is to close — the
+ * hard gate for the session-closed marker writers. This is a state predicate, not
+ * an existence one: "is close still approved right now", not "did a
+ * close signal ever appear". Scans the FULL transcript in line order, classifies
+ * each record, and tracks the approval as a LEASE.
  *
- * Evidence (any one is sufficient):
- *   1. a de-polluted NL close phrase — isClosePattern over extractUserMessages,
- *      which already drops injected / tool / hook-feedback text;
- *   2. a `/compact` invocation (queue-operation). `/clear` is deliberately NOT
- *      counted: it abandons context, whereas a session-close PRESERVES the work
- *      to the wiki — a different intent;
- *   3. an AskUserQuestion answer whose SELECTED value names a close action (the
- *      canonical "offer [세션 마무리] → user picks it" flow).
+ * Classification (structural fields only — never content heuristics for producer):
+ *   • GRANT      a genuine user close: an NL close phrase in user text that
+ *                survives {@link eventUserText}'s exclusions; a `/compact`
+ *                queue-op; a remove-path queued_command attachment carrying a
+ *                close with an audited human producer (origin.kind "human"); a
+ *                correlated, non-error AskUserQuestion answer naming a close.
+ *   • INVALIDATE a fresh user intent that expires the lease: any other genuine
+ *                user text, `/clear`, `popAll`, a non-close queued_command, a
+ *                non-close AskUserQuestion selection.
+ *   • NEUTRAL    everything the model can produce or the harness injects: system/
+ *                sdk replay, isMeta bodies, sidechain, interruptedMessageId
+ *                companions, assistant, tool_result, task-notification.
+ *   • FATAL      an unparseable line — the transcript is being appended to or is
+ *                corrupt, so refuse rather than read a half-written record.
  *
- * A Stop-hook block is NOT evidence: it is the hook's own nudge to close, so
- * counting it would be circular (the incident's block told the model to write the
- * marker). extractUserMessages already strips it.
+ * The last grant wins and a later invalidate expires it, so a stale close (Defect
+ * B), a queued "keep working" after a close, and a non-close AskUserQuestion
+ * selection all correctly read as NOT closed. Abandoned-branch staleness is a
+ * known limit (no leaf pointer exists to resolve it — see the branch note on the
+ * function), mitigated by the lease.
  *
- * Fail-closed: any read error → false (caller refuses the marker).
+ * Threat model: an honest-but-drifting model that does not forge the
+ * transcript. This is a safety interlock, not an authorization boundary — a model
+ * that forges records is out of scope and documented so.
+ *
+ * Fail-closed: any read/parse error, or an unresolvable branch, → false.
  */
+// Genuine user text of a record, or null when the record is on a channel the
+// honest-but-drifting model can reach (so it is never user intent — NEUTRAL).
+// role:user is the boundary the model cannot cross: it authors role:assistant,
+// so a user record that survives every exclusion below is genuine user text.
+// The exclusions are exactly the model-reachable channels:
+//   • isMeta            slash-command / skill bodies and local-command caveats
+//   • promptSource system|sdk   queue replay of injected text, SDK prompts
+//   • isSidechain       subagent context (a subagent must not close the session)
+//   • interruptedMessageId  the harness cut the model off; user-SHAPED, not a
+//                       user decision (e.g. the [Request interrupted by user]
+//                       companion of a delivered /compact)
+//   • Stop-hook feedback  the hook's own close nudge — circular
+//   • tool_result blocks  tool output, not typed text
+// No promptSource allowlist is required: requiring `typed` would drop the
+// legacy absent-promptSource close the older gate has always honoured, while the
+// dangerous replay/injection paths carry system|sdk|isMeta|isSidechain and are
+// excluded here anyway.
+function eventUserText(obj) {
+  if (obj.isMeta === true) return null;
+  if (obj.promptSource === 'system' || obj.promptSource === 'sdk') return null;
+  if (obj.isSidechain === true) return null;
+  if (obj.interruptedMessageId) return null;
+  const msg = obj.message ?? obj;
+  const role = msg.role ?? obj.role ?? obj.type;
+  if (role !== 'user') return null;
+  const content = msg.content ?? obj.content;
+  if (typeof content === 'string') {
+    return content.startsWith('Stop hook feedback') ? null : content;
+  }
+  if (Array.isArray(content)) {
+    const texts = content
+      .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text);
+    return texts.length ? texts.join('\n') : null;
+  }
+  return null;
+}
+
+// A record on a channel the honest-but-drifting model can reach, so it can never
+// be a user decision. Used to keep injected / replayed / subagent records out of
+// BOTH the user-text and the AskUserQuestion-answer classifiers.
+function isModelReachableRecord(obj) {
+  return (
+    obj.isMeta === true ||
+    obj.promptSource === 'system' ||
+    obj.promptSource === 'sdk' ||
+    obj.isSidechain === true
+  );
+}
+
 export function hasUserCloseSignal(transcriptPath) {
   if (!transcriptPath) return false;
-  let lines;
+  let raw;
   try {
-    lines = readFileSync(transcriptPath, 'utf-8').split('\n');
+    raw = readFileSync(transcriptPath, 'utf-8');
   } catch {
     return false;
   }
-  // (1) NL close over the full, de-polluted transcript.
-  if (isClosePattern(extractUserMessages(transcriptPath, Infinity))) return true;
-  // AskUserQuestion answers (3) must be correlated to a real AskUserQuestion
-  // tool_use by id — otherwise ANY tool_result string containing "have been
-  // answered" (e.g. a Read/Grep of this very file, or of a transcript) would
-  // satisfy the gate, reintroducing the tool_result pollution the de-pollution
-  // layer closes. First pass collects the genuine AskUserQuestion tool_use ids;
-  // the tool_use (assistant) always precedes its tool_result (user) in the log,
-  // so a single forward scan suffices.
-  const askIds = new Set();
-  for (const line of lines) {
+  // FATAL: a non-empty line that will not parse means the transcript is being
+  // appended to (a half-written record) or is corrupt. Skipping it would let a
+  // stale prior grant survive past an event we cannot read, so refuse. A line
+  // that parses to a non-object (a bare null / string / number) is valid JSON but
+  // not a record — noise, not corruption — so it is skipped, not fatal, and never
+  // reaches the field reads below.
+  const recs = [];
+  for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
-    let obj;
+    let o;
     try {
-      obj = JSON.parse(line);
+      o = JSON.parse(line);
     } catch {
-      continue;
+      return false;
     }
-    // (2) /compact (queue-operation). Not /clear — see doc above.
-    if (
-      obj.type === 'queue-operation' &&
-      typeof obj.content === 'string' &&
-      /^\/compact(?:\s|$)/.test(obj.content.trim())
-    ) {
-      return true;
-    }
-    const content = (obj.message ?? obj).content;
-    if (!Array.isArray(content)) continue;
-    for (const b of content) {
-      if (!b || typeof b !== 'object') continue;
-      // record AskUserQuestion tool_use ids
-      if (b.type === 'tool_use' && b.name === 'AskUserQuestion' && b.id) {
-        askIds.add(b.id);
+    if (o === null || typeof o !== 'object') continue;
+    recs.push(o);
+  }
+
+  // The approval is a LEASE, not an existence fact: walk the transcript in line
+  // order and track whether the LATEST user decision is a grant. Each grant sets
+  // it true, each invalidate sets it false, neutral leaves it — so at the end
+  // `granted` is "the most recent user decision was to close, and nothing has
+  // expired it since", which is how a stale close and a queued change-of-mind
+  // read as NOT closed.
+  //
+  // Branch note: line order mixes an abandoned branch's records with the live
+  // ones. A leaf-pointer ancestry filter was tried and withdrawn — the transcript
+  // carries no authoritative leaf pointer (measured: 0 leafUuid / summary
+  // records), so a heuristic leaf can skip the real invalidator and PRESERVE a
+  // stale grant (a fail-open, not a conservative filter). Until such a pointer
+  // exists, a close on a branch abandoned under a neutral tail is a known
+  // staleness limit, mitigated by the lease: any later live user intent, on any
+  // branch, still expires it.
+  const askIds = new Set();
+  let granted = false;
+
+  for (const o of recs) {
+    // Queue operations. The queue carries no correlation key (measured), so the
+    // ENQUEUE content is the decision — not a later contentless dequeue, which
+    // would need pairing we cannot do. Reading the enqueue also keeps the live
+    // PreCompact gate working (it sees the enqueue) and avoids double-counting the
+    // replay companion of an already-decided item (the /compact replay is not a
+    // fresh decision). popAll cancels the queue → invalidate. Delivery ops
+    // (dequeue, remove) carry no fresh decision here — a content-bearing remove of
+    // an NL queued command is handled by its queued_command attachment below.
+    if (o.type === 'queue-operation') {
+      if (o.operation === 'popAll') {
+        granted = false;
         continue;
       }
-      // (3) AskUserQuestion answer naming a close action — only when this
-      // tool_result actually answers a recorded AskUserQuestion. The answer lands
-      // in a role:user tool_result string: `… have been answered: "Q"="A". …`.
-      // Match the answer value(s) (the `="…"` side), never the question text, and
-      // run the SAME isClosePattern as the NL path so the two channels agree.
-      if (b.type === 'tool_result' && b.tool_use_id && askIds.has(b.tool_use_id)) {
+      if (o.operation !== 'enqueue') continue;
+      const c = typeof o.content === 'string' ? o.content.trim() : '';
+      if (/^\/compact(?:\s|$)/.test(c))
+        granted = true; // a user compaction preserves the work → grant
+      else if (/^\/clear(?:\s|$)/.test(c))
+        granted = false; // abandons context → invalidate
+      else if (!c || c.startsWith('<task-notification>')) {
+        /* model-caused / empty — neutral */
+      } else if (isClosePattern(c)) {
+        /* NL close via the queue — the open dequeue gap: the producer cannot be
+           attributed (a peer/model enqueue wears the same shape), so no grant */
+      } else granted = false; // a queued non-close user intent → invalidate (change of mind)
+      continue;
+    }
+
+    // remove-path delivery of a queued natural-language command (measured: the
+    // item leaves the queue as it is handed to the model, landing as an
+    // `attachment` of type queued_command with the prompt verbatim). A close here
+    // grants ONLY with an audited human producer — origin.kind "human", present
+    // on every 2.1.181+ user delivery (measured). A legacy origin-absent delivery
+    // cannot attest a producer, so it does not grant (fail-closed). A NON-close
+    // queued command (e.g. "keep working") is a fresh user intent and INVALIDATES
+    // a prior grant regardless of origin — that is what closes the re-close hole
+    // where a queued "continue" after a close leaves the stale lease live.
+    if (o.type === 'attachment' && o.attachment && o.attachment.type === 'queued_command') {
+      const prompt = typeof o.attachment.prompt === 'string' ? o.attachment.prompt : '';
+      const humanOrigin = !!(o.attachment.origin && o.attachment.origin.kind === 'human');
+      if (isClosePattern(prompt)) {
+        if (humanOrigin) granted = true;
+      } else if (prompt) {
+        granted = false;
+      }
+      continue;
+    }
+
+    // Record AskUserQuestion tool_use ids (assistant record, always precedes its
+    // answer in line order).
+    const content = (o.message ?? o).content;
+    if (Array.isArray(content)) {
+      for (const b of content) {
+        if (
+          b &&
+          typeof b === 'object' &&
+          b.type === 'tool_use' &&
+          b.name === 'AskUserQuestion' &&
+          b.id
+        )
+          askIds.add(b.id);
+      }
+    }
+
+    // Genuine user text → grant on a close phrase, invalidate on anything else.
+    const text = eventUserText(o);
+    if (text != null && text !== '') {
+      granted = isClosePattern(text);
+      continue;
+    }
+
+    // AskUserQuestion answer, correlated to a recorded AskUserQuestion, EXCLUDED
+    // and HARDENED. isModelReachableRecord keeps an injected / sdk / sidechain
+    // record from reaching the answer parser. is_error:false AND the host's
+    // success marker are required because a malformed AskUserQuestion echoes the
+    // raw input back in an is_error result, and the model authors the option
+    // labels. A close selection grants; any other real selection invalidates.
+    if (Array.isArray(content) && !isModelReachableRecord(o)) {
+      for (const b of content) {
+        if (!b || typeof b !== 'object') continue;
+        if (b.type !== 'tool_result' || !b.tool_use_id || !askIds.has(b.tool_use_id)) continue;
+        if (b.is_error === true) continue;
         const s = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+        if (!/have been answered/.test(s)) continue;
+        let sawAnswer = false;
+        let sawClose = false;
         for (const m of s.matchAll(/="([^"]*)"/g)) {
-          if (isClosePattern(m[1])) return true;
+          sawAnswer = true;
+          if (isClosePattern(m[1])) sawClose = true;
         }
+        if (sawClose) granted = true;
+        else if (sawAnswer) granted = false;
       }
     }
   }
-  return false;
+  return granted;
 }
 
 /** The literal the user must type to approve a parked-overwrite batch. */
