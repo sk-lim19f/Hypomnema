@@ -243,6 +243,207 @@ test('pre-commit hook blocks staged .env file via git commit', () => {
   });
 });
 
+suite('init.mjs --lint-strict opt-in gate (ISSUE-59)');
+
+test('default init: wiki pre-commit hook does not wire lint --strict', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const content = readFileSync(join(hypoDir, '.git', 'hooks', 'pre-commit'), 'utf8');
+    assert.ok(
+      !content.includes('lint.mjs'),
+      `--lint-strict was not requested; hook must not reference lint.mjs: ${content}`,
+    );
+  });
+});
+
+test('--lint-strict init: wiki pre-commit hook sequences lint --strict after the .hypoignore guard', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    const r = run('init.mjs', [
+      `--hypo-dir=${hypoDir}`,
+      '--no-hooks',
+      '--no-git-init',
+      '--lint-strict',
+    ]);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const content = readFileSync(join(hypoDir, '.git', 'hooks', 'pre-commit'), 'utf8');
+    assert.ok(content.includes('lint.mjs'), `hook should reference lint.mjs: ${content}`);
+    assert.ok(content.includes('--strict'), `hook should pass --strict: ${content}`);
+    // Sequential, not the old "exit $?" tail-call that made a second step
+    // unreachable dead code.
+    assert.ok(!content.includes('exit $?'), `hook must not tail-call exit $?: ${content}`);
+    const workerIdx = content.indexOf('hypo-pre-commit.mjs');
+    const lintIdx = content.indexOf('lint.mjs');
+    assert.ok(
+      workerIdx !== -1 && lintIdx !== -1 && workerIdx < lintIdx,
+      `.hypoignore guard must run before the lint --strict gate: ${content}`,
+    );
+  });
+});
+
+test('--lint-strict init: commit is blocked when a staged page fails lint --strict (W1 no-frontmatter)', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'config', 'user.email', 'test@hypo.test'], {
+      stdio: 'ignore',
+    });
+    spawnSync('git', ['-C', hypoDir, 'config', 'user.name', 'Hypo Test'], { stdio: 'ignore' });
+    const r = run('init.mjs', [
+      `--hypo-dir=${hypoDir}`,
+      '--no-hooks',
+      '--no-git-init',
+      '--lint-strict',
+    ]);
+    assert.equal(r.status, 0, `init failed: ${r.stderr}`);
+
+    spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+
+    writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
+    spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
+
+    const commitR = spawnSync(
+      'git',
+      ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
+      { encoding: 'utf-8' },
+    );
+    assert.notEqual(
+      commitR.status,
+      0,
+      `git commit should be blocked by lint --strict: ${commitR.stdout}${commitR.stderr}`,
+    );
+  });
+});
+
+test('default init (no --lint-strict): the same lint violation does NOT block the commit', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'config', 'user.email', 'test@hypo.test'], {
+      stdio: 'ignore',
+    });
+    spawnSync('git', ['-C', hypoDir, 'config', 'user.name', 'Hypo Test'], { stdio: 'ignore' });
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `init failed: ${r.stderr}`);
+
+    spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+
+    writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
+    spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
+
+    const commitR = spawnSync(
+      'git',
+      ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
+      { encoding: 'utf-8' },
+    );
+    assert.equal(
+      commitR.status,
+      0,
+      `--lint-strict was not opted in; commit must not be blocked: ${commitR.stdout}${commitR.stderr}`,
+    );
+  });
+});
+
+test('--lint-strict init with a RELATIVE --hypo-dir bakes an absolute path into the hook (codex BLOCKER)', () => {
+  withTmpDir((parentDir) => {
+    const hypoDir = join(parentDir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'init.mjs'),
+        '--hypo-dir=wiki',
+        '--no-hooks',
+        '--no-git-init',
+        '--lint-strict',
+      ],
+      {
+        cwd: parentDir,
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+      },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const content = readFileSync(join(hypoDir, '.git', 'hooks', 'pre-commit'), 'utf8');
+    // Git runs the hook with cwd = the wiki's own working-tree root. A
+    // relative --hypo-dir baked in verbatim re-resolves at commit time
+    // against THAT root, not the directory the caller meant — 'wiki' would
+    // become '<hypoDir>/wiki', a path that does not exist.
+    //
+    // Compare against the realpath, not the mkdtempSync path verbatim: macOS
+    // TMPDIR is itself a symlink (/var/folders/... -> /private/var/...), and
+    // a child process's process.cwd() resolves it, so `resolve()` inside
+    // init.mjs bakes in the physical path — that's still correct and
+    // absolute, just not byte-identical to the pre-realpath string.
+    const realHypoDir = realpathSync(hypoDir);
+    assert.ok(
+      content.includes(`--hypo-dir=${shellSingleQuoteForTest(realHypoDir)}`),
+      `--hypo-dir must be baked in absolute (${realHypoDir}): ${content}`,
+    );
+    assert.ok(
+      !content.includes(`--hypo-dir='wiki'`) && !content.includes('wiki/wiki'),
+      `--hypo-dir must not stay relative or double up against cwd: ${content}`,
+    );
+  });
+});
+
+function shellSingleQuoteForTest(p) {
+  return `'${p.replace(/'/g, "'\\''")}'`;
+}
+
+test('--lint-strict init with a RELATIVE --hypo-dir still blocks a real lint violation at commit time', () => {
+  withTmpDir((parentDir) => {
+    const hypoDir = join(parentDir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'config', 'user.email', 'test@hypo.test'], {
+      stdio: 'ignore',
+    });
+    spawnSync('git', ['-C', hypoDir, 'config', 'user.name', 'Hypo Test'], { stdio: 'ignore' });
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(SCRIPTS, 'init.mjs'),
+        '--hypo-dir=wiki',
+        '--no-hooks',
+        '--no-git-init',
+        '--lint-strict',
+      ],
+      {
+        cwd: parentDir,
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+      },
+    );
+    assert.equal(r.status, 0, `init failed: ${r.stderr}`);
+
+    spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+
+    writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
+    spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
+
+    // git invokes the hook with cwd = hypoDir (the wiki's own toplevel) —
+    // exactly the case a relative --hypo-dir at init time gets re-resolved
+    // against wrong.
+    const commitR = spawnSync(
+      'git',
+      ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
+      { encoding: 'utf-8' },
+    );
+    assert.notEqual(
+      commitR.status,
+      0,
+      `relative --hypo-dir at init must not defeat --lint-strict at commit time: ${commitR.stdout}${commitR.stderr}`,
+    );
+  });
+});
+
 // Write a hooks.json into a temp package root and return that root.
 function withPkgHooksJson(content, fn) {
   withTmpDir((dir) => {

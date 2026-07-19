@@ -32,7 +32,7 @@ import {
   renameSync,
   unlinkSync,
 } from 'fs';
-import { join, basename, dirname, isAbsolute } from 'path';
+import { join, basename, dirname, isAbsolute, resolve } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -121,6 +121,7 @@ function parseArgs(argv) {
     shellSetup: true,
     shellConfig: null,
     allowDowngrade: false,
+    lintStrict: false,
   };
   for (const arg of argv.slice(2)) {
     if (arg === '--help' || arg === '-h') {
@@ -154,6 +155,10 @@ Init options:
   --shell-config=<path>  Shell config file path (default: auto-detect)
   --allow-downgrade      Override the guard that refuses to overwrite NEWER active
                          hooks with an older package (stale-PATH-CLI footgun)
+  --lint-strict          Opt-in: also gate the wiki pre-commit hook on
+                         \`lint --strict\` (promotes STRICT_PROMOTE_IDS warnings
+                         to a blocking error), sequenced after the .hypoignore
+                         guard. Off by default; re-run init to add or drop it.
   --dry-run              Show what would be done without making changes
   --help, -h             Show this help message
 
@@ -179,6 +184,7 @@ docstring at the top of scripts/<command>.mjs; capture also accepts \`--help\`.`
     else if (arg === '--no-shell') args.shellSetup = false;
     else if (arg.startsWith('--shell-config=')) args.shellConfig = expandHome(arg.slice(15));
     else if (arg === '--allow-downgrade') args.allowDowngrade = true;
+    else if (arg === '--lint-strict') args.lintStrict = true;
   }
   return args;
 }
@@ -700,26 +706,56 @@ function installPkgGitHook(dryRun) {
 const WIKI_PRE_COMMIT_MARKER_START = '# hypo-managed:pre-commit:start';
 const WIKI_PRE_COMMIT_MARKER_END = '# hypo-managed:pre-commit:end';
 
-// `root` is the DURABLE install root the hook should resolve hypo-pre-commit.mjs
-// through — not necessarily PKG_ROOT. In a dual install (a manual/npm init while
-// the plugin is enabled) PKG_ROOT is the manual/npm checkout the dual-install
-// notice tells the user to uninstall; embedding it here would leave the vault's
-// git hook dangling the moment they do, breaking every wiki commit. The caller
-// passes the preserved plugin-owned root instead (see `durableRoot`), so the hook
-// points at the install that actually persists.
-function wikiPreCommitContent(root) {
-  const worker = join(root, 'hooks', 'hypo-pre-commit.mjs');
-  // Single-quote escaping prevents shell expansion of special chars (e.g. $HOME, backticks) in path
-  const escaped = worker.replace(/'/g, "'\\''");
-  return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\nnode '${escaped}'\nexit $?\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+// Single-quote escaping prevents shell expansion of special chars (e.g. $HOME, backticks) in path
+function shellSingleQuote(p) {
+  return `'${p.replace(/'/g, "'\\''")}'`;
 }
 
-function installWikiPreCommitHook(hypoDir, dryRun, force, root) {
+// `root` is the DURABLE install root the hook should resolve hypo-pre-commit.mjs
+// (and, when opted in, lint.mjs) through — not necessarily PKG_ROOT. In a dual
+// install (a manual/npm init while the plugin is enabled) PKG_ROOT is the
+// manual/npm checkout the dual-install notice tells the user to uninstall;
+// embedding it here would leave the vault's git hook dangling the moment they
+// do, breaking every wiki commit. The caller passes the preserved plugin-owned
+// root instead (see `durableRoot`), so the hook points at the install that
+// actually persists.
+//
+// The block runs its steps sequentially rather than tail-calling `exit $?` on
+// the first one, so a second step (the opt-in --lint-strict gate below) can
+// run after the .hypoignore guard instead of being unreachable dead code.
+// `lintStrict` is baked into the generated shim at install time — the same
+// pattern already used for HYPOMNEMA_ROOT/HYPOMNEMA_GIT_DIR in
+// install-git-hooks.mjs — so toggling it means re-running init with/without
+// `--lint-strict`, not editing the hook by hand.
+//
+// `hypoDir` MUST be absolutized before it is baked in. Git runs a pre-commit
+// hook with cwd set to the wiki's own working-tree root, so a relative
+// `--hypo-dir` (e.g. from `hypo init --hypo-dir=wiki` run from its parent) is
+// re-resolved AT COMMIT TIME against that root instead of the directory the
+// caller meant — `wiki` becomes `<wiki-root>/wiki`, a path that doesn't exist,
+// and lint.mjs falls through to its own default resolution (HYPO_DIR/
+// hypo-config.md scan) and may silently lint an unrelated vault. `worker`
+// needs no such treatment: `root` is already realpath'd upstream (see
+// `durableRoot` / PKG_ROOT resolution), so it's absolute at every call site.
+function wikiPreCommitContent(root, hypoDir, lintStrict) {
+  const absHypoDir = resolve(hypoDir);
+  const worker = join(root, 'hooks', 'hypo-pre-commit.mjs');
+  const steps = [`node ${shellSingleQuote(worker)} || exit 1`];
+  if (lintStrict) {
+    const lintScript = join(root, 'scripts', 'lint.mjs');
+    steps.push(
+      `node ${shellSingleQuote(lintScript)} --hypo-dir=${shellSingleQuote(absHypoDir)} --strict || exit 1`,
+    );
+  }
+  return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\n${steps.join('\n')}\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+}
+
+function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
   const gitDir = join(hypoDir, '.git');
   if (!existsSync(gitDir)) return; // no git repo — silently skip
   const hooksDir = join(gitDir, 'hooks');
   const hookPath = join(hooksDir, 'pre-commit');
-  const newContent = wikiPreCommitContent(root);
+  const newContent = wikiPreCommitContent(root, hypoDir, lintStrict);
 
   if (existsSync(hookPath)) {
     const existing = readFileSync(hookPath, 'utf-8');
@@ -1202,7 +1238,13 @@ if (args.hooks) {
 // 8b. wiki pre-commit hook (.hypoignore last-line-of-defence guard — §6.8).
 // Point it at the durable install root, not PKG_ROOT, so a dual install does not
 // embed a manual/npm path that dangles once the user uninstalls it.
-installWikiPreCommitHook(args.hypoDir, args.dryRun, args.forceCommands, durableRoot);
+installWikiPreCommitHook(
+  args.hypoDir,
+  args.dryRun,
+  args.forceCommands,
+  durableRoot,
+  args.lintStrict,
+);
 
 // 9. first commit + push (skip when cloned from remote — already has commits)
 if (args.gitInit && !args.fromRemote) {
