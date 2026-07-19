@@ -657,10 +657,10 @@ test('acceptance: /compact enqueue THEN remove → true (remove is delivery, so 
 // popAll carrying /compact grants anyway. popAll does carry content in the
 // corpus, so the shape is reachable — though this exact pairing, like the one
 // above, is composed rather than observed.
-test('acceptance: popAll carrying /compact → true (DEFECT: operation is never checked)', () => {
+test('acceptance: popAll carrying /compact → false (event model: popAll is a cancellation)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [QOP('popAll', '/compact')]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(hasUserCloseSignal(p), false);
   });
 });
 
@@ -725,7 +725,7 @@ const REMOVE_DELIVERY = (dir, { origin, version, removeContent, companions }) =>
 
 const HOOK_SUCCESS = { type: 'attachment', attachment: { type: 'hook_success' } };
 
-test('measured: NL close via the remove path, human origin (2.1.181+) → false (GAP: a real user close is invisible)', () => {
+test('measured: NL close via the remove path, human origin (2.1.181+) → true (event model reads the queued_command attachment)', () => {
   withTmpDir((dir) => {
     const p = REMOVE_DELIVERY(dir, {
       origin: { origin: { kind: 'human' } },
@@ -733,7 +733,7 @@ test('measured: NL close via the remove path, human origin (2.1.181+) → false 
       removeContent: true,
       companions: [HOOK_SUCCESS],
     });
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(hasUserCloseSignal(p), true);
   });
 });
 
@@ -986,24 +986,24 @@ const CLOSE_THEN_WORK = (dir, human) => {
   ]);
 };
 
-test('acceptance: close, then the user asks for more work → true (DEFECT: lease must expire)', () => {
+test('acceptance: close, then the user asks for more work → false (event model: lease expires)', () => {
   withTmpDir((dir) => {
-    assert.equal(hasUserCloseSignal(CLOSE_THEN_WORK(dir, true)), true);
+    assert.equal(hasUserCloseSignal(CLOSE_THEN_WORK(dir, true)), false);
   });
 });
 
-test('acceptance: close, then more work, both without origin → true (DEFECT: lease must expire here too)', () => {
+test('acceptance: close, then more work, both without origin → false (event model: lease expires here too)', () => {
   withTmpDir((dir) => {
-    assert.equal(hasUserCloseSignal(CLOSE_THEN_WORK(dir, false)), true);
+    assert.equal(hasUserCloseSignal(CLOSE_THEN_WORK(dir, false)), false);
   });
 });
 
 // INVALIDATE. /clear after a close abandons the context rather than preserving it.
 // It is a different intent, so it must retract the close rather than sit inert.
-test('acceptance: close, then /clear → true (DEFECT: /clear must invalidate the lease)', () => {
+test('acceptance: close, then /clear → false (event model: /clear invalidates the lease)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', '/clear')]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(hasUserCloseSignal(p), false);
   });
 });
 
@@ -1022,7 +1022,7 @@ test('acceptance: close, then /clear → true (DEFECT: /clear must invalidate th
 //
 // It must flip to false: this text is model-context, not a user decision, and a
 // subagent must never be able to close the session by quoting a close phrase.
-test('acceptance: sidechain mixed text+tool_result carrying a close → true (DEFECT: must never grant)', () => {
+test('acceptance: sidechain mixed text+tool_result carrying a close → false (event model excludes isSidechain)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [
       USER({
@@ -1041,7 +1041,158 @@ test('acceptance: sidechain mixed text+tool_result carrying a close → true (DE
         },
       }),
     ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// ── ADR 0075 event model: lease invalidation + robustness + AskUserQuestion hardening ──
+//
+// Coverage the merged measured-shapes suite does not carry, added after a
+// pre-commit review. The transcript has no authoritative leaf pointer (measured
+// 2026-07-19: 0 leafUuid / summary records), so a heuristic active-branch filter
+// was withdrawn — it could skip the real invalidator and PRESERVE a stale grant.
+// The gate is a pure line-order lease; these pin the invalidation edges, the
+// robustness edges, and the AskUserQuestion hardening.
+suite('hasUserCloseSignal() — lease invalidation + robustness + AskUserQuestion hardening');
+
+// LOAD-BEARING (invalidation via the queued non-close): the user closes, then
+// queues "keep working". The decision is read off the ENQUEUE content (the queue
+// has no correlation key), so the queued non-close expires the lease before the
+// dequeue+replay companions arrive. Without it the stale close would survive this
+// change-of-mind — the majority delivery path for queued text is the queue.
+test('close, then a queued non-close (read off the enqueue) → false', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      QOP('enqueue', '아 잠깐, 계속 작업하자'),
+      QOP('dequeue'),
+      USER({
+        message: { role: 'user', content: '아 잠깐, 계속 작업하자' },
+        isMeta: true,
+        promptSource: 'system',
+        queuePriority: 'later',
+      }),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// The negative twin: a task-notification replay wears promptSource:"system" too,
+// but carries origin.kind, so it is attributable as model-caused and stays
+// NEUTRAL — the user's close must survive the model's own background work.
+test('close, then a task-notification replay (origin.kind present) → true (stays granted)', () => {
+  withTmpDir((dir) => {
+    const notif =
+      '<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>';
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      QOP('enqueue', notif),
+      QOP('dequeue'),
+      USER({
+        message: { role: 'user', content: notif },
+        promptSource: 'system',
+        queuePriority: 'later',
+        origin: { kind: 'task-notification' },
+      }),
+    ]);
     assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// ROBUSTNESS: a line that parses to a bare `null` is valid JSON but not a record.
+// It must be skipped, not crash on a field read, and not change the verdict.
+test('a null JSONL line → skipped, not a crash, verdict unchanged', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [null, USER(CLOSE)]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// EXCLUSION: an AskUserQuestion answer on an injected record (isMeta / sdk) must
+// not reach the answer parser — model-reachable channels are never a user click,
+// even when correlated to a real AskUserQuestion tool_use.
+test('AskUserQuestion answer on an isMeta record → false (exclusion applies)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'AskUserQuestion', id: 'q' }] },
+      },
+      {
+        type: 'user',
+        isMeta: true,
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q',
+              content: 'Your questions have been answered: "다음?"="세션 마무리 해줘"',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// Q7 hardening, LOAD-BEARING: the pre-event scanner matched any `="…"` in a
+// correlated tool_result and would grant on this. A malformed AskUserQuestion
+// yields a host is_error result that echoes the model's raw input; even with the
+// close phrase steered into it AND the success marker present, is_error:true must
+// refuse. A click is the signal, not an echo.
+test('AskUserQuestion is_error echo of a close phrase → false', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'AskUserQuestion', id: 'q' }] },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q',
+              is_error: true,
+              content: 'Your questions have been answered: "다음?"="세션 마무리 해줘"',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// A non-close AskUserQuestion selection after a close is a fresh user decision,
+// so it expires the lease (the "still continue" click retracts the close).
+test('close, then a non-close AskUserQuestion selection → false (lease expires)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'AskUserQuestion', id: 'q' }] },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'q',
+              content: 'Your questions have been answered: "다음?"="아니 계속 작업하자"',
+            },
+          ],
+        },
+      },
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
   });
 });
 
