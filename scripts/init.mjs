@@ -32,7 +32,7 @@ import {
   renameSync,
   unlinkSync,
 } from 'fs';
-import { join, basename, dirname, isAbsolute, resolve } from 'path';
+import { join, basename, dirname, resolve } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -49,7 +49,11 @@ import {
 import { syncExtensions } from './lib/extensions.mjs';
 import { templateSchemaVersion } from './lib/template-schema-version.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
-import { isHypomnemaPluginEnabled, enabledHypomnemaPluginKey } from './lib/plugin-detect.mjs';
+import {
+  isHypomnemaPluginEnabled,
+  resolveEnabledPluginRoot as resolveEnabledPluginRootShared,
+  usablePkgRoot,
+} from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -535,22 +539,8 @@ function readPkgVersionAt(root) {
   }
 }
 
-// A pkgRoot is "usable" as a DURABLE install root only if it is an ABSOLUTE path to
-// a real package directory whose package.json carries a version. A relative path
-// (e.g. installPath ".") would be resolved against the caller's cwd and break the
-// vault git hook from any other directory; a version-less package.json cannot be
-// attributed a version without lying (see writePkgJson). A bare path that merely
-// exists is a pointer the runtime cannot resolve scripts through. Shared by the
-// registry resolution and the durable-root fallback so they agree on what is real.
-function usablePkgRoot(pkgRoot) {
-  return (
-    typeof pkgRoot === 'string' &&
-    pkgRoot.length > 0 &&
-    isAbsolute(pkgRoot) &&
-    existsSync(join(pkgRoot, 'package.json')) &&
-    readPkgVersionAt(pkgRoot) !== null
-  );
-}
+// usablePkgRoot now lives in ./lib/plugin-detect.mjs (imported above), shared with
+// upgrade.mjs's dualSkip provenance correction so both agree on what is real.
 
 function writePkgJson(dryRun, extraFields = {}, root = PKG_ROOT) {
   const dest = pkgJsonPath();
@@ -976,37 +966,15 @@ const hypomnemaPluginEnabled =
   !pluginMode && isHypomnemaPluginEnabled(join(HOME, '.claude', 'settings.json'));
 const coreManagedByPlugin = pluginMode || hypomnemaPluginEnabled;
 
-// Resolve the enabled Hypomnema plugin's REAL install root from the plugin
-// registry (~/.claude/plugins/installed_plugins.json). POSITIVE attribution: it
-// looks up the EXACT key that settings.json marks enabled (via
-// enabledHypomnemaPluginKey), not just any hypo-named entry — a disabled legacy or
-// other-marketplace entry must never be selected. Among that key's registry
-// entries it prefers the user-scope install (the one a plugin-enabled user runs),
-// falling back to any usable entry. Returns a usable absolute install root, or
-// null when the registry is absent/unreadable, names no entry for the enabled key,
-// or that entry is not a usable package dir.
+// resolveEnabledPluginRoot lives in ./lib/plugin-detect.mjs (shared with
+// upgrade.mjs's dualSkip provenance correction, imported above as
+// resolveEnabledPluginRootShared). This wrapper binds it to init's own HOME-derived
+// settings/registry paths so callers below read the same as before the move.
 function resolveEnabledPluginRoot(settingsPath) {
-  const key = enabledHypomnemaPluginKey(settingsPath);
-  if (!key) return null;
-  let reg;
-  try {
-    reg = JSON.parse(
-      readFileSync(join(HOME, '.claude', 'plugins', 'installed_plugins.json'), 'utf-8'),
-    );
-  } catch {
-    return null;
-  }
-  const plugins =
-    reg && typeof reg.plugins === 'object' && !Array.isArray(reg.plugins) ? reg.plugins : null;
-  const entries = plugins && Array.isArray(plugins[key]) ? plugins[key] : null;
-  if (!entries) return null;
-  const paths = (scope) =>
-    entries
-      .filter((e) => e && (scope === undefined || e.scope === scope))
-      .map((e) => (typeof e.installPath === 'string' ? e.installPath : null))
-      .filter((p) => usablePkgRoot(p));
-  // Prefer the user-scope install, then any usable entry for this exact key.
-  return paths('user')[0] ?? paths(undefined)[0] ?? null;
+  return resolveEnabledPluginRootShared(
+    settingsPath,
+    join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
+  );
 }
 
 // Non-mutating read of the recorded pkgRoot. resolveDurableRoot runs before init's

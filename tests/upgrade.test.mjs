@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
+import { writeDualSkipProvenance } from '../scripts/lib/pkg-json.mjs';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
@@ -1124,4 +1125,410 @@ test('manual install, plugin NOT enabled → normal core management (no false po
       'npm-only --apply must still copy core hooks (no regression)',
     );
   });
+});
+
+// ── dualSkip provenance self-heal (upgrade.mjs + lib/plugin-detect.mjs) ─────
+// npm-first counter-example: `npm init`, then enable the plugin, then `npm init`
+// again leaves hypo-pkg.json pointing at the npm root FOREVER — the old dualSkip
+// branch only ever preserved whatever was already recorded, never positively
+// checked it against the plugin registry. resolveEnabledPluginRoot (shared with
+// init.mjs's resolveDurableRoot) lets dualSkip self-heal that ONE case while
+// still refusing to touch an already-correct or unresolvable pointer.
+
+suite('upgrade.mjs — dualSkip provenance self-heal (registry root)');
+
+// A second fake install root standing in for "the plugin's real cache root" —
+// distinct from the npm root withDualInstall/withFakeUpgradeInstall builds, with
+// a DISTINGUISHABLE package.json version so a test can prove which root's
+// identity ended up recorded. Package.json only: usablePkgRoot/resolveEnabledPluginRoot
+// need nothing else, and these tests never invoke the registry root's own scripts.
+function withRegistryRoot(version, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-registry-'));
+  try {
+    const root = join(dir, 'plugins', 'cache', 'hypomnema', 'hypomnema', version);
+    mkdirSync(root, { recursive: true });
+    const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf-8'));
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ ...pkg, version }));
+    fn(root);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Writes ~/.claude/plugins/installed_plugins.json with a single entry for `key`
+// pointing at `installPath` (user scope — resolveEnabledPluginRoot prefers it).
+function writeRegistry(home, key, installPath) {
+  const dir = join(home, '.claude', 'plugins');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, 'installed_plugins.json'),
+    JSON.stringify({ plugins: { [key]: [{ installPath, scope: 'user' }] } }),
+  );
+}
+
+const DUAL_INSTALL_KEY = 'hypomnema@hypomnema'; // matches withDualInstall's settings.json fixture
+
+test('npm-first correction: stale npm pkgRoot + a real registry entry → dualSkip corrects to the registry root', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    withRegistryRoot('9.9.9', (registryRoot) => {
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      // Simulate the npm-first sequence: a stale/npm-shaped pointer already
+      // recorded, predating the plugin's registration.
+      writeFileSync(
+        pkgPath,
+        JSON.stringify({ pkgRoot: '/old/npm/root', pkgVersion: '1.0.0', schemaVersion: '2.0' }),
+      );
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(
+        r.status,
+        0,
+        `npm-first correction --apply should exit 0: ${r.stderr}\n${r.stdout}`,
+      );
+      const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      assert.equal(
+        realpathSync(meta.pkgRoot),
+        realpathSync(registryRoot),
+        'dualSkip must correct pkgRoot to the positively-resolved registry root',
+      );
+      assert.equal(
+        meta.pkgVersion,
+        '9.9.9',
+        'pkgVersion must come from the registry root, not npm',
+      );
+      assert.match(
+        r.stdout,
+        /corrected to enabled plugin registry root/,
+        'report must surface an explicit corrected outcome, not "preserved"/"stale"',
+      );
+    });
+  });
+});
+
+test('npm-first correction (dry run): reports the pending correction and does not write', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    withRegistryRoot('9.9.9', (registryRoot) => {
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      writeFileSync(
+        pkgPath,
+        JSON.stringify({ pkgRoot: '/old/npm/root', pkgVersion: '1.0.0', schemaVersion: '2.0' }),
+      );
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      const before = readFileSync(pkgPath, 'utf-8');
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+      assert.equal(
+        r.status,
+        1,
+        'a genuinely correctable npm-first divergence must count as drift (exit 1) so --apply is discoverable',
+      );
+      assert.match(
+        r.stdout,
+        /will correct it to the enabled plugin registry root/,
+        'dry run must preview the pending correction',
+      );
+      assert.equal(
+        readFileSync(pkgPath, 'utf-8'),
+        before,
+        'a dry run (no --apply) must never write',
+      );
+    });
+  });
+});
+
+test("npm-first correction (recorded already equals this run's PKG_ROOT): dry run still flags drift", () => {
+  // checkPkgJson()'s own status only ever compares the recorded pointer against
+  // THIS run's PKG_ROOT — so if the recorded pointer happens to equal PKG_ROOT,
+  // status reads 'up-to-date' even when the registry positively resolves a
+  // DIFFERENT, real plugin root. pkgJsonDrift must not let that 'up-to-date'
+  // status suppress the divergence: dualSkipWouldCorrect has to win regardless
+  // of status, or this exact npm-first shape goes unreported forever.
+  withDualInstall(true, ({ upgrade, root, home, wiki }) => {
+    withRegistryRoot('9.9.9', (registryRoot) => {
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      // checkPkgJson() compares the recorded string byte-for-byte against
+      // PKG_ROOT as the running upgrade.mjs computes it — which, via
+      // import.meta.url, is the REALPATH of `root` (macOS resolves the
+      // /var -> /private/var symlink at module-URL resolution time). Record
+      // the realpath so status is genuinely 'up-to-date', not merely 'stale'
+      // (which the pre-BLOCKER-1-fix formula already handled correctly).
+      writeFileSync(
+        pkgPath,
+        JSON.stringify({ pkgRoot: realpathSync(root), pkgVersion: '1.0.0', schemaVersion: '2.0' }),
+      );
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      const before = readFileSync(pkgPath, 'utf-8');
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+      const check = JSON.parse(runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json'], home).stdout);
+      assert.equal(
+        check.pkgJson.status,
+        'up-to-date',
+        'precondition: the recorded pointer must byte-match PKG_ROOT (status up-to-date), or this is not exercising the bug',
+      );
+      assert.equal(
+        r.status,
+        1,
+        `a registry divergence must count as drift even when recorded == PKG_ROOT (status up-to-date): ${r.stdout}`,
+      );
+      assert.match(
+        r.stdout,
+        /will correct it to the enabled plugin registry root/,
+        'dry run must preview the pending correction even when pkgJson.status is up-to-date',
+      );
+      assert.equal(
+        readFileSync(pkgPath, 'utf-8'),
+        before,
+        'a dry run (no --apply) must never write',
+      );
+    });
+  });
+});
+
+test('already-correct: registry root matches what is recorded → no rewrite (no churn)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    // Same version as the npm root's own package.json (REPO's) — an already-
+    // correct registry pointer must not itself look like a "newer active
+    // install" and trip the unrelated downgrade guard.
+    const repoVersion = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf-8')).version;
+    withRegistryRoot(repoVersion, (registryRoot) => {
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const seeded = JSON.stringify({
+        pkgRoot: registryRoot,
+        pkgVersion: repoVersion,
+        schemaVersion: '2.0',
+      });
+      writeFileSync(pkgPath, seeded);
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(r.status, 0, `already-correct --apply should exit 0: ${r.stderr}`);
+      // syncExtensions runs unconditionally in --apply and re-pretty-prints the
+      // file with an `extensions` field regardless of dualSkip — orthogonal to
+      // this correction logic — so compare the identity fields, not raw bytes.
+      const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      assert.equal(
+        meta.pkgRoot,
+        registryRoot,
+        'an already-correct dualSkip pointer must not be repointed',
+      );
+      assert.equal(
+        meta.pkgVersion,
+        repoVersion,
+        'an already-correct pkgVersion must not be rewritten',
+      );
+      assert.doesNotMatch(
+        r.stdout,
+        /corrected to enabled plugin registry root/,
+        'an unchanged identity must not be reported as corrected',
+      );
+    });
+  });
+});
+
+test('corrupt registry: usable recorded pointer is preserved, apply does not abort', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    const pluginRoot = '/some/.claude/plugins/cache/mp/hypomnema/1.3.0';
+    writeFileSync(
+      pkgPath,
+      JSON.stringify({ pkgRoot: pluginRoot, pkgVersion: '1.3.0', schemaVersion: '2.0' }),
+    );
+    // Corrupt registry: unreadable as JSON. resolveEnabledPluginRoot must fail
+    // open (null) — never abort a normal upgrade over a damaged registry file.
+    mkdirSync(join(home, '.claude', 'plugins'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), '{ not valid json');
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(
+      r.status,
+      0,
+      `--apply must not abort on a corrupt registry: ${r.stderr}\n${r.stdout}`,
+    );
+    const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    assert.equal(
+      meta.pkgRoot,
+      pluginRoot,
+      'a corrupt registry must preserve the existing usable pointer untouched',
+    );
+    assert.equal(meta.pkgVersion, '1.3.0');
+    assert.match(
+      r.stdout,
+      /plugin-owned \(preserved/,
+      'corrupt registry must report preserved, not corrected',
+    );
+  });
+});
+
+test('partial registry: enabled key absent from installed_plugins.json → preserved, no abort', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+    const pluginRoot = '/some/.claude/plugins/cache/mp/hypomnema/1.3.0';
+    writeFileSync(
+      pkgPath,
+      JSON.stringify({ pkgRoot: pluginRoot, pkgVersion: '1.3.0', schemaVersion: '2.0' }),
+    );
+    // Well-formed registry, but no entry for the enabled key (a different
+    // marketplace/name is installed) — must not be treated as a positive match.
+    writeRegistry(home, 'some-other-plugin@mp', '/irrelevant/root');
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(
+      r.status,
+      0,
+      `--apply must not abort on a registry with no matching entry: ${r.stderr}`,
+    );
+    const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    assert.equal(
+      meta.pkgRoot,
+      pluginRoot,
+      'no usable entry for the enabled key must preserve the existing pointer untouched',
+    );
+  });
+});
+
+test('correction preserves unrelated existing metadata (commands map, extensions)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    withRegistryRoot('9.9.9', (registryRoot) => {
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      writeFileSync(
+        pkgPath,
+        JSON.stringify({
+          pkgRoot: '/old/npm/root',
+          pkgVersion: '1.0.0',
+          schemaVersion: '2.0',
+          commands: { 'resume.md': 'deadbeef' },
+          extensions: { claude: { 'x.mjs': 'cafe' } },
+        }),
+      );
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(r.status, 0, `--apply should exit 0: ${r.stderr}`);
+      const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      assert.equal(realpathSync(meta.pkgRoot), realpathSync(registryRoot));
+      assert.equal(meta.pkgVersion, '9.9.9');
+      // Unlike writePluginModeMetadata (true plugin mode), a dualSkip provenance
+      // correction is NOT plugin-mode cleanup — it must not drop the commands map
+      // or touch unrelated fields, since the identity being written is the OTHER
+      // (plugin) install's, not this npm run's.
+      assert.deepEqual(
+        meta.commands,
+        { 'resume.md': 'deadbeef' },
+        'a dualSkip correction must preserve an existing commands map, unlike plugin-mode metadata writes',
+      );
+      assert.deepEqual(
+        meta.extensions,
+        { claude: { 'x.mjs': 'cafe' } },
+        'extensions must be preserved',
+      );
+    });
+  });
+});
+
+// ── writeDualSkipProvenance TOCTOU refusal (lib/pkg-json.mjs) ───────────────
+// resolveEnabledPluginRoot proves registryRoot usable via a SEPARATE, earlier
+// read; the writer re-reads registryRoot's package.json at write time and must
+// refuse (not stamp a new pkgRoot with a stale/missing version) if that root
+// stops being usable by the time the write actually happens. Unit-tested
+// directly against the shared lib function — deterministic, no timing race
+// needed — since upgrade.mjs itself has no exported surface to spawn this
+// exact boundary condition end-to-end.
+
+suite('lib/pkg-json.mjs — writeDualSkipProvenance TOCTOU refusal');
+
+function withPkgJsonFixture(seeded, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-pkgjson-'));
+  try {
+    const pkgPath = join(dir, 'hypo-pkg.json');
+    if (seeded !== null) writeFileSync(pkgPath, JSON.stringify(seeded));
+    fn(pkgPath);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('registry root unreadable at write time: refuses, preserves existing metadata, returns false', () => {
+  withPkgJsonFixture(
+    { pkgRoot: '/old/npm/root', pkgVersion: '1.0.0', schemaVersion: '2.0' },
+    (pkgPath) => {
+      const before = readFileSync(pkgPath, 'utf-8');
+      // A registryRoot whose package.json cannot be read at write time — the
+      // exact TOCTOU shape: something resolved this root as usable earlier,
+      // but by the time the writer re-reads it, it no longer is.
+      const result = writeDualSkipProvenance(pkgPath, '/nonexistent/registry/root');
+      assert.equal(
+        result,
+        false,
+        'must refuse (return false), not write a stale-version correction',
+      );
+      assert.equal(
+        readFileSync(pkgPath, 'utf-8'),
+        before,
+        'a refused correction must leave the existing metadata byte-identical',
+      );
+    },
+  );
+});
+
+test('registry root package.json is corrupt JSON at write time: refuses, preserves existing metadata', () => {
+  const registryDir = mkdtempSync(join(tmpdir(), 'hypo-registry-corrupt-'));
+  try {
+    writeFileSync(join(registryDir, 'package.json'), '{ not valid json');
+    withPkgJsonFixture(
+      { pkgRoot: '/old/npm/root', pkgVersion: '1.0.0', schemaVersion: '2.0' },
+      (pkgPath) => {
+        const before = readFileSync(pkgPath, 'utf-8');
+        const result = writeDualSkipProvenance(pkgPath, registryDir);
+        assert.equal(
+          result,
+          false,
+          'corrupt package.json at the registry root must refuse the correction',
+        );
+        assert.equal(readFileSync(pkgPath, 'utf-8'), before, 'existing metadata must be untouched');
+      },
+    );
+  } finally {
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+test('registry root package.json has no usable version at write time: refuses', () => {
+  const registryDir = mkdtempSync(join(tmpdir(), 'hypo-registry-noversion-'));
+  try {
+    writeFileSync(join(registryDir, 'package.json'), JSON.stringify({ name: 'hypomnema' }));
+    withPkgJsonFixture(
+      { pkgRoot: '/old/npm/root', pkgVersion: '1.0.0', schemaVersion: '2.0' },
+      (pkgPath) => {
+        const before = readFileSync(pkgPath, 'utf-8');
+        const result = writeDualSkipProvenance(pkgPath, registryDir);
+        assert.equal(result, false, 'a version-less package.json must refuse the correction');
+        assert.equal(readFileSync(pkgPath, 'utf-8'), before);
+      },
+    );
+  } finally {
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+test('registry root usable at write time: writes the correction and returns true', () => {
+  const registryDir = mkdtempSync(join(tmpdir(), 'hypo-registry-ok-'));
+  try {
+    writeFileSync(
+      join(registryDir, 'package.json'),
+      JSON.stringify({ name: 'hypomnema', version: '9.9.9' }),
+    );
+    withPkgJsonFixture(
+      {
+        pkgRoot: '/old/npm/root',
+        pkgVersion: '1.0.0',
+        schemaVersion: '2.0',
+        extensions: { claude: {} },
+      },
+      (pkgPath) => {
+        const result = writeDualSkipProvenance(pkgPath, registryDir);
+        assert.equal(result, true, 'a usable registry root must be written');
+        const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+        assert.equal(meta.pkgRoot, registryDir);
+        assert.equal(meta.pkgVersion, '9.9.9');
+        assert.deepEqual(meta.extensions, { claude: {} }, 'unrelated fields must be preserved');
+      },
+    );
+  } finally {
+    rmSync(registryDir, { recursive: true, force: true });
+  }
 });

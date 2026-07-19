@@ -15,7 +15,8 @@
 // legacy `hypomnema@<marketplace>` key in `enabledPlugins` until they reinstall
 // as `hypo@<marketplace>`, and the guard must hold across that gap.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 
 /**
  * @param {string} settingsPath  path to a Claude Code settings.json (e.g. ~/.claude/settings.json)
@@ -86,4 +87,64 @@ export function enabledHypomnemaPluginKey(settingsPath) {
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
   return enabledKeyFrom(parsed.enabledPlugins);
+}
+
+function readPkgVersionAt(root) {
+  try {
+    const v = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')).version;
+    return typeof v === 'string' && v.length > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// A pkgRoot is "usable" as a DURABLE install root only if it is an ABSOLUTE path to
+// a real package directory whose package.json carries a version. A relative path
+// (e.g. installPath ".") would be resolved against the caller's cwd and break the
+// vault git hook from any other directory; a version-less package.json cannot be
+// attributed a version without lying. A bare path that merely exists is a pointer
+// the runtime cannot resolve scripts through. Shared by init's registry resolution,
+// its durable-root fallback, and upgrade's dualSkip provenance correction so they
+// all agree on what is real.
+export function usablePkgRoot(pkgRoot) {
+  return (
+    typeof pkgRoot === 'string' &&
+    pkgRoot.length > 0 &&
+    isAbsolute(pkgRoot) &&
+    existsSync(join(pkgRoot, 'package.json')) &&
+    readPkgVersionAt(pkgRoot) !== null
+  );
+}
+
+// Resolve the enabled Hypomnema plugin's REAL install root from the plugin
+// registry (~/.claude/plugins/installed_plugins.json). POSITIVE attribution: it
+// looks up the EXACT key that settingsPath marks enabled (via
+// enabledHypomnemaPluginKey), not just any hypo-named entry — a disabled legacy or
+// other-marketplace entry must never be selected. Among that key's registry
+// entries it prefers the user-scope install (the one a plugin-enabled user runs),
+// falling back to any usable entry. Returns a usable absolute install root, or
+// null when the registry is absent/unreadable, names no entry for the enabled key,
+// or that entry is not a usable package dir. Fails open (null) on every
+// uncertainty — callers must treat null as "cannot positively resolve", never as
+// "resolved to nothing usable exists".
+export function resolveEnabledPluginRoot(settingsPath, registryPath) {
+  const key = enabledHypomnemaPluginKey(settingsPath);
+  if (!key) return null;
+  let reg;
+  try {
+    reg = JSON.parse(readFileSync(registryPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+  const plugins =
+    reg && typeof reg.plugins === 'object' && !Array.isArray(reg.plugins) ? reg.plugins : null;
+  const entries = plugins && Array.isArray(plugins[key]) ? plugins[key] : null;
+  if (!entries) return null;
+  const paths = (scope) =>
+    entries
+      .filter((e) => e && (scope === undefined || e.scope === scope))
+      .map((e) => (typeof e.installPath === 'string' ? e.installPath : null))
+      .filter((p) => usablePkgRoot(p));
+  // Prefer the user-scope install, then any usable entry for this exact key.
+  return paths('user')[0] ?? paths(undefined)[0] ?? null;
 }

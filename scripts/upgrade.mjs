@@ -49,9 +49,11 @@ import {
   sha256 as sha256Buf,
   isRegularFile,
   readFileIfRegular,
+  readVersionAtRoot,
+  writeDualSkipProvenance,
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
-import { isHypomnemaPluginEnabled } from './lib/plugin-detect.mjs';
+import { isHypomnemaPluginEnabled, resolveEnabledPluginRoot } from './lib/plugin-detect.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 
 const HOME = homedir();
@@ -873,6 +875,15 @@ function writePluginModeMetadata() {
   return true;
 }
 
+// readVersionAtRoot and writeDualSkipProvenance now live in ./lib/pkg-json.mjs
+// (imported above) — writeDualSkipProvenance is deliberately not
+// writePluginModeMetadata(): that function hardcodes THIS npm run's
+// PKG_ROOT/PKG_VERSION and always drops `commands` — both correct for true
+// plugin mode, both wrong for a dualSkip correction, where the identity being
+// written is the OTHER install's. Moving both into lib/pkg-json.mjs (alongside
+// the other pkgJsonPath-taking helpers already there) also makes the writer's
+// TOCTOU refusal directly unit-testable without spawning the whole script.
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -927,6 +938,37 @@ const guide = checkGuideVersion(args.hypoDir);
 const hooks = checkHookFiles(claudeHooksDir);
 const settings = checkSettingsJson(claudeSettingsPath, claudeHooksDir);
 const pkgJson = checkPkgJson();
+// dualSkip provenance self-heal: the registry root the enabled plugin key
+// POSITIVELY resolves to (same lookup init.mjs's resolveDurableRoot uses), or
+// null when the registry is absent/unreadable/corrupt or names no usable entry
+// for the enabled key. Computed unconditionally (fail-open on any uncertainty —
+// see lib/plugin-detect.mjs) so both the --apply write below and the read-only
+// report can agree on the same positively-resolved identity without a second
+// registry read racing the first.
+const dualSkipRegistryRoot = dualSkip
+  ? resolveEnabledPluginRoot(
+      claudeSettingsPath,
+      join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
+    )
+  : null;
+// The recorded pkgRoot currently on disk, read non-mutatingly (readPkgJsonSafe
+// would rename aside a corrupt file — a write — before this script has decided
+// whether to touch anything).
+const dualSkipRecordedRoot = (() => {
+  try {
+    const v = JSON.parse(readFileSync(pkgJsonPath(), 'utf-8')).pkgRoot;
+    return typeof v === 'string' ? v : null;
+  } catch {
+    return null;
+  }
+})();
+// A CONDITIONAL self-heal, never an unconditional rewrite: correct only when the
+// registry positively resolves a usable root that DIFFERS from what's already
+// recorded. An unresolvable registry (null) must PRESERVE the existing pointer,
+// not blank it or fall back to this npm PKG_ROOT — a null here is "cannot prove
+// a correction is needed", not "there is nothing to preserve".
+const dualSkipWouldCorrect =
+  dualSkip && dualSkipRegistryRoot !== null && dualSkipRegistryRoot !== dualSkipRecordedRoot;
 const commands = checkCommands();
 const oldHookRefs = checkOldHookNames(claudeSettingsPath);
 const hypoignore = checkHypoignore(args.hypoDir);
@@ -999,14 +1041,28 @@ const schemaDrift =
 // an already-installed pre-versioning vault, the population this change targets.
 // Excluding it (as the old unknown-only check did) is the bug this fixes.
 const guideDrift = guide.bump !== 'none' && guide.bump !== 'unknown' && guide.bump !== 'ahead';
-// Dual-install: when core is skipped, hypo-pkg.json is deliberately left
-// pointing at the PLUGIN's package root (preserved identity), so checkPkgJson()
-// reports it 'stale' relative to this npm/manual PKG_ROOT. That mismatch is
-// INTENTIONAL — `--apply` will not (and must not) rewrite it — so it must not
-// count as actionable drift, or the user would be nagged to run --apply forever.
-// A genuinely missing/corrupt file (status 'missing') is still surfaced (warning
+// Dual-install: when core is skipped, hypo-pkg.json is normally left pointing
+// at the PLUGIN's package root (preserved identity), so checkPkgJson() reports
+// it 'stale' relative to this npm/manual PKG_ROOT. That mismatch is USUALLY
+// intentional — `--apply` will not rewrite an already-correct plugin pointer
+// — so it must not count as actionable drift by default, or the user would be
+// nagged to run --apply forever. The one exception is dualSkipWouldCorrect: an
+// npm-first divergence where the recorded pointer differs from what the plugin
+// registry POSITIVELY resolves (e.g. `npm init`, enable the plugin, `npm init`
+// again — the npm root stays recorded forever otherwise). THAT case IS
+// actionable — `--apply` corrects it via writeDualSkipProvenance — so it must
+// count as drift, or the user has no signal to ever run --apply. dualSkipWouldCorrect
+// is checked FIRST and unconditionally (not gated behind `pkgJson.status !==
+// 'up-to-date'`): checkPkgJson() compares the recorded pointer only against
+// THIS run's own PKG_ROOT, so an npm-first divergence where the recorded
+// pointer happens to equal PKG_ROOT (but the registry resolves a DIFFERENT
+// plugin root) would read 'up-to-date' and slip past that status check
+// entirely — leaving a correctable divergence permanently unreported. A
+// genuinely missing/corrupt file (status 'missing') is still surfaced (warning
 // below), because the runtime then cannot resolve its package root at all.
-const pkgJsonDrift = pkgJson.status !== 'up-to-date' && !(dualSkip && pkgJson.status === 'stale');
+const pkgJsonDrift =
+  dualSkipWouldCorrect ||
+  (pkgJson.status !== 'up-to-date' && !(dualSkip && pkgJson.status === 'stale'));
 const staleCommands = commands.filter((c) => c.status === 'stale' || c.status === 'missing');
 const userModifiedCommands = commands.filter((c) => c.status === 'user-modified');
 const orphanedCommands = commands.filter((c) => c.status === 'orphaned');
@@ -1018,6 +1074,11 @@ let migrationPath = null;
 let appliedHooks = [];
 let appliedSettings = [];
 let appliedPkgJson = false;
+// True only once the dualSkip provenance self-heal actually WROTE a correction
+// this run (a positively-resolved registry root that differed from the
+// recorded one). Distinct from dualSkipWouldCorrect (a pre-apply preview
+// computed above), which stays true even in a dry run.
+let dualSkipCorrected = false;
 let appliedHookNameRenames = [];
 let appliedHooksCodex = [];
 let appliedSettingsCodex = [];
@@ -1104,6 +1165,20 @@ if (args.apply) {
     // user to resolve the dual install.
     if (pkgJson.status === 'missing') {
       appliedPkgJson = writePluginModeMetadata();
+    } else if (dualSkipWouldCorrect) {
+      // npm-first correction: a usable pkgRoot IS already recorded (status
+      // 'stale' or 'up-to-date'), but the registry positively resolves a
+      // DIFFERENT usable root — e.g. `npm init`, then enable the plugin, then
+      // `npm init` again, leaving the npm root recorded forever. Correct the
+      // provenance to the registry's own root/version. When the registry
+      // cannot positively resolve one (dualSkipWouldCorrect is false — null
+      // registry lookup, or it already matches what's recorded), fall through
+      // to preserving the existing pointer untouched; never blank it.
+      // writeDualSkipProvenance can still refuse here (TOCTOU: the registry
+      // root's own package.json became unreadable between resolution and this
+      // write) — dualSkipCorrected only follows an ACTUAL write, never assume it.
+      appliedPkgJson = writeDualSkipProvenance(pkgJsonPath(), dualSkipRegistryRoot);
+      dualSkipCorrected = appliedPkgJson;
     } else {
       appliedPkgJson = false;
     }
@@ -1403,7 +1478,28 @@ if (managesClaudeCore) {
 if (settingsCodex) pushSettingsSummary(settingsCodex, ' (codex)', invalidSettingsCodex);
 
 // Package metadata
-if (dualSkip && pkgJson.status === 'stale') {
+if (dualSkip && dualSkipCorrected) {
+  // npm-first correction actually WROTE this run: the pre-apply pkgJson
+  // classification above was computed against the running npm PKG_ROOT, so
+  // without this branch a corrected pointer would still be reported as
+  // "preserved — not rewritten" (or "up to date"/"stale") below, contradicting
+  // what --apply just did. Report the explicit outcome instead, with the
+  // registry package's own version — the identity now on disk.
+  const correctedVersion = readVersionAtRoot(dualSkipRegistryRoot);
+  lines.push(
+    `✓ Package metadata  hypo-pkg.json corrected to enabled plugin registry root` +
+      (correctedVersion ? ` (v${correctedVersion})` : ''),
+  );
+} else if (dualSkip && dualSkipWouldCorrect) {
+  // Same divergence, but this was a dry run (no --apply): preview what
+  // --apply would do rather than claiming the identity is already preserved.
+  const previewVersion = readVersionAtRoot(dualSkipRegistryRoot);
+  lines.push(
+    `⚠ Package metadata  hypo-pkg.json points at a stale npm/manual root — \`--apply\` will` +
+      ` correct it to the enabled plugin registry root` +
+      (previewVersion ? ` (v${previewVersion})` : ''),
+  );
+} else if (dualSkip && pkgJson.status === 'stale') {
   // Dual-install: the 'stale' here is the preserved plugin identity (pkgRoot points at
   // the plugin, not this npm/manual copy). That is intentional — not actionable.
   lines.push(
