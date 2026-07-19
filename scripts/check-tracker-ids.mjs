@@ -417,7 +417,62 @@ function runCommitMsg(file, json) {
 // itself stripped any editor template / --verbose scissors diff at commit time,
 // so unlike --commit-msg (which reads a live COMMIT_EDITMSG file) no
 // messageHasGitTemplate/stripScissors preprocessing applies or is needed here.
+// Parse a two-dot `base..head` shape without touching a three-dot
+// (symmetric-difference) range or anything else this checker never emits
+// itself — every caller in this file builds a two-dot range, so a `...` or a
+// dot-free string here is a shape this checker did not produce and the
+// existence pre-check below must not apply to it. Returns null for anything
+// that is not cleanly `<non-empty>..<non-empty>`, which sends the caller
+// straight to the original git-log path (and its original exit-2 behavior).
+function parseCommitRange(range) {
+  if (range.includes('...')) return null;
+  const idx = range.indexOf('..');
+  if (idx < 0) return null;
+  const base = range.slice(0, idx);
+  const head = range.slice(idx + 2);
+  if (!base || !head || base.includes('..') || head.includes('..')) return null;
+  return { base, head };
+}
+
+// True only if `ref` resolves to a commit this checkout can actually see.
+function commitExists(ref) {
+  return git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).status === 0;
+}
+
 function runCommitRange(range, json) {
+  // A squash-merge + --delete-branch (or a force-push) can leave `head`
+  // resolving to nothing once the branch is gone, so a CI re-run on the
+  // merged PR fails `git log a..b` with "Invalid revision range" — not
+  // because anything is wrong with the content, but because the ref this
+  // checker is asked to scan no longer exists anywhere. That is a procedural
+  // side effect of the merge, not a violation, so it must SKIP (exit 0), not
+  // FAIL (exit 2) and leave an already-merged, already-reviewed PR red for a
+  // reason nobody can act on.
+  //
+  // The pre-check only fires for a clean two-dot `base..head` shape
+  // (parseCommitRange), and ONLY skips when `base` resolves AND `head` does
+  // not — never on `base` alone missing, never on both missing. This is
+  // load-bearing, not cosmetic: `base` is where the real content lives (every
+  // commit in the range is `base`'s descendant), so an attacker (or a broken
+  // caller) could pair a bogus, unresolvable base with a real, violating head
+  // — `deadbeefdead..<violating-head>` — and if that were allowed to skip, it
+  // would walk straight past the gate with a genuine violation sitting right
+  // there. Requiring base to resolve means the "content anchor" of the range
+  // is always verified live; only the deleted-branch symptom (head vanished,
+  // base intact on a surviving branch like main) takes the skip path. A
+  // genuinely malformed range (three dots, missing side, garbage token, base
+  // missing, or both missing) skips this branch and falls straight into the
+  // original git-log call below, so it still fails exit 2 exactly as before.
+  const parsed = parseCommitRange(range);
+  if (parsed && commitExists(parsed.base) && !commitExists(parsed.head)) {
+    process.stdout.write(
+      `[check-tracker-ids] --commit-range: skipping "${range}" — head commit not found in this ` +
+        `checkout: ${parsed.head} (base ${parsed.base} resolves fine; likely a deleted branch ` +
+        `after merge, not a content violation; the pr-surface job already scanned this range ` +
+        `before the merge).\n`,
+    );
+    process.exit(0);
+  }
   const listRes = git(['log', '--format=%H', range, '--']);
   if (listRes.status !== 0) {
     process.stderr.write(
