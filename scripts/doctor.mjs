@@ -280,6 +280,16 @@ function checkFiles(hypoDir) {
   }
 }
 
+// .hyposcanignore is optional (scan-only exclusions, not a privacy boundary),
+// so its absence is info-level — pass either way, never warn/fail.
+function checkScanIgnoreFile(hypoDir) {
+  const present = existsSync(join(hypoDir, '.hyposcanignore'));
+  pass(
+    'File: .hyposcanignore',
+    present ? 'present' : 'optional — not present, no scan-only exclusions configured',
+  );
+}
+
 function checkHooks(coreManagedByPlugin) {
   const claudeHooks = join(HOME, '.claude', 'hooks');
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
@@ -1479,6 +1489,7 @@ const rootOk = checkHypoRoot(args.hypoDir);
 if (rootOk) {
   checkDirectories(args.hypoDir);
   checkFiles(args.hypoDir);
+  checkScanIgnoreFile(args.hypoDir);
   checkBrokenLinks(args.hypoDir, ignorePatterns);
   checkVerifyBy(args.hypoDir, ignorePatterns);
 }

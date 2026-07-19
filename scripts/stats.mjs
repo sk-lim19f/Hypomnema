@@ -16,7 +16,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, extname } from 'path';
 import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
-import { loadHypoIgnore, isIgnored, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -73,11 +73,15 @@ function parseFrontmatter(content) {
   return fm;
 }
 
-function listDirs(dir) {
+// hypoDir/ignorePatterns are optional so callers that don't need scan-ignore
+// filtering (none left in this file) still work unchanged.
+function listDirs(dir, hypoDir = '', ignorePatterns = []) {
   if (!existsSync(dir)) return [];
   return readdirSync(dir).filter((e) => {
     if (e.startsWith('.')) return false;
-    return statSync(join(dir, e)).isDirectory();
+    const full = join(dir, e);
+    if (hypoDir && isScanIgnored(full, hypoDir, ignorePatterns)) return false;
+    return statSync(full).isDirectory();
   });
 }
 
@@ -98,12 +102,18 @@ if (args.hypoDirSource) checkVaultOrExit(args.hypoDir, args.hypoDirSource);
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const pageFiles = collectMdFiles(join(args.hypoDir, 'pages'), [], args.hypoDir, ignorePatterns);
-const projects = listDirs(join(args.hypoDir, 'projects'));
+// isScanIgnored (via listDirs' hypoDir arg): a .hyposcanignore-listed project
+// dir drops out of the project count too, same rationale as sources below.
+const projects = listDirs(join(args.hypoDir, 'projects'), args.hypoDir, ignorePatterns);
+// isScanIgnored (not isIgnored): sources counted here feed a scan-aggregation
+// report, not the commit/hook privacy gate, so a .hyposcanignore-only match
+// should drop out of the count too. Privacy semantics are preserved — an
+// .hypoignore match is still excluded, isScanIgnored only ever widens that.
 const sources = existsSync(join(args.hypoDir, 'sources'))
   ? readdirSync(join(args.hypoDir, 'sources')).filter(
       (e) =>
         !e.startsWith('.') &&
-        !isIgnored(join(args.hypoDir, 'sources', e), args.hypoDir, ignorePatterns),
+        !isScanIgnored(join(args.hypoDir, 'sources', e), args.hypoDir, ignorePatterns),
     )
   : [];
 
@@ -134,7 +144,10 @@ let adrCount = 0;
 for (const p of projects) {
   const decisionsDir = join(args.hypoDir, 'projects', p, 'decisions');
   if (existsSync(decisionsDir)) {
-    adrCount += readdirSync(decisionsDir).filter((f) => f.endsWith('.md')).length;
+    adrCount += readdirSync(decisionsDir).filter(
+      (f) =>
+        f.endsWith('.md') && !isScanIgnored(join(decisionsDir, f), args.hypoDir, ignorePatterns),
+    ).length;
   }
 }
 

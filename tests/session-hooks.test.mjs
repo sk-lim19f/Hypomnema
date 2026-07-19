@@ -221,6 +221,95 @@ test('auto-stage skips .hypoignore-listed file_path', () => {
   });
 });
 
+suite('.hyposcanignore — scan-only exclusion does NOT block a commit (A안)');
+
+// Core regression: a .hyposcanignore match is a SCAN exclusion, not a privacy
+// boundary. It must still get committed by both commit loci — the auto-commit
+// Stop hook (commitWikiChanges) and the git pre-commit worker.
+test('auto-commit still commits a .hyposcanignore-only-listed path (not a privacy boundary)', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hyposcanignore'), 'drafts/\n');
+    mkdirSync(join(dir, 'drafts'), { recursive: true });
+    writeFileSync(join(dir, 'drafts', 'wip.md'), '# wip\n');
+    const r = runStop('hypo-auto-commit.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'drafts'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      tracked.includes('drafts/wip.md'),
+      `.hyposcanignore-only path must still be committed, got: ${tracked}`,
+    );
+  });
+});
+
+test('auto-commit still SKIPS a .hypoignore-listed path even when it also matches .hyposcanignore', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), 'secrets/\n');
+    writeFileSync(join(dir, '.hyposcanignore'), 'secrets/\n');
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets', 'token.md'), 'sk-leaked\n');
+    const r = runStop('hypo-auto-commit.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'secrets'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.equal(
+      tracked.trim(),
+      '',
+      `privacy .hypoignore must still block commit, got: ${tracked}`,
+    );
+  });
+});
+
+test('commitWikiChanges() stages a .hyposcanignore-only path directly (privacy isolation)', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hyposcanignore'), 'notes.md\n');
+    writeFileSync(join(dir, 'notes.md'), '# notes\n');
+    const result = commitWikiChanges(dir);
+    assert.equal(result.committed, true, `stderr: ${JSON.stringify(result)}`);
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'notes.md'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(tracked.includes('notes.md'), `expected notes.md committed, got: ${tracked}`);
+  });
+});
+
+test('git pre-commit worker (hooks/hypo-pre-commit.mjs) does NOT block a staged .hyposcanignore-only path', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hyposcanignore'), 'drafts/\n');
+    mkdirSync(join(dir, 'drafts'), { recursive: true });
+    writeFileSync(join(dir, 'drafts', 'wip.md'), '# wip\n');
+    spawnSync('git', ['-C', dir, 'add', 'drafts/wip.md']);
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-pre-commit.mjs')], {
+      cwd: dir,
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(
+      r.status,
+      0,
+      `.hyposcanignore-only staged file must not block commit: ${r.stderr}`,
+    );
+  });
+});
+
+test('git pre-commit worker still blocks a staged .hypoignore-listed path (privacy preserved)', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), 'secrets/\n');
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets', 'token.md'), 'sk-leaked\n');
+    spawnSync('git', ['-C', dir, 'add', '-f', 'secrets/token.md']);
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-pre-commit.mjs')], {
+      cwd: dir,
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+    assert.notEqual(r.status, 0, 'a staged .hypoignore-matched file must still block the commit');
+    assert.ok(/\.hypoignore/.test(r.stderr), `stderr should reference .hypoignore: ${r.stderr}`);
+  });
+});
+
 suite('hypo-file-watch.mjs — .hypoignore privacy guard (fix #48)');
 
 test('file-watch refuses to inject .hypoignore-matched file (e.g. .env)', () => {

@@ -297,6 +297,23 @@ function writeWikiignore(hypoDir, dryRun) {
   log('created', dest);
 }
 
+// ── .hyposcanignore ──────────────────────────────────────────────────────────
+// Scan-only exclusion sibling to .hypoignore. NOT a privacy boundary — see
+// templates/.hyposcanignore's header. Absence is fine: every scan-ignore
+// reader treats a missing file as an empty pattern list.
+
+function writeScanIgnore(hypoDir, dryRun) {
+  const dest = join(hypoDir, '.hyposcanignore');
+  if (existsSync(dest)) {
+    log('skipped', dest);
+    return;
+  }
+  const src = join(TEMPLATES, '.hyposcanignore');
+  const content = existsSync(src) ? readFileSync(src, 'utf-8') : '';
+  if (!dryRun) writeFileSync(dest, content);
+  log('created', dest);
+}
+
 // ── .gitignore ───────────────────────────────────────────────────────────────
 
 function writeGitignore(hypoDir, dryRun) {
@@ -1104,9 +1121,10 @@ if (args.fromRemote) {
     args.dryRun,
   );
 
-  // 3. hypo-config.md + .hypoignore + .gitignore
+  // 3. hypo-config.md + .hypoignore + .hyposcanignore + .gitignore
   writeHypoConfig(args.hypoDir, args.dryRun);
   writeWikiignore(args.hypoDir, args.dryRun);
+  writeScanIgnore(args.hypoDir, args.dryRun);
   writeGitignore(args.hypoDir, args.dryRun);
 }
 

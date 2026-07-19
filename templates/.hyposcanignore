@@ -1,0 +1,10 @@
+# .hyposcanignore — patterns excluded from scan (lint/graph/stats/query/verify/doctor) only
+# One glob per line. Lines starting with # are comments.
+# Matched files are skipped by catalog scans but are still committed and still
+# readable by hooks. For secrets and anything that must never be committed or
+# surfaced by a hook, use .hypoignore instead — this file does NOT block commits.
+# Syntax follows .gitignore glob rules.
+
+# Draft / scratch (uncomment to hide from scans without blocking their commit)
+# drafts/
+# scratch/

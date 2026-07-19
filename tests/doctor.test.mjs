@@ -76,6 +76,37 @@ test('doctor flags missing extensions baseline dir as failure', () => {
   });
 });
 
+// A안: .hyposcanignore is optional — presence/absence is info-level (pass
+// either way), never warn/fail.
+suite('doctor.mjs — .hyposcanignore info-level check (A안)');
+
+test('doctor passes File: .hyposcanignore when absent (optional file)', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+    rmSync(join(hypoDir, '.hyposcanignore'), { force: true });
+    const r = run('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json']);
+    const checks = JSON.parse(r.stdout);
+    const check = checks.find((c) => c.label === 'File: .hyposcanignore');
+    assert.ok(check, 'doctor should report a File: .hyposcanignore check');
+    assert.equal(check.status, 'pass', `absent .hyposcanignore must not warn/fail: ${r.stdout}`);
+  });
+});
+
+test('doctor passes File: .hyposcanignore when present', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+    assert.ok(existsSync(join(hypoDir, '.hyposcanignore')), 'init should scaffold it');
+    const r = run('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json']);
+    const checks = JSON.parse(r.stdout);
+    const check = checks.find((c) => c.label === 'File: .hyposcanignore');
+    assert.equal(check.status, 'pass');
+  });
+});
+
 // fix #6: doctor-checks-node-git-shell-npm
 suite('doctor.mjs — fix #6: external deps');
 

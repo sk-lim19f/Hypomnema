@@ -1071,6 +1071,7 @@ const {
   isGeneratedArtifact,
   isScanIgnored,
   isIgnored: isHypoIgnored,
+  loadScanIgnore,
 } = await import(`${SCRIPTS}/lib/hypo-ignore.mjs`);
 
 const GA_ROOT = '/tmp/ga-vault';
@@ -1104,6 +1105,106 @@ test('isScanIgnored hides a generated root artifact but isIgnored does NOT', () 
 test('isScanIgnored still honors .hypoignore patterns (secret-block preserved)', () => {
   const secret = join(GA_ROOT, 'my-token.md');
   assert.equal(isScanIgnored(secret, GA_ROOT, ['*token*']), true);
+});
+
+suite('lib/hypo-ignore.mjs — .hyposcanignore scan-only exclusion (A안)');
+
+function withScanIgnoreVault(scanIgnoreContent, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-scanignore-'));
+  try {
+    if (scanIgnoreContent !== null) {
+      writeFileSync(join(dir, '.hyposcanignore'), scanIgnoreContent);
+    }
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('loadScanIgnore returns [] when .hyposcanignore is absent (today parity)', () => {
+  withScanIgnoreVault(null, (dir) => {
+    assert.deepEqual(loadScanIgnore(dir), []);
+  });
+});
+
+test('loadScanIgnore parses glob lines, skipping comments and blanks', () => {
+  withScanIgnoreVault('# comment\n\ndrafts/\nscratch/*.md\n', (dir) => {
+    assert.deepEqual(loadScanIgnore(dir), ['drafts/', 'scratch/*.md']);
+  });
+});
+
+test('isScanIgnored matches a .hyposcanignore-only path, but isIgnored (privacy) does not', () => {
+  withScanIgnoreVault('drafts/\n', (dir) => {
+    const target = join(dir, 'drafts', 'wip.md');
+    assert.equal(
+      isHypoIgnored(target, dir, []),
+      false,
+      'privacy check must not see .hyposcanignore — commit path stays open',
+    );
+    assert.equal(
+      isScanIgnored(target, dir, []),
+      true,
+      'scan check must skip a .hyposcanignore-listed path',
+    );
+  });
+});
+
+test('isScanIgnored with no .hyposcanignore behaves exactly like privacy+generated-artifact only (today parity)', () => {
+  withScanIgnoreVault(null, (dir) => {
+    const plain = join(dir, 'pages', 'note.md');
+    assert.equal(isScanIgnored(plain, dir, []), false);
+    const artifact = join(dir, 'GRAPH_REPORT.md');
+    assert.equal(isScanIgnored(artifact, dir, []), true);
+  });
+});
+
+// Cache-key regression (codex pre-commit BLOCKER): a raw, un-resolved hypoDir
+// string as the cache key lets a relative spelling like '.' collide ACROSS
+// vaults when the caller cd's between them — the cache must key on the
+// resolved absolute path, not the caller's spelling.
+test('cross-vault bleed: hypoDir="." scanning vault A does not leak A\'s patterns into vault B scanned as "."', () => {
+  const originalCwd = process.cwd();
+  const vaultA = mkdtempSync(join(tmpdir(), 'hypo-scanignore-vaultA-'));
+  const vaultB = mkdtempSync(join(tmpdir(), 'hypo-scanignore-vaultB-'));
+  try {
+    writeFileSync(join(vaultA, '.hyposcanignore'), 'drafts/\n');
+    // vaultB deliberately has NO .hyposcanignore — drafts/ must stay scannable.
+
+    process.chdir(vaultA);
+    const aTarget = join('.', 'drafts', 'wip.md');
+    assert.equal(
+      isScanIgnored(aTarget, '.', []),
+      true,
+      'vault A: drafts/ is .hyposcanignore-listed there',
+    );
+
+    process.chdir(vaultB);
+    const bTarget = join('.', 'drafts', 'wip.md');
+    assert.equal(
+      isScanIgnored(bTarget, '.', []),
+      false,
+      'vault B: must NOT reuse vault A\'s cached scan patterns just because both were addressed as "."',
+    );
+  } finally {
+    process.chdir(originalCwd);
+    rmSync(vaultA, { recursive: true, force: true });
+    rmSync(vaultB, { recursive: true, force: true });
+  }
+});
+
+test('cache key normalizes "." and "./" to the same absolute vault (no duplicate cache entries, no bleed)', () => {
+  const originalCwd = process.cwd();
+  const vault = mkdtempSync(join(tmpdir(), 'hypo-scanignore-norm-'));
+  try {
+    writeFileSync(join(vault, '.hyposcanignore'), 'drafts/\n');
+    process.chdir(vault);
+    assert.equal(isScanIgnored(join('.', 'drafts', 'wip.md'), '.', []), true);
+    assert.equal(isScanIgnored(join('./', 'drafts', 'wip.md'), './', []), true);
+    assert.equal(isScanIgnored(join(vault, 'drafts', 'wip.md'), vault, []), true);
+  } finally {
+    process.chdir(originalCwd);
+    rmSync(vault, { recursive: true, force: true });
+  }
 });
 
 suite('lint.mjs wikilink resolution (ISSUE-21)');
