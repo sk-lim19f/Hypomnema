@@ -744,12 +744,107 @@ test('--commit-msg and --commit-range agree on the SAME message (one judgment, A
   });
 });
 
-test('CLI --commit-range: an unresolvable range exits 2 (git error), not a crash', () => {
+test('CLI --commit-range: BOTH endpoints missing (bogus base too) does NOT skip — still fails exit 2', () => {
+  // Skip requires the base to resolve. Two syntactically plausible but
+  // nonexistent shas is not the deleted-branch symptom (there the base is a
+  // real commit still reachable from a surviving branch like main); it is
+  // indistinguishable from a broken/garbage range, so it must keep failing
+  // loudly rather than silently pass.
   withTmpDir((dir) => {
     gitRepo(dir);
     writeFileSync(join(dir, 'a.txt'), 'one\n');
     commitIn(dir, 'chore: base');
     const r = runChecker(['--commit-range', 'deadbeefdead..cafebabecafe'], {
+      CHECK_TRACKER_ROOT: dir,
+    });
+    assert.equal(r.status, 2);
+  });
+});
+
+test('CLI --commit-range: a REAL base with a genuinely missing head skips (exit 0), and still reports the missing sha', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const base = commitIn(dir, 'chore: base');
+    // A syntactically plausible sha that was never committed here — stands in
+    // for a PR head that existed on GitHub but whose branch is now deleted.
+    const ghostHead = 'fa74adefa74adefa74adefa74adefa74adefa74';
+    const r = runChecker(['--commit-range', `${base}..${ghostHead}`], {
+      CHECK_TRACKER_ROOT: dir,
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /skipping/i);
+    assert.match(r.stdout, new RegExp(ghostHead));
+  });
+});
+
+test('CLI --commit-range: BLOCKER regression — a bogus base paired with a REAL violating head must NOT skip past the gate', () => {
+  // This is the exact bypass codex reproduced: a caller (or an attacker) pairs
+  // an unresolvable base with a real, violating head. If skip fired here, a
+  // genuine attribution trailer would walk straight past the CI gate. Skip
+  // must require the BASE to resolve, so this has to hit the original git-log
+  // path and fail exit 2 — never a silent pass.
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const violatingHead = commitIn(
+      dir,
+      'feat: thing\n\nCo-Authored-By: Claude <noreply@anthropic.com>',
+    );
+    const r = runChecker(['--commit-range', `deadbeefdead..${violatingHead}`], {
+      CHECK_TRACKER_ROOT: dir,
+    });
+    assert.equal(r.status, 2);
+    assert.doesNotMatch(r.stdout || '', /skipping/i);
+  });
+});
+
+test('CLI --commit-range: an empty head ("base..") is native git shorthand for HEAD, not our skip path', () => {
+  // `base..` is valid git rev-range syntax (git fills in HEAD for the empty
+  // side), so parseCommitRange rejects the shape (empty head) and this falls
+  // straight into the ORIGINAL git-log call — the same as before this fix.
+  // It is not our new skip branch: no "skipping" message, and it resolves
+  // via git's own defaulting rather than commitExists.
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const base = commitIn(dir, 'chore: base');
+    const r = runChecker(['--commit-range', `${base}..`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 0, r.stderr); // base == HEAD here, so an empty (clean) range
+    assert.doesNotMatch(r.stdout || '', /skipping/i);
+  });
+});
+
+test('CLI --commit-range: an empty base ("..head") is native git shorthand for HEAD, not our skip path', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    const head = commitIn(dir, 'chore: base');
+    const r = runChecker(['--commit-range', `..${head}`], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 0, r.stderr); // head == HEAD here, so an empty (clean) range
+    assert.doesNotMatch(r.stdout || '', /skipping/i);
+  });
+});
+
+test('CLI --commit-range: a genuinely malformed range (no two-dot shape) still fails exit 2', () => {
+  // The exact gap this fix must NOT open: an unparseable range is not the
+  // "branch deleted after merge" case, so it must keep failing loudly rather
+  // than silently skip past a broken CI wiring.
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    commitIn(dir, 'chore: base');
+    const r = runChecker(['--commit-range', 'not-a-range-at-all'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 2);
+  });
+});
+
+test('CLI --commit-range: a three-dot range with unresolvable endpoints still fails exit 2 (not the two-dot skip path)', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.txt'), 'one\n');
+    commitIn(dir, 'chore: base');
+    const r = runChecker(['--commit-range', 'deadbeefdead...cafebabecafe'], {
       CHECK_TRACKER_ROOT: dir,
     });
     assert.equal(r.status, 2);
