@@ -300,6 +300,10 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/git-hooks-dir.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/hypo-ignore.mjs",
     "exec": false
   },

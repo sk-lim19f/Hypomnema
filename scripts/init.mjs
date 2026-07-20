@@ -38,6 +38,7 @@ import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import { expandHome, resolveHypoRoot } from './lib/hypo-root.mjs';
+import { hooksDirForInstall, unsafeHookTargetReason } from './lib/git-hooks-dir.mjs';
 import { readCoreHooksConfig } from './lib/core-hooks.mjs';
 import {
   readPkgJson as readPkgJsonSafe,
@@ -693,10 +694,19 @@ function installCommands(targetDir, dryRun, force) {
 }
 
 function installPkgGitHook(dryRun) {
-  const gitDir = join(PKG_ROOT, '.git');
-  if (!existsSync(gitDir)) return;
-  const hooksDir = join(gitDir, 'hooks');
+  const { dir: hooksDir, skip } = hooksDirForInstall(PKG_ROOT);
+  if (!hooksDir) {
+    if (skip) log('skipped', `${PKG_ROOT} post-commit (${skip})`);
+    return;
+  }
   const hookPath = join(hooksDir, 'post-commit');
+  // Checked before existsSync: a dangling symlink reads as absent there, and
+  // writing would create its external target.
+  const unsafe = unsafeHookTargetReason(hookPath);
+  if (unsafe) {
+    log('skipped', `${hookPath} (${unsafe})`);
+    return;
+  }
   if (existsSync(hookPath)) {
     log('skipped', hookPath);
     return;
@@ -758,11 +768,22 @@ function wikiPreCommitContent(root, hypoDir, lintStrict) {
 }
 
 function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
-  const gitDir = join(hypoDir, '.git');
-  if (!existsSync(gitDir)) return; // no git repo — silently skip
-  const hooksDir = join(gitDir, 'hooks');
+  const { dir: hooksDir, skip } = hooksDirForInstall(hypoDir);
+  if (!hooksDir) {
+    // no git repo — silently skip, as before; anything else is worth surfacing
+    if (skip) log('skipped', `${hypoDir} pre-commit (${skip})`);
+    return;
+  }
   const hookPath = join(hooksDir, 'pre-commit');
   const newContent = wikiPreCommitContent(root, hypoDir, lintStrict);
+
+  // Before every branch below, including --force: a symlink here would send the
+  // write through to an arbitrary external file.
+  const unsafe = unsafeHookTargetReason(hookPath);
+  if (unsafe) {
+    log('skipped', `${hookPath} (${unsafe})`);
+    return;
+  }
 
   if (existsSync(hookPath)) {
     const existing = readFileSync(hookPath, 'utf-8');
@@ -777,8 +798,18 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
       }
       log('merged', `${hookPath} (pre-commit updated)`);
     } else if (force) {
+      // The .bak is a SECOND write to a DIFFERENT path, so the guard on
+      // hookPath above says nothing about it. Left unchecked, a pre-commit.bak
+      // symlink turns --force-commands into an overwrite of whatever it points
+      // at — deterministically, not as a race.
+      const bakPath = hookPath + '.bak';
+      const unsafeBak = unsafeHookTargetReason(bakPath);
+      if (unsafeBak) {
+        log('skipped', `${bakPath} (${unsafeBak}) — not force-overwriting without a safe backup`);
+        return;
+      }
       if (!dryRun) {
-        writeFileSync(hookPath + '.bak', existing);
+        writeFileSync(bakPath, existing);
         writeFileSync(hookPath, newContent);
         chmodSync(hookPath, 0o755);
       }

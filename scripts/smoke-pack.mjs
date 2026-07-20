@@ -28,6 +28,7 @@ import {
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { resolveGitHooksDir } from './lib/git-hooks-dir.mjs';
 
 const REPO = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const KEEP = process.argv.includes('--keep');
@@ -78,7 +79,13 @@ try {
   // `npm pack` didn't mutate it. The `prepare` lifecycle script runs during
   // `npm pack` and could theoretically touch .git/hooks/pre-commit; the
   // installer's CI/lifecycle guards must prevent that.
-  const preCommitPath = join(REPO, '.git', 'hooks', 'pre-commit');
+  // Resolve the ACTIVE hooks dir. Guessing `.git/hooks` snapshots the wrong
+  // file in a linked worktree (or under core.hooksPath), which would make the
+  // "pack didn't mutate the hook" assertion below vacuously pass.
+  const hooksProbe = resolveGitHooksDir(REPO);
+  const preCommitPath = hooksProbe.ok
+    ? join(hooksProbe.path, 'pre-commit')
+    : join(REPO, '.git', 'hooks', 'pre-commit');
   const preCommitBefore = existsSync(preCommitPath) ? readFileSync(preCommitPath, 'utf-8') : null;
 
   step('npm pack');

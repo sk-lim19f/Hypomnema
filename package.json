@@ -33,6 +33,7 @@
     "scripts/lib/failure-type.mjs",
     "scripts/lib/feedback-scope.mjs",
     "scripts/lib/frontmatter.mjs",
+    "scripts/lib/git-hooks-dir.mjs",
     "scripts/lib/hypo-ignore.mjs",
     "scripts/lib/hypo-root.mjs",
     "scripts/lib/page-usage.mjs",
