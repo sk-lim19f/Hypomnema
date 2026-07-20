@@ -19,6 +19,7 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { resolveGitHooksDir } from './lib/git-hooks-dir.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 import {
   readSyncState,
@@ -450,19 +451,57 @@ function checkGit(hypoDir) {
     warn('Git remote origin', 'No remote configured — wiki will not sync/backup automatically');
   }
 
-  const preCommitPath = join(hypoDir, '.git', 'hooks', 'pre-commit');
+  // Ask git for the ACTIVE hooks dir rather than assuming <repo>/.git/hooks —
+  // that guess is wrong in a linked worktree (`.git` is a file) and whenever
+  // core.hooksPath is set, and reporting "not installed" for either would be a
+  // false negative. Read-side policy differs from the installer's: doctor
+  // reports a hooks dir it would refuse to WRITE into, so the user can see it.
+  const resolved = resolveGitHooksDir(hypoDir);
+  if (!resolved.ok) {
+    const detail =
+      resolved.reason === 'hooks-disabled'
+        ? `Hooks path is not a directory (${resolved.path}) — git runs no hooks, so the .hypoignore guard cannot run`
+        : `Could not resolve the git hooks directory (${resolved.detail || resolved.reason})`;
+    warn('git hooks/pre-commit', detail);
+    return;
+  }
+
+  const preCommitPath = join(resolved.path, 'pre-commit');
+  const label = resolved.owned ? 'git hooks/pre-commit' : `pre-commit (${resolved.path})`;
+  let content = null;
+  let unreadable = null;
   if (existsSync(preCommitPath)) {
-    const content = readFileSync(preCommitPath, 'utf-8');
-    if (content.includes('# hypo-managed:pre-commit:start')) {
-      pass('.git/hooks/pre-commit', 'Hypomnema .hypoignore guard installed');
-    } else {
-      warn(
-        '.git/hooks/pre-commit',
-        'Exists but not managed by Hypomnema — manual git add can bypass .hypoignore',
-      );
+    try {
+      content = readFileSync(preCommitPath, 'utf-8');
+    } catch (e) {
+      unreadable = e.code || e.message;
     }
+  }
+
+  if (unreadable) {
+    warn(label, `Exists but could not be read (${unreadable})`);
+  } else if (content === null) {
+    // Telling the user to run /hypo:init here would contradict the ownership
+    // warning below, which says it will refuse this very path.
+    warn(
+      label,
+      resolved.owned
+        ? 'Not installed — run /hypo:init to install .hypoignore guard'
+        : 'Not installed, and /hypo:init will not install into this path — point core.hooksPath back inside the repository, or install the guard yourself',
+    );
+  } else if (content.includes('# hypo-managed:pre-commit:start')) {
+    pass(label, 'Hypomnema .hypoignore guard installed');
   } else {
-    warn('.git/hooks/pre-commit', 'Not installed — run /hypo:init to install .hypoignore guard');
+    warn(label, 'Exists but not managed by Hypomnema — manual git add can bypass .hypoignore');
+  }
+
+  // Reported even when the hook above was unreadable — an unreadable hook is
+  // exactly when knowing WHERE git looks matters most.
+  if (!resolved.owned) {
+    warn(
+      'core.hooksPath',
+      `Points outside this repository (${resolved.path}) — /hypo:init will not install there`,
+    );
   }
 }
 
