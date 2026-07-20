@@ -5,6 +5,133 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-07-20
+
+### New Features
+
+#### English
+
+- A session close leaves a page another session changed alone and parks the withheld bytes as a reviewable artifact under `.cache/proposals/`, inspectable and re-appliable via `hypomnema proposal list/apply/discard`. ([#180](https://github.com/sk-lim19f/Hypomnema/pull/180), [#184](https://github.com/sk-lim19f/Hypomnema/pull/184), [#185](https://github.com/sk-lim19f/Hypomnema/pull/185))
+- A parked proposal can be approved by typing the approval in the conversation, not only from a TTY, and the approval is unforgeable and single use. ([#194](https://github.com/sk-lim19f/Hypomnema/pull/194))
+- `doctor` and session start show the count of pending write-proposals awaiting review. ([#186](https://github.com/sk-lim19f/Hypomnema/pull/186))
+- Wiki pages can opt into a machine-scoped visibility namespace (`visibility_scope: machine:<device>`) so a page shows only on its owning device. ([#178](https://github.com/sk-lim19f/Hypomnema/pull/178))
+- Directory skills now sync both ways: `skills/<name>/SKILL.md` plus its subtree syncs to `~/.claude/skills/` with per-file ownership, and `hypomnema capture` pulls a locally-authored skill directory back into the wiki, where a sidecar manifest records its install name so other machines get it back under that name. ([#187](https://github.com/sk-lim19f/Hypomnema/pull/187), [#188](https://github.com/sk-lim19f/Hypomnema/pull/188))
+- New `/hypo:debate` skill: a structured debate (interrogate, verify against code, synthesize) to re-verify an overdue wiki claim or harden a decision into an ADR, with a bundled six-pattern orchestration reference. ([#206](https://github.com/sk-lim19f/Hypomnema/pull/206))
+- New optional `.hyposcanignore` excludes paths from scanning tools (lint, graph, stats, query, verify, doctor) without blocking commits, separating scan exclusion from the `.hypoignore` privacy gate. ([#216](https://github.com/sk-lim19f/Hypomnema/pull/216))
+- New opt-in `hypomnema init --lint-strict` flag gates the wiki pre-commit hook on `lint --strict`, so frontmatter and broken-wikilink warnings block commits. ([#215](https://github.com/sk-lim19f/Hypomnema/pull/215))
+- Close-path append writes are serialized with a per-target lockfile, so two sessions closing at once no longer interleave their entries.
+
+#### 한국어
+
+- 세션 종료가 다른 세션이 바꾼 페이지를 그대로 두고, 보류한 바이트를 `.cache/proposals/` 아래 검토 가능한 아티팩트로 park해 `hypomnema proposal list/apply/discard`로 확인하고 다시 적용할 수 있습니다. ([#180](https://github.com/sk-lim19f/Hypomnema/pull/180), [#184](https://github.com/sk-lim19f/Hypomnema/pull/184), [#185](https://github.com/sk-lim19f/Hypomnema/pull/185))
+- park된 proposal을 TTY 없이 대화창에 승인을 타이핑해 적용할 수 있고, 그 승인은 위조할 수 없으며 한 번만 쓰입니다. ([#194](https://github.com/sk-lim19f/Hypomnema/pull/194))
+- `doctor`와 세션 시작이 검토를 기다리는 write-proposal 건수를 보여줍니다. ([#186](https://github.com/sk-lim19f/Hypomnema/pull/186))
+- 위키 페이지가 머신 범위 visibility 네임스페이스(`visibility_scope: machine:<device>`)를 선택해 소유 머신에서만 보이게 할 수 있습니다. ([#178](https://github.com/sk-lim19f/Hypomnema/pull/178))
+- 디렉터리 skill이 양방향으로 동기화됩니다: `skills/<name>/SKILL.md`와 그 서브트리가 파일 단위 소유 추적과 함께 `~/.claude/skills/`로 내려가고, `hypomnema capture`가 로컬에서 만든 skill 디렉터리를 위키로 끌어오면서 sidecar manifest에 설치 이름을 남겨 다른 머신에서 그 이름으로 복원됩니다. ([#187](https://github.com/sk-lim19f/Hypomnema/pull/187), [#188](https://github.com/sk-lim19f/Hypomnema/pull/188))
+- 새 `/hypo:debate` 스킬: 구조화 디베이트(심문, 코드 대조 검증, 합성)로 기한이 지난 위키 주장을 재검증하거나 결정을 ADR로 굳히고, 멀티에이전트 6패턴 레퍼런스를 함께 배포합니다. ([#206](https://github.com/sk-lim19f/Hypomnema/pull/206))
+- 새 옵션 파일 `.hyposcanignore`가 스캔 도구(lint, graph, stats, query, verify, doctor)에서 경로를 제외하되 커밋은 막지 않아, 스캔 제외가 `.hypoignore` 프라이버시 게이트에서 분리됩니다. ([#216](https://github.com/sk-lim19f/Hypomnema/pull/216))
+- 새 opt-in `hypomnema init --lint-strict` 플래그가 위키 pre-commit 훅을 `lint --strict`로 게이트해, frontmatter·깨진 wikilink 경고가 커밋을 막습니다. ([#215](https://github.com/sk-lim19f/Hypomnema/pull/215))
+- close 경로의 append 쓰기를 대상별 lockfile로 직렬화해, 두 세션이 동시에 닫아도 엔트리가 섞이지 않습니다.
+
+### Bug Fixes
+
+#### English
+
+- A session close now verifies the user asked for it before writing anything, rather than after the files were already written and committed. ([#199](https://github.com/sk-lim19f/Hypomnema/pull/199))
+- The close gate tracks the latest user decision as a lease instead of scanning the whole transcript for any close signal, so a stale close, a queued change of mind, a `/clear`, or a model self-close no longer counts as a user close (decisions/0075). ([#213](https://github.com/sk-lim19f/Hypomnema/pull/213))
+- The session-close marker is attributed to the project the session actually closed rather than the vault's most recent one, and close debt is charged to the session that made it: an incomplete close in a project this session never touched is now a non-blocking notice instead of blocking `/compact`. ([#193](https://github.com/sk-lim19f/Hypomnema/pull/193), [#212](https://github.com/sk-lim19f/Hypomnema/pull/212))
+- A session close can no longer apply one session's payload under another's marker: the payload temp path is session-scoped, and apply refuses a payload whose `sessionId` does not match. ([#204](https://github.com/sk-lim19f/Hypomnema/pull/204))
+- Two sessions withholding an overwrite for the same page no longer keep only the last one's bytes, and `proposal apply` reports any proposal still pending against the file it just wrote. ([#191](https://github.com/sk-lim19f/Hypomnema/pull/191))
+- A session's own direct edit of a close target no longer triggers a false write-conflict that blocked the close. ([#181](https://github.com/sk-lim19f/Hypomnema/pull/181))
+- A session close hard-fails instead of silently overwriting a session-log shard or `log.md` that exists but cannot be read, so accumulated entries are no longer dropped. ([#183](https://github.com/sk-lim19f/Hypomnema/pull/183))
+- Fixed wiki auto-commit dying when a page path contains non-ASCII characters (Korean filenames, for instance), which left the session-close marker unwritten. ([#208](https://github.com/sk-lim19f/Hypomnema/pull/208))
+- The read commands (lint, stats, graph, query) no longer report an unfound vault as an empty success: a misconfigured `HYPO_DIR` fails with a clear error, and an unconfigured run prints a visible notice. ([#207](https://github.com/sk-lim19f/Hypomnema/pull/207))
+- Machine-scoped pages no longer surface on other machines through session start, cwd change, or `/hypo:resume`. ([#192](https://github.com/sk-lim19f/Hypomnema/pull/192))
+- lint no longer reports pages under `_`-prefixed directories (draft and spec scaffolds) as broken wikilinks: they stay unlinted but are now valid link targets, so `--strict` can reach a green gate. ([#198](https://github.com/sk-lim19f/Hypomnema/pull/198))
+- `doctor` and `init` recognize a plugin-channel install and stop double-registering core hooks; a dual install resolves the plugin's real root so `hypo-pkg.json` and the vault pre-commit hook survive an npm uninstall; `doctor` validates the `hypo-pkg.json` pointer; `init --dry-run` previews the `hypo-pkg.json` write. ([#211](https://github.com/sk-lim19f/Hypomnema/pull/211))
+- `hypomnema upgrade` in a dual install no longer preserves a stale npm-first `pkgRoot`: the dualSkip path re-resolves the plugin root from the registry and corrects `hypo-pkg.json` when it diverges, preserving it when the registry is unavailable. ([#217](https://github.com/sk-lim19f/Hypomnema/pull/217))
+- `/hypo:upgrade` warns when an installed `hypo-guide.md` has drifted from (or predates the versioning of) the shipped template, instead of leaving it silently stale. ([#209](https://github.com/sk-lim19f/Hypomnema/pull/209))
+- The npm package no longer ships maintainer-only tooling: the tarball contains the product surface alone, and a CI gate keeps it that way. ([#195](https://github.com/sk-lim19f/Hypomnema/pull/195))
+
+#### 한국어
+
+- 세션 close가 파일을 다 쓰고 커밋한 뒤가 아니라, 아무것도 쓰기 전에 사용자가 요청했는지 확인합니다. ([#199](https://github.com/sk-lim19f/Hypomnema/pull/199))
+- close 게이트가 트랜스크립트 전체에서 close 신호를 찾는 대신 가장 최근 사용자 결정을 lease로 추적해, 오래된 close나 큐에 넣은 마음 바꿈, `/clear`, 모델의 자기 종료가 더 이상 사용자 종료로 세어지지 않습니다(decisions/0075). ([#213](https://github.com/sk-lim19f/Hypomnema/pull/213))
+- session-close 마커가 볼트에서 가장 최근이었던 프로젝트가 아니라 이 세션이 실제로 닫은 프로젝트에 귀속되고, 이 세션이 건드린 적 없는 프로젝트의 미완 close는 `/compact`를 막는 대신 비차단 notice가 됩니다. ([#193](https://github.com/sk-lim19f/Hypomnema/pull/193), [#212](https://github.com/sk-lim19f/Hypomnema/pull/212))
+- 세션 close가 한 세션의 payload를 다른 세션 마커로 적용할 수 없게 됐습니다: payload 임시 경로가 세션 범위로 바뀌었고, `sessionId`가 맞지 않는 payload는 apply가 거부합니다. ([#204](https://github.com/sk-lim19f/Hypomnema/pull/204))
+- 같은 페이지에 대해 두 세션이 overwrite를 보류할 때 마지막 세션의 바이트만 남던 문제를 고쳤고, `proposal apply`가 방금 쓴 파일에 남아 있는 proposal을 알려줍니다. ([#191](https://github.com/sk-lim19f/Hypomnema/pull/191))
+- 세션이 close 대상을 직접 편집해도 close를 막던 거짓 쓰기 충돌이 더 이상 뜨지 않습니다. ([#181](https://github.com/sk-lim19f/Hypomnema/pull/181))
+- 세션 close가 session-log 샤드나 `log.md`가 존재하지만 읽을 수 없을 때 누적된 엔트리를 잃지 않도록, 조용히 덮어쓰지 않고 hard-fail합니다. ([#183](https://github.com/sk-lim19f/Hypomnema/pull/183))
+- 페이지 경로에 비ASCII 문자(예: 한글 파일명)가 있으면 위키 auto-commit이 죽어 session-close 마커가 안 찍히던 문제를 고쳤습니다. ([#208](https://github.com/sk-lim19f/Hypomnema/pull/208))
+- read 명령(lint, stats, graph, query)이 볼트를 못 찾을 때 빈 위키를 성공으로 보고하지 않고, `HYPO_DIR` 오설정은 명확한 에러로 실패하며 미설정 실행은 눈에 보이는 통지를 냅니다. ([#207](https://github.com/sk-lim19f/Hypomnema/pull/207))
+- 머신 범위 페이지가 세션 시작, 작업 디렉터리 변경, `/hypo:resume` 경로로 다른 머신에 노출되지 않습니다. ([#192](https://github.com/sk-lim19f/Hypomnema/pull/192))
+- lint가 `_` 접두 디렉터리(draft·spec scaffold) 아래 문서를 깨진 wikilink로 보고하지 않습니다: 검사 대상에서 빠지는 건 그대로지만 링크 대상으로는 유효해져, `--strict`가 green 게이트에 도달할 수 있습니다. ([#198](https://github.com/sk-lim19f/Hypomnema/pull/198))
+- `doctor`와 `init`이 플러그인 채널 설치를 인식해 코어 훅 이중 등록을 멈추고, dual install에서 플러그인의 실제 루트를 resolve해 npm 제거 후에도 `hypo-pkg.json`과 볼트 pre-commit 훅이 살아남으며, `doctor`가 그 포인터를 검증하고 `init --dry-run`이 쓰기를 미리 보여줍니다. ([#211](https://github.com/sk-lim19f/Hypomnema/pull/211))
+- dual install에서 `hypomnema upgrade`가 오래된 npm-first `pkgRoot`를 그대로 두지 않고, dualSkip 경로가 registry에서 플러그인 루트를 다시 resolve해 어긋나면 `hypo-pkg.json`을 정정합니다(registry가 없으면 보존). ([#217](https://github.com/sk-lim19f/Hypomnema/pull/217))
+- `/hypo:upgrade`가 설치된 `hypo-guide.md`가 배포 템플릿과 어긋나거나 버전 스탬프 이전일 때 조용히 stale로 두지 않고 경고합니다. ([#209](https://github.com/sk-lim19f/Hypomnema/pull/209))
+- npm 패키지가 메인테이너 전용 도구를 더 이상 싣지 않습니다: tarball은 제품 표면만 담고, CI 게이트가 그 상태를 유지시킵니다. ([#195](https://github.com/sk-lim19f/Hypomnema/pull/195))
+
+### Chores
+
+#### English
+
+- The README now documents current behavior instead of release history, and several inaccurate claims were corrected: a non-existent `hypomnema lint` command, extensions sync and capture described as automatic, capture's skill support, stale-flagging scope, the CI job count, and the undocumented `.hyposcanignore`. ([#219](https://github.com/sk-lim19f/Hypomnema/pull/219))
+- The README has a "For AI assistants" section stating the ground rules an agent operating the wiki needs: the wiki is the source of truth, `MEMORY.md` and `<learned_behaviors>` are one-way projections of `pages/feedback/`, and `sources/` is immutable. ([#190](https://github.com/sk-lim19f/Hypomnema/pull/190))
+- `hypomnema --help` lists the `capture` command. ([#177](https://github.com/sk-lim19f/Hypomnema/pull/177))
+
+#### 한국어
+
+- README가 릴리스 히스토리 대신 현재 동작을 기술하고, 부정확한 서술 여러 건을 정정했습니다: 존재하지 않는 `hypomnema lint` 명령, 자동이라고 적혀 있던 extensions sync와 capture, capture의 skill 지원 범위, stale 표시 범위, CI job 수, 문서에 없던 `.hyposcanignore`. ([#219](https://github.com/sk-lim19f/Hypomnema/pull/219))
+- README의 새 "For AI assistants" 섹션이 위키를 다루는 에이전트가 알아야 할 그라운드 룰을 명시합니다: 위키가 단일 정본이고, `MEMORY.md`와 `<learned_behaviors>`는 `pages/feedback/`의 단방향 투영이며, `sources/`는 불변입니다. ([#190](https://github.com/sk-lim19f/Hypomnema/pull/190))
+- `hypomnema --help`가 `capture` 명령을 표시합니다. ([#177](https://github.com/sk-lim19f/Hypomnema/pull/177))
+
+### Changelog
+
+- [#219](https://github.com/sk-lim19f/Hypomnema/pull/219) docs(readme): describe current behavior, retire the version-reconcile gate
+- [#218](https://github.com/sk-lim19f/Hypomnema/pull/218) test(hypo-ignore): guard the scan-only/privacy split at the call sites
+- [#217](https://github.com/sk-lim19f/Hypomnema/pull/217) fix(upgrade): re-resolve the dual-install plugin root from the registry in dualSkip
+- [#216](https://github.com/sk-lim19f/Hypomnema/pull/216) feat(ignore): add .hyposcanignore for scan-only exclusion
+- [#215](https://github.com/sk-lim19f/Hypomnema/pull/215) feat(init): add an opt-in --lint-strict wiki pre-commit gate
+- [#214](https://github.com/sk-lim19f/Hypomnema/pull/214) fix(check-tracker-ids): skip --commit-range when the head commit is gone after a branch delete
+- [#213](https://github.com/sk-lim19f/Hypomnema/pull/213) fix(close): make the session-close gate a lease, not an existence check
+- [#212](https://github.com/sk-lim19f/Hypomnema/pull/212) fix(close): attribute the session-close marker from evidence, not recency
+- [#211](https://github.com/sk-lim19f/Hypomnema/pull/211) fix(doctor,init): plugin-channel awareness + pkg-pointer integrity + dry-run parity
+- [#210](https://github.com/sk-lim19f/Hypomnema/pull/210) test(close): pin the measured transcript shapes the close-gate decision has to get right
+- [#209](https://github.com/sk-lim19f/Hypomnema/pull/209) fix(upgrade): surface a stale hypo-guide.md instead of leaving it silently drifted
+- [#208](https://github.com/sk-lim19f/Hypomnema/pull/208) fix(hooks): parse git status with -z so non-ASCII wiki paths commit
+- [#207](https://github.com/sk-lim19f/Hypomnema/pull/207) fix(root): stop reporting an unfound vault as an empty success
+- [#206](https://github.com/sk-lim19f/Hypomnema/pull/206) feat(skills): ship /hypo:debate and the orchestration-patterns reference
+- [#205](https://github.com/sk-lim19f/Hypomnema/pull/205) docs(pr-template): document the tracker-id ban and the Changelog carve-out
+- [#204](https://github.com/sk-lim19f/Hypomnema/pull/204) fix(close): bind session-close payload to its session
+- [#203](https://github.com/sk-lim19f/Hypomnema/pull/203) test: open a suite for each of the 17 unsuited banner regions
+- [#202](https://github.com/sk-lim19f/Hypomnema/pull/202) docs(contributing): fix the decision-record carve-out in tracker-id gating prose
+- [#201](https://github.com/sk-lim19f/Hypomnema/pull/201) chore(format): bring 7 pre-existing files to prettier style
+- [#200](https://github.com/sk-lim19f/Hypomnema/pull/200) refactor(tests): split the flat runner into one file per production area
+- [#199](https://github.com/sk-lim19f/Hypomnema/pull/199) fix(close): verify close authority before the writes, not after them
+- [#198](https://github.com/sk-lim19f/Hypomnema/pull/198) fix(lint): keep `_`-dir pages linkable so --strict can reach green
+- [#197](https://github.com/sk-lim19f/Hypomnema/pull/197) test: shard the runner across processes, and pin the HOME it lied about
+- [#196](https://github.com/sk-lim19f/Hypomnema/pull/196) fix(gate): enforce the ship-surface rules on the PR and commit surface
+- [#195](https://github.com/sk-lim19f/Hypomnema/pull/195) fix(pack): ship only the product surface, and gate it so it stays that way
+- [#194](https://github.com/sk-lim19f/Hypomnema/pull/194) fix(proposal): make the transcript approval unforgeable and single-use
+- [#193](https://github.com/sk-lim19f/Hypomnema/pull/193) fix(gate): attribute close debt to the session that made it
+- [#192](https://github.com/sk-lim19f/Hypomnema/pull/192) fix(scope): filter machine-scoped pages from session-resume injection paths
+- [#191](https://github.com/sk-lim19f/Hypomnema/pull/191) fix(proposal-store): supersede only the writing session's own parked proposal
+- [#190](https://github.com/sk-lim19f/Hypomnema/pull/190) docs(readme): add a "For AI assistants" section in both languages
+- [#189](https://github.com/sk-lim19f/Hypomnema/pull/189) ci(workflows): default every workflow to contents: read
+- [#188](https://github.com/sk-lim19f/Hypomnema/pull/188) feat(capture): reverse-capture directory skills into the wiki
+- [#187](https://github.com/sk-lim19f/Hypomnema/pull/187) feat(extensions): sync directory skills with per-file ownership
+- [#186](https://github.com/sk-lim19f/Hypomnema/pull/186) feat(surface): pending-proposal count in doctor and session-start
+- [#185](https://github.com/sk-lim19f/Hypomnema/pull/185) feat(cli): hypomnema proposal list/apply/discard
+- [#184](https://github.com/sk-lim19f/Hypomnema/pull/184) feat(proposal-store): park drifted overwrite targets as reviewable proposal artifacts
+- [#183](https://github.com/sk-lim19f/Hypomnema/pull/183) fix(crystallize): hard-fail on unreadable append target instead of silent overwrite
+- [#181](https://github.com/sk-lim19f/Hypomnema/pull/181) fix(write-proposal): advance observed-base on a session's own direct edits
+- [#180](https://github.com/sk-lim19f/Hypomnema/pull/180) feat(crystallize): observed-base guard on overwrite path with base advance
+- [#179](https://github.com/sk-lim19f/Hypomnema/pull/179) feat(base-store): per-session observed-base snapshot for the write=proposal gate
+- [#178](https://github.com/sk-lim19f/Hypomnema/pull/178) feat(scope): machine-scoped visibility namespace (first slice)
+- [#177](https://github.com/sk-lim19f/Hypomnema/pull/177) docs(cli): list `capture` command in `hypomnema --help`
+
+Contributors: @sk-lim19f
+
 ## [1.6.2] - 2026-07-07
 
 ### Bug Fixes
