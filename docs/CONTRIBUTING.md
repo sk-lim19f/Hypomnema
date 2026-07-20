@@ -324,10 +324,13 @@ command.
 Every Hypomnema release must carry Korean alongside the English body
 in **both** the CHANGELOG section AND the git tag annotation. The release
 workflow enforces this with `scripts/check-bilingual.mjs`; a lightweight tag, or
-a gated CHANGELOG section missing its `#### 한국어` sub-block, will block `npm publish`. It also requires the
-release version to appear in **both** `README.md` and `README.ko.md`
-(`scripts/check-readme-version.mjs`) — the floor that stops the README reconcile
-from being dropped.
+a gated CHANGELOG section missing its `#### 한국어` sub-block, will block `npm publish`.
+
+The READMEs are not part of a release. They describe what Hypomnema does now, not
+what each version added, so cutting a release never edits them. Version history
+lives in `CHANGELOG.md` alone. (A gate used to require the release version to
+appear in both READMEs, back when they carried a rolling version narrative. That
+narrative is gone, and the gate with it.)
 
 Prerequisite: the changelog collector in step 2 reads merged-PR data through the GitHub CLI, so have `gh` installed and authenticated (`gh auth status`) before you start. It is a maintainer-only release script and is not shipped to npm.
 
@@ -361,28 +364,25 @@ node scripts/collect-changelog.mjs --strict   # maintainer-only; not shipped to 
 #    "#### English" and a "#### 한국어" sub-block; check:bilingual enforces it.
 $EDITOR CHANGELOG.md
 
-# 3. Reconcile BOTH READMEs — add a v<version> sentence to the rolling version
-#    narrative in README.md AND README.ko.md, and update the first-viewport
-#    "current release" pointer. (Dropped 3x historically; check:readme is the floor.)
-$EDITOR README.md README.ko.md
+#    The READMEs need no edit here. They describe current behavior, so a release
+#    only touches them when the behavior itself changed.
 
-# 4. Verify locally before tagging (the full gate set CI + prepublishOnly run)
+# 3. Verify locally before tagging (the full gate set CI + prepublishOnly run)
 npm test                   # unit suite
 npm run lint               # vault linter
 npm run check:versions     # all version-carrying files (incl. package-lock) agree
 npm run check:bilingual    # each gated CHANGELOG section has #### English + #### 한국어
-npm run check:readme       # v<version> present in BOTH READMEs
 npm run smoke:plugin       # plugin manifest + hooks/commands/skills load-valid
 npm run smoke-pack         # packed tarball installs and resolves
 npm run check:tracker-ids  # no private-tracker pointers leaked into shipped files
 
-# 5. Commit — include EVERY file the bump touched, the READMEs, and the lockfile.
+# 4. Commit every file the bump touched, plus the lockfile.
 git add package.json package-lock.json .claude-plugin/ templates/hypo-config.md \
-        CHANGELOG.md README.md README.ko.md
+        CHANGELOG.md
 git commit -m "chore: release v<version>"
 #    Then open the release PR, pass review + green CI, and squash-merge to main.
 
-# 6. Tag the merge commit with an ANNOTATED tag, never a lightweight tag.
+# 5. Tag the merge commit with an ANNOTATED tag, never a lightweight tag.
 #    Annotation body shape: English summary, then "---" on its own line,
 #    then a Korean summary block. The GitHub Release republishes this body
 #    verbatim, so keep it on the same public surface as the CHANGELOG: PR
@@ -402,17 +402,17 @@ Hypomnema v<version>: <한 줄 한글 요약>
 EOF
 )"
 
-# 7. Rehearse the release locally (same checks CI runs against the tag)
+# 6. Rehearse the release locally (same checks CI runs against the tag)
 node scripts/check-bilingual.mjs --tag v<version>
 node scripts/check-versions.mjs --tag v<version>
 node scripts/check-tracker-ids.mjs --tag v<version>   # no tracker ids leak into the tag body
 npm publish --dry-run --access public   # packs + prepublishOnly, NO registry PUT
 
-# 8. Push the SPECIFIC tag alone — NOT --tags (that would push stale local tags
+# 7. Push the SPECIFIC tag alone — NOT --tags (that would push stale local tags
 #    and could trigger releases for versions you did not intend).
 git push origin v<version>
 
-# 9. (minor+ releases only) After the release workflow succeeds, close the spec
+# 8. (minor+ releases only) After the release workflow succeeds, close the spec
 #    lifecycle IN PLACE (no path move): set status: archived and
 #    archived_date: <release date> in the same spec, run the wiki lint, then
 #    commit and push the vault. Do this only after the release is green, never at
@@ -428,8 +428,7 @@ The `release.yml` workflow then:
 2. Smokes the plugin channel — manifest, `hooks/hooks.json` targets, and
    command/skill component files (`scripts/smoke-plugin.mjs`).
 3. Validates the CHANGELOG section AND the tag annotation are bilingual
-   (`scripts/check-bilingual.mjs`), and that the version is present in both
-   READMEs (`scripts/check-readme-version.mjs`).
+   (`scripts/check-bilingual.mjs`).
 4. Runs `npm test` and `npm run lint`.
 5. Publishes to npm with `npm publish --access public --provenance` and creates
    the GitHub Release from the tag body.
