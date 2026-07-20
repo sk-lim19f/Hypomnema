@@ -25,21 +25,21 @@ New to the terms below? Keep the [Term decoder](#term-decoder) open in another t
 
 ### Where automation stands today
 
-The current release is v1.6.2. It teaches session-close reconfirm to treat a background shell task or a scheduled wake as work still in flight, so a deferred close ("publish, then wrap up") waiting on a background command no longer nags for the marker on every turn. The v1.6.1 release before it fixes session close so a conditional or deferred wrap-up ("once X is done, wrap up") that still has uncommitted or in-flight work asks you whether to close now instead of nagging prematurely, and it hardens `working_dir` provenance so `cwd`-first resume can anchor a project that was missing its anchor. The v1.6.0 release before it completed reverse extension capture: `hypomnema capture` (and the `/hypo:capture` slash command) pulls a command, agent, or hook you created the normal way under `~/.claude/` into the wiki, so forward-sync propagates it to your other machines under its original name. That closes the "register on one machine, sync on another" gap for extensions you author by hand, without a daemon. The v1.5.1 release before it sharpened how the wiki signals its own freshness: a page whose `verify_by_date` has passed is flagged `[STALE ...]` the moment it is injected, lookup usage is tracked locally so crystallize can surface a linked-but-never-injected page as a cold candidate, and session close was made robust to the standard `session | project: title` colon log format that had been misread as stale. The v1.5.0 line before that turned to cross-machine reliability: `cwd`-first resume on a git-synced vault and a code-repo session told where the wiki lives.
-
 Wiki work (ingest, query, session-close) still starts from an explicit `/hypo:*` command or plain language. The v2 goal is full autonomy: Claude reading, writing, and synthesizing the wiki without being asked, which is the direction this is heading.
 
-The lanes that already run on their own: v1.1.0 shipped the observability score that measures how often the wiki is used per session, and v1.2.0 added four automated areas on top.
+The lanes that already run on their own: an observability score measures how often the wiki is used per session, and several areas run without a prompt.
 
+- Freshness signaling. A page whose `verify_by_date` has passed is flagged `[STALE ...]` when it's injected at session start or via lookup, and lookup usage is tracked locally so crystallize can surface a page not injected via lookup in the last 90 days as a cold candidate.
 - Edit feedback in one place and the rest follows. `pages/feedback/` is the single source of truth for behavior corrections, and Hypomnema derives `MEMORY.md` and the `<learned_behaviors>` block inside `~/.claude/CLAUDE.md` from it automatically.
-- Extensions sync alongside. Anything under `~/hypomnema/extensions/{agents,commands,hooks,skills}/` is mirrored into `~/.claude/` automatically. The `--codex` flag also mirrors `hooks` and `commands` into `~/.codex/`; `agents` and `skills` are Claude-only and skipped on purpose.
-- Reverse capture goes the other way. `hypomnema capture` (or `/hypo:capture`) pulls a command or agent you made the normal way under `~/.claude/{commands,agents}/`, or a canonical hook you registered in `~/.claude/settings.json`, into the wiki, so it then syncs to your other machines under its original name. Hooks are captured only when they round-trip losslessly to the canonical form; others are skipped with a reason. Capture is explicit and never overwrites a differing wiki file. Skills are not captured yet.
+- Project-aware resume on `cd`. Switching into a git-synced project directory injects that project's `hot.md` automatically, so a code-repo session already knows where the wiki lives and what happened last.
 - Auto-project creation. When you `cd` into a git repo with a project marker (`package.json`, `Cargo.toml`, etc.) and no matching wiki project exists, Hypomnema offers to scaffold one.
-- Session-close cleanup and `/clear` recovery. After a non-trivial session, a "save a minimal session-close note?" prompt appears automatically; a `/clear` after a forgotten close is detected and recovered at the next session start.
+- Session-close cleanup and `/clear` recovery. After a non-trivial session, a "save a minimal session-close note?" prompt appears automatically, but not if work is still in flight (a running background shell task or a scheduled wake); in that case Hypomnema asks whether to close now instead of forcing it or nagging every turn. A `/clear` after a forgotten close is detected and recovered at the next session start.
 
 What changed per version lives in the [CHANGELOG](CHANGELOG.md).
 
 One upgrade policy worth knowing up front: `hypomnema upgrade --apply` never overwrites a `SCHEMA.md` you have edited. When the schema bumps, upgrade writes a migration report into the wiki root and leaves the actual changes for you to apply (the policy the code calls Option C).
+
+Two things that look automatic but aren't: extensions sync and reverse capture. Anything under `~/hypomnema/extensions/{agents,commands,hooks,skills}/` is mirrored into `~/.claude/` (and, with `--codex`, `hooks`/`commands` into `~/.codex/` too), but only on a run you trigger yourself: `hypomnema init`, `hypomnema upgrade --apply`, or a non-dry-run `hypomnema capture`. No hook pushes it there on its own. `hypomnema capture` (or `/hypo:capture`) is also the reverse path, pulling your own commands/agents/hooks/skills into the wiki, and that too only runs when you call it. See the command table below.
 
 ---
 
@@ -126,14 +126,14 @@ Hypomnema          ───►  synthesis · markdown · git · hooks · local
 | Workflow integration | Native to Claude Code | Separate app | Separate app / browser tab | Separate service | Separate app | Separate site |
 | Format | Plain markdown + frontmatter | Markdown | Proprietary | Vector store | Proprietary | HTML |
 | Behavior tuning | `/hypo:feedback` → permanent rules | None | None | None | Sometimes | None |
-| Auto-behavior | `/hypo:*` triggers + observability score (v1.1) + four autonomous lanes (v1.2); v2 target = fully autonomous | None | None | None | Black box | None |
+| Auto-behavior | `/hypo:*` triggers + observability score + autonomous lanes; v2 target = fully autonomous | None | None | None | Black box | None |
 | Setup cost | One command | One install | Sign-up | Pipeline build | Sign-up | Repo connect |
 | Lock-in | Zero (markdown + git) | Low | High | Medium | High | Medium |
 
 ### What this trade-off buys you
 
 - Synthesis over storage. You don't end up with a graveyard of half-read articles. Each `/hypo:ingest` produces a structured page, and the next ingest on the same topic updates that page instead of adding a new one.
-- Compounding density. A wiki with 100 sources should not be 100 disconnected pages. After a few months of real use, page count grows sub-linearly while cross-links grow faster.
+- Compounding density. A wiki with 100 sources should not be 100 disconnected pages. The design intent: since ingest merges a new source into an existing page instead of always creating one, page count should grow sub-linearly while cross-links grow faster.
 - No context switch. You're already in Claude Code. The wiki is one slash command away, with no extra tab, app, or login.
 - Future-proof storage. Plain markdown + git will still be readable in 20 years, greps offline, moves to another tool anytime, and stays usable by AI assistants that don't exist yet, with no conversion needed.
 
@@ -149,14 +149,15 @@ These are the recurring terms used in the rest of the README. Keep this table op
 | wikilink | A `[[page-slug]]` cross-reference between pages; resolved at lint time |
 | ADR | "Architecture Decision Record": a short markdown page recording _why_ a non-obvious design choice was made |
 | schema | The type taxonomy and required-field rules in `SCHEMA.md`: what makes a page valid |
-| lint | A read-only validator (`hypomnema lint`) that checks frontmatter, wikilinks, and schema |
+| lint | A validator (`/hypo:lint`, or `npm run lint`) that checks frontmatter, wikilinks, and schema |
 | projection | A one-way automatic derivation: `pages/feedback/*.md` → `MEMORY.md` and CLAUDE.md `<learned_behaviors>` |
 | SoT ("source of truth") | The single file you edit; projections derive from it, never the other way around |
 | hook | A script Claude Code runs automatically on a lifecycle event (e.g. `SessionStart`, `Stop`) |
 | lifecycle event | A point Claude Code surfaces to plugins: session opens, prompt submitted, tool used, compact requested, session ends, etc. |
 | `hot.md` | Per-project cache: "what just happened" (most recent session highlights) |
 | `session-state.md` | Per-project cache: "what's next" (the resume payload for the next session) |
-| `.hypoignore` | Glob patterns that exclude paths from every content-injection hook and from `ingest` |
+| `.hypoignore` | Glob patterns that exclude paths from every content-injection hook and from `ingest`; a privacy boundary |
+| `.hyposcanignore` | Glob patterns that exclude paths from catalog scans only (`lint`, `graph`, `stats`, `query`, `verify`, `doctor`); not a privacy boundary, a matched path still gets committed and read by hooks |
 | observability score | A per-session metric (search / ingest / feedback activity) that measures whether the wiki is actually being used |
 | manifest | A small JSON the install scripts write to track exactly which files were installed and at what SHA |
 | `additionalContext` | The Claude Code hook field that injects extra context into the prompt: where content-injection hooks emit |
@@ -214,7 +215,7 @@ Every external dependency is a future failure: it breaks, gets bought, gets depr
 
 ### 7. Why `.hypoignore` instead of a privacy mode flag
 
-v1.0 had a `personal / shared / public` mode matrix. It didn't survive contact with reality: every privacy decision turned out to be a per-path question, and a single file (`.hypoignore`) handles per-path decisions natively. v1.1 deleted the mode concept entirely. One file, one source of truth.
+Hypomnema started with a `personal / shared / public` mode matrix. It didn't survive contact with reality: every privacy decision turned out to be a per-path question, and a single file (`.hypoignore`) handles per-path decisions natively. The mode concept was deleted entirely. One file, one source of truth.
 
 ---
 
@@ -267,12 +268,13 @@ All hooks resolve the wiki root via `HYPO_DIR` env → `hypo-config.md` scan →
 | `/hypo:uninstall` | Remove hooks and registrations |
 | `/hypo:stats` | Wiki statistics |
 | `/hypo:audit` | Observability audit (per-session metrics, weekly report) |
+| `hypomnema capture` (or `/hypo:capture`) | Pull a command/agent you created directly under `~/.claude/{commands,agents}/`, a canonical hook registered in `settings.json`, or a skill under `~/.claude/skills/`, into the wiki, so it syncs to your other machines under its original name. Explicit only, never overwrites a differing wiki file; only captures what round-trips losslessly |
 
 > Update notice: the `SessionStart` hook runs a non-blocking background check against npm and the Claude Code plugin marketplace, and prints an "Update available!" banner the next time a newer version has been published. Opt out with `HYPO_NO_UPDATE_CHECK=1`, `NO_UPDATE_NOTIFIER=1`, or by running under `CI=true`.
 
 ### Claude Agent Skills
 
-The synthesis-heavy commands (`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`) are also exposed as Claude Agent Skills in `skills/<name>/SKILL.md`, so they auto-trigger when the conversation matches their description, with no slash command required. You don't need to know the exact command; just say what you want.
+The six synthesis-heavy commands (`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`) are also exposed as Claude Agent Skills in `skills/<name>/SKILL.md`, so they auto-trigger when the conversation matches their description, with no slash command required. A seventh skill, `debate`, has no slash-command counterpart: it runs a structured two-phase review to re-verify a wiki claim or harden a hard-to-reverse decision into an ADR. You don't need to know the exact command; just say what you want.
 
 | Say this | Skill it triggers |
 |---|---|
@@ -335,6 +337,7 @@ Do not store here:
 ├── SCHEMA.md            ← type system reference
 ├── hypo-guide.md        ← operations guide
 ├── .hypoignore          ← glob patterns excluded from hooks
+├── .hyposcanignore      ← glob patterns excluded from catalog scans only (not a privacy boundary)
 ├── pages/               ← permanent knowledge pages
 │   └── feedback/        ← AI behavior corrections
 ├── projects/            ← project artifacts and session logs
@@ -363,9 +366,11 @@ Place a `hypo-config.md` at the wiki root to make it portable across machines wi
 
 `.hypoignore` controls which paths the hooks ignore (default: `*.pdf`, `*.zip`, `*.pem`, `*.env`, …). Edit it directly; there is no privacy mode flag. One file, one source of truth.
 
+`.hyposcanignore` is a different file with a narrower job. `init` writes one at the root of every new vault, and it only excludes paths from catalog scans (`lint`, `graph`, `stats`, `query`, `verify`, `doctor`). It is not a privacy boundary: a path matched by `.hyposcanignore` is still committed and still readable by hooks. To actually keep something out of injection and commits, use `.hypoignore`.
+
 > Provider transmission disclaimer: Hypomnema hooks emit wiki content into Claude Code's `additionalContext`, which is transmitted to the Claude model provider as part of the prompt. `.hypoignore` is enforced at every content-injection hook (`hypo-file-watch`, `hypo-session-start`, `hypo-cwd-change`, `hypo-lookup`) and at `ingest`, but any file _not_ matched by `.hypoignore` is fair game for transmission. (`hypo-auto-stage` and `hypo-auto-commit` are git-staging hooks, not injection points, and also honor `.hypoignore` for their staging decisions.) Keep secrets out of the wiki, and review `.hypoignore` patterns before storing anything sensitive under `HYPO_DIR`.
 
-> Scope of git sync: Hypomnema git-syncs only the `~/hypomnema/` wiki itself. `init` / `upgrade` do install and SHA-track a defined surface inside `~/.claude/` (Hypomnema's own hooks at `~/.claude/hooks/`, slash commands at `~/.claude/commands/hypo/`, and `settings.json` registrations), plus, via v1.2.0 extensions companion sync, any `agents/` · `commands/` · `hooks/` · `skills/` you ship inside `~/hypomnema/extensions/` (and with `--codex`, the `hooks` + `commands` subset into `~/.codex/`). Anything _outside_ that defined surface in `~/.claude/` is intentionally not managed by Hypomnema. For general cross-machine sync of Claude Code config (other agents/skills not staged via the wiki, machine-specific `settings.local.json`, etc.), use a separate dotfiles manager such as [chezmoi](https://www.chezmoi.io/).
+> Scope of git sync: Hypomnema git-syncs only the `~/hypomnema/` wiki itself. `init` / `upgrade` do install and SHA-track a defined surface inside `~/.claude/` (Hypomnema's own hooks at `~/.claude/hooks/`, slash commands at `~/.claude/commands/hypo/`, and `settings.json` registrations), plus, via the extensions companion sync, any `agents/` · `commands/` · `hooks/` · `skills/` you ship inside `~/hypomnema/extensions/` (and with `--codex`, the `hooks` + `commands` subset into `~/.codex/`). Anything _outside_ that defined surface in `~/.claude/` is intentionally not managed by Hypomnema. For general cross-machine sync of Claude Code config (other agents/skills not staged via the wiki, machine-specific `settings.local.json`, etc.), use a separate dotfiles manager such as [chezmoi](https://www.chezmoi.io/).
 
 ### Where do `/hypo:*` commands live?
 
@@ -388,7 +393,7 @@ No external services. No API keys. No vector databases.
 ## Status
 
 - Tests: see `npm test`. Exact totals shift as lanes ship, so the runner is the source of truth
-- CI: 7 independent jobs (test matrix, lint, init/upgrade snapshots, replay, hypo-absent, uninstall-smoke)
+- CI: about a dozen independent jobs (test matrix, lint, tracker-ids, ship-surface, init/upgrade snapshots, replay, hypo-absent, uninstall-smoke, and more); see `.github/workflows/ci.yml` for the exact set
 - Release: `npm publish --provenance` on `v*` tag push
 
 ---
@@ -412,6 +417,12 @@ The operating procedure ships inside the wiki, so you do not have to fetch anyth
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md): internals, component map, data flows
 - [CONTRIBUTING.md](docs/CONTRIBUTING.md): development setup, conventions, PR process
 - [CHANGELOG.md](CHANGELOG.md): release history
+
+---
+
+## Support
+
+Bugs and feature requests: [GitHub Issues](https://github.com/sk-lim19f/Hypomnema/issues). This is a personal project maintained on a best-effort basis; there's no response-time guarantee.
 
 ---
 

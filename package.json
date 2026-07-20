@@ -80,13 +80,12 @@
     "check:versions": "node scripts/check-versions.mjs",
     "smoke:plugin": "node scripts/smoke-plugin.mjs",
     "check:bilingual": "node scripts/check-bilingual.mjs --changelog",
-    "check:readme": "node scripts/check-readme-version.mjs",
     "check:tracker-ids": "node scripts/check-tracker-ids.mjs --all",
     "check:pack-surface": "node scripts/check-pack-surface.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepublishOnly": "npm test && npm run lint && npm run check:versions && npm run smoke:plugin && node scripts/check-pack-surface.mjs && npm run smoke-pack && npm run check:bilingual && npm run check:readme && npm run check:tracker-ids"
+    "prepublishOnly": "npm test && npm run lint && npm run check:versions && npm run smoke:plugin && node scripts/check-pack-surface.mjs && npm run smoke-pack && npm run check:bilingual && npm run check:tracker-ids"
   },
   "devDependencies": {
     "prettier": "^3.8.3"

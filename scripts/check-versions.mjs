@@ -7,9 +7,10 @@
 // The set mirrors scripts/bump-version.mjs (package.json, .claude-plugin/plugin.json,
 // .claude-plugin/marketplace.json, templates/hypo-config.md) PLUS package-lock.json,
 // which npm — not bump-version — manages, so it can lag a bump and silently break
-// `npm ci`. README/CHANGELOG carry prose version HISTORY (every past vX.Y.Z), not a
-// single release authority, so they are intentionally excluded (covered by the
-// bilingual + README-reconcile checklist instead).
+// `npm ci`. CHANGELOG carries prose version HISTORY (every past vX.Y.Z), not a
+// single release authority, so it is intentionally excluded (covered by the
+// bilingual checklist instead). The READMEs describe current behavior and carry
+// no version at all, so there is nothing here for them to agree with.
 //
 // Usage:
 //   node scripts/check-versions.mjs               # assert all files agree
