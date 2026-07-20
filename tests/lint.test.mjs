@@ -13,6 +13,7 @@ import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmat
 import { test, suite } from './harness.mjs';
 import {
   HOME,
+  REPO,
   SCRIPTS,
   SESSION_TMP_HOME,
   findDesignHistoryStale,
@@ -1204,6 +1205,48 @@ test('cache key normalizes "." and "./" to the same absolute vault (no duplicate
   } finally {
     process.chdir(originalCwd);
     rmSync(vault, { recursive: true, force: true });
+  }
+});
+
+// The A안 split only holds if privacy-relevant callers never reach for the
+// scan-only functions. The hole this guards is a gate loading .hyposcanignore
+// patterns IN PLACE OF .hypoignore ones, which would let a user-authored scan
+// pattern punch through the secret gate. (Using isScanIgnored in a reject-style
+// gate would over-block, not leak — annoying, but not a privacy failure.)
+//
+// Most hooks are structurally immune: hooks cannot import scripts/ (one-way
+// dependency direction), so hooks/hypo-shared.mjs carries its own
+// isIgnored/loadHypoIgnore with no scan variant. hooks/hypo-pre-commit.mjs is
+// the one hook that imports scripts/lib/hypo-ignore.mjs directly. installHooks
+// does copy it into ~/.claude/hooks/ along with every other hooks/*.mjs, but
+// that copy is never the one that runs: the wiki's git pre-commit shim executes
+// the package-root worker (scripts/init.mjs, wikiPreCommitContent), where
+// scripts/ sits alongside and the import resolves. So it can reach
+// isScanIgnored and has to be checked here. scripts/ingest.mjs,
+// scripts/capture.mjs, and scripts/lib/extensions.mjs are the other places a
+// privacy decision gets made; none of the four may touch the scan-only pair.
+const SCAN_IGNORE_CALLER_GUARD_FILES = [
+  'hooks/hypo-pre-commit.mjs',
+  'scripts/ingest.mjs',
+  'scripts/capture.mjs',
+  'scripts/lib/extensions.mjs',
+];
+
+test('privacy-relevant files never reference isScanIgnored/loadScanIgnore (scan-only stays scan-only)', () => {
+  for (const rel of SCAN_IGNORE_CALLER_GUARD_FILES) {
+    const code = readFileSync(join(REPO, rel), 'utf-8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    // Match the bare identifier, not `name(`: an aliased import
+    // (`import { isScanIgnored as si }`) or a passed reference
+    // (`someFilter(isScanIgnored)`) reaches the same file and a call-shaped
+    // regex would wave both through. Comments are stripped above, so a doc
+    // comment naming the function stays legal.
+    assert.equal(
+      /\b(isScanIgnored|loadScanIgnore)\b/.test(code),
+      false,
+      `${rel} must not reference the scan-only .hyposcanignore functions`,
+    );
   }
 });
 
