@@ -15,10 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A parked proposal can be approved by typing the approval in the conversation, not only from a TTY, and the approval is unforgeable and single use. ([#194](https://github.com/sk-lim19f/Hypomnema/pull/194))
 - `doctor` and session start show the count of pending write-proposals awaiting review. ([#186](https://github.com/sk-lim19f/Hypomnema/pull/186))
 - Wiki pages can opt into a machine-scoped visibility namespace (`visibility_scope: machine:<device>`) so a page shows only on its owning device. ([#178](https://github.com/sk-lim19f/Hypomnema/pull/178))
-- Directory skills now sync both ways: `skills/<name>/SKILL.md` plus its subtree syncs to `~/.claude/skills/` with per-file ownership, and `hypomnema capture` pulls a locally-authored skill directory back into the wiki under its original name. ([#187](https://github.com/sk-lim19f/Hypomnema/pull/187), [#188](https://github.com/sk-lim19f/Hypomnema/pull/188))
+- Directory skills now sync both ways: `skills/<name>/SKILL.md` plus its subtree syncs to `~/.claude/skills/` with per-file ownership, and `hypomnema capture` pulls a locally-authored skill directory back into the wiki, where a sidecar manifest records its install name so other machines get it back under that name. ([#187](https://github.com/sk-lim19f/Hypomnema/pull/187), [#188](https://github.com/sk-lim19f/Hypomnema/pull/188))
 - New `/hypo:debate` skill: a structured debate (interrogate, verify against code, synthesize) to re-verify an overdue wiki claim or harden a decision into an ADR, with a bundled six-pattern orchestration reference. ([#206](https://github.com/sk-lim19f/Hypomnema/pull/206))
 - New optional `.hyposcanignore` excludes paths from scanning tools (lint, graph, stats, query, verify, doctor) without blocking commits, separating scan exclusion from the `.hypoignore` privacy gate. ([#216](https://github.com/sk-lim19f/Hypomnema/pull/216))
-- New opt-in `hypo init --lint-strict` flag gates the wiki pre-commit hook on `lint --strict`, so frontmatter and broken-wikilink warnings block commits. ([#215](https://github.com/sk-lim19f/Hypomnema/pull/215))
+- New opt-in `hypomnema init --lint-strict` flag gates the wiki pre-commit hook on `lint --strict`, so frontmatter and broken-wikilink warnings block commits. ([#215](https://github.com/sk-lim19f/Hypomnema/pull/215))
 - Close-path append writes are serialized with a per-target lockfile, so two sessions closing at once no longer interleave their entries.
 
 #### 한국어
@@ -27,10 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - park된 proposal을 TTY 없이 대화창에 승인을 타이핑해 적용할 수 있고, 그 승인은 위조할 수 없으며 한 번만 쓰입니다. ([#194](https://github.com/sk-lim19f/Hypomnema/pull/194))
 - `doctor`와 세션 시작이 검토를 기다리는 write-proposal 건수를 보여줍니다. ([#186](https://github.com/sk-lim19f/Hypomnema/pull/186))
 - 위키 페이지가 머신 범위 visibility 네임스페이스(`visibility_scope: machine:<device>`)를 선택해 소유 머신에서만 보이게 할 수 있습니다. ([#178](https://github.com/sk-lim19f/Hypomnema/pull/178))
-- 디렉터리 skill이 양방향으로 동기화됩니다: `skills/<name>/SKILL.md`와 그 서브트리가 파일 단위 소유 추적과 함께 `~/.claude/skills/`로 내려가고, `hypomnema capture`가 로컬에서 만든 skill 디렉터리를 원래 이름 그대로 위키로 끌어옵니다. ([#187](https://github.com/sk-lim19f/Hypomnema/pull/187), [#188](https://github.com/sk-lim19f/Hypomnema/pull/188))
+- 디렉터리 skill이 양방향으로 동기화됩니다: `skills/<name>/SKILL.md`와 그 서브트리가 파일 단위 소유 추적과 함께 `~/.claude/skills/`로 내려가고, `hypomnema capture`가 로컬에서 만든 skill 디렉터리를 위키로 끌어오면서 sidecar manifest에 설치 이름을 남겨 다른 머신에서 그 이름으로 복원됩니다. ([#187](https://github.com/sk-lim19f/Hypomnema/pull/187), [#188](https://github.com/sk-lim19f/Hypomnema/pull/188))
 - 새 `/hypo:debate` 스킬: 구조화 디베이트(심문, 코드 대조 검증, 합성)로 기한이 지난 위키 주장을 재검증하거나 결정을 ADR로 굳히고, 멀티에이전트 6패턴 레퍼런스를 함께 배포합니다. ([#206](https://github.com/sk-lim19f/Hypomnema/pull/206))
 - 새 옵션 파일 `.hyposcanignore`가 스캔 도구(lint, graph, stats, query, verify, doctor)에서 경로를 제외하되 커밋은 막지 않아, 스캔 제외가 `.hypoignore` 프라이버시 게이트에서 분리됩니다. ([#216](https://github.com/sk-lim19f/Hypomnema/pull/216))
-- 새 opt-in `hypo init --lint-strict` 플래그가 위키 pre-commit 훅을 `lint --strict`로 게이트해, frontmatter·깨진 wikilink 경고가 커밋을 막습니다. ([#215](https://github.com/sk-lim19f/Hypomnema/pull/215))
+- 새 opt-in `hypomnema init --lint-strict` 플래그가 위키 pre-commit 훅을 `lint --strict`로 게이트해, frontmatter·깨진 wikilink 경고가 커밋을 막습니다. ([#215](https://github.com/sk-lim19f/Hypomnema/pull/215))
 - close 경로의 append 쓰기를 대상별 lockfile로 직렬화해, 두 세션이 동시에 닫아도 엔트리가 섞이지 않습니다.
 
 ### Bug Fixes
@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Machine-scoped pages no longer surface on other machines through session start, cwd change, or `/hypo:resume`. ([#192](https://github.com/sk-lim19f/Hypomnema/pull/192))
 - lint no longer reports pages under `_`-prefixed directories (draft and spec scaffolds) as broken wikilinks: they stay unlinted but are now valid link targets, so `--strict` can reach a green gate. ([#198](https://github.com/sk-lim19f/Hypomnema/pull/198))
 - `doctor` and `init` recognize a plugin-channel install and stop double-registering core hooks; a dual install resolves the plugin's real root so `hypo-pkg.json` and the vault pre-commit hook survive an npm uninstall; `doctor` validates the `hypo-pkg.json` pointer; `init --dry-run` previews the `hypo-pkg.json` write. ([#211](https://github.com/sk-lim19f/Hypomnema/pull/211))
-- `hypo upgrade` in a dual install no longer preserves a stale npm-first `pkgRoot`: the dualSkip path re-resolves the plugin root from the registry and corrects `hypo-pkg.json` when it diverges, preserving it when the registry is unavailable. ([#217](https://github.com/sk-lim19f/Hypomnema/pull/217))
+- `hypomnema upgrade` in a dual install no longer preserves a stale npm-first `pkgRoot`: the dualSkip path re-resolves the plugin root from the registry and corrects `hypo-pkg.json` when it diverges, preserving it when the registry is unavailable. ([#217](https://github.com/sk-lim19f/Hypomnema/pull/217))
 - `/hypo:upgrade` warns when an installed `hypo-guide.md` has drifted from (or predates the versioning of) the shipped template, instead of leaving it silently stale. ([#209](https://github.com/sk-lim19f/Hypomnema/pull/209))
 - The npm package no longer ships maintainer-only tooling: the tarball contains the product surface alone, and a CI gate keeps it that way. ([#195](https://github.com/sk-lim19f/Hypomnema/pull/195))
 
@@ -67,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 머신 범위 페이지가 세션 시작, 작업 디렉터리 변경, `/hypo:resume` 경로로 다른 머신에 노출되지 않습니다. ([#192](https://github.com/sk-lim19f/Hypomnema/pull/192))
 - lint가 `_` 접두 디렉터리(draft·spec scaffold) 아래 문서를 깨진 wikilink로 보고하지 않습니다: 검사 대상에서 빠지는 건 그대로지만 링크 대상으로는 유효해져, `--strict`가 green 게이트에 도달할 수 있습니다. ([#198](https://github.com/sk-lim19f/Hypomnema/pull/198))
 - `doctor`와 `init`이 플러그인 채널 설치를 인식해 코어 훅 이중 등록을 멈추고, dual install에서 플러그인의 실제 루트를 resolve해 npm 제거 후에도 `hypo-pkg.json`과 볼트 pre-commit 훅이 살아남으며, `doctor`가 그 포인터를 검증하고 `init --dry-run`이 쓰기를 미리 보여줍니다. ([#211](https://github.com/sk-lim19f/Hypomnema/pull/211))
-- dual install에서 `hypo upgrade`가 오래된 npm-first `pkgRoot`를 그대로 두지 않고, dualSkip 경로가 registry에서 플러그인 루트를 다시 resolve해 어긋나면 `hypo-pkg.json`을 정정합니다(registry가 없으면 보존). ([#217](https://github.com/sk-lim19f/Hypomnema/pull/217))
+- dual install에서 `hypomnema upgrade`가 오래된 npm-first `pkgRoot`를 그대로 두지 않고, dualSkip 경로가 registry에서 플러그인 루트를 다시 resolve해 어긋나면 `hypo-pkg.json`을 정정합니다(registry가 없으면 보존). ([#217](https://github.com/sk-lim19f/Hypomnema/pull/217))
 - `/hypo:upgrade`가 설치된 `hypo-guide.md`가 배포 템플릿과 어긋나거나 버전 스탬프 이전일 때 조용히 stale로 두지 않고 경고합니다. ([#209](https://github.com/sk-lim19f/Hypomnema/pull/209))
 - npm 패키지가 메인테이너 전용 도구를 더 이상 싣지 않습니다: tarball은 제품 표면만 담고, CI 게이트가 그 상태를 유지시킵니다. ([#195](https://github.com/sk-lim19f/Hypomnema/pull/195))
 
