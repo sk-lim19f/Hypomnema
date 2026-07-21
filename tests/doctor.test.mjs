@@ -278,6 +278,203 @@ test('doctor-sync-state-warn: conflict entry → manual-merge guidance, not gene
   });
 });
 
+// FEAT-34: last-success timestamp visibility in the sync-state check.
+suite('doctor.mjs — FEAT-34: sync-last-success visibility');
+
+function syncFixtureWiki(dir) {
+  writeFileSync(join(dir, 'hypo-config.md'), '# config');
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  mkdirSync(join(dir, 'projects'), { recursive: true });
+  mkdirSync(join(dir, 'sources'), { recursive: true });
+}
+
+test('doctor-sync-last-success: no success file, no failures → never synced (not unqualified healthy)', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+    assert.ok(
+      /never synced/.test(check.detail),
+      `absent success record must say "never synced", not an unqualified healthy message: ${check.detail}`,
+    );
+  });
+});
+
+test('doctor-sync-last-success: pull-only record → reports pull time, notes push missing', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ pull: { timestamp: '2026-07-20T00:00:00.000Z', host: 'test-host' } }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+    assert.ok(
+      check.detail.includes('2026-07-20T00:00:00.000Z') && check.detail.includes('test-host'),
+      `pull success time/host must be reported: ${check.detail}`,
+    );
+    assert.ok(
+      /push: none recorded/.test(check.detail),
+      `push-absent must be called out distinctly, not implied: ${check.detail}`,
+    );
+    assert.ok(
+      !/never synced/.test(check.detail),
+      `a pull-only record is not "never synced": ${check.detail}`,
+    );
+  });
+});
+
+test('doctor-sync-last-success: push-only record → reports push time, notes pull missing', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ push: { timestamp: '2026-07-19T12:00:00.000Z', host: 'other-host' } }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+    assert.ok(
+      check.detail.includes('2026-07-19T12:00:00.000Z') && check.detail.includes('other-host'),
+      `push success time/host must be reported: ${check.detail}`,
+    );
+    assert.ok(
+      /pull: none recorded/.test(check.detail),
+      `pull-absent must be called out distinctly: ${check.detail}`,
+    );
+  });
+});
+
+test('doctor-sync-last-success: corrupt sync-last-success.json → warn, not crash', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'sync-last-success.json'), 'not-json{{{');
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    assert.ok(r.status !== null && r.status <= 1, `doctor must not crash: exit ${r.status}`);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `corrupt success file must warn: ${check.detail}`);
+    assert.ok(
+      /sync-last-success\.json/.test(check.detail),
+      `warn must name the offending file: ${check.detail}`,
+    );
+  });
+});
+
+test('doctor-sync-last-success: malformed pull/push record (schema-valid JSON, wrong shape) → warn, not "undefined (undefined)"', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // Parseable JSON, but `pull` is a string instead of {timestamp, host} —
+    // must not render as `pull undefined (undefined)`.
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ pull: 'not-a-record' }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `malformed success record must warn: ${check.detail}`);
+    assert.ok(
+      !/undefined/.test(check.detail),
+      `malformed record must never render "undefined": ${check.detail}`,
+    );
+    assert.ok(
+      /sync-last-success\.json/.test(check.detail),
+      `warn must name the offending file: ${check.detail}`,
+    );
+  });
+});
+
+test('doctor-sync-last-success: empty-string timestamp/host → warn, not a false "pull ()" pass', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // typeof === 'string' is true for '', so a naive check would accept this
+    // and render "pull  ()" as a healthy pass.
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ pull: { timestamp: '', host: '' } }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `empty timestamp/host must warn, not pass: ${check.detail}`);
+    assert.ok(
+      !/pull \(\)|pull\s*$/.test(check.detail),
+      `must not render an empty "pull ()" as if it were a real record: ${check.detail}`,
+    );
+  });
+});
+
+test('doctor-sync-last-success: unrecognized top-level key → warn, not silently ignored', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({
+        pull: { timestamp: '2026-07-20T00:00:00.000Z', host: 'test-host' },
+        unexpectedKey: 'hand-edit or foreign writer',
+      }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `an unrecognized top-level key must warn, not be silently ignored: ${check.detail}`,
+    );
+  });
+});
+
+test('doctor-sync-last-success: unresolved failure still reported unchanged, even with a success record present', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ pull: { timestamp: '2026-07-20T00:00:00.000Z', host: 'test-host' } }),
+    );
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({
+        timestamp: '2026-07-20T01:00:00Z',
+        op: 'push',
+        error: 'network timeout',
+        host: 'test',
+      }) + '\n',
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    // The failure-reporting branch is unchanged by FEAT-34: same message shape
+    // as the pre-existing "open sync-state.json entries → warn" test.
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(
+      /unresolved failure\(s\) — last: push at 2026-07-20T01:00:00Z/.test(check.detail),
+      `unresolved-failure detail must be unchanged: ${check.detail}`,
+    );
+  });
+});
+
 suite('doctor.mjs — per-project index.md working_dir anchor coverage');
 
 function doctorAnchorCheck(dir) {

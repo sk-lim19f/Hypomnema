@@ -19,6 +19,7 @@ import {
   formatGrowthMetrics,
   readSyncState,
   clearSyncState,
+  recordSyncSuccess,
   readClearMarker,
   clearClearMarker,
   loadHypoIgnore,
@@ -253,14 +254,22 @@ function buildClearRecoveryLine(source) {
   );
 }
 
-/** Pull the wiki repo. Returns true only when the pull actually succeeded. */
+/**
+ * Pull the wiki repo. Returns true only when the pull actually succeeded. On
+ * success, also records the last-success timestamp (silently — no notice; the
+ * existing failure notice below is unchanged) so doctor never reports "never
+ * synced" right after a healthy startup pull, even when no auto-commit Stop
+ * hook has run yet this session.
+ */
 function gitPull(dir) {
   if (!existsSync(join(dir, '.git'))) return false;
   const r = spawnSync('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], {
     stdio: 'pipe',
     timeout: 10000,
   });
-  return r.status === 0;
+  const ok = r.status === 0;
+  if (ok) recordSyncSuccess(dir, 'pull');
+  return ok;
 }
 
 /**
