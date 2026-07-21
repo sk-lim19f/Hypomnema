@@ -101,6 +101,7 @@ import {
   resolveTranscriptBySessionId,
   hasUserCloseSignal,
   commitWikiChanges,
+  vaultCommitLockTarget,
   currentDevice,
   scopeVisible,
   readVisibilityScope,
@@ -1229,6 +1230,12 @@ function applySessionClose(args) {
 
   const applied = [];
   const skipped = [];
+  // The ACTUAL vault-relative paths this apply wrote, kept separate
+  // from `applied` (whose entries are display strings like `key (relPath)`,
+  // not bare paths). This is the scope handed to commitWikiChanges below;
+  // never the broader `payloadScope` above, which also includes lint/evidence
+  // candidates this apply may not have written a byte to.
+  const appliedPaths = [];
   // Overwrite targets this apply refused to write because the page moved under
   // it. T6 turns these into `.cache/proposals/` artifacts; here they are already
   // enough to withhold the bytes and fail the close.
@@ -1286,6 +1293,7 @@ function applySessionClose(args) {
     if (args.sessionId)
       advanceBase(args.hypoDir, args.sessionId, relPath, hashContent(field.content));
     applied.push(`${key} (${relPath})`);
+    appliedPaths.push(relPath);
   };
 
   overwrite('sessionState', join('projects', project, 'session-state.md'), payload.sessionState);
@@ -1368,6 +1376,7 @@ function applySessionClose(args) {
         { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
       );
       (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
+      if (outcome !== 'skipped') appliedPaths.push(rel);
     } catch (err) {
       // Only a lock-TIMEOUT is withheld as a conflict. A real fn() write error
       // (disk-full, EACCES, mkdir failure) must NOT be masked as a proposal-
@@ -1419,6 +1428,7 @@ function applySessionClose(args) {
         { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
       );
       (wrote ? applied : skipped).push('log (log.md)');
+      if (wrote) appliedPaths.push('log.md');
     } catch (err) {
       if (err?.code !== 'ELOCKTIMEOUT') throw err;
       // proposedContent is append-ready root-log bytes (the custom log line).
@@ -1455,6 +1465,7 @@ function applySessionClose(args) {
         { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
       );
       (wroteAny ? applied : skipped).push('log (log.md, derived)');
+      if (wroteAny) appliedPaths.push('log.md');
     } catch (err) {
       if (err?.code !== 'ELOCKTIMEOUT') throw err;
       // `derived: true` discriminates this from the payload.log conflict above:
@@ -1646,7 +1657,22 @@ function applySessionClose(args) {
     // user-close signal ONLY once the gate passes. planMarkerDecision owns the
     // branch priority + reason strings; the booleans below are computed in that
     // same short-circuiting order so no read runs earlier than it does today.
-    const commitOutcome = commitWikiChanges(args.hypoDir);
+    // Scope this commit to the paths THIS apply actually wrote
+    // (appliedPaths), never the broader payloadScope, which also
+    // names lint/evidence candidates apply may not have touched a byte of.
+    // Locked against the SAME target the auto-commit Stop hook holds, so a
+    // concurrent Stop-chain commit on this vault can't interleave with this
+    // apply's stage+commit. A lock-timeout is treated exactly like any other
+    // commit failure below (skip the marker, surface the reason) rather than
+    // crashing the apply.
+    let commitOutcome;
+    try {
+      commitOutcome = withFileLock(vaultCommitLockTarget(args.hypoDir), () =>
+        commitWikiChanges(args.hypoDir, appliedPaths),
+      );
+    } catch (err) {
+      commitOutcome = { committed: false, reason: `vault-commit-lock: ${err?.message || err}` };
+    }
     let closeTranscript = null;
     let gateOk = false;
     if (commitOutcome.committed) {

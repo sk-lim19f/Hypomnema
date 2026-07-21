@@ -658,3 +658,54 @@ test('payload.sessionId empty string → mismatches any real id, refused', () =>
     assert.equal(JSON.parse(r.stdout).stage, 'session-id-mismatch');
   });
 });
+
+suite('ISSUE-69: apply commits only the paths it actually wrote, not payloadScope');
+
+// The apply-time commit (crystallize.mjs's own commitWikiChanges call, at the
+// marker-write step) must be scoped to `appliedPaths` — the paths THIS close
+// actually wrote a byte to — never the broader `payloadScope` it also builds
+// (which additionally names lint/evidence candidates like the legacy monthly
+// session-log fallback). A pre-existing, unrelated dirty file in the same
+// working tree must not ride along in the commit this apply creates.
+test('apply commit excludes an unrelated pre-existing dirty file outside the payload', () => {
+  withWiki(null, (dir, today) => {
+    // A dirty file this close's payload never names — simulates lint/evidence
+    // debt elsewhere in the vault that must not be swept into THIS commit.
+    writeFileSync(join(dir, 'unrelated-debt.md'), '# pre-existing, unrelated debt\n');
+
+    const payload = payloadForCleanWiki(dir, today);
+    // sessionState/projectHot/rootHot re-assert identical content (idempotent
+    // skip); sessionLog + log carry fresh entries, so this close DOES write
+    // bytes — session-log/<ym>.md and log.md — while leaving the three
+    // overwrite targets untouched. That is exactly the mixed applied/skipped
+    // shape the scoped commit must handle correctly.
+    const r = runApply(dir, payload, { sessionId: 'sess-issue69-apply' });
+    assert.equal(r.status, 0, `apply must succeed: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `expected ok:true: ${r.stdout}`);
+
+    const committedAtHead = spawnSync(
+      'git',
+      ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
+      { encoding: 'utf-8' },
+    ).stdout;
+    assert.ok(
+      /log\.md/.test(committedAtHead),
+      `log.md (an actual apply write) must be committed: ${committedAtHead}`,
+    );
+    assert.ok(
+      !/unrelated-debt\.md/.test(committedAtHead),
+      `unrelated-debt.md must NOT be swept into the apply's commit: ${committedAtHead}`,
+    );
+
+    // The dirty file must be left exactly as apply found it: uncommitted,
+    // not silently staged either.
+    const status = spawnSync('git', ['-C', dir, 'status', '--porcelain', 'unrelated-debt.md'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      /unrelated-debt\.md/.test(status),
+      `unrelated-debt.md must remain dirty, untouched by apply: ${status}`,
+    );
+  });
+});

@@ -158,6 +158,13 @@ const {
   currentDevice,
   scopeVisible,
   readVisibilityScope,
+  recordTouchedPaths,
+  peekTouchedPaths,
+  clearTouchedPaths,
+  drainTouchedPaths,
+  commitTouchedPaths,
+  touchedPathsPath,
+  vaultCommitLockTarget,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -313,7 +320,16 @@ function runApply(dir, payload, { force = false, sessionId = undefined } = {}) {
   // Fix #39 (option D): payload presence = explicit close intent → always runs
   // full apply. --force only matters for the no-payload probe path, so tests
   // that supply a payload do NOT need --force.
-  const payloadPath = join(dir, '.payload.json');
+  //
+  // ISSUE-69: the payload file must live OUTSIDE the vault's own git tree.
+  // commitWikiChanges no longer sweeps the whole working tree, so a stray
+  // `.payload.json` left inside `dir` is no longer silently absorbed into
+  // apply's commit — it would sit there as a real "uncommitted changes" git
+  // blocker and fail the close gate this same apply is trying to pass.
+  const payloadPath = join(
+    tmpdir(),
+    `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+  );
   writeFileSync(payloadPath, JSON.stringify(payload));
   const flags = [
     `--hypo-dir=${dir}`,
@@ -383,9 +399,11 @@ function withGrowthWiki(fn) {
   }
 }
 
-function runStop(hookFile, dir) {
+// `payload` becomes the hook's stdin JSON — most Stop hooks read session_id
+// off it. Defaults to `{}` (no session_id) for callers that don't care.
+function runStop(hookFile, dir, payload = {}) {
   return spawnSync(process.execPath, [join(HOOKS, hookFile)], {
-    input: '{}',
+    input: JSON.stringify(payload),
     encoding: 'utf-8',
     env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
   });
@@ -757,6 +775,13 @@ export {
   readCoreHooksConfig,
   readVisibilityScope,
   recordLookupUsage,
+  recordTouchedPaths,
+  peekTouchedPaths,
+  clearTouchedPaths,
+  drainTouchedPaths,
+  commitTouchedPaths,
+  touchedPathsPath,
+  vaultCommitLockTarget,
   resolveHypoRoot,
   resolveHypoRootInfo,
   resolveInstallFile,

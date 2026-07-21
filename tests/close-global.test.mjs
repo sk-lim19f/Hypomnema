@@ -1827,7 +1827,11 @@ test('--apply-session-close --session-id with an unresolvable transcript → ref
       sessionLog: { entry: `## [${today}] auto-mark test\n` },
       log: { entry: `## [${today}] session | test-project — auto-mark\n` },
     };
-    const payloadPath = join(dir, '.payload.json');
+    // ISSUE-69: outside the vault's own git tree — commitWikiChanges no
+    // longer sweeps the whole working tree, so a payload file left inside
+    // `dir` would sit there as a real git blocker instead of being silently
+    // absorbed by the apply's own commit.
+    const payloadPath = join(tmpdir(), `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`);
     writeFileSync(payloadPath, JSON.stringify(payload));
     const sessionStateBefore = readFileSync(
       join(dir, 'projects', 'test-project', 'session-state.md'),
@@ -1878,7 +1882,11 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
       sessionLog: { entry: `## [${today}] auto-mark landed test\n` },
       log: { entry: `## [${today}] session | test-project — auto-mark landed\n` },
     };
-    const payloadPath = join(dir, '.payload.json');
+    // ISSUE-69: outside the vault's own git tree — commitWikiChanges no
+    // longer sweeps the whole working tree, so a payload file left inside
+    // `dir` would sit there as a real git blocker instead of being silently
+    // absorbed by the apply's own commit.
+    const payloadPath = join(tmpdir(), `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`);
     writeFileSync(payloadPath, JSON.stringify(payload));
     // Plant a transcript resolvable by session-id that carries a user-close signal.
     const cleanup = seedCloseTranscript('s-apply-land');
@@ -1930,7 +1938,12 @@ test('IMPR-15: no-user-close-signal → after an AskUserQuestion 세션 마무�
         sessionLog: { entry: `## [${today}] impr15 rerun test\n` },
         log: { entry: `## [${today}] session | test-project: impr15 rerun\n` },
       };
-      const payloadPath = join(dir, '.payload.json');
+      // ISSUE-69: outside the vault's own git tree — see the comment on the
+      // earlier two payloadPath sites in this file for why.
+      const payloadPath = join(
+        tmpdir(),
+        `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+      );
       writeFileSync(payloadPath, JSON.stringify(payload));
       const args = [
         `--hypo-dir=${dir}`,
