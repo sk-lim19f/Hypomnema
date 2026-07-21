@@ -7,7 +7,7 @@
 
 import { spawnSync } from 'child_process';
 import { relative } from 'path';
-import { HYPO_DIR, loadHypoIgnore, isIgnored } from './hypo-shared.mjs';
+import { HYPO_DIR, loadHypoIgnore, isIgnored, recordTouchedPaths } from './hypo-shared.mjs';
 import { advanceBaseForWrite, hashContent } from './base-store.mjs';
 
 // Tools that REPLACE file bytes. The base advance below must fire only for these:
@@ -40,24 +40,34 @@ if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
     spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' });
   }
 
-  // Write=proposal gate provenance: when this session's own write lands on one of
-  // the overwrite targets it snapshotted at start, advance that target's base so
-  // the close guard reads the change as "I wrote this", not "someone else did"
-  // (which would fail safe into a false proposal against the session's own edit).
-  // Self-scoping — a no-op unless the path is a tracked base key — so it runs
-  // regardless of .hypoignore (provenance is independent of privacy). Best-effort.
-  //
-  // The Write tool carries its full `content`, so advance to the bytes THIS
-  // session wrote (race-safe: a concurrent write landing between the tool and
-  // this hook cannot be adopted as our base). Edit/MultiEdit have no full content
-  // in the payload, so they fall back to a post-write disk read.
-  if (WRITE_TOOLS.has(input.tool_name) && input.session_id) {
+  if (WRITE_TOOLS.has(input.tool_name)) {
     const rel = relative(HYPO_DIR, filePath);
-    const known =
-      input.tool_name === 'Write' && typeof input.tool_input?.content === 'string'
-        ? hashContent(input.tool_input.content)
-        : null;
-    advanceBaseForWrite(HYPO_DIR, input.session_id, rel, filePath, known);
+
+    // Accumulate this write into the session's scoped auto-commit
+    // set, keyed by session_id (no-op without one; never a shared bucket).
+    // hypo-auto-commit.mjs drains this at Stop instead of sweeping the whole
+    // working tree, so another session's concurrent writes to this vault
+    // never land in THIS session's commit.
+    recordTouchedPaths(HYPO_DIR, input.session_id, rel);
+
+    // Write=proposal gate provenance: when this session's own write lands on one of
+    // the overwrite targets it snapshotted at start, advance that target's base so
+    // the close guard reads the change as "I wrote this", not "someone else did"
+    // (which would fail safe into a false proposal against the session's own edit).
+    // Self-scoping — a no-op unless the path is a tracked base key — so it runs
+    // regardless of .hypoignore (provenance is independent of privacy). Best-effort.
+    //
+    // The Write tool carries its full `content`, so advance to the bytes THIS
+    // session wrote (race-safe: a concurrent write landing between the tool and
+    // this hook cannot be adopted as our base). Edit/MultiEdit have no full content
+    // in the payload, so they fall back to a post-write disk read.
+    if (input.session_id) {
+      const known =
+        input.tool_name === 'Write' && typeof input.tool_input?.content === 'string'
+          ? hashContent(input.tool_input.content)
+          : null;
+      advanceBaseForWrite(HYPO_DIR, input.session_id, rel, filePath, known);
+    }
   }
 }
 

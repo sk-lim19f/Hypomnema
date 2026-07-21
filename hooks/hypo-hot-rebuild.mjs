@@ -17,10 +17,30 @@ import {
   computeSessionGrowth,
   formatGrowthMetrics,
   deriveRootLogEntries,
+  recordTouchedPaths,
 } from './hypo-shared.mjs';
 
 const HOT_PATH = join(HYPO_DIR, 'hot.md');
 const GROWTH_CACHE = join(HYPO_DIR, '.cache', 'last-session-growth.json');
+
+// This Stop hook runs BEFORE hypo-auto-commit and can write hot.md
+// (rebuild) and log.md (deriveRootLogEntries), both hook-generated, not user
+// Write/Edit, so hypo-auto-stage never sees them. Read session_id off stdin so
+// whatever this hook writes still lands in the scoped commit's set; without
+// this, a scope built from Write/Edit alone would silently drop these files
+// from every session's auto-commit.
+let sessionId = null;
+try {
+  const raw = await new Promise((r) => {
+    let d = '';
+    process.stdin.on('data', (c) => (d += c));
+    process.stdin.on('end', () => r(d));
+  });
+  const payload = JSON.parse(raw || '{}') || {};
+  sessionId = payload.session_id || payload.sessionId || null;
+} catch {
+  sessionId = null;
+}
 
 function parseFrontmatter(content) {
   const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -52,12 +72,13 @@ function parsePointerRows(content) {
   return rows;
 }
 
+/** @returns {boolean} true when hot.md was actually rewritten. */
 function rebuild() {
-  if (!existsSync(HOT_PATH)) return;
+  if (!existsSync(HOT_PATH)) return false;
 
   const current = readFileSync(HOT_PATH, 'utf-8');
   const rows = parsePointerRows(current);
-  if (rows.length === 0) return;
+  if (rows.length === 0) return false;
 
   const today = new Date().toISOString().slice(0, 10);
 
@@ -93,7 +114,11 @@ ${tableRows}
 3. Read \`projects/<name>/hot.md\` for project background
 `;
 
-  if (canonical !== current) writeFileSync(HOT_PATH, canonical);
+  if (canonical !== current) {
+    writeFileSync(HOT_PATH, canonical);
+    return true;
+  }
+  return false;
 }
 
 function emitGrowth() {
@@ -107,16 +132,18 @@ function emitGrowth() {
   } catch {}
 }
 
+let hotWritten = false;
 try {
-  rebuild();
+  hotWritten = rebuild();
 } catch (err) {
   process.stderr.write(`[hypo-hot-rebuild] error: ${err?.message ?? String(err)}\n`);
 }
 // Auto-derive the root log.md session entry from each project's session-log
 // heading (runs AFTER rebuild() so root hot.md is already fresh and isn't itself
 // counted as the project's open gate problem). Best-effort: own try/catch.
+let logEntriesAdded = 0;
 try {
-  deriveRootLogEntries(HYPO_DIR);
+  logEntriesAdded = deriveRootLogEntries(HYPO_DIR);
 } catch (err) {
   process.stderr.write(`[hypo-hot-rebuild] log-derive error: ${err?.message ?? String(err)}\n`);
 }
@@ -124,6 +151,17 @@ try {
   emitGrowth();
 } catch (err) {
   process.stderr.write(`[hypo-hot-rebuild] error: ${err?.message ?? String(err)}\n`);
+}
+
+// Feed this hook's own writes into the session's scoped auto-commit
+// set (see the sessionId comment above). No-op without a session_id.
+try {
+  const touched = [];
+  if (hotWritten) touched.push('hot.md');
+  if (logEntriesAdded > 0) touched.push('log.md');
+  if (touched.length > 0) recordTouchedPaths(HYPO_DIR, sessionId, touched);
+} catch (err) {
+  process.stderr.write(`[hypo-hot-rebuild] touched-paths error: ${err?.message ?? String(err)}\n`);
 }
 
 try {

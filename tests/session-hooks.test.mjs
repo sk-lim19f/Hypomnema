@@ -30,15 +30,22 @@ import {
   HOOKS,
   REPO,
   SESSION_TMP_HOME,
+  clearTouchedPaths,
+  commitTouchedPaths,
   commitWikiChanges,
+  drainTouchedPaths,
   formatGrowthMetrics,
   hypoIsClean,
   markerPath,
+  peekTouchedPaths,
   precompactGateStatus,
+  recordTouchedPaths,
   run,
   runFirstPrompt,
   runStop,
   syncRemote,
+  touchedPathsPath,
+  vaultCommitLockTarget,
   withGrowthWiki,
   withSyncedWiki,
   withTmpDir,
@@ -190,7 +197,10 @@ test('auto-commit skips .hypoignore-listed .cache paths', () => {
     writeFileSync(join(dir, '.cache', 'sessions', 'index.jsonl'), '{"session_id":"x"}\n');
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'note.md'), '# note\n');
-    const r = runStop('hypo-auto-commit.mjs', dir);
+    // ISSUE-69: commitWikiChanges is now scoped, not whole-tree — seed the
+    // session's touched-paths set the way hypo-auto-stage.mjs would have.
+    recordTouchedPaths(dir, 'sess-hypoignore-cache', 'pages/note.md');
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-hypoignore-cache' });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const tracked = spawnSync('git', ['-C', dir, 'ls-files', '.cache'], {
       encoding: 'utf-8',
@@ -231,7 +241,8 @@ test('auto-commit still commits a .hyposcanignore-only-listed path (not a privac
     writeFileSync(join(dir, '.hyposcanignore'), 'drafts/\n');
     mkdirSync(join(dir, 'drafts'), { recursive: true });
     writeFileSync(join(dir, 'drafts', 'wip.md'), '# wip\n');
-    const r = runStop('hypo-auto-commit.mjs', dir);
+    recordTouchedPaths(dir, 'sess-hyposcanignore', 'drafts/wip.md');
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-hyposcanignore' });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'drafts'], {
       encoding: 'utf-8',
@@ -249,7 +260,10 @@ test('auto-commit still SKIPS a .hypoignore-listed path even when it also matche
     writeFileSync(join(dir, '.hyposcanignore'), 'secrets/\n');
     mkdirSync(join(dir, 'secrets'), { recursive: true });
     writeFileSync(join(dir, 'secrets', 'token.md'), 'sk-leaked\n');
-    const r = runStop('hypo-auto-commit.mjs', dir);
+    recordTouchedPaths(dir, 'sess-hypoignore-and-scanignore', 'secrets/token.md');
+    const r = runStop('hypo-auto-commit.mjs', dir, {
+      session_id: 'sess-hypoignore-and-scanignore',
+    });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'secrets'], {
       encoding: 'utf-8',
@@ -262,11 +276,472 @@ test('auto-commit still SKIPS a .hypoignore-listed path even when it also matche
   });
 });
 
+suite('ISSUE-69 — scope the vault auto-commit to session-touched paths');
+
+test('hypo-auto-stage.mjs accumulates a Write/Edit/MultiEdit target into the session touched-paths set', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'note.md'), '# note\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+      input: JSON.stringify({
+        session_id: 'sess-accum',
+        tool_name: 'Write',
+        tool_input: { file_path: join(dir, 'pages', 'note.md'), content: '# note\n' },
+      }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-accum'), 'utf-8'));
+    assert.deepEqual(touched, ['pages/note.md']);
+  });
+});
+
+test('hypo-auto-stage.mjs does NOT accumulate a Read (non-mutating tool)', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'note.md'), '# note\n');
+    spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+      input: JSON.stringify({
+        session_id: 'sess-read-only',
+        tool_name: 'Read',
+        tool_input: { file_path: join(dir, 'pages', 'note.md') },
+      }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.ok(
+      !existsSync(touchedPathsPath(dir, 'sess-read-only')),
+      'a Read must not create a touched-paths set',
+    );
+  });
+});
+
+test('hypo-auto-commit.mjs: missing session_id → scoped commit SKIPPED, no whole-tree fallback', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'note.md'), '# note\n');
+    // no session_id in the stdin payload at all
+    const r = runStop('hypo-auto-commit.mjs', dir, {});
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], { encoding: 'utf-8' }).stdout;
+    assert.equal(
+      tracked.trim(),
+      '',
+      `no session_id must skip the commit entirely, not sweep the whole tree: ${tracked}`,
+    );
+    const staged = spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.equal(staged.trim(), '', `nothing should even be staged: ${staged}`);
+  });
+});
+
+test('hypo-auto-commit.mjs: an unrelated staged file from another session is left out of THIS commit', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# mine\n');
+    writeFileSync(join(dir, 'pages', 'theirs.md'), '# theirs\n');
+    // "theirs.md" is staged already, as if a concurrent session staged it —
+    // it must NOT be swept into this session's Stop-hook commit.
+    spawnSync('git', ['-C', dir, 'add', 'pages/theirs.md']);
+    recordTouchedPaths(dir, 'sess-scoped', 'pages/mine.md');
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-scoped' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const committed = spawnSync(
+      'git',
+      ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
+      { encoding: 'utf-8' },
+    ).stdout;
+    assert.ok(/pages\/mine\.md/.test(committed), `mine.md must be committed: ${committed}`);
+    assert.ok(
+      !/pages\/theirs\.md/.test(committed),
+      `theirs.md must NOT be swept into this commit: ${committed}`,
+    );
+    const staged = spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(/theirs\.md/.test(staged), `theirs.md must remain staged, untouched: ${staged}`);
+  });
+});
+
+test('hypo-hot-rebuild.mjs feeds its own hot.md write into the scoped commit', () => {
+  withGrowthWiki((dir) => {
+    // withGrowthWiki's hot.md has an empty pointer table, so rebuild() is a
+    // no-op there (parsePointerRows returns []); build a minimal fixture with
+    // one row so rebuild() actually rewrites hot.md deterministically.
+    mkdirSync(join(dir, 'projects', 'p1'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'p1', 'hot.md'),
+      '---\ntitle: hot\nupdated: 2020-01-01\n---\n',
+    );
+    writeFileSync(
+      join(dir, 'hot.md'),
+      '---\ntitle: Hot\nupdated: stale\n---\n\n## Active Projects\n\n' +
+        '| Project | Last Session | Hot Cache |\n|---|---|---|\n' +
+        '| p1 | old-date | [[projects/p1/hot]] |\n',
+    );
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed hot.md row'], { cwd: dir });
+    // hot-rebuild alone: proves it accumulates hot.md into the session's set.
+    const r = runStop('hypo-hot-rebuild.mjs', dir, { session_id: 'sess-hotrebuild' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-hotrebuild'), 'utf-8'));
+    assert.ok(touched.includes('hot.md'), `hot.md must be recorded as touched: ${JSON.stringify(touched)}`);
+    // end-to-end: hot-rebuild's accumulation is what lets auto-commit include
+    // the hook-generated hot.md, which never goes through Write/Edit at all.
+    const commitRes = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-hotrebuild' });
+    assert.equal(commitRes.status, 0, `stderr: ${commitRes.stderr}`);
+    const committed = spawnSync(
+      'git',
+      ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
+      { encoding: 'utf-8' },
+    ).stdout;
+    assert.ok(/^hot\.md$/m.test(committed), `hot.md must be in the scoped commit: ${committed}`);
+  });
+});
+
+// Codex pre-commit review (BLOCKER, 2 rounds) on the first cut of this suite:
+//
+//   1a. drain-before-lock: the Stop hook used to drain (delete) the session's
+//       touched-paths file BEFORE acquiring the vault lock. A lock-timeout
+//       lost the only record of the scope permanently. Fixed (round 1) by
+//       moving the drain inside the locked section.
+//   1b. requeue-on-failure still has a loss window: round 1's fix requeued
+//       (wrote the drained paths back) on a commit failure — but that
+//       requeue write is itself fallible (its own per-session lock-timeout,
+//       I/O error), so a commit failure could still silently lose the scope
+//       in the gap between the drain and the requeue. Fixed (round 2) by
+//       replacing drain-then-requeue with PEEK (non-destructive read) +
+//       commit + CLEAR-only-on-success (a set difference, under the
+//       per-session lock, of exactly the paths that were committed). Nothing
+//       is ever deleted from disk until the commit that used it has actually
+//       succeeded — there is no requeue path left to fail.
+//   2.  unlocked accumulate/drain: recordTouchedPaths/drainTouchedPaths did an
+//       unlocked read-merge-write / read-then-remove. Atomic rename prevents a
+//       torn file but not a lost update — two concurrent accumulations (or an
+//       accumulation racing a drain) could silently drop a path. Fixed by
+//       guarding every touched-paths mutation (record/peek/drain/clear) with
+//       the same per-session file lock.
+//
+// These tests pin the fixed behavior directly.
+
+test('hypo-auto-commit.mjs: a lock-timeout on the vault lock leaves the session scope on disk for the next Stop to retry', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# mine\n');
+    recordTouchedPaths(dir, 'sess-locktimeout', 'pages/mine.md');
+
+    // Hold the vault commit lock ourselves, standing in for a concurrent
+    // writer, so the Stop hook's own withFileLock call times out.
+    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, 'held by another writer\n');
+    try {
+      const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-commit.mjs')], {
+        input: JSON.stringify({ session_id: 'sess-locktimeout' }),
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          HOME: SESSION_TMP_HOME,
+          HYPO_DIR: dir,
+          HYPO_VAULT_LOCK_TIMEOUT_MS: '300', // fail fast instead of the 5s default
+        },
+      });
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    } finally {
+      rmSync(lockPath, { force: true });
+    }
+
+    // Nothing was committed (the lock was never acquired)...
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], { encoding: 'utf-8' }).stdout;
+    assert.equal(tracked.trim(), '', `no commit should have happened: ${tracked}`);
+    // ...and the touched-paths set is still on disk, untouched, for a retry.
+    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-locktimeout'), 'utf-8'));
+    assert.deepEqual(touched, ['pages/mine.md']);
+
+    // A retry (lock free this time) picks the scope back up and commits it.
+    const retry = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-commit.mjs')], {
+      input: JSON.stringify({ session_id: 'sess-locktimeout' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(retry.status, 0, `stderr: ${retry.stderr}`);
+    const trackedAfterRetry = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      trackedAfterRetry.includes('pages/mine.md'),
+      `retry must commit the preserved scope: ${trackedAfterRetry}`,
+    );
+  });
+});
+
+test('hypo-auto-commit.mjs: a COMMIT failure (peek, not drain) leaves the touched-paths file intact for the next Stop', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# mine\n');
+    recordTouchedPaths(dir, 'sess-commitfail', 'pages/mine.md');
+
+    // Force the commit itself to fail (a stale .git/index.lock makes both
+    // `git status` and `git add` fail with "Unable to create ... File
+    // exists.") — this is INSIDE the vault lock, past the point a lock-
+    // timeout would trip, so it exercises the peek+clear split specifically:
+    // peekTouchedPaths never deleted the file, so a downstream commit
+    // failure has nothing to lose (no requeue needed, unlike the design
+    // codex flagged in round 1).
+    const indexLock = join(dir, '.git', 'index.lock');
+    writeFileSync(indexLock, '');
+    try {
+      const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-commit.mjs')], {
+        input: JSON.stringify({ session_id: 'sess-commitfail' }),
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+      });
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    } finally {
+      rmSync(indexLock, { force: true });
+    }
+
+    // Nothing was committed...
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], { encoding: 'utf-8' }).stdout;
+    assert.equal(tracked.trim(), '', `no commit should have happened: ${tracked}`);
+    // ...and the touched-paths file was NEVER touched — peek, not drain —
+    // so it still holds exactly the pre-failure scope, untouched.
+    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-commitfail'), 'utf-8'));
+    assert.deepEqual(touched, ['pages/mine.md']);
+
+    // A retry (index.lock cleared) picks the same scope back up and commits it.
+    const retry = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-commit.mjs')], {
+      input: JSON.stringify({ session_id: 'sess-commitfail' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(retry.status, 0, `stderr: ${retry.stderr}`);
+    const trackedAfterRetry = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      trackedAfterRetry.includes('pages/mine.md'),
+      `retry must commit the preserved scope: ${trackedAfterRetry}`,
+    );
+    // The clear-on-success half of peek+clear did fire this time.
+    assert.ok(
+      !existsSync(touchedPathsPath(dir, 'sess-commitfail')),
+      'a successful commit must clear the now-committed scope',
+    );
+  });
+});
+
+test('clearTouchedPaths is a set difference: a path recorded between peek and clear survives (not lost by the post-commit clear)', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'a.md'), '# a\n');
+    recordTouchedPaths(dir, 'sess-peekclear', 'pages/a.md');
+
+    // Peek: read the scope WITHOUT clearing it (mirrors what the Stop hook
+    // does right before running commitWikiChanges).
+    const peeked = peekTouchedPaths(dir, 'sess-peekclear');
+    assert.deepEqual(peeked, ['pages/a.md']);
+    assert.ok(
+      existsSync(touchedPathsPath(dir, 'sess-peekclear')),
+      'peek must NOT delete the touched-paths file',
+    );
+
+    // Simulate a concurrent PostToolUse landing in the window between the
+    // peek and the clear — e.g. a hook-generated write (hot-rebuild) or a
+    // fast-follow Write/Edit in the same session, racing the commit that is
+    // about to run on `peeked`.
+    recordTouchedPaths(dir, 'sess-peekclear', 'pages/b.md');
+
+    // Commit only what was peeked, then clear only that (the real call
+    // order inside the Stop hook).
+    const res = commitWikiChanges(dir, peeked);
+    assert.equal(res.committed, true, `stderr: ${JSON.stringify(res)}`);
+    clearTouchedPaths(dir, 'sess-peekclear', peeked);
+
+    // pages/a.md is gone from the set (it was committed); pages/b.md, added
+    // AFTER the peek, must still be there — a set difference, not a clear.
+    const remaining = JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-peekclear'), 'utf-8'));
+    assert.deepEqual(
+      remaining,
+      ['pages/b.md'],
+      `the concurrently-recorded path must survive the post-commit clear: ${JSON.stringify(remaining)}`,
+    );
+  });
+});
+
+test('clearTouchedPaths: a corrupt/unreadable touched-paths file is left intact, never deleted (codex FIX 1)', () => {
+  withGrowthWiki((dir) => {
+    // A read/parse failure must NOT be read as "empty set". If it were, the
+    // set difference below would compute an empty remainder and DELETE the
+    // file outright on a transient I/O or parse error, losing every pending
+    // path. clearTouchedPaths must instead leave a corrupt file exactly as-is.
+    recordTouchedPaths(dir, 'sess-corrupt', 'pages/a.md'); // creates file + parent dir
+    const p = touchedPathsPath(dir, 'sess-corrupt');
+    writeFileSync(p, '{ this is not valid json');
+
+    clearTouchedPaths(dir, 'sess-corrupt', ['pages/a.md']);
+
+    assert.ok(existsSync(p), 'a corrupt touched-paths file must NOT be deleted by clear');
+    assert.equal(
+      readFileSync(p, 'utf-8'),
+      '{ this is not valid json',
+      'a corrupt touched-paths file must be left byte-identical',
+    );
+  });
+});
+
+test('commitTouchedPaths: one lock across peek+commit+clear — clears on success, retains on failure, never treats a corrupt file as empty (codex FIX 2)', () => {
+  withGrowthWiki((dir) => {
+    // Success: commitFn reports committed → the whole peeked scope is cleared.
+    recordTouchedPaths(dir, 'sess-ct-ok', 'pages/a.md');
+    let seen = null;
+    const okRes = commitTouchedPaths(dir, 'sess-ct-ok', (paths) => {
+      seen = paths;
+      return { committed: true };
+    });
+    assert.deepEqual(seen, ['pages/a.md'], 'commitFn receives exactly the peeked scope');
+    assert.equal(okRes.committed, true);
+    assert.ok(
+      !existsSync(touchedPathsPath(dir, 'sess-ct-ok')),
+      'a successful commit clears the now-committed scope',
+    );
+
+    // Failure: commitFn reports NOT committed → the file is left on disk so
+    // the next Stop retries the same scope. No requeue write to fail.
+    recordTouchedPaths(dir, 'sess-ct-fail', 'pages/b.md');
+    const failRes = commitTouchedPaths(dir, 'sess-ct-fail', () => ({ committed: false }));
+    assert.equal(failRes.committed, false);
+    assert.deepEqual(
+      JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-ct-fail'), 'utf-8')),
+      ['pages/b.md'],
+      'a commit failure must leave the scope on disk, untouched',
+    );
+
+    // Corrupt file: commitFn runs with an EMPTY scope (a safe no-op) and the
+    // corrupt file is left untouched — never read as empty and deleted.
+    recordTouchedPaths(dir, 'sess-ct-corrupt', 'pages/c.md');
+    const pc = touchedPathsPath(dir, 'sess-ct-corrupt');
+    writeFileSync(pc, '{ corrupt');
+    let corruptScope = 'unset';
+    commitTouchedPaths(dir, 'sess-ct-corrupt', (paths) => {
+      corruptScope = paths;
+      return { committed: true };
+    });
+    assert.deepEqual(corruptScope, [], 'a corrupt scope commits nothing (empty, safe no-op)');
+    assert.ok(existsSync(pc), 'commitTouchedPaths must never delete a corrupt file');
+    assert.equal(readFileSync(pc, 'utf-8'), '{ corrupt', 'corrupt file left byte-identical');
+  });
+});
+
+test('drainTouchedPaths: a corrupt touched-paths file is left intact, never deleted (parity with clear/commit)', () => {
+  withGrowthWiki((dir) => {
+    // drainTouchedPaths is not on the Stop path (commitTouchedPaths is), but it
+    // shares the same never-delete-on-read-failure guarantee so a corrupt file
+    // can't be erased by any caller that happens to use it.
+    recordTouchedPaths(dir, 'sess-drain-corrupt', 'pages/a.md');
+    const p = touchedPathsPath(dir, 'sess-drain-corrupt');
+    writeFileSync(p, '{ not valid json');
+
+    const drained = drainTouchedPaths(dir, 'sess-drain-corrupt');
+
+    assert.deepEqual(drained, [], 'a corrupt file yields nothing safely consumable');
+    assert.ok(existsSync(p), 'a corrupt touched-paths file must NOT be deleted by drain');
+    assert.equal(readFileSync(p, 'utf-8'), '{ not valid json', 'corrupt file left byte-identical');
+  });
+});
+
+test('recordTouchedPaths / drainTouchedPaths: concurrent accumulate + drain never loses a path', () => {
+  withGrowthWiki((dir) => {
+    // Interleave: accumulate A, drain (should see A), accumulate B while
+    // "nothing to drain" is possible, drain again (should see B). This
+    // exercises the SAME per-session lock both functions now take — without
+    // it, an unlocked read-merge-write/read-then-remove pair could drop a
+    // path recorded concurrently with a drain.
+    recordTouchedPaths(dir, 'sess-lockrace', 'pages/a.md');
+    const first = drainTouchedPaths(dir, 'sess-lockrace');
+    assert.deepEqual(first, ['pages/a.md']);
+    assert.ok(
+      !existsSync(touchedPathsPath(dir, 'sess-lockrace')),
+      'drain must remove the file once fully consumed',
+    );
+
+    recordTouchedPaths(dir, 'sess-lockrace', 'pages/b.md');
+    recordTouchedPaths(dir, 'sess-lockrace', 'pages/c.md'); // two accumulations back-to-back
+    const second = drainTouchedPaths(dir, 'sess-lockrace');
+    assert.deepEqual(second.sort(), ['pages/b.md', 'pages/c.md']);
+
+    // Fire N accumulations concurrently (real overlapping child processes, not
+    // just back-to-back sync calls) and confirm every one survives a drain —
+    // this is the actual race the file lock exists to close.
+    const N = 8;
+    const procs = [];
+    for (let i = 0; i < N; i++) {
+      procs.push(
+        spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+          input: JSON.stringify({
+            session_id: 'sess-lockrace-concurrent',
+            tool_name: 'Write',
+            tool_input: { file_path: join(dir, 'pages', `p${i}.md`), content: `# p${i}\n` },
+          }),
+          encoding: 'utf-8',
+          env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+        }),
+      );
+    }
+    for (const p of procs) assert.equal(p.status, 0, `stderr: ${p.stderr}`);
+    const drained = drainTouchedPaths(dir, 'sess-lockrace-concurrent');
+    const expected = Array.from({ length: N }, (_, i) => `pages/p${i}.md`).sort();
+    assert.deepEqual(
+      drained.sort(),
+      expected,
+      `every concurrently-accumulated path must survive the drain: ${JSON.stringify(drained)}`,
+    );
+  });
+});
+
+test('commitWikiChanges is called with the crystallize apply payload paths, not the broader lint/evidence scope', () => {
+  // Direct-unit coverage of the ISSUE-69 crystallize call site: the scope
+  // passed to commitWikiChanges must be the paths this apply ACTUALLY wrote
+  // (payload.sessionState / .projectHot / .rootHot + session-log + log.md),
+  // never the wider payloadScope crystallize.mjs also builds (which includes
+  // lint/evidence candidates the apply may not have touched at all).
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'proj'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'proj', 'session-state.md'), '# old state\n');
+    // A file this close's payload never names — simulates lint/evidence debt
+    // elsewhere in payloadScope that must NOT ride along in the commit.
+    writeFileSync(join(dir, 'unrelated-debt.md'), '# pre-existing debt\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed'], { cwd: dir });
+    writeFileSync(join(dir, 'unrelated-debt.md'), '# still dirty, untouched by apply\n');
+
+    const scopeActuallyWritten = ['projects/proj/session-state.md'];
+    writeFileSync(join(dir, 'projects', 'proj', 'session-state.md'), '# new state\n');
+    const res = commitWikiChanges(dir, scopeActuallyWritten);
+    assert.equal(res.committed, true, `stderr: ${JSON.stringify(res)}`);
+    const committed = spawnSync(
+      'git',
+      ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
+      { encoding: 'utf-8' },
+    ).stdout;
+    assert.ok(
+      /session-state\.md/.test(committed),
+      `session-state.md must be committed: ${committed}`,
+    );
+    assert.ok(
+      !/unrelated-debt\.md/.test(committed),
+      `pre-existing unrelated debt must NOT ride along: ${committed}`,
+    );
+  });
+});
+
 test('commitWikiChanges() stages a .hyposcanignore-only path directly (privacy isolation)', () => {
   withGrowthWiki((dir) => {
     writeFileSync(join(dir, '.hyposcanignore'), 'notes.md\n');
     writeFileSync(join(dir, 'notes.md'), '# notes\n');
-    const result = commitWikiChanges(dir);
+    const result = commitWikiChanges(dir, ['notes.md']);
     assert.equal(result.committed, true, `stderr: ${JSON.stringify(result)}`);
     const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'notes.md'], {
       encoding: 'utf-8',
@@ -1743,57 +2218,152 @@ test('precompactGateStatus: uncommitted change → git blocker (unchanged)', () 
 test('commitWikiChanges: dirty tree → commits, leaves tree uncommitted-clean', () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, 'new.md'), '# new\n');
-    const res = commitWikiChanges(dir);
+    const res = commitWikiChanges(dir, ['new.md']);
     assert.equal(res.committed, true, `expected commit: ${JSON.stringify(res)}`);
     assert.equal(hypoIsClean(dir).uncommitted, false, 'no uncommitted work after commit');
   });
 });
 
-test('commitWikiChanges: commits ALL non-ignored changes, not a subset (parity with auto-commit)', () => {
-  // codex round-2 CONCERN: apply commits the whole working tree, not just the
-  // payload it wrote. This is intentional — it is the SAME helper (and behavior)
-  // the auto-commit Stop hook has always used. Lock it so the parity is documented.
+// ISSUE-69: this used to be "commits ALL non-ignored changes, not a subset
+// (parity with auto-commit)" — it deliberately LOCKED IN the whole-tree sweep
+// as intentional, on the theory that apply and the auto-commit Stop hook
+// share one helper and therefore must share one (whole-tree) scope. That
+// theory was the bug: in a shared multi-project vault with concurrent Claude
+// Code sessions, another session's staged/dirty files got swept into THIS
+// session's commit and pushed, and the human-authored commit message was
+// clobbered by `auto: <date> wiki update`. commitWikiChanges now takes an
+// explicit `paths` scope and commits only that — this test asserts the new
+// behavior directly, replacing the old lock-in.
+test('commitWikiChanges: scopes the commit to supplied paths, excluding an unrelated staged (other-session) file (ISSUE-69)', () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, 'payload-like.md'), '# payload\n');
-    writeFileSync(join(dir, 'unrelated.md'), '# unrelated pre-existing edit\n');
-    const res = commitWikiChanges(dir);
-    assert.equal(res.committed, true);
-    const tracked = spawnSync('git', ['-C', dir, 'ls-files'], { encoding: 'utf-8' }).stdout;
+    writeFileSync(join(dir, 'unrelated.md'), "# another session's own edit\n");
+    // Simulate another concurrent session having already staged its own file
+    // in this shared working tree — exactly the scenario ISSUE-69 fixes.
+    spawnSync('git', ['-C', dir, 'add', 'unrelated.md']);
+    const res = commitWikiChanges(dir, ['payload-like.md']);
+    assert.equal(res.committed, true, `stderr: ${JSON.stringify(res)}`);
+    const committedFiles = spawnSync(
+      'git',
+      ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
+      { encoding: 'utf-8' },
+    ).stdout;
     assert.ok(
-      /payload-like\.md/.test(tracked) && /unrelated\.md/.test(tracked),
-      `both the payload-like and unrelated files must be committed: ${tracked}`,
+      /payload-like\.md/.test(committedFiles),
+      `payload-like.md must be committed: ${committedFiles}`,
     );
-    assert.equal(hypoIsClean(dir).uncommitted, false, 'tree fully committed');
+    assert.ok(
+      !/unrelated\.md/.test(committedFiles),
+      `unrelated.md must NOT be swept into this commit: ${committedFiles}`,
+    );
+    // The other session's staged file must be left exactly as it was — still
+    // staged, not committed, not dropped.
+    const staged = spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      /unrelated\.md/.test(staged),
+      `unrelated.md must remain staged, untouched: ${staged}`,
+    );
+  });
+});
+
+test('commitWikiChanges: empty scope (no paths supplied) → committed:true, no-op (ISSUE-69)', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'dirty.md'), '# dirty\n');
+    const res = commitWikiChanges(dir, []);
+    assert.equal(res.committed, true, `empty scope must be a clean no-op: ${JSON.stringify(res)}`);
+    assert.equal(res.scoped, 0);
+    const staged = spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.equal(staged.trim(), '', `nothing should be staged by an empty scope: ${staged}`);
+  });
+});
+
+test('commitWikiChanges: stale scope (path never actually changed) → committed:true, no-op (ISSUE-69)', () => {
+  withSyncedWiki((dir) => {
+    // `stale.md` is not in the fixture at all — the INTERSECT(supplied,
+    // currently-changed) step must drop it rather than error on a pathspec
+    // that names no change.
+    const res = commitWikiChanges(dir, ['stale.md']);
+    assert.equal(res.committed, true, `stale-only scope must be a clean no-op: ${JSON.stringify(res)}`);
+    assert.equal(res.scoped, 0);
   });
 });
 
 test('commitWikiChanges: nothing to commit (clean tree) → committed:true (success)', () => {
   withSyncedWiki((dir) => {
-    const res = commitWikiChanges(dir);
+    const res = commitWikiChanges(dir, ['nonexistent.md']);
     assert.equal(res.committed, true, `nothing-to-commit must be success: ${JSON.stringify(res)}`);
   });
 });
 
 test('commitWikiChanges: not a git repo → committed:false with reason', () => {
   withTmpDir((dir) => {
-    const res = commitWikiChanges(dir);
+    const res = commitWikiChanges(dir, ['whatever.md']);
     assert.equal(res.committed, false);
     assert.ok(/not a git repository/.test(res.reason || ''), `reason: ${res.reason}`);
   });
 });
 
-test('commitWikiChanges: respects .hypoignore (ignored file not staged)', () => {
+test('commitWikiChanges: respects .hypoignore (ignored file not staged) even when explicitly in scope', () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, '.hypoignore'), 'secret.md\n');
     writeFileSync(join(dir, 'secret.md'), '# private\n');
     writeFileSync(join(dir, 'public.md'), '# public\n');
-    const res = commitWikiChanges(dir);
+    // Both are in scope; .hypoignore must still exclude secret.md — the
+    // privacy boundary is orthogonal to (and inside) the ISSUE-69 scope.
+    const res = commitWikiChanges(dir, ['secret.md', 'public.md']);
     assert.equal(res.committed, true);
     // secret.md must remain uncommitted (ignored); the tree is therefore still
     // "uncommitted" because of the ignored file — confirm secret.md was not staged.
     const tracked = spawnSync('git', ['-C', dir, 'ls-files'], { encoding: 'utf-8' }).stdout;
     assert.ok(!/secret\.md/.test(tracked), `secret.md must not be committed: ${tracked}`);
     assert.ok(/public\.md/.test(tracked), `public.md must be committed: ${tracked}`);
+  });
+});
+
+test('commitWikiChanges: the commit message reports scoped N paths across M projects (ISSUE-69)', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'alpha'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'beta'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'alpha', 'hot.md'), '# alpha\n');
+    writeFileSync(join(dir, 'projects', 'alpha', 'session-state.md'), '# alpha state\n');
+    writeFileSync(join(dir, 'projects', 'beta', 'hot.md'), '# beta\n');
+    // project = `projects/<slug>/...` → <slug>. A top-level path (no
+    // `projects/` prefix) has no project of its own — this fixture stays
+    // entirely under `projects/` so N and M are unambiguous.
+    const scope = [
+      'projects/alpha/hot.md',
+      'projects/alpha/session-state.md',
+      'projects/beta/hot.md',
+    ];
+    const res = commitWikiChanges(dir, scope);
+    assert.equal(res.committed, true, `stderr: ${JSON.stringify(res)}`);
+    assert.equal(res.scoped, 3, `expected 3 scoped paths: ${JSON.stringify(res)}`);
+    const subject = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%s'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    assert.ok(
+      /\(3 paths across 2 projects\)/.test(subject),
+      `commit message must report N paths across M projects: ${subject}`,
+    );
+  });
+});
+
+test('commitWikiChanges: a top-level (non-projects/) path counts as its own project bucket', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'log.md'), '## [today] session\n');
+    const res = commitWikiChanges(dir, ['log.md']);
+    assert.equal(res.committed, true, `stderr: ${JSON.stringify(res)}`);
+    const subject = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%s'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    assert.ok(
+      /\(1 paths across 1 projects\)/.test(subject),
+      `a lone top-level path is its own 1-path/1-project commit: ${subject}`,
+    );
   });
 });
 
@@ -1811,7 +2381,7 @@ test('commitWikiChanges: a Korean filename commits under core.quotepath=true', (
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', '한글.md'), '# 한글\n');
     writeFileSync(join(dir, 'pages', 'ascii.md'), '# ascii\n');
-    const res = commitWikiChanges(dir);
+    const res = commitWikiChanges(dir, ['pages/한글.md', 'pages/ascii.md']);
     assert.equal(
       res.committed,
       true,
@@ -1844,7 +2414,7 @@ test('commitWikiChanges: a staged rename to a Korean name commits (the `from` re
     spawnSync('git', ['-C', dir, 'add', '-A']);
     spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed']);
     spawnSync('git', ['-C', dir, 'mv', 'pages/old.md', 'pages/새이름.md']);
-    const res = commitWikiChanges(dir);
+    const res = commitWikiChanges(dir, ['pages/새이름.md']);
     assert.equal(res.committed, true, `rename must commit cleanly: ${JSON.stringify(res)}`);
     assert.equal(hypoIsClean(dir).uncommitted, false, 'rename fully committed');
     const tracked = spawnSync('git', ['-C', dir, 'ls-files', '-z'], {
@@ -1884,7 +2454,7 @@ test('commitWikiChanges: a staged copy (status.renames=copies) commits, not a tr
       porcelain.split('\0')[0].startsWith('C'),
       `fixture must emit a copy record: ${JSON.stringify(porcelain)}`,
     );
-    const res = commitWikiChanges(dir);
+    const res = commitWikiChanges(dir, ['pages/copied.md', 'pages/source.md']);
     assert.equal(
       res.committed,
       true,
