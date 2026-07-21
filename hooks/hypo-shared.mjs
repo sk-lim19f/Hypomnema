@@ -1560,31 +1560,380 @@ export function syncRemote(hypoDir) {
   return result;
 }
 
+// ── touched-paths (scope the auto-commit to session-touched paths) ───────────
+//
+// The old commitWikiChanges swept the ENTIRE working tree: in a shared
+// multi-project vault with concurrent Claude Code sessions, another session's
+// staged/dirty files got committed and pushed by THIS session's Stop hook, and
+// the human-authored commit message was clobbered. The fix is to accumulate,
+// per session_id, the vault-relative paths this session actually touched, and
+// have commitWikiChanges commit only that scope.
+//
+// Sources that feed the accumulator:
+//   - hypo-auto-stage.mjs (PostToolUse): every Write/Edit/MultiEdit to a file
+//     under the vault.
+//   - hypo-hot-rebuild.mjs (Stop, runs BEFORE auto-commit): hot.md and log.md,
+//     which are hook-generated, not user Write/Edit — without this a scope
+//     built from Write/Edit alone would drop them from the scoped commit.
+//
+// No session_id → never accumulate, and never fall back to a shared "default"
+// bucket: a path recorded under the wrong key could leak between sessions.
+
+/** Directory holding one session's cache artifacts, incl. touched-paths.json. */
+function sessionCacheDir(hypoDir, sessionId) {
+  return join(hypoDir, '.cache', 'sessions', sanitizeSessionId(sessionId));
+}
+
+/** @returns {string} path to a session's accumulated touched-paths JSON array. */
+export function touchedPathsPath(hypoDir, sessionId) {
+  return join(sessionCacheDir(hypoDir, sessionId), 'touched-paths.json');
+}
+
 /**
- * Stage + commit every non-.hypoignore change in the wiki. Does NOT pull/push —
- * remote sync stays in the auto-commit Stop hook (commit is local + cheap; sync is
+ * Read the raw touched-paths JSON array off disk. Caller's responsibility to
+ * hold the per-session lock first — this has no locking of its own.
+ *
+ * Absent and unreadable are different answers, and callers MUST branch on
+ * the difference: a genuinely absent (or genuinely empty) file returns `[]`
+ * — safe to treat as "nothing accumulated". A file that exists but fails to
+ * read or parse returns `null` — NOT the same as empty. A caller that
+ * conflates the two (codex FIX 1) and then does a set-difference clear on
+ * `null`-as-`[]` will compute "nothing left" and delete the file outright,
+ * silently losing every pending path to a transient I/O or parse error.
+ *
+ * @returns {string[]|null} the array, or `null` on a read/parse failure
+ */
+function readTouchedPathsFile(path) {
+  if (!existsSync(path)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return Array.isArray(parsed) ? parsed.filter((p) => typeof p === 'string' && p) : null;
+  } catch {
+    return null; // corrupt/unreadable — NOT the same as empty; see above
+  }
+}
+
+/**
+ * Accumulate vault-relative touched paths for `sessionId`. Best-effort,
+ * dedup-on-insert, JSON array (not delimiter-joined — survives non-ASCII and
+ * any byte a filename can legally hold). No-op without a session_id: never
+ * accumulate into a shared bucket.
+ *
+ * Read-merge-write is guarded by the per-session file lock (the SAME lock
+ * `drainTouchedPaths` takes), so a PostToolUse hook accumulating concurrently
+ * with the Stop-chain drain can never lose a path to either a lost update
+ * (two writers merging from the same stale read) or a drain racing between
+ * this function's read and its write.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @param {string|string[]} relPaths one or more vault-relative paths
+ */
+export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
+  if (!sessionId) return;
+  const incoming = (Array.isArray(relPaths) ? relPaths : [relPaths]).filter(
+    (p) => typeof p === 'string' && p.length > 0,
+  );
+  if (incoming.length === 0) return;
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    withFileLock(path, () => {
+      const current = readTouchedPathsFile(path);
+      // A corrupt/unreadable file (current === null) is recovered from here,
+      // not preserved: an accumulate is additive by nature (there is nothing
+      // salvageable to merge with), so starting fresh from `incoming` is the
+      // correct best-effort behavior — unlike clearTouchedPaths, where the
+      // same `null` MUST NOT be treated as empty (see readTouchedPathsFile).
+      const merged = new Set(current === null ? [] : current);
+      for (const p of incoming) merged.add(p);
+      atomicWriteShared(path, JSON.stringify([...merged]));
+    });
+  } catch {
+    // best-effort: a hook must never fail a tool call over a cache write
+    // (includes a lock-timeout — a dropped accumulation here is the same
+    // fail-safe shape as every other best-effort cache write in this file).
+  }
+}
+
+/**
+ * Read and clear a session's accumulated touched paths in one step — "drain",
+ * not "read", because the caller is expected to consume the WHOLE set
+ * unconditionally. Kept for callers that genuinely want that (e.g. a
+ * probe/inspection path); the Stop-chain auto-commit does NOT use this —
+ * see commitTouchedPaths below, which holds ONE lock across a peek, the
+ * commit itself, and a clear scoped to exactly what committed, so neither a
+ * commit failure nor a same-path race loses anything.
+ *
+ * Guarded by the SAME per-session file lock every touched-paths mutation
+ * takes: the read-then-remove here is mutually exclusive with a concurrent
+ * accumulate or commitTouchedPaths call.
+ *
+ * A read/parse failure is NOT treated as an empty set to be cleared: like
+ * clearTouchedPaths and commitTouchedPaths, a corrupt/unreadable file
+ * (readTouchedPathsFile returns `null`) is left on disk untouched — never
+ * deleted — so a transient I/O or parse error can't erase a set that a human
+ * or a later pass could still recover. Drain returns `[]` in that case
+ * (nothing safely consumable), but does not remove the file.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @returns {string[]} vault-relative paths, deduped; [] when absent, corrupt, or no session_id
+ */
+export function drainTouchedPaths(hypoDir, sessionId) {
+  if (!sessionId) return [];
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    return withFileLock(path, () => {
+      const result = readTouchedPathsFile(path);
+      if (result === null) return []; // corrupt/unreadable: leave the file for inspection, never delete
+      try {
+        rmSync(path, { force: true });
+      } catch {
+        // best-effort
+      }
+      return result;
+    });
+  } catch {
+    // lock-timeout (or an unexpected lock error): fail closed to "nothing
+    // drained" rather than risk reading concurrently with a writer. The set
+    // stays on disk untouched, so it is still there for the next drain.
+    return [];
+  }
+}
+
+/**
+ * Read a session's accumulated touched paths WITHOUT clearing them. Kept as
+ * a standalone probe for callers that just want to inspect the set; the
+ * Stop-chain auto-commit does NOT call this on its own — see
+ * commitTouchedPaths, which performs an equivalent internal read but holds
+ * the lock through the commit and clear that follow it too.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @returns {string[]} vault-relative paths, deduped; [] when absent, corrupt,
+ *   no session_id, or a lock-timeout (fails closed to "nothing to commit" —
+ *   the set stays on disk, untouched, for the next Stop)
+ */
+export function peekTouchedPaths(hypoDir, sessionId) {
+  if (!sessionId) return [];
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    return withFileLock(path, () => {
+      const result = readTouchedPathsFile(path);
+      return result === null ? [] : result;
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Remove exactly `paths` from a session's touched-paths set — a set
+ * difference, not a clear, and NOT a drain: any path a concurrent
+ * PostToolUse (or Stop-chain generator) accumulated before this call is read
+ * fresh under the SAME lock and therefore survives, because it was never in
+ * `paths` to begin with.
+ *
+ * Called only after commitWikiChanges has ACTUALLY committed `paths` (or
+ * confirmed there was nothing to commit) — never on a commit failure.
+ *
+ * Two failure modes this function must not turn into data loss (codex FIX 1
+ * + FIX 2 review):
+ *
+ *   - A read/parse failure on the touched-paths file (readTouchedPathsFile
+ *     returns `null`, NOT `[]`) must NOT be treated as "nothing left" — that
+ *     would make the set difference below compute an empty remainder and
+ *     DELETE the file outright on a transient I/O or parse error, losing
+ *     every pending path. On `null`, this function does nothing at all:
+ *     no write, no delete, the file is left exactly as it was.
+ *   - If this clear itself fails (lock-timeout, I/O) after a successful
+ *     read, the already-committed paths simply stay in the file: the next
+ *     Stop re-peeks them and re-runs commitWikiChanges, which is a clean
+ *     no-op (INTERSECT against a tree with no more changes at those paths
+ *     yields an empty scoped set). Over-retention is safe by construction —
+ *     it can never lose a path, only a commit failure (handled by leaving
+ *     the file alone entirely, see commitTouchedPaths) can.
+ *
+ * Standalone use of peekTouchedPaths + clearTouchedPaths as two SEPARATE
+ * lock acquisitions still carries the same-path race codex FIX 2 describes
+ * (a write between the two calls is indistinguishable from the one already
+ * peeked, since the set only tracks path presence, not a generation/version
+ * per path) — that is exactly why the Stop hook uses commitTouchedPaths
+ * instead, which holds ONE lock across the whole peek→commit→clear window
+ * so no write can land inside it at all.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @param {string[]} paths the exact paths that were just committed
+ */
+export function clearTouchedPaths(hypoDir, sessionId, paths) {
+  if (!sessionId) return;
+  const toRemove = new Set((Array.isArray(paths) ? paths : []).filter(Boolean));
+  if (toRemove.size === 0) return;
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    withFileLock(path, () => {
+      const current = readTouchedPathsFile(path);
+      if (current === null) return; // FIX 1: never delete/write on a read failure
+      const remaining = current.filter((p) => !toRemove.has(p));
+      if (remaining.length === 0) {
+        try {
+          rmSync(path, { force: true });
+        } catch {
+          // best-effort
+        }
+      } else {
+        atomicWriteShared(path, JSON.stringify(remaining));
+      }
+    });
+  } catch {
+    // lock-timeout or unexpected error: leave the file as-is. Safe per the
+    // over-retention argument above — the committed paths simply linger
+    // until a later clear (or drain) removes them, at worst causing a
+    // future no-op re-commit attempt, never a lost path.
+  }
+}
+
+/**
+ * Peek a session's touched paths, run `commitFn(paths)` (expected to be
+ * `commitWikiChanges` or an equivalent), and — only when it reports
+ * `committed: true` — clear `paths` from the touched-paths set, ALL under
+ * ONE hold of the per-session file lock (codex FIX 2). This is what the
+ * Stop-chain auto-commit uses instead of calling peekTouchedPaths,
+ * commitFn, and clearTouchedPaths as three separate steps.
+ *
+ * Holding one lock across peek → commit → clear (rather than acquiring and
+ * releasing it three times, with the commit itself unlocked in between)
+ * closes a same-path race: without it, a `recordTouchedPaths` call for a
+ * path already in the just-peeked set could land in the window between the
+ * commit and the clear. Since the touched-paths set only tracks path
+ * PRESENCE (no per-path version/generation), that accumulate call is
+ * indistinguishable from the one already peeked — the clear would remove it
+ * anyway, silently orphaning a real edit that was never actually committed
+ * (it landed on disk after `git commit` already ran, but the touched-paths
+ * record of it just got wiped). With one continuous lock hold, that
+ * accumulate call either fully precedes the peek (so it's included in THIS
+ * commit, since commitWikiChanges reads live git status, not a cached
+ * snapshot) or fully follows the clear (so it's untouched, waiting for the
+ * next Stop) — there is no window where it can land in between.
+ *
+ * Lock order stays vault → per-session everywhere in this codebase (the
+ * Stop hook takes the vault lock before calling this; accumulation only
+ * ever takes the per-session lock, never the vault lock), so holding the
+ * per-session lock for the whole commit here introduces no new ordering and
+ * no deadlock risk.
+ *
+ * FIX 1 (read/parse failure) applies here too: a corrupt/unreadable
+ * touched-paths file is never treated as empty. `commitFn` still runs (with
+ * an empty scope — a safe no-op through commitWikiChanges), but nothing is
+ * ever written to the corrupt file; it is left exactly as it was for a
+ * human or a future recovery pass to look at.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @param {(paths: string[]) => {committed: boolean, [k: string]: unknown}} commitFn
+ * @returns {{committed: boolean, [k: string]: unknown}} whatever `commitFn` returned,
+ *   or `{committed: false, reason: 'touched-paths-lock-timeout'}` if the lock
+ *   itself could not be acquired (commitFn never ran; the file is untouched)
+ */
+export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
+  if (!sessionId) return commitFn([]);
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    return withFileLock(path, () => {
+      const current = readTouchedPathsFile(path);
+      if (current === null) {
+        // FIX 1: a read/parse failure is not "empty" — commit nothing this
+        // round (a safe no-op scope) and leave the corrupt file untouched,
+        // rather than let a downstream clear compute "nothing left" and
+        // delete it.
+        return commitFn([]);
+      }
+      const result = commitFn(current);
+      if (result && result.committed && current.length > 0) {
+        // Still under the SAME lock acquired above: no recordTouchedPaths
+        // call for this session can have landed since `current` was read
+        // (it takes this exact lock too), so the set on disk right now is
+        // EXACTLY `current` — clearing it needs no re-read or set
+        // difference, just remove what we already know is the whole thing.
+        try {
+          rmSync(path, { force: true });
+        } catch {
+          // best-effort: the committed paths just linger on disk; the next
+          // Stop re-peeks them and re-runs commitFn, a clean no-op.
+        }
+      }
+      return result;
+    });
+  } catch {
+    // Lock-timeout (or an unexpected lock error): never entered the
+    // critical section, so commitFn never ran and nothing was peeked or
+    // cleared. The touched-paths file is untouched on disk, and the next
+    // Stop retries this session's commit from the same scope.
+    return { committed: false, reason: 'touched-paths-lock-timeout' };
+  }
+}
+
+/**
+ * The lock target both commit loci (hypo-auto-commit.mjs Stop hook,
+ * crystallize.mjs --apply-session-close) hold while staging+committing (and,
+ * for the Stop hook, syncing) the vault, so two concurrent sessions on a
+ * shared vault never interleave `git add`/`git commit`/`git pull`/`git push`.
+ * A stable, non-content path — withFileLock only ever touches its `.lock`
+ * sibling, this file itself is never created.
+ */
+export function vaultCommitLockTarget(hypoDir) {
+  return join(hypoDir, '.cache', 'vault-commit');
+}
+
+/** `projects/<slug>/...` → `<slug>`; anything else → its first path segment. */
+function projectOfPath(relPath) {
+  const parts = relPath.split('/');
+  if (parts[0] === 'projects' && parts.length > 1 && parts[1]) return parts[1];
+  return parts[0] || relPath;
+}
+
+/**
+ * Stage + commit ONLY the caller-supplied `paths`, intersected with what is
+ * actually changed on disk right now. Does NOT pull/push; remote
+ * sync stays in the auto-commit Stop hook (commit is local + cheap; sync is
  * network + soft-fail). Shared by hypo-auto-commit.mjs and crystallize.mjs's
  * --apply-session-close path so the .hypoignore staging filter cannot diverge
  * between the two commit loci.
  *
- * "Nothing to commit" (clean tree, or only .hypoignore'd changes) is SUCCESS, not
- * failure — the caller's tree is already in the committed state it wanted.
+ * The caller supplies the scope; this function never re-derives it from the
+ * whole tree. `paths` absent/empty is a clean no-op (`scoped: 0`), not an
+ * error and not a whole-tree fallback — this is how a caller with nothing to
+ * contribute (e.g. no session_id, so nothing was accumulated) skips cleanly.
+ *
+ * The authoritative scope is INTERSECT(paths, currently-changed): a stale
+ * entry (already committed elsewhere, or never actually changed) is dropped
+ * silently rather than erroring. `.hypoignore` filtering, the staged
+ * re-derivation, the commit-message count, and the final commit all use this
+ * SAME scoped set — no step here may widen back to whole-tree, or another
+ * session's dirty/staged files could slip back in through any one of them.
+ *
+ * "Nothing to commit" (empty scope, or only .hypoignore'd changes) is
+ * SUCCESS, not failure — the caller's tree is already in the state it wanted.
  *
  * @param {string} hypoDir
- * @returns {{committed: boolean, reason?: string}} committed:true when a commit was
- *   created OR nothing needed committing; committed:false (with reason) on a real
- *   failure: not a git repo, or git status/add/commit erroring.
+ * @param {string[]} [paths] vault-relative paths this caller wrote/owns this close
+ * @returns {{committed: boolean, scoped?: number, reason?: string}} committed:true
+ *   when a commit was created OR nothing needed committing (scoped:0 in the
+ *   latter case); committed:false (with reason) on a real failure: not a git
+ *   repo, or git status/add/commit erroring.
  */
-export function commitWikiChanges(hypoDir) {
+export function commitWikiChanges(hypoDir, paths) {
   const git = (...args) =>
     spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
   if (git('rev-parse', '--is-inside-work-tree').status !== 0)
     return { committed: false, reason: `not a git repository: ${hypoDir}` };
-  // `-z`: NUL-separated records with verbatim paths — no surrounding quotes and
-  // no octal escaping, so non-ASCII paths (Korean page names are normal input
-  // here) survive intact. Without it, `core.quotepath=true` (the default) yields
-  // `"pages/\355\225\234\352\270\200.md"` and the old quote-strip parser fed that
-  // literal, non-existent path to `git add` — failing the whole commit.
+
+  const supplied = new Set(
+    (Array.isArray(paths) ? paths : []).filter((p) => typeof p === 'string' && p.length > 0),
+  );
+  if (supplied.size === 0) return { committed: true, scoped: 0 };
+
   // `-z`: NUL-separated records with verbatim paths — no surrounding quotes and
   // no octal escaping, so non-ASCII paths (Korean page names are normal input
   // here) survive intact. Without it, `core.quotepath=true` (the default) yields
@@ -1596,41 +1945,85 @@ export function commitWikiChanges(hypoDir) {
   // `.hypoignore` is the project privacy boundary. `git add -A` ignores it, so
   // enumerate changed paths, drop ignored ones, then stage explicitly.
   const ignorePatterns = loadHypoIgnore(hypoDir);
-  const paths = [];
+  const scoped = []; // pathspec for `git add -A` — worktree/index paths only
+  const commitScope = []; // pathspec for the final diff/commit --only (superset)
   const records = (porcelain.stdout || '').split('\0');
   for (let i = 0; i < records.length; i++) {
     const rec = records[i];
     if (!rec) continue;
     const xy = rec.slice(0, 2);
     const file = rec.slice(3); // `XY <path>`; the destination path for a rename/copy
+    const isRename = xy[0] === 'R' || xy[1] === 'R';
     // A rename OR copy emits two records (`to\0from`); consume the trailing
     // `from`. Copy `C` records only appear under `status.renames=copies`, but
     // when they do, missing this skip feeds the `from` path to `git add` as a
     // bogus pathspec — the exact auto-commit failure this parser fixes.
-    if (xy[0] === 'R' || xy[1] === 'R' || xy[0] === 'C' || xy[1] === 'C') i++;
+    let fromFile = null;
+    if (isRename || xy[0] === 'C' || xy[1] === 'C') {
+      i++;
+      fromFile = records[i] || null;
+    }
     if (!file) continue;
+    if (!supplied.has(file)) continue; // out of this caller's scope
     if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns))
       continue;
-    paths.push(file);
+    scoped.push(file);
+    commitScope.push(file);
+    // A rename's `from` path is the SAME change as its destination — without
+    // it, `git commit --only` on the destination alone commits the addition
+    // but leaves the source's deletion staged as residue (a git --only
+    // quirk, verified). It is NOT added to `git add -A` (the deletion is
+    // already staged by the rename itself, and its worktree entry is gone —
+    // `git add -A -- <a gone-and-already-staged path>` errors "did not match
+    // any files"), only to the commit's pathspec. A copy's `from` is
+    // independently-owned, still-existing content, so it is NOT auto-pulled
+    // in at all: the caller must name it explicitly if it wants it in scope.
+    if (isRename && fromFile) commitScope.push(fromFile);
   }
-  if (paths.length > 0) {
-    const add = git('add', '--', ...paths);
+  if (scoped.length === 0 && commitScope.length === 0) return { committed: true, scoped: 0 };
+
+  if (scoped.length > 0) {
+    const add = git('add', '-A', '--', ...scoped);
     if (add.status !== 0)
       return {
         committed: false,
         reason: `git add failed: ${(add.stderr || '').trim() || 'unknown'}`,
       };
   }
-  const staged = git('diff', '--cached', '--name-only').stdout?.trim() || '';
-  if (!staged) return { committed: true }; // nothing to commit = success (idempotent)
+
+  // Re-derive from what actually landed in the index, bounded by the SAME
+  // pathspec (commitScope, the rename-aware superset of `scoped`) — this step
+  // must not widen back to whole-tree either, or another session's already-
+  // staged file would slip into the commit here.
+  const staged = git('diff', '--cached', '--name-only', '-z', '--', ...commitScope);
+  const stagedFiles = (staged.stdout || '').split('\0').filter(Boolean);
+  if (stagedFiles.length === 0) return { committed: true, scoped: 0 };
+
+  const projects = new Set(stagedFiles.map(projectOfPath));
   const today = new Date().toISOString().slice(0, 10);
-  const commit = git('commit', '-m', `auto: ${today} wiki update`);
+  const msg = `auto: ${today} wiki update (${stagedFiles.length} paths across ${projects.size} projects)`;
+
+  // `git commit --only -- <paths>` (first use of --only in this repo): commits
+  // ONLY the staged changes under this pathspec, ignoring anything else
+  // staged in the index — e.g. another session's own staged-but-uncommitted
+  // work sharing this working tree. A bare `git commit -m` would sweep in
+  // every staged path, defeating the whole point of the scoped set above.
+  //
+  // Pathspec is `commitScope`, NOT `stagedFiles`: `git diff --name-only`
+  // collapses a rename to its destination alone (rename detection folds the
+  // pair into one line), so re-deriving the commit's own pathspec from that
+  // output would silently drop the `from` path again and reproduce the
+  // exact `--only`-leaves-the-deletion-staged residue this function's rename
+  // handling exists to avoid (verified). `stagedFiles` still governs the
+  // empty-scope check and the N/M count above — both correct as "how many
+  // logical changes", where a rename is rightly one.
+  const commit = git('commit', '--only', '-m', msg, '--', ...commitScope);
   if (commit.status !== 0)
     return {
       committed: false,
       reason: `git commit failed: ${(commit.stderr || '').trim() || 'unknown'}`,
     };
-  return { committed: true };
+  return { committed: true, scoped: stagedFiles.length };
 }
 
 /**
@@ -1964,7 +2357,7 @@ const SESSION_CLOSED_MARKER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Sanitize session_id for filesystem use — Claude session_ids are UUIDs but
  *  defend against accidental path traversal regardless. */
-function sanitizeSessionId(sessionId) {
+export function sanitizeSessionId(sessionId) {
   return String(sessionId)
     .replace(/[^A-Za-z0-9._-]/g, '_')
     .slice(0, 128);
