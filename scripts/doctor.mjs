@@ -23,6 +23,7 @@ import { resolveGitHooksDir } from './lib/git-hooks-dir.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 import {
   readSyncState,
+  readSyncLastSuccess,
   projectSuggestionsPath,
   collectProjectWorkingDirs,
 } from '../hooks/hypo-shared.mjs';
@@ -683,6 +684,21 @@ function checkProjectIndexAnchors(hypoDir) {
   }
 }
 
+/**
+ * Render a `.cache/sync-last-success.json` record as an absolute-time note.
+ * Deliberately no "recent"/staleness verdict — the failure-state check above
+ * already carries the health signal; this only says what and when.
+ */
+function formatLastSuccess(lastSuccess) {
+  const pull = lastSuccess.pull
+    ? `pull ${lastSuccess.pull.timestamp} (${lastSuccess.pull.host})`
+    : 'pull: none recorded';
+  const push = lastSuccess.push
+    ? `push ${lastSuccess.push.timestamp} (${lastSuccess.push.host})`
+    : 'push: none recorded';
+  return `${pull}; ${push}`;
+}
+
 function checkSyncState(hypoDir) {
   // "open" = file exists with ≥1 entries; session-start clears once
   // sync is healthy again. Schema + parsing live in hooks/hypo-shared.mjs.
@@ -694,7 +710,27 @@ function checkSyncState(hypoDir) {
   }
 
   if (entries.length === 0) {
-    pass('Sync state', 'No unresolved sync failures');
+    // No unresolved failure — but that alone does not mean sync ever ran.
+    // Read the separate, additive last-success record to tell "never synced"
+    // apart from "healthy" and, when present, from a pull-only/push-only
+    // history. A corrupt success file warns rather than crashing, same as the
+    // sync-state parse-error handling above.
+    const { data: lastSuccess, parseError: successParseError } = readSyncLastSuccess(hypoDir);
+    if (successParseError) {
+      warn('Sync state', 'Cannot parse .cache/sync-last-success.json — inspect manually');
+    } else if (!lastSuccess.pull && !lastSuccess.push) {
+      pass(
+        'Sync state',
+        'No unresolved sync failures — never synced (no recorded pull or push yet)',
+      );
+    } else {
+      // Distinguishes pull-only / push-only / both, since formatLastSuccess
+      // reports "none recorded" for whichever op is absent.
+      pass(
+        'Sync state',
+        `No unresolved sync failures. Last success — ${formatLastSuccess(lastSuccess)}`,
+      );
+    }
   } else {
     const last = entries[entries.length - 1];
     // A merge conflict needs a real manual merge, not a plain push/pull — give

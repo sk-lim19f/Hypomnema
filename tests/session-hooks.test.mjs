@@ -23,6 +23,8 @@ import {
   findBackfillCandidate,
   buildBackfillSuggestionLine,
   computeSessionGrowth,
+  recordSyncSuccess,
+  readSyncLastSuccess,
 } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import {
@@ -2157,6 +2159,228 @@ test('session-start surfaces a conflict entry with manual-merge guidance', () =>
     const ctx = JSON.parse(r.stdout).additionalContext || '';
     assert.ok(ctx.includes('remote diverged'), `conflict notice missing: ${ctx}`);
     assert.ok(ctx.includes('pull --no-rebase'), `manual-merge guidance missing: ${ctx}`);
+  });
+});
+
+// ── FEAT-34: last-success timestamp visibility ──────────────────────────────
+//
+// recordSyncSuccess writes `.cache/sync-last-success.json`, a separate,
+// PER-OPERATION file (sync-state.json is failure-only and gets wiped on
+// recovery, so a success record living there would be erased). The
+// concurrency contract under test: a pull-write and a push-write must not
+// erase each other's field — proving that requires actually writing pull
+// then push and checking both survive, not just checking the latest write.
+
+function readSyncLastSuccessFile(dir) {
+  return JSON.parse(readFileSync(join(dir, '.cache', 'sync-last-success.json'), 'utf-8'));
+}
+
+suite('FEAT-34 — recordSyncSuccess concurrency-safe merge');
+
+test('recordSyncSuccess: pull then push preserves both fields (no last-writer-wins erasure)', () => {
+  withGrowthWiki((dir) => {
+    recordSyncSuccess(dir, 'pull');
+    const afterPull = readSyncLastSuccessFile(dir);
+    assert.ok(
+      afterPull.pull?.timestamp && afterPull.pull?.host,
+      `pull field missing: ${JSON.stringify(afterPull)}`,
+    );
+    assert.ok(
+      !afterPull.push,
+      `push must be absent before it is recorded: ${JSON.stringify(afterPull)}`,
+    );
+
+    recordSyncSuccess(dir, 'push');
+    const afterPush = readSyncLastSuccessFile(dir);
+    // The proof: the push write did NOT clobber the pull field recorded above.
+    assert.ok(
+      afterPush.pull?.timestamp === afterPull.pull.timestamp &&
+        afterPush.pull?.host === afterPull.pull.host,
+      `push write must not erase the existing pull field (merge, not overwrite): ${JSON.stringify(afterPush)}`,
+    );
+    assert.ok(
+      afterPush.push?.timestamp && afterPush.push?.host,
+      `push field missing: ${JSON.stringify(afterPush)}`,
+    );
+  });
+});
+
+test('recordSyncSuccess: re-recording the same op overwrites only that op, with a fresh timestamp/host', () => {
+  withGrowthWiki((dir) => {
+    recordSyncSuccess(dir, 'pull');
+    const first = readSyncLastSuccessFile(dir).pull;
+    recordSyncSuccess(dir, 'pull');
+    const second = readSyncLastSuccessFile(dir).pull;
+    assert.equal(second.host, first.host, 'host should be stable within one test process');
+    assert.ok(second.timestamp, 'the re-recorded entry must still carry a timestamp');
+  });
+});
+
+test('recordSyncSuccess: never throws on a corrupt existing file — overwrites with a fresh record', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'sync-last-success.json'), 'not-json{{{');
+    assert.doesNotThrow(() => recordSyncSuccess(dir, 'push'));
+    const data = readSyncLastSuccessFile(dir);
+    assert.ok(
+      data.push?.timestamp,
+      `push must be recorded despite prior corruption: ${JSON.stringify(data)}`,
+    );
+  });
+});
+
+test('recordSyncSuccess: a malformed sibling field is dropped on write, not preserved as garbage', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // pull is schema-valid JSON but the wrong shape (not {timestamp, host})
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ pull: 'not-a-record' }),
+    );
+    recordSyncSuccess(dir, 'push');
+    const data = readSyncLastSuccessFile(dir);
+    assert.ok(
+      data.push?.timestamp && data.push?.host,
+      `push must be recorded: ${JSON.stringify(data)}`,
+    );
+    assert.ok(
+      !('pull' in data) ||
+        (typeof data.pull === 'object' && typeof data.pull.timestamp === 'string'),
+      `a malformed sibling must be dropped, never carried forward as garbage: ${JSON.stringify(data)}`,
+    );
+    assert.notEqual(data.pull, 'not-a-record', 'the malformed string must not survive the write');
+  });
+});
+
+test('recordSyncSuccess: an empty-string sibling ({timestamp:"",host:""}) is dropped on write, not preserved', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ pull: { timestamp: '', host: '' } }),
+    );
+    recordSyncSuccess(dir, 'push');
+    const data = readSyncLastSuccessFile(dir);
+    assert.ok(
+      data.push?.timestamp && data.push?.host,
+      `push must be recorded: ${JSON.stringify(data)}`,
+    );
+    assert.ok(
+      !data.pull,
+      `an empty-string sibling must be dropped, not carried forward: ${JSON.stringify(data)}`,
+    );
+  });
+});
+
+test('readSyncLastSuccess: empty-string timestamp/host is rejected (not merely typeof-checked)', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ pull: { timestamp: '', host: '' } }),
+    );
+    const { data, parseError } = readSyncLastSuccess(dir);
+    assert.equal(
+      parseError,
+      true,
+      'an empty-string record must flag parseError, not pass as valid',
+    );
+    assert.ok(!data.pull, 'the empty-string record must be dropped, never surfaced as real data');
+  });
+});
+
+test('readSyncLastSuccess: an unrecognized top-level key flags the file as corrupt', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({
+        pull: { timestamp: '2026-07-20T00:00:00.000Z', host: 'test-host' },
+        unexpectedKey: 'hand-edit',
+      }),
+    );
+    const { data, parseError } = readSyncLastSuccess(dir);
+    assert.equal(parseError, true, 'an unrecognized top-level key must be treated as corrupt');
+    assert.ok(data.pull, 'a genuinely valid sibling field is still surfaced even under parseError');
+  });
+});
+
+test('readSyncLastSuccess: a genuinely valid populated pull and push record is preserved (regression guard)', () => {
+  withGrowthWiki((dir) => {
+    recordSyncSuccess(dir, 'pull');
+    recordSyncSuccess(dir, 'push');
+    const { data, parseError } = readSyncLastSuccess(dir);
+    assert.equal(parseError, false);
+    assert.ok(
+      data.pull?.timestamp && data.pull?.host,
+      `pull must survive: ${JSON.stringify(data)}`,
+    );
+    assert.ok(
+      data.push?.timestamp && data.push?.host,
+      `push must survive: ${JSON.stringify(data)}`,
+    );
+  });
+});
+
+test('readSyncLastSuccess: a malformed pull/push record is dropped from data and flags parseError', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-last-success.json'),
+      JSON.stringify({ pull: 'not-a-record' }),
+    );
+    const { data, parseError } = readSyncLastSuccess(dir);
+    assert.equal(parseError, true, 'a malformed record must flag parseError so the caller warns');
+    assert.ok(!data.pull, 'the malformed field must be dropped, never rendered as pull:undefined');
+  });
+});
+
+suite(
+  'FEAT-34 — doctor never-synced vs healthy distinction (proved red without the success record)',
+);
+
+test('proved red: without any recorded success, the sync-state check cannot distinguish never-synced from healthy', () => {
+  withGrowthWiki((dir) => {
+    // No sync-state.json failures, and — the point of this test — no
+    // sync-last-success.json either, simulating the pre-FEAT-34 world where
+    // readSyncLastSuccess did not exist and checkSyncState had nothing to
+    // read. readSyncLastSuccess on a missing file returns {} (never synced),
+    // which is the fixture this suite's doctor tests rely on to tell "never
+    // synced" apart from "healthy" — assert that distinguishing signal is
+    // present so a regression that silently stops writing/reading the file
+    // is caught here too, not only in doctor.test.mjs.
+    const { data, parseError } = readSyncLastSuccess(dir);
+    assert.equal(parseError, false);
+    assert.deepEqual(data, {}, 'an unrecorded wiki must read back as "no success recorded"');
+
+    recordSyncSuccess(dir, 'pull');
+    const { data: afterRecord } = readSyncLastSuccess(dir);
+    assert.ok(
+      afterRecord.pull,
+      'after a recorded pull, the same read must show it — the distinguishing signal',
+    );
+  });
+});
+
+suite('FEAT-34 — session-start independent pull records success silently');
+
+test('session-start: a successful startup pull records sync-last-success without a new notice line', () => {
+  withSyncedWiki((dir) => {
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'sync-last-success.json')),
+      'no prior success record',
+    );
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `session-start must exit 0: ${r.stderr}`);
+    const data = readSyncLastSuccessFile(dir);
+    assert.ok(
+      data.pull?.timestamp && data.pull?.host,
+      `startup pull must record success: ${JSON.stringify(data)}`,
+    );
+    // Silent: the existing failure-notice contract is unchanged — no new
+    // success line is injected into additionalContext.
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(!ctx.includes('sync-last-success'), `startup pull success must stay silent: ${ctx}`);
   });
 });
 

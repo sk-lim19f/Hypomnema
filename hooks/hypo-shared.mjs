@@ -1528,6 +1528,7 @@ export function syncRemote(hypoDir) {
     const pull = git('pull', '--no-rebase', '-q');
     if (pull.status === 0) {
       result.pulled = true;
+      recordSyncSuccess(hypoDir, 'pull');
     } else {
       // A merge conflict leaves unmerged index entries; a network/auth failure
       // leaves none. Only the former must be aborted to keep the tree clean.
@@ -1552,8 +1553,10 @@ export function syncRemote(hypoDir) {
       appendSyncFailure(hypoDir, 'pull', pull.stderr || pull.stdout);
     }
     const push = git('push');
-    if (push.status === 0) result.pushed = true;
-    else appendSyncFailure(hypoDir, 'push', push.stderr || push.stdout);
+    if (push.status === 0) {
+      result.pushed = true;
+      recordSyncSuccess(hypoDir, 'push');
+    } else appendSyncFailure(hypoDir, 'push', push.stderr || push.stdout);
   } catch {
     // best-effort — never break the Stop hook
   }
@@ -2051,6 +2054,134 @@ export function clearSyncState(hypoDir) {
     rmSync(syncStatePath(hypoDir), { force: true });
   } catch {
     // best-effort
+  }
+}
+
+// ── sync-last-success ────────────────────────────────────────
+// `.cache/sync-last-success.json` is a single JSON object, PER-OPERATION:
+//   { "pull": {"timestamp": "<ISO>", "host": "<os.hostname()>"},
+//     "push": {"timestamp": "<ISO>", "host": "<...>"} }
+// Either key may be absent (pull-only or push-only history). Deliberately
+// separate from sync-state.json: that file is failure-only and gets wiped
+// wholesale on recovery (clearSyncState), so a success record living there
+// would be erased by the very thing it is meant to survive. syncRemote()
+// records here on a successful pull/push; session-start's independent
+// `git pull --ff-only` records a pull here too, so doctor never reports
+// "never synced" right after a healthy startup pull. doctor reads it via
+// readSyncLastSuccess; schema + parsing live here only.
+//
+// Scope: `.cache/` is gitignored (templates/gitignore), same as
+// sync-state.json — this file never syncs across machines, so there is no
+// cross-machine merge to protect. The lock below only has to cover the
+// same-machine case: two concurrent processes on one machine (a pull-writer
+// and a push-writer, or two overlapping sessions). `host` is kept per record
+// purely for provenance (which machine last recorded the op), not because a
+// remote write could ever land here.
+
+/** @returns {string} path to the sync-last-success JSON file for a wiki root. */
+function syncLastSuccessPath(hypoDir) {
+  return join(hypoDir, '.cache', 'sync-last-success.json');
+}
+
+/**
+ * A valid last-success record: `{timestamp: string, host: string}`. Anything
+ * else (wrong type, missing field, non-object) is malformed.
+ * @param {unknown} v
+ * @returns {boolean}
+ */
+function isValidSyncSuccessRecord(v) {
+  return (
+    v !== null &&
+    typeof v === 'object' &&
+    !Array.isArray(v) &&
+    typeof v.timestamp === 'string' &&
+    v.timestamp.trim().length > 0 &&
+    typeof v.host === 'string' &&
+    v.host.trim().length > 0
+  );
+}
+
+/**
+ * Read last-success records. A missing file means "never synced" (not an
+ * error) — the caller distinguishes that from a parse failure via
+ * `parseError`. A present `pull`/`push` field that does not match the
+ * `{timestamp, host}` shape (including an empty/whitespace-only timestamp or
+ * host — a technically-typed but content-free record) is dropped from `data`
+ * (never surfaced as if it were a real record) AND flags `parseError: true`,
+ * so the caller warns ("cannot parse ... inspect manually") instead of
+ * silently rendering `undefined` or an empty value — same corrupt-file
+ * handling as sync-state.json. An unrecognized top-level key (anything other
+ * than `pull`/`push`) likewise flags the whole file as corrupt: this schema
+ * has exactly two legal keys, so a third one is evidence of a hand-edit or a
+ * future/foreign writer, not a shape this reader should quietly tolerate.
+ *
+ * @param {string} hypoDir
+ * @returns {{data: {pull?: {timestamp: string, host: string}, push?: {timestamp: string, host: string}}, parseError: boolean}}
+ */
+export function readSyncLastSuccess(hypoDir) {
+  const path = syncLastSuccessPath(hypoDir);
+  if (!existsSync(path)) return { data: {}, parseError: false };
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+      return { data: {}, parseError: true };
+    let malformed = Object.keys(parsed).some((k) => k !== 'pull' && k !== 'push');
+    const data = {};
+    for (const op of ['pull', 'push']) {
+      if (parsed[op] === undefined) continue;
+      if (isValidSyncSuccessRecord(parsed[op])) data[op] = parsed[op];
+      else malformed = true; // drop the bad field; flag the file as corrupt
+    }
+    return { data, parseError: malformed };
+  } catch {
+    return { data: {}, parseError: true };
+  }
+}
+
+/**
+ * Record a successful pull or push. Concurrency-safe on the same machine:
+ * takes the vault file lock on the target path, re-reads the CURRENT file
+ * under the lock, updates only the given op's field (the other op's existing
+ * value survives — a same-machine concurrent pull-writer and push-writer must
+ * not erase each other), then commits via temp-write + rename so a crash or a
+ * concurrent read never sees a half-written file. `.cache/` is gitignored, so
+ * this file never syncs across machines — there is no cross-machine case to
+ * protect here. A pre-existing but unparseable file, or a sibling field that
+ * does not match `{timestamp, host}` (including an empty/whitespace-only
+ * value) or that carries an unrecognized key, is dropped rather than carried
+ * forward (never preserve garbage into a freshly-written record) — the same
+ * `isValidSyncSuccessRecord` predicate readSyncLastSuccess uses.
+ *
+ * Lock acquisition is best-effort — a timeout (or any other failure) is
+ * swallowed, same as appendSyncFailure, since a failed success-log must never
+ * break the caller (Stop hook / SessionStart).
+ *
+ * @param {string} hypoDir
+ * @param {'pull'|'push'} op
+ */
+export function recordSyncSuccess(hypoDir, op) {
+  try {
+    const path = syncLastSuccessPath(hypoDir);
+    withFileLock(path, () => {
+      let current = {};
+      try {
+        if (existsSync(path)) {
+          const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            for (const k of ['pull', 'push']) {
+              if (isValidSyncSuccessRecord(parsed[k])) current[k] = parsed[k];
+            }
+          }
+        }
+      } catch {
+        // corrupt existing file: overwrite with a fresh object rather than
+        // carry the corruption forward.
+      }
+      current[op] = { timestamp: new Date().toISOString(), host: hostname() };
+      atomicWriteShared(path, JSON.stringify(current, null, 2) + '\n');
+    });
+  } catch {
+    // best-effort: lock timeout or write failure must never break the caller
   }
 }
 
