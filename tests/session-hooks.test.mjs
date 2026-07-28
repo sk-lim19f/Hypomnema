@@ -326,7 +326,9 @@ test('hypo-auto-commit.mjs: missing session_id → scoped commit SKIPPED, no who
     // no session_id in the stdin payload at all
     const r = runStop('hypo-auto-commit.mjs', dir, {});
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], { encoding: 'utf-8' }).stdout;
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], {
+      encoding: 'utf-8',
+    }).stdout;
     assert.equal(
       tracked.trim(),
       '',
@@ -389,7 +391,10 @@ test('hypo-hot-rebuild.mjs feeds its own hot.md write into the scoped commit', (
     const r = runStop('hypo-hot-rebuild.mjs', dir, { session_id: 'sess-hotrebuild' });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-hotrebuild'), 'utf-8'));
-    assert.ok(touched.includes('hot.md'), `hot.md must be recorded as touched: ${JSON.stringify(touched)}`);
+    assert.ok(
+      touched.includes('hot.md'),
+      `hot.md must be recorded as touched: ${JSON.stringify(touched)}`,
+    );
     // end-to-end: hot-rebuild's accumulation is what lets auto-commit include
     // the hook-generated hot.md, which never goes through Write/Edit at all.
     const commitRes = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-hotrebuild' });
@@ -456,7 +461,9 @@ test('hypo-auto-commit.mjs: a lock-timeout on the vault lock leaves the session 
     }
 
     // Nothing was committed (the lock was never acquired)...
-    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], { encoding: 'utf-8' }).stdout;
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], {
+      encoding: 'utf-8',
+    }).stdout;
     assert.equal(tracked.trim(), '', `no commit should have happened: ${tracked}`);
     // ...and the touched-paths set is still on disk, untouched, for a retry.
     const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-locktimeout'), 'utf-8'));
@@ -506,7 +513,9 @@ test('hypo-auto-commit.mjs: a COMMIT failure (peek, not drain) leaves the touche
     }
 
     // Nothing was committed...
-    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], { encoding: 'utf-8' }).stdout;
+    const tracked = spawnSync('git', ['-C', dir, 'ls-files', 'pages'], {
+      encoding: 'utf-8',
+    }).stdout;
     assert.equal(tracked.trim(), '', `no commit should have happened: ${tracked}`);
     // ...and the touched-paths file was NEVER touched — peek, not drain —
     // so it still holds exactly the pre-failure scope, untouched.
@@ -2162,6 +2171,38 @@ test('session-start surfaces a conflict entry with manual-merge guidance', () =>
   });
 });
 
+// A merge --abort that itself fails is recorded as 'conflict-unresolved'
+// (syncRemote, hypo-shared.mjs) — the MORE dangerous of the two conflict ops,
+// since the tree may still be half-merged. Before this fix, syncStateNotice's
+// exact `last.op === 'conflict'` check missed it entirely and fell through to
+// the generic "last sync failed" line, which carries no manual-merge guidance
+// and (worse) doesn't warn against committing/pushing into a half-merged tree.
+test('session-start surfaces a conflict-unresolved entry with half-merged-tree guidance (distinct from a clean conflict)', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({
+        timestamp: '2026-07-28T00:00:00Z',
+        op: 'conflict-unresolved',
+        error: 'fatal: merge --abort failed',
+        host: 'test',
+      }) + '\n',
+    );
+    const r = runStart(dir);
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(ctx.includes('remote diverged'), `conflict-unresolved notice missing: ${ctx}`);
+    assert.ok(
+      /half-merged/.test(ctx),
+      `conflict-unresolved must warn about a possibly half-merged tree, not the plain conflict wording: ${ctx}`,
+    );
+    assert.ok(
+      !ctx.includes('your local work is committed and safe'),
+      `conflict-unresolved must NOT reuse the clean-conflict "committed and safe" claim (the abort itself failed): ${ctx}`,
+    );
+  });
+});
+
 // ── FEAT-34: last-success timestamp visibility ──────────────────────────────
 //
 // recordSyncSuccess writes `.cache/sync-last-success.json`, a separate,
@@ -2511,7 +2552,11 @@ test('commitWikiChanges: stale scope (path never actually changed) → committed
     // currently-changed) step must drop it rather than error on a pathspec
     // that names no change.
     const res = commitWikiChanges(dir, ['stale.md']);
-    assert.equal(res.committed, true, `stale-only scope must be a clean no-op: ${JSON.stringify(res)}`);
+    assert.equal(
+      res.committed,
+      true,
+      `stale-only scope must be a clean no-op: ${JSON.stringify(res)}`,
+    );
     assert.equal(res.scoped, 0);
   });
 });
