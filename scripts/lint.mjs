@@ -489,7 +489,16 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
 const args = parseArgs(process.argv);
 // Only validate the auto-resolved path (env/marker/default). An explicit
 // --hypo-dir=<path> (tests, other tooling) is trusted as-is, valid or not.
-if (args.hypoDirSource) checkVaultOrExit(args.hypoDir, args.hypoDirSource);
+// `vaultMissing` stays on the CI-safe exit-0 path (source 'default'/stale-
+// 'marker' — see checkVaultOrExit's doc comment and its pinned test coverage):
+// this repo's own `npm run lint` runs with no vault at all and must keep
+// passing. What was actually missing is that a vault-less run still printed
+// "no lint issues found" — indistinguishable, on stdout or in --json, from a
+// real empty vault that was actually scanned. Suppress that false-positive-
+// looking output below instead of changing the exit code.
+const vaultMissing = args.hypoDirSource
+  ? checkVaultOrExit(args.hypoDir, args.hypoDirSource)
+  : false;
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects', 'journal'].map((d) => join(args.hypoDir, d));
@@ -597,6 +606,11 @@ if (args.json) {
     JSON.stringify(
       {
         ok: errors.length === 0,
+        // A machine consumer piping `--json` (the exact CI-scripting case that
+        // motivated this field) can tell "scanned and clean" apart from
+        // "nothing to scan" without needing stderr. `ok` keeps its existing
+        // errors-only meaning so nothing that already reads it breaks.
+        vaultFound: !vaultMissing,
         errors: errors.map(toOut),
         warns: warns.map(toOut),
         total: issues.length,
@@ -605,6 +619,11 @@ if (args.json) {
       2,
     ),
   );
+} else if (vaultMissing) {
+  // checkVaultOrExit already put the "No Hypomnema vault found" notice on
+  // stderr. Printing "✓ No lint issues found" here as well would claim a scan
+  // that never happened — the exact false-green shape a piped/redirected
+  // caller cannot tell apart from a real, clean vault.
 } else {
   if (issues.length === 0) {
     console.log('✓ No lint issues found');

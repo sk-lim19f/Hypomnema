@@ -91,7 +91,7 @@ function escapeDot(s) {
 
 // ── formatters ────────────────────────────────────────────────────────────────
 
-function formatJson(pages, graph, minEdges) {
+function formatJson(pages, graph, minEdges, vaultFound) {
   const nodes = pages
     .map((p) => ({
       slug: p.slug,
@@ -107,7 +107,9 @@ function formatJson(pages, graph, minEdges) {
     return fn && tn;
   });
 
-  return JSON.stringify({ nodes, edges }, null, 2);
+  // vaultFound: same reasoning as lint.mjs/stats.mjs — an empty graph from a
+  // vault that was never found must not read the same as a real, linkless one.
+  return JSON.stringify({ nodes, edges, vaultFound }, null, 2);
 }
 
 function formatMermaid(pages, graph, minEdges) {
@@ -156,7 +158,11 @@ function formatDot(pages, graph, minEdges) {
 const args = parseArgs(process.argv);
 // Only validate the auto-resolved path (env/marker/default). An explicit
 // --hypo-dir=<path> (tests, other tooling) is trusted as-is, valid or not.
-if (args.hypoDirSource) checkVaultOrExit(args.hypoDir, args.hypoDirSource);
+// See lint.mjs's matching comment: source 'default'/stale-'marker' stays
+// exit-0 (CI-safe).
+const vaultMissing = args.hypoDirSource
+  ? checkVaultOrExit(args.hypoDir, args.hypoDirSource)
+  : false;
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
@@ -164,13 +170,22 @@ const pages = scanDirs.flatMap((d) => collectPagesGraph(d, args.hypoDir, ignoreP
 const slugIndex = buildSlugIndex(pages);
 const graph = buildGraph(pages, slugIndex);
 
-switch (args.format) {
-  case 'mermaid':
-    console.log(formatMermaid(pages, graph, args.minEdges));
-    break;
-  case 'dot':
-    console.log(formatDot(pages, graph, args.minEdges));
-    break;
-  default:
-    console.log(formatJson(pages, graph, args.minEdges));
+if (vaultMissing && (args.format === 'mermaid' || args.format === 'dot')) {
+  // Same reasoning as lint.mjs/stats.mjs: mermaid/dot render straight to a
+  // diagram tool with no JSON envelope to carry `vaultFound`, so a valid but
+  // linkless diagram from a real (empty) vault and "no vault was found at
+  // all" would otherwise render identically. checkVaultOrExit already put the
+  // "No Hypomnema vault found" notice on stderr; suppress the stdout diagram
+  // rather than hand the renderer an empty-but-"real"-looking graph.
+} else {
+  switch (args.format) {
+    case 'mermaid':
+      console.log(formatMermaid(pages, graph, args.minEdges));
+      break;
+    case 'dot':
+      console.log(formatDot(pages, graph, args.minEdges));
+      break;
+    default:
+      console.log(formatJson(pages, graph, args.minEdges, !vaultMissing));
+  }
 }

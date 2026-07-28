@@ -1244,3 +1244,113 @@ test('dual install points the wiki pre-commit hook at the durable plugin root', 
     }
   });
 });
+
+// ── CLI surface: unknown args / --version / help-dispatch consistency ───────
+//
+// An unrecognized argument used to fall through the parseArgs loop silently
+// and run the default init flow (scaffold + hook install + settings.json
+// merge) — a destructive write triggered by what read like a query. `--version`
+// was the concrete case: never implemented, looks like an inspection flag, and
+// a typo landed on a live wiki's pre-commit hook instead of printing anything.
+
+suite('init.mjs — unknown args / --version / help-dispatch consistency');
+
+test('an unrecognized flag exits 2 with a usage hint and does not run init', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--version-typo']);
+    assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stdout: ${r.stdout}`);
+    assert.ok(
+      r.stderr.includes('Unknown option: --version-typo'),
+      `stderr should name the bad flag: ${r.stderr}`,
+    );
+    assert.ok(r.stderr.includes('--help'), `stderr should point at --help: ${r.stderr}`);
+    assert.ok(!existsSync(hypoDir), 'an unknown flag must not scaffold a wiki');
+  });
+});
+
+test('--version prints the package version and exits 0 without scaffolding', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const pkgVersion = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf-8')).version;
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--version']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), pkgVersion, `stdout: ${r.stdout}`);
+    assert.ok(!existsSync(hypoDir), '--version must not scaffold a wiki');
+  });
+});
+
+test('--help lists exactly the dispatchable subcommand set (regression for the missing "proposal" entry)', () => {
+  const r = run('init.mjs', ['--help']);
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+
+  const src = readFileSync(join(SCRIPTS, 'init.mjs'), 'utf-8');
+  const known = src.match(/const KNOWN_SUBCOMMANDS = new Set\(\[([\s\S]*?)\]\)/);
+  assert.ok(known, 'could not locate KNOWN_SUBCOMMANDS in scripts/init.mjs source');
+  const dispatched = new Set(
+    known[1]
+      .split(',')
+      .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+      .filter(Boolean),
+  );
+
+  // Command names in the printed help: exactly 2 leading spaces, a lowercase
+  // (hyphenated) word, then 2+ spaces before the description. Continuation
+  // lines are indented past column 2 and the "Running ..." prose line starts
+  // uppercase, so both are excluded by construction rather than by an
+  // explicit denylist.
+  const listed = new Set([...r.stdout.matchAll(/^ {2}([a-z][a-z-]+)\s{2,}\S/gm)].map((m) => m[1]));
+
+  assert.ok(dispatched.size > 0, 'KNOWN_SUBCOMMANDS parsed as empty — regex likely stale');
+  assert.ok(listed.size > 0, 'help text parsed as empty — regex likely stale');
+  assert.deepEqual(
+    [...listed].sort(),
+    [...dispatched].sort(),
+    `help-listed commands must exactly match the dispatch set.\nlisted:     ${JSON.stringify([...listed].sort())}\ndispatched: ${JSON.stringify([...dispatched].sort())}`,
+  );
+  assert.ok(listed.has('proposal'), 'help must list the proposal subcommand (PR #185)');
+});
+
+// codex review finding (post-merge cross-check): --version was implemented
+// but never added to --help's own option list — the same shape of gap as the
+// "proposal" subcommand fix above, just one level down (an option instead of
+// a command). Same fix, same kind of drift test.
+
+test('--help lists --version among the Init options', () => {
+  const r = run('init.mjs', ['--help']);
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  assert.ok(/^ {2}--version(?:\s|,)/m.test(r.stdout), `--help should list --version: ${r.stdout}`);
+});
+
+test('--help option list matches every flag parseArgs actually recognizes', () => {
+  const r = run('init.mjs', ['--help']);
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+
+  const src = readFileSync(join(SCRIPTS, 'init.mjs'), 'utf-8');
+  // Exact-match flags: `arg === '--word'` (picks up --help, --version,
+  // --no-hooks, etc; the bare '-h' alias is intentionally not a member of
+  // this set — it is documented as ", -h" alongside --help, not as its own
+  // line). Prefix flags: `arg.startsWith('--word=')`, normalized by dropping
+  // the trailing '='.
+  const exact = [...src.matchAll(/arg\s*===\s*'(--[a-zA-Z-]+)'/g)].map((m) => m[1]);
+  const prefixed = [...src.matchAll(/arg\.startsWith\('(--[a-zA-Z-]+)='\)/g)].map((m) => m[1]);
+  const recognized = new Set([...exact, ...prefixed]);
+
+  // Flag names in the printed "Init options:" block: 2 leading spaces, the
+  // flag, an optional `=<placeholder>` or `, -h` alias, then 2+ spaces before
+  // the description. Continuation lines (indented past column 2) don't match.
+  const listed = new Set(
+    [...r.stdout.matchAll(/^ {2}(--[a-zA-Z-]+)(?:=\S+)?(?:,\s*-h)?\s{2,}\S/gm)].map((m) => m[1]),
+  );
+
+  assert.ok(
+    recognized.size > 0,
+    'no recognized flags parsed from init.mjs source — regex likely stale',
+  );
+  assert.ok(listed.size > 0, 'no flags parsed from --help output — regex likely stale');
+  assert.deepEqual(
+    [...listed].sort(),
+    [...recognized].sort(),
+    `--help's option list must exactly match the flags parseArgs recognizes.\nlisted:     ${JSON.stringify([...listed].sort())}\nrecognized: ${JSON.stringify([...recognized].sort())}`,
+  );
+});
