@@ -98,7 +98,12 @@ function getLastActivity(hypoDir) {
 const args = parseArgs(process.argv);
 // Only validate the auto-resolved path (env/marker/default). An explicit
 // --hypo-dir=<path> (tests, other tooling) is trusted as-is, valid or not.
-if (args.hypoDirSource) checkVaultOrExit(args.hypoDir, args.hypoDirSource);
+// See lint.mjs's matching comment: source 'default'/stale-'marker' stays
+// exit-0 (CI-safe), but the all-zero counts below must not be printed as if a
+// real (empty) vault had been scanned.
+const vaultMissing = args.hypoDirSource
+  ? checkVaultOrExit(args.hypoDir, args.hypoDirSource)
+  : false;
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const pageFiles = collectMdFiles(join(args.hypoDir, 'pages'), [], args.hypoDir, ignorePatterns);
@@ -165,7 +170,14 @@ const stats = {
 };
 
 if (args.json) {
-  console.log(JSON.stringify(stats, null, 2));
+  // vaultFound lets a machine consumer of `--json` tell "scanned, genuinely
+  // empty" apart from "nothing was scanned" without needing stderr — the
+  // same reasoning as lint.mjs's matching field.
+  console.log(JSON.stringify({ ...stats, vaultFound: !vaultMissing }, null, 2));
+} else if (vaultMissing) {
+  // checkVaultOrExit already printed the "No Hypomnema vault found" notice on
+  // stderr. An all-zero stats block here would read as "scanned an empty
+  // vault", which never happened.
 } else {
   console.log(`Pages:    ${pageFiles.length} total`);
   const typeEntries = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]);

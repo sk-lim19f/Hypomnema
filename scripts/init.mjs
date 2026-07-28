@@ -143,6 +143,9 @@ Commands:
   capture                 Reverse-capture ~/.claude/{commands,agents} extensions and
                           settings.json hooks into the wiki for cross-machine sync
                           (pass names or --all; --dry-run to preview)
+  proposal                Manage staged crystallize proposals: list, apply, or
+                          discard a parked write (also challenge/resolve for the
+                          no-TTY agent approval channel)
 
   Running \`hypomnema\` with no command is equivalent to \`hypomnema init\`.
 
@@ -165,10 +168,14 @@ Init options:
                          to a blocking error), sequenced after the .hypoignore
                          guard. Off by default; re-run init to add or drop it.
   --dry-run              Show what would be done without making changes
+  --version              Print the installed package version and exit
   --help, -h             Show this help message
 
 Subcommand-specific flags (upgrade/doctor/uninstall/capture) live in the
 docstring at the top of scripts/<command>.mjs; capture also accepts \`--help\`.`);
+      process.exit(0);
+    } else if (arg === '--version') {
+      console.log(PKG_VERSION ?? 'unknown');
       process.exit(0);
     } else if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg === '--no-hooks') args.hooks = false;
@@ -190,6 +197,18 @@ docstring at the top of scripts/<command>.mjs; capture also accepts \`--help\`.`
     else if (arg.startsWith('--shell-config=')) args.shellConfig = expandHome(arg.slice(15));
     else if (arg === '--allow-downgrade') args.allowDowngrade = true;
     else if (arg === '--lint-strict') args.lintStrict = true;
+    else {
+      // An unrecognized argument used to fall through silently and run the
+      // default init flow (scaffold + hook install + settings.json merge) —
+      // a destructive write triggered by what looked like a query. `--version`
+      // was the concrete case that bit a user: it reads like an inspection
+      // flag, was never implemented, and its typo/mistake landed on a live
+      // wiki's pre-commit hook instead of printing anything. Fail loud and
+      // do nothing, rather than guess what the caller meant.
+      console.error(`Unknown option: ${arg}`);
+      console.error('Run `hypomnema --help` for usage.');
+      process.exit(2);
+    }
   }
   return args;
 }

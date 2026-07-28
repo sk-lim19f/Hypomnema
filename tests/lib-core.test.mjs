@@ -290,6 +290,126 @@ test('valid vault via HYPO_DIR (marker present) → all 4 read CLIs behave as be
   }
 });
 
+// ── ISSUE-51 follow-up: vault-missing must not look like a real, clean scan ──
+//
+// checkVaultOrExit's exit-0 "default"/stale-"marker" path stays exit-0 (this
+// repo's own `npm run lint` in CI relies on it, pinned above) — but the
+// callers used to print their normal success shape regardless, so a piped
+// `--json` consumer (or a plain stdout read) could not tell "genuinely
+// scanned and empty" apart from "found no vault at all". Prove both halves:
+// the human-facing success line is suppressed, and the machine-facing `--json`
+// payload carries an explicit `vaultFound: false`.
+
+test('lint.mjs: no vault → stdout does NOT claim "No lint issues found"', () => {
+  const noVaultHome = mkdtempSync(join(tmpdir(), 'hypo-default-novault-lint-'));
+  try {
+    const r = spawnCli('lint.mjs', [], { HOME: noVaultHome, HYPO_DIR: '' });
+    assert.equal(r.status, 0, `expected exit 0 (CI-safe), got ${r.status}. stderr: ${r.stderr}`);
+    assert.ok(
+      !r.stdout.includes('No lint issues found'),
+      `no-vault run must not claim a clean scan that never happened: ${r.stdout}`,
+    );
+  } finally {
+    rmSync(noVaultHome, { recursive: true, force: true });
+  }
+});
+
+test('lint.mjs --json: no vault → vaultFound:false; real (empty) vault → vaultFound:true', () => {
+  const noVaultHome = mkdtempSync(join(tmpdir(), 'hypo-default-novault-lint-json-'));
+  const validDir = mkdtempSync(join(tmpdir(), 'hypo-valid-vault-lint-json-'));
+  try {
+    const missing = spawnCli('lint.mjs', ['--json'], { HOME: noVaultHome, HYPO_DIR: '' });
+    assert.equal(missing.status, 0, `stderr: ${missing.stderr}`);
+    assert.equal(JSON.parse(missing.stdout).vaultFound, false, `stdout: ${missing.stdout}`);
+
+    writeFileSync(join(validDir, 'hypo-config.md'), '# marker\n');
+    const found = spawnCli('lint.mjs', ['--json'], { HOME: SESSION_TMP_HOME, HYPO_DIR: validDir });
+    assert.equal(found.status, 0, `stderr: ${found.stderr}`);
+    assert.equal(JSON.parse(found.stdout).vaultFound, true, `stdout: ${found.stdout}`);
+  } finally {
+    rmSync(noVaultHome, { recursive: true, force: true });
+    rmSync(validDir, { recursive: true, force: true });
+  }
+});
+
+test('stats.mjs: no vault → stdout stays empty, not an all-zero stats block', () => {
+  const noVaultHome = mkdtempSync(join(tmpdir(), 'hypo-default-novault-stats-'));
+  try {
+    const r = spawnCli('stats.mjs', [], { HOME: noVaultHome, HYPO_DIR: '' });
+    assert.equal(r.status, 0, `expected exit 0 (CI-safe), got ${r.status}. stderr: ${r.stderr}`);
+    assert.equal(
+      r.stdout.trim(),
+      '',
+      `no-vault run must not print stats as if scanned: ${r.stdout}`,
+    );
+  } finally {
+    rmSync(noVaultHome, { recursive: true, force: true });
+  }
+});
+
+test('stats.mjs --json: no vault → vaultFound:false', () => {
+  const noVaultHome = mkdtempSync(join(tmpdir(), 'hypo-default-novault-stats-json-'));
+  try {
+    const r = spawnCli('stats.mjs', ['--json'], { HOME: noVaultHome, HYPO_DIR: '' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(JSON.parse(r.stdout).vaultFound, false, `stdout: ${r.stdout}`);
+  } finally {
+    rmSync(noVaultHome, { recursive: true, force: true });
+  }
+});
+
+test('graph.mjs (default json format): no vault → vaultFound:false', () => {
+  const noVaultHome = mkdtempSync(join(tmpdir(), 'hypo-default-novault-graph-'));
+  try {
+    const r = spawnCli('graph.mjs', [], { HOME: noVaultHome, HYPO_DIR: '' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(JSON.parse(r.stdout).vaultFound, false, `stdout: ${r.stdout}`);
+  } finally {
+    rmSync(noVaultHome, { recursive: true, force: true });
+  }
+});
+
+// mermaid/dot have no JSON envelope to carry vaultFound, so a vault-missing
+// run must suppress the diagram outright rather than hand a renderer an
+// empty-but-"real"-looking graph (codex review finding, following the
+// --format=json fix above).
+test('graph.mjs --format=mermaid: no vault → stdout stays empty, not an empty-but-valid diagram', () => {
+  const noVaultHome = mkdtempSync(join(tmpdir(), 'hypo-default-novault-graph-mermaid-'));
+  try {
+    const r = spawnCli('graph.mjs', ['--format=mermaid'], { HOME: noVaultHome, HYPO_DIR: '' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), '', `no-vault run must not render a diagram: ${r.stdout}`);
+  } finally {
+    rmSync(noVaultHome, { recursive: true, force: true });
+  }
+});
+
+test('graph.mjs --format=dot: no vault → stdout stays empty, not an empty-but-valid diagram', () => {
+  const noVaultHome = mkdtempSync(join(tmpdir(), 'hypo-default-novault-graph-dot-'));
+  try {
+    const r = spawnCli('graph.mjs', ['--format=dot'], { HOME: noVaultHome, HYPO_DIR: '' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), '', `no-vault run must not render a diagram: ${r.stdout}`);
+  } finally {
+    rmSync(noVaultHome, { recursive: true, force: true });
+  }
+});
+
+test('graph.mjs --format=mermaid: real (empty) vault still renders the normal diagram', () => {
+  const validDir = mkdtempSync(join(tmpdir(), 'hypo-valid-vault-graph-mermaid-'));
+  try {
+    writeFileSync(join(validDir, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('graph.mjs', ['--format=mermaid'], {
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: validDir,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), 'graph TD', `stdout: ${r.stdout}`);
+  } finally {
+    rmSync(validDir, { recursive: true, force: true });
+  }
+});
+
 // ── lib/wd-match.mjs (cross-machine project matcher) ─────────────────────────
 
 const { pickProjectByCwd, normalizeWorkingDir } = await import(`${SCRIPTS}/lib/wd-match.mjs`);
