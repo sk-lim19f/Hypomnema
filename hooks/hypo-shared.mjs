@@ -334,18 +334,30 @@ export function hasAnyTodayLogEntry(hypoDir) {
 }
 
 /**
- * Date strings that count as "today" for freshness checks. Both the local and
- * UTC dates are accepted: Claude writes file dates in the user's local zone,
- * while hypo-hot-rebuild stamps root hot.md with the UTC date. Accepting both
- * removes the ~timezone-offset window where a correctly closed session would
- * otherwise false-block.
+ * Local and UTC calendar-day strings for a given instant. Both matter because
+ * some writers stamp a date in the user's local zone (Claude writing file
+ * content) while others stamp UTC (hypo-hot-rebuild, the session-closed
+ * marker's `closed_at`) — comparing only one representation opens a
+ * ~timezone-offset window where a same-moment date-comparison reads as two
+ * different days. Shared by `freshDates()` (today) and any caller comparing
+ * against an arbitrary past timestamp (e.g. doctor correlating a marker's
+ * `closed_at` against an artifact's local-dated heading).
+ * @param {Date} [date]
+ * @returns {string[]} 1-2 ISO dates (YYYY-MM-DD), local first.
+ */
+export function localAndUtcDates(date = new Date()) {
+  const local = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  const utc = date.toISOString().slice(0, 10);
+  return local === utc ? [local] : [local, utc];
+}
+
+/**
+ * Date strings that count as "today" for freshness checks. See
+ * {@link localAndUtcDates} for why both representations are accepted.
  * @returns {string[]} 1-2 ISO dates (YYYY-MM-DD), most-relevant first.
  */
 export function freshDates() {
-  const d = new Date();
-  const local = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  const utc = d.toISOString().slice(0, 10);
-  return local === utc ? [local] : [local, utc];
+  return localAndUtcDates(new Date());
 }
 
 // Parse a single frontmatter scalar (mirrors hypo-session-start.mjs /
@@ -2484,7 +2496,7 @@ export function clearClearMarker(hypoDir) {
 // Writer authority lives in crystallize, NOT this hook: the hook only checks
 // presence. See amendment 2026-05-19 Q2 for the split rationale.
 
-const SESSION_CLOSED_MARKER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+export const SESSION_CLOSED_MARKER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Sanitize session_id for filesystem use — Claude session_ids are UUIDs but
  *  defend against accidental path traversal regardless. */
@@ -3642,6 +3654,114 @@ export function isClosePattern(text) {
     /\bclose\s+(?:the|this)\s+session\b/i,
   ];
   return [...krPatterns, ...enPatterns].some((re) => re.test(text));
+}
+
+// ── close ARTIFACTS, not the marker (issue: close gate lives on one writer) ──
+//
+// hasUserCloseSignal/isClosePattern answer "did the user ask to close" — the
+// input side of the gate. This answers a different question: "does this file
+// or commit message already READ as closed to a human", independent of
+// whether any marker writer ever ran. The 2026-07-28 incident produced a
+// closing session-state.md heading, a rewritten hot.md, and a close-worded
+// commit WITHOUT writing a session-closed marker at all — the hard gate on
+// the marker writer never fired because the model never called it. Closing
+// is a set of user-visible artifacts, not one internal file.
+//
+// Narrowed scope — this is a PARTIAL defense, not the completed artifact-set
+// gate: hot.md's REPLACEMENT is a diff against the prior version, which a
+// pure function taking only current content cannot see. This only catches a
+// hot.md that carries close vocabulary in its own bold heading — a hot.md
+// rewritten with a closing narrative that happens not to use 마감/종료
+// literally (as the incident's own hot.md rewrite did) will NOT trip this
+// signal. That is a real, known false-negative, not a corner this slice
+// closes: catching it needs a diff-aware check (comparing against the prior
+// committed hot.md, or a PreToolUse guard that sees the edit as it happens),
+// which is future work, not something reusing isClosePattern's heuristics
+// would fix either. The session-state heading and commit-message signals
+// still catch the one incident on record, so today's gap is documented, not
+// silent — but it is a gap, not a boundary this slice was designed to hold.
+//
+// A close word used as a NOUN-MODIFIER is not an announcement — "마감
+// 조건을/여부/로직/절차/정책" all describe something ABOUT closing, not a close
+// that happened. Enumerating the modifiers (blacklist, round 1) and then the
+// verb suffixes that ARE an announcement (whitelist, round 2) both kept
+// finding new words each review round — neither converges, because both are
+// open lexical classes. The convergent rule is a WORD-BOUNDARY, not a word
+// list: Korean verb conjugation attaches directly with no space (마감했다,
+// 마감되었습니다, 마감했습니다, 마감됨 — see the corpus in
+// tests/close-signals.test.mjs), while a noun-modifier is a SEPARATE word
+// after a space (마감 조건, 마감 정책, 종료 여부, 종료 절차). So: a close word
+// followed immediately (no space) by more Hangul is a conjugation and
+// announces a close; a close word followed by whitespace THEN Hangul is a
+// modifier and does not. `CLOSE_WORD_TAIL` consumes the (possibly empty)
+// directly-attached conjugation run, then requires the close word to be
+// effectively the LAST content in its heading: only a parenthetical, ":" +
+// trailing narrative, terminal punctuation, or the bold-heading's end may
+// follow — a bare space-separated Hangul word after it fails to match any of
+// those and rejects. Known accepted limit: a same-word-no-space compound like
+// "마감일" (deadline-date, a noun) would match — over the FN/FP asymmetry this
+// check is built on (a missed real close is the exact failure mode it exists
+// to catch; a stray warn is mild noise), that's the accepted direction.
+const CLOSE_WORD_TAIL = '[가-힣]*(?:\\s*:[^*\\n]*|(?:\\([^)]*\\))?[.,]?\\s*)';
+const SESSION_STATE_CLOSE_HEADING = new RegExp(
+  `\\*\\*(\\d{4}-\\d{2}-\\d{2})[^*\\n]*?마감${CLOSE_WORD_TAIL}\\*\\*`,
+);
+const HOT_CLOSE_NARRATIVE = new RegExp(
+  `\\*\\*(\\d{4}-\\d{2}-\\d{2})[^*\\n]*?(?:마감|세션\\s*종료)${CLOSE_WORD_TAIL}\\*\\*`,
+);
+// EN: requires the CLOSE's object to actually be "session" ("close the
+// session" / "close the Nth session" — an ORDINAL or digit-ordinal, the only
+// forms a real close commit uses), not any noun ("close the database
+// session", "close the browser session" are technical commits, not a
+// session-close). KR: same word-boundary rule as the heading patterns above,
+// applied as a lookahead only (a commit subject isn't bold-wrapped, so there
+// is no terminal structure to consume into) — reject only when a bare SPACE
+// separates the close word from a following Hangul word; a directly-attached
+// conjugation (세션을 종료했다) still matches. "을/를" is the object particle
+// Korean puts between "세션" and its verb.
+const ORDINAL =
+  '(?:\\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|' +
+  'eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth)';
+const CLOSE_COMMIT_MESSAGE = new RegExp(
+  `\\b(?:session:\\s*)?close(?:s|d)?\\s+(?:the|this)\\s+(?:${ORDINAL}\\s+)?session\\b|` +
+    `세션(?:을|를)?\\s*(?:마무리|마감|종료)(?!\\s+[가-힣])`,
+  'i',
+);
+
+/**
+ * Pure predicate: is this file content, or this commit message, a
+ * session-close ARTIFACT (something a human would read as "this session was
+ * closed")? Never reads the filesystem — callers own IO. `path`'s basename
+ * selects which pattern applies (`session-state.md` vs `hot.md`); pass
+ * `commitMessage` instead for a git log entry.
+ *
+ * Consumed today by doctor's post-hoc check: an artifact with no matching
+ * session-closed marker for its date is a signature of a hand-made close
+ * that never went through the gate. Meant to also back a future PreToolUse
+ * guard on the same definition, so the two defenses can't drift apart on
+ * what "close" means.
+ *
+ * @param {{path?: string|null, content?: string|null, commitMessage?: string|null}} input
+ * @returns {{matched: boolean, kind: string|null, date: string|null}} `date`
+ *   is the YYYY-MM-DD captured from the artifact's own heading, or null for a
+ *   commit-message match (the caller already has the commit's date).
+ */
+export function detectSessionCloseArtifact({ path = null, content = null, commitMessage = null } = {}) {
+  if (typeof commitMessage === 'string' && CLOSE_COMMIT_MESSAGE.test(commitMessage)) {
+    return { matched: true, kind: 'commit-message', date: null };
+  }
+  if (typeof path === 'string' && typeof content === 'string') {
+    const base = path.split(/[\\/]/).pop();
+    if (base === 'session-state.md') {
+      const m = SESSION_STATE_CLOSE_HEADING.exec(content);
+      if (m) return { matched: true, kind: 'session-state-heading', date: m[1] };
+    }
+    if (base === 'hot.md') {
+      const m = HOT_CLOSE_NARRATIVE.exec(content);
+      if (m) return { matched: true, kind: 'hot-narrative', date: m[1] };
+    }
+  }
+  return { matched: false, kind: null, date: null };
 }
 
 /**
