@@ -73,6 +73,9 @@ import {
   mkdirSync,
   renameSync,
   realpathSync,
+  openSync,
+  writeSync,
+  closeSync,
 } from 'fs';
 import { join, dirname } from 'path';
 import { spawnSync } from 'child_process';
@@ -81,7 +84,7 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
 import { collectPagesCrystallize, extractWikilinks } from './lib/wikilink.mjs';
 import { aggregateColdCandidates } from './lib/page-usage.mjs';
-import { isValidProjectName } from './lib/project-create.mjs';
+import { isValidProjectName, substituteTokens, TEMPLATE_DIR } from './lib/project-create.mjs';
 import { appendPendingTags, checkForbidden } from './lib/schema-vocab.mjs';
 import {
   sessionCloseFileStatus,
@@ -906,6 +909,70 @@ function verifyCloseAuthority(sessionId) {
   return { ok: true };
 }
 
+// A-1 (project index lifecycle): seed projects/<project>/index.md from the
+// template the first time this project closes without one. SCHEMA.md declares
+// project-index at projects/*/index.md and templates/projects/_template/ ships
+// one, but createProject (the auto-project-offer path) is the only writer of
+// it today — a project directory created any other way (a manual mkdir, an
+// older vault, direct Write tool calls) never gets one. Idempotent: an
+// existing index.md is left untouched; this only fills the gap, and only the
+// three tokens the template defines are substituted — the rest (one-line
+// description, Progress checklist) stays human-authored prose exactly as
+// createProject already leaves it.
+//
+// `working_dir` has no authoritative source in this flow: apply never
+// receives the session's cwd (see hooks/hypo-shared.mjs's precompactGateStatus
+// doc — process.cwd() is explicitly non-authoritative here, since it reflects
+// this script's own launch directory, not the session's). It is left EMPTY,
+// not filled with a placeholder string: hooks/hypo-shared.mjs's collector
+// (collectProjectWorkingDirs) and findBackfillCandidate both treat any truthy
+// `working_dir` as "already anchored" and stop offering to backfill the real
+// cwd — a fake placeholder is truthy, so it would silently and permanently
+// swallow the exact anchor-recovery path a human would otherwise get. Empty
+// stays falsy there, so the project surfaces as a genuine backfill candidate
+// until a person (or the auto-project-offer flow) fills in a real path. The
+// key itself stays present in the frontmatter (substituted to an empty value,
+// not omitted) so the shape matches every other index.md and a human sees
+// exactly where to type the answer.
+// "Never overwrite an existing index" is this feature's explicit contract, so
+// creation uses an EXCLUSIVE create (`wx`), not the existsSync-then-atomicWrite
+// shape every other target in this file uses. atomicWrite's tmp+rename
+// replaces whatever sits at `dest` the instant rename fires — existing or not —
+// so a plain `if (existsSync(dest)) return null` beforehand only narrows the
+// race, it does not close it: another writer (a human, or a concurrent close)
+// can land real bytes at `dest` between that check and this function's rename.
+// `wx` makes the OS do the check-and-create atomically, mirroring
+// hooks/base-store.mjs's snapshotBase (`openSync(path, 'wx')` + EEXIST ==
+// "someone already got there, leave it"). No tmp+rename is needed here: unlike
+// atomicWrite's use case (replacing bytes a reader might already be mid-read
+// of), a `wx` create can never observably tear — the file either doesn't
+// exist yet (nothing to tear) or the open fails outright.
+export function ensureProjectIndex(hypoDir, project, relPath, today) {
+  const dest = join(hypoDir, relPath);
+  const src = join(TEMPLATE_DIR, 'index.md');
+  if (!existsSync(src)) return null; // template missing — nothing to scaffold from
+  const content = substituteTokens(readFileSync(src, 'utf-8'), {
+    name: project,
+    started: today,
+    workingDir: '',
+    today,
+  });
+  mkdirSync(dirname(dest), { recursive: true });
+  let fd;
+  try {
+    fd = openSync(dest, 'wx');
+  } catch (e) {
+    if (e && e.code === 'EEXIST') return null; // another writer already created it
+    throw e;
+  }
+  try {
+    writeSync(fd, content);
+  } finally {
+    closeSync(fd);
+  }
+  return relPath;
+}
+
 function applySessionClose(args) {
   // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
@@ -1186,6 +1253,11 @@ function applySessionClose(args) {
   // normalization, so it must use the OS-native separator the sibling entries use.
   const sessionLogWriteTarget = join('projects', project, 'session-log', `${date}.md`);
   const sessionLogEvidence = join(...sessionLogScopePath(args.hypoDir, project, date).split('/'));
+  // A-1: known here (read-only check, no write yet) so a freshly-scaffolded
+  // index.md is scoped to THIS close's own payloadScope below, rather than
+  // showing up as an unrelated pre-existing-content notice.
+  const indexRelPath = join('projects', project, 'index.md');
+  const indexMissing = !existsSync(join(args.hypoDir, indexRelPath));
   const payloadScope = new Set([
     join('projects', project, 'session-state.md'),
     join('projects', project, 'hot.md'),
@@ -1194,6 +1266,7 @@ function applySessionClose(args) {
     sessionLogEvidence, // == write target, except a hybrid-month monthly fallback
     'log.md',
     ...(payload.openQuestions ? [join('pages', 'open-questions.md')] : []),
+    ...(indexMissing ? [indexRelPath] : []),
   ]);
 
   let preflightLint;
@@ -1300,6 +1373,17 @@ function applySessionClose(args) {
   overwrite('projectHot', join('projects', project, 'hot.md'), payload.projectHot);
   overwrite('rootHot', 'hot.md', payload.rootHot);
   overwrite('openQuestions', join('pages', 'open-questions.md'), payload.openQuestions);
+
+  // A-1: fill a missing project index as part of this close's writes (after
+  // preflight passed, so an aborted close never leaves a half-applied side
+  // effect on disk).
+  if (indexMissing) {
+    const createdIndex = ensureProjectIndex(args.hypoDir, project, indexRelPath, date);
+    if (createdIndex) {
+      applied.push(`projectIndex (${createdIndex})`);
+      appliedPaths.push(createdIndex);
+    }
+  }
 
   // Append idempotency: dedup by exact-entry presence, not by "any heading
   // dated today". The freshness gate (sessionCloseFileStatus) is what answers

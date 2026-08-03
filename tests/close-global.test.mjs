@@ -2864,7 +2864,10 @@ test('importing crystallize.mjs runs no CLI and exposes exactly the pure exports
   // The pure close-pipeline exports are usable only because the CLI dispatch is
   // guarded behind isMain(). A regressed guard that let the CLI run on import
   // would either crash (process.exit) or leak crystallize output here — assert
-  // the import is silent and yields exactly the two exported names.
+  // the import is silent and yields exactly the three exported names.
+  // ensureProjectIndex (A-1 project-index lifecycle) joined the list so
+  // tests/crystallize-apply.test.mjs can exercise its no-replace create
+  // directly, the same reason the other two are exported.
   const script = join(REPO, 'scripts', 'crystallize.mjs');
   const r = spawnSync(
     process.execPath,
@@ -2878,7 +2881,7 @@ test('importing crystallize.mjs runs no CLI and exposes exactly the pure exports
   assert.equal(r.status, 0, `import must exit 0, got ${r.status}: ${r.stderr}`);
   assert.equal(
     r.stdout,
-    'closeResultContradiction,planMarkerDecision',
+    'closeResultContradiction,ensureProjectIndex,planMarkerDecision',
     `import must print only the pure exports (no CLI output): ${JSON.stringify(r.stdout)}`,
   );
 });

@@ -164,16 +164,86 @@ test('adr missing source → error', () => {
   );
 });
 
-test('project-index missing working_dir → error', () => {
+// A-1/BLOCKER fix: working_dir dropped from project-index's required fields.
+// An index without a cwd anchor is a genuine, unfilled state (crystallize.mjs's
+// auto-created index has none to substitute) — it must lint clean, not error.
+// status/started stay required (they always have a real value).
+test('project-index missing working_dir → clean (no longer required), but W13 warns', () => {
   const { r, out } = lintWithSchema(
     'projects/p/index.md',
     '---\ntitle: T\ntype: project-index\nstatus: active\nstarted: 2026-05-18\nupdated: 2026-05-18\ntags: [project]\n---\nbody\n',
   );
-  assert.equal(r.status, 1);
+  assert.equal(r.status, 0, `missing working_dir must not error: ${r.stdout}`);
   assert.ok(
-    out.errors.some((e) =>
-      e.message.includes('Missing required field for type "project-index": working_dir'),
-    ),
+    !out.errors.some((e) => e.message.includes('working_dir')),
+    `working_dir must not be flagged as an ERROR: ${r.stdout}`,
+  );
+  // CONCERN 1 fix: a missing anchor is a WARNING (W13) — doctor's manual report
+  // is not the only surface this shows up on, and cwd-first backfill only
+  // fires when the cwd's leaf directory name happens to match the slug.
+  assert.ok(
+    out.warns.some((w) => w.message.includes('working_dir anchor')),
+    `expected a W13-style missing-anchor warning: ${r.stdout}`,
+  );
+});
+
+test('project-index with an EMPTY working_dir (crystallize.mjs A-1 shape) → W13 warns, no error', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/index.md',
+    '---\ntitle: T\ntype: project-index\nstatus: active\nstarted: 2026-05-18\nupdated: 2026-05-18\nworking_dir: \ntags: [project]\n---\nbody\n',
+  );
+  assert.equal(r.status, 0, `empty working_dir must not error: ${r.stdout}`);
+  // Matched by message, not `id`: non-strict --json omits `id` on every
+  // warning class except W8 (lint.mjs's byte-identical-default guarantee) —
+  // `--strict does not promote W13` below is what checks the `id` itself.
+  assert.ok(
+    out.warns.some((w) => w.message.includes('working_dir anchor')),
+    `expected a missing-anchor warning for an empty (present-but-blank) working_dir: ${r.stdout}`,
+  );
+});
+
+test('project-index WITH a real working_dir → no working_dir-anchor warning', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/index.md',
+    '---\ntitle: T\ntype: project-index\nstatus: active\nstarted: 2026-05-18\nupdated: 2026-05-18\nworking_dir: /real/path\ntags: [project]\n---\nbody\n',
+  );
+  assert.equal(r.status, 0, `well-anchored index must lint clean: ${r.stdout}`);
+  assert.ok(
+    !out.warns.some((w) => w.message.includes('working_dir anchor')),
+    `an anchored project-index must not trip the missing-anchor warning: ${r.stdout}`,
+  );
+});
+
+test('--strict does not promote W13 (stays a warn, exit 0)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-w13-'));
+  writeFileSync(join(dir, 'SCHEMA.md'), VOCAB_SCHEMA);
+  const pagePath = join(dir, 'projects', 'p', 'index.md');
+  mkdirSync(dirname(pagePath), { recursive: true });
+  writeFileSync(
+    pagePath,
+    '---\ntitle: T\ntype: project-index\nstatus: active\nstarted: 2026-05-18\nupdated: 2026-05-18\ntags: [project]\n---\nbody\n',
+  );
+  const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json', '--strict']);
+  const out = JSON.parse(r.stdout);
+  rmSync(dir, { recursive: true, force: true });
+  assert.equal(r.status, 0, `W13 is excluded from STRICT_PROMOTE_IDS → exit 0: ${r.stdout}`);
+  assert.ok(
+    out.warns.some((w) => w.id === 'W13'),
+    `W13 must stay a warn under --strict: ${r.stdout}`,
+  );
+});
+
+test('project-index missing status/started → still errors (contract unchanged for those)', () => {
+  const { r, out } = lintWithSchema(
+    'projects/p/index.md',
+    '---\ntitle: T\ntype: project-index\nupdated: 2026-05-18\ntags: [project]\n---\nbody\n',
+  );
+  assert.equal(r.status, 1, `missing status/started must still error: ${r.stdout}`);
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Missing required field for type "project-index": status')),
+  );
+  assert.ok(
+    out.errors.some((e) => e.message.includes('Missing required field for type "project-index": started')),
   );
 });
 
@@ -1783,6 +1853,87 @@ test('w8-lint-omits-id-for-other-warns', () => {
     assert.ok(
       nonId.length >= 1,
       `expected non-W8 warns to omit id field: ${JSON.stringify(parsed.warns)}`,
+    );
+  });
+});
+
+// ── A-2 (project index lifecycle): W12 missing-index warning ────────────────
+// scripts/lint.mjs: a projects/<slug>/ directory with no index.md warns — never
+// errors, since a hard block would stop /compact for every pre-existing
+// project that predates crystallize.mjs's A-1 create-on-close.
+
+suite('W12: missing project index.md');
+
+test('project dir without index.md → W12 warn, ok:true, exit 0', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    mkdirSync(join(root, 'projects', 'no-index'), { recursive: true });
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, `missing index must not fail lint: ${r.stdout}`);
+    assert.equal(parsed.ok, true);
+    const w12 = (parsed.warns || []).filter((w) =>
+      /Missing project index: projects\/no-index\//.test(w.message),
+    );
+    assert.equal(w12.length, 1, `expected one W12 warn: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+test('project dir WITH index.md → no W12 warn for it', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    mkdirSync(join(root, 'projects', 'has-index'), { recursive: true });
+    writeFileSync(
+      join(root, 'projects', 'has-index', 'index.md'),
+      '---\ntitle: has-index — Index\ntype: project-index\nstatus: active\nstarted: 2026-01-01\nupdated: 2026-01-01\nworking_dir: /tmp/x\n---\n\n# has-index\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, `well-formed index must not fail lint: ${r.stdout}`);
+    const w12 = (parsed.warns || []).filter((w) => /Missing project index/.test(w.message));
+    assert.equal(w12.length, 0, `has-index must not trigger W12: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+// Any `_`-prefixed directory is excluded, not just `_template` — matching the
+// markdown collector's own convention (scripts/lib/wikilink.mjs's
+// skipUnderscoreDir treats `_`-prefixed dirs as scaffold, not content).
+test('any `_`-prefixed project directory is excluded from the W12 scan', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    mkdirSync(join(root, 'projects', '_scratch'), { recursive: true }); // no index.md
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const w12 = (parsed.warns || []).filter((w) => /Missing project index/.test(w.message));
+    assert.equal(w12.length, 0, `_-prefixed dirs must be excluded: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+// CONCERN 1 fix: W12's own statSync is now wrapped in try/catch (mirroring
+// doctor.mjs's identical project-anchor scan guard), so a dangling symlink
+// entry reaching THIS loop is skipped, not thrown. No end-to-end test via the
+// lint.mjs CLI is possible for this today: a bare dangling symlink placed
+// directly under projects/ is stat'd — and throws — earlier in the SAME run,
+// in two pre-existing unguarded traversals this slice does not touch
+// (scripts/lib/wikilink.mjs's walkMarkdown, run by collectPagesLint before the
+// page loop; scripts/lib/design-history-stale.mjs's own project loop, run for
+// W8 before W12). Both crash on the identical dangling-symlink shape,
+// independent of any fix here, so no fixture reaches W12's code at all while
+// they stay unguarded. See out_of_scope.
+
+test('--strict does not promote W12 (stays a warn, exit 0)', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    mkdirSync(join(root, 'projects', 'no-index'), { recursive: true });
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json', '--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, 'W12 is excluded from STRICT_PROMOTE_IDS → exit 0');
+    assert.equal(parsed.ok, true);
+    const w12 = (parsed.warns || []).filter((w) => w.id === 'W12');
+    assert.equal(
+      w12.length,
+      1,
+      `W12 must stay a warn under --strict: ${JSON.stringify(parsed.warns)}`,
     );
   });
 });
