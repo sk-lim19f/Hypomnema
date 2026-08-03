@@ -954,17 +954,60 @@ function checkSyncState(hypoDir) {
     }
   } else {
     const last = entries[entries.length - 1];
-    // A merge conflict needs a real manual merge, not a plain push/pull — give
-    // the same explicit guidance session-start does instead of the generic hint.
-    if (String(last.op || '').startsWith('conflict')) {
+    // An unresolved failure does not mean the OTHER operation never
+    // succeeded — a push failure can sit right next to a healthy pull, and
+    // the last-success record above used to only wire into the healthy/
+    // never-synced branch, leaving this branch silent about it. Append it
+    // here too, best-effort, same as the healthy branch — a corrupt success
+    // file still warns, never crashes.
+    const { data: lastSuccess, parseError: successParseError } = readSyncLastSuccess(hypoDir);
+    // Not "unreadable": readSyncLastSuccess also sets parseError for a file
+    // that reads fine and parses as valid JSON but has the wrong shape (a
+    // malformed pull/push field, or an unrecognized key) — "unreadable" would
+    // misdescribe that case.
+    const successSuffix = successParseError
+      ? ' (.cache/sync-last-success.json is invalid or unreadable — inspect manually)'
+      : lastSuccess.pull || lastSuccess.push
+        ? ` Last success — ${formatLastSuccess(lastSuccess)}.`
+        : '';
+    // More than one open entry means the vault has been failing across
+    // multiple sync attempts without clearing — name each one (op@timestamp),
+    // not just the last, so the user isn't left to open sync-state.json
+    // themselves to see the pattern. Capped like checkBrokenLinks/checkVerifyBy.
+    const unresolvedList =
+      entries.length > 1
+        ? ` Unresolved: ${entries
+            .slice(-5)
+            .map((e) => `${e.op || '?'}@${e.timestamp || '?'}`)
+            .join(', ')}${entries.length > 5 ? ` (+${entries.length - 5} more)` : ''}.`
+        : '';
+    // 'conflict-unresolved' (the merge --abort itself failed, syncRemote) is
+    // the more dangerous of the two conflict ops: the tree may still be
+    // half-merged (unmerged index entries, or an in-progress MERGE_HEAD).
+    // Checked BEFORE the generic startsWith('conflict') branch below — that
+    // branch used to swallow this op too and claim "your local work is
+    // committed", which is not true when the abort itself failed, and its
+    // `git pull --no-rebase` advice would simply be refused by git while a
+    // merge is still in progress. Wording mirrors hypo-session-start.mjs's
+    // syncStateNotice so the two surfaces never contradict each other.
+    if (last.op === 'conflict-unresolved') {
       warn(
         'Sync state',
-        `${entries.length} unresolved sync issue(s) — last: remote diverged (merge conflict). Your local work is committed; the other machine's version is on the remote. Resolve with \`git pull --no-rebase\`, fix conflicts, then push.`,
+        `${entries.length} unresolved sync issue(s) — last: remote diverged AND the automatic merge-abort failed; the working tree may still be half-merged (unmerged paths or an in-progress merge). Do NOT commit or push yet. Run \`git status\` first: if a merge is in progress, resolve the conflicts, then \`git add <resolved paths>\` and \`git commit\` (git refuses a commit while unmerged entries remain staged) — or run \`git merge --abort\` to discard it instead, before continuing.${unresolvedList}${successSuffix}`,
+      );
+    } else if (String(last.op || '').startsWith('conflict')) {
+      // A merge conflict needs a real manual merge, not a plain push/pull —
+      // give the same explicit guidance session-start does instead of the
+      // generic hint. This branch is unmerged-index-free by construction (the
+      // abort succeeded), so "committed and safe" is an accurate claim here.
+      warn(
+        'Sync state',
+        `${entries.length} unresolved sync issue(s) — last: remote diverged (merge conflict). Your local work is committed; the other machine's version is on the remote. Resolve with \`git pull --no-rebase\`, fix conflicts, \`git add\` them, then commit and push.${unresolvedList}${successSuffix}`,
       );
     } else {
       warn(
         'Sync state',
-        `${entries.length} unresolved failure(s) — last: ${last.op || '?'} at ${last.timestamp || '?'}. Inspect .cache/sync-state.json or push/pull manually to clear.`,
+        `${entries.length} unresolved failure(s) — last: ${last.op || '?'} at ${last.timestamp || '?'}. Inspect .cache/sync-state.json or push/pull manually to clear.${unresolvedList}${successSuffix}`,
       );
     }
   }

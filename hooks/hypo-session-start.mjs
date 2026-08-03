@@ -283,7 +283,9 @@ function gitPull(dir) {
  * fresh `hypo init` wiki does not git-ignore `.cache/`, so a broader cleanliness
  * check would see the sync-state file itself and never clear.
  *
- * @returns {string} a `[WIKI: last sync failed: ...]` line, or '' when clear.
+ * @returns {string} a `[WIKI: last sync failed: ...]` (or, for a conflict/
+ *   conflict-unresolved entry, dedicated manual-merge guidance) line, or ''
+ *   when clear.
  */
 function syncStateNotice(pullOk) {
   const { entries, parseError } = readSyncState(HYPO_DIR);
@@ -304,7 +306,29 @@ function syncStateNotice(pullOk) {
     return '';
   }
   const last = entries[entries.length - 1];
-  if (last.op === 'conflict') {
+  // 'conflict-unresolved' (the merge --abort itself failed, syncRemote) is the
+  // more dangerous of the two conflict ops: the tree may still be half-merged
+  // (unmerged index entries, or an in-progress MERGE_HEAD), so the plain
+  // "pull --no-rebase" advice below is not enough and would be actively wrong
+  // — it tells the user their local work is safely committed when it may not
+  // be. Check this BEFORE the generic startsWith('conflict') branch so it gets
+  // its own guidance rather than being swallowed by the 'conflict' wording.
+  if (last.op === 'conflict-unresolved') {
+    return (
+      `[WIKI: remote diverged AND the automatic merge-abort failed — the working ` +
+      `tree may still be half-merged (unmerged paths or an in-progress merge). ` +
+      `Do NOT commit or push yet. Inspect \`git -C ${HYPO_DIR} status\` first: if a ` +
+      `merge is in progress, resolve the conflicts, then \`git -C ${HYPO_DIR} add <resolved paths>\` ` +
+      `and \`git -C ${HYPO_DIR} commit\` (git refuses a commit while unmerged entries remain staged) ` +
+      `— or run \`git -C ${HYPO_DIR} merge --abort\` to discard it instead, before continuing.]`
+    );
+  }
+  // startsWith, not ===: matches doctor.mjs's checkSyncState, which already
+  // treats every 'conflict*' op the same way. An exact-match check here used
+  // to miss 'conflict-unresolved' — the MORE dangerous op — and fall through
+  // to the generic "last sync failed" line below, which carries no manual-
+  // merge guidance at all.
+  if (String(last.op || '').startsWith('conflict')) {
     return (
       `[WIKI: remote diverged — auto-merge was aborted to protect your edits ` +
       `(your local work is committed and safe; the other machine's version is on the remote). ` +

@@ -282,6 +282,53 @@ test('doctor-sync-state-warn: conflict entry → manual-merge guidance, not gene
   });
 });
 
+// A merge --abort that itself fails ('conflict-unresolved', syncRemote) is the
+// MORE dangerous of the two conflict ops: the tree may still be half-merged
+// (unmerged index entries / an in-progress MERGE_HEAD). It must NOT get the
+// plain-conflict wording, which (a) claims "your local work is committed" —
+// untrue when the abort itself failed — and (b) tells the user to run
+// `git pull --no-rebase`, which git would simply refuse mid-merge. Distinct,
+// dedicated guidance is required, matching hypo-session-start.mjs's
+// syncStateNotice so the two surfaces never contradict each other.
+test('doctor-sync-state-warn: conflict-unresolved entry → dedicated half-merged-tree guidance, distinct from a clean conflict', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({
+        timestamp: '2026-06-19T00:00:00Z',
+        op: 'conflict-unresolved',
+        error: 'fatal: merge --abort failed',
+        host: 'test',
+      }) + '\n',
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(
+      /diverged/.test(check.detail) && /half-merged/.test(check.detail),
+      `conflict-unresolved must warn about a possibly half-merged tree, not the plain-conflict wording: ${check.detail}`,
+    );
+    assert.ok(
+      // /i: doctor.mjs capitalizes the sentence ("Your local work is
+      // committed"), so a case-sensitive negative match here would pass
+      // unconditionally and catch nothing if the swallow were reintroduced.
+      !/your local work is committed/i.test(check.detail),
+      `conflict-unresolved must NOT reuse the clean-conflict "committed and safe" claim (the abort itself failed): ${check.detail}`,
+    );
+    assert.ok(
+      !/pull --no-rebase/.test(check.detail),
+      `conflict-unresolved must not advise a plain \`git pull --no-rebase\` — git would refuse it mid-merge: ${check.detail}`,
+    );
+  });
+});
+
 // FEAT-34: last-success timestamp visibility in the sync-state check.
 suite('doctor.mjs — FEAT-34: sync-last-success visibility');
 
@@ -448,7 +495,7 @@ test('doctor-sync-last-success: unrecognized top-level key → warn, not silentl
   });
 });
 
-test('doctor-sync-last-success: unresolved failure still reported unchanged, even with a success record present', () => {
+test('doctor-sync-last-success: unresolved failure keeps its core message and now also names the last success', () => {
   withTmpDir((dir) => {
     syncFixtureWiki(dir);
     mkdirSync(join(dir, '.cache'), { recursive: true });
@@ -469,12 +516,44 @@ test('doctor-sync-last-success: unresolved failure still reported unchanged, eve
     const out = JSON.parse(r.stdout);
     const check = out.find((c) => c.label === 'Sync state');
     assert.ok(check, 'Sync state check not found');
-    // The failure-reporting branch is unchanged by FEAT-34: same message shape
-    // as the pre-existing "open sync-state.json entries → warn" test.
+    // FEAT-34 originally left this branch silent about last-success (a push
+    // failure hid an otherwise-healthy pull). The core message shape from the
+    // pre-existing "open sync-state.json entries → warn" test still holds —
+    // this only asserts the ADDITION, not a replacement.
     assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
     assert.ok(
       /unresolved failure\(s\) — last: push at 2026-07-20T01:00:00Z/.test(check.detail),
-      `unresolved-failure detail must be unchanged: ${check.detail}`,
+      `unresolved-failure core message must survive unchanged: ${check.detail}`,
+    );
+    assert.ok(
+      check.detail.includes('Last success') &&
+        check.detail.includes('2026-07-20T00:00:00.000Z') &&
+        check.detail.includes('test-host'),
+      `a failing op must not hide that the OTHER op last succeeded: ${check.detail}`,
+    );
+  });
+});
+
+test('doctor-sync-state-warn: multiple unresolved entries are listed, not just the last one', () => {
+  withTmpDir((dir) => {
+    syncFixtureWiki(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const lines = [
+      { timestamp: '2026-07-20T01:00:00Z', op: 'push', error: 'network timeout', host: 'test' },
+      { timestamp: '2026-07-20T02:00:00Z', op: 'pull', error: 'connection refused', host: 'test' },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, '.cache', 'sync-state.json'), lines + '\n');
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(
+      check.detail.includes('push@2026-07-20T01:00:00Z') &&
+        check.detail.includes('pull@2026-07-20T02:00:00Z'),
+      `both unresolved entries must be named, not just the last: ${check.detail}`,
     );
   });
 });
