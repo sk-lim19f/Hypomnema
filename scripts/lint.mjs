@@ -112,10 +112,19 @@ function parseTagsField(rawValue) {
 }
 
 // type-conditional required fields (spec §6.3, SCHEMA.md §2)
+// `project-index` deliberately does NOT list `working_dir` here. An index
+// existing at all is required (W12 above); the cwd anchor inside it is not —
+// crystallize.mjs's auto-created index has no session cwd to fill it with, and
+// requiring it would force a fake, non-empty placeholder into the field. A
+// placeholder value is truthy, and hooks/hypo-shared.mjs's collector +
+// findBackfillCandidate both read "has a truthy working_dir" as "already
+// anchored, do not offer to backfill" — so a fake value permanently poisons
+// the exact recovery path it should trigger. `status`/`started` stay required:
+// they always have a real value to substitute (`active` / the close date).
 const TYPE_CONDITIONAL_FIELDS = {
   prd: ['status', 'started'],
   adr: ['source', 'status', 'date'],
-  'project-index': ['working_dir', 'status', 'started'],
+  'project-index': ['status', 'started'],
   'tool-eval': ['status'],
   postmortem: ['outcome'],
   learning: ['source'],
@@ -397,6 +406,26 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
     }
   }
 
+  // W13: project-index with no working_dir anchor. Deliberately NOT in
+  // TYPE_CONDITIONAL_FIELDS (see the comment there) — an auto-created index has
+  // no cwd to put here, and that close must not block on its own output, so
+  // this stays warn-only and out of STRICT_PROMOTE_IDS, exactly like W12. The
+  // gap this closes: cwd-first backfill (hooks/hypo-shared.mjs's
+  // findBackfillCandidate) only fires when the cwd's leaf directory name
+  // matches the project's slug — a project whose real working dir has a
+  // DIFFERENT basename than its slug never becomes a backfill candidate, so an
+  // emptied/never-filled anchor can otherwise sit invisible except in
+  // `doctor`'s manual report.
+  if (fm.type === 'project-index' && !fm.working_dir) {
+    issue(
+      'warn',
+      rel,
+      `project-index has no working_dir anchor (cwd-first resume can't match this project)`,
+      null,
+      'W13',
+    );
+  }
+
   // type-conditional forbidden fields (W11): a field valid only on a
   // DIFFERENT type planted here by an unvalidated writer. Object.hasOwn
   // (not `fm[field]`) so a present-but-empty `working_dir:` still flags —
@@ -538,6 +567,40 @@ for (const s of findDesignHistoryStale(args.hypoDir)) {
     null,
     'W8',
   );
+}
+
+// W12: project directory missing index.md. SCHEMA.md declares project-index
+// at projects/*/index.md and templates/projects/_template/ ships one, so a
+// project without it is a tooling/vault drift, not a legitimate shape — but
+// warn-only: promoting this to an error would hard-block a close for every
+// pre-existing project that predates the create-on-close path (crystallize.mjs
+// A-1), and a missing index is never this close's fault to fix. `_`-prefixed
+// directories are excluded (not just `_template`), matching the markdown
+// collector's own convention (scripts/lib/wikilink.mjs's skipUnderscoreDir —
+// `_scratch`, `_drafts`, etc. are scaffold, not a project).
+if (existsSync(join(args.hypoDir, 'projects'))) {
+  for (const slug of readdirSync(join(args.hypoDir, 'projects'))) {
+    if (slug.startsWith('_')) continue;
+    const projectDir = join(args.hypoDir, 'projects', slug);
+    // A dangling symlink (or any other stat failure) must not crash the whole
+    // lint run — skip it exactly as doctor.mjs's own project-anchor scan does.
+    let st;
+    try {
+      st = statSync(projectDir);
+    } catch {
+      continue;
+    }
+    if (!st.isDirectory()) continue;
+    if (!existsSync(join(projectDir, 'index.md'))) {
+      issue(
+        'warn',
+        `projects/${slug}/index.md`,
+        `Missing project index: projects/${slug}/ has no index.md (SCHEMA.md declares project-index at projects/*/index.md)`,
+        null,
+        'W12',
+      );
+    }
+  }
 }
 
 if (args.fix) {

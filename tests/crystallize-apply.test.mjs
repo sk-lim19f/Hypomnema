@@ -8,6 +8,8 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { snapshotBase, overwriteTargets } from '../hooks/base-store.mjs';
+import { findBackfillCandidate } from '../hooks/hypo-shared.mjs';
+import { ensureProjectIndex } from '../scripts/crystallize.mjs';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
@@ -708,4 +710,161 @@ test('apply commit excludes an unrelated pre-existing dirty file outside the pay
       `unrelated-debt.md must remain dirty, untouched by apply: ${status}`,
     );
   });
+});
+
+suite('A-1 (project index lifecycle): apply creates a missing index.md');
+
+// SCHEMA.md declares project-index at projects/*/index.md and
+// templates/projects/_template/ ships one, but nothing wrote it for a project
+// created outside createProject (buildCleanWikiTree's test-project has no
+// index.md, mirroring that gap). apply now fills it on the project's first
+// close, substituting only the three tokens the template defines.
+test('apply on a project with no index.md creates one from the template, tokens substituted', () => {
+  withWiki(null, (dir, today) => {
+    const indexPath = join(dir, 'projects', 'test-project', 'index.md');
+    assert.ok(!existsSync(indexPath), 'fixture must start without an index.md');
+
+    const payload = payloadForCleanWiki(dir, today);
+    const r = runApply(dir, payload, { sessionId: 'sess-index-create' });
+    assert.equal(r.status, 0, `apply must succeed: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `expected ok:true: ${r.stdout}`);
+    assert.ok(
+      out.applied.some((a) => a.startsWith('projectIndex (')),
+      `applied must record the created index: ${JSON.stringify(out.applied)}`,
+    );
+
+    assert.ok(existsSync(indexPath), 'index.md must now exist');
+    const content = readFileSync(indexPath, 'utf-8');
+    assert.ok(
+      content.includes('title: test-project — Index'),
+      `slug not substituted into title: ${content}`,
+    );
+    assert.ok(content.includes('# test-project'), `slug not substituted into heading: ${content}`);
+    assert.ok(content.includes(`started: ${today}`), `started not substituted: ${content}`);
+    assert.ok(content.includes(`updated: ${today}`), `updated not substituted: ${content}`);
+    assert.ok(
+      !content.includes('<project-name>') &&
+        !content.includes('<started>') &&
+        !content.includes('<working_dir>'),
+      `unsubstituted template token leaked: ${content}`,
+    );
+    // working_dir must be EMPTY, not a placeholder string. A truthy placeholder
+    // reads as "already anchored" to the collector/backfill logic below and
+    // would permanently swallow the real anchor-recovery path (the bug this
+    // pins — a prior version filled this with prose text).
+    assert.match(
+      content,
+      /^working_dir:\s*$/m,
+      `working_dir must be empty, not a fake placeholder: ${content}`,
+    );
+
+    // BLOCKER regression (a): the auto-created index must be lint-clean on its
+    // own merits, independent of apply's internal post-apply-lint scoping.
+    const lintOut = JSON.parse(run('lint.mjs', [`--hypo-dir=${dir}`, '--json']).stdout);
+    const indexErrors = (lintOut.errors || []).filter(
+      (e) => e.file === 'projects/test-project/index.md',
+    );
+    assert.deepEqual(
+      indexErrors,
+      [],
+      `auto-created index must not trip lint errors: ${JSON.stringify(indexErrors)}`,
+    );
+    // CONCERN 1 (2nd round): a missing anchor is expected to surface as a
+    // visible W13 WARNING (not silence, not an error) so it doesn't sit
+    // invisible until a manual `doctor` run. Matched by message (not `id`):
+    // non-W8/non-strict --json deliberately omits the `id` field on every
+    // other warning class (lint.mjs's byte-identical-default guarantee).
+    assert.ok(
+      (lintOut.warns || []).some(
+        (w) =>
+          w.file === 'projects/test-project/index.md' && w.message.includes('working_dir anchor'),
+      ),
+      `auto-created index with an empty anchor must surface a working_dir-anchor warning: ${JSON.stringify(lintOut.warns)}`,
+    );
+
+    // BLOCKER regression (b): the empty working_dir must NOT read as
+    // "already anchored" — findBackfillCandidate must still offer to backfill
+    // this project's real cwd.
+    const candidate = findBackfillCandidate('/Users/dev/test-project', dir);
+    assert.ok(
+      candidate,
+      'an auto-created index with an empty working_dir must still be a backfill candidate',
+    );
+    assert.equal(candidate.slug, 'test-project');
+    assert.equal(candidate.hasIndex, true);
+  });
+});
+
+test('apply aborted at preflight-lint never creates the index (no side effect on a failed close)', () => {
+  withWiki(null, (dir, today) => {
+    // Reuses the proven "corrupt APPEND target still blocks" preflight-abort
+    // shape: a session-log daily shard with an unclosed frontmatter fence is an
+    // in-scope, non-overwrite append target preflight cannot filter out — here
+    // to prove the SAME abort leaves the index untouched.
+    writeFileSync(
+      join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
+      '---\ntitle: sl\ntype: session-log\n\nbody (frontmatter never closes)\n',
+    );
+    const indexPath = join(dir, 'projects', 'test-project', 'index.md');
+    assert.ok(!existsSync(indexPath), 'fixture must start without an index.md');
+    const payload = payloadForCleanWiki(dir, today);
+    const r = runApply(dir, payload, { sessionId: 'sess-index-preflight-abort' });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false, `expected preflight to abort: ${r.stdout}`);
+    assert.equal(out.stage, 'preflight-lint', `expected preflight-lint stage: ${r.stdout}`);
+    assert.ok(!existsSync(indexPath), 'a preflight abort must not create the index as a side effect');
+  });
+});
+
+// CONCERN 2 (TOCTOU): the caller's `indexMissing` flag is snapshotted early
+// (before preflight lint), then acted on later. Reproduce the race directly at
+// ensureProjectIndex's own boundary — a file lands at the destination between
+// when a caller last observed "missing" and this call — and assert the
+// winner's bytes survive. A plain existsSync-then-atomicWrite (tmp+rename)
+// would clobber it: rename replaces whatever sits at the destination the
+// instant it fires, existing or not.
+test('ensureProjectIndex: a file created after the caller\'s missing-check survives untouched (no-replace create)', () => {
+  withTmpDir((dir) => {
+    const relPath = join('projects', 'race-project', 'index.md');
+    const dest = join(dir, relPath);
+    mkdirSync(dirname(dest), { recursive: true });
+    const winnerContent =
+      '---\ntitle: race — Index\ntype: project-index\nstatus: active\nstarted: 2026-01-01\nupdated: 2026-01-01\nworking_dir: /real/path\n---\n\nwinner bytes, written after the caller believed this was missing\n';
+    // Simulates: caller checked indexMissing (got true), THEN another writer
+    // (human or a concurrent close) created the file, THEN this call runs.
+    writeFileSync(dest, winnerContent);
+    const result = ensureProjectIndex(dir, 'race-project', relPath, '2026-06-01');
+    assert.equal(result, null, 'ensureProjectIndex must report a no-op, not a create, on this race');
+    assert.equal(
+      readFileSync(dest, 'utf-8'),
+      winnerContent,
+      "the winner's bytes must survive byte-for-byte, never clobbered by the losing create",
+    );
+  });
+});
+
+test('apply on a project that already has an index.md leaves it byte-for-byte untouched', () => {
+  const existingIndex =
+    '---\ntitle: test-project — Index\ntype: project-index\nstatus: active\nstarted: 2026-01-01\nupdated: 2026-01-01\nworking_dir: /real/path\n---\n\n# test-project\n\nhand-written content\n';
+  withWiki(
+    (dir) => writeFileSync(join(dir, 'projects', 'test-project', 'index.md'), existingIndex),
+    (dir, today) => {
+      const indexPath = join(dir, 'projects', 'test-project', 'index.md');
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload, { sessionId: 'sess-index-keep' });
+      assert.equal(r.status, 0, `apply must succeed: ${r.stdout}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true, `expected ok:true: ${r.stdout}`);
+      assert.ok(
+        !out.applied.some((a) => a.startsWith('projectIndex (')),
+        `an existing index must never be reported as applied: ${JSON.stringify(out.applied)}`,
+      );
+      assert.equal(
+        readFileSync(indexPath, 'utf-8'),
+        existingIndex,
+        'a pre-existing index.md must be left byte-for-byte untouched',
+      );
+    },
+  );
 });

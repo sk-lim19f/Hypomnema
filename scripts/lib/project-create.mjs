@@ -28,7 +28,11 @@ import { resolveHypoRoot, expandHome } from './hypo-root.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(SCRIPT_DIR, '..', '..');
-const TEMPLATE_DIR = join(PKG_ROOT, 'templates', 'projects', '_template');
+// Exported so other project-scaffolding call sites (crystallize.mjs's
+// session-close apply, which fills a MISSING index.md on a project that
+// bypassed createProject entirely) resolve the same template dir instead of
+// re-deriving the path.
+export const TEMPLATE_DIR = join(PKG_ROOT, 'templates', 'projects', '_template');
 
 const TEMPLATE_FILES = ['index.md', 'prd.md', 'hot.md', 'session-state.md'];
 
