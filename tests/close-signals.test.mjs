@@ -13,6 +13,7 @@ import {
   askCloseReconfirmToolUse,
   buildOutput,
   closeFileTargets,
+  detectSessionCloseArtifact,
   extractUserMessages,
   gitRepo,
   hasMutatingTranscriptActivity,
@@ -210,6 +211,215 @@ test('isClosePattern source is byte-unchanged by this feature (function.toString
     '9b882b618b31833f268ac2c6e05693352044c526f7f70344e3fa0981520cdc53',
     'isClosePattern source changed — conditional-close-reconfirm must not touch this regex',
   );
+});
+
+// ── close ARTIFACTS, not the marker: the gate lived on one writer, so a close
+// done by hand (edit the files, skip crystallize) never tripped it. ──
+suite('detectSessionCloseArtifact()');
+
+test('session-state.md 마감 heading → matched, with the heading date captured', () => {
+  const r = detectSessionCloseArtifact({
+    path: 'projects/hypomnema/session-state.md',
+    content: '> **2026-07-28 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.',
+  });
+  assert.equal(r.matched, true);
+  assert.equal(r.kind, 'session-state-heading');
+  assert.equal(r.date, '2026-07-28');
+});
+
+test('session-state.md ordinary dated heading (no 마감) → not matched', () => {
+  const r = detectSessionCloseArtifact({
+    path: 'projects/hypomnema/session-state.md',
+    content: '**2026-07-28(13번째 세션): 다음 작업**\n\n- next task',
+  });
+  assert.equal(r.matched, false);
+});
+
+// The real hot.md/session-state.md convention puts "(Nth 세션)" right after
+// the date, THEN the colon-led narrative — so the close word can land either
+// before or after the parenthetical. Both orderings must match.
+test('session-state.md 마감 AFTER the "(Nth 세션)" parenthetical → matched', () => {
+  const r = detectSessionCloseArtifact({
+    path: 'projects/hypomnema/session-state.md',
+    content: '**2026-08-03(13번째 세션): 마감**',
+  });
+  assert.equal(r.matched, true);
+  assert.equal(r.date, '2026-08-03');
+});
+
+test('session-state.md 마감 as a noun-modifier ("마감 조건") is NOT a close announcement', () => {
+  const r = detectSessionCloseArtifact({
+    path: 'projects/hypomnema/session-state.md',
+    content: '**2026-08-03 마감 조건을 점검**',
+  });
+  assert.equal(r.matched, false);
+});
+
+test('hot.md carrying an explicit closing heading → matched', () => {
+  const r = detectSessionCloseArtifact({
+    path: 'projects/hypomnema/hot.md',
+    content: '**2026-07-28 세션 종료: 오늘 작업 요약**',
+  });
+  assert.equal(r.matched, true);
+  assert.equal(r.kind, 'hot-narrative');
+  assert.equal(r.date, '2026-07-28');
+});
+
+test('hot.md "세션 종료 여부" (whether-or-not, a question not an announcement) → NOT matched', () => {
+  const r = detectSessionCloseArtifact({
+    path: 'projects/hypomnema/hot.md',
+    content: '**2026-08-03 세션 종료 여부: 점검**',
+  });
+  assert.equal(r.matched, false);
+});
+
+// The noun-modifier class is open-ended (여부/조건/로직/절차/정책/… — codex kept
+// finding new ones across review rounds). Rather than enumerate, the guard
+// rejects ANY Hangul word directly following the close word — these two pin
+// modifiers that were NOT in the original blacklist, proving the structural
+// fix generalizes instead of chasing one more word each round.
+test('hot.md/session-state.md close word followed by an unlisted noun-modifier (절차/정책) → NOT matched', () => {
+  assert.equal(
+    detectSessionCloseArtifact({
+      path: 'projects/hypomnema/hot.md',
+      content: '**2026-08-03 세션 종료 절차: 문서화**',
+    }).matched,
+    false,
+  );
+  assert.equal(
+    detectSessionCloseArtifact({
+      path: 'projects/hypomnema/session-state.md',
+      content: '**2026-08-03 마감 정책: 문서화**',
+    }).matched,
+    false,
+  );
+});
+
+// Word-boundary rule, not an enumerated suffix list: a verb conjugation
+// attaches to 마감/종료 with NO space (거의 무한한 활용형), so ANY such
+// directly-attached run is accepted — honorific, passive, and nominal forms
+// alike, without naming each one. This is the corpus a real Korean speaker
+// (this user's default register is 존댓말) actually writes, not just the
+// bare dictionary form the old suffix-whitelist happened to enumerate.
+test('마감/종료 with a directly-attached conjugation (no space) → matched regardless of form', () => {
+  const forms = [
+    '마감했다', // plain past
+    '마감했습니다', // honorific past (해요체/합쇼체)
+    '마감하였습니다', // honorific past, full form
+    '마감되었습니다', // passive honorific
+    '마감됨', // nominalized passive
+  ];
+  for (const form of forms) {
+    const r = detectSessionCloseArtifact({
+      path: 'projects/hypomnema/session-state.md',
+      content: `**2026-08-03 ${form}**`,
+    });
+    assert.equal(r.matched, true, `expected a match for "${form}"`);
+  }
+});
+
+test('hot.md rewritten as a closing narrative WITHOUT 마감/종료 vocabulary is a PARTIAL-DEFENSE gap, not a solved case', () => {
+  // This is the literal text the 2026-07-28 incident wrote into hot.md. It
+  // reads as a wrap-up to a human but names no close word, and this signal
+  // can only see current content (no prior version to diff against) — so it
+  // does not fire here. This is NOT the completion of the artifact-set
+  // defense; catching a diff-shaped rewrite needs a diff-aware check (compare
+  // against the prior committed hot.md, or a PreToolUse guard watching the
+  // edit as it happens) — a follow-up slice, not something this pure
+  // function can be extended to cover. The session-state heading and
+  // commit-message signals still catch this same incident, so today's gap is
+  // documented, not silent — but it remains a real gap this test PINS, not a
+  // boundary this slice was designed to hold.
+  const r = detectSessionCloseArtifact({
+    path: 'projects/hypomnema/hot.md',
+    content:
+      '**2026-07-28(13번째 세션): 세 스트림 병렬을 표준으로 등재하고 처음 실행했다.** 사용자 결정으로 …',
+  });
+  assert.equal(r.matched, false);
+});
+
+test('commit message "session: close the Nth session" → matched', () => {
+  const r = detectSessionCloseArtifact({
+    commitMessage: 'session: close the thirteenth session, first parallel three-stream run',
+  });
+  assert.equal(r.matched, true);
+  assert.equal(r.kind, 'commit-message');
+  assert.equal(r.date, null); // caller supplies the commit's own date
+});
+
+test('commit message "세션 마무리" / "세션 종료" (bare) → matched', () => {
+  assert.equal(detectSessionCloseArtifact({ commitMessage: '세션 마무리' }).matched, true);
+  assert.equal(detectSessionCloseArtifact({ commitMessage: '세션 종료' }).matched, true);
+});
+
+// The object particle (을/를) between 세션 and its verb is normal Korean
+// syntax, not a modifier — "세션을 종료했다" is a plain sentence, not a heading.
+test('commit message "세션을 종료했다" (with object particle + honorific-adjacent verb) → matched', () => {
+  assert.equal(detectSessionCloseArtifact({ commitMessage: '세션을 종료했다' }).matched, true);
+});
+
+test('commit message "close the 13th session" (digit ordinal) → matched', () => {
+  assert.equal(detectSessionCloseArtifact({ commitMessage: 'close the 13th session' }).matched, true);
+});
+
+// The EN pattern's middle slot is now an ORDINAL only (the shape every real
+// close commit uses) — a technical commit that happens to say "close the
+// <noun> session" must not match just because "session" appears nearby.
+test('commit message "close the <noun> session" (technical, not a session-close) → NOT matched', () => {
+  assert.equal(
+    detectSessionCloseArtifact({ commitMessage: 'fix: close the database session' }).matched,
+    false,
+  );
+  assert.equal(
+    detectSessionCloseArtifact({ commitMessage: 'close the browser session' }).matched,
+    false,
+  );
+});
+
+test('commit message "close the session" / "close this session" (isClosePattern\'s own EN forms) → matched', () => {
+  assert.equal(detectSessionCloseArtifact({ commitMessage: 'close the session' }).matched, true);
+  assert.equal(detectSessionCloseArtifact({ commitMessage: 'close this session' }).matched, true);
+});
+
+test('commit message mentioning session and close unrelated to session-close → not matched', () => {
+  assert.equal(
+    detectSessionCloseArtifact({ commitMessage: 'fix(session): close leak on retry' }).matched,
+    false,
+  );
+  assert.equal(
+    detectSessionCloseArtifact({ commitMessage: 'feat: add close button to session modal' })
+      .matched,
+    false,
+  );
+  // A "session:" conventional-commit SCOPE label is not itself a close signal
+  // — the object being closed must actually be "the session".
+  assert.equal(
+    detectSessionCloseArtifact({ commitMessage: 'session: close database connection' }).matched,
+    false,
+  );
+  // 마감 as a noun-modifier (documenting a close CONDITION) is not an
+  // announcement that a close happened.
+  assert.equal(
+    detectSessionCloseArtifact({ commitMessage: '세션 마감 조건을 문서화' }).matched,
+    false,
+  );
+  assert.equal(
+    detectSessionCloseArtifact({ commitMessage: '세션 종료 절차를 문서화' }).matched,
+    false,
+  );
+});
+
+test('a file basename outside {session-state.md, hot.md} never matches, even with close content', () => {
+  const r = detectSessionCloseArtifact({
+    path: 'projects/hypomnema/notes.md',
+    content: '> **2026-07-28 마감(13번째 세션).**',
+  });
+  assert.equal(r.matched, false);
+});
+
+test('no arguments → not matched, not a crash', () => {
+  assert.equal(detectSessionCloseArtifact().matched, false);
+  assert.equal(detectSessionCloseArtifact({}).matched, false);
 });
 
 // ── ISSUE-29: extractUserMessages must not slurp tool_result content ──

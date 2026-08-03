@@ -5,11 +5,13 @@
 
 import assert from 'node:assert/strict';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   cpSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -22,6 +24,8 @@ import {
   NONEXISTENT_WIKI,
   REPO,
   SCRIPTS,
+  SESSION_TMP_HOME,
+  gitRepo,
   run,
   runWithHome,
   withTmpDir,
@@ -590,6 +594,501 @@ test('doctor-project-anchors: bare scaffold (no session artifacts) is not flagge
     const check = doctorAnchorCheck(dir);
     assert.ok(check, 'anchor check not found');
     assert.equal(check.status, 'pass', `expected pass (nothing to anchor yet): ${check.detail}`);
+  });
+});
+
+// Close is a set of user-visible artifacts (a 마감 heading, a closing hot.md
+// narrative, a close-worded commit), not just the session-closed marker — a
+// close done by hand, without crystallize, never trips the marker-writer hard
+// gate. This is a post-hoc, warning-only surface, not a second gate.
+suite('doctor.mjs — session-close artifacts without a matching marker');
+
+// A real init (hooks installed, extensions baseline scaffolded) so doctor
+// itself reports zero OTHER failures — the fixtures used elsewhere in this
+// file skip that scaffold, which is fine for a check found by label, but
+// leaves the whole run pre-failed and makes an exit-code assertion (CONCERN:
+// warn-only must not exit nonzero) meaningless.
+function baseWiki(dir) {
+  const initR = run('init.mjs', [`--hypo-dir=${dir}`, '--no-git-init']);
+  assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+}
+
+function runDoctorJson(dir) {
+  const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+  return { r, out: JSON.parse(r.stdout) };
+}
+
+function doctorCloseArtifactCheck(dir) {
+  const { out } = runDoctorJson(dir);
+  return out.find((c) => c.label === 'Session-close artifacts');
+}
+
+// Dates in this suite move with "now", never a fixed calendar date —
+// production ignores any marker older than 7 days
+// (SESSION_CLOSED_MARKER_STALE_MS, hooks/hypo-shared.mjs), so a fixture
+// pinned to a past date silently stops covering its own artifact once that
+// window passes (a "covering marker → pass" test would start reporting
+// warn). UTC is the portable anchor: a file-content artifact's date only
+// needs to equal ONE of the marker's {local, utc} days (localAndUtcDates,
+// hooks/hypo-shared.mjs), and the UTC day is always one of them regardless
+// of the host's own timezone — so pinning both the heading date and
+// `closed_at` to the same UTC day needs no TZ control. The one test that
+// specifically exercises the local/UTC boundary controls TZ explicitly
+// instead (below).
+function recentUtcIso(daysAgo, hourUtc = 12) {
+  const d = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
+  d.setUTCHours(hourUtc, 0, 0, 0);
+  return d.toISOString();
+}
+function recentUtcDate(daysAgo, hourUtc = 12) {
+  return recentUtcIso(daysAgo, hourUtc).slice(0, 10);
+}
+
+test('doctor-close-artifacts: no close artifacts anywhere → pass', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check.detail}`);
+  });
+});
+
+test('doctor-close-artifacts: session-state.md 마감 heading with no session-closed marker → warn, exit 0', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.\n`,
+    );
+    const { r, out } = runDoctorJson(dir);
+    const check = out.find((c) => c.label === 'Session-close artifacts');
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check?.detail}`);
+    assert.ok(
+      check.detail.includes('session-state.md'),
+      `expected the artifact file named: ${check.detail}`,
+    );
+    // warning-only contract: this check alone must never fail doctor's exit code.
+    assert.equal(r.status, 0, `warn must not exit nonzero: ${r.stdout}\n${r.stderr}`);
+  });
+});
+
+test('doctor-close-artifacts: v4 marker WITH a `projects` array covering the project + date → pass', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-abc123.marker'),
+      JSON.stringify({
+        session_id: 'abc123',
+        project: 'demo',
+        projects: ['demo'],
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check?.detail}`);
+  });
+});
+
+// A legacy marker's flat `project` field can be a recency-derived
+// misattribution (the same reason resolveCloseScope refuses to trust it
+// uncorroborated — hooks/hypo-shared.mjs resolveCloseScope doc comment).
+// doctor has no corroborating signal of its own, so a marker carrying ONLY
+// the legacy field (no `projects` array) must NOT count as scope evidence —
+// trusting it would silently re-open the exact masking BLOCKER this
+// per-project correlation exists to close.
+test('doctor-close-artifacts: legacy marker with ONLY a flat `project` (no `projects` array) does not count as evidence → warn', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-legacy.marker'),
+      JSON.stringify({
+        session_id: 'legacy',
+        project: 'demo', // flat field only — no `projects` array
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `an uncorroborated legacy flat project must not vouch for scope: ${check?.detail}`,
+    );
+  });
+});
+
+// The marker exists specifically for per-session/per-project precision
+// (hooks/hypo-shared.mjs SESSION_CLOSED_MARKER_STALE_MS comment) — a
+// same-day marker for an UNRELATED project must not silence an unapproved
+// close in THIS project. A date-only correlation would wrongly pass this.
+test('doctor-close-artifacts: a DIFFERENT project\'s same-day marker does not mask this project\'s unapproved close → warn', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    mkdirSync(join(dir, 'projects', 'project-a'), { recursive: true });
+    const projB = join(dir, 'projects', 'project-b');
+    mkdirSync(projB, { recursive: true });
+    writeFileSync(
+      join(projB, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(1번째 세션).** project-b를 마무리했다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // A genuinely-gated close, same day, but for project-a — must not cover project-b.
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-legit.marker'),
+      JSON.stringify({
+        session_id: 'legit',
+        project: 'project-a',
+        projects: ['project-a'],
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `a different project's marker must not mask this one: ${check?.detail}`,
+    );
+    assert.ok(
+      check.detail.includes('project-b'),
+      `expected project-b's artifact named: ${check.detail}`,
+    );
+  });
+});
+
+// closed_at is UTC; a heading date is written in the user's LOCAL zone
+// (crystallize.mjs todayLocal()). Force the child's TZ so the KST-midnight
+// case (UTC day ≠ local day) is deterministic regardless of the host's own
+// timezone.
+function runDoctorJsonInTz(dir, tz) {
+  const r = spawnSync(process.execPath, [join(SCRIPTS, 'doctor.mjs'), `--hypo-dir=${dir}`, '--json'], {
+    encoding: 'utf-8',
+    env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME, TZ: tz },
+  });
+  return { r, out: JSON.parse(r.stdout) };
+}
+
+test('doctor-close-artifacts: KST-local-date marker for a UTC-previous-day closed_at → pass (no false warn)', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    // ~1 day ago, pinned to 15:30 UTC — in Asia/Seoul (UTC+9, no DST) that
+    // instant is 00:30 the FOLLOWING calendar day, so its UTC day and its
+    // KST day always differ by exactly one, regardless of what "now" is. A
+    // real KST user closing right after midnight would stamp the KST
+    // (local) date in the heading, computed here via Intl rather than a
+    // fixed offset so it stays correct regardless of the HOST's own timezone.
+    const instant = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000);
+    instant.setUTCHours(15, 30, 0, 0);
+    const kstDate = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(instant);
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${kstDate} 마감(1번째 세션).** 자정 직후 닫았다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-midnight.marker'),
+      JSON.stringify({
+        session_id: 'midnight',
+        project: 'demo',
+        projects: ['demo'],
+        closed_at: instant.toISOString(), // UTC day = instant's day, KST day = +1
+      }),
+    );
+    const { r, out } = runDoctorJsonInTz(dir, 'Asia/Seoul');
+    const check = out.find((c) => c.label === 'Session-close artifacts');
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'pass',
+      `local/UTC day mismatch must not false-warn a real close: ${check?.detail}`,
+    );
+    assert.equal(r.status, 0, `pass must exit 0: ${r.stdout}\n${r.stderr}`);
+  });
+});
+
+// Root session-state.md carries the same 마감-heading convention as a
+// project's (init.mjs installs one at the wiki root) — a hand-made root
+// close must not have a blind spot just because it isn't under projects/.
+test('doctor-close-artifacts: ROOT session-state.md 마감 heading, no marker, no project files → warn', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    writeFileSync(
+      join(dir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(1번째 세션).** 루트에서 손으로 닫았다.\n`,
+    );
+    const { r, out } = runDoctorJson(dir);
+    const check = out.find((c) => c.label === 'Session-close artifacts');
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check?.detail}`);
+    assert.equal(r.status, 0, `warn must not exit nonzero: ${r.stdout}\n${r.stderr}`);
+  });
+});
+
+// Real close never writes root session-state.md (closeFileTargets in
+// hooks/hypo-shared.mjs only lists hot.md/log.md + the active project's own
+// files) — so unlike root hot.md, NO marker legitimately corroborates it,
+// even a real, same-day, properly-scoped one for an actual project.
+test('doctor-close-artifacts: ROOT session-state.md is never covered by ANY marker, even a real same-day one → warn', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    writeFileSync(
+      join(dir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(1번째 세션).** 루트에서 손으로 닫았다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-real.marker'),
+      JSON.stringify({
+        session_id: 'real',
+        projects: ['some-project'],
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `root session-state.md must never be covered by any marker: ${check?.detail}`,
+    );
+  });
+});
+
+// A merge or a multi-project commit can touch more than one project — the
+// close-worded message must then be verified against ALL of them, not
+// silently attributed to whichever one a marker happens to name.
+function commitTouchingProjects(dir, projects, message, isoDate) {
+  for (const p of projects) {
+    mkdirSync(join(dir, 'projects', p), { recursive: true });
+    writeFileSync(join(dir, 'projects', p, 'hot.md'), `# ${p}\n`);
+  }
+  spawnSync('git', ['-C', dir, 'add', '-A']);
+  spawnSync('git', ['-C', dir, 'commit', '-q', '-m', message], {
+    env: { ...process.env, GIT_AUTHOR_DATE: isoDate, GIT_COMMITTER_DATE: isoDate },
+  });
+}
+
+test('doctor-close-artifacts: a commit touching TWO projects, marker covers only ONE → warn', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    gitRepo(dir);
+    commitTouchingProjects(
+      dir,
+      ['project-a', 'project-b'],
+      'session: close the session for project-a and project-b',
+      recentUtcIso(1),
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-partial.marker'),
+      JSON.stringify({
+        session_id: 'partial',
+        projects: ['project-a'], // project-b is NOT covered
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `partial project coverage must still warn (project-b uncovered): ${check?.detail}`,
+    );
+  });
+});
+
+test('doctor-close-artifacts: a commit touching TWO projects, marker covers BOTH → pass', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    gitRepo(dir);
+    commitTouchingProjects(
+      dir,
+      ['project-a', 'project-b'],
+      'session: close the session for project-a and project-b',
+      recentUtcIso(1),
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-full.marker'),
+      JSON.stringify({
+        session_id: 'full',
+        projects: ['project-a', 'project-b'],
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'pass', `both projects covered must pass: ${check?.detail}`);
+  });
+});
+
+// A `projects/project-a/... → projects/project-b/...` RENAME is reported by
+// git as touching only the DESTINATION under a plain `--name-only` diff — the
+// origin project silently drops out of scope, and a marker naming only the
+// destination would then wrongly cover the whole commit. deriveCommitProjects
+// must see BOTH sides of a rename (git show --name-status -M).
+test('doctor-close-artifacts: a commit that RENAMES a file from project-a to project-b requires BOTH projects covered → warn', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    gitRepo(dir);
+    mkdirSync(join(dir, 'projects', 'project-a'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'project-a', 'hot.md'), '# project-a\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    const seedIso = recentUtcIso(2);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed'], {
+      env: { ...process.env, GIT_AUTHOR_DATE: seedIso, GIT_COMMITTER_DATE: seedIso },
+    });
+    mkdirSync(join(dir, 'projects', 'project-b'), { recursive: true });
+    renameSync(
+      join(dir, 'projects', 'project-a', 'hot.md'),
+      join(dir, 'projects', 'project-b', 'hot.md'),
+    );
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    const renameIso = recentUtcIso(1);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'session: close the session'], {
+      env: { ...process.env, GIT_AUTHOR_DATE: renameIso, GIT_COMMITTER_DATE: renameIso },
+    });
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // Names only the destination — project-a (the rename's origin) is NOT covered.
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-rename.marker'),
+      JSON.stringify({
+        session_id: 'rename',
+        projects: ['project-b'],
+        closed_at: renameIso,
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `a rename's origin project (project-a) must still require coverage: ${check?.detail}`,
+    );
+  });
+});
+
+// doctor reads marker files directly (not through readSessionClosedMarker),
+// so its OWN staleness enforcement is a separate code path from the shared
+// reader's — this exercises that path specifically, not the shared one
+// close-signals.test.mjs already covers.
+test('doctor-close-artifacts: a raw marker older than the 7-day staleness window is not usable evidence → warn', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    const oldDate = eightDaysAgo.toISOString().slice(0, 10);
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${oldDate} 마감(1번째 세션).** 오래 전에 닫았다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-stale.marker'),
+      JSON.stringify({
+        session_id: 'stale',
+        projects: ['demo'],
+        closed_at: eightDaysAgo.toISOString(), // same day as the artifact, but >7d old
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `an expired marker must not vouch for a same-age artifact: ${check?.detail}`,
+    );
+  });
+});
+
+test('doctor-close-artifacts: close-worded commit message with no marker → warn (git-history signal)', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    gitRepo(dir);
+    writeFileSync(join(dir, 'note.md'), '# note\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', [
+      '-C',
+      dir,
+      'commit',
+      '-q',
+      '-m',
+      'session: close the thirteenth session, first parallel three-stream run',
+    ]);
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check?.detail}`);
+  });
+});
+
+test('doctor-close-artifacts: an ordinary commit message never matches → pass', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    gitRepo(dir);
+    writeFileSync(join(dir, 'note.md'), '# note\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'docs: fix a typo in note.md']);
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check?.detail}`);
+  });
+});
+
+// CONCERN: an unreadable .cache/ must not crash the check (and flip the exit
+// code via an uncaught throw) — it should read as "no usable marker
+// evidence", i.e. same as no markers at all.
+test('doctor-close-artifacts: unreadable .cache/ does not crash — degrades to no-marker-evidence', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.\n`,
+    );
+    const cacheDir = join(dir, '.cache');
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(join(cacheDir, 'session-closed-x.marker'), '{}');
+    chmodSync(cacheDir, 0o000);
+    try {
+      const { r, out } = runDoctorJson(dir);
+      assert.ok(r.status === 0 || r.status === 1, `doctor must not crash: ${r.stderr}`);
+      const check = out.find((c) => c.label === 'Session-close artifacts');
+      assert.ok(check, 'check not found');
+      assert.equal(
+        check.status,
+        'warn',
+        `unreadable cache degrades to no evidence: ${check?.detail}`,
+      );
+    } finally {
+      chmodSync(cacheDir, 0o755);
+    }
   });
 });
 

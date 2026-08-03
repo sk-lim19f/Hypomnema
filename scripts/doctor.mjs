@@ -26,6 +26,9 @@ import {
   readSyncLastSuccess,
   projectSuggestionsPath,
   collectProjectWorkingDirs,
+  detectSessionCloseArtifact,
+  localAndUtcDates,
+  SESSION_CLOSED_MARKER_STALE_MS,
 } from '../hooks/hypo-shared.mjs';
 import { listProposals } from '../hooks/proposal-store.mjs';
 import {
@@ -682,6 +685,224 @@ function checkProjectIndexAnchors(hypoDir) {
       `${unanchored.length} project(s) cwd-first resume can't anchor: ${sample}${extra}`,
     );
   }
+}
+
+// The project(s) a commit touched, by which projects/<slug>/ paths it
+// changed — a SET, because a merge or a multi-project commit can touch more
+// than one, and `close the session` in that commit's message must then be
+// verified against ALL of them, not silently attributed to just one.
+// Empty when the commit touches no project path, or `git show` itself fails
+// (a corrupt or unreachable object) — both are "can't determine scope", which
+// this returns as *no scope at all*, not "any scope"; see markerCoversArtifact
+// for why that direction matters.
+function deriveCommitProjects(hypoDir, hash) {
+  // --name-status -M (not --name-only): a rename prints ONLY the destination
+  // path under --name-only ("R100 old\tnew" collapses to just "new"), so a
+  // projects/a/hot.md → projects/b/hot.md rename would silently drop project
+  // a from scope — a marker naming only "b" would then wrongly cover the
+  // whole commit. -M's tab-separated `status\told\tnew` line carries both.
+  const show = spawnSync(
+    'git',
+    ['-C', hypoDir, 'show', '--name-status', '-M', '--format=', hash],
+    { encoding: 'utf-8' },
+  );
+  if (show.status !== 0 || !show.stdout) return [];
+  const projects = new Set();
+  for (const line of show.stdout.split('\n')) {
+    if (!line.trim()) continue;
+    // status\tpath (add/modify/delete) or status\told\tnew (rename/copy) —
+    // every field after the status column is a path this commit touched.
+    const [, ...paths] = line.split('\t');
+    for (const path of paths) {
+      const m = /^projects\/([^/]+)\//.exec(path.trim());
+      // _template is the scaffold, never a real project — same exclusion the
+      // file-scan loop above applies, so a commit that happens to touch it
+      // (e.g. an init/upgrade run) doesn't manufacture a phantom project a
+      // marker can never cover.
+      if (m && m[1] !== '_template') projects.add(m[1]);
+    }
+  }
+  return [...projects];
+}
+
+// A marker only vouches for the project(s) it names, PLUS its own calendar
+// day. Two ways that can go wrong if handled loosely, both fixed here:
+//
+//   1. Scope creep: a same-day close in a DIFFERENT project must not silence
+//      this one (the marker was introduced for per-session precision
+//      specifically to prevent one close from vouching for another —
+//      hooks/hypo-shared.mjs SESSION_CLOSED_MARKER_STALE_MS comment).
+//   2. Timezone artifact: closed_at is UTC; a file-content artifact's date is
+//      local (hooks/hypo-shared.mjs localAndUtcDates() accepts both for
+//      exactly this reason).
+//
+// `artifact.scope.kind` is a closed set, not a free-form nullable project —
+// an UNKNOWN scope must never default to "any marker on that date covers
+// it": this is a warning-only, best-effort check, so the cost of a false
+// PASS (the exact failure mode it exists to catch) outweighs the cost of a
+// false WARN (mild noise). Concretely:
+//   • 'root-universal' — root hot.md. The real close procedure updates it on
+//     EVERY close regardless of project (closeFileTargets in
+//     hooks/hypo-shared.mjs), so date-only correlation is legitimate here,
+//     not a gap.
+//   • 'unscoped' — root session-state.md (NOT part of the real close file
+//     set — the same closeFileTargets list proves it), or a commit whose
+//     touched-project set came back empty/ambiguous. No marker can vouch for
+//     an artifact with no verifiable scope, so this never matches, ever.
+//   • 'projects' — a project file, or a commit that touched one or more
+//     identifiable projects/<slug>/ paths. EVERY named project must appear
+//     in the marker's own `projects` list.
+function markerCoversArtifact(marker, artifact) {
+  if (!marker.dates.includes(artifact.date)) return false;
+  switch (artifact.scope.kind) {
+    case 'root-universal':
+      return true;
+    case 'projects':
+      return artifact.scope.projects.every((p) => marker.projects.includes(p));
+    default:
+      return false; // 'unscoped'
+  }
+}
+
+// Post-hoc surface for a session closed BY HAND, without the session-closed
+// marker hard gate ever firing (the gate lives on the marker writer, and a
+// close done by editing files directly never calls it). Warning-only: this
+// cannot tell an actually-approved-but-ungated close from an over-close, it
+// can only say the two signals disagree, so it never blocks.
+//
+// Window: 7 days for the git-log scan, matching SESSION_CLOSED_MARKER_STALE_MS
+// in hooks/hypo-shared.mjs — a marker older than that is already treated as
+// expired everywhere else (enforced below too, when reading the raw marker
+// files), so correlating against a longer window would compare a close
+// artifact against a marker doctor itself considers stale.
+function checkSessionCloseArtifacts(hypoDir) {
+  const artifacts = [];
+
+  const scanFile = (path, scope) => {
+    if (!existsSync(path)) return;
+    let content;
+    try {
+      content = readFileSync(path, 'utf-8');
+    } catch {
+      return;
+    }
+    const result = detectSessionCloseArtifact({ path, content });
+    if (result.matched) {
+      artifacts.push({ date: result.date, scope, where: relative(hypoDir, path) });
+    }
+  };
+
+  // Root hot.md is a real close artifact of every close, project or not — see
+  // markerCoversArtifact's 'root-universal' case. Root session-state.md is
+  // NOT: the real close procedure never touches it (closeFileTargets in
+  // hooks/hypo-shared.mjs lists hot.md/log.md + the ACTIVE project's files
+  // only), so a 마감 heading appearing there has no legitimate close to
+  // attribute it to — 'unscoped' means no marker, however fresh, ever covers it.
+  scanFile(join(hypoDir, 'hot.md'), { kind: 'root-universal' });
+  scanFile(join(hypoDir, 'session-state.md'), { kind: 'unscoped' });
+  const projectsDir = join(hypoDir, 'projects');
+  if (existsSync(projectsDir)) {
+    for (const slug of readdirSync(projectsDir)) {
+      if (slug === '_template') continue;
+      const dir = join(projectsDir, slug);
+      try {
+        if (!statSync(dir).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      scanFile(join(dir, 'session-state.md'), { kind: 'projects', projects: [slug] });
+      scanFile(join(dir, 'hot.md'), { kind: 'projects', projects: [slug] });
+    }
+  }
+
+  if (existsSync(join(hypoDir, '.git'))) {
+    const log = spawnSync(
+      'git',
+      ['-C', hypoDir, 'log', '--since=7.days.ago', '--format=%H%x1f%ad%x1f%s', '--date=short'],
+      { encoding: 'utf-8' },
+    );
+    if (log.status === 0 && log.stdout) {
+      for (const line of log.stdout.split('\n')) {
+        if (!line.trim()) continue;
+        const [hash, date, subject] = line.split('\x1f');
+        if (detectSessionCloseArtifact({ commitMessage: subject }).matched) {
+          const projects = deriveCommitProjects(hypoDir, hash);
+          artifacts.push({
+            date,
+            scope: projects.length > 0 ? { kind: 'projects', projects } : { kind: 'unscoped' },
+            where: `commit "${subject}"`,
+          });
+        }
+      }
+    }
+  }
+
+  if (artifacts.length === 0) {
+    pass('Session-close artifacts', 'No close artifacts found');
+    return;
+  }
+
+  // Read the raw marker files directly rather than readSessionClosedMarker,
+  // which also DELETES an expired one as a side effect; a health check
+  // should not mutate state to produce a diagnosis. Staleness is still
+  // enforced here (same SESSION_CLOSED_MARKER_STALE_MS window) so an
+  // already-expired marker can't vouch for anything.
+  const cacheDir = join(hypoDir, '.cache');
+  const markers = [];
+  let cacheEntries = [];
+  if (existsSync(cacheDir)) {
+    try {
+      cacheEntries = readdirSync(cacheDir);
+    } catch {
+      // unreadable .cache/ — not this check's job to diagnose that
+    }
+  }
+  for (const file of cacheEntries) {
+    if (!file.startsWith('session-closed-') || !file.endsWith('.marker')) continue;
+    try {
+      const data = JSON.parse(readFileSync(join(cacheDir, file), 'utf-8'));
+      const ts = Date.parse(data?.closed_at || '');
+      if (!Number.isFinite(ts) || Date.now() - ts > SESSION_CLOSED_MARKER_STALE_MS) continue;
+      // ONLY the v4 `projects` array counts as project-scope evidence. A
+      // legacy flat `project` field can be a recency-derived misattribution
+      // (the P1 bug resolveCloseScope's own doc comment describes) — the
+      // runtime scope resolver already refuses to trust it uncorroborated,
+      // and doctor has no corroborating signal of its own to add, so it
+      // must refuse it too rather than re-opening the same hole standalone.
+      const projects = Array.isArray(data?.projects) ? data.projects.filter(Boolean) : [];
+      markers.push({ projects: [...new Set(projects)], dates: localAndUtcDates(new Date(ts)) });
+    } catch {
+      // corrupt marker — not this check's job to clean up
+    }
+  }
+
+  const unmatched = artifacts.filter(
+    (a) => !a.date || !markers.some((m) => markerCoversArtifact(m, a)),
+  );
+  if (unmatched.length === 0) {
+    pass(
+      'Session-close artifacts',
+      `${artifacts.length} close artifact(s), all covered by a session-closed marker`,
+    );
+    return;
+  }
+
+  const sample = unmatched
+    .slice(0, 5)
+    .map((a) => `${a.where}${a.date ? ` (${a.date})` : ''}`)
+    .join(', ');
+  const extra = unmatched.length > 5 ? ` (+${unmatched.length - 5} more)` : '';
+  // Not necessarily UNAPPROVED — an approved log-only marker (deliberately
+  // empty `projects`) or one scoped to a different project would ALSO land
+  // here, since neither covers a specific project's artifact. Both readings
+  // are worth a human look, so the wording covers both instead of asserting
+  // the stronger, sometimes-wrong one.
+  warn(
+    'Session-close artifacts',
+    `${unmatched.length} close artifact(s) with no session-closed marker covering their ` +
+      `date and project scope — may be an unapproved hand-made close, or an approved close ` +
+      `whose marker doesn't attribute this project: ${sample}${extra}`,
+  );
 }
 
 /**
@@ -1576,6 +1797,7 @@ if (args.codex) checkCodexPaths();
 if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
+if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkProposals(args.hypoDir);
