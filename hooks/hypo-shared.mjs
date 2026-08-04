@@ -17,13 +17,14 @@ import {
   readdirSync,
   realpathSync,
   openSync,
-  closeSync,
   unlinkSync,
   renameSync,
+  linkSync,
 } from 'fs';
 import { join, relative, basename, dirname } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
+import { randomBytes } from 'crypto';
 
 const HOME = homedir();
 
@@ -1282,22 +1283,75 @@ function atomicWriteShared(path, content) {
   renameSync(tmp, path);
 }
 
+// Read the pid the current holder recorded in its lockfile (see withFileLock).
+// Returns null for anything we can't trust as a pid: empty/missing content (a
+// lock written before this pid-recording existed, or already gone), or content
+// that doesn't parse as a positive integer. null means "unknown holder" and the
+// caller falls back to the pre-liveness, mtime-only steal rule.
+function readLockHolderPid(lockPath) {
+  let raw;
+  try {
+    raw = readFileSync(lockPath, 'utf-8').trim();
+  } catch {
+    return null; // vanished/unreadable mid-check — let the caller's own catch handle it
+  }
+  // Canonical decimal only. `Number()` would accept '1e3' and '0x10' as pids,
+  // which contradicts what this function promises its callers: anything we
+  // can't trust is null, not a number we guessed at.
+  if (!/^[1-9][0-9]*$/.test(raw)) return null;
+  const pid = Number(raw);
+  return Number.isSafeInteger(pid) ? pid : null;
+}
+
+// Is `pid` still running? EPERM means it exists but we can't signal it (e.g. a
+// different user) — treat that as alive too, since "can't prove it's dead" must
+// not be steal-eligible.
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
 /**
  * Run `fn` while holding an exclusive lock on `<targetPath>.lock`.
  *
- * Acquire is a spin on `openSync(lock, 'wx')`: EEXIST means another writer holds
- * it, so poll until it frees. A lock whose holder looks dead (mtime older than
- * `staleMs`) is stolen. Steal is recoverable friction in the normal case (the
- * stealer re-reads the committed bytes before writing), but NOT loss-free in two
- * edge cases, both requiring the lock to sit untouched for `staleMs`: (1) a LIVE
- * holder preempted past `staleMs` gets stolen from, so two writers run the
- * critical section and one update is lost; (2) between the stale `statSync` and
- * the `unlinkSync`, the holder can release and a fresh holder grab the same path,
- * whose lock we then remove. `staleMs` is set well above a normal close (seconds)
- * to make both extreme-low-probability. If the lock cannot be acquired within
- * `timeoutMs`, throw so the caller can fall back to the write=proposal gate — for
- * an append that means blocking the close (proposal-pending) with no artifact; the
- * next close re-appends (architecturally consistent with the existing fail-safe).
+ * Acquire is a spin on `linkSync(tmp, lock)`, where `tmp` already holds this
+ * process's pid in full: EEXIST means another writer holds it, so poll until it
+ * frees. Linking a complete file is what makes the lock's content trustworthy —
+ * a lock is never observable in a half-written state, so "no pid in there" always
+ * means a genuine pre-liveness lockfile and never a holder mid-acquire. The lock
+ * file's content is therefore the holder's own pid,
+ * so a lock whose mtime is older than `staleMs` is only stolen once we can also
+ * confirm the recorded holder is no longer running (`process.kill(pid, 0)`). A
+ * LIVE holder preempted past `staleMs` is therefore left alone — its lock is not
+ * stolen, so the second writer instead polls through to `timeoutMs` and throws,
+ * falling back to the write=proposal gate instead of racing the live holder's
+ * critical section (this was case (1) of the old mtime-only rule, and it's what
+ * closes it). A lock with no readable/parseable pid (written before this
+ * recording existed) falls back to the old mtime-only rule so pre-existing
+ * lockfiles from a live process on disk still get treated as steal-eligible once
+ * stale — see `readLockHolderPid`. Every steal, and every steal we refuse because
+ * the holder is alive, is logged to stderr so a preemption or an actual steal is
+ * never silent. One edge remains, unrelated to holder liveness: between the
+ * stale `statSync` and the `unlinkSync`, the holder can release and a fresh
+ * holder grab the same path, whose lock we then remove — `staleMs` is set well
+ * above a normal close (seconds) to make that extreme-low-probability, and it is
+ * out of scope here. Release is symmetric: we only unlink the lock while it still
+ * records OUR pid, so a writer that WAS stolen from never removes the lock of the
+ * holder that replaced it. If the lock cannot be acquired within `timeoutMs`,
+ * throw so the caller can fall back to the write=proposal gate — for an append
+ * that means blocking the close (proposal-pending) with no artifact; the next
+ * close re-appends (architecturally consistent with the existing fail-safe).
+ *
+ * Note what refusing to steal from a live holder trades away: a holder that is
+ * alive but permanently hung is now never stolen from, so every later close
+ * times out too. That is availability loss, not a deadlock (`timeoutMs` still
+ * bounds each attempt), but unlike an ordinary lock timeout it does NOT self-heal
+ * on the next close — it needs the hung process to go away. Losing an append is
+ * silent; blocking one is visible, so this is the direction to fail in.
  *
  * @param {string} targetPath file being guarded (lock is a sibling `.lock`)
  * @param {() => T} fn critical section
@@ -1310,10 +1364,49 @@ export function withFileLock(targetPath, fn, opts = {}) {
   const lockPath = `${targetPath}.lock`;
   mkdirSync(dirname(lockPath), { recursive: true });
   const start = Date.now();
-  let fd;
+  // Publish the lock ATOMICALLY: write the whole pid into a private sibling
+  // first, then `linkSync` it into place. `openSync(lockPath,'wx')` followed by
+  // a write cannot do this — it publishes an EMPTY lock and fills it in after,
+  // and a holder preempted inside that window looks exactly like a pid-less
+  // legacy lock, so a second writer steals it and both run the critical section.
+  // That is the very bug the liveness check exists to close, so the acquire has
+  // to be atomic for the check to mean anything. `link` also gives us the same
+  // EEXIST-if-taken primitive `wx` did, and it leaves nothing behind when the
+  // write fails: no link, no lock.
+  // The staging name is per-call random, and the staging write is exclusive.
+  // A predictable `<lock>.<pid>.tmp` would be reachable again by a later run of
+  // the same pid, and a crash between the link and the staging unlink leaves tmp
+  // and lock as two names for ONE inode — writing the staging file would then
+  // rewrite the live lock's bytes and mtime, resurrecting a dead lock under a
+  // live pid that the liveness check would then protect. Random + `wx` removes
+  // both the collision and the symlink it could otherwise be pointed through.
+  const tmpPath = `${lockPath}.${randomBytes(8).toString('hex')}.tmp`;
+  let staged = false;
+  // The live-holder refusal is re-evaluated on every poll, but it is one event,
+  // not `timeoutMs / pollMs` of them. Log each once per acquire or a single
+  // preemption buries the hook's stderr under ~100 identical lines.
+  let loggedLiveHolder = false;
+  let loggedSteal = false;
+  try {
   for (;;) {
     try {
-      fd = openSync(lockPath, 'wx');
+      if (!staged) {
+        try {
+          writeFileSync(tmpPath, String(process.pid), { flag: 'wx' });
+          staged = true;
+        } catch (stageErr) {
+          // Staging fails for the same reason acquisition does — an unwritable
+          // directory — and `openSync(lock,'wx')` used to report exactly that as
+          // EEXIST whenever a lock was already sitting there, sending it down the
+          // contention path. Preserve that: contend if a lock exists, and surface
+          // a genuine write failure otherwise rather than masking it as a timeout.
+          if (!existsSync(lockPath)) throw stageErr;
+          throw Object.assign(new Error('lock-contended'), { code: 'EEXIST' });
+        }
+      }
+      // Kept separate from staging on purpose: EPERM/EMLINK from the link are
+      // real failures, not contention, and must not decay into ELOCKTIMEOUT.
+      linkSync(tmpPath, lockPath);
       break;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
@@ -1325,12 +1418,37 @@ export function withFileLock(targetPath, fn, opts = {}) {
       // the timeoutMs → ELOCKTIMEOUT contract (caller falls to the proposal gate).
       let stale = false;
       try {
-        // Steal a lock whose holder looks dead. Loss-free unless the holder is
-        // actually live-but-preempted past staleMs (see JSDoc edge cases).
+        // Steal-eligible by age alone; liveness is checked separately below
+        // before we actually act on it.
         stale = Date.now() - statSync(lockPath).mtimeMs > staleMs;
       } catch (statErr) {
         if (statErr.code === 'ENOENT') continue; // lock vanished; retry create now
         throw statErr; // unexpected stat failure — surface it, don't mask
+      }
+      if (stale) {
+        const holderPid = readLockHolderPid(lockPath);
+        if (holderPid !== null && isPidAlive(holderPid)) {
+          // LIVE holder preempted past staleMs: do NOT steal. Surface it so the
+          // preemption is visible, then fall through to the poll/timeout path
+          // below instead of racing a second writer into the critical section.
+          if (!loggedLiveHolder) {
+            console.error(
+              `[hypomnema] withFileLock: NOT stealing ${lockPath} — holder pid ${holderPid} is still alive past staleMs=${staleMs}`,
+            );
+            loggedLiveHolder = true;
+          }
+          stale = false;
+        } else if (!loggedSteal) {
+          // Also once per acquire: an un-removable stale lock re-enters this
+          // branch on every poll, and the steal is one event either way.
+          console.error(
+            `[hypomnema] withFileLock: stealing stale lock ${lockPath}` +
+              (holderPid !== null
+                ? ` (holder pid ${holderPid} is no longer running)`
+                : ' (no readable holder pid — pre-liveness lockfile)'),
+          );
+          loggedSteal = true;
+        }
       }
       if (stale) {
         try {
@@ -1353,16 +1471,33 @@ export function withFileLock(targetPath, fn, opts = {}) {
       sleepSync(pollMs);
     }
   }
+  } finally {
+    // The sibling is only ever a staging file: once linked, the lock IS the
+    // link, and on every failure path it must not survive as litter.
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      /* never created, or already gone */
+    }
+  }
   try {
     return fn();
   } finally {
+    // Only remove the lock if it is still OURS. Recording the pid makes this
+    // checkable: if we were stolen from (a legacy pid-less lock of ours, or the
+    // stat/unlink window below), the path now holds a DIFFERENT holder's lock and
+    // unlinking it unconditionally would hand a third writer the critical section
+    // while that holder is still inside it. Leaving a foreign lock alone costs
+    // nothing — its own holder releases it, or it goes stale.
     try {
-      closeSync(fd);
-    } catch {
-      /* fd already gone */
-    }
-    try {
-      unlinkSync(lockPath);
+      const stillOurs = readLockHolderPid(lockPath);
+      if (stillOurs === process.pid) unlinkSync(lockPath);
+      else if (existsSync(lockPath))
+        console.error(
+          `[hypomnema] withFileLock: not releasing ${lockPath} — it now holds ${
+            stillOurs === null ? 'no readable pid' : `pid ${stillOurs}`
+          }, so ours was stolen`,
+        );
     } catch {
       /* lock already stolen/removed */
     }
