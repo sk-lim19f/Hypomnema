@@ -176,6 +176,10 @@
     "exec": false
   },
   {
+    "path": "hooks/hypo-close-guard.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/hypo-compact-guard.mjs",
     "exec": false
   },
