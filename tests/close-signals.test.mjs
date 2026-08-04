@@ -1949,6 +1949,69 @@ test('guard true when both .gitignore and .hypoignore cover .cache/', () => {
   });
 });
 
+// A probe that never answered is not the same as git saying "not ignored".
+// check-ignore exits 0 (ignored) or 1 (not ignored); 128 means git errored out,
+// and a null status means the 2s timeout fired or the spawn failed outright —
+// which is what a machine running one process per suite actually produces. The
+// old code collapsed all of those into `false` and then cached it, so one blip
+// kept logging disabled for the whole session even after the cause cleared.
+// That is the flake behind the .cache/ guard failing only under --shards=N.
+test('an inconclusive git probe records an outage, never a verdict', () => {
+  withTmpDir((dir) => {
+    const sessionId = 'b1-inconclusive';
+    const cachePath = pageUsageGuardCachePath(sessionId, dir);
+    try {
+      writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+      writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+
+      // Not a git repo yet → check-ignore exits 128, i.e. it did not answer.
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId), false);
+      const recorded = JSON.parse(readFileSync(cachePath, 'utf-8'));
+      assert.equal(
+        recorded.gitIgnored,
+        undefined,
+        'an unanswered probe must never be written down as an answer',
+      );
+      assert.equal(typeof recorded.unavailableUntil, 'number');
+
+      // The outage stamp suppresses re-probing while it stands. That is what
+      // keeps a wedged git from costing a full timeout on every prompt.
+      gitRepo(dir);
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId), false);
+
+      // Once it lapses, the answer is recomputed rather than served from the
+      // outage — the old code cached `false` here and never recovered.
+      writeFileSync(cachePath, JSON.stringify({ unavailableUntil: Date.now() - 1 }));
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId), true);
+    } finally {
+      rmSync(cachePath, { force: true });
+    }
+  });
+});
+
+// Without a session id the cache key collapses to `default`, so one session's
+// verdict would answer for the next — and nothing expires the file. The guard
+// re-probes instead, which is what lets removed .gitignore coverage take effect.
+test('no session id → the git verdict is not cached at all', () => {
+  withTmpDir((dir) => {
+    const cachePath = pageUsageGuardCachePath(undefined, dir);
+    try {
+      rmSync(cachePath, { force: true });
+      gitRepo(dir);
+      writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+      writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+      assert.equal(pageUsageLoggingAllowed(dir, undefined), true);
+      assert.ok(!existsSync(cachePath), 'an unscoped verdict must not be written');
+
+      // Coverage removed → the next call must see it, not a stale `true`.
+      writeFileSync(join(dir, '.gitignore'), 'unrelated/\n');
+      assert.equal(pageUsageLoggingAllowed(dir, undefined), false);
+    } finally {
+      rmSync(cachePath, { force: true });
+    }
+  });
+});
+
 test('guard false when only .gitignore covers .cache/ (both signals required)', () => {
   withTmpDir((dir) => {
     gitRepo(dir);

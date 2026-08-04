@@ -459,31 +459,82 @@ export function pageUsageLoggingAllowed(hypoDir, sessionId) {
 // subprocess, so cache its result per session. The verdict cached here is only
 // the git signal, never the composite allow decision, so the fresh .hypoignore
 // re-check above always still runs.
+// How long an unanswered probe suppresses the next one. Long enough that a git
+// that is genuinely wedged costs one 10s wait per half-minute instead of one per
+// prompt, short enough that a blip clears on its own well inside a session.
+const PROBE_BACKOFF_MS = 30000;
+
 function gitIgnoresPageUsageCached(hypoDir, sessionId) {
+  // Without a session id every caller lands on the same `default` cache file, so
+  // one session's verdict would answer for the next one — and the file outlives
+  // both, sitting in tmpdir with nothing to expire it. A verdict that cannot be
+  // scoped to a session is not cached at all: re-probe every time instead of
+  // serving a stale `true` after .gitignore coverage has been removed.
+  const scoped = Boolean(sessionId);
   const cachePath = pageUsageGuardCachePath(sessionId, hypoDir);
-  try {
-    if (existsSync(cachePath)) {
-      const cached = JSON.parse(readFileSync(cachePath, 'utf-8'));
-      if (typeof cached.gitIgnored === 'boolean') return cached.gitIgnored;
+  if (scoped) {
+    try {
+      if (existsSync(cachePath)) {
+        const cached = JSON.parse(readFileSync(cachePath, 'utf-8'));
+        if (typeof cached.gitIgnored === 'boolean') return cached.gitIgnored;
+        // A recorded outage still stands until it expires. This is what keeps a
+        // wedged git off the UserPromptSubmit path: hypo-lookup calls this before
+        // it prints, so a 10s wait here is 10s of dead prompt, every prompt.
+        if (typeof cached.unavailableUntil === 'number' && Date.now() < cached.unavailableUntil) {
+          return false;
+        }
+      }
+    } catch {
+      // corrupt cache → recompute below
     }
-  } catch {
-    // corrupt cache → recompute below
   }
 
-  let gitIgnored = false;
+  // check-ignore answers with an exit code: 0 = ignored, 1 = not ignored. Every
+  // other outcome means the probe never got to answer — 128 for a fatal git
+  // error (hypoDir not a repo yet), or a null status when the 2s timeout fired
+  // or the spawn itself failed, which is what a machine under heavy process
+  // load produces. Treating those as a plain `false` is the bug this guards
+  // against: it is indistinguishable from git actually saying "not ignored",
+  // and the verdict then gets cached, so one blip keeps logging disabled for
+  // the rest of the session even after the condition clears.
+  // The bound is here to survive a git that never returns (an index.lock held by
+  // a dead process, a corrupt repo), not to race a busy machine. It used to be
+  // 2s, which a loaded box clears by a hair: instrumenting a one-process-per-suite
+  // run produced eight ETIMEDOUT probes, every one of them landing between 2011ms
+  // and 2254ms. check-ignore on a real vault costs single-digit milliseconds, so
+  // the old bound was three orders of magnitude tighter than the work and was
+  // measuring scheduler latency instead of git. 10s still catches a true hang.
+  let probe = null;
   try {
-    gitIgnored =
-      spawnSync('git', ['-C', hypoDir, 'check-ignore', '-q', '--', PAGE_USAGE_REL], {
-        timeout: 2000,
-      }).status === 0;
+    probe = spawnSync('git', ['-C', hypoDir, 'check-ignore', '-q', '--', PAGE_USAGE_REL], {
+      timeout: 10000,
+    });
   } catch {
-    gitIgnored = false;
+    probe = null;
   }
 
-  try {
-    writeFileSync(cachePath, JSON.stringify({ gitIgnored }));
-  } catch {
-    // cache write failure is non-fatal; the git probe just reruns next prompt
+  // Inconclusive → fail closed for this call. The verdict is never cached as an
+  // answer; what gets recorded is that the probe is down, and only until the
+  // backoff expires. So a scheduler blip self-heals within the session, while a
+  // wedged git is waited on once per backoff window rather than once per prompt.
+  if (!probe || (probe.status !== 0 && probe.status !== 1)) {
+    if (scoped) {
+      try {
+        writeFileSync(cachePath, JSON.stringify({ unavailableUntil: Date.now() + PROBE_BACKOFF_MS }));
+      } catch {
+        // non-fatal; the probe just runs again next prompt
+      }
+    }
+    return false;
+  }
+
+  const gitIgnored = probe.status === 0;
+  if (scoped) {
+    try {
+      writeFileSync(cachePath, JSON.stringify({ gitIgnored }));
+    } catch {
+      // cache write failure is non-fatal; the git probe just reruns next prompt
+    }
   }
   return gitIgnored;
 }
