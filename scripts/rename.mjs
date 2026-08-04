@@ -39,13 +39,14 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
-  rmSync,
   mkdirSync,
   readdirSync,
   renameSync,
   statSync,
   lstatSync,
   realpathSync,
+  chmodSync,
+  rmSync,
 } from 'fs';
 import { join, basename, dirname, normalize, isAbsolute, sep } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
@@ -225,6 +226,66 @@ function fail(args, msg) {
   if (args.json) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
   else console.error(`✗ ${msg}`);
   process.exit(1);
+}
+
+/** Atomic write via tmp+rename (same pattern as crystallize.mjs/proposal.mjs's
+ * atomicWrite): a crash or full disk mid-write leaves the ORIGINAL bytes at
+ * `path` untouched, never a truncated/partial file. Needed for every rewrite
+ * this script lands on a page that already has content on disk — including a
+ * page's own self-referential rewrite — because a plain writeFileSync
+ * truncates before writing and a crash in that gap destroys the one copy. */
+function atomicWrite(path, content) {
+  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  // Swapping in a fresh inode also swaps in fresh permissions, so a 0444 or 0600
+  // page would come back 0644 and this rewrite would quietly widen it. Carry the
+  // existing mode over. Ownership, ACLs and hard-link identity are NOT carried;
+  // a vault page with any of those is outside what this script claims to handle.
+  let mode = null;
+  try {
+    mode = statSync(path).mode;
+  } catch {
+    mode = null; // new file, nothing to preserve
+  }
+  // `wx` so a collision is an error rather than a silent clobber of somebody
+  // else's temp, and drop the temp if anything after it fails (a full disk,
+  // a rename that cannot land) instead of leaving `.tmp` litter in the vault.
+  try {
+    writeFileSync(tmp, content, { flag: 'wx' });
+    if (mode !== null) chmodSync(tmp, mode);
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // best effort; the original at `path` is untouched either way
+    }
+    throw err;
+  }
+}
+
+// Refuse an --apply that would have to cross a filesystem/mount boundary,
+// BEFORE any rewrite is written to disk. renameSync cannot move across
+// devices (throws EXDEV); falling back to write-then-remove in that case
+// reintroduces the exact non-convergent "both paths exist, --to-already-exists
+// forever" crash window a single renameSync exists to close. Call this first,
+// so a device mismatch is refused with the vault untouched — not discovered
+// mid-move with inbound links already rewritten.
+function assertSameDevice(args, fromAbsPath, toAbsPath) {
+  let ancestor = dirname(toAbsPath);
+  while (!existsSync(ancestor)) ancestor = dirname(ancestor);
+  let fromDev, toDev;
+  try {
+    fromDev = statSync(fromAbsPath).dev;
+    toDev = statSync(ancestor).dev;
+  } catch {
+    return; // can't tell in advance — let the real move surface the real error
+  }
+  if (fromDev !== toDev) {
+    fail(
+      args,
+      `--from and --to are on different filesystems/mounts — an atomic move is not possible across that boundary. Move it by hand instead of --apply.`,
+    );
+  }
 }
 
 // ── directory mode ─────────────────────────────────────────────────────────────
@@ -545,7 +606,7 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
 
   // Rewrite inbound references across the vault.
   const externalWrites = new Map(); // abs path → content (non-moved source files)
-  const movedBodies = new Map(); // new rel → content (moved page bodies, written post-move)
+  const movedBodies = new Map(); // OLD rel → content (moved-page bodies, written pre-rename)
   const fileResults = [];
   const ambiguities = [];
   let totalRewrites = 0;
@@ -577,21 +638,45 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
       const landRel = inSubtree ? movedByRel.get(p.rel).toPage.rel : p.rel;
       fileResults.push({ file: landRel, rewrites });
       totalRewrites += rewrites.length;
-      if (inSubtree) movedBodies.set(movedByRel.get(p.rel).toPage.rel, content);
+      // Keyed by the OLD rel: this gets written at the OLD path, before the
+      // subtree rename, so the content travels with the directory move instead
+      // of racing it (see the apply block below).
+      if (inSubtree) movedBodies.set(p.rel, content);
       else externalWrites.set(p.path, content);
     }
     if (ambiguous.length > 0) ambiguities.push({ file: p.rel, ambiguous });
   }
 
-  // Apply: external rewrites in place → renameSync the whole subtree (carries
-  // non-.md assets) → write rewritten moved bodies at their new paths.
+  // Apply: refuse a cross-device move up front (assertSameDevice) → external
+  // rewrites in place → moved-page bodies rewritten at their OLD paths → THEN
+  // renameSync the whole subtree in one syscall (carries non-.md assets and the
+  // just-rewritten bodies along with it).
+  //
+  // Writing moved bodies before the rename (not after, as this used to) matters
+  // for convergence: a crash after renameSync but before those writes used to
+  // leave `projects/new/*` links still pointing at `projects/old/*` forever —
+  // --from no longer resolves (the directory already moved), so a re-run failed
+  // with "did not resolve to a unique existing page" instead of finishing the
+  // job. Writing pre-rename means the content moves atomically with the
+  // directory: there is no window where the subtree has moved but its own
+  // internal links have not been rewritten yet.
   let moved = false;
   if (args.apply) {
-    for (const [path, content] of externalWrites) writeFileSync(path, content);
+    assertSameDevice(args, fromAbs, toAbs);
+    for (const [path, content] of externalWrites) atomicWrite(path, content);
+    for (const [oldRel, content] of movedBodies) {
+      atomicWrite(join(args.hypoDir, oldRel), content);
+    }
     mkdirSync(dirname(toAbs), { recursive: true });
-    renameSync(fromAbs, toAbs);
-    for (const [newRel, content] of movedBodies) {
-      writeFileSync(join(args.hypoDir, newRel), content);
+    try {
+      renameSync(fromAbs, toAbs);
+    } catch (err) {
+      // assertSameDevice above should already have refused this. A device
+      // change mid-run is the only way to reach EXDEV here — fail loudly
+      // instead of an unsafe write-then-remove fallback; every write above is
+      // already atomic, so a re-run picks up cleanly.
+      if (err.code !== 'EXDEV') throw err;
+      fail(args, `--from and --to ended up on different filesystems mid-run — refusing an unsafe fallback move.`);
     }
     moved = true;
   }
@@ -730,6 +815,12 @@ function run(args) {
     }
   }
 
+  // Refuse a cross-device --apply before anything below writes a single byte
+  // (see assertSameDevice) — the external rewrite loop right after this can
+  // otherwise land partial vault changes ahead of a move that turns out to be
+  // impossible.
+  if (args.apply) assertSameDevice(args, fromPage.path, toPath);
+
   // Rewrite inbound references across every NON-preserved page (skip the moved
   // page itself — self-references are rewritten on its own content separately).
   const fileResults = [];
@@ -748,12 +839,12 @@ function run(args) {
       fileResults.push({ file: p.rel, rewrites });
       totalRewrites += rewrites.length;
       if (args.apply && content !== raw) {
-        // The from-page is about to move; write its rewritten body to the NEW
-        // path below, not the old one.
+        // The from-page is about to move; stash its own rewritten body — it is
+        // written to the OLD path below, right before the rename, not here.
         if (p.rel === fromPage.rel) {
           fromPage._rewritten = content;
         } else {
-          writeFileSync(p.path, content);
+          atomicWrite(p.path, content);
         }
       } else if (p.rel === fromPage.rel) {
         fromPage._rewritten = content;
@@ -764,15 +855,33 @@ function run(args) {
     }
   }
 
-  // Move the file (--apply only): write the (possibly self-rewritten) body at the
-  // new path, then drop the old one. Done as write-then-remove rather than a raw
-  // rename so the carried-over self-reference rewrites are preserved.
+  // Move the file (--apply only): if the from-page carries a self-rewritten body
+  // (its own [[foo]]-style links needed retargeting), write it to the OLD path
+  // first (atomically — a crash mid-write must never corrupt the one copy),
+  // then renameSync the file into place. A rename is one syscall with no
+  // observable intermediate state, so a crash either lands before it (old path
+  // still has the rewritten body, re-run converges) or after it (new path exists,
+  // nothing to redo) — never both paths present at once, which is the state a
+  // prior write-then-remove could leave and that the --to-already-exists guard
+  // above then refuses to recover from.
   let moved = false;
   if (args.apply) {
+    if (fromPage._rewritten !== undefined) atomicWrite(fromPage.path, fromPage._rewritten);
     mkdirSync(dirname(toPath), { recursive: true });
-    const body = fromPage._rewritten ?? readFileSync(fromPage.path, 'utf-8');
-    writeFileSync(toPath, body);
-    if (toPath !== fromPage.path) rmSync(fromPage.path, { force: true });
+    if (toPath !== fromPage.path) {
+      try {
+        renameSync(fromPage.path, toPath);
+      } catch (err) {
+        // assertSameDevice above should already have refused a cross-device
+        // move before any write happened. Reaching EXDEV here means the mount
+        // changed mid-run — fail loudly rather than silently falling back to
+        // write-then-remove, which is exactly the non-atomic state this fix
+        // removes. fromPage.path still holds the valid (possibly rewritten)
+        // body, so a re-run picks up cleanly once the device issue is gone.
+        if (err.code !== 'EXDEV') throw err;
+        fail(args, `--from and --to ended up on different filesystems mid-run — refusing an unsafe fallback move.`);
+      }
+    }
     moved = true;
   }
 
