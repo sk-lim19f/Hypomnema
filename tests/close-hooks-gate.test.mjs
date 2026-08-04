@@ -19,10 +19,14 @@ import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
+  HOOKS,
   SESSION_TMP_HOME,
   buildCleanWikiTree,
+  commitTouchedPaths,
   extractTouchedWikiFiles,
   payloadForCleanWiki,
+  peekTouchedPaths,
+  recordTouchedPaths,
   run,
   runApply,
   runHook,
@@ -30,6 +34,7 @@ import {
   sessionLogReadCandidates,
   sessionLogShardPath,
   todayLocal,
+  touchedPathsPath,
   withCleanWiki,
   withTmpDir,
   withWiki,
@@ -897,4 +902,436 @@ test('missing log.md → exit 1 + log.md in missing list', () => {
       assert.ok(out.missing.includes('log.md'), `missing list should name log.md: ${r.stdout}`);
     },
   );
+});
+
+// ── ISSUE-77: hypo-close-guard.mjs (PreToolUse) — intercept a close artifact
+// BEFORE it lands, instead of only detecting it after (doctor's post-hoc
+// detectSessionCloseArtifact). ──────────────────────────────────────────────
+suite('hypo-close-guard.mjs — registration');
+
+test('hypo-close-guard.mjs is registered under hooks.json PreToolUse', () => {
+  const cfg = JSON.parse(readFileSync(join(HOOKS, 'hooks.json'), 'utf-8'));
+  const groups = cfg.hooks.PreToolUse || [];
+  const commands = groups.flatMap((g) => g.hooks.map((h) => h.command));
+  assert.ok(
+    commands.some((c) => /hypo-close-guard\.mjs$/.test(c)),
+    `PreToolUse must register hypo-close-guard.mjs, got: ${JSON.stringify(commands)}`,
+  );
+});
+
+suite('hypo-close-guard.mjs — contract');
+
+test('hook-itself failure (invalid JSON stdin) → silent pass-through, NOT an explicit allow', () => {
+  const r = runHook('hypo-close-guard.mjs', 'not-json');
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  assert.equal(
+    r.stdout.trim(),
+    '',
+    `a broken hook must exit silently, never write a permission decision: ${r.stdout}`,
+  );
+});
+
+test('non-write tool (Read) targeting hot.md → silent (permission gate untouched)', () => {
+  withWiki(null, (dir) => {
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-read',
+        tool_name: 'Read',
+        tool_input: { file_path: join(dir, 'projects', 'test-project', 'hot.md') },
+      },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.stdout.trim(), '', `must not print an explicit allow: ${r.stdout}`);
+  });
+});
+
+test('write outside HYPO_DIR → silent (permission gate untouched)', () => {
+  const r = runHook('hypo-close-guard.mjs', {
+    session_id: 'sess-outside',
+    tool_name: 'Write',
+    tool_input: { file_path: '/tmp/not-the-wiki/hot.md', content: '# hi\n' },
+  });
+  assert.equal(r.stdout.trim(), '', `must not print an explicit allow: ${r.stdout}`);
+});
+
+test('write to an unrelated wiki file (not session-state.md/hot.md) → silent', () => {
+  withWiki(null, (dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-unrelated',
+        tool_name: 'Write',
+        tool_input: { file_path: join(dir, 'pages', 'note.md'), content: '# note\n' },
+      },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.stdout.trim(), '', `must not print an explicit allow: ${r.stdout}`);
+  });
+});
+
+test(
+  'structural signal: hot.md rewritten with NO 마감/종료 vocabulary, after session-state.md ' +
+    'was already touched this session and no user close signal → ask (2026-07-28 gap, PR #226)',
+  () => {
+    withWiki(null, (dir) => {
+      // Simulates hypo-auto-stage's PostToolUse having already accumulated an
+      // earlier write to session-state.md THIS session.
+      recordTouchedPaths(dir, 'sess-1', 'projects/test-project/session-state.md');
+      const r = runHook(
+        'hypo-close-guard.mjs',
+        {
+          session_id: 'sess-1',
+          tool_name: 'Write',
+          tool_input: {
+            file_path: join(dir, 'projects', 'test-project', 'hot.md'),
+            // The literal text the 2026-07-28 incident wrote into hot.md — reads
+            // as a wrap-up to a human but names no 마감/종료 word, which is
+            // exactly the case close-signals.test.mjs pins as unreachable by
+            // detectSessionCloseArtifact alone.
+            content:
+              '**2026-07-28(13번째 세션): 세 스트림 병렬을 표준으로 등재하고 처음 실행했다.** 사용자 결정으로 …',
+          },
+        },
+        { HYPO_DIR: dir },
+      );
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
+      assert.ok(
+        /WIKI CLOSE GUARD/.test(out.hookSpecificOutput.permissionDecisionReason),
+        `reason should name the guard: ${r.stdout}`,
+      );
+    });
+  },
+);
+
+test('structural signal fires in the opposite order too (session-state.md is the second write)', () => {
+  withWiki(null, (dir) => {
+    recordTouchedPaths(dir, 'sess-2', 'projects/test-project/hot.md');
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-2',
+        tool_name: 'Write',
+        tool_input: {
+          file_path: join(dir, 'projects', 'test-project', 'session-state.md'),
+          content: '# no close words here\n',
+        },
+      },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
+  });
+});
+
+test(
+  'pairing is project-scoped: root hot.md does NOT structurally pair against an ' +
+    "unrelated project's session-state.md (codex review — root hot.md churns every " +
+    'session via hypo-hot-rebuild.mjs and must not false-positive)',
+  () => {
+    withWiki(null, (dir) => {
+      recordTouchedPaths(dir, 'sess-root', 'projects/test-project/session-state.md');
+      const r = runHook(
+        'hypo-close-guard.mjs',
+        {
+          session_id: 'sess-root',
+          tool_name: 'Write',
+          tool_input: {
+            file_path: join(dir, 'hot.md'), // ROOT hot.md, not projects/test-project/hot.md
+            content: '# ordinary rebuilt hot.md, no close wording\n',
+          },
+        },
+        { HYPO_DIR: dir },
+      );
+      assert.equal(
+        r.stdout.trim(),
+        '',
+        `root hot.md must not pair with another project's session-state.md: ${r.stdout}`,
+      );
+    });
+  },
+);
+
+test(
+  "KNOWN WINDOW: once Stop-chain auto-commit (the REAL commitTouchedPaths path, " +
+    'hooks/hypo-auto-commit.mjs → hypo-shared.mjs:1854) clears touched-paths, the ' +
+    "structural signal is gone in the NEXT turn — pins the guard's documented " +
+    "one-turn window, not a claim that it always catches (mirrors how PR #226 " +
+    'pinned its own gap)',
+  () => {
+    withWiki(null, (dir) => {
+      recordTouchedPaths(dir, 'sess-drained', 'projects/test-project/session-state.md');
+      // The actual Stop-chain call shape (hypo-auto-commit.mjs), not a bare
+      // drain: commitFn reports a successful commit, so commitTouchedPaths
+      // clears exactly what it peeked, under one lock — the real path that
+      // empties touched-paths between turns, not a simulation of it.
+      const result = commitTouchedPaths(dir, 'sess-drained', () => ({ committed: true }));
+      assert.equal(result.committed, true, 'the stub commitFn must report success');
+      assert.deepEqual(
+        peekTouchedPaths(dir, 'sess-drained'),
+        [],
+        'touched-paths must actually be empty after a real commitTouchedPaths clear',
+      );
+      const r = runHook(
+        'hypo-close-guard.mjs',
+        {
+          session_id: 'sess-drained',
+          tool_name: 'Write',
+          tool_input: {
+            file_path: join(dir, 'projects', 'test-project', 'hot.md'),
+            // Same wordless-rewrite shape as the 2026-07-28 incident — only
+            // reachable pre-clear via the structural signal, which is now gone.
+            content:
+              '**2026-07-28(13번째 세션): 세 스트림 병렬을 표준으로 등재하고 처음 실행했다.** 사용자 결정으로 …',
+          },
+        },
+        { HYPO_DIR: dir },
+      );
+      assert.equal(
+        r.stdout.trim(),
+        '',
+        `after the clear, a wordless close in a NEW turn is a known miss, not a catch: ${r.stdout}`,
+      );
+    });
+  },
+);
+
+test('only ONE close-artifact file touched this session (no pair yet) and no wording → silent', () => {
+  withWiki(null, (dir) => {
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-lonely',
+        tool_name: 'Write',
+        tool_input: {
+          file_path: join(dir, 'projects', 'test-project', 'hot.md'),
+          content: '# ordinary progress update, no close wording\n',
+        },
+      },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.stdout.trim(), '', `must not print an explicit allow: ${r.stdout}`);
+  });
+});
+
+test(
+  'CASE FOLDING: a mis-cased write (HOT.md) still structurally pairs against ' +
+    'session-state.md written earlier this session (macOS default volume is ' +
+    'case-insensitive — codex review)',
+  () => {
+    withWiki(null, (dir) => {
+      recordTouchedPaths(dir, 'sess-case', 'projects/test-project/session-state.md');
+      const r = runHook(
+        'hypo-close-guard.mjs',
+        {
+          session_id: 'sess-case',
+          tool_name: 'Write',
+          tool_input: {
+            // Deliberately wrong case: the real file on disk is hot.md.
+            file_path: join(dir, 'projects', 'test-project', 'HOT.md'),
+            content: '# ordinary wrap-up, no close wording\n',
+          },
+        },
+        { HYPO_DIR: dir },
+      );
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.hookSpecificOutput.permissionDecision,
+        'ask',
+        `a mis-cased basename must not dodge the structural signal: ${r.stdout}`,
+      );
+    });
+  },
+);
+
+test(
+  'CASE FOLDING: the reverse pairing direction also folds case (Session-State.md)',
+  () => {
+    withWiki(null, (dir) => {
+      recordTouchedPaths(dir, 'sess-case-2', 'projects/test-project/hot.md');
+      const r = runHook(
+        'hypo-close-guard.mjs',
+        {
+          session_id: 'sess-case-2',
+          tool_name: 'Write',
+          tool_input: {
+            file_path: join(dir, 'projects', 'test-project', 'Session-State.md'),
+            content: '# ordinary wrap-up, no close wording\n',
+          },
+        },
+        { HYPO_DIR: dir },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
+    });
+  },
+);
+
+suite('hypo-close-guard.mjs — undecidable structural signal (ask, conservative)');
+
+test(
+  'UNDECIDABLE: no session_id on a project close-artifact write → ask, not silent ' +
+    "pass-through (main decision: 'cannot tell' must not read as 'clean')",
+  () => {
+    withWiki(null, (dir) => {
+      const r = runHook(
+        'hypo-close-guard.mjs',
+        {
+          // session_id deliberately omitted.
+          tool_name: 'Write',
+          tool_input: {
+            file_path: join(dir, 'projects', 'test-project', 'hot.md'),
+            content: '# ordinary wrap-up, no close wording\n',
+          },
+        },
+        { HYPO_DIR: dir },
+      );
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.hookSpecificOutput.permissionDecision,
+        'ask',
+        `an undecidable structural read must ask, not pass silently: ${r.stdout}`,
+      );
+      assert.ok(
+        /could not be determined/.test(out.hookSpecificOutput.permissionDecisionReason),
+        `reason should name the undecidable state: ${r.stdout}`,
+      );
+    });
+  },
+);
+
+test('UNDECIDABLE: a corrupt touched-paths cache file → ask, not silent pass-through', () => {
+  withWiki(null, (dir) => {
+    recordTouchedPaths(dir, 'sess-corrupt', 'projects/test-project/session-state.md');
+    // Corrupt the cache file recordTouchedPaths just wrote — same file
+    // readTouchedPathsOrUndecidable (hypo-close-guard.mjs) reads.
+    writeFileSync(touchedPathsPath(dir, 'sess-corrupt'), 'not valid json{{{');
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-corrupt',
+        tool_name: 'Write',
+        tool_input: {
+          file_path: join(dir, 'projects', 'test-project', 'hot.md'),
+          content: '# ordinary wrap-up, no close wording\n',
+        },
+      },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.hookSpecificOutput.permissionDecision,
+      'ask',
+      `a corrupt cache must ask, not read as 'nothing touched': ${r.stdout}`,
+    );
+  });
+});
+
+test(
+  'UNDECIDABLE vs BROKEN: a hook-itself failure (bad stdin) stays silent even ' +
+    'though an undecidable structural read asks — the two must not be conflated',
+  () => {
+    const r = runHook('hypo-close-guard.mjs', 'not-json');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(
+      r.stdout.trim(),
+      '',
+      `a broken hook must stay silent, unlike an undecidable structural read: ${r.stdout}`,
+    );
+  },
+);
+
+suite('hypo-close-guard.mjs — contract (continued)');
+
+test('lexical signal alone: a wordy close heading fires before its pair ever lands (Edit new_string)', () => {
+  withWiki(null, (dir) => {
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-3',
+        tool_name: 'Edit',
+        tool_input: {
+          file_path: join(dir, 'projects', 'test-project', 'session-state.md'),
+          old_string: 'old heading',
+          new_string: '**2026-08-04 마감**',
+        },
+      },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
+  });
+});
+
+test('ISSUE-74 must not regress: a genuine user close signal in the transcript is NOT re-asked', () => {
+  withWiki(null, (dir) => {
+    recordTouchedPaths(dir, 'sess-4', 'projects/test-project/session-state.md');
+    const transcript = join(dir, 'transcript.jsonl');
+    writeFileSync(
+      transcript,
+      JSON.stringify({ type: 'user', message: { role: 'user', content: '세션 마무리 해줘' } }) +
+        '\n',
+    );
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-4',
+        transcript_path: transcript,
+        tool_name: 'Write',
+        tool_input: {
+          file_path: join(dir, 'projects', 'test-project', 'hot.md'),
+          content: '**2026-08-04(1번째 세션): 세션을 마감했다.**',
+        },
+      },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(
+      r.stdout.trim(),
+      '',
+      `a genuine user close must not be re-asked: ${r.stdout}`,
+    );
+  });
+});
+
+test('HYPO_SKIP_GATE=1 bypasses the guard even on a structural hit', () => {
+  withWiki(null, (dir) => {
+    recordTouchedPaths(dir, 'sess-5', 'projects/test-project/session-state.md');
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-5',
+        tool_name: 'Write',
+        tool_input: {
+          file_path: join(dir, 'projects', 'test-project', 'hot.md'),
+          content: 'wrap-up narrative, no close words',
+        },
+      },
+      { HYPO_DIR: dir, HYPO_SKIP_GATE: '1' },
+    );
+    assert.equal(r.stdout.trim(), '', `must not print an explicit allow: ${r.stdout}`);
+  });
+});
+
+test('touched-paths accumulated for a DIFFERENT session_id does not leak into this one', () => {
+  withWiki(null, (dir) => {
+    recordTouchedPaths(dir, 'sess-other', 'projects/test-project/session-state.md');
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-mine',
+        tool_name: 'Write',
+        tool_input: {
+          file_path: join(dir, 'projects', 'test-project', 'hot.md'),
+          content: 'wrap-up narrative, no close words',
+        },
+      },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.stdout.trim(), '', `must not print an explicit allow: ${r.stdout}`);
+  });
 });
