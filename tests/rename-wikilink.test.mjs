@@ -4,8 +4,21 @@
 // build on each other; suites may not — that is what lets the runner shard.
 
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync } from 'node:fs';
+import {
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  symlinkSync,
+  cpSync,
+  chmodSync,
+  statSync,
+  mkdtempSync,
+  rmSync,
+} from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, basename } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   collectPagesLint,
   collectPagesLinkable,
@@ -16,11 +29,33 @@ import {
   extractWikilinks,
 } from '../scripts/lib/wikilink.mjs';
 import { test, suite } from './harness.mjs';
-import { run, withTmpDir } from './helpers.mjs';
+import { run, withTmpDir, SCRIPTS, SESSION_TMP_HOME } from './helpers.mjs';
 
 // ── rename.mjs (inbound wikilink rewrite) ─────────────────────────────────────
 
 suite('rename.mjs');
+
+// Rewrites go through a temp file and a rename, which means a brand new inode.
+// A new inode carries new permissions, so without carrying the old mode over an
+// inbound rewrite would quietly turn a 0600 page into 0644 and widen it.
+test('an inbound rewrite keeps the page mode it found (no widening via temp+rename)', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nself\n');
+    const priv = join(dir, 'pages', 'private.md');
+    writeFileSync(priv, '---\ntitle: private\n---\nsee [[foo]].\n');
+    chmodSync(priv, 0o600);
+
+    const r = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=foo', '--to=bar', '--apply', '--json']);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.ok(readFileSync(priv, 'utf-8').includes('[[bar]]'), 'the link was actually rewritten');
+    assert.equal(
+      statSync(priv).mode & 0o777,
+      0o600,
+      'a rewritten page keeps its original mode',
+    );
+  });
+});
 
 test('rewrites bare / alias / anchor inbound links and moves the page', () => {
   withTmpDir((dir) => {
@@ -303,6 +338,175 @@ test('--to with a regular-file ancestor → refused before any rewrite (page mod
       'no inbound rewrite landed before refusal',
     );
   });
+});
+
+// Regression: the move step used to be write-to-new-path, then rmSync the old
+// one — two syscalls with an observable gap between them. A crash landing in
+// that gap left both paths on disk, and re-running hit the --to-already-exists
+// guard forever (exit 1, no way out without a manual delete). The fix folds the
+// move into a single renameSync, so the only two states reachable are "old path
+// only" and "new path only" — never both.
+//
+// This proves it by actually killing a child process bracketing the real
+// renameSync call — right before it and right after it — rather than before
+// the unrelated body-write step. Killing before body-write would pass under a
+// write-then-remove implementation too (nothing has moved yet either way), so
+// it wouldn't tell the two implementations apart. Killing on the renameSync
+// call itself is the only place that distinguishes "one syscall" from "two
+// syscalls with a gap".
+//
+// The kill hook is NOT in the shipped script: this builds ONE throwaway copy
+// of scripts/ with both anchors patched, and every crash test below spawns
+// that copy. scripts/rename.mjs in the repo stays exactly as written above.
+const KILL_COPY_ROOT = mkdtempSync(join(tmpdir(), 'hypo-rename-kill-'));
+process.on('exit', () => {
+  try {
+    rmSync(KILL_COPY_ROOT, { recursive: true, force: true });
+  } catch {}
+});
+const KILL_SCRIPTS = join(KILL_COPY_ROOT, 'scripts');
+const KILL_RENAME = join(KILL_SCRIPTS, 'rename.mjs');
+cpSync(SCRIPTS, KILL_SCRIPTS, { recursive: true });
+{
+  let src = readFileSync(KILL_RENAME, 'utf-8');
+  const pageAnchor = 'renameSync(fromPage.path, toPath);';
+  const dirAnchor = 'renameSync(fromAbs, toAbs);';
+  assert.ok(src.includes(pageAnchor), `page-mode renameSync anchor not found — did rename.mjs change?`);
+  assert.ok(src.includes(dirAnchor), `dir-mode renameSync anchor not found — did rename.mjs change?`);
+  src = src.replace(
+    pageAnchor,
+    `if (process.env.HYPO_TEST_KILL_PAGE_PRE) process.kill(process.pid, 'SIGKILL');\n        ${pageAnchor}\n        if (process.env.HYPO_TEST_KILL_PAGE_POST) process.kill(process.pid, 'SIGKILL');`,
+  );
+  src = src.replace(
+    dirAnchor,
+    `if (process.env.HYPO_TEST_KILL_DIR_PRE) process.kill(process.pid, 'SIGKILL');\n      ${dirAnchor}\n      if (process.env.HYPO_TEST_KILL_DIR_POST) process.kill(process.pid, 'SIGKILL');`,
+  );
+  writeFileSync(KILL_RENAME, src);
+}
+
+test('crash bracketing the single-file renameSync converges, two paths never coexist (page mode)', () => {
+  for (const [envVar, label] of [
+    ['HYPO_TEST_KILL_PAGE_PRE', 'pre-rename'],
+    ['HYPO_TEST_KILL_PAGE_POST', 'post-rename'],
+  ]) {
+    withTmpDir((base) => {
+      const wiki = join(base, 'wiki');
+      const home = join(base, 'home');
+      mkdirSync(join(wiki, 'pages'), { recursive: true });
+      mkdirSync(home, { recursive: true });
+      // Self-referential link forces fromPage._rewritten, so the pre-rename
+      // write actually runs before the PRE kill point.
+      writeFileSync(join(wiki, 'pages', 'foo.md'), '---\ntitle: foo\n---\nsee [[foo]] itself.\n');
+
+      const cmd = [KILL_RENAME, `--hypo-dir=${wiki}`, '--from=foo', '--to=bar', '--apply', '--json'];
+      const killed = spawnSync(process.execPath, cmd, {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: home, [envVar]: '1' },
+      });
+      assert.equal(killed.signal, 'SIGKILL', `[${label}] expected the kill hook to fire: ${killed.stderr}`);
+
+      const fooPath = join(wiki, 'pages', 'foo.md');
+      const barPath = join(wiki, 'pages', 'bar.md');
+      const fooExists = existsSync(fooPath);
+      const barExists = existsSync(barPath);
+      // The property the fix pins: renameSync is one syscall, so no kill point
+      // can observe both the old and the new path at once.
+      assert.ok(!(fooExists && barExists), `[${label}] old and new path must never coexist after a crash`);
+      assert.ok(fooExists || barExists, `[${label}] exactly one path must survive the crash`);
+
+      const rerun = spawnSync(process.execPath, cmd, { encoding: 'utf-8', env: { ...process.env, HOME: home } });
+      if (fooExists) {
+        // Killed before the rename: --from still resolves, re-run finishes the move.
+        assert.equal(
+          rerun.status,
+          0,
+          `[${label}] re-run from the pre-rename state must converge: ${rerun.stdout}${rerun.stderr}`,
+        );
+        assert.ok(existsSync(barPath), `[${label}] bar.md exists after re-run`);
+        assert.ok(!existsSync(fooPath), `[${label}] foo.md gone after re-run`);
+        const bar = readFileSync(barPath, 'utf-8');
+        assert.ok(bar.includes('[[bar]]'), `[${label}] self-reference rewrite carried through: ${bar}`);
+      } else {
+        // Killed after the rename: the move already landed, --from correctly
+        // no longer resolves — nothing left to converge.
+        assert.equal(
+          rerun.status,
+          1,
+          `[${label}] already-moved re-run must report --from missing, not redo anything: ${rerun.stdout}`,
+        );
+      }
+    });
+  }
+});
+
+// Same property, directory mode (BLOCKER: moved-body content used to be written
+// AFTER renameSync, so a crash between them left the relocated subtree's own
+// internal links pointing at the pre-move prefix forever — --from no longer
+// resolved once the directory had moved, so re-run couldn't repair it. The fix
+// writes moved bodies at their OLD paths before the rename, so the content
+// travels with the directory instead of racing it.
+test('crash bracketing the directory renameSync converges, two dirs never coexist (directory mode)', () => {
+  for (const [envVar, label] of [
+    ['HYPO_TEST_KILL_DIR_PRE', 'pre-rename'],
+    ['HYPO_TEST_KILL_DIR_POST', 'post-rename'],
+  ]) {
+    withTmpDir((base) => {
+      const wiki = join(base, 'wiki');
+      const home = join(base, 'home');
+      mkdirSync(join(wiki, 'projects', 'old'), { recursive: true });
+      mkdirSync(home, { recursive: true });
+      // a → b is an intra-subtree full-slug link: it MUST be rewritten to the
+      // new prefix, so a non-empty moved-body write actually happens.
+      writeFileSync(
+        join(wiki, 'projects', 'old', 'a.md'),
+        '---\ntitle: a\n---\nsee [[projects/old/b]].\n',
+      );
+      writeFileSync(join(wiki, 'projects', 'old', 'b.md'), '---\ntitle: b\n---\nb page\n');
+
+      const cmd = [
+        KILL_RENAME,
+        `--hypo-dir=${wiki}`,
+        '--from=projects/old',
+        '--to=projects/new',
+        '--apply',
+        '--json',
+      ];
+      const killed = spawnSync(process.execPath, cmd, {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: home, [envVar]: '1' },
+      });
+      assert.equal(killed.signal, 'SIGKILL', `[${label}] expected the kill hook to fire: ${killed.stderr}`);
+
+      const oldDir = join(wiki, 'projects', 'old');
+      const newDir = join(wiki, 'projects', 'new');
+      const oldExists = existsSync(oldDir);
+      const newExists = existsSync(newDir);
+      assert.ok(!(oldExists && newExists), `[${label}] old and new directory must never coexist after a crash`);
+      assert.ok(oldExists || newExists, `[${label}] exactly one directory must survive the crash`);
+
+      const rerun = spawnSync(process.execPath, cmd, { encoding: 'utf-8', env: { ...process.env, HOME: home } });
+      if (oldExists) {
+        assert.equal(
+          rerun.status,
+          0,
+          `[${label}] re-run from the pre-rename state must converge: ${rerun.stdout}${rerun.stderr}`,
+        );
+        assert.ok(existsSync(join(newDir, 'a.md')), `[${label}] a.md exists at the new path after re-run`);
+        assert.ok(!existsSync(oldDir), `[${label}] projects/old gone after re-run`);
+        const a = readFileSync(join(newDir, 'a.md'), 'utf-8');
+        assert.ok(
+          a.includes('[[projects/new/b]]'),
+          `[${label}] intra-subtree link rewritten to the new prefix: ${a}`,
+        );
+      } else {
+        assert.equal(
+          rerun.status,
+          1,
+          `[${label}] already-moved re-run must report --from missing, not redo anything: ${rerun.stdout}`,
+        );
+      }
+    });
+  }
 });
 
 // ── rename.mjs directory mode (subtree relocation) ────────────────────────────
