@@ -8,3 +8,7 @@
 # writes (crystallize apply, deriveRootLogEntries). Normally deleted immediately;
 # a crashed holder can leave a stale one, which must never be committed.
 *.lock
+# The lock is published by linking a staged sibling into place. `*.lock` does not
+# match the staging name, and a crash between the link and its cleanup leaves one
+# behind — where `git add -A` would happily pick it up.
+*.lock.*.tmp

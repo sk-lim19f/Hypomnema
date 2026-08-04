@@ -2807,6 +2807,141 @@ test('steals a stale lock whose holder died (mtime older than staleMs)', () => {
   });
 });
 
+// Atomicity here is a property of HOW the lock is published, and no black-box
+// assertion can observe the window it closes: create-then-write leaves the lock
+// empty for microseconds, and a test would have to preempt the holder inside
+// them. Pin the mechanism instead — reintroducing openSync-then-write on the
+// lock path is what would silently revive the race.
+test('publishes the lock by linking a complete file, never by creating an empty one (IMPR-32)', () => {
+  const src = readFileSync(join(REPO, 'hooks', 'hypo-shared.mjs'), 'utf-8');
+  const body = src.slice(src.indexOf('export function withFileLock'));
+  // Comments in here discuss the create-then-write shape by name, so strip them
+  // — otherwise the assertion below fires on the prose explaining why it's gone.
+  const acquire = body
+    .slice(0, body.indexOf('return fn();'))
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  assert.match(acquire, /linkSync\(tmpPath, lockPath\)/, 'the lock is published by link');
+  assert.equal(
+    /openSync\(\s*lockPath/.test(acquire),
+    false,
+    'the lock path is never created directly — that publishes it empty and a stealer reads it as a pid-less legacy lock',
+  );
+  // A predictable staging name is reachable by a later run of the same pid, and
+  // after a crash between the link and its cleanup the staging name and the lock
+  // are one inode — writing the former would rewrite the live lock.
+  assert.match(acquire, /randomBytes\(/, 'the staging name is per-call random');
+  assert.match(acquire, /flag: 'wx'/, 'the staging write is exclusive, never onto an existing file');
+});
+
+// A directory we cannot write to is not the same event as a lock someone else
+// holds, and only the second one may become ELOCKTIMEOUT. Conflating them sends
+// the caller to the proposal gate over what is really a broken vault.
+test('a staging failure with no lock present surfaces the real error, not a lock timeout (IMPR-32)', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withTmpDir((dir) => {
+    const sub = join(dir, 'sub');
+    mkdirSync(sub);
+    const target = join(sub, 'log.md');
+    chmodSync(sub, 0o555); // nothing can be created here, and no lock is held
+    try {
+      assert.throws(
+        () => wfl(target, () => {}, { timeoutMs: 200, pollMs: 20 }),
+        (err) => err.code === 'EACCES' || err.code === 'EPERM',
+        'an unwritable directory is a write failure, not contention',
+      );
+    } finally {
+      chmodSync(sub, 0o755);
+    }
+  });
+});
+
+// The lock is published by linking a fully-written sibling into place, so no
+// writer can ever observe an empty lock and mistake a holder mid-acquire for a
+// pid-less legacy lock (which it would then steal, reviving the exact race the
+// liveness check closes). The staging file must not outlive the acquire.
+test('leaves no staging file behind, and the published lock is never empty (IMPR-32)', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'log.md');
+    wfl(target, () => {
+      assert.deepEqual(
+        readdirSync(dir).filter((f) => f.endsWith('.tmp')),
+        [],
+        'the staging sibling is gone by the time the critical section runs — the lock is the link, not a file we are still filling in',
+      );
+    });
+    assert.deepEqual(readdirSync(dir), [], 'no lock and no staging residue after release');
+  });
+});
+
+// Release must be as ownership-aware as acquire. A writer that was stolen from
+// used to unlink whatever lock sat at the path on its way out, handing a third
+// writer the critical section while the current holder was still inside it.
+test('does not release a lock that was stolen and now belongs to another holder (IMPR-32)', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'log.md');
+    const lockPath = `${target}.lock`;
+    wfl(target, () => {
+      // Simulate being stolen from mid-critical-section: our lock is replaced by
+      // a live foreign holder's. A pid we are certain is not ours and not alive
+      // would be indistinguishable from a dead holder, so use a live one.
+      writeFileSync(lockPath, String(process.ppid));
+    });
+    assert.equal(
+      existsSync(lockPath),
+      true,
+      "the foreign holder's lock survives our release — we only remove a lock still recording our own pid",
+    );
+  });
+});
+
+// The liveness check is only as good as the pid actually being on disk. Without
+// this, dropping the write leaves every real lock empty — the stealer reads no
+// pid, falls back to the mtime-only rule, and the defense is dead in production
+// while the test above still passes (it writes the pid itself). (IMPR-32)
+test('records the holder pid in the lock file while the critical section runs (IMPR-32)', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'log.md');
+    const lockPath = `${target}.lock`;
+    let recorded = null;
+    wfl(target, () => {
+      recorded = readFileSync(lockPath, 'utf-8').trim();
+    });
+    assert.equal(
+      recorded,
+      String(process.pid),
+      'the lock file holds the holder pid, which is what makes the liveness check possible',
+    );
+  });
+});
+
+test('does not steal a lock whose recorded holder pid is still alive, even past staleMs — the holder keeps its entry (IMPR-32)', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'log.md');
+    const lockPath = `${target}.lock`;
+    writeFileSync(target, '- entry from writer 1\n'); // writer 1's already-committed entry
+    writeFileSync(lockPath, String(process.pid)); // writer 1 still holds it — we ARE that pid
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, old, old); // preempted well past staleMs, but still alive
+    assert.throws(
+      () =>
+        wfl(
+          target,
+          () => writeFileSync(target, readFileSync(target, 'utf-8') + '- entry from writer 2\n'),
+          { staleMs: 1000, timeoutMs: 200, pollMs: 20 },
+        ),
+      /lock-timeout/,
+      'writer 2 must time out instead of stealing a live lock',
+    );
+    assert.equal(
+      readFileSync(target, 'utf-8'),
+      '- entry from writer 1\n',
+      "writer 1's entry survives — a live holder's lock is never stolen out from under it",
+    );
+    assert.equal(existsSync(lockPath), true, "writer 1's lock is left intact");
+  });
+});
+
 test('throws lock-timeout when a fresh lock is held past timeoutMs', () => {
   withTmpDir((dir) => {
     const target = join(dir, 'log.md');
