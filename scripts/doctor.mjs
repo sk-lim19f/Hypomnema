@@ -25,6 +25,7 @@ import { parseFrontmatter } from './lib/frontmatter.mjs';
 import {
   readSyncState,
   readSyncLastSuccess,
+  classifySyncOp,
   projectSuggestionsPath,
   collectProjectWorkingDirs,
   detectSessionCloseArtifact,
@@ -1092,21 +1093,24 @@ function checkSyncState(hypoDir) {
             .map((e) => `${e.op || '?'}@${e.timestamp || '?'}`)
             .join(', ')}${entries.length > 5 ? ` (+${entries.length - 5} more)` : ''}.`
         : '';
-    // 'conflict-unresolved' (the merge --abort itself failed, syncRemote) is
-    // the more dangerous of the two conflict ops: the tree may still be
-    // half-merged (unmerged index entries, or an in-progress MERGE_HEAD).
-    // Checked BEFORE the generic startsWith('conflict') branch below — that
-    // branch used to swallow this op too and claim "your local work is
-    // committed", which is not true when the abort itself failed, and its
-    // `git pull --no-rebase` advice would simply be refused by git while a
-    // merge is still in progress. Wording mirrors hypo-session-start.mjs's
+    // classifySyncOp (hooks/hypo-shared.mjs) is the single judgment both this
+    // check and hypo-session-start.mjs's syncStateNotice branch on, so the
+    // two surfaces cannot silently diverge on WHICH op gets which treatment.
+    // 'conflict-unresolved' — the merge --abort itself failed — is the more
+    // dangerous of the two conflict ops: the tree may still be
+    // half-merged (unmerged index entries, or an in-progress MERGE_HEAD), so
+    // it gets dedicated guidance rather than the plain-conflict branch below,
+    // which claims "your local work is committed" (not true when the abort
+    // itself failed) and advises `git pull --no-rebase` (git would simply
+    // refuse that mid-merge). Wording mirrors hypo-session-start.mjs's
     // syncStateNotice so the two surfaces never contradict each other.
-    if (last.op === 'conflict-unresolved') {
+    const cls = classifySyncOp(last.op);
+    if (cls === 'conflict-unresolved') {
       warn(
         'Sync state',
         `${entries.length} unresolved sync issue(s) — last: remote diverged AND the automatic merge-abort failed; the working tree may still be half-merged (unmerged paths or an in-progress merge). Do NOT commit or push yet. Run \`git status\` first: if a merge is in progress, resolve the conflicts, then \`git add <resolved paths>\` and \`git commit\` (git refuses a commit while unmerged entries remain staged) — or run \`git merge --abort\` to discard it instead, before continuing.${unresolvedList}${successSuffix}`,
       );
-    } else if (String(last.op || '').startsWith('conflict')) {
+    } else if (cls === 'conflict') {
       // A merge conflict needs a real manual merge, not a plain push/pull —
       // give the same explicit guidance session-start does instead of the
       // generic hint. This branch is unmerged-index-free by construction (the
@@ -1114,6 +1118,16 @@ function checkSyncState(hypoDir) {
       warn(
         'Sync state',
         `${entries.length} unresolved sync issue(s) — last: remote diverged (merge conflict). Your local work is committed; the other machine's version is on the remote. Resolve with \`git pull --no-rebase\`, fix conflicts, \`git add\` them, then commit and push.${unresolvedList}${successSuffix}`,
+      );
+    } else if (cls === 'unknown-conflict') {
+      // An unrecognized `conflict*` op — a future syncRemote failure mode
+      // this check has no dedicated branch for. Neither the 'conflict'
+      // branch's "committed" claim nor the 'conflict-unresolved' branch's
+      // "abort failed" claim is known to hold here, so assert neither:
+      // report the state as unknown and treat it as unresolved.
+      warn(
+        'Sync state',
+        `${entries.length} unresolved sync issue(s) — last: remote diverged — an unrecognized conflict-related sync failure ('${last.op}') was recorded. Its resolution state cannot be confirmed automatically — treat it as unresolved. Run \`git status\` first to check for unmerged paths or an in-progress merge before committing or pushing.${unresolvedList}${successSuffix}`,
       );
     } else {
       warn(

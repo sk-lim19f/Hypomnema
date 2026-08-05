@@ -1674,6 +1674,39 @@ function syncStatePath(hypoDir) {
 }
 
 /**
+ * Classify a sync-state `op` into the guidance branch it needs. Centralized
+ * here — rather than each surface repeating its own string check — because
+ * hypo-session-start.mjs's syncStateNotice and doctor.mjs's checkSyncState
+ * used to each carry their own comparison, and drifted: session-start's
+ * exact `=== 'conflict'` check silently missed 'conflict-unresolved' (the
+ * MORE dangerous op, since the abort itself failed and the tree may still be
+ * half-merged) and fell through to the generic "last sync failed" line,
+ * while doctor's `startsWith('conflict')` already caught it. Both
+ * callers now branch on this single function's return value, so they cannot
+ * silently diverge on WHICH op gets which treatment again — only on the
+ * prose each renders for a given branch.
+ *
+ * Both known ops are matched by EXACT string, not startsWith: a future
+ * `conflict-*` value this function has never seen (e.g. a new syncRemote
+ * failure mode added later) must not silently fall into either known
+ * bucket. 'conflict' asserts the abort succeeded and local work is safely
+ * committed; 'conflict-unresolved' asserts the abort itself failed. Neither
+ * claim is known to hold for an op nobody has written a branch for yet, so
+ * it gets its own conservative 'unknown-conflict' bucket instead of
+ * inheriting either surface's reassurance by accident.
+ *
+ * @param {string} op
+ * @returns {'conflict-unresolved'|'conflict'|'unknown-conflict'|'other'}
+ */
+export function classifySyncOp(op) {
+  const s = String(op || '');
+  if (s === 'conflict-unresolved') return 'conflict-unresolved';
+  if (s === 'conflict') return 'conflict';
+  if (s.startsWith('conflict')) return 'unknown-conflict';
+  return 'other';
+}
+
+/**
  * Append a sync failure entry. Best-effort — never throws, since a failed
  * failure-log must not break the Stop hook that calls it.
  *

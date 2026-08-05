@@ -329,6 +329,48 @@ test('doctor-sync-state-warn: conflict-unresolved entry → dedicated half-merge
   });
 });
 
+// A `conflict*` op this check has no dedicated branch for (a future
+// syncRemote failure mode, neither 'conflict' nor 'conflict-unresolved')
+// must not default into the plain-conflict "committed" reassurance via a
+// startsWith('conflict') fallback — that claim is not known to hold for an
+// unrecognized op, and neither is 'conflict-unresolved''s "the abort failed".
+// Report the state as unknown and treat it as unresolved instead.
+test('doctor-sync-state-warn: unrecognized conflict-* op → conservative unresolved guidance, no borrowed claim', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    mkdirSync(join(dir, 'sources'), { recursive: true });
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({
+        timestamp: '2026-08-05T00:00:00Z',
+        op: 'conflict-future-op',
+        error: 'unrecognized failure mode',
+        host: 'test',
+      }) + '\n',
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Sync state');
+    assert.ok(check, 'Sync state check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${check.detail}`);
+    assert.ok(
+      /diverged/.test(check.detail) && /unresolved/.test(check.detail),
+      `unrecognized conflict-* op must warn as unresolved: ${check.detail}`,
+    );
+    assert.ok(
+      !/your local work is committed/i.test(check.detail),
+      `unrecognized conflict-* op must NOT borrow the clean-conflict "committed" claim: ${check.detail}`,
+    );
+    assert.ok(
+      !/automatic merge-abort failed/i.test(check.detail),
+      `unrecognized conflict-* op must NOT borrow the conflict-unresolved "abort failed" claim: ${check.detail}`,
+    );
+  });
+});
+
 // FEAT-34: last-success timestamp visibility in the sync-state check.
 suite('doctor.mjs — FEAT-34: sync-last-success visibility');
 
