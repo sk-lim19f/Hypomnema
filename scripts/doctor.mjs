@@ -13,12 +13,13 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
-import { join, relative, extname } from 'path';
+import { join, relative, extname, dirname } from 'path';
 import { homedir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { readRenameMarker, renameMarkerPath, RENAME_MARKER_REL } from './lib/rename-marker.mjs';
 import { resolveGitHooksDir } from './lib/git-hooks-dir.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 import {
@@ -507,6 +508,116 @@ function checkGit(hypoDir) {
       `Points outside this repository (${resolved.path}) — /hypo:init will not install there`,
     );
   }
+}
+
+// rename.mjs --apply writes .cache/rename-in-progress.json before its first
+// inbound-link rewrite and removes it only after the terminal move lands (see
+// rename.mjs's writeRenameMarker/clearRenameMarker). A marker still present
+// means the process died mid-run: some inbound wikilinks may already point at
+// `to` while the page/directory itself still sits at `from`. checkBrokenLinks
+// below would just report those as generic broken links (W4's doctor
+// counterpart) with no clue why — this names the cause and the exact fix.
+// Re-running the SAME command converges on its own (the module docstring's
+// move-last invariant): nothing to merge or roll back by hand.
+// Best-effort: does this vault's git repo leave `markerPath` un-ignored (either
+// already tracked, or plain untracked-and-stageable)? `git check-ignore` answers
+// both at once — a tracked file is also reported "not ignored" by it, since
+// .gitignore rules don't retroactively apply to tracked paths. Fails CLOSED to
+// "don't know, say nothing": no `.git`, no git on PATH, or any non-0/1 exit
+// (128 = not a repo / path outside it / other error) all return false, because
+// this is advisory-only and a wrong guess is worse than silence (codex CONCERN 3
+// — never turn an inconclusive git query into an error of its own).
+function markerNotGitIgnored(hypoDir, markerPath) {
+  if (!existsSync(join(hypoDir, '.git'))) return false;
+  const rel = relative(hypoDir, markerPath);
+  const r = spawnSync('git', ['-C', hypoDir, 'check-ignore', '-q', rel], { encoding: 'utf-8' });
+  if (r.error || r.status === null) return false;
+  if (r.status !== 0 && r.status !== 1) return false; // 128 etc — inconclusive
+  return r.status === 1; // check-ignore's "not ignored" exit code
+}
+
+function checkIncompleteRename(hypoDir) {
+  // "no marker" and "a marker we cannot read" are different answers and must not
+  // collapse. readRenameMarker returns null for both, so ask the filesystem
+  // which one it is: a present-but-unreadable marker still means a rename did
+  // not finish, and reporting that as a pass would make the detector fail open
+  // on exactly the case it exists for.
+  const markerPath = renameMarkerPath(hypoDir);
+  const present = existsSync(markerPath);
+  if (!present) {
+    pass('Incomplete rename', 'No rename-in-progress marker found');
+    return;
+  }
+
+  // codex CONCERN 3: a legacy/custom vault whose .gitignore predates
+  // templates/gitignore's `.cache/` entry (init never edits an existing
+  // .gitignore) can let `git add -A` commit this marker, producing a ghost
+  // warning on another machine that never ran a rename at all. Advisory only —
+  // never turns the rename itself into an error — appended to every branch
+  // below that reports on a present marker.
+  const gitAdvisory = markerNotGitIgnored(hypoDir, markerPath)
+    ? ` This vault's git repo does not ignore ${dirname(RENAME_MARKER_REL)}/ — \`git add -A\` could commit this marker and produce a ghost warning on another machine. Add \`.cache/\` to .gitignore.`
+    : '';
+
+  const marker = readRenameMarker(hypoDir);
+  if (!marker || !marker.from || !marker.to) {
+    warn(
+      'Incomplete rename',
+      `${markerPath} exists but is unreadable or missing its from/to fields, so a rename did not finish and this cannot say which one. Inspect the file, re-run that rename to converge, then delete the marker.${gitAdvisory}`,
+    );
+    return;
+  }
+
+  // codex BLOCKER 2: the marker alone cannot distinguish a genuinely stuck
+  // rename from one that finished right before the process died — rename.mjs's
+  // move (renameSync) is the terminal step, and the marker is only cleared
+  // AFTER it. Cross-check `from`/`to` (vault-root-relative) against the
+  // filesystem to tell the three reachable states apart.
+  const { mode, from, to, started_at } = marker;
+  const label = mode === 'directory' ? 'directory' : 'page';
+  const fromExists = existsSync(join(hypoDir, from));
+  const toExists = existsSync(join(hypoDir, to));
+  const cmd = `node ${join(PKG_ROOT, 'scripts', 'rename.mjs')} --hypo-dir=${hypoDir} --from=${from} --to=${to} --apply`;
+
+  if (fromExists && !toExists) {
+    // The real in-progress case: --from still resolves, so re-running the
+    // IDENTICAL command converges on its own (rename.mjs's move-last invariant).
+    warn(
+      'Incomplete rename',
+      `a ${label} rename from '${from}' to '${to}' did not finish` +
+        (started_at ? ` (started ${started_at})` : '') +
+        ` — some inbound links may already point at the new name while the ${label} itself has not moved. Re-run the identical rename to converge: ${cmd}${gitAdvisory}`,
+    );
+    return;
+  }
+
+  if (!fromExists && toExists) {
+    // The move already landed — renameSync is one syscall, so this can only mean
+    // the process died AFTER it and BEFORE clearRenameMarker ran. Re-running the
+    // same command here would just fail (`--from` no longer resolves — see
+    // rename.mjs's own "did not resolve to a unique existing page" refusal), so
+    // suggesting a re-run (the prior behavior) handed the user a command that
+    // errors. Nothing to converge: the marker is pure leftover.
+    warn(
+      'Incomplete rename',
+      `a ${label} rename from '${from}' to '${to}' already finished (the ${label} moved) but its ` +
+        `in-progress marker was never cleared — the process likely died right after the move landed. ` +
+        `Nothing left to redo; just delete the stale marker: rm ${markerPath}${gitAdvisory}`,
+    );
+    return;
+  }
+
+  // Both paths exist, or neither does — the marker's from/to no longer map onto
+  // a determinable state (e.g. something else since recreated one of the two
+  // paths). Refuse to guess in either direction; a human needs to look.
+  warn(
+    'Incomplete rename',
+    `${markerPath} names a ${label} rename from '${from}' to '${to}', but ${
+      fromExists && toExists
+        ? 'BOTH the from and to paths currently exist'
+        : 'NEITHER the from nor the to path currently exists'
+    } — cannot tell whether the rename finished. Inspect both paths by hand, then either re-run the rename or delete the marker: ${markerPath}${gitAdvisory}`,
+  );
 }
 
 function checkBrokenLinks(hypoDir, ignorePatterns = []) {
@@ -1830,6 +1941,7 @@ if (rootOk) {
   checkFiles(args.hypoDir);
   checkScanIgnoreFile(args.hypoDir);
   checkBrokenLinks(args.hypoDir, ignorePatterns);
+  checkIncompleteRename(args.hypoDir);
   checkVerifyBy(args.hypoDir, ignorePatterns);
 }
 checkHooks(coreManagedByPlugin);

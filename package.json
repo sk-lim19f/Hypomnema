@@ -40,6 +40,7 @@
     "scripts/lib/pkg-json.mjs",
     "scripts/lib/plugin-detect.mjs",
     "scripts/lib/project-create.mjs",
+    "scripts/lib/rename-marker.mjs",
     "scripts/lib/schema-vocab.mjs",
     "scripts/lib/template-schema-version.mjs",
     "scripts/lib/wd-match.mjs",

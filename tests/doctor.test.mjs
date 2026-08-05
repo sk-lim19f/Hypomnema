@@ -1716,3 +1716,225 @@ test('pkgRoot .git is corrupt so git status exits nonzero → warn "cannot class
     }
   });
 });
+
+// ── 'Incomplete rename' — .cache/rename-in-progress.json detection ────────────
+//
+// rename.mjs writes this marker before its first inbound-link rewrite and
+// removes it after the terminal move (see tests/rename-wikilink.test.mjs's
+// "crash-recovery marker" suite, which owns rename.mjs's write/clear side).
+// This suite owns doctor.mjs's READ side: report shape when the marker is
+// absent, well-formed, or present-but-broken.
+
+suite("doctor.mjs — 'Incomplete rename' marker detection");
+
+function markerFixtureWiki(dir) {
+  writeFileSync(join(dir, 'hypo-config.md'), '# config');
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  mkdirSync(join(dir, 'projects'), { recursive: true });
+  mkdirSync(join(dir, 'sources'), { recursive: true });
+  mkdirSync(join(dir, '.cache'), { recursive: true });
+}
+
+test('no marker file → Incomplete rename passes', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir);
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Incomplete rename');
+    assert.ok(check, 'Incomplete rename check not found');
+    assert.equal(check.status, 'pass', `expected pass with no marker: ${check.detail}`);
+  });
+});
+
+test('a well-formed marker → warn naming from/to and a runnable re-run command', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir);
+    // codex BLOCKER 2: doctor now cross-checks from/to against the filesystem to
+    // tell a genuinely-stuck rename apart from a finished one whose marker just
+    // never got cleared. `from` present + `to` absent is what "genuinely
+    // mid-rename, --from still resolves" actually looks like — without this the
+    // fixture named neither path and fell into the (correct, but different)
+    // "cannot tell" branch instead of the re-run branch this test means to pin.
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
+    writeFileSync(
+      join(dir, '.cache', 'rename-in-progress.json'),
+      JSON.stringify({
+        mode: 'page',
+        from: 'pages/foo.md',
+        to: 'pages/bar.md',
+        started_at: '2026-08-04T00:00:00.000Z',
+      }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Incomplete rename');
+    assert.ok(check, 'Incomplete rename check not found');
+    assert.equal(check.status, 'warn', `expected warn with a marker present: ${check.detail}`);
+    assert.ok(check.detail.includes('pages/foo.md'), `detail must name the from-page: ${check.detail}`);
+    assert.ok(check.detail.includes('pages/bar.md'), `detail must name the to-page: ${check.detail}`);
+    assert.ok(
+      /node .*rename\.mjs .*--from=pages\/foo\.md .*--to=pages\/bar\.md .*--apply/.test(check.detail),
+      `detail must include an exact runnable re-run command: ${check.detail}`,
+    );
+  });
+});
+
+// The fail-open case the coordinator caught: readRenameMarker collapses "no
+// file" and "unreadable file" to the same null, so checkIncompleteRename must
+// ask existsSync() separately and never let a present-but-broken marker fall
+// through to the "no marker" pass branch.
+test('marker file exists but is invalid JSON → warn, not pass', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir);
+    writeFileSync(join(dir, '.cache', 'rename-in-progress.json'), '{oops');
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Incomplete rename');
+    assert.ok(check, 'Incomplete rename check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `a present-but-corrupt marker must warn, not silently pass: ${check.detail}`,
+    );
+  });
+});
+
+test('marker file parses but is missing from/to → warn, not pass', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir);
+    writeFileSync(join(dir, '.cache', 'rename-in-progress.json'), JSON.stringify({}));
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Incomplete rename');
+    assert.ok(check, 'Incomplete rename check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `a present marker missing from/to must warn, not silently pass: ${check.detail}`,
+    );
+  });
+});
+
+// codex BLOCKER 2 (three-state read side): a marker whose `from` no longer
+// exists but whose `to` does is a FINISHED rename, not a stuck one — the move
+// (renameSync) is the terminal step and the marker only clears after it, so a
+// crash right there is exactly the "done, marker leftover" state. The prior
+// single-branch warn always said "re-run", which fails here (--from no longer
+// resolves). Reproducing the real SIGKILL window is covered in
+// rename-wikilink.test.mjs (owns the KILL_RENAME harness); this pins doctor's
+// own read-side classification directly off a hand-built marker + fs state.
+test('marker present, from gone, to exists (move finished, marker leftover) → warn "clean up", not "re-run"', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir);
+    writeFileSync(join(dir, 'pages', 'bar.md'), '---\ntitle: bar\n---\nbar page\n');
+    writeFileSync(
+      join(dir, '.cache', 'rename-in-progress.json'),
+      JSON.stringify({
+        mode: 'page',
+        from: 'pages/foo.md',
+        to: 'pages/bar.md',
+        started_at: '2026-08-01T00:00:00.000Z',
+      }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
+    assert.ok(check, 'Incomplete rename check not found');
+    assert.equal(check.status, 'warn', `stale-but-finished marker must still warn: ${check.detail}`);
+    assert.ok(
+      !/re-run/i.test(check.detail),
+      `must not suggest a re-run that would fail (--from no longer resolves): ${check.detail}`,
+    );
+    assert.ok(
+      /delete|clean|remove/i.test(check.detail),
+      `must point at deleting the leftover marker: ${check.detail}`,
+    );
+  });
+});
+
+// The genuine in-progress case still gets the re-run guidance — this pins the
+// OTHER branch of the three-state split so a fix to the stale branch can't
+// silently regress this one.
+test('marker present, from exists, to absent (genuinely mid-rename) → warn with a re-run command', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir);
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
+    writeFileSync(
+      join(dir, '.cache', 'rename-in-progress.json'),
+      JSON.stringify({
+        mode: 'page',
+        from: 'pages/foo.md',
+        to: 'pages/bar.md',
+        started_at: '2026-08-01T00:00:00.000Z',
+      }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
+    assert.equal(check.status, 'warn');
+    assert.ok(
+      /re-run/i.test(check.detail) && /--apply/.test(check.detail),
+      `genuinely-stuck marker must still suggest the re-run: ${check.detail}`,
+    );
+  });
+});
+
+// codex CONCERN 3: a legacy/custom vault whose .gitignore predates
+// templates/gitignore's `.cache/` entry can let `git add -A` commit this
+// marker, producing a ghost warning on a machine that never ran a rename.
+// Advisory only, and additive to whichever branch above fires.
+suite("doctor.mjs — 'Incomplete rename' gitignore advisory (CONCERN 3)");
+
+test('marker in a git repo that does NOT ignore .cache/ → doctor appends a gitignore hint', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir);
+    gitRepo(dir);
+    // No .gitignore at all — .cache/ is not excluded.
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
+    writeFileSync(
+      join(dir, '.cache', 'rename-in-progress.json'),
+      JSON.stringify({ mode: 'page', from: 'pages/foo.md', to: 'pages/bar.md', started_at: '2026-08-01T00:00:00.000Z' }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
+    assert.equal(check.status, 'warn');
+    assert.ok(
+      /gitignore/i.test(check.detail) && check.detail.includes('.cache/'),
+      `un-ignored .cache/ in a git repo must get a gitignore hint: ${check.detail}`,
+    );
+  });
+});
+
+test('marker in a git repo that DOES ignore .cache/ → no gitignore hint', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir);
+    gitRepo(dir);
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
+    writeFileSync(
+      join(dir, '.cache', 'rename-in-progress.json'),
+      JSON.stringify({ mode: 'page', from: 'pages/foo.md', to: 'pages/bar.md', started_at: '2026-08-01T00:00:00.000Z' }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
+    assert.equal(check.status, 'warn');
+    assert.ok(
+      !/gitignore/i.test(check.detail),
+      `a properly-ignored .cache/ must not get the gitignore hint: ${check.detail}`,
+    );
+  });
+});
+
+test('marker in a non-git vault → no gitignore hint, no crash', () => {
+  withTmpDir((dir) => {
+    markerFixtureWiki(dir); // no gitRepo(dir) — no .git at all
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
+    writeFileSync(
+      join(dir, '.cache', 'rename-in-progress.json'),
+      JSON.stringify({ mode: 'page', from: 'pages/foo.md', to: 'pages/bar.md', started_at: '2026-08-01T00:00:00.000Z' }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    assert.ok(r.status !== null && r.status <= 1, `doctor must not crash on a non-git vault: ${r.stdout}${r.stderr}`);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
+    assert.equal(check.status, 'warn');
+    assert.ok(!/gitignore/i.test(check.detail), `non-git vault must get no gitignore hint: ${check.detail}`);
+  });
+});
