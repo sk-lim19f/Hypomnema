@@ -15,6 +15,7 @@ import {
   symlinkSync,
   unlinkSync,
   cpSync,
+  realpathSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -835,8 +836,12 @@ suite('update-notifier (ISSUE-5): banner routed to user-visible systemMessage');
 function withFakeNpmInstall(installedVersion, fn) {
   const base = mkdtempSync(join(tmpdir(), 'hypo-npm-'));
   try {
-    const root = join(base, 'node_modules', 'hypomnema');
-    mkdirSync(root, { recursive: true });
+    const rawRoot = join(base, 'node_modules', 'hypomnema');
+    mkdirSync(rawRoot, { recursive: true });
+    // realpath: os.tmpdir() is a symlink on macOS (/var → /private/var), and
+    // self-location (hooks/hypo-shared.mjs) resolves through it — a raw join()
+    // here would carry the symlinked form and never equal that.
+    const root = realpathSync(rawRoot);
     cpSync(HOOKS, join(root, 'hooks'), { recursive: true }); // hooks are self-contained
     writeFileSync(
       join(root, 'package.json'),
@@ -845,6 +850,14 @@ function withFakeNpmInstall(installedVersion, fn) {
     const home = join(base, 'home');
     const cacheDir = join(home, '.claude', 'hypomnema', 'cache');
     mkdirSync(cacheDir, { recursive: true });
+    // Point the cache at this same root so self-location and the cache agree
+    // (status 'match') — otherwise every probe through this fixture would
+    // ALSO carry a pkgRoot-drift banner (a real, separate notice) that these
+    // update-notifier tests predate and don't assert on.
+    writeFileSync(
+      join(home, '.claude', 'hypo-pkg.json'),
+      JSON.stringify({ pkgRoot: root, pkgVersion: installedVersion }),
+    );
     const wiki = join(base, 'wiki');
     mkdirSync(wiki, { recursive: true });
     fn({
@@ -912,6 +925,434 @@ test('session-start: opted out (CI) → update banner suppressed on every channe
       runFakeStart(hook, home, wiki, 'upd-issue5-optout', { CI: 'true' }).stdout,
     );
     assert.ok(!('systemMessage' in out), 'opted-out session must not surface an update banner');
+  });
+});
+
+// ── ISSUE-70: pkgRoot self-location vs cache (resolvePkgRoot / pkgRootDriftStatus)
+// resolvePkgRoot() (hooks/hypo-shared.mjs) is exported as a const computed at
+// import time, so exercising different HOME/self-location combinations needs
+// a fresh child process per scenario — mirrors lib-core.test.mjs's
+// marker-scan pattern rather than re-importing (cached) in this process.
+//
+// A settings.json/plugin-registry cross-check approach was tried and
+// reverted here (codex review): Claude Code layers `enabledPlugins` across
+// user/project/local/managed settings with project overriding user, and a
+// plugin absent from the map is enabled by default — so a single settings
+// file can prove neither "enabled" nor "disabled", and the registry lookup
+// built on top of it was certain to misjudge some real layout. The code
+// already knows where IT is running from (import.meta.url), so self-location
+// replaces that guesswork entirely; see hooks/hypo-shared.mjs's
+// selfLocationPkgRoot() doc comment for the resolution order.
+suite('ISSUE-70: pkgRoot self-location vs cache (resolvePkgRoot / pkgRootDriftStatus)');
+
+function seedHypoPkg(home, pkgRoot) {
+  const claudeDir = join(home, '.claude');
+  mkdirSync(claudeDir, { recursive: true });
+  writeFileSync(
+    join(claudeDir, 'hypo-pkg.json'),
+    JSON.stringify({ pkgRoot, pkgVersion: '1.0.0' }),
+  );
+}
+
+// A pkgRoot usable per isUsablePkgRootLocal (hooks/hypo-shared.mjs): absolute
+// path, real package.json, non-empty version.
+function seedUsableRoot(root, version = '1.7.0') {
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'hypomnema', version }));
+}
+
+// Copies just hooks/ into a throwaway tmp dir, so a hook running FROM that
+// copy is not self-containing anywhere in its bounded ancestor walk — mirrors
+// the real npm/manual deploy (hooks copied standalone into ~/.claude/hooks/)
+// where self-location genuinely cannot resolve. Caller must clean up the
+// returned dir.
+function standaloneHooksCopy() {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-standalone-hooks-'));
+  cpSync(HOOKS, join(dir, 'hooks'), { recursive: true });
+  return dir;
+}
+
+// Copies hooks/ WITH its own versioned package.json one level up, so a hook
+// run from the copy self-locates to `root` (the same shape as REPO, or a real
+// plugin/npm install). realpath-normalized so a self-location comparison
+// against `root` is never fooled by os.tmpdir()'s symlink on macOS.
+function withFakePkgInstall(version, fn) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-fake-pkgroot-'));
+  try {
+    const root = join(base, 'install-root');
+    mkdirSync(root, { recursive: true });
+    const realRoot = realpathSync(root);
+    cpSync(HOOKS, join(realRoot, 'hooks'), { recursive: true });
+    writeFileSync(join(realRoot, 'package.json'), JSON.stringify({ name: 'hypomnema', version }));
+    fn(realRoot);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+// Probes hooks/hypo-shared.mjs's exported PKG_ROOT + pkgRootDriftStatus() in a
+// fresh child process. `hooksSharedPath` defaults to THIS checkout's real
+// hooks/hypo-shared.mjs, whose self-location always resolves to REPO (REPO
+// has its own versioned package.json one level above hooks/) — the direct
+// analogue of a plugin/dev install actually running. Pass a path under
+// standaloneHooksCopy() to exercise the self-location-unresolvable branch.
+function probePkgRoot(home, hooksSharedPath = join(HOOKS, 'hypo-shared.mjs')) {
+  const script = `
+    const { PKG_ROOT, pkgRootDriftStatus } = await import(${JSON.stringify(hooksSharedPath)});
+    console.log(JSON.stringify({ PKG_ROOT, status: pkgRootDriftStatus() }));
+  `;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: home, HYPO_DIR: '' },
+  });
+  assert.equal(r.status, 0, `probe process should exit 0: ${r.stderr}`);
+  return JSON.parse(r.stdout.trim());
+}
+
+test('resolvePkgRoot: self-location wins over a disagreeing cache (status: drift)', () => {
+  withTmpHome((home) => {
+    const staleRoot = join(home, 'stale-cached-root');
+    mkdirSync(staleRoot, { recursive: true });
+    seedHypoPkg(home, staleRoot);
+    const { PKG_ROOT, status } = probePkgRoot(home);
+    assert.equal(
+      PKG_ROOT,
+      REPO,
+      "PKG_ROOT must be the code's own resolved location, not the stale cache",
+    );
+    assert.equal(status.status, 'drift');
+    assert.equal(status.cached, staleRoot);
+    assert.equal(status.self, REPO);
+  });
+});
+
+test('resolvePkgRoot: cache matches self-location → status match, no noise', () => {
+  withTmpHome((home) => {
+    seedHypoPkg(home, REPO);
+    const { PKG_ROOT, status } = probePkgRoot(home);
+    assert.equal(PKG_ROOT, REPO);
+    assert.deepEqual(status, { status: 'match' });
+  });
+});
+
+test('resolvePkgRoot: hypo-pkg.json missing or corrupt never throws (self-location still resolves)', () => {
+  withTmpHome((home) => {
+    // no hypo-pkg.json at all
+    let r = probePkgRoot(home);
+    assert.equal(r.PKG_ROOT, REPO);
+    assert.equal(r.status.status, 'drift'); // cached=null !== self=REPO
+
+    // corrupt hypo-pkg.json
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'hypo-pkg.json'), '{not json');
+    r = probePkgRoot(home);
+    assert.equal(r.PKG_ROOT, REPO);
+  });
+});
+
+test('resolvePkgRoot: self-location unresolvable (standalone-copied hooks, mirrors the npm/manual deploy) → status unknown, falls back to a usable cache', () => {
+  withTmpHome((home) => {
+    const standaloneDir = standaloneHooksCopy();
+    try {
+      const usableCache = join(home, 'cached-root');
+      seedUsableRoot(usableCache);
+      seedHypoPkg(home, usableCache);
+      const r = probePkgRoot(home, join(standaloneDir, 'hooks', 'hypo-shared.mjs'));
+      assert.equal(r.status.status, 'unknown');
+      assert.equal(
+        r.PKG_ROOT,
+        usableCache,
+        'falls back to the (usable) cache when self-location cannot resolve',
+      );
+    } finally {
+      rmSync(standaloneDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resolvePkgRoot: cache contract — an unusable cached pkgRoot (no package.json, or relative) is never returned, even with self-location unresolvable', () => {
+  withTmpHome((home) => {
+    const standaloneDir = standaloneHooksCopy();
+    try {
+      const hooksSharedPath = join(standaloneDir, 'hooks', 'hypo-shared.mjs');
+
+      // (a) existing directory, no package.json at all
+      const bareDir = join(home, 'cached-dir-no-package-json');
+      mkdirSync(bareDir, { recursive: true });
+      seedHypoPkg(home, bareDir);
+      let r = probePkgRoot(home, hooksSharedPath);
+      assert.equal(r.PKG_ROOT, null, 'a cached dir with no package.json must not be returned');
+      assert.equal(r.status.status, 'unknown');
+
+      // (b) relative cached pkgRoot — must never be adopted
+      seedHypoPkg(home, '.');
+      r = probePkgRoot(home, hooksSharedPath);
+      assert.equal(r.PKG_ROOT, null, 'a relative cached pkgRoot must not be returned');
+
+      // (c) package.json present but missing a version field
+      const versionlessRoot = join(home, 'versionless-root');
+      mkdirSync(versionlessRoot, { recursive: true });
+      writeFileSync(join(versionlessRoot, 'package.json'), JSON.stringify({ name: 'hypomnema' }));
+      seedHypoPkg(home, versionlessRoot);
+      r = probePkgRoot(home, hooksSharedPath);
+      assert.equal(r.PKG_ROOT, null, 'a cached package.json without a version must not be usable');
+    } finally {
+      rmSync(standaloneDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resolvePkgRoot: self-containment — an UNRELATED versioned package.json two levels above a standalone hooks copy is rejected → status unknown, falls back to cache', () => {
+  withTmpHome((home) => {
+    // codex repro shape: hooks copied standalone (no package.json alongside),
+    // but some ANCESTOR above it happens to carry its own, unrelated, perfectly
+    // "usable" package.json — e.g. $HOME/package.json from some other project,
+    // with the standalone hooks/ living a level or two under $HOME. That
+    // ancestor has no hooks/ of its own at all, so self-containment fails on a
+    // plain ENOENT; isUsablePkgRootLocal alone (no self-containment check)
+    // would have wrongly accepted it purely for having a versioned package.json.
+    const base = mkdtempSync(join(tmpdir(), 'hypo-unrelated-pkg-'));
+    try {
+      const root = realpathSync(base); // e.g. stands in for $HOME
+      writeFileSync(
+        join(root, 'package.json'),
+        JSON.stringify({ name: 'some-unrelated-package', version: '3.0.0' }),
+      );
+      const nestedHooksDir = join(root, 'nested', 'hooks'); // e.g. $HOME/.claude/hooks
+      mkdirSync(nestedHooksDir, { recursive: true });
+      cpSync(HOOKS, nestedHooksDir, { recursive: true });
+
+      const usableCache = join(home, 'cached-root');
+      seedUsableRoot(usableCache);
+      seedHypoPkg(home, usableCache);
+
+      const r = probePkgRoot(home, join(nestedHooksDir, 'hypo-shared.mjs'));
+      assert.equal(
+        r.status.status,
+        'unknown',
+        'an unrelated-but-usable ancestor package.json must never be adopted as self-location',
+      );
+      assert.equal(r.PKG_ROOT, usableCache, 'must fall back to the cache, not the unrelated package');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resolvePkgRoot: self-containment — an ancestor with A hooks/hypo-shared.mjs at the right path, but not THIS one, is rejected', () => {
+  withTmpHome((home) => {
+    const base = mkdtempSync(join(tmpdir(), 'hypo-foreign-ancestor-'));
+    try {
+      const root = realpathSync(base);
+      // An ancestor that is otherwise a perfectly valid candidate: usable
+      // package.json, AND a hooks/hypo-shared.mjs sitting at exactly the path
+      // the walk checks — but that file is a foreign stub, not the module
+      // actually running.
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'x', version: '9.9.9' }));
+      mkdirSync(join(root, 'hooks'), { recursive: true });
+      writeFileSync(join(root, 'hooks', 'hypo-shared.mjs'), '// foreign stub, not the real module\n');
+
+      // The REAL running module lives nested one level deeper, so `root` is
+      // an ancestor the walk will actually reach and test.
+      const nestedHooksDir = join(root, 'nested', 'hooks');
+      mkdirSync(nestedHooksDir, { recursive: true });
+      cpSync(HOOKS, nestedHooksDir, { recursive: true });
+
+      const usableCache = join(home, 'cached-root');
+      seedUsableRoot(usableCache);
+      seedHypoPkg(home, usableCache);
+
+      const r = probePkgRoot(home, join(nestedHooksDir, 'hypo-shared.mjs'));
+      assert.equal(
+        r.status.status,
+        'unknown',
+        'an ancestor with A hooks/hypo-shared.mjs, but not THIS one, must not be adopted',
+      );
+      assert.equal(r.PKG_ROOT, usableCache);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resolvePkgRoot: self and a symlink alias of the SAME physical root compare as match (canonical path)', () => {
+  withFakePkgInstall('1.7.0', (realRoot) => {
+    withTmpHome((home) => {
+      const aliasPath = join(home, 'plugin-alias');
+      symlinkSync(realRoot, aliasPath);
+      seedHypoPkg(home, aliasPath); // cache records the symlink, not the real path
+      const r = probePkgRoot(home, join(realRoot, 'hooks', 'hypo-shared.mjs'));
+      assert.deepEqual(
+        r.status,
+        { status: 'match' },
+        'a symlink alias of the same physical root must not read as drift',
+      );
+      assert.equal(r.PKG_ROOT, realRoot);
+    });
+  });
+});
+
+// ── ISSUE-70: session-start pkgRoot-drift notice + throttle ──────────────────
+suite('ISSUE-70: session-start pkgRoot-drift notice + throttle');
+
+function runSessionStartAt(hookPath, home, sessionId, extraEnv = {}) {
+  return spawnSync(process.execPath, [hookPath], {
+    input: JSON.stringify({ cwd: home, session_id: sessionId }),
+    encoding: 'utf-8',
+    env: { ...process.env, ...NOTIFY_ON, HYPO_DIR: '', HOME: home, ...extraEnv },
+  });
+}
+
+test('session-start: pkgRoot drift surfaces a one-shot notice, then throttles', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      seedHypoPkg(home, staleRoot);
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      const first = runSessionStartAt(hook, home, 'pkgdrift-test');
+      assert.match(first.stderr, /Package metadata drift/);
+      const out = JSON.parse(first.stdout);
+      assert.match(out.additionalContext || '', /Package metadata drift/);
+      assert.match(out.systemMessage || '', /Package metadata drift/);
+
+      // second start: same tuple already notified → suppressed
+      const second = runSessionStartAt(hook, home, 'pkgdrift-test');
+      assert.doesNotMatch(second.stderr, /Package metadata drift/);
+    });
+  });
+});
+
+test('session-start: no drift (cache matches self-location) → no notice (no false nag)', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      seedHypoPkg(home, fakeRoot);
+      const r = runSessionStartAt(
+        join(fakeRoot, 'hooks', 'hypo-session-start.mjs'),
+        home,
+        'pkgdrift-ok',
+      );
+      assert.doesNotMatch(r.stderr, /Package metadata drift/);
+    });
+  });
+});
+
+test('session-start: opted out (CI) suppresses the pkgRoot-drift notice', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      seedHypoPkg(home, staleRoot);
+      const r = runSessionStartAt(
+        join(fakeRoot, 'hooks', 'hypo-session-start.mjs'),
+        home,
+        'pkgdrift-optout',
+        { CI: 'true' },
+      );
+      assert.doesNotMatch(r.stderr, /Package metadata drift/);
+    });
+  });
+});
+
+test('session-start: drift → notice → resolves (mark cleared) → same pair recurs → notice fires again', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      // 1) drift → notice fires
+      seedHypoPkg(home, staleRoot);
+      const first = runSessionStartAt(hook, home, 'pkgdrift-recur-1');
+      assert.match(first.stderr, /Package metadata drift/);
+
+      // 2) drift resolves (cache now matches self-location) → no notice, and
+      // the prior mark must be cleared, not left standing
+      seedHypoPkg(home, fakeRoot);
+      const second = runSessionStartAt(hook, home, 'pkgdrift-recur-2');
+      assert.doesNotMatch(second.stderr, /Package metadata drift/);
+
+      // 3) the SAME (cached → self-location) pair recurs (cache falls back to
+      // staleRoot) → must notify again, not stay permanently suppressed
+      seedHypoPkg(home, staleRoot);
+      const third = runSessionStartAt(hook, home, 'pkgdrift-recur-3');
+      assert.match(
+        third.stderr,
+        /Package metadata drift/,
+        'the same pair must re-notify after resolving in between, not stay silenced forever',
+      );
+    });
+  });
+});
+
+test('session-start: an opted-out session still clears a resolved drift mark (opt-out ordering)', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      // 1) not opted out: drift → notice fires, mark set
+      seedHypoPkg(home, staleRoot);
+      const first = runSessionStartAt(hook, home, 'pkgdrift-optclear-1');
+      assert.match(first.stderr, /Package metadata drift/);
+
+      // 2) drift resolves AND this run IS opted out (CI) — the clear must
+      // still happen (status 'match' is checked before the opt-out check)
+      seedHypoPkg(home, fakeRoot);
+      const second = runSessionStartAt(hook, home, 'pkgdrift-optclear-2', { CI: 'true' });
+      assert.doesNotMatch(second.stderr, /Package metadata drift/);
+
+      // 3) back to normal (not opted out), the same pair recurs — if step 2
+      // failed to clear the mark, this would stay wrongly suppressed
+      seedHypoPkg(home, staleRoot);
+      const third = runSessionStartAt(hook, home, 'pkgdrift-optclear-3');
+      assert.match(
+        third.stderr,
+        /Package metadata drift/,
+        'an opted-out session must still clear a resolved mark, or a later real session stays silenced',
+      );
+    });
+  });
+});
+
+test('session-start: self-location unresolvable (status unknown) leaves an existing drift mark untouched', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      seedHypoPkg(home, staleRoot);
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      // 1) drift → notice fires, mark set
+      const first = runSessionStartAt(hook, home, 'pkgdrift-unknown-1');
+      assert.match(first.stderr, /Package metadata drift/);
+
+      // 2) run from a STANDALONE-copied hook (no package.json in its
+      // ancestry) → self-location cannot resolve → status 'unknown' → must
+      // not touch the mark either way
+      const standaloneDir = standaloneHooksCopy();
+      try {
+        const unknownRun = runSessionStartAt(
+          join(standaloneDir, 'hooks', 'hypo-session-start.mjs'),
+          home,
+          'pkgdrift-unknown-2',
+        );
+        assert.doesNotMatch(unknownRun.stderr, /Package metadata drift/);
+      } finally {
+        rmSync(standaloneDir, { recursive: true, force: true });
+      }
+
+      // 3) back on the drift-resolving install, the SAME pair must still be
+      // suppressed — proving step 2 did not clear the mark
+      const third = runSessionStartAt(hook, home, 'pkgdrift-unknown-3');
+      assert.doesNotMatch(
+        third.stderr,
+        /Package metadata drift/,
+        'an unknown-status session must not have cleared the mark from step 1',
+      );
+    });
   });
 });
 

@@ -21,10 +21,11 @@ import {
   renameSync,
   linkSync,
 } from 'fs';
-import { join, relative, basename, dirname } from 'path';
+import { join, relative, basename, dirname, isAbsolute } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { randomBytes } from 'crypto';
+import { fileURLToPath } from 'url';
 
 const HOME = homedir();
 
@@ -95,18 +96,195 @@ export const LOG_PATH = join(HYPO_DIR, 'log.md');
 export const HOT_PATH = join(HYPO_DIR, 'hot.md');
 export const GUIDE_PATH = join(HYPO_DIR, 'hypo-guide.md');
 
-// Package root: written by init/upgrade to ~/.claude/hypo-pkg.json
-function resolvePkgRoot() {
-  const p = join(HOME, '.claude', 'hypo-pkg.json');
-  if (!existsSync(p)) return null;
+// Package root: written by init/upgrade to ~/.claude/hypo-pkg.json.
+//
+// The plugin channel is the primary distribution path, and
+// Claude Code's own plugin manager updates hooks WITHOUT ever touching
+// hypo-pkg.json — only our own init/upgrade write it. So after a plugin
+// auto-update this file can point at a stale pkgRoot indefinitely with no
+// signal to the user, and PKG_ROOT (resolved here) is what lint/feedback
+// scripts get resolved through — a hook can run at the new version while the
+// script it shells out to still runs from the old one.
+//
+// An earlier version of this cross-check queried ~/.claude/settings.json's
+// `enabledPlugins` + the plugin registry to positively attribute an active
+// install. That was wrong: Claude Code layers `enabledPlugins` across
+// user/project/local/managed settings (project overrides user), and a plugin
+// with no explicit key is enabled by default — so a single-file read of the
+// user settings can neither prove "enabled" nor "disabled". Querying it was
+// certain to misjudge some real layout.
+//
+// This code already knows the one thing that can't be wrong: where IT is
+// running from. `import.meta.url`, walked up to the nearest package.json,
+// names the actual root of the code executing right now — no
+// settings/registry guessing needed. That's `selfLocationPkgRoot()` below.
+//
+// Never throw: this runs at hook-module load time (`export const PKG_ROOT =
+// resolvePkgRoot()`), so a throw here takes the whole hook process down.
+// Every read below is try/caught and every helper fails open to null.
+
+/** Non-mutating read of the cached pointer, or null on any absence/corruption. */
+function readCachedPkgRoot() {
   try {
+    const p = join(HOME, '.claude', 'hypo-pkg.json');
+    if (!existsSync(p)) return null;
     const v = JSON.parse(readFileSync(p, 'utf-8')).pkgRoot;
     return typeof v === 'string' && v ? v : null;
   } catch {
     return null;
   }
 }
+
+// A pkgRoot is usable only as an ABSOLUTE path to a real package directory
+// whose package.json carries a version. A relative path (e.g. ".") resolves
+// against whatever cwd the reading process happens to have; a directory that
+// merely EXISTS but carries no versioned package.json is a pointer nothing
+// can actually resolve scripts through. Same contract for every source of a
+// pkgRoot value in this file — the cache included (a cached `pkgRoot: "."`
+// used to pass on directory-existence alone).
+//
+// NOT sufficient by itself for self-location (see selfLocationPkgRoot below):
+// "absolute path + a package.json with SOME version" is true of any Node
+// package anywhere on disk, including one that has nothing to do with
+// Hypomnema — e.g. `$HOME/package.json` from an unrelated project. This
+// contract answers "is this a real, resolvable directory", not "is this OUR
+// package". Callers that need the latter also require self-containment.
+function isUsablePkgRootLocal(pkgRoot) {
+  if (typeof pkgRoot !== 'string' || !pkgRoot || !isAbsolute(pkgRoot)) return false;
+  try {
+    const v = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8')).version;
+    return typeof v === 'string' && v.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// True iff `candidateRoot` actually CONTAINS the module that is running right
+// now — i.e. `<candidateRoot>/hooks/hypo-shared.mjs` is, on disk, the exact
+// same file as `ownRealPath` (this module's own realpath). This is the
+// decisive check self-location needs and isUsablePkgRootLocal alone cannot
+// give it: a versioned package.json only proves SOME package lives at
+// `candidateRoot`, not that it is the Hypomnema install this code is part of.
+// Without this, walking up from an unrelated location (a standalone-copied
+// hooks/ dir sitting under a directory that happens to have its own,
+// unrelated package.json a few levels up — e.g. `$HOME/package.json`) would
+// silently adopt that unrelated tree as PKG_ROOT, and every script path built
+// from it (`join(PKG_ROOT, 'scripts', 'lint.mjs')`, the crystallize recovery
+// command in hypo-auto-minimal-crystallize.mjs, etc.) would point at files
+// that were never shipped there.
+//
+// Both paths are realpath'd before comparing so a symlinked candidate or a
+// symlinked ancestor of the running module (macOS's /var → /private/var, a
+// symlinked plugin cache dir) still compares correctly. Fails closed (false)
+// on any read error — a candidate this can't positively confirm is never
+// adopted.
+function candidateContainsRunningModule(candidateRoot, ownRealPath) {
+  try {
+    return realpathSync(join(candidateRoot, 'hooks', 'hypo-shared.mjs')) === ownRealPath;
+  } catch {
+    return false;
+  }
+}
+
+// Walk up from the PARENT of the directory this module (hooks/hypo-shared.mjs)
+// is actually running from, looking for the nearest ancestor that is (a) a
+// usable package root AND (b) actually contains this exact running module —
+// that IS the package root of the code currently executing, regardless of
+// which channel put it there (plugin, npm, dev checkout).
+//
+// Plugin mode runs hooks straight out of the plugin's own cache directory
+// (`${CLAUDE_PLUGIN_ROOT}/hooks/...`), so this resolves directly to whatever
+// the plugin loader most recently updated — exactly the channel that can
+// silently drift ahead of hypo-pkg.json. A manual/npm install COPIES hooks
+// standalone into ~/.claude/hooks/ with no package.json alongside (the "hooks
+// import only Node built-ins, nothing outside the hooks dir" contract), so
+// this correctly finds nothing self-containing there and resolvePkgRoot()
+// falls through to the cache — which IS authoritative for that channel, since
+// our own init/upgrade own writing it. And even if SOME unrelated ancestor
+// happens to carry its own versioned package.json (a plain "usable" root),
+// candidateContainsRunningModule rejects it: that ancestor's own hooks/
+// subdirectory (if it even has one) is not this file.
+//
+// Bounded walk: up to 6 candidate ancestors above hooks/'s own parent (the
+// ordinary root sits at the very first one; a few extra levels tolerate an
+// unusual nesting depth). Never throws, fails open to null on any error.
+function selfLocationPkgRoot() {
+  let hooksDir, ownRealPath;
+  try {
+    hooksDir = dirname(fileURLToPath(import.meta.url));
+    ownRealPath = realpathSync(join(hooksDir, 'hypo-shared.mjs'));
+  } catch {
+    return null; // can't even resolve our own path — nothing to self-contain against
+  }
+  try {
+    let dir = dirname(hooksDir); // first candidate: the ordinary root, one level above hooks/
+    for (let i = 0; i < 6; i++) {
+      if (isUsablePkgRootLocal(dir) && candidateContainsRunningModule(dir, ownRealPath)) {
+        return dir;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break; // reached filesystem root
+      dir = parent;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolution order: self-location wins whenever it resolves — it is a direct,
+// self-containment-verified fact about the code currently running, not an
+// inference. Only when it cannot resolve (the standalone-copied hooks case
+// above, or a genuine read failure) does the cache get to answer, and only
+// after passing the same usable-root contract as everything else here.
+function resolvePkgRoot() {
+  const self = selfLocationPkgRoot();
+  if (self) return self;
+  const cached = readCachedPkgRoot();
+  return isUsablePkgRootLocal(cached) ? cached : null;
+}
 export const PKG_ROOT = resolvePkgRoot();
+
+// realpath a path for comparison, falling back to the raw value on any error
+// (missing/unreadable/etc — the comparison then just degrades to a literal
+// string compare, same as before this existed). Never throws.
+function canonicalPath(p) {
+  if (typeof p !== 'string' || !p) return p;
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+// Tri-state comparison between the cache and the code's own resolved
+// location, for the SURFACING decision only (resolvePkgRoot() above already
+// self-corrects PKG_ROOT in memory regardless of this). Three outcomes:
+//   'match'   — cache and self-location agree (or both resolve to nothing
+//               comparable) → any earlier drift mark should be CLEARED.
+//   'drift'   — self-location resolves and DISAGREES with the cache → notify.
+//   'unknown' — self-location could not be resolved at all → leave any
+//               existing mark untouched. This is the PERMANENT steady state
+//               for the npm/manual channel (no package.json ships next to the
+//               standalone-copied hooks), not a rare hiccup — collapsing it
+//               into 'match' would let that channel silently clear a mark it
+//               never had grounds to judge, and collapsing it into 'drift'
+//               would falsely warn a channel with nothing to compare against.
+//
+// The equality check canonicalizes BOTH sides first: the cache may record a
+// symlink alias of the very same physical root selfLocationPkgRoot() just
+// walked to (a symlinked plugin cache dir, or the same /var vs /private/var
+// split candidateContainsRunningModule already has to handle) — a literal
+// string compare would misreport that as drift.
+//
+// Never throws (every helper it calls already fails open).
+export function pkgRootDriftStatus() {
+  const self = selfLocationPkgRoot();
+  if (!self) return { status: 'unknown' };
+  const cached = readCachedPkgRoot();
+  if (canonicalPath(self) === canonicalPath(cached)) return { status: 'match' };
+  return { status: 'drift', cached, self };
+}
 
 // Optional H2 allowlist for hot.md validation.
 // Set HYPO_ALLOWED_HOT_H2=comma,separated,headings to enable.

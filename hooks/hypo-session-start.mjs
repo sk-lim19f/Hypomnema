@@ -37,6 +37,7 @@ import {
   currentDevice,
   scopeVisible,
   readVisibilityScope,
+  pkgRootDriftStatus,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -50,6 +51,9 @@ import {
   computeSiblingNotice,
   siblingAlreadyNotified,
   markSiblingNotified,
+  pkgRootDriftAlreadyNotified,
+  markPkgRootDriftNotified,
+  clearPkgRootDriftNotified,
 } from './version-check.mjs';
 import { snapshotBase, overwriteTargets } from './base-store.mjs';
 import { listProposals } from './proposal-store.mjs';
@@ -211,6 +215,52 @@ function buildSiblingNotice() {
     if (siblingAlreadyNotified(cache, notice.key)) return '';
     markSiblingNotified(cachePath, notice.key);
     return notice.line;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * pkgRoot drift notice. hypo-shared.mjs's resolvePkgRoot() already
+ * self-corrects PKG_ROOT in memory whenever the code's own resolved location
+ * disagrees with the cached hypo-pkg.json — but silent self-correction is the
+ * exact failure this closes: the user's own `upgrade` habit stops mattering
+ * and nothing ever tells them hypo-pkg.json fell behind. Surfaced once per
+ * (cached → self-location) pair via the same notify-once cache the sibling
+ * notice above uses — a fresh drift (new self-location) re-notifies, but
+ * staying on the same drifted state doesn't nag every session.
+ *
+ * Tri-state (pkgRootDriftStatus): 'match' CLEARS any earlier mark (checked
+ * FIRST, unconditionally — even under opt-out, so a drift that resolves while
+ * opted out doesn't leave a stale mark that then suppresses a genuine
+ * recurrence once opt-out is lifted); 'unknown' touches nothing (self-location
+ * could not be resolved this session — the permanent steady state for the
+ * npm/manual channel, not evidence either way); only 'drift' can produce a
+ * banner, and opt-out is checked there so an opted-out session never marks a
+ * pair as notified it never actually showed.
+ */
+function buildPkgRootDriftNotice() {
+  try {
+    const status = pkgRootDriftStatus();
+    const cachePath = defaultCachePath();
+    if (status.status === 'match') {
+      clearPkgRootDriftNotified(cachePath);
+      return '';
+    }
+    if (status.status === 'unknown') return '';
+    if (isOptedOut()) return '';
+    const key = `${status.cached || '(none)'}->${status.self}`;
+    const cache = readCache(cachePath);
+    if (pkgRootDriftAlreadyNotified(cache, key)) return '';
+    markPkgRootDriftNotified(cachePath, key);
+    return (
+      `[Hypomnema] Package metadata drift: hypo-pkg.json still points at ` +
+      `\`${status.cached || '(none)'}\`, but the code actually running resolves to ` +
+      `\`${status.self}\`.\n` +
+      `  Hooks already resolved the correct root for this session — this is a ` +
+      `heads-up, not a blocker.\n` +
+      `  → run \`/hypo:upgrade --apply\` to bring hypo-pkg.json back in sync.`
+    );
   } catch {
     return '';
   }
@@ -449,15 +499,17 @@ process.stdin.on('end', () => {
     const clearRecoveryLine = buildClearRecoveryLine(data.source);
     const updateLine = buildUpdateNotice();
     const siblingLine = buildSiblingNotice();
-    // The update + stale-sibling banners must reach the USER. On a
-    // SessionStart hook that exits 0, stderr is invisible in the normal TUI
-    // (only shown on exit 2 / --verbose) and additionalContext is model-only —
-    // `systemMessage` is the documented user-visible channel. Route those two
-    // banners there. They ALSO stay in noticePrefix → additionalContext below,
-    // so the model and the user start the session looking at the same state.
-    // (The other stderr notices — sync/growth/clear/suggest — are intentionally
-    // transcript/--verbose only and out of this banner's scope.)
-    const userMessage = [updateLine, siblingLine].filter(Boolean).join('\n\n');
+    const pkgDriftLine = buildPkgRootDriftNotice();
+    // The update + stale-sibling + pkgRoot-drift banners must reach the USER.
+    // On a SessionStart hook that exits 0, stderr is invisible in the normal
+    // TUI (only shown on exit 2 / --verbose) and additionalContext is
+    // model-only — `systemMessage` is the documented user-visible channel.
+    // Route those banners there. They ALSO stay in noticePrefix →
+    // additionalContext below, so the model and the user start the session
+    // looking at the same state. (The other stderr notices —
+    // sync/growth/clear/suggest — are intentionally transcript/--verbose only
+    // and out of this banner's scope.)
+    const userMessage = [updateLine, siblingLine, pkgDriftLine].filter(Boolean).join('\n\n');
     if (userMessage) outExtra = { ...outExtra, systemMessage: userMessage };
     const notices = [
       syncLine,
@@ -466,6 +518,7 @@ process.stdin.on('end', () => {
       clearRecoveryLine,
       updateLine,
       siblingLine,
+      pkgDriftLine,
     ].filter(Boolean);
     let noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
     if (syncLine) process.stderr.write(`\n\x1b[33m${syncLine}\x1b[0m\n`);
@@ -475,6 +528,7 @@ process.stdin.on('end', () => {
       process.stderr.write(`\n\x1b[33m${clearRecoveryLine.split('\n')[0]}\x1b[0m\n`);
     if (updateLine) process.stderr.write(`\n\x1b[33m${updateLine}\x1b[0m\n`);
     if (siblingLine) process.stderr.write(`\n\x1b[33m${siblingLine}\x1b[0m\n`);
+    if (pkgDriftLine) process.stderr.write(`\n\x1b[33m${pkgDriftLine}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = sessionMarkerPath(sessionId);
