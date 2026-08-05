@@ -332,6 +332,10 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/rename-marker.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/schema-vocab.mjs",
     "exec": false
   },

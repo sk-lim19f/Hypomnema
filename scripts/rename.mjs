@@ -52,6 +52,7 @@ import { join, basename, dirname, normalize, isAbsolute, sep } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
 import { collectPagesRename, slugForms } from './lib/wikilink.mjs';
+import { RENAME_MARKER_REL, renameMarkerPath, readRenameMarker } from './lib/rename-marker.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
@@ -260,6 +261,81 @@ function atomicWrite(path, content) {
       // best effort; the original at `path` is untouched either way
     }
     throw err;
+  }
+}
+
+// ── crash-recovery marker ────────────────────────────────────────────────────
+// Written as the FIRST disk write of an --apply run (right after the last guard
+// passes, before any inbound-link rewrite lands) and cleared as the LAST action
+// (right after the terminal renameSync). If the process dies in between, this
+// is the only trace left that the rename is incomplete: --from still resolves
+// at that point (the move itself hasn't happened yet — see the module
+// docstring's move-last invariant), so a re-run of the identical command
+// converges on its own. Nothing else in the vault says "you need to re-run it".
+//
+// Fail-closed by construction: writeRenameMarker calls fail() (process.exit(1))
+// on any write error, so --apply never proceeds without a marker on disk. A
+// detector with no reliable marker is worse than no detector at all.
+function writeRenameMarker(args, marker) {
+  const path = join(args.hypoDir, RENAME_MARKER_REL);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    atomicWrite(path, JSON.stringify(marker, null, 2));
+  } catch (err) {
+    fail(
+      args,
+      `could not write the rename-in-progress marker (${err.message}) — refusing --apply without it: it is the only signal a crash mid-rewrite would leave behind.`,
+    );
+  }
+}
+
+// codex BLOCKER: writeRenameMarker above used to atomicWrite unconditionally,
+// so a SECOND rename whose own --apply started after a FIRST one crashed mid-run
+// would silently clobber the first rename's marker — permanently erasing the
+// only trace that the first rename's move/rewrite is incomplete. Called right
+// before writeRenameMarker in both modes, so the check runs before this run's
+// marker (or anything else) touches disk.
+//
+// Three outcomes:
+//   - no marker on disk                → nothing to conflict with, proceed.
+//   - marker names THIS exact command  → this is the legitimate re-run path the
+//     whole mechanism exists to let converge (identical mode/from/to). Proceed;
+//     writeRenameMarker below simply overwrites it with a fresh started_at —
+//     mode/from/to don't change, only the timestamp does.
+//   - marker names a DIFFERENT command, or can't be parsed at all → refuse. A
+//     marker we can't parse might belong to this command or a different one;
+//     "can't tell" must resolve to refuse, not to a silent overwrite.
+function guardExistingMarker(args, thisMarker) {
+  const path = renameMarkerPath(args.hypoDir);
+  if (!existsSync(path)) return;
+  const marker = readRenameMarker(args.hypoDir);
+  if (!marker || !marker.from || !marker.to) {
+    fail(
+      args,
+      `${path} exists but could not be parsed (or is missing from/to), so it cannot be told apart from this rename's own marker. Inspect it by hand, finish or discard the rename it describes, then delete the marker before retrying.`,
+    );
+  }
+  const same =
+    marker.mode === thisMarker.mode && marker.from === thisMarker.from && marker.to === thisMarker.to;
+  if (!same) {
+    fail(
+      args,
+      `a rename is already in progress (${marker.mode === 'directory' ? 'directory' : 'page'} '${marker.from}' → '${marker.to}', marker at ${path}) — finish that rename first (re-run the identical command), or confirm it is safe and delete the marker, before starting a different one.`,
+    );
+  }
+}
+
+// A failure here is not fatal — the move already succeeded — but a marker left
+// behind would make doctor misreport a finished rename as incomplete, so it is
+// surfaced (stderr) rather than swallowed.
+function clearRenameMarker(args) {
+  const path = join(args.hypoDir, RENAME_MARKER_REL);
+  try {
+    rmSync(path, { force: true });
+  } catch (err) {
+    console.error(
+      `⚠ rename completed, but could not remove the in-progress marker (${err.message}) — remove ${path} by hand.`,
+    );
   }
 }
 
@@ -663,6 +739,14 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
   let moved = false;
   if (args.apply) {
     assertSameDevice(args, fromAbs, toAbs);
+    const thisMarker = {
+      mode: 'directory',
+      from: fromDirRel,
+      to: toDirRel,
+      started_at: new Date().toISOString(),
+    };
+    guardExistingMarker(args, thisMarker);
+    writeRenameMarker(args, thisMarker);
     for (const [path, content] of externalWrites) atomicWrite(path, content);
     for (const [oldRel, content] of movedBodies) {
       atomicWrite(join(args.hypoDir, oldRel), content);
@@ -678,6 +762,7 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
       if (err.code !== 'EXDEV') throw err;
       fail(args, `--from and --to ended up on different filesystems mid-run — refusing an unsafe fallback move.`);
     }
+    clearRenameMarker(args);
     moved = true;
   }
 
@@ -819,7 +904,17 @@ function run(args) {
   // (see assertSameDevice) — the external rewrite loop right after this can
   // otherwise land partial vault changes ahead of a move that turns out to be
   // impossible.
-  if (args.apply) assertSameDevice(args, fromPage.path, toPath);
+  if (args.apply) {
+    assertSameDevice(args, fromPage.path, toPath);
+    const thisMarker = {
+      mode: 'page',
+      from: fromPage.rel,
+      to: toRel,
+      started_at: new Date().toISOString(),
+    };
+    guardExistingMarker(args, thisMarker);
+    writeRenameMarker(args, thisMarker);
+  }
 
   // Rewrite inbound references across every NON-preserved page (skip the moved
   // page itself — self-references are rewritten on its own content separately).
@@ -882,6 +977,7 @@ function run(args) {
         fail(args, `--from and --to ended up on different filesystems mid-run — refusing an unsafe fallback move.`);
       }
     }
+    clearRenameMarker(args);
     moved = true;
   }
 
