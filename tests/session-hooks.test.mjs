@@ -25,6 +25,7 @@ import {
   computeSessionGrowth,
   recordSyncSuccess,
   readSyncLastSuccess,
+  classifySyncOp,
 } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import {
@@ -2197,10 +2198,169 @@ test('session-start surfaces a conflict-unresolved entry with half-merged-tree g
       `conflict-unresolved must warn about a possibly half-merged tree, not the plain conflict wording: ${ctx}`,
     );
     assert.ok(
-      !ctx.includes('your local work is committed and safe'),
-      `conflict-unresolved must NOT reuse the clean-conflict "committed and safe" claim (the abort itself failed): ${ctx}`,
+      // /i, not a literal-substring check: the clean-conflict branch could be
+      // reworded ("Your local work is committed", capitalized, no "and safe")
+      // without tripping an exact-substring negative — this must catch any
+      // rephrasing of the same false reassurance, matching doctor.test.mjs's
+      // equivalent check.
+      !/your local work is committed/i.test(ctx),
+      `conflict-unresolved must NOT reuse the clean-conflict "committed" claim (the abort itself failed): ${ctx}`,
     );
   });
+});
+
+// A `conflict*` op this hook has no dedicated branch for (a future syncRemote
+// failure mode neither 'conflict' nor 'conflict-unresolved') must NOT default
+// into the clean-conflict "committed and safe" reassurance — that claim is
+// not known to hold for an unrecognized op — nor assert the conflict-
+// unresolved branch's "the abort failed", which is equally unverified here.
+test('session-start treats an unrecognized conflict-* op as unresolved, without either conflict branch\'s claim', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({
+        timestamp: '2026-08-05T00:00:00Z',
+        op: 'conflict-future-op',
+        error: 'unrecognized failure mode',
+        host: 'test',
+      }) + '\n',
+    );
+    const r = runStart(dir);
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(ctx.includes('remote diverged'), `unknown-conflict notice missing: ${ctx}`);
+    assert.ok(/unresolved/.test(ctx), `unknown-conflict must say to treat it as unresolved: ${ctx}`);
+    assert.ok(
+      !/your local work is committed/i.test(ctx),
+      `unknown-conflict must NOT borrow the clean-conflict "committed" claim: ${ctx}`,
+    );
+    assert.ok(
+      !/automatic merge-abort failed/i.test(ctx),
+      `unknown-conflict must NOT borrow the conflict-unresolved "abort failed" claim (not verified for an unknown op): ${ctx}`,
+    );
+  });
+});
+
+test('session-start emits no conflict/half-merged guidance for an unrelated op (regression guard)', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'sync-state.json'),
+      JSON.stringify({
+        timestamp: '2026-05-14T00:00:00Z',
+        op: 'push',
+        error: 'network timeout',
+        host: 'test',
+      }) + '\n',
+    );
+    const r = runStart(dir);
+    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    assert.ok(ctx.includes('last sync failed'), `generic sync notice missing: ${ctx}`);
+    assert.ok(!ctx.includes('remote diverged'), `unrelated op must not get conflict wording: ${ctx}`);
+    assert.ok(!/half-merged/.test(ctx), `unrelated op must not get half-merged wording: ${ctx}`);
+  });
+});
+
+suite('IMPR-31 — session-start and doctor share one sync-op judgment');
+
+test('classifySyncOp: exhaustive op set (conflict-unresolved / conflict / unknown-conflict / other)', () => {
+  assert.equal(classifySyncOp('conflict-unresolved'), 'conflict-unresolved');
+  assert.equal(classifySyncOp('conflict'), 'conflict');
+  // An unrecognized conflict-* value must NOT fall into the known 'conflict'
+  // bucket by startsWith accident — it gets its own conservative bucket.
+  assert.equal(classifySyncOp('conflict-future-op'), 'unknown-conflict');
+  assert.equal(classifySyncOp('conflict-abort-failed'), 'unknown-conflict');
+  assert.equal(classifySyncOp('pull'), 'other');
+  assert.equal(classifySyncOp('push'), 'other');
+  assert.equal(classifySyncOp(undefined), 'other');
+  assert.equal(classifySyncOp(''), 'other');
+});
+
+// Regression guard for the exact split this fix closes: before it,
+// hypo-session-start.mjs used an exact `=== 'conflict'` check that missed
+// 'conflict-unresolved' while doctor.mjs's `startsWith('conflict')` already
+// caught it. Both surfaces now branch on classifySyncOp, so this drives every
+// op through BOTH real hooks/scripts and asserts they land on the same
+// wording family — a defense a per-surface test cannot catch, since each of
+// those only proves its own surface, never that the two still agree.
+test('session-start and doctor render the same wording family for every sync-state op (parity)', () => {
+  const ops = [
+    'conflict-unresolved',
+    'conflict',
+    'conflict-future-op',
+    'pull',
+    'push',
+    'future-unknown-op',
+  ];
+  for (const op of ops) {
+    withGrowthWiki((dir) => {
+      mkdirSync(join(dir, '.cache'), { recursive: true });
+      writeFileSync(
+        join(dir, '.cache', 'sync-state.json'),
+        JSON.stringify({ timestamp: '2026-06-19T00:00:00Z', op, error: 'x', host: 'test' }) + '\n',
+      );
+      const startCtx = JSON.parse(runStart(dir).stdout).additionalContext || '';
+      const doctorOut = JSON.parse(
+        run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']).stdout,
+      );
+      const doctorDetail = doctorOut.find((c) => c.label === 'Sync state')?.detail || '';
+
+      const cls = classifySyncOp(op);
+      if (cls === 'conflict-unresolved') {
+        assert.ok(
+          /half-merged/.test(startCtx),
+          `session-start missing half-merged wording for op=${op}: ${startCtx}`,
+        );
+        assert.ok(
+          /half-merged/.test(doctorDetail),
+          `doctor missing half-merged wording for op=${op}: ${doctorDetail}`,
+        );
+      } else if (cls === 'conflict') {
+        assert.ok(
+          /diverged/.test(startCtx) && !/half-merged/.test(startCtx),
+          `session-start conflict wording wrong for op=${op}: ${startCtx}`,
+        );
+        assert.ok(
+          /diverged/.test(doctorDetail) && !/half-merged/.test(doctorDetail),
+          `doctor conflict wording wrong for op=${op}: ${doctorDetail}`,
+        );
+      } else if (cls === 'unknown-conflict') {
+        // The policy this branch pins: an unrecognized conflict-* op must be
+        // treated conservatively — surfaced and unresolved — but WITHOUT
+        // borrowing either known branch's claim (neither "committed and
+        // safe" nor "the abort failed" is verified for an op nobody wrote a
+        // branch for). This is the case the earlier version of this test
+        // could not catch: 'conflict-future-op' used to fall into the plain
+        // 'conflict' bucket via startsWith and get the false "committed and
+        // safe" reassurance on both surfaces.
+        assert.ok(
+          /diverged/.test(startCtx) && /unresolved/.test(startCtx),
+          `session-start unknown-conflict wording wrong for op=${op}: ${startCtx}`,
+        );
+        assert.ok(
+          !/your local work is committed/i.test(startCtx),
+          `session-start unknown-conflict must not reuse the committed claim for op=${op}: ${startCtx}`,
+        );
+        assert.ok(
+          /diverged/.test(doctorDetail) && /unresolved/.test(doctorDetail),
+          `doctor unknown-conflict wording wrong for op=${op}: ${doctorDetail}`,
+        );
+        assert.ok(
+          !/your local work is committed/i.test(doctorDetail),
+          `doctor unknown-conflict must not reuse the committed claim for op=${op}: ${doctorDetail}`,
+        );
+      } else {
+        assert.ok(
+          !/diverged/.test(startCtx) && !/half-merged/.test(startCtx),
+          `session-start must not use conflict wording for op=${op}: ${startCtx}`,
+        );
+        assert.ok(
+          !/diverged/.test(doctorDetail) && !/half-merged/.test(doctorDetail),
+          `doctor must not use conflict wording for op=${op}: ${doctorDetail}`,
+        );
+      }
+    });
+  }
 });
 
 // ── FEAT-34: last-success timestamp visibility ──────────────────────────────
