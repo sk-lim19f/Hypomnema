@@ -435,7 +435,11 @@ export function pageUsageGuardCachePath(sessionId, hypoDir) {
   return join(tmpdir(), `hypo-pageusage-guard-${safe}-${h.toString(36)}.json`);
 }
 
-export function pageUsageLoggingAllowed(hypoDir, sessionId) {
+// `probeFn` is test-only: tests inject a fake to control the "did git answer"
+// outcome deterministically instead of racing a real subprocess under shard
+// load. Production callers never pass it, so they always get `runGitCheckIgnore`
+// below, byte-for-byte the same spawnSync call this file always made.
+export function pageUsageLoggingAllowed(hypoDir, sessionId, probeFn) {
   // The load-bearing commit gate is .hypoignore: it is what hypo-auto-stage and
   // commitWikiChanges actually filter on. Re-check it FRESH on every call (it is
   // cheap, no subprocess) so that if coverage is removed mid-session the guard
@@ -452,7 +456,7 @@ export function pageUsageLoggingAllowed(hypoDir, sessionId) {
   }
   if (!hypoIgnored) return false;
 
-  return gitIgnoresPageUsageCached(hypoDir, sessionId);
+  return gitIgnoresPageUsageCached(hypoDir, sessionId, probeFn);
 }
 
 // git check-ignore is the belt signal (defends a manual `git add`); it spawns a
@@ -464,7 +468,16 @@ export function pageUsageLoggingAllowed(hypoDir, sessionId) {
 // prompt, short enough that a blip clears on its own well inside a session.
 const PROBE_BACKOFF_MS = 30000;
 
-function gitIgnoresPageUsageCached(hypoDir, sessionId) {
+// The real probe: check-ignore answers with an exit code, 0 = ignored, 1 = not
+// ignored. Split out to a named function so `gitIgnoresPageUsageCached` can take
+// a substitute in tests without touching what production actually spawns.
+function runGitCheckIgnore(hypoDir) {
+  return spawnSync('git', ['-C', hypoDir, 'check-ignore', '-q', '--', PAGE_USAGE_REL], {
+    timeout: 10000,
+  });
+}
+
+function gitIgnoresPageUsageCached(hypoDir, sessionId, probeFn = runGitCheckIgnore) {
   // Without a session id every caller lands on the same `default` cache file, so
   // one session's verdict would answer for the next one — and the file outlives
   // both, sitting in tmpdir with nothing to expire it. A verdict that cannot be
@@ -491,9 +504,9 @@ function gitIgnoresPageUsageCached(hypoDir, sessionId) {
 
   // check-ignore answers with an exit code: 0 = ignored, 1 = not ignored. Every
   // other outcome means the probe never got to answer — 128 for a fatal git
-  // error (hypoDir not a repo yet), or a null status when the 2s timeout fired
-  // or the spawn itself failed, which is what a machine under heavy process
-  // load produces. Treating those as a plain `false` is the bug this guards
+  // error (hypoDir not a repo yet), or a null status when the timeout below
+  // fired or the spawn itself failed, which is what a machine under heavy
+  // process load produces. Treating those as a plain `false` is the bug this guards
   // against: it is indistinguishable from git actually saying "not ignored",
   // and the verdict then gets cached, so one blip keeps logging disabled for
   // the rest of the session even after the condition clears.
@@ -506,9 +519,7 @@ function gitIgnoresPageUsageCached(hypoDir, sessionId) {
   // measuring scheduler latency instead of git. 10s still catches a true hang.
   let probe = null;
   try {
-    probe = spawnSync('git', ['-C', hypoDir, 'check-ignore', '-q', '--', PAGE_USAGE_REL], {
-      timeout: 10000,
-    });
+    probe = probeFn(hypoDir);
   } catch {
     probe = null;
   }

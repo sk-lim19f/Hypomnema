@@ -1940,32 +1940,59 @@ test('verify.mjs stays independent of the shared predicate (A1 invariant)', () =
 // ── B1: page-usage logging coverage guard (fail-closed) ──────────────────────
 suite('hypo-shared.mjs — page-usage logging guard (B1)');
 
+// Fake probes stand in for the real `spawnSync('git', ['check-ignore', ...])`
+// call: same shape (`{ status }` or a throw/null for "never answered"), no
+// subprocess. That makes the guard's own branching deterministic — the flake
+// this suite used to have came from racing a real git process across 278
+// concurrent shards, not from the guard logic itself. `runGitCheckIgnore`
+// (the production default in hypo-shared.mjs) is exercised separately, below,
+// by the one real-git integration test.
+const fakeProbe = (status) => () => ({ status });
+const fakeProbeThrows = () => {
+  throw new Error('spawn failed');
+};
+
+// A probe that records whether it was consulted. Needed because a *throwing*
+// probe cannot prove "the guard short-circuited before the probe": the guard
+// wraps the call in `try/catch` and turns a throw into `probe = null`, which
+// then returns `false` — the same answer the short-circuit gives. So a test
+// asserting `false` passes whether or not the probe ran. Counting the calls is
+// what actually distinguishes the two, and it is the only way to pin that the
+// composite guard never pays for a subprocess once .hypoignore has already
+// denied. Verified by re-running the short-circuit regression proof against it.
+const countingProbe = (status) => {
+  const fn = () => {
+    fn.calls += 1;
+    return { status };
+  };
+  fn.calls = 0;
+  return fn;
+};
+
 test('guard true when both .gitignore and .hypoignore cover .cache/', () => {
   withTmpDir((dir) => {
-    gitRepo(dir);
-    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
     writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
-    assert.equal(pageUsageLoggingAllowed(dir, 'b1-both'), true);
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-both', fakeProbe(0)), true);
   });
 });
 
 // A probe that never answered is not the same as git saying "not ignored".
 // check-ignore exits 0 (ignored) or 1 (not ignored); 128 means git errored out,
-// and a null status means the 2s timeout fired or the spawn failed outright —
-// which is what a machine running one process per suite actually produces. The
-// old code collapsed all of those into `false` and then cached it, so one blip
-// kept logging disabled for the whole session even after the cause cleared.
-// That is the flake behind the .cache/ guard failing only under --shards=N.
+// and a null status means the timeout fired or the spawn failed outright — which
+// is what a machine under heavy process load produces. The old code collapsed
+// all of those into `false` and then cached it, so one blip kept logging
+// disabled for the whole session even after the cause cleared. That is the
+// flake this test pins: simulated here instead of raced, so it is deterministic
+// and instant instead of depending on the real 10s timeout ever firing.
 test('an inconclusive git probe records an outage, never a verdict', () => {
   withTmpDir((dir) => {
     const sessionId = 'b1-inconclusive';
     const cachePath = pageUsageGuardCachePath(sessionId, dir);
     try {
-      writeFileSync(join(dir, '.gitignore'), '.cache/\n');
       writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
 
-      // Not a git repo yet → check-ignore exits 128, i.e. it did not answer.
-      assert.equal(pageUsageLoggingAllowed(dir, sessionId), false);
+      // status 128 (git errored) is one shape of "never answered".
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId, fakeProbe(128)), false);
       const recorded = JSON.parse(readFileSync(cachePath, 'utf-8'));
       assert.equal(
         recorded.gitIgnored,
@@ -1974,15 +2001,60 @@ test('an inconclusive git probe records an outage, never a verdict', () => {
       );
       assert.equal(typeof recorded.unavailableUntil, 'number');
 
-      // The outage stamp suppresses re-probing while it stands. That is what
-      // keeps a wedged git from costing a full timeout on every prompt.
-      gitRepo(dir);
-      assert.equal(pageUsageLoggingAllowed(dir, sessionId), false);
+      // The outage stamp suppresses re-probing while it stands: a probe that
+      // would now say "ignored" is still not consulted, proving the backoff
+      // — not the probe — is what answered `false` here.
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId, fakeProbe(0)), false);
 
-      // Once it lapses, the answer is recomputed rather than served from the
-      // outage — the old code cached `false` here and never recovered.
+      // A thrown spawn (the other shape of "never answered": spawnSync itself
+      // failing) is inconclusive the same way once the backoff lapses.
       writeFileSync(cachePath, JSON.stringify({ unavailableUntil: Date.now() - 1 }));
-      assert.equal(pageUsageLoggingAllowed(dir, sessionId), true);
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId, fakeProbeThrows), false);
+
+      // Once the backoff lapses and the probe finally answers, the verdict is
+      // recomputed rather than served from the outage — the old code cached
+      // `false` here and never recovered.
+      writeFileSync(cachePath, JSON.stringify({ unavailableUntil: Date.now() - 1 }));
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId, fakeProbe(0)), true);
+    } finally {
+      rmSync(cachePath, { force: true });
+    }
+  });
+});
+
+// `{ status: null }` is the shape spawnSync actually returns when the timeout
+// fires, and a fired timeout under process load is the exact flake that opened
+// ISSUE-79 — yet nothing pinned it: the test above covers 128 and a throw only.
+// Narrowing the guard to `status === 128` would keep every one of those green
+// while reintroducing the original bug, so this walks the null path end to end.
+suite('hypo-shared.mjs — page-usage guard, timed-out probe (B1b)');
+
+test('a timed-out probe ({ status: null }) is an outage, not a "not ignored" answer', () => {
+  withTmpDir((dir) => {
+    const sessionId = 'b1b-timeout';
+    const cachePath = pageUsageGuardCachePath(sessionId, dir);
+    try {
+      writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId, fakeProbe(null)), false);
+      const recorded = JSON.parse(readFileSync(cachePath, 'utf-8'));
+      assert.equal(
+        recorded.gitIgnored,
+        undefined,
+        'a timed-out probe must never be written down as an answer',
+      );
+      assert.equal(typeof recorded.unavailableUntil, 'number');
+
+      // While the outage stands, a probe that would now answer "ignored" is not
+      // even called — the backoff is what suppresses the next subprocess, which
+      // is the whole point of not paying a timeout on every prompt.
+      const probe = countingProbe(0);
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId, probe), false);
+      assert.equal(probe.calls, 0, 'the backoff must suppress the probe, not just its verdict');
+
+      // Once it lapses, the guard recovers on its own.
+      writeFileSync(cachePath, JSON.stringify({ unavailableUntil: Date.now() - 1 }));
+      assert.equal(pageUsageLoggingAllowed(dir, sessionId, fakeProbe(0)), true);
     } finally {
       rmSync(cachePath, { force: true });
     }
@@ -1997,15 +2069,13 @@ test('no session id → the git verdict is not cached at all', () => {
     const cachePath = pageUsageGuardCachePath(undefined, dir);
     try {
       rmSync(cachePath, { force: true });
-      gitRepo(dir);
-      writeFileSync(join(dir, '.gitignore'), '.cache/\n');
       writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
-      assert.equal(pageUsageLoggingAllowed(dir, undefined), true);
+      assert.equal(pageUsageLoggingAllowed(dir, undefined, fakeProbe(0)), true);
       assert.ok(!existsSync(cachePath), 'an unscoped verdict must not be written');
 
-      // Coverage removed → the next call must see it, not a stale `true`.
-      writeFileSync(join(dir, '.gitignore'), 'unrelated/\n');
-      assert.equal(pageUsageLoggingAllowed(dir, undefined), false);
+      // Coverage removed (probe now answers "not ignored") → the next call
+      // must see it, not a stale `true` served from a cache.
+      assert.equal(pageUsageLoggingAllowed(dir, undefined, fakeProbe(1)), false);
     } finally {
       rmSync(cachePath, { force: true });
     }
@@ -2014,58 +2084,99 @@ test('no session id → the git verdict is not cached at all', () => {
 
 test('guard false when only .gitignore covers .cache/ (both signals required)', () => {
   withTmpDir((dir) => {
-    gitRepo(dir);
-    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
-    assert.equal(pageUsageLoggingAllowed(dir, 'b1-git-only'), false);
+    // No .hypoignore → the composite guard must short-circuit before it ever
+    // reaches the probe. Count the calls rather than throwing from the probe:
+    // the guard swallows a throw into `probe = null` and returns `false`, which
+    // is the same answer the short-circuit gives, so a throwing probe cannot
+    // tell the two apart.
+    const probe = countingProbe(0);
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-git-only', probe), false);
+    assert.equal(probe.calls, 0, 'a denied .hypoignore must short-circuit before the probe');
   });
 });
 
 test('guard false when only .hypoignore covers .cache/', () => {
   withTmpDir((dir) => {
-    gitRepo(dir);
     writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
-    assert.equal(pageUsageLoggingAllowed(dir, 'b1-hypo-only'), false);
+    // .hypoignore alone clears the short-circuit; the probe still has to say
+    // "not ignored" for the composite verdict to be false.
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-hypo-only', fakeProbe(1)), false);
   });
 });
 
 test('guard false in a non-git vault (fail-closed)', () => {
   withTmpDir((dir) => {
-    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
     writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
-    assert.equal(pageUsageLoggingAllowed(dir, 'b1-nogit'), false);
+    // A non-repo vault is exactly what makes check-ignore exit 128 in real git;
+    // fakeProbe(128) simulates that without needing an actual non-repo dir.
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-nogit', fakeProbe(128)), false);
   });
 });
 
 test('git probe is cached per session (no recompute of the git signal)', () => {
   withTmpDir((dir) => {
-    gitRepo(dir);
-    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
     writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
-    assert.equal(pageUsageLoggingAllowed(dir, 'b1-cache'), true);
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-cache', fakeProbe(0)), true);
     const cachePath = pageUsageGuardCachePath('b1-cache', dir);
     assert.ok(existsSync(cachePath), 'guard must write a session cache file');
-    // Remove .gitignore coverage. A fresh git probe would now say "not ignored",
-    // but the git signal is cached, so with .hypoignore still present the verdict
-    // stays true, proving the 2nd call skipped the git subprocess.
-    rmSync(join(dir, '.gitignore'));
-    assert.equal(pageUsageLoggingAllowed(dir, 'b1-cache'), true, 'git signal must be cached');
+    // A second call with a probe that would now say "not ignored" must still
+    // read `true` from the cache, proving the 2nd call skipped the probe.
+    assert.equal(
+      pageUsageLoggingAllowed(dir, 'b1-cache', fakeProbe(1)),
+      true,
+      'git signal must be cached',
+    );
   });
 });
 
 test('privacy: removing .hypoignore mid-session flips the guard closed', () => {
   withTmpDir((dir) => {
-    gitRepo(dir);
-    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
     writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
-    assert.equal(pageUsageLoggingAllowed(dir, 'b1-privacy'), true);
+    assert.equal(pageUsageLoggingAllowed(dir, 'b1-privacy', fakeProbe(0)), true);
     // .hypoignore is the load-bearing commit gate and is re-checked fresh every
-    // call: dropping it must immediately deny logging even within the session.
+    // call: dropping it must immediately deny logging even within the session,
+    // before the (still "ignored") probe is ever consulted again.
     rmSync(join(dir, '.hypoignore'));
+    const probe = countingProbe(0);
     assert.equal(
-      pageUsageLoggingAllowed(dir, 'b1-privacy'),
+      pageUsageLoggingAllowed(dir, 'b1-privacy', probe),
       false,
       'a mid-session .hypoignore removal must fail closed',
     );
+    // What stops the probe here is the .hypoignore short-circuit, which runs
+    // before the cache is ever consulted (pageUsageLoggingAllowed returns on
+    // `!hypoIgnored` before calling gitIgnoresPageUsageCached at all).
+    // But this assertion does not *pin* that: the first call above already
+    // cached a verdict for this session, so removing the short-circuit still
+    // leaves the cache to answer without a subprocess, and the count stays 0.
+    // Confirmed by regression proof — forcing the probe call ahead of the
+    // short-circuit failed b1-git-only and left this test green. So what this
+    // pins is "the denial costs no subprocess"; the short-circuit itself is
+    // pinned by b1-git-only, which has no cache to hide behind.
+    assert.equal(probe.calls, 0, 'and the denial must cost no subprocess');
+  });
+});
+
+// The one place *this suite* still spawns a real `git check-ignore` — not the
+// only one in the test tree. The B2 hook E2E tests in tests/lookup-usage.test.mjs
+// run hypo-lookup.mjs as a child process, and that hook calls the guard with two
+// args, so it takes the default probe and spawns real git too. Those cannot take
+// an injected probe (the seam does not cross a process boundary) and real git is
+// the point of a hook E2E, so the shard-load exposure is reduced here, not
+// eliminated tree-wide. Recorded on ISSUE-79 rather than papered over.
+//
+// Unscoped so the guard's session cache is never touched: two independent real
+// probes (ignored, then not-ignored) with no shared state between them. That
+// removes cache contention, not process contention.
+test('real git check-ignore: ignored/not-ignored round trip (integration)', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, '.hypoignore'), '.cache/\n');
+    writeFileSync(join(dir, '.gitignore'), '.cache/\n');
+    assert.equal(pageUsageLoggingAllowed(dir, undefined), true);
+
+    writeFileSync(join(dir, '.gitignore'), 'unrelated/\n');
+    assert.equal(pageUsageLoggingAllowed(dir, undefined), false);
   });
 });
 
