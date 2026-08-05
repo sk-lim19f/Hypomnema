@@ -385,6 +385,51 @@ export function markSiblingNotified(path, key) {
   }
 }
 
+// ── pkgRoot drift notice ────────────────────────────────────────────────────
+// Same notify-once shape as the sibling banner above, in a field of its own
+// (`pkgRootDriftNotifiedFor`) so the two never suppress each other — they are
+// unrelated tuples that happen to share this cache file.
+
+/** Has this exact (cached → self-location) pkgRoot-drift pair already been surfaced? */
+export function pkgRootDriftAlreadyNotified(cache, key) {
+  return Boolean(cache && cache.pkgRootDriftNotifiedFor === key);
+}
+
+/** Record that the pkgRoot-drift banner for `key` was shown (read-merge-write). */
+export function markPkgRootDriftNotified(path, key) {
+  try {
+    const cache = readCache(path) || {};
+    cache.pkgRootDriftNotifiedFor = key;
+    writeCacheAtomic(path, cache);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Clear a previously-recorded pkgRoot-drift mark once the drift is observed
+ * to be resolved (cache catches up with self-location again — status
+ * 'match'). Without this the mark is permanent: the SAME (cached →
+ * self-location) pair recurring later — e.g. hypo-pkg.json catches up, then a
+ * later plugin update or a manual edit drifts it right back to the identical
+ * pair — would stay silently suppressed forever, because only a DIFFERENT
+ * pair would ever produce a new key. Callers must NOT call this on status
+ * 'unknown' (self-location could not be resolved) — that would wrongly wipe a
+ * mark this session had no grounds to judge one way or the other. Read-merge-
+ * write, best-effort (a failure here just means the notice stays suppressed
+ * one extra cycle, never a crash).
+ */
+export function clearPkgRootDriftNotified(path) {
+  try {
+    const cache = readCache(path);
+    if (!cache || !('pkgRootDriftNotifiedFor' in cache)) return;
+    delete cache.pkgRootDriftNotifiedFor;
+    writeCacheAtomic(path, cache);
+  } catch {
+    /* best-effort */
+  }
+}
+
 /**
  * Shared one-line message for the init/upgrade downgrade guard (P). `op` is
  * 'init' or 'upgrade'. Kept here so guard text stays identical across both CLIs.
