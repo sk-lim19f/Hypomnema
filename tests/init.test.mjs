@@ -5,6 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   mkdirSync,
   mkdtempSync,
@@ -19,8 +20,10 @@ import {
 import { join, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
+import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
 import {
   HOME,
+  HOOKS,
   REPO,
   SCRIPTS,
   SESSION_TMP_HOME,
@@ -1353,4 +1356,100 @@ test('--help option list matches every flag parseArgs actually recognizes', () =
     [...recognized].sort(),
     `--help's option list must exactly match the flags parseArgs recognizes.\nlisted:     ${JSON.stringify([...listed].sort())}\nrecognized: ${JSON.stringify([...recognized].sort())}`,
   );
+});
+
+// ── ISSUE-80: installHooks writes/refreshes the provenance sidecar ────────────
+// `.hypo-provenance.json` (scripts/lib/pkg-provenance.mjs) is what
+// hooks/hypo-shared.mjs's resolvePkgRoot() falls back to on a standalone
+// (manual/npm) hooks copy once self-location can't resolve. installHooks is
+// the writer for the manual/npm channel's ~/.claude/hooks.
+suite('init.mjs — provenance sidecar (ISSUE-80)');
+
+function repoHypoSharedSha256() {
+  return createHash('sha256')
+    .update(readFileSync(join(HOOKS, 'hypo-shared.mjs')))
+    .digest('hex');
+}
+
+test('installHooks writes a provenance sidecar that verifies against this package', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const r = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-commands', '--no-shell', '--no-git-init'],
+        home,
+      );
+      assert.equal(r.status, 0, `init failed: ${r.stderr}`);
+
+      const sidecarPath = join(home, '.claude', 'hooks', PROVENANCE_FILENAME);
+      assert.ok(existsSync(sidecarPath), 'installHooks must write the provenance sidecar');
+      const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+      assert.equal(sidecar.pkgRoot, REPO, 'sidecar pkgRoot must point at this package');
+      assert.equal(
+        sidecar.hypoSharedSha256,
+        repoHypoSharedSha256(),
+        'sidecar hash must match the hypo-shared.mjs actually copied',
+      );
+    });
+  });
+});
+
+// The whole point of the fix: a re-run where every hooks/*.mjs file is
+// already-present (and therefore skipped, per scripts/init.mjs's own
+// installHooks comment) must still refresh the sidecar, not leave a stale
+// one behind. copiedAt is a fresh timestamp per write, so it changing across
+// runs is the observable proof the sidecar was actually rewritten, not just
+// left untouched because the hook files themselves were untouched.
+test('a second init run, with every hook file skipped as already-present, still refreshes the sidecar', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const args = [`--hypo-dir=${hypoDir}`, '--no-commands', '--no-shell', '--no-git-init'];
+      const first = runWithHome('init.mjs', args, home);
+      assert.equal(first.status, 0, `first init failed: ${first.stderr}`);
+      const sidecarPath = join(home, '.claude', 'hooks', PROVENANCE_FILENAME);
+      const afterFirst = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+
+      const second = runWithHome('init.mjs', args, home);
+      assert.equal(second.status, 0, `second init failed: ${second.stderr}`);
+      assert.match(
+        second.stdout,
+        /skipped/i,
+        `second run must report the hook files as skipped (already-present): ${second.stdout}`,
+      );
+      const afterSecond = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+      assert.equal(
+        afterSecond.pkgRoot,
+        REPO,
+        'the refreshed sidecar must still point at the current package',
+      );
+      assert.equal(
+        afterSecond.hypoSharedSha256,
+        repoHypoSharedSha256(),
+        'the refreshed sidecar must still hash-match the current hypo-shared.mjs',
+      );
+      assert.notEqual(
+        afterSecond.copiedAt,
+        afterFirst.copiedAt,
+        'a skip-everything re-run must still rewrite the sidecar (fresh copiedAt), not leave it untouched',
+      );
+    });
+  });
+});
+
+test('--dry-run does not write the provenance sidecar', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const r = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--dry-run', '--no-commands', '--no-shell', '--no-git-init'],
+        home,
+      );
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const sidecarPath = join(home, '.claude', 'hooks', PROVENANCE_FILENAME);
+      assert.ok(!existsSync(sidecarPath), '--dry-run must not write the provenance sidecar');
+    });
+  });
 });

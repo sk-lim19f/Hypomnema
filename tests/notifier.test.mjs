@@ -5,6 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   mkdtempSync,
   mkdirSync,
@@ -948,10 +949,7 @@ suite('ISSUE-70: pkgRoot self-location vs cache (resolvePkgRoot / pkgRootDriftSt
 function seedHypoPkg(home, pkgRoot) {
   const claudeDir = join(home, '.claude');
   mkdirSync(claudeDir, { recursive: true });
-  writeFileSync(
-    join(claudeDir, 'hypo-pkg.json'),
-    JSON.stringify({ pkgRoot, pkgVersion: '1.0.0' }),
-  );
+  writeFileSync(join(claudeDir, 'hypo-pkg.json'), JSON.stringify({ pkgRoot, pkgVersion: '1.0.0' }));
 }
 
 // A pkgRoot usable per isUsablePkgRootLocal (hooks/hypo-shared.mjs): absolute
@@ -959,6 +957,28 @@ function seedHypoPkg(home, pkgRoot) {
 function seedUsableRoot(root, version = '1.7.0') {
   mkdirSync(root, { recursive: true });
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'hypomnema', version }));
+}
+
+// SHA-256 of a standalone hooks copy's hypo-shared.mjs — identical bytes to
+// HOOKS/hypo-shared.mjs since standaloneHooksCopy() does a plain cpSync.
+function hypoSharedSha256(hooksSrc = HOOKS) {
+  return createHash('sha256')
+    .update(readFileSync(join(hooksSrc, 'hypo-shared.mjs')))
+    .digest('hex');
+}
+
+// Writes `.hypo-provenance.json` (scripts/lib/pkg-provenance.mjs's contract)
+// next to a standalone hooks copy at `hooksDir`. Defaults produce a sidecar
+// that VERIFIES; pass overrides to build a rejection case.
+function seedProvenance(hooksDir, overrides = {}) {
+  const data = {
+    pkgRoot: overrides.pkgRoot,
+    pkgVersion: overrides.pkgVersion ?? '1.7.0',
+    hypoSharedSha256:
+      'hypoSharedSha256' in overrides ? overrides.hypoSharedSha256 : hypoSharedSha256(),
+    copiedAt: new Date().toISOString(),
+  };
+  writeFileSync(join(hooksDir, '.hypo-provenance.json'), JSON.stringify(data));
 }
 
 // Copies just hooks/ into a throwaway tmp dir, so a hook running FROM that
@@ -1050,10 +1070,13 @@ test('resolvePkgRoot: hypo-pkg.json missing or corrupt never throws (self-locati
   });
 });
 
-test('resolvePkgRoot: self-location unresolvable (standalone-copied hooks, mirrors the npm/manual deploy) → status unknown, falls back to a usable cache', () => {
+test('resolvePkgRoot: self-location unresolvable (standalone-copied hooks, mirrors the npm/manual deploy), no provenance sidecar → status unknown, PKG_ROOT null (BLOCKER 1: no cache fallback)', () => {
   withTmpHome((home) => {
     const standaloneDir = standaloneHooksCopy();
     try {
+      // A usable, up-to-date cache exists — the OLD behavior (pre-fix) would
+      // have adopted it. The new policy is self → verified provenance → null,
+      // full stop: the cache is never consulted for resolution any more.
       const usableCache = join(home, 'cached-root');
       seedUsableRoot(usableCache);
       seedHypoPkg(home, usableCache);
@@ -1061,8 +1084,8 @@ test('resolvePkgRoot: self-location unresolvable (standalone-copied hooks, mirro
       assert.equal(r.status.status, 'unknown');
       assert.equal(
         r.PKG_ROOT,
-        usableCache,
-        'falls back to the (usable) cache when self-location cannot resolve',
+        null,
+        'no provenance sidecar and self-location unresolvable → null, even with a usable cache present',
       );
     } finally {
       rmSync(standaloneDir, { recursive: true, force: true });
@@ -1070,39 +1093,142 @@ test('resolvePkgRoot: self-location unresolvable (standalone-copied hooks, mirro
   });
 });
 
-test('resolvePkgRoot: cache contract — an unusable cached pkgRoot (no package.json, or relative) is never returned, even with self-location unresolvable', () => {
+test('resolvePkgRoot: self-location unresolvable + valid provenance sidecar → PKG_ROOT resolves to the sidecar pkgRoot', () => {
   withTmpHome((home) => {
     const standaloneDir = standaloneHooksCopy();
     try {
-      const hooksSharedPath = join(standaloneDir, 'hooks', 'hypo-shared.mjs');
-
-      // (a) existing directory, no package.json at all
-      const bareDir = join(home, 'cached-dir-no-package-json');
-      mkdirSync(bareDir, { recursive: true });
-      seedHypoPkg(home, bareDir);
-      let r = probePkgRoot(home, hooksSharedPath);
-      assert.equal(r.PKG_ROOT, null, 'a cached dir with no package.json must not be returned');
+      const provenanceRoot = join(home, 'provenance-root');
+      seedUsableRoot(provenanceRoot);
+      const hooksDir = join(standaloneDir, 'hooks');
+      seedProvenance(hooksDir, { pkgRoot: provenanceRoot });
+      const r = probePkgRoot(home, join(hooksDir, 'hypo-shared.mjs'));
       assert.equal(r.status.status, 'unknown');
-
-      // (b) relative cached pkgRoot — must never be adopted
-      seedHypoPkg(home, '.');
-      r = probePkgRoot(home, hooksSharedPath);
-      assert.equal(r.PKG_ROOT, null, 'a relative cached pkgRoot must not be returned');
-
-      // (c) package.json present but missing a version field
-      const versionlessRoot = join(home, 'versionless-root');
-      mkdirSync(versionlessRoot, { recursive: true });
-      writeFileSync(join(versionlessRoot, 'package.json'), JSON.stringify({ name: 'hypomnema' }));
-      seedHypoPkg(home, versionlessRoot);
-      r = probePkgRoot(home, hooksSharedPath);
-      assert.equal(r.PKG_ROOT, null, 'a cached package.json without a version must not be usable');
+      assert.equal(
+        r.PKG_ROOT,
+        provenanceRoot,
+        'a verified provenance sidecar must resolve PKG_ROOT',
+      );
     } finally {
       rmSync(standaloneDir, { recursive: true, force: true });
     }
   });
 });
 
-test('resolvePkgRoot: self-containment — an UNRELATED versioned package.json two levels above a standalone hooks copy is rejected → status unknown, falls back to cache', () => {
+test('resolvePkgRoot: self-location succeeds → self wins even when the provenance sidecar points somewhere else', () => {
+  withFakePkgInstall('1.7.0', (realRoot) => {
+    withTmpHome((home) => {
+      // The sidecar is never even consulted once self-location resolves — a
+      // disagreeing (or outright garbage) sidecar must not change the answer.
+      const elsewhere = join(home, 'provenance-elsewhere');
+      seedUsableRoot(elsewhere);
+      seedProvenance(join(realRoot, 'hooks'), { pkgRoot: elsewhere });
+      const r = probePkgRoot(home, join(realRoot, 'hooks', 'hypo-shared.mjs'));
+      assert.equal(
+        r.PKG_ROOT,
+        realRoot,
+        'self-location must win over a disagreeing provenance sidecar',
+      );
+    });
+  });
+});
+
+// BLOCKER 2 producer proof, both halves. Neither a name mismatch nor a hash
+// mismatch may resolve — and, per BLOCKER 1, neither falls back to the cache.
+test('resolvePkgRoot: provenance producer proof — pkgRoot package.json "name" must be "hypomnema", else null', () => {
+  withTmpHome((home) => {
+    const standaloneDir = standaloneHooksCopy();
+    try {
+      const foreignRoot = join(home, 'foreign-root');
+      mkdirSync(foreignRoot, { recursive: true });
+      writeFileSync(
+        join(foreignRoot, 'package.json'),
+        JSON.stringify({ name: 'not-hypomnema', version: '1.7.0' }),
+      );
+      const hooksDir = join(standaloneDir, 'hooks');
+      seedProvenance(hooksDir, { pkgRoot: foreignRoot });
+      // A usable cache is present too — must still not be adopted (BLOCKER 1).
+      seedHypoPkg(home, foreignRoot);
+      const r = probePkgRoot(home, join(hooksDir, 'hypo-shared.mjs'));
+      assert.equal(
+        r.PKG_ROOT,
+        null,
+        'a provenance pkgRoot whose package.json name != "hypomnema" must be rejected',
+      );
+    } finally {
+      rmSync(standaloneDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resolvePkgRoot: provenance producer proof — hypoSharedSha256 must match the running hypo-shared.mjs, else null', () => {
+  withTmpHome((home) => {
+    const standaloneDir = standaloneHooksCopy();
+    try {
+      const provenanceRoot = join(home, 'provenance-root');
+      seedUsableRoot(provenanceRoot);
+      const hooksDir = join(standaloneDir, 'hooks');
+      seedProvenance(hooksDir, { pkgRoot: provenanceRoot, hypoSharedSha256: 'deadbeef'.repeat(8) });
+      // A usable cache is present too — this is the assertion that pins
+      // BLOCKER 1: a hash mismatch must NOT fall back to the cache.
+      seedHypoPkg(home, provenanceRoot);
+      const r = probePkgRoot(home, join(hooksDir, 'hypo-shared.mjs'));
+      assert.equal(
+        r.PKG_ROOT,
+        null,
+        'a hypoSharedSha256 mismatch must reject the sidecar and must NOT fall back to the cache',
+      );
+    } finally {
+      rmSync(standaloneDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resolvePkgRoot: provenance contract — unusable pkgRoot shapes (missing/relative/versionless) and missing/corrupt sidecar all resolve to null, never throw', () => {
+  withTmpHome((home) => {
+    const standaloneDir = standaloneHooksCopy();
+    try {
+      const hooksDir = join(standaloneDir, 'hooks');
+      const hooksSharedPath = join(hooksDir, 'hypo-shared.mjs');
+
+      // (a) no sidecar at all
+      let r = probePkgRoot(home, hooksSharedPath);
+      assert.equal(r.PKG_ROOT, null, 'no sidecar → null');
+
+      // (b) corrupt JSON
+      writeFileSync(join(hooksDir, '.hypo-provenance.json'), '{not json');
+      r = probePkgRoot(home, hooksSharedPath);
+      assert.equal(r.PKG_ROOT, null, 'corrupt sidecar JSON → null, not a throw');
+
+      // (c) sidecar pkgRoot points at a dir with no package.json
+      const bareDir = join(home, 'bare-dir-no-package-json');
+      mkdirSync(bareDir, { recursive: true });
+      seedProvenance(hooksDir, { pkgRoot: bareDir });
+      r = probePkgRoot(home, hooksSharedPath);
+      assert.equal(r.PKG_ROOT, null, 'sidecar pkgRoot with no package.json → null');
+
+      // (d) sidecar pkgRoot is relative — must never be adopted
+      seedProvenance(hooksDir, { pkgRoot: '.' });
+      r = probePkgRoot(home, hooksSharedPath);
+      assert.equal(r.PKG_ROOT, null, 'a relative sidecar pkgRoot must not be returned');
+
+      // (e) sidecar pkgRoot's package.json has no version field
+      const versionlessRoot = join(home, 'versionless-root');
+      mkdirSync(versionlessRoot, { recursive: true });
+      writeFileSync(join(versionlessRoot, 'package.json'), JSON.stringify({ name: 'hypomnema' }));
+      seedProvenance(hooksDir, { pkgRoot: versionlessRoot });
+      r = probePkgRoot(home, hooksSharedPath);
+      assert.equal(
+        r.PKG_ROOT,
+        null,
+        'a sidecar pkgRoot package.json without a version must not be usable',
+      );
+    } finally {
+      rmSync(standaloneDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resolvePkgRoot: self-containment — an UNRELATED versioned package.json two levels above a standalone hooks copy is rejected → status unknown, PKG_ROOT null (no cache fallback)', () => {
   withTmpHome((home) => {
     // codex repro shape: hooks copied standalone (no package.json alongside),
     // but some ANCESTOR above it happens to carry its own, unrelated, perfectly
@@ -1122,6 +1248,9 @@ test('resolvePkgRoot: self-containment — an UNRELATED versioned package.json t
       mkdirSync(nestedHooksDir, { recursive: true });
       cpSync(HOOKS, nestedHooksDir, { recursive: true });
 
+      // A usable cache is present too — must still not be adopted (BLOCKER 1:
+      // resolution is self → verified provenance → null, cache is never a
+      // resolution fallback), and no provenance sidecar was written here.
       const usableCache = join(home, 'cached-root');
       seedUsableRoot(usableCache);
       seedHypoPkg(home, usableCache);
@@ -1132,7 +1261,11 @@ test('resolvePkgRoot: self-containment — an UNRELATED versioned package.json t
         'unknown',
         'an unrelated-but-usable ancestor package.json must never be adopted as self-location',
       );
-      assert.equal(r.PKG_ROOT, usableCache, 'must fall back to the cache, not the unrelated package');
+      assert.equal(
+        r.PKG_ROOT,
+        null,
+        'must not fall back to the cache, nor adopt the unrelated package',
+      );
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -1150,7 +1283,10 @@ test('resolvePkgRoot: self-containment — an ancestor with A hooks/hypo-shared.
       // actually running.
       writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'x', version: '9.9.9' }));
       mkdirSync(join(root, 'hooks'), { recursive: true });
-      writeFileSync(join(root, 'hooks', 'hypo-shared.mjs'), '// foreign stub, not the real module\n');
+      writeFileSync(
+        join(root, 'hooks', 'hypo-shared.mjs'),
+        '// foreign stub, not the real module\n',
+      );
 
       // The REAL running module lives nested one level deeper, so `root` is
       // an ancestor the walk will actually reach and test.
@@ -1158,6 +1294,7 @@ test('resolvePkgRoot: self-containment — an ancestor with A hooks/hypo-shared.
       mkdirSync(nestedHooksDir, { recursive: true });
       cpSync(HOOKS, nestedHooksDir, { recursive: true });
 
+      // A usable cache is present too — must still not be adopted (BLOCKER 1).
       const usableCache = join(home, 'cached-root');
       seedUsableRoot(usableCache);
       seedHypoPkg(home, usableCache);
@@ -1168,7 +1305,7 @@ test('resolvePkgRoot: self-containment — an ancestor with A hooks/hypo-shared.
         'unknown',
         'an ancestor with A hooks/hypo-shared.mjs, but not THIS one, must not be adopted',
       );
-      assert.equal(r.PKG_ROOT, usableCache);
+      assert.equal(r.PKG_ROOT, null, 'must not fall back to the cache');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

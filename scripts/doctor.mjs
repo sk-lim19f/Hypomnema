@@ -31,6 +31,8 @@ import {
   detectSessionCloseArtifact,
   localAndUtcDates,
   SESSION_CLOSED_MARKER_STALE_MS,
+  isUsablePkgRootLocal,
+  selfLocationPkgRootFrom,
 } from '../hooks/hypo-shared.mjs';
 import { listProposals } from '../hooks/proposal-store.mjs';
 import {
@@ -50,12 +52,19 @@ import {
   CODEX_TYPES,
 } from './lib/extensions.mjs';
 import { sha256, readFileIfRegular, readPkgJson } from './lib/pkg-json.mjs';
+import {
+  provenancePath,
+  EXPECTED_PKG_NAME,
+  HOOKS_DIGEST_FIELD,
+  computeHooksDigest,
+} from './lib/pkg-provenance.mjs';
 import { resolveCliOnPath, classifyInstall } from '../hooks/version-check.mjs';
 import { isHypomnemaPluginEnabled } from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const PKG_ROOT = join(SCRIPT_DIR, '..');
+const HOOKS_SRC = join(PKG_ROOT, 'hooks');
 
 // ── install channel ───────────────────────────────────────────────────────────
 //
@@ -320,6 +329,8 @@ function checkHooks(coreManagedByPlugin) {
   } else {
     fail('Hook files installed', `No hook files found in ${claudeHooks} — run /hypo:init`);
   }
+
+  checkProvenanceSidecar(claudeHooks, 'hooks/.hypo-provenance.json');
 }
 
 function checkSettingsJson(coreManagedByPlugin) {
@@ -813,11 +824,9 @@ function deriveCommitProjects(hypoDir, hash) {
   // projects/a/hot.md → projects/b/hot.md rename would silently drop project
   // a from scope — a marker naming only "b" would then wrongly cover the
   // whole commit. -M's tab-separated `status\told\tnew` line carries both.
-  const show = spawnSync(
-    'git',
-    ['-C', hypoDir, 'show', '--name-status', '-M', '--format=', hash],
-    { encoding: 'utf-8' },
-  );
+  const show = spawnSync('git', ['-C', hypoDir, 'show', '--name-status', '-M', '--format=', hash], {
+    encoding: 'utf-8',
+  });
   if (show.status !== 0 || !show.stdout) return [];
   const projects = new Set();
   for (const line of show.stdout.split('\n')) {
@@ -1229,6 +1238,8 @@ function checkCodexPaths() {
       `No hook files found in ${codexHooks} — run /hypo:init --codex`,
     );
   }
+
+  checkProvenanceSidecar(codexHooks, 'Codex hooks/.hypo-provenance.json');
 
   const settingsPath = join(HOME, '.codex', 'settings.json');
   if (!existsSync(settingsPath)) {
@@ -1826,6 +1837,136 @@ function checkStaleSibling() {
   } else {
     pass('PATH CLI vs active install', `v${cli.version} (active v${active.pkgVersion})`);
   }
+}
+
+// ── provenance sidecar (manual/npm channel) ────────────────────────────────────
+//
+// `.hypo-provenance.json` lives next to a standalone-copied hooks/ dir
+// (installHooks/applyHookFiles — scripts/lib/pkg-provenance.mjs) and is what
+// hooks/hypo-shared.mjs's resolvePkgRoot() falls back to when self-location
+// can't resolve. Absent is a normal state whenever there is no INSTALLED
+// hooks/hypo-shared.mjs at `hooksDir` to worry about at all (plugin channel:
+// hooks run straight from CLAUDE_PLUGIN_ROOT, nothing is ever copied here;
+// a truly fresh, never-inited home) — that case stays silent. It is also
+// normal, and stays silent, when hypo-shared.mjs IS installed here but
+// self-locates on its own (a dev checkout whose "hooksDir" happens to be the
+// package's own hooks/, not a copy). The one PRESENT-but-broken and the one
+// ABSENT-but-should-not-be-silent case are both actionable (CONCERN 4):
+//   - present sidecar that fails to verify → WARN, same three-way shape as
+//     checkPkgIntegrity below, never FAIL (a broken sidecar just degrades
+//     PKG_ROOT to null, surfaced live by hypo-session-start.mjs's
+//     PKG_ROOT-null banner, not corrupting anything on disk)
+//   - installed hypo-shared.mjs, self-location fails for it, AND no sidecar
+//     at all → that combination IS "PKG_ROOT is null for every hook running
+//     from here" (resolvePkgRoot() has nothing left to try), so silence here
+//     would hide exactly the state the live banner already warns about
+function checkProvenanceSidecar(hooksDir, label) {
+  const sidecarPath = provenancePath(hooksDir);
+  if (!existsSync(sidecarPath)) {
+    if (existsSync(join(hooksDir, 'hypo-shared.mjs')) && !selfLocationPkgRootFrom(hooksDir)) {
+      warn(
+        label,
+        `no provenance sidecar, and this install's hooks cannot self-locate their ` +
+          `package — PKG_ROOT resolves to null for every hook running from ${hooksDir}; ` +
+          `run \`hypomnema upgrade --apply\` to write one`,
+      );
+    }
+    return;
+  }
+
+  let sidecar;
+  try {
+    sidecar = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+  } catch {
+    warn(label, `${sidecarPath} is not valid JSON — run /hypo:upgrade --apply to rewrite it`);
+    return;
+  }
+
+  const { pkgRoot, hypoSharedSha256, [HOOKS_DIGEST_FIELD]: hooksDigest } = sidecar || {};
+
+  // Same predicate the runtime resolver requires (isUsablePkgRootLocal, used
+  // by readVerifiedProvenancePkgRoot in hooks/hypo-shared.mjs) — imported,
+  // not hand-rolled again here, so a version-less "name":"hypomnema" root can
+  // no longer PASS this check while resolvePkgRoot() treats it as null.
+  const usableOk = isUsablePkgRootLocal(pkgRoot);
+
+  let producerName = null;
+  try {
+    producerName = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8')).name;
+  } catch {
+    /* pkgRoot missing/unreadable — nameOk stays false below */
+  }
+  const nameOk = producerName === EXPECTED_PKG_NAME;
+
+  let hashOk = false;
+  try {
+    hashOk = sha256(readFileSync(join(hooksDir, 'hypo-shared.mjs'))) === hypoSharedSha256;
+  } catch {
+    /* hooks/hypo-shared.mjs unreadable in its own hooks dir — hashOk stays false */
+  }
+
+  if (usableOk && nameOk && hashOk) {
+    // hooksDigest (BLOCKER A item 3) can still turn this into a warn: it is
+    // folded into the SAME label/check rather than pushed as a second entry,
+    // so a caller reading checks by label (every other check in this file,
+    // and every test asserting on one) sees exactly one verdict per sidecar.
+    const digestIssue = hooksDigestMismatch(hooksDir, hooksDigest);
+    if (!digestIssue) {
+      pass(label, `verified — resolves to ${pkgRoot}`);
+    } else {
+      warn(label, `verified (pkgRoot/hash), but ${digestIssue}`);
+    }
+    return;
+  }
+  const reasons = [];
+  if (!usableOk) {
+    reasons.push(
+      `recorded pkgRoot (${pkgRoot}) is not a usable package root (must be an absolute ` +
+        `path to a directory whose package.json carries a version)`,
+    );
+  }
+  if (!nameOk) reasons.push(`recorded pkgRoot (${pkgRoot}) is not this package`);
+  if (!hashOk)
+    reasons.push('recorded hypoSharedSha256 does not match the installed hypo-shared.mjs');
+  warn(
+    label,
+    `${sidecarPath} does not verify (${reasons.join('; ')}) — resolvePkgRoot() will treat ` +
+      `PKG_ROOT as unresolved this session; run /hypo:upgrade --apply to refresh it`,
+  );
+}
+
+// BLOCKER A item 3: the runtime SHA check above (hashOk) pins ONE file,
+// hypo-shared.mjs — see that function's own hooks/hypo-shared.mjs-side
+// comment for why. This pins every OTHER file hooks.json wires up too, once
+// per `hypomnema doctor` run rather than once per hook load (too expensive
+// to do there — see computeHooksDigest's doc comment in
+// scripts/lib/pkg-provenance.mjs). Skips silently when the sidecar predates
+// this field (an older init/upgrade wrote it before BLOCKER A existed) —
+// there is nothing recorded to compare against, and the runtime never reads
+// this field either, so staying quiet hides nothing the runtime already
+// trusts.
+//
+// Returns null when there is nothing to report (field absent, or digests
+// match), or a ready-to-append reason string naming a few diverged files.
+function hooksDigestMismatch(hooksDir, recordedDigest) {
+  if (typeof recordedDigest !== 'string' || !recordedDigest) return null;
+  const actualDigest = computeHooksDigest(PKG_ROOT, hooksDir);
+  if (actualDigest === null || actualDigest === recordedDigest) return null;
+
+  const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
+  const diverged = allFiles.filter((file) => {
+    try {
+      return !readFileSync(join(hooksDir, file)).equals(readFileSync(join(HOOKS_SRC, file)));
+    } catch {
+      return true; // unreadable on either side counts as diverged
+    }
+  });
+  const examples = diverged.slice(0, 3).join(', ');
+  return (
+    `hooksDigest mismatch: ${diverged.length}/${allFiles.length} hook file(s) differ from ` +
+    `the current package source${examples ? ` (e.g. ${examples})` : ''} — run ` +
+    `\`hypomnema upgrade --apply\``
+  );
 }
 
 // ── package integrity ─────────────────────────────────────────────────────────

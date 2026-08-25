@@ -5,6 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   mkdtempSync,
   mkdirSync,
@@ -20,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import { writeDualSkipProvenance } from '../scripts/lib/pkg-json.mjs';
+import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
@@ -1531,4 +1533,70 @@ test('registry root usable at write time: writes the correction and returns true
   } finally {
     rmSync(registryDir, { recursive: true, force: true });
   }
+});
+
+// ── ISSUE-80: --apply refreshes the provenance sidecar (scripts/lib/pkg-provenance.mjs) ──
+suite('upgrade.mjs — provenance sidecar refresh (ISSUE-80)');
+
+function repoHypoSharedSha256() {
+  return createHash('sha256')
+    .update(readFileSync(join(HOOKS, 'hypo-shared.mjs')))
+    .digest('hex');
+}
+
+test('--apply refreshes a corrupted claude-side provenance sidecar (scripts/upgrade.mjs:1144)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const sidecarPath = join(home, '.claude', 'hooks', PROVENANCE_FILENAME);
+      assert.ok(existsSync(sidecarPath), 'pre-state: init must have written the sidecar');
+      // Corrupt it so a real regression (upgrade never touching it) is
+      // distinguishable from "it happened to already be correct".
+      writeFileSync(sidecarPath, '{not json');
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r.status, 0, `upgrade --apply failed: ${r.stderr}`);
+
+      const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+      assert.equal(sidecar.pkgRoot, REPO, '--apply must rewrite the sidecar pkgRoot');
+      assert.equal(
+        sidecar.hypoSharedSha256,
+        repoHypoSharedSha256(),
+        '--apply must rewrite the sidecar hash to match the installed hypo-shared.mjs',
+      );
+    });
+  });
+});
+
+// scripts/upgrade.mjs:1206 mirrors the same write for the codex hooks
+// directory, but only under `if (args.codex)`. --codex has no dependency
+// on a codex CLI actually being installed (applyHookFiles mkdirSync's the
+// target unconditionally), so the fixture just needs the flag.
+test('--apply --codex writes the provenance sidecar into the codex hooks dir (scripts/upgrade.mjs:1206)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(r.status, 0, `upgrade --apply --codex failed: ${r.stderr}`);
+
+      const codexSidecarPath = join(home, '.codex', 'hooks', PROVENANCE_FILENAME);
+      assert.ok(
+        existsSync(codexSidecarPath),
+        '--apply --codex must write the codex-side provenance sidecar',
+      );
+      const sidecar = JSON.parse(readFileSync(codexSidecarPath, 'utf-8'));
+      assert.equal(sidecar.pkgRoot, REPO, 'codex sidecar pkgRoot must point at this package');
+      assert.equal(
+        sidecar.hypoSharedSha256,
+        repoHypoSharedSha256(),
+        'codex sidecar hash must match the installed hypo-shared.mjs',
+      );
+    });
+  });
 });

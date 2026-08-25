@@ -3531,3 +3531,24 @@ test('uninstall-extensions-skips-non-regular-symlink', () => {
     });
   });
 });
+
+// ISSUE-80: uninstall must remove the `.hypo-provenance.json` sidecar
+// installHooks writes next to ~/.claude/hooks (scripts/lib/pkg-provenance.mjs)
+// — same lifecycle as the hook files it sits beside. A leftover sidecar after
+// uninstall would describe a package root no hooks point through any more.
+test('uninstall-removes-provenance-sidecar-with-hooks', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const sidecarPath = join(home, '.claude', 'hooks', '.hypo-provenance.json');
+      assert.ok(existsSync(sidecarPath), 'pre-state: init must write the provenance sidecar');
+
+      const un = runWithHome('uninstall.mjs', ['--apply'], home);
+      assert.equal(un.status, 0, `uninstall failed: ${un.stderr}\n${un.stdout}`);
+      assert.ok(!existsSync(sidecarPath), 'uninstall must remove the provenance sidecar');
+    });
+  });
+});

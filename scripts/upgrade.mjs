@@ -53,6 +53,7 @@ import {
   writeDualSkipProvenance,
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
+import { writeProvenanceSidecar } from './lib/pkg-provenance.mjs';
 import { isHypomnemaPluginEnabled, resolveEnabledPluginRoot } from './lib/plugin-detect.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 
@@ -1135,6 +1136,12 @@ if (args.apply) {
       );
     }
     appliedHooks = applyHookFiles(hooks, claudeHooksDir);
+    // Refresh every run managesClaudeCore is true, not only when a stale hook
+    // was actually copied above: applyHookFiles OVERWRITES (never skips) a
+    // stale hook, but even a run that finds every hook already up-to-date
+    // must still keep the sidecar's pkgVersion truthful, same reasoning as
+    // installHooks's own refresh-every-run comment.
+    writeProvenanceSidecar(claudeHooksDir, PKG_ROOT, readVersionAtRoot(PKG_ROOT), HOOKS_SRC, false);
     appliedSettings = applySettingsJson(settings, claudeSettingsPath);
     // applyCommands handles the single atomic hypo-pkg.json write (pkgRoot, version, schema, commands map)
     appliedCommands = applyCommands(commands, args.forceCommands);
@@ -1196,6 +1203,7 @@ if (args.apply) {
       );
     }
     appliedHooksCodex = applyHookFiles(hooksCodex, codexHooksDir);
+    writeProvenanceSidecar(codexHooksDir, PKG_ROOT, readVersionAtRoot(PKG_ROOT), HOOKS_SRC, false);
     appliedSettingsCodex = applySettingsJson(settingsCodex, codexSettingsPath);
   }
   // After applyCommands wrote hypo-pkg.json — merges extensions.<target> alongside.

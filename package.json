@@ -38,6 +38,7 @@
     "scripts/lib/hypo-root.mjs",
     "scripts/lib/page-usage.mjs",
     "scripts/lib/pkg-json.mjs",
+    "scripts/lib/pkg-provenance.mjs",
     "scripts/lib/plugin-detect.mjs",
     "scripts/lib/project-create.mjs",
     "scripts/lib/rename-marker.mjs",

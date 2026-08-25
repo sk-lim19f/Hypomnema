@@ -38,6 +38,7 @@ import {
   scopeVisible,
   readVisibilityScope,
   pkgRootDriftStatus,
+  PKG_ROOT,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -54,6 +55,9 @@ import {
   pkgRootDriftAlreadyNotified,
   markPkgRootDriftNotified,
   clearPkgRootDriftNotified,
+  pkgRootNullAlreadyNotified,
+  markPkgRootNullNotified,
+  clearPkgRootNullNotified,
 } from './version-check.mjs';
 import { snapshotBase, overwriteTargets } from './base-store.mjs';
 import { listProposals } from './proposal-store.mjs';
@@ -260,6 +264,48 @@ function buildPkgRootDriftNotice() {
       `  Hooks already resolved the correct root for this session — this is a ` +
       `heads-up, not a blocker.\n` +
       `  → run \`/hypo:upgrade --apply\` to bring hypo-pkg.json back in sync.`
+    );
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * PKG_ROOT-null notice. A different failure than the drift banner above:
+ * drift only fires when self-location DID resolve (PKG_ROOT is non-null,
+ * just disagreeing with the cache). This fires when hooks/hypo-shared.mjs's
+ * resolvePkgRoot() came up with nothing at all — self-location failed AND no
+ * verified provenance sidecar covered it — which is exactly the state where
+ * PreCompact's lint/feedback calls silently no-op (they have no root to
+ * shell scripts through). The two conditions cannot both hold in the same
+ * session (drift requires a non-null self-location), so there is no overlap
+ * to arbitrate — they use separate notify-once cache fields regardless, so
+ * neither one depends on that being true forever.
+ *
+ * Same notify-once shape as the drift banner: shown once, cleared as soon as
+ * PKG_ROOT resolves again so a later recurrence re-notifies instead of
+ * staying suppressed by a mark from a different install state.
+ */
+function buildPkgRootNullNotice() {
+  try {
+    const cachePath = defaultCachePath();
+    if (PKG_ROOT) {
+      clearPkgRootNullNotified(cachePath);
+      return '';
+    }
+    if (isOptedOut()) return '';
+    const cache = readCache(cachePath);
+    if (pkgRootNullAlreadyNotified(cache)) return '';
+    markPkgRootNullNotified(cachePath);
+    return (
+      `[Hypomnema] Package root unresolved: this install's hooks cannot locate ` +
+      `their own package, so PreCompact's lint/feedback checks are silently ` +
+      `skipped this session.\n` +
+      `  → run \`hypomnema upgrade --apply\` to sync this install's hook copies ` +
+      `with the current package (the \`/hypo:upgrade --apply\` slash command does ` +
+      `the same thing, where slash commands were installed). \`/hypo:init\` will ` +
+      `NOT fix this — it skips every hook file that already exists.\n` +
+      `  → or run \`hypomnema doctor\` to see what's missing.`
     );
   } catch {
     return '';
@@ -500,16 +546,24 @@ process.stdin.on('end', () => {
     const updateLine = buildUpdateNotice();
     const siblingLine = buildSiblingNotice();
     const pkgDriftLine = buildPkgRootDriftNotice();
-    // The update + stale-sibling + pkgRoot-drift banners must reach the USER.
-    // On a SessionStart hook that exits 0, stderr is invisible in the normal
-    // TUI (only shown on exit 2 / --verbose) and additionalContext is
+    // pkgDriftLine and pkgNullLine can never both be non-empty in the same
+    // session: drift requires PKG_ROOT to have resolved (non-null) via
+    // self-location, while the null notice fires exactly when it did not.
+    // Listed together below on that basis, not because one is chosen over
+    // the other.
+    const pkgNullLine = buildPkgRootNullNotice();
+    // The update + stale-sibling + pkgRoot-drift/null banners must reach the
+    // USER. On a SessionStart hook that exits 0, stderr is invisible in the
+    // normal TUI (only shown on exit 2 / --verbose) and additionalContext is
     // model-only — `systemMessage` is the documented user-visible channel.
     // Route those banners there. They ALSO stay in noticePrefix →
     // additionalContext below, so the model and the user start the session
     // looking at the same state. (The other stderr notices —
     // sync/growth/clear/suggest — are intentionally transcript/--verbose only
     // and out of this banner's scope.)
-    const userMessage = [updateLine, siblingLine, pkgDriftLine].filter(Boolean).join('\n\n');
+    const userMessage = [updateLine, siblingLine, pkgDriftLine, pkgNullLine]
+      .filter(Boolean)
+      .join('\n\n');
     if (userMessage) outExtra = { ...outExtra, systemMessage: userMessage };
     const notices = [
       syncLine,
@@ -519,6 +573,7 @@ process.stdin.on('end', () => {
       updateLine,
       siblingLine,
       pkgDriftLine,
+      pkgNullLine,
     ].filter(Boolean);
     let noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
     if (syncLine) process.stderr.write(`\n\x1b[33m${syncLine}\x1b[0m\n`);
@@ -529,6 +584,7 @@ process.stdin.on('end', () => {
     if (updateLine) process.stderr.write(`\n\x1b[33m${updateLine}\x1b[0m\n`);
     if (siblingLine) process.stderr.write(`\n\x1b[33m${siblingLine}\x1b[0m\n`);
     if (pkgDriftLine) process.stderr.write(`\n\x1b[33m${pkgDriftLine}\x1b[0m\n`);
+    if (pkgNullLine) process.stderr.write(`\n\x1b[33m${pkgNullLine}\x1b[0m\n`);
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = sessionMarkerPath(sessionId);

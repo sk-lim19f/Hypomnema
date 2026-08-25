@@ -31,6 +31,7 @@ import {
   withTmpDir,
   withTmpHome,
 } from './helpers.mjs';
+import { PROVENANCE_FILENAME, EXPECTED_PKG_NAME } from '../scripts/lib/pkg-provenance.mjs';
 
 // ── doctor.mjs smoke tests ───────────────────────────────────────────────────
 
@@ -860,7 +861,7 @@ test('doctor-close-artifacts: legacy marker with ONLY a flat `project` (no `proj
 // (hooks/hypo-shared.mjs SESSION_CLOSED_MARKER_STALE_MS comment) — a
 // same-day marker for an UNRELATED project must not silence an unapproved
 // close in THIS project. A date-only correlation would wrongly pass this.
-test('doctor-close-artifacts: a DIFFERENT project\'s same-day marker does not mask this project\'s unapproved close → warn', () => {
+test("doctor-close-artifacts: a DIFFERENT project's same-day marker does not mask this project's unapproved close → warn", () => {
   withTmpDir((dir) => {
     baseWiki(dir);
     mkdirSync(join(dir, 'projects', 'project-a'), { recursive: true });
@@ -900,10 +901,14 @@ test('doctor-close-artifacts: a DIFFERENT project\'s same-day marker does not ma
 // case (UTC day ≠ local day) is deterministic regardless of the host's own
 // timezone.
 function runDoctorJsonInTz(dir, tz) {
-  const r = spawnSync(process.execPath, [join(SCRIPTS, 'doctor.mjs'), `--hypo-dir=${dir}`, '--json'], {
-    encoding: 'utf-8',
-    env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME, TZ: tz },
-  });
+  const r = spawnSync(
+    process.execPath,
+    [join(SCRIPTS, 'doctor.mjs'), `--hypo-dir=${dir}`, '--json'],
+    {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME, TZ: tz },
+    },
+  );
   return { r, out: JSON.parse(r.stdout) };
 }
 
@@ -1812,10 +1817,18 @@ test('a well-formed marker → warn naming from/to and a runnable re-run command
     const check = out.find((c) => c.label === 'Incomplete rename');
     assert.ok(check, 'Incomplete rename check not found');
     assert.equal(check.status, 'warn', `expected warn with a marker present: ${check.detail}`);
-    assert.ok(check.detail.includes('pages/foo.md'), `detail must name the from-page: ${check.detail}`);
-    assert.ok(check.detail.includes('pages/bar.md'), `detail must name the to-page: ${check.detail}`);
     assert.ok(
-      /node .*rename\.mjs .*--from=pages\/foo\.md .*--to=pages\/bar\.md .*--apply/.test(check.detail),
+      check.detail.includes('pages/foo.md'),
+      `detail must name the from-page: ${check.detail}`,
+    );
+    assert.ok(
+      check.detail.includes('pages/bar.md'),
+      `detail must name the to-page: ${check.detail}`,
+    );
+    assert.ok(
+      /node .*rename\.mjs .*--from=pages\/foo\.md .*--to=pages\/bar\.md .*--apply/.test(
+        check.detail,
+      ),
       `detail must include an exact runnable re-run command: ${check.detail}`,
     );
   });
@@ -1881,7 +1894,11 @@ test('marker present, from gone, to exists (move finished, marker leftover) → 
     const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
     const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
     assert.ok(check, 'Incomplete rename check not found');
-    assert.equal(check.status, 'warn', `stale-but-finished marker must still warn: ${check.detail}`);
+    assert.equal(
+      check.status,
+      'warn',
+      `stale-but-finished marker must still warn: ${check.detail}`,
+    );
     assert.ok(
       !/re-run/i.test(check.detail),
       `must not suggest a re-run that would fail (--from no longer resolves): ${check.detail}`,
@@ -1933,7 +1950,12 @@ test('marker in a git repo that does NOT ignore .cache/ → doctor appends a git
     writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
     writeFileSync(
       join(dir, '.cache', 'rename-in-progress.json'),
-      JSON.stringify({ mode: 'page', from: 'pages/foo.md', to: 'pages/bar.md', started_at: '2026-08-01T00:00:00.000Z' }),
+      JSON.stringify({
+        mode: 'page',
+        from: 'pages/foo.md',
+        to: 'pages/bar.md',
+        started_at: '2026-08-01T00:00:00.000Z',
+      }),
     );
     const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
     const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
@@ -1953,7 +1975,12 @@ test('marker in a git repo that DOES ignore .cache/ → no gitignore hint', () =
     writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
     writeFileSync(
       join(dir, '.cache', 'rename-in-progress.json'),
-      JSON.stringify({ mode: 'page', from: 'pages/foo.md', to: 'pages/bar.md', started_at: '2026-08-01T00:00:00.000Z' }),
+      JSON.stringify({
+        mode: 'page',
+        from: 'pages/foo.md',
+        to: 'pages/bar.md',
+        started_at: '2026-08-01T00:00:00.000Z',
+      }),
     );
     const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
     const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
@@ -1971,12 +1998,287 @@ test('marker in a non-git vault → no gitignore hint, no crash', () => {
     writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
     writeFileSync(
       join(dir, '.cache', 'rename-in-progress.json'),
-      JSON.stringify({ mode: 'page', from: 'pages/foo.md', to: 'pages/bar.md', started_at: '2026-08-01T00:00:00.000Z' }),
+      JSON.stringify({
+        mode: 'page',
+        from: 'pages/foo.md',
+        to: 'pages/bar.md',
+        started_at: '2026-08-01T00:00:00.000Z',
+      }),
     );
     const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
-    assert.ok(r.status !== null && r.status <= 1, `doctor must not crash on a non-git vault: ${r.stdout}${r.stderr}`);
+    assert.ok(
+      r.status !== null && r.status <= 1,
+      `doctor must not crash on a non-git vault: ${r.stdout}${r.stderr}`,
+    );
     const check = JSON.parse(r.stdout).find((c) => c.label === 'Incomplete rename');
     assert.equal(check.status, 'warn');
-    assert.ok(!/gitignore/i.test(check.detail), `non-git vault must get no gitignore hint: ${check.detail}`);
+    assert.ok(
+      !/gitignore/i.test(check.detail),
+      `non-git vault must get no gitignore hint: ${check.detail}`,
+    );
+  });
+});
+
+// ── ISSUE-80: provenance sidecar check (scripts/doctor.mjs's checkProvenanceSidecar) ──
+// Absent is a normal, silent state (plugin/dev channels never write one; so does
+// a manual install predating this check). Present is either verified (pass) or
+// broken (warn, never fail — a broken sidecar just degrades PKG_ROOT to null,
+// which the SessionStart PKG_ROOT-null banner surfaces instead).
+suite('doctor.mjs — provenance sidecar check (ISSUE-80)');
+
+test('no sidecar at all (fresh install) → no check reported', () => {
+  withTmpHome((home) => {
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+    assert.equal(check, undefined, 'an absent sidecar must not be reported at all');
+  });
+});
+
+test('a verified sidecar (written by init) → pass', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+      assert.ok(check, 'expected a hooks/.hypo-provenance.json check');
+      assert.equal(check.status, 'pass', `a freshly-written sidecar must verify: ${check.detail}`);
+      assert.match(check.detail, /verified/);
+    });
+  });
+});
+
+test('corrupt sidecar JSON → warn', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const sidecarPath = join(home, '.claude', 'hooks', '.hypo-provenance.json');
+      writeFileSync(sidecarPath, '{not json');
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+      assert.ok(check, 'expected a hooks/.hypo-provenance.json check');
+      assert.equal(check.status, 'warn', `corrupt JSON must warn, not pass/fail: ${check.detail}`);
+      assert.match(check.detail, /not valid JSON/);
+    });
+  });
+});
+
+test('sidecar pkgRoot package.json name != "hypomnema" → warn', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const foreignRoot = mkdtempSync(join(tmpdir(), 'hypo-foreign-root-'));
+      try {
+        writeFileSync(
+          join(foreignRoot, 'package.json'),
+          JSON.stringify({ name: 'not-hypomnema', version: '1.0.0' }),
+        );
+        const sidecarPath = join(home, '.claude', 'hooks', '.hypo-provenance.json');
+        const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+        sidecar.pkgRoot = foreignRoot;
+        writeFileSync(sidecarPath, JSON.stringify(sidecar));
+        const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+        const out = JSON.parse(r.stdout);
+        const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+        assert.ok(check, 'expected a hooks/.hypo-provenance.json check');
+        assert.equal(check.status, 'warn', `a foreign pkgRoot must warn: ${check.detail}`);
+        assert.match(check.detail, /is not this package/);
+      } finally {
+        rmSync(foreignRoot, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+test('sidecar hypoSharedSha256 mismatch → warn', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const sidecarPath = join(home, '.claude', 'hooks', '.hypo-provenance.json');
+      const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+      sidecar.hypoSharedSha256 = 'deadbeef'.repeat(8);
+      writeFileSync(sidecarPath, JSON.stringify(sidecar));
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+      assert.ok(check, 'expected a hooks/.hypo-provenance.json check');
+      assert.equal(check.status, 'warn', `a hash mismatch must warn: ${check.detail}`);
+      assert.match(check.detail, /does not match the installed hypo-shared\.mjs/);
+    });
+  });
+});
+
+test('--codex flag: a verified codex-side sidecar (written by upgrade --apply --codex) → pass', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const upR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(upR.status, 0, `upgrade --apply --codex failed: ${upR.stderr}`);
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--codex', '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'Codex hooks/.hypo-provenance.json');
+      assert.ok(check, 'expected a Codex hooks/.hypo-provenance.json check');
+      assert.equal(check.status, 'pass', `codex sidecar must verify: ${check.detail}`);
+    });
+  });
+});
+
+// CONCERN 1 (fix/pkgroot-provenance codex review): the sidecar filename and
+// producer-name check are duplicated byte-for-byte between
+// hooks/hypo-shared.mjs (a private const — hooks can't import scripts/) and
+// scripts/lib/pkg-provenance.mjs (the exported source of truth). A source
+// scan, not a shared import, is the only way to bind them: importing
+// hooks/hypo-shared.mjs's PKG_ROOT here would run selfLocationPkgRoot()
+// against THIS test file's own checkout, an unrelated side effect. Follows
+// the same read-source-as-text pattern as tests/proposal-base.test.mjs's
+// "publishes the lock by linking" test.
+test('CONCERN 1: PROVENANCE_FILENAME/EXPECTED_PKG_NAME stay byte-identical between hooks/hypo-shared.mjs and scripts/lib/pkg-provenance.mjs', () => {
+  const sharedSrc = readFileSync(join(REPO, 'hooks', 'hypo-shared.mjs'), 'utf-8');
+  const filenameMatch = sharedSrc.match(/const PROVENANCE_FILENAME = '([^']+)'/);
+  const nameMatch = sharedSrc.match(/const EXPECTED_PKG_NAME = '([^']+)'/);
+  assert.ok(
+    filenameMatch,
+    'hooks/hypo-shared.mjs must define PROVENANCE_FILENAME as a plain string literal',
+  );
+  assert.ok(
+    nameMatch,
+    'hooks/hypo-shared.mjs must define EXPECTED_PKG_NAME as a plain string literal',
+  );
+  assert.equal(
+    filenameMatch[1],
+    PROVENANCE_FILENAME,
+    'sidecar filename diverged between the runtime reader and scripts/lib/pkg-provenance.mjs',
+  );
+  assert.equal(
+    nameMatch[1],
+    EXPECTED_PKG_NAME,
+    'producer-name check diverged between the runtime reader and scripts/lib/pkg-provenance.mjs',
+  );
+});
+
+// ── BLOCKER A: hooksDigest (aggregate hash over every hook.json-wired file) ──
+suite('doctor.mjs — hooksDigest + self-location checks (fix/pkgroot-provenance)');
+
+test('a hook file other than hypo-shared.mjs changed after copy → hooksDigest mismatch names it', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const hooksDir = join(home, '.claude', 'hooks');
+      const target = join(hooksDir, 'hypo-personal-check.mjs');
+      // hypo-shared.mjs itself is untouched — the runtime SHA check alone
+      // would still verify this install; only the aggregate hooksDigest sees
+      // this file drift.
+      writeFileSync(target, readFileSync(target, 'utf-8') + '\n// tampered for test\n');
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+      assert.ok(check, 'expected a hooks/.hypo-provenance.json check');
+      assert.equal(
+        check.status,
+        'warn',
+        `a changed non-hypo-shared hook file must surface as a hooksDigest warn: ${check.detail}`,
+      );
+      assert.match(check.detail, /hooksDigest mismatch/);
+      assert.match(check.detail, /hypo-personal-check\.mjs/);
+    });
+  });
+});
+
+test('sidecar predating hooksDigest (no such field) → doctor skips the digest check silently', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const hooksDir = join(home, '.claude', 'hooks');
+      const sidecarPath = join(hooksDir, '.hypo-provenance.json');
+      const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+      delete sidecar.hooksDigest;
+      writeFileSync(sidecarPath, JSON.stringify(sidecar));
+      // Tamper a hook file too — if the digest check ran anyway, this would warn.
+      const target = join(hooksDir, 'hypo-personal-check.mjs');
+      writeFileSync(target, readFileSync(target, 'utf-8') + '\n// tampered for test\n');
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+      assert.ok(check, 'expected a hooks/.hypo-provenance.json check');
+      assert.equal(
+        check.status,
+        'pass',
+        `a pre-hooksDigest sidecar must still verify on name+hash+usable alone: ${check.detail}`,
+      );
+    });
+  });
+});
+
+test('sidecar pkgRoot package.json has no version → doctor warns, does not PASS', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const versionlessRoot = mkdtempSync(join(tmpdir(), 'hypo-versionless-root-'));
+      try {
+        writeFileSync(
+          join(versionlessRoot, 'package.json'),
+          JSON.stringify({ name: 'hypomnema' }), // name matches; no "version" field
+        );
+        const sidecarPath = join(home, '.claude', 'hooks', '.hypo-provenance.json');
+        const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
+        sidecar.pkgRoot = versionlessRoot;
+        writeFileSync(sidecarPath, JSON.stringify(sidecar));
+        const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+        const out = JSON.parse(r.stdout);
+        const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+        assert.ok(check, 'expected a hooks/.hypo-provenance.json check');
+        assert.equal(
+          check.status,
+          'warn',
+          `a version-less root must not PASS — isUsablePkgRootLocal (the same predicate ` +
+            `the runtime resolver requires) rejects it too: ${check.detail}`,
+        );
+        assert.match(check.detail, /not a usable package root/);
+      } finally {
+        rmSync(versionlessRoot, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+test('hooks installed, self-location fails, no sidecar at all → doctor warns, not silent', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      // A standalone `init` copy has no package.json alongside it, so
+      // self-location for this hooksDir always fails — same steady state
+      // documented on selfLocationPkgRootFrom in hooks/hypo-shared.mjs.
+      const sidecarPath = join(home, '.claude', 'hooks', '.hypo-provenance.json');
+      rmSync(sidecarPath, { force: true });
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+      assert.ok(
+        check,
+        'an installed-but-unresolvable hook copy with no sidecar must not stay silent',
+      );
+      assert.equal(check.status, 'warn', `must not stay silent: ${check.detail}`);
+      assert.match(check.detail, /PKG_ROOT resolves to null/);
+    });
   });
 });
