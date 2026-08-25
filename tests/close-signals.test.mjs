@@ -359,7 +359,10 @@ test('commit message "세션을 종료했다" (with object particle + honorific-
 });
 
 test('commit message "close the 13th session" (digit ordinal) → matched', () => {
-  assert.equal(detectSessionCloseArtifact({ commitMessage: 'close the 13th session' }).matched, true);
+  assert.equal(
+    detectSessionCloseArtifact({ commitMessage: 'close the 13th session' }).matched,
+    true,
+  );
 });
 
 // The EN pattern's middle slot is now an ORDINAL only (the shape every real
@@ -1401,6 +1404,243 @@ test('close, then a non-close AskUserQuestion selection → false (lease expires
           ],
         },
       },
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// ── the approval line must not expire the close lease (ISSUE-74) ──
+// One carve-out survives review: a typed `apply-proposals <nonce>` for a nonce this
+// transcript shows `proposal challenge` minting. The command-channel carve-out was
+// removed after codex showed a model-issued Skill call produces the same non-meta
+// <command-name> user record, and the AskUserQuestion carve-out was removed because
+// "does not read as a retraction" is fail-open on an open class of phrasings.
+// Those two removals are pinned here as NEGATIVES, so re-adding either turns red.
+suite('hasUserCloseSignal(): the minted approval line, and what is NOT a channel');
+
+// The nonce shape `proposal challenge` mints (randomBytes(16).toString('hex')).
+const NONCE = '0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+const OTHER_NONCE = 'aaaabbbbccccddddeeeeffff00001111';
+// The challenge output verbatim (scripts/proposal.mjs). The drift pin below keeps
+// this fixture honest against the real writer.
+const CHALLENGE_TEXT = (nonce) =>
+  '\nTo approve the 1 overwrite(s) above, the USER must type this line in the conversation:\n\n' +
+  `    apply-proposals ${nonce}\n\nThen run: hypomnema proposal resolve --session-id=s\n`;
+const TOOL_USE = (name, id) => ({
+  type: 'assistant',
+  message: { content: [{ type: 'tool_use', name, id, input: {} }] },
+});
+// A tool_result record: role:'user' in the transcript, but no text block, so it is
+// never genuine user text.
+const TOOL_RESULT = (id, content, extra = {}) => ({
+  type: 'user',
+  message: {
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: id, content, ...extra }],
+  },
+});
+// The minting pair as it really lands: the model runs `proposal challenge` via Bash
+// and the challenge output comes back correlated to that Bash tool_use.
+const MINT = (nonce) => [TOOL_USE('Bash', 'bash-1'), TOOL_RESULT('bash-1', CHALLENGE_TEXT(nonce))];
+const TYPED = (text) => USER({ message: { role: 'user', content: text }, promptSource: 'typed' });
+// A slash-command / Skill invocation as the harness records it. Not a channel: the
+// model's own Skill call produces this same shape.
+const COMMAND_TAGS = (name, args) =>
+  USER({
+    message: {
+      role: 'user',
+      content:
+        `<command-message>${name}</command-message>\n` +
+        `<command-name>/${name}</command-name>` +
+        (args ? `\n<command-args>${args}</command-args>` : ''),
+    },
+  });
+const ASK = (id) => ({
+  type: 'assistant',
+  message: { content: [{ type: 'tool_use', name: 'AskUserQuestion', id }] },
+});
+const ANSWER = (id, picked) =>
+  TOOL_RESULT(id, `Your questions have been answered: "?"="${picked}"`);
+
+test('typing the minted approval line does not expire the close lease', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [USER(CLOSE), ...MINT(NONCE), TYPED(`apply-proposals ${NONCE}`)]);
+    assert.equal(hasUserCloseSignal(p), true);
+  });
+});
+
+// THE CARVE-OUT NEVER GRANTS. Same transcript minus the close: neutral leaves the
+// lease exactly where it was, and where it was is "never granted".
+test('the approval line alone is not a close signal (neutral never creates a grant)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [...MINT(NONCE), TYPED(`apply-proposals ${NONCE}`)]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('an approval line whose nonce this transcript never minted still expires the lease', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      ...MINT(NONCE),
+      TYPED(`apply-proposals ${OTHER_NONCE}`),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('a user message cannot mint the nonce it then spends (no self-mint, order held)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      TYPED(`apply-proposals ${NONCE}`),
+      TYPED(`apply-proposals ${NONCE}`),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// PRODUCER, not presence: the model can write the challenge framing into its own
+// prose, and that must not neutralize the user's next message.
+test('the challenge framing in ASSISTANT prose is not a mint', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      { type: 'assistant', message: { content: [{ type: 'text', text: CHALLENGE_TEXT(NONCE) }] } },
+      TYPED(`apply-proposals ${NONCE}`),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('the challenge framing from a NON-Bash tool is not a mint', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      TOOL_USE('Read', 'read-1'),
+      TOOL_RESULT('read-1', CHALLENGE_TEXT(NONCE)),
+      TYPED(`apply-proposals ${NONCE}`),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('an uncorrelated tool_result (no tool_use behind it) is not a mint', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      TOOL_RESULT('ghost-1', CHALLENGE_TEXT(NONCE)),
+      TYPED(`apply-proposals ${NONCE}`),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('a FAILED challenge run (is_error) is not a mint', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      TOOL_USE('Bash', 'bash-1'),
+      TOOL_RESULT('bash-1', CHALLENGE_TEXT(NONCE), { is_error: true }),
+      TYPED(`apply-proposals ${NONCE}`),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('a bare hex in Bash output, without the challenge framing, is not a mint', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      TOOL_USE('Bash', 'bash-1'),
+      TOOL_RESULT('bash-1', `apply-proposals ${NONCE}\n`),
+      TYPED(`apply-proposals ${NONCE}`),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('the approval line must be the WHOLE message, as the TTY channel requires', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      ...MINT(NONCE),
+      TYPED(`동의 안 해, 그냥 인용만 할게: apply-proposals ${NONCE}`),
+    ]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// DRIFT PIN: the mint matcher anchors on two literals from `proposal challenge`'s
+// output. If that output is reworded, the carve-out silently stops working (a
+// re-typed approval starts expiring the lease again) and no other test notices.
+test('the mint matcher still anchors on what proposal challenge actually prints', () => {
+  const src = readFileSync(join(REPO, 'scripts', 'proposal.mjs'), 'utf-8');
+  for (const literal of [
+    'must type this line in the conversation:',
+    'Then run: hypomnema proposal resolve',
+  ]) {
+    assert.ok(src.includes(literal), `proposal.mjs no longer prints: ${literal}`);
+  }
+  // And the fixture above is what that template renders.
+  assert.ok(CHALLENGE_TEXT(NONCE).includes(`apply-proposals ${NONCE}`));
+});
+
+// NOT A CHANNEL (removed after review): a `<command-name>` user record proves
+// nothing about who produced it. Claude Code routes a model-issued Skill call
+// through the same slash-command path, so an invocation record can be the model's
+// own. Each variant below must stay a non-grant.
+test('a command invocation record is not a close signal, in any namespace form', () => {
+  withTmpDir((dir) => {
+    for (const rec of [
+      COMMAND_TAGS('hypo:crystallize'),
+      COMMAND_TAGS('other-plugin:crystallize'),
+      COMMAND_TAGS('crystallize'),
+      COMMAND_TAGS('hypo:crystallize', '위키 지식합성 진행해줘'),
+      // the XML block pasted on its own, with no <command-message> wrapper
+      TYPED('<command-name>/hypo:crystallize</command-name>'),
+    ]) {
+      const p = writeJsonl(dir, [rec]);
+      assert.equal(hasUserCloseSignal(p), false, JSON.stringify(rec.message.content));
+    }
+  });
+});
+
+test('a command invocation after a close still expires the lease (it is user text)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [USER(CLOSE), COMMAND_TAGS('hypo:crystallize')]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+// NOT A CHANNEL (removed after review): an AskUserQuestion answer that is not a
+// close still expires the lease, including phrasings no retraction list would have
+// held. This is the fail-closed direction the repo's unknown-enum rule asks for.
+test('a non-close AskUserQuestion answer expires the lease, whatever its wording', () => {
+  withTmpDir((dir) => {
+    for (const picked of ['지금 종료하지 말아 줘', '지금 쓴다', '3개', 'whatever']) {
+      const p = writeJsonl(dir, [USER(CLOSE), ASK('q'), ANSWER('q', picked)]);
+      assert.equal(hasUserCloseSignal(p), false, picked);
+    }
+  });
+});
+
+// THE FENCE (ISSUE-31): the carve-out does not touch typed user text, so a user who
+// asks for more work after a close still expires the lease.
+test('typed non-close text after a grant still expires the lease (over-close defense)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [USER(CLOSE), TYPED('아 잠깐, 이거 먼저 고쳐줘')]);
+    assert.equal(hasUserCloseSignal(p), false);
+  });
+});
+
+test('typed non-close text after the approval line still expires the lease', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      ...MINT(NONCE),
+      TYPED(`apply-proposals ${NONCE}`),
+      TYPED('하나만 더 해줘'),
     ]);
     assert.equal(hasUserCloseSignal(p), false);
   });
