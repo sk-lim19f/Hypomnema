@@ -5,6 +5,52 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-08-25
+
+### New Features
+
+#### English
+
+- `hypo:doctor` now detects a rename that was interrupted partway and tells you whether to re-run it or just delete the leftover marker, instead of leaving the half-rewritten links to show up as ordinary broken links. ([#233](https://github.com/sk-lim19f/Hypomnema/pull/233))
+- A session-close artifact written without you asking for a close now prompts for confirmation before the file lands, instead of being reported by `doctor` after it is already written and committed. ([#229](https://github.com/sk-lim19f/Hypomnema/pull/229))
+- `doctor` now surfaces a session that was closed by hand without the user-confirmation gate firing, correlating close artifacts (session-state headings, hot.md narratives, close-worded commits) against the session-closed markers on disk. Warn-only. ([#226](https://github.com/sk-lim19f/Hypomnema/pull/226))
+- A session close now creates `projects/<name>/index.md` from the template when a project has none, and `lint` warns (never errors) on a project with no index and on an index with no `working_dir` anchor. ([#227](https://github.com/sk-lim19f/Hypomnema/pull/227))
+- `hypo:doctor` now shows the last successful pull and push time, distinguishing a healthy vault from one that has never synced. ([#223](https://github.com/sk-lim19f/Hypomnema/pull/223))
+
+#### 한국어
+
+- `hypo:doctor`가 중간에 끊긴 rename을 감지해, 재실행해야 하는지 남은 마커만 지우면 되는지 알려 줍니다. 절반만 재작성된 링크가 그냥 깨진 링크로 보이던 것이 바뀝니다. ([#233](https://github.com/sk-lim19f/Hypomnema/pull/233))
+- close를 요청하지 않았는데 쓰이는 세션 close 산출물이, 파일이 쓰이고 커밋된 뒤에 `doctor`로 보고되는 대신 쓰이기 전에 확인을 묻습니다. ([#229](https://github.com/sk-lim19f/Hypomnema/pull/229))
+- `doctor`가 사용자 확인 게이트를 거치지 않고 손으로 닫힌 세션을 찾아냅니다. close 산출물(session-state 마감 헤딩, hot.md 종료 서술, close 어휘 커밋)을 디스크의 session-closed 마커와 대조해 경고만 냅니다. ([#226](https://github.com/sk-lim19f/Hypomnema/pull/226))
+- 세션 종료 시 index가 없는 프로젝트에 `projects/<name>/index.md`를 템플릿에서 생성합니다. `lint`는 index 없는 프로젝트와 `working_dir` 앵커 없는 index에 경고를 냅니다(에러 아님). ([#227](https://github.com/sk-lim19f/Hypomnema/pull/227))
+- `hypo:doctor`가 마지막 pull·push 성공 시각을 보여줘, 정상 볼트와 한 번도 동기화 안 된 볼트를 구분합니다. ([#223](https://github.com/sk-lim19f/Hypomnema/pull/223))
+
+### Bug Fixes
+
+#### English
+
+- Closing a session no longer needs a second confirmation after you type the proposal-approval line. The line is now neutral: it cannot expire a close approval, and it cannot create one. A message that is not a close phrase still expires the approval, so a session is never closed without being asked. ([#236](https://github.com/sk-lim19f/Hypomnema/pull/236))
+- Hooks now resolve their package root from where the code is actually running, so a plugin-channel update no longer leaves them running one version while the scripts they invoke resolve under another. ([#235](https://github.com/sk-lim19f/Hypomnema/pull/235))
+- An interrupted `rename --apply` can now always be re-run: the move is a single atomic step, so it no longer leaves a page at two paths (page mode) or a moved subtree whose own links still point at the old path (directory mode), both of which used to refuse every re-run. ([#231](https://github.com/sk-lim19f/Hypomnema/pull/231))
+- Page-usage logging no longer stays off for the rest of a session after a single `git check-ignore` probe fails to answer, and the probe's timeout was raised so it stops firing on a loaded machine. ([#230](https://github.com/sk-lim19f/Hypomnema/pull/230))
+- Fixed a silent lost update in the session-log append path: a lock is no longer taken from a holder that is still running, and it is never published in a momentarily empty state where a second writer would read it as abandoned. ([#228](https://github.com/sk-lim19f/Hypomnema/pull/228))
+- A failed merge-abort (`conflict-unresolved`) now gets its own recovery guidance in both `doctor` and the session-start notice, instead of the clean-conflict wording that wrongly claimed local work was committed and safe; `doctor` also names the last successful sync and lists several unresolved failures rather than only the most recent one. ([#225](https://github.com/sk-lim19f/Hypomnema/pull/225))
+- `hypomnema` now rejects an unknown flag with exit 2 instead of silently running init, implements and documents `--version`, lists the `proposal` subcommand in `--help`, and stops `lint`, `stats` and `graph` from reporting a clean scan when no vault was found. ([#224](https://github.com/sk-lim19f/Hypomnema/pull/224))
+- Vault auto-commit now commits only the current session's touched paths, so a concurrent session's staged files are no longer swept into an unrelated commit. ([#222](https://github.com/sk-lim19f/Hypomnema/pull/222))
+- Hook installation and `hypo:doctor` now resolve the git hooks directory from git, fixing an `ENOTDIR` crash in linked worktrees and a false "not installed" report when `core.hooksPath` is set. ([#221](https://github.com/sk-lim19f/Hypomnema/pull/221))
+
+#### 한국어
+
+- proposal 승인 줄을 타이핑한 뒤 세션 종료를 다시 확인받지 않아도 됩니다. 이 줄은 이제 중립이라 close 승인을 만료시키지도, 새로 만들지도 않습니다. close 문구가 아닌 발화는 예전처럼 승인을 만료시키므로, 요청하지 않은 종료는 여전히 일어나지 않습니다. ([#236](https://github.com/sk-lim19f/Hypomnema/pull/236))
+- 훅이 실제로 실행되는 위치에서 package root를 정합니다. 플러그인 채널로 업데이트해도 훅과 그 훅이 부르는 스크립트가 서로 다른 버전에서 도는 일이 없습니다. ([#235](https://github.com/sk-lim19f/Hypomnema/pull/235))
+- 중단된 `rename --apply`를 이제 항상 다시 돌릴 수 있습니다. 이동이 원자적 한 단계라, 페이지가 두 경로에 남거나(페이지 모드) 옮겨진 서브트리의 링크가 옛 경로를 가리킨 채 남는(디렉터리 모드) 상태가 생기지 않습니다. 둘 다 예전에는 재실행이 거부되던 상태입니다. ([#231](https://github.com/sk-lim19f/Hypomnema/pull/231))
+- `git check-ignore` probe가 한 번 답하지 못했다고 해서 page-usage 로깅이 세션 내내 꺼져 있지 않고, 부하 걸린 머신에서 상한이 발화하지 않도록 타임아웃을 올렸습니다. ([#230](https://github.com/sk-lim19f/Hypomnema/pull/230))
+- 세션 로그 append 경로의 조용한 갱신 유실을 고쳤습니다. 살아 있는 holder의 락을 더 이상 뺏지 않고, 두 번째 writer가 버려진 락으로 읽을 만한 빈 상태로 공개하지도 않습니다. ([#228](https://github.com/sk-lim19f/Hypomnema/pull/228))
+- merge abort가 실패한 상태(`conflict-unresolved`)가 `doctor`와 session-start 안내 양쪽에서 전용 복구 안내를 받습니다. 로컬 작업이 커밋돼 안전하다고 잘못 단정하던 일반 충돌 문구를 쓰지 않습니다. `doctor`는 마지막 성공 sync를 함께 보여주고, 가장 최근 하나가 아니라 여러 미해결 실패를 나열합니다. ([#225](https://github.com/sk-lim19f/Hypomnema/pull/225))
+- `hypomnema`가 알 수 없는 플래그를 조용히 init으로 흘리는 대신 exit 2로 거부하고, `--version`을 구현해 문서화했으며, `--help`에 `proposal` 서브커맨드를 싣고, `lint`, `stats`, `graph`가 볼트를 찾지 못했을 때 정상 스캔인 것처럼 보고하지 않습니다. ([#224](https://github.com/sk-lim19f/Hypomnema/pull/224))
+- 볼트 auto-commit이 이번 세션이 건드린 경로만 커밋해, 동시에 도는 다른 세션의 staged 파일이 무관한 커밋에 섞이지 않습니다. ([#222](https://github.com/sk-lim19f/Hypomnema/pull/222))
+- 훅 설치와 `hypo:doctor`가 훅 디렉터리를 git에서 해석합니다. linked worktree에서 나던 `ENOTDIR` 크래시와 `core.hooksPath` 설정 시의 잘못된 "미설치" 보고를 고쳤습니다. ([#221](https://github.com/sk-lim19f/Hypomnema/pull/221))
+
 ## [1.7.0] - 2026-07-20
 
 ### New Features
