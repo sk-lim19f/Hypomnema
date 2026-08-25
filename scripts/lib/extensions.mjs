@@ -15,8 +15,10 @@
  *
  * Security (plan §5 #9): only files matching the `hypo-ext-<name>.<ext>` basename
  * whitelist are discovered, and the settings.json command string is always
- * constructed here as `node $HOME/.claude/hooks/<basename>` — never sourced from
- * the manifest. A manifest cannot inject an arbitrary command path.
+ * constructed here as `<interpreter> $HOME/.claude/hooks/<basename>` — never
+ * sourced from the manifest verbatim. `interpreter` is validated against
+ * HOOK_INTERPRETER_EXT's allowlist before it is ever allowed to reach the command
+ * string, so a manifest cannot inject an arbitrary command path or executable.
  */
 
 import {
@@ -54,8 +56,53 @@ export const EXT_PREFIX = 'hypo-ext-';
 // Codex supports hooks + commands only; skills/agents are Claude-only.
 export const CODEX_TYPES = ['hooks', 'commands'];
 
-// Per-type expected file extension. Hooks are executable .mjs; the rest are .md.
-const TYPE_FILE_EXT = { hooks: '.mjs', commands: '.md', skills: '.md', agents: '.md' };
+// Per-type expected file extension. Hooks have no single extension (see
+// HOOK_INTERPRETER_EXT below); the rest are .md.
+const TYPE_FILE_EXT = { commands: '.md', skills: '.md', agents: '.md' };
+
+// Hook interpreter allowlist. Before this, capture rejected every non-node hook.
+// This is a trust boundary: a manifest `interpreter` value, and a settings.json
+// command prefix on the reverse-capture path, are only ever accepted from this
+// exact set. Nothing outside it can reach a settings.json command string, which
+// is what makes a captured manifest safe to replay as an executable command.
+// Each interpreter maps to the one file extension it installs and captures
+// under, keeping buildHookCommand/parseCapturableHookCommand/resolveInstallFile
+// in agreement on what "a node hook" or "a python hook" even means.
+export const HOOK_INTERPRETER_EXT = { node: '.mjs', python3: '.py', bash: '.sh' };
+export const HOOK_INTERPRETERS = new Set(Object.keys(HOOK_INTERPRETER_EXT));
+
+// A manifest with no `interpreter` field predates this allowlist (backward
+// compatible): it is interpreted as `node`, matching the only interpreter that
+// ever existed before. buildHookCommand/resolveInstallFile default to this so
+// an existing `.mjs` hook's command string and install path never change.
+export const DEFAULT_HOOK_INTERPRETER = 'node';
+
+/** The install/capture extension for one hook interpreter, defaulting a missing
+ * value to `node` (backward compatible). Callers only reach this after the
+ * interpreter has already been validated against HOOK_INTERPRETERS (by
+ * parseManifest for the forward path, by parseCapturableHookCommand for the
+ * reverse path) — this is a lookup, not a second validation. */
+export function hookExtFor(interpreter) {
+  return HOOK_INTERPRETER_EXT[interpreter ?? DEFAULT_HOOK_INTERPRETER];
+}
+
+/**
+ * Derive a hook's sidecar `.manifest.json` install name from its main install
+ * filename, whichever interpreter extension it carries (`.mjs`/`.py`/`.sh`).
+ * A plain `installFile.replace(/\.mjs$/, ...)` — the node-only shape this replaced — only
+ * matched node hooks; for a python/bash installFile it silently no-opped,
+ * which would point the manifest copy at the hook's OWN install path (main
+ * file and sidecar landing on the same destPath) instead of a distinct
+ * `.manifest.json`. Returns `installFile` unchanged if it carries none of the
+ * known extensions (unreachable in practice: every caller's installFile is
+ * built from HOOK_INTERPRETER_EXT).
+ */
+export function hookManifestNameFor(installFile) {
+  for (const ext of Object.values(HOOK_INTERPRETER_EXT)) {
+    if (installFile.endsWith(ext)) return `${installFile.slice(0, -ext.length)}.manifest.json`;
+  }
+  return installFile;
+}
 
 // Singular manifest `type` value per directory (capture design §3). A captured
 // extension's sidecar manifest must declare a `type` matching its parent dir
@@ -128,11 +175,17 @@ export function isValidInstallStem(stem) {
  * Resolve the install filename for a discovered extension (capture design §3).
  * Returns `{ installFile }` — the basename under `~/.claude/<type>/`. Defaults
  * to `ext.file` (the wiki storage name) so existing hypo-ext-* extensions are
- * untouched (backward compatible). Only commands/agents with a sidecar manifest
- * whose `type` matches the directory AND whose `installName` is valid install
- * under the user's original name. A present-but-invalid installName yields
- * `{ skip, warn }` — the extension is dropped rather than silently installed
- * under a surprising name.
+ * untouched (backward compatible). Only commands/agents/hooks with a sidecar
+ * manifest whose `type` matches the directory AND whose `installName` is valid
+ * install under the user's original name. A present-but-invalid installName
+ * yields `{ skip, warn }` — the extension is dropped rather than silently
+ * installed under a surprising name.
+ *
+ * For hooks, the extension is the manifest's `interpreter` (default `node`),
+ * not the fixed `.mjs`: `python3 $HOME/.claude/hooks/foo.py` and
+ * `bash $HOME/.claude/hooks/bar.sh` are both valid install shapes. parseManifest
+ * already rejected any `interpreter` outside HOOK_INTERPRETERS, so a `parsed.ok`
+ * manifest's value here is trusted without re-checking.
  */
 export function resolveInstallFile(ext) {
   if (!INSTALLNAME_TYPES.has(ext.type) || !ext.manifestPath) {
@@ -153,7 +206,8 @@ export function resolveInstallFile(ext) {
       warn: `${ext.type}/${ext.file}: invalid installName "${m.installName}" — extension skipped`,
     };
   }
-  return { installFile: m.installName + TYPE_FILE_EXT[ext.type] };
+  const fileExt = ext.type === 'hooks' ? hookExtFor(m.interpreter) : TYPE_FILE_EXT[ext.type];
+  return { installFile: m.installName + fileExt };
 }
 
 /**
@@ -221,10 +275,18 @@ export function parseExtKey(key, coveredTypes) {
   if (installFile.includes('/') || installFile.includes('\\')) return null;
   if (installFile.includes('..') || installFile.startsWith('.')) return null;
   const MANIFEST_SUFFIX = '.manifest.json';
-  const suffix =
-    type === 'hooks' && installFile.endsWith(MANIFEST_SUFFIX)
-      ? MANIFEST_SUFFIX
-      : TYPE_FILE_EXT[type];
+  let suffix;
+  if (type === 'hooks' && installFile.endsWith(MANIFEST_SUFFIX)) {
+    suffix = MANIFEST_SUFFIX;
+  } else if (type === 'hooks') {
+    // A hook's main file may end in any interpreter's extension (.mjs/.py/.sh);
+    // reject anything that matches none of them rather than guessing one.
+    const match = Object.values(HOOK_INTERPRETER_EXT).find((e) => installFile.endsWith(e));
+    if (match === undefined) return null;
+    suffix = match;
+  } else {
+    suffix = TYPE_FILE_EXT[type];
+  }
   if (!installFile.endsWith(suffix)) return null;
   const stem = installFile.slice(0, -suffix.length);
   if (stem.length === 0) return null;
@@ -624,7 +686,6 @@ export function discoverExtensions(extDir, hypoignorePatterns, hypoDir) {
     } catch {
       continue;
     }
-    const fileExt = TYPE_FILE_EXT[type];
     for (const fname of entries) {
       if (fname === '.gitkeep') continue;
       // Manifests are paired with their sibling, not discovered standalone.
@@ -665,7 +726,13 @@ export function discoverExtensions(extDir, hypoignorePatterns, hypoDir) {
       }
 
       if (!isRegularFile(srcPath)) continue;
-      if (!fname.endsWith(fileExt)) continue;
+      // A hook's wiki storage file may carry any interpreter's extension
+      // (.mjs/.py/.sh); every other type has exactly one.
+      const fileExt =
+        type === 'hooks'
+          ? Object.values(HOOK_INTERPRETER_EXT).find((e) => fname.endsWith(e))
+          : TYPE_FILE_EXT[type];
+      if (!fileExt || !fname.endsWith(fileExt)) continue;
       const stem = fname.slice(0, -fileExt.length);
       if (!SAFE_EXT_STEM.test(stem)) {
         result.warnings.push(
@@ -728,6 +795,14 @@ export function parseManifest(path) {
   if (m.timeout !== undefined && (typeof m.timeout !== 'number' || m.timeout <= 0)) {
     return { ok: false, error: 'timeout must be a positive number' };
   }
+  // Trust boundary: interpreter drives the settings.json command
+  // prefix, so it is validated here, the same place event/matcher/timeout are —
+  // a malformed manifest is dropped whole, never partially trusted downstream.
+  // Absent is fine (defaults to `node`, backward compatible); present-but-
+  // unknown is not.
+  if (m.interpreter !== undefined && !HOOK_INTERPRETERS.has(m.interpreter)) {
+    return { ok: false, error: `unknown hook interpreter: ${m.interpreter}` };
+  }
   // Boundary normalization: `matcher: ""` is a
   // valid string per the type check above, but every downstream call site
   // disagrees on what it means — `if (entry.matcher)` (line ~641) silently
@@ -744,11 +819,20 @@ export function parseManifest(path) {
 
 /**
  * Build the settings.json entries expected for the discovered hook extensions.
- * The command string is constructed here (never from the manifest) via the shared
- * `buildHookCommand`, using the installName-resolved install filename so a captured
- * hook registers under its original name and its command matches the installed
- * `.mjs`. Extensions whose manifest is missing, not registrable, or whose
- * installName is invalid (resolveInstallFile skip) yield no entry.
+ * The command string is constructed here (never from the manifest path/verbatim)
+ * via the shared `buildHookCommand`, using the installName-resolved install
+ * filename so a captured hook registers under its original name and its command
+ * matches the installed file. The interpreter (default `node`) comes from the
+ * manifest, but only after parseManifest has already validated it against
+ * HOOK_INTERPRETERS — `parsed.ok` here means it is trustworthy. Extensions whose
+ * manifest is missing, not registrable, whose installName is invalid
+ * (resolveInstallFile skip), or whose resolved install filename's extension
+ * disagrees with its own interpreter (a wiki-storage-name hook whose file
+ * extension and manifest interpreter were never checked against each other)
+ * yield no entry — the last case is what keeps this function and
+ * parseCapturableHookCommand mirrors of each other on every path, not only the
+ * installName-rename one, including doctor.mjs's direct call on unfiltered
+ * discovery.
  */
 export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
   const entries = [];
@@ -758,7 +842,15 @@ export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
     if (!parsed.ok || !parsed.registrable) continue;
     const resolved = resolveInstallFile(ext);
     if (resolved.skip) continue;
-    const command = buildHookCommand(targetHooksDir, resolved.installFile);
+    const interpreter = parsed.manifest.interpreter ?? DEFAULT_HOOK_INTERPRETER;
+    // Forward and reverse must never drift: an install filename whose extension
+    // disagrees with the manifest's own interpreter (possible for a wiki-storage
+    // hook with no installName override, e.g. a `.py` file and no `interpreter`
+    // field, which defaults to node) would build a command
+    // parseCapturableHookCommand can never re-accept. Refuse to emit it rather
+    // than register a hook under a command its own source cannot run.
+    if (!resolved.installFile.endsWith(hookExtFor(interpreter))) continue;
+    const command = buildHookCommand(targetHooksDir, resolved.installFile, interpreter);
     entries.push({
       name: ext.name,
       file: ext.file,
@@ -777,40 +869,55 @@ export function buildExpectedSettingsEntries(discoveredHooks, targetHooksDir) {
  * strict parser (`parseCapturableHookCommand`) mirror this one shape so the two
  * directions can never drift. `hooksDir` is `<HOME>/.claude/hooks`, rewritten to
  * a `$HOME` literal so a captured registration stays portable across machines.
+ *
+ * `interpreter` defaults to `node` (backward compatible: a manifest predating
+ * interpreter support has none, and its command string must stay byte-identical). Any other
+ * value must already be in HOOK_INTERPRETERS — this function trusts its caller
+ * rather than re-validating, so every caller must route through parseManifest
+ * (forward path) or parseCapturableHookCommand (reverse path) first.
  */
-export function buildHookCommand(hooksDir, installFile) {
-  return `node ${hooksDir.replace(HOME, '$HOME')}/${installFile}`;
+export function buildHookCommand(hooksDir, installFile, interpreter = DEFAULT_HOOK_INTERPRETER) {
+  if (!HOOK_INTERPRETERS.has(interpreter)) {
+    throw new Error(`buildHookCommand: unknown interpreter "${interpreter}"`);
+  }
+  return `${interpreter} ${hooksDir.replace(HOME, '$HOME')}/${installFile}`;
 }
 
 // The exact canonical hook path prefix that `buildHookCommand` emits for a dir
 // under HOME. The strict parser accepts only this literal — an absolute path, a
 // `~`, or an env prefix all diverge and are rejected with a visible reason.
 const CAPTURABLE_HOOK_PATH_PREFIX = '$HOME/.claude/hooks/';
-const CAPTURABLE_NODE_PREFIX = 'node ';
-const MJS_EXT = '.mjs';
 
 /**
- * Strict, fs-free parser for a capturable hook command (capture design F4). It
- * accepts ONLY the byte-for-byte shape `buildHookCommand` produces for a dir
- * under HOME: `node $HOME/.claude/hooks/<stem>.mjs`. Returns
- * `{ ok:true, stem, basename }` on a match, else `{ ok:false, reason }` with a
- * distinct reason per rejection axis so a caller can surface why a hook was not
- * captured (never a silent drop). This is deliberately NOT the lenient
- * `_extractCommandFileName` used by init: capture eligibility must be exact.
+ * Strict, fs-free parser for a capturable hook command (capture design F4,
+ * widened to non-node interpreters). It accepts ONLY the byte-for-byte shape
+ * `buildHookCommand` produces for a dir under HOME:
+ * `<interpreter> $HOME/.claude/hooks/<stem><ext>`, where `interpreter` is in
+ * HOOK_INTERPRETERS and `ext` is that interpreter's HOOK_INTERPRETER_EXT value
+ * (a `python3` command must end in `.py`, never `.mjs` — the interpreter and
+ * the extension are read together, not independently). Returns
+ * `{ ok:true, stem, basename, interpreter }` on a match, else
+ * `{ ok:false, reason }` with a distinct reason per rejection axis so a caller
+ * can surface why a hook was not captured (never a silent drop). This is
+ * deliberately NOT the lenient `_extractCommandFileName` used by init: capture
+ * eligibility must be exact.
  */
 export function parseCapturableHookCommand(command) {
   if (typeof command !== 'string') return { ok: false, reason: 'not-a-string' };
   // A newline in a command would break the one-line canonical shape and could
   // smuggle a second statement past a prefix check.
   if (/[\r\n]/.test(command)) return { ok: false, reason: 'contains-newline' };
-  if (!command.startsWith(CAPTURABLE_NODE_PREFIX)) {
-    return { ok: false, reason: 'bad-node-prefix' };
+  const spaceIdx = command.indexOf(' ');
+  const interpreter = spaceIdx === -1 ? command : command.slice(0, spaceIdx);
+  if (!HOOK_INTERPRETERS.has(interpreter)) {
+    return { ok: false, reason: 'bad-interpreter-prefix' };
   }
-  const rest = command.slice(CAPTURABLE_NODE_PREFIX.length);
-  // Reject extra leading whitespace (a double space or a tab after `node`): the
-  // builder emits exactly one space, so anything more is a lossy divergence.
+  const rest = command.slice(interpreter.length + 1);
+  // Reject extra leading whitespace (a double space or a tab after the
+  // interpreter): the builder emits exactly one space, so anything more is a
+  // lossy divergence.
   if (rest.length === 0 || rest[0] === ' ' || rest[0] === '\t') {
-    return { ok: false, reason: 'bad-node-prefix' };
+    return { ok: false, reason: 'bad-interpreter-prefix' };
   }
   if (!rest.startsWith(CAPTURABLE_HOOK_PATH_PREFIX)) {
     // Covers `~`, a relative path, an env prefix, and an absolute path — none
@@ -823,16 +930,17 @@ export function parseCapturableHookCommand(command) {
   if (tail.includes('/') || tail.includes('\\') || tail.includes('..')) {
     return { ok: false, reason: 'nested-segment' };
   }
-  if (!tail.endsWith(MJS_EXT)) {
-    return { ok: false, reason: 'not-mjs' };
+  const ext = HOOK_INTERPRETER_EXT[interpreter];
+  if (!tail.endsWith(ext)) {
+    return { ok: false, reason: 'wrong-extension' };
   }
-  const stem = tail.slice(0, -MJS_EXT.length);
+  const stem = tail.slice(0, -ext.length);
   // Same stem gate as install (rejects the reserved hypo-* namespace, Windows
   // device names, and out-of-charset names) so parse and install agree.
   if (!isValidInstallStem(stem)) {
     return { ok: false, reason: 'invalid-stem' };
   }
-  return { ok: true, stem, basename: tail };
+  return { ok: true, stem, basename: tail, interpreter };
 }
 
 /**
@@ -1395,7 +1503,7 @@ export function syncExtensions({
     // uninstall. commands/agents have no sidecar, so their single key is preserved.
     const keys = [`${ext.type}/${inst}`];
     if (ext.type === 'hooks') {
-      keys.push(`${ext.type}/${inst.replace(/\.mjs$/, '.manifest.json')}`);
+      keys.push(`${ext.type}/${hookManifestNameFor(inst)}`);
     }
     for (const key of keys) {
       if (recorded[key] !== undefined && newSHAs[key] === undefined) newSHAs[key] = recorded[key];
@@ -1439,6 +1547,23 @@ export function syncExtensions({
             );
             continue;
           }
+          // The forward and reverse hook-command shapes are mirrors and must never
+          // drift: buildHookCommand/parseCapturableHookCommand only agree when the
+          // install filename's extension matches what the manifest's interpreter
+          // expects. installFile already carries the interpreter-derived extension
+          // when an installName renamed it, so this only ever fires for a
+          // wiki-storage-name hook (no installName) whose file extension disagrees
+          // with its own manifest — e.g. a `.py` file with no `interpreter` (which
+          // defaults to node) or the wrong one. Caught here, before any hard-copy,
+          // the same way a malformed manifest is: never a silent drop, and never a
+          // hook installed under a command its own source cannot run.
+          const interpreter = manifestParsed.manifest.interpreter ?? DEFAULT_HOOK_INTERPRETER;
+          if (!installFile.endsWith(hookExtFor(interpreter))) {
+            result.warnings.push(
+              `${type}/${ext.file}: interpreter "${interpreter}" does not match "${installFile}"'s extension (interpreter-extension-mismatch) — skipping ${ext.name}`,
+            );
+            continue;
+          }
         } else {
           result.warnings.push(`${ext.name}.manifest.json missing — hook will not auto-register`);
         }
@@ -1478,11 +1603,12 @@ export function syncExtensions({
         manifestParsed &&
         manifestParsed.ok
       ) {
-        // P1: derive the sidecar install name from the sibling `.mjs` installFile
-        // so the manifest copy + SHA key follow installName exactly as the hook
-        // file does. For a wiki-authored hook (no installName) installFile is
-        // `ext.file`, so this equals the old `ext.manifestName` (no regression).
-        const installManifestName = installFile.replace(/\.mjs$/, '.manifest.json');
+        // P1: derive the sidecar install name from the sibling installFile (any
+        // interpreter extension) so the manifest copy + SHA key follow
+        // installName exactly as the hook file does. For a wiki-authored hook (no
+        // installName) installFile is `ext.file`, so this equals the old
+        // `ext.manifestName` (no regression).
+        const installManifestName = hookManifestNameFor(installFile);
         const mKey = `${type}/${installManifestName}`;
         const mRes = copyOne({
           srcPath: ext.manifestPath,
