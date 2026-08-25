@@ -4233,6 +4233,9 @@ export function resolveTranscriptBySessionId(
  *   • INVALIDATE a fresh user intent that expires the lease: any other genuine
  *                user text, `/clear`, `popAll`, a non-close queued_command, a
  *                non-close AskUserQuestion selection.
+ *   • NEUTRAL    additionally: a typed `apply-proposals <nonce>` whose nonce this
+ *                transcript shows `proposal challenge` minting (see "the approval
+ *                line" below).
  *   • NEUTRAL    everything the model can produce or the harness injects: system/
  *                sdk replay, isMeta bodies, sidechain, interruptedMessageId
  *                companions, assistant, tool_result, task-notification.
@@ -4245,9 +4248,45 @@ export function resolveTranscriptBySessionId(
  * known limit (no leaf pointer exists to resolve it — see the branch note on the
  * function), mitigated by the lease.
  *
+ * THE APPROVAL LINE IS NOT A CHANGE OF MIND. The lease exists to catch a user who
+ * changed their mind, and it also caught the user for doing what the close
+ * procedure told them to do. `proposal challenge` instructs the user to type
+ * `apply-proposals <nonce>`, which can never be a close phrase, so typing it
+ * expired the close grant given a turn earlier (measured 2026-08-06: the close
+ * needed three approval round trips because of it). Two gates read one transcript
+ * under two rules, and passing one broke the other.
+ *
+ * So one carve-out: a user message that IS the approval line, for a nonce this
+ * transcript shows being minted, is NEUTRAL. It never grants; a lease that was not
+ * already live stays dead. The mint has to be correlated, not merely present:
+ * `collectMinted` reads only a tool_result correlated to a Bash tool_use, and only
+ * when the surrounding challenge framing is there too, so a hex the model typed in
+ * its own prose (or any other tool's output) is not a mint. Order is part of it:
+ * the set fills as the walk goes, so a message can never mint the nonce it spends.
+ * An unminted hex is ordinary text and still expires the lease.
+ *
+ * What this does NOT cover: an AskUserQuestion answer during the close procedure
+ * (the skill's Step 1a reflections) still expires the lease. A carve-out was
+ * written for it and withdrawn, because "the answer does not read as a retraction"
+ * is fail-open on an open class of phrasings, and this repo routes an unknown value
+ * to the cautious branch. Recognizing a close-procedure answer POSITIVELY needs a
+ * marker on the question, and the model authors the question. The round trip stays.
+ *
  * Threat model: an honest-but-drifting model that does not forge the
  * transcript. This is a safety interlock, not an authorization boundary — a model
- * that forges records is out of scope and documented so.
+ * that forges records is out of scope and documented so. The carve-out does not
+ * move that boundary: it only PRESERVES a grant the user already gave, so the model
+ * still cannot manufacture one. The residual it does carry: a model that runs an
+ * arbitrary Bash command can print the challenge framing itself and plant a mint.
+ * That buys it nothing on its own, because the user still has to send the approval
+ * line, and the result is neutrality rather than a grant.
+ *
+ * A command invocation is NOT a channel here. `/hypo:crystallize` typed by the user
+ * was accepted as a grant for one review round and removed: the harness records a
+ * model-issued Skill call as the same non-meta `<command-name>` user record
+ * (verified against Claude Code 2.1.243's `processPromptSlashCommand`), so the
+ * model could have closed the session by calling its own skill. The premise that a
+ * command tag proves a human typed it is false.
  *
  * Fail-closed: any read/parse error, or an unresolvable branch, → false.
  */
@@ -4344,9 +4383,42 @@ export function hasUserCloseSignal(transcriptPath) {
   // staleness limit, mitigated by the lease: any later live user intent, on any
   // branch, still expires it.
   const askIds = new Set();
+  // Bash tool_use ids, so a mint can be tied to a command that actually ran rather
+  // than to any string in the file. Filled in the same content scan as askIds.
+  const bashIds = new Set();
   let granted = false;
+  // The nonces this transcript shows `proposal challenge` minting. Producer, not
+  // just presence: the hex has to arrive in a NON-error tool_result of a Bash
+  // tool_use, wrapped in the challenge's own framing. Model prose carrying a
+  // plausible hex, an isMeta/system body, and any other tool's output all fail
+  // that, which matters because a mint neutralizes the user's next message. The
+  // set fills as the walk goes, so a message cannot mint the nonce it spends.
+  const mintedNonces = new Set();
+  const challengeMint = new RegExp(
+    `must type this line in the conversation:\\s*${APPROVAL_PHRASE} ([a-f0-9]{32,})\\s*Then run: hypomnema proposal resolve`,
+    'g',
+  );
+  const approvalLine = new RegExp(`^${APPROVAL_PHRASE}\\s+([a-f0-9]{32,})$`);
+  const collectMinted = (o) => {
+    const c = (o.message ?? o).content;
+    if (!Array.isArray(c)) return;
+    for (const b of c) {
+      if (!b || typeof b !== 'object') continue;
+      if (b.type !== 'tool_result' || !b.tool_use_id || !bashIds.has(b.tool_use_id)) continue;
+      if (b.is_error === true) continue;
+      const text = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+      if (typeof text !== 'string' || !text.includes(APPROVAL_PHRASE)) continue;
+      for (const m of text.matchAll(challengeMint)) mintedNonces.add(m[1]);
+    }
+  };
 
   for (const o of recs) {
+    // Genuine user text of this record, or null when the record is on a channel
+    // the model can reach. Computed once here: the mint scan below is the exact
+    // complement of it (mint from everything that is NOT the user's own text).
+    const userText = eventUserText(o);
+    if (userText == null) collectMinted(o);
+
     // Queue operations. The queue carries no correlation key (measured), so the
     // ENQUEUE content is the decision — not a later contentless dequeue, which
     // would need pairing we cannot do. Reading the enqueue also keeps the live
@@ -4396,25 +4468,29 @@ export function hasUserCloseSignal(transcriptPath) {
     }
 
     // Record AskUserQuestion tool_use ids (assistant record, always precedes its
-    // answer in line order).
+    // answer in line order). Bash ids ride along in the same scan, for the mint
+    // correlation above.
     const content = (o.message ?? o).content;
     if (Array.isArray(content)) {
       for (const b of content) {
-        if (
-          b &&
-          typeof b === 'object' &&
-          b.type === 'tool_use' &&
-          b.name === 'AskUserQuestion' &&
-          b.id
-        )
-          askIds.add(b.id);
+        if (!b || typeof b !== 'object' || b.type !== 'tool_use' || !b.id) continue;
+        if (b.name === 'AskUserQuestion') askIds.add(b.id);
+        else if (b.name === 'Bash') bashIds.add(b.id);
       }
     }
 
-    // Genuine user text → grant on a close phrase, invalidate on anything else.
-    const text = eventUserText(o);
-    if (text != null && text !== '') {
-      granted = isClosePattern(text);
+    // Genuine user text → grant on a close phrase, invalidate on anything else,
+    // minus the one carve-out for what the product itself asked the user to send.
+    if (userText != null && userText !== '') {
+      const spend = approvalLine.exec(userText.trim());
+      if (spend && mintedNonces.has(spend[1])) {
+        // The approval line `proposal challenge` tells the user to type, bound to a
+        // nonce this transcript minted. Neutral, never a grant: an untouched
+        // `granted` that was false stays false. An unminted hex is ordinary text and
+        // falls through to the invalidating branch below.
+        continue;
+      }
+      granted = isClosePattern(userText);
       continue;
     }
 
