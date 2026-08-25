@@ -1878,7 +1878,10 @@ function checkProvenanceSidecar(hooksDir, label) {
   try {
     sidecar = JSON.parse(readFileSync(sidecarPath, 'utf-8'));
   } catch {
-    warn(label, `${sidecarPath} is not valid JSON — run /hypo:upgrade --apply to rewrite it`);
+    warn(
+      label,
+      `${sidecarPath} is not valid JSON — run \`hypomnema upgrade --apply\` to rewrite it`,
+    );
     return;
   }
 
@@ -1931,7 +1934,7 @@ function checkProvenanceSidecar(hooksDir, label) {
   warn(
     label,
     `${sidecarPath} does not verify (${reasons.join('; ')}) — resolvePkgRoot() will treat ` +
-      `PKG_ROOT as unresolved this session; run /hypo:upgrade --apply to refresh it`,
+      `PKG_ROOT as unresolved this session; run \`hypomnema upgrade --apply\` to refresh it`,
   );
 }
 
