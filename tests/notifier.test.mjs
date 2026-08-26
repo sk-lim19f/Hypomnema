@@ -768,10 +768,40 @@ test('doctor: passes when PATH CLI matches/exceeds the active install', () => {
 // back IN by clearing the opt-out vars in the child env (CI failure 2026-06-07).
 const NOTIFY_ON = { CI: '', NO_UPDATE_NOTIFIER: '', HYPO_NO_UPDATE_CHECK: '' };
 
+// Every test that opts notices back IN with NOTIFY_ON must call this before it
+// runs SessionStart. Opting in is what reaches buildUpdateNotice(), which fires
+// a DETACHED version-check worker whenever the cache reads as stale. That worker
+// outlives the spawnSync and keeps writing under <HOME>/.claude/hypomnema/cache,
+// racing the teardown of the HOME it is writing into. Seeding a cache that reads
+// as fresh removes the spawn condition, so the worker never starts.
+//
+// MERGE, never overwrite: this same file also carries the notify-once marks the
+// notices read and write (notifiedFor, pkgRootDriftNotified,
+// pkgRootNullNotified). Replacing it wholesale silently resets the very state a
+// multi-step test is asserting on, which is what the first version of this
+// helper did; an assertion pins that now.
+//
+// No `latest` is recorded, so computeNotice() returns null and no update banner
+// joins the stderr these tests match on. Tests that DO exercise the update
+// notifier seed their own cache with a `latest` and are unaffected.
+function seedFreshVersionCache(home) {
+  const cacheDir = join(home, '.claude', 'hypomnema', 'cache');
+  const cachePath = join(cacheDir, 'version-check.json');
+  mkdirSync(cacheDir, { recursive: true });
+  let cache = {};
+  try {
+    cache = JSON.parse(readFileSync(cachePath, 'utf-8'));
+  } catch {
+    /* first call in this HOME */
+  }
+  writeFileSync(cachePath, JSON.stringify({ ...cache, checkedAt: Date.now() }));
+}
+
 test('session-start (D3): stale PATH sibling surfaces a one-shot notice, then throttles', () => {
   withTmpHome((home) => {
     withFakeCli('1.1.0', ({ binDir }) => {
       seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      seedFreshVersionCache(home); // no detached worker; see the helper above
       const payload = JSON.stringify({ cwd: home, session_id: 'sib-test' });
       const first = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
         input: payload,
@@ -801,6 +831,7 @@ test('session-start (D3): no notice when CLI matches active (no false nag)', () 
   withTmpHome((home) => {
     withFakeCli('9.9.9', ({ binDir }) => {
       seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      seedFreshVersionCache(home); // no detached worker; see the helper above
       const r = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
         input: JSON.stringify({ cwd: home, session_id: 'sib-ok' }),
         encoding: 'utf-8',
@@ -815,6 +846,7 @@ test('session-start (D3): opted out (CI/NO_UPDATE_NOTIFIER) suppresses the sibli
   withTmpHome((home) => {
     withFakeCli('1.1.0', ({ binDir }) => {
       seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      seedFreshVersionCache(home); // no detached worker; see the helper above
       const r = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
         input: JSON.stringify({ cwd: home, session_id: 'sib-optout' }),
         encoding: 'utf-8',
@@ -1333,6 +1365,7 @@ test('resolvePkgRoot: self and a symlink alias of the SAME physical root compare
 suite('ISSUE-70: session-start pkgRoot-drift notice + throttle');
 
 function runSessionStartAt(hookPath, home, sessionId, extraEnv = {}) {
+  seedFreshVersionCache(home);
   return spawnSync(process.execPath, [hookPath], {
     input: JSON.stringify({ cwd: home, session_id: sessionId }),
     encoding: 'utf-8',
@@ -1720,4 +1753,84 @@ test('replay-post-tool-use-rejects-non-http-schemes: file:// / ftp:// / data: �
       `non-http URL contents leaked in stdout: ${r.stdout}`,
     );
   }
+});
+
+// ── detached version-check worker: the spawn condition itself ────────────────
+//
+// SessionStart fires a detached worker when the version-check cache reads as
+// stale. That worker outlives the spawnSync a test used to run the hook and
+// keeps writing under <HOME>/.claude/hypomnema/cache, racing the teardown of
+// the very HOME it is writing into. It cost three simultaneous Node-version CI
+// failures on a run whose only change was a doc edit; the same commit had been
+// green minutes before, and stayed green locally on both 4 and 8 shards.
+//
+// What is pinned here is the CONDITION, not the race. A race cannot be asserted
+// on directly: the outcome depends on which of two processes wins, so a passing
+// run proves nothing. The spawn condition is deterministic, so that is what
+// these two assert, and they only mean something as a PAIR. Alone, "no marker
+// appeared" is indistinguishable from a harness that never triggers the worker
+// at all, which is why the stale case is here as the control.
+suite('detached version-check worker spawn condition');
+
+// Replaces the real worker with one that records that it ran. The fake writes
+// synchronously on startup, so the wait below is for process scheduling only.
+function fakeWorkerInstall(markerPath, fn) {
+  withFakePkgInstall('1.7.0', (root) => {
+    writeFileSync(
+      join(root, 'hooks', 'version-check-fetch.mjs'),
+      `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(markerPath)}, 'ran');\n`,
+    );
+    fn(root);
+  });
+}
+
+// Synchronous poll: test() does not await, so a promise-based wait would be
+// dropped on the floor and the assertion would pass unconditionally.
+function waitForMarker(markerPath, timeoutMs = 8000) {
+  const sab = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(markerPath)) return true;
+    Atomics.wait(sab, 0, 0, 50);
+  }
+  return existsSync(markerPath);
+}
+
+test('control: a STALE version-check cache does spawn the detached worker', () => {
+  withTmpHome((home) => {
+    const marker = join(home, 'worker-ran');
+    fakeWorkerInstall(marker, (root) => {
+      seedHypoPkg(home, root);
+      // Deliberately NOT seeding a fresh cache: this is the pre-fix behavior.
+      spawnSync(process.execPath, [join(root, 'hooks', 'hypo-session-start.mjs')], {
+        input: JSON.stringify({ cwd: home, session_id: 'worker-control' }),
+        encoding: 'utf-8',
+        env: { ...process.env, ...NOTIFY_ON, HYPO_DIR: '', HOME: home },
+      });
+      assert.ok(
+        waitForMarker(marker),
+        'the control must actually spawn the worker, otherwise the case below proves nothing',
+      );
+    });
+  });
+});
+
+test('a FRESH version-check cache does not spawn the detached worker', () => {
+  withTmpHome((home) => {
+    const marker = join(home, 'worker-ran');
+    fakeWorkerInstall(marker, (root) => {
+      seedHypoPkg(home, root);
+      // runSessionStartAt seeds the fresh cache; that is the behavior under test.
+      const r = runSessionStartAt(
+        join(root, 'hooks', 'hypo-session-start.mjs'),
+        home,
+        'worker-fresh',
+      );
+      // Check the hook actually ran to completion first. Without this, a hook
+      // that died before reaching buildUpdateNotice() would also leave no
+      // marker, and this assertion would pass while testing nothing.
+      assert.equal(r.status, 0, `hook did not exit cleanly: ${r.stderr}`);
+      assert.ok(!waitForMarker(marker, 3000), 'a fresh cache must leave the worker unspawned');
+    });
+  });
 });
