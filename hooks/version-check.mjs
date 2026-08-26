@@ -430,6 +430,53 @@ export function clearPkgRootDriftNotified(path) {
   }
 }
 
+// ── pkgRoot-null notice ─────────────────────────────────────────────────────
+// A DIFFERENT failure than drift above: drift only ever fires when
+// self-location resolved (PKG_ROOT is non-null, just disagreeing with the
+// cache). This one fires when PKG_ROOT itself resolved to null — self-location
+// failed AND no verified provenance sidecar covered it — the case where
+// PreCompact's lint/feedback calls silently no-op because they have no root to
+// shell scripts through. The two conditions can never both hold in the same
+// session (drift requires a non-null self-location), so there is no "which
+// wins" question in practice, but the two use separate cache fields regardless
+// so neither implementation depends on that being true forever.
+// Boolean (not a pair-key like drift) — the notified state is just "already
+// told them this session's install has no resolvable pkgRoot".
+
+/** Has the PKG_ROOT-null state already been surfaced since it last cleared? */
+export function pkgRootNullAlreadyNotified(cache) {
+  return Boolean(cache && cache.pkgRootNullNotified === true);
+}
+
+/** Record that the PKG_ROOT-null banner was shown (read-merge-write). */
+export function markPkgRootNullNotified(path) {
+  try {
+    const cache = readCache(path) || {};
+    cache.pkgRootNullNotified = true;
+    writeCacheAtomic(path, cache);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Clear a previously-recorded PKG_ROOT-null mark once PKG_ROOT resolves again
+ * (self-location or a verified provenance sidecar). Without this, a null state
+ * that resolves and then recurs later (e.g. the provenance sidecar's hash
+ * binding breaks again after a partial re-install) would stay silently
+ * suppressed forever. Read-merge-write, best-effort.
+ */
+export function clearPkgRootNullNotified(path) {
+  try {
+    const cache = readCache(path);
+    if (!cache || !('pkgRootNullNotified' in cache)) return;
+    delete cache.pkgRootNullNotified;
+    writeCacheAtomic(path, cache);
+  } catch {
+    /* best-effort */
+  }
+}
+
 /**
  * Shared one-line message for the init/upgrade downgrade guard (P). `op` is
  * 'init' or 'upgrade'. Kept here so guard text stays identical across both CLIs.

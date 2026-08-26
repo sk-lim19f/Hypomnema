@@ -14,10 +14,12 @@ import {
   existsSync,
   symlinkSync,
   unlinkSync,
+  cpSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
+import { writeProvenanceSidecar, provenancePath } from '../scripts/lib/pkg-provenance.mjs';
 import {
   buildProjectSuggestionLine,
   findBackfillCandidate,
@@ -2214,7 +2216,7 @@ test('session-start surfaces a conflict-unresolved entry with half-merged-tree g
 // into the clean-conflict "committed and safe" reassurance — that claim is
 // not known to hold for an unrecognized op — nor assert the conflict-
 // unresolved branch's "the abort failed", which is equally unverified here.
-test('session-start treats an unrecognized conflict-* op as unresolved, without either conflict branch\'s claim', () => {
+test("session-start treats an unrecognized conflict-* op as unresolved, without either conflict branch's claim", () => {
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, '.cache'), { recursive: true });
     writeFileSync(
@@ -2229,7 +2231,10 @@ test('session-start treats an unrecognized conflict-* op as unresolved, without 
     const r = runStart(dir);
     const ctx = JSON.parse(r.stdout).additionalContext || '';
     assert.ok(ctx.includes('remote diverged'), `unknown-conflict notice missing: ${ctx}`);
-    assert.ok(/unresolved/.test(ctx), `unknown-conflict must say to treat it as unresolved: ${ctx}`);
+    assert.ok(
+      /unresolved/.test(ctx),
+      `unknown-conflict must say to treat it as unresolved: ${ctx}`,
+    );
     assert.ok(
       !/your local work is committed/i.test(ctx),
       `unknown-conflict must NOT borrow the clean-conflict "committed" claim: ${ctx}`,
@@ -2256,7 +2261,10 @@ test('session-start emits no conflict/half-merged guidance for an unrelated op (
     const r = runStart(dir);
     const ctx = JSON.parse(r.stdout).additionalContext || '';
     assert.ok(ctx.includes('last sync failed'), `generic sync notice missing: ${ctx}`);
-    assert.ok(!ctx.includes('remote diverged'), `unrelated op must not get conflict wording: ${ctx}`);
+    assert.ok(
+      !ctx.includes('remote diverged'),
+      `unrelated op must not get conflict wording: ${ctx}`,
+    );
     assert.ok(!/half-merged/.test(ctx), `unrelated op must not get half-merged wording: ${ctx}`);
   });
 });
@@ -2300,9 +2308,7 @@ test('session-start and doctor render the same wording family for every sync-sta
         JSON.stringify({ timestamp: '2026-06-19T00:00:00Z', op, error: 'x', host: 'test' }) + '\n',
       );
       const startCtx = JSON.parse(runStart(dir).stdout).additionalContext || '';
-      const doctorOut = JSON.parse(
-        run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']).stdout,
-      );
+      const doctorOut = JSON.parse(run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']).stdout);
       const doctorDetail = doctorOut.find((c) => c.label === 'Sync state')?.detail || '';
 
       const cls = classifySyncOp(op);
@@ -3100,4 +3106,120 @@ test('replay-session-start-drops-stale-clear-marker: >7 day marker is discarded'
     assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `stale marker must not fire: ${ctx}`);
     assert.ok(!existsSync(p), 'stale marker must be cleaned up');
   });
+});
+
+// ── ISSUE-80: PKG_ROOT-null notice (hypo-session-start.mjs's buildPkgRootNullNotice) ──
+//
+// The banner fires only when hooks/hypo-shared.mjs's resolvePkgRoot() itself
+// resolves to null — self-location must fail. Running the hook straight from
+// HOOKS (this checkout) always self-locates, so these tests run it from a
+// standalone COPY of hooks/ instead (mirrors the npm/manual deploy shape
+// notifier.test.mjs's resolvePkgRoot suite uses), with no --codex/plugin
+// involved: just a bare `cp hooks/ elsewhere`.
+suite('hypo-session-start.mjs — PKG_ROOT-null notice (ISSUE-80)');
+
+// The banner (like the update notifier / sibling notice) honors isOptedOut(),
+// which the CI runner's own CI=true would otherwise suppress — opt back IN by
+// clearing the opt-out vars in the child env (same pattern as notifier.test.mjs's
+// NOTIFY_ON).
+const NOTIFY_ON = { CI: '', NO_UPDATE_NOTIFIER: '', HYPO_NO_UPDATE_CHECK: '' };
+
+function standaloneHooksCopy() {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-standalone-hooks-'));
+  cpSync(HOOKS, join(dir, 'hooks'), { recursive: true });
+  return join(dir, 'hooks');
+}
+
+function runStandaloneSessionStart(hooksDir, home, extraEnv = {}) {
+  return spawnSync(process.execPath, [join(hooksDir, 'hypo-session-start.mjs')], {
+    input: JSON.stringify({ cwd: home, session_id: 'pkgroot-null-test' }),
+    encoding: 'utf-8',
+    env: { ...process.env, ...NOTIFY_ON, HYPO_DIR: '', HOME: home, ...extraEnv },
+  });
+}
+
+test('PKG_ROOT null (no provenance sidecar): the banner fires once, then throttles on a re-run', () => {
+  const standaloneDir = standaloneHooksCopy();
+  try {
+    const home = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-null-home-'));
+    try {
+      const first = runStandaloneSessionStart(standaloneDir, home);
+      assert.match(first.stderr, /Package root unresolved/, `stderr: ${first.stderr}`);
+      const out = JSON.parse(first.stdout);
+      assert.match(out.systemMessage || '', /Package root unresolved/);
+      assert.match(out.additionalContext || '', /Package root unresolved/);
+
+      // Same PKG_ROOT-null state, same session cache under the same HOME →
+      // notify-once must suppress the second showing.
+      const second = runStandaloneSessionStart(standaloneDir, home);
+      assert.doesNotMatch(
+        second.stderr,
+        /Package root unresolved/,
+        'a second run in the same unresolved state must not re-notify',
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(dirname(standaloneDir), { recursive: true, force: true });
+  }
+});
+
+test('PKG_ROOT resolving again clears the mark, so a later recurrence re-notifies', () => {
+  const standaloneDir = standaloneHooksCopy();
+  try {
+    const home = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-null-recur-home-'));
+    try {
+      const first = runStandaloneSessionStart(standaloneDir, home);
+      assert.match(first.stderr, /Package root unresolved/, `stderr: ${first.stderr}`);
+
+      // PKG_ROOT resolves (a verified provenance sidecar now covers this
+      // standalone copy) → clearPkgRootNullNotified() must run, and this run
+      // itself carries no notice (PKG_ROOT is non-null here).
+      writeProvenanceSidecar(standaloneDir, REPO, '0.0.0-test', HOOKS, false);
+      const resolved = runStandaloneSessionStart(standaloneDir, home);
+      assert.doesNotMatch(
+        resolved.stderr,
+        /Package root unresolved/,
+        'a run where PKG_ROOT resolves must carry no PKG_ROOT-null notice',
+      );
+
+      // PKG_ROOT goes null again (sidecar removed) → the mark was cleared
+      // above, so this must re-notify rather than stay silently suppressed.
+      unlinkSync(provenancePath(standaloneDir));
+      const recurred = runStandaloneSessionStart(standaloneDir, home);
+      assert.match(
+        recurred.stderr,
+        /Package root unresolved/,
+        `a recurrence after the mark was cleared must re-notify: ${recurred.stderr}`,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(dirname(standaloneDir), { recursive: true, force: true });
+  }
+});
+
+test('opt-out (CI=true) suppresses the PKG_ROOT-null notice', () => {
+  const standaloneDir = standaloneHooksCopy();
+  try {
+    const home = mkdtempSync(join(tmpdir(), 'hypo-pkgroot-null-optout-home-'));
+    try {
+      const r = spawnSync(process.execPath, [join(standaloneDir, 'hypo-session-start.mjs')], {
+        input: JSON.stringify({ cwd: home, session_id: 'pkgroot-null-optout' }),
+        encoding: 'utf-8',
+        env: { ...process.env, HYPO_DIR: '', HOME: home, CI: 'true' },
+      });
+      assert.doesNotMatch(
+        r.stderr,
+        /Package root unresolved/,
+        `opted-out (CI=true) must suppress the notice: ${r.stderr}`,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(dirname(standaloneDir), { recursive: true, force: true });
+  }
 });

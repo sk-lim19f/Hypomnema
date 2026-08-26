@@ -48,6 +48,7 @@ import {
   readFileIfRegular,
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
+import { writeProvenanceSidecar } from './lib/pkg-provenance.mjs';
 import { templateSchemaVersion } from './lib/template-schema-version.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 import {
@@ -458,6 +459,14 @@ function installHooks(targetDir, dryRun) {
     if (!dryRun) copyFileSync(join(HOOKS_SRC, file), dest);
     log('created', dest);
   }
+  // Refresh the provenance sidecar every run, even when every .mjs above was
+  // skipped as already-present: this is the standalone (manual/npm) channel
+  // only (the plugin channel never calls installHooks), and resolvePkgRoot()'s
+  // provenance fallback needs it to track the truth of what is actually on
+  // disk here, not just what a fresh copy left behind. See
+  // hooks/hypo-shared.mjs's readVerifiedProvenancePkgRoot() for the reader.
+  const sidecar = writeProvenanceSidecar(targetDir, PKG_ROOT, PKG_VERSION, HOOKS_SRC, dryRun);
+  if (sidecar) log('created', sidecar);
 }
 
 function mergeSettingsJson(settingsPath, hooksDir, dryRun, hookMap) {

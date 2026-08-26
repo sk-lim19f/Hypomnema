@@ -24,7 +24,7 @@ import {
 import { join, relative, basename, dirname, isAbsolute } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 
 const HOME = homedir();
@@ -149,7 +149,14 @@ function readCachedPkgRoot() {
 // Hypomnema — e.g. `$HOME/package.json` from an unrelated project. This
 // contract answers "is this a real, resolvable directory", not "is this OUR
 // package". Callers that need the latter also require self-containment.
-function isUsablePkgRootLocal(pkgRoot) {
+//
+// Exported so scripts/doctor.mjs can apply the SAME predicate to a sidecar's
+// recorded pkgRoot that readVerifiedProvenancePkgRoot() below applies at
+// runtime — doctor used to hand-roll a thinner name+hash check that a
+// version-less "name":"hypomnema" root would pass while the runtime resolver
+// rejects it, so doctor could PASS a sidecar the runtime treats as null. The
+// import direction stays scripts/ → hooks/, never the reverse.
+export function isUsablePkgRootLocal(pkgRoot) {
   if (typeof pkgRoot !== 'string' || !pkgRoot || !isAbsolute(pkgRoot)) return false;
   try {
     const v = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8')).version;
@@ -205,16 +212,25 @@ function candidateContainsRunningModule(candidateRoot, ownRealPath) {
 // candidateContainsRunningModule rejects it: that ancestor's own hooks/
 // subdirectory (if it even has one) is not this file.
 //
-// Bounded walk: up to 6 candidate ancestors above hooks/'s own parent (the
+// Bounded walk: up to 6 candidate ancestors above hooksDir's own parent (the
 // ordinary root sits at the very first one; a few extra levels tolerate an
 // unusual nesting depth). Never throws, fails open to null on any error.
-function selfLocationPkgRoot() {
-  let hooksDir, ownRealPath;
+//
+// Split out from selfLocationPkgRoot() (below) so scripts/doctor.mjs can ask
+// the same question about an ARBITRARY installed hooks directory
+// (~/.claude/hooks, ~/.codex/hooks) instead of only about wherever THIS
+// running module happens to live. doctor needs that to tell "self-location
+// genuinely can't resolve for this install" (the standalone-copy steady
+// state, silence is correct) apart from "self-location would resolve but the
+// provenance sidecar is missing/broken" (a real gap — see CONCERN 4's
+// PKG_ROOT-null-and-silent fix in checkProvenanceSidecar). Exported;
+// scripts/ → hooks/ stays the only allowed import direction.
+export function selfLocationPkgRootFrom(hooksDir) {
+  let ownRealPath;
   try {
-    hooksDir = dirname(fileURLToPath(import.meta.url));
     ownRealPath = realpathSync(join(hooksDir, 'hypo-shared.mjs'));
   } catch {
-    return null; // can't even resolve our own path — nothing to self-contain against
+    return null; // can't even resolve the module at hooksDir — nothing to self-contain against
   }
   try {
     let dir = dirname(hooksDir); // first candidate: the ordinary root, one level above hooks/
@@ -232,16 +248,93 @@ function selfLocationPkgRoot() {
   }
 }
 
+function selfLocationPkgRoot() {
+  let hooksDir;
+  try {
+    hooksDir = dirname(fileURLToPath(import.meta.url));
+  } catch {
+    return null; // can't even resolve our own path
+  }
+  return selfLocationPkgRootFrom(hooksDir);
+}
+
+// Copy-time provenance sidecar (`.hypo-provenance.json`, written next to a
+// standalone-copied hooks/ dir by installHooks/applyHookFiles — see
+// scripts/lib/pkg-provenance.mjs, the writer half of this contract) is the
+// ONLY fallback resolvePkgRoot() gets when self-location can't resolve. The
+// filename and the "hypomnema" name check below must stay byte-identical
+// with scripts/lib/pkg-provenance.mjs — hooks can't import scripts/ (no
+// reaching outside hooks/), so the contract is duplicated, not shared.
+//
+// This is accidental-staleness protection, not a security boundary: any
+// process running as this OS user can edit this JSON file (or hypo-shared.mjs
+// itself) freely. It only catches what installHooks/applyHookFiles left
+// unguarded before this fix — a manual-install hooks/ copy left pointing at
+// an old pkgVersion because a skip-then-refresh-the-cache-anyway sequence
+// (init re-run against an unchanged hooks/ dir) recorded a version the copy
+// on disk never actually became.
+//
+// Producer proof, BOTH required before this pkgRoot is trusted:
+//   - the recorded pkgRoot's package.json "name" must be "hypomnema" (not
+//     merely "some usable versioned package.json" — isUsablePkgRootLocal
+//     alone would accept $HOME/package.json from an unrelated project)
+//   - the recorded hypoSharedSha256 must match the SHA-256 of THIS running
+//     hypo-shared.mjs file — ties the sidecar to the exact copy it was
+//     written next to, so a sidecar surviving a partial re-install (new
+//     hooks/*.mjs dropped in, old sidecar left behind) is rejected rather
+//     than silently trusted.
+//
+// Scope, stated honestly: hypoSharedSha256 pins ONE file — this file. A
+// sidecar surviving a re-install that touched some OTHER hook (e.g.
+// hypo-personal-check.mjs got a new version, hypo-shared.mjs itself didn't
+// change a byte) still passes this check and PKG_ROOT still resolves,
+// because the running module — the one thing this function can verify
+// without cost — never changed. Catching that wider drift needs hashing
+// every file hooks.json wires up, which is too expensive to do on every
+// hook load (this function runs on every single hook invocation); that
+// broader, once-per-`doctor`-run check is `hooksDigest`
+// (scripts/lib/pkg-provenance.mjs's computeHooksDigest, verified by
+// scripts/doctor.mjs), deliberately NOT read here.
+const PROVENANCE_FILENAME = '.hypo-provenance.json';
+const EXPECTED_PKG_NAME = 'hypomnema';
+
+function readVerifiedProvenancePkgRoot(hooksDir) {
+  try {
+    const raw = JSON.parse(readFileSync(join(hooksDir, PROVENANCE_FILENAME), 'utf-8'));
+    const { pkgRoot, hypoSharedSha256 } = raw || {};
+    if (!isUsablePkgRootLocal(pkgRoot)) return null;
+    const producerPkgJson = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8'));
+    if (producerPkgJson.name !== EXPECTED_PKG_NAME) return null;
+    if (typeof hypoSharedSha256 !== 'string' || !hypoSharedSha256) return null;
+    const ownHash = createHash('sha256')
+      .update(readFileSync(join(hooksDir, 'hypo-shared.mjs')))
+      .digest('hex');
+    if (ownHash !== hypoSharedSha256) return null;
+    return pkgRoot;
+  } catch {
+    return null;
+  }
+}
+
 // Resolution order: self-location wins whenever it resolves — it is a direct,
 // self-containment-verified fact about the code currently running, not an
 // inference. Only when it cannot resolve (the standalone-copied hooks case
-// above, or a genuine read failure) does the cache get to answer, and only
-// after passing the same usable-root contract as everything else here.
+// above, or a genuine read failure) does the verified provenance sidecar get
+// to answer, checked against the same directory this module is actually
+// running from. The cache (readCachedPkgRoot/hypo-pkg.json) is deliberately
+// NOT a resolution fallback here — a disagreeing provenance sidecar means
+// "stop", not "ask the cache", because the cache is exactly what can be
+// stale (that staleness is this fix's whole premise). readCachedPkgRoot stays
+// in this file only for pkgRootDriftStatus()'s surfacing comparison below.
 function resolvePkgRoot() {
   const self = selfLocationPkgRoot();
   if (self) return self;
-  const cached = readCachedPkgRoot();
-  return isUsablePkgRootLocal(cached) ? cached : null;
+  try {
+    const hooksDir = dirname(fileURLToPath(import.meta.url));
+    return readVerifiedProvenancePkgRoot(hooksDir);
+  } catch {
+    return null;
+  }
 }
 export const PKG_ROOT = resolvePkgRoot();
 
@@ -709,7 +802,10 @@ function gitIgnoresPageUsageCached(hypoDir, sessionId, probeFn = runGitCheckIgno
   if (!probe || (probe.status !== 0 && probe.status !== 1)) {
     if (scoped) {
       try {
-        writeFileSync(cachePath, JSON.stringify({ unavailableUntil: Date.now() + PROBE_BACKOFF_MS }));
+        writeFileSync(
+          cachePath,
+          JSON.stringify({ unavailableUntil: Date.now() + PROBE_BACKOFF_MS }),
+        );
       } catch {
         // non-fatal; the probe just runs again next prompt
       }
@@ -1628,89 +1724,89 @@ export function withFileLock(targetPath, fn, opts = {}) {
   let loggedLiveHolder = false;
   let loggedSteal = false;
   try {
-  for (;;) {
-    try {
-      if (!staged) {
-        try {
-          writeFileSync(tmpPath, String(process.pid), { flag: 'wx' });
-          staged = true;
-        } catch (stageErr) {
-          // Staging fails for the same reason acquisition does — an unwritable
-          // directory — and `openSync(lock,'wx')` used to report exactly that as
-          // EEXIST whenever a lock was already sitting there, sending it down the
-          // contention path. Preserve that: contend if a lock exists, and surface
-          // a genuine write failure otherwise rather than masking it as a timeout.
-          if (!existsSync(lockPath)) throw stageErr;
-          throw Object.assign(new Error('lock-contended'), { code: 'EEXIST' });
-        }
-      }
-      // Kept separate from staging on purpose: EPERM/EMLINK from the link are
-      // real failures, not contention, and must not decay into ELOCKTIMEOUT.
-      linkSync(tmpPath, lockPath);
-      break;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      // Held by another writer. Steal ONLY a demonstrably stale lock; otherwise
-      // wait and eventually time out. The stat and the unlink are handled
-      // separately on purpose: an un-removable stale lock (EACCES/EPERM/EBUSY)
-      // and a fresh lock must both fall through to the timeout check — never
-      // `continue` past it, or an un-unlinkable lock spins forever and violates
-      // the timeoutMs → ELOCKTIMEOUT contract (caller falls to the proposal gate).
-      let stale = false;
+    for (;;) {
       try {
-        // Steal-eligible by age alone; liveness is checked separately below
-        // before we actually act on it.
-        stale = Date.now() - statSync(lockPath).mtimeMs > staleMs;
-      } catch (statErr) {
-        if (statErr.code === 'ENOENT') continue; // lock vanished; retry create now
-        throw statErr; // unexpected stat failure — surface it, don't mask
-      }
-      if (stale) {
-        const holderPid = readLockHolderPid(lockPath);
-        if (holderPid !== null && isPidAlive(holderPid)) {
-          // LIVE holder preempted past staleMs: do NOT steal. Surface it so the
-          // preemption is visible, then fall through to the poll/timeout path
-          // below instead of racing a second writer into the critical section.
-          if (!loggedLiveHolder) {
-            console.error(
-              `[hypomnema] withFileLock: NOT stealing ${lockPath} — holder pid ${holderPid} is still alive past staleMs=${staleMs}`,
-            );
-            loggedLiveHolder = true;
+        if (!staged) {
+          try {
+            writeFileSync(tmpPath, String(process.pid), { flag: 'wx' });
+            staged = true;
+          } catch (stageErr) {
+            // Staging fails for the same reason acquisition does — an unwritable
+            // directory — and `openSync(lock,'wx')` used to report exactly that as
+            // EEXIST whenever a lock was already sitting there, sending it down the
+            // contention path. Preserve that: contend if a lock exists, and surface
+            // a genuine write failure otherwise rather than masking it as a timeout.
+            if (!existsSync(lockPath)) throw stageErr;
+            throw Object.assign(new Error('lock-contended'), { code: 'EEXIST' });
           }
-          stale = false;
-        } else if (!loggedSteal) {
-          // Also once per acquire: an un-removable stale lock re-enters this
-          // branch on every poll, and the steal is one event either way.
-          console.error(
-            `[hypomnema] withFileLock: stealing stale lock ${lockPath}` +
-              (holderPid !== null
-                ? ` (holder pid ${holderPid} is no longer running)`
-                : ' (no readable holder pid — pre-liveness lockfile)'),
-          );
-          loggedSteal = true;
         }
-      }
-      if (stale) {
+        // Kept separate from staging on purpose: EPERM/EMLINK from the link are
+        // real failures, not contention, and must not decay into ELOCKTIMEOUT.
+        linkSync(tmpPath, lockPath);
+        break;
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+        // Held by another writer. Steal ONLY a demonstrably stale lock; otherwise
+        // wait and eventually time out. The stat and the unlink are handled
+        // separately on purpose: an un-removable stale lock (EACCES/EPERM/EBUSY)
+        // and a fresh lock must both fall through to the timeout check — never
+        // `continue` past it, or an un-unlinkable lock spins forever and violates
+        // the timeoutMs → ELOCKTIMEOUT contract (caller falls to the proposal gate).
+        let stale = false;
         try {
-          unlinkSync(lockPath);
-          continue; // stole it; retry the create immediately
-        } catch (unlinkErr) {
-          if (unlinkErr.code === 'ENOENT') continue; // another stealer won; retry
-          // Cannot remove it: do NOT spin — fall through to timeout/sleep so
-          // acquisition eventually throws ELOCKTIMEOUT instead of hanging.
+          // Steal-eligible by age alone; liveness is checked separately below
+          // before we actually act on it.
+          stale = Date.now() - statSync(lockPath).mtimeMs > staleMs;
+        } catch (statErr) {
+          if (statErr.code === 'ENOENT') continue; // lock vanished; retry create now
+          throw statErr; // unexpected stat failure — surface it, don't mask
         }
+        if (stale) {
+          const holderPid = readLockHolderPid(lockPath);
+          if (holderPid !== null && isPidAlive(holderPid)) {
+            // LIVE holder preempted past staleMs: do NOT steal. Surface it so the
+            // preemption is visible, then fall through to the poll/timeout path
+            // below instead of racing a second writer into the critical section.
+            if (!loggedLiveHolder) {
+              console.error(
+                `[hypomnema] withFileLock: NOT stealing ${lockPath} — holder pid ${holderPid} is still alive past staleMs=${staleMs}`,
+              );
+              loggedLiveHolder = true;
+            }
+            stale = false;
+          } else if (!loggedSteal) {
+            // Also once per acquire: an un-removable stale lock re-enters this
+            // branch on every poll, and the steal is one event either way.
+            console.error(
+              `[hypomnema] withFileLock: stealing stale lock ${lockPath}` +
+                (holderPid !== null
+                  ? ` (holder pid ${holderPid} is no longer running)`
+                  : ' (no readable holder pid — pre-liveness lockfile)'),
+            );
+            loggedSteal = true;
+          }
+        }
+        if (stale) {
+          try {
+            unlinkSync(lockPath);
+            continue; // stole it; retry the create immediately
+          } catch (unlinkErr) {
+            if (unlinkErr.code === 'ENOENT') continue; // another stealer won; retry
+            // Cannot remove it: do NOT spin — fall through to timeout/sleep so
+            // acquisition eventually throws ELOCKTIMEOUT instead of hanging.
+          }
+        }
+        if (Date.now() - start > timeoutMs) {
+          // Tagged so callers can distinguish "could not get the lock" (fall to the
+          // proposal gate) from a real fn() write error (mkdir/openSync/disk-full),
+          // which must NOT be masked as a timeout.
+          const e = new Error(`lock-timeout: ${lockPath}`);
+          e.code = 'ELOCKTIMEOUT';
+          throw e;
+        }
+        sleepSync(pollMs);
       }
-      if (Date.now() - start > timeoutMs) {
-        // Tagged so callers can distinguish "could not get the lock" (fall to the
-        // proposal gate) from a real fn() write error (mkdir/openSync/disk-full),
-        // which must NOT be masked as a timeout.
-        const e = new Error(`lock-timeout: ${lockPath}`);
-        e.code = 'ELOCKTIMEOUT';
-        throw e;
-      }
-      sleepSync(pollMs);
     }
-  }
   } finally {
     // The sibling is only ever a staging file: once linked, the lock IS the
     // link, and on every failure path it must not survive as litter.
@@ -4154,7 +4250,11 @@ const CLOSE_COMMIT_MESSAGE = new RegExp(
  *   is the YYYY-MM-DD captured from the artifact's own heading, or null for a
  *   commit-message match (the caller already has the commit's date).
  */
-export function detectSessionCloseArtifact({ path = null, content = null, commitMessage = null } = {}) {
+export function detectSessionCloseArtifact({
+  path = null,
+  content = null,
+  commitMessage = null,
+} = {}) {
   if (typeof commitMessage === 'string' && CLOSE_COMMIT_MESSAGE.test(commitMessage)) {
     return { matched: true, kind: 'commit-message', date: null };
   }

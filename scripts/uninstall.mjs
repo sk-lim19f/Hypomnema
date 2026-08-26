@@ -47,6 +47,7 @@ import {
   hasSymlinkAncestor,
   buildHookCommand,
 } from './lib/extensions.mjs';
+import { removeProvenanceSidecar } from './lib/pkg-provenance.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -510,6 +511,17 @@ function removeHookFiles(hooksDir, hookFiles, apply) {
       missing.push(p);
     }
   }
+  // .hypo-provenance.json (scripts/lib/pkg-provenance.mjs) is written next to
+  // this exact hooksDir by installHooks/applyHookFiles — same lifecycle as the
+  // hook files themselves, so it is removed in the same pass rather than left
+  // behind to describe a package root that no longer has any hooks pointing
+  // through it. Unlike hookFiles above, this is an optional file (only the
+  // manual/npm channel ever writes one) — so, mirroring the loop's own
+  // present/absent split, it is only added to `removed` (dry-run: "to remove")
+  // when it actually exists; a channel that never wrote one gets no line at
+  // all, not a spurious "already absent".
+  const sidecar = removeProvenanceSidecar(hooksDir, apply);
+  if (sidecar) removed.push(sidecar);
   return { removed, missing };
 }
 

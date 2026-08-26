@@ -324,6 +324,10 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/pkg-provenance.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/plugin-detect.mjs",
     "exec": false
   },
