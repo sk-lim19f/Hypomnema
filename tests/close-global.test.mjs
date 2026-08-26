@@ -490,6 +490,145 @@ test('--check-session-close (no --project): JSON scope is global, no scoped_proj
   });
 });
 
+// ── check/apply project-resolution divergence (2026-08-25 QA) ──────────────
+// A real apply never infers: payload.project is required input, so a
+// same-vault apply resolves a brand-new project (no session-state.md, no
+// hot.md row, no log.md entry yet) trivially. --check-session-close carries no
+// payload, so with no --project it depends entirely on
+// sessionCloseGlobalStatus's own discovery (hot.md pointer table + today
+// close-activity scan), and that discovery has nothing to find for a project
+// this fresh. The transcript is the one signal check can still reach for.
+//
+// This fallback is a diagnostic estimate, not a preview of what a real apply
+// will do. A payload's `project` field is whatever the caller puts in it; it
+// can legitimately name a project the transcript never mentions. These tests
+// pin the check's own behavior in isolation (resolve on a trustworthy
+// single-project transcript, stay unresolved on an ambiguous or untrustworthy
+// one) — none of them assert that check and a real apply would agree, because
+// that is not a guarantee this fallback makes.
+suite('crystallize --check-session-close: project inference (2026-08-25 QA divergence)');
+
+function seedUndiscoverableProject(dir, slug) {
+  mkdirSync(join(dir, 'projects', slug), { recursive: true });
+  writeFileSync(join(dir, 'projects', slug, 'index.md'), '---\ntitle: index\n---\n');
+  spawnSync('git', ['-C', dir, 'add', '-A']);
+  spawnSync('git', ['-C', dir, 'commit', '-q', '-m', `seed ${slug}`]);
+  spawnSync('git', ['-C', dir, 'push', '-q', 'origin', 'HEAD']);
+}
+
+function toolUseTranscript(dir, files) {
+  const transcript = join(dir, '.cache', 'transcript.jsonl');
+  mkdirSync(join(dir, '.cache'), { recursive: true });
+  writeFileSync(
+    transcript,
+    JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: files.map((f) => ({
+          type: 'tool_use',
+          name: 'Write',
+          input: { file_path: join(dir, f) },
+        })),
+      },
+    }) + '\n',
+  );
+  return transcript;
+}
+
+test('check with no --project and no evidence resolves nothing (matches the QA repro)', () => {
+  withSyncedWiki((dir) => {
+    seedUndiscoverableProject(dir, 'hook-qa');
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.project, null, `discovery alone must not find a project this fresh: ${r.stdout}`);
+    assert.ok(
+      out.missing.includes('hot.md (no active project in pointer table)'),
+      `must reproduce the exact QA message: ${JSON.stringify(out.missing)}`,
+    );
+  });
+});
+
+test('check with --transcript-path, single-project transcript: resolves via the transcript fallback (diagnostic, not an apply preview)', () => {
+  withSyncedWiki((dir) => {
+    seedUndiscoverableProject(dir, 'hook-qa');
+    const transcript = toolUseTranscript(dir, ['projects/hook-qa/index.md']);
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      `--transcript-path=${transcript}`,
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.project, 'hook-qa', `check must resolve hook-qa via the transcript: ${r.stdout}`);
+    assert.equal(out.scope, 'project', 'an inferred project is a scoped diagnostic, like --project');
+    assert.equal(out.scoped_project, 'hook-qa');
+    assert.equal(
+      out.project_inferred_from_transcript,
+      true,
+      'must be labeled as inferred, not mistaken for a caller-typed --project',
+    );
+  });
+});
+
+test('check with a transcript touching two different projects still refuses to guess', () => {
+  withSyncedWiki((dir) => {
+    seedUndiscoverableProject(dir, 'alpha');
+    seedUndiscoverableProject(dir, 'beta');
+    const transcript = toolUseTranscript(dir, ['projects/alpha/index.md', 'projects/beta/index.md']);
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      `--transcript-path=${transcript}`,
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.project, null, 'an ambiguous transcript must stay unresolved, not guessed at');
+    assert.equal(out.scope, 'global');
+    assert.ok(!('scoped_project' in out), 'no scoped_project when the fallback declines to guess');
+  });
+});
+
+// A transcript whose readable lines name exactly one project, but that also
+// carries a line the JSONL walk cannot parse, is not a trustworthy single-
+// project reading: the unreadable line could have named a second project the
+// walk never saw. extractTouchedWikiFilesWithTrust flags this as
+// `trusted:false`, and the fallback must refuse it exactly like a genuinely
+// ambiguous transcript, not resolve on the partial Set it did manage to read.
+test('check with a transcript that reads single-project but has a corrupt line stays unresolved (trusted:false)', () => {
+  withSyncedWiki((dir) => {
+    seedUndiscoverableProject(dir, 'hook-qa');
+    const transcript = join(dir, '.cache', 'transcript.jsonl');
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    const validLine = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            name: 'Write',
+            input: { file_path: join(dir, 'projects', 'hook-qa', 'index.md') },
+          },
+        ],
+      },
+    });
+    writeFileSync(transcript, `${validLine}\nnot valid json {{{\n`);
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      `--transcript-path=${transcript}`,
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.project,
+      null,
+      `an untrustworthy walk must not be read as a complete single-project scope: ${r.stdout}`,
+    );
+    assert.equal(out.scope, 'global');
+    assert.ok(!('scoped_project' in out), 'no scoped_project when the transcript walk cannot be trusted');
+  });
+});
+
 test('--mark-session-closed --project=<absent> → exit 1 before the gate (existence check)', () => {
   withCleanWiki((dir) => {
     const r = run('crystallize.mjs', [
@@ -1854,7 +1993,8 @@ test('--apply-session-close --session-id with an unresolvable transcript → ref
     assert.equal(out.ok, false);
     assert.equal(out.reason, 'transcript-unresolved');
     assert.deepEqual(out.applied, []);
-    assert.equal(out.committed, false);
+    // `null`, not `false`: refused before the commit step is ever reached.
+    assert.equal(out.committed, null, 'refused before the commit step ever ran');
     assert.equal(gitHead(dir), headBefore, 'refused before any write → no new commit');
     assert.equal(
       readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
@@ -1981,7 +2121,8 @@ test('IMPR-15: no-user-close-signal → after an AskUserQuestion 세션 마무�
         `expected the no-signal reason (not transcript-unresolved): ${JSON.stringify(o1)}`,
       );
       assert.deepEqual(o1.applied, []);
-      assert.equal(o1.committed, false);
+      // `null`, not `false`: refused before the commit step is ever reached.
+      assert.equal(o1.committed, null, 'refused before the commit step ever ran');
       assert.equal(gitHead(dir), headBefore, 'refused before any write → no new commit');
       assert.equal(
         readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),

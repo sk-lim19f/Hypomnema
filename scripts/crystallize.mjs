@@ -109,6 +109,7 @@ import {
   scopeVisible,
   readVisibilityScope,
   withFileLock,
+  extractTouchedWikiFilesWithTrust,
 } from '../hooks/hypo-shared.mjs';
 import { hashContent, readBaseEntry, advanceBase } from '../hooks/base-store.mjs';
 import { writeProposal } from '../hooks/proposal-store.mjs';
@@ -225,6 +226,35 @@ function requireProjectDir(args, slug) {
   }
 }
 
+// When the global gate's own discovery (hot.md pointer table + today
+// close-activity scan, both in hypo-shared.mjs) comes back with NO project at
+// all, a real apply never hits that dead end: it is handed `payload.project`
+// directly and never infers. --check-session-close has no payload, so its one
+// remaining authoritative signal is the same session's own transcript — which
+// project's files did THIS session actually touch. Reusing the exact
+// evidence-resolution helper the widened-lint-scope path already trusts here
+// keeps this a single inference vocabulary (touched wiki files), not a second
+// one: the difference is only which project-shaped question gets asked of it.
+// Never guessed: a transcript touching zero or more than one project's files
+// leaves the check exactly as unresolved as it was before this fallback.
+function deriveTouchedProject(hypoDir, transcriptPath) {
+  if (!transcriptPath) return null;
+  const { files, trusted } = extractTouchedWikiFilesWithTrust(transcriptPath, hypoDir);
+  // `trusted:false` means the walk itself may be incomplete (a missing/unreadable
+  // transcript, or a line that failed to parse). A truncated line could have named
+  // a SECOND project the walk never saw, so treating this Set as "the whole
+  // truth" would resolve a single-project reading off a scope that is only
+  // single-project because part of it is missing, exactly the ambiguity this
+  // fallback exists to refuse rather than guess through.
+  if (!trusted) return null;
+  const slugs = new Set();
+  for (const f of files) {
+    const m = /^projects\/([^/]+)\//.exec(f);
+    if (m && existsSync(join(hypoDir, 'projects', m[1]))) slugs.add(m[1]);
+  }
+  return slugs.size === 1 ? [...slugs][0] : null;
+}
+
 // ── session-close check (spec §5.2.7 / §8.3) ────────────────────────
 // Mirrors the hard gate in hypo-personal-check.mjs so the /hypo:crystallize
 // flow can self-verify before /compact triggers PreCompact.
@@ -261,7 +291,7 @@ function runSessionCloseCheck(args) {
     args.transcriptPath ||
     (args.sessionId ? resolveTranscriptBySessionId(args.sessionId) : null) ||
     null;
-  const status = precompactGateStatus(args.hypoDir, {
+  let status = precompactGateStatus(args.hypoDir, {
     ...(args.project
       ? { projectOverride: args.project }
       : checkTranscript
@@ -276,7 +306,30 @@ function runSessionCloseCheck(args) {
     // enforcement lives in the PreCompact/Stop hooks, which carry payload.cwd).
     ...(args.sessionCwd && !args.project ? { sessionCwd: args.sessionCwd } : {}),
   });
+
+  // check/apply divergence (2026-08-25 QA): a real apply never hits discovery
+  // dead-ends because payload.project is required input, not an inference. This
+  // check has no payload, so when discovery finds NO project at all (not even
+  // the recency fallback), it retries scoped to whatever single project this
+  // session's own transcript shows it touching. This is a diagnostic estimate,
+  // not a preview of what a real apply will do: a payload's `project` field is
+  // whatever the caller puts there and can legitimately name a project the
+  // transcript never mentions. Only fires on a fully unresolved global result,
+  // and only on a TRUSTED single-project reading (see deriveTouchedProject): an
+  // already-successful discovery, an ambiguous/empty transcript, or one the walk
+  // could not fully read is left untouched rather than guessed at.
+  let inferredProject = null;
+  if (!args.project && !status.close.project) {
+    inferredProject = deriveTouchedProject(args.hypoDir, checkTranscript);
+    if (inferredProject) {
+      status = precompactGateStatus(args.hypoDir, {
+        projectOverride: inferredProject,
+        ...(args.sessionId ? { sessionId: args.sessionId } : {}),
+      });
+    }
+  }
   const close = status.close;
+  const scopedProject = args.project || inferredProject;
 
   // When a --session-id is supplied, report whether THIS session's
   // per-session marker (the Stop-chain completion signal) exists. This is a
@@ -301,8 +354,8 @@ function runSessionCloseCheck(args) {
   // log-only marker governs the session, the gate runs in log-only mode and the
   // --project override is IGNORED — surface that rather than implying X was
   // checked (it was not).
-  const logOnlyWon = args.project != null && markerObj?.scope === 'log-only';
-  const scope = args.project ? (logOnlyWon ? 'log-only' : 'project') : 'global';
+  const logOnlyWon = scopedProject != null && markerObj?.scope === 'log-only';
+  const scope = scopedProject ? (logOnlyWon ? 'log-only' : 'project') : 'global';
 
   if (args.json) {
     console.log(
@@ -325,9 +378,13 @@ function runSessionCloseCheck(args) {
           skipped: status.skipped,
           // scope is additive; `global` keeps prior semantics for existing readers
           scope,
-          ...(args.project
+          ...(scopedProject
             ? {
-                scoped_project: args.project,
+                scoped_project: scopedProject,
+                // Distinguishes a user-typed --project from this check picking one
+                // for itself off the transcript — a reader should not mistake the
+                // latter for an explicit ask (see deriveTouchedProject above).
+                ...(inferredProject ? { project_inferred_from_transcript: true } : {}),
                 ...(logOnlyWon ? { project_override_ignored: true } : {}),
               }
             : {}),
@@ -340,13 +397,20 @@ function runSessionCloseCheck(args) {
     process.exit(status.ok ? 0 : 1);
   }
 
+  // Label the scoped project by how it was chosen — an explicit --project reads
+  // as a flag the caller typed; an inferred one reads as this check's own guess
+  // off the transcript, so a reader does not credit the caller with an ask
+  // nobody made.
+  const scopedProjectLabel = args.project
+    ? `--project=${args.project}`
+    : `project=${scopedProject} (inferred from the session transcript, no --project given)`;
   if (logOnlyWon) {
     console.log(
-      `Note: a log-only session-closed marker governs session ${args.sessionId}, so the gate ran in log-only mode and --project=${args.project} was IGNORED (no project was checked).\n`,
+      `Note: a log-only session-closed marker governs session ${args.sessionId}, so the gate ran in log-only mode and ${scopedProjectLabel} was IGNORED (no project was checked).\n`,
     );
   } else if (scope === 'project') {
     console.log(
-      `Note: --project=${args.project} — this is a PROJECT-SCOPED diagnostic, not the global /compact gate. A green result means only ${args.project} is close-complete; another project can still block /compact.\n`,
+      `Note: ${scopedProjectLabel} — this is a PROJECT-SCOPED diagnostic, not the global /compact gate. A green result means only ${scopedProject} is close-complete; another project can still block /compact.\n`,
     );
   }
 
@@ -398,8 +462,8 @@ function runSessionCloseCheck(args) {
     // Do NOT claim global compact-readiness (the whole point of the narrow).
     console.log(
       status.ok
-        ? `✓ ${args.project} is close-complete (project-scoped). This is NOT a global /compact guarantee — run \`--check-session-close\` without --project for that.`
-        : `✗ ${args.project} is not close-complete — resolve the ✗ items above.`,
+        ? `✓ ${scopedProject} is close-complete (project-scoped). This is NOT a global /compact guarantee — run \`--check-session-close\` without --project for that.`
+        : `✗ ${scopedProject} is not close-complete — resolve the ✗ items above.`,
     );
   } else {
     console.log(
@@ -1043,7 +1107,10 @@ function applySessionClose(args) {
       stage: 'no-user-close-signal',
       reason: closeAuth.reason,
       applied: [],
-      committed: false,
+      // `null`, not `false`: this refusal fires before the commit step is ever
+      // reached (see the general result's own `committed` contract below).
+      // `false` is reserved for a commit that actually ran and failed.
+      committed: null,
       error: closeAuth.error,
     };
     console.log(
@@ -1103,7 +1170,9 @@ function applySessionClose(args) {
       stage: 'session-id-mismatch',
       error: msg,
       applied: [],
-      committed: false,
+      // `null`, not `false` — refused before the commit step, same contract as
+      // the `no-user-close-signal` refusal above.
+      committed: null,
     };
     console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${msg}`);
     process.exit(1);
@@ -1734,6 +1803,10 @@ function applySessionClose(args) {
   // but silently.
   let markerWritten = false;
   let markerSkipReason = null;
+  // Hoisted so the result JSON below can report it: `null` when this apply never
+  // reached the commit step at all (ok:false before the writes were even
+  // verified), distinct from a commit that ran and reported `committed:false`.
+  let commitOutcome = null;
   if (ok && args.sessionId) {
     // IO stays lazy so this preserves the exact side-effect order (codex design
     // review): commit first (the only mutation), then resolve the
@@ -1749,7 +1822,6 @@ function applySessionClose(args) {
     // apply's stage+commit. A lock-timeout is treated exactly like any other
     // commit failure below (skip the marker, surface the reason) rather than
     // crashing the apply.
-    let commitOutcome;
     try {
       commitOutcome = withFileLock(vaultCommitLockTarget(args.hypoDir), () =>
         commitWikiChanges(args.hypoDir, appliedPaths),
@@ -1843,6 +1915,19 @@ function applySessionClose(args) {
     date,
     applied,
     skipped,
+    // Was the general-shape sibling of the two early-refusal `committed:null`
+    // fields (no-user-close-signal / session-id-mismatch), which this path never
+    // carried before: a reader of `applied:[]` on a no-op re-run had no
+    // `committed` value to check against and no way to tell it apart from a run
+    // that never reached the commit step. `null` here means exactly that: `ok`
+    // came back false before the commit ever ran (see `stage` for which check
+    // failed: post-apply-verification, post-apply-lint, or proposal-pending). It
+    // does NOT mean nothing was written — an overwrite/append can already be on
+    // disk (see `applied` / `appliedUncommitted`) while `committed` stays `null`.
+    // `true` covers both an actual commit and the legitimate "nothing to stage"
+    // no-op (commitWikiChanges' own contract, see hooks/hypo-shared.mjs); `false`
+    // is a real commit failure, surfaced together with markerSkipReason below.
+    committed: commitOutcome ? commitOutcome.committed : null,
     // Targets withheld: an overwrite drifted from this session's observed base, or
     // an append could not take the file lock in time (`kind: 'append'`). Two
     // channels resolve these, and `proposals` vs `conflicts[].kind` are the sole

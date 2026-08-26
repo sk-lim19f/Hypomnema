@@ -35,6 +35,34 @@ import {
 
 suite('crystallize.mjs --apply-session-close (#38)');
 
+// The 2026-08-03 QA gap this closes: `applied: []` alone cannot tell an
+// already-applied no-op re-run apart from a run that failed before writing
+// anything. `skipped` (pre-existing) names every field that matched disk;
+// `committed` (newly surfaced on this path, previously only present on the
+// two early-refusal branches) tells apart a commit that ran and found
+// nothing to stage (`true`) from one that never ran at all (`null`, a
+// verification/lint failure) or that ran and failed (`false`).
+test('a second apply of an unchanged payload: applied:[], skipped names every field, committed:true', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const first = runApply(dir, payload);
+    const firstOut = JSON.parse(first.stdout);
+    assert.equal(firstOut.ok, true, `first apply must succeed: ${first.stdout}`);
+
+    const second = runApply(dir, payload);
+    const out = JSON.parse(second.stdout);
+    assert.equal(out.ok, true, `second apply must still succeed: ${second.stdout}`);
+    assert.deepEqual(out.applied, [], 'nothing new to write on an identical re-run');
+    assert.ok(
+      ['sessionState', 'projectHot', 'rootHot', 'sessionLog', 'log'].every((k) =>
+        out.skipped.some((s) => s.startsWith(k)),
+      ),
+      `skipped must name every field the payload carries: ${JSON.stringify(out.skipped)}`,
+    );
+    assert.equal(out.committed, true, 'nothing to stage is still a successful commit outcome');
+  });
+});
+
 // FEAT-11 T5 fail-safe: drives the REAL close path (not a worker reimplementation
 // of append). Pre-hold a fresh lock on the daily shard so crystallize's append
 // cannot acquire it → the close must withhold to proposal-pending WITHOUT touching
@@ -586,7 +614,9 @@ test('payload.sessionId ≠ --session-id → session-id-mismatch, zero bytes', (
       `stage must be session-id-mismatch: ${r.stdout}`,
     );
     assert.deepEqual(out.applied, [], 'nothing may be reported applied');
-    assert.equal(out.committed, false, 'nothing may be committed');
+    // `null`, not `false`: this refusal fires before the commit step is ever
+    // reached. `false` is reserved for a commit that ran and failed.
+    assert.equal(out.committed, null, 'refused before the commit step ever ran');
     const tracked = spawnSync('git', ['diff', '--quiet'], { cwd: dir });
     assert.equal(tracked.status, 0, 'no committed file may be modified on reject');
     const after = existsSync(shard) ? readFileSync(shard, 'utf-8') : '';

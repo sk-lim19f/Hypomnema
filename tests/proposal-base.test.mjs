@@ -2537,7 +2537,8 @@ test('no --session-id → apply is refused before any write (no legacy escape ha
     assert.notEqual(r.status, 0, 'omitting --session-id must not succeed');
     assert.equal(out.reason, 'session-id-required');
     assert.deepEqual(out.applied, []);
-    assert.equal(out.committed, false);
+    // `null`, not `false`: refused before the commit step is ever reached.
+    assert.equal(out.committed, null, 'refused before the commit step ever ran');
     assert.equal(gitHead(dir), headBefore, 'refused before any write → no new commit');
     assert.equal(
       readFileSync(t4ProjectHot(dir), 'utf-8'),
