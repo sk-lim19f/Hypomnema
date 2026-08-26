@@ -19,7 +19,7 @@
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { join, extname, basename } from 'path';
 import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
-import { SESSION_STATE_NEXT_HEADINGS } from '../hooks/hypo-shared.mjs';
+import { SESSION_STATE_NEXT_HEADINGS, closeFileTargetsGlobal } from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import {
   parseSchemaVocab,
@@ -553,6 +553,50 @@ const pageDirs = parseSchemaPageDirs(args.hypoDir);
 const validTypes = new Set([...VALID_TYPES, ...parseSchemaTypes(args.hypoDir)]);
 
 for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs, validTypes);
+
+// W4 (broken-wikilink only, NOT the full lintPage) for close's root-level
+// write targets that fall outside pages/projects/journal: hot.md and log.md
+// today. closeFileTargetsGlobal is the one list of what close writes
+// (hooks/hypo-shared.mjs), reused here instead of re-derived, so a future
+// close target is covered automatically. Only the entries NOT already under
+// a scanDir are new; closeFileTargetsGlobal's projects/<slug>/* entries are
+// already linted in full above.
+//
+// Why link-only and not the full lintPage: measured, not assumed. On the
+// packaged templates/ (hot.md type:reference, log.md type:log, both declared
+// in templates/SCHEMA.md's taxonomy), full lintPage on both files comes back
+// completely clean, so "these types trip W2" is not the reason to hold back.
+// The real reason is that live vaults do not all match the template. A vault
+// whose SCHEMA.md predates the `log` type row (or has none) gets a fresh
+// "Unknown type: log" W2 the moment log.md is run through lintPage, and a
+// vault whose root log.md predates the frontmatter convention entirely (no
+// leading `---` block at all, confirmed against a real maintainer vault)
+// gets a fresh "No frontmatter found" W1. Both W1 and W2 are in
+// STRICT_PROMOTE_IDS, so under --strict a vault that lint has always passed
+// would start failing on a file whose content this fix never touched. Full
+// lintPage stays reserved for pages/projects/journal, where every file was
+// already being linted before this change and there is no such newly-exposed
+// vault. W4 itself stays warn-only outside --strict, and postApply
+// (crystallize.mjs) gates only on errors, so this addition can add a new
+// warning to a close's lint output but can never fail one.
+const closeRootTargets = [...closeFileTargetsGlobal(args.hypoDir)].filter(
+  (f) => !f.startsWith('pages/') && !f.startsWith('projects/') && !f.startsWith('journal/'),
+);
+for (const rel of closeRootTargets) {
+  const full = join(args.hypoDir, rel);
+  if (!existsSync(full) || isScanIgnored(full, args.hypoDir, ignorePatterns)) continue;
+  let content;
+  try {
+    content = readFileSync(full, 'utf-8');
+  } catch {
+    continue;
+  }
+  for (const link of extractWikilinks(content)) {
+    if (!slugMap.has(link)) {
+      issue('warn', rel, `Broken wikilink: [[${link}]]`, null, 'W4');
+    }
+  }
+}
 
 // W8: design-history.md stale relative to session-log.md. Emitted once per
 // project (not per page) — runs outside the page loop. POSIX-separated path
