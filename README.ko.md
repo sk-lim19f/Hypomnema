@@ -289,7 +289,7 @@ PostToolUse 훅 둘은 matcher 없이 등록되고 각자 tool_name으로 거릅
 
 ### Claude Agent Skills
 
-합성이 핵심인 명령어 6개(`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`)는 `skills/<name>/SKILL.md`로도 등록돼 있습니다. 대화 내용이 해당 스킬의 `description`과 맞으면 Claude Agent Skills 메커니즘이 슬래시 명령 없이도 자동으로 호출합니다. 일곱 번째 스킬인 `debate`는 대응하는 슬래시 커맨드가 따로 없습니다. 세 단계(심문, 검증, 종합)로 구조화된 검토를 실행해 위키 주장을 재검증하거나 되돌리기 어려운 결정을 ADR로 굳힙니다. 명령어를 정확히 몰라도 하려는 일을 말로 적으면 됩니다.
+합성이 핵심인 명령어 6개(`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`)는 `skills/<name>/SKILL.md`로도 등록돼 있습니다. 대화 내용이 해당 스킬의 `description`과 맞으면 Claude Agent Skills 메커니즘이 슬래시 명령 없이도 자동으로 호출합니다. 일곱 번째인 `debate`는 스킬로만 있습니다. `commands/` 아래에 파일이 없지만 플러그인이 `skills/`도 함께 싣기 때문에 `/hypo:debate`는 나머지와 똑같이 동작합니다. 세 단계(심문, 검증, 종합)로 구조화된 검토를 실행해 위키 주장을 재검증하거나 되돌리기 어려운 결정을 ADR로 굳힙니다. 위 명령어 표에 없는 것은 그 표가 `commands/` 아래 파일을 세기 때문이지 칠 수 있는 것을 세기 때문이 아닙니다. 명령어를 정확히 몰라도 하려는 일을 말로 적으면 됩니다.
 
 | 이렇게 말하면 | 트리거되는 스킬 |
 |---|---|

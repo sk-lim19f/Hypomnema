@@ -287,7 +287,7 @@ Every maintenance command also runs from a plain shell, which is what you need w
 
 ### Claude Agent Skills
 
-The six synthesis-heavy commands (`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`) are also exposed as Claude Agent Skills in `skills/<name>/SKILL.md`, so they auto-trigger when the conversation matches their description, with no slash command required. A seventh skill, `debate`, has no slash-command counterpart: it runs a structured three-phase review (interrogate, verify, synthesize) to re-verify a wiki claim or harden a hard-to-reverse decision into an ADR.
+The six synthesis-heavy commands (`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`) are also exposed as Claude Agent Skills in `skills/<name>/SKILL.md`, so they auto-trigger when the conversation matches their description, with no slash command required. A seventh, `debate`, is a skill only: it has no file under `commands/`, but the plugin loads `skills/` too, so `/hypo:debate` works like the rest. It runs a structured three-phase review (interrogate, verify, synthesize) to re-verify a wiki claim or harden a hard-to-reverse decision into an ADR. It is absent from the command tables above because those count the files under `commands/`, not what you can type.
 
 | Say this | Skill it triggers |
 |---|---|
