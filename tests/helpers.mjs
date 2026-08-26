@@ -33,9 +33,29 @@ const NONEXISTENT_WIKI = join(tmpdir(), `hypo-no-wiki-${process.pid}`);
 // need a specific HOME use runWithHome() to override.
 const SESSION_TMP_HOME = mkdtempSync(join(tmpdir(), 'hypo-session-home-'));
 
+// A tmp HOME can still be written to while it is being torn down. SessionStart
+// fires a DETACHED version-check worker (hooks/hypo-session-start.mjs, the
+// `spawn(..., { detached: true })` in buildUpdateNotice) that outlives the
+// spawnSync the test used to run the hook, and it writes under
+// <HOME>/.claude/hypomnema/cache. A plain recursive rmSync races that write and
+// dies with ENOTEMPTY, which is a green-or-red coin flip decided by CI load
+// rather than by the code under test. Retrying the unlink is the safety net;
+// the tests that exercise notices also seed a fresh version-check cache so the
+// worker never spawns in the first place. Both are needed: the seed removes the
+// known producer, the retry covers any other late writer.
+//
+// Node backs off LINEARLY on ENOTEMPTY, so these numbers buy 100+200+...+1000,
+// about 5.5s, not one second. That is comfortably past the worker's own 2s
+// network budget, but it is NOT a synchronization primitive: a detached child
+// has no bound on when it is scheduled, and one that starts AFTER the delete
+// succeeded will mkdirSync the HOME back into existence with no retry left to
+// catch it. The seed is what actually removes that case; this only widens the
+// window for writers we have not named.
+const RM_RETRY = { recursive: true, force: true, maxRetries: 10, retryDelay: 100 };
+
 process.on('exit', () => {
   try {
-    rmSync(SESSION_TMP_HOME, { recursive: true, force: true });
+    rmSync(SESSION_TMP_HOME, RM_RETRY);
   } catch {}
 });
 
@@ -90,7 +110,7 @@ function withTmpHome(fn) {
   try {
     fn(dir);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, RM_RETRY);
   }
 }
 
