@@ -153,13 +153,13 @@ The result JSON includes a `stage` field when `ok: false`. Branch on it:
 | `post-apply-lint` | The payload introduced an error-level lint blocker in a payload file (malformed body / bad frontmatter), or lint crashed. | Fix the offending content in the payload, then re-run. (Broken wikilinks are W4 warnings — not gated.) |
 | `post-apply-verification+lint` | Both above. | Fix both; re-run. |
 
-Once `ok: true`, report:
+Once `ok: true`, report from the result JSON's `applied` and `skipped` arrays together, not `applied` alone. `applied` lists only the fields this run actually wrote bytes for; `skipped` lists the fields that already matched what was on disk (a re-run of an already-applied payload). An idempotent re-run legitimately reports `applied: []`, and that is success, not a failure to report on: check `skipped` for the same 4-6 entries instead. Read `committed` the same way: `true` covers both a real commit and the case where nothing needed staging (a full no-op re-run); `false` means the commit itself ran and failed (see `markerSkipReason`); `null` means apply never reached the commit step at all, because `ok` was already false (an authority refusal before any write, or a verification/lint failure, or a withheld conflict, per `stage`). `null` does NOT mean nothing was written: `applied` can be non-empty (bytes landed on disk) while `committed` stays `null`, because those bytes were never staged into git.
 
-- ✓ session-state.md applied
-- ✓ hot.md (project + root) applied
-- ✓ session-log entry appended
+- ✓ session-state.md applied (or already current, per `skipped`)
+- ✓ hot.md (project + root) applied (or already current)
+- ✓ session-log entry appended (or already present)
 - ✓ open-questions applied (or skipped if unchanged)
-- ✓ log.md entry appended
+- ✓ log.md entry appended (or already present)
 - ✓ post-apply lint clean
 - **marker written?** (required check): if `markerWritten: true`, report "session-close marker written"; if `markerWritten: false`, report "session-close marker NOT written (reason: `<markerSkipReason>`)" and do NOT declare the session "closed" or "complete". A missing marker means the Stop-chain is still open; recover per the `markerSkipReason` branch below.
 
