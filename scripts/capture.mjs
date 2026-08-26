@@ -42,9 +42,10 @@ import {
   unlinkSync,
   renameSync,
   realpathSync,
-  lstatSync,
   openSync,
   closeSync,
+  statSync,
+  chmodSync,
 } from 'fs';
 import { randomBytes } from 'crypto';
 import { join, dirname, relative, sep } from 'path';
@@ -76,6 +77,7 @@ import {
   HOOK_EVENT_ALLOWLIST,
   SKILL_ROOT_FILE,
   EXT_PREFIX,
+  withSrcExecBits,
 } from './lib/extensions.mjs';
 import { readCoreHooksConfig, deriveCoreHookBasenames } from './lib/core-hooks.mjs';
 
@@ -582,13 +584,21 @@ function log(msg) {
 // `${dest}.tmp.${pid}` name was predictable, and writeFileSync on a path someone had
 // already planted a symlink at would follow it straight out of the wiki. O_EXCL fails
 // on an existing path of any kind, symlink included.
-function writeAtomic(dest, buf) {
+// `srcMode`, when given, carries the source file's execute bit onto the wiki
+// copy (openSync's own mode argument is clipped by umask same as writeFileSync,
+// so this still has to be a separate chmod). Omitted for a manifest write: that
+// content is JSON we generated, not a copy of something with a mode worth
+// keeping.
+function writeAtomic(dest, buf, srcMode) {
   const tmp = `${dest}.tmp.${process.pid}.${randomBytes(6).toString('hex')}`;
   const fd = openSync(tmp, 'wx');
   try {
     writeFileSync(fd, buf);
   } finally {
     closeSync(fd);
+  }
+  if (srcMode != null) {
+    chmodSync(tmp, withSrcExecBits(statSync(tmp).mode, srcMode));
   }
   try {
     renameSync(tmp, dest);
@@ -719,7 +729,8 @@ function writeSkill({ rec, skillRoot, manifestPath, manifest, files, guard, wiki
         madeDirs.add(cur);
       }
     }
-    writeAtomic(destPath, readFileSync(f.srcPath));
+    const buf = readFileSync(f.srcPath);
+    writeAtomic(destPath, buf, statSync(f.srcPath).mode);
     rec.createdFiles.push(destPath);
   }
 }
@@ -812,22 +823,6 @@ function captureOneSkill({ c, extDir, guard, wikiRoot, args, captured, skipped, 
     log(`= ${label}: already captured`);
     captured.push({ ...rec, status: 'already' });
     return;
-  }
-
-  // Content round-trips; the executable bit does not (forward-sync writes with the
-  // default mode). Say so rather than let a captured `scripts/run.sh` arrive
-  // non-executable on the far machine without a word.
-  const execFiles = c.files.filter((f) => {
-    try {
-      return (lstatSync(f.srcPath).mode & 0o111) !== 0;
-    } catch {
-      return false;
-    }
-  });
-  if (execFiles.length > 0) {
-    log(
-      `! ${label}: ${execFiles.length} executable file(s) — content is captured, but the executable bit is not carried by sync`,
-    );
   }
 
   if (!args.dryRun) {
@@ -1055,7 +1050,7 @@ function run(args, { claudeHome = join(HOME, '.claude') } = {}) {
         manifestPrevBuf: existingManifestBuf,
       };
       writeAtomic(manifestPath, JSON.stringify(plan.manifest, null, 2) + '\n');
-      writeAtomic(filePath, srcBuf);
+      writeAtomic(filePath, srcBuf, statSync(c.srcPath).mode);
       created.push(rec);
     }
     captured.push({ ...c, installFile, requiredKeys, status: 'ready' });
