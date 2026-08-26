@@ -12,6 +12,8 @@ import {
   readdirSync,
   existsSync,
   symlinkSync,
+  chmodSync,
+  statSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { test, suite } from './harness.mjs';
@@ -100,6 +102,87 @@ test('upgrade-extensions-hard-copy-and-manifest-register', () => {
         settingsAfter,
         settingsBefore,
         'settings.json drifted across idempotent --apply',
+      );
+    });
+  });
+});
+
+// forward-sync must carry a wiki script's executable bit to the install target
+// (the bug this pins: a 755 wiki script always landed 644 on a fresh machine).
+test('forward-sync carries the executable bit on a fresh install (create branch)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-runner.mjs', '#!/usr/bin/env node\n');
+      chmodSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-runner.mjs'), 0o755);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r.status, 0, `apply failed: ${r.stderr}`);
+
+      const installed = join(home, '.claude', 'hooks', 'hypo-ext-runner.mjs');
+      const mode = statSync(installed).mode & 0o777;
+      assert.equal(
+        mode & 0o111,
+        0o111,
+        `installed copy must carry the src's 755 exec bit, got ${mode.toString(8)}`,
+      );
+    });
+  });
+});
+
+// The 'up-to-date' branch (content already matches src) used to be a pure no-op:
+// a mode mismatch there was never healed, on any sync, ever. This pins the fix,
+// including that check-mode (no --apply) must count the mismatch as pending work
+// rather than reporting "up to date" while a stale bit sits on disk.
+test('forward-sync heals a stale exec bit when content is already up to date', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const srcPath = join(hypoDir, 'extensions', 'hooks', 'hypo-ext-stale.mjs');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-stale.mjs', '#!/usr/bin/env node\n');
+      chmodSync(srcPath, 0o755);
+
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r1.status, 0, `first apply failed: ${r1.stderr}`);
+      const installed = join(home, '.claude', 'hooks', 'hypo-ext-stale.mjs');
+
+      // Simulate a pre-fix install (or a user's own `chmod -x`): identical bytes,
+      // wrong mode.
+      chmodSync(installed, 0o644);
+
+      const check = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      assert.equal(check.status, 1, `check mode must exit non-zero on pending work: ${check.stderr}`);
+      const checkOut = JSON.parse(check.stdout);
+      assert.equal(
+        checkOut.extensions.needsWork,
+        true,
+        'a mode-only mismatch must count as pending work, not "up to date"',
+      );
+
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second apply failed: ${r2.stderr}`);
+      const out2 = JSON.parse(r2.stdout);
+      const fixed = out2.applied.extensions.actions.find(
+        (a) => a.file === 'hooks/hypo-ext-stale.mjs',
+      );
+      assert.ok(fixed, 'the mode-only fix must show up in the actions list');
+      assert.equal(
+        fixed.action,
+        'update',
+        'a content-identical mode fix reuses the existing update action, not a new one',
+      );
+
+      const mode = statSync(installed).mode & 0o777;
+      assert.equal(
+        mode & 0o111,
+        0o111,
+        `stale 644 copy must be healed back to executable, got ${mode.toString(8)}`,
       );
     });
   });

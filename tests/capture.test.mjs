@@ -11,6 +11,8 @@ import {
   existsSync,
   symlinkSync,
   lstatSync,
+  chmodSync,
+  statSync,
 } from 'node:fs';
 import { join, basename } from 'node:path';
 import { test, suite } from './harness.mjs';
@@ -1765,6 +1767,63 @@ test('captures a directory skill, adopts it, and reinstalls it on a second machi
         assert.ok(
           !existsSync(join(home2, '.claude', 'skills', 'hypo-ext-mine')),
           'installs under the original name, not the wiki storage name',
+        );
+      });
+    });
+  });
+});
+
+// Regression: capture's OWN wiki write must not lose the source's executable
+// bit. Before this fix, capture.mjs's writeAtomic always wrote 644, so the wiki
+// copy was wrong from the moment capture created it. The immediate adopt sync
+// then made it worse: its up-to-date branch heals mode FROM the wiki (now the
+// source of truth for forward-sync), and the wiki copy was already wrong, so
+// the heal wrote 644 back onto the user's ORIGINAL local file too.
+test('capture preserves the executable bit end to end: wiki copy, far install, and the original', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      const helper = join(src, 'run.sh');
+      writeFileSync(helper, '#!/bin/sh\necho hi\n');
+      chmodSync(helper, 0o755);
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      // (b) the regression this test pins: the original local file must still be
+      // executable after capture + its own adopt sync.
+      const origMode = statSync(helper).mode & 0o777;
+      assert.equal(
+        origMode & 0o111,
+        0o111,
+        `capture must not strip the original file's executable bit, got ${origMode.toString(8)}`,
+      );
+
+      const wikiHelper = join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine', 'run.sh');
+      const wikiMode = statSync(wikiHelper).mode & 0o777;
+      assert.equal(
+        wikiMode & 0o111,
+        0o111,
+        `wiki copy must carry the source's executable bit, got ${wikiMode.toString(8)}`,
+      );
+
+      // (a) a second machine syncing the same wiki must install it executable too.
+      withTmpHome((home2) => {
+        const up = runWithHome('upgrade.mjs', ['--apply', `--hypo-dir=${hypoDir}`], home2);
+        assert.equal(up.status, 0, up.stderr);
+        const farHelper = join(home2, '.claude', 'skills', 'mine', 'run.sh');
+        const farMode = statSync(farHelper).mode & 0o777;
+        assert.equal(
+          farMode & 0o111,
+          0o111,
+          `far install must carry the executable bit, got ${farMode.toString(8)}`,
         );
       });
     });

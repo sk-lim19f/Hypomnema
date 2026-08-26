@@ -28,6 +28,8 @@ import {
   unlinkSync,
   mkdirSync,
   lstatSync,
+  statSync,
+  chmodSync,
   rmdirSync,
 } from 'fs';
 import { join, dirname, relative, resolve, posix, sep } from 'path';
@@ -894,9 +896,26 @@ export function readExtensionPkgStateNoMutate(pkgPath, target) {
 
 // ── sync orchestration ─────────────────────────────────────────────────────────
 
-function writeFreshAtomic(dest, content) {
+/** Carry only src's execute bits (owner/group/other) onto a mode value; every
+ * other permission bit (dest's own read/write, however umask shaped it) is
+ * left alone. This is the one place forward-sync decides "should this file be
+ * executable", so every writer of dest routes through it. Exported so
+ * capture.mjs's own atomic writer (a captured file's FIRST write into the wiki)
+ * applies the identical rule; the wiki copy must not lose the bit before
+ * forward-sync ever gets a chance to carry it further. */
+export function withSrcExecBits(destMode, srcMode) {
+  return (destMode & ~0o111) | (srcMode & 0o111);
+}
+
+function writeFreshAtomic(dest, content, srcMode) {
   const tmp = `${dest}.tmp.${process.pid}.${Date.now()}`;
   writeFileSync(tmp, content);
+  if (srcMode != null) {
+    // writeFileSync has no mode option that survives umask, so the execute bit
+    // has to be applied explicitly, and before the rename: otherwise dest is
+    // briefly visible with the wrong mode to anything racing this write.
+    chmodSync(tmp, withSrcExecBits(statSync(tmp).mode, srcMode));
+  }
   try {
     renameSync(tmp, dest);
   } catch (err) {
@@ -914,13 +933,19 @@ function writeFreshAtomic(dest, content) {
  * overwrites user-modified / unowned files; without it those are left untouched and
  * surface as drift/conflict. A symlink/non-regular dest is never followed even under
  * force (the isRegularFile guard precedes the force branch).
+ *
+ * The executable bit is not tracked anywhere (no mode column in the SHA map's
+ * ownership model), so src's mode is the only source of truth for it and gets
+ * carried onto dest on every branch that (re)writes it, including the
+ * content-identical `up-to-date` branch below.
  */
 function copyOne({ srcPath, destPath, key, recordedSHA, apply, force }) {
   const srcContent = readFileSync(srcPath);
   const srcSHA = sha256(srcContent);
+  const srcMode = statSync(srcPath).mode;
 
   if (!existsSync(destPath)) {
-    if (apply) writeFreshAtomic(destPath, srcContent);
+    if (apply) writeFreshAtomic(destPath, srcContent, srcMode);
     return { action: 'create', sha: srcSHA };
   }
   if (!isRegularFile(destPath)) {
@@ -933,6 +958,20 @@ function copyOne({ srcPath, destPath, key, recordedSHA, apply, force }) {
   }
   const onDiskSHA = sha256(onDisk);
   if (onDiskSHA === srcSHA) {
+    // Content already matches, but the exec bit can still be stale: this used to
+    // be a pure no-op, which is exactly why a mismatched bit here never healed.
+    // Reported as 'update' (not a new action) so every existing "N to sync" /
+    // "N synced" count and log line already keyed on create/update/force-update
+    // picks it up for free.
+    // ponytail: this also overwrites an exec bit a user deliberately flipped on a
+    // file whose content happens to still match src (chmod -x'd a script they
+    // like read-only). Upgrade path: record mode next to sha in the pkg-json map
+    // so a user's own bit can be told apart from our default and left alone.
+    const destMode = statSync(destPath).mode;
+    if ((destMode & 0o111) !== (srcMode & 0o111)) {
+      if (apply) chmodSync(destPath, withSrcExecBits(destMode, srcMode));
+      return { action: 'update', sha: srcSHA };
+    }
     return { action: 'up-to-date', sha: srcSHA };
   }
   if (recordedSHA && onDiskSHA === recordedSHA) {
@@ -942,7 +981,7 @@ function copyOne({ srcPath, destPath, key, recordedSHA, apply, force }) {
       if (!verify || sha256(verify) !== recordedSHA) {
         return { action: 'skip-changed', sha: recordedSHA };
       }
-      writeFreshAtomic(destPath, srcContent);
+      writeFreshAtomic(destPath, srcContent, srcMode);
     }
     return { action: 'update', sha: srcSHA };
   }
@@ -950,7 +989,7 @@ function copyOne({ srcPath, destPath, key, recordedSHA, apply, force }) {
   if (force) {
     if (apply) {
       writeFreshAtomic(`${destPath}.bak`, onDisk);
-      writeFreshAtomic(destPath, srcContent);
+      writeFreshAtomic(destPath, srcContent, srcMode);
     }
     return { action: 'force-update', sha: srcSHA };
   }
