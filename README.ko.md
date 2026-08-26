@@ -27,17 +27,19 @@ Andrej Karpathy의 "LLM 네이티브 위키" 스케치에서 출발했습니다.
 
 위키 작업(자료 정리·검색·세션 마무리)은 아직 `/hypo:*` 명령이나 자연어로 시작합니다. v2의 목표는 Claude가 시키지 않아도 위키를 읽고 쓰고 합성하는 완전 자율 동작이고, 지금 그쪽으로 가는 중입니다.
 
-이미 자동으로 도는 영역은 다음과 같습니다. 위키가 한 세션에서 얼마나 쓰였는지 재는 관측성 점수가 있고, 여러 영역이 요청 없이 돌아갑니다.
+위키가 한 세션에서 얼마나 쓰였는지는 관측성 점수가 잽니다. 요청 없이 알아서 도는 건 다음입니다.
 
-- 신선도 신호. `verify_by_date`가 지난 페이지는 세션 시작 주입이나 lookup 주입 시 `[STALE ...]`로 표시되고, lookup 사용을 로컬에서 추적해 최근 90일간 lookup으로 주입되지 않은 페이지를 crystallize가 cold 후보로 표면화합니다.
+- 신선도 신호. `verify_by_date`가 지난 페이지는 세션 시작 주입이나 lookup 주입 시 `[STALE ...]`로 표시되고, lookup 사용을 로컬에서 추적해 최근 90일간 lookup으로 주입된 적 없는 페이지를 crystallize가 cold 후보로 끌어올려 보여 줍니다.
 - 피드백 한 곳만 고치면 나머지는 따라옵니다. `pages/feedback/`에 한 번 적으면 위키가 `MEMORY.md`와 `~/.claude/CLAUDE.md`의 `<learned_behaviors>` 블록을 자동으로 갱신합니다(단방향 projection).
 - `cd`만 해도 프로젝트를 알아보고 재개 정보를 띄웁니다. git 동기화된 프로젝트 디렉터리로 이동하면 대응하는 위키 프로젝트의 `hot.md`가 자동으로 주입되어, 코드 레포 세션이 위키 위치와 최근 상황을 바로 압니다.
 - 프로젝트 자동 생성. 프로젝트 표식(`package.json`·`Cargo.toml` 등)이 있는 git 저장소로 `cd` 했는데 대응하는 위키 프로젝트가 없으면 만들지 물어봅니다.
-- 세션 종료 자동 정리와 `/clear` 복구. 의미 있는 세션이 끝나면 "마무리 메모를 짧게 남길까요?"가 자동으로 뜹니다. 단 진행 중인 작업(백그라운드 셸 작업이나 예약된 wake 포함)이 남아 있으면 강제로 닫거나 매 턴 다시 묻지 않고, 지금 닫을지만 되묻습니다. 마무리하지 않은 채 `/clear`를 입력해도 다음 세션 시작 때 이어서 정리할 수 있습니다.
+- 세션 종료 자동 정리와 `/clear` 복구. 의미 있는 세션을 마치겠다고 신호하면 "마무리 메모를 짧게 남길까요?"가 자동으로 뜹니다. 단 진행 중인 작업(백그라운드 셸 작업이나 예약된 wake 포함)이 남아 있으면 강제로 닫거나 매 턴 다시 묻지 않고, 지금 닫을지만 되묻습니다. 마무리하지 않은 채 `/clear`를 입력해도 다음 세션 시작 때 이어서 정리할 수 있습니다.
 
 버전별로 무엇이 바뀌었는지는 [CHANGELOG](CHANGELOG.md)에 있습니다.
 
-업그레이드 정책 하나만 미리 알아 두세요. `hypomnema upgrade --apply`는 사용자가 직접 편집한 `SCHEMA.md`를 덮어쓰지 않습니다. 스키마가 올라가면 위키 루트에 마이그레이션 보고서만 써 주고, 실제 반영은 사용자가 직접 결정합니다(코드에서 Option C라고 부르는 정책).
+업그레이드 정책 하나만 미리 알아 두세요. `hypomnema upgrade --apply`는 사용자가 직접 편집한 `SCHEMA.md`를 덮어쓰지 않습니다. 스키마가 올라가면 위키 루트에 마이그레이션 보고서만 써 주고, 실제 반영은 사용자가 직접 합니다(코드에서 Option C라고 부르는 정책).
+
+같은 보류 방식이 세션 마무리 파일을 쓸 때에도 적용됩니다. 세션 종료 쓰기의 대상 파일이 이 세션이 읽은 뒤에 바뀌었다면 Hypomnema는 덮어쓰지 않습니다. 그 내용을 `<위키>/.cache/proposals/` 아래에 보류하고 알려 줍니다. 검토와 적용은 직접 하세요. `hypomnema proposal list`로 목록을 보고 `hypomnema proposal apply <id>` 또는 `hypomnema proposal discard <id>`를 씁니다. 자동 적용은 없습니다.
 
 자동처럼 보이지만 실제로는 직접 실행해야 하는 기능이 두 가지 있습니다. extensions sync와 역방향 capture입니다. 위키 안 `~/hypomnema/extensions/{agents,commands,hooks,skills}/`에 둔 파일은 `~/.claude/`에 반영되는데(`--codex`를 붙이면 `hooks`·`commands`는 `~/.codex/`에도), 직접 `hypomnema init`, `hypomnema upgrade --apply`, 또는 dry-run이 아닌 `hypomnema capture`를 돌려야만 반영됩니다. 저절로 밀어 넣는 트리거는 없습니다. `hypomnema capture`(또는 `/hypo:capture`)는 반대 방향으로, 직접 만든 command·agent·hook·skill을 위키로 가져오는 경로인데 이것도 마찬가지로 명시적으로 불러야 동작합니다. 자세한 내용은 아래 명령어 표를 보세요.
 
@@ -45,7 +47,7 @@ Andrej Karpathy의 "LLM 네이티브 위키" 스케치에서 출발했습니다.
 
 ## 빠른 시작
 
-설치 경로는 두 가지입니다. 어느 쪽이든 같은 위키·훅·`/hypo:*` 슬래시 커맨드가 만들어집니다.
+설치 경로는 두 가지입니다. 어느 쪽이든 같은 위키·훅·`/hypo:*` 슬래시 커맨드가 만들어지지만, 하나만 고르고 유지하세요. 둘 다 설치돼 있으면 core 훅의 소유자는 플러그인이고, `hypomnema upgrade`가 재등록을 일부러 거부하며 dual-install 배너를 출력합니다. `--allow-dual-install`로 강행하면 모든 훅이 두 번 발화하니 한쪽을 지우세요.
 
 ### Path A: Claude Code 플러그인 (권장)
 
@@ -57,7 +59,7 @@ Claude Code 안에서:
 /hypo:init
 ```
 
-플러그인을 설치하면 패키지의 `commands/` 디렉터리에서 `/hypo:*` 커맨드가 등록되고, `/hypo:init`이 위키 스캐폴딩과 `~/.claude/settings.json` 훅 병합을 처리합니다.
+플러그인을 설치하면 패키지의 `commands/` 디렉터리에서 `/hypo:*` 커맨드가 등록되고 `hooks/hooks.json`의 라이프사이클 훅이 자동으로 연결됩니다. `/hypo:init`은 위키 스캐폴딩만 합니다. 이 경로에서는 훅을 `~/.claude/hooks/`로 복사하거나 `settings.json`에 병합하지 않습니다. 플러그인 로더가 이미 제공하므로 둘 다 설치하면 모든 훅이 두 번 발화합니다.
 
 ### Path B: npm CLI
 
@@ -72,6 +74,12 @@ hypomnema
 
 > 어느 경로든 첫 실행 뒤에는 Claude Code를 재시작(또는 새 세션 열기)해야 새 훅과 슬래시 커맨드가 반영됩니다.
 
+> `init`은 `~/.zshrc`(또는 `~/.bashrc`)에 `claude()` 셸 함수도 추가합니다. `# hypo-managed:shell-setup:start`와 `:end` 마커 사이에 들어가며, `cd`만 한 세션에도 프로젝트 컨텍스트가 주입되게 합니다. `--no-shell`로 건너뛰거나 `--shell-config=<path>`로 대상 파일을 바꿀 수 있습니다. `uninstall`은 이 블록을 지우지 않으니 마커 사이 줄을 직접 지우세요.
+
+> `init`은 위키 저장소에 pre-commit 훅도 설치합니다(`<위키>/.git/hooks/pre-commit`, `# hypo-managed:pre-commit:*` 마커). `.hypoignore`에 걸리는 파일이 스테이지되면 커밋을 막습니다. 해당 파일을 unstage 하거나 `git commit --no-verify`로 우회하세요. 이 훅에는 설치된 패키지의 절대 경로가 박히므로, Hypomnema를 옮기거나 재설치했다면 `hypomnema init`을 다시 돌려 경로를 갱신해야 합니다. 그러지 않으면 위키의 모든 커밋이 실패합니다. `uninstall`은 이 파일을 지우지 않습니다.
+
+> 두 번째 기기에서는 그냥 `hypomnema`를 돌리지 마세요. 원격과 무관한 새 위키가 만들어집니다. 기존 위키를 클론하는 쪽을 쓰세요. `hypomnema --from-remote=<git-url>`이 위키 루트로 클론한 뒤 실제 Hypomnema 위키인지 확인하고, 새 git 히스토리를 만들지 않은 채 훅과 슬래시 커맨드만 설치합니다. 대상 디렉터리가 이미 있으면 거부합니다.
+
 ### Step 2: 위키처럼 쓰기
 
 ```
@@ -82,7 +90,7 @@ hypomnema
 
 나머지는 훅이 합니다. 자동 staging, 자동 commit/push, 세션 상태 주입, 관련 노트 룩업까지 알아서 처리합니다.
 
-> 명령어를 외울 필요는 없습니다. 하려는 일을 평범한 말로 적으면 대화 내용에 맞는 스킬이 슬래시 명령 없이 자동으로 뜹니다. "이 글 위키에 저장해줘"는 `ingest`, "내가 X에 대해 뭘 알고 있지?"는 `query`, "이번 세션 마무리하자"는 `crystallize`로 이어집니다. 동작 원리는 [Claude Agent Skills](#claude-agent-skills) 참고.
+> 명령어를 외울 필요는 없습니다. 하려는 일을 평범한 말로 적으면 맞는 스킬이 슬래시 명령 없이 알아서 실행됩니다. "이 글 위키에 저장해줘"는 `ingest`, "내가 X에 대해 뭘 알고 있지?"는 `query`, "이번 세션 마무리하자"는 `crystallize`로 이어집니다. 동작 원리는 [Claude Agent Skills](#claude-agent-skills) 참고.
 
 > 여러 기기 동기화: 위키는 처음부터 git 저장소입니다. remote만 한 번 연결해 두면 이후 매 세션 종료 때 `Stop` 훅이 동기화를 맞춰 줍니다.
 
@@ -124,7 +132,7 @@ Hypomnema         ───►  합성 · 마크다운 · git · 훅 · 로컬
 | 검색 | LLM이 근거 있는 답을 합성 | 전문 검색 / 백링크 | 키워드 검색 | 최근접 청크 | 불투명 | 코드 검색 |
 | 세션 연속성 | `hot.md` + `session-state.md`로 자동 재개 | 없음 | 없음 | 없음 | 일부 | 없음 |
 | 워크플로 통합 | Claude Code 네이티브 | 별도 앱 | 별도 앱 / 브라우저 | 별도 서비스 | 별도 앱 | 별도 사이트 |
-| 포맷 | 평문 마크다운 + frontmatter | 마크다운 | 독자 포맷 | 벡터 스토어 | 독자 포맷 | HTML |
+| 포맷 | 평문 마크다운 + 프런트매터 | 마크다운 | 독자 포맷 | 벡터 스토어 | 독자 포맷 | HTML |
 | 행동 튜닝 | `/hypo:feedback` → 영구 규칙 | 없음 | 없음 | 없음 | 일부 | 없음 |
 | 자동 동작 | `/hypo:*` 호출 + 관측성 점수 + 자동 동작 영역; v2 목표는 완전 자율 | 없음 | 없음 | 없음 | 블랙박스 | 없음 |
 | 셋업 비용 | 명령 1개 | 설치 1번 | 가입 | 파이프라인 구축 | 가입 | 레포 연결 |
@@ -133,7 +141,7 @@ Hypomnema         ───►  합성 · 마크다운 · git · 훅 · 로컬
 ### 이 선택이 가져다주는 것
 
 - 저장이 아니라 합성. 끝까지 읽지도 못한 글이 무덤처럼 쌓이지 않습니다. `/hypo:ingest`는 매번 구조화된 페이지를 만듭니다. 같은 주제를 다음에 인제스트하면 새 페이지를 만들지 않고 기존 페이지를 갱신합니다.
-- 밀도가 쌓이도록 설계했습니다. 소스 100개가 단절된 페이지 100개로 끝나면 의미가 없습니다. ingest가 새 소스를 늘 새 페이지로 만들지 않고 기존 페이지에 합치는 구조라, 페이지 수는 소스 증가보다 천천히 늘고 교차 링크는 더 빠르게 늘어나도록 설계했습니다.
+- 밀도가 쌓이도록 설계했습니다. 소스 100개가 단절된 페이지 100개로 끝나면 의미가 없습니다. ingest가 새 소스를 늘 새 페이지로 만들지 않고 기존 페이지에 합치는 구조라, 페이지 수는 소스 증가보다 천천히 늘고, 교차 링크는 더 빠르게 늘어납니다.
 - 맥락 전환이 없습니다. 어차피 Claude Code 안에서 일하는 중입니다. 위키는 슬래시 명령 한 줄로 닿습니다. 새 탭도, 다른 앱도, 추가 로그인도 없습니다.
 - 저장 형식이 오래 살아남습니다. 평문 마크다운 + git은 20년 뒤에도 읽힙니다. 오프라인에서도 `grep`이 됩니다. 언제든 다른 도구로 옮길 수 있고, 아직 나오지 않은 미래의 AI 도우미도 변환 없이 그대로 읽습니다.
 
@@ -143,26 +151,26 @@ Hypomnema         ───►  합성 · 마크다운 · git · 훅 · 로컬
 
 본문에서 반복해서 쓰는 용어를 한 표에 모았습니다. 읽다가 막히면 여기서 찾으세요.
 
-| 용어 | Hypomnema에서의 뜻 |
+| 용어 | Hypomnema에서 쓰는 뜻 |
 |---|---|
 | frontmatter(프런트매터) | 마크다운 페이지 맨 위의 YAML 블록. `title`, `type`, `tags` 같은 항목이 들어갑니다 |
-| wikilink(위키링크) | `[[페이지-슬러그]]` 형태의 페이지 간 교차 참조. `lint`가 유효성을 확인합니다 |
+| wikilink(위키링크) | `[[페이지-슬러그]]` 형태의 페이지 간 교차 참조. `lint`가 링크를 해석합니다 |
 | ADR | "Architecture Decision Record". 자명하지 않은 설계 결정을 왜 했는지 짧게 적는 마크다운 페이지 |
 | schema(스키마) | `SCHEMA.md`에 정의된 타입 분류와 필수 항목 규칙. 페이지가 유효한지 판단하는 기준 |
 | lint | 검증기(`/hypo:lint`, 또는 `npm run lint`). 프런트매터·위키링크·스키마를 점검 |
 | projection(투영) | 한 방향 자동 파생. `pages/feedback/*.md` → `MEMORY.md`와 CLAUDE.md `<learned_behaviors>` |
-| 단일 원천(source of truth, SoT) | 사용자가 편집하는 단 하나의 파일. projection은 거기서만 파생되고 역방향은 막습니다 |
+| 단일 원천(source of truth, SoT) | 사용자가 편집하는 단 하나의 파일. projection은 거기서만 파생되고 역방향은 없습니다 |
 | 훅(hook) | Claude Code가 라이프사이클 이벤트(`SessionStart`, `Stop` 등)에 자동으로 실행하는 스크립트 |
 | 라이프사이클 이벤트 | Claude Code가 플러그인에 알리는 시점. 세션 시작·프롬프트 제출·도구 사용·compact 요청·세션 종료 등 |
 | `hot.md` | 프로젝트별 캐시. "방금 무엇을 했는지"(직전 세션의 핵심) |
 | `session-state.md` | 프로젝트별 캐시. "다음에 무엇을 할지"(다음 세션 시작 때 주입되는 이어받기 데이터) |
 | `.hypoignore` | 모든 콘텐츠 주입 훅과 `ingest`에서 제외할 경로(글롭 패턴). 프라이버시 경계 |
-| `.hyposcanignore` | 카탈로그 스캔(`lint`, `graph`, `stats`, `query`, `verify`, `doctor`)에서만 제외할 경로. 프라이버시 경계가 아니며, 매치돼도 여전히 커밋되고 훅이 읽음 |
+| `.hyposcanignore` | 카탈로그 스캔(`lint`, `stats`, `query`, `verify`, `doctor`)에서만 제외할 경로. 프라이버시 경계가 아니며, 매치돼도 여전히 커밋되고 훅이 읽음 |
 | 관측성 점수(observability score) | 세션별 측정값(search·ingest·feedback 활동). 위키가 실제로 쓰였는지 보여줍니다 |
 | manifest | 설치 스크립트가 쓰는 작은 JSON. 어떤 파일을 어떤 SHA로 설치했는지 기록 |
 | `additionalContext` | Claude Code 훅이 프롬프트에 컨텍스트를 끼워 넣는 필드. 콘텐츠 주입 훅의 출력 위치 |
 | 바이트 동일(byte-equal) | `--apply` 전후가 비트 단위로 같은 파일. "건드리지 않았다"의 가장 강한 보장 |
-| BM25 | 고전적인 전문(全文) 랭킹 알고리즘. `/hypo:query`의 MISS 내성 검색을 담당 |
+| BM25 | 고전적인 전문 랭킹 알고리즘. 매 프롬프트마다 도는 hypo-lookup의 MISS 내성 검색을 담당 |
 | Option C | `hypomnema upgrade --apply`가 사용자의 `SCHEMA.md`를 절대 덮어쓰지 않는 정책. 마이그레이션 보고서만 쓰고, 적용은 사용자가 직접 한다 |
 
 이 표에 빠진 용어를 본문에서 만났다면 문서 버그입니다. 이슈를 남겨 주세요.
@@ -175,7 +183,7 @@ Hypomnema         ───►  합성 · 마크다운 · git · 훅 · 로컬
 
 ### 1. 왜 청크 기반 RAG가 아니라 합성인가
 
-RAG는 낯선 코퍼스에 강합니다. 100만 페이지짜리 법률 아카이브를 주면 관련 단편을 잘 찾아냅니다. 그런데 내가 아는 개인 지식의 실패는 정반대 지점에서 옵니다.
+RAG는 낯선 코퍼스에 강합니다. 100만 페이지짜리 법률 아카이브를 주면 관련 단편을 잘 찾아냅니다. 반면 개인 지식에서는 실패 양상이 정반대입니다.
 
 - 코퍼스가 작은 대신 중복이 많습니다(같은 주제의 글 3편).
 - 사용자는 단편이 아니라 관점을 원합니다.
@@ -185,7 +193,7 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 
 ### 2. 왜 독자 포맷이 아니라 마크다운 + git인가
 
-개인 지식 베이스는 특정 도구 하나보다 오래 살아남아야 합니다. 마크다운은 살아남습니다. git도 살아남습니다. 둘 다 어떤 LLM이든 읽고 오프라인에서 동작합니다. 30년치 도구 생태계가 받쳐 줍니다. 스택은 일부러 지루하게 골랐습니다. 흥미로운 부분은 그 위에서 Claude가 무엇을 하느냐에 있으니까요.
+개인 지식 베이스는 특정 도구 하나보다 오래 살아남아야 합니다. 마크다운은 살아남습니다. git도 살아남습니다. 둘 다 어떤 LLM이든 읽을 수 있고, 오프라인에서도 돕니다. 30년치 도구 생태계가 받쳐 줍니다. 스택은 일부러 지루하게 골랐습니다. 흥미로운 부분은 그 위에서 Claude가 무엇을 하느냐에 있으니까요.
 
 ### 3. 왜 수동 명령이 아니라 라이프사이클 훅인가
 
@@ -196,26 +204,28 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | `SessionStart` | "어디까지 했더라?" `hot.md` / `session-state.md` 다시 읽기 |
 | `UserPromptSubmit` | "이거 이미 정리해 뒀나?" BM25 룩업, top-3 주입 |
 | `PreCompact` | "세션 정리는 했나?" 체크리스트 가드 |
-| `PostToolUse` (Write/Edit) | `git add` |
-| `Stop` | `git pull --rebase && git commit && git push` |
+| `PostToolUse` (Write/Edit/MultiEdit) | `git add` |
+| `Stop` | `git commit && git pull --no-rebase && git push` |
 
 설치하고 나면 위키를 관리하는 일을 그만두게 됩니다. 그냥 쌓입니다.
 
 ### 4. 왜 재개에 `hot.md` 캐시를 쓰는가
 
-멈춘 프로젝트에서 가장 비싼 건 일을 다시 하는 게 아니라 컨텍스트를 다시 쌓는 일입니다. `session-log/`를 처음부터 다시 읽으면 분 단위 시간과 토큰이 들지만, 한 페이지짜리 `hot.md`를 읽는 건 둘 다 거의 0입니다. 그래서 가장 최근 상태를 따로 캐싱합니다. `Stop`에서 다시 만들어 `SessionStart`에서 주입합니다. 재개는 O(1)입니다.
+멈춘 프로젝트에서 가장 비싼 건 일을 다시 하는 게 아니라 컨텍스트를 다시 쌓는 일입니다. `session-log/`를 처음부터 다시 읽으면 분 단위 시간과 토큰이 들지만, 한 페이지짜리 `hot.md`를 읽는 건 둘 다 들지 않습니다. 그래서 최근 상태를 프로젝트별 `hot.md`에 따로 캐싱합니다. 세션 마무리(`crystallize`)가 다시 만들고 `SessionStart`가 주입합니다. 재개는 O(1)입니다.
 
 ### 5. 왜 feedback → behavior 파이프라인인가
 
 대부분의 AI 도구는 교정을 지금 이 대화에 한해서만 받아들입니다. 다음으로 이어지지 않습니다. Hypomnema는 모든 `/hypo:feedback`을 `pages/feedback/`으로 흘려보냅니다. 오래 갈 규칙은 `CLAUDE.md`의 `<learned_behaviors>` 블록으로 승격합니다. 이후 모든 세션, 위키를 pull하는 모든 기기에서 살아 있습니다.
 
+이 투영에는 전제 조건이 하나 있고, 설치 과정 어디도 그것을 대신 만들어 주지 않습니다. `~/.claude/CLAUDE.md` 안에 빈 `<learned_behaviors></learned_behaviors>` 쌍이 있어야 합니다. 없으면 매 sync가 조용한 no-op이 되어 전역 규칙이 한 줄도 로드되지 않습니다. 설치 후 `hypomnema feedback-sync --ensure-container`를 한 번 돌리세요. 이미 있는 `CLAUDE.md`에 쌍을 덧붙이고, 여러 번 돌려도 같으며, 컨테이너가 깨져 있으면 추측 대신 거부합니다. `CLAUDE.md` 자체가 없으면 아무것도 하지 않으니 파일을 먼저 만들어야 합니다. `hypomnema feedback-sync --check`로 확인할 수 있고, 깨진 상태는 `/hypo:doctor`가 Feedback projection 실패로 보고합니다.
+
 ### 6. 왜 API 키도, 벡터 DB도, 외부 서비스도 없는가
 
-외부 의존은 전부 언젠가 터질 위험입니다. 언젠가 깨지거나 인수되거나 단종되거나 자격증명이 샙니다. Hypomnema는 Node.js 스크립트 + 마크다운 파일 + git이 전부입니다. "AI" 부분은 Claude 자체뿐이고, 그건 어차피 켜져 있습니다.
+외부 의존성은 전부 언젠가 터질 위험입니다. 깨지거나, 인수되거나, 단종되거나, 자격증명이 샙니다. Hypomnema는 Node.js 스크립트 + 마크다운 파일 + git이 전부입니다. "AI" 부분은 Claude 자체뿐이고, 그건 어차피 켜져 있습니다.
 
 ### 7. 왜 privacy mode 플래그가 아니라 `.hypoignore`인가
 
-처음에는 `personal / shared / public` 3-mode를 만들었습니다. 현실과 부딪히자 바로 무너졌습니다. 모든 privacy 결정은 결국 경로 단위 질문이었고, 그건 단일 파일(`.hypoignore`) 하나로 처리됩니다. 그래서 mode 개념을 통째로 지웠습니다. 파일 하나가 모든 결정을 담는 단일 원천 구조입니다.
+처음에는 `personal / shared / public` 3-mode를 만들었습니다. 현실과 부딪히자 바로 무너졌습니다. 모든 privacy 결정은 결국 경로 단위 질문이었고, 그건 파일 하나(`.hypoignore`)로 처리됩니다. 그래서 mode 개념을 통째로 지웠습니다. 파일 하나, 원천 하나입니다.
 
 ---
 
@@ -228,33 +238,36 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | 명령어 | 하는 일 | 언제 쓰나 |
 |---|---|---|
 | `/hypo:ingest` | 원본을 `sources/`에 보관하고 Claude가 `pages/`에 구조화된 페이지를 합성. 셸 헬퍼(`scripts/ingest.mjs`)는 읽기 전용이라 아직 인제스트 안 된 소스를 목록만 출력 | 보관할 가치가 있는 글을 읽었을 때 |
-| `/hypo:query` | BM25 검색 + LLM 합성 + `[[wikilink]]` 인용 | 자기 노트에 근거한 답이 필요할 때 |
-| `/hypo:crystallize` | 세션 마무리 체크리스트(1-6단계) 실행. 요청하면 초안 합성(7-11단계)까지 | 단순하지 않은 세션을 마칠 때 |
+| `/hypo:query` | 전문 검색 + LLM 합성 + `[[wikilink]]` 인용 | 자기 노트에 근거한 답이 필요할 때 |
+| `/hypo:crystallize` | 세션 마무리 경로(1-4단계) 실행. 요청하면 합성 스캔(5-7단계)까지 | 의미 있는 세션을 마칠 때 |
 | `/hypo:resume` | 활성 프로젝트의 가장 최근 세션 상태 불러오기 | 잠시 미뤄둔 프로젝트로 돌아올 때 |
 | `/hypo:feedback` | AI 행동 교정을 기록. 영구 규칙 승격 후보가 됨 | Claude가 잘못했을 때, 또는 반대로 잘했을 때 |
 | `/hypo:verify` | `verify_by` 프런트매터가 붙은 페이지를 점검 | 시간이 지나 옛 정보가 됐을 수 있을 때 |
-| `/hypo:lint` | frontmatter·위키링크·스키마 검증 | 커밋 전, CI에서 |
+| `/hypo:lint` | 프런트매터·위키링크·스키마 검증 | 커밋 전, CI에서 |
 | `/hypo:graph` | 위키링크 의존성 그래프 생성 | 구조가 어떻게 자랐는지 보고 싶을 때 |
 | `/hypo:rename` | 페이지·디렉터리 이름 변경 + 인바운드 `[[위키링크]]` 갱신 | 페이지나 프로젝트 폴더 이름을 바꿀 때 |
 
-### 라이프사이클 훅 (14개)
+### 라이프사이클 훅 (15개)
 
 | 훅 | 이벤트 | 역할 |
 |---|---|---|
+| `hypo-close-guard.mjs` | `PreToolUse` | Write/Edit/MultiEdit가 세션 마무리 쓰기로 보이는데 트랜스크립트에 사용자의 마무리 신호가 없으면, 파일이 바뀌기 전에 확인을 받음 |
 | `hypo-session-start.mjs` | `SessionStart` | `hot.md` / `session-state.md` 주입 + `git pull --ff-only` |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | 마커 기반 일회성 `hot.md` 주입 (10분 TTL) |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT 주입 / MISS면 가까운 슬러그 신호 |
-| `hypo-compact-guard.mjs` | `UserPromptSubmit` | `/compact` 감지 시 session-close 체크리스트 강제 |
+| `hypo-compact-guard.mjs` | `UserPromptSubmit` | 채팅에 입력된 `/compact`나 `/clear`를 감지해 컨텍스트가 지워지기 전에 session-close 체크리스트를 강제 |
 | `hypo-cwd-change.mjs` | `CwdChanged` | cwd에 맞는 프로젝트 `hot.md` 주입 |
 | `hypo-file-watch.mjs` | `FileChanged` | 위키 파일 변경 알림 (`.hypoignore` 준수. 매칭 경로는 LLM 컨텍스트로 다시 주입하지 않음) |
-| `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit)` | 위키 파일 자동 stage |
+| `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | 위키 파일 자동 stage |
 | `hypo-auto-commit.mjs` | `Stop` | 자동 commit + pull + push |
-| `hypo-hot-rebuild.mjs` | `Stop` | `hot.md` 재생성 |
-| `hypo-personal-check.mjs` | `PreCompact` | lint 실패 또는 session-close 미완이면 compact 차단 |
+| `hypo-hot-rebuild.mjs` | `Stop` | 루트 `hot.md` 포인터 테이블 재생성 (구조와 날짜) |
+| `hypo-personal-check.mjs` | `PreCompact` | session-close 미완, 위키 커밋/푸시 누락, hot.md 구조 위반, lint 블로커면 compact 차단 (우회: `HYPO_SKIP_GATE=1`) |
 | `hypo-session-end.mjs` | `SessionEnd` | SessionEnd 마커 기록. 다음 SessionStart가 `source=clear` 복구를 감지하게 함 |
 | `hypo-session-record.mjs` | `Stop` | observability 점수 + auto-resume 신호용 세션 메타데이터 기록 |
-| `hypo-auto-minimal-crystallize.mjs` | `Stop` | 단순하지 않은 세션이 끝나면 `/hypo:crystallize --apply-session-close --minimal`을 자동 제안 (동의하면 실행) |
+| `hypo-auto-minimal-crystallize.mjs` | `Stop` | 사용자가 마무리를 신호한 뒤, 의미 있는 작업을 했는데 세션 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려줌. 미커밋 변경이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되물음 |
 | `hypo-web-fetch-ingest.mjs` | `PostToolUse(WebFetch/WebSearch)` | WebFetch/WebSearch 뒤 `additionalContext`에 `/hypo:ingest` 권유 주입 (URL의 query/hash/userinfo 제거) |
+
+PostToolUse 훅 둘은 matcher 없이 등록되고 각자 tool_name으로 거릅니다.
 
 모든 훅은 위키 루트를 `HYPO_DIR` 환경변수 → `hypo-config.md` 스캔 → `~/hypomnema` 기본값 순으로 찾고, `hypo-shared.mjs`(`hooks.json`의 `shared` 필드로 선언)를 공유합니다.
 
@@ -263,18 +276,20 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | 명령어 | 목적 |
 |---|---|
 | `/hypo:init` | 최초 설치 (디렉터리, 훅, settings.json 병합, 첫 commit/push) |
-| `/hypo:doctor` | 상태 점검 (훅, 경로, frontmatter, git) |
+| `/hypo:doctor` | 상태 점검 (훅, 경로, 프런트매터, git) |
 | `/hypo:upgrade` | 훅·설정을 최신 버전으로 마이그레이션 |
 | `/hypo:uninstall` | 훅 및 등록 정보 제거 |
 | `/hypo:stats` | 위키 통계 |
 | `/hypo:audit` | observability 감사 (세션별 메트릭, 주간 보고서) |
-| `hypomnema capture`(`/hypo:capture`) | `~/.claude/{commands,agents}/`에 직접 만든 command·agent, `settings.json`에 등록한 정규형 hook, 또는 `~/.claude/skills/`의 skill을 위키로 가져와 다른 기기에 원래 이름으로 동기화. 명시적 호출만 동작하고, 내용이 다른 위키 파일은 덮어쓰지 않으며, 손실 없이 원형 복원되는 것만 대상 |
+| `hypomnema capture`(`/hypo:capture`) | `~/.claude/{commands,agents}/`에 직접 만든 command·agent, `settings.json`에 표준 형식으로 등록한 hook, 또는 `~/.claude/skills/`의 skill을 위키로 가져와 다른 기기에 원래 이름으로 동기화. 명시적 호출만 동작하고, 내용이 다른 위키 파일은 덮어쓰지 않으며, 다시 꺼내도 원본과 같아지는 것만 대상 |
+
+> 유지보수 명령은 모두 일반 셸에서도 돌아갑니다. Claude Code 자체가 말썽일 때 필요한 경로입니다. `hypomnema doctor`, `hypomnema uninstall --apply`(`--apply` 없으면 dry-run), `hypomnema upgrade --check|--apply`, `hypomnema feedback-sync --check|--write`, `hypomnema proposal list`.
 
 > 업데이트 알림: `SessionStart` 훅이 npm 레지스트리와 Claude Code 플러그인 마켓플레이스를 백그라운드에서 확인합니다(세션 시작을 막지 않습니다). 새 버전이 올라와 있으면 다음 세션 시작 때 "Update available!" 안내가 한 줄 뜹니다. `HYPO_NO_UPDATE_CHECK=1`, `NO_UPDATE_NOTIFIER=1`을 주거나 `CI=true` 환경이면 건너뜁니다.
 
 ### Claude Agent Skills
 
-합성이 핵심인 명령어 6개(`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`)는 `skills/<name>/SKILL.md`로도 등록돼 있습니다. 대화 내용이 해당 스킬의 `description`과 맞으면 Claude Agent Skills 메커니즘이 슬래시 명령 없이도 자동으로 호출합니다. 일곱 번째 스킬인 `debate`는 대응하는 슬래시 커맨드가 따로 없습니다. 위키 주장을 다시 검증하거나 되돌리기 힘든 결정을 ADR로 굳힐 때, 두 단계로 나뉜 구조화된 검토를 실행합니다. 명령어를 정확히 몰라도 하려는 일을 말로 적으면 됩니다.
+합성이 핵심인 명령어 6개(`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`)는 `skills/<name>/SKILL.md`로도 등록돼 있습니다. 대화 내용이 해당 스킬의 `description`과 맞으면 Claude Agent Skills 메커니즘이 슬래시 명령 없이도 자동으로 호출합니다. 일곱 번째 스킬인 `debate`는 대응하는 슬래시 커맨드가 따로 없습니다. 세 단계(심문, 검증, 종합)로 구조화된 검토를 실행해 위키 주장을 재검증하거나 되돌리기 어려운 결정을 ADR로 굳힙니다. 명령어를 정확히 몰라도 하려는 일을 말로 적으면 됩니다.
 
 | 이렇게 말하면 | 트리거되는 스킬 |
 |---|---|
@@ -283,7 +298,7 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | "이번 세션 마무리하자", "오늘 작업 정리해줘" | `crystallize` |
 | "이 페이지들 링크 안 깨졌는지 확인해줘" | `lint` |
 
-슬래시 명령은 트리거가 확실할 때, 자연어는 흐름을 끊고 싶지 않을 때 쓰면 됩니다. 둘은 같은 스킬로 이어집니다.
+슬래시 명령은 명시적으로 지정하고 싶을 때, 자연어는 흐름을 끊고 싶지 않을 때 쓰면 됩니다. 둘은 같은 스킬로 이어집니다.
 
 ---
 
@@ -302,7 +317,7 @@ D. AI 행동 튜닝.
 Claude가 잘못했을 때, 또는 반대로 잘했을 때 `/hypo:feedback`을 실행합니다. 교정 내용이 `pages/feedback/`에 저장되고 다음 세션 시작 때 자동으로 주입되므로 같은 실수가 반복되지 않습니다. 그 대화 한 번으로 끝나지 않고 세션이 바뀌어도 그대로 남습니다.
 
 E. 멈춘 프로젝트 재개.
-3주 손 놓았던 프로젝트로 돌아옵니다. 다음 세션 시작 때 `hypo-session-start.mjs`가 `projects/<name>/session-state.md`를 읽어 "다음 작업"과 최근 결정을 컨텍스트에 주입합니다. 첫 프롬프트를 치기 전에 이미 업무 파악이 끝나 있습니다.
+3주 손 놓았던 프로젝트로 돌아옵니다. 다음 세션 시작 때 `hypo-session-start.mjs`가 `projects/<name>/session-state.md`를 읽어 "다음 작업"과 최근 결정을 컨텍스트에 주입합니다. 첫 프롬프트를 치기도 전에 감이 돌아와 있습니다.
 
 ---
 
@@ -312,13 +327,13 @@ E. 멈춘 프로젝트 재개.
 
 - 외부 소스(문서, 논문, 강연)에서 합성한 지식
 - 아키텍처 결정과 근거
-- AI 행동 교정 및 선호
-- git에 담기 어려운 프로젝트 컨텍스트 (이해관계자 제약, 미결 질문, 배경)
+- AI 행동 교정과 작업 선호
+- git에 둘 성격이 아닌 프로젝트 컨텍스트 (이해관계자 제약, 미결 질문, 배경)
 - 연구 결과 및 교차 소스 비교
 
 저장하지 말 것:
 
-- 원본 소스 자료. `sources/`에 자동·미편집으로 보관됩니다
+- 원본 소스 자료. 손대지 않은 그대로 `sources/`에 자동으로 보관됩니다
 - 자격증명·토큰·비밀. `.hypoignore`로 민감 경로를 제외하세요
 - 이번 세션의 일시적 작업 목록. 대화 안의 작업 목록을 쓰세요
 - 레포에서 도출되는 코드 패턴. `git log`, `grep`이 원본 기준입니다
@@ -338,39 +353,52 @@ E. 멈춘 프로젝트 재개.
 ├── hypo-guide.md        ← 운영 가이드
 ├── .hypoignore          ← 훅에서 제외할 글로브 패턴
 ├── .hyposcanignore      ← 카탈로그 스캔에서만 제외할 글로브 패턴 (프라이버시 경계 아님)
+├── extensions/          ← 직접 만든 agent/command/hook/skill. init·upgrade·capture 때 ~/.claude로 미러링
+│   └── {agents,commands,hooks,skills}/
 ├── pages/               ← 영구 지식 페이지
-│   └── feedback/        ← AI 행동 교정
+│   ├── feedback/        ← AI 행동 교정 (첫 /hypo:feedback 때 생성)
+│   └── observability/   ← 세션별 사용 지표와 주간 리포트 (/hypo:audit)
 ├── projects/            ← 프로젝트 아티팩트 및 세션 로그
+│   ├── _template/       ← 새 프로젝트를 만들 때 복사되는 스캐폴드
 │   └── <name>/
 │       ├── hot.md
 │       ├── session-state.md
 │       └── session-log/
 ├── journal/             ← daily / weekly / monthly 기록
-└── sources/             ← 원본 인제스트 소스 (수정 금지)
+├── sources/             ← 원본 인제스트 소스 (수정 금지)
+└── .cache/              ← 런타임 상태(gitignore 대상). 세션 범위, 보류된 proposal, 동기화 상태
 ```
 
 ---
 
 ## 설정
 
-위키 경로는 다음 순서로 찾습니다 (`scripts/lib/hypo-root.mjs` 참조).
+위키 경로는 다음 순서로 찾습니다 (2-4단계는 `scripts/lib/hypo-root.mjs`, 1단계는 플래그를 받는 각 스크립트가 직접 파싱합니다).
 
 | 우선순위 | 출처 |
 |---|---|
 | 1 | `--hypo-dir=<path>` CLI 플래그 (스크립트 단위 오버라이드. 이 플래그를 받는 스크립트에서만 동작) |
 | 2 | `HYPO_DIR` 환경변수 |
-| 3 | 홈 기준 후보(`~/hypomnema`, `~/wiki`, `~/notes`, `~/knowledge`, `~/Documents/{hypomnema,wiki,notes}`)에서 `hypo-config.md` 마커 발견 |
+| 3 | 고정된 홈 기준 후보 목록(`~/hypomnema`, `~/wiki`, `~/notes`, `~/knowledge`, `~/Documents/{hypomnema,wiki}`)에서 `hypo-config.md` 마커 발견. CLI는 `~/Documents/notes`까지 보지만 훅은 보지 않으므로, 볼트가 거기 있으면 `HYPO_DIR`를 지정하세요 |
 | 4 | 기본값: `~/hypomnema` |
 
 위키 루트에 `hypo-config.md`를 두면 환경변수 없이도 다른 기기로 옮겨 쓸 수 있습니다.
 
-`.hypoignore`는 훅이 무시할 경로를 정합니다 (기본: `*.pdf`, `*.zip`, `*.pem`, `*.env` 등). 직접 편집하면 됩니다. privacy mode 플래그는 없습니다. 파일 하나가 모든 결정을 담는 단일 원천 구조입니다.
+`.hypoignore`는 훅이 무시할 경로를 정합니다 (기본: `*.pdf`, `*.zip`, `*.pem`, `.env*`, `*secret*`, `*token*` 등). 직접 편집하면 됩니다. privacy mode 플래그는 없습니다. 파일 하나, 원천 하나입니다.
 
-`.hyposcanignore`는 역할이 다른 별도 파일입니다. `init`이 모든 신규 볼트 루트에 자동으로 만들며, 카탈로그 스캔(`lint`, `graph`, `stats`, `query`, `verify`, `doctor`)에서만 경로를 뺍니다. 프라이버시 경계가 아닙니다. `.hyposcanignore`에 매치돼도 여전히 커밋되고 훅이 읽을 수 있습니다. 주입과 커밋을 실제로 막으려면 `.hypoignore`를 쓰세요.
+기본 `.hypoignore`는 경로에 credentials, secret, token, password, passwd가 들어간 파일도 전부 제외합니다. 부분일치 글로브라서 `pages/oauth-token-refresh.md` 같은 평범한 페이지도 걸립니다. 어떤 훅에도 주입되지 않고 위키 pre-commit 훅이 커밋 자체를 거부합니다. 이 주제를 위키에 쓴다면 패턴을 좁히거나 페이지 이름을 바꾸세요.
 
-> 모델 사업자에게 전송되는 범위: Hypomnema 훅은 위키 본문을 Claude Code의 추가 컨텍스트(`additionalContext`)에 실어 보내고, 이 내용은 프롬프트의 일부로 Claude 모델 사업자에게 전송됩니다. `.hypoignore`에 등록된 경로는 모든 주입 훅(`hypo-file-watch`, `hypo-session-start`, `hypo-cwd-change`, `hypo-lookup`)과 `ingest`에서 제외되지만, 등록하지 않은 파일은 전송 대상입니다. (`hypo-auto-stage`/`hypo-auto-commit`은 git 스테이징용 훅이라 컨텍스트를 주입하지는 않지만, 스테이징 판단에도 `.hypoignore`를 참고합니다.) 비밀 정보는 위키에 두지 마시고, `HYPO_DIR` 아래에 민감한 내용을 저장하기 전에 `.hypoignore` 패턴을 먼저 점검하세요.
+`.hyposcanignore`는 역할이 다른 별도 파일입니다. `init`이 모든 신규 볼트 루트에 자동으로 만들며, 카탈로그 스캔(`lint`, `stats`, `query`, `verify`, `doctor`)에서만 경로를 뺍니다. 프라이버시 경계가 아닙니다. `.hyposcanignore`에 매치돼도 여전히 커밋되고 훅이 읽을 수 있습니다. 주입과 커밋을 실제로 막으려면 `.hypoignore`를 쓰세요.
 
-> git sync 범위: Hypomnema는 `~/hypomnema/` 위키 자체만 git sync합니다. 단 `init` / `upgrade`는 `~/.claude/` 안의 관리 대상 영역(Hypomnema 자체 hook `~/.claude/hooks/`, 슬래시 커맨드 `~/.claude/commands/hypo/`, `settings.json` 등록)을 설치·SHA 추적하고, extensions companion sync로 위키의 `~/hypomnema/extensions/`에 둔 `agents/`·`commands/`·`hooks/`·`skills/`도 자동 미러링합니다(`--codex`면 `hooks`·`commands` 부분집합만 `~/.codex/`로). 이 관리 대상 바깥에 있는 `~/.claude/` 콘텐츠는 일부러 관리하지 않습니다. 위키를 거치지 않는 기타 agent/skill, 머신 고유 `settings.local.json` 같은 일반 Claude Code 설정의 기기 간 동기화는 [chezmoi](https://www.chezmoi.io/) 같은 별도 dotfiles 매니저를 권합니다.
+세 번째 프라이버시 축은 경로가 아니라 페이지 단위로 걸립니다. 페이지 프런트매터에 `visibility_scope: machine:<device>`를 넣으면 그 기기에서만 노출됩니다. `<device>`의 기본값은 hostname이며, hostname이 고정적이지 않은 환경이라면 `HYPO_DEVICE`로 못박으세요. 그러지 않으면 페이지가 자기 기기와도 매치되지 않습니다. 필드를 생략하면 shared입니다.
+
+`HYPO_SKIP_GATE=1`은 세션 중간에 사용자를 막을 수 있는 게이트 전부가 존중합니다. `hypo-personal-check`(PreCompact), `hypo-compact-guard`, `hypo-close-guard`, `hypo-auto-minimal-crystallize`, 그리고 `hypo-web-fetch-ingest`의 ingest 안내까지입니다. 기록할 필요 없는 가벼운 세션에 씁니다.
+
+> 모델 제공사에게 전송되는 범위: Hypomnema 훅은 위키 본문을 Claude Code의 추가 컨텍스트(`additionalContext`)에 실어 보내고, 이 내용은 프롬프트의 일부로 Claude 모델 제공사로 전송됩니다. `.hypoignore`에 등록된 경로는 모든 주입 훅(`hypo-file-watch`, `hypo-session-start`, `hypo-cwd-change`, `hypo-lookup`)과 `ingest`에서 제외되지만, 등록하지 않은 파일은 전송 대상입니다. (`hypo-auto-stage`/`hypo-auto-commit`은 git 스테이징용 훅이라 컨텍스트를 주입하지는 않지만, 스테이징 판단에도 `.hypoignore`를 참고합니다.) 비밀 정보는 위키에 두지 마시고, `HYPO_DIR` 아래에 민감한 내용을 저장하기 전에 `.hypoignore` 패턴을 먼저 점검하세요.
+
+> git sync 범위: Hypomnema는 `~/hypomnema/` 위키 자체만 git sync합니다. 단 `init` / `upgrade`는 `~/.claude/` 안의 관리 대상 영역(Hypomnema 자체 hook `~/.claude/hooks/`, 슬래시 커맨드 `~/.claude/commands/hypo/`, `settings.json` 등록)을 설치·SHA 추적하고, extensions companion sync로 위키의 `~/hypomnema/extensions/`에 둔 `agents/`·`commands/`·`hooks/`·`skills/`도 미러링합니다(직접 `init`·`upgrade --apply`·`capture`를 돌릴 때. `--codex`면 `hooks`·`commands` 부분집합만 `~/.codex/`로). 이 관리 대상 바깥에 있는 `~/.claude/` 콘텐츠는 일부러 관리하지 않습니다. 위키를 거치지 않는 기타 agent/skill, 머신 고유 `settings.local.json` 같은 일반 Claude Code 설정의 기기 간 동기화는 [chezmoi](https://www.chezmoi.io/) 같은 별도 dotfiles 매니저를 권합니다.
+
+> 동기화 충돌: `Stop` 훅의 pull이 머지 충돌을 만나면 머지를 abort 하고 push를 건너뛴 뒤 실패를 기록합니다. 로컬 커밋은 안전하지만, 손대기 전까지 기기 간 동기화는 멈춥니다. `git -C <내 위키> pull --no-rebase`로 충돌을 해결하고 커밋과 푸시를 하면 됩니다. 막힌 동기화는 `/hypo:doctor`가 알려 줍니다.
 
 ### `/hypo:*` 커맨드는 어디서 오는가
 
@@ -385,6 +413,7 @@ E. 멈춘 프로젝트 재개.
 
 - Node.js ≥ 18 (18 / 20 / 22 검증됨)
 - Claude Code CLI
+- git (user.name과 user.email이 설정되어 있어야 합니다. 없으면 첫 커밋이 실패합니다)
 
 외부 서비스·API 키·벡터 DB 모두 필요 없습니다.
 
@@ -392,7 +421,7 @@ E. 멈춘 프로젝트 재개.
 
 ## 상태
 
-- 테스트: `npm test` 참조. 테스트가 추가될 때마다 개수가 바뀌므로, 정확한 기준은 테스트 러너입니다
+- 테스트: `npm test` 참조. 기능이 나갈 때마다 개수가 바뀌므로, 정확한 기준은 테스트 러너입니다
 - CI: 독립 job 약 12개 (test matrix, lint, tracker-ids, ship-surface, init/upgrade snapshots, replay, hypo-absent, uninstall-smoke 등). 정확한 목록은 `.github/workflows/ci.yml` 참고
 - 릴리스: `v*` 태그 push 시 `npm publish --provenance` 자동 실행
 
@@ -402,13 +431,13 @@ E. 멈춘 프로젝트 재개.
 
 Claude(또는 다른 코딩 에이전트)로서 Hypomnema 위키를 운영한다면 아래가 기본 규칙입니다.
 
-위키가 단일 SoT입니다. 사용자가 기억해 달라고 한 것은 전부 위키 루트 아래 마크다운으로 있고, 기억에 의존해 답하기 전에 그것부터 읽습니다. 한 프로젝트의 배경은 `projects/<name>/hot.md`에, 다음에 할 일은 `projects/<name>/session-state.md`에 있으며 `/hypo:resume`이 둘 다 불러옵니다. 위키 루트의 `hot.md`는 다른 파일입니다. 어떤 프로젝트가 활성인지 가리키는 포인터 테이블입니다.
+위키가 단일 원천입니다. 사용자가 기억해 달라고 한 것은 전부 위키 루트 아래 마크다운으로 있고, 기억에 의존해 답하기 전에 그것부터 읽습니다. 한 프로젝트의 배경은 `projects/<name>/hot.md`에, 다음에 할 일은 `projects/<name>/session-state.md`에 있으며 `/hypo:resume`이 둘 다 불러옵니다. 위키 루트의 `hot.md`는 다른 파일입니다. 어떤 프로젝트가 활성인지 가리키는 포인터 테이블입니다.
 
-그 상태를 위키 밖에 또 두지 마세요. `MEMORY.md`와 `~/.claude/CLAUDE.md`의 `<learned_behaviors>` 블록은 당신의 메모리처럼 보이지만, Hypomnema가 `pages/feedback/`에서 뽑아내는 단방향 projection입니다. 교정은 `/hypo:feedback`으로 적고 동기화가 다시 만들게 두면 됩니다. projection을 손으로 고치면 다음 동기화가 그것을 병합하지 않고 conflict로 멈춥니다. 어느 쪽이 진실인지 판단할 근거가 없기 때문이고, 그때부터 feedback 페이지로 되돌려 정리하는 일은 당신 몫이 됩니다. 위키 사실을 당신만 보는 곳에 챙겨두면 사용자의 다른 머신에는 아예 닿지 않습니다.
+그 상태를 위키 밖에 또 두지 마세요. `MEMORY.md`와 `~/.claude/CLAUDE.md`의 `<learned_behaviors>` 블록은 스스로의 메모리처럼 보이지만, Hypomnema가 `pages/feedback/`에서 뽑아내는 단방향 projection입니다. 교정은 `/hypo:feedback`으로 적고 동기화가 다시 만들게 두면 됩니다. projection을 손으로 고치면 다음 동기화가 그것을 병합하지 않고 conflict로 멈춥니다. 어느 쪽이 진실인지 판단할 근거가 없기 때문이고, 그때부터 feedback 페이지로 되돌려 정리하는 일이 남습니다. 위키에 있어야 할 내용을 혼자만 보는 곳에 따로 챙겨 두면, 사용자의 다른 기기에는 끝내 닿지 않습니다.
 
 `sources/`는 불변입니다. 그 아래는 무엇도 고치지 않습니다. 대신 `pages/`로 합성하고 출처를 링크로 되짚습니다.
 
-운영 절차는 위키 안에 함께 깔리므로 따로 받아올 필요가 없습니다. 위키 루트의 `hypo-guide.md`가 운영 가이드이고, `SCHEMA.md`가 페이지 타입과 frontmatter를 정의하며, `hypo-help.md`가 명령어 목록입니다. 세션에서 첫 위키 작업을 할 때 `SCHEMA.md`, `hypo-guide.md` 순으로 읽습니다.
+운영 절차는 위키 안에 함께 깔리므로 따로 받아올 필요가 없습니다. 위키 루트의 `hypo-guide.md`가 운영 가이드이고, `SCHEMA.md`가 페이지 타입과 프런트매터를 정의하며, `hypo-help.md`가 명령어 목록입니다. 세션에서 첫 위키 작업을 할 때 `SCHEMA.md`, `hypo-guide.md` 순으로 읽습니다.
 
 ---
 
