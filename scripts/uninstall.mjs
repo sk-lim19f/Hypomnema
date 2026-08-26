@@ -14,6 +14,15 @@
  *   --force-commands     Remove user-modified slash commands instead of preserving them
  *   --force-extensions   Remove user-modified extension files (hypo-ext-*) instead of preserving them
  *   --hooks-dir=<path>   Override Claude hooks directory (default: ~/.claude/hooks)
+ *   --hypo-dir=<path>    Wiki vault to remove the pre-commit hook from (default: auto-resolve,
+ *                        same rules as init/lint/query)
+ *   --shell-config=<path> Shell rc file to strip the shell block from (default: checks both
+ *                        ~/.zshrc and ~/.bashrc, since init may have run under either shell)
+ *
+ * The wiki's git pre-commit hook and the shell rc's `claude()` wrapper function are removed
+ * only when they still carry the marker init.mjs wrote (WIKI_PRE_COMMIT_MARKER_START /
+ * SHELL_MARKER_START, both from ./lib/git-hooks-dir.mjs). A user's own pre-commit hook, a
+ * symlinked hook target, and any rc content outside the marker block are never touched.
  *
  * Extensions: hypo-ext-* hard-copies under
  * ~/.claude/{hooks,commands,skills,agents}/ and ~/.codex/{hooks,commands}/ (with
@@ -23,7 +32,16 @@
  * does not follow them). The wiki source (~/hypomnema/extensions/) is preserved.
  */
 
-import { existsSync, readFileSync, writeFileSync, rmSync, rmdirSync, readdirSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+  rmdirSync,
+  readdirSync,
+  statSync,
+  realpathSync,
+} from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -48,6 +66,15 @@ import {
   buildHookCommand,
 } from './lib/extensions.mjs';
 import { removeProvenanceSidecar } from './lib/pkg-provenance.mjs';
+import {
+  hooksDirForInstall,
+  unsafeHookTargetReason,
+  WIKI_PRE_COMMIT_MARKER_START,
+  WIKI_PRE_COMMIT_MARKER_END,
+  SHELL_MARKER_START,
+  SHELL_MARKER_END,
+} from './lib/git-hooks-dir.mjs';
+import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -428,6 +455,182 @@ function stripExtensionSettings(settingsPath, hooksDir, apply, ownedCommands = n
   return { stripped };
 }
 
+// ── marker-span validation (shared by both removal paths below) ────────────
+
+// Two independent indexOf() calls cannot tell "well-formed" apart from
+// "duplicated" or "swapped": if a file happens to hold two full copies of the
+// block, indexOf finds only the first END, so slicing [firstStart, firstEnd]
+// leaves the second copy's install behind with no report of it. If END
+// precedes START (a hand-edited or corrupted file), slicing [start, end) with
+// start > end does not error, it silently duplicates whatever sits between
+// them into the "removed" span. Neither this script nor the file it is
+// touching has a way back from either outcome, so a span is only trusted when
+// both markers appear EXACTLY once and START comes before END.
+function countOccurrences(content, needle) {
+  let count = 0;
+  let idx = 0;
+  while ((idx = content.indexOf(needle, idx)) !== -1) {
+    count++;
+    idx += needle.length;
+  }
+  return count;
+}
+
+function findMarkerSpan(content, startMarker, endMarker) {
+  const startCount = countOccurrences(content, startMarker);
+  const endCount = countOccurrences(content, endMarker);
+  if (startCount !== 1 || endCount !== 1) {
+    return {
+      ok: false,
+      reason: `expected exactly one start and one end marker, found ${startCount} start / ${endCount} end`,
+    };
+  }
+  const startIdx = content.indexOf(startMarker);
+  const endIdx = content.indexOf(endMarker);
+  if (!(startIdx < endIdx)) {
+    return { ok: false, reason: 'the end marker appears before the start marker' };
+  }
+  return { ok: true, startIdx, endIdx };
+}
+
+// ── wiki pre-commit hook removal ────────────────────────────────────────────
+
+// Mirrors init.mjs's own resolution (hooksDirForInstall) as the PRIMARY
+// candidate, so this finds the hook wherever init would put it today,
+// including under a core.hooksPath override. A second, best-effort candidate
+// (the vault's plain .git/hooks/pre-commit) is checked too: if core.hooksPath
+// changed after install, the current resolution no longer points at the file
+// init actually wrote, and that file would otherwise never be found. Both
+// candidates go through the same marker/ownership gate below, so widening the
+// search costs nothing in safety, only in how many places we bother to look.
+// A hook that still carries our marker is removed; a user's own pre-commit (no
+// marker), a symlinked/non-regular target, and a hook whose marker is
+// duplicated, swapped, or missing its shebang are all left standing.
+// `pre-commit.bak` (init's --force-commands backup of the user's original
+// hook) is never removed here, only reported so the user knows it exists.
+function removeWikiPreCommitHook(hypoDir, apply) {
+  const result = { removed: [], skipped: [], bakPresent: [] };
+
+  if (!hypoDir || !existsSync(join(hypoDir, 'hypo-config.md'))) {
+    result.skipped.push(`no Hypomnema vault found${hypoDir ? ` at ${hypoDir}` : ''} — nothing to remove`);
+    return result;
+  }
+
+  const candidateDirs = [];
+  const { dir: hooksDir, skip } = hooksDirForInstall(hypoDir);
+  if (hooksDir) candidateDirs.push(hooksDir);
+  else if (skip) result.skipped.push(skip);
+
+  // Best-effort fallback: only when `.git` is a real directory here (a plain
+  // checkout, not a linked worktree's gitdir-pointer FILE, which this join
+  // would misread entirely — resolveGitHooksDir already handles that layout
+  // correctly via the primary candidate above).
+  const legacyGitDir = join(hypoDir, '.git');
+  if (existsSync(legacyGitDir) && statSync(legacyGitDir).isDirectory()) {
+    candidateDirs.push(join(legacyGitDir, 'hooks'));
+  }
+
+  const seen = new Set();
+  for (const dir of candidateDirs) {
+    const hookPath = join(dir, 'pre-commit');
+    // Dedupe by the resolved real path, not the string: the primary candidate
+    // is realpath'd internally (resolveGitHooksDir's canonicalize) while the
+    // legacy join above is not, so the same physical file can arrive under two
+    // different-looking paths. Falling back to the raw path when the file does
+    // not exist is fine — two distinct absent candidates never collide.
+    let key = hookPath;
+    try {
+      key = realpathSync(hookPath);
+    } catch {
+      // leave key as hookPath
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const bakPath = `${hookPath}.bak`;
+    if (existsSync(bakPath)) result.bakPresent.push(bakPath);
+
+    const unsafe = unsafeHookTargetReason(hookPath);
+    if (unsafe) {
+      result.skipped.push(`${hookPath} (${unsafe})`);
+      continue;
+    }
+    if (!existsSync(hookPath)) continue; // already absent, nothing to report
+
+    let content;
+    try {
+      content = readFileSync(hookPath, 'utf-8');
+    } catch (e) {
+      result.skipped.push(`${hookPath} (cannot read: ${e.code || e.message})`);
+      continue;
+    }
+    if (!content.includes(WIKI_PRE_COMMIT_MARKER_START) || !content.includes(WIKI_PRE_COMMIT_MARKER_END)) {
+      result.skipped.push(`${hookPath} (not managed by Hypomnema — preserving)`);
+      continue;
+    }
+
+    const span = findMarkerSpan(content, WIKI_PRE_COMMIT_MARKER_START, WIKI_PRE_COMMIT_MARKER_END);
+    if (!span.ok) {
+      result.skipped.push(`${hookPath} (${span.reason} — preserving)`);
+      continue;
+    }
+
+    // init writes the marker as the ENTIRE hook body: a bare "#!/bin/sh\n"
+    // right before WIKI_PRE_COMMIT_MARKER_START, nothing after
+    // WIKI_PRE_COMMIT_MARKER_END. A file with no shebang there was never
+    // written by init even if it happens to carry a well-formed marker span
+    // (hand-authored or copy-pasted) — deleting it on marker presence alone
+    // would remove code we do not own. A user who appended their own check
+    // after the block turned this into a file we only partly own. init's own
+    // --force-commands path handles the analogous case by OVERWRITING with
+    // equivalent content (a safe merge); uninstall has no such repair, only
+    // rmSync, so treating "extra content" the same as "fully ours" would
+    // silently delete the user's check with no way back.
+    const before = content.slice(0, span.startIdx);
+    const after = content.slice(span.endIdx + WIKI_PRE_COMMIT_MARKER_END.length);
+    if (!/^#![^\n]*\n$/.test(before)) {
+      result.skipped.push(`${hookPath} (hook carries content before the Hypomnema block — preserving)`);
+      continue;
+    }
+    if (after.trim() !== '') {
+      result.skipped.push(`${hookPath} (hook carries content after the Hypomnema block — preserving)`);
+      continue;
+    }
+
+    if (apply) rmSync(hookPath);
+    result.removed.push(hookPath);
+  }
+
+  return result;
+}
+
+// ── shell function block removal ────────────────────────────────────────────
+
+// init picks ONE rc file at install time from $SHELL (or --shell-config), but
+// $SHELL by uninstall time may point somewhere else, or init may have run in
+// a different shell session altogether — so both common rc files are checked
+// by default rather than guessing one. Only the marker span itself is
+// stripped; every other byte in the file, including surrounding blank lines,
+// is left exactly as it was. A malformed span (duplicated or swapped markers,
+// see findMarkerSpan above) leaves the file completely untouched: an rc file
+// is the user's own, and this script has no backup to restore it from.
+function removeShellFunctionBlock(shellConfigPath, apply) {
+  if (!existsSync(shellConfigPath)) return null;
+  const content = readFileSync(shellConfigPath, 'utf-8');
+  if (!content.includes(SHELL_MARKER_START) && !content.includes(SHELL_MARKER_END)) {
+    return null; // block not present here at all
+  }
+
+  const span = findMarkerSpan(content, SHELL_MARKER_START, SHELL_MARKER_END);
+  if (!span.ok) {
+    return { path: shellConfigPath, removed: false, skipped: span.reason };
+  }
+
+  const updated = content.slice(0, span.startIdx) + content.slice(span.endIdx + SHELL_MARKER_END.length);
+  if (apply) writeFileSync(shellConfigPath, updated);
+  return { path: shellConfigPath, removed: true, skipped: null };
+}
+
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -437,6 +640,8 @@ function parseArgs(argv) {
     hooksDir: null,
     forceCommands: false,
     forceExtensions: false,
+    hypoDir: null,
+    shellConfig: null,
   };
   for (const arg of argv.slice(2)) {
     if (arg === '--apply') args.apply = true;
@@ -444,6 +649,16 @@ function parseArgs(argv) {
     else if (arg === '--force-commands') args.forceCommands = true;
     else if (arg === '--force-extensions') args.forceExtensions = true;
     else if (arg.startsWith('--hooks-dir=')) args.hooksDir = arg.slice(12);
+    // expandHome mirrors init.mjs's own --hypo-dir/--shell-config parsing
+    // (init.mjs's parseArgs) exactly, reusing the same function from
+    // ./lib/hypo-root.mjs rather than re-deriving it. Uninstall must undo
+    // whatever path init actually wrote to disk, and init resolves a leading
+    // "~/" itself (the shell never does, since the value arrives already
+    // quoted inside "--flag=value"); skipping that step here would silently
+    // fail to find the vault or rc file a user installed with "~/..." to
+    // begin with.
+    else if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
+    else if (arg.startsWith('--shell-config=')) args.shellConfig = expandHome(arg.slice(15));
   }
   return args;
 }
@@ -588,6 +803,20 @@ const claudeSettings = join(HOME, '.claude', 'settings.json');
 const hookResult = removeHookFiles(claudeHooksDir, hookFiles, args.apply);
 const settingsResult = stripSettingsJson(claudeSettings, claudeHooksDir, hookMap, args.apply);
 const commandResult = removeCommands(args.apply, args.forceCommands);
+
+// Wiki-side cleanup: the git pre-commit hook and the shell rc block init.mjs
+// installs outside ~/.claude entirely. Both are independent of --codex/--hooks-dir.
+const hypoDir = args.hypoDir ?? resolveHypoRoot();
+const preCommitResult = removeWikiPreCommitHook(hypoDir, args.apply);
+
+const shellConfigCandidates = args.shellConfig
+  ? [args.shellConfig]
+  : [join(HOME, '.zshrc'), join(HOME, '.bashrc')];
+const shellBlockOutcomes = shellConfigCandidates
+  .map((p) => removeShellFunctionBlock(p, args.apply))
+  .filter(Boolean);
+const shellBlockResults = shellBlockOutcomes.filter((r) => r.removed).map((r) => r.path);
+const shellBlockSkipped = shellBlockOutcomes.filter((r) => !r.removed);
 
 // Extensions. Order matters: remove files first, then strip
 // settings, then surgically clear the per-target SHA map. The SHA strip uses
@@ -736,6 +965,27 @@ if (hookResult.missing.length)
   lines.push(
     `⊘ Already absent (${hookResult.missing.length}):\n${hookResult.missing.map((p) => `  ${p}`).join('\n')}`,
   );
+if (preCommitResult.removed.length)
+  lines.push(
+    `✓ Wiki pre-commit hook ${dryRun ? 'to remove' : 'removed'} (${preCommitResult.removed.length}):\n${preCommitResult.removed.map((p) => `  ${p}`).join('\n')}`,
+  );
+if (preCommitResult.skipped.length)
+  lines.push(
+    `⊘ Wiki pre-commit hook preserved:\n${preCommitResult.skipped.map((p) => `  ${p}`).join('\n')}`,
+  );
+if (preCommitResult.bakPresent.length)
+  lines.push(
+    `ⓘ Pre-commit backup left in place (from --force-commands, never touched by uninstall):\n${preCommitResult.bakPresent.map((p) => `  ${p}`).join('\n')}`,
+  );
+if (shellBlockResults.length)
+  lines.push(
+    `✓ Shell function block ${dryRun ? 'to remove' : 'removed'} (${shellBlockResults.length}):\n${shellBlockResults.map((p) => `  ${p}`).join('\n')}`,
+  );
+if (shellBlockSkipped.length)
+  lines.push(
+    `⊘ Shell function block preserved:\n${shellBlockSkipped.map((r) => `  ${r.path} (${r.skipped})`).join('\n')}`,
+  );
+
 if (settingsResult.error) lines.push(`⚠ ${settingsResult.error}`);
 if (claudeExtSettings.error) lines.push(`⚠ ${claudeExtSettings.error}`);
 if (codexExtSettings.error) lines.push(`⚠ ${codexExtSettings.error}`);
@@ -750,7 +1000,9 @@ if (
   !pkgJsonRemoved &&
   !commandResult.skippedUserModified.length &&
   !extSkippedUserModified.length &&
-  !extSkippedNonRegular.length
+  !extSkippedNonRegular.length &&
+  !preCommitResult.removed.length &&
+  !shellBlockResults.length
 ) {
   lines.push('Nothing to uninstall — Hypomnema does not appear to be installed.');
 }
