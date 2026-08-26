@@ -445,6 +445,72 @@ export function hypoIsClean(dir = HYPO_DIR) {
   }
 }
 
+/**
+ * Repo-relative POSIX paths with uncommitted changes (tracked or untracked) in
+ * `dir`. Reuses the SAME `-z` rename-aware porcelain parsing as
+ * commitWikiChanges (PR #222): a rename or copy emits `to\0from`, and both
+ * sides count as dirty (a rename's source still shows staged until the rename
+ * itself lands). This is the read-only half of that fix's pathspec boundary:
+ * commitWikiChanges narrows what gets COMMITTED to a caller-supplied scope;
+ * this narrows what counts as a BLOCKER the same way, for precompactGateStatus
+ * to attribute dirty files to the session that owns them instead of the whole
+ * shared working tree.
+ *
+ * Paths are normalized to be relative to `dir` itself, NOT to the git
+ * repository's top level: `git -C <dir> status --porcelain` prints paths
+ * relative to the repo TOP LEVEL even under `-C` (verified empirically: a
+ * vault nested under `<repo>/vault/` reports `vault/hot.md`, not `hot.md`).
+ * Every other path this file compares against (closeAccountableScope,
+ * closeFileTargetsGlobal, extractTouchedWikiFiles) is `dir`-relative, so
+ * without this normalization a nested vault's OWN files would never match
+ * its own scope and every one of them would look foreign (codex pre-commit
+ * review BLOCKER 2). `git rev-parse --show-prefix` gives exactly the prefix
+ * to strip; a dirty path that does not start with it lives outside the
+ * vault entirely (the rest of a bigger host repo) and is dropped, never
+ * "mine".
+ *
+ * @returns {string[]} dirty paths relative to `dir`, or `[]` on any git
+ *   failure (the caller already has its own git-status result via
+ *   hypoIsClean and treats that failure as an unconditional blocker; an
+ *   empty return here just means "cannot attribute", not "clean").
+ */
+function gitDirtyFiles(dir) {
+  const prefixRes = spawnSync('git', ['-C', dir, 'rev-parse', '--show-prefix'], {
+    encoding: 'utf-8',
+  });
+  if (prefixRes.status !== 0) return []; // can't resolve the repo → cannot attribute
+  const prefix = (prefixRes.stdout || '').trim();
+
+  const porcelain = spawnSync('git', ['-C', dir, 'status', '--porcelain', '-uall', '-z'], {
+    encoding: 'utf-8',
+  });
+  if (porcelain.status !== 0) return [];
+  const out = [];
+  const records = (porcelain.stdout || '').split('\0');
+  const toDirRelative = (f) => {
+    if (!f) return null;
+    if (!prefix) return f; // dir IS the repo top level, nothing to strip
+    return f.startsWith(prefix) ? f.slice(prefix.length) : null; // outside the vault
+  };
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    if (!rec) continue;
+    const xy = rec.slice(0, 2);
+    const file = rec.slice(3); // destination path for a rename/copy
+    const isRenameOrCopy = xy[0] === 'R' || xy[1] === 'R' || xy[0] === 'C' || xy[1] === 'C';
+    let fromFile = null;
+    if (isRenameOrCopy) {
+      i++;
+      fromFile = records[i] || null;
+    }
+    const rel = toDirRelative(file);
+    if (rel) out.push(rel);
+    const relFrom = toDirRelative(fromFile);
+    if (relFrom) out.push(relFrom);
+  }
+  return out;
+}
+
 export function hotMdIsClean(dir = HYPO_DIR) {
   const hotPath = dir === HYPO_DIR ? HOT_PATH : join(dir, 'hot.md');
   if (!existsSync(hotPath)) return { clean: true };
@@ -3281,22 +3347,32 @@ function toHypoRel(absPath, hypoDir) {
 }
 
 /**
- * Repo-relative POSIX paths of wiki files this session edited via direct
- * Edit/Write/MultiEdit/NotebookEdit tool_use. Returns a Set; empty when the
- * transcript is missing/unreadable (callers decide the fallback). A per-line
- * JSON parse error skips that line only (transcripts occasionally truncate).
+ * Same walk as extractTouchedWikiFiles, but also reports whether the walk can
+ * be TRUSTED as a complete enumeration: `trusted: false` when the transcript
+ * is missing, unreadable, or contains a line that failed to parse (transcripts
+ * occasionally truncate mid-write). `extractTouchedWikiFiles` collapses all of
+ * that to an empty/partial Set, indistinguishable from "this session touched
+ * nothing", which is fine for lint's existing debt-partition (a false notice is not a
+ * false pass), but NOT fine for an attribution-sensitive caller like
+ * precompactGateStatus's git-scope check: treating an untrustworthy empty Set
+ * as "nothing to widen" would let a session's own dirty file, invisible only
+ * because its transcript could not be read, pass as someone else's foreign
+ * debt (codex pre-commit review BLOCKER 1).
+ *
+ * @returns {{files: Set<string>, trusted: boolean}}
  */
-export function extractTouchedWikiFiles(transcriptPath, hypoDir) {
+export function extractTouchedWikiFilesWithTrust(transcriptPath, hypoDir) {
   const out = new Set();
   if (!transcriptPath || typeof transcriptPath !== 'string' || !existsSync(transcriptPath)) {
-    return out;
+    return { files: out, trusted: false };
   }
   let raw;
   try {
     raw = readFileSync(transcriptPath, 'utf-8');
   } catch {
-    return out;
+    return { files: out, trusted: false };
   }
+  let trusted = true;
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -3304,6 +3380,7 @@ export function extractTouchedWikiFiles(transcriptPath, hypoDir) {
     try {
       entry = JSON.parse(t);
     } catch {
+      trusted = false; // a truncated/corrupt line: the walk may be incomplete
       continue;
     }
     for (const fp of extractTranscriptToolFilePaths(entry)) {
@@ -3311,7 +3388,19 @@ export function extractTouchedWikiFiles(transcriptPath, hypoDir) {
       if (rel) out.add(rel);
     }
   }
-  return out;
+  return { files: out, trusted };
+}
+
+/**
+ * Repo-relative POSIX paths of wiki files this session edited via direct
+ * Edit/Write/MultiEdit/NotebookEdit tool_use. Returns a Set; empty when the
+ * transcript is missing/unreadable (callers decide the fallback). A per-line
+ * JSON parse error skips that line only (transcripts occasionally truncate).
+ * A caller that needs to tell "genuinely empty" apart from "could not fully
+ * enumerate" wants extractTouchedWikiFilesWithTrust instead.
+ */
+export function extractTouchedWikiFiles(transcriptPath, hypoDir) {
+  return extractTouchedWikiFilesWithTrust(transcriptPath, hypoDir).files;
 }
 
 /**
@@ -3539,20 +3628,89 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const marker = opts.sessionId ? readSessionClosedMarker(hypoDir, opts.sessionId) : null;
   const logOnly = opts.logOnly === true || marker?.scope === 'log-only';
 
-  // 1. wiki git state. Uncommitted changes (real unsaved work) BLOCK:
-  //    they are human-fixable. Unpushed commits (ahead) DEMOTE to a notice: push is
+  // Paths this session is accountable for at THIS close: the same signals the
+  // lint partition below already trusts for exactly this question ("is this
+  // file mine or pre-existing debt"), hoisted so the git check (step 1) can
+  // partition on it too. Base = the mandatory close-target files (opts.lintScope
+  // override, else the log-only shared root files, else one project's close
+  // files under projectOverride, else every today-active project's); widened by
+  // every file this session's transcript shows it editing directly.
+  const closeAccountableScope = new Set(
+    opts.lintScope ||
+      (logOnly
+        ? ['hot.md', 'log.md']
+        : opts.projectOverride
+          ? closeFileTargetsForProject(hypoDir, opts.projectOverride)
+          : closeFileTargetsGlobal(hypoDir)),
+  );
+  // Trust signal for the git-scope check below (codex pre-commit review
+  // BLOCKER 1): closeAccountableScope's mandatory-files base is always
+  // reliable, but the transcript widening that catches an ad hoc page this
+  // session edited is only as good as the transcript. No opts.transcriptPath
+  // at all, an unreadable file, or a line that fails to parse all mean the
+  // widened scope may be under-inclusive, NOT that this session touched
+  // nothing extra. Only a fully-read, fully-parsed transcript earns
+  // sessionTouchTrusted:true. A single tool_use with no file_path does NOT
+  // lower trust: most tool_use blocks (Read, Bash, Grep, ...) never carry one
+  // and that is expected, not corruption, so treating it as untrustworthy
+  // would make almost every real transcript untrusted and defeat the scoping
+  // this fix exists to add.
+  let sessionTouchTrusted = false;
+  if (opts.transcriptPath) {
+    const widened = extractTouchedWikiFilesWithTrust(opts.transcriptPath, hypoDir);
+    sessionTouchTrusted = widened.trusted;
+    for (const f of widened.files) closeAccountableScope.add(f);
+  }
+
+  // 1. wiki git state. Uncommitted changes (real unsaved work) BLOCK, but only
+  //    the ones inside closeAccountableScope, and only when sessionTouchTrusted
+  //    (above) says that scope can actually be trusted: a session's own scoped
+  //    auto-commit (commitWikiChanges, PR #222) can leave the working tree
+  //    non-empty when a DIFFERENT session sharing this vault still has its own
+  //    file dirty, the 2026-08-03 multi-session block. That dirty file is
+  //    human-fixable by whoever owns it, not by this session, so it demotes to
+  //    a notice (listed by path, never silently dropped) instead of refusing
+  //    this session's marker. A dirty file THIS session owns still blocks
+  //    unconditionally (fail-closed is unchanged for scope this session
+  //    actually touched), and so does an unattributable state: a git failure
+  //    gitDirtyFiles can't enumerate (dirty.length === 0 despite
+  //    git.uncommitted === true), OR a scope we cannot trust
+  //    (!sessionTouchTrusted) both fall back to the original unscoped blocker:
+  //    "cannot attribute" is not "clean".
+  //    Unpushed commits (ahead) DEMOTE to a notice regardless of scope: push is
   //    automatic (auto-commit Stop hook) and its failures are already non-fatal, so
   //    "ahead" is a transient sync state, not a human-fixable blocker. Demoting it
   //    here (the shared gate) keeps the marker == compact-ready invariant:
   //    a committed-but-unpushed close marks AND compacts, instead of the close writer
   //    committing its own payload and then being blocked by its own (unpushed) commit.
   const git = hypoIsClean(hypoDir);
-  if (git.uncommitted) blockers.push({ type: 'git', reason: git.reason });
-  else if (git.ahead)
+  if (git.uncommitted) {
+    const dirty = gitDirtyFiles(hypoDir);
+    if (dirty.length === 0 || !sessionTouchTrusted) {
+      blockers.push({ type: 'git', reason: git.reason });
+    } else {
+      const mine = dirty.filter((f) => closeAccountableScope.has(posixPath(f)));
+      const foreign = dirty.filter((f) => !closeAccountableScope.has(posixPath(f)));
+      if (mine.length > 0) {
+        blockers.push({
+          type: 'git',
+          reason: `uncommitted changes in ${hypoDir}: ${mine.join(', ')}`,
+        });
+      }
+      for (const f of foreign) {
+        notices.push({
+          type: 'git',
+          file: f,
+          reason: `uncommitted changes outside this session's scope: ${f}`,
+        });
+      }
+    }
+  } else if (git.ahead) {
     notices.push({
       type: 'git-sync',
       reason: `unpushed commits in ${hypoDir} (push deferred to Stop hook)`,
     });
+  }
 
   // 2. root hot.md structure
   const hot = hotMdIsClean(hypoDir);
@@ -3762,25 +3920,13 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       const parsed = JSON.parse(r.stdout);
       const allErrors = parsed.errors || [];
       const allW8 = (parsed.warns || []).filter((w) => w.id === 'W8');
-      // log-only base scope = the shared root files only (hot.md / log.md) — NOT
-      // closeFileTargetsGlobal, which would fold the active/phantom project's
-      // mandatory files in and re-introduce the cross-project attribution. The
-      // session's own transcript-touched files are still added below (a log-only
-      // session is accountable for the wiki files it actually edited).
-      // Lint scope: explicit opts.lintScope wins; else log-only uses the shared
-      // root files only; else projectOverride narrows to that one project's close
-      // files (matching the narrowed close status above); else the global set.
-      const scope = new Set(
-        opts.lintScope ||
-          (logOnly
-            ? ['hot.md', 'log.md']
-            : opts.projectOverride
-              ? closeFileTargetsForProject(hypoDir, opts.projectOverride)
-              : closeFileTargetsGlobal(hypoDir)),
-      );
-      if (opts.transcriptPath && existsSync(opts.transcriptPath)) {
-        for (const f of extractTouchedWikiFiles(opts.transcriptPath, hypoDir)) scope.add(f);
-      }
+      // Lint scope = closeAccountableScope, hoisted above step 1 so the git
+      // check can partition on the same "is this mine" answer. See that
+      // hoisted comment for what feeds it (opts.lintScope override, else
+      // log-only's shared root files, else one project's close files under
+      // projectOverride, else the global set, widened by transcript-touched
+      // files).
+      const scope = closeAccountableScope;
       const part = partitionLintScope(allErrors, scope);
       if (part.blocking.length > 0) {
         blockers.push({

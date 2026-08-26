@@ -10,6 +10,7 @@ import {
   mkdirSync,
   rmSync,
   writeFileSync,
+  appendFileSync,
   readFileSync,
   existsSync,
   symlinkSync,
@@ -2766,13 +2767,204 @@ test('precompactGateStatus: ahead-only → NO git blocker, has git-sync notice',
   });
 });
 
-test('precompactGateStatus: uncommitted change → git blocker (unchanged)', () => {
+// BASE-SCOPE test: hot.md is in closeFileTargetsGlobal unconditionally, with
+// or without a transcript, so this proves only that a dirty file INSIDE the
+// deterministic base scope always blocks. It does NOT exercise the
+// transcript-trust gate below (a broken trust check cannot turn this test
+// red, because hot.md never depends on it) -- that is what the two
+// attribution-unknown tests further down are for, using pages/mine.md, a
+// file that enters scope ONLY via a trusted transcript.
+test('precompactGateStatus: uncommitted change in the base scope (hot.md) → git blocker', () => {
   withSyncedWiki((dir) => {
-    writeFileSync(join(dir, 'dirty.md'), '# dirty\n');
+    appendFileSync(join(dir, 'hot.md'), '\ndirty\n');
     const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
     assert.ok(
       (gate.blockers || []).some((b) => b.type === 'git'),
-      `uncommitted work must still be a git blocker: ${JSON.stringify(gate.blockers)}`,
+      `uncommitted work in the base scope must still be a git blocker: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// 2026-08-03 multi-session incident: this session's own scoped commit
+// (commitWikiChanges, PR #222) can leave the working tree non-empty when a
+// DIFFERENT session sharing the same vault still has its own file dirty. That
+// file is human-fixable by whoever owns it, not by this session, so it must
+// not refuse THIS session's close.
+test('precompactGateStatus: uncommitted change OUTSIDE this session\'s scope → notice, not a git blocker', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'unrelated-session.md'), "# another session's own edit\n");
+    // The partition only fires with a TRUSTED transcript (codex pre-commit
+    // review BLOCKER 1): a readable, fully-parseable transcript that shows
+    // this session editing hot.md only, never unrelated-session.md, is what
+    // earns the demotion below. Without a transcript the gate must fall back
+    // to the unscoped blocker instead (see the two attribution-unknown tests
+    // further down).
+    const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+    const transcript = join(tdir, 't.jsonl');
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'hot.md') } }] },
+      }) + '\n',
+    );
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      transcriptPath: transcript,
+    });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git'),
+      `a foreign session's dirty file must NOT be a git blocker: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      (gate.notices || []).some(
+        (n) => n.type === 'git' && n.file === 'unrelated-session.md',
+      ),
+      `the foreign dirty file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+// ATTRIBUTION-UNKNOWN tests (codex pre-commit review BLOCKER 1):
+// extractTouchedWikiFiles collapses "no transcript" and "genuinely touched
+// nothing" into the same empty Set, so a naive partition would let this
+// session's OWN dirty file get demoted to a notice just because there was
+// nothing to widen the scope with. pages/mine.md is deliberately OUTSIDE the
+// base scope (unlike hot.md above) -- it can only ever enter
+// closeAccountableScope via a trusted transcript widening, so it is the one
+// file that actually exercises the `sessionTouchTrusted` gate: deleting
+// `|| !sessionTouchTrusted` from the git check turns THESE two tests red
+// without touching the base-scope test above.
+test('precompactGateStatus: no transcript at all → a transcript-only-scope file still blocks (not demoted)', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
+    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `no transcript means unattributable, which must still block: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('precompactGateStatus: transcript with a corrupt line → a transcript-only-scope file still blocks', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
+    const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+    const transcript = join(tdir, 't.jsonl');
+    // One well-formed line plus one truncated (mid-write) line: the walk
+    // still returns SOME files, but must not be trusted as complete.
+    writeFileSync(
+      transcript,
+      [
+        JSON.stringify({
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'log.md') } }] },
+        }),
+        '{"type": "assistant", "message": {"content": [{"trunc',
+      ].join('\n') + '\n',
+    );
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      transcriptPath: transcript,
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `a corrupt transcript line means the scope cannot be trusted, which must still block: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// codex pre-commit review BLOCKER 2: `git -C <dir> status --porcelain` prints
+// paths relative to the repo TOP LEVEL, not to `dir`, even under `-C`. A
+// vault living under a bigger host repo (`<repo>/vault/`) would report its
+// own `hot.md` as `vault/hot.md`, which never matches the vault-relative
+// `hot.md` in closeAccountableScope, so the session's OWN dirty file would
+// look foreign and pass. A trusted (parseable) transcript is required here so
+// the partition actually runs instead of falling back to the unscoped
+// blocker on attribution-unknown grounds.
+test('precompactGateStatus: vault nested under a bigger git repo, my hot.md dirty → still a git blocker', () => {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-nested-'));
+  try {
+    const vault = join(base, 'vault');
+    mkdirSync(vault, { recursive: true });
+    spawnSync('git', ['init', '-q'], { cwd: base });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: base });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: base });
+    writeFileSync(
+      join(vault, 'hot.md'),
+      '---\ntitle: Hot\nupdated: today\n---\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
+    );
+    writeFileSync(join(vault, 'log.md'), '# Log\n');
+    writeFileSync(join(base, 'host-repo-file.md'), '# unrelated content living outside the vault\n');
+    spawnSync('git', ['add', '-A'], { cwd: base });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: base });
+    appendFileSync(join(vault, 'hot.md'), '\ndirty\n');
+    const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+    const transcript = join(tdir, 't.jsonl');
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(vault, 'log.md') } }] },
+      }) + '\n',
+    );
+    const gate = precompactGateStatus(vault, {
+      claudeHome: join(vault, '.claude-none'),
+      transcriptPath: transcript,
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `hot.md dirty in a nested vault must still block (top-level path prefix bug): ${JSON.stringify(gate.blockers)}`,
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// A rename touches TWO porcelain records (`to\0from`, see gitDirtyFiles); the
+// destination lands in scope here (session-state.md is a mandatory close
+// file), so the blocker must fire even though the change is carried as a
+// rename, not a plain modification.
+test('precompactGateStatus: a renamed file landing in scope → still a git blocker', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'draft.md'), '# draft session-state\n'.repeat(20));
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed draft']);
+    spawnSync('git', [
+      '-C',
+      dir,
+      'mv',
+      'projects/demo/draft.md',
+      'projects/demo/session-state.md',
+    ]);
+    const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+    const transcript = join(tdir, 't.jsonl');
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_use',
+              name: 'Write',
+              input: { file_path: join(dir, 'projects', 'demo', 'session-state.md') },
+            },
+          ],
+        },
+      }) + '\n',
+    );
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      transcriptPath: transcript,
+      projectOverride: 'demo',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `a renamed file landing in scope must still block: ${JSON.stringify(gate.blockers)}`,
     );
   });
 });
