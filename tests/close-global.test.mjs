@@ -1179,7 +1179,7 @@ test('uncommitted wiki + conditional close phrase, no decline → reconfirm bloc
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
       {
         type: 'user',
         message: { role: 'user', content: '구현 완료하면 세션 마무리하자' },
@@ -1221,7 +1221,7 @@ test('a correlated "아직, 계속" decline suppresses the reconfirm → continu
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
       { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
       askCloseReconfirmToolUse('q1'),
       {
@@ -1296,7 +1296,7 @@ test('decline label variants ("나중에" / "later") also suppress (label-drift 
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
       { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
       askCloseReconfirmToolUse('q1'),
       {
@@ -1334,7 +1334,7 @@ test('genuine close-now + uncommitted, no decline → still reconfirm block (no 
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
       { type: 'user', message: { role: 'user', content: '다 끝났으면 세션 마무리하자' } },
     ]);
     const r = runAutoMinimal(dir, {
@@ -1501,7 +1501,7 @@ test('absent background_tasks + uncommitted → in-flight fails open, git alone 
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
       { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
     ]);
     // No background_tasks key at all in the payload.
@@ -1580,8 +1580,12 @@ test('--mark-session-closed with failing gate → exit 1, no marker', () => {
 // while close work is still uncommitted.
 test('--mark-session-closed with ok gate but dirty git → exit 1, no marker (ADR Q2 regression)', () => {
   withWiki(null, (dir) => {
-    // Introduce uncommitted change AFTER buildCleanWikiTree's commit.
-    writeFileSync(join(dir, 'untracked.md'), 'dirty\n');
+    // Introduce uncommitted change AFTER buildCleanWikiTree's commit. `hot.md`
+    // is always inside the git-blocker's accountable scope (see
+    // precompactGateStatus's closeAccountableScope), unlike an arbitrary root
+    // file, so dirtying it still proves THIS session's own uncommitted work
+    // blocks unconditionally under the multi-session scoping added below.
+    appendFileSync(join(dir, 'hot.md'), '\ndirty\n');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -2465,7 +2469,10 @@ test('--log-only: active project not closed today → marker written, project:nu
 // log-only is NOT a global-gate bypass: git must still be clean.
 test('--log-only: dirty git still blocks (not a global bypass)', () => {
   withWiki(null, (dir) => {
-    writeFileSync(join(dir, 'untracked.md'), 'dirty\n');
+    // hot.md is in the log-only base scope (['hot.md', 'log.md']) unconditionally,
+    // so dirtying it still proves the git blocker fires for the session's own
+    // scope, not merely for any dirty file in the vault.
+    appendFileSync(join(dir, 'hot.md'), '\ndirty\n');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
