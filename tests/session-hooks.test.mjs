@@ -29,6 +29,13 @@ import {
   readSyncLastSuccess,
   classifySyncOp,
 } from '../hooks/hypo-shared.mjs';
+import {
+  snapshotBase,
+  readBaseEntry,
+  advanceBase,
+  hashContent,
+  overwriteTargets,
+} from '../hooks/base-store.mjs';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
@@ -42,10 +49,12 @@ import {
   formatGrowthMetrics,
   hypoIsClean,
   markerPath,
+  payloadForCleanWiki,
   peekTouchedPaths,
   precompactGateStatus,
   recordTouchedPaths,
   run,
+  runApply,
   runFirstPrompt,
   runStop,
   syncRemote,
@@ -54,6 +63,7 @@ import {
   withGrowthWiki,
   withSyncedWiki,
   withTmpDir,
+  withWiki,
   writeMarker,
 } from './helpers.mjs';
 
@@ -189,6 +199,127 @@ test('markdown link row is silently excluded when mixed with a valid wikilink ro
     assert.ok(
       !result.includes('bad-project'),
       'markdown link row must be excluded from rebuilt output',
+    );
+  });
+});
+
+suite('hypo-hot-rebuild.mjs — same-session base advance (root hot.md drift fix)');
+
+// hot-rebuild rewrites hot.md with a direct writeFileSync, which
+// hypo-auto-stage's PostToolUse-based advanceBaseForWrite never sees (it only
+// fires for a Write/Edit/MultiEdit TOOL call). Before this fix, that write
+// left the session's observed base for hot.md pointing at the pre-rebuild
+// bytes, so a later --apply-session-close with the (correct, post-rebuild)
+// content parked as a false 'base-mismatch' conflict against its own
+// session's edit.
+//
+// The stale row seeded below has nothing to do with a date rollover (it is a
+// deliberately wrong literal date), so this pins the general case: ANY
+// same-day rewrite hot-rebuild makes must still keep the base in sync, not
+// only one triggered by the calendar turning over at midnight.
+test('hot-rebuild advances this session base to the bytes it just wrote, so a matching apply does not park', () => {
+  withWiki(
+    (dir, today) => {
+      const rootHotPath = join(dir, 'hot.md');
+      writeFileSync(
+        rootHotPath,
+        readFileSync(rootHotPath, 'utf-8').replace(
+          `| test-project | ${today} |`,
+          '| test-project | 2000-01-01 |',
+        ),
+      );
+    },
+    (dir, today) => {
+      const sid = 'sess-hotrebuild-advance';
+      snapshotBase(dir, sid, overwriteTargets('test-project'));
+      const baseBefore = readBaseEntry(dir, sid, 'hot.md');
+      assert.equal(baseBefore.state, 'hash', 'snapshotBase must have recorded a base for hot.md');
+
+      const r = runStop('hypo-hot-rebuild.mjs', dir, { session_id: sid });
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+
+      const disk = readFileSync(join(dir, 'hot.md'), 'utf-8');
+      assert.ok(
+        disk.includes(`| test-project | ${today} |`),
+        'hot-rebuild must have corrected the stale row',
+      );
+
+      // Assertion 1: the base now matches what hot-rebuild actually wrote.
+      const baseAfter = readBaseEntry(dir, sid, 'hot.md');
+      assert.equal(
+        baseAfter.hash,
+        hashContent(disk),
+        'hot-rebuild must advance this session base to the bytes it just wrote',
+      );
+      assert.notEqual(baseAfter.hash, baseBefore.hash, 'the base must have MOVED off the stale snapshot');
+
+      // Assertion 2: an apply carrying VALID BUT BYTE-DISTINCT content (one
+      // trailing newline off disk, the exact shape that reproduced the false
+      // park during the investigation) actually reaches the base check
+      // instead of short-circuiting on it. A payload byte-identical to disk
+      // would hit crystallize.mjs's idempotent skip BEFORE the base is ever
+      // consulted, so it would pass here even with a stale base and prove
+      // nothing about the advance this test exists to pin.
+      const proposed = disk.endsWith('\n') ? disk.slice(0, -1) : `${disk}\n`;
+      const payload = payloadForCleanWiki(dir, today);
+      payload.rootHot = { content: proposed };
+      const r2 = runApply(dir, payload, { sessionId: sid });
+      const out = JSON.parse(r2.stdout);
+      assert.equal(out.ok, true, `apply must not park: ${r2.stdout}`);
+      assert.deepEqual(out.conflicts ?? [], [], `no conflict expected: ${r2.stdout}`);
+      assert.ok(
+        (out.applied ?? []).some((a) => a.includes('rootHot')),
+        `rootHot must have gone through the base check and been written, not merely skipped: ${r2.stdout}`,
+      );
+    },
+  );
+});
+
+test('hot-rebuild leaves the base untouched when the file is already canonical (no write, no advance)', () => {
+  withTmpDir((dir) => {
+    // Byte-exact match to rebuild()'s own canonical template (hooks/hypo-hot-
+    // rebuild.mjs), computed the same way it computes `today` (UTC, not
+    // local), so canonical === current and this hook is a true no-op. Reusing
+    // buildCleanWikiTree()'s simpler hot.md here would NOT be a no-op: its
+    // shape already differs structurally from the canonical template, so
+    // rebuild() would always rewrite it regardless of date.
+    const rebuildToday = new Date().toISOString().slice(0, 10);
+    writeFileSync(
+      join(dir, 'hot.md'),
+      `---\ntitle: Hot Cache — Pointer\ntype: reference\nupdated: ${rebuildToday}\ntags: [wiki, operations]\n---\n\n` +
+        `# Hot Cache\n\n> Read at session start → navigate to the relevant project session-state.md and hot.md.\n` +
+        `> Update at session close: project session-state.md, project hot.md, and this file's "Active Projects" table.\n\n` +
+        `## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n` +
+        `| my-project | ${rebuildToday} | [[projects/my-project/hot]] |\n\n` +
+        `## Session Start Checklist\n\n1. Check this file for the relevant project link\n` +
+        `2. Read \`projects/<name>/session-state.md\` for next tasks if it exists\n` +
+        `3. Read \`projects/<name>/hot.md\` for project background\n`,
+    );
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+
+    const sid = 'sess-hotrebuild-noop';
+    snapshotBase(dir, sid, ['hot.md']);
+    // Force the recorded base to a SENTINEL that is deliberately wrong (not
+    // the disk hash). If the fixture's base already matched disk (as a plain
+    // snapshot would, since disk is already canonical here), a stray
+    // advanceBase call outside the write branch would just re-record the
+    // SAME hash and this assertion would pass for the wrong reason -- it
+    // would never actually observe a call that fires when it should not.
+    // With a sentinel, any advanceBase call is forced to overwrite it with
+    // the real disk hash, which this assertion can tell apart from "untouched".
+    const SENTINEL_HASH = 'sentinel-does-not-match-disk';
+    advanceBase(dir, sid, 'hot.md', SENTINEL_HASH);
+    const baseBefore = readBaseEntry(dir, sid, 'hot.md');
+    assert.equal(baseBefore.hash, SENTINEL_HASH, 'sentinel must be in place before the hook runs');
+
+    const r = runStop('hypo-hot-rebuild.mjs', dir, { session_id: sid });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+
+    const baseAfter = readBaseEntry(dir, sid, 'hot.md');
+    assert.equal(
+      baseAfter.hash,
+      SENTINEL_HASH,
+      'a no-op rebuild must not touch the observed base (advanceBase must not fire outside the write branch)',
     );
   });
 });
