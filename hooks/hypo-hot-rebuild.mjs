@@ -19,6 +19,7 @@ import {
   deriveRootLogEntries,
   recordTouchedPaths,
 } from './hypo-shared.mjs';
+import { advanceBase, hashContent } from './base-store.mjs';
 
 const HOT_PATH = join(HYPO_DIR, 'hot.md');
 const GROWTH_CACHE = join(HYPO_DIR, '.cache', 'last-session-growth.json');
@@ -73,7 +74,7 @@ function parsePointerRows(content) {
 }
 
 /** @returns {boolean} true when hot.md was actually rewritten. */
-function rebuild() {
+function rebuild(sessionId) {
   if (!existsSync(HOT_PATH)) return false;
 
   const current = readFileSync(HOT_PATH, 'utf-8');
@@ -116,6 +117,25 @@ ${tableRows}
 
   if (canonical !== current) {
     writeFileSync(HOT_PATH, canonical);
+    // This write bypasses the Write/Edit tool, so hypo-auto-stage's
+    // PostToolUse-based advanceBaseForWrite never sees it (see the file-header
+    // comment above). Without advancing the base here, this session's own
+    // rewrite of hot.md looks -- at close time -- exactly like a DIFFERENT
+    // session having edited it, and the observed-base guard in crystallize.mjs
+    // parks a false conflict against this session's own work. Mirrors
+    // crystallize.mjs's overwrite(): advanceBase right after the write that
+    // made it true.
+    //
+    // No session_id on stdin (empty/malformed payload): advanceBase is a
+    // no-op without a snapshot anyway, so this stays silent-safe like before
+    // this fix -- just observable on stderr instead of a guess.
+    if (sessionId) {
+      advanceBase(HYPO_DIR, sessionId, 'hot.md', hashContent(canonical));
+    } else {
+      process.stderr.write(
+        '[hypo-hot-rebuild] no session_id on stdin; base not advanced for hot.md\n',
+      );
+    }
     return true;
   }
   return false;
@@ -134,7 +154,7 @@ function emitGrowth() {
 
 let hotWritten = false;
 try {
-  hotWritten = rebuild();
+  hotWritten = rebuild(sessionId);
 } catch (err) {
   process.stderr.write(`[hypo-hot-rebuild] error: ${err?.message ?? String(err)}\n`);
 }
