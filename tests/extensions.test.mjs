@@ -12,6 +12,9 @@ import {
   readdirSync,
   existsSync,
   symlinkSync,
+  chmodSync,
+  statSync,
+  cpSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { test, suite } from './harness.mjs';
@@ -100,6 +103,243 @@ test('upgrade-extensions-hard-copy-and-manifest-register', () => {
         settingsAfter,
         settingsBefore,
         'settings.json drifted across idempotent --apply',
+      );
+    });
+  });
+});
+
+// forward-sync must carry a wiki script's executable bit to the install target
+// (the bug this pins: a 755 wiki script always landed 644 on a fresh machine).
+test('forward-sync carries the executable bit on a fresh install (create branch)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      writeExt(hypoDir, 'hooks', 'hypo-ext-runner.mjs', '#!/usr/bin/env node\n');
+      chmodSync(join(hypoDir, 'extensions', 'hooks', 'hypo-ext-runner.mjs'), 0o755);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r.status, 0, `apply failed: ${r.stderr}`);
+
+      const installed = join(home, '.claude', 'hooks', 'hypo-ext-runner.mjs');
+      const mode = statSync(installed).mode & 0o777;
+      assert.equal(
+        mode & 0o111,
+        0o111,
+        `installed copy must carry the src's 755 exec bit, got ${mode.toString(8)}`,
+      );
+    });
+  });
+});
+
+// The 'up-to-date' branch (content already matches src) used to be a pure no-op:
+// a mode mismatch there was never healed, on any sync, ever. This pins the fix,
+// including that check-mode (no --apply) must count the mismatch as pending work
+// rather than reporting "up to date" while a stale bit sits on disk.
+test('forward-sync heals a stale exec bit when content is already up to date', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const srcPath = join(hypoDir, 'extensions', 'hooks', 'hypo-ext-stale.mjs');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-stale.mjs', '#!/usr/bin/env node\n');
+      chmodSync(srcPath, 0o755);
+
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r1.status, 0, `first apply failed: ${r1.stderr}`);
+      const installed = join(home, '.claude', 'hooks', 'hypo-ext-stale.mjs');
+
+      // Simulate a pre-fix install (or a user's own `chmod -x`): identical bytes,
+      // wrong mode.
+      chmodSync(installed, 0o644);
+
+      const check = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      assert.equal(
+        check.status,
+        1,
+        `check mode must exit non-zero on pending work: ${check.stderr}`,
+      );
+      const checkOut = JSON.parse(check.stdout);
+      assert.equal(
+        checkOut.extensions.needsWork,
+        true,
+        'a mode-only mismatch must count as pending work, not "up to date"',
+      );
+
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second apply failed: ${r2.stderr}`);
+      const out2 = JSON.parse(r2.stdout);
+      const fixed = out2.applied.extensions.actions.find(
+        (a) => a.file === 'hooks/hypo-ext-stale.mjs',
+      );
+      assert.ok(fixed, 'the mode-only fix must show up in the actions list');
+      assert.equal(
+        fixed.action,
+        'update',
+        'a content-identical mode fix reuses the existing update action, not a new one',
+      );
+
+      const mode = statSync(installed).mode & 0o777;
+      assert.equal(
+        mode & 0o111,
+        0o111,
+        `stale 644 copy must be healed back to executable, got ${mode.toString(8)}`,
+      );
+    });
+  });
+});
+
+// Reverse direction: the wiki copy is 644 (a pre-fix capture, or a wiki file
+// that never had the bit) while the installed copy is already 755. Healing
+// must never turn a bit off here: the installed 755 could be a user's own
+// `chmod +x`, and we have no way to tell that apart from our own bit. Check
+// mode must also not flag this as pending work, or `--apply` would have
+// nothing to do yet check would loop forever reporting exit 1.
+test('forward-sync never strips an exec bit the install has that the wiki copy lacks', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const srcPath = join(hypoDir, 'extensions', 'hooks', 'hypo-ext-preserved.mjs');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-preserved.mjs', '#!/usr/bin/env node\n');
+      chmodSync(srcPath, 0o755);
+
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r1.status, 0, `first apply failed: ${r1.stderr}`);
+      const installed = join(home, '.claude', 'hooks', 'hypo-ext-preserved.mjs');
+
+      // Simulate a pre-fix wiki copy: identical bytes, non-executable mode.
+      chmodSync(srcPath, 0o644);
+
+      const check = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      assert.equal(check.status, 0, `reverse mismatch must not be pending work: ${check.stderr}`);
+      const checkOut = JSON.parse(check.stdout);
+      assert.equal(
+        checkOut.extensions.needsWork,
+        false,
+        'a dest-only exec bit must not be reported as needing work',
+      );
+
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second apply failed: ${r2.stderr}`);
+
+      const mode = statSync(installed).mode & 0o777;
+      assert.equal(
+        mode & 0o111,
+        0o111,
+        `installed 755 must survive a wiki copy that is 644, got ${mode.toString(8)}`,
+      );
+    });
+  });
+});
+
+// codex pre-commit BLOCKER: the heal condition used to treat the exec bit as one
+// boolean ("is anything executable"), so a cross combination — src owner-only,
+// dest group-only — read as already-satisfied and the owner bit never healed.
+// Per-bit OR merge fixes it: add exactly the bits src has that dest lacks, and
+// keep every bit dest already has, whichever owner/group/other it happens to be.
+test('forward-sync heals only the missing exec bits, per owner/group/other (cross combination)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const srcPath = join(hypoDir, 'extensions', 'hooks', 'hypo-ext-cross.mjs');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-cross.mjs', '#!/usr/bin/env node\n');
+      chmodSync(srcPath, 0o755);
+
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r1.status, 0, `first apply failed: ${r1.stderr}`);
+      const installed = join(home, '.claude', 'hooks', 'hypo-ext-cross.mjs');
+
+      // Diverge into the cross combination: src owner-exec only, dest group-exec
+      // only. Content stays byte-identical on both sides throughout.
+      chmodSync(srcPath, 0o744);
+      chmodSync(installed, 0o654);
+      assert.equal(statSync(installed).mode & 0o777, 0o654, 'setup: dest must start at 0654');
+
+      const check = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      assert.equal(
+        check.status,
+        1,
+        `a missing owner-exec bit must count as pending work: ${check.stderr}`,
+      );
+      const checkOut = JSON.parse(check.stdout);
+      assert.equal(
+        checkOut.extensions.needsWork,
+        true,
+        'cross-bit combination must be flagged as needing work, not read as already satisfied',
+      );
+
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r2.status, 0, `second apply failed: ${r2.stderr}`);
+
+      const after = statSync(installed).mode & 0o777;
+      assert.equal(
+        after,
+        0o754,
+        `missing owner bit must be added and the existing group bit kept, got ${after.toString(8)}`,
+      );
+    });
+  });
+});
+
+// codex pre-commit BLOCKER: only the skill loop's copyOne caller pre-checked
+// hasSymlinkAncestor before writing; the flat main-file and manifest callers had
+// no such guard, so chmod-ing a content-identical dest through a symlinked
+// ~/.claude/hooks/ escalated permissions on whatever the symlink actually points
+// at. The fix moves the guard inside copyOne itself, right before its one
+// pathname-based chmod, so every caller is covered without a per-call-site fix.
+test('forward-sync does not chmod through a symlinked ancestor typeDir (flat file)', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const srcPath = join(hypoDir, 'extensions', 'hooks', 'hypo-ext-linked.mjs');
+      writeExt(hypoDir, 'hooks', 'hypo-ext-linked.mjs', '#!/usr/bin/env node\n');
+      chmodSync(srcPath, 0o755);
+
+      const r1 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(r1.status, 0, `first apply failed: ${r1.stderr}`);
+
+      // Move ~/.claude/hooks out and replace it with a symlink to the same
+      // content, so every path reached through it now runs through a symlinked
+      // ancestor directory (the leaf file itself stays a plain regular file).
+      const hooksDir = join(home, '.claude', 'hooks');
+      const outside = join(dir, 'outside-hooks');
+      cpSync(hooksDir, outside, { recursive: true });
+      rmSync(hooksDir, { recursive: true });
+      symlinkSync(outside, hooksDir);
+
+      const outsideFile = join(outside, 'hypo-ext-linked.mjs');
+      chmodSync(outsideFile, 0o644); // stale bit, content unchanged
+      assert.equal(
+        statSync(outsideFile).mode & 0o777,
+        0o644,
+        'setup: the real file behind the symlink must start at 0644',
+      );
+
+      const r2 = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(
+        r2.status,
+        0,
+        `apply through the symlinked ancestor must not error: ${r2.stderr}`,
+      );
+
+      const after = statSync(outsideFile).mode & 0o777;
+      assert.equal(
+        after,
+        0o644,
+        `chmod must not follow the symlinked ancestor onto the real file, got ${after.toString(8)}`,
       );
     });
   });

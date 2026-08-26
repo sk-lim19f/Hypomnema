@@ -11,6 +11,8 @@ import {
   existsSync,
   symlinkSync,
   lstatSync,
+  chmodSync,
+  statSync,
 } from 'node:fs';
 import { join, basename } from 'node:path';
 import { test, suite } from './harness.mjs';
@@ -1769,6 +1771,92 @@ test('captures a directory skill, adopts it, and reinstalls it on a second machi
       });
     });
   });
+});
+
+// Regression: capture's OWN wiki write must not lose the source's executable
+// bit. Before this fix, capture.mjs's writeAtomic always wrote 644, so the wiki
+// copy was wrong from the moment capture created it. The immediate adopt sync
+// then made it worse: its up-to-date branch heals mode FROM the wiki (now the
+// source of truth for forward-sync), and the wiki copy was already wrong, so
+// the heal wrote 644 back onto the user's ORIGINAL local file too.
+test('capture preserves the executable bit end to end: wiki copy, far install, and the original', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const src = join(home, '.claude', 'skills', 'mine');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'SKILL.md'), '# mine\n');
+      const helper = join(src, 'run.sh');
+      writeFileSync(helper, '#!/bin/sh\necho hi\n');
+      chmodSync(helper, 0o755);
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      // (b) the regression this test pins: the original local file must still be
+      // executable after capture + its own adopt sync.
+      const origMode = statSync(helper).mode & 0o777;
+      assert.equal(
+        origMode & 0o111,
+        0o111,
+        `capture must not strip the original file's executable bit, got ${origMode.toString(8)}`,
+      );
+
+      const wikiHelper = join(hypoDir, 'extensions', 'skills', 'hypo-ext-mine', 'run.sh');
+      const wikiMode = statSync(wikiHelper).mode & 0o777;
+      assert.equal(
+        wikiMode & 0o111,
+        0o111,
+        `wiki copy must carry the source's executable bit, got ${wikiMode.toString(8)}`,
+      );
+
+      // (a) a second machine syncing the same wiki must install it executable too.
+      withTmpHome((home2) => {
+        const up = runWithHome('upgrade.mjs', ['--apply', `--hypo-dir=${hypoDir}`], home2);
+        assert.equal(up.status, 0, up.stderr);
+        const farHelper = join(home2, '.claude', 'skills', 'mine', 'run.sh');
+        const farMode = statSync(farHelper).mode & 0o777;
+        assert.equal(
+          farMode & 0o111,
+          0o111,
+          `far install must carry the executable bit, got ${farMode.toString(8)}`,
+        );
+      });
+    });
+  });
+});
+
+// codex pre-commit CONCERN: writeAtomic used to chmod the tmp file by PATHNAME
+// after its fd was already closed. `wx` (O_CREAT|O_EXCL) only protects the tmp
+// file's creation; a competing process racing this write could delete tmp and
+// plant a symlink at the same name in the window between close and that
+// pathname chmod, and chmodSync would then follow it onto whatever the symlink
+// points at. fchmodSync on the still-open fd, before close, has no such window:
+// it can only ever act on the file this process itself just created, matching
+// the ordering extensions.mjs's own writeFreshAtomic already uses. A real race
+// is inherently non-deterministic to reproduce inside one synchronous test
+// process, so this pins the ordering directly from source instead.
+test('writeAtomic sets the mode on the open fd before closing it (no post-close pathname chmod)', () => {
+  const src = readFileSync(join(SCRIPTS, 'capture.mjs'), 'utf-8');
+  const match = src.match(/function writeAtomic\([^]*?\n}\n/);
+  assert.ok(match, 'writeAtomic function body not found for source scan');
+  const body = match[0];
+  assert.ok(
+    !/chmodSync\(tmp/.test(body),
+    'writeAtomic must not chmod the tmp file by pathname after it is written',
+  );
+  const fchmodAt = body.indexOf('fchmodSync(fd');
+  const closeAt = body.indexOf('closeSync(fd)');
+  assert.ok(fchmodAt !== -1, 'writeAtomic must set the mode via fchmodSync on the open fd');
+  assert.ok(closeAt !== -1, 'writeAtomic must close the fd');
+  assert.ok(
+    fchmodAt < closeAt,
+    'fchmodSync must run before closeSync, closing the post-close pathname-chmod race window',
+  );
 });
 
 test('--dry-run writes nothing to the wiki and does not adopt a skill', () => {
