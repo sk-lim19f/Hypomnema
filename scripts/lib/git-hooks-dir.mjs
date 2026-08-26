@@ -38,6 +38,16 @@ import { execFileSync } from 'child_process';
 import { existsSync, lstatSync, realpathSync, statSync } from 'fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path';
 
+// ── shared install/uninstall markers ────────────────────────────────────────
+// init.mjs writes these when it installs the wiki's git pre-commit hook and
+// the shell rc block; uninstall.mjs reads them back to remove exactly what
+// init created. Defined once here, imported by both, so the two scripts can
+// never drift into recognizing different markers.
+export const WIKI_PRE_COMMIT_MARKER_START = '# hypo-managed:pre-commit:start';
+export const WIKI_PRE_COMMIT_MARKER_END = '# hypo-managed:pre-commit:end';
+export const SHELL_MARKER_START = '# hypo-managed:shell-setup:start';
+export const SHELL_MARKER_END = '# hypo-managed:shell-setup:end';
+
 // Fallback scrub list for git versions without `rev-parse --local-env-vars`.
 // Mirrors scripts/install-git-hooks.mjs, which established this trust model.
 const STATIC_LOCAL_ENV_VARS = [

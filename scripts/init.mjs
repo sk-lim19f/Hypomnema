@@ -38,7 +38,14 @@ import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import { expandHome, resolveHypoRoot } from './lib/hypo-root.mjs';
-import { hooksDirForInstall, unsafeHookTargetReason } from './lib/git-hooks-dir.mjs';
+import {
+  hooksDirForInstall,
+  unsafeHookTargetReason,
+  WIKI_PRE_COMMIT_MARKER_START,
+  WIKI_PRE_COMMIT_MARKER_END,
+  SHELL_MARKER_START,
+  SHELL_MARKER_END,
+} from './lib/git-hooks-dir.mjs';
 import { readCoreHooksConfig } from './lib/core-hooks.mjs';
 import {
   readPkgJson as readPkgJsonSafe,
@@ -748,9 +755,6 @@ function installPkgGitHook(dryRun) {
 
 // ── wiki pre-commit hook ─────────────────────────────────────────────────────
 
-const WIKI_PRE_COMMIT_MARKER_START = '# hypo-managed:pre-commit:start';
-const WIKI_PRE_COMMIT_MARKER_END = '# hypo-managed:pre-commit:end';
-
 // Single-quote escaping prevents shell expansion of special chars (e.g. $HOME, backticks) in path
 function shellSingleQuote(p) {
   return `'${p.replace(/'/g, "'\\''")}'`;
@@ -858,9 +862,6 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
 }
 
 // ── shell function setup ─────────────────────────────────────────────────────
-
-const SHELL_MARKER_START = '# hypo-managed:shell-setup:start';
-const SHELL_MARKER_END = '# hypo-managed:shell-setup:end';
 
 function shellFunctionBlock() {
   return `${SHELL_MARKER_START}
