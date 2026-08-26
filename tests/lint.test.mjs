@@ -1347,7 +1347,7 @@ function lintWiki(files) {
     const broken = out.warns
       .filter((w) => /Broken wikilink/.test(w.message))
       .map((w) => (w.message.match(/\[\[(.+?)\]\]/) || [])[1]);
-    return { broken, errors: out.errors, status: r.status };
+    return { broken, errors: out.errors, warns: out.warns, status: r.status };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1560,6 +1560,105 @@ test('dir-relative collision across scan dirs resolves when a real file matches'
     !broken.includes('x/foo'),
     `collision key must resolve when a real file exists: ${JSON.stringify(broken)}`,
   );
+});
+
+// ── root close targets (hot.md / log.md) get W4-only scanning ───────────────
+// closeFileTargetsGlobal (hooks/hypo-shared.mjs) says a session close writes
+// root hot.md and log.md, but the three scanDirs (pages/projects/journal)
+// never covered the vault root, so a broken wikilink close itself just wrote
+// there passed lint clean while doctor caught it. See CLAUDE.md's hook-table
+// caveat for why hooks/hypo-shared.mjs, not docs, is the source of truth here.
+suite('lint.mjs root close-target scan (hot.md / log.md)');
+
+test('a broken wikilink in root log.md is caught (not just by doctor)', () => {
+  const { broken } = lintWiki({
+    'log.md': '---\ntitle: Activity Log\ntype: log\nupdated: 2026-06-08\n---\n\nsee [[projects/ghost/hot]]\n',
+  });
+  assert.ok(
+    broken.includes('projects/ghost/hot'),
+    `root log.md broken link must be reported: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('a broken wikilink in root hot.md is caught (not just by doctor)', () => {
+  const { broken } = lintWiki({
+    'hot.md': '---\ntitle: Hot Cache\ntype: reference\nupdated: 2026-06-08\n---\n\nsee [[projects/ghost/hot]]\n',
+  });
+  assert.ok(
+    broken.includes('projects/ghost/hot'),
+    `root hot.md broken link must be reported: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('root log.md: a broken link is caught AND a real link resolves in the same run (no false positive)', () => {
+  // A single vacuous "broken is empty" read passes whether or not the new loop
+  // runs at all (log.md unscanned → no warns either way). Asserting the broken
+  // and the real link together only holds if the loop actually ran: a disabled
+  // loop reports the real link as clean by omission, but ALSO drops the
+  // broken one, so this specific pairing only passes with the loop alive.
+  const { broken } = lintWiki({
+    'log.md':
+      '---\ntitle: Activity Log\ntype: log\nupdated: 2026-06-08\n---\n\nreal [[pages/target]], ghost [[projects/ghost/hot]]\n',
+    'pages/target.md': wlPage('reference', '# Target'),
+  });
+  assert.ok(
+    broken.includes('projects/ghost/hot'),
+    `the broken link must still be reported: ${JSON.stringify(broken)}`,
+  );
+  assert.ok(
+    !broken.includes('pages/target'),
+    `the real link target must resolve, not just go unmentioned: ${JSON.stringify(broken)}`,
+  );
+});
+
+test('root log.md still gets no full lintPage treatment (its non-VALID_TYPES type stays silent)', () => {
+  // log.md's `type: log` is not declared in VOCAB_SCHEMA's taxonomy (it has no
+  // Page Type Taxonomy table), so parseSchemaTypes() contributes nothing and
+  // validTypes falls back to the hardcoded VALID_TYPES list, which does not
+  // include `log`. If lintPage ran on this file, that would raise a W2 "Unknown
+  // type" WARN, not an error, so checking `errors` alone proves nothing; this
+  // reads `warns` directly to prove the type check never ran at all.
+  const { warns } = lintWiki({
+    'log.md': '---\ntitle: Activity Log\ntype: log\nupdated: 2026-06-08\n---\n\nno links here\n',
+  });
+  assert.ok(
+    !warns.some((w) => w.file === 'log.md'),
+    `root log.md must not be run through full lintPage: ${JSON.stringify(warns)}`,
+  );
+});
+
+test('.hyposcanignore flips the same broken link from reported to unscanned', () => {
+  // A single ignored-and-clean run would pass even with the new loop deleted
+  // entirely (log.md never in scope either way). Running the SAME file both
+  // with and without the ignore entry, and asserting the warn flips, only
+  // holds if the loop is both alive and honoring isScanIgnored.
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-wl-'));
+  try {
+    writeFileSync(join(dir, 'SCHEMA.md'), VOCAB_SCHEMA);
+    writeFileSync(
+      join(dir, 'log.md'),
+      '---\ntitle: Activity Log\ntype: log\nupdated: 2026-06-08\n---\n\nsee [[projects/ghost/hot]]\n',
+    );
+    const runLint = () => {
+      const r = spawnSync(
+        process.execPath,
+        [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${dir}`, '--json'],
+        {
+          encoding: 'utf-8',
+          maxBuffer: 64 * 1024 * 1024,
+          env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+        },
+      );
+      return JSON.parse(r.stdout).warns.some(
+        (w) => w.file === 'log.md' && /Broken wikilink/.test(w.message),
+      );
+    };
+    assert.equal(runLint(), true, 'before .hyposcanignore: the broken link must be reported');
+    writeFileSync(join(dir, '.hyposcanignore'), 'log.md\n');
+    assert.equal(runLint(), false, 'after .hyposcanignore: log.md must be skipped entirely');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 suite('fix #49: findDesignHistoryStale()');
