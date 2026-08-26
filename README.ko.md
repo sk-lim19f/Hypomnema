@@ -74,9 +74,9 @@ hypomnema
 
 > 어느 경로든 첫 실행 뒤에는 Claude Code를 재시작(또는 새 세션 열기)해야 새 훅과 슬래시 커맨드가 반영됩니다.
 
-> `init`은 `~/.zshrc`(또는 `~/.bashrc`)에 `claude()` 셸 함수도 추가합니다. `# hypo-managed:shell-setup:start`와 `:end` 마커 사이에 들어가며, `cd`만 한 세션에도 프로젝트 컨텍스트가 주입되게 합니다. `--no-shell`로 건너뛰거나 `--shell-config=<path>`로 대상 파일을 바꿀 수 있습니다. `uninstall`은 이 블록을 지우지 않으니 마커 사이 줄을 직접 지우세요.
+> `init`은 `~/.zshrc`(또는 `~/.bashrc`)에 `claude()` 셸 함수도 추가합니다. `# hypo-managed:shell-setup:start`와 `:end` 마커 사이에 들어가며, `cd`만 한 세션에도 프로젝트 컨텍스트가 주입되게 합니다. `--no-shell`로 건너뛰거나 `--shell-config=<path>`로 대상 파일을 바꿀 수 있습니다. `uninstall --apply`는 이 블록을 지웁니다(기본으로 `~/.zshrc`와 `~/.bashrc` 둘 다 확인하고, `--shell-config`로 지정한 파일이 있으면 그것만 봅니다). 다만 마커를 손으로 편집해서 중복되거나 순서가 뒤바뀐 상태라면, 무엇을 지워야 할지 안전하게 판단할 수 없으므로 블록을 그대로 둡니다.
 
-> `init`은 위키 저장소에 pre-commit 훅도 설치합니다(`<위키>/.git/hooks/pre-commit`, `# hypo-managed:pre-commit:*` 마커). `.hypoignore`에 걸리는 파일이 스테이지되면 커밋을 막습니다. 해당 파일을 unstage 하거나 `git commit --no-verify`로 우회하세요. 이 훅에는 설치된 패키지의 절대 경로가 박히므로, Hypomnema를 옮기거나 재설치했다면 `hypomnema init`을 다시 돌려 경로를 갱신해야 합니다. 그러지 않으면 위키의 모든 커밋이 실패합니다. `uninstall`은 이 파일을 지우지 않습니다.
+> `init`은 위키 저장소에 pre-commit 훅도 설치합니다(`<위키>/.git/hooks/pre-commit`, `# hypo-managed:pre-commit:*` 마커). `.hypoignore`에 걸리는 파일이 스테이지되면 커밋을 막습니다. 해당 파일을 unstage 하거나 `git commit --no-verify`로 우회하세요. 이 훅에는 설치된 패키지의 절대 경로가 박히므로, Hypomnema를 옮기거나 재설치했다면 `hypomnema init`을 다시 돌려 경로를 갱신해야 합니다. 그러지 않으면 위키의 모든 커밋이 실패합니다. `uninstall --apply`는 이 훅을 지웁니다. 위키 위치는 `init`과 같은 방식으로 찾고, `--hypo-dir=<path>`로 직접 지정할 수도 있습니다. 다만 마커는 있지만 그 바깥에 다른 내용이 붙은 훅처럼 더 이상 온전히 Hypomnema 소유가 아닌 훅은 손대지 않고 그대로 둡니다.
 
 > 두 번째 기기에서는 그냥 `hypomnema`를 돌리지 마세요. 원격과 무관한 새 위키가 만들어집니다. 기존 위키를 클론하는 쪽을 쓰세요. `hypomnema --from-remote=<git-url>`이 위키 루트로 클론한 뒤 실제 Hypomnema 위키인지 확인하고, 새 git 히스토리를 만들지 않은 채 훅과 슬래시 커맨드만 설치합니다. 대상 디렉터리가 이미 있으면 거부합니다.
 

@@ -20,7 +20,7 @@ import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { readRenameMarker, renameMarkerPath, RENAME_MARKER_REL } from './lib/rename-marker.mjs';
-import { resolveGitHooksDir } from './lib/git-hooks-dir.mjs';
+import { resolveGitHooksDir, WIKI_PRE_COMMIT_MARKER_START } from './lib/git-hooks-dir.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 import {
   readSyncState,
@@ -506,7 +506,7 @@ function checkGit(hypoDir) {
         ? 'Not installed — run /hypo:init to install .hypoignore guard'
         : 'Not installed, and /hypo:init will not install into this path — point core.hooksPath back inside the repository, or install the guard yourself',
     );
-  } else if (content.includes('# hypo-managed:pre-commit:start')) {
+  } else if (content.includes(WIKI_PRE_COMMIT_MARKER_START)) {
     pass(label, 'Hypomnema .hypoignore guard installed');
   } else {
     warn(label, 'Exists but not managed by Hypomnema — manual git add can bypass .hypoignore');

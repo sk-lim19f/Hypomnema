@@ -233,7 +233,7 @@ Hooks inline this logic in `hypo-shared.mjs`. Scripts use `scripts/lib/hypo-root
 
 ### `/hypo:uninstall`
 
-Removes hypo-prefixed hooks from `~/.claude/hooks/` and matching entries from `~/.claude/settings.json`. **Non-hypo hooks are preserved**. The wiki vault itself is never touched.
+Removes hypo-prefixed hooks from `~/.claude/hooks/` and matching entries from `~/.claude/settings.json`. **Non-hypo hooks are preserved**. `--apply` also reaches past `~/.claude/`: it strips the marked `claude()` block from the shell rc file(s) init wrote to, and removes the marked pre-commit hook from the wiki's own git repo. Both removals are marker-gated the same way the hooks-dir cleanup is, so a hand-edited block or hook is left in place rather than guessed at.
 
 ---
 
