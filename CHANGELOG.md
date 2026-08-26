@@ -5,6 +5,28 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-08-26
+
+### Bug Fixes
+
+#### English
+
+- The npm and manual install channels now detect a stale package root instead of silently running an older release's scripts: a hooks copy is trusted only when it can prove which package wrote it, and an unresolvable root is surfaced once at session start rather than degrading the session in silence. ([#239](https://github.com/sk-lim19f/Hypomnema/pull/239))
+
+#### 한국어
+
+- npm 및 수동 설치 채널이 낡은 패키지 루트를 잡아낸다. 예전에는 옛 릴리스의 scripts 를 조용히 실행했다. 훅 사본은 어느 패키지가 썼는지 증명할 수 있을 때만 신뢰하고, 루트가 해석되지 않으면 세션 시작에 한 번 알린다. ([#239](https://github.com/sk-lim19f/Hypomnema/pull/239))
+
+### Chores
+
+#### English
+
+- The README now matches the code. Seven false statements were corrected (including a backwards description of the recommended install path and a privacy glob that was inverted), and five behaviors that surprise a new user are documented for the first time: `init` edits your shell rc, it installs a `pre-commit` hook into the wiki repo, `uninstall` removes neither, the default ignore patterns match substrings and can swallow ordinary pages, and cloning an existing wiki onto a second machine has a flag that was never mentioned. ([#241](https://github.com/sk-lim19f/Hypomnema/pull/241))
+
+#### 한국어
+
+- README 가 코드와 맞게 됐다. 거짓 일곱 가지를 고쳤고(권장 설치 경로가 거꾸로 적힌 것, 프라이버시 글로브가 뒤집힌 것 포함), 처음 쓰는 사람을 놀라게 하는 동작 다섯 가지를 처음으로 문서화했다. `init` 이 셸 rc 를 고친다는 것, 위키 저장소에 `pre-commit` 훅을 설치한다는 것, `uninstall` 이 둘 다 안 지운다는 것, 기본 ignore 패턴이 부분일치라 평범한 페이지를 삼킬 수 있다는 것, 그리고 두 번째 기기로 기존 위키를 가져오는 플래그가 있다는 것이다. ([#241](https://github.com/sk-lim19f/Hypomnema/pull/241))
+
 ## [1.7.1] - 2026-08-25
 
 ### New Features
