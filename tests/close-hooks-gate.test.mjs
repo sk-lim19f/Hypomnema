@@ -13,6 +13,7 @@ import {
   readFileSync,
   existsSync,
   unlinkSync,
+  chmodSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -30,6 +31,7 @@ import {
   run,
   runApply,
   runHook,
+  seedCloseTranscript,
   sessionCloseFileStatus,
   sessionLogReadCandidates,
   sessionLogShardPath,
@@ -1056,10 +1058,10 @@ test(
 );
 
 test(
-  "KNOWN WINDOW: once Stop-chain auto-commit (the REAL commitTouchedPaths path, " +
+  'KNOWN WINDOW: once Stop-chain auto-commit (the REAL commitTouchedPaths path, ' +
     'hooks/hypo-auto-commit.mjs → hypo-shared.mjs:1854) clears touched-paths, the ' +
     "structural signal is gone in the NEXT turn — pins the guard's documented " +
-    "one-turn window, not a claim that it always catches (mirrors how PR #226 " +
+    'one-turn window, not a claim that it always catches (mirrors how PR #226 ' +
     'pinned its own gap)',
   () => {
     withWiki(null, (dir) => {
@@ -1148,28 +1150,25 @@ test(
   },
 );
 
-test(
-  'CASE FOLDING: the reverse pairing direction also folds case (Session-State.md)',
-  () => {
-    withWiki(null, (dir) => {
-      recordTouchedPaths(dir, 'sess-case-2', 'projects/test-project/hot.md');
-      const r = runHook(
-        'hypo-close-guard.mjs',
-        {
-          session_id: 'sess-case-2',
-          tool_name: 'Write',
-          tool_input: {
-            file_path: join(dir, 'projects', 'test-project', 'Session-State.md'),
-            content: '# ordinary wrap-up, no close wording\n',
-          },
+test('CASE FOLDING: the reverse pairing direction also folds case (Session-State.md)', () => {
+  withWiki(null, (dir) => {
+    recordTouchedPaths(dir, 'sess-case-2', 'projects/test-project/hot.md');
+    const r = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-case-2',
+        tool_name: 'Write',
+        tool_input: {
+          file_path: join(dir, 'projects', 'test-project', 'Session-State.md'),
+          content: '# ordinary wrap-up, no close wording\n',
         },
-        { HYPO_DIR: dir },
-      );
-      const out = JSON.parse(r.stdout);
-      assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
-    });
-  },
-);
+      },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
+  });
+});
 
 suite('hypo-close-guard.mjs — undecidable structural signal (ask, conservative)');
 
@@ -1290,11 +1289,7 @@ test('ISSUE-74 must not regress: a genuine user close signal in the transcript i
       },
       { HYPO_DIR: dir },
     );
-    assert.equal(
-      r.stdout.trim(),
-      '',
-      `a genuine user close must not be re-asked: ${r.stdout}`,
-    );
+    assert.equal(r.stdout.trim(), '', `a genuine user close must not be re-asked: ${r.stdout}`);
   });
 });
 
@@ -1333,5 +1328,186 @@ test('touched-paths accumulated for a DIFFERENT session_id does not leak into th
       { HYPO_DIR: dir },
     );
     assert.equal(r.stdout.trim(), '', `must not print an explicit allow: ${r.stdout}`);
+  });
+});
+
+// ── close-gate resolution wiring (T3, decision 5) ───────────────────────────
+// Resolution is written at the ONE success exit path (`ok`), independent of
+// whether the per-session marker below it actually lands. Both writers go
+// through `hooks/close-gate-store.mjs`'s Buffer-only contract: a caller that
+// decodes the transcript to a string first would get a `null` stamp and a
+// silent no-write, so every assertion here reads the resolution FILE back
+// off disk rather than trusting a function's return value alone.
+suite('close-gate resolution wiring (T3, decision 5)');
+
+test('a successful apply records a real closedAtIndex and closedPrefixSha on disk', () => {
+  withCleanWiki((wiki) => {
+    const today = todayLocal();
+    const projDir = join(wiki, 'projects', 'test-project');
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: { content: readFileSync(join(projDir, 'session-state.md'), 'utf-8') },
+      projectHot: { content: readFileSync(join(projDir, 'hot.md'), 'utf-8') },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] test session\n` },
+      log: { entry: `## [${today}] session | test-project\n` },
+    };
+    const sessionId = 's-t3-success';
+    const r = runApply(wiki, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `apply must succeed: ${r.stdout}\n${r.stderr}`);
+
+    const gatePath = join(wiki, '.cache', 'close-gate', `${sessionId}.json`);
+    assert.ok(existsSync(gatePath), 'the resolution file must actually exist on disk');
+    const recorded = JSON.parse(readFileSync(gatePath, 'utf-8'));
+    assert.equal(recorded.v, 1);
+    assert.equal(recorded.sessionId, sessionId);
+    // Pins the exact failure mode this task warns about: a caller that reads
+    // the transcript WITH an encoding argument gets a lossy string,
+    // resolutionStamp(string) returns null, and recordGateClosed silently
+    // writes nothing. A return-value-only check cannot tell that apart from
+    // success; reading the bytes back off disk can.
+    assert.ok(
+      Number.isSafeInteger(recorded.closedAtIndex) && recorded.closedAtIndex >= 1,
+      `closedAtIndex must be a real positive integer, got ${JSON.stringify(recorded.closedAtIndex)}`,
+    );
+    assert.equal(typeof recorded.closedPrefixSha, 'string');
+    assert.equal(recorded.closedPrefixSha.length, 64, 'sha256 hex digest must be 64 chars');
+  });
+});
+
+test('a marker withheld by a real vault-commit failure still gets its close-gate resolution recorded (decision 5)', () => {
+  withCleanWiki((wiki) => {
+    const today = todayLocal();
+    // Force the vault's OWN internal commit (crystallize's commitWikiChanges)
+    // to fail, independent of everything this apply itself verifies: a
+    // pre-commit hook that always rejects. This is a REAL git failure, not a
+    // simulated one — the payload writes and verification already happened
+    // before this runs, so `ok` must still read true; only the marker (which
+    // additionally requires a clean commit) should be withheld.
+    const hooksDir = join(wiki, '.git', 'hooks');
+    mkdirSync(hooksDir, { recursive: true });
+    const hookPath = join(hooksDir, 'pre-commit');
+    writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+    chmodSync(hookPath, 0o755);
+
+    const projDir = join(wiki, 'projects', 'test-project');
+    // Every field below is a no-op (identical to what's already on disk from
+    // buildCleanWikiTree) — a byte CHANGE to an overwrite field this session
+    // has no prior observed base for is its own conflict (base-unknown), a
+    // different failure this test does not want. What still gives the
+    // internal commit something to stage is `ensureProjectIndex`: apply
+    // unconditionally seeds `projects/test-project/index.md` on its first
+    // close (this fixture never created one), so the commit step is never
+    // a no-op and always reaches the pre-commit hook below.
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: { content: readFileSync(join(projDir, 'session-state.md'), 'utf-8') },
+      projectHot: { content: readFileSync(join(projDir, 'hot.md'), 'utf-8') },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] test session\n` },
+      log: { entry: `## [${today}] session | test-project\n` },
+    };
+    const sessionId = 's-t3-marker-withheld';
+    const r = runApply(wiki, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.ok,
+      true,
+      `apply must still succeed on a vault-commit failure: ${r.stdout}\n${r.stderr}`,
+    );
+    assert.equal(out.markerWritten, false, 'the marker must be withheld on a real commit failure');
+    assert.ok(
+      /^commit-failed:/.test(out.markerSkipReason || ''),
+      `expected a commit-failed skip reason, got ${JSON.stringify(out.markerSkipReason)}`,
+    );
+
+    // This is decision 5 itself: the resolution must exist even though the
+    // marker branch (gated on a clean commit) never wrote anything.
+    const gatePath = join(wiki, '.cache', 'close-gate', `${sessionId}.json`);
+    assert.ok(
+      existsSync(gatePath),
+      'the resolution file must exist even though the marker was withheld',
+    );
+    const recorded = JSON.parse(readFileSync(gatePath, 'utf-8'));
+    assert.equal(recorded.sessionId, sessionId);
+    assert.ok(Number.isSafeInteger(recorded.closedAtIndex) && recorded.closedAtIndex >= 1);
+    assert.equal(typeof recorded.closedPrefixSha, 'string');
+    assert.equal(recorded.closedPrefixSha.length, 64);
+  });
+});
+
+test('a failed apply leaves no close-gate resolution behind', () => {
+  withCleanWiki((wiki) => {
+    const today = todayLocal();
+    const projDir = join(wiki, 'projects', 'test-project');
+    const payload = {
+      project: 'test-project',
+      date: today,
+      // A genuine user close signal already authorized this apply (runApply
+      // seeds one below) — this is not an early auth refusal. The writes are
+      // attempted and only the post-write freshness check fails, because
+      // this `updated:` date can never be "today".
+      sessionState: {
+        content:
+          '---\ntitle: session-state\ntype: session-state\nupdated: 2000-01-01\n---\n\nstale\n',
+      },
+      projectHot: { content: readFileSync(join(projDir, 'hot.md'), 'utf-8') },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] test session\n` },
+      log: { entry: `## [${today}] session | test-project\n` },
+    };
+    const sessionId = 's-t3-apply-failed';
+    const r = runApply(wiki, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false, `apply must fail on the stale field: ${r.stdout}\n${r.stderr}`);
+
+    const gatePath = join(wiki, '.cache', 'close-gate', `${sessionId}.json`);
+    assert.equal(existsSync(gatePath), false, 'a failed apply must leave no resolution file');
+  });
+});
+
+test('SessionEnd(reason="clear") records a close-gate resolution', () => {
+  withTmpDir((dir) => {
+    const sessionId = 's-t3-clear';
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const r = runHook(
+        'hypo-session-end.mjs',
+        { reason: 'clear', session_id: sessionId },
+        { HYPO_DIR: dir },
+      );
+      assert.equal(r.status, 0, `hook must exit 0: ${r.stderr}`);
+      const gatePath = join(dir, '.cache', 'close-gate', `${sessionId}.json`);
+      assert.ok(existsSync(gatePath), 'reason=clear must record a resolution');
+      const recorded = JSON.parse(readFileSync(gatePath, 'utf-8'));
+      assert.equal(recorded.sessionId, sessionId);
+      assert.ok(Number.isSafeInteger(recorded.closedAtIndex) && recorded.closedAtIndex >= 1);
+      assert.equal(typeof recorded.closedPrefixSha, 'string');
+      assert.equal(recorded.closedPrefixSha.length, 64);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a non-clear SessionEnd reason records nothing', () => {
+  withTmpDir((dir) => {
+    const sessionId = 's-t3-not-clear';
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const r = runHook(
+        'hypo-session-end.mjs',
+        { reason: 'prompt_input_exit', session_id: sessionId },
+        { HYPO_DIR: dir },
+      );
+      assert.equal(r.status, 0, `hook must exit 0: ${r.stderr}`);
+      const gatePath = join(dir, '.cache', 'close-gate', `${sessionId}.json`);
+      assert.equal(existsSync(gatePath), false, 'a non-clear reason must not record a resolution');
+    } finally {
+      cleanup();
+    }
   });
 });
