@@ -4508,11 +4508,15 @@ export function resolveTranscriptBySessionId(
  *             queue-op; a remove-path queued_command attachment carrying a
  *             close with an audited human producer (origin.kind "human"); a
  *             correlated, non-error AskUserQuestion answer naming a close.
- *   • CLOSE   a fresh user intent that closes the gate: any other genuine user
- *             text that is not a close phrase, `/clear`, `popAll`, a non-close
- *             queued_command, a non-close AskUserQuestion selection, or typed
- *             text matching {@link isCloseRetractionPattern} (the retraction
- *             tripwire).
+ *   • CLOSE   a fresh user intent that closes the gate: `/clear`, `popAll`, a
+ *             non-close queued_command, a decline answering an AskUserQuestion
+ *             whose own prompt carried {@link CLOSE_RECONFIRM_MARK} (ours, so
+ *             the decline rejects OUR close question and nobody else's), or
+ *             typed text matching {@link isCloseRetractionPattern} (the
+ *             retraction tripwire). Two things that used to close no longer do:
+ *             plain typed text that is merely not a close phrase, and an
+ *             ordinary non-close answer to an unmarked question. Both are
+ *             NEUTRAL below.
  *   • NEUTRAL everything the model can produce or the harness injects: system/
  *             sdk replay, isMeta bodies, sidechain, interruptedMessageId
  *             companions, a command-invocation record, assistant,
@@ -4682,6 +4686,17 @@ export function walkCloseGate(transcriptPath) {
   // staleness limit, mitigated the same way: any later live user intent, on any
   // branch, still closes it.
   const askIds = new Set();
+  // Subset of askIds whose tool_use input carries CLOSE_RECONFIRM_MARK, i.e.
+  // it IS our close-reconfirm prompt, not some unrelated question the model
+  // happens to ask around the same time. Same correlation guard
+  // isCloseReconfirmDeclined uses (see its doc comment below), reimplemented
+  // here rather than calling that function: its re-arm rule only recognizes a
+  // typed close phrase, which misses the three new openers this walk already
+  // tracks (a queued /compact, a human-origin queued delivery, an
+  // AskUserQuestion close answer). Driving decline off this walk instead means
+  // any of those already reopens the gate for free, with no separate re-arm
+  // rule to keep in sync.
+  const markedAskIds = new Set();
   let open = false;
   let openedAtIndex = -1;
 
@@ -4744,12 +4759,15 @@ export function walkCloseGate(transcriptPath) {
     }
 
     // Record AskUserQuestion tool_use ids (assistant record, always precedes its
-    // answer in line order).
+    // answer in line order), and separately mark the ones that ARE our
+    // close-reconfirm prompt (input carries CLOSE_RECONFIRM_MARK).
     const content = (o.message ?? o).content;
     if (Array.isArray(content)) {
       for (const b of content) {
         if (!b || typeof b !== 'object' || b.type !== 'tool_use' || !b.id) continue;
-        if (b.name === 'AskUserQuestion') askIds.add(b.id);
+        if (b.name !== 'AskUserQuestion') continue;
+        askIds.add(b.id);
+        if (JSON.stringify(b.input ?? null).includes(CLOSE_RECONFIRM_MARK)) markedAskIds.add(b.id);
       }
     }
 
@@ -4772,7 +4790,20 @@ export function walkCloseGate(transcriptPath) {
     // record from reaching the answer parser. is_error:false AND the host's
     // success marker are required because a malformed AskUserQuestion echoes the
     // raw input back in an is_error result, and the model authors the option
-    // labels. A close selection opens the gate; any other real selection closes it.
+    // labels.
+    //
+    // T5: a close phrase in the answer opens the gate, same as before. But a
+    // decline no longer closes it on its own: only a decline answering a
+    // MARKED prompt (ours, see markedAskIds above) does. Every other answer,
+    // including a non-close, non-decline click and a decline to an unmarked
+    // question, is neutral. The old default (any other real selection closed
+    // the gate) let a reflection question the close skill's own Step 1a asks
+    // mid-procedure cancel the approval that started that procedure: the
+    // model asks something adjacent, the user answers plainly, and the answer
+    // was not a close phrase, so the old rule read it as a change of mind.
+    // The loss this buys: an unmarked question answered with "지금 종료하지
+    // 말아 줘" (a real request to keep going, just not phrased as a decline
+    // to OUR prompt) now passes through neutral instead of closing the gate.
     if (Array.isArray(content) && !isModelReachableRecord(o)) {
       for (const b of content) {
         if (!b || typeof b !== 'object') continue;
@@ -4780,17 +4811,29 @@ export function walkCloseGate(transcriptPath) {
         if (b.is_error === true) continue;
         const s = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
         if (!/have been answered/.test(s)) continue;
-        let sawAnswer = false;
         let sawClose = false;
+        let sawDecline = false;
         for (const m of s.matchAll(/="([^"]*)"/g)) {
-          sawAnswer = true;
+          // Independent checks, not else-if: a marked prompt's decline option
+          // can itself contain close wording (the model authors the text),
+          // and the decline-wins priority below only works if sawDecline gets
+          // set even when the same string also matches isClosePattern.
           if (isClosePattern(m[1])) sawClose = true;
+          if (CLOSE_RECONFIRM_DECLINE_WORDS.test(m[1])) sawDecline = true;
         }
-        if (sawClose) {
+        // A decline on a MARKED prompt wins over a close match checked on the
+        // same answer. The model authors the option text, and a marked prompt
+        // exists precisely to ask "close now, yes or no", so an answer that
+        // reads as a decline of THAT question must not be overridable by a
+        // close phrase riding along elsewhere in the same answer string. If
+        // the close check ran first, the model could word a decline option to
+        // also contain a close phrase and force the gate open on its own
+        // rejection.
+        if (sawDecline && markedAskIds.has(b.tool_use_id)) {
+          open = false;
+        } else if (sawClose) {
           open = true;
           openedAtIndex = i;
-        } else if (sawAnswer) {
-          open = false;
         }
       }
     }
@@ -4930,6 +4973,16 @@ export function hasPendingBackgroundWork(payload) {
 // reason silently break this correlation with no test to catch it.
 export const CLOSE_RECONFIRM_MARK = '지금 닫기';
 
+// The decline vocabulary shared by walkCloseGate's marked-reconfirm click
+// branch and isCloseReconfirmDeclined below. One constant so the two walks
+// cannot drift into recognizing different words for the same "not now"
+// answer: they stay separate WALKS on purpose (isCloseReconfirmDeclined's
+// re-arm rule only recognizes a typed close phrase, which is too narrow for
+// walkCloseGate's other openers), but the vocabulary they match against is
+// one value, not two copies that a future edit could update in only one
+// place.
+const CLOSE_RECONFIRM_DECLINE_WORDS = /(아직|나중|not\s?yet|later)/i;
+
 /**
  * True iff the LATEST correlated AskUserQuestion answer in the transcript
  * declined an autoclose reconfirm prompt ("아직" / "나중" / "not yet" /
@@ -4975,7 +5028,6 @@ export function isCloseReconfirmDeclined(transcriptPath) {
   } catch {
     return false;
   }
-  const DECLINE = /(아직|나중|not\s?yet|later)/i;
   const askIds = new Set();
   let declined = false;
   for (const line of lines) {
@@ -5024,7 +5076,7 @@ export function isCloseReconfirmDeclined(transcriptPath) {
       if (b.type === 'tool_result' && b.tool_use_id && askIds.has(b.tool_use_id)) {
         const s = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
         for (const m of s.matchAll(/="([^"]*)"/g)) {
-          if (DECLINE.test(m[1])) declined = true;
+          if (CLOSE_RECONFIRM_DECLINE_WORDS.test(m[1])) declined = true;
         }
       }
     }

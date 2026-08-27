@@ -1382,9 +1382,15 @@ test('AskUserQuestion is_error echo of a close phrase → false', () => {
   });
 });
 
-// A non-close AskUserQuestion selection after a close is a fresh user decision,
-// so it expires the lease (the "still continue" click retracts the close).
-test('close, then a non-close AskUserQuestion selection → false (lease expires)', () => {
+// T5 flip: a non-close AskUserQuestion selection used to expire the lease (the
+// old default closed on ANY non-close click). It no longer does. A reflection
+// question the close skill's own Step 1a asks mid-procedure produced this
+// exact shape, an ordinary click answering an unrelated question, and the old
+// rule read it as the user changing their mind and cancelled the approval that
+// started the procedure. Now only a close phrase in the answer opens the gate,
+// and only a decline answering OUR MARKED close-reconfirm prompt closes it
+// (see the click-axis reconfirm suite below); an ordinary click is neutral.
+test('close, then a non-close AskUserQuestion selection → true (no longer expires the lease)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [
       USER(CLOSE),
@@ -1406,7 +1412,7 @@ test('close, then a non-close AskUserQuestion selection → false (lease expires
         },
       },
     ]);
-    assert.equal(isCloseGateOpen(p), false);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -1748,14 +1754,20 @@ test('empty string and non-string input → false', () => {
   assert.equal(isCloseRetractionPattern(42), false);
 });
 
-// NOT A CHANNEL (removed after review): an AskUserQuestion answer that is not a
-// close still expires the lease, including phrasings no retraction list would have
-// held. This is the fail-closed direction the repo's unknown-enum rule asks for.
-test('a non-close AskUserQuestion answer expires the lease, whatever its wording', () => {
+// T5 flip: this used to pin the fail-closed direction (any non-close answer
+// expires the lease, whatever its wording). That direction is gone; a click
+// axis that closed on any unrecognized answer is exactly the default that let
+// an unrelated mid-procedure question cancel a real approval. Now the answer
+// is neutral unless it names a close, or declines OUR MARKED reconfirm prompt.
+// The loss this buys: '지금 종료하지 말아 줘' is a genuine request to keep
+// going, but it is not a close phrase and this question is not marked, so it
+// now passes through neutral instead of closing, same as the other three
+// unrelated wordings below.
+test('a non-close AskUserQuestion answer on an unmarked question is neutral, whatever its wording', () => {
   withTmpDir((dir) => {
     for (const picked of ['지금 종료하지 말아 줘', '지금 쓴다', '3개', 'whatever']) {
       const p = writeJsonl(dir, [USER(CLOSE), ASK('q'), ANSWER('q', picked)]);
-      assert.equal(isCloseGateOpen(p), false, picked);
+      assert.equal(isCloseGateOpen(p), true, picked);
     }
   });
 });
@@ -1783,6 +1795,170 @@ test('typed non-close text after the approval line still expires the lease', () 
       TYPED('하나만 더 해줘'),
     ]);
     assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// ── T5: click axis, marked reconfirm decline only ──────────────────────────
+// A close answer still opens the gate exactly as before. The other half of
+// the click axis is new: an answer no longer closes the gate just for not
+// naming a close. Only a decline answering OUR marked close-reconfirm prompt
+// (askCloseReconfirmToolUse, correlated via CLOSE_RECONFIRM_MARK) closes it,
+// and any of the four openers this walk already recognizes reopens it right
+// after, the same as it would after any other close.
+suite('isCloseGateOpen() click axis: marked reconfirm decline only (T5)');
+
+test('a decline answering OUR marked close-reconfirm prompt closes an open gate', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      askCloseReconfirmToolUse('q1'),
+      ANSWER('q1', '아직, 계속'),
+    ]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// A decline that ALSO contains close wording (the model authors the option
+// text, so it could word a decline to carry a close phrase too) must still
+// close: the decline branch is checked first for a marked prompt, and only
+// falls through to the close check when the answer did not decline.
+// Otherwise a marked reconfirm's own "no" option would be a forgeable way to
+// force the gate open on the user's own rejection.
+test('a decline that also carries close wording still closes, on a marked prompt (decline wins)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      askCloseReconfirmToolUse('q1'),
+      ANSWER('q1', '나중에 세션 마무리'),
+    ]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+test('an English decline that also carries close wording still closes, on a marked prompt (decline wins)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      askCloseReconfirmToolUse('q1'),
+      ANSWER('q1', 'not yet, wrap up later'),
+    ]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// COVERAGE GAP (found in review): every T5 assertion above starts from an
+// ALREADY-OPEN gate (USER(CLOSE) first), so a neutral answer and an
+// opening answer read the same isCloseGateOpen(p) === true and no assertion
+// tells them apart. A sabotage that made every AskUserQuestion answer open
+// the gate (`if (m[1] !== undefined) sawClose = true;` in place of
+// `if (isClosePattern(m[1])) sawClose = true;`) passed the whole suite
+// green. These three start from a transcript with NO initiation record at
+// all (no typed close, no /compact enqueue, no queued delivery), so a
+// non-close answer opening the gate has nowhere to hide.
+test('no initiation at all, then an UNMARKED non-close AskUserQuestion answer, stays closed (does not open)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [ASK('q'), ANSWER('q', '3개')]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// Being marked (askCloseReconfirmToolUse) grants no opening authority of its
+// own: it only narrows what CLOSES an already-open gate. A non-close,
+// non-decline answer to a marked prompt, with no prior initiation, must stay
+// closed exactly like the unmarked case above.
+test('no initiation at all, then a MARKED non-close non-decline AskUserQuestion answer, stays closed (marked grants no opening authority)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [askCloseReconfirmToolUse('q1'), ANSWER('q1', '3개')]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// The priority flip above is scoped to a MARKED prompt only: markedAskIds.has
+// gates the decline branch, so an unmarked question's close answer is
+// unaffected and still opens the gate exactly as before. This fixture also
+// has NO prior initiation record, so it doubles as the positive twin of the
+// two closed-gate tests above: with no initiation at all, a close-naming
+// answer is what actually opens the gate, nothing else does.
+test('a close answer to an UNMARKED question still opens the gate (priority flip does not touch the opening axis)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [ASK('q'), ANSWER('q', '세션 마무리')]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+// SOURCE SCAN: walkCloseGate and isCloseReconfirmDeclined must match the SAME
+// decline vocabulary, or the two walks quietly drift apart on what counts as
+// "not now". Counting the literal regex text (not calling either function)
+// pins that the pattern is defined once and referenced, not copied.
+test('the reconfirm decline vocabulary regex literal is defined in exactly one place in the source', () => {
+  const src = readFileSync(join(REPO, 'hooks', 'hypo-shared.mjs'), 'utf-8');
+  const literal = '/(아직|나중|not\\s?yet|later)/i';
+  const occurrences = src.split(literal).length - 1;
+  assert.equal(occurrences, 1, 'the decline regex literal must be defined once and shared');
+});
+
+test('the same decline wording answering an UNMARKED question does not close the gate', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [USER(CLOSE), ASK('q'), ANSWER('q', '아직, 계속')]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+test('after a marked decline closes the gate, a typed close phrase reopens it', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      askCloseReconfirmToolUse('q1'),
+      ANSWER('q1', '아직, 계속'),
+      TYPED('세션 마무리 해줘'),
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+test('after a marked decline closes the gate, a queued /compact reopens it', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      askCloseReconfirmToolUse('q1'),
+      ANSWER('q1', '아직, 계속'),
+      QOP('enqueue', '/compact'),
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+test('after a marked decline closes the gate, a human-origin queued close delivery reopens it', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      askCloseReconfirmToolUse('q1'),
+      ANSWER('q1', '아직, 계속'),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: '세션 마무리 해줘',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+test('after a marked decline closes the gate, a fresh AskUserQuestion close answer reopens it', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      askCloseReconfirmToolUse('q1'),
+      ANSWER('q1', '아직, 계속'),
+      ASK('q2'),
+      ANSWER('q2', '세션 마무리 해줘'),
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
