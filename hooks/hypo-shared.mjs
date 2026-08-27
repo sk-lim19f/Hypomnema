@@ -4306,9 +4306,41 @@ export function isClosePattern(text) {
   return [...krPatterns, ...enPatterns].some((re) => re.test(text));
 }
 
+/**
+ * Retraction TRIPWIRE for the close gate — a mitigation that can only CLOSE the
+ * gate, never open it. The gate no longer has its old per-turn overwrite (any
+ * typed text that was not a close phrase used to expire the approval outright),
+ * because an unknown typed phrase must not silently retract an approval the
+ * user actually gave — that is what turned the close skill's own "did you mean
+ * X or Y" reflection question into a false retraction. Under the new
+ * rule, typed text that is neither a close phrase nor a retraction phrase is
+ * NEUTRAL: it leaves the gate exactly where it was.
+ *
+ * This function is the one deliberate exception, and its asymmetry is the
+ * safety property: a phrase MISSING from the corpus below just falls through
+ * to neutral, which is the ordinary, already-accepted behaviour of an unknown
+ * typed message. So the corpus can be grown at any time without weakening an
+ * existing guarantee — the worst case of a miss is a gate that stays open,
+ * not one that opens when it should not. That asymmetry is also why this is
+ * NOT a counterexample to the rule that a defence is written as an effect,
+ * not a name list: a name list is dangerous exactly when it backs a GRANT,
+ * because the one name missing from it is a silent bypass. Here the missing
+ * name is a silent no-op.
+ *
+ * If this function is ever consumed by an opening decision instead of a
+ * closing one, that asymmetry disappears and the rule for an unknown
+ * value (route to the cautious branch) applies again — do not repurpose it
+ * without re-deriving the corpus under that rule.
+ */
+export function isCloseRetractionPattern(text) {
+  if (!text || typeof text !== 'string') return false;
+  const patterns = [/아\s*잠깐,?\s*이(?:것도|거)\s*(?:먼저\s*)?고쳐줘/, /하나만\s*더\s*해줘/];
+  return patterns.some((re) => re.test(text));
+}
+
 // ── close ARTIFACTS, not the marker (issue: close gate lives on one writer) ──
 //
-// hasUserCloseSignal/isClosePattern answer "did the user ask to close" — the
+// isCloseGateOpen/isClosePattern answer "did the user ask to close" — the
 // input side of the gate. This answers a different question: "does this file
 // or commit message already READ as closed to a human", independent of
 // whether any marker writer ever ran. The 2026-07-28 incident produced a
@@ -4464,77 +4496,65 @@ export function resolveTranscriptBySessionId(
 }
 
 /**
- * Returns true iff the transcript's LATEST live user decision is to close — the
- * hard gate for the session-closed marker writers. This is a state predicate, not
- * an existence one: "is close still approved right now", not "did a
- * close signal ever appear". Scans the FULL transcript in line order, classifies
- * each record, and tracks the approval as a LEASE.
+ * Internal walk: does this transcript's typed/queued/answered event history
+ * currently leave the close gate OPEN? This is the TRANSCRIPT axis only — a
+ * resolution recorded separately in the vault (`close-gate-store.mjs`)
+ * can only narrow this result further, never widen it, and is computed
+ * elsewhere entirely.
  *
  * Classification (structural fields only — never content heuristics for producer):
- *   • GRANT      a genuine user close: an NL close phrase in user text that
- *                survives {@link eventUserText}'s exclusions; a `/compact`
- *                queue-op; a remove-path queued_command attachment carrying a
- *                close with an audited human producer (origin.kind "human"); a
- *                correlated, non-error AskUserQuestion answer naming a close.
- *   • INVALIDATE a fresh user intent that expires the lease: any other genuine
- *                user text, `/clear`, `popAll`, a non-close queued_command, a
- *                non-close AskUserQuestion selection.
- *   • NEUTRAL    additionally: a typed `apply-proposals <nonce>` whose nonce this
- *                transcript shows `proposal challenge` minting (see "the approval
- *                line" below).
- *   • NEUTRAL    everything the model can produce or the harness injects: system/
- *                sdk replay, isMeta bodies, sidechain, interruptedMessageId
- *                companions, assistant, tool_result, task-notification.
- *   • FATAL      an unparseable line — the transcript is being appended to or is
- *                corrupt, so refuse rather than read a half-written record.
+ *   • OPEN    a genuine user close: an NL close phrase in user text that
+ *             survives {@link eventUserText}'s exclusions; a `/compact`
+ *             queue-op; a remove-path queued_command attachment carrying a
+ *             close with an audited human producer (origin.kind "human"); a
+ *             correlated, non-error AskUserQuestion answer naming a close.
+ *   • CLOSE   a fresh user intent that closes the gate: any other genuine user
+ *             text that is not a close phrase, `/clear`, `popAll`, a non-close
+ *             queued_command, a non-close AskUserQuestion selection, or typed
+ *             text matching {@link isCloseRetractionPattern} (the retraction
+ *             tripwire).
+ *   • NEUTRAL everything the model can produce or the harness injects: system/
+ *             sdk replay, isMeta bodies, sidechain, interruptedMessageId
+ *             companions, a command-invocation record, assistant,
+ *             tool_result, task-notification — and, under the current rule, any typed
+ *             text that is neither a close phrase nor a retraction phrase. An
+ *             unrecognized message must not silently close a gate the user
+ *             already opened; that per-turn overwrite (`granted =
+ *             isClosePattern(userText)` on every typed record) is exactly what
+ *             produced the close skill's own reflection question reading as a
+ *             retraction, and is what this walk replaces.
+ *   • FATAL   an unparseable line — the transcript is being appended to or is
+ *             corrupt, so refuse rather than read a half-written record.
  *
- * The last grant wins and a later invalidate expires it, so a stale close (Defect
- * B), a queued "keep working" after a close, and a non-close AskUserQuestion
- * selection all correctly read as NOT closed. Abandoned-branch staleness is a
- * known limit (no leaf pointer exists to resolve it — see the branch note on the
- * function), mitigated by the lease.
+ * The last OPEN/CLOSE event wins, so a stale close (Defect B), a queued "keep
+ * working" after a close, and a non-close AskUserQuestion selection all
+ * correctly read as not open. Abandoned-branch staleness is a known limit (no
+ * leaf pointer exists to resolve it — see the branch note in the body),
+ * mitigated the same way: any later live user intent, on any branch, still
+ * closes it.
  *
- * THE APPROVAL LINE IS NOT A CHANGE OF MIND. The lease exists to catch a user who
- * changed their mind, and it also caught the user for doing what the close
- * procedure told them to do. `proposal challenge` instructs the user to type
- * `apply-proposals <nonce>`, which can never be a close phrase, so typing it
- * expired the close grant given a turn earlier (measured 2026-08-06: the close
- * needed three approval round trips because of it). Two gates read one transcript
- * under two rules, and passing one broke the other.
- *
- * So one carve-out: a user message that IS the approval line, for a nonce this
- * transcript shows being minted, is NEUTRAL. It never grants; a lease that was not
- * already live stays dead. The mint has to be correlated, not merely present:
- * `collectMinted` reads only a tool_result correlated to a Bash tool_use, and only
- * when the surrounding challenge framing is there too, so a hex the model typed in
- * its own prose (or any other tool's output) is not a mint. Order is part of it:
- * the set fills as the walk goes, so a message can never mint the nonce it spends.
- * An unminted hex is ordinary text and still expires the lease.
- *
- * What this does NOT cover: an AskUserQuestion answer during the close procedure
- * (the skill's Step 1a reflections) still expires the lease. A carve-out was
- * written for it and withdrawn, because "the answer does not read as a retraction"
- * is fail-open on an open class of phrasings, and this repo routes an unknown value
- * to the cautious branch. Recognizing a close-procedure answer POSITIVELY needs a
- * marker on the question, and the model authors the question. The round trip stays.
+ * The typed `apply-proposals <nonce>` approval line no longer needs its own
+ * carve-out. It used to: the old per-turn rule closed on ANY typed text that
+ * was not itself a close phrase, and the approval line the close procedure
+ * instructs the user to type can never BE a close phrase — so following that
+ * instruction closed the gate the instruction was for (measured 2026-08-06:
+ * three round trips to close because of it). With the per-turn overwrite gone,
+ * the approval line is ordinary typed text — neither a close phrase nor a
+ * retraction phrase — so it falls to NEUTRAL by the same rule every other
+ * unrecognized message gets, with no special case required.
  *
  * Threat model: an honest-but-drifting model that does not forge the
- * transcript. This is a safety interlock, not an authorization boundary — a model
- * that forges records is out of scope and documented so. The carve-out does not
- * move that boundary: it only PRESERVES a grant the user already gave, so the model
- * still cannot manufacture one. The residual it does carry: a model that runs an
- * arbitrary Bash command can print the challenge framing itself and plant a mint.
- * That buys it nothing on its own, because the user still has to send the approval
- * line, and the result is neutrality rather than a grant.
+ * transcript. This is a safety interlock, not an authorization boundary — a
+ * model that forges records is out of scope and documented so.
  *
- * A command invocation is NOT a channel here. `/hypo:crystallize` typed by the user
- * was accepted as a grant for one review round and removed: the harness records a
- * model-issued Skill call as the same non-meta `<command-name>` user record
- * (verified against Claude Code 2.1.243's `processPromptSlashCommand`), so the
- * model could have closed the session by calling its own skill. The premise that a
- * command tag proves a human typed it is false.
+ * Fail-closed: any read/parse error → not open.
  *
- * Fail-closed: any read/parse error, or an unresolvable branch, → false.
+ * @returns {{open: boolean, openedAtIndex: number}} `openedAtIndex` is the
+ *   position, in the FATAL-filtered record array this walk builds internally
+ *   (blank lines dropped, non-object JSON values dropped, first parse failure
+ *   returns early), of the most recent event that opened the gate, or -1 if
+ *   none ever did. `close-gate-store.mjs`'s `resolutionStamp` counts records
+ *   by the same definition, so the two indices are comparable.
  */
 // Genuine user text of a record, or null when the record is on a channel the
 // honest-but-drifting model can reach (so it is never user intent — NEUTRAL).
@@ -4549,10 +4569,20 @@ export function resolveTranscriptBySessionId(
 //                       companion of a delivered /compact)
 //   • Stop-hook feedback  the hook's own close nudge — circular
 //   • tool_result blocks  tool output, not typed text
+//   • a command-invocation tag (<command-name>/<command-message>/<command-args>)
+//     anywhere in the text. Claude Code routes a model-issued Skill
+//     call through the same processPromptSlashCommand path a human's typed
+//     `/hypo:crystallize` goes through, and both land as this identical
+//     non-meta role:user record — so a tag proves nothing about who produced
+//     it. Excluding the whole text, not just the tag substring, means a close
+//     phrase riding along in <command-args> (e.g. `/hypo:crystallize 세션
+//     마무리해줘`) cannot open the gate either; the user still opens it by
+//     saying the same words in plain text.
 // No promptSource allowlist is required: requiring `typed` would drop the
 // legacy absent-promptSource close the older gate has always honoured, while the
 // dangerous replay/injection paths carry system|sdk|isMeta|isSidechain and are
 // excluded here anyway.
+const COMMAND_INVOCATION_TAG = /<command-(?:name|message|args)>/;
 function eventUserText(obj) {
   if (obj.isMeta === true) return null;
   if (obj.promptSource === 'system' || obj.promptSource === 'sdk') return null;
@@ -4562,16 +4592,42 @@ function eventUserText(obj) {
   const role = msg.role ?? obj.role ?? obj.type;
   if (role !== 'user') return null;
   const content = msg.content ?? obj.content;
+  let text = null;
   if (typeof content === 'string') {
-    return content.startsWith('Stop hook feedback') ? null : content;
-  }
-  if (Array.isArray(content)) {
+    text = content.startsWith('Stop hook feedback') ? null : content;
+  } else if (Array.isArray(content)) {
     const texts = content
       .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
       .map((b) => b.text);
-    return texts.length ? texts.join('\n') : null;
+    text = texts.length ? texts.join('\n') : null;
+    // A command-invocation tag split across adjacent text blocks (e.g.
+    // '<command-na' + 'me>/hypo:crystallize</command-name>') would survive the
+    // '\n'-joined `text` above with a newline spliced into the middle of the
+    // tag name, so the plain check below can miss it entirely. Today's actual
+    // host format sends the whole invocation as ONE string, so this exact
+    // split is not reproducible against a live session yet — but a check for
+    // "did the host format ever put the tag exactly on a block boundary"
+    // should not depend on where a future host happens to cut the blocks. So
+    // also test each run of CONSECUTIVE text blocks joined with no separator.
+    // This must stay scoped to consecutive text blocks only, never the whole
+    // array: joining across a non-text block in between (an image, say) would
+    // synthesize a tag that never existed in the real content, and that is a
+    // different bug, not a fix — it would throw away a genuine close spoken
+    // next to an unrelated attachment. So a non-text block ends the current
+    // run and starts a new one; it never bridges two runs into one string.
+    let tightRun = '';
+    for (const b of content) {
+      if (b && b.type === 'text' && typeof b.text === 'string') {
+        tightRun += b.text;
+        continue;
+      }
+      if (COMMAND_INVOCATION_TAG.test(tightRun)) return null;
+      tightRun = '';
+    }
+    if (COMMAND_INVOCATION_TAG.test(tightRun)) return null;
   }
-  return null;
+  if (text != null && COMMAND_INVOCATION_TAG.test(text)) return null;
+  return text;
 }
 
 // A record on a channel the honest-but-drifting model can reach, so it can never
@@ -4586,17 +4642,17 @@ function isModelReachableRecord(obj) {
   );
 }
 
-export function hasUserCloseSignal(transcriptPath) {
-  if (!transcriptPath) return false;
+export function walkCloseGate(transcriptPath) {
+  if (!transcriptPath) return { open: false, openedAtIndex: -1 };
   let raw;
   try {
     raw = readFileSync(transcriptPath, 'utf-8');
   } catch {
-    return false;
+    return { open: false, openedAtIndex: -1 };
   }
   // FATAL: a non-empty line that will not parse means the transcript is being
   // appended to (a half-written record) or is corrupt. Skipping it would let a
-  // stale prior grant survive past an event we cannot read, so refuse. A line
+  // stale prior open survive past an event we cannot read, so refuse. A line
   // that parses to a non-object (a bare null / string / number) is valid JSON but
   // not a record — noise, not corruption — so it is skipped, not fatal, and never
   // reaches the field reads below.
@@ -4607,136 +4663,107 @@ export function hasUserCloseSignal(transcriptPath) {
     try {
       o = JSON.parse(line);
     } catch {
-      return false;
+      return { open: false, openedAtIndex: -1 };
     }
     if (o === null || typeof o !== 'object') continue;
     recs.push(o);
   }
 
-  // The approval is a LEASE, not an existence fact: walk the transcript in line
-  // order and track whether the LATEST user decision is a grant. Each grant sets
-  // it true, each invalidate sets it false, neutral leaves it — so at the end
-  // `granted` is "the most recent user decision was to close, and nothing has
-  // expired it since", which is how a stale close and a queued change-of-mind
-  // read as NOT closed.
+  // Walk the transcript in line order and track whether the LATEST event opened
+  // or closed the gate — last event wins, so a stale open and a queued
+  // change-of-mind both correctly read as closed.
   //
   // Branch note: line order mixes an abandoned branch's records with the live
   // ones. A leaf-pointer ancestry filter was tried and withdrawn — the transcript
   // carries no authoritative leaf pointer (measured: 0 leafUuid / summary
-  // records), so a heuristic leaf can skip the real invalidator and PRESERVE a
-  // stale grant (a fail-open, not a conservative filter). Until such a pointer
-  // exists, a close on a branch abandoned under a neutral tail is a known
-  // staleness limit, mitigated by the lease: any later live user intent, on any
-  // branch, still expires it.
+  // records), so a heuristic leaf can skip the real closing event and PRESERVE a
+  // stale open (a fail-open, not a conservative filter). Until such a pointer
+  // exists, an open on a branch abandoned under a neutral tail is a known
+  // staleness limit, mitigated the same way: any later live user intent, on any
+  // branch, still closes it.
   const askIds = new Set();
-  // Bash tool_use ids, so a mint can be tied to a command that actually ran rather
-  // than to any string in the file. Filled in the same content scan as askIds.
-  const bashIds = new Set();
-  let granted = false;
-  // The nonces this transcript shows `proposal challenge` minting. Producer, not
-  // just presence: the hex has to arrive in a NON-error tool_result of a Bash
-  // tool_use, wrapped in the challenge's own framing. Model prose carrying a
-  // plausible hex, an isMeta/system body, and any other tool's output all fail
-  // that, which matters because a mint neutralizes the user's next message. The
-  // set fills as the walk goes, so a message cannot mint the nonce it spends.
-  const mintedNonces = new Set();
-  const challengeMint = new RegExp(
-    `must type this line in the conversation:\\s*${APPROVAL_PHRASE} ([a-f0-9]{32,})\\s*Then run: hypomnema proposal resolve`,
-    'g',
-  );
-  const approvalLine = new RegExp(`^${APPROVAL_PHRASE}\\s+([a-f0-9]{32,})$`);
-  const collectMinted = (o) => {
-    const c = (o.message ?? o).content;
-    if (!Array.isArray(c)) return;
-    for (const b of c) {
-      if (!b || typeof b !== 'object') continue;
-      if (b.type !== 'tool_result' || !b.tool_use_id || !bashIds.has(b.tool_use_id)) continue;
-      if (b.is_error === true) continue;
-      const text = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
-      if (typeof text !== 'string' || !text.includes(APPROVAL_PHRASE)) continue;
-      for (const m of text.matchAll(challengeMint)) mintedNonces.add(m[1]);
-    }
-  };
+  let open = false;
+  let openedAtIndex = -1;
 
-  for (const o of recs) {
+  for (let i = 0; i < recs.length; i++) {
+    const o = recs[i];
     // Genuine user text of this record, or null when the record is on a channel
-    // the model can reach. Computed once here: the mint scan below is the exact
-    // complement of it (mint from everything that is NOT the user's own text).
+    // the model can reach (including a command-invocation record).
     const userText = eventUserText(o);
-    if (userText == null) collectMinted(o);
 
     // Queue operations. The queue carries no correlation key (measured), so the
     // ENQUEUE content is the decision — not a later contentless dequeue, which
     // would need pairing we cannot do. Reading the enqueue also keeps the live
     // PreCompact gate working (it sees the enqueue) and avoids double-counting the
     // replay companion of an already-decided item (the /compact replay is not a
-    // fresh decision). popAll cancels the queue → invalidate. Delivery ops
+    // fresh decision). popAll cancels the queue → close. Delivery ops
     // (dequeue, remove) carry no fresh decision here — a content-bearing remove of
     // an NL queued command is handled by its queued_command attachment below.
     if (o.type === 'queue-operation') {
       if (o.operation === 'popAll') {
-        granted = false;
+        open = false;
         continue;
       }
       if (o.operation !== 'enqueue') continue;
       const c = typeof o.content === 'string' ? o.content.trim() : '';
-      if (/^\/compact(?:\s|$)/.test(c))
-        granted = true; // a user compaction preserves the work → grant
-      else if (/^\/clear(?:\s|$)/.test(c))
-        granted = false; // abandons context → invalidate
-      else if (!c || c.startsWith('<task-notification>')) {
+      if (/^\/compact(?:\s|$)/.test(c)) {
+        open = true; // a user compaction preserves the work → open
+        openedAtIndex = i;
+      } else if (/^\/clear(?:\s|$)/.test(c)) {
+        open = false; // abandons context → close
+      } else if (!c || c.startsWith('<task-notification>')) {
         /* model-caused / empty — neutral */
       } else if (isClosePattern(c)) {
         /* NL close via the queue — the open dequeue gap: the producer cannot be
-           attributed (a peer/model enqueue wears the same shape), so no grant */
-      } else granted = false; // a queued non-close user intent → invalidate (change of mind)
+           attributed (a peer/model enqueue wears the same shape), so no open */
+      } else open = false; // a queued non-close user intent → close (change of mind)
       continue;
     }
 
     // remove-path delivery of a queued natural-language command (measured: the
     // item leaves the queue as it is handed to the model, landing as an
-    // `attachment` of type queued_command with the prompt verbatim). A close here
-    // grants ONLY with an audited human producer — origin.kind "human", present
+    // `attachment` of type queued_command with the prompt verbatim). This opens
+    // the gate ONLY with an audited human producer — origin.kind "human", present
     // on every 2.1.181+ user delivery (measured). A legacy origin-absent delivery
-    // cannot attest a producer, so it does not grant (fail-closed). A NON-close
-    // queued command (e.g. "keep working") is a fresh user intent and INVALIDATES
-    // a prior grant regardless of origin — that is what closes the re-close hole
-    // where a queued "continue" after a close leaves the stale lease live.
+    // cannot attest a producer, so it does not open (fail-closed). A NON-close
+    // queued command (e.g. "keep working") is a fresh user intent and CLOSES
+    // a prior open regardless of origin — that is what closes the re-close hole
+    // where a queued "continue" after a close leaves the stale open live.
     if (o.type === 'attachment' && o.attachment && o.attachment.type === 'queued_command') {
       const prompt = typeof o.attachment.prompt === 'string' ? o.attachment.prompt : '';
       const humanOrigin = !!(o.attachment.origin && o.attachment.origin.kind === 'human');
       if (isClosePattern(prompt)) {
-        if (humanOrigin) granted = true;
+        if (humanOrigin) {
+          open = true;
+          openedAtIndex = i;
+        }
       } else if (prompt) {
-        granted = false;
+        open = false;
       }
       continue;
     }
 
     // Record AskUserQuestion tool_use ids (assistant record, always precedes its
-    // answer in line order). Bash ids ride along in the same scan, for the mint
-    // correlation above.
+    // answer in line order).
     const content = (o.message ?? o).content;
     if (Array.isArray(content)) {
       for (const b of content) {
         if (!b || typeof b !== 'object' || b.type !== 'tool_use' || !b.id) continue;
         if (b.name === 'AskUserQuestion') askIds.add(b.id);
-        else if (b.name === 'Bash') bashIds.add(b.id);
       }
     }
 
-    // Genuine user text → grant on a close phrase, invalidate on anything else,
-    // minus the one carve-out for what the product itself asked the user to send.
+    // Genuine typed user text. A close phrase opens the gate; the retraction
+    // tripwire closes it; everything else is neutral (an
+    // unrecognized phrase must not silently close a gate the user opened, so
+    // there is no default "else close" branch here the way there used to be).
     if (userText != null && userText !== '') {
-      const spend = approvalLine.exec(userText.trim());
-      if (spend && mintedNonces.has(spend[1])) {
-        // The approval line `proposal challenge` tells the user to type, bound to a
-        // nonce this transcript minted. Neutral, never a grant: an untouched
-        // `granted` that was false stays false. An unminted hex is ordinary text and
-        // falls through to the invalidating branch below.
-        continue;
+      if (isClosePattern(userText)) {
+        open = true;
+        openedAtIndex = i;
+      } else if (isCloseRetractionPattern(userText)) {
+        open = false;
       }
-      granted = isClosePattern(userText);
       continue;
     }
 
@@ -4745,7 +4772,7 @@ export function hasUserCloseSignal(transcriptPath) {
     // record from reaching the answer parser. is_error:false AND the host's
     // success marker are required because a malformed AskUserQuestion echoes the
     // raw input back in an is_error result, and the model authors the option
-    // labels. A close selection grants; any other real selection invalidates.
+    // labels. A close selection opens the gate; any other real selection closes it.
     if (Array.isArray(content) && !isModelReachableRecord(o)) {
       for (const b of content) {
         if (!b || typeof b !== 'object') continue;
@@ -4759,12 +4786,28 @@ export function hasUserCloseSignal(transcriptPath) {
           sawAnswer = true;
           if (isClosePattern(m[1])) sawClose = true;
         }
-        if (sawClose) granted = true;
-        else if (sawAnswer) granted = false;
+        if (sawClose) {
+          open = true;
+          openedAtIndex = i;
+        } else if (sawAnswer) {
+          open = false;
+        }
       }
     }
   }
-  return granted;
+  return { open, openedAtIndex };
+}
+
+/**
+ * Public opening-axis predicate: does this transcript's typed/queued/answered
+ * event history currently leave the close gate open? A thin boolean wrapper
+ * over {@link walkCloseGate} — every caller that only needs the verdict uses
+ * this. `close-gate-store.mjs`'s `closeGateStatus` imports `walkCloseGate`
+ * directly instead, because it also needs `openedAtIndex` to order the open
+ * against a recorded resolution.
+ */
+export function isCloseGateOpen(transcriptPath) {
+  return walkCloseGate(transcriptPath).open;
 }
 
 /** The literal the user must type to approve a parked-overwrite batch. */
@@ -4774,7 +4817,7 @@ export const APPROVAL_PHRASE = 'apply-proposals';
  * True iff the transcript carries a user's TYPED approval of the batch this nonce
  * was minted for — the authorization gate for a transcript-approved apply.
  *
- * Deliberately NOT hasUserCloseSignal. That function answers "did the user want to
+ * Deliberately NOT isCloseGateOpen. That function answers "did the user want to
  * end the session", and it accepts a correlated AskUserQuestion answer as evidence
  * (see above). Reusing it here would let a SESSION-CLOSE approval spend itself as an
  * OVERWRITE approval: different authority, different question. Two gates, two
@@ -4895,10 +4938,11 @@ export const CLOSE_RECONFIRM_MARK = '지금 닫기';
  *
  * Read-only, forward scan over the FULL transcript (no tail truncation — a
  * decline can precede the next Stop by any number of turns). Reuses the same
- * askIds + tool_use_id correlation `hasUserCloseSignal` (above) uses to bind
+ * askIds + tool_use_id correlation `walkCloseGate` (above) uses to bind
  * an AskUserQuestion answer to its own tool_use, so an unrelated tool_result
- * string can't forge a decline. Unlike `hasUserCloseSignal` (which is a
- * "any evidence, ever" OR), this tracks a single latest-wins boolean as it
+ * string can't forge a decline. Unlike `walkCloseGate` (which is already a
+ * latest-event-wins walk, not an "any evidence, ever" OR), this tracks a
+ * separate single latest-wins boolean as it
  * scans: a decline answer sets it true, and any later GENUINE USER close
  * signal resets it to false — the user asked to close again, so the prior
  * decline no longer applies.

@@ -102,7 +102,7 @@ import {
   hasSessionLogHeading,
   hasLogEntry,
   resolveTranscriptBySessionId,
-  hasUserCloseSignal,
+  isCloseGateOpen,
   commitWikiChanges,
   vaultCommitLockTarget,
   currentDevice,
@@ -113,6 +113,7 @@ import {
 } from '../hooks/hypo-shared.mjs';
 import { hashContent, readBaseEntry, advanceBase } from '../hooks/base-store.mjs';
 import { writeProposal } from '../hooks/proposal-store.mjs';
+import { recordGateClosed, resolutionStamp } from '../hooks/close-gate-store.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
 // commands as `node <SELF_SCRIPT> ...` rather than a bare `crystallize` bin,
@@ -750,7 +751,7 @@ function runMarkSessionClosed(args) {
   // /compact, or an AskUserQuestion close answer). This is the hard backstop for
   // model over-close, where prose guidance lost to a conflicting global rule.
   // Fail-closed when the transcript can't be resolved.
-  if (!closeTranscript || !hasUserCloseSignal(closeTranscript)) {
+  if (!closeTranscript || !isCloseGateOpen(closeTranscript)) {
     const reason = !closeTranscript
       ? `cannot resolve a transcript for session ${args.sessionId} — the session-closed marker requires a verifiable user close signal`
       : "no user close signal in this session's transcript — marker refused (the user did not signal session close)";
@@ -961,7 +962,7 @@ function verifyCloseAuthority(sessionId) {
         `authority here.`,
     };
   }
-  if (!hasUserCloseSignal(transcript)) {
+  if (!isCloseGateOpen(transcript)) {
     return {
       ok: false,
       reason: 'no-user-close-signal',
@@ -1808,6 +1809,39 @@ function applySessionClose(args) {
   // verified), distinct from a commit that ran and reported `committed:false`.
   let commitOutcome = null;
   if (ok && args.sessionId) {
+    // Close-gate resolution: apply succeeding (`ok`) IS the resolution, not
+    // whether the per-session marker below happens to land. The marker can
+    // be withheld for reasons that have nothing to do with whether this
+    // apply's own writes were valid (a stale git tree, a feedback-projection
+    // cap, W8 design-history staleness) — none of that should leave the
+    // resolution unrecorded, because the wiki writes already happened, and
+    // re-running the SAME apply with no fresh user close signal is exactly
+    // what this record exists to block. So this sits OUTSIDE and ahead of
+    // the marker's own commit-gated logic below, resolving its own
+    // transcript rather than sharing the marker's `closeTranscript` (which
+    // stays null whenever the commit fails) — a commit failure withholds
+    // the marker but must not also withhold the resolution.
+    //
+    // Best-effort like every other write in this store: resolutionStamp
+    // returns null on anything it cannot read as a Buffer, recordGateClosed
+    // refuses a null stamp, and both fail silently, so a transcript that
+    // vanishes mid-read (or a cache-write failure) can never turn an
+    // otherwise-successful apply into a failure.
+    try {
+      const resolutionTranscriptPath = resolveTranscriptBySessionId(args.sessionId);
+      if (resolutionTranscriptPath) {
+        recordGateClosed(
+          args.hypoDir,
+          args.sessionId,
+          resolutionStamp(readFileSync(resolutionTranscriptPath)),
+        );
+      }
+    } catch {
+      // Unreadable at the moment of a successful close is not this apply's
+      // problem to surface — the resolution just stays unrecorded, same as
+      // if this session had never resolved at all (NO_CONSTRAINT).
+    }
+
     // IO stays lazy so this preserves the exact side-effect order (codex design
     // review): commit first (the only mutation), then resolve the
     // transcript, then run the compact gate with that transcript, then scan the
@@ -1851,8 +1885,8 @@ function applySessionClose(args) {
       gateOk,
       transcriptResolved: !!closeTranscript,
       // Scan the signal only when the gate passed AND a transcript resolved —
-      // hasUserCloseSignal never runs earlier than the original nested `else if`.
-      hasUserSignal: gateOk && !!closeTranscript && hasUserCloseSignal(closeTranscript),
+      // isCloseGateOpen never runs earlier than the original nested `else if`.
+      hasUserSignal: gateOk && !!closeTranscript && isCloseGateOpen(closeTranscript),
     });
     markerSkipReason = decision.skipReason;
     if (decision.write) {

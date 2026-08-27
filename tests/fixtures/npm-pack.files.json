@@ -160,6 +160,10 @@
     "exec": false
   },
   {
+    "path": "hooks/close-gate-store.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/hooks.json",
     "exec": false
   },

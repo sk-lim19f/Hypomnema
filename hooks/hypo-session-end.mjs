@@ -16,8 +16,9 @@
  * debug lines only.
  */
 
-import { HYPO_DIR, writeClearMarker } from './hypo-shared.mjs';
-import { existsSync } from 'fs';
+import { HYPO_DIR, writeClearMarker, resolveTranscriptBySessionId } from './hypo-shared.mjs';
+import { recordGateClosed, resolutionStamp } from './close-gate-store.mjs';
+import { existsSync, readFileSync } from 'fs';
 
 function emitContinue() {
   console.log(JSON.stringify({ continue: true, suppressOutput: true }));
@@ -50,6 +51,24 @@ process.stdin.on('end', () => {
       prev_transcript_path: payload.transcript_path || payload.transcriptPath || null,
       prev_cwd: payload.cwd || null,
     });
+
+    // Close-gate resolution, the second writer (decision 5): `/clear` ends
+    // the session as surely as a close apply does, so it closes the gate
+    // the same way. `sessionId` is the SAME payload field already read two
+    // lines above for the clear marker, not a new one. The transcript path
+    // is independently re-resolved by session id (glob under
+    // ~/.claude/projects), never trusted straight off the payload, matching
+    // every other resolver this store's callers use. Best-effort: a missing
+    // session id, an unresolvable transcript, or any read/write failure
+    // here is caught by this function's own outer try/catch below and never
+    // blocks `/clear` itself.
+    const sessionId = payload.session_id || payload.sessionId || null;
+    if (sessionId) {
+      const transcriptPath = resolveTranscriptBySessionId(sessionId);
+      if (transcriptPath) {
+        recordGateClosed(HYPO_DIR, sessionId, resolutionStamp(readFileSync(transcriptPath)));
+      }
+    }
   } catch (err) {
     // Best-effort: a marker failure must not break /clear itself.
     process.stderr.write(`[hypo-session-end] error: ${err?.message ?? String(err)}\n`);
