@@ -226,6 +226,13 @@ function buildCleanWikiTree(dir, today) {
   const ym = today.slice(0, 7);
   const projDir = join(dir, 'projects', 'test-project');
   mkdirSync(join(projDir, 'session-log'), { recursive: true });
+  // Match real init, which writes `.cache/` into the vault's .gitignore (see
+  // withGrowthWiki for the same line and the same reason). Runtime stores live
+  // under .cache/ — the base store, parked proposals, the close-gate resolution
+  // — so without this a fixture reports a dirty tree for writes that are
+  // invisible to git in every installed vault. That would be the fixture's own
+  // bookkeeping masquerading as a finding.
+  writeFileSync(join(dir, '.gitignore'), '.cache/\n');
   writeFileSync(join(dir, 'hypo-config.md'), '# config');
   writeFileSync(join(dir, 'log.md'), `## [${today}] session | test-project\n`);
   writeFileSync(
