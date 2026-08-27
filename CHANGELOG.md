@@ -5,6 +5,28 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3] - 2026-08-27
+
+### Bug Fixes
+
+#### English
+
+- A close result now reports whether the commit ran (`committed`), so a re-applied payload's empty `applied` list is no longer indistinguishable from a run that wrote nothing; `--check-session-close` also resolves the project from the session transcript when nothing else identifies it, and stays unresolved rather than guessing when the evidence is ambiguous or untrusted. ([#249](https://github.com/sk-lim19f/Hypomnema/pull/249))
+- Lint now checks the vault-root files a session close overwrites, so a broken wikilink written by close is caught by the lint that runs right after it instead of only by `doctor`. ([#248](https://github.com/sk-lim19f/Hypomnema/pull/248))
+- A session can finish closing while another session sharing the same vault still has uncommitted work; only files the closing session is accountable for block its marker, and the rest are listed as a notice. ([#247](https://github.com/sk-lim19f/Hypomnema/pull/247))
+- Closing a session no longer parks the root `hot.md` as a false conflict against the session's own Stop-hook rewrite. ([#246](https://github.com/sk-lim19f/Hypomnema/pull/246))
+- Captured and synced files keep their executable bit end to end, so a `755` script no longer arrives `644` on another machine; a stale mode on an already-installed copy is healed on the next sync. ([#245](https://github.com/sk-lim19f/Hypomnema/pull/245))
+- `uninstall` now removes the shell rc block and the wiki `pre-commit` hook that `init` installs, so removal is the inverse of installation. ([#244](https://github.com/sk-lim19f/Hypomnema/pull/244))
+
+#### 한국어
+
+- close 결과가 커밋이 돌았는지를 `committed` 로 보고한다. 재적용한 payload 의 빈 `applied` 를 아무것도 쓰지 않은 실행과 구별할 수 있다. `--check-session-close` 는 다른 단서가 없으면 세션 트랜스크립트에서 프로젝트를 찾고, 증거가 모호하거나 신뢰할 수 없으면 추측하지 않고 unresolved 로 남는다. ([#249](https://github.com/sk-lim19f/Hypomnema/pull/249))
+- lint 가 세션 close 가 덮어쓰는 볼트 루트 파일도 검사한다. close 가 쓴 깨진 wikilink 를 `doctor` 만이 아니라 그 직후 도는 lint 가 잡는다. ([#248](https://github.com/sk-lim19f/Hypomnema/pull/248))
+- 같은 볼트를 쓰는 다른 세션에 미커밋 작업이 남아 있어도 이 세션은 close 를 끝낼 수 있다. 마커를 막는 것은 닫는 세션이 책임지는 파일뿐이고 나머지는 notice 로 나열된다. ([#247](https://github.com/sk-lim19f/Hypomnema/pull/247))
+- 세션을 닫을 때 루트 `hot.md` 가 그 세션 자신의 Stop 훅 재작성을 상대로 가짜 충돌을 내지 않는다. ([#246](https://github.com/sk-lim19f/Hypomnema/pull/246))
+- capture 하고 sync 한 파일이 실행 비트를 끝까지 지킨다. `755` 스크립트가 다른 머신에 `644` 로 도착하지 않고, 이미 설치된 사본의 어긋난 mode 는 다음 sync 에서 고쳐진다. ([#245](https://github.com/sk-lim19f/Hypomnema/pull/245))
+- `uninstall` 이 `init` 이 만든 셸 rc 블록과 위키 `pre-commit` 훅을 지운다. 제거가 설치의 역이 된다. ([#244](https://github.com/sk-lim19f/Hypomnema/pull/244))
+
 ## [1.7.2] - 2026-08-26
 
 ### Bug Fixes
