@@ -18,10 +18,11 @@ import {
   gitRepo,
   hasMutatingTranscriptActivity,
   hasPendingBackgroundWork,
-  hasUserCloseSignal,
+  isCloseGateOpen,
   isClearCommand,
   isClosePattern,
   isCloseReconfirmDeclined,
+  isCloseRetractionPattern,
   isCompactCommand,
   isCompactOrClearCommand,
   isGateSkipped,
@@ -547,8 +548,8 @@ test('"Stop hook feedback" string (hook nudge) is excluded — not circular evid
   });
 });
 
-// ── ADR 0055: hasUserCloseSignal — the marker-writer hard gate ──
-suite('hasUserCloseSignal() (ADR 0055)');
+// ── ADR 0055: isCloseGateOpen — the marker-writer hard gate ──
+suite('isCloseGateOpen() (ADR 0055)');
 
 test('NL close phrase anywhere in the full transcript → true', () => {
   withTmpDir((dir) => {
@@ -557,7 +558,7 @@ test('NL close phrase anywhere in the full transcript → true', () => {
       toolUse('Edit'),
       { type: 'user', message: { role: 'user', content: '세션 마무리 해줘' } },
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -567,7 +568,7 @@ test('/compact queue-operation → true', () => {
       { type: 'user', message: { role: 'user', content: '계속' } },
       { type: 'queue-operation', operation: 'enqueue', content: '/compact' },
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -593,7 +594,7 @@ test('AskUserQuestion answer naming a close action → true (correlated by tool_
         },
       },
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -617,7 +618,7 @@ test('"have been answered" tool_result NOT from AskUserQuestion → false (no po
         },
       },
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -627,7 +628,7 @@ test('no close signal (model self-close / over-close) → false', () => {
       { type: 'user', message: { role: 'user', content: 'ingest 해줘' } },
       toolUse('Write'),
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -637,13 +638,13 @@ test('injected close phrase (isMeta) does NOT satisfy the gate', () => {
       { isMeta: true, type: 'user', message: { role: 'user', content: '… "close the session" …' } },
       { type: 'user', message: { role: 'user', content: '버그 고쳐줘' } },
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
 test('unreadable / missing transcript → false (fail-closed)', () => {
-  assert.equal(hasUserCloseSignal('/no/such/transcript.jsonl'), false);
-  assert.equal(hasUserCloseSignal(null), false);
+  assert.equal(isCloseGateOpen('/no/such/transcript.jsonl'), false);
+  assert.equal(isCloseGateOpen(null), false);
 });
 
 // ── Measured transcript shapes (ADR 0075) ──────────────────────────────────
@@ -687,7 +688,7 @@ test('unreadable / missing transcript → false (fail-closed)', () => {
 // origin": task-notification replays DO carry origin.kind, and are attributable.
 // It is specifically the replay of USER-queued text that carries no origin at all
 // — so the one path that needs attribution is the one path that lacks it.
-suite('hasUserCloseSignal() — measured transcript shapes (ADR 0075)');
+suite('isCloseGateOpen() — measured transcript shapes (ADR 0075)');
 
 const QOP = (operation, content) => {
   const r = {
@@ -777,7 +778,7 @@ test('measured: the one observed /compact lifecycle, through the caveat → true
         isMeta: true,
       }),
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -792,7 +793,7 @@ test('acceptance: pending /compact enqueue, never delivered → true (DEFECT: mu
       USER({ message: { role: 'user', content: '계속' }, promptSource: 'typed' }),
       QOP('enqueue', '/compact'),
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -816,7 +817,7 @@ test('acceptance: delivered /compact with neutral companions → true (must STAY
         interruptedMessageId: 'msg_1',
       }),
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -835,14 +836,14 @@ test('measured: <task-notification> enqueue (model-caused) → false', () => {
       ),
       QOP('dequeue'),
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
 test('measured: /clear enqueue → false (abandons context; not a close)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [QOP('enqueue', '/clear')]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -860,7 +861,7 @@ test('measured: /clear enqueue → false (abandons context; not a close)', () =>
 test('acceptance: /compact enqueue THEN remove → true (remove is delivery, so this SHOULD grant)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [QOP('enqueue', '/compact'), QOP('remove', '/compact')]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -873,7 +874,7 @@ test('acceptance: /compact enqueue THEN remove → true (remove is delivery, so 
 test('acceptance: popAll carrying /compact → false (event model: popAll is a cancellation)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [QOP('popAll', '/compact')]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -946,7 +947,7 @@ test('measured: NL close via the remove path, human origin (2.1.181+) → true (
       removeContent: true,
       companions: [HOOK_SUCCESS],
     });
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -978,7 +979,7 @@ test('measured: NL close via the remove path, legacy 2.1.179 with no origin → 
         HOOK_SUCCESS,
       ],
     });
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1000,7 +1001,7 @@ test('measured: promptSource "typed" close → true (the authorship signal the g
     const p = writeJsonl(dir, [
       USER({ message: { role: 'user', content: '세션 마무리 해줘' }, promptSource: 'typed' }),
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -1059,7 +1060,7 @@ test('acceptance: queued close, delivered via the correlated dequeue lifecycle �
         queuePriority: 'later',
       }),
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1098,7 +1099,7 @@ test('acceptance: model-origin text on the same correlated lifecycle → false (
         origin: { kind: 'peer' },
       }),
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1151,7 +1152,7 @@ test('acceptance: close, then a model-caused <task-notification> lifecycle → t
         origin: { kind: 'task-notification' },
       }),
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -1165,7 +1166,7 @@ test('acceptance: close, then a model-caused <task-notification> lifecycle → t
 test('acceptance: close, then the model works → true (must STAY granted: tool_use is not an invalidator)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [USER(CLOSE), toolUse('Write')]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -1201,13 +1202,13 @@ const CLOSE_THEN_WORK = (dir, human) => {
 
 test('acceptance: close, then the user asks for more work → false (event model: lease expires)', () => {
   withTmpDir((dir) => {
-    assert.equal(hasUserCloseSignal(CLOSE_THEN_WORK(dir, true)), false);
+    assert.equal(isCloseGateOpen(CLOSE_THEN_WORK(dir, true)), false);
   });
 });
 
 test('acceptance: close, then more work, both without origin → false (event model: lease expires here too)', () => {
   withTmpDir((dir) => {
-    assert.equal(hasUserCloseSignal(CLOSE_THEN_WORK(dir, false)), false);
+    assert.equal(isCloseGateOpen(CLOSE_THEN_WORK(dir, false)), false);
   });
 });
 
@@ -1216,7 +1217,7 @@ test('acceptance: close, then more work, both without origin → false (event mo
 test('acceptance: close, then /clear → false (event model: /clear invalidates the lease)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', '/clear')]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1254,7 +1255,7 @@ test('acceptance: sidechain mixed text+tool_result carrying a close → false (e
         },
       }),
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1266,7 +1267,7 @@ test('acceptance: sidechain mixed text+tool_result carrying a close → false (e
 // was withdrawn — it could skip the real invalidator and PRESERVE a stale grant.
 // The gate is a pure line-order lease; these pin the invalidation edges, the
 // robustness edges, and the AskUserQuestion hardening.
-suite('hasUserCloseSignal() — lease invalidation + robustness + AskUserQuestion hardening');
+suite('isCloseGateOpen() — lease invalidation + robustness + AskUserQuestion hardening');
 
 // LOAD-BEARING (invalidation via the queued non-close): the user closes, then
 // queues "keep working". The decision is read off the ENQUEUE content (the queue
@@ -1286,7 +1287,7 @@ test('close, then a queued non-close (read off the enqueue) → false', () => {
         queuePriority: 'later',
       }),
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1308,7 +1309,7 @@ test('close, then a task-notification replay (origin.kind present) → true (sta
         origin: { kind: 'task-notification' },
       }),
     ]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -1317,7 +1318,7 @@ test('close, then a task-notification replay (origin.kind present) → true (sta
 test('a null JSONL line → skipped, not a crash, verdict unchanged', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [null, USER(CLOSE)]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -1346,7 +1347,7 @@ test('AskUserQuestion answer on an isMeta record → false (exclusion applies)',
         },
       },
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1377,7 +1378,7 @@ test('AskUserQuestion is_error echo of a close phrase → false', () => {
         },
       },
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1405,7 +1406,7 @@ test('close, then a non-close AskUserQuestion selection → false (lease expires
         },
       },
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1416,11 +1417,10 @@ test('close, then a non-close AskUserQuestion selection → false (lease expires
 // <command-name> user record, and the AskUserQuestion carve-out was removed because
 // "does not read as a retraction" is fail-open on an open class of phrasings.
 // Those two removals are pinned here as NEGATIVES, so re-adding either turns red.
-suite('hasUserCloseSignal(): the minted approval line, and what is NOT a channel');
+suite('isCloseGateOpen(): the minted approval line, and what is NOT a channel');
 
 // The nonce shape `proposal challenge` mints (randomBytes(16).toString('hex')).
 const NONCE = '0f1e2d3c4b5a69788796a5b4c3d2e1f0';
-const OTHER_NONCE = 'aaaabbbbccccddddeeeeffff00001111';
 // The challenge output verbatim (scripts/proposal.mjs). The drift pin below keeps
 // this fixture honest against the real writer.
 const CHALLENGE_TEXT = (nonce) =>
@@ -1462,10 +1462,15 @@ const ASK = (id) => ({
 const ANSWER = (id, picked) =>
   TOOL_RESULT(id, `Your questions have been answered: "?"="${picked}"`);
 
-test('typing the minted approval line does not expire the close lease', () => {
+// Renamed (codex): mint is no longer the thing this pins — the per-turn
+// overwrite that could have expired a grant on any non-close typed text is
+// gone (T4). What actually survives here is narrower: the approval line
+// `apply-proposals <nonce>` is itself neither a close phrase nor a
+// retraction phrase, so it is NEUTRAL and the grant made by CLOSE stands.
+test('the apply-proposals approval line is neutral and does not retract a prior grant', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [USER(CLOSE), ...MINT(NONCE), TYPED(`apply-proposals ${NONCE}`)]);
-    assert.equal(hasUserCloseSignal(p), true);
+    assert.equal(isCloseGateOpen(p), true);
   });
 });
 
@@ -1474,117 +1479,22 @@ test('typing the minted approval line does not expire the close lease', () => {
 test('the approval line alone is not a close signal (neutral never creates a grant)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [...MINT(NONCE), TYPED(`apply-proposals ${NONCE}`)]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
-test('an approval line whose nonce this transcript never minted still expires the lease', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      USER(CLOSE),
-      ...MINT(NONCE),
-      TYPED(`apply-proposals ${OTHER_NONCE}`),
-    ]);
-    assert.equal(hasUserCloseSignal(p), false);
-  });
-});
-
-test('a user message cannot mint the nonce it then spends (no self-mint, order held)', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      USER(CLOSE),
-      TYPED(`apply-proposals ${NONCE}`),
-      TYPED(`apply-proposals ${NONCE}`),
-    ]);
-    assert.equal(hasUserCloseSignal(p), false);
-  });
-});
-
-// PRODUCER, not presence: the model can write the challenge framing into its own
-// prose, and that must not neutralize the user's next message.
-test('the challenge framing in ASSISTANT prose is not a mint', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      USER(CLOSE),
-      { type: 'assistant', message: { content: [{ type: 'text', text: CHALLENGE_TEXT(NONCE) }] } },
-      TYPED(`apply-proposals ${NONCE}`),
-    ]);
-    assert.equal(hasUserCloseSignal(p), false);
-  });
-});
-
-test('the challenge framing from a NON-Bash tool is not a mint', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      USER(CLOSE),
-      TOOL_USE('Read', 'read-1'),
-      TOOL_RESULT('read-1', CHALLENGE_TEXT(NONCE)),
-      TYPED(`apply-proposals ${NONCE}`),
-    ]);
-    assert.equal(hasUserCloseSignal(p), false);
-  });
-});
-
-test('an uncorrelated tool_result (no tool_use behind it) is not a mint', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      USER(CLOSE),
-      TOOL_RESULT('ghost-1', CHALLENGE_TEXT(NONCE)),
-      TYPED(`apply-proposals ${NONCE}`),
-    ]);
-    assert.equal(hasUserCloseSignal(p), false);
-  });
-});
-
-test('a FAILED challenge run (is_error) is not a mint', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      USER(CLOSE),
-      TOOL_USE('Bash', 'bash-1'),
-      TOOL_RESULT('bash-1', CHALLENGE_TEXT(NONCE), { is_error: true }),
-      TYPED(`apply-proposals ${NONCE}`),
-    ]);
-    assert.equal(hasUserCloseSignal(p), false);
-  });
-});
-
-test('a bare hex in Bash output, without the challenge framing, is not a mint', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      USER(CLOSE),
-      TOOL_USE('Bash', 'bash-1'),
-      TOOL_RESULT('bash-1', `apply-proposals ${NONCE}\n`),
-      TYPED(`apply-proposals ${NONCE}`),
-    ]);
-    assert.equal(hasUserCloseSignal(p), false);
-  });
-});
-
-test('the approval line must be the WHOLE message, as the TTY channel requires', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      USER(CLOSE),
-      ...MINT(NONCE),
-      TYPED(`동의 안 해, 그냥 인용만 할게: apply-proposals ${NONCE}`),
-    ]);
-    assert.equal(hasUserCloseSignal(p), false);
-  });
-});
-
-// DRIFT PIN: the mint matcher anchors on two literals from `proposal challenge`'s
-// output. If that output is reworded, the carve-out silently stops working (a
-// re-typed approval starts expiring the lease again) and no other test notices.
-test('the mint matcher still anchors on what proposal challenge actually prints', () => {
-  const src = readFileSync(join(REPO, 'scripts', 'proposal.mjs'), 'utf-8');
-  for (const literal of [
-    'must type this line in the conversation:',
-    'Then run: hypomnema proposal resolve',
-  ]) {
-    assert.ok(src.includes(literal), `proposal.mjs no longer prints: ${literal}`);
-  }
-  // And the fixture above is what that template renders.
-  assert.ok(CHALLENGE_TEXT(NONCE).includes(`apply-proposals ${NONCE}`));
-});
+// The eight mint-carve-out tests that used to sit here (a minted nonce's twin,
+// self-mint ordering, assistant/non-Bash/uncorrelated/failed/bare-hex framing,
+// and whole-message exactness) and the drift pin on `proposal challenge`'s
+// wording are gone along with the carve-out itself (ADR 0088, T4). Every one
+// of them asserted that a non-close typed message EXPIRED the lease — the
+// exact per-turn overwrite this task deletes. Under the new rule an
+// unrecognized typed message (including the approval line itself) is NEUTRAL,
+// so those assertions became false rather than merely untested; keeping them
+// would have meant weakening the assertion to reach green, which this task
+// forbids. `MINT`/`NONCE`/`CHALLENGE_TEXT` stay defined above because the
+// surviving tests below still use them to build a close-then-neutral-then-
+// retraction sequence.
 
 // NOT A CHANNEL (removed after review): a `<command-name>` user record proves
 // nothing about who produced it. Claude Code routes a model-issued Skill call
@@ -1601,16 +1511,241 @@ test('a command invocation record is not a close signal, in any namespace form',
       TYPED('<command-name>/hypo:crystallize</command-name>'),
     ]) {
       const p = writeJsonl(dir, [rec]);
-      assert.equal(hasUserCloseSignal(p), false, JSON.stringify(rec.message.content));
+      assert.equal(isCloseGateOpen(p), false, JSON.stringify(rec.message.content));
     }
   });
 });
 
-test('a command invocation after a close still expires the lease (it is user text)', () => {
+// DISCARDED (T4): a command invocation after a close used to expire the lease,
+// because the old rule read a command-tag record as ordinary user text and any
+// non-close user text closed the gate. Now `eventUserText` excludes a
+// command-tag record entirely (it is model-reachable, ADR 0087), so it is
+// NEUTRAL rather than closing — the assertion this test made is no longer
+// true, not merely untested, so it is removed rather than weakened.
+
+// NEW (T4): a close phrase riding along INSIDE a command invocation must not
+// open the gate either — the exclusion covers the whole record, not just a
+// bare tag with no close wording attached. Regression for ADR 0087 applied to
+// the OPENING axis: without the exclusion in `eventUserText`, either fixture
+// below opens the gate on the strength of a model-reachable record.
+test('a close phrase riding inside a command invocation does not open the gate', () => {
   withTmpDir((dir) => {
-    const p = writeJsonl(dir, [USER(CLOSE), COMMAND_TAGS('hypo:crystallize')]);
-    assert.equal(hasUserCloseSignal(p), false);
+    for (const rec of [
+      COMMAND_TAGS('hypo:crystallize', '세션 마무리해줘'),
+      TYPED('<command-name>/hypo:crystallize</command-name> 세션 마무리 해줘'),
+    ]) {
+      const p = writeJsonl(dir, [rec]);
+      assert.equal(isCloseGateOpen(p), false, JSON.stringify(rec.message.content));
+    }
   });
+});
+
+// F5 (CONCERN): eventUserText used to join array content blocks with a bare
+// '\n' before scanning for a command-invocation tag. A tag split across block
+// boundaries (e.g. '<command-na' | 'me>/hypo:crystallize</command-name>' |
+// '세션 마무리해줘') gets a newline spliced into the middle of the tag name by
+// that join, so the regex misses it and the trailing close phrase opens the
+// gate — a fail-open on a format drift, not on today's string-content host
+// shape. Not reproducible via today's live Skill path (the host sends one
+// string), but the exclusion must not depend on where the blocks happen to be
+// cut, so this pins the fix directly against the split shape.
+test('a command tag split across array content blocks (no separator between them) does not open the gate', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER({
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: '<command-na' },
+            { type: 'text', text: 'me>/hypo:crystallize</command-name>' },
+            { type: 'text', text: '세션 마무리해줘' },
+          ],
+        },
+      }),
+    ]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// The no-separator check above must stay scoped to CONSECUTIVE text blocks —
+// joining across an intervening non-text block (an image, here) would
+// synthesize a tag out of two text blocks that were never actually adjacent
+// in the real content, and that is a new false-open-turned-false-close bug:
+// a real close spoken right after attaching an image would be thrown away.
+// Neither the two text blocks bridged by the image, nor the '\n'-joined whole
+// text, ever form the tag, so this must open the gate on the trailing close
+// phrase exactly as it would with no image in between.
+test('a command-tag-shaped fragment bridged across an intervening non-text block (an image) does not suppress the close underneath it', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER({
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: '<command-na' },
+            { type: 'image', source: '첨부 이미지' },
+            { type: 'text', text: 'me>/hypo:crystallize</command-name>' },
+            { type: 'text', text: '세션 마무리해줘' },
+          ],
+        },
+      }),
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+// F3 (BLOCKER fix). The behavioral guard the source scan below cannot be —
+// a name-based scan is defeated by renaming the variable
+// (`open = isClosePattern(userText)` reads identically to the old rule and
+// still passes a regex keyed on the literal name `granted`). What must
+// actually hold is the EFFECT: once the gate is open, typed text that is
+// neither a close phrase nor a retraction phrase must leave it open. If the
+// per-turn overwrite ever comes back — under any variable name — one of
+// these ordinary, unrelated messages would silently close a gate the user
+// already opened, and this assertion goes red.
+//
+// A single fixed sentence let an implementation special-case that exact
+// string and still pass (`if (userText === '이거 어떻게 돼?') continue; open =
+// isClosePattern(userText);`), so this now runs several different, unrelated
+// sentences — Korean and English, a question and a plain statement — none of
+// them a close phrase or a retraction phrase, and requires every one to
+// leave the gate open.
+test('a grant survives several different ordinary, unrelated typed messages (per-turn overwrite would silently close it)', () => {
+  const neutralPhrases = [
+    '이거 어떻게 돼?',
+    '테스트 결과 좀 보여줘',
+    'what does this function return?',
+    'can you check the linter output',
+  ];
+  for (const phrase of neutralPhrases) {
+    withTmpDir((dir) => {
+      const p = writeJsonl(dir, [USER(CLOSE), TYPED(phrase)]);
+      assert.equal(isCloseGateOpen(p), true, phrase);
+    });
+  }
+});
+
+// S3 (codex round 4 CONCERN). A fixed list of four sentences is still a name
+// list: an implementation can special-case exactly those four strings and
+// fall through to the old per-turn overwrite for everything else, passing
+// every assertion above while still misclosing on e.g. '다음 파일도 읽어줘'.
+// The four-phrase test stays (a concrete example is still useful to a
+// reader), but the actual guard has to be the EFFECT from the walk's own
+// contract: typed text classifies into close / retraction / neutral, and
+// anything neither matcher recognizes MUST be neutral — i.e. it must never
+// change whether the gate is open. This pins that default branch directly,
+// over a battery of GENERATED sentences rather than a hand-picked handful,
+// so a variable-renamed or string-keyed reintroduction of the old rule has
+// no finite list left to hide behind.
+//
+// The generator is deterministic (a fixed word list crossed with a fixed set
+// of sentence templates, Korean and English), not random — a flaky suite
+// helps nobody. The FILTER is the actual effect criterion this fix cares
+// about: every candidate is checked against isClosePattern and
+// isCloseRetractionPattern first, and only the ones BOTH reject (i.e.
+// genuinely unclassified, "neutral" by the walk's own rulebook) are used.
+// None of the words or templates below was chosen to name a close or
+// retraction phrase, so in practice the filter keeps nearly everything — but
+// asserting the filtered set, not the raw one, is what makes this a test of
+// the EFFECT ("unmatched implies neutral") instead of one more fixed list.
+const NEUTRAL_CANDIDATE_WORDS = [
+  '파일',
+  '코드',
+  '버그',
+  '문서',
+  '설정',
+  '로그',
+  '링크',
+  '결과',
+  '함수',
+  '테이블',
+];
+const NEUTRAL_CANDIDATE_TEMPLATES = [
+  (w) => `${w} 어떻게 돼?`,
+  (w) => `${w} 좀 보여줘`,
+  (w) => `${w} 다시 확인해줘`,
+  (w) => `${w} 내용 알려줘`,
+  (w) => `what about the ${w}`,
+  (w) => `can you check the ${w}`,
+  (w) => `show me the ${w} again`,
+  (w) => `please read the ${w}`,
+];
+function generateUnclassifiedTypedTexts() {
+  const out = [];
+  for (const w of NEUTRAL_CANDIDATE_WORDS) {
+    for (const tpl of NEUTRAL_CANDIDATE_TEMPLATES) {
+      const s = tpl(w);
+      if (!isClosePattern(s) && !isCloseRetractionPattern(s)) out.push(s);
+    }
+  }
+  return out;
+}
+
+test('every generated typed message that neither matcher classifies leaves an open gate open (the walk default branch is neutral, not close-by-default)', () => {
+  const candidates = generateUnclassifiedTypedTexts();
+  // Sanity floor on the filter itself: if this drops to 0 the test below
+  // would vacuously pass on an empty set, proving nothing. The word/template
+  // grid is 10 x 8 = 80 candidates; none of the words or templates was
+  // chosen to look like a close or retraction phrase, so this should keep
+  // all 80 — a much smaller surviving count would itself be a signal that
+  // isClosePattern's own word list grew wide enough to eat the fixture.
+  assert.ok(
+    candidates.length >= 40,
+    `expected a substantial unmatched set, got ${candidates.length}`,
+  );
+  for (const phrase of candidates) {
+    withTmpDir((dir) => {
+      const p = writeJsonl(dir, [USER(CLOSE), TYPED(phrase)]);
+      assert.equal(isCloseGateOpen(p), true, phrase);
+    });
+  }
+});
+
+// SOURCE SCAN: this is a SECONDARY, name-based guard, not the primary
+// defense (the behavioral test above is) — a rewrite that renames every one
+// of these identifiers would sail through this scan while still reproducing
+// the old per-turn overwrite, which is exactly why the behavioral test exists
+// alongside it. Kept because a literal reintroduction under the SAME names is
+// a cheap, zero-cost thing to also catch. `granted = isClosePattern(` is the
+// old rule's exact shape (any typed text unconditionally sets the verdict);
+// `bashIds` is mint-machinery's own correlation state, so its return would
+// signal the same deleted subsystem coming back even before any use of it
+// reappears.
+test('the per-turn overwrite and the mint machinery are gone from the source', () => {
+  const src = readFileSync(join(REPO, 'hooks', 'hypo-shared.mjs'), 'utf-8');
+  assert.equal(/granted\s*=\s*isClosePattern\(/.test(src), false);
+  for (const id of ['mintedNonces', 'challengeMint', 'collectMinted', 'bashIds']) {
+    assert.equal(src.includes(id), false, `${id} should no longer exist`);
+  }
+});
+
+// F4 (BLOCKER fix). isCloseRetractionPattern was imported but never called
+// directly anywhere in this file — every existing pass was routed through
+// isCloseGateOpen, which never proves the matcher's OWN boundary (a false
+// positive on the approval line or a close phrase would have been masked by
+// isCloseGateOpen's other branches). These call it directly.
+suite('isCloseRetractionPattern()');
+
+test('the three corpus retraction phrases → true', () => {
+  assert.equal(isCloseRetractionPattern('아 잠깐, 이것도 고쳐줘'), true);
+  assert.equal(isCloseRetractionPattern('아 잠깐, 이거 먼저 고쳐줘'), true);
+  assert.equal(isCloseRetractionPattern('하나만 더 해줘'), true);
+});
+
+test('the approval line, a close phrase itself, and an ordinary question → false', () => {
+  assert.equal(isCloseRetractionPattern(`apply-proposals ${'0'.repeat(32)}`), false);
+  assert.equal(isCloseRetractionPattern('세션 마무리 해줘'), false);
+  assert.equal(
+    isCloseRetractionPattern('업데이트 했는데 /hypo:upgrade --apply 이거 실행해야해?'),
+    false,
+  );
+});
+
+test('empty string and non-string input → false', () => {
+  assert.equal(isCloseRetractionPattern(''), false);
+  assert.equal(isCloseRetractionPattern(null), false);
+  assert.equal(isCloseRetractionPattern(undefined), false);
+  assert.equal(isCloseRetractionPattern(42), false);
 });
 
 // NOT A CHANNEL (removed after review): an AskUserQuestion answer that is not a
@@ -1620,17 +1755,22 @@ test('a non-close AskUserQuestion answer expires the lease, whatever its wording
   withTmpDir((dir) => {
     for (const picked of ['지금 종료하지 말아 줘', '지금 쓴다', '3개', 'whatever']) {
       const p = writeJsonl(dir, [USER(CLOSE), ASK('q'), ANSWER('q', picked)]);
-      assert.equal(hasUserCloseSignal(p), false, picked);
+      assert.equal(isCloseGateOpen(p), false, picked);
     }
   });
 });
 
 // THE FENCE (ISSUE-31): the carve-out does not touch typed user text, so a user who
 // asks for more work after a close still expires the lease.
-test('typed non-close text after a grant still expires the lease (over-close defense)', () => {
+// Renamed (codex): the old name claimed every non-close text expires the
+// grant; the per-turn overwrite that made that true is gone (T4), and this
+// fixture types one of the retraction tripwire's own corpus phrases, not an
+// arbitrary non-close message — see the neutral-survival test above for what
+// an UNLISTED non-close phrase does instead (nothing).
+test('a tripwire retraction phrase after a grant expires the lease (over-close defense)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [USER(CLOSE), TYPED('아 잠깐, 이거 먼저 고쳐줘')]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 
@@ -1642,7 +1782,7 @@ test('typed non-close text after the approval line still expires the lease', () 
       TYPED(`apply-proposals ${NONCE}`),
       TYPED('하나만 더 해줘'),
     ]);
-    assert.equal(hasUserCloseSignal(p), false);
+    assert.equal(isCloseGateOpen(p), false);
   });
 });
 

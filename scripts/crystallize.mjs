@@ -102,7 +102,7 @@ import {
   hasSessionLogHeading,
   hasLogEntry,
   resolveTranscriptBySessionId,
-  hasUserCloseSignal,
+  isCloseGateOpen,
   commitWikiChanges,
   vaultCommitLockTarget,
   currentDevice,
@@ -750,7 +750,7 @@ function runMarkSessionClosed(args) {
   // /compact, or an AskUserQuestion close answer). This is the hard backstop for
   // model over-close, where prose guidance lost to a conflicting global rule.
   // Fail-closed when the transcript can't be resolved.
-  if (!closeTranscript || !hasUserCloseSignal(closeTranscript)) {
+  if (!closeTranscript || !isCloseGateOpen(closeTranscript)) {
     const reason = !closeTranscript
       ? `cannot resolve a transcript for session ${args.sessionId} — the session-closed marker requires a verifiable user close signal`
       : "no user close signal in this session's transcript — marker refused (the user did not signal session close)";
@@ -961,7 +961,7 @@ function verifyCloseAuthority(sessionId) {
         `authority here.`,
     };
   }
-  if (!hasUserCloseSignal(transcript)) {
+  if (!isCloseGateOpen(transcript)) {
     return {
       ok: false,
       reason: 'no-user-close-signal',
@@ -1851,8 +1851,8 @@ function applySessionClose(args) {
       gateOk,
       transcriptResolved: !!closeTranscript,
       // Scan the signal only when the gate passed AND a transcript resolved —
-      // hasUserCloseSignal never runs earlier than the original nested `else if`.
-      hasUserSignal: gateOk && !!closeTranscript && hasUserCloseSignal(closeTranscript),
+      // isCloseGateOpen never runs earlier than the original nested `else if`.
+      hasUserSignal: gateOk && !!closeTranscript && isCloseGateOpen(closeTranscript),
     });
     markerSkipReason = decision.skipReason;
     if (decision.write) {

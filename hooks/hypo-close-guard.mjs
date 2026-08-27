@@ -103,7 +103,7 @@ import { relative } from 'path';
 import {
   HYPO_DIR,
   detectSessionCloseArtifact,
-  hasUserCloseSignal,
+  isCloseGateOpen,
   isGateSkipped,
   touchedPathsPath,
   withFileLock,
@@ -215,7 +215,7 @@ try {
     process.exit(0);
   }
 
-  if (hasUserCloseSignal(input.transcript_path ?? null)) {
+  if (isCloseGateOpen(input.transcript_path ?? null)) {
     process.exit(0);
   }
 
