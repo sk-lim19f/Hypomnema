@@ -43,6 +43,7 @@
     "scripts/lib/project-create.mjs",
     "scripts/lib/rename-marker.mjs",
     "scripts/lib/schema-vocab.mjs",
+    "scripts/lib/slug-resolver.mjs",
     "scripts/lib/template-schema-version.mjs",
     "scripts/lib/wd-match.mjs",
     "scripts/lib/wikilink.mjs",

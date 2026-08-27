@@ -48,11 +48,22 @@ import {
   chmodSync,
   rmSync,
 } from 'fs';
-import { join, basename, dirname, normalize, isAbsolute, sep } from 'path';
+import { join, basename, dirname, normalize, isAbsolute } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
-import { collectPagesRename, slugForms } from './lib/wikilink.mjs';
+import { collectPagesRename } from './lib/wikilink.mjs';
 import { RENAME_MARKER_REL, renameMarkerPath, readRenameMarker } from './lib/rename-marker.mjs';
+import {
+  dirRelForm,
+  buildFormIndex,
+  classifyTarget,
+  newTargetFor,
+  maskNonWikilinkRegions,
+  splitLinkBody,
+  preservationClass,
+  isPreservedSource,
+  realContainedInVault,
+} from './lib/slug-resolver.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
@@ -69,108 +80,16 @@ function parseArgs(argv) {
   return args;
 }
 
-// ── preservation class of a link-source path ───────────────────────────────────
-// Two distinct reasons a file is normally skipped as a link SOURCE, kept separate
-// because directory mode treats them differently (codex design BLOCKER):
-//
-//   'timerecord' — append-only snapshots (journal / session-log / weekly / archive
-//      / postmortems + root log.md). Rewriting a [[old]] inside a past entry would
-//      falsify that moment. BUT a directory move relocates the whole subtree, so a
-//      time-record INSIDE the moved subtree that links a moving sibling must update
-//      that intra-subtree path label (the page genuinely moved); see runDirectory.
-//
-//   'sources'    — sources/* immutable CAPTURED material. Never rewritten, not even
-//      inside a moved subtree: a directory move must not claim ownership over the
-//      bytes of an external source we transcribed verbatim.
-//
-// Matches a path SEGMENT so `pages/journal/x.md` and `projects/p/session-log/y.md`
-// both qualify. Returns null for ordinary live pages.
-function preservationClass(rel) {
-  const p = rel.replace(/\\/g, '/');
-  if (/(^|\/)sources(\/|$)/.test(p)) return 'sources';
-  if (p === 'log.md') return 'timerecord';
-  if (/(^|\/)(journal|session-log|weekly|archive|postmortems)(\/|$)/.test(p)) return 'timerecord';
-  return null;
-}
-
-// Single-page mode preserves BOTH classes as link sources (unchanged behavior): a
-// rename elsewhere in the vault must never churn a frozen snapshot or a source.
-function isPreservedSource(rel) {
-  return preservationClass(rel) !== null;
-}
-
-// ── slug-form index (resolution with collision detection) ──────────────────────
-// Unlike lint's buildSlugMap (a Set that silently dedups collisions), rename
-// needs to KNOW when a form is shared, so it maps each form → the set of page
-// rels that expose it. precedence forms per page: full noExt slug, bare
-// basename, dir-relative (drop the leading scan-dir segment).
-const dirRelForm = (slug) => slugForms(slug).dirRel;
-
-function buildFormIndex(pages) {
-  const index = new Map(); // form → Set<rel>
-  const add = (form, rel) => {
-    if (!form) return;
-    if (!index.has(form)) index.set(form, new Set());
-    index.get(form).add(rel);
-  };
-  for (const p of pages) {
-    add(p.slug, p.rel);
-    // sources/* are full-slug-only link targets, exactly as lint's
-    // collectLinkTargets treats them: a bare `[[name]]` must NOT resolve to a
-    // source file. Adding their bare/dir-relative aliases here would make a real
-    // page's bare link look ambiguous and skip a legitimate rewrite.
-    if (/(^|\/)sources(\/|$)/.test(p.rel)) continue;
-    add(p.bare, p.rel);
-    add(dirRelForm(p.slug), p.rel);
-  }
-  return index;
-}
-
-// Classify a link target against the from-page. Returns the form KIND when the
-// target points at from-page, plus whether that form is ambiguous (shared with
-// another page → unsafe to auto-rewrite).
-function classifyTarget(target, fromPage, formIndex) {
-  const owners = formIndex.get(target);
-  if (!owners || !owners.has(fromPage.rel)) return { kind: null, ambiguous: false };
-  const ambiguous = owners.size > 1;
-  let kind = null;
-  if (target === fromPage.slug) kind = 'full';
-  else if (target === dirRelForm(fromPage.slug)) kind = 'dirrel';
-  else if (target === fromPage.bare) kind = 'bare';
-  return { kind, ambiguous };
-}
-
-// The new target string for a matched form kind — same kind, new page.
-function newTargetFor(kind, toPage) {
-  if (kind === 'full') return toPage.slug;
-  if (kind === 'dirrel') return dirRelForm(toPage.slug) ?? toPage.bare;
-  return toPage.bare; // bare
-}
-
-// ── wikilink masking (mirror lint.mjs stripNonWikilinkRegions) ──────────────────
-// Blank out fenced code, inline code, and HTML comments WITHOUT changing length,
-// so a [[ref]] match index in the mask aligns with the same index in the source.
-// Rewriting then edits the source at those exact spans, never touching a link
-// that only appears inside a code sample.
-function maskNonWikilinkRegions(content) {
-  let out = content;
-  out = out.replace(/^[ \t]{0,3}```[\s\S]*?^[ \t]{0,3}```/gm, (m) => m.replace(/[^\n]/g, ' '));
-  out = out.replace(/^[ \t]{0,3}~~~[\s\S]*?^[ \t]{0,3}~~~/gm, (m) => m.replace(/[^\n]/g, ' '));
-  out = out.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '));
-  out = out.replace(/``[^`\n]*``/g, (m) => ' '.repeat(m.length));
-  out = out.replace(/`[^`\n]*`/g, (m) => ' '.repeat(m.length));
-  return out;
-}
-
-// Parse the inside of a `[[ ... ]]` into { target, suffix } where suffix is the
-// alias/anchor tail to preserve verbatim (including a table-escaped `\|`). The
-// target capture stops before an optional `\` preceding the `|`/`#` delimiter,
-// matching lint's extractor exactly.
-function splitLinkBody(body) {
-  const m = body.match(/^([^|#\\]+?)(\\?[|#][\s\S]*)?$/);
-  if (!m) return null;
-  return { target: m[1].trim(), suffix: m[2] || '' };
-}
+// ── preservation class of a link-source path, form index, masking, and link-body
+// parsing (preservationClass / isPreservedSource / dirRelForm / buildFormIndex /
+// classifyTarget / newTargetFor / maskNonWikilinkRegions / splitLinkBody) now
+// live in ./lib/slug-resolver.mjs, shared with lint.mjs's existence-check mode.
+// Directory mode's own notes on the two preservation classes: 'timerecord' is
+// skipped as a link SOURCE outside the moved subtree, but a time-record INSIDE
+// the moved subtree that links a moving sibling must update that intra-subtree
+// path label (the page genuinely moved); see runDirectory. 'sources' is never
+// rewritten even inside a moved subtree: a directory move must not claim
+// ownership over the bytes of an external source transcribed verbatim.
 
 // Rewrite every inbound reference to fromPage in `content`. Returns
 // { content, rewrites, ambiguous } where rewrites/ambiguous list the links
@@ -316,7 +235,9 @@ function guardExistingMarker(args, thisMarker) {
     );
   }
   const same =
-    marker.mode === thisMarker.mode && marker.from === thisMarker.from && marker.to === thisMarker.to;
+    marker.mode === thisMarker.mode &&
+    marker.from === thisMarker.from &&
+    marker.to === thisMarker.to;
   if (!same) {
     fail(
       args,
@@ -468,40 +389,10 @@ function rewriteContentDir(content, movedByRel, formIndex, aliasPreserve) {
   return { content: out, rewrites, ambiguous };
 }
 
-// Verify a path resolves — following any symlink ANCESTOR — to a location inside
-// the real vault root. A lexical ../-check cannot catch this: `projects/link/new`
-// where `projects/link` → /tmp/outside is lexically in-vault, yet renameSync would
-// follow the symlink and write across the vault boundary. The destination may not
-// exist, so the deepest existing prefix is resolved (its realpath is where a write
-// would actually land). Fail-closed: returns false on any resolution error.
-//
-// The walk uses lstat (NOT existsSync) so a DANGLING symlink prefix is detected as
-// present-but-unresolvable rather than skipped as absent — otherwise the walk would
-// step past it to an in-vault parent and wrongly report containment, letting an
-// external rewrite land before renameSync crashes on the dangling target.
-function realContainedInVault(absPath, realRoot) {
-  let probe = absPath;
-  // Walk up to the deepest path component that exists as a link-or-real entry.
-  for (;;) {
-    let exists = true;
-    try {
-      lstatSync(probe);
-    } catch {
-      exists = false;
-    }
-    if (exists) break;
-    const parent = dirname(probe);
-    if (parent === probe) return false;
-    probe = parent;
-  }
-  let real;
-  try {
-    real = realpathSync(probe); // follows links; throws on a dangling symlink
-  } catch {
-    return false;
-  }
-  return real === realRoot || real.startsWith(realRoot + sep);
-}
+// realContainedInVault now lives in ./lib/slug-resolver.mjs (imported above),
+// reused as-is: `projects/link/new` where `projects/link` → /tmp/outside is
+// lexically in-vault, yet renameSync would follow the symlink and write
+// across the vault boundary, which is exactly what it guards against below.
 
 // The destination's deepest existing ancestor must be a directory. Otherwise
 // mkdirSync(dirname, {recursive}) fails with ENOTDIR — but only AFTER the inbound
@@ -760,7 +651,10 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
       // instead of an unsafe write-then-remove fallback; every write above is
       // already atomic, so a re-run picks up cleanly.
       if (err.code !== 'EXDEV') throw err;
-      fail(args, `--from and --to ended up on different filesystems mid-run — refusing an unsafe fallback move.`);
+      fail(
+        args,
+        `--from and --to ended up on different filesystems mid-run — refusing an unsafe fallback move.`,
+      );
     }
     clearRenameMarker(args);
     moved = true;
@@ -974,7 +868,10 @@ function run(args) {
         // removes. fromPage.path still holds the valid (possibly rewritten)
         // body, so a re-run picks up cleanly once the device issue is gone.
         if (err.code !== 'EXDEV') throw err;
-        fail(args, `--from and --to ended up on different filesystems mid-run — refusing an unsafe fallback move.`);
+        fail(
+          args,
+          `--from and --to ended up on different filesystems mid-run — refusing an unsafe fallback move.`,
+        );
       }
     }
     clearRenameMarker(args);

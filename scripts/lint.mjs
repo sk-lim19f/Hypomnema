@@ -30,8 +30,9 @@ import {
 import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
 import { FAILURE_TYPE_ENUM } from './lib/failure-type.mjs';
-import { collectPagesLint, collectPagesLinkable, slugForms } from './lib/wikilink.mjs';
+import { collectPagesLint, collectPagesLinkable } from './lib/wikilink.mjs';
 import { parseFrontmatter, SEQUENCE_ENTRY_RE } from './lib/frontmatter.mjs';
+import { buildSlugMap } from './lib/slug-resolver.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -176,28 +177,9 @@ const TYPE_ENUM_FIELDS = {
 };
 
 // ── page collector ────────────────────────────────────────────────────────────
-
-// ── slug map ─────────────────────────────────────────────────────────────────
-
-// `extraTargets` are link-target-only slugs (root *.md, sources/*) that resolve
-// wikilinks but are not themselves linted — added verbatim, with NO derived
-// basename/dir-relative aliases, so they can't mask an unrelated broken link.
-function buildSlugMap(pages, extraTargets = []) {
-  const map = new Set();
-  for (const { rel } of pages) {
-    const noExt = rel.replace(/\.md$/, '').replace(/\\/g, '/');
-    // full slug + bare basename + dir-relative alias (drop the leading scan-dir
-    // segment so the convention link [[learnings/foo]] resolves to
-    // pages/learnings/foo.md). slugForms returns dirRel=null when the slug has no
-    // `/` (a page directly under a scan dir has no extra segment to drop).
-    const { full, bare, dirRel } = slugForms(noExt);
-    map.add(full);
-    map.add(bare);
-    if (dirRel) map.add(dirRel);
-  }
-  for (const t of extraTargets) map.add(t);
-  return map;
-}
+//
+// buildSlugMap (existence-check mode) now lives in ./lib/slug-resolver.mjs,
+// shared with rename.mjs's collision-aware owner mode.
 
 // Link-target-only slugs: files that are valid wikilink destinations but are
 // NOT linted themselves. Root-level *.md (hot.md / log.md / hypo-guide.md /
