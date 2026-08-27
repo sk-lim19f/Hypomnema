@@ -348,6 +348,10 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/slug-resolver.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/template-schema-version.mjs",
     "exec": false
   },
