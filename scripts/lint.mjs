@@ -290,6 +290,10 @@ const issues = [];
 //   W3 missing-updated  → excluded (auto-repaired by --fix).
 //   W8 design-history-stale → excluded (hypo-personal-check handles it; would
 //                             double-gate).
+//   W14 design-history-missing → excluded, same reason as W8, and deliberately
+//                             a different id so hypo-shared.mjs's W8-only
+//                             blocker filter never sees it (stays warn, never
+//                             hard-blocks PreCompact).
 // NOTE: no gate currently passes --strict (npm run lint / CI / release.yml /
 // crystallize / the close-gate all run plain lint), so promotion is
 // forward-looking: these surface as warnings today. The deliverable is
@@ -584,7 +588,25 @@ for (const rel of closeRootTargets) {
 // project (not per page) — runs outside the page loop. POSIX-separated path
 // literal (not path.join) so consumers can rely on `file.split('/')` shape
 // regardless of host OS — `hooks/hypo-personal-check.mjs:246` depends on this.
+//
+// W14: design-history.md does not exist at all, but session-log carries a
+// design-relevant entry with nowhere to land. Distinct id from W8 on purpose —
+// hypo-shared.mjs's PreCompact gate filters strictly on `w.id === 'W8'` to
+// hard-block an active project on staleness, and W14 must NOT enter that path
+// (a bootstrapping gap on 14 of 16 live projects would block every one of
+// them). W14 stays a plain warn: never added to STRICT_PROMOTE_IDS, never
+// matched by that W8-only filter.
 for (const s of findDesignHistoryStale(args.hypoDir)) {
+  if (s.kind === 'missing') {
+    issue(
+      'warn',
+      `projects/${s.project}/design-history.md`,
+      `design-history missing: session-log 설계-관련 최신=${s.lastSession}인데 projects/${s.project}/design-history.md가 없습니다 — 파일을 새로 만들어 설계 변경 사항을 append 하는 것을 권고합니다`,
+      null,
+      'W14',
+    );
+    continue;
+  }
   const gap = s.diffDays != null ? ` (${s.diffDays}일 차이)` : '';
   issue(
     'warn',

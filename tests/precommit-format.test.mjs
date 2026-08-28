@@ -18,7 +18,7 @@ import {
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
-import { test, suite } from './harness.mjs';
+import { test, testAsync, suite } from './harness.mjs';
 import {
   HOME,
   SCRIPTS,
@@ -513,6 +513,89 @@ test('shim: foreign hypomnema-named repo via GIT_DIR/GIT_WORK_TREE → does NOT 
   }
 });
 
+test('shim: reversed mix (GIT_DIR = our own worktree admin dir, GIT_WORK_TREE = foreign) does NOT format the foreign repo', () => {
+  // Reverse of the "mixed-env" attack above. That one used a foreign GIT_DIR
+  // with GIT_WORK_TREE spoofed to our own toplevel; checks (3)/(3a) already
+  // catch it because absGitDirR itself is foreign. This flips which side is
+  // ours: GIT_DIR points at one of OUR OWN linked-worktree admin dirs
+  // (genuinely nested under our .git, genuinely sharing our commondir), while
+  // GIT_WORK_TREE points at an unrelated, hypomnema-named repo. (3)/(3a) both
+  // pass on the git-dir side; only the (3b) worktree-binding check (toplevel's
+  // own .git entry must point back at absGitDirR) catches this one, because
+  // the foreign repo's own .git points at its own git dir, never at our
+  // worktree admin dir (codex round-10 finding).
+  const { dir, git } = setupHypomnemaFixture();
+  const { dir: foreign, git: foreignGit } = makeGitRepo();
+  let wt = null;
+  try {
+    writeFileSync(
+      join(foreign, 'package.json'),
+      JSON.stringify({ name: 'hypomnema', version: '0.0.0', type: 'module' }) + '\n',
+    );
+    const foreignBin = join(foreign, 'node_modules', '.bin');
+    mkdirSync(foreignBin, { recursive: true });
+    writeFileSync(
+      join(foreignBin, 'prettier'),
+      '#!/bin/sh\n# fake prettier: lowercase --write args\n' +
+        'while [ $# -gt 0 ]; do\n' +
+        '  case "$1" in\n' +
+        '    --write|--) shift; continue;;\n' +
+        '    *) f="$1"; tr "A-Z" "a-z" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"; shift;;\n' +
+        '  esac\n' +
+        'done\nexit 0\n',
+      { mode: 0o755 },
+    );
+    foreignGit(['commit', '--allow-empty', '-q', '-m', 'init']);
+    writeFileSync(join(foreign, 'victim.txt'), 'VICTIM UPPER\n');
+    foreignGit(['add', 'victim.txt']);
+    const before = readFileSync(join(foreign, 'victim.txt'), 'utf-8');
+
+    // Give ourselves a real linked worktree so we have a real admin dir to
+    // attack with: `<dir>/.git/worktrees/<name>`.
+    git(['branch', 'feat']);
+    wt = mkdtempSync(join(tmpdir(), 'hypo-wt-reverse-'));
+    rmSync(wt, { recursive: true, force: true });
+    const wtAdd = spawnSync('git', ['-C', dir, 'worktree', 'add', wt, 'feat'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(wtAdd.status, 0, `worktree add failed: ${wtAdd.stderr}`);
+    const ourAdminDir = spawnSync('git', ['-C', wt, 'rev-parse', '--absolute-git-dir'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    }).stdout.trim();
+    assert.ok(ourAdminDir, 'must resolve our own worktree admin dir');
+
+    const r = spawnSync(process.execPath, [join(dir, 'scripts', 'pre-commit-format.mjs')], {
+      cwd: foreign,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        HOME: SESSION_TMP_HOME,
+        GIT_DIR: ourAdminDir,
+        GIT_WORK_TREE: foreign,
+      },
+    });
+    assert.equal(r.status, 0);
+    const after = readFileSync(join(foreign, 'victim.txt'), 'utf-8');
+    assert.equal(
+      after,
+      before,
+      'foreign repo file must NOT be mutated by the reversed GIT_DIR/GIT_WORK_TREE mix',
+    );
+  } finally {
+    if (wt) {
+      spawnSync('git', ['-C', dir, 'worktree', 'remove', '--force', wt], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+      rmSync(wt, { recursive: true, force: true });
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(foreign, { recursive: true, force: true });
+  }
+});
+
 suite('pre-commit-format: installer');
 
 function runInstaller(dir, extraEnv = {}) {
@@ -726,3 +809,167 @@ test('installer: HYPOMNEMA_HOOK_VERBOSE=1 surfaces skip reason on stderr', () =>
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+suite('pre-commit-format: installed hook runs inside a linked worktree');
+
+// The installer refuses to run (and write a hook) FROM WITHIN a linked
+// worktree ("installer: linked worktree → skips" above) — but the hook it
+// wrote in the MAIN checkout is a single physical file inside the shared
+// common git dir, which every linked worktree also uses for its hooks. So the
+// question this suite answers is different: once installed from the main
+// checkout, does that one shared hook file actually GATE a commit made inside
+// a worktree, or does its own runtime identity guard wave the commit through?
+function addTrackerGate(dir) {
+  cpSync(join(SCRIPTS, 'check-tracker-ids.mjs'), join(dir, 'scripts', 'check-tracker-ids.mjs'));
+  cpSync(
+    join(SCRIPTS, 'lib', 'check-tracker-ids.mjs'),
+    join(dir, 'scripts', 'lib', 'check-tracker-ids.mjs'),
+  );
+}
+
+function gitIn(cwd, args) {
+  return spawnSync('git', args, {
+    cwd,
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME },
+  });
+}
+
+await testAsync(
+  'installed pre-commit hook blocks a tracker-id commit made inside a linked worktree',
+  async () => {
+    const { dir, git } = setupHypomnemaFixture();
+    addTrackerGate(dir);
+    let wt = null;
+    try {
+      const install = runInstaller(dir);
+      assert.equal(install.status, 0, `installer failed: ${install.stderr}`);
+      const hookPath = join(dir, '.git', 'hooks', 'pre-commit');
+      assert.ok(
+        existsSync(hookPath),
+        'installer should have written the hook in the main checkout',
+      );
+
+      git(['branch', 'feat'], { env: { ...process.env, HOME: SESSION_TMP_HOME } });
+      wt = mkdtempSync(join(tmpdir(), 'hypo-wt-runtime-'));
+      rmSync(wt, { recursive: true, force: true });
+      const wtAdd = spawnSync('git', ['-C', dir, 'worktree', 'add', wt, 'feat'], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+      assert.equal(wtAdd.status, 0, `worktree add failed: ${wtAdd.stderr}`);
+
+      // Stage a tracker-id violation INSIDE the worktree and try to commit it
+      // there — the hook file the worktree runs is the SAME physical file the
+      // installer wrote in the main checkout (shared common git dir).
+      writeFileSync(join(wt, 'README.md'), '# Test\n\nSee ISSUE-4242 for background.\n');
+      const add = gitIn(wt, ['add', 'README.md']);
+      assert.equal(add.status, 0, `git add failed: ${add.stderr}`);
+      const commit = gitIn(wt, ['commit', '-m', 'test: add tracker id']);
+      assert.notEqual(
+        commit.status,
+        0,
+        'commit should have been BLOCKED by the pre-commit gate inside the worktree, but it ' +
+          `succeeded:\n${commit.stdout}${commit.stderr}`,
+      );
+      assert.match(
+        commit.stdout + commit.stderr,
+        /wiki issue-tracker id/,
+        'the block must come from the tracker-id gate, not some unrelated failure',
+      );
+    } finally {
+      if (wt) {
+        spawnSync('git', ['-C', dir, 'worktree', 'remove', '--force', wt], {
+          encoding: 'utf-8',
+          env: { ...process.env, HOME: SESSION_TMP_HOME },
+        });
+        rmSync(wt, { recursive: true, force: true });
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+await testAsync(
+  'installed pre-commit hook formats a staged file inside a linked worktree',
+  async () => {
+    // Companion to the tracker-id test above, targeting the OTHER half of the
+    // same shared shim: scripts/pre-commit-format.mjs's own identity guards,
+    // layered independently under the shell shim (see that script's header
+    // comment). Before the fix, those guards anchored on --absolute-git-dir /
+    // --show-toplevel matching expectedRoot exactly, which a linked worktree
+    // can never satisfy (its toplevel is the worktree's own path, and its git
+    // dir is a per-worktree admin dir under the main .git) — so the format
+    // step silently exited 0 on every worktree commit while the tracker-id
+    // gate (a separate script with no such anchor) kept working. Passing
+    // ONLY because a commit gets blocked does not prove formatting runs; this
+    // pins the actual byte content.
+    const { dir, git } = setupHypomnemaFixture();
+    let wt = null;
+    try {
+      const install = runInstaller(dir);
+      assert.equal(install.status, 0, `installer failed: ${install.stderr}`);
+
+      git(['branch', 'feat'], { env: { ...process.env, HOME: SESSION_TMP_HOME } });
+      wt = mkdtempSync(join(tmpdir(), 'hypo-wt-format-'));
+      rmSync(wt, { recursive: true, force: true });
+      const wtAdd = spawnSync('git', ['-C', dir, 'worktree', 'add', wt, 'feat'], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+      assert.equal(wtAdd.status, 0, `worktree add failed: ${wtAdd.stderr}`);
+
+      // package.json and node_modules/.bin/prettier are written directly onto
+      // disk by setupHypomnemaFixture rather than committed (mirroring how a
+      // real node_modules is gitignored), so a fresh worktree does not
+      // inherit either from the shared object store — a real contributor
+      // would `npm install` here. Recreate both directly in the worktree so
+      // the formatter is actually reachable from the worktree's own toplevel,
+      // the same directory pre-commit-format.mjs's selectFormatter() looks in.
+      writeFileSync(
+        join(wt, 'package.json'),
+        JSON.stringify({ name: 'hypomnema', version: '0.0.0', type: 'module' }) + '\n',
+      );
+      const wtBinDir = join(wt, 'node_modules', '.bin');
+      mkdirSync(wtBinDir, { recursive: true });
+      writeFileSync(
+        join(wtBinDir, 'prettier'),
+        '#!/bin/sh\n# fake prettier: lowercase --write args\n' +
+          'while [ $# -gt 0 ]; do\n' +
+          '  case "$1" in\n' +
+          '    --write|--) shift; continue;;\n' +
+          '    *) f="$1"; tr "A-Z" "a-z" < "$f" > "$f.tmp" && mv "$f.tmp" "$f"; shift;;\n' +
+          '  esac\n' +
+          'done\nexit 0\n',
+        { mode: 0o755 },
+      );
+
+      // Stage and commit an uppercase file INSIDE the worktree. The shim it
+      // runs is the same physical file the installer wrote in the main
+      // checkout's shared common git dir, and that shim in turn execs the
+      // same scripts/pre-commit-format.mjs from HYPOMNEMA_ROOT.
+      writeFileSync(join(wt, 'sample.txt'), 'HELLO WORLD\n');
+      const add = gitIn(wt, ['add', 'sample.txt']);
+      assert.equal(add.status, 0, `git add failed: ${add.stderr}`);
+      const commit = gitIn(wt, ['commit', '-m', 'test: add sample']);
+      assert.equal(commit.status, 0, `commit failed:\n${commit.stdout}${commit.stderr}`);
+
+      const committed = gitIn(wt, ['show', 'HEAD:sample.txt']);
+      assert.equal(
+        committed.stdout,
+        'hello world\n',
+        'pre-commit-format.mjs must format staged files inside a linked worktree, not ' +
+          'silently exit 0 while only the tracker-id gate runs',
+      );
+    } finally {
+      if (wt) {
+        spawnSync('git', ['-C', dir, 'worktree', 'remove', '--force', wt], {
+          encoding: 'utf-8',
+          env: { ...process.env, HOME: SESSION_TMP_HOME },
+        });
+        rmSync(wt, { recursive: true, force: true });
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);

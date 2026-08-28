@@ -120,7 +120,8 @@ If you need to share new logic, prefer extending an existing helper over adding 
 
 ```bash
 npm test           # tests/*.test.mjs, sharded across processes — unit + smoke + contract
-npm run lint       # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale vs session-log)
+npm run lint       # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale
+                   # vs session-log) + W14 (design-history missing but session-log implies one)
 npm run fix:verify # Phase 1 of learned_behavior #6 — verifies fix #N status claims in
                    # a wiki spec against `// @fix #N: <test-name>` anchors, read as a
                    # union across every tests/*.mjs. Maintainer dogfood; needs a wiki at
@@ -172,17 +173,19 @@ Some hook behavior is only observable inside a Claude Code session. Document the
 
 `npm install` in this checkout installs a git `pre-commit` hook that runs `prettier --write` on staged files only. The hook is **non-blocking**: formatter failures print a notice but the commit still proceeds. The only block is when `git add` itself fails during restage (true index corruption).
 
-**Requirements**: Git ≥ 2.13 (uses `--absolute-git-dir`; `--git-common-dir` is 2.5+).
+**Requirements**: Git ≥ 2.13. The installed shell shim itself only calls `--git-common-dir` (2.5+), but the installer and `pre-commit-format.mjs`'s own identity guard still call `--absolute-git-dir`, which is what actually sets the floor.
 
 **Path-locked to your checkout.** The shim embeds the absolute paths of your `HYPOMNEMA_ROOT` and `.git/` directory at install time. If you `mv` the checkout, re-run `npm install` to regenerate the shim — until then it safely no-ops.
 
-**Main worktree only.** `git worktree add` checkouts silently skip — the shared `.git/hooks/pre-commit` can only point at one embedded root at a time. Commit from the main worktree to get auto-format, or accept the no-op in linked worktrees.
+**Linked worktrees work too.** Both the shell shim and `pre-commit-format.mjs`'s own identity guard compare on `--git-common-dir`, not `--show-toplevel` or `--absolute-git-dir`. A linked worktree's toplevel and git dir differ from the main checkout's, but its common dir is still the same shared `.git`, so a commit made from a linked worktree gets the same auto-format and tracker-id gate as one made from the main checkout.
 
 **CI is skipped.** `npm ci` runs `prepare`, but the installer detects `CI=true` and exits 0 without touching `.git/hooks/`. CI runs never mutate hooks.
 
 **Symlink-safe.** If `.git/hooks/` is a symlink, or an existing `pre-commit` is a symlink, the installer refuses to write through it.
 
-**Shared `core.hooksPath` safe.** The shim verifies both `--show-toplevel` and `--absolute-git-dir` against the embedded values before executing. Foreign repos that share your global `core.hooksPath` will silently no-op.
+**Shared `core.hooksPath` safe.** The shim verifies the live `--git-common-dir` against the embedded value before executing; `pre-commit-format.mjs` re-checks the same axis plus containment on `--absolute-git-dir` as a second, independent layer. Foreign repos that share your global `core.hooksPath` have their own, different common dir, so they still silently no-op.
+
+**Reversed `GIT_DIR`/`GIT_WORK_TREE` mixes are also closed.** The common-dir check above proves the git dir Git reports is ours; it never looks at `--show-toplevel`. That leaves a reversed mix open: `GIT_DIR` pointed at one of your own linked-worktree admin dirs (genuinely ours) while `GIT_WORK_TREE` points at an unrelated repo. `pre-commit-format.mjs` closes it with a worktree-binding check: it reads the toplevel's own `.git` entry (a directory for a main checkout, a `gitdir:` pointer file for a linked worktree) and requires it to resolve back to the git dir Git reported. A foreign toplevel's `.git` always points at its own git dir, never at yours, so it fails there regardless of what `GIT_DIR`/`GIT_WORK_TREE` claim. The shell shim's own `--git-common-dir` check is a fast pre-filter only; this second axis is enforced in the Node script, not the shell.
 
 **Env-override defense.** The Node side strips every `GIT_*` env from `git rev-parse --local-env-vars` (plus `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_CONFIG_*`) before its own git spawns. Inherited `GIT_INDEX_FILE` is preserved **only** when invoked from the installed shell shim (signalled via a sentinel env var). Direct `node scripts/pre-commit-format.mjs` invocation drops `GIT_INDEX_FILE` and falls back to the default `.git/index`, closing the class of attacks that try to drive the formatter against a crafted alternate index.
 

@@ -69,9 +69,10 @@ function maxDate(dates) {
   return dates.reduce((a, b) => (a > b ? a : b));
 }
 
-// Returns stale findings: { project, lastSession, lastDesignHistory, diffDays }
-// Only includes projects where design-history.md exists AND is stale relative
-// to the latest session-log entry. Date source is body section headings
+// Returns findings: { project, kind, lastSession, lastDesignHistory, diffDays }.
+// `kind` is 'stale' (the file exists but session-log has moved past it) or
+// 'missing' (the file does not exist at all, yet session-log carries at least
+// one design-relevant entry). Date source is body section headings
 // (## YYYY-MM-DD), not frontmatter `updated:` — auto-stage hooks bump the
 // frontmatter on unrelated edits, so it can't signal staleness on its own.
 export function findDesignHistoryStale(hypoDir) {
@@ -81,17 +82,19 @@ export function findDesignHistoryStale(hypoDir) {
   if (!existsSync(projectsDir)) return stale;
 
   for (const name of readdirSync(projectsDir)) {
+    if (name.startsWith('_')) continue; // e.g. templates/projects/_template — not a real project
     const projectDir = join(projectsDir, name);
     if (!statSync(projectDir).isDirectory()) continue;
 
     const dhPath = join(projectDir, 'design-history.md');
-    if (!existsSync(dhPath)) continue;
 
     // session-log can live as a flat `session-log.md` (legacy) or a directory of
     // daily shards `session-log/YYYY-MM-DD.md` (canonical; legacy
     // monthly `YYYY-MM.md` files still appear pre-cutover). This globs every
     // `.md` in the directory, so daily and monthly shapes are both aggregated —
-    // the staleness check needs to see all of them.
+    // the staleness check needs to see all of them. Gathered before the
+    // existsSync(dhPath) branch below, since a project with zero design-history
+    // file still needs this to decide whether it has a design-relevant entry.
     const sessionDates = [];
     const flatSlPath = join(projectDir, 'session-log.md');
     if (existsSync(flatSlPath)) {
@@ -107,16 +110,32 @@ export function findDesignHistoryStale(hypoDir) {
     }
     if (sessionDates.length === 0) continue;
 
+    if (!existsSync(dhPath)) {
+      // The file was never created, so there is nothing to compare dates
+      // against — but parseSessionDates already excluded pure "ADR 없음"
+      // entries, so a non-empty sessionDates here means at least one entry
+      // recorded (or implied) a design change with nowhere to land. This is a
+      // bootstrap gap, not a staleness gap: `lastDesignHistory`/`diffDays` stay
+      // null and callers must key off `kind` to avoid conflating the two.
+      stale.push({
+        project: name,
+        kind: 'missing',
+        lastSession: maxDate(sessionDates).toISOString().slice(0, 10),
+        lastDesignHistory: null,
+        diffDays: null,
+      });
+      continue;
+    }
+
     const dhText = readFileSync(dhPath, 'utf-8');
     const lastSession = maxDate(sessionDates);
     const lastDH = maxDate(parseDates(dhText, DESIGN_HISTORY_DATE_RE));
-
-    if (!lastSession) continue;
 
     if (!lastDH || lastSession > lastDH) {
       const diffDays = lastDH ? Math.round((lastSession - lastDH) / (1000 * 60 * 60 * 24)) : null;
       stale.push({
         project: name,
+        kind: 'stale',
         lastSession: lastSession.toISOString().slice(0, 10),
         lastDesignHistory: lastDH ? lastDH.toISOString().slice(0, 10) : '(없음)',
         diffDays,

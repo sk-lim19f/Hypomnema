@@ -666,7 +666,17 @@ const {
 
 function makeGitRepo() {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-precommit-'));
-  const git = (args, opts = {}) => spawnSync('git', args, { cwd: dir, encoding: 'utf-8', ...opts });
+  // HOME pinned to the session tmp dir by default: a global core.hooksPath on
+  // the developer's real ~/.claude would otherwise fire for the `init` /
+  // `config` calls below too, not just for commits callers make afterward.
+  // Callers that need a different HOME (or other env) still can via opts.env.
+  const git = (args, opts = {}) =>
+    spawnSync('git', args, {
+      cwd: dir,
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+      ...opts,
+    });
   git(['init', '-q', '-b', 'main']);
   git(['config', 'user.email', 'test@example.com']);
   git(['config', 'user.name', 'Test']);

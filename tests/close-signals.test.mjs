@@ -753,6 +753,16 @@ const CLOSE = { ...CLOSE_TEXT, origin: { kind: 'human' } };
 // [Request interrupted by user] is today extracted as user TEXT rather than
 // structurally ignored (so the event model must neutralize interruptedMessageId
 // explicitly), and the caveat record is gate-relevant because isMeta is read.
+// `dequeue` itself carries no content, so it too is NEUTRAL, a host companion
+// rather than a user event: a naive "any user event after the grant
+// invalidates it" rule would otherwise reject this, the only observed
+// delivered /compact (n=1, one observation proves no more).
+//
+// Folded in (T7) a second, stripped-down fixture that used to sit right after
+// this one: its transcript was a strict subset of this one's, so it pinned
+// nothing this fixture does not already cover on its own. What the merged
+// fixture fixes is one claim: a delivered /compact opens the gate, and none
+// of the records that accompany delivery undo that opening.
 test('measured: the one observed /compact lifecycle, through the caveat → true (must STAY granted)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [
@@ -792,30 +802,6 @@ test('acceptance: pending /compact enqueue, never delivered → true (DEFECT: mu
     const p = writeJsonl(dir, [
       USER({ message: { role: 'user', content: '계속' }, promptSource: 'typed' }),
       QOP('enqueue', '/compact'),
-    ]);
-    assert.equal(isCloseGateOpen(p), true);
-  });
-});
-
-// The delivered /compact, stripped to the companions that must not break it.
-// `dequeue` carries no content: the event model must treat it as NEUTRAL, a host
-// companion rather than a user event. Same for the interrupt — it is user-SHAPED
-// (the harness cutting the model off to run the compaction) but it is not a user
-// decision, so it must be neutralized structurally on interruptedMessageId. A
-// naive "any user event after the grant invalidates it" rule would reject the
-// only observed delivered /compact (n=1 — one observation proves no more).
-test('acceptance: delivered /compact with neutral companions → true (must STAY granted)', () => {
-  withTmpDir((dir) => {
-    const p = writeJsonl(dir, [
-      QOP('enqueue', '/compact'),
-      QOP('dequeue'),
-      USER({
-        message: {
-          role: 'user',
-          content: [{ type: 'text', text: '[Request interrupted by user]' }],
-        },
-        interruptedMessageId: 'msg_1',
-      }),
     ]);
     assert.equal(isCloseGateOpen(p), true);
   });
@@ -1171,22 +1157,32 @@ test('acceptance: close, then the model works → true (must STAY granted: tool_
 });
 
 // INVALIDATE. The user closes, then changes their mind and asks for more work.
-// The lease must expire. Today it does not: the stale close is still "somewhere
-// in the transcript", which is exactly Defect B.
+// What closes the gate here is not a rule that any later typed text undoes a
+// grant: T4 deleted that per-turn overwrite. It is the retraction tripwire
+// (isCloseRetractionPattern) matching the exact corpus phrase this fixture
+// types ('아 잠깐, 이것도 고쳐줘'). The limit that comes with a fixed corpus: a
+// real retraction worded outside the tripwire's list is missed, and the gate
+// stays open.
 //
 // Twice, because the invalidator's own producer field is what a fix will reach
 // for. Of the 7 real close→more-work cases, 6 carry human origin on BOTH typed
 // records and 1 has origin absent on both (a legacy transcript, same 2.1.181
 // boundary as the remove path). A model that invalidates only on
-// origin.kind === "human" would pass the first fixture and keep the stale lease
-// alive in the seventh real case, which is the failure this pair exists to block.
+// origin.kind === "human" would pass the first fixture and keep the gate open
+// in the seventh real case, which is the failure this pair exists to block.
 // Both must flip to false: `typed` is the ADR's producer contract, and it is
 // present on both variants.
 //
-// The distance is elided, not modelled: in the real cases 4–225 records separate
-// the close from the next instruction (18–83 for the task-notification fixture
-// above, 111 for /clear). What is pinned is the RELATION — a later typed
-// instruction expires the lease — not the gap, since no rule should key on it.
+// The distance is elided, not modelled: in the real cases 4 to 225 records
+// separate the close from the next instruction (18 to 83 for the
+// task-notification fixture above, 111 for /clear). The second half of that
+// still holds after this rewrite; the first half does not. What is pinned is
+// no longer "a later typed instruction expires the lease" (false since T4: an
+// unmatched typed instruction is neutral, not an invalidator). It is order: a
+// tripwire match closes the gate whenever it lands after the open, and no
+// rule may key on how far after. That is the same order-over-distance
+// principle the resolution store applies outside this file (openedAtIndex
+// compared against closedAtIndex, never a record count between them).
 const CLOSE_THEN_WORK = (dir, human) => {
   const origin = human ? { origin: { kind: 'human' } } : {};
   return writeJsonl(dir, [
@@ -1468,11 +1464,15 @@ const ASK = (id) => ({
 const ANSWER = (id, picked) =>
   TOOL_RESULT(id, `Your questions have been answered: "?"="${picked}"`);
 
-// Renamed (codex): mint is no longer the thing this pins — the per-turn
+// Renamed (codex): mint is no longer the thing this pins. The per-turn
 // overwrite that could have expired a grant on any non-close typed text is
-// gone (T4). What actually survives here is narrower: the approval line
-// `apply-proposals <nonce>` is itself neither a close phrase nor a
-// retraction phrase, so it is NEUTRAL and the grant made by CLOSE stands.
+// gone (T4). What survives here is narrower: the retraction tripwire does not
+// match the approval line `apply-proposals <nonce>` at all, so it stays
+// NEUTRAL and the grant made by CLOSE stands. Pairs with 'typed non-close
+// text after the approval line still expires the lease' further down, which
+// pins the tripwire firing normally on a real retraction typed right after
+// this same line. MINT/NONCE/CHALLENGE_TEXT stay defined above only because
+// this test and that pairing test both still build on them.
 test('the apply-proposals approval line is neutral and does not retract a prior grant', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [USER(CLOSE), ...MINT(NONCE), TYPED(`apply-proposals ${NONCE}`)]);
@@ -1772,12 +1772,12 @@ test('a non-close AskUserQuestion answer on an unmarked question is neutral, wha
   });
 });
 
-// THE FENCE (ISSUE-31): the carve-out does not touch typed user text, so a user who
-// asks for more work after a close still expires the lease.
+// THE FENCE (ISSUE-31): a user who types one of the retraction tripwire's own
+// corpus phrases after a close closes the gate again.
 // Renamed (codex): the old name claimed every non-close text expires the
 // grant; the per-turn overwrite that made that true is gone (T4), and this
 // fixture types one of the retraction tripwire's own corpus phrases, not an
-// arbitrary non-close message — see the neutral-survival test above for what
+// arbitrary non-close message. See the neutral-survival test above for what
 // an UNLISTED non-close phrase does instead (nothing).
 test('a tripwire retraction phrase after a grant expires the lease (over-close defense)', () => {
   withTmpDir((dir) => {
@@ -1786,6 +1786,12 @@ test('a tripwire retraction phrase after a grant expires the lease (over-close d
   });
 });
 
+// Pairs with 'the apply-proposals approval line is neutral and does not
+// retract a prior grant' above: that test shows the approval line itself
+// never matches the retraction tripwire, and this one shows the tripwire
+// still fires normally on a real retraction typed right after it. Together
+// they pin that the approval line carries no special immunity beyond being,
+// like any other unrecognized text, neutral on its own.
 test('typed non-close text after the approval line still expires the lease', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [

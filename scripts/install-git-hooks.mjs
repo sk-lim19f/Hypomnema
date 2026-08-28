@@ -16,8 +16,15 @@
  *     plus GIT_NAMESPACE / GIT_CEILING_DIRECTORIES / GIT_CONFIG_*).
  *   - Probes run with `cwd: expectedRoot` so npm `--prefix` invocations
  *     can't redirect resolution either.
- *   - Generated shim embeds `HYPOMNEMA_ROOT` + `HYPOMNEMA_GIT_DIR`. Runtime
- *     shim refuses to exec unless both literals match the current values.
+ *   - Generated shim embeds `HYPOMNEMA_ROOT` + `HYPOMNEMA_GIT_DIR` (the repo's
+ *     shared `--git-common-dir`, canonicalized). Runtime shim refuses to exec
+ *     unless the root literal matches AND the live `git rev-parse
+ *     --git-common-dir`, physically resolved via `cd ... && pwd -P`, equals the
+ *     embedded common dir. Comparing on the common dir (not `--absolute-git-dir`)
+ *     is what makes a linked worktree recognized: a worktree's own git dir lives
+ *     under `.git/worktrees/<name>`, but its common dir is still the main repo's
+ *     `.git`, same as `HYPOMNEMA_GIT_DIR`. A foreign repository still has its own,
+ *     different common dir, so it is still rejected.
  *
  * Refusal conditions (all exit 0):
  *   - `CI=true` env (npm ci on CI runs prepare; we must not touch hooks)
@@ -116,28 +123,52 @@ node "$TRK" --commit-msg "$1" || exit 1
 exit 0`;
 }
 
-function shimBody(kind, root, gitDir) {
+function shimBody(kind, root, commonDir) {
   return `#!/bin/sh
 # hypomnema-${kind}-marker v2
 # Fail-open at every identity/setup guard. Only the gate below can exit nonzero.
 set +e
 HYPOMNEMA_ROOT=${shellSingleQuote(root)}
-HYPOMNEMA_GIT_DIR=${shellSingleQuote(gitDir)}
-TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
-[ -z "$TOPLEVEL" ] && exit 0
-[ "$TOPLEVEL" = "$HYPOMNEMA_ROOT" ] || exit 0
-ABSGITDIR="$(git rev-parse --absolute-git-dir 2>/dev/null)" || exit 0
-[ "$ABSGITDIR" = "$HYPOMNEMA_GIT_DIR" ] || exit 0
+HYPOMNEMA_GIT_DIR=${shellSingleQuote(commonDir)}
 command -v node >/dev/null 2>&1 || exit 0
+# Identity guard: compare the live --git-common-dir, not --show-toplevel or
+# --absolute-git-dir. Both of those differ from the embedded values inside a
+# linked worktree (its toplevel is the worktree's own path, and its git dir is
+# the per-worktree .git/worktrees/<name>), which is exactly why this hook used
+# to exit 0 on every worktree commit. --git-common-dir stays the shared repo's
+# .git for a worktree AND for the main checkout, so one comparison covers both
+# while a genuinely foreign repo (its own, different common dir) still fails it.
+# cd ... && pwd -P resolves the raw --git-common-dir output (which may be
+# relative, and on any host may still cross a symlink such as macOS's
+# /tmp -> /private/tmp) into the same physical path realpath() produced when
+# HYPOMNEMA_GIT_DIR was embedded at install time, so the two sides compare equal.
+#
+# This CDIR check alone lets a reversed env mix through: GIT_DIR pointed at one
+# of OUR OWN linked-worktree admin dirs, paired with GIT_WORK_TREE pointing at
+# an unrelated repo. That admin dir's commondir file genuinely resolves to our
+# main .git, so CDIR matches HYPOMNEMA_GIT_DIR here even though the working
+# tree the commit actually runs against is foreign. This shim is a fast
+# pre-filter, not the definitive gate on that axis: pre-commit-format.mjs's own
+# identity guard (its "(3b) worktree binding" check) is what rejects that case
+# for real, by confirming --show-toplevel's own .git entry points back at
+# --absolute-git-dir. check-tracker-ids.mjs has no such second layer, so a
+# foreign repo sharing this hooksPath can still have its own staged blobs
+# scanned for tracker ids; that only blocks that foreign commit with our error
+# text, it never reads or writes foreign files, so it is not tracked as a
+# fix here.
+CDIR="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+[ -z "$CDIR" ] && exit 0
+CDIR="$(cd "$CDIR" 2>/dev/null && pwd -P)" || exit 0
+[ "$CDIR" = "$HYPOMNEMA_GIT_DIR" ] || exit 0
 ${gateLines(kind)}
 `;
 }
 
 // Write a single hook shim. Returns true on success, false on write failure.
 // Does NOT exit — the caller installs multiple hooks and reports once.
-function writeShim(target, kind, root, gitDir) {
+function writeShim(target, kind, root, commonDir) {
   try {
-    fs.writeFileSync(target, shimBody(kind, root, gitDir), { mode: 0o755 });
+    fs.writeFileSync(target, shimBody(kind, root, commonDir), { mode: 0o755 });
     try {
       fs.chmodSync(target, 0o755);
     } catch {}
@@ -151,14 +182,16 @@ function writeShim(target, kind, root, gitDir) {
 // status string (never throws, never exits). Refreshes our own marker (any
 // version) so a checkout move or a shim-body change re-propagates; never
 // clobbers a user's own non-marker hook or a symlink.
-function installHook(kind, absHooksDir, root, gitDir) {
+function installHook(kind, absHooksDir, root, commonDir) {
   const target = path.join(absHooksDir, kind);
   let existing;
   try {
     existing = fs.lstatSync(target);
   } catch (e) {
     if (e.code === 'ENOENT') {
-      return writeShim(target, kind, root, gitDir) ? `installed ${kind}` : `write ${kind} failed`;
+      return writeShim(target, kind, root, commonDir)
+        ? `installed ${kind}`
+        : `write ${kind} failed`;
     }
     return `stat ${kind} failed: ${e.code}`;
   }
@@ -170,7 +203,9 @@ function installHook(kind, absHooksDir, root, gitDir) {
     return `read ${kind} failed; skipping`;
   }
   if (head.includes(`hypomnema-${kind}-marker`)) {
-    return writeShim(target, kind, root, gitDir) ? `refreshed ${kind}` : `refresh ${kind} failed`;
+    return writeShim(target, kind, root, commonDir)
+      ? `refreshed ${kind}`
+      : `refresh ${kind} failed`;
   }
   return `existing non-marker ${kind}; not overwriting`;
 }
@@ -289,9 +324,15 @@ async function main() {
     //     blobs) and commit-msg (tracker-id + tool-attribution gate on the
     //     message). Each is independently marker-detected so a user's own hook is
     //     never clobbered.
+    // Embed commonDir, not absGitDir: it is what the runtime shim's identity
+    // guard now compares against (see shimBody). Guard (4) above already
+    // proved absGitDir === commonDir on this non-worktree install path, so
+    // this is the same string today; it is the semantically correct one for
+    // what the shim actually checks at commit time, including inside a
+    // worktree created after this install.
     const results = [
-      installHook('pre-commit', absHooksDir, expectedRoot, absGitDir),
-      installHook('commit-msg', absHooksDir, expectedRoot, absGitDir),
+      installHook('pre-commit', absHooksDir, expectedRoot, commonDir),
+      installHook('commit-msg', absHooksDir, expectedRoot, commonDir),
     ];
     return exitSilent(results.join('; '));
   } catch (e) {
