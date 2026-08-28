@@ -404,7 +404,7 @@ Place a `hypo-config.md` at the wiki root to make it portable across machines wi
 
 | Install path | Slash commands served from |
 |---|---|
-| Plugin (Path A) | Claude Code's plugin cache; updated via `/plugin marketplace update hypomnema` then `/reload-plugins` |
+| Plugin (Path A) | Claude Code's plugin cache; updated via `/plugin marketplace update hypomnema` then `/reload-plugins`. The cache directory is named after the manifest version, so an update lands only when that version has changed. A commit merged under an unchanged version does not reach an existing install. |
 | npm CLI (Path B) | `~/.claude/commands/hypo/`; updated via `hypomnema upgrade --apply` with per-file SHA tracking. Pass `--force-commands` to overwrite hand-edits (creates `.bak`). |
 
 ---

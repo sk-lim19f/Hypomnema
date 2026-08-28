@@ -326,6 +326,12 @@ in **both** the CHANGELOG section AND the git tag annotation. The release
 workflow enforces this with `scripts/check-bilingual.mjs`; a lightweight tag, or
 a gated CHANGELOG section missing its `#### 한국어` sub-block, will block `npm publish`.
 
+A release is what makes a fix reachable, on both channels. The plugin installer names its
+cache directory after the manifest version, so it skips the copy when that version has not
+moved: commits merged to `main` under an unchanged version never reach an existing install.
+"It is on main, so people have it" is false. Bump the version and cut the release, or the
+work sits where nobody can run it.
+
 The READMEs are not part of a release. They describe what Hypomnema does now, not
 what each version added, so cutting a release never edits them. Version history
 lives in `CHANGELOG.md` alone. (A gate used to require the release version to
