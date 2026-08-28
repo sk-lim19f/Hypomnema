@@ -29,7 +29,11 @@ import {
   mkdirSync,
   lstatSync,
   statSync,
+  fstatSync,
   chmodSync,
+  fchmodSync,
+  openSync,
+  closeSync,
   rmdirSync,
 } from 'fs';
 import { join, dirname, relative, resolve, posix, sep } from 'path';
@@ -907,14 +911,34 @@ export function withSrcExecBits(destMode, srcMode) {
   return (destMode & ~0o111) | (srcMode & 0o111);
 }
 
+/** Add only the execute bits src has that dest is missing, onto dest — every bit
+ * dest already carries (owner/group/other, ours or the user's) survives untouched.
+ * This is the additive counterpart to `withSrcExecBits` above: that one REPLACES
+ * dest's exec bits wholesale, which is right for a fresh write (there is no prior
+ * dest state worth keeping) but wrong for healing an existing file, where treating
+ * "executable" as one boolean instead of three independent bits made a cross
+ * combination (src owner-only, dest group-only) read as already-satisfied and
+ * never get healed. Used only by copyOne's content-identical branch. */
+export function addSrcExecBits(destMode, srcMode) {
+  return destMode | (srcMode & 0o111);
+}
+
 function writeFreshAtomic(dest, content, srcMode) {
+  // `wx` (O_CREAT|O_EXCL) refuses to open a path that already exists, symlink
+  // included, so a predictable tmp name can't be raced into following one, the
+  // same hardening capture.mjs's own writeAtomic already carries.
   const tmp = `${dest}.tmp.${process.pid}.${Date.now()}`;
-  writeFileSync(tmp, content);
-  if (srcMode != null) {
-    // writeFileSync has no mode option that survives umask, so the execute bit
-    // has to be applied explicitly, and before the rename: otherwise dest is
-    // briefly visible with the wrong mode to anything racing this write.
-    chmodSync(tmp, withSrcExecBits(statSync(tmp).mode, srcMode));
+  const fd = openSync(tmp, 'wx');
+  try {
+    writeFileSync(fd, content);
+    if (srcMode != null) {
+      // No fd-based write has a mode option that survives umask, so the execute
+      // bit has to be applied explicitly, and before the rename: otherwise dest
+      // is briefly visible with the wrong mode to anything racing this write.
+      fchmodSync(fd, withSrcExecBits(fstatSync(fd).mode, srcMode));
+    }
+  } finally {
+    closeSync(fd);
   }
   try {
     renameSync(tmp, dest);
@@ -936,10 +960,17 @@ function writeFreshAtomic(dest, content, srcMode) {
  *
  * The executable bit is not tracked anywhere (no mode column in the SHA map's
  * ownership model), so src's mode is the only source of truth for it and gets
- * carried onto dest on every branch that (re)writes it, including the
- * content-identical `up-to-date` branch below.
+ * carried onto dest on every branch that (re)writes it. The content-identical
+ * branch below is the exception: it only ADDS a bit src has that dest lacks
+ * (per owner/group/other, not "executable" as one boolean), never turns one
+ * off, since a dest exec bit that src lacks can't be told apart from one the
+ * user set. `typeDir` is the symlink-ancestor boundary for that same branch's
+ * chmod: every caller passes the extension-type root (`~/.claude/hooks`, etc.)
+ * so a symlinked ancestor there is never chmod'd through to whatever it points
+ * at (codex pre-commit BLOCKER — the flat-file and manifest callers had no
+ * such guard, unlike the skill loop's own pre-check on `destPath`).
  */
-function copyOne({ srcPath, destPath, key, recordedSHA, apply, force }) {
+function copyOne({ srcPath, destPath, key, recordedSHA, apply, force, typeDir }) {
   const srcContent = readFileSync(srcPath);
   const srcSHA = sha256(srcContent);
   const srcMode = statSync(srcPath).mode;
@@ -959,17 +990,27 @@ function copyOne({ srcPath, destPath, key, recordedSHA, apply, force }) {
   const onDiskSHA = sha256(onDisk);
   if (onDiskSHA === srcSHA) {
     // Content already matches, but the exec bit can still be stale: this used to
-    // be a pure no-op, which is exactly why a mismatched bit here never healed.
+    // be a pure no-op, which is exactly why a missing bit here never healed. Only
+    // heal by ADDING the specific bits src has that dest lacks (owner/group/other
+    // checked independently — a prior boolean "is anything executable" check made
+    // a cross combination like src=owner-only/dest=group-only read as already
+    // satisfied and skip healing the owner bit entirely, codex pre-commit BLOCKER).
+    // A dest bit src lacks is always left alone, because that could be this same
+    // heal from an older run, or a bit the user set on purpose, and we have no way
+    // to tell those apart. This also means a wiki copy captured before this fix
+    // (recorded 644 for a 755 local original) can no longer strip the local file
+    // back to 644 on the next sync; it can only ever add bits.
     // Reported as 'update' (not a new action) so every existing "N to sync" /
     // "N synced" count and log line already keyed on create/update/force-update
     // picks it up for free.
-    // ponytail: this also overwrites an exec bit a user deliberately flipped on a
-    // file whose content happens to still match src (chmod -x'd a script they
-    // like read-only). Upgrade path: record mode next to sha in the pkg-json map
-    // so a user's own bit can be told apart from our default and left alone.
+    // ponytail: add-only means a dest that lost a bit src still has (content
+    // matches, exec bit was stripped some other way) never gets it back either.
+    // Upgrade path: record mode next to sha in the pkg-json map so a user's own
+    // bit can be told apart from our default and healed in both directions.
     const destMode = statSync(destPath).mode;
-    if ((destMode & 0o111) !== (srcMode & 0o111)) {
-      if (apply) chmodSync(destPath, withSrcExecBits(destMode, srcMode));
+    const missingBits = srcMode & 0o111 & ~destMode;
+    if (missingBits !== 0 && !hasSymlinkAncestor(typeDir, destPath)) {
+      if (apply) chmodSync(destPath, addSrcExecBits(destMode, srcMode));
       return { action: 'update', sha: srcSHA };
     }
     return { action: 'up-to-date', sha: srcSHA };
@@ -1097,6 +1138,7 @@ function syncOneSkill({
       recordedSHA: recordedNested[f.rel],
       apply,
       force,
+      typeDir,
     });
     if (res.sha != null) newNested[f.rel] = res.sha;
     result.actions.push({ target, file: fileKey, action: res.action });
@@ -1414,6 +1456,7 @@ export function syncExtensions({
         recordedSHA: recorded[fileKey],
         apply,
         force,
+        typeDir,
       });
       if (fileRes.sha != null) newSHAs[fileKey] = fileRes.sha;
       result.actions.push({ target, file: fileKey, action: fileRes.action });
@@ -1448,6 +1491,7 @@ export function syncExtensions({
           recordedSHA: recorded[mKey],
           apply,
           force,
+          typeDir,
         });
         if (mRes.sha != null) newSHAs[mKey] = mRes.sha;
         result.actions.push({ target, file: mKey, action: mRes.action });
