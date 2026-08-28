@@ -48,6 +48,133 @@ export const WIKI_PRE_COMMIT_MARKER_END = '# hypo-managed:pre-commit:end';
 export const SHELL_MARKER_START = '# hypo-managed:shell-setup:start';
 export const SHELL_MARKER_END = '# hypo-managed:shell-setup:end';
 
+// ── marker-span validation (shared by both the writer in init.mjs and both
+// removal paths in uninstall.mjs) ───────────────────────────────────────────
+//
+// Two independent indexOf() calls cannot tell "well-formed" apart from
+// "duplicated" or "swapped": if a file happens to hold two full copies of the
+// block, indexOf finds only the first END, so slicing [firstStart, firstEnd]
+// leaves the second copy's install behind with no report of it. If END
+// precedes START (a hand-edited or corrupted file), slicing [start, end) with
+// start > end does not error, it silently duplicates whatever sits between
+// them into the "removed" (or, on the writer's side, the "replaced") span.
+// Neither script has a way back from either outcome, so a span is only
+// trusted when both markers appear EXACTLY once and START comes before END.
+function countOccurrences(content, needle) {
+  let count = 0;
+  let idx = 0;
+  while ((idx = content.indexOf(needle, idx)) !== -1) {
+    count++;
+    idx += needle.length;
+  }
+  return count;
+}
+
+export function findMarkerSpan(content, startMarker, endMarker) {
+  const startCount = countOccurrences(content, startMarker);
+  const endCount = countOccurrences(content, endMarker);
+  if (startCount !== 1 || endCount !== 1) {
+    return {
+      ok: false,
+      reason: `expected exactly one start and one end marker, found ${startCount} start / ${endCount} end`,
+    };
+  }
+  const startIdx = content.indexOf(startMarker);
+  const endIdx = content.indexOf(endMarker);
+  if (!(startIdx < endIdx)) {
+    return { ok: false, reason: 'the end marker appears before the start marker' };
+  }
+  return { ok: true, startIdx, endIdx };
+}
+
+// ── body-shape validation (shared by both removal paths in uninstall.mjs) ──
+//
+// findMarkerSpan proves the span itself is well-formed. It says nothing about
+// what sits INSIDE that span. A well-formed marker pair is trivial to forge
+// around arbitrary content — a user's own shell function, a user's own
+// pre-commit check — and codex reproduced exactly that (2026-08-27): a marker
+// pair wrapped around `echo USER_OWNED_DEPLOY_CHECK` passed every prior check
+// (one start, one end, start before end, a leading shebang) and got deleted
+// along with the user's line, because nothing ever looked at the body text
+// itself. These two functions are that missing check.
+//
+// The shell block is fully static — init never bakes a path into it — so its
+// body can be matched byte-for-byte against SHELL_FUNCTION_BODY below. The
+// pre-commit body cannot: it embeds the absolute install root, which moves
+// across machines and package versions, so requiring an exact match would
+// refuse to remove a hook a real (older, or differently-installed) init.mjs
+// actually wrote. It is matched structurally instead — the "one or two `node
+// '<path>' ... || exit 1` steps, then `exit 0`" shape — checking only that
+// the referenced script is ours (ends in `/hooks/hypo-pre-commit.mjs` or
+// `/scripts/lint.mjs`), not which root it lives under.
+//
+// Both directions of a mismatch here are unequal: failing to recognize a
+// hook init actually wrote costs a re-run with --force-*; deleting a file
+// that was never ours has no recovery. So an unrecognized shape is always
+// treated as "not ours" and left standing, never as "close enough".
+
+const PRE_COMMIT_WORKER_LINE = /^node '(.+)' \|\| exit 1$/;
+const PRE_COMMIT_LINT_LINE = /^node '(.+)' --hypo-dir='(?:.+)' --strict \|\| exit 1$/;
+
+// Reverses shellSingleQuote()'s escaping (a literal `'` becomes `'\''`) so the
+// captured path can be compared against the suffix it must end in.
+function unescapeShellSingleQuoted(s) {
+  return s.split("'\\''").join("'");
+}
+
+/**
+ * @param {string} content full pre-commit hook file content
+ * @param {{startIdx: number, endIdx: number}} span a `findMarkerSpan` result
+ *   already confirmed `ok: true` for WIKI_PRE_COMMIT_MARKER_START/END
+ * @returns {boolean} true when the text between the markers is recognizable
+ *   as a body init.mjs's wikiPreCommitContent() writes
+ */
+export function isOwnedWikiPreCommitBody(content, span) {
+  const body = content.slice(span.startIdx + WIKI_PRE_COMMIT_MARKER_START.length, span.endIdx);
+  const lines = body.split('\n');
+  // wikiPreCommitContent() always places a bare "\n" right after START and
+  // right before END, so the first and last split segments must be empty.
+  if (lines[0] !== '' || lines[lines.length - 1] !== '') return false;
+  const middle = lines.slice(1, -1);
+  if (middle.length < 2 || middle.length > 3 || middle[middle.length - 1] !== 'exit 0') {
+    return false;
+  }
+  const steps = middle.slice(0, -1);
+  const worker = PRE_COMMIT_WORKER_LINE.exec(steps[0]);
+  if (!worker || !unescapeShellSingleQuoted(worker[1]).endsWith('/hooks/hypo-pre-commit.mjs')) {
+    return false;
+  }
+  if (steps.length === 2) {
+    const lint = PRE_COMMIT_LINT_LINE.exec(steps[1]);
+    if (!lint || !unescapeShellSingleQuoted(lint[1]).endsWith('/scripts/lint.mjs')) return false;
+  }
+  return true;
+}
+
+// The exact text init.mjs's shellFunctionBlock() writes between the shell
+// markers. Exported so init.mjs builds the block FROM this constant rather
+// than a second copy of the same literal — the two can then never drift the
+// way independent copies of the pre-commit worker line already could not
+// (see the module-level comment on the markers above).
+export const SHELL_FUNCTION_BODY = `
+function claude() {
+  echo "{\\"cwd\\":\\"$(pwd)\\"}" | node "$HOME/.claude/hooks/hypo-session-start.mjs" > /dev/null 2>&1
+  command claude "$@"
+}
+`;
+
+/**
+ * @param {string} content full rc file content
+ * @param {{startIdx: number, endIdx: number}} span a `findMarkerSpan` result
+ *   already confirmed `ok: true` for SHELL_MARKER_START/END
+ * @returns {boolean} true when the text between the markers is byte-identical
+ *   to what init.mjs writes
+ */
+export function isOwnedShellFunctionBody(content, span) {
+  const body = content.slice(span.startIdx + SHELL_MARKER_START.length, span.endIdx);
+  return body === SHELL_FUNCTION_BODY;
+}
+
 // Fallback scrub list for git versions without `rev-parse --local-env-vars`.
 // Mirrors scripts/install-git-hooks.mjs, which established this trust model.
 const STATIC_LOCAL_ENV_VARS = [
@@ -82,7 +209,7 @@ function buildScrubbedEnv(localEnvList) {
 // Canonicalize a path that may not exist yet: realpath the deepest existing
 // ancestor and re-append the rest. Without this, a hooks dir git will create
 // lazily could evade the containment check via an unresolved symlinked parent.
-function canonicalize(p) {
+export function canonicalize(p) {
   let cur = resolve(p);
   const tail = [];
   for (;;) {
@@ -101,7 +228,7 @@ function canonicalize(p) {
   }
 }
 
-function isInside(child, parent) {
+export function isInside(child, parent) {
   return child === parent || child.startsWith(parent + sep);
 }
 

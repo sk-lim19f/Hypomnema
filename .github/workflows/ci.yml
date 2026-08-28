@@ -257,14 +257,23 @@ jobs:
           node-version: 20
       - name: Dry-run reports DRY RUN
         run: |
+          # --hooks-dir only scopes the ~/.claude/hooks removal; it does not
+          # bound the rc-block / wiki-pre-commit-hook cleanup, which lives
+          # outside ~/.claude entirely. Without --keep-shell/--keep-wiki-hook
+          # this run would read the runner's real ~/.bashrc and scan its real
+          # $HOME for a vault, since this job never sandboxes HOME.
           out=$(node scripts/uninstall.mjs \
-            --hooks-dir=/tmp/no-hooks-$RANDOM)
+            --hooks-dir=/tmp/no-hooks-$RANDOM \
+            --keep-shell \
+            --keep-wiki-hook)
           echo "$out" | grep -q '\[DRY RUN'
       - name: Apply mode exits 0 when nothing is installed
         run: |
           node scripts/uninstall.mjs \
             --apply \
-            --hooks-dir=/tmp/no-hooks-$RANDOM
+            --hooks-dir=/tmp/no-hooks-$RANDOM \
+            --keep-shell \
+            --keep-wiki-hook
 
   hypo-absent:
     name: Hypo-absent (Node ${{ matrix.node-version }})
