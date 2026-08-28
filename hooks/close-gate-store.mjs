@@ -34,6 +34,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { walkCloseGate } from './hypo-shared.mjs';
 
 /** `<hypoDir>/.cache/close-gate/<session-id>.json`. */
 export function closeGatePath(hypoDir, sessionId) {
@@ -303,4 +304,132 @@ export function readResolution(hypoDir, sessionId, rawTranscript) {
   return verified
     ? { closedAtIndex: parsed.closedAtIndex, prefixMatches: true }
     : { closedAtIndex: REJECTED_INDEX, prefixMatches: false };
+}
+
+/**
+ * The one gate a consumer needs when the caller is about to WRITE the wiki
+ * or WRITE the marker: does this session's transcript, taken together with
+ * any recorded resolution, currently authorize a close? This is the
+ * composite `walkCloseGate` + `readResolution` such a caller should use
+ * instead of wiring the two together itself.
+ *
+ * Three rules, in order:
+ *   1. No open in the transcript at all (`walkCloseGate(...).open` is
+ *      false) → reject. There is nothing to check a resolution against.
+ *   2. A recorded resolution exists and its prefix hash still matches this
+ *      transcript's bytes through the resolved record → pass only when the
+ *      open found in step 1 happened STRICTLY AFTER that record
+ *      (`openedAtIndex >= closedAtIndex`). The two sides of that comparison
+ *      use DIFFERENT bases on purpose, not by accident: `openedAtIndex` is
+ *      `walkCloseGate`'s 0-based position in its record array, while
+ *      `closedAtIndex` is `resolutionStamp`'s 1-based COUNT of records
+ *      resolved. A count of N records resolved (positions 0..N-1 spent)
+ *      means position N is the first UNRESOLVED one — so `openedAtIndex
+ *      (N) >= closedAtIndex (N)` lands exactly on the next fresh record,
+ *      not on the one the resolution already consumed. Reusing this
+ *      comparison anywhere else requires reusing this base mismatch too;
+ *      the new-open tests in the test file below pin this exact boundary,
+ *      so DO NOT "fix" the operator to `>` — that would move the boundary
+ *      off by one in the other direction. An open that does not clear the
+ *      boundary is the signal already spent; it does not authorize a
+ *      second apply.
+ *   3. The recorded resolution's prefix hash does NOT match (the
+ *      transcript was rewritten before the resolved record) → reject,
+ *      distinctly from rule 2, because the fix is different: rule 2 asks
+ *      for a fresh close phrase, rule 3 says the evidence itself cannot be
+ *      trusted.
+ *   (No resolution record at all — `readResolution`'s `NO_CONSTRAINT` — is
+ *   not a fourth rule: it is the absence of rule 2's and rule 3's
+ *   precondition, so an open from step 1 passes with nothing further to
+ *   check.)
+ *
+ * `open` in the return value is `walkCloseGate`'s own verdict (rule 1),
+ * unfiltered by the resolution check — a consumer that wants to know
+ * "did the user say close at all, resolution aside" reads this field.
+ * `ok` is the full three-rule verdict.
+ *
+ * NOT every `isCloseGateOpen` caller should switch to this. Writing bytes is
+ * not the test: `--mark-session-closed` writes a file too (the marker), and
+ * it still belongs on `isCloseGateOpen`. The real criterion is which close
+ * event a call is transacting FOR. `verifyCloseAuthority` and
+ * `hypo-close-guard.mjs` each gate a NEW authorization request: a write
+ * that has not happened yet, standing on whatever close signal the
+ * transcript currently carries — so a resolution recorded by an EARLIER
+ * close must retire that old signal before a new one is trusted again.
+ * `runMarkSessionClosed` (crystallize.mjs's standalone
+ * `--mark-session-closed`) is different in kind: it is the FOLLOW-UP
+ * RECOVERY of a close that, per the resolution file itself, has ALREADY
+ * happened (a successful apply is what wrote that resolution in the first
+ * place). Gating that recovery on `closeGateStatus` would make an apply's
+ * own success permanently block its one legitimate repair path — its
+ * `openedAtIndex` comes from the same transcript snapshot the resolution
+ * was just stamped FROM, so it can never clear the boundary rule 2 needs,
+ * and a marker withheld by a commit failure could never be recovered
+ * without a brand-new close phrase the user has no reason to type twice.
+ * tests/close-hooks-gate.test.mjs's test C
+ * ("crystallize.mjs:754 (runMarkSessionClosed) stays on isCloseGateOpen")
+ * pins exactly this: it withholds a marker via a real commit failure, fixes
+ * the commit by hand with NO new close signal, and asserts the recovery run
+ * still succeeds; swapping :754 to `closeGateStatus` turns that test red.
+ * As of this writing the two callers that gate a NEW request are
+ * `verifyCloseAuthority` (crystallize.mjs, before any wiki byte is written)
+ * and `hypo-close-guard.mjs`'s PreToolUse intercept (before a
+ * Write/Edit/MultiEdit on a close-artifact file lands); every path that
+ * recovers or reports on an ALREADY-recorded close (`runMarkSessionClosed`,
+ * and the post-apply diagnostic that reports whether the transcript carried
+ * a signal) reads `isCloseGateOpen` directly, on purpose, and should keep
+ * doing so.
+ *
+ * @param {{transcriptPath: string|null, hypoDir: string, sessionId: string|null}} args
+ * @returns {{ok: boolean, open: boolean, reason: string|null}}
+ */
+export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
+  const { open, openedAtIndex } = walkCloseGate(transcriptPath ?? null);
+  if (!open) {
+    return {
+      ok: false,
+      open: false,
+      reason:
+        'no-open: this session carries no close signal in its transcript yet — ' +
+        'ask the user whether they actually want to close before treating this as one.',
+    };
+  }
+
+  let rawTranscript = null;
+  try {
+    rawTranscript = transcriptPath ? readFileSync(transcriptPath) : null;
+  } catch {
+    rawTranscript = null; // unreadable at the moment of the check; readResolution treats this as unverifiable, not absent
+  }
+  const { closedAtIndex, prefixMatches } = readResolution(hypoDir, sessionId, rawTranscript);
+
+  if (closedAtIndex === null) {
+    // NO_CONSTRAINT: no valid resolution record exists for this session, so
+    // the open found above is unconstrained.
+    return { ok: true, open: true, reason: null };
+  }
+  if (prefixMatches === false) {
+    // Checked ahead of the index comparison on purpose, even though
+    // REJECTED_INDEX already makes `openedAtIndex >= closedAtIndex` fail on
+    // its own arithmetic: the point here is the DISTINCT reason string, not
+    // the pass/fail outcome.
+    return {
+      ok: false,
+      open: true,
+      reason:
+        'transcript-rewrite-detected: the recorded resolution no longer matches this ' +
+        "transcript's history — treat this session's prior resolution as untrustworthy " +
+        'and confirm the close with the user again.',
+    };
+  }
+  if (openedAtIndex >= closedAtIndex) {
+    return { ok: true, open: true, reason: null };
+  }
+  return {
+    ok: false,
+    open: true,
+    reason:
+      'no-new-open-since-resolution: this session already resolved its last close signal — ' +
+      'a fresh close phrase from the user is needed before this can pass again.',
+  };
 }

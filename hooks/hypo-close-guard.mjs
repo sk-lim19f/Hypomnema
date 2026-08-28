@@ -103,11 +103,11 @@ import { relative } from 'path';
 import {
   HYPO_DIR,
   detectSessionCloseArtifact,
-  isCloseGateOpen,
   isGateSkipped,
   touchedPathsPath,
   withFileLock,
 } from './hypo-shared.mjs';
+import { closeGateStatus } from './close-gate-store.mjs';
 
 const CLOSE_ARTIFACT_BASENAMES = new Set(['session-state.md', 'hot.md']);
 // Mirrors hypo-auto-stage.mjs's WRITE_TOOLS: the tools that replace file bytes.
@@ -215,7 +215,22 @@ try {
     process.exit(0);
   }
 
-  if (isCloseGateOpen(input.transcript_path ?? null)) {
+  const gateStatus = closeGateStatus({
+    transcriptPath: input.transcript_path ?? null,
+    hypoDir: HYPO_DIR,
+    sessionId: input.session_id ?? null,
+  });
+  // F4: without session_id, closeGateStatus's own readResolution can never
+  // look up THIS session's close-gate/<id>.json, so a PRIOR close this exact
+  // session already resolved would silently read back as unconstrained (rule
+  // 1's raw transcript open, none of the resolution check rules 2/3 add) —
+  // the same T6-before behavior this whole file exists to close. Real
+  // PreToolUse input always carries session_id (measured), so this branch is
+  // a defensive fail-closed for a shape that should not occur, not the
+  // everyday path: an absent session_id forces an ask on top of whatever
+  // closeGateStatus itself found, rather than letting "cannot verify" read
+  // as "verified clean" the way an unchecked `gateStatus.ok` would.
+  if (gateStatus.ok && input.session_id) {
     process.exit(0);
   }
 
@@ -224,6 +239,11 @@ try {
     : structuralHit
       ? `both session-state.md and hot.md are being rewritten this session`
       : `this write reads as a close announcement (마감/종료 wording)`;
+  // gateStatus.reason is null when gateStatus.ok is true — the missing-
+  // session_id branch above is the only way to reach here with ok:true, so
+  // name that gap explicitly instead of printing a literal "(null)".
+  const gateReason =
+    gateStatus.reason ?? 'no session_id — cannot verify against a recorded resolution';
 
   console.log(
     JSON.stringify({
@@ -233,8 +253,8 @@ try {
         permissionDecision: 'ask',
         permissionDecisionReason:
           `[WIKI CLOSE GUARD] ${rel} — ${why}, but no user close signal was seen ` +
-          `in this session. Confirm with the user before writing: did they actually ` +
-          `ask to close the session?\n` +
+          `in this session (${gateReason}). Confirm with the user before writing: did they ` +
+          `actually ask to close the session?\n` +
           `To bypass: set HYPO_SKIP_GATE=1`,
       },
     }),

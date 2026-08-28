@@ -113,7 +113,7 @@ import {
 } from '../hooks/hypo-shared.mjs';
 import { hashContent, readBaseEntry, advanceBase } from '../hooks/base-store.mjs';
 import { writeProposal } from '../hooks/proposal-store.mjs';
-import { recordGateClosed, resolutionStamp } from '../hooks/close-gate-store.mjs';
+import { recordGateClosed, resolutionStamp, closeGateStatus } from '../hooks/close-gate-store.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
 // commands as `node <SELF_SCRIPT> ...` rather than a bare `crystallize` bin,
@@ -939,7 +939,7 @@ const CLOSE_REFUSAL_HELP = [
  *   { ok: false, reason, error }   reason: session-id-required | transcript-unresolved
  *                                          | no-user-close-signal
  */
-function verifyCloseAuthority(sessionId) {
+function verifyCloseAuthority(sessionId, hypoDir) {
   if (!sessionId) {
     return {
       ok: false,
@@ -962,13 +962,15 @@ function verifyCloseAuthority(sessionId) {
         `authority here.`,
     };
   }
-  if (!isCloseGateOpen(transcript)) {
+  const gateStatus = closeGateStatus({ transcriptPath: transcript, hypoDir, sessionId });
+  if (!gateStatus.ok) {
     return {
       ok: false,
       reason: 'no-user-close-signal',
       error:
         "session-close apply refused before any wiki write or commit: this session's transcript " +
-        'carries no user close signal. The user did not ask to close.',
+        'carries no user close signal. The user did not ask to close. ' +
+        `Gate detail: ${gateStatus.reason}`,
     };
   }
   return { ok: true };
@@ -1101,7 +1103,9 @@ function applySessionClose(args) {
   // Only a payload-bearing call can write. A payload-less one falls through to the
   // "payload is required" error below without touching a byte, so gating it here
   // would just replace one refusal with a less accurate one.
-  const closeAuth = args.payload ? verifyCloseAuthority(args.sessionId) : { ok: true };
+  const closeAuth = args.payload
+    ? verifyCloseAuthority(args.sessionId, args.hypoDir)
+    : { ok: true };
   if (!closeAuth.ok) {
     const out = {
       ok: false,
@@ -1886,6 +1890,16 @@ function applySessionClose(args) {
       transcriptResolved: !!closeTranscript,
       // Scan the signal only when the gate passed AND a transcript resolved —
       // isCloseGateOpen never runs earlier than the original nested `else if`.
+      // Reads the raw walkCloseGate open, not closeGateStatus: this apply's
+      // OWN recordGateClosed call above already ran with this transcript's
+      // full record count as closedAtIndex, and openedAtIndex can never reach
+      // or pass a count taken from the very same transcript (see
+      // closeGateStatus's doc comment) — so gating this diagnostic on .ok
+      // would read false on every apply, unconditionally, not just a stale
+      // one. This field asks a narrower question than closeGateStatus
+      // answers: "did the transcript carry a close signal", not "is this
+      // apply itself still authorized" (verifyCloseAuthority already settled
+      // that, before any byte was written).
       hasUserSignal: gateOk && !!closeTranscript && isCloseGateOpen(closeTranscript),
     });
     markerSkipReason = decision.skipReason;

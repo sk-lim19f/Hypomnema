@@ -18,6 +18,7 @@ import {
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
+import { recordGateClosed, resolutionStamp } from '../hooks/close-gate-store.mjs';
 import {
   HOME,
   HOOKS,
@@ -28,6 +29,7 @@ import {
   payloadForCleanWiki,
   peekTouchedPaths,
   recordTouchedPaths,
+  resolveTranscriptBySessionId,
   run,
   runApply,
   runHook,
@@ -1508,6 +1510,222 @@ test('a non-clear SessionEnd reason records nothing', () => {
       assert.equal(existsSync(gatePath), false, 'a non-clear reason must not record a resolution');
     } finally {
       cleanup();
+    }
+  });
+});
+
+// ── T6: consumer wiring, not the judge function itself ─────────────────────
+//
+// tests/close-gate-store.test.mjs's (a)-(e) call closeGateStatus directly, so
+// they pass whether or not any real caller ever wires it in. The two tests
+// below observe THROUGH the two production call sites instead
+// (verifyCloseAuthority via --apply-session-close, hypo-close-guard.mjs via
+// PreToolUse), so a revert of either wiring — reading `.open` instead of
+// `.ok`, or dropping the call entirely — turns one of these red. Each was
+// confirmed red against the exact neutralization it pins, then restored.
+
+suite('close-gate resolution wiring (T6, consumer gating)');
+
+test('A) verifyCloseAuthority: a resolved close refuses a re-run with no fresh signal, before any byte is written', () => {
+  withCleanWiki((wiki) => {
+    const today = todayLocal();
+    const projDir = join(wiki, 'projects', 'test-project');
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: { content: readFileSync(join(projDir, 'session-state.md'), 'utf-8') },
+      projectHot: { content: readFileSync(join(projDir, 'hot.md'), 'utf-8') },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] first close\n` },
+      log: { entry: `## [${today}] session | test-project — first close\n` },
+    };
+    const sessionId = 's-t6-verify-authority';
+
+    // Seed the transcript ourselves (not via runApply's auto-seed) so it
+    // survives between calls instead of being deleted by runApply's own
+    // cleanup after the first one — the second and third calls need to see
+    // the SAME session's growing transcript.
+    const cleanupTranscript = seedCloseTranscript(sessionId);
+    try {
+      // 1) A close signal exists, no resolution recorded yet → apply succeeds
+      // (its own success is what records the resolution — see the T3 suite
+      // above).
+      const first = runApply(wiki, payload, { sessionId });
+      const firstOut = JSON.parse(first.stdout);
+      assert.equal(firstOut.ok, true, `first apply must succeed: ${first.stdout}\n${first.stderr}`);
+
+      // 2) Same session, same transcript, no fresh close phrase since the
+      // resolution → verifyCloseAuthority must refuse before any write. The
+      // payload carries DIFFERENT projectHot bytes than the first apply
+      // wrote, on purpose: reusing the same payload would make a rejected
+      // apply and a silently-successful no-op write indistinguishable on
+      // disk (F3 — same bytes either way), so the disk-untouched assertion
+      // below actually needs bytes that would visibly land if the gate did
+      // not hold.
+      const hotBefore = readFileSync(join(projDir, 'hot.md'), 'utf-8');
+      const second = runApply(
+        wiki,
+        { ...payload, projectHot: { content: `${hotBefore}\nsecond close, must never land.\n` } },
+        { sessionId },
+      );
+      const secondOut = JSON.parse(second.stdout);
+      assert.notEqual(second.status, 0, 'a reused, already-resolved signal must not re-authorize');
+      assert.equal(secondOut.ok, false);
+      assert.equal(secondOut.reason, 'no-user-close-signal');
+      assert.match(
+        secondOut.error,
+        /no-new-open-since-resolution/,
+        `the refusal must name the specific gate reason: ${secondOut.error}`,
+      );
+      assert.deepEqual(secondOut.applied, [], 'a refused authority check must write nothing');
+      assert.equal(
+        secondOut.committed,
+        null,
+        'a refused authority check must not attempt a commit',
+      );
+      assert.equal(
+        readFileSync(join(projDir, 'hot.md'), 'utf-8'),
+        hotBefore,
+        'the refused apply must not touch disk',
+      );
+
+      // 3) Pair assertion: a fresh close phrase appended to the SAME
+      // transcript authorizes the re-run.
+      const transcriptPath = resolveTranscriptBySessionId(
+        sessionId,
+        join(SESSION_TMP_HOME, '.claude', 'projects'),
+      );
+      writeFileSync(
+        transcriptPath,
+        readFileSync(transcriptPath, 'utf-8') +
+          JSON.stringify({ type: 'user', message: { role: 'user', content: '세션 마무리 해줘' } }) +
+          '\n',
+      );
+      const third = runApply(wiki, payload, { sessionId });
+      const thirdOut = JSON.parse(third.stdout);
+      assert.equal(thirdOut.ok, true, `a fresh close signal must re-authorize: ${third.stdout}`);
+    } finally {
+      cleanupTranscript();
+    }
+  });
+});
+
+test('B) hypo-close-guard.mjs: a resolved close with no new open re-asks, and names the specific gate rejection', () => {
+  withCleanWiki((wiki) => {
+    const sessionId = 's-t6-guard-wiring';
+    const transcriptPath = join(wiki, `transcript-${sessionId}.jsonl`);
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: 'user', message: { role: 'user', content: '세션 마무리 해줘' } }) +
+        '\n',
+    );
+    const stdin = {
+      session_id: sessionId,
+      transcript_path: transcriptPath,
+      tool_name: 'Write',
+      tool_input: {
+        file_path: join(wiki, 'projects', 'test-project', 'hot.md'),
+        content: '**2026-08-04(1번째 세션): 세션을 마감했다.**',
+      },
+    };
+
+    // 1) A close signal exists, no resolution recorded → the guard passes
+    // silently (the `ok` path).
+    const before = runHook('hypo-close-guard.mjs', stdin, { HYPO_DIR: wiki });
+    assert.equal(
+      before.stdout.trim(),
+      '',
+      `an open, unresolved close must pass silently: ${before.stdout}`,
+    );
+
+    // 2) Record a resolution against these exact bytes; no new open since.
+    recordGateClosed(wiki, sessionId, resolutionStamp(readFileSync(transcriptPath)));
+
+    const after = runHook('hypo-close-guard.mjs', stdin, { HYPO_DIR: wiki });
+    assert.notEqual(after.stdout.trim(), '', 'a resolved close with no new open must re-ask');
+    const out = JSON.parse(after.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
+    assert.match(
+      out.hookSpecificOutput.permissionDecisionReason,
+      /no-new-open-since-resolution/,
+      `the ask reason must name the specific gate rejection: ${out.hookSpecificOutput.permissionDecisionReason}`,
+    );
+  });
+});
+
+test('C) crystallize.mjs:754 (runMarkSessionClosed) stays on isCloseGateOpen: a commit-failed marker still recovers with NO new close signal', () => {
+  withCleanWiki((wiki) => {
+    // Same commit-failure fixture as the T3 suite above: force the vault's
+    // own commit to fail, so apply succeeds (ok:true, resolution recorded by
+    // its own success) but the marker is withheld (commit-failed).
+    const hooksDir = join(wiki, '.git', 'hooks');
+    mkdirSync(hooksDir, { recursive: true });
+    const hookPath = join(hooksDir, 'pre-commit');
+    writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+    chmodSync(hookPath, 0o755);
+
+    const today = todayLocal();
+    const projDir = join(wiki, 'projects', 'test-project');
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: { content: readFileSync(join(projDir, 'session-state.md'), 'utf-8') },
+      projectHot: { content: readFileSync(join(projDir, 'hot.md'), 'utf-8') },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] test session\n` },
+      log: { entry: `## [${today}] session | test-project\n` },
+    };
+    const sessionId = 's-t6-mark-recovery';
+    const cleanupTranscript = seedCloseTranscript(sessionId);
+    try {
+      const applyResult = runApply(wiki, payload, { sessionId });
+      const applyOut = JSON.parse(applyResult.stdout);
+      assert.equal(
+        applyOut.ok,
+        true,
+        `apply must still succeed on a commit failure: ${applyResult.stdout}\n${applyResult.stderr}`,
+      );
+      assert.equal(
+        applyOut.markerWritten,
+        false,
+        'the marker must be withheld on a commit failure',
+      );
+      assert.ok(
+        /^commit-failed:/.test(applyOut.markerSkipReason || ''),
+        `expected a commit-failed skip reason, got ${JSON.stringify(applyOut.markerSkipReason)}`,
+      );
+      const markerPath = join(wiki, '.cache', `session-closed-${sessionId}.marker`);
+      assert.equal(existsSync(markerPath), false, 'no marker must exist yet');
+
+      // The person fixes the commit failure by hand and lands the payload's
+      // own writes (commands/crystallize.md's documented recovery for
+      // `commit-failed:` — fix the git issue, then re-run). No new close
+      // phrase enters the transcript: this is recovering the SAME close, not
+      // requesting a new one.
+      unlinkSync(hookPath);
+      spawnSync('git', ['add', '-A'], { cwd: wiki });
+      spawnSync('git', ['commit', '-q', '-m', 'recover commit-failed close'], { cwd: wiki });
+
+      // This is the decision F1/F2 pin: :754 must stay isCloseGateOpen, not
+      // closeGateStatus, or this recovery run would refuse itself against
+      // the resolution its own first apply just recorded.
+      const markResult = run('crystallize.mjs', [
+        `--hypo-dir=${wiki}`,
+        '--mark-session-closed',
+        `--session-id=${sessionId}`,
+        '--project=test-project',
+        '--json',
+      ]);
+      const markOut = JSON.parse(markResult.stdout);
+      assert.equal(
+        markResult.status,
+        0,
+        `the recovery marker write must succeed with no new close signal: ${markResult.stdout}\n${markResult.stderr}`,
+      );
+      assert.equal(markOut.ok, true);
+      assert.ok(existsSync(markerPath), 'the marker must land on the recovery run');
+    } finally {
+      cleanupTranscript();
     }
   });
 });

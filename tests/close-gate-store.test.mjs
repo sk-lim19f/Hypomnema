@@ -10,6 +10,7 @@ import { test, suite } from './harness.mjs';
 import { withTmpDir } from './helpers.mjs';
 import {
   closeGatePath,
+  closeGateStatus,
   readResolution,
   recordGateClosed,
   resolutionStamp,
@@ -454,5 +455,159 @@ test('readResolution: a verified match stays a verified match across a JSON roun
     assert.equal(naiveConsumerAllows(after, stamp.index), true);
     assert.equal(naiveConsumerAllows(verified, stamp.index - 1), false);
     assert.equal(naiveConsumerAllows(after, stamp.index - 1), false);
+  });
+});
+
+// --- T6: closeGateStatus — the composite walkCloseGate + readResolution gate
+// every consumer should call instead of wiring the two together itself ---
+
+// A genuine typed close-phrase user record, in the same JSONL shape a real
+// transcript carries (see helpers.mjs's seedCloseTranscript, which uses the
+// same phrase against the real transcript resolver).
+const CLOSE_TEXT = '세션 마무리 해줘';
+function closeRecord(text = CLOSE_TEXT) {
+  return JSON.stringify({ type: 'user', message: { role: 'user', content: text } });
+}
+
+/** Writes JSONL records (already-stringified lines) to a fresh transcript
+ * file under `dir` and returns its path. */
+function writeTranscript(dir, ...lines) {
+  const path = join(dir, `transcript-${Math.random().toString(36).slice(2, 10)}.jsonl`);
+  writeFileSync(path, lines.join('\n') + '\n');
+  return path;
+}
+
+suite('close-gate-store: closeGateStatus (T6, the composite gate)');
+
+test('(a) an open with no recorded resolution passes', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(hypoDir, closeRecord());
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, true);
+    assert.equal(result.open, true);
+  });
+});
+
+test('(b) a resolved close with no NEW open since the resolution is rejected', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptText = closeRecord() + '\n';
+    const stamp = resolutionStamp(Buffer.from(transcriptText, 'utf-8'));
+    assert.equal(recordGateClosed(hypoDir, SESSION, stamp), true);
+
+    // Same bytes, no fresh close phrase appended since the resolution.
+    const transcriptPath = writeTranscript(hypoDir, closeRecord());
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, false);
+    assert.equal(result.open, true, 'the transcript itself still opens — only the gate rejects');
+    assert.match(result.reason, /no-new-open-since-resolution/);
+  });
+});
+
+test('(c) a resolved close followed by a fresh close phrase passes', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptText = closeRecord() + '\n';
+    const stamp = resolutionStamp(Buffer.from(transcriptText, 'utf-8'));
+    recordGateClosed(hypoDir, SESSION, stamp);
+
+    // A second, later close phrase — a fresh user decision after the resolution.
+    const transcriptPath = writeTranscript(hypoDir, closeRecord(), closeRecord());
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, true);
+    assert.equal(result.reason, null);
+  });
+});
+
+test('(d) a prefix-hash mismatch (transcript rewritten ahead of the resolved record) is rejected', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptText = closeRecord() + '\n';
+    const stamp = resolutionStamp(Buffer.from(transcriptText, 'utf-8'));
+    recordGateClosed(hypoDir, SESSION, stamp);
+
+    // A record inserted AHEAD of the resolved one shifts every byte the
+    // resolution's hash was computed over — a rewrite, not an append.
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } }),
+      closeRecord(),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /transcript-rewrite-detected/);
+  });
+});
+
+test('(e) polarity invariant: a forged resolution file never passes MORE than an absent one does', () => {
+  const forgedPayloads = [
+    { open: true },
+    { granted: true },
+    { humanTurnAt: new Date(Date.now() + 86_400_000).toISOString() }, // future
+    { fresh: true },
+  ];
+  // A transcript that never opens the gate at all — rule 1 of closeGateStatus
+  // must reject it before ever reading a resolution file, so this is the ONE
+  // shape where "no file" is NOT already the maximally permissive baseline
+  // (withoutFile is false here, not true). A forged permissive-looking key
+  // like {open:true} making withFile true here is exactly the bug this test
+  // exists to catch — the earlier version of this test only ever exercised a
+  // transcript that already passed on its own, where withoutFile is always
+  // true and `withFile <= withoutFile` cannot fail for ANY withFile value.
+  const NEUTRAL_TEXT = JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: 'hello, not a close phrase' },
+  });
+
+  for (const payload of forgedPayloads) {
+    withTmpDir((hypoDir) => {
+      writeRawFile(hypoDir, SESSION, payload);
+
+      // Direct assertion on the mechanism, not just the outcome: the forged
+      // file must read back as the exact same NO_CONSTRAINT shape an absent
+      // file gives, regardless of which permissive-looking key it carries.
+      const transcriptForRead = Buffer.from(closeRecord() + '\n', 'utf-8');
+      assert.deepEqual(
+        readResolution(hypoDir, SESSION, transcriptForRead),
+        { closedAtIndex: null, prefixMatches: null },
+        `forged payload must read as NO_CONSTRAINT: ${JSON.stringify(payload)}`,
+      );
+
+      const openPath = writeTranscript(hypoDir, closeRecord());
+      const withFileOpen = closeGateStatus({
+        transcriptPath: openPath,
+        hypoDir,
+        sessionId: SESSION,
+      }).ok;
+      assert.equal(
+        withFileOpen,
+        true,
+        `an open transcript with only a forged (no-constraint) file must still pass: ${JSON.stringify(payload)}`,
+      );
+
+      const noOpenPath = writeTranscript(hypoDir, NEUTRAL_TEXT);
+      const withFileNoOpen = closeGateStatus({
+        transcriptPath: noOpenPath,
+        hypoDir,
+        sessionId: SESSION,
+      }).ok;
+      assert.equal(
+        withFileNoOpen,
+        false,
+        `a forged file must not open a gate the transcript itself never opened: ${JSON.stringify(payload)}`,
+      );
+    });
+  }
+
+  // Baseline: no resolution file at all, same two transcript shapes. Both
+  // scenarios above must match this exactly (open → true, no-open → false).
+  withTmpDir((hypoDir) => {
+    const openPath = writeTranscript(hypoDir, closeRecord());
+    assert.equal(
+      closeGateStatus({ transcriptPath: openPath, hypoDir, sessionId: SESSION }).ok,
+      true,
+    );
+    const noOpenPath = writeTranscript(hypoDir, NEUTRAL_TEXT);
+    assert.equal(
+      closeGateStatus({ transcriptPath: noOpenPath, hypoDir, sessionId: SESSION }).ok,
+      false,
+    );
   });
 });
