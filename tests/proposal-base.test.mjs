@@ -2496,23 +2496,50 @@ test('same session closing twice does not raise a false-positive against its own
   // The ONLY test that fails when advanceBase is removed. A single apply passes
   // either way, which is exactly why this exists:
   // [[pages/learnings/mutation-check-invariants-a-passing-suite-cannot-see]]
+  //
+  // T6: verifyCloseAuthority now gates on closeGateStatus, which refuses a
+  // REUSED transcript once this session has already resolved a close against
+  // it (the same evidence cannot authorize a second apply with no fresh user
+  // signal). So this test seeds the transcript itself, outside t4Apply's
+  // auto-seed/cleanup, and appends a genuine second close phrase before the
+  // second apply — exactly the evidence a real second close of the same
+  // session would carry. The base-store invariant this test pins (self-conflict
+  // without advanceBase) is otherwise untouched.
   withWiki(null, (dir, today) => {
     snapshotBase(dir, 's-twice', overwriteTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
 
-    const first = `${observed}\nfirst close.\n`;
-    const a = t4Apply(dir, t4Payload(dir, today, first, 'first close'), 's-twice');
-    assert.deepEqual(a.out.conflicts, [], 'first close writes cleanly');
-    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), first);
+    const cleanupTranscript = seedCloseTranscript('s-twice');
+    try {
+      const first = `${observed}\nfirst close.\n`;
+      const a = t4Apply(dir, t4Payload(dir, today, first, 'first close'), 's-twice');
+      assert.deepEqual(a.out.conflicts, [], 'first close writes cleanly');
+      assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), first);
 
-    const second = `${observed}\nsecond close, same session.\n`;
-    const b = t4Apply(dir, t4Payload(dir, today, second, 'second close'), 's-twice');
-    assert.deepEqual(
-      b.out.conflicts,
-      [],
-      'without advanceBase the session diffs against its own stale base and self-conflicts',
-    );
-    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), second);
+      // A fresh close phrase, appended after the first apply already resolved
+      // the transcript through the record above it.
+      const transcriptPath = resolveTranscriptBySessionId(
+        's-twice',
+        join(SESSION_TMP_HOME, '.claude', 'projects'),
+      );
+      writeFileSync(
+        transcriptPath,
+        readFileSync(transcriptPath, 'utf-8') +
+          JSON.stringify({ type: 'user', message: { role: 'user', content: '세션 마무리 해줘' } }) +
+          '\n',
+      );
+
+      const second = `${observed}\nsecond close, same session.\n`;
+      const b = t4Apply(dir, t4Payload(dir, today, second, 'second close'), 's-twice');
+      assert.deepEqual(
+        b.out.conflicts,
+        [],
+        'without advanceBase the session diffs against its own stale base and self-conflicts',
+      );
+      assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), second);
+    } finally {
+      cleanupTranscript();
+    }
   });
 });
 
@@ -2832,7 +2859,11 @@ test('publishes the lock by linking a complete file, never by creating an empty 
   // after a crash between the link and its cleanup the staging name and the lock
   // are one inode — writing the former would rewrite the live lock.
   assert.match(acquire, /randomBytes\(/, 'the staging name is per-call random');
-  assert.match(acquire, /flag: 'wx'/, 'the staging write is exclusive, never onto an existing file');
+  assert.match(
+    acquire,
+    /flag: 'wx'/,
+    'the staging write is exclusive, never onto an existing file',
+  );
 });
 
 // A directory we cannot write to is not the same event as a lock someone else
