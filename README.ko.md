@@ -404,7 +404,7 @@ E. 멈춘 프로젝트 재개.
 
 | 설치 경로 | 슬래시 커맨드 위치 |
 |---|---|
-| 플러그인 (Path A) | Claude Code 플러그인 캐시. `/plugin marketplace update hypomnema` 후 `/reload-plugins`로 갱신 |
+| 플러그인 (Path A) | Claude Code 플러그인 캐시. `/plugin marketplace update hypomnema` 후 `/reload-plugins`로 갱신. 캐시 디렉터리 이름이 매니페스트 버전이라, 그 버전이 바뀌어야 갱신이 반영된다. 버전을 그대로 둔 채 머지한 커밋은 이미 설치된 곳에 닿지 않는다. |
 | npm CLI (Path B) | `~/.claude/commands/hypo/`. `hypomnema upgrade --apply`로 갱신, 파일별 SHA 추적. 사용자 수정본까지 덮어쓰려면 `--force-commands`(원본은 `.bak`으로 보존) |
 
 ---
