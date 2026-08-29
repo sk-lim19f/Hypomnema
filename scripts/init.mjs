@@ -41,10 +41,12 @@ import { expandHome, resolveHypoRoot } from './lib/hypo-root.mjs';
 import {
   hooksDirForInstall,
   unsafeHookTargetReason,
+  findMarkerSpan,
   WIKI_PRE_COMMIT_MARKER_START,
   WIKI_PRE_COMMIT_MARKER_END,
   SHELL_MARKER_START,
   SHELL_MARKER_END,
+  SHELL_FUNCTION_BODY,
 } from './lib/git-hooks-dir.mjs';
 import { readCoreHooksConfig } from './lib/core-hooks.mjs';
 import {
@@ -863,13 +865,13 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
 
 // ── shell function setup ─────────────────────────────────────────────────────
 
+// Built FROM SHELL_FUNCTION_BODY (./lib/git-hooks-dir.mjs), not a second copy
+// of the same literal: uninstall's isOwnedShellFunctionBody() compares an
+// existing marker span's body against that same constant byte-for-byte, so
+// this and that check can never drift apart the way two independent string
+// literals could.
 function shellFunctionBlock() {
-  return `${SHELL_MARKER_START}
-function claude() {
-  echo "{\\"cwd\\":\\"$(pwd)\\"}" | node "$HOME/.claude/hooks/hypo-session-start.mjs" > /dev/null 2>&1
-  command claude "$@"
-}
-${SHELL_MARKER_END}`;
+  return `${SHELL_MARKER_START}${SHELL_FUNCTION_BODY}${SHELL_MARKER_END}`;
 }
 
 function detectShellConfig(customPath) {
@@ -892,19 +894,32 @@ function installShellFunction(shellConfigPath, dryRun) {
   }
 
   const content = readFileSync(shellConfigPath, 'utf-8');
-  const startIdx = content.indexOf(SHELL_MARKER_START);
-  const endIdx = content.indexOf(SHELL_MARKER_END);
 
-  if (startIdx !== -1 && endIdx !== -1) {
+  if (content.includes(SHELL_MARKER_START) || content.includes(SHELL_MARKER_END)) {
+    // A block-shaped span is claimed here: validate it the same way uninstall
+    // does before touching a single byte. Two bare indexOf() calls cannot tell
+    // "well-formed" apart from "duplicated" (only the FIRST end is found, so a
+    // second full copy's body gets stranded in the untouched tail) or "swapped"
+    // (end before start silently duplicates whatever sits between them into the
+    // "replaced" span instead of raising anything). Neither corruption is
+    // something this script can safely repair, so a malformed span is left
+    // completely alone, the same contract uninstall.mjs holds for removal.
+    const span = findMarkerSpan(content, SHELL_MARKER_START, SHELL_MARKER_END);
+    if (!span.ok) {
+      log('skipped', `${shellConfigPath} (${span.reason}, leaving the file untouched)`);
+      return;
+    }
     // Block exists — check if already up to date
-    const existing = content.slice(startIdx, endIdx + SHELL_MARKER_END.length);
+    const existing = content.slice(span.startIdx, span.endIdx + SHELL_MARKER_END.length);
     if (existing === block) {
       log('skipped', `${shellConfigPath} (shell function up to date)`);
       return;
     }
     // Replace stale block
     const updated =
-      content.slice(0, startIdx) + block + content.slice(endIdx + SHELL_MARKER_END.length);
+      content.slice(0, span.startIdx) +
+      block +
+      content.slice(span.endIdx + SHELL_MARKER_END.length);
     if (!dryRun) writeFileSync(shellConfigPath, updated);
     log('merged', `${shellConfigPath} (shell function updated)`);
     return;

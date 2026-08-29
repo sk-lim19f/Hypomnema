@@ -18,11 +18,20 @@
  *                        same rules as init/lint/query)
  *   --shell-config=<path> Shell rc file to strip the shell block from (default: checks both
  *                        ~/.zshrc and ~/.bashrc, since init may have run under either shell)
+ *   --keep-shell         Skip the shell rc `claude()` block removal entirely
+ *   --keep-wiki-hook     Skip the wiki pre-commit hook removal entirely
  *
  * The wiki's git pre-commit hook and the shell rc's `claude()` wrapper function are removed
  * only when they still carry the marker init.mjs wrote (WIKI_PRE_COMMIT_MARKER_START /
  * SHELL_MARKER_START, both from ./lib/git-hooks-dir.mjs). A user's own pre-commit hook, a
  * symlinked hook target, and any rc content outside the marker block are never touched.
+ *
+ * --hooks-dir only redirects where the ~/.claude/hooks/*.mjs removal looks; it does NOT bound
+ * the rc-block and wiki-hook removals above, since those live outside ~/.claude entirely and a
+ * hypo-dir override already exists for the latter. A caller that wants an uninstall run scoped
+ * to a throwaway hooks dir (a sandboxed CI check, for instance) and NOT touching the real
+ * machine's shell rc files or scanning for a real vault must say so explicitly with
+ * --keep-shell --keep-wiki-hook.
  *
  * Extensions: hypo-ext-* hard-copies under
  * ~/.claude/{hooks,commands,skills,agents}/ and ~/.codex/{hooks,commands}/ (with
@@ -69,6 +78,11 @@ import { removeProvenanceSidecar } from './lib/pkg-provenance.mjs';
 import {
   hooksDirForInstall,
   unsafeHookTargetReason,
+  findMarkerSpan,
+  isOwnedWikiPreCommitBody,
+  isOwnedShellFunctionBody,
+  canonicalize,
+  isInside,
   WIKI_PRE_COMMIT_MARKER_START,
   WIKI_PRE_COMMIT_MARKER_END,
   SHELL_MARKER_START,
@@ -455,54 +469,19 @@ function stripExtensionSettings(settingsPath, hooksDir, apply, ownedCommands = n
   return { stripped };
 }
 
-// ── marker-span validation (shared by both removal paths below) ────────────
-
-// Two independent indexOf() calls cannot tell "well-formed" apart from
-// "duplicated" or "swapped": if a file happens to hold two full copies of the
-// block, indexOf finds only the first END, so slicing [firstStart, firstEnd]
-// leaves the second copy's install behind with no report of it. If END
-// precedes START (a hand-edited or corrupted file), slicing [start, end) with
-// start > end does not error, it silently duplicates whatever sits between
-// them into the "removed" span. Neither this script nor the file it is
-// touching has a way back from either outcome, so a span is only trusted when
-// both markers appear EXACTLY once and START comes before END.
-function countOccurrences(content, needle) {
-  let count = 0;
-  let idx = 0;
-  while ((idx = content.indexOf(needle, idx)) !== -1) {
-    count++;
-    idx += needle.length;
-  }
-  return count;
-}
-
-function findMarkerSpan(content, startMarker, endMarker) {
-  const startCount = countOccurrences(content, startMarker);
-  const endCount = countOccurrences(content, endMarker);
-  if (startCount !== 1 || endCount !== 1) {
-    return {
-      ok: false,
-      reason: `expected exactly one start and one end marker, found ${startCount} start / ${endCount} end`,
-    };
-  }
-  const startIdx = content.indexOf(startMarker);
-  const endIdx = content.indexOf(endMarker);
-  if (!(startIdx < endIdx)) {
-    return { ok: false, reason: 'the end marker appears before the start marker' };
-  }
-  return { ok: true, startIdx, endIdx };
-}
-
 // ── wiki pre-commit hook removal ────────────────────────────────────────────
 
 // Mirrors init.mjs's own resolution (hooksDirForInstall) as the PRIMARY
 // candidate, so this finds the hook wherever init would put it today,
 // including under a core.hooksPath override. A second, best-effort candidate
-// (the vault's plain .git/hooks/pre-commit) is checked too: if core.hooksPath
-// changed after install, the current resolution no longer points at the file
-// init actually wrote, and that file would otherwise never be found. Both
-// candidates go through the same marker/ownership gate below, so widening the
-// search costs nothing in safety, only in how many places we bother to look.
+// (the vault's plain .git/hooks/pre-commit) is checked too, but it only
+// recovers ONE specific drift: an install that went to the default .git/hooks
+// and had core.hooksPath pointed elsewhere afterward. It does not recover the
+// general case (an install that went to a non-default core.hooksPath which was
+// then repointed somewhere else again), since the only fallback candidate is
+// the plain .git/hooks path, never the original custom one. Both candidates go
+// through the same marker/ownership gate below, so widening the search costs
+// nothing in safety, only in how many places we bother to look.
 // A hook that still carries our marker is removed; a user's own pre-commit (no
 // marker), a symlinked/non-regular target, and a hook whose marker is
 // duplicated, swapped, or missing its shebang are all left standing.
@@ -512,7 +491,9 @@ function removeWikiPreCommitHook(hypoDir, apply) {
   const result = { removed: [], skipped: [], bakPresent: [] };
 
   if (!hypoDir || !existsSync(join(hypoDir, 'hypo-config.md'))) {
-    result.skipped.push(`no Hypomnema vault found${hypoDir ? ` at ${hypoDir}` : ''} — nothing to remove`);
+    result.skipped.push(
+      `no Hypomnema vault found${hypoDir ? ` at ${hypoDir}` : ''} — nothing to remove`,
+    );
     return result;
   }
 
@@ -527,7 +508,23 @@ function removeWikiPreCommitHook(hypoDir, apply) {
   // correctly via the primary candidate above).
   const legacyGitDir = join(hypoDir, '.git');
   if (existsSync(legacyGitDir) && statSync(legacyGitDir).isDirectory()) {
-    candidateDirs.push(join(legacyGitDir, 'hooks'));
+    const legacyHooksDir = join(legacyGitDir, 'hooks');
+    // Canonicalize before trusting this candidate. The primary path above
+    // already refuses to write through a `.git/hooks` that resolves outside
+    // the repo (resolveGitHooksDir's `owned` check), but that refusal does
+    // nothing for THIS fallback, which built its candidate by string join,
+    // not by resolving anything. If `.git/hooks` (or any ancestor of it) is
+    // itself a symlink to an external directory, the join above still points
+    // there, and the leaf-only unsafeHookTargetReason() below cannot see it:
+    // lstat on the FINAL path component says nothing about a symlink the OS
+    // already followed to reach that component. Codex reproduced exactly
+    // this (2026-08-27): a symlinked `.git/hooks` pointing at an external
+    // directory let this fallback delete a file the primary path had
+    // already, correctly, refused to touch.
+    const resolvedCandidate = canonicalize(legacyHooksDir);
+    if (isInside(resolvedCandidate, canonicalize(legacyGitDir))) {
+      candidateDirs.push(legacyHooksDir);
+    }
   }
 
   const seen = new Set();
@@ -547,9 +544,6 @@ function removeWikiPreCommitHook(hypoDir, apply) {
     if (seen.has(key)) continue;
     seen.add(key);
 
-    const bakPath = `${hookPath}.bak`;
-    if (existsSync(bakPath)) result.bakPresent.push(bakPath);
-
     const unsafe = unsafeHookTargetReason(hookPath);
     if (unsafe) {
       result.skipped.push(`${hookPath} (${unsafe})`);
@@ -564,10 +558,21 @@ function removeWikiPreCommitHook(hypoDir, apply) {
       result.skipped.push(`${hookPath} (cannot read: ${e.code || e.message})`);
       continue;
     }
-    if (!content.includes(WIKI_PRE_COMMIT_MARKER_START) || !content.includes(WIKI_PRE_COMMIT_MARKER_END)) {
+    if (
+      !content.includes(WIKI_PRE_COMMIT_MARKER_START) ||
+      !content.includes(WIKI_PRE_COMMIT_MARKER_END)
+    ) {
       result.skipped.push(`${hookPath} (not managed by Hypomnema — preserving)`);
       continue;
     }
+
+    // Report the backup only past the ownership gate above: a vault with no
+    // Hypomnema hook at all (or a symlinked/unreadable one) can still happen
+    // to have a stray pre-commit.bak lying around, and attributing that to
+    // "from --force-commands" before confirming this IS a Hypomnema-managed
+    // hook would misdescribe someone else's file.
+    const bakPath = `${hookPath}.bak`;
+    if (existsSync(bakPath)) result.bakPresent.push(bakPath);
 
     const span = findMarkerSpan(content, WIKI_PRE_COMMIT_MARKER_START, WIKI_PRE_COMMIT_MARKER_END);
     if (!span.ok) {
@@ -589,16 +594,53 @@ function removeWikiPreCommitHook(hypoDir, apply) {
     const before = content.slice(0, span.startIdx);
     const after = content.slice(span.endIdx + WIKI_PRE_COMMIT_MARKER_END.length);
     if (!/^#![^\n]*\n$/.test(before)) {
-      result.skipped.push(`${hookPath} (hook carries content before the Hypomnema block — preserving)`);
+      result.skipped.push(
+        `${hookPath} (hook carries content before the Hypomnema block — preserving)`,
+      );
       continue;
     }
     if (after.trim() !== '') {
-      result.skipped.push(`${hookPath} (hook carries content after the Hypomnema block — preserving)`);
+      result.skipped.push(
+        `${hookPath} (hook carries content after the Hypomnema block — preserving)`,
+      );
+      continue;
+    }
+
+    // A well-formed span (one start, one end, in order) with a bare shebang
+    // before it and nothing after proves only the SHAPE around the block is
+    // ours. It says nothing about what is INSIDE the block — a marker pair
+    // can be hand-copied around arbitrary content, including a user's own
+    // check (codex BLOCKER, 2026-08-27). Refuse unless the body itself is
+    // recognizable as what wikiPreCommitContent() writes.
+    if (!isOwnedWikiPreCommitBody(content, span)) {
+      result.skipped.push(
+        `${hookPath} (marker span present but its body does not match the hook Hypomnema writes — preserving)`,
+      );
       continue;
     }
 
     if (apply) rmSync(hookPath);
     result.removed.push(hookPath);
+  }
+
+  // Every candidate came back plain-absent (existsSync(hookPath) was false for
+  // all of them): nothing was removed, and nothing was skipped-with-a-reason
+  // either, so silence here would read as "there was nothing to say" when it
+  // actually means "the fallback above did not find a marked hook anywhere it
+  // looked". Report that explicitly instead of just going quiet — and name the
+  // one drift this cannot recover from: if core.hooksPath pointed somewhere
+  // else at install time and has since been repointed AGAIN (custom to
+  // custom, not the default-to-custom case the fallback above does cover),
+  // the hook Hypomnema wrote is still sitting at that first custom path,
+  // still executable, and can fail a future commit there with no cleanup
+  // path from this run.
+  if (candidateDirs.length > 0 && result.removed.length === 0 && result.skipped.length === 0) {
+    result.skipped.push(
+      `no Hypomnema-marked pre-commit hook found in ${candidateDirs.join(' or ')} — if core.hooksPath ` +
+        `pointed somewhere else at install time and has since changed again, the hook Hypomnema wrote ` +
+        `may still be sitting at that earlier path; it will keep running on every commit there and can ` +
+        `fail commits until it is removed by hand`,
+    );
   }
 
   return result;
@@ -626,7 +668,23 @@ function removeShellFunctionBlock(shellConfigPath, apply) {
     return { path: shellConfigPath, removed: false, skipped: span.reason };
   }
 
-  const updated = content.slice(0, span.startIdx) + content.slice(span.endIdx + SHELL_MARKER_END.length);
+  // A well-formed span proves only that a start and an end marker exist in
+  // order — nothing about what sits between them. A marker pair copy-pasted
+  // around a user's own function (or appended to, inside the same span) would
+  // pass every check above and get removed along with that user's code
+  // (codex BLOCKER, 2026-08-27). Refuse unless the body between the markers
+  // is byte-identical to what init.mjs installs.
+  if (!isOwnedShellFunctionBody(content, span)) {
+    return {
+      path: shellConfigPath,
+      removed: false,
+      skipped:
+        'marker span present but its body does not match the shell function Hypomnema installs',
+    };
+  }
+
+  const updated =
+    content.slice(0, span.startIdx) + content.slice(span.endIdx + SHELL_MARKER_END.length);
   if (apply) writeFileSync(shellConfigPath, updated);
   return { path: shellConfigPath, removed: true, skipped: null };
 }
@@ -642,12 +700,16 @@ function parseArgs(argv) {
     forceExtensions: false,
     hypoDir: null,
     shellConfig: null,
+    keepShell: false,
+    keepWikiHook: false,
   };
   for (const arg of argv.slice(2)) {
     if (arg === '--apply') args.apply = true;
     else if (arg === '--codex') args.codex = true;
     else if (arg === '--force-commands') args.forceCommands = true;
     else if (arg === '--force-extensions') args.forceExtensions = true;
+    else if (arg === '--keep-shell') args.keepShell = true;
+    else if (arg === '--keep-wiki-hook') args.keepWikiHook = true;
     else if (arg.startsWith('--hooks-dir=')) args.hooksDir = arg.slice(12);
     // expandHome mirrors init.mjs's own --hypo-dir/--shell-config parsing
     // (init.mjs's parseArgs) exactly, reusing the same function from
@@ -795,6 +857,22 @@ function stripSettingsJson(settingsPath, hooksDir, hookMap, apply) {
 const args = parseArgs(process.argv);
 const dryRun = !args.apply;
 
+// --hooks-dir only redirects the ~/.claude/hooks/*.mjs cleanup below (see the
+// module doc comment). A caller who passes it alone, expecting the run to
+// stay confined to that throwaway directory, is surprised when the real
+// machine's shell rc files and auto-resolved wiki vault get touched too
+// (codex CONCERN, 2026-08-27). Warn before any of the removal functions run,
+// not just in the final report, since by the time that report prints under
+// --apply the files are already gone.
+if (args.hooksDir && !args.keepShell && !args.keepWikiHook) {
+  console.error(
+    `⚠ --hooks-dir only redirects the ~/.claude/hooks/*.mjs cleanup. This run will still ` +
+      `${dryRun ? 'inspect' : 'modify'} the real shell rc files (~/.zshrc, ~/.bashrc, or --shell-config) ` +
+      `and the auto-resolved wiki vault's pre-commit hook. Pass --keep-shell and/or --keep-wiki-hook to ` +
+      `scope this run to --hooks-dir only.`,
+  );
+}
+
 const { hookMap, hookFiles } = loadHookFiles();
 
 const claudeHooksDir = args.hooksDir ?? join(HOME, '.claude', 'hooks');
@@ -805,16 +883,35 @@ const settingsResult = stripSettingsJson(claudeSettings, claudeHooksDir, hookMap
 const commandResult = removeCommands(args.apply, args.forceCommands);
 
 // Wiki-side cleanup: the git pre-commit hook and the shell rc block init.mjs
-// installs outside ~/.claude entirely. Both are independent of --codex/--hooks-dir.
-const hypoDir = args.hypoDir ?? resolveHypoRoot();
-const preCommitResult = removeWikiPreCommitHook(hypoDir, args.apply);
+// installs outside ~/.claude entirely. Both are independent of --codex/--hooks-dir:
+// --hooks-dir only redirects the ~/.claude/hooks/*.mjs removal above, it does not
+// bound these two, since they live outside ~/.claude and already have their own
+// scoping flags (--hypo-dir, --shell-config). A caller that wants an uninstall run
+// confined to a throwaway --hooks-dir and NOT touching the real machine's shell rc
+// files or scanning for a real vault (a sandboxed CI check, for instance) says so
+// explicitly with --keep-shell / --keep-wiki-hook rather than relying on
+// --hooks-dir to imply it.
+// resolveHypoRoot() scans a fixed list of candidate directories under HOME
+// (see ./lib/hypo-root.mjs). --keep-wiki-hook says the caller does not want
+// this run touching a vault at all, so the scan itself is skipped rather than
+// run and then discarded — matching the module doc comment above ("--keep-
+// wiki-hook" is described as skipping the cleanup outright, not as skipping
+// only the removal after still resolving a root).
+const hypoDir = args.keepWikiHook ? null : (args.hypoDir ?? resolveHypoRoot());
+const preCommitResult = args.keepWikiHook
+  ? {
+      removed: [],
+      skipped: ['--keep-wiki-hook passed: wiki pre-commit hook cleanup skipped'],
+      bakPresent: [],
+    }
+  : removeWikiPreCommitHook(hypoDir, args.apply);
 
 const shellConfigCandidates = args.shellConfig
   ? [args.shellConfig]
   : [join(HOME, '.zshrc'), join(HOME, '.bashrc')];
-const shellBlockOutcomes = shellConfigCandidates
-  .map((p) => removeShellFunctionBlock(p, args.apply))
-  .filter(Boolean);
+const shellBlockOutcomes = args.keepShell
+  ? []
+  : shellConfigCandidates.map((p) => removeShellFunctionBlock(p, args.apply)).filter(Boolean);
 const shellBlockResults = shellBlockOutcomes.filter((r) => r.removed).map((r) => r.path);
 const shellBlockSkipped = shellBlockOutcomes.filter((r) => !r.removed);
 
