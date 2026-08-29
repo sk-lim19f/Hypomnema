@@ -1830,6 +1830,35 @@ test('capture preserves the executable bit end to end: wiki copy, far install, a
   });
 });
 
+// codex pre-commit CONCERN: writeAtomic used to chmod the tmp file by PATHNAME
+// after its fd was already closed. `wx` (O_CREAT|O_EXCL) only protects the tmp
+// file's creation; a competing process racing this write could delete tmp and
+// plant a symlink at the same name in the window between close and that
+// pathname chmod, and chmodSync would then follow it onto whatever the symlink
+// points at. fchmodSync on the still-open fd, before close, has no such window:
+// it can only ever act on the file this process itself just created, matching
+// the ordering extensions.mjs's own writeFreshAtomic already uses. A real race
+// is inherently non-deterministic to reproduce inside one synchronous test
+// process, so this pins the ordering directly from source instead.
+test('writeAtomic sets the mode on the open fd before closing it (no post-close pathname chmod)', () => {
+  const src = readFileSync(join(SCRIPTS, 'capture.mjs'), 'utf-8');
+  const match = src.match(/function writeAtomic\([^]*?\n}\n/);
+  assert.ok(match, 'writeAtomic function body not found for source scan');
+  const body = match[0];
+  assert.ok(
+    !/chmodSync\(tmp/.test(body),
+    'writeAtomic must not chmod the tmp file by pathname after it is written',
+  );
+  const fchmodAt = body.indexOf('fchmodSync(fd');
+  const closeAt = body.indexOf('closeSync(fd)');
+  assert.ok(fchmodAt !== -1, 'writeAtomic must set the mode via fchmodSync on the open fd');
+  assert.ok(closeAt !== -1, 'writeAtomic must close the fd');
+  assert.ok(
+    fchmodAt < closeAt,
+    'fchmodSync must run before closeSync, closing the post-close pathname-chmod race window',
+  );
+});
+
 test('--dry-run writes nothing to the wiki and does not adopt a skill', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {

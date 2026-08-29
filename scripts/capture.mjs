@@ -45,7 +45,8 @@ import {
   openSync,
   closeSync,
   statSync,
-  chmodSync,
+  fstatSync,
+  fchmodSync,
 } from 'fs';
 import { randomBytes } from 'crypto';
 import { join, dirname, relative, sep } from 'path';
@@ -589,16 +590,26 @@ function log(msg) {
 // so this still has to be a separate chmod). Omitted for a manifest write: that
 // content is JSON we generated, not a copy of something with a mode worth
 // keeping.
+//
+// The mode is set on the open FD (`fchmodSync`), before the FD is closed, the
+// same ordering the forward writer (extensions.mjs's writeFreshAtomic) already
+// uses. A pathname-based `chmodSync(tmp, ...)` run after `closeSync` reopens
+// `tmp` by name, and a competing process racing this write could have already
+// deleted `tmp` and planted a symlink at that name in the gap between close
+// and chmod — `wx` only protects the file's creation, not everything after it.
+// Chmod-ing the FD closes that window: it always addresses the file this
+// process itself just created, never whatever a symlink at the same name
+// might point to by the time the pathname is looked up again.
 function writeAtomic(dest, buf, srcMode) {
   const tmp = `${dest}.tmp.${process.pid}.${randomBytes(6).toString('hex')}`;
   const fd = openSync(tmp, 'wx');
   try {
     writeFileSync(fd, buf);
+    if (srcMode != null) {
+      fchmodSync(fd, withSrcExecBits(fstatSync(fd).mode, srcMode));
+    }
   } finally {
     closeSync(fd);
-  }
-  if (srcMode != null) {
-    chmodSync(tmp, withSrcExecBits(statSync(tmp).mode, srcMode));
   }
   try {
     renameSync(tmp, dest);
