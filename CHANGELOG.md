@@ -5,6 +5,58 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.4] - 2026-08-29
+
+### New Features
+
+#### English
+
+- The close gate is now a state that stays open once you ask for a close, so ordinary typing during the procedure no longer expires an approval you already gave. ([#251](https://github.com/sk-lim19f/Hypomnema/pull/251))
+- Close approval is checked against the resolution a successful apply records, so a spent close phrase cannot re-authorize a later write, and a refusal says which rule stopped it. ([#254](https://github.com/sk-lim19f/Hypomnema/pull/254))
+
+#### 한국어
+
+- close 게이트가 close 를 요청한 뒤에는 열린 채로 유지되는 상태가 되어, 절차 중의 평범한 타이핑이 이미 준 승인을 만료시키지 않습니다. ([#251](https://github.com/sk-lim19f/Hypomnema/pull/251))
+- close 승인을 apply 성공이 남긴 해결 기록과 대조하여, 이미 소비된 close 문장이 이후의 쓰기를 다시 인가하지 못하고 거절이 어느 규칙에 막혔는지 말해 줍니다. ([#254](https://github.com/sk-lim19f/Hypomnema/pull/254))
+
+### Bug Fixes
+
+#### English
+
+- The close gate no longer treats an ordinary answer to a mid-procedure question as a change of mind: a question answer opens it only on a close phrase, and closes it only on a decline to the close-reconfirm prompt. ([#252](https://github.com/sk-lim19f/Hypomnema/pull/252))
+- The pre-commit hook now runs its format and tracker-id checks inside linked worktrees instead of silently doing nothing, and `lint` warns (W14) when a project records a design change but has no `design-history.md`. ([#255](https://github.com/sk-lim19f/Hypomnema/pull/255))
+- Forward-sync no longer removes an executable bit an install already has, and compares each bit separately so a partial mismatch is not reported as up to date. ([#259](https://github.com/sk-lim19f/Hypomnema/pull/259))
+- `uninstall` now refuses to delete a marked hook or rc block whose contents no longer match what `init` wrote, and `--keep-shell` / `--keep-wiki-hook` skip the shell rc and wiki pre-commit cleanups respectively. ([#260](https://github.com/sk-lim19f/Hypomnema/pull/260))
+
+#### 한국어
+
+- close 게이트가 절차 중 질문에 대한 평범한 응답을 마음이 바뀐 것으로 읽지 않습니다. 질문 응답은 close 문구에만 게이트를 열고, close 재확인 프롬프트에 대한 거절에만 닫습니다. ([#252](https://github.com/sk-lim19f/Hypomnema/pull/252))
+- pre-commit 훅이 linked worktree 안에서도 포맷 검사와 트래커 id 검사를 실제로 돌리고, `lint` 는 설계 변경은 있는데 `design-history.md` 가 없는 프로젝트를 W14 경고로 띄웁니다. ([#255](https://github.com/sk-lim19f/Hypomnema/pull/255))
+- forward-sync 가 설치본이 이미 가진 실행 비트를 지우지 않고, 비트를 각각 비교하므로 일부만 어긋난 경우를 up-to-date 로 보고하지 않습니다. ([#259](https://github.com/sk-lim19f/Hypomnema/pull/259))
+- `uninstall` 이 내용이 `init` 이 쓴 것과 달라진 마커 훅이나 rc 블록을 지우지 않고, `--keep-shell` / `--keep-wiki-hook` 은 각각 셸 rc 정리와 위키 pre-commit 정리를 건너뜁니다. ([#260](https://github.com/sk-lim19f/Hypomnema/pull/260))
+
+### Chores
+
+#### English
+
+- The contributor notes and both READMEs now say that a plugin-channel install picks up new commits only when the manifest version changes, correcting the claim that any merge to `main` reaches users. ([#258](https://github.com/sk-lim19f/Hypomnema/pull/258))
+
+#### 한국어
+
+- 기여 노트와 두 README 가 플러그인 채널 설치는 매니페스트 버전이 바뀔 때만 새 커밋을 받는다고 적습니다. `main` 머지가 곧 사용자 도달이라던 서술을 정정한 것입니다. ([#258](https://github.com/sk-lim19f/Hypomnema/pull/258))
+
+### Changelog
+
+- [#260](https://github.com/sk-lim19f/Hypomnema/pull/260) uninstall ownership proof
+- [#259](https://github.com/sk-lim19f/Hypomnema/pull/259) exec-bit sync direction
+- [#258](https://github.com/sk-lim19f/Hypomnema/pull/258) plugin-channel update docs
+- [#255](https://github.com/sk-lim19f/Hypomnema/pull/255) pre-commit gates in linked worktrees
+- [#254](https://github.com/sk-lim19f/Hypomnema/pull/254) close approval ordered against the recorded resolution
+- [#253](https://github.com/sk-lim19f/Hypomnema/pull/253) shared slug resolver extraction
+- [#252](https://github.com/sk-lim19f/Hypomnema/pull/252) question-answer close gate transitions
+- [#251](https://github.com/sk-lim19f/Hypomnema/pull/251) close gate as durable state
+Contributors: @sk-lim19f
+
 ## [1.7.3] - 2026-08-27
 
 ### Bug Fixes
