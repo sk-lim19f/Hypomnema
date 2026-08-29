@@ -240,10 +240,14 @@ test('project-index missing status/started → still errors (contract unchanged 
   );
   assert.equal(r.status, 1, `missing status/started must still error: ${r.stdout}`);
   assert.ok(
-    out.errors.some((e) => e.message.includes('Missing required field for type "project-index": status')),
+    out.errors.some((e) =>
+      e.message.includes('Missing required field for type "project-index": status'),
+    ),
   );
   assert.ok(
-    out.errors.some((e) => e.message.includes('Missing required field for type "project-index": started')),
+    out.errors.some((e) =>
+      e.message.includes('Missing required field for type "project-index": started'),
+    ),
   );
 });
 
@@ -1572,7 +1576,8 @@ suite('lint.mjs root close-target scan (hot.md / log.md)');
 
 test('a broken wikilink in root log.md is caught (not just by doctor)', () => {
   const { broken } = lintWiki({
-    'log.md': '---\ntitle: Activity Log\ntype: log\nupdated: 2026-06-08\n---\n\nsee [[projects/ghost/hot]]\n',
+    'log.md':
+      '---\ntitle: Activity Log\ntype: log\nupdated: 2026-06-08\n---\n\nsee [[projects/ghost/hot]]\n',
   });
   assert.ok(
     broken.includes('projects/ghost/hot'),
@@ -1582,7 +1587,8 @@ test('a broken wikilink in root log.md is caught (not just by doctor)', () => {
 
 test('a broken wikilink in root hot.md is caught (not just by doctor)', () => {
   const { broken } = lintWiki({
-    'hot.md': '---\ntitle: Hot Cache\ntype: reference\nupdated: 2026-06-08\n---\n\nsee [[projects/ghost/hot]]\n',
+    'hot.md':
+      '---\ntitle: Hot Cache\ntype: reference\nupdated: 2026-06-08\n---\n\nsee [[projects/ghost/hot]]\n',
   });
   assert.ok(
     broken.includes('projects/ghost/hot'),
@@ -1703,9 +1709,32 @@ test('w8-clean: session-log older than design-history → no emit', () => {
   });
 });
 
-test('w8-skip: project without design-history.md is skipped', () => {
+// Was "w8-skip: project without design-history.md is skipped" until this fix:
+// a project with a design-relevant session-log entry and NO design-history.md
+// at all used to fall through `continue` silently, so the design change had
+// nowhere to land and nothing warned about it. Now it reports kind:'missing'
+// instead of being dropped.
+test('w14-missing: project with a design-relevant entry and no design-history.md at all → missing', () => {
   withTmpDir((root) => {
     setupDhProject(root, 'p4', { sessionLogMd: '## [2026-05-20] s\n' });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].project, 'p4');
+    assert.equal(stale[0].kind, 'missing');
+    assert.equal(stale[0].lastSession, '2026-05-20');
+    assert.equal(stale[0].lastDesignHistory, null);
+    assert.equal(stale[0].diffDays, null);
+  });
+});
+
+test('w14-missing: "ADR 없음" latest entry with no design-history.md → no finding', () => {
+  // Mirrors the W8 no-design exclusion: parseSessionDates already drops a pure
+  // "ADR 없음" entry, so an all-no-design session-log produces zero
+  // design-relevant dates and must not trip the missing-file finding either.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p4b', {
+      sessionLogMd: '## [2026-05-20] docs\n- ADR 없음 — fix only\n',
+    });
     assert.equal(findDesignHistoryStale(root).length, 0);
   });
 });
@@ -1956,6 +1985,75 @@ test('w8-lint-omits-id-for-other-warns', () => {
   });
 });
 
+// ── W14: design-history.md missing entirely, session-log carries a design
+// entry. Distinct id from W8 on purpose: hypo-shared.mjs's PreCompact gate
+// filters strictly on `w.id === 'W8'` to hard-block an active project on
+// staleness, and W14 must never enter that path (a bootstrap gap on most
+// live projects would otherwise block every one of them at once).
+
+suite('W14: design-history missing (bootstrap gap)');
+
+test('w14-lint-emits-warn-with-distinct-message-and-no-W8-id', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', { sessionLogMd: '## [2026-05-20] s\n' }); // no dh
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    const r = runLintE(root);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, `missing design-history must not fail lint: ${r.stdout}`);
+    assert.equal(parsed.ok, true);
+    const missing = (parsed.warns || []).filter((w) =>
+      w.message.includes('design-history missing'),
+    );
+    assert.equal(missing.length, 1, `expected one W14 warn: ${JSON.stringify(parsed.warns)}`);
+    assert.equal(missing[0].file, 'projects/demo/design-history.md');
+    // must not be mistaken for a stale (W8) finding — different message body
+    assert.ok(!missing[0].message.includes('design-history stale'));
+    // default (non-strict) --json hides ids for anything but W8
+    assert.ok(!('id' in missing[0]));
+    const w8 = (parsed.warns || []).filter((w) => w.id === 'W8');
+    assert.equal(w8.length, 0, 'a missing file has nothing to compare, so it is never W8');
+  });
+});
+
+test('w14-strict: --strict exposes id W14 and does not promote it to an error', () => {
+  withTmpDir((root) => {
+    // valid frontmatter on the session-log so the *only* finding is W14 —
+    // otherwise a bare session-log.md trips W1 (no-frontmatter), which
+    // --strict promotes and would mask what this test asserts.
+    setupDhProject(root, 'demo', {
+      sessionLogMd:
+        '---\ntitle: sl\ntype: session-log\nupdated: 2026-05-20\n---\n\n## [2026-05-20] s\n',
+    }); // no dh
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    const r = runLintE(root, ['--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, 'W14 is excluded from STRICT_PROMOTE_IDS → exit 0');
+    assert.equal(parsed.ok, true);
+    const w14 = (parsed.warns || []).filter((w) => w.id === 'W14');
+    assert.equal(w14.length, 1, `W14 stays a warn under --strict: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+test('w14-clean: project WITH design-history.md never emits W14, only W8/none', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-05-10\nfoo\n',
+      sessionLogMd: '## [2026-05-20] s\n',
+    });
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    const r = runLintE(root);
+    const parsed = JSON.parse(r.stdout);
+    const missing = (parsed.warns || []).filter((w) =>
+      w.message.includes('design-history missing'),
+    );
+    assert.equal(
+      missing.length,
+      0,
+      `existing file must never trip W14: ${JSON.stringify(parsed.warns)}`,
+    );
+  });
+});
+
 // ── A-2 (project index lifecycle): W12 missing-index warning ────────────────
 // scripts/lint.mjs: a projects/<slug>/ directory with no index.md warns — never
 // errors, since a hard block would stop /compact for every pre-existing
@@ -2004,7 +2102,11 @@ test('any `_`-prefixed project directory is excluded from the W12 scan', () => {
     const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
     const parsed = JSON.parse(r.stdout);
     const w12 = (parsed.warns || []).filter((w) => /Missing project index/.test(w.message));
-    assert.equal(w12.length, 0, `_-prefixed dirs must be excluded: ${JSON.stringify(parsed.warns)}`);
+    assert.equal(
+      w12.length,
+      0,
+      `_-prefixed dirs must be excluded: ${JSON.stringify(parsed.warns)}`,
+    );
   });
 });
 

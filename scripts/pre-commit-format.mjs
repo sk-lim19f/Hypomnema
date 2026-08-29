@@ -70,28 +70,77 @@ try {
     process.exit(0);
   }
 
-  // (3) Trust anchor — refuse to run against any toplevel other than this
-  //     script's own checkout. Closes the GIT_DIR/GIT_WORK_TREE attack where a
-  //     foreign hypomnema-named repo would otherwise pass the package.json check.
-  if (toplevelR !== expectedRoot) process.exit(0);
-
-  // (3a) Anchor the git dir to the expected location too. Without this, a
-  //      mixed-env attack — GIT_DIR=/foreign/.git + GIT_WORK_TREE=expectedRoot
-  //      + GIT_INDEX_FILE=/foreign/.git/index — would let `absGitDirR` point at
-  //      the foreign repo while `--show-toplevel` reports expectedRoot. The
-  //      subsequent GIT_INDEX_FILE check would then pass relative to the
-  //      foreign git dir, and the lib would operate on a foreign index while
-  //      mutating real files. (Live-verified by codex round 7.)
+  // (3) Trust anchor — the git dir Git says we're using must be physically
+  //     nested under THIS script's own repo: either the main .git itself, or
+  //     one of its own worktree admin dirs (.git/worktrees/<name>). This is
+  //     what lets a linked worktree pass: its --absolute-git-dir lives under
+  //     the main .git even though its --show-toplevel is the worktree's own
+  //     path, not expectedRoot (so toplevelR is deliberately NOT compared to
+  //     expectedRoot below — a worktree's toplevel legitimately differs). A
+  //     foreign repo — even one that also names itself "hypomnema" and sets
+  //     GIT_DIR/GIT_WORK_TREE to point elsewhere — has its own, unrelated
+  //     absolute-git-dir, so it still fails here regardless of what
+  //     --show-toplevel reports.
   let expectedGitDirR;
   try {
     expectedGitDirR = fs.realpathSync(path.join(expectedRoot, '.git'));
   } catch {
     process.exit(0);
   }
-  if (absGitDirR !== expectedGitDirR) process.exit(0);
+  if (absGitDirR !== expectedGitDirR && !absGitDirR.startsWith(expectedGitDirR + path.sep)) {
+    process.exit(0);
+  }
 
-  // (4) Linked worktree → main-worktree only (documented limitation).
-  if (absGitDirR !== commonDirR) process.exit(0);
+  // (3a) The shared common dir must resolve to that same main .git too. For
+  //      the main worktree this is the same string as (3) above; for a linked
+  //      worktree it's what makes the worktree recognized as ours in the
+  //      first place. Comparing on this axis is the same one
+  //      scripts/install-git-hooks.mjs's shell shim already uses (its `CDIR`
+  //      check) — the two layers now agree on what "our repo" means. The
+  //      mixed-env attack this guard combination replaces (a foreign GIT_DIR
+  //      paired with a spoofed GIT_WORK_TREE=expectedRoot, live-verified by
+  //      codex round 7) is still caught: a foreign absGitDir is neither equal
+  //      to nor nested under expectedGitDirR, so (3) above already exits
+  //      before this line runs.
+  if (commonDirR !== expectedGitDirR) process.exit(0);
+
+  // (3b) Worktree binding: does TOPLEVEL actually belong to absGitDirR? Checks
+  //      (3)/(3a) above only prove the git dir Git reports lives under our own
+  //      .git; neither ever looks at toplevel. That leaves a reversed mix open:
+  //      GIT_DIR=<our own linked-worktree admin dir>, GIT_WORK_TREE=<a foreign
+  //      "hypomnema"-named repo>. The admin dir is genuinely ours (passes (3)),
+  //      its commondir file genuinely resolves to our main .git (passes (3a)),
+  //      but --show-toplevel then reports the foreign repo, which (3)/(3a) never
+  //      inspect (codex round-10 finding, live-verified: --absolute-git-dir and
+  //      --git-common-dir both resolved to paths under our own .git while
+  //      --show-toplevel returned the foreign path).
+  //
+  //      The fix reads TOPLEVEL's own `.git` entry and requires it to point
+  //      back at absGitDirR: a real main checkout's `.git` is a directory that
+  //      IS absGitDirR; a real linked worktree's `.git` is a file whose
+  //      `gitdir:` line resolves to absGitDirR (Git writes that file itself at
+  //      `worktree add` time, so a genuine worktree always satisfies this). A
+  //      foreign toplevel's `.git` points at ITS OWN git dir, never at ours, so
+  //      it fails here regardless of what GIT_DIR/GIT_WORK_TREE claim. This
+  //      also re-covers the already-closed direction (foreign GIT_DIR + spoofed
+  //      GIT_WORK_TREE=expectedRoot): that one is caught earlier by (3), but a
+  //      second, independent check on the other axis costs nothing here.
+  let toplevelGitDirR;
+  try {
+    const dotGit = path.join(toplevelR, '.git');
+    const st = fs.lstatSync(dotGit);
+    if (st.isDirectory()) {
+      toplevelGitDirR = fs.realpathSync(dotGit);
+    } else {
+      const m = fs.readFileSync(dotGit, 'utf8').match(/^gitdir:\s*(.+?)\s*$/m);
+      if (!m) throw new Error('no gitdir pointer');
+      const pointer = path.isAbsolute(m[1]) ? m[1] : path.resolve(toplevelR, m[1]);
+      toplevelGitDirR = fs.realpathSync(pointer);
+    }
+  } catch {
+    process.exit(0);
+  }
+  if (toplevelGitDirR !== absGitDirR) process.exit(0);
 
   // (5) Repo identity check — package.json name must be "hypomnema" (defence in
   //     depth alongside the expectedRoot anchor above).
