@@ -76,6 +76,8 @@ import {
   scanSettingsHooks,
   parseCapturableHookCommand,
   HOOK_EVENT_ALLOWLIST,
+  HOOK_INTERPRETER_EXT,
+  DEFAULT_HOOK_INTERPRETER,
   SKILL_ROOT_FILE,
   EXT_PREFIX,
   withSrcExecBits,
@@ -90,8 +92,9 @@ const HOME = homedir();
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // Captured types and their singular manifest `type` value. commands/agents install
-// as top-level `.md` files; hooks install as `.mjs` and additionally register a
-// settings.json entry (reverse of forward-sync); skills install as a DIRECTORY.
+// as top-level `.md` files; hooks install as an interpreter-specific executable
+// (.mjs/.py/.sh) and additionally register a settings.json entry
+// (reverse of forward-sync); skills install as a DIRECTORY.
 const CAPTURE_TYPES = ['commands', 'agents', 'hooks', 'skills'];
 // The flat, single-file types. `TYPE_EXT` has no `skills` entry on purpose: a skill
 // has no install extension, and letting it through a flat helper would silently
@@ -101,7 +104,20 @@ const FLAT_TYPES = ['commands', 'agents', 'hooks'];
 // registration instead, and skills have their own directory scanner.
 const READDIR_TYPES = ['commands', 'agents'];
 const TYPE_SINGULAR = { commands: 'command', agents: 'agent', hooks: 'hook', skills: 'skill' };
-const TYPE_EXT = { commands: '.md', agents: '.md', hooks: '.mjs' };
+// `TYPE_EXT` has no `hooks` entry either, for the same reason as skills: a hook's
+// extension depends on its interpreter (HOOK_INTERPRETER_EXT), not its type.
+// captureFileExt() is the one place that resolves it; every hook-touching call
+// site below goes through that, not this map.
+const TYPE_EXT = { commands: '.md', agents: '.md' };
+
+/** The install/wiki-storage extension for one capture candidate. hooks vary by
+ * interpreter (mirrors buildHookCommand/parseCapturableHookCommand in
+ * extensions.mjs); the other flat types have one fixed extension. */
+function captureFileExt(c) {
+  return c.type === 'hooks'
+    ? HOOK_INTERPRETER_EXT[c.interpreter ?? DEFAULT_HOOK_INTERPRETER]
+    : TYPE_EXT[c.type];
+}
 
 // Ceilings for a captured skill subtree (skills-capture design §3). A hand-authored
 // skill is a handful of files; a vendored one (gstack: 14,311 files / 1.1GB, mostly
@@ -124,9 +140,14 @@ function pkgJsonPath() {
  * hooks/commands + already-synced hypo-ext-* copies), anything already owned
  * (a recorded SHA for its install path means the wiki already manages it), and
  * non-.md files. Symlink/non-regular is checked by the caller (needs an fs stat).
+ * `type` must be a flat readdir type with a single fixed extension (TYPE_EXT);
+ * hooks have no entry there (extension depends on interpreter) and are never
+ * routed through this function — scanCandidates only calls it for READDIR_TYPES.
  */
 export function isCaptureCandidate(type, file, recorded) {
-  if (!file.endsWith(TYPE_EXT[type])) return { ok: false, reason: `not a ${TYPE_EXT[type]} file` };
+  const ext = TYPE_EXT[type];
+  if (!ext) return { ok: false, reason: `capture-by-readdir does not cover ${type}` };
+  if (!file.endsWith(ext)) return { ok: false, reason: `not a ${ext} file` };
   const lower = file.toLowerCase();
   if (lower === 'hypo' || lower.startsWith('hypo-')) {
     return { ok: false, reason: 'reserved hypo namespace' };
@@ -296,10 +317,14 @@ export function planSkillCapture({
 /**
  * Reverse-generate the sidecar manifest for a capture candidate. commands/agents
  * carry only `{ type, installName }`; hooks additionally carry the settings
- * registration fields `{ event, matcher?, timeout? }`. matcher/timeout are omitted
- * when absent (an empty-string matcher is already normalized to undefined by the
- * scanner) via conditional spread, so the in-memory object never carries an
- * `undefined`-valued key that would break the planCapture deep-equality check.
+ * registration fields `{ event, matcher?, timeout?, interpreter? }`. Every
+ * optional field is omitted when it would equal its default (an empty-string
+ * matcher is already normalized to undefined by the scanner; `node` is the
+ * default interpreter) via conditional spread, so the in-memory object never
+ * carries an `undefined`-valued key or a redundant explicit default, either of
+ * which would break the planCapture deep-equality check against a manifest
+ * captured before interpreter support landed (a `.mjs` hook's manifest must stay byte-for-byte
+ * identical, or every prior capture becomes a false conflict).
  */
 function buildWantManifest(c) {
   const manifest = { type: TYPE_SINGULAR[c.type], installName: c.stem };
@@ -307,6 +332,9 @@ function buildWantManifest(c) {
     manifest.event = c.event;
     if (c.matcher !== undefined && c.matcher !== '') manifest.matcher = c.matcher;
     if (c.timeout !== undefined) manifest.timeout = c.timeout;
+    if (c.interpreter !== undefined && c.interpreter !== DEFAULT_HOOK_INTERPRETER) {
+      manifest.interpreter = c.interpreter;
+    }
   }
   return manifest;
 }
@@ -438,8 +466,9 @@ function subsetOf(keys, allowed) {
  * canonical.
  *
  * A candidate must satisfy ALL of: strict command grammar
- * (`parseCapturableHookCommand`) resolving under `~/.claude/hooks/`; the resolved
- * `.mjs` is a real regular file (no symlink / non-regular); `type === 'command'`;
+ * (`parseCapturableHookCommand`, which also recovers the interpreter — node,
+ * python3, or bash) resolving under `~/.claude/hooks/`; the resolved
+ * file is a real regular file (no symlink / non-regular); `type === 'command'`;
  * the event is in `HOOK_EVENT_ALLOWLIST`; a preservable shape (F3); the case-folded
  * basename appears exactly once across all settings hooks (F6); and the stem is not
  * a core hook, not the reserved hypo namespace, and not already wiki-owned.
@@ -479,7 +508,7 @@ export function scanHookCandidates(claudeHome, settingsPath, recorded, coreBasen
       skipped.push({ type: 'hooks', command: rec.command, reason: parsed.reason });
       continue;
     }
-    const { stem, basename } = parsed;
+    const { stem, basename, interpreter } = parsed;
     const label = `hooks/${basename}`;
 
     // Duplicate first: a basename registered 2+ times is uniformly skipped so both
@@ -547,6 +576,7 @@ export function scanHookCandidates(claudeHome, settingsPath, recorded, coreBasen
       event: rec.event,
       matcher: rec.matcher,
       timeout: rec.timeout,
+      interpreter,
       label,
     });
   }
@@ -993,7 +1023,7 @@ function run(args, { claudeHome = join(HOME, '.claude') } = {}) {
       captureOneSkill({ c, extDir, guard, wikiRoot, args, captured, skipped, created });
       continue;
     }
-    const fileExt = TYPE_EXT[c.type];
+    const fileExt = captureFileExt(c);
     const wikiStem = `${EXT_PREFIX}${c.stem}`;
     const typeDir = join(extDir, c.type);
     const filePath = join(typeDir, `${wikiStem}${fileExt}`);
@@ -1024,11 +1054,12 @@ function run(args, { claudeHome = join(HOME, '.claude') } = {}) {
     const plan = planCapture({ wantManifest, srcSha, existingFileSha, existingManifestRaw });
 
     // installFile is the ORIGINAL name the far machine installs under (installName
-    // adoption); for hooks that is `<stem>.mjs`, for commands/agents `<stem>.md`.
+    // adoption); for hooks that is `<stem>` plus its interpreter's extension
+    // (`.mjs`/`.py`/`.sh`), for commands/agents `<stem>.md`.
     const installFile = `${c.stem}${fileExt}`;
     // Ownership keys sync must record for the adoption to count. Hooks track BOTH
-    // the `.mjs` and its `.manifest.json` sidecar under the install path (success
-    // criterion d); commands/agents track only the single install file.
+    // the main file and its `.manifest.json` sidecar under the install path
+    // (success criterion d); commands/agents track only the single install file.
     const requiredKeys =
       c.type === 'hooks'
         ? [`hooks/${installFile}`, `hooks/${c.stem}.manifest.json`]
@@ -1173,7 +1204,7 @@ function report(captured, skipped, failed, dryRun) {
       const dest =
         c.type === 'skills'
           ? `extensions/skills/${EXT_PREFIX}${c.stem}/`
-          : `extensions/${c.type}/${EXT_PREFIX}${c.stem}${TYPE_EXT[c.type]}`;
+          : `extensions/${c.type}/${EXT_PREFIX}${c.stem}${captureFileExt(c)}`;
       log(`  ${c.type}/${c.file} → ${dest}`);
     }
   }

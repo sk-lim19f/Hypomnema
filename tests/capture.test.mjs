@@ -165,6 +165,53 @@ test('hooks skip an invalid installName rather than install under the wiki name'
   });
 });
 
+// IMPR-38: capture rejected every non-node hook. resolveInstallFile is one of
+// the three symmetric build/parse/extension sites this widens.
+suite('capture: resolveInstallFile interpreter widening (IMPR-38)');
+
+test('a python3 installName resolves to .py, a bash installName to .sh', () => {
+  withTmpDir((dir) => {
+    for (const [interpreter, ext] of [
+      ['python3', '.py'],
+      ['bash', '.sh'],
+    ]) {
+      const wiki = extWithManifest(dir, 'hooks', `hypo-ext-h${ext}`, {
+        type: 'hook',
+        event: 'Stop',
+        installName: 'myhook',
+        interpreter,
+      });
+      assert.deepEqual(resolveInstallFile(wiki), { installFile: `myhook${ext}` });
+    }
+  });
+});
+
+test('an absent interpreter defaults to node, byte-identical to pre-IMPR-38 (backward compat)', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
+      type: 'hook',
+      event: 'Stop',
+      installName: 'myhook',
+    });
+    assert.deepEqual(resolveInstallFile(ext), { installFile: 'myhook.mjs' });
+  });
+});
+
+test('an unknown interpreter makes the whole manifest malformed, falling back to the wiki name (never a skip on the installName axis)', () => {
+  withTmpDir((dir) => {
+    const ext = extWithManifest(dir, 'hooks', 'hypo-ext-h.mjs', {
+      type: 'hook',
+      event: 'Stop',
+      installName: 'myhook',
+      interpreter: 'perl',
+    });
+    // parseManifest rejects the whole manifest (interpreter is validated the same
+    // place event/matcher/timeout are), so resolveInstallFile takes its
+    // malformed-manifest fallback: the wiki storage name, not a skip+warn.
+    assert.deepEqual(resolveInstallFile(ext), { installFile: 'hypo-ext-h.mjs' });
+  });
+});
+
 suite('capture: parseExtKey (ADR 0061 §8 uninstall key safety)');
 
 const COVERED = ['hooks', 'commands', 'skills', 'agents'];
@@ -181,7 +228,7 @@ test('rejects traversal / separators / wrong extension / unknown type', () => {
   assert.equal(parseExtKey('commands/a/b.md', COVERED), null);
   assert.equal(parseExtKey('commands/a..b.md', COVERED), null);
   assert.equal(parseExtKey('commands/mycmd.txt', COVERED), null);
-  assert.equal(parseExtKey('hooks/x.md', COVERED), null); // hooks want .mjs
+  assert.equal(parseExtKey('hooks/x.md', COVERED), null); // hooks want .mjs/.py/.sh, not .md
   assert.equal(parseExtKey('unknown/x.md', COVERED), null);
   assert.equal(parseExtKey('commands/.hidden.md', COVERED), null);
   assert.equal(parseExtKey('nokey', COVERED), null);
@@ -197,6 +244,21 @@ test('accepts the hook manifest sidecar but only for hooks', () => {
   // removable file (widened destructive surface).
   assert.equal(parseExtKey('commands/x.manifest.json', COVERED), null);
   assert.equal(parseExtKey('agents/x.manifest.json', COVERED), null);
+});
+
+test('accepts a hook install key under any interpreter extension (IMPR-38)', () => {
+  assert.deepEqual(parseExtKey('hooks/myhook.py', COVERED), {
+    type: 'hooks',
+    installFile: 'myhook.py',
+  });
+  assert.deepEqual(parseExtKey('hooks/myhook.sh', COVERED), {
+    type: 'hooks',
+    installFile: 'myhook.sh',
+  });
+  assert.deepEqual(parseExtKey('hooks/myhook.mjs', COVERED), {
+    type: 'hooks',
+    installFile: 'myhook.mjs',
+  });
 });
 
 test('respects the covered-types scope (codex excludes skills/agents)', () => {
@@ -561,6 +623,165 @@ test('installName hook installs mjs, sidecar, and command under the original nam
   });
 });
 
+// IMPR-38: capture manifest widened to carry `interpreter`, and the three
+// symmetric sites (discoverExtensions' extension filter, resolveInstallFile,
+// buildHookCommand) widen together — a python3 hook installs, registers, and
+// is owned exactly like the node case above, just under .py and its own
+// interpreter prefix.
+test('a python3 hook installs the .py, its sidecar, and a python3-prefixed command', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeExt(hypoDir, 'hooks', 'hypo-ext-h.py', '#!/usr/bin/env python3\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        installName: 'mypyhook',
+        interpreter: 'python3',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      const copyDir = join(home, '.claude', 'hooks');
+      assert.ok(existsSync(join(copyDir, 'mypyhook.py')), 'hook not installed under installName');
+      assert.ok(
+        existsSync(join(copyDir, 'mypyhook.manifest.json')),
+        'sidecar not installed under installName (must not collide with the .py itself)',
+      );
+
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const groups = (settings.hooks?.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('mypyhook.py')),
+      );
+      assert.equal(groups.length, 1, 'exactly one PostToolUse entry expected');
+      assert.equal(
+        groups[0].hooks[0].command,
+        'python3 $HOME/.claude/hooks/mypyhook.py',
+        'command must use the python3 interpreter, not node',
+      );
+
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        pkg.extensions.claude['hooks/mypyhook.py'],
+        'hook SHA key not owned under installName',
+      );
+      assert.ok(
+        pkg.extensions.claude['hooks/mypyhook.manifest.json'],
+        'sidecar SHA key not owned under installName',
+      );
+    });
+  });
+});
+
+// A bash hook needs no installName: discoverExtensions must recognize .sh as a
+// hook extension on its own (the wiki-storage-name path), separately from the
+// installName-driven rename tested above.
+test('a bash hook with no installName installs and registers under its wiki name', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeExt(hypoDir, 'hooks', 'hypo-ext-shhook.sh', '#!/usr/bin/env bash\n', {
+        type: 'hook',
+        event: 'Stop',
+        interpreter: 'bash',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      const copyDir = join(home, '.claude', 'hooks');
+      assert.ok(existsSync(join(copyDir, 'hypo-ext-shhook.sh')), 'bash hook not hard-copied');
+      const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf-8'));
+      const groups = (settings.hooks?.Stop || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('hypo-ext-shhook.sh')),
+      );
+      assert.equal(groups.length, 1);
+      assert.equal(groups[0].hooks[0].command, 'bash $HOME/.claude/hooks/hypo-ext-shhook.sh');
+    });
+  });
+});
+
+// The production regression this was actually about: a wiki-storage-name hook
+// (no installName) whose file extension disagrees with its manifest's
+// interpreter (here, a `.py` file with no `interpreter` field, which defaults
+// to node) must never be hard-copied or registered. Without this guard,
+// forward-sync would install the `.py` under `node ...py`, a command its own
+// reverse parser then refuses (`wrong-extension`) — the exact asymmetry a
+// build/parse mirror must not allow.
+test('a hook whose extension disagrees with its interpreter is skipped with a visible reason, not installed', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      // No `interpreter` field: defaults to node, which wants .mjs, not .py.
+      writeExt(hypoDir, 'hooks', 'hypo-ext-mismatch.py', '#!/usr/bin/env python3\n', {
+        type: 'hook',
+        event: 'Stop',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+      const out = JSON.parse(r.stdout);
+
+      const copyDir = join(home, '.claude', 'hooks');
+      assert.ok(
+        !existsSync(join(copyDir, 'hypo-ext-mismatch.py')),
+        'mismatched hook must not be hard-copied',
+      );
+      assert.ok(
+        !existsSync(join(copyDir, 'hypo-ext-mismatch.manifest.json')),
+        'sidecar must not be copied for a hook that was refused',
+      );
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const settingsText = existsSync(settingsPath) ? readFileSync(settingsPath, 'utf-8') : '';
+      assert.ok(!settingsText.includes('mismatch'), 'no settings.json entry for the mismatched hook');
+      assert.ok(
+        out.applied.extensions.warnings.some(
+          (w) => w.includes('interpreter-extension-mismatch') && w.includes('hypo-ext-mismatch'),
+        ),
+        'a distinct, visible skip reason must be reported',
+      );
+    });
+  });
+});
+
+// Interpreter present but still wrong for the extension: python3 does not
+// install a .mjs.
+test('a python3-declared hook over a .mjs file is skipped the same way', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      writeExt(hypoDir, 'hooks', 'hypo-ext-badpair.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'Stop',
+        interpreter: 'python3',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, r.stderr);
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        !existsSync(join(home, '.claude', 'hooks', 'hypo-ext-badpair.mjs')),
+        'mismatched hook must not be hard-copied',
+      );
+      assert.ok(
+        out.applied.extensions.warnings.some((w) => w.includes('interpreter-extension-mismatch')),
+      );
+    });
+  });
+});
+
 test('duplicate installName skips the whole group (no partial install)', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {
@@ -832,7 +1053,47 @@ test('round-trip accept: a HOME-relative dir builds a command the parser restore
     assert.ok(parsed.ok, `${stem} should round-trip`);
     assert.equal(parsed.stem, stem);
     assert.equal(parsed.basename, `${stem}.mjs`);
+    assert.equal(parsed.interpreter, 'node');
   }
+});
+
+// IMPR-38: capture rejected every non-node hook. buildHookCommand/
+// parseCapturableHookCommand must widen together (build/parse are mirrors) so a
+// python or bash hook registers and captures under its own interpreter+extension.
+// The one assertion that pins "build and parse can never drift" across the
+// FULL interpreter allowlist, not just node. If a new interpreter is ever added
+// to HOOK_INTERPRETER_EXT without a matching parseCapturableHookCommand branch,
+// this is what catches it: every interpreter's own buildHookCommand output must
+// come back ok:true, with the SAME stem/interpreter, through the strict parser.
+test('round-trip accept: every allowlisted interpreter build/parses under its own extension', () => {
+  const hooksDir = join(HOME, '.claude', 'hooks');
+  for (const [interpreter, ext] of [
+    ['node', '.mjs'],
+    ['python3', '.py'],
+    ['bash', '.sh'],
+  ]) {
+    const command = buildHookCommand(hooksDir, `mycmd${ext}`, interpreter);
+    assert.equal(command, `${interpreter} $HOME/.claude/hooks/mycmd${ext}`);
+    const parsed = parseCapturableHookCommand(command);
+    assert.ok(parsed.ok, `${interpreter} should round-trip`);
+    assert.equal(parsed.stem, 'mycmd');
+    assert.equal(parsed.basename, `mycmd${ext}`);
+    assert.equal(parsed.interpreter, interpreter);
+  }
+});
+
+// This is a unit-level property of the two pure functions, NOT proof that the
+// production forward path is safe: buildHookCommand itself does not validate
+// the installFile/interpreter pairing (see the reasoning at its definition), so
+// on its own it happily builds this exact mismatched command. What actually
+// keeps a mismatched hook out of settings.json is buildExpectedSettingsEntries
+// (and, before any hard-copy, syncExtensions) refusing to call buildHookCommand
+// for a mismatched pair in the first place — covered separately below in
+// "capture: forward-sync installFile integration".
+test('buildHookCommand does not itself validate the pairing; parseCapturableHookCommand is the parser-side backstop', () => {
+  const command = buildHookCommand(join(HOME, '.claude', 'hooks'), 'x.py', 'node');
+  assert.equal(command, `node $HOME/.claude/hooks/x.py`);
+  assert.equal(parseCapturableHookCommand(command).reason, 'wrong-extension');
 });
 
 test('round-trip reject: a dir outside HOME builds an absolute command the parser rejects', () => {
@@ -853,7 +1114,12 @@ suite('capture: parseCapturableHookCommand strict axes');
 
 test('accepts the exact canonical form', () => {
   const parsed = parseCapturableHookCommand('node $HOME/.claude/hooks/mycmd.mjs');
-  assert.deepEqual(parsed, { ok: true, stem: 'mycmd', basename: 'mycmd.mjs' });
+  assert.deepEqual(parsed, {
+    ok: true,
+    stem: 'mycmd',
+    basename: 'mycmd.mjs',
+    interpreter: 'node',
+  });
 });
 
 test('rejects a non-string with a distinct reason', () => {
@@ -877,28 +1143,38 @@ test('rejects CR/LF', () => {
   );
 });
 
-test('rejects a bad node prefix, including double space and tab', () => {
+test('rejects an interpreter outside the allowlist, and a bad prefix shape, including double space and tab', () => {
   assert.equal(
     parseCapturableHookCommand('nodex $HOME/.claude/hooks/x.mjs').reason,
-    'bad-node-prefix',
+    'bad-interpreter-prefix',
   );
   assert.equal(
     parseCapturableHookCommand('/usr/bin/node $HOME/.claude/hooks/x.mjs').reason,
-    'bad-node-prefix',
+    'bad-interpreter-prefix',
+  );
+  // python (no trailing 3) and ruby/perl/sh are all outside HOOK_INTERPRETERS —
+  // this is the allowlist itself, not a shape defect.
+  assert.equal(
+    parseCapturableHookCommand('python $HOME/.claude/hooks/x.py').reason,
+    'bad-interpreter-prefix',
+  );
+  assert.equal(
+    parseCapturableHookCommand('sh $HOME/.claude/hooks/x.sh').reason,
+    'bad-interpreter-prefix',
   );
   assert.equal(
     parseCapturableHookCommand('node  $HOME/.claude/hooks/x.mjs').reason,
-    'bad-node-prefix',
+    'bad-interpreter-prefix',
   ); // double space
   assert.equal(
     parseCapturableHookCommand('node\t$HOME/.claude/hooks/x.mjs').reason,
-    'bad-node-prefix',
+    'bad-interpreter-prefix',
   ); // tab for space
   assert.equal(
     parseCapturableHookCommand('node \t$HOME/.claude/hooks/x.mjs').reason,
-    'bad-node-prefix',
+    'bad-interpreter-prefix',
   ); // space then tab
-  assert.equal(parseCapturableHookCommand('node ').reason, 'bad-node-prefix');
+  assert.equal(parseCapturableHookCommand('node ').reason, 'bad-interpreter-prefix');
 });
 
 test('rejects a path not under $HOME/.claude/hooks (tilde, relative, env prefix, absolute)', () => {
@@ -944,10 +1220,26 @@ test('rejects a nested segment or traversal in the tail', () => {
   );
 });
 
-test('rejects a non-.mjs tail', () => {
-  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x.js').reason, 'not-mjs');
-  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x').reason, 'not-mjs');
-  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x.mjs.bak').reason, 'not-mjs');
+test('rejects a tail whose extension does not match the interpreter', () => {
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/x.js').reason,
+    'wrong-extension',
+  );
+  assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/x').reason, 'wrong-extension');
+  assert.equal(
+    parseCapturableHookCommand('node $HOME/.claude/hooks/x.mjs.bak').reason,
+    'wrong-extension',
+  );
+  // Right allowlisted interpreter, wrong interpreter's extension — the two are
+  // read together, never independently.
+  assert.equal(
+    parseCapturableHookCommand('python3 $HOME/.claude/hooks/x.mjs').reason,
+    'wrong-extension',
+  );
+  assert.equal(
+    parseCapturableHookCommand('bash $HOME/.claude/hooks/x.py').reason,
+    'wrong-extension',
+  );
 });
 
 test('rejects a stem that fails isValidInstallStem, including the reserved hypo namespace', () => {
@@ -968,6 +1260,10 @@ test('rejects a stem that fails isValidInstallStem, including the reserved hypo 
     'invalid-stem',
   );
   assert.equal(parseCapturableHookCommand('node $HOME/.claude/hooks/.mjs').reason, 'invalid-stem'); // empty stem
+  assert.equal(
+    parseCapturableHookCommand('python3 $HOME/.claude/hooks/hypo-core.py').reason,
+    'invalid-stem',
+  );
 });
 
 suite('capture: scanSettingsHooks defensive walk');
@@ -1107,15 +1403,18 @@ test('lossy command axes each skip with a visible reason and yield no candidate'
   // Each axis uses a UNIQUE basename so the F6 duplicate check never shadows the
   // per-axis reason. None of these is capturable, so nothing is written anywhere.
   const axes = [
-    { command: 'node $HOME/.claude/hooks/argh.mjs --flag', reason: 'not-mjs' }, // extra CLI arg
-    { command: 'FOO=1 node $HOME/.claude/hooks/envh.mjs', reason: 'bad-node-prefix' }, // env prefix
-    { command: 'node $HOME/.claude/hooks/shellh.mjs && echo hi', reason: 'not-mjs' }, // inline shell
-    { command: '/usr/bin/node $HOME/.claude/hooks/absnodeh.mjs', reason: 'bad-node-prefix' }, // non-bare node
+    { command: 'node $HOME/.claude/hooks/argh.mjs --flag', reason: 'wrong-extension' }, // extra CLI arg
+    { command: 'FOO=1 node $HOME/.claude/hooks/envh.mjs', reason: 'bad-interpreter-prefix' }, // env prefix
+    { command: 'node $HOME/.claude/hooks/shellh.mjs && echo hi', reason: 'wrong-extension' }, // inline shell
+    {
+      command: '/usr/bin/node $HOME/.claude/hooks/absnodeh.mjs',
+      reason: 'bad-interpreter-prefix',
+    }, // non-bare node
     { command: 'node $HOME/.claude/hooks/ghosth.mjs', reason: 'unresolved-source' }, // .mjs missing
     { command: 'node $HOME/.config/hooks/outh.mjs', reason: 'path-not-under-home-hooks' }, // path outside
     { command: 'node hooks/relh.mjs', reason: 'path-not-under-home-hooks' }, // relative
     { command: 'node ~/.claude/hooks/tildeh.mjs', reason: 'path-not-under-home-hooks' }, // tilde
-    { command: 'node  $HOME/.claude/hooks/dblh.mjs', reason: 'bad-node-prefix' }, // double space
+    { command: 'node  $HOME/.claude/hooks/dblh.mjs', reason: 'bad-interpreter-prefix' }, // double space
     { command: 'node $HOME/.claude/hooks/crh.mjs\n', reason: 'contains-newline' }, // CRLF
   ];
   const settings = {
@@ -1318,14 +1617,20 @@ test('a symlinked source (non-regular) is refused as unresolved-source', () => {
 
 // Register one canonical hook (a real .mjs source + the exact settings.json form
 // forward-sync emits) so the capture → adopt round-trip can be observed whole.
-function seedCanonicalHook(home, { stem, event = 'PostToolUse', matcher, timeout, body }) {
+function seedCanonicalHook(
+  home,
+  { stem, event = 'PostToolUse', matcher, timeout, body, interpreter = 'node', ext = '.mjs' },
+) {
   const hooksDir = join(home, '.claude', 'hooks');
   mkdirSync(hooksDir, { recursive: true });
-  writeFileSync(join(hooksDir, `${stem}.mjs`), body);
+  writeFileSync(join(hooksDir, `${stem}${ext}`), body);
   const settingsPath = join(home, '.claude', 'settings.json');
   const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf-8')) : {};
   settings.hooks = settings.hooks || {};
-  const hookEntry = { type: 'command', command: `node $HOME/.claude/hooks/${stem}.mjs` };
+  const hookEntry = {
+    type: 'command',
+    command: `${interpreter} $HOME/.claude/hooks/${stem}${ext}`,
+  };
   if (timeout !== undefined) hookEntry.timeout = timeout;
   const group = { hooks: [hookEntry] };
   if (matcher !== undefined) group.matcher = matcher;
@@ -1415,6 +1720,58 @@ test('omits an empty matcher from the reverse-generated manifest', () => {
         ),
       );
       assert.deepEqual(manifest, { type: 'hook', installName: 'nomatch', event: 'PostToolUse' });
+    });
+  });
+});
+
+// IMPR-38: reverse-capture of a python3 hook. The manifest must carry
+// `interpreter: 'python3'` (unlike the node case above, where it is omitted for
+// backward compat) and the wiki storage file keeps the .py extension.
+test('captures a canonical python3 hook, recording interpreter in the manifest', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      assert.equal(
+        runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home).status,
+        0,
+      );
+      const body = '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n';
+      const settingsPath = seedCanonicalHook(home, {
+        stem: 'mypyhook',
+        interpreter: 'python3',
+        ext: '.py',
+        body,
+      });
+
+      const r = runWithHome('capture.mjs', [`--hypo-dir=${hypoDir}`, '--all'], home);
+      assert.equal(r.status, 0, r.stderr);
+
+      const wikiDir = join(hypoDir, 'extensions', 'hooks');
+      assert.equal(readFileSync(join(wikiDir, 'hypo-ext-mypyhook.py'), 'utf-8'), body);
+      const manifest = JSON.parse(
+        readFileSync(join(wikiDir, 'hypo-ext-mypyhook.manifest.json'), 'utf-8'),
+      );
+      assert.deepEqual(manifest, {
+        type: 'hook',
+        installName: 'mypyhook',
+        event: 'PostToolUse',
+        interpreter: 'python3',
+      });
+
+      const pkg = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(pkg.extensions.claude['hooks/mypyhook.py'], 'py key owned');
+      assert.ok(pkg.extensions.claude['hooks/mypyhook.manifest.json'], 'sidecar key owned');
+
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const groups = (after.hooks.PostToolUse || []).filter((g) =>
+        (g.hooks || []).some((h) => (h.command || '').includes('mypyhook.py')),
+      );
+      assert.equal(groups.length, 1, 'no duplicate registration');
+      assert.equal(
+        groups[0].hooks[0].command,
+        'python3 $HOME/.claude/hooks/mypyhook.py',
+        'command char-identical, python3 interpreter preserved',
+      );
     });
   });
 });
