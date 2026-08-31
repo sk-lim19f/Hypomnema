@@ -843,7 +843,10 @@ test('apply aborted at preflight-lint never creates the index (no side effect on
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false, `expected preflight to abort: ${r.stdout}`);
     assert.equal(out.stage, 'preflight-lint', `expected preflight-lint stage: ${r.stdout}`);
-    assert.ok(!existsSync(indexPath), 'a preflight abort must not create the index as a side effect');
+    assert.ok(
+      !existsSync(indexPath),
+      'a preflight abort must not create the index as a side effect',
+    );
   });
 });
 
@@ -854,7 +857,7 @@ test('apply aborted at preflight-lint never creates the index (no side effect on
 // winner's bytes survive. A plain existsSync-then-atomicWrite (tmp+rename)
 // would clobber it: rename replaces whatever sits at the destination the
 // instant it fires, existing or not.
-test('ensureProjectIndex: a file created after the caller\'s missing-check survives untouched (no-replace create)', () => {
+test("ensureProjectIndex: a file created after the caller's missing-check survives untouched (no-replace create)", () => {
   withTmpDir((dir) => {
     const relPath = join('projects', 'race-project', 'index.md');
     const dest = join(dir, relPath);
@@ -865,7 +868,11 @@ test('ensureProjectIndex: a file created after the caller\'s missing-check survi
     // (human or a concurrent close) created the file, THEN this call runs.
     writeFileSync(dest, winnerContent);
     const result = ensureProjectIndex(dir, 'race-project', relPath, '2026-06-01');
-    assert.equal(result, null, 'ensureProjectIndex must report a no-op, not a create, on this race');
+    assert.equal(
+      result,
+      null,
+      'ensureProjectIndex must report a no-op, not a create, on this race',
+    );
     assert.equal(
       readFileSync(dest, 'utf-8'),
       winnerContent,
@@ -897,4 +904,45 @@ test('apply on a project that already has an index.md leaves it byte-for-byte un
       );
     },
   );
+});
+
+// ── every whole-file base-mismatch parks ─────────────────────────────────────
+// Root hot.md is a shared pointer table, and two machines editing DIFFERENT rows
+// produce a whole-file base-mismatch that reads as a collision even though nothing
+// collided. Five predicates tried to recognise that case and skip the park; four
+// review rounds broke all five against the real vault, the last by inserting a row
+// between a table's header and its separator. So there is no escape any more: a
+// mismatch parks, and a human resolves it through challenge and resolve.
+
+suite('every whole-file base-mismatch parks');
+
+test('root hot.md parks on a mismatch even when the payload keeps every disk row', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 'mismatch-parks';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+
+    // A different machine appends its own row directly on disk, after the base
+    // snapshot: the normal multi-machine pointer-table pattern, and the exact shape
+    // the deleted predicates used to wave through.
+    const betaRow = `| beta-project | ${today} | [[projects/beta-project/hot]] |`;
+    const original = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    const drifted = `${original.trimEnd()}\n${betaRow}\n`;
+    writeFileSync(join(dir, 'hot.md'), drifted);
+
+    const gammaRow = `| gamma-project | ${today} | [[projects/gamma-project/hot]] |`;
+    const payload = payloadForCleanWiki(dir, today);
+    payload.rootHot = { content: `${drifted.trimEnd()}\n${gammaRow}\n` };
+
+    const r = runApply(dir, payload, { sessionId: sid });
+    assert.notEqual(r.status, 0, 'a drifted overwrite must not write');
+    const out = JSON.parse(r.stdout);
+    const c = out.conflicts.find((x) => x.target === 'hot.md');
+    assert.ok(c, `root hot.md must park: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.reason, 'base-mismatch');
+    assert.equal(
+      readFileSync(join(dir, 'hot.md'), 'utf-8'),
+      drifted,
+      "the other machine's bytes are left exactly as they were",
+    );
+  });
 });

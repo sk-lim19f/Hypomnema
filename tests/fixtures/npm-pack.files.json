@@ -8,6 +8,10 @@
     "exec": false
   },
   {
+    "path": "CHANGELOG.md",
+    "exec": false
+  },
+  {
     "path": "LICENSE",
     "exec": false
   },

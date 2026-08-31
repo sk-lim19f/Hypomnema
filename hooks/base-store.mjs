@@ -250,6 +250,20 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
   }
 }
 
+// The four whole-file overwrite targets are prose-and-table markdown documents, and
+// a base-mismatch on one of them always parks. Five predicates lived here that tried
+// to skip the park when a payload "provably" lost nothing, and four rounds of review
+// broke all five against the real vault. The last one accepted an insertion between a
+// table's header and its separator, which keeps every byte and stops the table from
+// being a table. They all failed the same way: a markdown document's meaning comes
+// from block context that begins far above the line under judgement, and a hook that
+// may use Node built-ins only is not the place to own a block parser.
+//
+// The pointer table this was built for should stop being a shared whole-file
+// overwrite target and become a locally generated projection of the per-project files
+// that already own those facts. Then two machines never contend over it, and nothing
+// here needs to prove anything.
+
 /**
  * The four overwrite targets crystallize replaces wholesale. `project` may be
  * null when cwd resolves to no project; the two project-scoped paths are then

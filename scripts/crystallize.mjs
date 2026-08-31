@@ -1421,6 +1421,26 @@ function applySessionClose(args) {
     // (2) conflict, only where a session context makes a base observable
     if (args.sessionId) {
       const entry = readBaseEntry(args.hypoDir, args.sessionId, relPath);
+      // EVERY mismatch parks. A drifted whole-file overwrite is resolved by a
+      // human through `proposal challenge` and `proposal resolve`, which writes
+      // exactly the bytes that were shown.
+      //
+      // Five predicates were written to skip the park when the payload "provably"
+      // lost nothing, and four rounds of review broke all five against the real
+      // vault: table rows only, a trimmed multiset, an ordered verbatim
+      // subsequence, that plus a row-shaped-insert rule, and that plus a placement
+      // rule. Each fell to the same thing. A markdown document's meaning is set by
+      // block context that starts far above the line being judged, so a predicate
+      // reading lines and their neighbours cannot see a payload that preserves
+      // every byte and still fences the file into code, merges two paragraphs,
+      // invalidates the frontmatter, or cuts a table off from its separator.
+      // Proving it needs a block parser, and this guard is not where a markdown
+      // parser should live.
+      //
+      // The narrowing is not coming back in this shape. The pointer table it was
+      // built for should stop being a shared whole-file overwrite target at all and
+      // become a locally generated projection of the project files that already own
+      // those facts; then two machines never contend over it.
       const reason = overwriteConflictReason(entry, disk);
       if (reason) {
         conflicts.push({

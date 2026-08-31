@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * proposal.mjs: `hypomnema proposal list|apply|discard|challenge|resolve`, the
- * human-in-the-loop gate for parked overwrite-conflict artifacts (the write=proposal
- * store).
+ * proposal.mjs: `hypomnema proposal list|apply|discard|challenge|resolve`,
+ * the human-in-the-loop gate for parked overwrite-conflict artifacts (the
+ * write=proposal store).
  *
  * When crystallize's close path finds an OVERWRITE target drifted from the base
  * this session observed, it withholds the bytes and parks them under
