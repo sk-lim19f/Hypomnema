@@ -32,6 +32,7 @@ import {
   withTmpHome,
 } from './helpers.mjs';
 import { PROVENANCE_FILENAME, EXPECTED_PKG_NAME } from '../scripts/lib/pkg-provenance.mjs';
+import { resolveEnabledPluginRoot, leafVersionDrift } from '../scripts/lib/plugin-detect.mjs';
 
 // ── doctor.mjs smoke tests ───────────────────────────────────────────────────
 
@@ -2280,5 +2281,171 @@ test('hooks installed, self-location fails, no sidecar at all → doctor warns, 
       assert.equal(check.status, 'warn', `must not stay silent: ${check.detail}`);
       assert.match(check.detail, /PKG_ROOT resolves to null/);
     });
+  });
+});
+
+// ── plugin cache leaf version (plugin channel) ──────────────────────────────
+//
+// ISSUE-113: `/plugin marketplace update` names its cache directory after the
+// release it copies in and skips the copy once that version string stops
+// moving, so the leaf can end up naming an older release than the
+// package.json actually sitting inside it. Registry shape mirrors upgrade.mjs
+// dualSkip's own fixtures (tests/upgrade.test.mjs writeRegistry/withRegistryRoot):
+// `{ plugins: { "<key>": [{ installPath, scope }] } }`.
+
+suite('doctor.mjs: plugin cache leaf version (ISSUE-113)');
+
+const PLUGIN_KEY = 'hypo@hypomnema';
+
+function enablePlugin(home) {
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(
+    join(home, '.claude', 'settings.json'),
+    JSON.stringify({ enabledPlugins: { [PLUGIN_KEY]: true } }),
+  );
+}
+
+// Builds a plugin cache root shaped like Claude Code's own
+// `cache/<marketplace>/hypo/<leafVersion>/` and points installed_plugins.json
+// at it, with a package.json inside carrying `manifestVersion`. Passing
+// `leafVersion !== manifestVersion` reproduces the exact QA fixture (leaf
+// "1.7.3", package.json "1.7.4").
+// `scopes` mirrors the real registry shape: a live machine carries BOTH a
+// user-scope and a project-scope row for one key, and both name the SAME
+// installPath (verified on this machine 2026-08-31). The default stays single so
+// the existing tests read unchanged.
+function registerPluginCache(home, leafVersion, manifestVersion, scopes = ['user']) {
+  const root = join(home, '.claude', 'plugins', 'cache', 'hypomnema', 'hypo', leafVersion);
+  mkdirSync(root, { recursive: true });
+  writeFileSync(
+    join(root, 'package.json'),
+    JSON.stringify({ name: 'hypomnema', version: manifestVersion }),
+  );
+  const registryDir = join(home, '.claude', 'plugins');
+  mkdirSync(registryDir, { recursive: true });
+  writeFileSync(
+    join(registryDir, 'installed_plugins.json'),
+    JSON.stringify({
+      plugins: { [PLUGIN_KEY]: scopes.map((scope) => ({ installPath: root, scope })) },
+    }),
+  );
+  return root;
+}
+
+test('plugin not enabled: check is silent (not reported at all)', () => {
+  withTmpHome((home) => {
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Plugin cache leaf version');
+    assert.equal(check, undefined, 'no enabled plugin means nothing to verify');
+  });
+});
+
+test('plugin enabled, leaf matches package.json version: passes', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    registerPluginCache(home, '1.7.4', '1.7.4');
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Plugin cache leaf version');
+    assert.ok(check, 'expected a Plugin cache leaf version check');
+    assert.equal(check.status, 'pass', `matching leaf must pass: ${check.detail}`);
+  });
+});
+
+test('plugin enabled, leaf drifted from package.json version: warns and names the exact drift', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    // The measured 2026-08-29 QA shape: cache leaf "1.7.3", package.json "1.7.4".
+    registerPluginCache(home, '1.7.3', '1.7.4');
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Plugin cache leaf version');
+    assert.ok(check, 'expected a Plugin cache leaf version check');
+    assert.equal(check.status, 'warn', `drifted leaf must warn, not pass: ${check.detail}`);
+    assert.match(check.detail, /leaf says v1\.7\.3/);
+    assert.match(check.detail, /package\.json says v1\.7\.4/);
+  });
+});
+
+// Two registry rows, one directory. The real shape on a live machine: `hypo@hypomnema`
+// carries a user-scope AND a project-scope entry pointing at the same installPath.
+// Iterating rows instead of paths reported "2 plugin cache path(s)" and printed the
+// identical path twice, so both the count and the list overstated the damage.
+test('duplicate registry rows naming one path are reported once', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    registerPluginCache(home, '1.7.3', '1.7.4', ['user', 'project']);
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Plugin cache leaf version');
+    assert.ok(check, 'expected a Plugin cache leaf version check');
+    assert.equal(check.status, 'warn');
+    assert.match(check.detail, /1 plugin cache path\(s\)/, `count must dedupe: ${check.detail}`);
+    const hits = check.detail.match(/leaf says v1\.7\.3/g) || [];
+    assert.equal(hits.length, 1, `path must be listed once, got ${hits.length}: ${check.detail}`);
+  });
+});
+
+// A leaf that merely STARTS with a version is not a version-named cache dir. An
+// unanchored test read it as one, and since package.json can never equal the whole
+// leaf string, a perfectly healthy root warned forever.
+test('a leaf that only starts with a version is not treated as version-named', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    registerPluginCache(home, '1.7.4-hypomnema-backup', '1.7.4');
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Plugin cache leaf version');
+    assert.ok(check, 'expected a Plugin cache leaf version check');
+    // Not `pass`: nothing was compared, and saying "matches" would state a fact nobody
+    // established. Not the drift wording either — that is what an unanchored regex
+    // produces here, so asserting on the detail is what makes this test distinguish the
+    // two failure directions rather than just the status word.
+    assert.equal(check.status, 'warn', `unverifiable must not read as verified: ${check.detail}`);
+    assert.match(check.detail, /could be compared/, `expected the unverified wording: ${check.detail}`);
+    assert.doesNotMatch(
+      check.detail,
+      /leaf says v/,
+      `a non-version leaf must not be reported as drifted: ${check.detail}`,
+    );
+  });
+});
+
+// The exclusion this feature deliberately does NOT do. Filtering drifted roots out
+// of resolveEnabledPluginRoot makes it return null, and init.mjs's resolveDurableRoot
+// then falls back to PKG_ROOT — in a dual install that is the npm checkout, which
+// gets baked into the vault's pre-commit hook and dangles the moment the user removes
+// it. Drift is a reporting concern; resolution must still hand back the working root.
+test('a drifted leaf is still resolved as the plugin root (report, never exclude)', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    const root = registerPluginCache(home, '1.7.3', '1.7.4');
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const registryPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    assert.equal(
+      resolveEnabledPluginRoot(settingsPath, registryPath),
+      root,
+      'drift must not remove a usable root from resolution',
+    );
+    assert.equal(leafVersionDrift(root).drift, true, 'fixture must actually be drifted');
+  });
+});
+
+// leafVersionDrift is exported, and doctor is not its only possible caller. doctor
+// happens to gate on usablePkgRoot first (which requires a readable version), so an
+// unreadable package.json cannot reach the comparison today. Pin the contract directly
+// anyway: a version-shaped leaf over a package.json with no version is a judgment
+// FAILURE, and reporting it as `checked: true, drift: false` would read as "compared
+// and matched" — the same fail-open shape doctor's own `compared === 0` branch closes.
+test('leafVersionDrift: unreadable manifest is checked:false, not a clean compare', () => {
+  withTmpHome((home) => {
+    const root = join(home, '.claude', 'plugins', 'cache', 'hypomnema', 'hypo', '1.7.4');
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'hypomnema' })); // no version
+    const d = leafVersionDrift(root);
+    assert.equal(d.checked, false, 'a manifest with no version was never compared');
+    assert.equal(d.drift, false, 'and an uncompared root must not be reported as drifted');
+    assert.equal(d.manifestVersion, null);
   });
 });
