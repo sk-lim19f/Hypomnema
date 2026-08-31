@@ -4,10 +4,11 @@
  * the human-in-the-loop gate for parked overwrite-conflict artifacts (the
  * write=proposal store).
  *
- * `accept-base` is the odd one out: it never touches a parked proposal. It moves a
+ * `accept-base` is the odd one out: it never WRITES a parked proposal. It moves a
  * session's own base-store entry (hooks/base-store.mjs) to a target's current disk
  * bytes, which is the documented, agent-usable way to resolve a base-mismatch that
- * an auto-advance (`advanceBaseIfSuperset`) could not prove safe on its own.
+ * an auto-advance (`advanceBaseIfSuperset`) could not prove safe on its own. It does
+ * read the store, to refuse a move that has no parked conflict behind it.
  *
  * When crystallize's close path finds an OVERWRITE target drifted from the base
  * this session observed, it withholds the bytes and parks them under
@@ -945,6 +946,30 @@ export function acceptBase({ hypoDir, sessionId, target }, { stdout, stderr, jso
     err.write(`✗ target is unsafe or escapes the vault: ${shownTarget}\n`);
     return { ok: false, code: 2, reason: 'unsafe-target' };
   }
+  // `--session-id` is an ARGUMENT, and a session id is not a secret: hooks pass it
+  // on the command line and the transcript records it. Comparing an argument to an
+  // argument would not be a check, and this command is the first place a base move
+  // is reachable from OUTSIDE the owning session's own process. So the door is
+  // narrowed by what the caller is here to do: this session must have a proposal
+  // parked on THIS target. With nothing parked there is no conflict to resolve, and
+  // an arbitrary reset of someone else's base has no legitimate shape to hide in.
+  //
+  // `typeof === 'string'` before comparing, never String(p.sessionId): proposal
+  // bodies are hand-editable and listProposals validates only `id`, so a field like
+  // `["s-A"]` would coerce to a matching primitive (same reasoning as
+  // writeProposal's supersede scan).
+  const parked = listProposals(hypoDir).filter(
+    (p) => p.target === target && typeof p.sessionId === 'string' && p.sessionId === sessionId,
+  );
+  if (parked.length === 0) {
+    err.write(
+      `✗ session ${sessionId} has no proposal parked on ${shownTarget}; ` +
+        `there is no withheld write to accept a base against.\n` +
+        `  Run \`hypomnema proposal list\` to see what is parked.\n`,
+    );
+    return { ok: false, code: 1, reason: 'no-parked-proposal' };
+  }
+
   const current = readTarget(full);
   if (current === undefined) {
     err.write(`✗ target is unreadable, refusing to accept it as the base: ${shownTarget}\n`);

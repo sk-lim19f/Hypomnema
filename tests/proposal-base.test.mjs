@@ -3760,6 +3760,21 @@ function hotTable(rows) {
 
 const ROW_ALPHA = '| alpha | 2026-08-01 | [[projects/alpha/hot]] |';
 const ROW_BETA = '| beta | 2026-08-27 | [[projects/beta/hot]] |';
+const ROW_GAMMA = '| gamma | 2026-08-31 | [[projects/gamma/hot]] |';
+
+// A close that hit a drifted overwrite target parks its withheld bytes here. Since
+// ISSUE-101, that parked artifact is accept-base's precondition, so any test of the
+// legitimate path has to stand one up first.
+function parkFor(dir, sessionId, rel, proposedContent) {
+  return psWriteProposal(dir, {
+    target: rel,
+    baseHash: 'b-observed',
+    currentAtProposalHash: 'c-at-park',
+    proposedContent,
+    sessionId,
+    device: 'dev-test',
+  });
+}
 
 test('ISSUE-63 a: every disk row preserved (order changed, a row appended) is a superset', () => {
   const disk = hotTable([ROW_ALPHA]);
@@ -3776,7 +3791,11 @@ test('ISSUE-63 a: superset content auto-advances the base, no conflict left behi
     const withOtherRow = hotTable([ROW_ALPHA, ROW_BETA]);
     writeFileSync(join(dir, rel), disk);
     snapshotBase(dir, sid, [rel]);
-    assert.equal(readBaseEntry(dir, sid, rel).hash, bsHashContent(disk), 'base captured disk bytes');
+    assert.equal(
+      readBaseEntry(dir, sid, rel).hash,
+      bsHashContent(disk),
+      'base captured disk bytes',
+    );
 
     const result = advanceBaseIfSuperset(dir, sid, rel, disk, withOtherRow);
     assert.equal(result.resolved, true, 'a superset write must auto-resolve');
@@ -3805,7 +3824,11 @@ test('ISSUE-63 a: a disk row dropped from the new content is not a superset, bas
     assert.equal(isTableSuperset(disk, missingBeta), false);
     const result = advanceBaseIfSuperset(dir, sid, rel, disk, missingBeta);
     assert.equal(result.resolved, false, 'a dropped row must not auto-resolve');
-    assert.deepEqual(readBaseEntry(dir, sid, rel), before, 'the existing conflict base is untouched');
+    assert.deepEqual(
+      readBaseEntry(dir, sid, rel),
+      before,
+      'the existing conflict base is untouched',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -3862,7 +3885,11 @@ test('ISSUE-63 a: polarity invariant, a throwing judge preserves the existing co
     const result = advanceBaseIfSuperset(dir, sid, rel, disk, trueSuperset, {
       judge: throwingJudge,
     });
-    assert.equal(result.resolved, false, 'a thrown judge must fall through to the existing conflict');
+    assert.equal(
+      result.resolved,
+      false,
+      'a thrown judge must fall through to the existing conflict',
+    );
     assert.deepEqual(
       readBaseEntry(dir, sid, rel),
       before,
@@ -3885,6 +3912,10 @@ test('ISSUE-63 b: accept-base advances the base so the same overwrite no longer 
     // A different machine drifts the shared pointer table after the snapshot.
     const drifted = hotTable([ROW_ALPHA, ROW_BETA]);
     writeFileSync(join(dir, rel), drifted);
+
+    // ISSUE-101: the close that hit this drift parked its withheld bytes. That
+    // parked artifact is what accept-base is FOR, and is now its precondition.
+    parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_GAMMA]));
 
     // Before accept-base: the write-guard's own base-vs-disk comparison mismatches,
     // which is exactly what makes crystallize park the overwrite as a conflict.
@@ -3921,6 +3952,7 @@ test('ISSUE-63 b: accept-base supports --json like the other subcommands', () =>
     const rel = 'hot.md';
     writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
     snapshotBase(dir, sid, [rel]);
+    parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_BETA]));
 
     const out = capStream();
     const res = acceptBase(
@@ -3950,7 +3982,10 @@ test('ISSUE-63 b: accept-base fails closed on an unsafe target and on a session 
     assert.equal(escape.ok, false);
     assert.equal(escape.reason, 'unsafe-target');
 
-    // A valid target, but this session never had SessionStart snapshot its base.
+    // A valid target with a parked proposal behind it, but this session never had
+    // SessionStart snapshot its base. Parking first keeps this case pinned on the
+    // base-snapshot refusal rather than sliding onto ISSUE-101's earlier gate.
+    parkFor(dir, 's-never-started', 'hot.md', hotTable([ROW_ALPHA, ROW_BETA]));
     const noSnapErr = capStream();
     const noSnap = acceptBase(
       { hypoDir: dir, sessionId: 's-never-started', target: 'hot.md' },
@@ -3967,4 +4002,120 @@ test('ISSUE-63 b: accept-base fails closed on an unsafe target and on a session 
 test('ISSUE-63 b: proposal.mjs usage text documents accept-base', () => {
   const src = readFileSync(join(SCRIPTS, 'proposal.mjs'), 'utf-8');
   assert.match(src, /accept-base/);
+});
+
+// ── ISSUE-101: accept-base is the first base move reachable from outside the ──
+// owning session's own process, and `--session-id` is an argument, not proof.
+// The gate is what the caller is here to resolve: a proposal this session parked
+// on this target. Nothing parked, nothing to accept.
+test('ISSUE-101: accept-base refuses when nothing is parked on the target, and the base does not move', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const sid = 's-victim';
+    const rel = 'hot.md';
+    writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+
+    // Someone else drifts the file and then tries to make the victim session
+    // accept it, so the victim's next close would overwrite instead of parking.
+    writeFileSync(join(dir, rel), hotTable([ROW_BETA]));
+
+    const err = capStream();
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: capStream(), stderr: err },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'no-parked-proposal');
+    assert.match(err.text(), /no proposal parked/);
+    assert.deepEqual(
+      readBaseEntry(dir, sid, rel),
+      before,
+      'a refused accept-base must leave the base exactly where it was',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ISSUE-101: a proposal parked by another session does not unlock this session's base", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const victim = 's-victim';
+    const other = 's-other';
+    const rel = 'hot.md';
+    writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, victim, [rel]);
+    const before = readBaseEntry(dir, victim, rel);
+
+    // A real parked artifact exists on this target — it just belongs to someone
+    // else. Same-target alone must not be enough.
+    parkFor(dir, other, rel, hotTable([ROW_ALPHA, ROW_BETA]));
+    writeFileSync(join(dir, rel), hotTable([ROW_BETA]));
+
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: victim, target: rel },
+      { stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'no-parked-proposal');
+    assert.deepEqual(readBaseEntry(dir, victim, rel), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-101: a parked proposal unlocks only the target it was parked on', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const sid = 's-scoped';
+    writeFileSync(join(dir, 'hot.md'), hotTable([ROW_ALPHA]));
+    mkdirSync(join(dir, 'projects', 'p'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'hot.md'), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, sid, ['hot.md', join('projects', 'p', 'hot.md')]);
+    const beforeOther = readBaseEntry(dir, sid, join('projects', 'p', 'hot.md'));
+
+    parkFor(dir, sid, 'hot.md', hotTable([ROW_ALPHA, ROW_BETA]));
+    writeFileSync(join(dir, 'projects', 'p', 'hot.md'), hotTable([ROW_BETA]));
+
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: join('projects', 'p', 'hot.md') },
+      { stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'no-parked-proposal');
+    assert.deepEqual(readBaseEntry(dir, sid, join('projects', 'p', 'hot.md')), beforeOther);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-101: a non-string sessionId in a hand-edited artifact never matches', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const sid = 's-victim';
+    const rel = 'hot.md';
+    writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+
+    // Proposal bodies are hand-editable and listProposals validates only `id`.
+    // `["s-victim"]` coerces to the victim's id under String(), so the comparison
+    // must reject it on type before it ever compares.
+    const parked = parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_BETA]));
+    const artifact = JSON.parse(readFileSync(parked.path, 'utf-8'));
+    artifact.sessionId = [sid];
+    writeFileSync(parked.path, JSON.stringify(artifact, null, 2));
+
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'no-parked-proposal');
+    assert.deepEqual(readBaseEntry(dir, sid, rel), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
