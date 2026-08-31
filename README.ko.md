@@ -41,8 +41,6 @@ Andrej Karpathy의 "LLM 네이티브 위키" 스케치에서 출발했습니다.
 
 같은 보류 방식이 세션 마무리 파일을 쓸 때에도 적용됩니다. 세션 종료 쓰기의 대상 파일이 이 세션이 읽은 뒤에 바뀌었다면 Hypomnema는 덮어쓰지 않습니다. 그 내용을 `<위키>/.cache/proposals/` 아래에 보류하고 알려 줍니다. 검토와 적용은 직접 하세요. `hypomnema proposal list`로 목록을 보고 터미널에서 `hypomnema proposal apply <id>` 또는 `hypomnema proposal discard <id>`를 씁니다. 세션 안에서는 타이핑할 터미널이 없으므로 같은 승인을 대화에서 받습니다. `hypomnema proposal challenge`가 diff를 보여 주고, 거기 적힌 줄을 직접 입력하면, `hypomnema proposal resolve`가 본 그대로를 씁니다. 자동 적용은 없습니다.
 
-한 경우만 보류하지 않습니다. 차이가 **이미 있던 표 안에 행이 늘어난 것뿐**일 때입니다. 나머지 줄은 빈 줄까지 포함해 전부 바이트 그대로 같은 순서로 이미 있어야 하고, 늘어난 줄은 전부 그 표 몸통 안에 놓인 행이어야 합니다. 두 머신이 같은 포인터 표를 고치는 바로 그 경우이고, 그것으로는 잃을 것이 없습니다. 그 밖에는 전부 보류하고 사람을 기다립니다.
-
 자동처럼 보이지만 실제로는 직접 실행해야 하는 기능이 두 가지 있습니다. extensions sync와 역방향 capture입니다. 위키 안 `~/hypomnema/extensions/{agents,commands,hooks,skills}/`에 둔 파일은 `~/.claude/`에 반영되는데(`--codex`를 붙이면 `hooks`·`commands`는 `~/.codex/`에도), 직접 `hypomnema init`, `hypomnema upgrade --apply`, 또는 dry-run이 아닌 `hypomnema capture`를 돌려야만 반영됩니다. 저절로 밀어 넣는 트리거는 없습니다. `hypomnema capture`(또는 `/hypo:capture`)는 반대 방향으로, 직접 만든 command·agent·hook·skill을 위키로 가져오는 경로인데 이것도 마찬가지로 명시적으로 불러야 동작합니다. 자세한 내용은 아래 명령어 표를 보세요.
 
 ---

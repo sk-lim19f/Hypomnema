@@ -250,140 +250,19 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
   }
 }
 
-// ── row-insertion detection ──────────────────────────────────────────────────
+// The four whole-file overwrite targets are prose-and-table markdown documents, and
+// a base-mismatch on one of them always parks. Five predicates lived here that tried
+// to skip the park when a payload "provably" lost nothing, and four rounds of review
+// broke all five against the real vault. The last one accepted an insertion between a
+// table's header and its separator, which keeps every byte and stops the table from
+// being a table. They all failed the same way: a markdown document's meaning comes
+// from block context that begins far above the line under judgement, and a hook that
+// may use Node built-ins only is not the place to own a block parser.
 //
-// A root-level pointer table (hot.md's "Active Projects", SCHEMA.md's tag list) is
-// edited by appending or updating one row per machine or project, so two machines
-// editing DIFFERENT rows produce a whole-file hash mismatch that looks exactly like
-// a colliding edit even though nothing collided. This narrows the guard for that one
-// case, and proves the case rather than assuming it.
-//
-// Three earlier judges were unsound, each in the direction that costs a file, and the
-// third is why this one no longer works line by line at all:
-//
-//   • Table DATA ROWS only. A payload that kept every row while deleting the prose
-//     around it read as safe. It also failed OPEN when rows could not be extracted,
-//     which the shipped templates/hot.md triggers with two HTML comments under the
-//     separator: zero rows collected, and every() over an empty array is true.
-//   • TRIMMED lines as a multiset. Reordering passed, so frontmatter moved below the
-//     first heading (where it stops being frontmatter) and an item moved to another
-//     section (where it is reclassified) both read as safe. Trimming passed, so a
-//     trailing-space hard break and a code block's indentation vanished silently.
-//   • Verbatim lines as an ordered subsequence. Every line survives and the document
-//     still changes meaning: wrapping the whole file in a four-backtick fence turns
-//     frontmatter, tables and links into code text, and deleting one blank line
-//     merges two paragraphs. Measured against the real vault; all passed.
-//
-// The lesson is that no judge over lines alone can prove a markdown document survived,
-// because meaning lives in the delimiters between lines as much as in the lines. So
-// this one stops trying. It asks the narrow question the feature actually needs: were
-// table rows INSERTED and nothing else touched at all? Everything already on disk must
-// still be there, verbatim, in order, blank lines included; and every line the payload
-// adds must itself be a table row. A fence, a heading, a paragraph, even a blank line
-// is not a row, so none of them can ride along.
-
-/**
- * True when `line` opens and closes a markdown table row with `|`. The raw line,
- * NOT a trimmed one: an indented `| x |` is a line inside a code block, and calling
- * that a table row is how a payload injects text into code.
- */
-function isPipeLine(line) {
-  return typeof line === 'string' && line.length > 1 && line.startsWith('|') && line.endsWith('|');
-}
-
-/** True when `line` is a table's header/data separator rather than real content. */
-function isTableSeparatorLine(line) {
-  return isPipeLine(line) && line.includes('-') && /^[|:\s-]+$/.test(line);
-}
-
-/** True when `line` is a table DATA row: pipe-delimited content, not a separator. */
-function isTableDataRow(line) {
-  return isPipeLine(line) && !isTableSeparatorLine(line);
-}
-
-/**
- * Whether `newContent` is `diskContent` with table data rows inserted into a table
- * that is already there, and nothing else changed at all.
- *
- * Three things must hold, and the third is the one earlier versions kept missing:
- *
- *   • PRESERVATION. Every line of `diskContent` appears in `newContent` verbatim and
- *     in order, blank lines included. Dropping a blank line merges two paragraphs and
- *     adding one splits a paragraph, so blanks are content here.
- *   • SHAPE. Every line `newContent` adds is a table data row. A separator is
- *     excluded too: inserting one splits a table in half and re-headers everything
- *     under it.
- *   • PLACE. Every added line sits directly after a pipe line, so it lands inside a
- *     table body that already existed. Shape alone is not enough. A row-shaped line
- *     is only a row where a table is: dropped into frontmatter it makes the YAML
- *     invalid, and the judge that checked shape alone accepted exactly that against
- *     the real vault.
- *
- * Fail-closed by construction: an empty disk, a non-string on either side, and a
- * payload identical to disk all return false. The last one is not a resolution to
- * make, because a base MISMATCH is never looking at bytes that match.
- *
- * @returns {boolean}
- */
-export function isRowInsertionOnly(diskContent, newContent) {
-  if (typeof diskContent !== 'string' || typeof newContent !== 'string') return false;
-  if (diskContent === '') return false;
-  const disk = diskContent.split('\n');
-  const next = newContent.split('\n');
-  let i = 0;
-  let inserted = 0;
-  for (let k = 0; k < next.length; k += 1) {
-    const line = next[k];
-    // The greedy scan takes the earliest match, which never forfeits a later one, so
-    // a disk line left unconsumed at the end means no matching exists at all.
-    if (i < disk.length && line === disk[i]) {
-      i += 1;
-      continue;
-    }
-    if (!isTableDataRow(line)) return false;
-    if (k === 0 || !isPipeLine(next[k - 1])) return false;
-    inserted += 1;
-  }
-  if (i !== disk.length) return false;
-  return inserted > 0;
-}
-
-/**
- * Auto-resolve a base-mismatch on `relPath` when `newContent` differs from
- * `diskContent` only by inserted table rows (see `isRowInsertionOnly`): the base
- * advances to `newContent`'s hash, so the caller's overwrite guard can treat this as
- * no conflict rather than park a proposal.
- *
- * The polarity is one-directional and enforced structurally: `judge` runs inside a
- * try/catch, so ANY failure of the check, thrown or merely `false`, resolves to
- * `{ resolved: false }` and leaves the base untouched, exactly what a caller sees
- * today with no handling at all. A base write that itself fails resolves the same
- * way, because a caller told `resolved: true` goes on to overwrite the target, and
- * doing that against a base that never moved is the one outcome this function must
- * never produce. `judge` is injectable so a test can prove that guarantee against a
- * judge that misbehaves; a production caller should never pass one.
- *
- * @returns {{resolved: boolean, hash?: string}}
- */
-export function advanceBaseIfRowInsertion(
-  hypoDir,
-  sessionId,
-  relPath,
-  diskContent,
-  newContent,
-  { judge = isRowInsertionOnly } = {},
-) {
-  let safe;
-  try {
-    safe = Boolean(judge(diskContent, newContent));
-  } catch {
-    safe = false;
-  }
-  if (!safe) return { resolved: false };
-  const hash = hashContent(newContent);
-  if (!advanceBase(hypoDir, sessionId, relPath, hash)) return { resolved: false };
-  return { resolved: true, hash };
-}
+// The pointer table this was built for should stop being a shared whole-file
+// overwrite target and become a locally generated projection of the per-project files
+// that already own those facts. Then two machines never contend over it, and nothing
+// here needs to prove anything.
 
 /**
  * The four overwrite targets crystallize replaces wholesale. `project` may be
