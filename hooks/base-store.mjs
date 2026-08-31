@@ -250,95 +250,88 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
   }
 }
 
-// ── pointer-table superset detection ──────────────────────────────────────────
+// ── superset detection ───────────────────────────────────────────────────────
 //
 // A root-level pointer table (hot.md's "Active Projects", SCHEMA.md's tag list)
 // is edited by appending or updating one row per machine or project, so two
 // machines editing DIFFERENT rows produce a whole-file hash mismatch that looks
 // exactly like a colliding edit even though nothing actually collided. When the
-// content a session is about to write still carries every data row the disk copy
-// currently has, that write cannot have dropped anyone's row, so a base-mismatch
-// against it is safe to auto-advance instead of park. The check below only ever
-// narrows that guard: anything it is not certain about still returns false.
-
-/** True when `line`, trimmed, opens and closes a markdown table row with `|`. */
-function isTableRowLine(line) {
-  const t = String(line ?? '').trim();
-  return t.length > 1 && t.startsWith('|') && t.endsWith('|');
-}
-
-/**
- * True when `line` is a table's header/data separator (only `-`, `:`, `|`, and
- * whitespace, with at least one dash), as opposed to a row of real cell content.
- */
-function isTableSeparatorLine(line) {
-  const t = String(line ?? '').trim();
-  return t.includes('-') && /^[|:\s-]+$/.test(t);
-}
+// content a session is about to write still carries every LINE the disk copy
+// currently has, that write cannot have dropped anything anyone put there, so a
+// base-mismatch against it is safe to auto-advance instead of park.
+//
+// An earlier version of this judged table DATA ROWS only, and that was unsound in
+// the direction that costs a file. Every overwrite target is a prose-and-table
+// mix, so a payload that kept every row while dropping a heading, a checklist, or
+// a frontmatter field read as a superset and the guard let the write through. It
+// also failed OPEN when a table's rows could not be extracted: the shipped
+// `templates/hot.md` puts two HTML comments directly under the separator, which
+// stopped row collection at zero, and `[].every()` is vacuously true — so on any
+// vault built from that template, a payload that dropped every row passed.
+//
+// Comparing whole lines has neither hole and needs no parser. It only ever narrows
+// the guard: anything it is not certain about still returns false.
 
 /**
- * Pull every data row (as trimmed, verbatim text) out of every markdown table in
- * `content`. Returns `null`, not `[]`, when `content` carries no table at all: an
- * empty array would read as "a table with zero rows", which is a different fact
- * from "there is no table here to compare".
+ * Count every non-blank line (trimmed) in `content`. Counts, not a Set, so a line
+ * the disk holds twice must appear twice: collapsing duplicates would let one of
+ * two identical rows disappear unnoticed.
  *
- * @returns {string[]|null}
+ * @returns {Map<string, number>|null} null when `content` is not a string.
  */
-function extractTableDataRows(content) {
+function lineCounts(content) {
   if (typeof content !== 'string') return null;
-  const lines = content.split('\n');
-  const rows = [];
-  let sawTable = false;
-  for (let i = 0; i < lines.length - 1; i++) {
-    const isHeader = isTableRowLine(lines[i]) && !isTableSeparatorLine(lines[i]);
-    if (isHeader && isTableSeparatorLine(lines[i + 1])) {
-      sawTable = true;
-      let j = i + 2;
-      while (j < lines.length && isTableRowLine(lines[j]) && !isTableSeparatorLine(lines[j])) {
-        rows.push(lines[j].trim());
-        j++;
-      }
-      i = j - 1; // resume scanning after this table, in case another one follows
-    }
+  const counts = new Map();
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (line === '') continue;
+    counts.set(line, (counts.get(line) ?? 0) + 1);
   }
-  return sawTable ? rows : null;
+  return counts;
 }
 
 /**
- * Whether `newContent` is a superset of `diskContent`: every data row currently on
- * disk appears, character for character, somewhere among `newContent`'s data rows.
- * Row ORDER may change (that is the point: a second writer appending its own row
- * shifts nobody else's position); a row that is missing, or present with altered
- * text, is not a superset.
+ * Whether `newContent` preserves every non-blank line of `diskContent`, character
+ * for character and at least as many times. Line ORDER may change (that is the
+ * point: a second writer appending its own row shifts nobody else's position); a
+ * line that is missing, or present with altered text, is not a superset.
  *
- * Fail-closed by construction: a file that carries no markdown table makes
- * `extractTableDataRows` return `null`, and either side being `null` makes this
- * `false`. Prose outside a table (a heading, a checklist line) is never inspected,
- * so a change there cannot itself flip the verdict, in either direction.
+ * Blank lines are ignored on both sides: they carry no content a writer can lose,
+ * and holding the payload to the disk copy's exact spacing would park nearly every
+ * legitimate close.
+ *
+ * Fail-closed by construction. A non-string on either side returns false, and so
+ * does an empty disk side: "there is nothing here to preserve" is not the same
+ * fact as "this write preserved everything", and only the second one earns a pass.
  *
  * @returns {boolean}
  */
-export function isTableSuperset(diskContent, newContent) {
-  const diskRows = extractTableDataRows(diskContent);
-  const newRows = extractTableDataRows(newContent);
-  if (diskRows === null || newRows === null) return false;
-  const newRowSet = new Set(newRows);
-  return diskRows.every((row) => newRowSet.has(row));
+export function isLineSuperset(diskContent, newContent) {
+  const disk = lineCounts(diskContent);
+  const next = lineCounts(newContent);
+  if (disk === null || next === null) return false;
+  if (disk.size === 0) return false;
+  for (const [line, n] of disk) {
+    if ((next.get(line) ?? 0) < n) return false;
+  }
+  return true;
 }
 
 /**
  * Auto-resolve a base-mismatch on `relPath` when `newContent` is a superset of
- * `diskContent` (see `isTableSuperset`): the base advances to `newContent`'s hash,
+ * `diskContent` (see `isLineSuperset`): the base advances to `newContent`'s hash,
  * so the caller's overwrite guard can treat this as no conflict rather than park a
  * proposal.
  *
  * The polarity is one-directional and enforced structurally: `judge` runs inside a
  * try/catch, so ANY failure of the superset check, thrown or merely `false`,
  * resolves to `{ resolved: false }` and leaves the base untouched, exactly what a
- * caller sees today with no superset handling at all. This function can therefore
- * only turn a park into a pass, never the reverse. `judge` is injectable so a test
- * can prove that guarantee against a judge that misbehaves; a production caller
- * should never pass one.
+ * caller sees today with no superset handling at all. A base write that itself
+ * fails resolves the same way, because a caller told `resolved: true` goes on to
+ * overwrite the target, and doing that against a base that never moved is the one
+ * outcome this function must never produce. `judge` is injectable so a test can
+ * prove that guarantee against a judge that misbehaves; a production caller should
+ * never pass one.
  *
  * @returns {{resolved: boolean, hash?: string}}
  */
@@ -348,7 +341,7 @@ export function advanceBaseIfSuperset(
   relPath,
   diskContent,
   newContent,
-  { judge = isTableSuperset } = {},
+  { judge = isLineSuperset } = {},
 ) {
   let superset;
   try {
@@ -358,7 +351,7 @@ export function advanceBaseIfSuperset(
   }
   if (!superset) return { resolved: false };
   const hash = hashContent(newContent);
-  advanceBase(hypoDir, sessionId, relPath, hash);
+  if (!advanceBase(hypoDir, sessionId, relPath, hash)) return { resolved: false };
   return { resolved: true, hash };
 }
 

@@ -29,7 +29,7 @@ import {
   advanceBase,
   advanceBaseForWrite,
   overwriteTargets,
-  isTableSuperset,
+  isLineSuperset,
   advanceBaseIfSuperset,
 } from '../hooks/base-store.mjs';
 import {
@@ -2690,8 +2690,14 @@ test('session directly edits a target, the hook advances its base, close writes 
 });
 
 test('control: WITHOUT the hook the very same flow self-conflicts (bug reproduced)', () => {
-  // Proves the hook subprocess is what prevents the conflict. Identical to the
+  // Proves the hook subprocess is what prevents the conflict. Same flow as the
   // test above except the auto-stage step is omitted, so the base never advances.
+  //
+  // The close payload here DROPS the line the session wrote, where the test above
+  // keeps it. That difference is load-bearing: an append-only payload preserves
+  // every line on disk and so escapes through advanceBaseIfSuperset, which would
+  // make this control pass for a reason that has nothing to do with the hook. A
+  // payload that drops a line is the case only provenance can settle.
   withWiki(null, (dir, today) => {
     snapshotBase(dir, 's-noprov', overwriteTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
@@ -2699,7 +2705,7 @@ test('control: WITHOUT the hook the very same flow self-conflicts (bug reproduce
     const edited = `${observed}\ndirectly edited by this session.\n`;
     writeFileSync(t4ProjectHot(dir), edited); // no hook → base stays at the pre-edit bytes
 
-    const closed = `${edited}\nand the close adds this.\n`;
+    const closed = `${observed}\nand the close replaces that line with this.\n`;
     const { r, out } = t4Apply(dir, t4Payload(dir, today, closed, 'no-prov close'), 's-noprov');
 
     assert.notEqual(r.status, 0, 'without provenance the close must fail safe');
@@ -3729,7 +3735,9 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
       `${name} must not reach into the apply CLI`,
     );
     assert.equal(
-      /\b(resolveProposals|challengeProposals|applyProposal|writeApprovedProposal)\s*\(/.test(code),
+      /\b(resolveProposals|challengeProposals|applyProposal|writeApprovedProposal|acceptBase)\s*\(/.test(
+        code,
+      ),
       false,
       `${name} must not call an apply actor`,
     );
@@ -3739,20 +3747,49 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
 // ── ISSUE-63: superset auto-advance + a CLI-usable base-accept path ───────────
 // A shared pointer table (root hot.md) is edited by appending one row per
 // project, so two machines editing DIFFERENT rows produce a whole-file hash
-// mismatch that reads as a collision even though nothing collided. `isTableSuperset`
+// mismatch that reads as a collision even though nothing collided. `isLineSuperset`
 // /`advanceBaseIfSuperset` narrow that guard for the cases a machine can prove
 // safe; `accept-base` is the CLI surface for everything else.
+//
+// The judge compares whole non-blank LINES, not table rows. Every overwrite target
+// is a prose-and-table mix, and a row-only judge called a payload that kept every
+// row while dropping the prose around it a superset.
 
 suite('ISSUE-63: superset auto-advance and accept-base');
 
-function hotTable(rows) {
+// Shaped like the real overwrite targets (and like the shipped templates/hot.md):
+// frontmatter, a heading, the pointer table, and prose AFTER it. A bare table would
+// only ever exercise the judge on the part it already got right.
+function hotTable(rows, { prose = true } = {}) {
   return [
+    '---',
+    'title: Hot Cache Pointer',
+    'type: reference',
+    'updated: 2026-08-31',
+    '---',
+    '',
     '# Hot Cache',
     '',
     '## Active Projects',
     '',
     '| Project | Last Session | Hot Cache |',
     '|---|---|---|',
+    ...rows,
+    '',
+    ...(prose ? ['## Session Start Checklist', '', '1. Read the project session-state', ''] : []),
+  ].join('\n');
+}
+
+// The shape templates/hot.md actually ships: two HTML comments sit directly under
+// the separator, before any real row.
+function templateShapedHot(rows) {
+  return [
+    '# Hot Cache',
+    '',
+    '| Project | Last Session | Hot Cache |',
+    '|---|---|---|',
+    '<!-- Row format: | Project Name | YYYY-MM-DD | projects/<slug>/hot (wikilink) | -->',
+    '<!-- col2 date is rebuilt from projects/<slug>/hot.md frontmatter on each close -->',
     ...rows,
     '',
   ].join('\n');
@@ -3776,10 +3813,31 @@ function parkFor(dir, sessionId, rel, proposedContent) {
   });
 }
 
+// accept-base takes the same transcript-attested approval `resolve` takes, so the
+// legitimate path needs the whole channel standing up: a parked artifact, a
+// challenge minted over it, and a real user turn that typed that challenge's nonce.
+// Driving the real matcher rather than injecting `hasApproval` keeps these tests
+// honest about what the gate actually reads.
+function approveAcceptBase(dir, sessionId, parkedIds) {
+  const ch = challengeProposals(
+    { hypoDir: dir, sessionId, ids: parkedIds },
+    { stdout: capStream(), stderr: capStream() },
+  );
+  const transcriptPath = join(dir, `t-${sessionId}.jsonl`);
+  writeFileSync(
+    transcriptPath,
+    `${JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: `apply-proposals ${ch.nonce}` }] },
+    })}\n`,
+  );
+  return { nonce: ch.nonce, transcriptPath };
+}
+
 test('ISSUE-63 a: every disk row preserved (order changed, a row appended) is a superset', () => {
   const disk = hotTable([ROW_ALPHA]);
   const superset = hotTable([ROW_BETA, ROW_ALPHA]); // reordered AND appended
-  assert.equal(isTableSuperset(disk, superset), true);
+  assert.equal(isLineSuperset(disk, superset), true);
 });
 
 test('ISSUE-63 a: superset content auto-advances the base, no conflict left behind', () => {
@@ -3821,7 +3879,7 @@ test('ISSUE-63 a: a disk row dropped from the new content is not a superset, bas
     snapshotBase(dir, sid, [rel]);
     const before = readBaseEntry(dir, sid, rel);
 
-    assert.equal(isTableSuperset(disk, missingBeta), false);
+    assert.equal(isLineSuperset(disk, missingBeta), false);
     const result = advanceBaseIfSuperset(dir, sid, rel, disk, missingBeta);
     assert.equal(result.resolved, false, 'a dropped row must not auto-resolve');
     assert.deepEqual(
@@ -3846,7 +3904,7 @@ test('ISSUE-63 a: a row present but with altered text is not a superset, base st
     snapshotBase(dir, sid, [rel]);
     const before = readBaseEntry(dir, sid, rel);
 
-    assert.equal(isTableSuperset(disk, changedRow), false);
+    assert.equal(isLineSuperset(disk, changedRow), false);
     const result = advanceBaseIfSuperset(dir, sid, rel, disk, changedRow);
     assert.equal(result.resolved, false, 'an altered row must not auto-resolve');
     assert.deepEqual(readBaseEntry(dir, sid, rel), before);
@@ -3855,13 +3913,81 @@ test('ISSUE-63 a: a row present but with altered text is not a superset, base st
   }
 });
 
-test('ISSUE-63 a: a non-table file never judges as a superset (fail-closed)', () => {
+test('ISSUE-63 a: a replaced prose line is not a superset (fail-closed)', () => {
   const disk = '# Session state\n\nJust prose here, no table at all.\n';
-  const new1 = '# Session state\n\nMore prose was added, still no table.\n';
-  assert.equal(isTableSuperset(disk, new1), false, 'no table on either side: fail closed');
-  // A table appears only on the new side: disk still has nothing to compare against.
-  const newWithTable = `${new1}\n| a | b |\n|---|---|\n| 1 | 2 |\n`;
-  assert.equal(isTableSuperset(disk, newWithTable), false, 'disk carries no table: fail closed');
+  const replaced = '# Session state\n\nMore prose was added, still no table.\n';
+  assert.equal(isLineSuperset(disk, replaced), false, "the disk's prose line is gone");
+  // Appending to prose, keeping every existing line, IS a superset. A table-row
+  // judge could not see either of these cases at all.
+  const appended = `${disk}\nAnd a second paragraph.\n`;
+  assert.equal(isLineSuperset(disk, appended), true, 'nothing on disk was dropped');
+});
+
+test('ISSUE-63 a: an empty or unreadable disk side fails closed', () => {
+  assert.equal(isLineSuperset('', 'anything at all\n'), false, 'nothing to prove preserved');
+  assert.equal(isLineSuperset('   \n\n', 'x\n'), false, 'blank-only disk is the same fact');
+  assert.equal(isLineSuperset(null, 'x\n'), false, 'unreadable disk fails closed');
+  assert.equal(isLineSuperset('x\n', null), false, 'unreadable payload fails closed');
+});
+
+// The failure the row-only judge shipped with: every row survives, the prose around
+// it does not, and the guard called that safe. Measured against the real vault's
+// hot.md before the fix: true.
+test('ISSUE-63 a: keeping every row while dropping the prose is NOT a superset', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
+  try {
+    const sid = 's-prose-loss';
+    const rel = 'hot.md';
+    const disk = hotTable([ROW_ALPHA, ROW_BETA]);
+    const rowsKeptProseGone = hotTable([ROW_ALPHA, ROW_BETA], { prose: false });
+    assert.notEqual(disk, rowsKeptProseGone, 'sanity: the two differ');
+
+    writeFileSync(join(dir, rel), disk);
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+
+    assert.equal(isLineSuperset(disk, rowsKeptProseGone), false);
+    const result = advanceBaseIfSuperset(dir, sid, rel, disk, rowsKeptProseGone);
+    assert.equal(result.resolved, false, 'the checklist must not be droppable');
+    assert.deepEqual(readBaseEntry(dir, sid, rel), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The shipped template put two comments under the separator, which stopped row
+// collection at zero rows — and `[].every()` is vacuously true, so on any vault
+// built from that template a payload that dropped EVERY row read as a superset.
+test('ISSUE-63 a: a template-shaped table whose rows resist extraction still fails closed', () => {
+  const disk = templateShapedHot([ROW_ALPHA, ROW_BETA]);
+  const allRowsDropped = templateShapedHot([]);
+  assert.equal(isLineSuperset(disk, allRowsDropped), false, 'dropping every row is never safe');
+  assert.equal(
+    isLineSuperset(disk, templateShapedHot([ROW_ALPHA, ROW_BETA, ROW_GAMMA])),
+    true,
+    'the legitimate case still resolves on this shape',
+  );
+});
+
+// A `resolved: true` sends the caller on to overwrite the target. Doing that
+// against a base that never moved is the one outcome this must never produce.
+test('ISSUE-63 a: a base that cannot be advanced reports unresolved, never resolved', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
+  try {
+    const rel = 'hot.md';
+    const disk = hotTable([ROW_ALPHA]);
+    const trueSuperset = hotTable([ROW_ALPHA, ROW_BETA]);
+    assert.equal(isLineSuperset(disk, trueSuperset), true, 'sanity: this pair IS a superset');
+    writeFileSync(join(dir, rel), disk);
+
+    // No snapshotBase for this session, so advanceBase has no entry to move and
+    // returns false. The judge still says yes; the write is what fails.
+    const result = advanceBaseIfSuperset(dir, 's-no-snapshot', rel, disk, trueSuperset);
+    assert.equal(result.resolved, false, 'a failed base write must not read as resolved');
+    assert.equal(result.hash, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('ISSUE-63 a: polarity invariant, a throwing judge preserves the existing conflict outcome', () => {
@@ -3873,7 +3999,7 @@ test('ISSUE-63 a: polarity invariant, a throwing judge preserves the existing co
     // Genuinely a superset by the real judge, so a passing test here would only
     // prove the judge works, not that a failing judge is contained.
     const trueSuperset = hotTable([ROW_ALPHA, ROW_BETA]);
-    assert.equal(isTableSuperset(disk, trueSuperset), true, 'sanity: this pair IS a superset');
+    assert.equal(isLineSuperset(disk, trueSuperset), true, 'sanity: this pair IS a superset');
 
     writeFileSync(join(dir, rel), disk);
     snapshotBase(dir, sid, [rel]);
@@ -3915,7 +4041,8 @@ test('ISSUE-63 b: accept-base advances the base so the same overwrite no longer 
 
     // ISSUE-101: the close that hit this drift parked its withheld bytes. That
     // parked artifact is what accept-base is FOR, and is now its precondition.
-    parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_GAMMA]));
+    const parked = parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_GAMMA]));
+    const { transcriptPath } = approveAcceptBase(dir, sid, [parked.id]);
 
     // Before accept-base: the write-guard's own base-vs-disk comparison mismatches,
     // which is exactly what makes crystallize park the overwrite as a conflict.
@@ -3928,7 +4055,7 @@ test('ISSUE-63 b: accept-base advances the base so the same overwrite no longer 
     const out = capStream();
     const res = acceptBase(
       { hypoDir: dir, sessionId: sid, target: rel },
-      { stdout: out, stderr: capStream() },
+      { stdout: out, stderr: capStream(), transcriptPath },
     );
     assert.equal(res.ok, true, `accept-base should succeed: ${JSON.stringify(res)}`);
     assert.equal(res.hash, bsHashFile(join(dir, rel)));
@@ -3952,12 +4079,13 @@ test('ISSUE-63 b: accept-base supports --json like the other subcommands', () =>
     const rel = 'hot.md';
     writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
     snapshotBase(dir, sid, [rel]);
-    parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_BETA]));
+    const parked = parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_BETA]));
+    const { transcriptPath } = approveAcceptBase(dir, sid, [parked.id]);
 
     const out = capStream();
     const res = acceptBase(
       { hypoDir: dir, sessionId: sid, target: rel },
-      { stdout: out, stderr: capStream(), json: true },
+      { stdout: out, stderr: capStream(), json: true, transcriptPath },
     );
     assert.equal(res.ok, true);
     const parsed = JSON.parse(out.text());
@@ -3985,11 +4113,12 @@ test('ISSUE-63 b: accept-base fails closed on an unsafe target and on a session 
     // A valid target with a parked proposal behind it, but this session never had
     // SessionStart snapshot its base. Parking first keeps this case pinned on the
     // base-snapshot refusal rather than sliding onto ISSUE-101's earlier gate.
-    parkFor(dir, 's-never-started', 'hot.md', hotTable([ROW_ALPHA, ROW_BETA]));
+    const parkedNS = parkFor(dir, 's-never-started', 'hot.md', hotTable([ROW_ALPHA, ROW_BETA]));
+    const approvedNS = approveAcceptBase(dir, 's-never-started', [parkedNS.id]);
     const noSnapErr = capStream();
     const noSnap = acceptBase(
       { hypoDir: dir, sessionId: 's-never-started', target: 'hot.md' },
-      { stdout: capStream(), stderr: noSnapErr },
+      { stdout: capStream(), stderr: noSnapErr, transcriptPath: approvedNS.transcriptPath },
     );
     assert.equal(noSnap.ok, false);
     assert.equal(noSnap.reason, 'no-base-snapshot');
@@ -4086,6 +4215,104 @@ test('ISSUE-101: a parked proposal unlocks only the target it was parked on', ()
     assert.equal(res.ok, false);
     assert.equal(res.reason, 'no-parked-proposal');
     assert.deepEqual(readBaseEntry(dir, sid, join('projects', 'p', 'hot.md')), beforeOther);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A park existing is not authorization: `proposal list` publishes the session id
+// and the target of every parked artifact, so anyone who can read the vault can
+// restate both. Moving a base is the deferred half of an apply — the next close
+// writes this session's payload over the drifted disk with no park in the way — so
+// it takes the same human gate the apply paths take.
+test('ISSUE-101: a park with no approval challenge does not move the base', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const sid = 's-unapproved';
+    const rel = 'hot.md';
+    writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+    parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_BETA]));
+
+    const err = capStream();
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: capStream(), stderr: err },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'no-challenge');
+    assert.match(err.text(), /proposal challenge/);
+    assert.deepEqual(readBaseEntry(dir, sid, rel), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-101: a challenge the user never answered does not move the base', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const sid = 's-silent';
+    const rel = 'hot.md';
+    writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+    const parked = parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_BETA]));
+    challengeProposals(
+      { hypoDir: dir, sessionId: sid, ids: [parked.id] },
+      { stdout: capStream(), stderr: capStream() },
+    );
+
+    // A transcript that exists but carries no typed approval. The model telling the
+    // user what to type is role:assistant and is never counted.
+    const transcriptPath = join(dir, 't-silent.jsonl');
+    writeFileSync(
+      transcriptPath,
+      `${JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'please approve' }] },
+      })}\n`,
+    );
+
+    const err = capStream();
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: capStream(), stderr: err, transcriptPath },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'not-approved');
+    assert.match(err.text(), /must TYPE this line/);
+    assert.deepEqual(readBaseEntry(dir, sid, rel), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-101: an approval for one target does not carry to another', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const sid = 's-scoped-approval';
+    const approvedRel = 'hot.md';
+    const otherRel = join('pages', 'open-questions.md');
+    writeFileSync(join(dir, approvedRel), hotTable([ROW_ALPHA]));
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, otherRel), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, sid, [approvedRel, otherRel]);
+    const before = readBaseEntry(dir, sid, otherRel);
+
+    // Both targets are parked, but the user reviewed and approved only one diff.
+    const approvedPark = parkFor(dir, sid, approvedRel, hotTable([ROW_ALPHA, ROW_BETA]));
+    parkFor(dir, sid, otherRel, hotTable([ROW_ALPHA, ROW_GAMMA]));
+    const { transcriptPath } = approveAcceptBase(dir, sid, [approvedPark.id]);
+
+    const err = capStream();
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: otherRel },
+      { stdout: capStream(), stderr: err, transcriptPath },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'target-not-approved');
+    assert.deepEqual(readBaseEntry(dir, sid, otherRel), before);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

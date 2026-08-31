@@ -146,6 +146,14 @@ the store entirely and silently destroys the other session's edits. Drive it out
    and writes them.
 5. **Re-run the close.** `resolve` writes the pages; it does NOT close the session. The
    re-run skips what already landed and finishes the close.
+
+   If the user would rather keep what is on disk as the starting point and have the
+   close write this session's page over it on the next run, that is
+   `hypomnema proposal accept-base --session-id <id> <target>`. It moves this
+   session's recorded base, never a page byte, and it takes the SAME approval this
+   step already collected: the target must be parked, the challenge in step 2 must
+   cover it, and the user must have typed the line in step 3. Without all three it
+   refuses and the base does not move.
 6. **Check `markerWritten` again** before you say the session is closed. It is never
    automatic.
 

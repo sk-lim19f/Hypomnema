@@ -4,11 +4,14 @@
  * the human-in-the-loop gate for parked overwrite-conflict artifacts (the
  * write=proposal store).
  *
- * `accept-base` is the odd one out: it never WRITES a parked proposal. It moves a
- * session's own base-store entry (hooks/base-store.mjs) to a target's current disk
- * bytes, which is the documented, agent-usable way to resolve a base-mismatch that
- * an auto-advance (`advanceBaseIfSuperset`) could not prove safe on its own. It does
- * read the store, to refuse a move that has no parked conflict behind it.
+ * `accept-base` writes no page bytes of its own. It moves a session's own
+ * base-store entry (hooks/base-store.mjs) to a target's current disk bytes, which
+ * is the documented, agent-usable way to resolve a base-mismatch that an
+ * auto-advance (`advanceBaseIfSuperset`) could not prove safe on its own. That is
+ * the DEFERRED half of an apply, not a lighter thing than one: the next close then
+ * writes this session's payload over the drifted disk with no park in the way. So
+ * it takes the same transcript-attested human approval `resolve` takes, over the
+ * same challenge and the same typed phrase.
  *
  * When crystallize's close path finds an OVERWRITE target drifted from the base
  * this session observed, it withholds the bytes and parks them under
@@ -23,7 +26,8 @@
  *
  *   • `apply <id>` — a person at a shell types the confirm phrase on a TTY.
  *   • `challenge` → the user types `apply-proposals <nonce>` in the conversation →
- *     `resolve` — the approval is verified in the session TRANSCRIPT.
+ *     `resolve` — the approval is verified in the session TRANSCRIPT. `accept-base`
+ *     rides this same channel, because it authorizes the same eventual write.
  *
  * The second channel exists because an AGENT has no TTY, so a drifted close used to
  * dead-end: the only way to finish was to bypass this store entirely with a direct
@@ -928,9 +932,13 @@ export function discardProposal({ hypoDir, id }, { stdout, stderr } = {}) {
  * bytes read here instead of the stale snapshot from session start, and a write
  * that would otherwise have parked no longer sees a mismatch.
  */
-export function acceptBase({ hypoDir, sessionId, target }, { stdout, stderr, json } = {}) {
+export function acceptBase(
+  { hypoDir, sessionId, target },
+  { stdout, stderr, json, transcriptPath, hasApproval } = {},
+) {
   const out = stdout ?? process.stdout;
   const err = stderr ?? process.stderr;
+  const approves = hasApproval ?? hasTypedUserApproval;
 
   if (!isValidSessionId(sessionId)) {
     err.write(`✗ invalid --session-id\n`);
@@ -968,6 +976,48 @@ export function acceptBase({ hypoDir, sessionId, target }, { stdout, stderr, jso
         `  Run \`hypomnema proposal list\` to see what is parked.\n`,
     );
     return { ok: false, code: 1, reason: 'no-parked-proposal' };
+  }
+
+  // A park existing is not authorization. `proposal list` publishes both the
+  // session id and the target of every parked artifact, so "this session has a
+  // park here" is a fact anyone who can read the vault can look up and restate.
+  //
+  // So accept-base takes the SAME human gate the other write paths take. Moving a
+  // base is the deferred half of an apply: the next close writes this session's
+  // payload over the drifted disk without parking, which is byte-for-byte the
+  // outcome `apply` produces now. The two must not disagree about what consent
+  // looks like, so this reuses the challenge and the typed phrase rather than
+  // minting a second, weaker channel beside them.
+  const challenge = readChallenge(hypoDir, sessionId);
+  if (!challenge) {
+    err.write(
+      `✗ no valid approval challenge for this session. ` +
+        `Run \`hypomnema proposal challenge\` first.\n`,
+    );
+    return { ok: false, code: 1, reason: 'no-challenge' };
+  }
+  const tPath = transcriptPath ?? resolveTranscriptBySessionId(sessionId);
+  if (!tPath) {
+    err.write(`✗ cannot resolve a transcript for session ${sessionId}; approval unverifiable.\n`);
+    return { ok: false, code: 1, reason: 'transcript-unresolved' };
+  }
+  if (!approves(tPath, challenge.nonce)) {
+    err.write(
+      `✗ no user approval in this session's transcript.\n` +
+        `    The user must TYPE this line in the conversation (a click does not count):\n` +
+        `        ${APPROVAL_PHRASE} ${challenge.nonce}\n` +
+        `    The base was not moved.\n`,
+    );
+    return { ok: false, code: 1, reason: 'not-approved' };
+  }
+  // The user approved a SET of targets when they read the challenge's diffs. A
+  // target outside that set is a write they never saw.
+  if (!challenge.items?.some((it) => it.target === target)) {
+    err.write(
+      `✗ ${shownTarget} is not among the targets the user approved in this challenge; ` +
+        `re-run \`hypomnema proposal challenge\` and review it.\n`,
+    );
+    return { ok: false, code: 1, reason: 'target-not-approved' };
   }
 
   const current = readTarget(full);
