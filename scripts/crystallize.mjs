@@ -111,7 +111,12 @@ import {
   withFileLock,
   extractTouchedWikiFilesWithTrust,
 } from '../hooks/hypo-shared.mjs';
-import { hashContent, readBaseEntry, advanceBase } from '../hooks/base-store.mjs';
+import {
+  hashContent,
+  readBaseEntry,
+  advanceBase,
+  advanceBaseIfSuperset,
+} from '../hooks/base-store.mjs';
 import { writeProposal } from '../hooks/proposal-store.mjs';
 import { recordGateClosed, resolutionStamp, closeGateStatus } from '../hooks/close-gate-store.mjs';
 
@@ -1421,7 +1426,20 @@ function applySessionClose(args) {
     // (2) conflict, only where a session context makes a base observable
     if (args.sessionId) {
       const entry = readBaseEntry(args.hypoDir, args.sessionId, relPath);
-      const reason = overwriteConflictReason(entry, disk);
+      let reason = overwriteConflictReason(entry, disk);
+      // A whole-file base-mismatch on a pointer table (root hot.md, and anything
+      // shaped like it) is often just two writers appending different rows. When
+      // the new content still carries every row the disk copy has, nothing was
+      // dropped, so advance the base instead of parking a false conflict. Every
+      // other reason (`base-unknown`, `base-absent-target-exists`,
+      // `base-hash-target-missing`, `target-unreadable`) still parks: this only
+      // narrows the one case that is provably safe.
+      if (
+        reason === 'base-mismatch' &&
+        advanceBaseIfSuperset(args.hypoDir, args.sessionId, relPath, disk, field.content).resolved
+      ) {
+        reason = null;
+      }
       if (reason) {
         conflicts.push({
           key,

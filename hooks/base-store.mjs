@@ -250,6 +250,118 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
   }
 }
 
+// ── pointer-table superset detection ──────────────────────────────────────────
+//
+// A root-level pointer table (hot.md's "Active Projects", SCHEMA.md's tag list)
+// is edited by appending or updating one row per machine or project, so two
+// machines editing DIFFERENT rows produce a whole-file hash mismatch that looks
+// exactly like a colliding edit even though nothing actually collided. When the
+// content a session is about to write still carries every data row the disk copy
+// currently has, that write cannot have dropped anyone's row, so a base-mismatch
+// against it is safe to auto-advance instead of park. The check below only ever
+// narrows that guard: anything it is not certain about still returns false.
+
+/** True when `line`, trimmed, opens and closes a markdown table row with `|`. */
+function isTableRowLine(line) {
+  const t = String(line ?? '').trim();
+  return t.length > 1 && t.startsWith('|') && t.endsWith('|');
+}
+
+/**
+ * True when `line` is a table's header/data separator (only `-`, `:`, `|`, and
+ * whitespace, with at least one dash), as opposed to a row of real cell content.
+ */
+function isTableSeparatorLine(line) {
+  const t = String(line ?? '').trim();
+  return t.includes('-') && /^[|:\s-]+$/.test(t);
+}
+
+/**
+ * Pull every data row (as trimmed, verbatim text) out of every markdown table in
+ * `content`. Returns `null`, not `[]`, when `content` carries no table at all: an
+ * empty array would read as "a table with zero rows", which is a different fact
+ * from "there is no table here to compare".
+ *
+ * @returns {string[]|null}
+ */
+function extractTableDataRows(content) {
+  if (typeof content !== 'string') return null;
+  const lines = content.split('\n');
+  const rows = [];
+  let sawTable = false;
+  for (let i = 0; i < lines.length - 1; i++) {
+    const isHeader = isTableRowLine(lines[i]) && !isTableSeparatorLine(lines[i]);
+    if (isHeader && isTableSeparatorLine(lines[i + 1])) {
+      sawTable = true;
+      let j = i + 2;
+      while (j < lines.length && isTableRowLine(lines[j]) && !isTableSeparatorLine(lines[j])) {
+        rows.push(lines[j].trim());
+        j++;
+      }
+      i = j - 1; // resume scanning after this table, in case another one follows
+    }
+  }
+  return sawTable ? rows : null;
+}
+
+/**
+ * Whether `newContent` is a superset of `diskContent`: every data row currently on
+ * disk appears, character for character, somewhere among `newContent`'s data rows.
+ * Row ORDER may change (that is the point: a second writer appending its own row
+ * shifts nobody else's position); a row that is missing, or present with altered
+ * text, is not a superset.
+ *
+ * Fail-closed by construction: a file that carries no markdown table makes
+ * `extractTableDataRows` return `null`, and either side being `null` makes this
+ * `false`. Prose outside a table (a heading, a checklist line) is never inspected,
+ * so a change there cannot itself flip the verdict, in either direction.
+ *
+ * @returns {boolean}
+ */
+export function isTableSuperset(diskContent, newContent) {
+  const diskRows = extractTableDataRows(diskContent);
+  const newRows = extractTableDataRows(newContent);
+  if (diskRows === null || newRows === null) return false;
+  const newRowSet = new Set(newRows);
+  return diskRows.every((row) => newRowSet.has(row));
+}
+
+/**
+ * Auto-resolve a base-mismatch on `relPath` when `newContent` is a superset of
+ * `diskContent` (see `isTableSuperset`): the base advances to `newContent`'s hash,
+ * so the caller's overwrite guard can treat this as no conflict rather than park a
+ * proposal.
+ *
+ * The polarity is one-directional and enforced structurally: `judge` runs inside a
+ * try/catch, so ANY failure of the superset check, thrown or merely `false`,
+ * resolves to `{ resolved: false }` and leaves the base untouched, exactly what a
+ * caller sees today with no superset handling at all. This function can therefore
+ * only turn a park into a pass, never the reverse. `judge` is injectable so a test
+ * can prove that guarantee against a judge that misbehaves; a production caller
+ * should never pass one.
+ *
+ * @returns {{resolved: boolean, hash?: string}}
+ */
+export function advanceBaseIfSuperset(
+  hypoDir,
+  sessionId,
+  relPath,
+  diskContent,
+  newContent,
+  { judge = isTableSuperset } = {},
+) {
+  let superset;
+  try {
+    superset = Boolean(judge(diskContent, newContent));
+  } catch {
+    superset = false;
+  }
+  if (!superset) return { resolved: false };
+  const hash = hashContent(newContent);
+  advanceBase(hypoDir, sessionId, relPath, hash);
+  return { resolved: true, hash };
+}
+
 /**
  * The four overwrite targets crystallize replaces wholesale. `project` may be
  * null when cwd resolves to no project; the two project-scoped paths are then

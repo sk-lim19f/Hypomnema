@@ -29,6 +29,8 @@ import {
   advanceBase,
   advanceBaseForWrite,
   overwriteTargets,
+  isTableSuperset,
+  advanceBaseIfSuperset,
 } from '../hooks/base-store.mjs';
 import {
   writeProposal as psWriteProposal,
@@ -52,6 +54,7 @@ import {
   resolveProposals,
   discardProposal,
   listPending,
+  acceptBase,
 } from '../scripts/proposal.mjs';
 import { test, testAsync, suite } from './harness.mjs';
 import {
@@ -3731,4 +3734,237 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
       `${name} must not call an apply actor`,
     );
   }
+});
+
+// ── ISSUE-63: superset auto-advance + a CLI-usable base-accept path ───────────
+// A shared pointer table (root hot.md) is edited by appending one row per
+// project, so two machines editing DIFFERENT rows produce a whole-file hash
+// mismatch that reads as a collision even though nothing collided. `isTableSuperset`
+// /`advanceBaseIfSuperset` narrow that guard for the cases a machine can prove
+// safe; `accept-base` is the CLI surface for everything else.
+
+suite('ISSUE-63: superset auto-advance and accept-base');
+
+function hotTable(rows) {
+  return [
+    '# Hot Cache',
+    '',
+    '## Active Projects',
+    '',
+    '| Project | Last Session | Hot Cache |',
+    '|---|---|---|',
+    ...rows,
+    '',
+  ].join('\n');
+}
+
+const ROW_ALPHA = '| alpha | 2026-08-01 | [[projects/alpha/hot]] |';
+const ROW_BETA = '| beta | 2026-08-27 | [[projects/beta/hot]] |';
+
+test('ISSUE-63 a: every disk row preserved (order changed, a row appended) is a superset', () => {
+  const disk = hotTable([ROW_ALPHA]);
+  const superset = hotTable([ROW_BETA, ROW_ALPHA]); // reordered AND appended
+  assert.equal(isTableSuperset(disk, superset), true);
+});
+
+test('ISSUE-63 a: superset content auto-advances the base, no conflict left behind', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
+  try {
+    const sid = 's-superset';
+    const rel = 'hot.md';
+    const disk = hotTable([ROW_ALPHA]);
+    const withOtherRow = hotTable([ROW_ALPHA, ROW_BETA]);
+    writeFileSync(join(dir, rel), disk);
+    snapshotBase(dir, sid, [rel]);
+    assert.equal(readBaseEntry(dir, sid, rel).hash, bsHashContent(disk), 'base captured disk bytes');
+
+    const result = advanceBaseIfSuperset(dir, sid, rel, disk, withOtherRow);
+    assert.equal(result.resolved, true, 'a superset write must auto-resolve');
+    assert.equal(result.hash, bsHashContent(withOtherRow));
+    assert.equal(
+      readBaseEntry(dir, sid, rel).hash,
+      bsHashContent(withOtherRow),
+      'the base advances to the new content, so the next close sees no drift',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-63 a: a disk row dropped from the new content is not a superset, base stays put (conflict)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
+  try {
+    const sid = 's-dropped-row';
+    const rel = 'hot.md';
+    const disk = hotTable([ROW_ALPHA, ROW_BETA]);
+    const missingBeta = hotTable([ROW_ALPHA]); // beta's row is gone
+    writeFileSync(join(dir, rel), disk);
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+
+    assert.equal(isTableSuperset(disk, missingBeta), false);
+    const result = advanceBaseIfSuperset(dir, sid, rel, disk, missingBeta);
+    assert.equal(result.resolved, false, 'a dropped row must not auto-resolve');
+    assert.deepEqual(readBaseEntry(dir, sid, rel), before, 'the existing conflict base is untouched');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-63 a: a row present but with altered text is not a superset, base stays put (conflict)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
+  try {
+    const sid = 's-altered-row';
+    const rel = 'hot.md';
+    const disk = hotTable([ROW_ALPHA, ROW_BETA]);
+    const alteredAlpha = ROW_ALPHA.replace('2026-08-01', '2026-08-15');
+    const changedRow = hotTable([alteredAlpha, ROW_BETA]);
+    writeFileSync(join(dir, rel), disk);
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+
+    assert.equal(isTableSuperset(disk, changedRow), false);
+    const result = advanceBaseIfSuperset(dir, sid, rel, disk, changedRow);
+    assert.equal(result.resolved, false, 'an altered row must not auto-resolve');
+    assert.deepEqual(readBaseEntry(dir, sid, rel), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-63 a: a non-table file never judges as a superset (fail-closed)', () => {
+  const disk = '# Session state\n\nJust prose here, no table at all.\n';
+  const new1 = '# Session state\n\nMore prose was added, still no table.\n';
+  assert.equal(isTableSuperset(disk, new1), false, 'no table on either side: fail closed');
+  // A table appears only on the new side: disk still has nothing to compare against.
+  const newWithTable = `${new1}\n| a | b |\n|---|---|\n| 1 | 2 |\n`;
+  assert.equal(isTableSuperset(disk, newWithTable), false, 'disk carries no table: fail closed');
+});
+
+test('ISSUE-63 a: polarity invariant, a throwing judge preserves the existing conflict outcome', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
+  try {
+    const sid = 's-throwing-judge';
+    const rel = 'hot.md';
+    const disk = hotTable([ROW_ALPHA]);
+    // Genuinely a superset by the real judge, so a passing test here would only
+    // prove the judge works, not that a failing judge is contained.
+    const trueSuperset = hotTable([ROW_ALPHA, ROW_BETA]);
+    assert.equal(isTableSuperset(disk, trueSuperset), true, 'sanity: this pair IS a superset');
+
+    writeFileSync(join(dir, rel), disk);
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+
+    const throwingJudge = () => {
+      throw new Error('judge exploded');
+    };
+    const result = advanceBaseIfSuperset(dir, sid, rel, disk, trueSuperset, {
+      judge: throwingJudge,
+    });
+    assert.equal(result.resolved, false, 'a thrown judge must fall through to the existing conflict');
+    assert.deepEqual(
+      readBaseEntry(dir, sid, rel),
+      before,
+      'the base must not move when the judge itself failed',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-63 b: accept-base advances the base so the same overwrite no longer parks', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-cli-'));
+  try {
+    const sid = 's-accept-base';
+    const rel = 'hot.md';
+    const original = hotTable([ROW_ALPHA]);
+    writeFileSync(join(dir, rel), original);
+    snapshotBase(dir, sid, [rel]);
+
+    // A different machine drifts the shared pointer table after the snapshot.
+    const drifted = hotTable([ROW_ALPHA, ROW_BETA]);
+    writeFileSync(join(dir, rel), drifted);
+
+    // Before accept-base: the write-guard's own base-vs-disk comparison mismatches,
+    // which is exactly what makes crystallize park the overwrite as a conflict.
+    assert.notEqual(
+      readBaseEntry(dir, sid, rel).hash,
+      bsHashFile(join(dir, rel)),
+      'the stale base still mismatches disk before accept-base',
+    );
+
+    const out = capStream();
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: out, stderr: capStream() },
+    );
+    assert.equal(res.ok, true, `accept-base should succeed: ${JSON.stringify(res)}`);
+    assert.equal(res.hash, bsHashFile(join(dir, rel)));
+    assert.match(out.text(), /accepted current disk content/);
+    assert.ok(out.text().includes(rel), 'the output names the accepted target');
+
+    assert.equal(
+      readBaseEntry(dir, sid, rel).hash,
+      bsHashFile(join(dir, rel)),
+      'base now matches disk: the same overwrite would no longer be seen as a conflict',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-63 b: accept-base supports --json like the other subcommands', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-cli-'));
+  try {
+    const sid = 's-accept-base-json';
+    const rel = 'hot.md';
+    writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, sid, [rel]);
+
+    const out = capStream();
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: out, stderr: capStream(), json: true },
+    );
+    assert.equal(res.ok, true);
+    const parsed = JSON.parse(out.text());
+    assert.equal(parsed.target, rel);
+    assert.equal(parsed.sessionId, sid);
+    assert.equal(parsed.hash, res.hash);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-63 b: accept-base fails closed on an unsafe target and on a session with no base snapshot', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-cli-'));
+  try {
+    writeFileSync(join(dir, 'hot.md'), hotTable([ROW_ALPHA]));
+
+    const escapeErr = capStream();
+    const escape = acceptBase(
+      { hypoDir: dir, sessionId: 's-x', target: join('..', '..', 'etc', 'passwd') },
+      { stdout: capStream(), stderr: escapeErr },
+    );
+    assert.equal(escape.ok, false);
+    assert.equal(escape.reason, 'unsafe-target');
+
+    // A valid target, but this session never had SessionStart snapshot its base.
+    const noSnapErr = capStream();
+    const noSnap = acceptBase(
+      { hypoDir: dir, sessionId: 's-never-started', target: 'hot.md' },
+      { stdout: capStream(), stderr: noSnapErr },
+    );
+    assert.equal(noSnap.ok, false);
+    assert.equal(noSnap.reason, 'no-base-snapshot');
+    assert.match(noSnapErr.text(), /no base snapshot/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ISSUE-63 b: proposal.mjs usage text documents accept-base', () => {
+  const src = readFileSync(join(SCRIPTS, 'proposal.mjs'), 'utf-8');
+  assert.match(src, /accept-base/);
 });

@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 /**
- * proposal.mjs: `hypomnema proposal list|apply|discard|challenge|resolve`, the
- * human-in-the-loop gate for parked overwrite-conflict artifacts (the write=proposal
- * store).
+ * proposal.mjs: `hypomnema proposal list|apply|discard|challenge|resolve|accept-base`,
+ * the human-in-the-loop gate for parked overwrite-conflict artifacts (the
+ * write=proposal store).
+ *
+ * `accept-base` is the odd one out: it never touches a parked proposal. It moves a
+ * session's own base-store entry (hooks/base-store.mjs) to a target's current disk
+ * bytes, which is the documented, agent-usable way to resolve a base-mismatch that
+ * an auto-advance (`advanceBaseIfSuperset`) could not prove safe on its own.
  *
  * When crystallize's close path finds an OVERWRITE target drifted from the base
  * this session observed, it withholds the bytes and parks them under
@@ -72,6 +77,7 @@ import {
   hasTypedUserApproval,
   resolveTranscriptBySessionId,
 } from '../hooks/hypo-shared.mjs';
+import { advanceBase, hashContent } from '../hooks/base-store.mjs';
 
 // ── target-path hardening ─────────────────────────────────────────────────────
 
@@ -910,6 +916,61 @@ export function discardProposal({ hypoDir, id }, { stdout, stderr } = {}) {
 }
 
 /**
+ * Accept `target`'s CURRENT on-disk bytes as `sessionId`'s base, with no superset
+ * judgment at all. Where `advanceBaseIfSuperset` (base-store.mjs) auto-resolves
+ * only the base-mismatches a machine can prove safe, this is the escape hatch for
+ * everything else: a human, or an agent that has actually read the diff and
+ * decided the disk content is fine to build on.
+ *
+ * This never writes `target` itself. It only moves what `readBaseEntry` will
+ * report for this session and target, so the NEXT close compares against the
+ * bytes read here instead of the stale snapshot from session start, and a write
+ * that would otherwise have parked no longer sees a mismatch.
+ */
+export function acceptBase({ hypoDir, sessionId, target }, { stdout, stderr, json } = {}) {
+  const out = stdout ?? process.stdout;
+  const err = stderr ?? process.stderr;
+
+  if (!isValidSessionId(sessionId)) {
+    err.write(`✗ invalid --session-id\n`);
+    return { ok: false, code: 2, reason: 'invalid-session-id' };
+  }
+  if (typeof target !== 'string' || target === '') {
+    err.write(`✗ usage: hypomnema proposal accept-base --session-id=<id> <target>\n`);
+    return { ok: false, code: 2, reason: 'no-target' };
+  }
+  const shownTarget = sanitizeForDisplay(target, { allowNewlines: false });
+  const full = resolveTargetPath(hypoDir, target);
+  if (!full) {
+    err.write(`✗ target is unsafe or escapes the vault: ${shownTarget}\n`);
+    return { ok: false, code: 2, reason: 'unsafe-target' };
+  }
+  const current = readTarget(full);
+  if (current === undefined) {
+    err.write(`✗ target is unreadable, refusing to accept it as the base: ${shownTarget}\n`);
+    return { ok: false, code: 1, reason: 'target-unreadable' };
+  }
+  const hash = current === null ? null : hashContent(current);
+  if (!advanceBase(hypoDir, sessionId, target, hash)) {
+    err.write(
+      `✗ no base snapshot exists for session ${sessionId}; nothing to accept against. ` +
+        `A session's base is written once at start, before this command can move it.\n`,
+    );
+    return { ok: false, code: 1, reason: 'no-base-snapshot' };
+  }
+
+  const result = { ok: true, code: 0, target, sessionId, hash };
+  if (json) {
+    out.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    out.write(`✓ accepted current disk content as the base for ${shownTarget}\n`);
+    out.write(`  session: ${sessionId}\n`);
+    out.write(`  new base hash: ${hash ?? '(absent)'}\n`);
+  }
+  return result;
+}
+
+/**
  * List pending proposals (id, target, createdAt, plus session/device), oldest
  * first. `--json` emits the array; the human form prints one line each, or a
  * "no pending proposals" notice.
@@ -1007,11 +1068,24 @@ async function main() {
       }
       result = discardProposal({ hypoDir: args.hypoDir, id: args.id }, {});
       break;
+    case 'accept-base':
+      if (!args.id) {
+        process.stderr.write(
+          '✗ usage: hypomnema proposal accept-base --session-id <id> <target>\n',
+        );
+        process.exit(2);
+      }
+      result = acceptBase(
+        { hypoDir: args.hypoDir, sessionId: args.sessionId, target: args.id },
+        { json: args.json },
+      );
+      break;
     default:
       process.stderr.write(
         'usage: hypomnema proposal <list|apply|discard> [id] [--json] [--hypo-dir <path>]\n' +
           '       hypomnema proposal challenge --session-id <id> --ids <id,...>\n' +
-          '       hypomnema proposal resolve --session-id <id>\n',
+          '       hypomnema proposal resolve --session-id <id>\n' +
+          '       hypomnema proposal accept-base --session-id <id> <target> [--json]\n',
       );
       process.exit(2);
   }

@@ -898,3 +898,107 @@ test('apply on a project that already has an index.md leaves it byte-for-byte un
     },
   );
 });
+
+// ── ISSUE-63: pointer-table superset auto-advance (end to end) ───────────────
+// Root hot.md is a shared pointer table: one row per project, edited by
+// appending or updating a row. Two machines editing DIFFERENT rows produce a
+// whole-file base-mismatch that reads as a collision even though nothing
+// collided. `overwrite()` now escapes exactly that one reason through
+// advanceBaseIfSuperset (hooks/base-store.mjs); every other conflict reason,
+// including base-unknown, must still park unchanged.
+suite('ISSUE-63: pointer-table superset auto-advance escapes base-mismatch only');
+
+test('a base-mismatch on root hot.md auto-resolves when the payload preserves every disk row (superset)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 'issue63-superset';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+
+    // A different machine appends its own row directly on disk, after the base
+    // snapshot: the normal multi-machine pointer-table pattern.
+    const betaRow = `| beta-project | ${today} | [[projects/beta-project/hot]] |`;
+    const original = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    const originalRow = original.split('\n').find((l) => l.startsWith('| test-project'));
+    writeFileSync(join(dir, 'hot.md'), `${original.trimEnd()}\n${betaRow}\n`);
+
+    // This session's own close carries BOTH rows, just reordered: the other
+    // writer's row is preserved, only its position moved.
+    const payload = payloadForCleanWiki(dir, today);
+    payload.rootHot = { content: original.replace(originalRow, `${betaRow}\n${originalRow}`) };
+
+    const r = runApply(dir, payload, { sessionId: sid });
+    assert.equal(
+      r.status,
+      0,
+      `a superset overwrite must not fail the close: ${r.stdout}\n${r.stderr}`,
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.deepEqual(out.conflicts, [], 'no conflict when the new content is a superset of disk');
+    assert.equal(
+      readFileSync(join(dir, 'hot.md'), 'utf-8'),
+      payload.rootHot.content,
+      'the payload content is written directly, not withheld',
+    );
+  });
+});
+
+test('a base-mismatch on root hot.md still parks when the payload drops a disk row', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 'issue63-dropped-row';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+
+    const betaRow = `| beta-project | ${today} | [[projects/beta-project/hot]] |`;
+    const original = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    writeFileSync(join(dir, 'hot.md'), `${original.trimEnd()}\n${betaRow}\n`);
+
+    // This session's write is unaware of the other machine's row: it would
+    // silently drop beta-project's row, so it is not a superset.
+    const payload = payloadForCleanWiki(dir, today);
+    payload.rootHot = { content: `${original.trimEnd()}\n<!-- own edit -->\n` };
+
+    const r = runApply(dir, payload, { sessionId: sid });
+    assert.notEqual(r.status, 0, `a dropped row must still park: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.stage, 'proposal-pending');
+    const rootHotConflict = out.conflicts.find((c) => c.target === 'hot.md');
+    assert.ok(rootHotConflict, `hot.md must be in conflicts: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(rootHotConflict.reason, 'base-mismatch');
+    assert.ok(
+      !readFileSync(join(dir, 'hot.md'), 'utf-8').includes('own edit'),
+      'the target must stay unclobbered on disk',
+    );
+  });
+});
+
+test('a base-unknown target still parks even for a superset payload (the escape is base-mismatch only)', () => {
+  withWiki(null, (dir, today) => {
+    // No snapshotBase call: this session never observed hot.md, so its entry
+    // state is 'unknown' no matter what the payload contains.
+    const sid = 'issue63-base-unknown';
+    const betaRow = `| beta-project | ${today} | [[projects/beta-project/hot]] |`;
+    const original = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    const originalRow = original.split('\n').find((l) => l.startsWith('| test-project'));
+
+    // A genuine superset of the current disk content: it carries the existing
+    // row and only adds a new one.
+    const payload = payloadForCleanWiki(dir, today);
+    payload.rootHot = { content: original.replace(originalRow, `${originalRow}\n${betaRow}`) };
+
+    const r = runApply(dir, payload, { sessionId: sid });
+    assert.notEqual(
+      r.status,
+      0,
+      `base-unknown must still park even for a superset write: ${r.stdout}\n${r.stderr}`,
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    const rootHotConflict = out.conflicts.find((c) => c.target === 'hot.md');
+    assert.ok(rootHotConflict, `hot.md must still be in conflicts: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(
+      rootHotConflict.reason,
+      'base-unknown',
+      'the superset escape must not touch base-unknown',
+    );
+  });
+});
