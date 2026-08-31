@@ -53,7 +53,8 @@
     "templates/",
     "docs/",
     ".claude-plugin/",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "keywords": [
     "wiki",
