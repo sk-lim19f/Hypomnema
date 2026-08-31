@@ -4318,6 +4318,71 @@ test('ISSUE-101: an approval for one target does not carry to another', () => {
   }
 });
 
+test('ISSUE-101: a target that moved after the approval is refused (stale approval)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const sid = 's-stale';
+    const rel = 'hot.md';
+    writeFileSync(join(dir, rel), hotTable([ROW_ALPHA]));
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+    const parked = parkFor(dir, sid, rel, hotTable([ROW_ALPHA, ROW_BETA]));
+    const { transcriptPath } = approveAcceptBase(dir, sid, [parked.id]);
+
+    // A third writer lands after the user read the diff. Adopting the disk now
+    // would adopt bytes they never saw.
+    writeFileSync(join(dir, rel), hotTable([ROW_ALPHA, ROW_GAMMA]));
+
+    const err = capStream();
+    const res = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: capStream(), stderr: err, transcriptPath },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'stale-approval');
+    assert.match(err.text(), /changed since the user approved it/);
+    assert.deepEqual(readBaseEntry(dir, sid, rel), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The challenge records `{state:'absent'}` when the target did not exist at review
+// time. Accepting "absent" as the base is a real decision the user can make, and it
+// must still refuse once something appears there.
+test('ISSUE-101: an approval taken against an absent target refuses once bytes appear', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
+  try {
+    const sid = 's-absent';
+    const rel = 'hot.md';
+    // No file on disk. snapshotBase still records the target as observed-absent.
+    snapshotBase(dir, sid, [rel]);
+    const before = readBaseEntry(dir, sid, rel);
+    const parked = parkFor(dir, sid, rel, hotTable([ROW_ALPHA]));
+    const { transcriptPath } = approveAcceptBase(dir, sid, [parked.id]);
+
+    // Still absent: the approved state and the disk state agree.
+    const okRes = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: capStream(), stderr: capStream(), transcriptPath },
+    );
+    assert.equal(okRes.ok, true, `absent-to-absent must accept: ${JSON.stringify(okRes)}`);
+    assert.equal(okRes.hash, null, 'the accepted base is the absence itself');
+
+    // Now a writer creates the file. The same approval must no longer carry.
+    writeFileSync(join(dir, rel), hotTable([ROW_BETA]));
+    const staleRes = acceptBase(
+      { hypoDir: dir, sessionId: sid, target: rel },
+      { stdout: capStream(), stderr: capStream(), transcriptPath },
+    );
+    assert.equal(staleRes.ok, false);
+    assert.equal(staleRes.reason, 'stale-approval');
+    assert.notDeepEqual(before, null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('ISSUE-101: a non-string sessionId in a hand-edited artifact never matches', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-base101-'));
   try {

@@ -1012,7 +1012,8 @@ export function acceptBase(
   }
   // The user approved a SET of targets when they read the challenge's diffs. A
   // target outside that set is a write they never saw.
-  if (!challenge.items?.some((it) => it.target === target)) {
+  const approvedItem = challenge.items?.find((it) => it.target === target);
+  if (!approvedItem) {
     err.write(
       `✗ ${shownTarget} is not among the targets the user approved in this challenge; ` +
         `re-run \`hypomnema proposal challenge\` and review it.\n`,
@@ -1026,6 +1027,26 @@ export function acceptBase(
     return { ok: false, code: 1, reason: 'target-unreadable' };
   }
   const hash = current === null ? null : hashContent(current);
+
+  // What the user approved is THESE disk bytes, the ones the challenge rendered a
+  // diff against. Adopting a base is adopting that side of the diff, so a target
+  // that moved since they read it is a different decision than the one they made.
+  //
+  // Pinning here is also why this does not spend the challenge the way `resolve`
+  // does: one close can park several targets, the user approves the set once, and
+  // consuming on the first accept-base would force a re-approval per file. A replay
+  // against unmoved bytes is a no-op, and a replay against moved bytes is refused
+  // right here, so leaving the challenge in place costs nothing.
+  const approvedHash =
+    approvedItem.freshness?.state === 'absent' ? null : approvedItem.freshness?.hash;
+  if (approvedHash !== hash) {
+    err.write(
+      `✗ ${shownTarget} changed since the user approved it; ` +
+        `the bytes they reviewed are not the bytes on disk now.\n` +
+        `  Re-run \`hypomnema proposal challenge\` so they see the current diff.\n`,
+    );
+    return { ok: false, code: 1, reason: 'stale-approval' };
+  }
   if (!advanceBase(hypoDir, sessionId, target, hash)) {
     err.write(
       `✗ no base snapshot exists for session ${sessionId}; nothing to accept against. ` +

@@ -41,7 +41,7 @@ Andrej Karpathy의 "LLM 네이티브 위키" 스케치에서 출발했습니다.
 
 같은 보류 방식이 세션 마무리 파일을 쓸 때에도 적용됩니다. 세션 종료 쓰기의 대상 파일이 이 세션이 읽은 뒤에 바뀌었다면 Hypomnema는 덮어쓰지 않습니다. 그 내용을 `<위키>/.cache/proposals/` 아래에 보류하고 알려 줍니다. 검토와 적용은 직접 하세요. `hypomnema proposal list`로 목록을 보고 `hypomnema proposal apply <id>` 또는 `hypomnema proposal discard <id>`를 씁니다. 자동 적용은 없습니다.
 
-디스크의 변경이 줄을 **추가하기만** 했고 이 close 가 지키려던 줄을 하나도 안 지웠다면 잃을 것이 없으므로 보류 없이 그대로 진행합니다. 그 밖의 경우에는 `hypomnema proposal accept-base --session-id <id> <대상>` 이 "디스크에 있는 것을 내 출발점으로 삼겠다" 를 뜻하고, 다음 close 가 그 파일을 다시 보류하지 않고 씁니다. 요구하는 승인은 apply 와 같습니다. 그 대상에 보류된 proposal 이 있어야 하고, 그것을 포함한 `hypomnema proposal challenge` 가 있어야 하고, 승인 문구를 대화에 직접 입력해야 합니다.
+디스크의 변경이 줄을 **추가하기만** 했고 이 close 가 지키려던 줄을 하나도 안 지웠다면 잃을 것이 없으므로 보류 없이 그대로 진행합니다. 그 밖의 경우에는 `hypomnema proposal accept-base --session-id <id> <대상>` 이 "디스크에 있는 것을 내 출발점으로 삼겠다" 를 뜻하고, 다음 close 가 그 파일을 다시 보류하지 않고 씁니다. 요구하는 승인은 apply 와 같습니다. 그 대상에 보류된 proposal 이 있어야 하고, 그것을 포함한 `hypomnema proposal challenge` 가 있어야 하고, 승인 문구를 대화에 직접 입력해야 합니다. 승인한 뒤에 그 파일이 또 바뀌면 거절합니다. 승인된 것은 누군가 읽은 그 diff 이지 그 뒤에 들어온 내용이 아닙니다.
 
 자동처럼 보이지만 실제로는 직접 실행해야 하는 기능이 두 가지 있습니다. extensions sync와 역방향 capture입니다. 위키 안 `~/hypomnema/extensions/{agents,commands,hooks,skills}/`에 둔 파일은 `~/.claude/`에 반영되는데(`--codex`를 붙이면 `hooks`·`commands`는 `~/.codex/`에도), 직접 `hypomnema init`, `hypomnema upgrade --apply`, 또는 dry-run이 아닌 `hypomnema capture`를 돌려야만 반영됩니다. 저절로 밀어 넣는 트리거는 없습니다. `hypomnema capture`(또는 `/hypo:capture`)는 반대 방향으로, 직접 만든 command·agent·hook·skill을 위키로 가져오는 경로인데 이것도 마찬가지로 명시적으로 불러야 동작합니다. 자세한 내용은 아래 명령어 표를 보세요.
 

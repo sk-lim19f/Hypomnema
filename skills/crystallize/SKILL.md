@@ -152,8 +152,9 @@ the store entirely and silently destroys the other session's edits. Drive it out
    `hypomnema proposal accept-base --session-id <id> <target>`. It moves this
    session's recorded base, never a page byte, and it takes the SAME approval this
    step already collected: the target must be parked, the challenge in step 2 must
-   cover it, and the user must have typed the line in step 3. Without all three it
-   refuses and the base does not move.
+   cover it, and the user must have typed the line in step 3. It also refuses if the
+   page moved again since they read that diff, because the bytes they approved are
+   no longer the bytes on disk. Any of those missing and the base does not move.
 6. **Check `markerWritten` again** before you say the session is closed. It is never
    automatic.
 
