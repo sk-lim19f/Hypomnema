@@ -250,111 +250,111 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
   }
 }
 
-// ── superset detection ───────────────────────────────────────────────────────
+// ── row-insertion detection ──────────────────────────────────────────────────
 //
-// A root-level pointer table (hot.md's "Active Projects", SCHEMA.md's tag list)
-// is edited by appending or updating one row per machine or project, so two
-// machines editing DIFFERENT rows produce a whole-file hash mismatch that looks
-// exactly like a colliding edit even though nothing actually collided. When the
-// content a session is about to write still carries every LINE the disk copy
-// currently has, in the same order, that write cannot have dropped or reshuffled
-// anything anyone put there, so a base-mismatch against it is safe to auto-advance
-// instead of park.
+// A root-level pointer table (hot.md's "Active Projects", SCHEMA.md's tag list) is
+// edited by appending or updating one row per machine or project, so two machines
+// editing DIFFERENT rows produce a whole-file hash mismatch that looks exactly like
+// a colliding edit even though nothing collided. This narrows the guard for that one
+// case, and proves the case rather than assuming it.
 //
-// An earlier version of this judged table DATA ROWS only, and that was unsound in
-// the direction that costs a file. Every overwrite target is a prose-and-table
-// mix, so a payload that kept every row while dropping a heading, a checklist, or
-// a frontmatter field read as a superset and the guard let the write through. It
-// also failed OPEN when a table's rows could not be extracted: the shipped
-// `templates/hot.md` puts two HTML comments directly under the separator, which
-// stopped row collection at zero, and `[].every()` is vacuously true — so on any
-// vault built from that template, a payload that dropped every row passed.
+// Three earlier judges were unsound, each in the direction that costs a file, and the
+// third is why this one no longer works line by line at all:
 //
-// Comparing whole lines in order has neither hole and needs no parser. It only ever
-// narrows the guard: anything it is not certain about still returns false.
+//   • Table DATA ROWS only. A payload that kept every row while deleting the prose
+//     around it read as safe. It also failed OPEN when rows could not be extracted,
+//     which the shipped templates/hot.md triggers with two HTML comments under the
+//     separator: zero rows collected, and every() over an empty array is true.
+//   • TRIMMED lines as a multiset. Reordering passed, so frontmatter moved below the
+//     first heading (where it stops being frontmatter) and an item moved to another
+//     section (where it is reclassified) both read as safe. Trimming passed, so a
+//     trailing-space hard break and a code block's indentation vanished silently.
+//   • Verbatim lines as an ordered subsequence. Every line survives and the document
+//     still changes meaning: wrapping the whole file in a four-backtick fence turns
+//     frontmatter, tables and links into code text, and deleting one blank line
+//     merges two paragraphs. Measured against the real vault; all passed.
+//
+// The lesson is that no judge over lines alone can prove a markdown document survived,
+// because meaning lives in the delimiters between lines as much as in the lines. So
+// this one stops trying. It asks the narrow question the feature actually needs: were
+// table rows INSERTED and nothing else touched at all? Everything already on disk must
+// still be there, verbatim, in order, blank lines included; and every line the payload
+// adds must itself be a table row. A fence, a heading, a paragraph, even a blank line
+// is not a row, so none of them can ride along.
 
-/**
- * Every line of `content` that carries something, VERBATIM. Only whitespace-only
- * lines are dropped, and nothing is trimmed: trailing spaces are a markdown hard
- * break and leading spaces are a code block, so a judge that trimmed would call
- * their loss "nothing was dropped".
- *
- * @returns {string[]|null} null when `content` is not a string.
- */
-function contentLines(content) {
-  if (typeof content !== 'string') return null;
-  return content.split('\n').filter((line) => line.trim() !== '');
+/** True when `line`, trimmed, opens and closes a markdown table row with `|`. */
+function isTableRowLine(line) {
+  const t = String(line ?? '').trim();
+  return t.length > 1 && t.startsWith('|') && t.endsWith('|');
 }
 
 /**
- * Whether `newContent` preserves every content line of `diskContent`, character
- * for character, as many times, AND in the same relative order. That is: disk's
- * lines are a subsequence of the payload's.
+ * Whether `newContent` is `diskContent` with table rows inserted and nothing else
+ * changed: every line of `diskContent` survives verbatim, in the same order, blank
+ * lines included, and every line `newContent` adds is a markdown table row.
  *
- * Order is part of the claim, not an incidental detail. In a markdown file a line's
- * meaning comes from where it sits, so an order-blind judge passes payloads that
- * destroy the document while keeping every line: frontmatter moved below the first
- * heading stops being frontmatter, and an item moved from one section to another is
- * reclassified without a character changing. Both were reproduced against the real
- * vault. Requiring order costs nothing the guard was built for, because the case it
- * exists for is a second machine APPENDING its own row, which shifts nobody.
+ * Blank lines count here, unlike in a line-only comparison. Dropping one merges two
+ * paragraphs, and adding one splits a paragraph, neither of which is a row insertion.
  *
- * Blank lines are the one thing ignored, on both sides. They carry nothing a writer
- * can lose, and holding a payload to the disk copy's exact spacing would park nearly
- * every legitimate close.
- *
- * Fail-closed by construction. A non-string on either side returns false, and so
- * does an empty disk side: "there is nothing here to preserve" is not the same fact
- * as "this write preserved everything", and only the second one earns a pass.
+ * Fail-closed by construction. A non-string on either side returns false; so does a
+ * payload identical to disk, which cannot be what a base-MISMATCH is looking at and
+ * so is a state this was never asked to judge.
  *
  * @returns {boolean}
  */
-export function isLineSuperset(diskContent, newContent) {
-  const disk = contentLines(diskContent);
-  const next = contentLines(newContent);
-  if (disk === null || next === null) return false;
-  if (disk.length === 0) return false;
+export function isRowInsertionOnly(diskContent, newContent) {
+  if (typeof diskContent !== 'string' || typeof newContent !== 'string') return false;
+  const disk = diskContent.split('\n');
+  const next = newContent.split('\n');
+  const inserted = [];
   let i = 0;
   for (const line of next) {
-    if (i === disk.length) break;
-    if (line === disk[i]) i += 1;
+    if (i < disk.length && line === disk[i]) {
+      i += 1;
+      continue;
+    }
+    inserted.push(line);
   }
-  return i === disk.length;
+  // A leftover disk line means something was deleted, altered, or moved: the greedy
+  // scan takes the earliest match, which never forfeits a later one, so failing to
+  // consume every disk line means no matching exists.
+  if (i !== disk.length) return false;
+  if (inserted.length === 0) return false;
+  return inserted.every(isTableRowLine);
 }
 
 /**
- * Auto-resolve a base-mismatch on `relPath` when `newContent` is a superset of
- * `diskContent` (see `isLineSuperset`): the base advances to `newContent`'s hash,
- * so the caller's overwrite guard can treat this as no conflict rather than park a
- * proposal.
+ * Auto-resolve a base-mismatch on `relPath` when `newContent` differs from
+ * `diskContent` only by inserted table rows (see `isRowInsertionOnly`): the base
+ * advances to `newContent`'s hash, so the caller's overwrite guard can treat this as
+ * no conflict rather than park a proposal.
  *
  * The polarity is one-directional and enforced structurally: `judge` runs inside a
- * try/catch, so ANY failure of the superset check, thrown or merely `false`,
- * resolves to `{ resolved: false }` and leaves the base untouched, exactly what a
- * caller sees today with no superset handling at all. A base write that itself
- * fails resolves the same way, because a caller told `resolved: true` goes on to
- * overwrite the target, and doing that against a base that never moved is the one
- * outcome this function must never produce. `judge` is injectable so a test can
- * prove that guarantee against a judge that misbehaves; a production caller should
- * never pass one.
+ * try/catch, so ANY failure of the check, thrown or merely `false`, resolves to
+ * `{ resolved: false }` and leaves the base untouched, exactly what a caller sees
+ * today with no handling at all. A base write that itself fails resolves the same
+ * way, because a caller told `resolved: true` goes on to overwrite the target, and
+ * doing that against a base that never moved is the one outcome this function must
+ * never produce. `judge` is injectable so a test can prove that guarantee against a
+ * judge that misbehaves; a production caller should never pass one.
  *
  * @returns {{resolved: boolean, hash?: string}}
  */
-export function advanceBaseIfSuperset(
+export function advanceBaseIfRowInsertion(
   hypoDir,
   sessionId,
   relPath,
   diskContent,
   newContent,
-  { judge = isLineSuperset } = {},
+  { judge = isRowInsertionOnly } = {},
 ) {
-  let superset;
+  let safe;
   try {
-    superset = Boolean(judge(diskContent, newContent));
+    safe = Boolean(judge(diskContent, newContent));
   } catch {
-    superset = false;
+    safe = false;
   }
-  if (!superset) return { resolved: false };
+  if (!safe) return { resolved: false };
   const hash = hashContent(newContent);
   if (!advanceBase(hypoDir, sessionId, relPath, hash)) return { resolved: false };
   return { resolved: true, hash };

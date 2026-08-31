@@ -911,7 +911,7 @@ test('apply on a project that already has an index.md leaves it byte-for-byte un
 // appending or updating a row. Two machines editing DIFFERENT rows produce a
 // whole-file base-mismatch that reads as a collision even though nothing
 // collided. `overwrite()` now escapes exactly that one reason through
-// advanceBaseIfSuperset (hooks/base-store.mjs); every other conflict reason,
+// advanceBaseIfRowInsertion (hooks/base-store.mjs); every other conflict reason,
 // including base-unknown, must still park unchanged.
 suite('ISSUE-63: pointer-table superset auto-advance escapes base-mismatch only');
 

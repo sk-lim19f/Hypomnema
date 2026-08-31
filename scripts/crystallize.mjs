@@ -115,7 +115,7 @@ import {
   hashContent,
   readBaseEntry,
   advanceBase,
-  advanceBaseIfSuperset,
+  advanceBaseIfRowInsertion,
 } from '../hooks/base-store.mjs';
 import { writeProposal } from '../hooks/proposal-store.mjs';
 import { recordGateClosed, resolutionStamp, closeGateStatus } from '../hooks/close-gate-store.mjs';
@@ -1436,7 +1436,7 @@ function applySessionClose(args) {
       // narrows the one case that is provably safe.
       if (
         reason === 'base-mismatch' &&
-        advanceBaseIfSuperset(args.hypoDir, args.sessionId, relPath, disk, field.content).resolved
+        advanceBaseIfRowInsertion(args.hypoDir, args.sessionId, relPath, disk, field.content).resolved
       ) {
         reason = null;
       }

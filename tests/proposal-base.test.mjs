@@ -29,8 +29,8 @@ import {
   advanceBase,
   advanceBaseForWrite,
   overwriteTargets,
-  isLineSuperset,
-  advanceBaseIfSuperset,
+  isRowInsertionOnly,
+  advanceBaseIfRowInsertion,
 } from '../hooks/base-store.mjs';
 import {
   writeProposal as psWriteProposal,
@@ -2695,7 +2695,7 @@ test('control: WITHOUT the hook a lossful close self-conflicts (bug reproduced)'
   //
   // The close payload here DROPS the line the session wrote, where the test above
   // keeps it. That difference is load-bearing: an append-only payload preserves
-  // every line on disk and so escapes through advanceBaseIfSuperset, which would
+  // every line on disk and so escapes through advanceBaseIfRowInsertion, which would
   // make this control pass for a reason that has nothing to do with the hook. A
   // payload that drops a line is the case only provenance can settle.
   withWiki(null, (dir, today) => {
@@ -3742,24 +3742,25 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
   }
 });
 
-// ── ISSUE-63: superset auto-advance ──────────────────────────────────────────
-// A shared pointer table (root hot.md) is edited by appending one row per
-// project, so two machines editing DIFFERENT rows produce a whole-file hash
-// mismatch that reads as a collision even though nothing collided. `isLineSuperset`
-// /`advanceBaseIfSuperset` narrow that guard for the cases a machine can prove
-// safe. Everything else still parks and waits for `challenge` + `resolve`.
+// ── ISSUE-63: auto-advance a base past a pure row insertion ──────────────────
+// A shared pointer table (root hot.md) is edited by appending one row per project,
+// so two machines editing DIFFERENT rows produce a whole-file hash mismatch that
+// reads as a collision even though nothing collided. `isRowInsertionOnly` /
+// `advanceBaseIfRowInsertion` narrow the guard for exactly that, and for nothing
+// else. Everything the judge is not certain about still parks and waits for
+// `challenge` + `resolve`.
 //
-// The judge compares whole content LINES verbatim and IN ORDER, not table rows.
-// Every overwrite target is a prose-and-table mix, so a row-only judge called a
-// payload that kept every row while dropping the prose around it a superset; an
-// order-blind or trimming judge does the same for a payload that moves frontmatter
-// below a heading, moves an item to another section, or drops a hard break.
+// Three earlier judges shipped a hole apiece, each reproduced against the real
+// vault, and the tests below pin all three shut. Table-rows-only let a payload keep
+// every row while deleting the prose around it. Trimmed multiset let a payload
+// reorder lines (frontmatter below a heading stops being frontmatter) and drop
+// whitespace that carries meaning. Ordered verbatim lines still let a payload wrap
+// the whole file in a code fence, or delete a blank line and merge two paragraphs.
+// So the judge stopped asking "did every line survive" and started asking "were
+// rows inserted and nothing else touched".
 
-suite('ISSUE-63: superset auto-advance');
+suite('ISSUE-63: auto-advance a base past a pure row insertion');
 
-// Shaped like the real overwrite targets (and like the shipped templates/hot.md):
-// frontmatter, a heading, the pointer table, and prose AFTER it. A bare table would
-// only ever exercise the judge on the part it already got right.
 function hotTable(rows, { prose = true } = {}) {
   return [
     '---',
@@ -3781,7 +3782,8 @@ function hotTable(rows, { prose = true } = {}) {
 }
 
 // The shape templates/hot.md actually ships: two HTML comments sit directly under
-// the separator, before any real row.
+// the separator, before any real row. A table-row extractor collected zero rows
+// here, and every() over an empty array is true.
 function templateShapedHot(rows) {
   return [
     '# Hot Cache',
@@ -3799,13 +3801,20 @@ const ROW_ALPHA = '| alpha | 2026-08-01 | [[projects/alpha/hot]] |';
 const ROW_BETA = '| beta | 2026-08-27 | [[projects/beta/hot]] |';
 const ROW_GAMMA = '| gamma | 2026-08-31 | [[projects/gamma/hot]] |';
 
-test('ISSUE-63 a: every disk row preserved in place, with a row appended, is a superset', () => {
+test('ISSUE-63: a row added after the existing ones is a pure insertion', () => {
   const disk = hotTable([ROW_ALPHA]);
-  const superset = hotTable([ROW_ALPHA, ROW_BETA]); // appended, nobody shifted
-  assert.equal(isLineSuperset(disk, superset), true);
+  assert.equal(isRowInsertionOnly(disk, hotTable([ROW_ALPHA, ROW_BETA])), true);
+  // Inserted BETWEEN existing rows too: position is not the point, preservation is.
+  assert.equal(
+    isRowInsertionOnly(
+      hotTable([ROW_ALPHA, ROW_GAMMA]),
+      hotTable([ROW_ALPHA, ROW_BETA, ROW_GAMMA]),
+    ),
+    true,
+  );
 });
 
-test('ISSUE-63 a: superset content auto-advances the base, no conflict left behind', () => {
+test('ISSUE-63: an insertion auto-advances the base, no conflict left behind', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
   try {
     const sid = 's-superset';
@@ -3814,14 +3823,9 @@ test('ISSUE-63 a: superset content auto-advances the base, no conflict left behi
     const withOtherRow = hotTable([ROW_ALPHA, ROW_BETA]);
     writeFileSync(join(dir, rel), disk);
     snapshotBase(dir, sid, [rel]);
-    assert.equal(
-      readBaseEntry(dir, sid, rel).hash,
-      bsHashContent(disk),
-      'base captured disk bytes',
-    );
 
-    const result = advanceBaseIfSuperset(dir, sid, rel, disk, withOtherRow);
-    assert.equal(result.resolved, true, 'a superset write must auto-resolve');
+    const result = advanceBaseIfRowInsertion(dir, sid, rel, disk, withOtherRow);
+    assert.equal(result.resolved, true, 'a pure row insertion must auto-resolve');
     assert.equal(result.hash, bsHashContent(withOtherRow));
     assert.equal(
       readBaseEntry(dir, sid, rel).hash,
@@ -3833,169 +3837,144 @@ test('ISSUE-63 a: superset content auto-advances the base, no conflict left behi
   }
 });
 
-test('ISSUE-63 a: a disk row dropped from the new content is not a superset, base stays put (conflict)', () => {
+test('ISSUE-63: a dropped or altered disk row leaves the conflict standing', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
   try {
-    const sid = 's-dropped-row';
+    const sid = 's-lossful';
     const rel = 'hot.md';
     const disk = hotTable([ROW_ALPHA, ROW_BETA]);
-    const missingBeta = hotTable([ROW_ALPHA]); // beta's row is gone
     writeFileSync(join(dir, rel), disk);
     snapshotBase(dir, sid, [rel]);
     const before = readBaseEntry(dir, sid, rel);
 
-    assert.equal(isLineSuperset(disk, missingBeta), false);
-    const result = advanceBaseIfSuperset(dir, sid, rel, disk, missingBeta);
-    assert.equal(result.resolved, false, 'a dropped row must not auto-resolve');
-    assert.deepEqual(
-      readBaseEntry(dir, sid, rel),
-      before,
-      'the existing conflict base is untouched',
-    );
+    const missingBeta = hotTable([ROW_ALPHA]);
+    assert.equal(isRowInsertionOnly(disk, missingBeta), false, "beta's row is gone");
+    assert.equal(advanceBaseIfRowInsertion(dir, sid, rel, disk, missingBeta).resolved, false);
+
+    const altered = hotTable([ROW_ALPHA.replace('2026-08-01', '2026-08-15'), ROW_BETA]);
+    assert.equal(isRowInsertionOnly(disk, altered), false, 'an altered row is a lost row');
+    assert.equal(advanceBaseIfRowInsertion(dir, sid, rel, disk, altered).resolved, false);
+
+    assert.deepEqual(readBaseEntry(dir, sid, rel), before, 'the conflict base is untouched');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('ISSUE-63 a: a row present but with altered text is not a superset, base stays put (conflict)', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
-  try {
-    const sid = 's-altered-row';
-    const rel = 'hot.md';
-    const disk = hotTable([ROW_ALPHA, ROW_BETA]);
-    const alteredAlpha = ROW_ALPHA.replace('2026-08-01', '2026-08-15');
-    const changedRow = hotTable([alteredAlpha, ROW_BETA]);
-    writeFileSync(join(dir, rel), disk);
-    snapshotBase(dir, sid, [rel]);
-    const before = readBaseEntry(dir, sid, rel);
-
-    assert.equal(isLineSuperset(disk, changedRow), false);
-    const result = advanceBaseIfSuperset(dir, sid, rel, disk, changedRow);
-    assert.equal(result.resolved, false, 'an altered row must not auto-resolve');
-    assert.deepEqual(readBaseEntry(dir, sid, rel), before);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+// Hole 1: the table-rows-only judge. Every row survives, the prose around it does
+// not, and the guard called that safe. Measured against the real vault's hot.md.
+test('ISSUE-63: keeping every row while dropping the prose is not an insertion', () => {
+  const disk = hotTable([ROW_ALPHA, ROW_BETA]);
+  assert.equal(isRowInsertionOnly(disk, hotTable([ROW_ALPHA, ROW_BETA], { prose: false })), false);
 });
 
-test('ISSUE-63 a: a replaced prose line is not a superset (fail-closed)', () => {
-  const disk = '# Session state\n\nJust prose here, no table at all.\n';
-  const replaced = '# Session state\n\nMore prose was added, still no table.\n';
-  assert.equal(isLineSuperset(disk, replaced), false, "the disk's prose line is gone");
-  // Appending to prose, keeping every existing line, IS a superset. A table-row
-  // judge could not see either of these cases at all.
-  const appended = `${disk}\nAnd a second paragraph.\n`;
-  assert.equal(isLineSuperset(disk, appended), true, 'nothing on disk was dropped');
-});
-
-test('ISSUE-63 a: an empty or unreadable disk side fails closed', () => {
-  assert.equal(isLineSuperset('', 'anything at all\n'), false, 'nothing to prove preserved');
-  assert.equal(isLineSuperset('   \n\n', 'x\n'), false, 'blank-only disk is the same fact');
-  assert.equal(isLineSuperset(null, 'x\n'), false, 'unreadable disk fails closed');
-  assert.equal(isLineSuperset('x\n', null), false, 'unreadable payload fails closed');
-});
-
-// The failure the row-only judge shipped with: every row survives, the prose around
-// it does not, and the guard called that safe. Measured against the real vault's
-// hot.md before the fix: true.
-test('ISSUE-63 a: keeping every row while dropping the prose is NOT a superset', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
-  try {
-    const sid = 's-prose-loss';
-    const rel = 'hot.md';
-    const disk = hotTable([ROW_ALPHA, ROW_BETA]);
-    const rowsKeptProseGone = hotTable([ROW_ALPHA, ROW_BETA], { prose: false });
-    assert.notEqual(disk, rowsKeptProseGone, 'sanity: the two differ');
-
-    writeFileSync(join(dir, rel), disk);
-    snapshotBase(dir, sid, [rel]);
-    const before = readBaseEntry(dir, sid, rel);
-
-    assert.equal(isLineSuperset(disk, rowsKeptProseGone), false);
-    const result = advanceBaseIfSuperset(dir, sid, rel, disk, rowsKeptProseGone);
-    assert.equal(result.resolved, false, 'the checklist must not be droppable');
-    assert.deepEqual(readBaseEntry(dir, sid, rel), before);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// The shipped template put two comments under the separator, which stopped row
-// collection at zero rows — and `[].every()` is vacuously true, so on any vault
-// built from that template a payload that dropped EVERY row read as a superset.
-test('ISSUE-63 a: a template-shaped table whose rows resist extraction still fails closed', () => {
+// Hole 1, second face: rows that resist extraction made the old judge fail OPEN, so
+// on a vault built from the shipped template a payload dropping every row passed.
+test('ISSUE-63: a template-shaped table whose rows resist extraction still fails closed', () => {
   const disk = templateShapedHot([ROW_ALPHA, ROW_BETA]);
-  const allRowsDropped = templateShapedHot([]);
-  assert.equal(isLineSuperset(disk, allRowsDropped), false, 'dropping every row is never safe');
+  assert.equal(isRowInsertionOnly(disk, templateShapedHot([])), false, 'dropping every row');
   assert.equal(
-    isLineSuperset(disk, templateShapedHot([ROW_ALPHA, ROW_BETA, ROW_GAMMA])),
+    isRowInsertionOnly(disk, templateShapedHot([ROW_ALPHA, ROW_BETA, ROW_GAMMA])),
     true,
     'the legitimate case still resolves on this shape',
   );
 });
 
-// A `resolved: true` sends the caller on to overwrite the target. Doing that
-// against a base that never moved is the one outcome this must never produce.
-// Reordering keeps every line and still destroys the document. Reproduced against
-// the real vault before the judge required order: frontmatter moved below the first
-// heading stops being frontmatter, and an item moved from one section to another is
-// reclassified without a character changing.
-test('ISSUE-63 a: a payload that only REORDERS the disk lines is not a superset', () => {
-  const frontmatterFirst = '---\ntitle: Hot Cache\n---\n# Hot Cache\n';
-  const frontmatterMoved = '# Hot Cache\n---\ntitle: Hot Cache\n---\n';
+// Hole 2: the trimmed-multiset judge. Every line survives and the document changes
+// meaning anyway, because a line's meaning comes from where it sits.
+test('ISSUE-63: reordering the disk lines is not an insertion', () => {
   assert.equal(
-    isLineSuperset(frontmatterFirst, frontmatterMoved),
+    isRowInsertionOnly(
+      '---\ntitle: Hot Cache\n---\n# Hot Cache\n',
+      '# Hot Cache\n---\ntitle: Hot Cache\n---\n',
+    ),
     false,
     'frontmatter below the heading is no longer frontmatter',
   );
-
-  const sectioned = '## Pending\n- item A\n## Resolved\n';
-  const reclassified = '## Pending\n## Resolved\n- item A\n';
   assert.equal(
-    isLineSuperset(sectioned, reclassified),
+    isRowInsertionOnly(
+      '## Pending\n- item A\n## Resolved\n',
+      '## Pending\n## Resolved\n- item A\n',
+    ),
     false,
-    'an item moved under another heading changed meaning without changing text',
+    'an item moved under another heading was reclassified without changing text',
   );
+});
 
-  // Inserting BETWEEN existing lines keeps their order and is still a superset.
+// Hole 2, second face: trailing spaces are a markdown hard break and leading spaces
+// are a code block, so a judge that trimmed called their loss "nothing was dropped".
+test('ISSUE-63: whitespace inside a line is content', () => {
+  assert.equal(isRowInsertionOnly('one  \ntwo\n', 'one\ntwo\n'), false, 'a hard break was dropped');
+  assert.equal(isRowInsertionOnly('    code\n', 'code\n'), false, 'code indentation was dropped');
+});
+
+// Hole 3: the ordered-subsequence judge. Every line survived both of these, and the
+// whole document was reparsed. Reproduced against the real vault.
+test('ISSUE-63: a payload that only adds delimiters is not an insertion', () => {
+  const doc = '---\ntitle: X\n---\n\n# H\n\n| a | b |\n|---|---|\n| 1 | 2 |\n';
   assert.equal(
-    isLineSuperset(sectioned, '## Pending\n- item A\n- item B\n## Resolved\n'),
-    true,
-    'an insertion that shifts nobody is still safe',
+    isRowInsertionOnly(doc, `\`\`\`\`markdown\n${doc}\n\`\`\`\`\n`),
+    false,
+    'a fence around the whole file turns every line into code text',
   );
-});
-
-// Trimming would call these "nothing was dropped". Trailing spaces are a markdown
-// hard break and leading spaces are a code block, so both carry meaning.
-test('ISSUE-63 a: whitespace is content, not noise', () => {
-  assert.equal(isLineSuperset('one  \ntwo\n', 'one\ntwo\n'), false, 'a hard break was dropped');
-  assert.equal(isLineSuperset('    code\n', 'code\n'), false, 'code indentation was dropped');
   assert.equal(
-    isLineSuperset('one\ntwo\n', 'one\n\n\ntwo\n'),
-    true,
-    'blank lines alone carry nothing, so spacing changes still pass',
+    isRowInsertionOnly('para one\n\npara two\n', 'para one\npara two\n'),
+    false,
+    'deleting a blank line merges two paragraphs',
+  );
+  assert.equal(
+    isRowInsertionOnly('para one\npara two\n', 'para one\n\npara two\n'),
+    false,
+    'adding a blank line splits one paragraph, and a blank line is not a row',
+  );
+
+  // The two cases above stay false even for a judge that ignores blank lines, just
+  // for a different reason (nothing is left to insert), so neither of them pins the
+  // blank-line rule. This one does: a real row insertion rides along with a blank
+  // line deletion, and only a judge that counts blank lines can tell them apart.
+  const disk = '| a | b |\n|---|---|\n| 1 | 2 |\n\ntrailing prose\n';
+  const rowPlusMergedParagraph = '| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\ntrailing prose\n';
+  assert.equal(
+    isRowInsertionOnly(disk, rowPlusMergedParagraph),
+    false,
+    'a row insertion does not license deleting the blank line beside it',
   );
 });
 
-// Counting, not set membership: two identical rows on disk need two in the payload.
-test('ISSUE-63 a: a duplicated disk line must appear as many times in the payload', () => {
-  assert.equal(isLineSuperset('same\nsame\n', 'same\n'), false, 'one of the two was dropped');
-  assert.equal(isLineSuperset('same\nsame\n', 'same\nsame\n'), true);
-  assert.equal(isLineSuperset('same\nsame\n', 'same\nother\nsame\n'), true);
+test('ISSUE-63: only table rows may be the thing inserted', () => {
+  const disk = hotTable([ROW_ALPHA]);
+  assert.equal(isRowInsertionOnly(disk, `${disk}a new sentence\n`), false, 'prose is not a row');
+  assert.equal(
+    isRowInsertionOnly(
+      disk,
+      disk.replace('## Session Start Checklist', '## Notes\n\n## Session Start Checklist'),
+    ),
+    false,
+    'a heading is not a row',
+  );
 });
 
-test('ISSUE-63 a: a base that cannot be advanced reports unresolved, never resolved', () => {
+test('ISSUE-63: an unreadable side, and a payload identical to disk, fail closed', () => {
+  assert.equal(isRowInsertionOnly(null, 'x\n'), false, 'unreadable disk');
+  assert.equal(isRowInsertionOnly('x\n', null), false, 'unreadable payload');
+  const disk = hotTable([ROW_ALPHA]);
+  assert.equal(isRowInsertionOnly(disk, disk), false, 'nothing inserted is not a resolution');
+});
+
+// A `resolved: true` sends the caller on to overwrite the target. Doing that against
+// a base that never moved is the one outcome this must never produce.
+test('ISSUE-63: a base that cannot be advanced reports unresolved, never resolved', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
   try {
     const rel = 'hot.md';
     const disk = hotTable([ROW_ALPHA]);
-    const trueSuperset = hotTable([ROW_ALPHA, ROW_BETA]);
-    assert.equal(isLineSuperset(disk, trueSuperset), true, 'sanity: this pair IS a superset');
+    const inserted = hotTable([ROW_ALPHA, ROW_BETA]);
+    assert.equal(isRowInsertionOnly(disk, inserted), true, 'sanity: this pair IS an insertion');
     writeFileSync(join(dir, rel), disk);
 
     // No snapshotBase for this session, so advanceBase has no entry to move and
     // returns false. The judge still says yes; the write is what fails.
-    const result = advanceBaseIfSuperset(dir, 's-no-snapshot', rel, disk, trueSuperset);
+    const result = advanceBaseIfRowInsertion(dir, 's-no-snapshot', rel, disk, inserted);
     assert.equal(result.resolved, false, 'a failed base write must not read as resolved');
     assert.equal(result.hash, undefined);
   } finally {
@@ -4003,16 +3982,16 @@ test('ISSUE-63 a: a base that cannot be advanced reports unresolved, never resol
   }
 });
 
-test('ISSUE-63 a: polarity invariant, a throwing judge preserves the existing conflict outcome', () => {
+test('ISSUE-63: polarity invariant, a throwing judge preserves the existing conflict outcome', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-base63-'));
   try {
     const sid = 's-throwing-judge';
     const rel = 'hot.md';
     const disk = hotTable([ROW_ALPHA]);
-    // Genuinely a superset by the real judge, so a passing test here would only
+    // Genuinely an insertion by the real judge, so a passing test here would only
     // prove the judge works, not that a failing judge is contained.
-    const trueSuperset = hotTable([ROW_ALPHA, ROW_BETA]);
-    assert.equal(isLineSuperset(disk, trueSuperset), true, 'sanity: this pair IS a superset');
+    const inserted = hotTable([ROW_ALPHA, ROW_BETA]);
+    assert.equal(isRowInsertionOnly(disk, inserted), true, 'sanity: this pair IS an insertion');
 
     writeFileSync(join(dir, rel), disk);
     snapshotBase(dir, sid, [rel]);
@@ -4021,7 +4000,7 @@ test('ISSUE-63 a: polarity invariant, a throwing judge preserves the existing co
     const throwingJudge = () => {
       throw new Error('judge exploded');
     };
-    const result = advanceBaseIfSuperset(dir, sid, rel, disk, trueSuperset, {
+    const result = advanceBaseIfRowInsertion(dir, sid, rel, disk, inserted, {
       judge: throwingJudge,
     });
     assert.equal(
