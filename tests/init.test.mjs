@@ -642,6 +642,152 @@ test('defensive: odd cfg does not throw, yields a (possibly partial) Set', () =>
   assert.ok(names.has('ok.mjs') && !names.has('no-ext'), 'only .mjs names admitted');
 });
 
+// ── templates/hypo-automation.md hook table vs hooks.json (drift guard, ISSUE-92) ──
+// The doc's `| hook | event | purpose |` table is a hand-maintained mirror of
+// hooks.json. Nothing regenerates it, so a hook added to hooks.json (or an event
+// typo'd in the doc) drifts silently. Reuses readCoreHooksConfig/deriveCoreHookBasenames
+// (already proven above against the real hooks.json) instead of re-parsing it here.
+
+suite('templates/hypo-automation.md hook table');
+
+function actualEventByBasename() {
+  const res = readCoreHooksConfig(REPO);
+  assert.equal(res.ok, true, `real hooks.json should load: ${res.error}`);
+  const eventOf = new Map();
+  for (const [event, groups] of Object.entries(res.cfg.hooks)) {
+    // Scope the derive call to one event at a time (shared:[] so no shared
+    // basenames leak in) so the union helper still does the extraction/
+    // lowercasing, but per-event instead of flattened.
+    for (const name of deriveCoreHookBasenames({ hooks: { [event]: groups }, shared: [] })) {
+      eventOf.set(name, event);
+    }
+  }
+  return eventOf;
+}
+
+function readAutomationDoc() {
+  return readFileSync(join(REPO, 'templates', 'hypo-automation.md'), 'utf-8');
+}
+
+test('doc table lists exactly the hooks.json hooks, with matching events', () => {
+  const eventOf = actualEventByBasename();
+  const doc = readAutomationDoc();
+
+  const rowRe = /^\|\s*`([\w.-]+\.mjs)`\s*\|\s*`([A-Za-z]+)`\s*\|/gm;
+  const docEventOf = new Map();
+  let m;
+  while ((m = rowRe.exec(doc)) !== null) {
+    docEventOf.set(m[1].toLowerCase(), m[2]);
+  }
+  assert.ok(docEventOf.size > 0, 'expected to parse at least one hook row from the doc table');
+
+  const actualNames = new Set(eventOf.keys());
+  const docNames = new Set(docEventOf.keys());
+
+  const missingFromDoc = [...actualNames].filter((n) => !docNames.has(n));
+  const extraInDoc = [...docNames].filter((n) => !actualNames.has(n));
+  assert.deepEqual(
+    missingFromDoc,
+    [],
+    `hooks.json hooks missing from the doc table: ${missingFromDoc}`,
+  );
+  assert.deepEqual(
+    extraInDoc,
+    [],
+    `doc table lists hooks that hooks.json does not register: ${extraInDoc}`,
+  );
+
+  for (const [name, event] of docEventOf) {
+    assert.equal(
+      event,
+      eventOf.get(name),
+      `doc lists ${name} under ${event}, hooks.json says ${eventOf.get(name)}`,
+    );
+  }
+});
+
+test('doc states the current hook count, matching hooks.json', () => {
+  const eventOf = actualEventByBasename();
+  const doc = readAutomationDoc();
+  const m = /All (\d+) hooks registered in `hooks\/hooks\.json`/.exec(doc);
+  assert.ok(m, 'expected a stated hook count sentence in the doc');
+  assert.equal(Number(m[1]), eventOf.size, 'stated hook count must match hooks.json');
+});
+
+// The two hooks known to reach the network as of this commit, plus the fact that the
+// vault's own git remote is one of the two destinations. Deriving "reaches the network"
+// from source is not something a test can do, so this pins the shape that kept getting
+// written wrong rather than the property in general.
+//
+// Two rewrites of this paragraph shipped false claims before this assertion took its
+// current form. First "no network requests" while the hook table four lines above said
+// hypo-auto-commit "pushes". Then "one exception: SessionStart's update check", which
+// missed that SessionStart ALSO runs a blocking `git pull --ff-only`
+// (hypo-session-start.mjs:537, unconditional; isOptedOut only guards the notice
+// builders). So the git-sync verbs are asserted too: dropping them is how both misses
+// happened.
+test('doc names every hook that reaches the network', () => {
+  const doc = readAutomationDoc();
+  // Bound the slice to the network paragraph itself. Slicing to end of file instead
+  // let the Session Flow block below it satisfy the check: that block names the same
+  // hooks for an unrelated reason, so the assertion passed with the network paragraph
+  // stripped of every hook name.
+  const start = doc.search(/^.*reach the network.*$/m);
+  assert.ok(start >= 0, 'expected a network paragraph in the doc');
+  const rest = doc.slice(start);
+  const end = rest.search(/\n---\n|\n## /);
+  const section = end >= 0 ? rest.slice(0, end) : rest;
+  for (const hook of ['hypo-auto-commit.mjs', 'hypo-session-start.mjs']) {
+    assert.ok(
+      section.includes(hook),
+      `network section must name ${hook}: it makes network calls (auto-commit runs ` +
+        `git pull/push via syncRemote; session-start spawns the update check)`,
+    );
+  }
+  for (const verb of ['git pull', 'git push']) {
+    assert.ok(
+      section.includes(verb),
+      `network section must name \`${verb}\`: the vault's own remote is one of the two ` +
+        `network destinations, and it has no opt-out flag`,
+    );
+  }
+  assert.ok(
+    !/no network requests/i.test(doc),
+    'doc must not blanket-claim no network requests',
+  );
+});
+
+// The facts inside the network section, not just which hooks it names. Version 3 shortened
+// the marketplace URL to its host and wrote "set to any value" for the opt-out; both were
+// wrong and both passed the name-and-verb check above. So read the URLs out of
+// version-check-fetch.mjs and require the document to carry them verbatim, and require the
+// opt-out sentence to name all three variables the implementation actually reads.
+test('doc carries the update-check URLs verbatim and names every opt-out variable', () => {
+  const doc = readAutomationDoc();
+  const fetchSrc = readFileSync(join(REPO, 'hooks', 'version-check-fetch.mjs'), 'utf-8');
+  const urls = [...fetchSrc.matchAll(/'(https:\/\/[^']+)'/g)].map((m) => m[1]);
+  assert.ok(urls.length >= 2, `expected the fetch URLs in version-check-fetch.mjs, got ${urls.length}`);
+  for (const u of urls) {
+    assert.ok(doc.includes(u), `doc must carry the fetched URL verbatim: ${u}`);
+  }
+
+  const checkSrc = readFileSync(join(REPO, 'hooks', 'version-check.mjs'), 'utf-8');
+  const optOut = /Boolean\(([^)]*)\)/.exec(checkSrc.slice(checkSrc.indexOf('isOptedOut')));
+  assert.ok(optOut, 'expected the isOptedOut expression in version-check.mjs');
+  const vars = [...optOut[1].matchAll(/env\.([A-Z_]+)/g)].map((m) => m[1]);
+  assert.ok(vars.length >= 3, `expected the opt-out variables, got ${vars}`);
+  for (const v of vars) {
+    assert.ok(doc.includes(v), `doc must name the opt-out variable ${v}`);
+  }
+  // `Boolean(a || b || c)` means an empty string is NOT an opt-out. The document said
+  // "set to any value" until this was caught; keep the distinction stated.
+  assert.match(
+    doc,
+    /non-empty value/,
+    'doc must say the opt-out needs a non-empty value, not merely being set',
+  );
+});
+
 // ── init.mjs still exits 1 on a malformed hooks.json (loader routed via helper) ─
 // loadHookMap now reads+parses through readCoreHooksConfig but keeps init's own
 // validation + process.exit(1). Copy the package, corrupt hooks.json, and run
