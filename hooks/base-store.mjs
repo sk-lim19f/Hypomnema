@@ -257,8 +257,9 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
 // machines editing DIFFERENT rows produce a whole-file hash mismatch that looks
 // exactly like a colliding edit even though nothing actually collided. When the
 // content a session is about to write still carries every LINE the disk copy
-// currently has, that write cannot have dropped anything anyone put there, so a
-// base-mismatch against it is safe to auto-advance instead of park.
+// currently has, in the same order, that write cannot have dropped or reshuffled
+// anything anyone put there, so a base-mismatch against it is safe to auto-advance
+// instead of park.
 //
 // An earlier version of this judged table DATA ROWS only, and that was unsound in
 // the direction that costs a file. Every overwrite target is a prose-and-table
@@ -269,52 +270,56 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
 // stopped row collection at zero, and `[].every()` is vacuously true — so on any
 // vault built from that template, a payload that dropped every row passed.
 //
-// Comparing whole lines has neither hole and needs no parser. It only ever narrows
-// the guard: anything it is not certain about still returns false.
+// Comparing whole lines in order has neither hole and needs no parser. It only ever
+// narrows the guard: anything it is not certain about still returns false.
 
 /**
- * Count every non-blank line (trimmed) in `content`. Counts, not a Set, so a line
- * the disk holds twice must appear twice: collapsing duplicates would let one of
- * two identical rows disappear unnoticed.
+ * Every line of `content` that carries something, VERBATIM. Only whitespace-only
+ * lines are dropped, and nothing is trimmed: trailing spaces are a markdown hard
+ * break and leading spaces are a code block, so a judge that trimmed would call
+ * their loss "nothing was dropped".
  *
- * @returns {Map<string, number>|null} null when `content` is not a string.
+ * @returns {string[]|null} null when `content` is not a string.
  */
-function lineCounts(content) {
+function contentLines(content) {
   if (typeof content !== 'string') return null;
-  const counts = new Map();
-  for (const raw of content.split('\n')) {
-    const line = raw.trim();
-    if (line === '') continue;
-    counts.set(line, (counts.get(line) ?? 0) + 1);
-  }
-  return counts;
+  return content.split('\n').filter((line) => line.trim() !== '');
 }
 
 /**
- * Whether `newContent` preserves every non-blank line of `diskContent`, character
- * for character and at least as many times. Line ORDER may change (that is the
- * point: a second writer appending its own row shifts nobody else's position); a
- * line that is missing, or present with altered text, is not a superset.
+ * Whether `newContent` preserves every content line of `diskContent`, character
+ * for character, as many times, AND in the same relative order. That is: disk's
+ * lines are a subsequence of the payload's.
  *
- * Blank lines are ignored on both sides: they carry no content a writer can lose,
- * and holding the payload to the disk copy's exact spacing would park nearly every
- * legitimate close.
+ * Order is part of the claim, not an incidental detail. In a markdown file a line's
+ * meaning comes from where it sits, so an order-blind judge passes payloads that
+ * destroy the document while keeping every line: frontmatter moved below the first
+ * heading stops being frontmatter, and an item moved from one section to another is
+ * reclassified without a character changing. Both were reproduced against the real
+ * vault. Requiring order costs nothing the guard was built for, because the case it
+ * exists for is a second machine APPENDING its own row, which shifts nobody.
+ *
+ * Blank lines are the one thing ignored, on both sides. They carry nothing a writer
+ * can lose, and holding a payload to the disk copy's exact spacing would park nearly
+ * every legitimate close.
  *
  * Fail-closed by construction. A non-string on either side returns false, and so
- * does an empty disk side: "there is nothing here to preserve" is not the same
- * fact as "this write preserved everything", and only the second one earns a pass.
+ * does an empty disk side: "there is nothing here to preserve" is not the same fact
+ * as "this write preserved everything", and only the second one earns a pass.
  *
  * @returns {boolean}
  */
 export function isLineSuperset(diskContent, newContent) {
-  const disk = lineCounts(diskContent);
-  const next = lineCounts(newContent);
+  const disk = contentLines(diskContent);
+  const next = contentLines(newContent);
   if (disk === null || next === null) return false;
-  if (disk.size === 0) return false;
-  for (const [line, n] of disk) {
-    if ((next.get(line) ?? 0) < n) return false;
+  if (disk.length === 0) return false;
+  let i = 0;
+  for (const line of next) {
+    if (i === disk.length) break;
+    if (line === disk[i]) i += 1;
   }
-  return true;
+  return i === disk.length;
 }
 
 /**

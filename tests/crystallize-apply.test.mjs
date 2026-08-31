@@ -843,7 +843,10 @@ test('apply aborted at preflight-lint never creates the index (no side effect on
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false, `expected preflight to abort: ${r.stdout}`);
     assert.equal(out.stage, 'preflight-lint', `expected preflight-lint stage: ${r.stdout}`);
-    assert.ok(!existsSync(indexPath), 'a preflight abort must not create the index as a side effect');
+    assert.ok(
+      !existsSync(indexPath),
+      'a preflight abort must not create the index as a side effect',
+    );
   });
 });
 
@@ -854,7 +857,7 @@ test('apply aborted at preflight-lint never creates the index (no side effect on
 // winner's bytes survive. A plain existsSync-then-atomicWrite (tmp+rename)
 // would clobber it: rename replaces whatever sits at the destination the
 // instant it fires, existing or not.
-test('ensureProjectIndex: a file created after the caller\'s missing-check survives untouched (no-replace create)', () => {
+test("ensureProjectIndex: a file created after the caller's missing-check survives untouched (no-replace create)", () => {
   withTmpDir((dir) => {
     const relPath = join('projects', 'race-project', 'index.md');
     const dest = join(dir, relPath);
@@ -865,7 +868,11 @@ test('ensureProjectIndex: a file created after the caller\'s missing-check survi
     // (human or a concurrent close) created the file, THEN this call runs.
     writeFileSync(dest, winnerContent);
     const result = ensureProjectIndex(dir, 'race-project', relPath, '2026-06-01');
-    assert.equal(result, null, 'ensureProjectIndex must report a no-op, not a create, on this race');
+    assert.equal(
+      result,
+      null,
+      'ensureProjectIndex must report a no-op, not a create, on this race',
+    );
     assert.equal(
       readFileSync(dest, 'utf-8'),
       winnerContent,
@@ -917,13 +924,16 @@ test('a base-mismatch on root hot.md auto-resolves when the payload preserves ev
     // snapshot: the normal multi-machine pointer-table pattern.
     const betaRow = `| beta-project | ${today} | [[projects/beta-project/hot]] |`;
     const original = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    const originalRow = original.split('\n').find((l) => l.startsWith('| test-project'));
-    writeFileSync(join(dir, 'hot.md'), `${original.trimEnd()}\n${betaRow}\n`);
+    const drifted = `${original.trimEnd()}\n${betaRow}\n`;
+    writeFileSync(join(dir, 'hot.md'), drifted);
 
-    // This session's own close carries BOTH rows, just reordered: the other
-    // writer's row is preserved, only its position moved.
+    // This session's own close carries every line the other writer left, in the
+    // order they are in on disk, and adds its own row after them. That is the
+    // multi-machine pointer-table pattern the auto-advance exists for: appending
+    // shifts nobody, so nothing anyone wrote can be lost by this write.
+    const gammaRow = `| gamma-project | ${today} | [[projects/gamma-project/hot]] |`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.rootHot = { content: original.replace(originalRow, `${betaRow}\n${originalRow}`) };
+    payload.rootHot = { content: `${drifted.trimEnd()}\n${gammaRow}\n` };
 
     const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(
@@ -994,7 +1004,10 @@ test('a base-unknown target still parks even for a superset payload (the escape 
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     const rootHotConflict = out.conflicts.find((c) => c.target === 'hot.md');
-    assert.ok(rootHotConflict, `hot.md must still be in conflicts: ${JSON.stringify(out.conflicts)}`);
+    assert.ok(
+      rootHotConflict,
+      `hot.md must still be in conflicts: ${JSON.stringify(out.conflicts)}`,
+    );
     assert.equal(
       rootHotConflict.reason,
       'base-unknown',
