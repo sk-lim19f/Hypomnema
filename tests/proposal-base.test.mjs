@@ -3952,6 +3952,62 @@ test('ISSUE-63: only table rows may be the thing inserted', () => {
     false,
     'a heading is not a row',
   );
+  // A separator is pipe-shaped and still not insertable: dropping one into a table
+  // body splits the table and re-headers everything under it.
+  assert.equal(
+    isRowInsertionOnly(disk, disk.replace(ROW_ALPHA, `${ROW_ALPHA}\n|---|---|`)),
+    false,
+    'a separator splits the table it lands in',
+  );
+});
+
+// Hole 4: shape without place. A row-shaped line is only a row where a table is.
+// Dropped into frontmatter it makes the YAML invalid, and dropped into an indented
+// block it becomes code — both accepted by the judge that checked shape alone, both
+// measured against the real vault.
+test('ISSUE-63: an inserted row must land inside a table that was already there', () => {
+  const disk = hotTable([ROW_ALPHA]);
+  assert.equal(
+    isRowInsertionOnly(disk, disk.replace('type: reference', 'type: reference\n| injected |')),
+    false,
+    'a row-shaped line inside frontmatter breaks the YAML',
+  );
+  assert.equal(
+    isRowInsertionOnly('    alpha\n    beta\n', '    alpha\n    | injected |\n    beta\n'),
+    false,
+    'an indented pipe line is code, not a table row',
+  );
+  // The line above is refused on PLACE (its neighbour is not a pipe line), so it
+  // says nothing about the shape test. This one lands right inside a real table
+  // body, where only the raw-line shape check can still refuse it: four spaces of
+  // indentation ends the table and opens a code block.
+  const table = '| a | b |\n|---|---|\n| 1 | 2 |\n';
+  assert.equal(
+    isRowInsertionOnly(table, '| a | b |\n|---|---|\n| 1 | 2 |\n    | 3 | 4 |\n'),
+    false,
+    'an indented row inside a table body breaks the table it appears to join',
+  );
+  assert.equal(
+    isRowInsertionOnly(table, '| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n'),
+    true,
+    'the same row unindented is the legitimate insertion',
+  );
+  assert.equal(
+    isRowInsertionOnly(disk, `${disk}| stray | row | here |\n`),
+    false,
+    'a row appended after the prose starts a new table of its own',
+  );
+});
+
+// `''.split('\n')` yields one phantom empty line, which used to let a payload match
+// it and then append. An empty file has nothing to preserve, so nothing is proved.
+test('ISSUE-63: an empty disk, or bytes after its trailing newline, fail closed', () => {
+  assert.equal(isRowInsertionOnly('', '\n| injected |'), false, 'an empty disk proves nothing');
+  assert.equal(
+    isRowInsertionOnly('a\n', 'a\n\n| x |'),
+    false,
+    'a blank line plus a row after the last line is not an insertion into a table',
+  );
 });
 
 test('ISSUE-63: an unreadable side, and a payload identical to disk, fail closed', () => {

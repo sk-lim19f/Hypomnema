@@ -282,45 +282,70 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
 // adds must itself be a table row. A fence, a heading, a paragraph, even a blank line
 // is not a row, so none of them can ride along.
 
-/** True when `line`, trimmed, opens and closes a markdown table row with `|`. */
-function isTableRowLine(line) {
-  const t = String(line ?? '').trim();
-  return t.length > 1 && t.startsWith('|') && t.endsWith('|');
+/**
+ * True when `line` opens and closes a markdown table row with `|`. The raw line,
+ * NOT a trimmed one: an indented `| x |` is a line inside a code block, and calling
+ * that a table row is how a payload injects text into code.
+ */
+function isPipeLine(line) {
+  return typeof line === 'string' && line.length > 1 && line.startsWith('|') && line.endsWith('|');
+}
+
+/** True when `line` is a table's header/data separator rather than real content. */
+function isTableSeparatorLine(line) {
+  return isPipeLine(line) && line.includes('-') && /^[|:\s-]+$/.test(line);
+}
+
+/** True when `line` is a table DATA row: pipe-delimited content, not a separator. */
+function isTableDataRow(line) {
+  return isPipeLine(line) && !isTableSeparatorLine(line);
 }
 
 /**
- * Whether `newContent` is `diskContent` with table rows inserted and nothing else
- * changed: every line of `diskContent` survives verbatim, in the same order, blank
- * lines included, and every line `newContent` adds is a markdown table row.
+ * Whether `newContent` is `diskContent` with table data rows inserted into a table
+ * that is already there, and nothing else changed at all.
  *
- * Blank lines count here, unlike in a line-only comparison. Dropping one merges two
- * paragraphs, and adding one splits a paragraph, neither of which is a row insertion.
+ * Three things must hold, and the third is the one earlier versions kept missing:
  *
- * Fail-closed by construction. A non-string on either side returns false; so does a
- * payload identical to disk, which cannot be what a base-MISMATCH is looking at and
- * so is a state this was never asked to judge.
+ *   • PRESERVATION. Every line of `diskContent` appears in `newContent` verbatim and
+ *     in order, blank lines included. Dropping a blank line merges two paragraphs and
+ *     adding one splits a paragraph, so blanks are content here.
+ *   • SHAPE. Every line `newContent` adds is a table data row. A separator is
+ *     excluded too: inserting one splits a table in half and re-headers everything
+ *     under it.
+ *   • PLACE. Every added line sits directly after a pipe line, so it lands inside a
+ *     table body that already existed. Shape alone is not enough. A row-shaped line
+ *     is only a row where a table is: dropped into frontmatter it makes the YAML
+ *     invalid, and the judge that checked shape alone accepted exactly that against
+ *     the real vault.
+ *
+ * Fail-closed by construction: an empty disk, a non-string on either side, and a
+ * payload identical to disk all return false. The last one is not a resolution to
+ * make, because a base MISMATCH is never looking at bytes that match.
  *
  * @returns {boolean}
  */
 export function isRowInsertionOnly(diskContent, newContent) {
   if (typeof diskContent !== 'string' || typeof newContent !== 'string') return false;
+  if (diskContent === '') return false;
   const disk = diskContent.split('\n');
   const next = newContent.split('\n');
-  const inserted = [];
   let i = 0;
-  for (const line of next) {
+  let inserted = 0;
+  for (let k = 0; k < next.length; k += 1) {
+    const line = next[k];
+    // The greedy scan takes the earliest match, which never forfeits a later one, so
+    // a disk line left unconsumed at the end means no matching exists at all.
     if (i < disk.length && line === disk[i]) {
       i += 1;
       continue;
     }
-    inserted.push(line);
+    if (!isTableDataRow(line)) return false;
+    if (k === 0 || !isPipeLine(next[k - 1])) return false;
+    inserted += 1;
   }
-  // A leftover disk line means something was deleted, altered, or moved: the greedy
-  // scan takes the earliest match, which never forfeits a later one, so failing to
-  // consume every disk line means no matching exists.
   if (i !== disk.length) return false;
-  if (inserted.length === 0) return false;
-  return inserted.every(isTableRowLine);
+  return inserted > 0;
 }
 
 /**
