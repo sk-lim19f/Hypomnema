@@ -113,12 +113,19 @@ export function findMarkerSpan(content, startMarker, endMarker) {
 // that was never ours has no recovery. So an unrecognized shape is always
 // treated as "not ours" and left standing, never as "close enough".
 
-const PRE_COMMIT_WORKER_LINE = /^node '(.+)' \|\| exit 1$/;
-const PRE_COMMIT_LINT_LINE = /^node '(.+)' --hypo-dir='(?:.+)' --strict \|\| exit 1$/;
+export const PRE_COMMIT_WORKER_LINE = /^node '(.+)' \|\| exit 1$/;
+// The second group used to be non-capturing: nothing here needed the embedded
+// --hypo-dir value, only the lint script path in group 1. parseWikiPreCommitRoot
+// below now reads it back (group 2) so upgrade.mjs's self-heal can preserve the
+// --hypo-dir a --lint-strict install already had baked in, rather than
+// substituting this run's args.hypoDir — those two can differ (upgrade run with
+// a different --hypo-dir than the one init baked in), and substituting silently
+// repoints the lint gate at the wrong vault.
+export const PRE_COMMIT_LINT_LINE = /^node '(.+)' --hypo-dir='(.+)' --strict \|\| exit 1$/;
 
 // Reverses shellSingleQuote()'s escaping (a literal `'` becomes `'\''`) so the
 // captured path can be compared against the suffix it must end in.
-function unescapeShellSingleQuoted(s) {
+export function unescapeShellSingleQuoted(s) {
   return s.split("'\\''").join("'");
 }
 
@@ -149,6 +156,84 @@ export function isOwnedWikiPreCommitBody(content, span) {
     if (!lint || !unescapeShellSingleQuoted(lint[1]).endsWith('/scripts/lint.mjs')) return false;
   }
   return true;
+}
+
+// Single-quote escaping prevents shell expansion of special chars (e.g. $HOME,
+// backticks) in a path baked into the hook. Shared by wikiPreCommitContent
+// (init.mjs's writer, upgrade.mjs's self-heal) and, via the regexes above,
+// by isOwnedWikiPreCommitBody's reader — one escaping scheme, one place.
+export function shellSingleQuote(p) {
+  return `'${p.replace(/'/g, "'\\''")}'`;
+}
+
+// `root` is the DURABLE install root the hook should resolve hypo-pre-commit.mjs
+// (and, when opted in, lint.mjs) through — not necessarily PKG_ROOT. In a dual
+// install (a manual/npm init while the plugin is enabled) PKG_ROOT is the
+// manual/npm checkout the dual-install notice tells the user to uninstall;
+// embedding it here would leave the vault's git hook dangling the moment they
+// do, breaking every wiki commit. Callers pass the preserved/positively-resolved
+// plugin root instead, so the hook points at the install that actually persists.
+//
+// The block runs its steps sequentially rather than tail-calling `exit $?` on
+// the first one, so a second step (the opt-in --lint-strict gate below) can
+// run after the .hypoignore guard instead of being unreachable dead code.
+// `lintStrict` is baked into the generated shim at install time, so toggling it
+// means re-running init with/without `--lint-strict` (or upgrade repointing an
+// existing install), not editing the hook by hand.
+//
+// `hypoDir` MUST be absolutized before it is baked in. Git runs a pre-commit
+// hook with cwd set to the wiki's own working-tree root, so a relative
+// `--hypo-dir` (e.g. from `hypo init --hypo-dir=wiki` run from its parent) is
+// re-resolved AT COMMIT TIME against that root instead of the directory the
+// caller meant — `wiki` becomes `<wiki-root>/wiki`, a path that doesn't exist,
+// and lint.mjs falls through to its own default resolution (HYPO_DIR/
+// hypo-config.md scan) and may silently lint an unrelated vault. `root` needs
+// no such treatment: every caller has already realpath'd it upstream, so it's
+// absolute at every call site.
+export function wikiPreCommitContent(root, hypoDir, lintStrict) {
+  const absHypoDir = resolve(hypoDir);
+  const worker = join(root, 'hooks', 'hypo-pre-commit.mjs');
+  const steps = [`node ${shellSingleQuote(worker)} || exit 1`];
+  if (lintStrict) {
+    const lintScript = join(root, 'scripts', 'lint.mjs');
+    steps.push(
+      `node ${shellSingleQuote(lintScript)} --hypo-dir=${shellSingleQuote(absHypoDir)} --strict || exit 1`,
+    );
+  }
+  return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\n${steps.join('\n')}\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+}
+
+// Read the install root, --lint-strict shape, and (when present) the embedded
+// --hypo-dir currently baked into a wiki's pre-commit hook, so upgrade.mjs can
+// self-heal it and doctor.mjs can report when it disagrees with the active
+// install — without either duplicating the body-shape rules
+// isOwnedWikiPreCommitBody already enforces. Returns `{ ok: false }` for
+// anything that isn't a body wikiPreCommitContent() could have written: a
+// missing/duplicated marker pair, a user's own hook, or one too malformed to
+// trust. `ok: true` results always carry an absolute `root` (validated by the
+// `/hooks/hypo-pre-commit.mjs` suffix check below, mirroring
+// isOwnedWikiPreCommitBody), a `lintStrict` flag, and `hypoDir`: the embedded
+// --hypo-dir value when `lintStrict` is true, else `null` (a plain hook never
+// bakes one in). The caller that repoints `root` on --apply must reuse this
+// `hypoDir` verbatim rather than the CURRENT run's --hypo-dir — the two are
+// not guaranteed to be the same directory.
+export function parseWikiPreCommitRoot(content) {
+  const span = findMarkerSpan(content, WIKI_PRE_COMMIT_MARKER_START, WIKI_PRE_COMMIT_MARKER_END);
+  if (!span.ok || !isOwnedWikiPreCommitBody(content, span)) return { ok: false };
+  const body = content.slice(span.startIdx + WIKI_PRE_COMMIT_MARKER_START.length, span.endIdx);
+  const steps = body.split('\n').slice(1, -2); // drop leading '', trailing 'exit 0' + ''
+  const worker = PRE_COMMIT_WORKER_LINE.exec(steps[0]);
+  const workerPath = unescapeShellSingleQuoted(worker[1]);
+  const root = workerPath.slice(0, -'/hooks/hypo-pre-commit.mjs'.length);
+  const lintStrict = steps.length === 2;
+  let hypoDir = null;
+  if (lintStrict) {
+    // isOwnedWikiPreCommitBody already confirmed steps[1] matches this shape,
+    // so the exec here cannot fail.
+    const lint = PRE_COMMIT_LINT_LINE.exec(steps[1]);
+    hypoDir = unescapeShellSingleQuoted(lint[2]);
+  }
+  return { ok: true, root, lintStrict, hypoDir };
 }
 
 // The exact text init.mjs's shellFunctionBlock() writes between the shell

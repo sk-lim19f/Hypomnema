@@ -156,16 +156,54 @@ export function selectPluginVersion(plugins) {
   return typeof v === 'string' ? v : null;
 }
 
-/** Channel-specific one-line update instruction. */
+/** The command that runs an upgrade apply, in the form the caller's channel can
+ *  actually run. A plugin-only install has no `hypomnema` on PATH: that binary is
+ *  the npm package's bin, while the plugin manifest ships commands only. And the
+ *  slash command takes no `--apply` argument, so naming the flag there describes
+ *  a call it does not make: it runs the check and appends --apply only after the
+ *  operator confirms.
+ *
+ *  Lives here because both hooks and scripts need it and the dependency only
+ *  runs one way (scripts import hooks, never the reverse). This file is already
+ *  in hooks.json's `shared` list, so it reaches every standalone install.
+ *
+ *  Use UPGRADE_APPLY_EITHER when the target channel is genuinely unknown, e.g.
+ *  an instruction about a DIFFERENT machine. */
+export function upgradeApplyHint(isPluginChannel) {
+  return isPluginChannel
+    ? '`/hypo:upgrade` (confirm the apply step)'
+    : '`hypomnema upgrade --apply`';
+}
+
+export const UPGRADE_APPLY_EITHER =
+  '`hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install)';
+
+/** Channel-specific one-line update instruction.
+ *
+ *  Every channel ends with the same second step. Installing a release does NOT
+ *  repoint the vault's git pre-commit hook: that hook holds an absolute path
+ *  baked in at init time, and only `upgrade --apply` rewrites it. No hook can
+ *  do it either (a hook must never invoke an apply path). Without this line the
+ *  user updates, sees the new version string, and keeps committing through the
+ *  install they had when they first ran init. */
 export function buildUpdateLine(channel, current, latest) {
   const head = `[Hypomnema] Update available! ${current} → ${latest}`;
+  // The repoint step has to be RUNNABLE on the channel it is printed for. A
+  // plugin-only install has no `hypomnema` on PATH (that binary is the npm
+  // package's bin; the plugin manifest ships commands only), so its form is the
+  // slash command. And the slash command takes no --apply argument: that
+  // command runs the check first and only appends --apply after the operator
+  // confirms, so naming the flag there would describe a call the command does
+  // not make. Both mistakes are the same class as naming a flag no script parses.
+  const repoint = (cmd) => `\n  → then: ${cmd}  (repoints the vault's git hook at the new install)`;
   if (channel === 'plugin') {
-    return `${head}\n  → run: /plugin marketplace update hypomnema  then  /reload-plugins`;
+    return `${head}\n  → run: /plugin marketplace update hypomnema  then  /reload-plugins${repoint(upgradeApplyHint(true))}`;
   }
-  if (channel === 'npm') {
-    return `${head}\n  → run: npm install -g hypomnema`;
-  }
-  return `${head}\n  → npm i -g hypomnema  (or  /plugin marketplace update hypomnema && /reload-plugins)`;
+  // The only remaining displayed channel is npm: computeNotice drops 'unknown'
+  // before anything renders, and a dual install reports the channel of the hook
+  // root actually running, never a third "mixed" value. A branch for one would
+  // be code no user reaches.
+  return `${head}\n  → run: npm install -g hypomnema${repoint(upgradeApplyHint(false))}`;
 }
 
 // ── cache freshness + notice decision (pure) ─────────────────────────────────

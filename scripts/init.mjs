@@ -32,7 +32,7 @@ import {
   renameSync,
   unlinkSync,
 } from 'fs';
-import { join, basename, dirname, resolve } from 'path';
+import { join, basename, dirname } from 'path';
 import { homedir } from 'os';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -47,6 +47,7 @@ import {
   SHELL_MARKER_START,
   SHELL_MARKER_END,
   SHELL_FUNCTION_BODY,
+  wikiPreCommitContent,
 } from './lib/git-hooks-dir.mjs';
 import { readCoreHooksConfig } from './lib/core-hooks.mjs';
 import {
@@ -756,50 +757,12 @@ function installPkgGitHook(dryRun) {
 }
 
 // ── wiki pre-commit hook ─────────────────────────────────────────────────────
-
-// Single-quote escaping prevents shell expansion of special chars (e.g. $HOME, backticks) in path
-function shellSingleQuote(p) {
-  return `'${p.replace(/'/g, "'\\''")}'`;
-}
-
-// `root` is the DURABLE install root the hook should resolve hypo-pre-commit.mjs
-// (and, when opted in, lint.mjs) through — not necessarily PKG_ROOT. In a dual
-// install (a manual/npm init while the plugin is enabled) PKG_ROOT is the
-// manual/npm checkout the dual-install notice tells the user to uninstall;
-// embedding it here would leave the vault's git hook dangling the moment they
-// do, breaking every wiki commit. The caller passes the preserved plugin-owned
-// root instead (see `durableRoot`), so the hook points at the install that
-// actually persists.
 //
-// The block runs its steps sequentially rather than tail-calling `exit $?` on
-// the first one, so a second step (the opt-in --lint-strict gate below) can
-// run after the .hypoignore guard instead of being unreachable dead code.
-// `lintStrict` is baked into the generated shim at install time — the same
-// pattern already used for HYPOMNEMA_ROOT/HYPOMNEMA_GIT_DIR in
-// install-git-hooks.mjs — so toggling it means re-running init with/without
-// `--lint-strict`, not editing the hook by hand.
-//
-// `hypoDir` MUST be absolutized before it is baked in. Git runs a pre-commit
-// hook with cwd set to the wiki's own working-tree root, so a relative
-// `--hypo-dir` (e.g. from `hypo init --hypo-dir=wiki` run from its parent) is
-// re-resolved AT COMMIT TIME against that root instead of the directory the
-// caller meant — `wiki` becomes `<wiki-root>/wiki`, a path that doesn't exist,
-// and lint.mjs falls through to its own default resolution (HYPO_DIR/
-// hypo-config.md scan) and may silently lint an unrelated vault. `worker`
-// needs no such treatment: `root` is already realpath'd upstream (see
-// `durableRoot` / PKG_ROOT resolution), so it's absolute at every call site.
-function wikiPreCommitContent(root, hypoDir, lintStrict) {
-  const absHypoDir = resolve(hypoDir);
-  const worker = join(root, 'hooks', 'hypo-pre-commit.mjs');
-  const steps = [`node ${shellSingleQuote(worker)} || exit 1`];
-  if (lintStrict) {
-    const lintScript = join(root, 'scripts', 'lint.mjs');
-    steps.push(
-      `node ${shellSingleQuote(lintScript)} --hypo-dir=${shellSingleQuote(absHypoDir)} --strict || exit 1`,
-    );
-  }
-  return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\n${steps.join('\n')}\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
-}
+// shellSingleQuote and wikiPreCommitContent live in lib/git-hooks-dir.mjs, not
+// here: upgrade.mjs's self-heal (repointing an existing hook at the current
+// durable root) and doctor.mjs's drift check both need to build/parse the
+// exact same body this writer produces, so one copy is shared rather than
+// three independent copies silently drifting apart.
 
 function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
   const { dir: hooksDir, skip } = hooksDirForInstall(hypoDir);

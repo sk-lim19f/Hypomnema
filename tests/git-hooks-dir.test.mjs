@@ -24,6 +24,10 @@ import {
   resolveGitHooksDir,
   hooksDirForInstall,
   unsafeHookTargetReason,
+  parseWikiPreCommitRoot,
+  wikiPreCommitContent,
+  WIKI_PRE_COMMIT_MARKER_START,
+  WIKI_PRE_COMMIT_MARKER_END,
 } from '../scripts/lib/git-hooks-dir.mjs';
 import { runWithHome, withTmpHome } from './helpers.mjs';
 
@@ -359,4 +363,68 @@ test('--force-commands does not write the backup through a symlinked .bak', () =
     rmSync(outside, { recursive: true, force: true });
     rmSync(repo, { recursive: true, force: true });
   }
+});
+
+// ── parseWikiPreCommitRoot ───────────────────────────────────────────────────
+// Reads back what wikiPreCommitContent() wrote, so upgrade.mjs's self-heal and
+// doctor.mjs's drift warning can trust it. Untested until now: no ok:false
+// input had a single assertion anywhere in the suite, despite this being the
+// one function standing between a hostile/hand-edited hook and upgrade.mjs
+// deciding it is safe to rewrite.
+
+suite('git-hooks-dir.mjs — parseWikiPreCommitRoot');
+
+test('parseWikiPreCommitRoot: round-trips a plain (non --lint-strict) hook', () => {
+  const content = wikiPreCommitContent('/opt/hypomnema', '/home/me/hypomnema', false);
+  const parsed = parseWikiPreCommitRoot(content);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.root, '/opt/hypomnema');
+  assert.equal(parsed.lintStrict, false);
+  assert.equal(parsed.hypoDir, null, 'a plain hook never bakes in a --hypo-dir');
+});
+
+test('parseWikiPreCommitRoot: round-trips a --lint-strict hook, including the embedded --hypo-dir', () => {
+  const content = wikiPreCommitContent('/opt/hypomnema/1.4.0', '/home/me/vault', true);
+  const parsed = parseWikiPreCommitRoot(content);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.root, '/opt/hypomnema/1.4.0');
+  assert.equal(parsed.lintStrict, true);
+  assert.equal(
+    parsed.hypoDir,
+    '/home/me/vault',
+    'the --lint-strict step must give back the exact --hypo-dir it was built with',
+  );
+});
+
+test('parseWikiPreCommitRoot: rejects a duplicated marker pair', () => {
+  const once = wikiPreCommitContent('/opt/hypomnema', '/home/me/vault', false);
+  // Two full copies concatenated: findMarkerSpan sees two starts and two
+  // ends, the exact forged-marker shape a hand-edited/merged hook can produce.
+  const doubled = once + once;
+  assert.equal(parseWikiPreCommitRoot(doubled).ok, false);
+});
+
+test("parseWikiPreCommitRoot: rejects a marker pair wrapped around a user's own hook body", () => {
+  // The forged-marker precedent this mirrors (2026-08-27): a marker pair is
+  // trivial to wrap around arbitrary content, and nothing about the markers
+  // themselves proves the body inside is ours.
+  const forged = `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\necho USER_OWNED_DEPLOY_CHECK\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+  assert.equal(parseWikiPreCommitRoot(forged).ok, false);
+});
+
+test('parseWikiPreCommitRoot: rejects a body missing the trailing exit 0', () => {
+  const content = wikiPreCommitContent('/opt/hypomnema', '/home/me/vault', false);
+  const mangled = content.replace('exit 0\n', '');
+  assert.equal(parseWikiPreCommitRoot(mangled).ok, false);
+});
+
+test('parseWikiPreCommitRoot: rejects a worker line pointing outside hooks/hypo-pre-commit.mjs', () => {
+  const content = wikiPreCommitContent('/opt/hypomnema', '/home/me/vault', false)
+    // Same "|| exit 1" shape, but the referenced script is not ours.
+    .replace('hooks/hypo-pre-commit.mjs', 'hooks/some-other-script.mjs');
+  assert.equal(parseWikiPreCommitRoot(content).ok, false);
+});
+
+test('parseWikiPreCommitRoot: rejects content with no marker at all', () => {
+  assert.equal(parseWikiPreCommitRoot('#!/bin/sh\necho hi\n').ok, false);
 });

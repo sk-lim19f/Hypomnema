@@ -14,7 +14,7 @@ You are running `/hypo:upgrade`. Check if the installed Hypomnema wiki is out of
 
 ## Step 1 — Run script
 
-Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` or reinstall instead of guessing the cache layout.
+Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install) or reinstall instead of guessing the cache layout.
 
 If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag.
 
@@ -28,7 +28,7 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/upgrade.mjs [--hypo-dir="<path>"]
 
 Show the output verbatim.
 
-> **Plugin installs**: if the output begins with `ℹ Plugin install detected`, the core hooks, slash commands, and `settings.json` wiring are managed by the Claude Code plugin loader — **not** by `/hypo:upgrade`. Do **not** run `--apply` expecting it to update them (it intentionally skips those to avoid double-registering every hook). To upgrade the plugin itself: `/plugin marketplace update hypomnema` then `/reload-plugins`. `--apply` in plugin mode applies vault-side migrations (SCHEMA, `.hypoignore`), refreshes package metadata, and still syncs any vault extensions — but does **not** install the core hooks/commands/settings (the plugin provides those).
+> **Plugin installs**: if the output begins with `ℹ Plugin install detected`, the core hooks, slash commands, and `settings.json` wiring are managed by the Claude Code plugin loader — **not** by `/hypo:upgrade`. Do **not** run `--apply` expecting it to update them (it intentionally skips those to avoid double-registering every hook). To upgrade the plugin itself: `/plugin marketplace update hypomnema` then `/reload-plugins`. **Then run `--apply` anyway**: the vault's git pre-commit hook holds an absolute path baked in at init time, and reloading the plugin does not move it, so without that step every wiki commit keeps running the install you had when you first ran init. `--apply` in plugin mode applies vault-side migrations (SCHEMA, `.hypoignore`), refreshes package metadata, and still syncs any vault extensions — but does **not** install the core hooks/commands/settings (the plugin provides those).
 
 > **Note**: A major SCHEMA bump is only **detected** in this step. The informational `MIGRATION-vX.Y.md` file is written later by `--apply` (Step 4) and only on a major bump. `SCHEMA.md` is never auto-overwritten.
 

@@ -58,6 +58,7 @@ import {
   pkgRootNullAlreadyNotified,
   markPkgRootNullNotified,
   clearPkgRootNullNotified,
+  UPGRADE_APPLY_EITHER,
 } from './version-check.mjs';
 import { snapshotBase, overwriteTargets } from './base-store.mjs';
 import { listProposals } from './proposal-store.mjs';
@@ -263,7 +264,7 @@ function buildPkgRootDriftNotice() {
       `\`${status.self}\`.\n` +
       `  Hooks already resolved the correct root for this session — this is a ` +
       `heads-up, not a blocker.\n` +
-      `  → run \`/hypo:upgrade --apply\` to bring hypo-pkg.json back in sync.`
+      `  → run \`/hypo:upgrade\` and confirm the apply step to bring hypo-pkg.json back in sync.`
     );
   } catch {
     return '';
@@ -301,9 +302,8 @@ function buildPkgRootNullNotice() {
       `[Hypomnema] Package root unresolved: this install's hooks cannot locate ` +
       `their own package, so PreCompact's lint/feedback checks are silently ` +
       `skipped this session.\n` +
-      `  → run \`hypomnema upgrade --apply\` to sync this install's hook copies ` +
-      `with the current package (the \`/hypo:upgrade --apply\` slash command does ` +
-      `the same thing, where slash commands were installed). \`/hypo:init\` will ` +
+      `  → run ${UPGRADE_APPLY_EITHER} to sync this install's hook copies ` +
+      `with the current package. \`/hypo:init\` will ` +
       `NOT fix this — it skips every hook file that already exists.\n` +
       `  → or run \`hypomnema doctor\` to see what's missing.`
     );
