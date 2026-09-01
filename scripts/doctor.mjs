@@ -59,7 +59,12 @@ import {
   computeHooksDigest,
 } from './lib/pkg-provenance.mjs';
 import { resolveCliOnPath, classifyInstall } from '../hooks/version-check.mjs';
-import { isHypomnemaPluginEnabled } from './lib/plugin-detect.mjs';
+import {
+  isHypomnemaPluginEnabled,
+  enabledHypomnemaPluginKey,
+  usablePkgRoot,
+  leafVersionDrift,
+} from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -1839,6 +1844,116 @@ function checkStaleSibling() {
   }
 }
 
+// ── plugin cache leaf version (plugin channel) ──────────────────────────────
+//
+// `/plugin marketplace update` names its cache directory after the release it
+// copies in (`cache/<marketplace>/hypo/<version>/`, per the plugin-channel
+// invariant in this repo's CLAUDE.md) and skips the copy whenever that version
+// string has not moved, so a leaf can end up naming an older release than the
+// package.json actually sitting inside it (2026-08-29 QA constructed that shape:
+// leaf "1.7.3", package.json "1.7.4"). This is the ONLY surface for that signal.
+// resolveEnabledPluginRoot (lib/plugin-detect.mjs) deliberately does NOT exclude a
+// drifted candidate: an earlier revision did, and excluding it makes that function
+// return null. init's resolveDurableRoot then tries the recorded pkgRoot and, when that
+// is unusable too, PKG_ROOT, which in a dual install is a removable npm checkout that
+// would get baked into the vault's git hook. So resolution stays permissive
+// and reporting lives here, named per-entry so a user can see exactly which registry
+// path disagrees with itself and what it actually contains.
+//
+// Only meaningful when the Hypomnema plugin is actually enabled: an entry in
+// installed_plugins.json for a disabled/other plugin proves nothing about this
+// install, so the check is silent (not even a pass) when the plugin key is not
+// enabled in settings.json.
+function checkPluginLeafVersion() {
+  const settingsPath = join(HOME, '.claude', 'settings.json');
+  const key = enabledHypomnemaPluginKey(settingsPath);
+  if (!key) return; // plugin not enabled, nothing to verify
+
+  const registryPath = join(HOME, '.claude', 'plugins', 'installed_plugins.json');
+  let reg;
+  try {
+    reg = JSON.parse(readFileSync(registryPath, 'utf-8'));
+  } catch {
+    warn(
+      'Plugin cache leaf version',
+      `Cannot read ${registryPath}, so the plugin cache directory's identity cannot be verified`,
+    );
+    return;
+  }
+  const entries =
+    reg &&
+    typeof reg.plugins === 'object' &&
+    !Array.isArray(reg.plugins) &&
+    Array.isArray(reg.plugins[key])
+      ? reg.plugins[key]
+      : null;
+  if (!entries || entries.length === 0) {
+    warn(
+      'Plugin cache leaf version',
+      `No registry entry for ${key} in ${registryPath}, so the plugin cache directory's identity cannot be verified`,
+    );
+    return;
+  }
+
+  // Deduped by installPath: one plugin key routinely carries several registry
+  // entries (a user-scope and a project-scope row) that name the SAME directory.
+  // Counting rows instead of paths reports "2 plugin cache path(s)" and lists the
+  // identical path twice — both the count and the list mislead about how many
+  // installs are actually drifted.
+  const driftedByPath = new Map();
+  const seen = new Set();
+  let compared = 0;
+  for (const e of entries) {
+    const installPath = e && typeof e.installPath === 'string' ? e.installPath : null;
+    if (!installPath || seen.has(installPath)) continue;
+    seen.add(installPath);
+    if (!usablePkgRoot(installPath)) continue;
+    const d = leafVersionDrift(installPath);
+    if (!d.checked) continue;
+    compared += 1;
+    if (d.drift) {
+      driftedByPath.set(
+        installPath,
+        `${installPath} (leaf says v${d.leaf}, package.json says v${d.manifestVersion})`,
+      );
+    }
+  }
+  const drifted = [...driftedByPath.values()];
+
+  // "Nothing drifted" and "nothing was comparable" are different answers, and this check
+  // used to give the same one for both. A path that is unreadable, or whose leaf is not
+  // version-named, was never compared — reporting "matches" there states a fact nobody
+  // established. The function already warns on its other two unverifiable states (an
+  // unreadable registry, a key with no entries), so passing here was the odd one out.
+  if (compared === 0) {
+    warn(
+      'Plugin cache leaf version',
+      `The plugin is enabled and the registry names ${key}, but no path it names could be ` +
+        `compared: none is a readable package dir with a version-named leaf. Common for a ` +
+        `local or dev marketplace checkout. The cache directory's identity is unverified; ` +
+        `this is not a statement that the installed version matches.`,
+    );
+  } else if (drifted.length === 0) {
+    pass(
+      'Plugin cache leaf version',
+      `Cache directory name matches the package installed inside it (${compared} path(s) compared)`,
+    );
+  } else {
+    // Scoped to the paths themselves. resolveEnabledPluginRoot picks ONE entry
+    // (user scope first, then any usable one), so a drifted project-scope row beside a
+    // healthy user-scope row is not the root Hypomnema actually runs from. Claiming
+    // "Hypomnema is silently running a different version" for every drifted row
+    // overstates what was measured.
+    warn(
+      'Plugin cache leaf version',
+      `${drifted.length} plugin cache path(s) whose directory name disagrees with the release ` +
+        `installed inside it: ${drifted.join(', ')}. Anything resolving through such a path ` +
+        `runs a different version than the name claims. Run ` +
+        `\`/plugin marketplace update hypomnema\` then \`/reload-plugins\`, or reinstall the plugin.`,
+    );
+  }
+}
+
 // ── provenance sidecar (manual/npm channel) ────────────────────────────────────
 //
 // `.hypo-provenance.json` lives next to a standalone-copied hooks/ dir
@@ -2106,6 +2221,7 @@ checkHooks(coreManagedByPlugin);
 checkSettingsJson(coreManagedByPlugin);
 checkPkgIntegrity(args.claudeHome);
 checkStaleSibling();
+checkPluginLeafVersion();
 if (args.codex) checkCodexPaths();
 if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
