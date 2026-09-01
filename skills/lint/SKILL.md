@@ -18,14 +18,14 @@ You are running `/hypo:lint`. Validate all wiki pages for frontmatter correctnes
 
 Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` or reinstall instead of guessing the cache layout.
 
-If the user specified a wiki directory, pass it as `--wiki-dir="<path>"`. Otherwise omit the flag and the script resolves the wiki root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
+If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise omit the flag and the script resolves the Hypomnema root automatically via `HYPO_DIR` → `hypo-config.md` scan → `~/hypomnema`.
 
 ---
 
 ## Step 2 — Run lint
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/scripts/lint.mjs [--wiki-dir="<path>"] [--json] [--fix]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/lint.mjs [--hypo-dir="<path>"] [--json] [--fix]
 ```
 
 Options:

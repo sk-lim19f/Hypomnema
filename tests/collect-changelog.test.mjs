@@ -719,22 +719,52 @@ test('prompt surfaces: bundled-script references resolve via CLAUDE_PLUGIN_ROOT/
   surfaceFiles.push(join(REPO, 'templates', 'hypo-guide.md')); // the operational guide
 
   // Collect code-context text: fenced-block lines + inline `code` spans on prose lines.
-  const codeText = (md) => {
+  const codeLines = (md) => {
     const out = [];
     let inFence = false;
-    for (const line of md.split('\n')) {
+    md.split('\n').forEach((line, i) => {
       if (line.trim().startsWith('```')) {
         inFence = !inFence;
-        continue;
+        return;
       }
       if (inFence) {
-        out.push(line);
-        continue;
+        out.push({ text: line, lineNo: i + 1 });
+        return;
       }
       const spans = line.match(/`[^`]+`/g);
-      if (spans) out.push(spans.join(' '));
-    }
-    return out.join('\n');
+      if (spans) out.push({ text: spans.join(' '), lineNo: i + 1 });
+    });
+    return out;
+  };
+  // Keeps the ORIGINAL 1-based file line on every entry: a diagnostic pointing
+  // at an index into the stripped text sends the reader to the wrong place,
+  // which is worse than giving no line at all.
+  const codeText = (md) =>
+    codeLines(md)
+      .map((e) => e.text)
+      .join('\n');
+
+  // A logical shell command: physical lines glued on a trailing backslash.
+  const joinContinuations = (entries) => {
+    const out = [];
+    let buf = null;
+    let start = 0;
+    entries.forEach(({ text: raw, lineNo }) => {
+      const cont = /\\\s*$/.test(raw);
+      const body = raw.replace(/\\\s*$/, '');
+      if (buf === null) {
+        buf = body;
+        start = lineNo;
+      } else {
+        buf = `${buf} ${body.trim()}`;
+      }
+      if (!cont) {
+        out.push({ line: buf, startLine: start });
+        buf = null;
+      }
+    });
+    if (buf !== null) out.push({ line: buf, startLine: start });
+    return out;
   };
 
   // Known bundled-script basenames, derived from scripts/ so the gate stays current.
@@ -783,4 +813,101 @@ test('prompt surfaces: bundled-script references resolve via CLAUDE_PLUGIN_ROOT/
     0,
     `surfaces invoking a bundled script but missing the hypo-pkg.json resolution fallback: ${missingFallback.join(', ')}`,
   );
+
+  // Same surfaces, second question: does every flag a surface tells the model to
+  // pass actually get PARSED by the script it names? Most shipped scripts do not
+  // reject an unknown flag (init.mjs:210-220 is the exception, exiting 2), so a
+  // wrong one is usually dropped and the run falls through to default vault
+  // resolution while reporting success. That is how `--wiki-dir` sat
+  // in five SKILL.md files against scripts that only ever read `--hypo-dir`, with
+  // `crystallize` among them, so a close could have been written into a vault the
+  // user did not name. The same-named commands/*.md had it right the whole time,
+  // which is why this sweeps BOTH surfaces from the one `surfaceFiles` list above.
+  //
+  // Derive the parsed set, never `src.includes(flag)`: a substring test passes for
+  // `--apply`, `--check` and `--mark` against crystallize.mjs, because each is a
+  // prefix of a real flag AND appears in that file's own usage header. Those are
+  // the most likely next drift, and a substring guard waves them through.
+  //
+  // The path class includes `/` on purpose: templates/hypo-guide.md invokes
+  // scripts/lib/project-create.mjs, and a `[a-z0-9-]+` class silently skipped that
+  // surface entirely — neither swept nor reported as unswept, which is the exact
+  // hole the completeness check below exists to catch.
+  //
+  // ponytail: recognises the two arg-parsing shapes this repo uses (`arg === '--x'`
+  // and `arg.startsWith('--x=')`). A script that switches to a table-driven or
+  // third-party parser yields an empty set and fails loudly here rather than
+  // silently passing; retune this regex then.
+  const parsedFlags = (src) =>
+    new Set(
+      [...src.matchAll(/(?:===?\s*|startsWith\(\s*)['"`](--[a-z][a-z0-9-]*)=?['"`]/g)].map(
+        (m) => m[1],
+      ),
+    );
+  const flagCache = new Map();
+  const badFlags = [];
+  const sweptSurfaces = new Set();
+  for (const p of surfaceFiles) {
+    const rel = p.slice(REPO.length + 1);
+    const code = codeText(readFileSync(p, 'utf8'));
+    // Join backslash continuations into one logical shell command before
+    // scanning. The usage blocks that matter are written multi-line:
+    //   node ${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs \
+    //     [--hypo-dir="<path>"] \
+    //     [--json]
+    // A per-physical-line sweep sees the script name on one line and the flags
+    // on the next, matches neither against the other, and reports nothing. That
+    // is not hypothetical: graph, query, verify and crystallize all use this
+    // shape, so four of the five files this guard was written for were not
+    // actually covered by it, and a revert of their `--hypo-dir` passed green.
+    // The line number is the logical command's first physical line, which is
+    // where the reader has to look even when the flag sits on a continuation.
+    let lineNo = 0;
+    for (const { line, startLine } of joinContinuations(codeLines(readFileSync(p, 'utf8')))) {
+      lineNo = startLine;
+      const named = line.match(/scripts\/([a-z0-9/-]+\.mjs)/);
+      if (!named) continue;
+      const scriptPath = join(REPO, 'scripts', named[1]);
+      if (!existsSync(scriptPath)) {
+        // Not a silent skip: a surface naming a script that is not there is itself
+        // a finding, and the unresolved sweep above would not see a well-formed path.
+        badFlags.push(`${rel}:${lineNo} names scripts/${named[1]}, which does not exist`);
+        continue;
+      }
+      if (!flagCache.has(named[1]))
+        flagCache.set(named[1], parsedFlags(readFileSync(scriptPath, 'utf8')));
+      const parsed = flagCache.get(named[1]);
+      assert.ok(parsed.size > 0, `parsed-flag sweep found no flags in scripts/${named[1]}`);
+      sweptSurfaces.add(rel);
+      for (const flag of new Set(line.match(/--[a-z][a-z0-9-]*/g) || [])) {
+        if (!parsed.has(flag)) {
+          badFlags.push(
+            `${rel}:${lineNo} passes ${flag} to scripts/${named[1]}, which never parses it`,
+          );
+        }
+      }
+    }
+  }
+  assert.equal(
+    badFlags.length,
+    0,
+    `A prompt surface tells the model to pass a flag its script does not parse. ` +
+      `FIX THE DOCUMENT, not the script: the flag the script really takes is the ` +
+      `correct one, and adding a parser to match the doc would ship a second spelling. ` +
+      `Most scripts ignore an unknown flag rather than rejecting it (init.mjs is the ` +
+      `exception), so the value is usually dropped and the run falls through to default ` +
+      `vault resolution while reporting success.\n  ${badFlags.join('\n  ')}`,
+  );
+  // Guard the guard, per surface rather than by a global count: a threshold like
+  // ">= 5" against the real 24 stays green with five of six skills missing.
+  for (const p of surfaceFiles) {
+    const rel = p.slice(REPO.length + 1);
+    const code = codeText(readFileSync(p, 'utf8'));
+    if (/scripts\/[a-z0-9/-]+\.mjs/.test(code)) {
+      assert.ok(
+        sweptSurfaces.has(rel),
+        `${rel} names a bundled script but was not swept for flags`,
+      );
+    }
+  }
 });
