@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
+import { wikiPreCommitContent } from '../scripts/lib/git-hooks-dir.mjs';
 import { writeDualSkipProvenance } from '../scripts/lib/pkg-json.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
 import { test, suite } from './harness.mjs';
@@ -1533,6 +1534,267 @@ test('registry root usable at write time: writes the correction and returns true
   } finally {
     rmSync(registryDir, { recursive: true, force: true });
   }
+});
+
+// ── wiki pre-commit hook: install-root self-heal ────────────────────────────
+// init.mjs bakes an absolute install root into the vault's pre-commit hook. A
+// plugin-channel upgrade moves PKG_ROOT to a new version directory every
+// release, but nothing ever re-runs init afterward, so the hook keeps calling
+// whatever release happened to be current the day /hypo:init last ran, with no
+// signal anywhere (measured 2026-09-01: a vault hook pointed at a release four
+// months stale while the registry and hypo-pkg.json both agreed on the current
+// one). Judged by the SAME rule as the pkgRoot self-heal above: a positively-
+// resolved root that differs from what's embedded gets corrected; an
+// unresolvable one (null) must PRESERVE the existing pointer.
+
+suite('upgrade.mjs — wiki pre-commit hook root self-heal');
+
+// Writes a pre-commit hook via the SAME writer init.mjs itself uses (not a
+// hand-rolled string), so these tests exercise the real body shape and any
+// drift in that shape would show up in test (c)'s byte-identical assertion.
+// `embeddedHypoDir` defaults to `wiki` (the common case: --hypo-dir usually IS
+// the vault's own root) but callers that need to distinguish "preserved the
+// baked-in value" from "substituted this run's --hypo-dir" pass a different
+// one — see test (c) below.
+function seedWikiPreCommitHook(wiki, root, lintStrict, embeddedHypoDir = wiki) {
+  // git init must not read the developer's real ~/.gitconfig: a global
+  // core.hooksPath or init.templateDir there would make git look for the hook
+  // somewhere other than <wiki>/.git/hooks, and the assertions below (which
+  // read that exact path) would then pass or fail for the wrong reason. See
+  // CLAUDE.md's "every process a test spawns gets HOME pinned" rule.
+  spawnSync('git', ['init', wiki], {
+    stdio: 'ignore',
+    env: { ...process.env, HOME: SESSION_TMP_HOME },
+  });
+  const hooksDir = join(wiki, '.git', 'hooks');
+  mkdirSync(hooksDir, { recursive: true });
+  const hookPath = join(hooksDir, 'pre-commit');
+  writeFileSync(hookPath, wikiPreCommitContent(root, embeddedHypoDir, lintStrict), {
+    mode: 0o755,
+  });
+  return hookPath;
+}
+
+test('plugin mode: --apply repoints a stale pre-commit hook at the current install root', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, root, home, wiki }) => {
+    const staleRoot = join(tmpdir(), 'hypo-stale-root-4-months-old');
+    const hookPath = seedWikiPreCommitHook(wiki, staleRoot, false);
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `--apply should exit 0: ${r.stderr}\n${r.stdout}`);
+    const hook = readFileSync(hookPath, 'utf-8');
+    assert.ok(
+      hook.includes(join(realpathSync(root), 'hooks', 'hypo-pre-commit.mjs')),
+      `hook must be repointed at the active install root: ${hook}`,
+    );
+    assert.ok(!hook.includes(staleRoot), 'the stale root must not survive the correction');
+    assert.match(
+      r.stdout,
+      /Wiki pre-commit.*repointed/,
+      'report must surface the correction, not silence it',
+    );
+  });
+});
+
+test('dual install: --allow-dual-install does NOT change which root the vault hook gets', () => {
+  withDualInstall(true, ({ upgrade, home, wiki, root }) => {
+    // `--allow-dual-install` means "stop refusing to write the core surface
+    // twice". It says nothing about which install a vault's git hook should
+    // resolve through. Reading it as a root choice made upgrade repoint the
+    // hook at this npm/manual PKG_ROOT while doctor kept calling that stale
+    // against the registry root, so a user following doctor's advice silently
+    // undid their own run, and re-running WITH the flag changed nothing
+    // because upgrade already agreed with the manual root. The flag must be
+    // inert here: with and without it, wantRoot is the registry's answer.
+    seedWikiPreCommitHook(wiki, '/some/old/hypomnema/1.6.0', false);
+    const registryRoot = join(home, '.claude', 'plugins', 'cache', 'mp', 'hypo', '9.9.9');
+    mkdirSync(registryRoot, { recursive: true });
+    // usablePkgRoot() demands a package.json carrying a version; without it the
+    // resolver returns null for BOTH runs and the comparison below passes while
+    // measuring nothing. That is exactly how the first version of this test
+    // stayed green over a real divergence.
+    writeFileSync(join(registryRoot, 'package.json'), JSON.stringify({ version: '9.9.9' }));
+    writeFileSync(
+      join(home, '.claude', 'plugins', 'installed_plugins.json'),
+      JSON.stringify({
+        version: 2,
+        plugins: { 'hypomnema@hypomnema': [{ scope: 'user', installPath: registryRoot }] },
+      }),
+    );
+    const withoutFlag = JSON.parse(
+      runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json'], home).stdout,
+    ).wikiPreCommitRoot?.wantRoot;
+    const withFlag = JSON.parse(
+      runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json', '--allow-dual-install'], home).stdout,
+    ).wikiPreCommitRoot?.wantRoot;
+    assert.equal(
+      withFlag,
+      withoutFlag,
+      '--allow-dual-install must not move the vault hook target: doctor has no such flag, and the two tools disagreeing is what let a user undo their own repoint',
+    );
+    // Both runs must POSITIVELY resolve the registry root. A null on either side
+    // would let the equality above pass for the wrong reason.
+    assert.equal(
+      withoutFlag,
+      registryRoot,
+      `without the flag the hook target must be the registry root: ${withoutFlag}`,
+    );
+    assert.equal(
+      withFlag,
+      registryRoot,
+      `--allow-dual-install must not swap the hook target for this manual PKG_ROOT: ${withFlag}`,
+    );
+    assert.ok(
+      !String(withFlag).startsWith(root),
+      'the manual/npm checkout is never the durable hook root while a plugin install resolves',
+    );
+  });
+});
+
+test('dual install + no registry entry: --apply preserves the hook (null must not become overwrite)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    // Plugin enabled in settings.json, but no installed_plugins.json at all —
+    // resolveEnabledPluginRoot fails open to null, which must read as "cannot
+    // prove a correction is needed", never as "nothing to preserve".
+    const staleRoot = '/some/old/hypomnema/1.6.0';
+    const hookPath = seedWikiPreCommitHook(wiki, staleRoot, false);
+    const before = readFileSync(hookPath, 'utf-8');
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--json'], home);
+    assert.equal(r.status, 0, `dual-install --apply should exit 0: ${r.stderr}`);
+    assert.equal(
+      readFileSync(hookPath, 'utf-8'),
+      before,
+      'an unresolvable registry must preserve the existing hook untouched',
+    );
+    // Names WHY nothing moved: without this, "preserved" is indistinguishable
+    // from "git init never even created a hook to touch" (a real failure mode
+    // when git init inherits an ambient core.hooksPath / init.templateDir).
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.wikiPreCommitRoot?.current,
+      staleRoot,
+      'doctor/upgrade must have actually found and parsed the seeded hook',
+    );
+    assert.equal(
+      out.wikiPreCommitRoot?.wantRoot,
+      null,
+      'an unresolvable dual-install registry must report wantRoot as null, not a guess',
+    );
+  });
+});
+
+test("plugin mode: --apply on a --lint-strict hook preserves the EMBEDDED --hypo-dir, not this run's", () => {
+  withFakeUpgradeInstall(true, ({ upgrade, root, home, wiki }) => {
+    const staleRoot = join(tmpdir(), 'hypo-stale-lintstrict-root');
+    // Deliberately NOT `wiki` (the --hypo-dir this run's `--apply` passes), so
+    // a regression that substitutes the current run's --hypo-dir for the
+    // preserved embedded one is caught: upgrade.mjs previously called
+    // wikiPreCommitContent(wantRoot, args.hypoDir, ...) here, silently
+    // repointing the lint gate at whatever --hypo-dir happened to be passed
+    // this run rather than the one the hook was actually built for.
+    const embeddedHypoDir = join(tmpdir(), 'hypo-embedded-hypo-dir-differs-from-this-run');
+    const hookPath = seedWikiPreCommitHook(wiki, staleRoot, true, embeddedHypoDir);
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `--apply should exit 0: ${r.stderr}\n${r.stdout}`);
+    const hook = readFileSync(hookPath, 'utf-8');
+    assert.ok(
+      hook.includes(join(realpathSync(root), 'scripts', 'lint.mjs')),
+      `the --lint-strict step must survive the correction, not be dropped: ${hook}`,
+    );
+    assert.equal(
+      hook,
+      wikiPreCommitContent(realpathSync(root), embeddedHypoDir, true),
+      'a corrected --lint-strict hook must keep the embedded --hypo-dir, only the root moves',
+    );
+    assert.ok(
+      !hook.includes(wiki),
+      "this run's --hypo-dir must not leak into the hook when it differs from the embedded one",
+    );
+  });
+});
+
+test('plugin mode: --apply refuses a --lint-strict hook whose embedded --hypo-dir is relative', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, root, home, wiki }) => {
+    const staleRoot = join(tmpdir(), 'hypo-stale-relative-hypodir-root');
+    // seedWikiPreCommitHook cannot produce this: wikiPreCommitContent() resolves
+    // the value before baking it, so a relative --hypo-dir only ever reaches the
+    // hook through a hand edit. That edit still passes the ownership check
+    // (isOwnedWikiPreCommitBody validates the marker span and line shape, not
+    // whether the path is absolute), so the refusal branch in
+    // applyWikiPreCommitRoot is reachable in practice, not dead code. Without
+    // this test that branch has no red to prove it, and the next refactor that
+    // "helpfully" resolve()s the value would silently defeat it: upgrade's cwd
+    // is never what a relative --hypo-dir there was meant to mean.
+    const hookPath = seedWikiPreCommitHook(wiki, staleRoot, true);
+    const relative = readFileSync(hookPath, 'utf-8').replace(
+      /--hypo-dir='[^']*'/,
+      "--hypo-dir='relative/vault'",
+    );
+    writeFileSync(hookPath, relative, { mode: 0o755 });
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `a refusal must not fail the whole upgrade: ${r.stderr}`);
+    assert.equal(
+      readFileSync(hookPath, 'utf-8'),
+      relative,
+      'a hook with a relative embedded --hypo-dir must be left byte-for-byte untouched',
+    );
+    assert.ok(
+      !readFileSync(hookPath, 'utf-8').includes(realpathSync(root)),
+      'refusing means the root is not repointed either: the whole rewrite is skipped',
+    );
+  });
+});
+
+// This asserts doctor.mjs's output, which by area rules belongs in
+// tests/doctor.test.mjs, and it stays here anyway: it reuses
+// withFakeUpgradeInstall / seedWikiPreCommitHook, both local to this file, and
+// moving the assertion alone would mean lifting that fixture into
+// tests/helpers.mjs — the one file CLAUDE.md says to keep as small as
+// possible because every line in it is a conflict handed to someone else. One
+// misplaced assertion is a smaller cost than a second area now sharing a
+// fixture only this one needs.
+test('doctor reports a stale pre-commit root without excluding it from the active-install answer', () => {
+  withFakeUpgradeInstall(true, ({ root, home, wiki }) => {
+    const staleRoot = join(tmpdir(), 'hypo-stale-doctor-root');
+    seedWikiPreCommitHook(wiki, staleRoot, false);
+    const doctor = join(root, 'scripts', 'doctor.mjs');
+    const r = spawnSync(process.execPath, [doctor, `--hypo-dir=${wiki}`, '--json'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    const out = JSON.parse(r.stdout);
+    const rootCheck = out.find((c) => c.label === 'git hooks/pre-commit root');
+    assert.ok(rootCheck, `expected a pre-commit root drift check: ${r.stdout}`);
+    assert.equal(rootCheck.status, 'warn', 'a stale root must be reported, not silently passed');
+    assert.ok(
+      rootCheck.detail.includes(staleRoot),
+      `detail must name the stale root: ${rootCheck.detail}`,
+    );
+    // The recovery command has to be RUNNABLE on the channel it is printed for.
+    // This fixture is a plugin install, which has no `hypomnema` on PATH: the
+    // CLI bin belongs to the npm package, the plugin manifest ships commands
+    // only. Naming the binary here would send a plugin user to a command they
+    // cannot run, the same defect the update notifier had.
+    assert.match(
+      rootCheck.detail,
+      /\/hypo:upgrade/,
+      `a plugin install must be pointed at the slash command: ${rootCheck.detail}`,
+    );
+    assert.doesNotMatch(
+      rootCheck.detail,
+      /hypomnema upgrade --apply/,
+      `a plugin install must not be told to run the npm binary: ${rootCheck.detail}`,
+    );
+    // The plugin-cache leaf-drift precedent this mirrors exists precisely
+    // because excluding a drifted root from resolution left users pointed at a
+    // directory that no longer existed — reporting must stay additive, so the
+    // active root doctor names here must still be a real, resolvable install.
+    assert.ok(
+      existsSync(realpathSync(root)),
+      'the root doctor names as active must still resolve to a real directory',
+    );
+    const markerCheck = out.find((c) => c.label === 'git hooks/pre-commit');
+    assert.equal(markerCheck?.status, 'pass', 'the marker/guard check itself must stay a pass');
+  });
 });
 
 // ── ISSUE-80: --apply refreshes the provenance sidecar (scripts/lib/pkg-provenance.mjs) ──

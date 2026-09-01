@@ -35,8 +35,9 @@ import {
   readdirSync,
   renameSync,
   unlinkSync,
+  chmodSync,
 } from 'fs';
-import { join } from 'path';
+import { join, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
@@ -55,6 +56,12 @@ import {
 import { syncExtensions } from './lib/extensions.mjs';
 import { writeProvenanceSidecar } from './lib/pkg-provenance.mjs';
 import { isHypomnemaPluginEnabled, resolveEnabledPluginRoot } from './lib/plugin-detect.mjs';
+import {
+  resolveGitHooksDir,
+  unsafeHookTargetReason,
+  parseWikiPreCommitRoot,
+  wikiPreCommitContent,
+} from './lib/git-hooks-dir.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 
 const HOME = homedir();
@@ -548,6 +555,78 @@ function applyGitignoreMigration(result) {
   return appended;
 }
 
+// ── wiki pre-commit hook: install-root self-heal ────────────────────────────
+//
+// init.mjs bakes an absolute install root into the vault's pre-commit hook
+// (see wikiPreCommitContent in lib/git-hooks-dir.mjs). A plugin-channel upgrade
+// moves PKG_ROOT to a new version directory every release, but nothing ever
+// re-ran init afterward, so the hook keeps calling whatever release happened
+// to be current the day /hypo:init last ran — silently, since the entry-point
+// file the hook calls is often byte-identical across versions while the
+// module graph it pulls in from its own directory is not. Read-only: locates
+// the hook (if any) and, only when it carries our marker in a shape
+// wikiPreCommitContent() could have written, the root currently baked into it.
+function checkWikiPreCommitRoot(hypoDir) {
+  const resolved = resolveGitHooksDir(hypoDir);
+  if (!resolved.ok || !resolved.owned) return null;
+  const hookPath = join(resolved.path, 'pre-commit');
+  if (!existsSync(hookPath)) return null;
+  let content;
+  try {
+    content = readFileSync(hookPath, 'utf-8');
+  } catch {
+    return null;
+  }
+  const parsed = parseWikiPreCommitRoot(content);
+  if (!parsed.ok) return null;
+  return { hookPath, root: parsed.root, lintStrict: parsed.lintStrict, hypoDir: parsed.hypoDir };
+}
+
+// Rewrites ONLY the embedded root, reusing the exact writer init.mjs itself
+// uses so the regenerated hook is byte-identical to what a fresh init would
+// produce — the --lint-strict step count (info.lintStrict) is preserved
+// exactly, never collapsed to one step, or the lint gate goes silently dark.
+// The --hypo-dir baked into a --lint-strict hook is preserved from `info`
+// (what parseWikiPreCommitRoot read back), never taken from this run's own
+// --hypo-dir: upgrade can run against a vault with a different --hypo-dir than
+// the one init baked in, and substituting the current run's value would
+// silently repoint the lint gate at an unrelated directory. A non-absolute
+// embedded value is refused rather than trusted (wikiPreCommitContent()
+// re-resolves it against upgrade's own cwd, which is never what a relative
+// value there was meant to mean), leaving the hook untouched for that run.
+//
+// This only self-heals the ROOT. If the vault itself has actually moved, the
+// embedded --hypo-dir is wrong too and no amount of --apply repoints it — only
+// re-running `hypomnema init` rewrites --hypo-dir.
+//
+// Returns `{ ok: true }` on a successful rewrite, or `{ ok: false, reason }`
+// naming why the write was refused or failed, so the caller can surface that
+// reason instead of silently reporting "unchanged".
+function applyWikiPreCommitRoot(info, wantRoot) {
+  const unsafe = unsafeHookTargetReason(info.hookPath);
+  if (unsafe) return { ok: false, reason: unsafe };
+  if (info.lintStrict && !isAbsolute(info.hypoDir)) {
+    return {
+      ok: false,
+      reason: `embedded --hypo-dir is not absolute (${info.hypoDir}) — refusing to repoint`,
+    };
+  }
+  // hypoDir only affects output when lintStrict is true (see
+  // wikiPreCommitContent); the fallback here never reaches the written file.
+  const hypoDir = info.lintStrict ? info.hypoDir : '.';
+  const newContent = wikiPreCommitContent(wantRoot, hypoDir, info.lintStrict);
+  // A REFUSAL (above) is a soft skip, matching init's contract that an unsafe
+  // or unresolvable target is logged and stepped over. A real I/O failure is
+  // not that: every other apply write in this file lets the exception through,
+  // and init does the same, so swallowing EACCES here would make this one
+  // self-heal quieter than the rest of --apply for no reason. It also reported
+  // the wrong thing: a chmod that fails AFTER the write says "still points at
+  // old" while the file already holds the new root.
+  writeFileSync(info.hookPath, newContent);
+  chmodSync(info.hookPath, 0o755);
+  return { ok: true };
+}
+
 function writeMigrationReport(hypoDir, fromVersion, toVersion, { pluginMode = false } = {}) {
   const today = new Date().toISOString().slice(0, 10);
   const filename = `MIGRATION-v${toVersion}.md`;
@@ -640,7 +719,7 @@ Review the SCHEMA diff and update your wiki pages accordingly.
 
 ## Action items
 
-This report was generated during \`/hypo:upgrade --apply\`. ${
+This report was generated during an upgrade apply. ${
         pluginMode
           ? 'You are on a **plugin install**, so the core hook files and settings.json hook ' +
             'registrations were NOT touched — the Claude Code plugin loader owns them (upgrade the ' +
@@ -665,7 +744,7 @@ tags: [schema]
 
 # Migration Report: v${fromVersion} → v${toVersion}
 
-Generated by \`/hypo:upgrade\` on ${today}.
+Generated during an upgrade apply on ${today}.
 
 ${specificBody}
 ## Notes
@@ -946,12 +1025,20 @@ const pkgJson = checkPkgJson();
 // see lib/plugin-detect.mjs) so both the --apply write below and the read-only
 // report can agree on the same positively-resolved identity without a second
 // registry read racing the first.
-const dualSkipRegistryRoot = dualSkip
+// Resolved on hypomnemaPluginEnabled, the SAME condition doctor's
+// resolveDurableHookRoot uses. Gating the lookup itself on dualSkip put the two
+// tools back out of step the moment --allow-dual-install was passed: dualSkip
+// went false, the registry was never read, wantRoot came back null, and upgrade
+// declined to repoint a hook doctor was still calling stale. Which install a
+// vault's git hook resolves through does not depend on whether the user allowed
+// writing the core surface twice.
+const pluginRegistryRoot = hypomnemaPluginEnabled
   ? resolveEnabledPluginRoot(
       claudeSettingsPath,
       join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
     )
   : null;
+const dualSkipRegistryRoot = dualSkip ? pluginRegistryRoot : null;
 // The recorded pkgRoot currently on disk, read non-mutatingly (readPkgJsonSafe
 // would rename aside a corrupt file — a write — before this script has decided
 // whether to touch anything).
@@ -970,6 +1057,29 @@ const dualSkipRecordedRoot = (() => {
 // a correction is needed", not "there is nothing to preserve".
 const dualSkipWouldCorrect =
   dualSkip && dualSkipRegistryRoot !== null && dualSkipRegistryRoot !== dualSkipRecordedRoot;
+// The durable root the vault's pre-commit hook should embed, judged by the
+// The durable hook root keys on whether a plugin install EXISTS, not on
+// dualSkip. `--allow-dual-install` means "stop refusing to write the core
+// surface twice" (see its flag doc below); it says nothing about which install
+// a vault's git hook should resolve through, and reading it as a root choice
+// is what made doctor and upgrade answer differently. Concretely: with the
+// flag, upgrade repointed the hook at the manual PKG_ROOT while doctor kept
+// calling that stale against the registry root, so a user following doctor's
+// advice silently undid their own run, and re-running WITH the flag changed
+// nothing because upgrade already agreed with the manual root. Keying on the
+// registry root alone makes the two tools give one answer.
+//
+// PKG_ROOT stays the target only when no plugin install resolves at all: this
+// run IS that install and there is no "cannot resolve" case. When a plugin
+// install exists, null from the registry means "cannot prove a correction is
+// needed" and the hook must be PRESERVED, never repointed at a PKG_ROOT the
+// dual-install notice tells the user to remove.
+const wikiHookWantRoot = hypomnemaPluginEnabled ? pluginRegistryRoot : PKG_ROOT;
+const wikiPreCommitInfo = checkWikiPreCommitRoot(args.hypoDir);
+const wikiPreCommitDrift =
+  wikiPreCommitInfo !== null &&
+  wikiHookWantRoot !== null &&
+  wikiHookWantRoot !== wikiPreCommitInfo.root;
 const commands = checkCommands();
 const oldHookRefs = checkOldHookNames(claudeSettingsPath);
 const hypoignore = checkHypoignore(args.hypoDir);
@@ -1087,6 +1197,8 @@ let appliedHookNameRenamesCodex = [];
 let appliedCommands = [];
 let appliedHypoignore = [];
 let appliedGitignore = [];
+let appliedWikiPreCommitRoot = false;
+let wikiPreCommitApplyFailReason = null;
 let appliedExtensions = null;
 let appliedExtensionsCodex = null;
 
@@ -1192,6 +1304,14 @@ if (args.apply) {
   }
   appliedHypoignore = applyHypoignoreMigration(hypoignore);
   appliedGitignore = applyGitignoreMigration(gitignore);
+  // Runs unconditionally on wikiPreCommitDrift, independent of dualSkip/pluginMode:
+  // wikiHookWantRoot is null only when dualSkip cannot positively resolve the
+  // registry (preserve case), and wikiPreCommitDrift is already false then.
+  if (wikiPreCommitDrift) {
+    const wikiPreCommitResult = applyWikiPreCommitRoot(wikiPreCommitInfo, wikiHookWantRoot);
+    appliedWikiPreCommitRoot = wikiPreCommitResult.ok;
+    if (!wikiPreCommitResult.ok) wikiPreCommitApplyFailReason = wikiPreCommitResult.reason;
+  }
   // codex core hooks + settings + wiki-*→hypo-* rename mirror. Same order
   // as the claude side (rename first so subsequent hook copy can find renamed targets).
   if (args.codex) {
@@ -1271,7 +1391,8 @@ const hasDrift =
   hypoignore.status === 'needs-migration' ||
   gitignore.status === 'needs-migration' ||
   extDrift ||
-  codexCoreDrift;
+  codexCoreDrift ||
+  wikiPreCommitDrift;
 
 if (args.json) {
   console.log(
@@ -1292,6 +1413,13 @@ if (args.json) {
         oldHookRefs,
         hypoignore,
         gitignore,
+        wikiPreCommitRoot: wikiPreCommitInfo
+          ? {
+              current: wikiPreCommitInfo.root,
+              wantRoot: wikiHookWantRoot,
+              drift: wikiPreCommitDrift,
+            }
+          : null,
         extensions: extCheck,
         extensionsCodex: extCheckCodex,
         // codex core mirror (null when --codex absent).
@@ -1306,6 +1434,7 @@ if (args.json) {
           commands: appliedCommands,
           hypoignore: appliedHypoignore,
           gitignore: appliedGitignore,
+          wikiPreCommitRoot: appliedWikiPreCommitRoot,
           extensions: appliedExtensions,
           extensionsCodex: appliedExtensionsCodex,
           hooksCodex: appliedHooksCodex,
@@ -1340,7 +1469,7 @@ if (pluginMode) {
     '  plugin loader, so `/hypo:upgrade` does NOT manage them (and `--apply` will',
     '  not copy/register them — that would double-register every hook).',
     '  → To upgrade the plugin: `/plugin marketplace update hypomnema` then `/reload-plugins`.',
-    '  → `/hypo:upgrade --apply` here applies vault-side migrations (SCHEMA,',
+    '  → `/hypo:upgrade` (apply step confirmed) here applies vault-side migrations (SCHEMA,',
     '    .hypoignore), refreshes package metadata, and still syncs any vault',
     '    extensions — but does NOT install the core hooks/commands/settings.',
     '',
@@ -1531,6 +1660,29 @@ if (dualSkip && dualSkipCorrected) {
   );
 } else {
   lines.push(`✗ Package metadata  hypo-pkg.json missing — run --apply to install`);
+}
+
+// Vault pre-commit hook install root
+if (wikiPreCommitInfo && wikiPreCommitDrift) {
+  if (appliedWikiPreCommitRoot) {
+    lines.push(
+      `✓ Wiki pre-commit   hook repointed from ${wikiPreCommitInfo.root} to ${wikiHookWantRoot}`,
+    );
+  } else if (args.apply) {
+    // --apply ran but the write was refused or failed — say why, rather than
+    // printing the same "run --apply" nudge that already ran and did nothing.
+    lines.push(
+      `⚠ Wiki pre-commit   could not repoint hook (${wikiPreCommitApplyFailReason}) — still` +
+        ` points at ${wikiPreCommitInfo.root}, active install is ${wikiHookWantRoot}`,
+    );
+  } else {
+    lines.push(
+      `⚠ Wiki pre-commit   hook points at ${wikiPreCommitInfo.root}, active install is` +
+        ` ${wikiHookWantRoot} — run --apply to repoint it`,
+    );
+  }
+} else if (wikiPreCommitInfo) {
+  lines.push(`✓ Wiki pre-commit   hook root up to date`);
 }
 
 // Slash commands
@@ -1764,6 +1916,7 @@ const totalDrift =
   (guideDrift ? 1 : 0) +
   (hypoignore.status === 'needs-migration' ? hypoignore.missing.length : 0) +
   (gitignore.status === 'needs-migration' ? gitignore.missing.length : 0) +
+  (wikiPreCommitDrift ? 1 : 0) +
   extCheck.actions.filter(
     (a) => a.action === 'create' || a.action === 'update' || a.action === 'force-update',
   ).length +
@@ -1802,6 +1955,7 @@ if (totalDrift === 0) {
     appliedHookNameRenames.length +
     appliedHypoignore.length +
     appliedGitignore.length +
+    (appliedWikiPreCommitRoot ? 1 : 0) +
     appliedExtCount +
     appliedHooksCodex.length +
     appliedSettingsCodex.length +

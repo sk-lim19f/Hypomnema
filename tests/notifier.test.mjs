@@ -12,6 +12,7 @@ import {
   rmSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
   symlinkSync,
   unlinkSync,
@@ -104,6 +105,96 @@ test('buildUpdateLine: channel-specific update command', () => {
   );
   assert.match(vc.buildUpdateLine('plugin', '1.0.0', '1.1.0'), /reload-plugins/);
   assert.match(vc.buildUpdateLine('unknown', '1.0.0', '1.1.0'), /1\.0\.0 → 1\.1\.0/);
+});
+
+test('buildUpdateLine: EVERY channel tells the user to repoint the vault hook', () => {
+  // Installing a release does not move the vault's git pre-commit hook: that
+  // hook holds an absolute path baked in at init time, and only
+  // `upgrade --apply` rewrites it. No hook can do it for the user either (a
+  // hook must never invoke an apply path). This vault ran four months of
+  // commits through a 1.7.0 install while its version string read 1.7.4
+  // because the notifier stopped at "update available" and nobody knew there
+  // was a second step. Asserting one channel would not catch a future channel
+  // added without it, so this checks all three.
+  // Channel by channel, and the command must be RUNNABLE there. A plugin-only
+  // install has no `hypomnema` binary on PATH; its surface is the slash
+  // command. A bare /upgrade --apply/ match passes for a line that names a
+  // second step the user cannot take.
+  const plugin = vc.buildUpdateLine('plugin', '1.0.0', '1.1.0');
+  assert.match(plugin, /\/hypo:upgrade/, 'plugin users get the slash command');
+  // Anchoring on `then:` was too narrow: `then: run \`hypomnema upgrade --apply\``
+  // would have slipped through. Ban the binary name anywhere in the line.
+  assert.doesNotMatch(
+    plugin,
+    /hypomnema upgrade/,
+    'plugin users must not be told to run a binary they do not have: the CLI bin is the npm package surface, the plugin manifest ships commands only',
+  );
+  assert.doesNotMatch(
+    plugin,
+    /\/hypo:upgrade\s+--apply/,
+    'the slash command runs the check first and only appends --apply after the operator confirms, so naming the flag there describes a call it does not make',
+  );
+  assert.match(
+    vc.buildUpdateLine('npm', '1.0.0', '1.1.0'),
+    /hypomnema upgrade --apply/,
+    'npm users get the CLI form',
+  );
+  // `unknown` never reaches a user: computeNotice drops it before display, so
+  // asserting on it would measure a path nobody walks. The mixed-channel line
+  // is the one a real ambiguous install shows, and it must carry both forms.
+  assert.equal(vc.computeNotice({ latest: { unknown: '1.1.0' } }, 'unknown', '1.0.0'), null);
+});
+
+test('no shipped surface names `/hypo:upgrade --apply`, a call that command does not make', () => {
+  // `commands/upgrade.md` runs the check first and appends --apply only after the
+  // operator confirms; the slash command takes no such argument. Naming it prints
+  // an invocation nobody can make, the same class of defect as naming a flag no
+  // script parses. This kept coming back one file at a time across three review
+  // rounds (session-start, two upgrade.mjs strings, the notifier itself), so the
+  // guard sweeps the tree instead of pinning one message.
+  //
+  // ponytail: literal scan, no shell parsing. A surface that builds the string
+  // from pieces would slip through; nothing does that today.
+  // Derived from the packed-tarball snapshot, never a hand-written list. Two
+  // hand-written lists in a row got the scope wrong: six directories missing
+  // README and .claude-plugin, then 109 of the 137 files npm ships. The
+  // snapshot is regenerated from `npm pack --dry-run --json` and CI fails on
+  // any drift between it and the real tarball, so it cannot quietly shrink.
+  //
+  // NO EXEMPTIONS. Earlier versions tried to let comments through, and every
+  // round found a new way past the parser: `//` in markdown renders as body
+  // text, a multi-line block's closing line still holds live code after `*/`,
+  // a template literal's contents look like comments. This repo already
+  // learned that a line-reading predicate cannot decide what a line MEANS
+  // (decisions/0095). So the rule is literal: if a shipped file contains this
+  // string anywhere, it fails, and prose that needs to discuss the mistake
+  // describes it instead of quoting it. That cost one comment rewrite.
+  //
+  // CHANGELOG.md is not scanned, and not because of an exemption rule: a
+  // feature PR may not edit it at all (CLAUDE.md), since the release collector
+  // assembles it from merged PR bodies. Three v1.3.1-era entries quote the
+  // string while describing what that release did. Scanning a file this PR is
+  // forbidden to fix would make the gate unsatisfiable.
+  const shipped = JSON.parse(
+    readFileSync(join(REPO, 'tests', 'fixtures', 'npm-pack.files.json'), 'utf8'),
+  ).map((e) => e.path);
+
+  const offenders = [];
+  for (const rel of shipped) {
+    if (!/\.(mjs|md|json)$/.test(rel) || rel === 'CHANGELOG.md') continue;
+    const full = join(REPO, rel);
+    if (!existsSync(full)) continue;
+    readFileSync(full, 'utf8')
+      .split('\n')
+      .forEach((line, i) => {
+        if (/\/hypo:upgrade\s+--apply/.test(line)) offenders.push(`${rel}:${i + 1}`);
+      });
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `these name \`/hypo:upgrade --apply\`, which that command never runs: ${offenders.join(', ')}`,
+  );
 });
 
 test('selectPluginVersion: resolves current name, legacy name, ordering, and bad input', () => {

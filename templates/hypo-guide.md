@@ -179,7 +179,7 @@ ignore it:**
    `~/.claude/hypo-pkg.json` (only when non-empty and the script exists under it);
    otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath
    in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the
-   user to run `hypomnema upgrade --apply` or reinstall instead of guessing.
+   user to run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install) or reinstall instead of guessing.
    Then tell the user: "Created project `<name>` at
    `~/hypomnema/projects/<name>/`. Edit `index.md` to refine." Do **not** hand-write
    the five files — the helper keeps substitution and registration consistent.

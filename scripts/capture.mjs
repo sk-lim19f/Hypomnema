@@ -32,6 +32,7 @@
  * acquired through the normal sync path, never by injecting a SHA directly.
  */
 
+import { UPGRADE_APPLY_EITHER } from '../hooks/version-check.mjs';
 import {
   existsSync,
   readFileSync,
@@ -1213,7 +1214,7 @@ function report(captured, skipped, failed, dryRun) {
     log(`Failed to adopt ${failed.length} (see sync warnings; wiki files rolled back).`);
   if (!dryRun && captured.some((c) => c.status === 'captured')) {
     log('');
-    log('Next: commit + push the wiki, then run `hypomnema upgrade --apply` on another machine.');
+    log(`Next: commit + push the wiki, then run ${UPGRADE_APPLY_EITHER} on another machine.`);
   }
 }
 

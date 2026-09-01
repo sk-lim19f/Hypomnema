@@ -39,4 +39,4 @@ A flat capture stores the file in the wiki as `extensions/<type>/hypo-ext-<name>
 
 ## Step 4: Commit the wiki, then sync elsewhere
 
-Show the script output verbatim. When something was captured, remind the user to commit and push the wiki, then run `hypomnema upgrade --apply` on their other machine to install the captured extension under its original name.
+Show the script output verbatim. When something was captured, remind the user to commit and push the wiki, then run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install) on their other machine to install the captured extension under its original name.

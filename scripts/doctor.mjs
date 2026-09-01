@@ -20,7 +20,11 @@ import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { readRenameMarker, renameMarkerPath, RENAME_MARKER_REL } from './lib/rename-marker.mjs';
-import { resolveGitHooksDir, WIKI_PRE_COMMIT_MARKER_START } from './lib/git-hooks-dir.mjs';
+import {
+  resolveGitHooksDir,
+  WIKI_PRE_COMMIT_MARKER_START,
+  parseWikiPreCommitRoot,
+} from './lib/git-hooks-dir.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
 import {
   readSyncState,
@@ -58,12 +62,13 @@ import {
   HOOKS_DIGEST_FIELD,
   computeHooksDigest,
 } from './lib/pkg-provenance.mjs';
-import { resolveCliOnPath, classifyInstall } from '../hooks/version-check.mjs';
+import { resolveCliOnPath, classifyInstall, upgradeApplyHint } from '../hooks/version-check.mjs';
 import {
   isHypomnemaPluginEnabled,
   enabledHypomnemaPluginKey,
   usablePkgRoot,
   leafVersionDrift,
+  resolveEnabledPluginRoot,
 } from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
@@ -90,6 +95,22 @@ const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
 const hypomnemaPluginEnabled =
   !pluginMode && isHypomnemaPluginEnabled(join(HOME, '.claude', 'settings.json'));
 const coreManagedByPlugin = pluginMode || hypomnemaPluginEnabled;
+
+// The durable root the vault's pre-commit hook SHOULD embed, mirroring the same
+// rule upgrade.mjs's self-heal uses: in normal operation (plain plugin mode or
+// plain npm/manual) doctor's own PKG_ROOT already IS the active install, no
+// registry lookup needed or even possible to get wrong. In a dual install
+// (manual/npm doctor run while the plugin is also enabled) the active runtime
+// is the PLUGIN's, so only the registry's positive resolution can be trusted —
+// null means "cannot verify", never "matches", so checkGit below must skip the
+// comparison rather than report a false pass or a false drift.
+function resolveDurableHookRoot() {
+  if (!hypomnemaPluginEnabled) return PKG_ROOT;
+  return resolveEnabledPluginRoot(
+    join(HOME, '.claude', 'settings.json'),
+    join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
+  );
+}
 
 // Shown after every fatal package-integrity error. These conditions mean the
 // shipped hooks/hooks.json is missing or malformed — never a user mistake —
@@ -513,6 +534,23 @@ function checkGit(hypoDir) {
     );
   } else if (content.includes(WIKI_PRE_COMMIT_MARKER_START)) {
     pass(label, 'Hypomnema .hypoignore guard installed');
+    // A stale root never trips the marker check above (the marker itself never
+    // moves), so it is a SEPARATE, additive report, never a replacement for the
+    // pass — excluding a drifted root from consideration here would leave the
+    // exact silent-staleness failure this check exists to catch (see the
+    // plugin-cache leaf-drift precedent: reporting must never turn into
+    // filtering, or a still-real, still-resolvable root looks like it vanished).
+    const parsedRoot = parseWikiPreCommitRoot(content);
+    const wantRoot = resolveDurableHookRoot();
+    if (parsedRoot.ok && wantRoot !== null && wantRoot !== parsedRoot.root) {
+      warn(
+        `${label} root`,
+        `Points at an old install root (${parsedRoot.root}) — the active install is ` +
+          `${wantRoot}. To repoint it, run ${upgradeApplyHint(
+            pluginMode || hypomnemaPluginEnabled,
+          )}.`,
+      );
+    }
   } else {
     warn(label, 'Exists but not managed by Hypomnema — manual git add can bypass .hypoignore');
   }
@@ -1983,7 +2021,7 @@ function checkProvenanceSidecar(hooksDir, label) {
         label,
         `no provenance sidecar, and this install's hooks cannot self-locate their ` +
           `package — PKG_ROOT resolves to null for every hook running from ${hooksDir}; ` +
-          `run \`hypomnema upgrade --apply\` to write one`,
+          `run ${upgradeApplyHint(pluginMode || hypomnemaPluginEnabled)} to write one`,
       );
     }
     return;
@@ -1995,7 +2033,7 @@ function checkProvenanceSidecar(hooksDir, label) {
   } catch {
     warn(
       label,
-      `${sidecarPath} is not valid JSON — run \`hypomnema upgrade --apply\` to rewrite it`,
+      `${sidecarPath} is not valid JSON — run ${upgradeApplyHint(pluginMode || hypomnemaPluginEnabled)} to rewrite it`,
     );
     return;
   }
@@ -2049,7 +2087,7 @@ function checkProvenanceSidecar(hooksDir, label) {
   warn(
     label,
     `${sidecarPath} does not verify (${reasons.join('; ')}) — resolvePkgRoot() will treat ` +
-      `PKG_ROOT as unresolved this session; run \`hypomnema upgrade --apply\` to refresh it`,
+      `PKG_ROOT as unresolved this session; run ${upgradeApplyHint(pluginMode || hypomnemaPluginEnabled)} to refresh it`,
   );
 }
 
@@ -2083,7 +2121,7 @@ function hooksDigestMismatch(hooksDir, recordedDigest) {
   return (
     `hooksDigest mismatch: ${diverged.length}/${allFiles.length} hook file(s) differ from ` +
     `the current package source${examples ? ` (e.g. ${examples})` : ''} — run ` +
-    `\`hypomnema upgrade --apply\``
+    `${upgradeApplyHint(pluginMode || hypomnemaPluginEnabled)}`
   );
 }
 
