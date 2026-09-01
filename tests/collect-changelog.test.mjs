@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { writeFileSync, readFileSync, readdirSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import {
   classifyChange,
   sanitizeTrackerIds,
@@ -844,6 +844,28 @@ test('prompt surfaces: bundled-script references resolve via CLAUDE_PLUGIN_ROOT/
         (m) => m[1],
       ),
     );
+  // A script may parse its flags in a helper module rather than in its own
+  // body. crystallize.mjs does: the argument parsing lives in
+  // scripts/lib/crystallize-args.mjs. Sweeping only the named file would find
+  // zero flags there and report every documented flag as unparsed, so follow
+  // the script's own local imports one hop and collect their flags too.
+  //
+  // Only when the script itself parses nothing. A union over every local
+  // import would let a script inherit flags it does not take: weekly-report.mjs
+  // imports session-audit.mjs, which parses --max-age-days that weekly-report
+  // never reads, and a document passing it would then sweep clean. Delegating
+  // the parsing wholesale is the case this follows; parsing some flags here and
+  // some there is not, and stays a loud failure.
+  const flagsFor = (scriptPath) => {
+    const src = readFileSync(scriptPath, 'utf8');
+    const flags = parsedFlags(src);
+    if (flags.size) return flags;
+    for (const m of src.matchAll(/from\s+['"](\.\.?\/[^'"]+\.mjs)['"]/g)) {
+      const dep = join(dirname(scriptPath), m[1]);
+      if (existsSync(dep)) for (const f of parsedFlags(readFileSync(dep, 'utf8'))) flags.add(f);
+    }
+    return flags;
+  };
   const flagCache = new Map();
   const badFlags = [];
   const sweptSurfaces = new Set();
@@ -874,8 +896,7 @@ test('prompt surfaces: bundled-script references resolve via CLAUDE_PLUGIN_ROOT/
         badFlags.push(`${rel}:${lineNo} names scripts/${named[1]}, which does not exist`);
         continue;
       }
-      if (!flagCache.has(named[1]))
-        flagCache.set(named[1], parsedFlags(readFileSync(scriptPath, 'utf8')));
+      if (!flagCache.has(named[1])) flagCache.set(named[1], flagsFor(scriptPath));
       const parsed = flagCache.get(named[1]);
       assert.ok(parsed.size > 0, `parsed-flag sweep found no flags in scripts/${named[1]}`);
       sweptSurfaces.add(rel);
