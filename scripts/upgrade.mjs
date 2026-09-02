@@ -55,7 +55,7 @@ import {
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
 import { writeProvenanceSidecar } from './lib/pkg-provenance.mjs';
-import { isHypomnemaPluginEnabled, resolveEnabledPluginRoot } from './lib/plugin-detect.mjs';
+import { resolvePluginChannel } from './lib/plugin-detect.mjs';
 import {
   resolveGitHooksDir,
   unsafeHookTargetReason,
@@ -990,7 +990,6 @@ const codexSettingsPath = join(HOME, '.codex', 'settings.json');
 // legitimate npm/dev checkout under some unrelated `…/plugins/…` path must not be
 // misclassified and silently stop managing its hooks. (detectChannel's broad
 // `/plugins/` test is fine for the notifier's display-only use, but too loose here.)
-const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
 // Dual install: the OTHER way the same double-registration can happen.
 // Here the MANUAL/npm upgrade.mjs is running (pluginMode=false), but the Hypomnema
 // plugin is ALSO enabled in ~/.claude/settings.json — so the plugin loader already
@@ -999,7 +998,17 @@ const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
 // (see lib/plugin-detect.mjs): a false positive would wrongly alter a legitimate
 // npm-only user's upgrade, so it only fires on an exact `hypo@<mp>: true` (or the
 // legacy `hypomnema@<mp>: true`, matched across the plugin-rename migration window).
-const hypomnemaPluginEnabled = !pluginMode && isHypomnemaPluginEnabled(claudeSettingsPath);
+// resolvePluginChannel is the single place pluginMode/hypomnemaPluginEnabled/the
+// registry root are judged — doctor.mjs and init.mjs call the same function with
+// their own PKG_ROOT so all three tools agree. managesClaudeCore/dualSkip below
+// layer upgrade's own `--allow-dual-install` override on top of that judgment;
+// they are upgrade-specific and stay local to this script.
+const pluginChannel = resolvePluginChannel({
+  pkgRoot: PKG_ROOT,
+  settingsPath: claudeSettingsPath,
+  registryPath: join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
+});
+const { pluginMode, hypomnemaPluginEnabled } = pluginChannel;
 const dualInstallCoreConflict = hypomnemaPluginEnabled;
 // Surface policy: the Claude core surface (hooks/settings/commands/hook-name
 // migration) is skipped when EITHER the plugin runs this script (pluginMode) OR a
@@ -1032,12 +1041,7 @@ const pkgJson = checkPkgJson();
 // declined to repoint a hook doctor was still calling stale. Which install a
 // vault's git hook resolves through does not depend on whether the user allowed
 // writing the core surface twice.
-const pluginRegistryRoot = hypomnemaPluginEnabled
-  ? resolveEnabledPluginRoot(
-      claudeSettingsPath,
-      join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
-    )
-  : null;
+const pluginRegistryRoot = hypomnemaPluginEnabled ? pluginChannel.root : null;
 const dualSkipRegistryRoot = dualSkip ? pluginRegistryRoot : null;
 // The recorded pkgRoot currently on disk, read non-mutatingly (readPkgJsonSafe
 // would rename aside a corrupt file — a write — before this script has decided

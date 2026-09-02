@@ -33,7 +33,12 @@ import {
   withTmpHome,
 } from './helpers.mjs';
 import { PROVENANCE_FILENAME, EXPECTED_PKG_NAME } from '../scripts/lib/pkg-provenance.mjs';
-import { resolveEnabledPluginRoot, leafVersionDrift } from '../scripts/lib/plugin-detect.mjs';
+import {
+  resolveEnabledPluginRoot,
+  resolveEnabledPluginEntry,
+  resolvePluginChannel,
+  leafVersionDrift,
+} from '../scripts/lib/plugin-detect.mjs';
 
 // ── doctor.mjs smoke tests ───────────────────────────────────────────────────
 
@@ -2455,6 +2460,199 @@ test('leafVersionDrift: unreadable manifest is checked:false, not a clean compar
   });
 });
 
+// ── Why checkPluginLeafVersion does NOT consume resolvePluginChannel ────────
+//
+// IMPR-45 pulled the channel judgment into one function, so the next reader
+// meets a leaf-version check that still calls enabledHypomnemaPluginKey and
+// reads the registry itself, and reasonably asks "is this the duplication we
+// just removed?". It is not, for two reasons a comment cannot enforce, so both
+// are pinned here. Consolidating would silently delete a diagnostic for exactly
+// the users it exists to serve, and a silent deletion is what ADR 0097 already
+// caught once by reading past a comment.
+
+test('checkPluginLeafVersion needs EVERY registry row, not the one the resolver picks', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    // Two DISTINCT cache directories, both drifted. resolveEnabledPluginEntry
+    // returns a single chosen row, so a caller built on it can only ever report
+    // one of these. This assertion fails the moment someone rewrites the check
+    // to consume that single entry.
+    const mk = (leaf, manifest) => {
+      const root = join(home, '.claude', 'plugins', 'cache', 'hypomnema', 'hypo', leaf);
+      mkdirSync(root, { recursive: true });
+      writeFileSync(
+        join(root, 'package.json'),
+        JSON.stringify({ name: 'hypomnema', version: manifest }),
+      );
+      return root;
+    };
+    const a = mk('1.7.4', '1.7.9');
+    const b = mk('1.8.0', '1.8.5');
+    mkdirSync(join(home, '.claude', 'plugins'), { recursive: true });
+    writeFileSync(
+      join(home, '.claude', 'plugins', 'installed_plugins.json'),
+      JSON.stringify({
+        plugins: {
+          [PLUGIN_KEY]: [
+            { installPath: a, scope: 'user' },
+            { installPath: b, scope: 'project' },
+          ],
+        },
+      }),
+    );
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Plugin cache leaf version');
+    assert.ok(check, 'the leaf-version check must be reported at all');
+    assert.ok(check.detail.includes(a), `both drifted paths must be named, missing ${a}`);
+    assert.ok(check.detail.includes(b), `both drifted paths must be named, missing ${b}`);
+  });
+});
+
+test('resolvePluginChannel short-circuits enabledKey to null in pluginMode', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    const root = registerPluginCache(home, '1.7.4', '1.7.4');
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const registryPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+
+    // Not in pluginMode: the key is there, so a consolidation would look safe.
+    const outside = resolvePluginChannel({
+      pkgRoot: join(home, 'checkout'),
+      settingsPath,
+      registryPath,
+    });
+    assert.ok(outside.enabledKey, 'outside pluginMode the key resolves, which is the trap');
+
+    // In pluginMode (PKG_ROOT under ~/.claude/plugins/), the channel short-circuits
+    // and enabledKey is null. checkPluginLeafVersion asks the settings file directly
+    // BECAUSE of this: routing it through the channel would skip the diagnostic on
+    // exactly the plugin-channel installs it is for.
+    const inside = resolvePluginChannel({ pkgRoot: root, settingsPath, registryPath });
+    assert.equal(inside.pluginMode, true);
+    assert.equal(inside.enabledKey, null, 'pluginMode must not carry an enabledKey');
+  });
+});
+
+// ── lib/plugin-detect.mjs: resolveEnabledPluginEntry reason discrimination ──
+//
+// A judge's null return must read as "cannot positively resolve", never as
+// "resolved to nothing usable exists". resolveEnabledPluginEntry's `reason`
+// field is what makes that distinction machine-checkable instead of a comment
+// a caller can read past. Pinned here as a pure-function contract, independent
+// of any one caller's response (doctor's own checkPluginInstallDrift/leaf-version
+// suites, plus init's and upgrade's dual-install suites, cover how each caller
+// reacts to it).
+
+suite('lib/plugin-detect.mjs — resolveEnabledPluginEntry (reason discrimination)');
+
+test('plugin not enabled: reason is not-enabled, not unresolved', () => {
+  withTmpHome((home) => {
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const registryPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const r = resolveEnabledPluginEntry(settingsPath, registryPath);
+    assert.equal(r.reason, 'not-enabled');
+    assert.equal(r.key, null);
+    assert.equal(r.entry, null);
+    assert.equal(r.root, null);
+  });
+});
+
+test('enabled but registry file missing: reason is registry-unreadable, not unresolved', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const registryPath = join(home, '.claude', 'plugins', 'installed_plugins.json'); // never written
+    const r = resolveEnabledPluginEntry(settingsPath, registryPath);
+    assert.equal(r.reason, 'registry-unreadable');
+    assert.equal(r.key, PLUGIN_KEY, 'the key is still known even when the registry cannot be read');
+    assert.equal(r.entry, null);
+    assert.equal(r.root, null);
+  });
+});
+
+test('enabled, registry present, no usable entry for the key: reason is unresolved', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    const registryDir = join(home, '.claude', 'plugins');
+    mkdirSync(registryDir, { recursive: true });
+    // installPath does not exist on disk, so no candidate is usable.
+    writeFileSync(
+      join(registryDir, 'installed_plugins.json'),
+      JSON.stringify({
+        plugins: { [PLUGIN_KEY]: [{ installPath: join(home, 'nowhere'), scope: 'user' }] },
+      }),
+    );
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const registryPath = join(registryDir, 'installed_plugins.json');
+    const r = resolveEnabledPluginEntry(settingsPath, registryPath);
+    assert.equal(r.reason, 'unresolved');
+    assert.equal(r.key, PLUGIN_KEY);
+    assert.equal(r.entry, null);
+    assert.equal(r.root, null);
+  });
+});
+
+test('enabled, usable entry found: reason is resolved, and entry is the SAME row root came from', () => {
+  withTmpHome((home) => {
+    enablePlugin(home);
+    const root = registerPluginCache(home, '1.7.4', '1.7.4');
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const registryPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const r = resolveEnabledPluginEntry(settingsPath, registryPath);
+    assert.equal(r.reason, 'resolved');
+    assert.equal(r.root, root);
+    assert.equal(r.entry.installPath, root, 'entry is the actual registry row, not just its path');
+  });
+});
+
+// resolveEnabledPluginRoot must stay a pure projection of `.root`, never a
+// second, independently-derived answer that could drift from resolveEnabledPluginEntry.
+// Compares the two functions AGAINST EACH OTHER, not against literals: the thin
+// projection can only be proven equivalent by calling both. Comparing
+// resolveEnabledPluginRoot to a hardcoded null/root would still pass if someone
+// re-implemented it independently and it drifted, which is the exact failure
+// IMPR-45 exists to stop. All four reasons are walked.
+test('resolveEnabledPluginRoot(...) === resolveEnabledPluginEntry(...).root, for every reason', () => {
+  withTmpHome((home) => {
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const registryPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const bothAgree = (expectedReason) => {
+      const entry = resolveEnabledPluginEntry(settingsPath, registryPath);
+      assert.equal(entry.reason, expectedReason, `reason should be ${expectedReason}`);
+      assert.equal(
+        resolveEnabledPluginRoot(settingsPath, registryPath),
+        entry.root,
+        `projection diverged from the entry it projects (${expectedReason})`,
+      );
+      return entry;
+    };
+
+    bothAgree('not-enabled');
+
+    enablePlugin(home);
+    bothAgree('registry-unreadable');
+
+    // unresolved: the key IS enabled and the registry parses, but no row points at
+    // a usable package directory. Without this step the projection is never
+    // compared on the one reason where a naive re-implementation is most likely
+    // to return a path instead of null.
+    mkdirSync(join(home, '.claude', 'plugins'), { recursive: true });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        plugins: {
+          [PLUGIN_KEY]: [{ installPath: join(home, 'no', 'such', 'dir'), scope: 'user' }],
+        },
+      }),
+    );
+    bothAgree('unresolved');
+
+    const root = registerPluginCache(home, '1.7.4', '1.7.4');
+    const resolved = bothAgree('resolved');
+    assert.equal(resolved.root, root);
+  });
+});
+
 // ── doctor.mjs: installed cache vs marketplace HEAD ─────────────────────────
 //
 // `/plugin marketplace update <marketplace>` pulls the marketplace clone
@@ -2550,6 +2748,26 @@ test('plugin not enabled: check is silent (not reported at all)', () => {
     const out = JSON.parse(r.stdout);
     const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
     assert.equal(check, undefined, 'no enabled plugin means nothing to verify');
+  });
+});
+
+// "not enabled" (above, silent) and "enabled but the registry cannot be read"
+// (here, warns) must read differently to the actual production caller, not
+// just to the resolver's own reason field: this is checkPluginInstallDrift
+// itself, not a unit test of resolveEnabledPluginEntry in isolation.
+test('plugin enabled, registry file missing: warns, and does not read as "not enabled"', () => {
+  withTmpHome((home) => {
+    ipdEnablePlugin(home); // enabledPlugins set, installed_plugins.json never written
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'an enabled plugin must produce a check, not silence');
+    assert.equal(
+      check.status,
+      'warn',
+      `an unreadable registry must not read as verified: ${check.detail}`,
+    );
+    assert.match(check.detail, /Cannot read/, check.detail);
   });
 });
 
