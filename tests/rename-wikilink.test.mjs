@@ -46,14 +46,16 @@ test('an inbound rewrite keeps the page mode it found (no widening via temp+rena
     writeFileSync(priv, '---\ntitle: private\n---\nsee [[foo]].\n');
     chmodSync(priv, 0o600);
 
-    const r = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=foo', '--to=bar', '--apply', '--json']);
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
     assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
     assert.ok(readFileSync(priv, 'utf-8').includes('[[bar]]'), 'the link was actually rewritten');
-    assert.equal(
-      statSync(priv).mode & 0o777,
-      0o600,
-      'a rewritten page keeps its original mode',
-    );
+    assert.equal(statSync(priv).mode & 0o777, 0o600, 'a rewritten page keeps its original mode');
   });
 });
 
@@ -377,10 +379,22 @@ cpSync(SCRIPTS, KILL_SCRIPTS, { recursive: true });
   // caring which mode or which file is currently being written.
   const atomicWriteDecl = 'function atomicWrite(path, content) {';
   const atomicWriteAnchor = 'renameSync(tmp, path);';
-  assert.ok(src.includes(pageAnchor), `page-mode renameSync anchor not found — did rename.mjs change?`);
-  assert.ok(src.includes(dirAnchor), `dir-mode renameSync anchor not found — did rename.mjs change?`);
-  assert.ok(src.includes(atomicWriteDecl), `atomicWrite declaration not found — did rename.mjs change?`);
-  assert.ok(src.includes(atomicWriteAnchor), `atomicWrite renameSync anchor not found — did rename.mjs change?`);
+  assert.ok(
+    src.includes(pageAnchor),
+    `page-mode renameSync anchor not found — did rename.mjs change?`,
+  );
+  assert.ok(
+    src.includes(dirAnchor),
+    `dir-mode renameSync anchor not found — did rename.mjs change?`,
+  );
+  assert.ok(
+    src.includes(atomicWriteDecl),
+    `atomicWrite declaration not found — did rename.mjs change?`,
+  );
+  assert.ok(
+    src.includes(atomicWriteAnchor),
+    `atomicWrite renameSync anchor not found — did rename.mjs change?`,
+  );
   src = src.replace(
     pageAnchor,
     `if (process.env.HYPO_TEST_KILL_PAGE_PRE) process.kill(process.pid, 'SIGKILL');\n        ${pageAnchor}\n        if (process.env.HYPO_TEST_KILL_PAGE_POST) process.kill(process.pid, 'SIGKILL');`,
@@ -411,12 +425,23 @@ test('crash bracketing the single-file renameSync converges, two paths never coe
       // write actually runs before the PRE kill point.
       writeFileSync(join(wiki, 'pages', 'foo.md'), '---\ntitle: foo\n---\nsee [[foo]] itself.\n');
 
-      const cmd = [KILL_RENAME, `--hypo-dir=${wiki}`, '--from=foo', '--to=bar', '--apply', '--json'];
+      const cmd = [
+        KILL_RENAME,
+        `--hypo-dir=${wiki}`,
+        '--from=foo',
+        '--to=bar',
+        '--apply',
+        '--json',
+      ];
       const killed = spawnSync(process.execPath, cmd, {
         encoding: 'utf-8',
         env: { ...process.env, HOME: home, [envVar]: '1' },
       });
-      assert.equal(killed.signal, 'SIGKILL', `[${label}] expected the kill hook to fire: ${killed.stderr}`);
+      assert.equal(
+        killed.signal,
+        'SIGKILL',
+        `[${label}] expected the kill hook to fire: ${killed.stderr}`,
+      );
 
       const fooPath = join(wiki, 'pages', 'foo.md');
       const barPath = join(wiki, 'pages', 'bar.md');
@@ -424,10 +449,16 @@ test('crash bracketing the single-file renameSync converges, two paths never coe
       const barExists = existsSync(barPath);
       // The property the fix pins: renameSync is one syscall, so no kill point
       // can observe both the old and the new path at once.
-      assert.ok(!(fooExists && barExists), `[${label}] old and new path must never coexist after a crash`);
+      assert.ok(
+        !(fooExists && barExists),
+        `[${label}] old and new path must never coexist after a crash`,
+      );
       assert.ok(fooExists || barExists, `[${label}] exactly one path must survive the crash`);
 
-      const rerun = spawnSync(process.execPath, cmd, { encoding: 'utf-8', env: { ...process.env, HOME: home } });
+      const rerun = spawnSync(process.execPath, cmd, {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: home },
+      });
       if (fooExists) {
         // Killed before the rename: --from still resolves, re-run finishes the move.
         assert.equal(
@@ -438,7 +469,10 @@ test('crash bracketing the single-file renameSync converges, two paths never coe
         assert.ok(existsSync(barPath), `[${label}] bar.md exists after re-run`);
         assert.ok(!existsSync(fooPath), `[${label}] foo.md gone after re-run`);
         const bar = readFileSync(barPath, 'utf-8');
-        assert.ok(bar.includes('[[bar]]'), `[${label}] self-reference rewrite carried through: ${bar}`);
+        assert.ok(
+          bar.includes('[[bar]]'),
+          `[${label}] self-reference rewrite carried through: ${bar}`,
+        );
       } else {
         // Killed after the rename: the move already landed, --from correctly
         // no longer resolves — nothing left to converge.
@@ -488,23 +522,36 @@ test('crash bracketing the directory renameSync converges, two dirs never coexis
         encoding: 'utf-8',
         env: { ...process.env, HOME: home, [envVar]: '1' },
       });
-      assert.equal(killed.signal, 'SIGKILL', `[${label}] expected the kill hook to fire: ${killed.stderr}`);
+      assert.equal(
+        killed.signal,
+        'SIGKILL',
+        `[${label}] expected the kill hook to fire: ${killed.stderr}`,
+      );
 
       const oldDir = join(wiki, 'projects', 'old');
       const newDir = join(wiki, 'projects', 'new');
       const oldExists = existsSync(oldDir);
       const newExists = existsSync(newDir);
-      assert.ok(!(oldExists && newExists), `[${label}] old and new directory must never coexist after a crash`);
+      assert.ok(
+        !(oldExists && newExists),
+        `[${label}] old and new directory must never coexist after a crash`,
+      );
       assert.ok(oldExists || newExists, `[${label}] exactly one directory must survive the crash`);
 
-      const rerun = spawnSync(process.execPath, cmd, { encoding: 'utf-8', env: { ...process.env, HOME: home } });
+      const rerun = spawnSync(process.execPath, cmd, {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: home },
+      });
       if (oldExists) {
         assert.equal(
           rerun.status,
           0,
           `[${label}] re-run from the pre-rename state must converge: ${rerun.stdout}${rerun.stderr}`,
         );
-        assert.ok(existsSync(join(newDir, 'a.md')), `[${label}] a.md exists at the new path after re-run`);
+        assert.ok(
+          existsSync(join(newDir, 'a.md')),
+          `[${label}] a.md exists at the new path after re-run`,
+        );
         assert.ok(!existsSync(oldDir), `[${label}] projects/old gone after re-run`);
         const a = readFileSync(join(newDir, 'a.md'), 'utf-8');
         assert.ok(
@@ -912,7 +959,13 @@ test('successful --apply clears the marker (page mode)', () => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nfoo page\n');
     writeFileSync(join(dir, 'pages', 'a.md'), '---\ntitle: a\n---\nsee [[foo]].\n');
-    const r = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=foo', '--to=bar', '--apply', '--json']);
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
     assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
     assert.ok(
       !existsSync(join(dir, '.cache', 'rename-in-progress.json')),
@@ -966,8 +1019,18 @@ test('marker write failure is fail-closed: --apply aborts before any rewrite or 
     writeFileSync(join(dir, 'pages', 'a.md'), '---\ntitle: a\n---\nsee [[foo]].\n');
     chmodSync(join(dir, '.cache'), 0o500); // read+execute only — no write inside it
     try {
-      const r = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=foo', '--to=bar', '--apply', '--json']);
-      assert.notEqual(r.status, 0, `--apply must fail when the marker cannot be written: ${r.stdout}${r.stderr}`);
+      const r = run('rename.mjs', [
+        `--hypo-dir=${dir}`,
+        '--from=foo',
+        '--to=bar',
+        '--apply',
+        '--json',
+      ]);
+      assert.notEqual(
+        r.status,
+        0,
+        `--apply must fail when the marker cannot be written: ${r.stdout}${r.stderr}`,
+      );
       assert.ok(existsSync(join(dir, 'pages', 'foo.md')), 'foo.md must not have moved');
       assert.ok(!existsSync(join(dir, 'pages', 'bar.md')), 'bar.md must not exist');
       const a = readFileSync(join(dir, 'pages', 'a.md'), 'utf-8');
@@ -1004,16 +1067,27 @@ test('existing marker for a DIFFERENT rename → --apply refused, zero rewrites,
       '--apply',
       '--json',
     ]);
-    assert.equal(r.status, 1, `a different in-progress marker must refuse --apply: ${r.stdout}${r.stderr}`);
+    assert.equal(
+      r.status,
+      1,
+      `a different in-progress marker must refuse --apply: ${r.stdout}${r.stderr}`,
+    );
     assert.ok(existsSync(join(dir, 'pages', 'foo.md')), 'foo.md not moved (0 moves)');
     assert.ok(!existsSync(join(dir, 'pages', 'bar.md')), 'bar.md not created');
     const a = readFileSync(join(dir, 'pages', 'a.md'), 'utf-8');
     assert.ok(a.includes('[[foo]]') && !a.includes('[[bar]]'), '0 inbound rewrites happened');
-    const marker = JSON.parse(readFileSync(join(dir, '.cache', 'rename-in-progress.json'), 'utf-8'));
+    const marker = JSON.parse(
+      readFileSync(join(dir, '.cache', 'rename-in-progress.json'), 'utf-8'),
+    );
     assert.deepEqual(
       marker,
-      { mode: 'page', from: 'pages/other.md', to: 'pages/moved.md', started_at: '2026-01-01T00:00:00.000Z' },
-      'the OTHER rename\'s marker must survive untouched, not be overwritten',
+      {
+        mode: 'page',
+        from: 'pages/other.md',
+        to: 'pages/moved.md',
+        started_at: '2026-01-01T00:00:00.000Z',
+      },
+      "the OTHER rename's marker must survive untouched, not be overwritten",
     );
   });
 });
@@ -1043,7 +1117,11 @@ test('existing marker for the SAME rename → --apply proceeds and converges (re
       '--apply',
       '--json',
     ]);
-    assert.equal(r.status, 0, `a same-command marker must not block the legitimate re-run: ${r.stdout}${r.stderr}`);
+    assert.equal(
+      r.status,
+      0,
+      `a same-command marker must not block the legitimate re-run: ${r.stdout}${r.stderr}`,
+    );
     assert.ok(existsSync(join(dir, 'pages', 'bar.md')), 'bar.md exists');
     assert.ok(!existsSync(join(dir, 'pages', 'foo.md')), 'foo.md gone');
     assert.ok(
@@ -1104,7 +1182,11 @@ test('doctor.mjs after a post-renameSync crash: marker present + move done → "
       encoding: 'utf-8',
       env: { ...process.env, HOME: home, HYPO_TEST_KILL_PAGE_POST: '1' },
     });
-    assert.equal(killed.signal, 'SIGKILL', `expected the kill hook to fire post-rename: ${killed.stderr}`);
+    assert.equal(
+      killed.signal,
+      'SIGKILL',
+      `expected the kill hook to fire post-rename: ${killed.stderr}`,
+    );
 
     const markerPath = join(wiki, '.cache', 'rename-in-progress.json');
     assert.ok(existsSync(markerPath), 'the marker must survive a post-move crash');
@@ -1115,7 +1197,11 @@ test('doctor.mjs after a post-renameSync crash: marker present + move done → "
     const checks = JSON.parse(doctorR.stdout);
     const check = checks.find((c) => c.label === 'Incomplete rename');
     assert.ok(check, 'Incomplete rename check not found');
-    assert.equal(check.status, 'warn', `stale-but-done marker must still warn (not pass): ${check.detail}`);
+    assert.equal(
+      check.status,
+      'warn',
+      `stale-but-done marker must still warn (not pass): ${check.detail}`,
+    );
     assert.ok(
       !/re-run/i.test(check.detail),
       `must NOT tell the user to re-run a command that would fail (--from no longer resolves): ${check.detail}`,
@@ -1130,7 +1216,11 @@ test('doctor.mjs after a post-renameSync crash: marker present + move done → "
     rmSync(markerPath, { force: true });
     const doctorR2 = run('doctor.mjs', [`--hypo-dir=${wiki}`, '--json']);
     const check2 = JSON.parse(doctorR2.stdout).find((c) => c.label === 'Incomplete rename');
-    assert.equal(check2.status, 'pass', `following the guidance must leave doctor clean: ${check2.detail}`);
+    assert.equal(
+      check2.status,
+      'pass',
+      `following the guidance must leave doctor clean: ${check2.detail}`,
+    );
   });
 });
 
@@ -1153,7 +1243,11 @@ test('crash mid-rewrite-loop: marker records mode/from/to, page not yet moved, r
       encoding: 'utf-8',
       env: { ...process.env, HOME: home, HYPO_TEST_KILL_AFTER_N: '3' },
     });
-    assert.equal(killed.signal, 'SIGKILL', `expected the kill hook to fire: ${killed.stdout}${killed.stderr}`);
+    assert.equal(
+      killed.signal,
+      'SIGKILL',
+      `expected the kill hook to fire: ${killed.stdout}${killed.stderr}`,
+    );
 
     const markerPath = join(wiki, '.cache', 'rename-in-progress.json');
     assert.ok(existsSync(markerPath), 'marker must survive the crash');
@@ -1174,7 +1268,10 @@ test('crash mid-rewrite-loop: marker records mode/from/to, page not yet moved, r
     );
 
     // Re-running the SAME command (no kill env) must converge and clear the marker.
-    const rerun = spawnSync(process.execPath, cmd, { encoding: 'utf-8', env: { ...process.env, HOME: home } });
+    const rerun = spawnSync(process.execPath, cmd, {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: home },
+    });
     assert.equal(rerun.status, 0, `re-run must converge: ${rerun.stdout}${rerun.stderr}`);
     assert.ok(existsSync(join(wiki, 'pages', 'bar.md')), 'bar.md must exist after re-run');
     assert.ok(!existsSync(join(wiki, 'pages', 'foo.md')), 'foo.md must be gone after re-run');

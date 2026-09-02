@@ -252,7 +252,11 @@ test('hot-rebuild advances this session base to the bytes it just wrote, so a ma
         hashContent(disk),
         'hot-rebuild must advance this session base to the bytes it just wrote',
       );
-      assert.notEqual(baseAfter.hash, baseBefore.hash, 'the base must have MOVED off the stale snapshot');
+      assert.notEqual(
+        baseAfter.hash,
+        baseBefore.hash,
+        'the base must have MOVED off the stale snapshot',
+      );
 
       // Assertion 2: an apply carrying VALID BUT BYTE-DISTINCT content (one
       // trailing newline off disk, the exact shape that reproduced the false
@@ -2790,7 +2794,7 @@ test('precompactGateStatus: uncommitted change in the base scope (hot.md) → gi
 // DIFFERENT session sharing the same vault still has its own file dirty. That
 // file is human-fixable by whoever owns it, not by this session, so it must
 // not refuse THIS session's close.
-test('precompactGateStatus: uncommitted change OUTSIDE this session\'s scope → notice, not a git blocker', () => {
+test("precompactGateStatus: uncommitted change OUTSIDE this session's scope → notice, not a git blocker", () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, 'unrelated-session.md'), "# another session's own edit\n");
     // The partition only fires with a TRUSTED transcript (codex pre-commit
@@ -2805,7 +2809,9 @@ test('precompactGateStatus: uncommitted change OUTSIDE this session\'s scope →
       transcript,
       JSON.stringify({
         type: 'assistant',
-        message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'hot.md') } }] },
+        message: {
+          content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'hot.md') } }],
+        },
       }) + '\n',
     );
     const gate = precompactGateStatus(dir, {
@@ -2817,9 +2823,7 @@ test('precompactGateStatus: uncommitted change OUTSIDE this session\'s scope →
       `a foreign session's dirty file must NOT be a git blocker: ${JSON.stringify(gate.blockers)}`,
     );
     assert.ok(
-      (gate.notices || []).some(
-        (n) => n.type === 'git' && n.file === 'unrelated-session.md',
-      ),
+      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'unrelated-session.md'),
       `the foreign dirty file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
     );
   });
@@ -2860,7 +2864,11 @@ test('precompactGateStatus: transcript with a corrupt line → a transcript-only
       [
         JSON.stringify({
           type: 'assistant',
-          message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'log.md') } }] },
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'log.md') } },
+            ],
+          },
         }),
         '{"type": "assistant", "message": {"content": [{"trunc',
       ].join('\n') + '\n',
@@ -2897,7 +2905,10 @@ test('precompactGateStatus: vault nested under a bigger git repo, my hot.md dirt
       '---\ntitle: Hot\nupdated: today\n---\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
     );
     writeFileSync(join(vault, 'log.md'), '# Log\n');
-    writeFileSync(join(base, 'host-repo-file.md'), '# unrelated content living outside the vault\n');
+    writeFileSync(
+      join(base, 'host-repo-file.md'),
+      '# unrelated content living outside the vault\n',
+    );
     spawnSync('git', ['add', '-A'], { cwd: base });
     spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: base });
     appendFileSync(join(vault, 'hot.md'), '\ndirty\n');
@@ -2907,7 +2918,11 @@ test('precompactGateStatus: vault nested under a bigger git repo, my hot.md dirt
       transcript,
       JSON.stringify({
         type: 'assistant',
-        message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(vault, 'log.md') } }] },
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(vault, 'log.md') } },
+          ],
+        },
       }) + '\n',
     );
     const gate = precompactGateStatus(vault, {
@@ -2933,13 +2948,7 @@ test('precompactGateStatus: a renamed file landing in scope → still a git bloc
     writeFileSync(join(dir, 'projects', 'demo', 'draft.md'), '# draft session-state\n'.repeat(20));
     spawnSync('git', ['-C', dir, 'add', '-A']);
     spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed draft']);
-    spawnSync('git', [
-      '-C',
-      dir,
-      'mv',
-      'projects/demo/draft.md',
-      'projects/demo/session-state.md',
-    ]);
+    spawnSync('git', ['-C', dir, 'mv', 'projects/demo/draft.md', 'projects/demo/session-state.md']);
     const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
     const transcript = join(tdir, 't.jsonl');
     writeFileSync(

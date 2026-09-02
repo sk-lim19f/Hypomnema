@@ -42,6 +42,28 @@ jobs:
       - name: Run lint
         run: npm run lint
 
+  format:
+    name: Format
+    # The only place that catches drift, and it detects rather than prevents:
+    # no branch protection makes this a required check, so a red result has to
+    # be read before merging. The local pre-commit hook (scripts/pre-commit-
+    # format.mjs) warns on stderr but does not block when
+    # node_modules/.bin/prettier is missing in the worktree that made the
+    # commit, and prepublishOnly does not run format:check either, so a file
+    # can go un-formatted past both and reach `main`. `npm ci` here rather than
+    # `npx`: the devDependency is pinned exactly, so this job and the hook
+    # measure against the same prettier, while a bare `npx prettier` resolves
+    # whatever is newest and will disagree.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Every checked file matches Prettier's output
+        run: npm run format:check
+
   tracker-ids:
     name: Tracker-id gate
     runs-on: ubuntu-latest

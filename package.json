@@ -93,6 +93,6 @@
     "prepublishOnly": "npm test && npm run lint && npm run check:versions && npm run smoke:plugin && node scripts/check-pack-surface.mjs && npm run smoke-pack && npm run check:bilingual && npm run check:tracker-ids"
   },
   "devDependencies": {
-    "prettier": "^3.8.3"
+    "prettier": "3.8.3"
   }
 }

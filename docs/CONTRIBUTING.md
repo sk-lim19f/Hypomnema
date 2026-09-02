@@ -384,6 +384,7 @@ npm run check:bilingual    # each gated CHANGELOG section has #### English + ###
 npm run smoke:plugin       # plugin manifest + hooks/commands/skills load-valid
 npm run smoke-pack         # packed tarball installs and resolves
 npm run check:tracker-ids  # no private-tracker pointers leaked into shipped files
+npm run format:check       # every checked file matches Prettier's output
 
 # 4. Commit every file the bump touched, plus the lockfile.
 git add package.json package-lock.json .claude-plugin/ templates/hypo-config.md \

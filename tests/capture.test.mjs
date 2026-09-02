@@ -742,7 +742,10 @@ test('a hook whose extension disagrees with its interpreter is skipped with a vi
       );
       const settingsPath = join(home, '.claude', 'settings.json');
       const settingsText = existsSync(settingsPath) ? readFileSync(settingsPath, 'utf-8') : '';
-      assert.ok(!settingsText.includes('mismatch'), 'no settings.json entry for the mismatched hook');
+      assert.ok(
+        !settingsText.includes('mismatch'),
+        'no settings.json entry for the mismatched hook',
+      );
       assert.ok(
         out.applied.extensions.warnings.some(
           (w) => w.includes('interpreter-extension-mismatch') && w.includes('hypo-ext-mismatch'),
