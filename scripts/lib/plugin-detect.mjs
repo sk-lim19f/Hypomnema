@@ -170,7 +170,8 @@ export function leafVersionDrift(pkgRoot) {
   // doctor happens to gate on usablePkgRoot first, which requires a readable version, so
   // this is unreachable today; it is closed here because this is an exported API and the
   // next caller will not know to add that gate.
-  if (manifestVersion === null) return { checked: false, drift: false, leaf, manifestVersion: null };
+  if (manifestVersion === null)
+    return { checked: false, drift: false, leaf, manifestVersion: null };
   return { checked: true, drift: manifestVersion !== leaf, leaf, manifestVersion };
 }
 

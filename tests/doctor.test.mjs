@@ -2403,7 +2403,11 @@ test('a leaf that only starts with a version is not treated as version-named', (
     // produces here, so asserting on the detail is what makes this test distinguish the
     // two failure directions rather than just the status word.
     assert.equal(check.status, 'warn', `unverifiable must not read as verified: ${check.detail}`);
-    assert.match(check.detail, /could be compared/, `expected the unverified wording: ${check.detail}`);
+    assert.match(
+      check.detail,
+      /could be compared/,
+      `expected the unverified wording: ${check.detail}`,
+    );
     assert.doesNotMatch(
       check.detail,
       /leaf says v/,

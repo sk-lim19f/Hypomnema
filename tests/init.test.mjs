@@ -751,10 +751,7 @@ test('doc names every hook that reaches the network', () => {
         `network destinations, and it has no opt-out flag`,
     );
   }
-  assert.ok(
-    !/no network requests/i.test(doc),
-    'doc must not blanket-claim no network requests',
-  );
+  assert.ok(!/no network requests/i.test(doc), 'doc must not blanket-claim no network requests');
 });
 
 // The facts inside the network section, not just which hooks it names. Version 3 shortened
@@ -766,7 +763,10 @@ test('doc carries the update-check URLs verbatim and names every opt-out variabl
   const doc = readAutomationDoc();
   const fetchSrc = readFileSync(join(REPO, 'hooks', 'version-check-fetch.mjs'), 'utf-8');
   const urls = [...fetchSrc.matchAll(/'(https:\/\/[^']+)'/g)].map((m) => m[1]);
-  assert.ok(urls.length >= 2, `expected the fetch URLs in version-check-fetch.mjs, got ${urls.length}`);
+  assert.ok(
+    urls.length >= 2,
+    `expected the fetch URLs in version-check-fetch.mjs, got ${urls.length}`,
+  );
   for (const u of urls) {
     assert.ok(doc.includes(u), `doc must carry the fetched URL verbatim: ${u}`);
   }

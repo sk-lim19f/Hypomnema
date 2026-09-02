@@ -540,7 +540,11 @@ test('check with no --project and no evidence resolves nothing (matches the QA r
     seedUndiscoverableProject(dir, 'hook-qa');
     const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', '--json']);
     const out = JSON.parse(r.stdout);
-    assert.equal(out.project, null, `discovery alone must not find a project this fresh: ${r.stdout}`);
+    assert.equal(
+      out.project,
+      null,
+      `discovery alone must not find a project this fresh: ${r.stdout}`,
+    );
     assert.ok(
       out.missing.includes('hot.md (no active project in pointer table)'),
       `must reproduce the exact QA message: ${JSON.stringify(out.missing)}`,
@@ -559,8 +563,16 @@ test('check with --transcript-path, single-project transcript: resolves via the 
       '--json',
     ]);
     const out = JSON.parse(r.stdout);
-    assert.equal(out.project, 'hook-qa', `check must resolve hook-qa via the transcript: ${r.stdout}`);
-    assert.equal(out.scope, 'project', 'an inferred project is a scoped diagnostic, like --project');
+    assert.equal(
+      out.project,
+      'hook-qa',
+      `check must resolve hook-qa via the transcript: ${r.stdout}`,
+    );
+    assert.equal(
+      out.scope,
+      'project',
+      'an inferred project is a scoped diagnostic, like --project',
+    );
     assert.equal(out.scoped_project, 'hook-qa');
     assert.equal(
       out.project_inferred_from_transcript,
@@ -574,7 +586,10 @@ test('check with a transcript touching two different projects still refuses to g
   withSyncedWiki((dir) => {
     seedUndiscoverableProject(dir, 'alpha');
     seedUndiscoverableProject(dir, 'beta');
-    const transcript = toolUseTranscript(dir, ['projects/alpha/index.md', 'projects/beta/index.md']);
+    const transcript = toolUseTranscript(dir, [
+      'projects/alpha/index.md',
+      'projects/beta/index.md',
+    ]);
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--check-session-close',
@@ -625,7 +640,10 @@ test('check with a transcript that reads single-project but has a corrupt line s
       `an untrustworthy walk must not be read as a complete single-project scope: ${r.stdout}`,
     );
     assert.equal(out.scope, 'global');
-    assert.ok(!('scoped_project' in out), 'no scoped_project when the transcript walk cannot be trusted');
+    assert.ok(
+      !('scoped_project' in out),
+      'no scoped_project when the transcript walk cannot be trusted',
+    );
   });
 });
 
@@ -1318,7 +1336,14 @@ test('uncommitted wiki + conditional close phrase, no decline → reconfirm bloc
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
       {
         type: 'user',
         message: { role: 'user', content: '구현 완료하면 세션 마무리하자' },
@@ -1360,7 +1385,14 @@ test('a correlated "아직, 계속" decline suppresses the reconfirm → continu
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
       { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
       askCloseReconfirmToolUse('q1'),
       {
@@ -1435,7 +1467,14 @@ test('decline label variants ("나중에" / "later") also suppress (label-drift 
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
       { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
       askCloseReconfirmToolUse('q1'),
       {
@@ -1473,7 +1512,14 @@ test('genuine close-now + uncommitted, no decline → still reconfirm block (no 
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
       { type: 'user', message: { role: 'user', content: '다 끝났으면 세션 마무리하자' } },
     ]);
     const r = runAutoMinimal(dir, {
@@ -1640,7 +1686,14 @@ test('absent background_tasks + uncommitted → in-flight fails open, git alone 
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
     const transcript = writeTranscript(dir, [
-      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } }] } },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
       { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
     ]);
     // No background_tasks key at all in the payload.
@@ -1974,7 +2027,10 @@ test('--apply-session-close --session-id with an unresolvable transcript → ref
     // longer sweeps the whole working tree, so a payload file left inside
     // `dir` would sit there as a real git blocker instead of being silently
     // absorbed by the apply's own commit.
-    const payloadPath = join(tmpdir(), `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`);
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
     writeFileSync(payloadPath, JSON.stringify(payload));
     const sessionStateBefore = readFileSync(
       join(dir, 'projects', 'test-project', 'session-state.md'),
@@ -2030,7 +2086,10 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
     // longer sweeps the whole working tree, so a payload file left inside
     // `dir` would sit there as a real git blocker instead of being silently
     // absorbed by the apply's own commit.
-    const payloadPath = join(tmpdir(), `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`);
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
     writeFileSync(payloadPath, JSON.stringify(payload));
     // Plant a transcript resolvable by session-id that carries a user-close signal.
     const cleanup = seedCloseTranscript('s-apply-land');

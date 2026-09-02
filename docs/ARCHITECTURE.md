@@ -448,7 +448,11 @@ does not matter.
 
 ## CI / Release
 
-### `ci.yml` — 7 independent jobs
+### `ci.yml` — independent jobs
+
+The table below is not exhaustive and the count is deliberately left out: it went
+stale once already. `.github/workflows/ci.yml` is the source of truth for which
+jobs exist.
 
 | Job | Purpose |
 |---|---|
