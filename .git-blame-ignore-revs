@@ -3,3 +3,6 @@
 
 # style: apply Prettier formatting to scripts/, hooks/, tests/ (2026-05-16)
 4dac33c
+
+# style: reformat seven files that drifted past the pre-commit hook (2026-09-02)
+cc4ebdc
