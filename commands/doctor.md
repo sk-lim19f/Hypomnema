@@ -52,6 +52,15 @@ For any `✗` failures:
 - Missing Hypomnema root or required directories/files → run `/hypo:init`.
 - 0 hook files installed → run `/hypo:init`.
 - 0 hook registrations in settings.json → run `/hypo:init`.
+- `Hook execution smoke test` failed → show the stderr excerpt in the detail
+  verbatim; it names the cause. The repair depends on the channel, and
+  `/hypo:init` is only right on one of them. If `Hook files installed` says
+  "provided by the plugin loader", the install is plugin-managed and
+  `/hypo:init` deliberately leaves core hooks alone: tell the user to
+  re-install the plugin. Otherwise (npm or manual install) `/hypo:init`
+  repairs an incomplete copy. When the excerpt is not a missing module, have
+  the user run the hook directly in their shell
+  (`echo '{}' | node <the path in the detail>`) and read the error there.
 
 For `⚠` warnings:
 - Missing `hypo-config.md` → run `/hypo:init` — it creates the config marker.
@@ -59,6 +68,11 @@ For `⚠` warnings:
 - Partial hook files (some missing) → run `/hypo:init` to install missing hooks.
 - Partial settings.json registrations → run `/hypo:init` to merge missing entries.
 - Missing git remote → `git -C <hypo-dir> remote add origin <url>`.
+- `Installed cache vs marketplace HEAD` says the install is behind → the plugin
+  version string did not move, so the update left the old cache in place. Wait
+  for the next version bump, or swap the cache directory by hand knowing the
+  next real update overwrites it. If it says *ahead* instead, that is a local
+  checkout running in front of the marketplace and there is nothing to do.
 - Broken `[[links]]` → list the affected files and ask if the user wants to fix them now.
 - Overdue `verify_by_date` → offer to open the affected pages for review.
 - Missing `verify_by` question → suggest adding a `verify_by` field to the listed pages.

@@ -25,6 +25,7 @@ import {
   REPO,
   SCRIPTS,
   SESSION_TMP_HOME,
+  gitHead,
   gitRepo,
   run,
   runWithHome,
@@ -2453,3 +2454,368 @@ test('leafVersionDrift: unreadable manifest is checked:false, not a clean compar
     assert.equal(d.manifestVersion, null);
   });
 });
+
+// ── doctor.mjs: installed cache vs marketplace HEAD ─────────────────────────
+//
+// `/plugin marketplace update <marketplace>` pulls the marketplace clone
+// forward but only re-copies the plugin CACHE when the version string moved,
+// so the cache can sit commits behind a marketplace clone under the same
+// version string. installed_plugins.json's `gitCommitSha` records the commit
+// each cache row was populated from; the marketplace clone's own `git
+// rev-parse HEAD` is the other half of the comparison.
+
+suite('doctor.mjs: installed cache vs marketplace HEAD');
+
+const IPD_KEY = 'hypo@hypomnema';
+
+function ipdEnablePlugin(home) {
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(
+    join(home, '.claude', 'settings.json'),
+    JSON.stringify({ enabledPlugins: { [IPD_KEY]: true } }),
+  );
+}
+
+// A real git clone with `commitCount` commits, standing in for
+// ~/.claude/plugins/marketplaces/hypomnema/. Returns every commit sha, oldest
+// first, so a test can pin the installed cache to any point in the history.
+// Every git child here gets HOME pinned to the fixture's own home and hooks
+// switched off. gitRepo() from helpers.mjs does neither, and a developer with a
+// global core.hooksPath would have this fixture's commits run their real hooks
+// against a temp repo. The suite already sets core.hooksPath=/dev/null in its
+// other git fixture; this brings the marketplace one in line.
+function ipdGit(home, args, opts = {}) {
+  return spawnSync('git', args, {
+    encoding: 'utf-8',
+    ...opts,
+    env: {
+      ...process.env,
+      HOME: home,
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_SYSTEM: '/dev/null',
+    },
+  });
+}
+
+function ipdBuildMarketplace(home, commitCount) {
+  const marketplaceDir = join(home, '.claude', 'plugins', 'marketplaces', 'hypomnema');
+  mkdirSync(marketplaceDir, { recursive: true });
+  const cwd = { cwd: marketplaceDir };
+  ipdGit(home, ['init', '-q'], cwd);
+  ipdGit(home, ['config', 'user.email', 't@t.test'], cwd);
+  ipdGit(home, ['config', 'user.name', 'test'], cwd);
+  ipdGit(home, ['config', 'commit.gpgsign', 'false'], cwd);
+  ipdGit(home, ['config', 'core.hooksPath', '/dev/null'], cwd);
+  const shas = [];
+  for (let i = 0; i < commitCount; i++) {
+    writeFileSync(join(marketplaceDir, 'f.txt'), String(i));
+    ipdGit(home, ['add', '-A'], cwd);
+    const c = ipdGit(home, ['commit', '-q', '-m', `c${i}`], cwd);
+    assert.equal(c.status, 0, `fixture commit c${i} failed: ${c.stderr}`);
+    shas.push(ipdGit(home, ['rev-parse', 'HEAD'], cwd).stdout.trim());
+  }
+  return { marketplaceDir, shas };
+}
+
+// installed_plugins.json entry shape, `gitCommitSha` included: the field
+// this check reads and the older `registerPluginCache` fixture (leaf-version
+// suite above) does not carry.
+function ipdRegisterCache(home, installedSha, scopes = ['user']) {
+  const root = join(home, '.claude', 'plugins', 'cache', 'hypomnema', 'hypo', '1.7.4');
+  mkdirSync(root, { recursive: true });
+  writeFileSync(
+    join(root, 'package.json'),
+    JSON.stringify({ name: 'hypomnema', version: '1.7.4' }),
+  );
+  const registryDir = join(home, '.claude', 'plugins');
+  mkdirSync(registryDir, { recursive: true });
+  writeFileSync(
+    join(registryDir, 'installed_plugins.json'),
+    JSON.stringify({
+      plugins: {
+        [IPD_KEY]: scopes.map((scope) => ({
+          installPath: root,
+          scope,
+          gitCommitSha: installedSha,
+        })),
+      },
+    }),
+  );
+  return root;
+}
+
+test('plugin not enabled: check is silent (not reported at all)', () => {
+  withTmpHome((home) => {
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.equal(check, undefined, 'no enabled plugin means nothing to verify');
+  });
+});
+
+test('installed sha matches marketplace HEAD: passes', () => {
+  withTmpHome((home) => {
+    ipdEnablePlugin(home);
+    const { shas } = ipdBuildMarketplace(home, 2);
+    ipdRegisterCache(home, shas[1]); // shas[1] is HEAD
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'expected an Installed cache vs marketplace HEAD check');
+    assert.equal(check.status, 'pass', `matching sha must pass: ${check.detail}`);
+  });
+});
+
+test('installed sha behind marketplace HEAD: warns and names the commit count', () => {
+  withTmpHome((home) => {
+    ipdEnablePlugin(home);
+    const { shas } = ipdBuildMarketplace(home, 3);
+    ipdRegisterCache(home, shas[0]); // two commits behind HEAD (shas[2])
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'expected an Installed cache vs marketplace HEAD check');
+    assert.equal(check.status, 'warn', `drifted sha must warn, not pass: ${check.detail}`);
+    assert.match(check.detail, /2 commit\(s\) behind/, check.detail);
+  });
+});
+
+test('installed sha ahead of marketplace HEAD: says ahead, never tells the user to overwrite it', () => {
+  withTmpHome((home) => {
+    ipdEnablePlugin(home);
+    const { marketplaceDir, shas } = ipdBuildMarketplace(home, 3);
+    // Roll the clone back so the install (shas[2]) is a descendant of its HEAD.
+    // `rev-list --count shas[2]..shas[0]` is 0 here, the same value a matching
+    // pair would give, which is why the shas are compared for equality first.
+    const reset = ipdGit(home, ['reset', '--hard', '-q', shas[0]], { cwd: marketplaceDir });
+    assert.equal(reset.status, 0, `fixture reset failed: ${reset.stderr}`);
+    ipdRegisterCache(home, shas[2]);
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'expected an Installed cache vs marketplace HEAD check');
+    assert.match(check.detail, /ahead of/, check.detail);
+    assert.doesNotMatch(
+      check.detail,
+      /behind/,
+      `an ahead install must not read as behind: ${check.detail}`,
+    );
+    assert.doesNotMatch(
+      check.detail,
+      /replace .* by hand/,
+      `overwriting a newer cache with an older clone is a downgrade: ${check.detail}`,
+    );
+  });
+});
+
+// The marketplace clone on a real machine is shallow: `/plugin marketplace
+// update` clones with a truncated history, so `.git/shallow` is present and a
+// walk that has to cross the graft point simply stops. A full-clone fixture
+// never exercises that, which is how a count-based direction check passed here
+// while being wrong on the only clone shape that actually ships.
+test('shallow marketplace clone: an undecidable direction is said, not guessed', () => {
+  withTmpHome((home) => {
+    ipdEnablePlugin(home);
+    const { marketplaceDir, shas } = ipdBuildMarketplace(home, 3);
+    // Re-clone at depth 1 over the same path, so HEAD is the tip and every
+    // earlier commit is beyond the graft point.
+    const upstream = join(home, 'upstream.git');
+    const mv = ipdGit(home, ['clone', '-q', '--bare', marketplaceDir, upstream]);
+    assert.equal(mv.status, 0, `fixture bare clone failed: ${mv.stderr}`);
+    rmSync(marketplaceDir, { recursive: true, force: true });
+    const cl = ipdGit(home, ['clone', '-q', '--depth', '1', `file://${upstream}`, marketplaceDir]);
+    assert.equal(cl.status, 0, `fixture shallow clone failed: ${cl.stderr}`);
+    assert.ok(
+      existsSync(join(marketplaceDir, '.git', 'shallow')),
+      'the fixture must actually be shallow, or it tests the same thing as the full-clone case',
+    );
+
+    // shas[0] is real upstream history but unreachable from this clone's graft
+    // point, so git can place it in neither direction.
+    ipdRegisterCache(home, shas[0]);
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'expected an Installed cache vs marketplace HEAD check');
+    assert.match(check.detail, /cannot be determined/, check.detail);
+    assert.doesNotMatch(
+      check.detail,
+      /commit\(s\) behind/,
+      `no count may be claimed when the direction is unknown: ${check.detail}`,
+    );
+    assert.doesNotMatch(
+      check.detail,
+      /replace .* by hand/,
+      `overwriting on an unknown direction can be a downgrade: ${check.detail}`,
+    );
+  });
+});
+
+// The exact combination the task names: BOTH the current key (`hypo@hypomnema`)
+// and the legacy key (`hypomnema@hypomnema`) present in one registry file, only
+// the current one enabled. The legacy row is deliberately stale (an unrelated
+// sha) — if the check ever picked the wrong key, this would read as drifted.
+test('registry carries both the current and legacy plugin key: only the enabled key is compared', () => {
+  withTmpHome((home) => {
+    ipdEnablePlugin(home); // enables hypo@hypomnema only
+    const { shas } = ipdBuildMarketplace(home, 2);
+    ipdRegisterCache(home, shas[1]); // current key matches HEAD
+    const registryPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const reg = JSON.parse(readFileSync(registryPath, 'utf-8'));
+    reg.plugins['hypomnema@hypomnema'] = [
+      {
+        installPath: join(home, '.claude', 'plugins', 'cache', 'hypomnema', 'hypo', '1.6.0'),
+        scope: 'user',
+        gitCommitSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      },
+    ];
+    writeFileSync(registryPath, JSON.stringify(reg));
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'expected an Installed cache vs marketplace HEAD check');
+    assert.equal(
+      check.status,
+      'pass',
+      `must compare the enabled key's row, not the legacy one: ${check.detail}`,
+    );
+  });
+});
+
+// A registry from before gitCommitSha existed (or an entry missing it) — must
+// degrade to an unverifiable warn, never read as a clean compare.
+test('registry entry carries no gitCommitSha: warns, does not silently pass', () => {
+  withTmpHome((home) => {
+    enablePlugin(home); // shared fixture from the leaf-version suite, same key
+    registerPluginCache(home, '1.7.4', '1.7.4'); // no gitCommitSha field
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'expected an Installed cache vs marketplace HEAD check');
+    assert.equal(
+      check.status,
+      'warn',
+      `missing gitCommitSha must not read as verified: ${check.detail}`,
+    );
+    assert.match(check.detail, /gitCommitSha/, check.detail);
+  });
+});
+
+// ── doctor.mjs: hook execution smoke test ───────────────────────────────────
+//
+// checkHooks/checkSettingsJson only prove a hook file exists and is
+// registered. This proves it can actually run: spawn hypo-file-watch.mjs with
+// a stdin payload it cannot match against HYPO_DIR, and check it exits 0 with
+// parseable JSON. The broken-hook fixture below deletes the hook's own
+// hypo-shared.mjs dependency so `node hypo-file-watch.mjs` dies at ESM
+// resolution with `Cannot find module ... Require stack:` on stderr and exit
+// 1 — the same shape (any node invocation of this file dies before its own
+// code runs) as the measured incident's stale NODE_OPTIONS `--require`, without
+// literally exporting that env: NODE_OPTIONS is inherited by doctor.mjs's own
+// process too, so setting it globally kills doctor before it reaches this
+// check at all (confirmed empirically), not just the hook subprocess.
+
+suite('doctor.mjs: hook execution smoke test');
+// The registry can carry a user row and a project row on the SAME installPath.
+// resolveEnabledPluginRoot picks the user one; the drift check has to pick the
+// same one or it reports a stale project sha as the state of a user install
+// that is actually at HEAD, and answers a healthy cache with "replace it by
+// hand". Ordering the project row first is what makes the two rules diverge.
+// The order the two rules run in decides which row answers. Filtering for a sha
+// first and preferring user scope second silently swaps rows when the user row
+// has no gitCommitSha: the project row's older sha becomes the provenance of an
+// install it does not describe, and the reader is told to replace a cache by
+// hand. Choosing the row first and asking about its sha second cannot swap.
+test('user row on the path has no sha: says unverifiable, does not borrow the project row sha', () => {
+  withTmpHome((home) => {
+    ipdEnablePlugin(home);
+    const { shas } = ipdBuildMarketplace(home, 3);
+    const root = join(home, '.claude', 'plugins', 'cache', 'hypomnema', 'hypo', '1.7.4');
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'hypomnema', version: '1.7.4' }),
+    );
+    writeFileSync(
+      join(home, '.claude', 'plugins', 'installed_plugins.json'),
+      JSON.stringify({
+        plugins: {
+          [IPD_KEY]: [
+            {
+              scope: 'project',
+              projectPath: join(home, 'some-project'),
+              installPath: root,
+              version: '1.7.4',
+              gitCommitSha: shas[0],
+            },
+            // The row the resolver picks, and it carries no sha.
+            { scope: 'user', installPath: root, version: '1.7.4' },
+          ],
+        },
+      }),
+    );
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'expected an Installed cache vs marketplace HEAD check');
+    assert.match(check.detail, /carries no gitCommitSha/, check.detail);
+    assert.doesNotMatch(
+      check.detail,
+      /behind/,
+      `an unverifiable row must not be answered with a drift verdict: ${check.detail}`,
+    );
+    assert.doesNotMatch(check.detail, /replace .* by hand/, check.detail);
+  });
+});
+
+test('registry has user and project rows on one path: drift reads the user row, not whichever is first', () => {
+  withTmpHome((home) => {
+    ipdEnablePlugin(home);
+    const { shas } = ipdBuildMarketplace(home, 3);
+    const root = join(home, '.claude', 'plugins', 'cache', 'hypomnema', 'hypo', '1.7.4');
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'hypomnema', version: '1.7.4' }),
+    );
+    writeFileSync(
+      join(home, '.claude', 'plugins', 'installed_plugins.json'),
+      JSON.stringify({
+        plugins: {
+          [IPD_KEY]: [
+            // Project row FIRST, carrying an older sha.
+            {
+              scope: 'project',
+              projectPath: join(home, 'some-project'),
+              installPath: root,
+              version: '1.7.4',
+              gitCommitSha: shas[0],
+            },
+            { scope: 'user', installPath: root, version: '1.7.4', gitCommitSha: shas[2] },
+          ],
+        },
+      }),
+    );
+    const r = runWithHome('doctor.mjs', [`--hypo-dir=${NONEXISTENT_WIKI}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Installed cache vs marketplace HEAD');
+    assert.ok(check, 'expected an Installed cache vs marketplace HEAD check');
+    assert.equal(
+      check.status,
+      'pass',
+      `the user row is at HEAD, so this install is not behind: ${check.detail}`,
+    );
+    assert.doesNotMatch(check.detail, /behind/, check.detail);
+  });
+});
+// ── doctor.mjs: feedback projection attributes "no JSON report" to a broken
+// hook smoke test when one already fired ─────────────────────────────────────
+//
+// A copy of doctor's own scripts/hooks tree (mirrors ISSUE-52's
+// withFakeDoctorInstall above) with scripts/feedback-sync.mjs replaced by a
+// stub that prints nothing and exits 1 — reliably reproducing "no JSON
+// report" without depending on a real feedback-sync crash path (the script's
+// own defenses against filesystem errors are already hardened; see the
+// build-failed comment in evaluateTarget).
+
+suite('doctor.mjs: feedback projection attributes hook-broken');
