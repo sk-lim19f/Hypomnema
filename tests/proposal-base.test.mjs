@@ -3730,5 +3730,25 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
       false,
       `${name} must not call an apply actor`,
     );
+    // applySessionClose was a private function inside crystallize.mjs, so no
+    // hook could import it however hard it tried. Splitting the file made it an
+    // export, which is a reachable apply path this scan did not previously have
+    // to name. Both doors: importing the module, and spawning the CLI flag that
+    // reaches the same function.
+    assert.equal(
+      /scripts\/lib\/crystallize-close-apply\.mjs/.test(code),
+      false,
+      `${name} must not import the session-close apply module`,
+    );
+    assert.equal(
+      /\bapplySessionClose\s*\(/.test(code),
+      false,
+      `${name} must not call the session-close apply actor`,
+    );
+    assert.equal(
+      /--apply-session-close/.test(code),
+      false,
+      `${name} must not spawn the session-close apply CLI`,
+    );
   }
 });

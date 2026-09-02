@@ -1451,7 +1451,7 @@ function closeCandidateSlugs(hypoDir, dates) {
         // slug yields a token that no longer maps to a `projects/<slug>/`
         // directory — gating on disk keeps it out of the dangling-close set.
         // Directory (not bare-exists) mirrors the apply-path project check
-        // (crystallize.mjs:193).
+        // (crystallize-args.mjs).
         const dir = join(projectsDir, m[1]);
         if (existsSync(dir) && statSync(dir).isDirectory()) slugs.add(m[1]);
       }

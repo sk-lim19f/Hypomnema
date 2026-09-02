@@ -367,10 +367,11 @@ export function readResolution(hypoDir, sessionId, rawTranscript) {
  * and a marker withheld by a commit failure could never be recovered
  * without a brand-new close phrase the user has no reason to type twice.
  * tests/close-hooks-gate.test.mjs's test C
- * ("crystallize.mjs:754 (runMarkSessionClosed) stays on isCloseGateOpen")
+ * ("runMarkSessionClosed stays on isCloseGateOpen")
  * pins exactly this: it withholds a marker via a real commit failure, fixes
  * the commit by hand with NO new close signal, and asserts the recovery run
- * still succeeds; swapping :754 to `closeGateStatus` turns that test red.
+ * still succeeds; swapping that call to `closeGateStatus` turns that test
+ * red.
  * As of this writing the two callers that gate a NEW request are
  * `verifyCloseAuthority` (crystallize.mjs, before any wiki byte is written)
  * and `hypo-close-guard.mjs`'s PreToolUse intercept (before a

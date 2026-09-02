@@ -1653,7 +1653,7 @@ test('B) hypo-close-guard.mjs: a resolved close with no new open re-asks, and na
   });
 });
 
-test('C) crystallize.mjs:754 (runMarkSessionClosed) stays on isCloseGateOpen: a commit-failed marker still recovers with NO new close signal', () => {
+test('C) runMarkSessionClosed stays on isCloseGateOpen: a commit-failed marker still recovers with NO new close signal', () => {
   withCleanWiki((wiki) => {
     // Same commit-failure fixture as the T3 suite above: force the vault's
     // own commit to fail, so apply succeeds (ok:true, resolution recorded by

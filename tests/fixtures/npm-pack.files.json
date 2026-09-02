@@ -292,6 +292,26 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/crystallize-args.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/crystallize-close-apply.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/crystallize-close-check.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/crystallize-close-gate.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/crystallize-helpers.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/design-history-stale.mjs",
     "exec": false
   },
