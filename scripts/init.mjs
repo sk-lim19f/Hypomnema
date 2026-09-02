@@ -989,7 +989,7 @@ const args = parseArgs(process.argv);
 
 // ── install channel ───────────────────────────────────────────────────────────
 //
-// A plugin-channel install already provides the 14 core hooks + slash commands
+// A plugin-channel install already provides the core hooks in hooks/hooks.json plus the slash commands
 // through the package's own hooks/hooks.json + commands/ (Claude Code auto-wires
 // them). Copying the same hooks into ~/.claude/hooks and registering the same
 // events in settings.json on top makes every core hook fire TWICE, the same

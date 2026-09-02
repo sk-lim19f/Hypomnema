@@ -78,7 +78,7 @@ const HOOKS_SRC = join(PKG_ROOT, 'hooks');
 
 // ── install channel ───────────────────────────────────────────────────────────
 //
-// A plugin-channel install registers its 14 core hooks straight out of the
+// A plugin-channel install registers the core hooks named in hooks/hooks.json straight out of the
 // package's own hooks/hooks.json (CLAUDE_PLUGIN_ROOT) — Claude Code auto-wires
 // them, they are never copied into ~/.claude/hooks and never listed in
 // ~/.claude/settings.json. checkHooks/checkSettingsJson used to treat that
@@ -1992,6 +1992,184 @@ function checkPluginLeafVersion() {
   }
 }
 
+// ── installed cache vs marketplace clone (plugin channel) ──────────────────
+//
+// `/plugin marketplace update <marketplace>` pulls the marketplace repo to its
+// own clone at `~/.claude/plugins/marketplaces/<marketplace>/`, but only
+// re-copies that clone into the plugin CACHE (the directory hooks actually run
+// from) when plugin.json's version string has moved, the same skip-the-copy
+// behavior `checkPluginLeafVersion` above reports on. When the version string
+// has not moved, the marketplace clone can sit commits ahead of the cache with
+// no symptom anywhere: hooks run, slash commands resolve, the version string
+// still reads correctly, and a bug already fixed on `main` keeps reproducing.
+// Measured 2026-08-27: marketplace clone at one commit, install cache three
+// merges behind, same version string, no surface said so.
+//
+// `installed_plugins.json` records the exact commit each cache entry was
+// populated from (`gitCommitSha`); the marketplace clone's own `git rev-parse
+// HEAD` is the other half. Compared against the SAME install root
+// `resolveEnabledPluginRoot` resolves (user scope preferred, matching what
+// actually runs), this is the only place the two can be told apart. Never a
+// hard failure: a developer's checkout running ahead of an install is the
+// normal state while iterating, so this only makes the gap visible (warn),
+// with what the user can actually do about it (wait for the next version
+// bump, or replace the cache directory by hand knowing the next real update
+// overwrites it anyway); there is no way to force the copy to happen sooner.
+function checkPluginInstallDrift() {
+  const settingsPath = join(HOME, '.claude', 'settings.json');
+  const key = enabledHypomnemaPluginKey(settingsPath);
+  if (!key) return; // plugin not enabled, nothing to verify
+
+  const registryPath = join(HOME, '.claude', 'plugins', 'installed_plugins.json');
+  const installRoot = resolveEnabledPluginRoot(settingsPath, registryPath);
+  if (!installRoot) {
+    warn(
+      'Installed cache vs marketplace HEAD',
+      `${key} is enabled but no usable install root could be positively resolved from ` +
+        `${registryPath}, so the installed cache's commit cannot be verified`,
+    );
+    return;
+  }
+
+  let reg;
+  try {
+    reg = JSON.parse(readFileSync(registryPath, 'utf-8'));
+  } catch {
+    warn(
+      'Installed cache vs marketplace HEAD',
+      `Cannot read ${registryPath}, so the installed cache's commit cannot be verified`,
+    );
+    return;
+  }
+  const entries =
+    reg &&
+    typeof reg.plugins === 'object' &&
+    !Array.isArray(reg.plugins) &&
+    Array.isArray(reg.plugins[key])
+      ? reg.plugins[key]
+      : null;
+  // Same row this exact install root came from, not just any row for `key`,
+  // since a stale duplicate row (e.g. a leftover project-scope entry) can
+  // carry a different, and misleading, gitCommitSha.
+  //
+  // And among rows on that path, the same one resolveEnabledPluginRoot picked:
+  // user scope first. Measured, user and project rows share an installPath, so
+  // taking whichever comes first in the array means a project row's older sha
+  // can be read as the state of a user install that is actually at HEAD, and
+  // the answer would be "behind, replace it by hand" for a cache that is fine.
+  // Pick the row the resolver picked, THEN ask whether it carries a sha. Doing
+  // it the other way round (filter for a sha first, then prefer user scope)
+  // silently swaps rows when the user row has no gitCommitSha: the project
+  // row's older sha gets read as the provenance of the install that actually
+  // runs. Measured, user and project rows share an installPath, so the swap is
+  // reachable, and its output is "behind, replace it by hand" for a cache that
+  // may be fine. A chosen row without a sha is unverifiable, not a reason to
+  // ask a different row.
+  const onPath = (entries ?? []).filter((e) => e && e.installPath === installRoot);
+  const entry = onPath.find((e) => e.scope === 'user') ?? onPath[0];
+  if (entry && !(typeof entry.gitCommitSha === 'string' && entry.gitCommitSha)) {
+    warn(
+      'Installed cache vs marketplace HEAD',
+      `The registry row for ${installRoot} carries no gitCommitSha, so the installed cache's ` +
+        `commit cannot be verified. Another row on the same path may have one, but it describes ` +
+        `a different install`,
+    );
+    return;
+  }
+  if (!entry) {
+    warn(
+      'Installed cache vs marketplace HEAD',
+      `No registry row for ${installRoot} carries a gitCommitSha, so the installed cache's ` +
+        `commit cannot be verified`,
+    );
+    return;
+  }
+  const installedSha = entry.gitCommitSha;
+
+  // `hypo@<marketplace>` / legacy `hypomnema@<marketplace>` → the marketplace
+  // clone lives at `~/.claude/plugins/marketplaces/<marketplace>/`.
+  const marketplaceName = key.slice(key.indexOf('@') + 1);
+  const marketplaceDir = join(HOME, '.claude', 'plugins', 'marketplaces', marketplaceName);
+  const headResult = spawnSync('git', ['-C', marketplaceDir, 'rev-parse', 'HEAD'], {
+    encoding: 'utf-8',
+  });
+  if (headResult.status !== 0 || !headResult.stdout.trim()) {
+    warn(
+      'Installed cache vs marketplace HEAD',
+      `Cannot read the marketplace clone's HEAD at ${marketplaceDir}, so the installed cache ` +
+        `cannot be compared to it`,
+    );
+    return;
+  }
+  const marketplaceHead = headResult.stdout.trim();
+
+  if (installedSha === marketplaceHead) {
+    pass(
+      'Installed cache vs marketplace HEAD',
+      `matches marketplace HEAD (${marketplaceHead.slice(0, 7)})`,
+    );
+    return;
+  }
+
+  // Which way the two shas sit is a question about ancestry, so ask git that
+  // directly instead of inferring it from a count. `A..B` returns 0 both when
+  // the install is ahead and when history is truncated so the walk cannot
+  // reach back, and those two want opposite advice: telling someone to
+  // overwrite a newer cache with an older clone is a downgrade. The
+  // marketplace clone on this machine is shallow (`.git/shallow` present), so
+  // the truncated case is the normal one here, not an edge.
+  const ancestor = (older, newer) =>
+    spawnSync('git', ['-C', marketplaceDir, 'merge-base', '--is-ancestor', older, newer], {
+      encoding: 'utf-8',
+    }).status === 0;
+
+  if (ancestor(marketplaceHead, installedSha)) {
+    warn(
+      'Installed cache vs marketplace HEAD',
+      `The installed cache (${installRoot}) is running ${installedSha.slice(0, 7)}, which is ` +
+        `ahead of the marketplace clone's HEAD (${marketplaceHead.slice(0, 7)}). That is the ` +
+        `normal state while developing against a local checkout; nothing to do.`,
+    );
+    return;
+  }
+
+  if (!ancestor(installedSha, marketplaceHead)) {
+    // Neither reaches the other. Divergent histories, a force-pushed branch, a
+    // commit that predates a shallow clone's graft point. The shas differ and
+    // that is worth saying, but any "N commits behind" or "replace it by hand"
+    // would be a guess about a direction git just declined to give.
+    warn(
+      'Installed cache vs marketplace HEAD',
+      `The installed cache (${installRoot}) is running ${installedSha.slice(0, 7)} and the ` +
+        `marketplace clone's HEAD is ${marketplaceHead.slice(0, 7)}. Neither commit reaches the ` +
+        `other in this clone, so which one is newer cannot be determined here (the clone may be ` +
+        `shallow, or the branch force-pushed). Compare them against the upstream repository ` +
+        `before changing anything.`,
+    );
+    return;
+  }
+
+  // Behind, established by ancestry. The count is a nice-to-have on top; a
+  // shallow clone can refuse to produce one and the sentence still holds.
+  const countResult = spawnSync(
+    'git',
+    ['-C', marketplaceDir, 'rev-list', '--count', `${installedSha}..${marketplaceHead}`],
+    { encoding: 'utf-8' },
+  );
+  const behindCount =
+    countResult.status === 0 && countResult.stdout.trim() !== '' ? countResult.stdout.trim() : null;
+  const behindText = behindCount !== null ? `${behindCount} commit(s) behind` : 'behind';
+  warn(
+    'Installed cache vs marketplace HEAD',
+    `The installed cache (${installRoot}) is running ${installedSha.slice(0, 7)}, ${behindText} ` +
+      `the marketplace clone's HEAD (${marketplaceHead.slice(0, 7)}). The version string did not ` +
+      `move, so \`/plugin marketplace update ${marketplaceName}\` pulled the marketplace clone ` +
+      `forward but skipped re-copying the cache hooks actually run from. Wait for the next ` +
+      `version bump, or replace ${installRoot} by hand with a copy of ${marketplaceDir} (a real ` +
+      `update will overwrite it anyway).`,
+  );
+}
+
 // ── provenance sidecar (manual/npm channel) ────────────────────────────────────
 //
 // `.hypo-provenance.json` lives next to a standalone-copied hooks/ dir
@@ -2260,6 +2438,7 @@ checkSettingsJson(coreManagedByPlugin);
 checkPkgIntegrity(args.claudeHome);
 checkStaleSibling();
 checkPluginLeafVersion();
+checkPluginInstallDrift();
 if (args.codex) checkCodexPaths();
 if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
