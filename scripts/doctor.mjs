@@ -64,11 +64,11 @@ import {
 } from './lib/pkg-provenance.mjs';
 import { resolveCliOnPath, classifyInstall, upgradeApplyHint } from '../hooks/version-check.mjs';
 import {
-  isHypomnemaPluginEnabled,
   enabledHypomnemaPluginKey,
   usablePkgRoot,
   leafVersionDrift,
-  resolveEnabledPluginRoot,
+  resolvePluginChannel,
+  resolveEnabledPluginEntry,
 } from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
@@ -90,11 +90,15 @@ const HOOKS_SRC = join(PKG_ROOT, 'hooks');
 // dual-install variant — a manual/npm doctor.mjs run while the plugin is ALSO
 // enabled in settings.json (see lib/plugin-detect.mjs; fails open on any
 // uncertainty). Either signal means Claude's core hook surface is
-// plugin-managed, not missing.
-const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
-const hypomnemaPluginEnabled =
-  !pluginMode && isHypomnemaPluginEnabled(join(HOME, '.claude', 'settings.json'));
-const coreManagedByPlugin = pluginMode || hypomnemaPluginEnabled;
+// plugin-managed, not missing. resolvePluginChannel is the single place this
+// judgment is made — init.mjs and upgrade.mjs call the same function with their
+// own PKG_ROOT so all three tools agree.
+const pluginChannel = resolvePluginChannel({
+  pkgRoot: PKG_ROOT,
+  settingsPath: join(HOME, '.claude', 'settings.json'),
+  registryPath: join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
+});
+const { pluginMode, hypomnemaPluginEnabled, coreManagedByPlugin } = pluginChannel;
 
 // The durable root the vault's pre-commit hook SHOULD embed, mirroring the same
 // rule upgrade.mjs's self-heal uses: in normal operation (plain plugin mode or
@@ -106,10 +110,7 @@ const coreManagedByPlugin = pluginMode || hypomnemaPluginEnabled;
 // comparison rather than report a false pass or a false drift.
 function resolveDurableHookRoot() {
   if (!hypomnemaPluginEnabled) return PKG_ROOT;
-  return resolveEnabledPluginRoot(
-    join(HOME, '.claude', 'settings.json'),
-    join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
-  );
+  return pluginChannel.root;
 }
 
 // Shown after every fatal package-integrity error. These conditions mean the
@@ -2007,80 +2008,50 @@ function checkPluginLeafVersion() {
 //
 // `installed_plugins.json` records the exact commit each cache entry was
 // populated from (`gitCommitSha`); the marketplace clone's own `git rev-parse
-// HEAD` is the other half. Compared against the SAME install root
-// `resolveEnabledPluginRoot` resolves (user scope preferred, matching what
+// HEAD` is the other half. Compared against the SAME row
+// `resolveEnabledPluginEntry` picks (user scope preferred, matching what
 // actually runs), this is the only place the two can be told apart. Never a
 // hard failure: a developer's checkout running ahead of an install is the
 // normal state while iterating, so this only makes the gap visible (warn),
 // with what the user can actually do about it (wait for the next version
 // bump, or replace the cache directory by hand knowing the next real update
 // overwrites it anyway); there is no way to force the copy to happen sooner.
+//
+// Reads the row through resolveEnabledPluginEntry rather than resolving a path
+// and then re-filtering the registry for the row that produced it (an earlier
+// revision of this function did exactly that, in the opposite order — filter
+// for a sha first, prefer user scope second — which silently swaps rows
+// whenever the user row has no gitCommitSha; see resolveEnabledPluginEntry's
+// own comment in lib/plugin-detect.mjs). One resolver call means one selection
+// rule and one registry read; there is no second row to disagree with.
 function checkPluginInstallDrift() {
   const settingsPath = join(HOME, '.claude', 'settings.json');
-  const key = enabledHypomnemaPluginKey(settingsPath);
-  if (!key) return; // plugin not enabled, nothing to verify
-
   const registryPath = join(HOME, '.claude', 'plugins', 'installed_plugins.json');
-  const installRoot = resolveEnabledPluginRoot(settingsPath, registryPath);
-  if (!installRoot) {
-    warn(
-      'Installed cache vs marketplace HEAD',
-      `${key} is enabled but no usable install root could be positively resolved from ` +
-        `${registryPath}, so the installed cache's commit cannot be verified`,
-    );
-    return;
-  }
+  const resolved = resolveEnabledPluginEntry(settingsPath, registryPath);
+  if (resolved.reason === 'not-enabled') return; // plugin not enabled, nothing to verify
 
-  let reg;
-  try {
-    reg = JSON.parse(readFileSync(registryPath, 'utf-8'));
-  } catch {
+  if (resolved.reason === 'registry-unreadable') {
     warn(
       'Installed cache vs marketplace HEAD',
       `Cannot read ${registryPath}, so the installed cache's commit cannot be verified`,
     );
     return;
   }
-  const entries =
-    reg &&
-    typeof reg.plugins === 'object' &&
-    !Array.isArray(reg.plugins) &&
-    Array.isArray(reg.plugins[key])
-      ? reg.plugins[key]
-      : null;
-  // Same row this exact install root came from, not just any row for `key`,
-  // since a stale duplicate row (e.g. a leftover project-scope entry) can
-  // carry a different, and misleading, gitCommitSha.
-  //
-  // And among rows on that path, the same one resolveEnabledPluginRoot picked:
-  // user scope first. Measured, user and project rows share an installPath, so
-  // taking whichever comes first in the array means a project row's older sha
-  // can be read as the state of a user install that is actually at HEAD, and
-  // the answer would be "behind, replace it by hand" for a cache that is fine.
-  // Pick the row the resolver picked, THEN ask whether it carries a sha. Doing
-  // it the other way round (filter for a sha first, then prefer user scope)
-  // silently swaps rows when the user row has no gitCommitSha: the project
-  // row's older sha gets read as the provenance of the install that actually
-  // runs. Measured, user and project rows share an installPath, so the swap is
-  // reachable, and its output is "behind, replace it by hand" for a cache that
-  // may be fine. A chosen row without a sha is unverifiable, not a reason to
-  // ask a different row.
-  const onPath = (entries ?? []).filter((e) => e && e.installPath === installRoot);
-  const entry = onPath.find((e) => e.scope === 'user') ?? onPath[0];
-  if (entry && !(typeof entry.gitCommitSha === 'string' && entry.gitCommitSha)) {
+  if (resolved.reason === 'unresolved') {
+    warn(
+      'Installed cache vs marketplace HEAD',
+      `${resolved.key} is enabled but no usable install root could be positively resolved from ` +
+        `${registryPath}, so the installed cache's commit cannot be verified`,
+    );
+    return;
+  }
+  const { key, entry, root: installRoot } = resolved;
+  if (!(typeof entry.gitCommitSha === 'string' && entry.gitCommitSha)) {
     warn(
       'Installed cache vs marketplace HEAD',
       `The registry row for ${installRoot} carries no gitCommitSha, so the installed cache's ` +
         `commit cannot be verified. Another row on the same path may have one, but it describes ` +
         `a different install`,
-    );
-    return;
-  }
-  if (!entry) {
-    warn(
-      'Installed cache vs marketplace HEAD',
-      `No registry row for ${installRoot} carries a gitCommitSha, so the installed cache's ` +
-        `commit cannot be verified`,
     );
     return;
   }

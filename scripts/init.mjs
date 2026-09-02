@@ -61,11 +61,7 @@ import { syncExtensions } from './lib/extensions.mjs';
 import { writeProvenanceSidecar } from './lib/pkg-provenance.mjs';
 import { templateSchemaVersion } from './lib/template-schema-version.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
-import {
-  isHypomnemaPluginEnabled,
-  resolveEnabledPluginRoot as resolveEnabledPluginRootShared,
-  usablePkgRoot,
-} from './lib/plugin-detect.mjs';
+import { resolvePluginChannel, usablePkgRoot } from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -998,22 +994,15 @@ const args = parseArgs(process.argv);
 // `.claude/plugins/…` root); `hypomnemaPluginEnabled` catches the dual-install
 // variant (a manual/npm init.mjs run while the plugin is ALSO enabled — see
 // lib/plugin-detect.mjs, fail-open on any uncertainty). Either signal means
-// Claude's core hook/command surface is plugin-managed already.
-const pluginMode = PKG_ROOT.replace(/\\/g, '/').includes('/.claude/plugins/');
-const hypomnemaPluginEnabled =
-  !pluginMode && isHypomnemaPluginEnabled(join(HOME, '.claude', 'settings.json'));
-const coreManagedByPlugin = pluginMode || hypomnemaPluginEnabled;
-
-// resolveEnabledPluginRoot lives in ./lib/plugin-detect.mjs (shared with
-// upgrade.mjs's dualSkip provenance correction, imported above as
-// resolveEnabledPluginRootShared). This wrapper binds it to init's own HOME-derived
-// settings/registry paths so callers below read the same as before the move.
-function resolveEnabledPluginRoot(settingsPath) {
-  return resolveEnabledPluginRootShared(
-    settingsPath,
-    join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
-  );
-}
+// Claude's core hook/command surface is plugin-managed already. resolvePluginChannel
+// is the single place this judgment is made — doctor.mjs and upgrade.mjs call the
+// same function with their own PKG_ROOT so all three tools agree.
+const pluginChannel = resolvePluginChannel({
+  pkgRoot: PKG_ROOT,
+  settingsPath: join(HOME, '.claude', 'settings.json'),
+  registryPath: join(HOME, '.claude', 'plugins', 'installed_plugins.json'),
+});
+const { pluginMode, hypomnemaPluginEnabled, coreManagedByPlugin } = pluginChannel;
 
 // Non-mutating read of the recorded pkgRoot. resolveDurableRoot runs before init's
 // package validation and its "no writes before validation" guarantee, so it must
@@ -1039,8 +1028,7 @@ function recordedPkgRoot() {
 // only install.
 function resolveDurableRoot() {
   if (!hypomnemaPluginEnabled) return PKG_ROOT;
-  const pluginRoot = resolveEnabledPluginRoot(join(HOME, '.claude', 'settings.json'));
-  if (pluginRoot) return pluginRoot;
+  if (pluginChannel.root) return pluginChannel.root;
   const recorded = recordedPkgRoot();
   if (usablePkgRoot(recorded)) return recorded;
   return PKG_ROOT;

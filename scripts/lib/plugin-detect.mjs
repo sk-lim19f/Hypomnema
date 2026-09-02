@@ -175,47 +175,131 @@ export function leafVersionDrift(pkgRoot) {
   return { checked: true, drift: manifestVersion !== leaf, leaf, manifestVersion };
 }
 
-// Resolve the enabled Hypomnema plugin's REAL install root from the plugin
-// registry (~/.claude/plugins/installed_plugins.json). POSITIVE attribution: it
-// looks up the EXACT key that settingsPath marks enabled (via
-// enabledHypomnemaPluginKey), not just any hypo-named entry — a disabled legacy or
-// other-marketplace entry must never be selected. Among that key's registry
-// entries it prefers the user-scope install (the one a plugin-enabled user runs),
-// falling back to any usable entry. Returns a usable absolute install root, or
-// null when the registry is absent/unreadable, names no entry for the enabled key,
-// or that entry is not a usable package dir. Fails open (null) on every
-// uncertainty; callers must treat null as "cannot positively resolve", never as
-// "resolved to nothing usable exists".
+// Among a key's registry entries, the exact row resolveEnabledPluginEntry (and
+// therefore resolveEnabledPluginRoot) picks: the user-scope install first (the
+// one a plugin-enabled user runs), falling back to any usable entry. A caller
+// that needs a FIELD off that row (not just its path — e.g. checkPluginInstallDrift
+// wants gitCommitSha) must get the same row this returns, or it re-derives the
+// selection rule itself and the two can disagree the moment a project-scope row
+// sits ahead of the user row on the same installPath (measured 2026-09-02: PR
+// #269 reimplemented this exact filter-then-prefer-scope rule at its call site,
+// in the opposite order, which silently swaps rows whenever the user row has no
+// gitCommitSha).
+function selectEntry(entries, scope) {
+  return (
+    entries.find(
+      (e) => e && (scope === undefined || e.scope === scope) && usablePkgRoot(e.installPath),
+    ) ?? null
+  );
+}
+
+// Resolve the enabled Hypomnema plugin's registry row and its REAL install root
+// in one lookup, from the plugin registry (~/.claude/plugins/installed_plugins.json).
+// POSITIVE attribution: it looks up the EXACT key that settingsPath marks enabled
+// (via enabledHypomnemaPluginKey), not just any hypo-named entry — a disabled
+// legacy or other-marketplace entry must never be selected.
+//
+// Returns `{ key, reason, entry, root }`. `reason` distinguishes WHY `entry`/`root`
+// came back null, which is the distinction resolveEnabledPluginRoot's plain
+// null could not make and callers used to re-derive by hand:
+//   - 'not-enabled':         no enabledPlugins key is enabled — there is no
+//                            plugin-channel question to answer here at all.
+//   - 'registry-unreadable': the key IS enabled, but the registry file could not
+//                            be read or parsed — a judgment FAILURE, not "no
+//                            plugin installed".
+//   - 'unresolved':          the key is enabled and the registry parsed, but no
+//                            entry for that key is a usable package dir — also a
+//                            judgment failure, never "confirmed absent".
+//   - 'resolved':            a usable entry was found; `entry` and `root` are set.
+//
+// Every non-'resolved' reason means "cannot positively resolve" — never read it
+// as "resolved to nothing usable exists".
 //
 // Leaf-version drift does NOT exclude a candidate here, deliberately. An earlier
 // pass filtered on `!leafVersionDrift(p).drift`, and that turns a reporting
-// problem into a breaking one: when this returns null, resolveDurableRoot (init.mjs)
-// falls through to the recorded pkgRoot in hypo-pkg.json and, if that is not usable
-// either, to PKG_ROOT. In a dual install PKG_ROOT is the
-// manual/npm checkout the dual-install notice tells the user to remove. That path
-// gets written into the vault's pre-commit hook, so removing the npm copy leaves
-// the hook dangling and breaks every wiki commit (the failure init.mjs's own
-// `durableRoot` comment exists to prevent). It also silences upgrade's
-// dualSkipWouldCorrect trigger, disabling the very self-heal that fixes a stale
-// pointer. Drift is surfaced by doctor's checkPluginLeafVersion instead.
-export function resolveEnabledPluginRoot(settingsPath, registryPath) {
+// problem into a breaking one: when this returns no usable entry, resolveDurableRoot
+// (init.mjs) falls through to the recorded pkgRoot in hypo-pkg.json and, if that is
+// not usable either, to PKG_ROOT. In a dual install PKG_ROOT is the manual/npm
+// checkout the dual-install notice tells the user to remove. That path gets written
+// into the vault's pre-commit hook, so removing the npm copy leaves the hook
+// dangling and breaks every wiki commit (the failure init.mjs's own `durableRoot`
+// comment exists to prevent). It also silences upgrade's dualSkipWouldCorrect
+// trigger, disabling the very self-heal that fixes a stale pointer. Drift is
+// surfaced by doctor's checkPluginLeafVersion instead.
+export function resolveEnabledPluginEntry(settingsPath, registryPath) {
   const key = enabledHypomnemaPluginKey(settingsPath);
-  if (!key) return null;
+  if (!key) return { key: null, reason: 'not-enabled', entry: null, root: null };
   let reg;
   try {
     reg = JSON.parse(readFileSync(registryPath, 'utf-8'));
   } catch {
-    return null;
+    return { key, reason: 'registry-unreadable', entry: null, root: null };
   }
   const plugins =
     reg && typeof reg.plugins === 'object' && !Array.isArray(reg.plugins) ? reg.plugins : null;
   const entries = plugins && Array.isArray(plugins[key]) ? plugins[key] : null;
-  if (!entries) return null;
-  const paths = (scope) =>
-    entries
-      .filter((e) => e && (scope === undefined || e.scope === scope))
-      .map((e) => (typeof e.installPath === 'string' ? e.installPath : null))
-      .filter((p) => usablePkgRoot(p));
   // Prefer the user-scope install, then any usable entry for this exact key.
-  return paths('user')[0] ?? paths(undefined)[0] ?? null;
+  const entry = entries ? (selectEntry(entries, 'user') ?? selectEntry(entries)) : null;
+  if (!entry) return { key, reason: 'unresolved', entry: null, root: null };
+  return { key, reason: 'resolved', entry, root: entry.installPath };
+}
+
+// Thin projection of resolveEnabledPluginEntry for callers that only need the
+// path. Kept as its own export (rather than inlining `.root` everywhere) because
+// it is the one most callers actually want, and because it is the name this
+// repo's existing callers already know.
+export function resolveEnabledPluginRoot(settingsPath, registryPath) {
+  return resolveEnabledPluginEntry(settingsPath, registryPath).root;
+}
+
+// Single-computation answer to "is Claude's core hook/command surface
+// plugin-managed for THIS process, and if that requires a registry lookup, what
+// did it find?" doctor.mjs, init.mjs and upgrade.mjs each used to compute
+// `pluginMode` / `hypomnemaPluginEnabled` / `coreManagedByPlugin` independently
+// (three copies of the same three lines), and upgrade.mjs additionally called
+// resolveEnabledPluginRoot on its own without ever computing coreManagedByPlugin
+// at all. Same inputs everywhere:
+//   pkgRoot       — the caller's own PKG_ROOT (this script's own install root)
+//   settingsPath  — ~/.claude/settings.json
+//   registryPath  — ~/.claude/plugins/installed_plugins.json
+//
+// Returns `{ pluginMode, hypomnemaPluginEnabled, coreManagedByPlugin, enabledKey,
+// root, rootReason }`. `rootReason` is resolveEnabledPluginEntry's `reason`
+// field for the dual-install case, or 'self' when pluginMode is true (root is
+// pkgRoot itself — no registry lookup is needed or even meaningful there).
+// Why detectChannel (hooks/version-check.mjs) is NOT reused here: its bare
+// `/plugins/` substring is deliberately broader because that judgment is
+// display-only for the notifier, while pluginMode below gates install behavior
+// and needs the narrower `.claude/plugins/` match. The full rationale is at
+// scripts/upgrade.mjs (the "generic /plugins/ substring" comment above its own
+// channel block). The direction is not the obstacle: scripts/ importing hooks/
+// is the legal one and doctor.mjs already does it.
+//
+// NOTE for a future consolidator: `enabledKey` is null whenever pluginMode is
+// true (the short-circuit below). doctor.mjs's checkPluginLeafVersion therefore
+// asks the settings file directly instead of reading it from here, and it walks
+// EVERY registry row while resolveEnabledPluginEntry returns one. Two assertions
+// in tests/doctor.test.mjs pin both facts.
+export function resolvePluginChannel({ pkgRoot, settingsPath, registryPath }) {
+  const pluginMode = pkgRoot.replace(/\\/g, '/').includes('/.claude/plugins/');
+  if (pluginMode) {
+    return {
+      pluginMode: true,
+      hypomnemaPluginEnabled: false,
+      coreManagedByPlugin: true,
+      enabledKey: null,
+      root: pkgRoot,
+      rootReason: 'self',
+    };
+  }
+  const resolved = resolveEnabledPluginEntry(settingsPath, registryPath);
+  const hypomnemaPluginEnabled = resolved.reason !== 'not-enabled';
+  return {
+    pluginMode: false,
+    hypomnemaPluginEnabled,
+    coreManagedByPlugin: hypomnemaPluginEnabled,
+    enabledKey: resolved.key,
+    root: resolved.root,
+    rootReason: resolved.reason,
+  };
 }
