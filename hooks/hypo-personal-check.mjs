@@ -2,21 +2,22 @@
 /**
  * hypo-personal-check.mjs — PreCompact hook
  *
- * Hard gate before /compact. Blocks if:
- *   - the session-close memory files were not updated this session
- *     (session-state.md, project hot.md, root hot.md, session-log, log.md)
- *   - wiki git repo has uncommitted/unpushed changes
- *   - hot.md has forbidden structure
- *   - lint blockers exist
- *
- * Bypass options (checked in order, per spec §7.5):
- *   1. HYPO_SKIP_GATE=1 env var
- *   2. HYPO_SKIP_GATE=1 in a recent *user-role* transcript message
- *      (assistant/tool output is excluded to prevent self-triggering from block reason text)
+ * NEVER blocks /compact (session-close-scope-boundary spec §1). It used to be
+ * a hard gate here, but /compact was the only hard path that "compact-ready"
+ * marker's invariant leaned on, and a hard block here meant every check
+ * `precompactGateStatus` runs (git-clean, hot.md structure, session-close
+ * files, scoped lint, W8 design-history, feedback projection) could hold
+ * /compact hostage on a project this session never touched. That is the
+ * scope-boundary bug this hook no longer causes. Session close is still
+ * enforced, just not HERE: the Stop hook (hypo-auto-minimal-crystallize.mjs)
+ * still blocks on close-intent + incomplete close, and `--mark-session-closed`
+ * still refuses the marker on a red gate. What follows is now advisory: an
+ * incomplete close surfaces as a systemMessage, never as decision:'block'.
  *
  * NOTE: capacity bypass (wiki-context-critical.json ≥90%) was REMOVED
- * (amendment 2026-05-13). Spec §7.5: even at full context, minimal
- * session-close is mandatory — auto-bypass on capacity caused silent state loss.
+ * (amendment 2026-05-13), and HYPO_SKIP_GATE is now moot for THIS hook since
+ * nothing here blocks — it is kept only so an incomplete-close systemMessage
+ * doesn't repeat the recommendation once bypassed.
  */
 
 import { spawnSync } from 'child_process';
@@ -32,6 +33,7 @@ import {
   isClosePattern,
   extractUserMessages,
   isUnderProjectDirs,
+  resolveGateProjectOverride,
 } from './hypo-shared.mjs';
 
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
@@ -63,22 +65,18 @@ process.stdin.on('end', () => {
   //    Even at full context, minimal session-close is mandatory (spec §7.5).
   //    Bypass paths are now only: HYPO_SKIP_GATE env / HYPO_SKIP_GATE in transcript.
 
-  // ── Block 1.5: context warning (≥70%) — request session-compact before compact ──
+  // ── Context warning (≥70%) — advisory nudge toward session-compact, never a block ──
   if (existsSync(WARNING_FILE)) {
     try {
       unlinkSync(WARNING_FILE);
     } catch {}
     console.log(
       JSON.stringify({
-        decision: 'block',
-        reason: [
-          `[WIKI CHECK — BLOCKING] Context ≥70%: run /session-compact before compacting.`,
-          `STOP. Do NOT compact yet.`,
-          `1. If Skill tool is available: call it with skill="session-compact" immediately.`,
-          `2. If Skill tool is unavailable: perform the full session-close checklist from hypo-guide.md.`,
-          `After session close completes, compact will proceed normally.`,
-          ``,
-          `To skip: set HYPO_SKIP_GATE=1`,
+        continue: true,
+        systemMessage: [
+          `[WIKI CHECK] Context ≥70%: consider running /session-compact before compacting.`,
+          `1. If Skill tool is available: call it with skill="session-compact".`,
+          `2. If Skill tool is unavailable: perform the session-close checklist from hypo-guide.md.`,
         ].join('\n'),
       }),
     );
@@ -108,12 +106,23 @@ process.stdin.on('end', () => {
   // lint scope to this session's edited files; without one the scope
   // is the mandatory close files. Read-only: pure feedback drift comes back as
   // gate.driftTargets, a self-heal effect requirement we run as --write below.
+  // resolveGateProjectOverride (session-close-scope-boundary spec §2/§3): PreCompact
+  // gets no explicit --project, only the payload's sessionCwd, so this resolves
+  // to the one project that cwd unambiguously owns (or null, which leaves the
+  // gate global). Passed below as `attributionScope`, never `projectOverride`:
+  // that key is the check-only diagnostic's and would also narrow
+  // sessionCloseGlobalStatus to this one project, turning off the mine/foreign
+  // partition that is what actually turns a foreign project's dangling close
+  // into a notice instead of debt this session gets blamed for in the message.
+  const attributionScope = resolveGateProjectOverride(HYPO_DIR, { sessionCwd });
+
   let gate;
   try {
     gate = precompactGateStatus(HYPO_DIR, {
       transcriptPath,
       ...(sessionId ? { sessionId } : {}),
       ...(sessionCwd ? { sessionCwd } : {}),
+      ...(attributionScope ? { attributionScope } : {}),
     });
   } catch (err) {
     // Defense-in-depth: precompactGateStatus fails open per-check, but if it ever
@@ -233,7 +242,7 @@ process.stdin.on('end', () => {
     return;
   }
 
-  // ── Block ──
+  // ── Advisory (never blocks — spec §1) ──
   // gate.blockers already carry per-type reasons in the canonical order
   // (git, hot, close, lint, design-history, feedback) — same strings as before
   // Now sourced from the shared gate instead of inline checks.
@@ -273,18 +282,14 @@ process.stdin.on('end', () => {
 
   console.log(
     JSON.stringify({
-      decision: 'block',
-      reason: [
-        `${closeIntentNote}[WIKI CHECK — BLOCKING] Session close incomplete. (${reasons.join(', ')})`,
-        `Run the checklist below in order, then retry /compact:`,
+      continue: true,
+      systemMessage: [
+        `${closeIntentNote}[WIKI CHECK] Session close incomplete. (${reasons.join(', ')})`,
+        `Recommended before /compact — run the checklist below:`,
         ``,
         checklistText,
         ...(noticeText ? ['', noticeText] : []),
-        ``,
-        `Trivial session? Bypass with HYPO_SKIP_GATE=1`,
       ].join('\n'),
-      continue: false,
-      stopReason: `Session close incomplete: ${reasons.join(', ')}`,
     }),
   );
 });

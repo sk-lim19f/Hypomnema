@@ -69,6 +69,7 @@ import {
   hasPendingBackgroundWork,
   isCloseReconfirmDeclined,
   CLOSE_RECONFIRM_MARK,
+  resolveGateProjectOverride,
 } from './hypo-shared.mjs';
 
 function emitContinue() {
@@ -245,10 +246,19 @@ process.stdin.on('end', () => {
     let gate = null;
     const computeGate = () => {
       try {
+        // resolveGateProjectOverride (session-close-scope-boundary spec §2/§3): Stop
+        // gets no explicit project, only sessionCwd, same as PreCompact. Passed
+        // below as `attributionScope` (never `projectOverride`, which is the
+        // check-only diagnostic's key and would also disable the mine/foreign
+        // partition): this is what demotes a foreign project's dangling close to
+        // a notice instead of holding this session's Stop hostage on debt it
+        // never touched.
+        const attributionScope = resolveGateProjectOverride(HYPO_DIR, { sessionCwd });
         return precompactGateStatus(HYPO_DIR, {
           ...(transcriptPath ? { transcriptPath } : {}),
           ...(sessionCwd ? { sessionCwd } : {}),
           ...(sessionId ? { sessionId } : {}),
+          ...(attributionScope ? { attributionScope } : {}),
         });
       } catch {
         return null;

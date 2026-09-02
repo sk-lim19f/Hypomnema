@@ -1063,6 +1063,63 @@ export function collectProjectWorkingDirs(hypoDir) {
   return out;
 }
 
+// One place that answers "is this string a slug naming a real project directory?".
+// Both resolveGateProjectOverride (a caller-supplied --project) and the gate's
+// mustEvaluate filter (slugs arriving from a transcript or a marker) need it, and
+// having the grammar in two inline copies is the duplication this release spent a
+// codex round removing elsewhere. Not exported: scripts/ has its own validator,
+// and importing that here would invert the one-way hooks/ <- scripts/ dependency.
+function isProjectSlugDirectory(hypoDir, slug) {
+  if (typeof slug !== 'string' || !/^[A-Za-z0-9._-]+$/.test(slug)) return false;
+  if (/^\.+$/.test(slug) || !/[A-Za-z0-9]/.test(slug)) return false;
+  try {
+    return statSync(join(hypoDir, 'projects', slug)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// session-close-scope-boundary spec §2: the one place that turns a caller-
+// supplied project name into precompactGateStatus's opts.projectOverride. Four
+// call sites share it (--mark-session-closed, apply's auto-marker, PreCompact,
+// Stop) so a foreign project's dangling close files demote to a notice instead
+// of blocking a session that never touched them, everywhere the gate runs.
+//
+// `project` is trusted nowhere upstream of this function: crystallize.mjs's
+// own --project only gets slug-syntax + directory-existence checked when the
+// CLI itself parses it (parseArgs + requireProjectDir); a value that arrives
+// via a hook payload or apply's JSON body never passes through that. So this
+// re-validates from scratch — same charset rule as project-create.mjs's
+// isValidProjectName, duplicated rather than imported because hooks/ cannot
+// import scripts/ (dependency direction is one-way) — plus a directory
+// existence check. Either failure returns null, the same as "no project was
+// given": a garbage slug must never narrow the gate's scope, only a real one
+// may (spec success criterion: "opts.projectOverride 가 없는 slug 이면 게이트가
+// 그것을 거절한다").
+//
+// With no `project`, the override is inferred from `sessionCwd` via
+// pickProjectByCwd's rejectAmbiguous mode — the same mode the gate's own
+// close-cwd check already trusts. Without rejectAmbiguous, two projects
+// sharing one working_dir (a monorepo with no uniqueness invariant) would
+// silently resolve to the first slug and could narrow the gate to a project
+// whose OWN close is still incomplete while the real cwd project goes
+// unchecked. A decline here (null) is not a failure: precompactGateStatus
+// falls back to the global, unscoped judgment, which is exactly the STOP-hook
+// call site's actual point (session-close-scope-boundary spec §2: "해석 실패면
+// 기존 fail-closed 가 받아 준다는 틀렸다 ... cwd 미해결을 마커 차단으로 만들지 않는다").
+//
+// @param {string} hypoDir
+// @param {{project?: string|null, sessionCwd?: string|null}} [opts]
+// @returns {string|null}
+export function resolveGateProjectOverride(hypoDir, { project = null, sessionCwd = null } = {}) {
+  if (project) {
+    return isProjectSlugDirectory(hypoDir, project) ? project : null;
+  }
+  return pickProjectByCwd(collectProjectWorkingDirs(hypoDir), sessionCwd, {
+    rejectAmbiguous: true,
+  });
+}
+
 // A project without a working_dir anchor (no index.md, or an index.md missing
 // the field) never enters collectProjectWorkingDirs' universe, so cwd-first
 // resume always MISSes for it — the SessionStart/CwdChanged MISS branch would
@@ -1526,10 +1583,17 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // projectOverride (check-only): the caller (`crystallize --check-session-close
   // --project=<slug>`) wants THIS project's close status, not the recency pick —
   // bypass discovery and report the single project, preserving the global return
-  // shape. NEVER threaded from a marker-writing path (--mark / apply auto-marker /
-  // PreCompact): those stay global so the marker == compact-ready invariant holds
-  // (codex design review). A green status here is a project-scoped
-  // diagnostic, not the global compact-readiness verdict.
+  // shape. This is the ONLY caller of projectOverride now: the four marker-writing
+  // paths (--mark / apply auto-marker / PreCompact / Stop) attribute through
+  // `opts.attributionScope` instead (resolveCloseScope, below this function), which
+  // only widens the mine/foreign partition's scope Set and leaves this function
+  // evaluating every project, same as an unscoped call. A green status here is a
+  // project-scoped diagnostic, not the global compact-readiness verdict. The
+  // invariant that once justified keeping the writer paths fully unscoped
+  // ("marker == compact-ready", codex design review) is superseded by that
+  // partition, not restored by it — a marker's own `verified_scope`, attesting
+  // exactly what it checked, is still missing (session-close-scope-boundary
+  // spec §3, next wave).
   if (opts.projectOverride) {
     const s = sessionCloseFileStatus(hypoDir, { projectOverride: opts.projectOverride });
     return {
@@ -1547,11 +1611,30 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   }
   const dates = freshDates();
   const recency = resolveActiveProject(hypoDir); // no cwd — close never picks by cwd
-  const todayActive = [...closeCandidateSlugs(hypoDir, dates)].filter((p) =>
+  // opts.mustEvaluate: slugs this session ATTRIBUTED its close to (explicit
+  // --project, transcript close-file edits, a prior marker). They are evaluated
+  // even when they are not today-active candidates, because the marker writer
+  // stamps the attribution scope: a slug that reaches the marker but never
+  // reached this evaluation would be attested as closed without ever being
+  // checked (codex pre-commit BLOCKER, reproduced with an empty projects/orphan/).
+  // `projects/<slug>/` must exist on disk; a slug naming a directory that is gone
+  // (a stale marker inside its 7-day TTL) is dropped rather than turned into a
+  // permanent blocker for a project nobody can close any more.
+  // existsSync alone would admit a file, or a traversal like '..', from a
+  // malformed marker or transcript slug and turn it into a surprise blocker.
+  // Same slug grammar the CLI and resolveGateProjectOverride validate against.
+  const mustEvaluate = [...(opts.mustEvaluate || [])].filter((p) =>
+    isProjectSlugDirectory(hypoDir, p),
+  );
+  // The fallback decision reads REAL today activity only. Letting mustEvaluate
+  // populate it would mean an attributed slug suppresses the "this session closed
+  // nothing at all" branch, and that branch is a fail-closed guard the partition
+  // below depends on (`!close.fallback`).
+  const activeCandidates = [...closeCandidateSlugs(hypoDir, dates)].filter((p) =>
     hasTodayCloseActivity(hypoDir, p, dates),
   );
 
-  if (todayActive.length === 0) {
+  if (activeCandidates.length === 0) {
     const legacy = sessionCloseFileStatus(hypoDir);
     return {
       ok: legacy.ok,
@@ -1566,6 +1649,8 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
       missing: legacy.missing,
     };
   }
+
+  const todayActive = [...new Set([...activeCandidates, ...mustEvaluate])];
 
   // primary = the recency project when it is itself today-active, else the first
   // today-active slug (stable order from the candidate set). Used only as the
@@ -3550,6 +3635,15 @@ function projectsFromTouchedCloseFiles(transcriptPath, hypoDir) {
  *      the `project` that same writer recorded, so the two can never disagree.
  */
 export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
+  // `direct` is the subset attributable to THIS close attempt: explicit
+  // --project/closeScope, this session's transcript close-file edits, and the
+  // resolved attributionScope. A marker's `projects` is PAST evidence of a close
+  // that already happened, so it belongs in the partition scope (it must not be
+  // demoted as foreign debt) but NOT in the mandatory-evaluation set: a 7-day-TTL
+  // marker naming a project that is no longer today-active would otherwise make
+  // that project's stale close block an unrelated close today (codex round 2,
+  // reproduced with a 24h-old marker). The returned Set carries `direct` as a
+  // property so the caller does not re-derive it, and the transcript is parsed once.
   const scope = new Set(opts.closeScope || []);
   for (const p of projectsFromTouchedCloseFiles(opts.transcriptPath, hypoDir)) scope.add(p);
   // Marker attribution (session-close attribution). A v4 marker carries `projects` — the
@@ -3561,6 +3655,20 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
   // above (explicit close scope or transcript close-file edits) already corroborate
   // the SAME slug; otherwise it stays a display hint. This narrow gap self-heals as
   // pre-v4 markers expire (7-day TTL).
+  // opts.attributionScope (session-close-scope-boundary spec §2/§3): a fourth
+  // signal, one slug, from resolveGateProjectOverride. A cwd that unambiguously
+  // owns one project, or an explicit --project the caller already validated, is
+  // evidence this session is closing THAT project — the same standing the three
+  // signals above already have. It is the opt key the four marker-writing paths
+  // (PreCompact, Stop, --mark-session-closed, apply's auto-marker) pass instead
+  // of `opts.projectOverride`: that key stays the check-only diagnostic's (it
+  // also narrows sessionCloseGlobalStatus's own evaluation and turns off the
+  // partition below), while this one only widens the set the partition demotes
+  // everything outside of.
+  if (opts.attributionScope) scope.add(opts.attributionScope);
+  // Snapshot the direct signals BEFORE the marker union below widens the set.
+  scope.direct = new Set(scope);
+
   if (Array.isArray(marker?.projects)) {
     for (const p of marker.projects) if (p) scope.add(p);
   }
@@ -3590,12 +3698,17 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * opts.projectOverride (CHECK-ONLY) narrows BOTH the close status and the lint
  * scope to a single project, for `--check-session-close --project=<slug>`. A
  * green result is then a project-scoped diagnostic, NOT the global compact-ready
- * verdict: the caller must surface the scope. It is NEVER passed from
- * a marker-writing path (--mark / apply auto-marker / PreCompact); those stay
- * global so a marker can't attest compact-ready while PreCompact re-checks red
- * (the marker == compact-ready invariant, codex design review). When a
- * log-only marker governs the session, log-only mode wins and projectOverride is
- * ignored.
+ * verdict: the caller must surface the scope. The four marker-writing paths
+ * (--mark / apply auto-marker / PreCompact / Stop) never set this — they pass
+ * `opts.attributionScope` instead, which only feeds resolveCloseScope's set and
+ * leaves this status evaluating every project, so the mine/foreign partition
+ * below can tell their own incomplete close from someone else's debt. The
+ * invariant that once justified keeping those paths fully unscoped ("marker ==
+ * compact-ready", codex design review) is replaced by that partition, not
+ * restored by it — a marker's own `verified_scope`, attesting exactly what it
+ * checked, is still missing (session-close-scope-boundary spec §3, next wave).
+ * When a log-only marker governs the session, log-only mode wins and
+ * projectOverride is ignored.
  *
  * @param {string} hypoDir
  * opts.sessionCwd (session-cwd close check): the authoritative cwd of the session being
@@ -3606,7 +3719,7 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * cwd yields a best-effort notice, not a block. apply never passes it (its launch
  * cwd may differ from the authoritative payload.project).
  *
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, sessionCwd?: string|null, sessionId?: string|null, logOnly?: boolean, closeScope?: string[]}} [opts]
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, logOnly?: boolean, closeScope?: string[]}} [opts]
  * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
@@ -3739,8 +3852,21 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     }
   } else {
     // projectOverride narrows the close status to one project (check-only); a
-    // marker-writing caller never sets it, so the marker path stays global.
-    close = sessionCloseGlobalStatus(hypoDir, { projectOverride: opts.projectOverride });
+    // marker-writing caller never sets it. It attributes instead through
+    // opts.attributionScope, consumed a few lines down by resolveCloseScope, so
+    // the status computed here stays global and only the partition below scopes it.
+    // scopeSet is computed BEFORE the status so the attributed slugs become
+    // mandatory evaluation targets (sessionCloseGlobalStatus's mustEvaluate).
+    // Computing it after would let a slug reach the marker that the status never
+    // looked at, which is the false-green this ordering exists to stop.
+    const attributedScope = resolveCloseScope(hypoDir, opts, marker);
+    close = sessionCloseGlobalStatus(hypoDir, {
+      projectOverride: opts.projectOverride,
+      // direct only: a past marker's projects must not become mandatory
+      // evaluation targets (codex round 2). They stay in attributedScope so the
+      // partition still treats them as this session's, not foreign debt.
+      mustEvaluate: attributedScope.direct,
+    });
 
     // Attribute the close debt before blocking on it. An incomplete close belongs
     // to whichever session performed it; charging it to an unrelated session is the
@@ -3771,7 +3897,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     // pre-existing tradeoff documented there). And the marker is never written, so the
     // Stop hook still refuses to end the session. Closing this properly needs a
     // durable close-attempt record; it is not worth a new state-file lifecycle here.
-    const scopeSet = resolveCloseScope(hypoDir, opts, marker);
+    const scopeSet = attributedScope;
     const failed = (close.projects || []).filter((p) => !p.ok);
     const partition =
       !close.fallback && !opts.projectOverride && scopeSet.size > 0 && failed.length > 0;

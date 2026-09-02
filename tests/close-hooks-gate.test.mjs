@@ -26,6 +26,7 @@ import {
   buildCleanWikiTree,
   commitTouchedPaths,
   extractTouchedWikiFiles,
+  makeMultiProjectWiki,
   payloadForCleanWiki,
   peekTouchedPaths,
   recordTouchedPaths,
@@ -378,7 +379,7 @@ test('/clearfoo (no word boundary) → pass-through (not /clear)', () => {
 
 suite('hypo-personal-check.mjs — close-intent enrichment (#20)');
 
-test('close intent in transcript → block message includes close-intent note', () => {
+test('close intent in transcript → systemMessage includes close-intent note, never blocks', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-close-'));
   try {
     const transcript = join(dir, 'transcript.jsonl');
@@ -388,23 +389,23 @@ test('close intent in transcript → block message includes close-intent note', 
     );
     const r = runHook('hypo-personal-check.mjs', { transcript_path: transcript });
     const out = JSON.parse(r.stdout);
-    assert.ok(out.decision === 'block', 'should still block when session close is incomplete');
+    assert.ok(out.continue === true, 'PreCompact never blocks (spec §1)');
     assert.ok(
-      out.reason.includes('Close intent'),
-      'block reason should mention close intent detection',
+      out.systemMessage.includes('Close intent'),
+      'systemMessage should mention close intent detection',
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('no close intent → block message does NOT include close-intent note', () => {
+test('no close intent → systemMessage does NOT include close-intent note', () => {
   const r = runHook('hypo-personal-check.mjs', {});
   const out = JSON.parse(r.stdout);
-  assert.ok(out.decision === 'block');
+  assert.ok(out.continue === true, 'PreCompact never blocks (spec §1)');
   assert.ok(
-    !out.reason.includes('Close intent'),
-    'block reason should not mention close intent when absent',
+    !out.systemMessage.includes('Close intent'),
+    'systemMessage should not mention close intent when absent',
   );
 });
 
@@ -415,23 +416,23 @@ test('output is always valid JSON', () => {
   assert.doesNotThrow(() => JSON.parse(r.stdout), `stdout: ${r.stdout}`);
 });
 
-test('no wiki dir → block decision', () => {
+test('no wiki dir → advisory, never blocks (spec §1)', () => {
   const r = runHook('hypo-personal-check.mjs', '');
   const out = JSON.parse(r.stdout);
-  assert.equal(out.decision, 'block');
-  assert.equal(out.continue, false);
+  assert.equal(out.decision, undefined, 'PreCompact must never set decision:block');
+  assert.equal(out.continue, true);
 });
 
-test('block response includes stopReason string', () => {
+test('advisory response carries no stopReason (never blocks, spec §1)', () => {
   const r = runHook('hypo-personal-check.mjs', '');
   const out = JSON.parse(r.stdout);
-  assert.ok(typeof out.stopReason === 'string' && out.stopReason.length > 0);
+  assert.equal(out.stopReason, undefined);
 });
 
-test('block reason contains WIKI CHECK marker', () => {
+test('systemMessage contains WIKI CHECK marker', () => {
   const r = runHook('hypo-personal-check.mjs', '');
   const out = JSON.parse(r.stdout);
-  assert.ok(out.reason.includes('WIKI CHECK'), 'missing WIKI CHECK marker in reason');
+  assert.ok(out.systemMessage.includes('WIKI CHECK'), 'missing WIKI CHECK marker in systemMessage');
 });
 
 test('HYPO_SKIP_GATE=1 → continue:true + systemMessage (PreCompact has no additionalContext)', () => {
@@ -470,7 +471,7 @@ test('5 mandatory memory files fresh → suppressOutput:true', () => {
   });
 });
 
-test('project hot.md not updated today → block, reason names the file', () => {
+test('project hot.md not updated today → advisory systemMessage names the file', () => {
   withWiki(
     (dir) => {
       writeFileSync(
@@ -481,16 +482,16 @@ test('project hot.md not updated today → block, reason names the file', () => 
     (dir) => {
       const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
       const out = JSON.parse(r.stdout);
-      assert.equal(out.decision, 'block', `expected block, got: ${r.stdout}`);
+      assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
       assert.ok(
-        out.reason.includes('projects/test-project/hot.md'),
-        `block reason should name the stale file: ${out.reason}`,
+        out.systemMessage.includes('projects/test-project/hot.md'),
+        `systemMessage should name the stale file: ${out.systemMessage}`,
       );
     },
   );
 });
 
-test('session-log missing a today-dated heading → block', () => {
+test('session-log missing a today-dated heading → advisory systemMessage', () => {
   withWiki(
     (dir, today) => {
       const ym = today.slice(0, 7);
@@ -502,16 +503,16 @@ test('session-log missing a today-dated heading → block', () => {
     (dir) => {
       const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
       const out = JSON.parse(r.stdout);
-      assert.equal(out.decision, 'block', `expected block, got: ${r.stdout}`);
+      assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
       assert.ok(
-        out.reason.includes('session-log'),
-        `block reason should name the session-log file: ${out.reason}`,
+        out.systemMessage.includes('session-log'),
+        `systemMessage should name the session-log file: ${out.systemMessage}`,
       );
     },
   );
 });
 
-test('lint blockers without id field → reason names files, no empty placeholders', () => {
+test('lint blockers without id field → systemMessage names files, no empty placeholders', () => {
   // Regression: line 244 used `b.id` directly, but error-severity lint issues
   // never carry an id (only W8 warns do). The result was a reason like
   // `lint blockers: , , , , , , ,` — blocks correctly but tells the user
@@ -531,14 +532,14 @@ test('lint blockers without id field → reason names files, no empty placeholde
     (dir) => {
       const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
       const out = JSON.parse(r.stdout);
-      assert.equal(out.decision, 'block', `expected block: ${r.stdout}`);
+      assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
       assert.ok(
-        out.reason.includes('lint blockers: projects/test-project/session-state.md'),
-        `lint blockers should name the file, got: ${out.reason}`,
+        out.systemMessage.includes('lint blockers: projects/test-project/session-state.md'),
+        `lint blockers should name the file, got: ${out.systemMessage}`,
       );
       assert.ok(
-        !/lint blockers:\s*,/.test(out.reason),
-        `lint blockers section must not start with empty commas: ${out.reason}`,
+        !/lint blockers:\s*,/.test(out.systemMessage),
+        `lint blockers section must not start with empty commas: ${out.systemMessage}`,
       );
     },
   );
@@ -607,7 +608,7 @@ test('PreCompact notice scope: debt UNDER an active project dir is named, not fo
   );
 });
 
-test('PreCompact with transcript touching an out-of-scope file → that file blocks', () => {
+test('PreCompact with transcript touching an out-of-scope file → that file surfaces in systemMessage', () => {
   // The transcript widens the scope: a file the session actually edited via
   // Edit/Write is in-scope and its lint error blocks, even though it lives
   // outside closeFileTargets. This is the have-transcript half of ADR 0041.
@@ -642,16 +643,16 @@ test('PreCompact with transcript touching an out-of-scope file → that file blo
         { HYPO_DIR: dir },
       );
       const out = JSON.parse(r.stdout);
-      assert.equal(out.decision, 'block', `a touched file's lint error must block: ${r.stdout}`);
+      assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
       assert.ok(
-        out.reason.includes('lint blockers: pages/feedback/broken.md'),
-        `block reason should name the touched file: ${out.reason}`,
+        out.systemMessage.includes('lint blockers: pages/feedback/broken.md'),
+        `systemMessage should name the touched file: ${out.systemMessage}`,
       );
     },
   );
 });
 
-test('no-transcript PreCompact: active project design-history stale → blocks (W8)', () => {
+test('no-transcript PreCompact: active project design-history stale → surfaces in systemMessage (W8)', () => {
   // W8 (design-history stale) for the ACTIVE project is this session's close
   // responsibility and must block, in the no-transcript path too (ADR 0041
   // unifies the branches so W8 is scoped to the active project either way).
@@ -665,14 +666,10 @@ test('no-transcript PreCompact: active project design-history stale → blocks (
     (dir) => {
       const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
       const out = JSON.parse(r.stdout);
-      assert.equal(
-        out.decision,
-        'block',
-        `active-project stale design-history must block: ${r.stdout}`,
-      );
+      assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
       assert.ok(
-        out.reason.includes('design-history stale'),
-        `block reason should name design-history staleness: ${out.reason}`,
+        out.systemMessage.includes('design-history stale'),
+        `systemMessage should name design-history staleness: ${out.systemMessage}`,
       );
     },
   );
@@ -729,7 +726,7 @@ test('open-questions.md absent/stale → still passes (conditional, not gated)',
   );
 });
 
-test('log.md missing a today-dated session entry → block', () => {
+test('log.md missing a today-dated session entry → advisory systemMessage', () => {
   withWiki(
     (dir) => {
       // log.md exists but its session entry is stale-dated.
@@ -738,13 +735,16 @@ test('log.md missing a today-dated session entry → block', () => {
     (dir) => {
       const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
       const out = JSON.parse(r.stdout);
-      assert.equal(out.decision, 'block', `expected block, got: ${r.stdout}`);
-      assert.ok(out.reason.includes('log.md'), `block reason should name log.md: ${out.reason}`);
+      assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
+      assert.ok(
+        out.systemMessage.includes('log.md'),
+        `systemMessage should name log.md: ${out.systemMessage}`,
+      );
     },
   );
 });
 
-test('log.md session entry for a different project → block', () => {
+test('log.md session entry for a different project → advisory systemMessage', () => {
   withWiki(
     (dir, today) => {
       // A fresh session entry, but for some other project — must not satisfy
@@ -754,8 +754,15 @@ test('log.md session entry for a different project → block', () => {
     (dir) => {
       const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
       const out = JSON.parse(r.stdout);
-      assert.equal(out.decision, 'block', `cross-project log entry must not pass: ${r.stdout}`);
-      assert.ok(out.reason.includes('log.md'), `block reason should name log.md: ${out.reason}`);
+      assert.equal(
+        out.continue,
+        true,
+        `PreCompact never blocks (spec §1), cross-project log entry: ${r.stdout}`,
+      );
+      assert.ok(
+        out.systemMessage.includes('log.md'),
+        `systemMessage should name log.md: ${out.systemMessage}`,
+      );
     },
   );
 });
@@ -778,6 +785,71 @@ test('HYPO_SKIP_GATE=1 bypasses an incomplete session close', () => {
       );
     },
   );
+});
+
+// Two projects, `mine`'s index.md carrying a `working_dir` the payload's cwd
+// resolves to (P2's session-cwd close check). `mine` is fully closed today;
+// `foreign` is today-active but its session-log never got the dated heading
+// (mirrors close-global.test.mjs's INCIDENT / withClosePartitionWiki, kept
+// local here since this suite needs only the payload.cwd half of it).
+function withCwdPartitionWiki(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-cwd-partition-'));
+  try {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [
+      { slug: 'mine', date: today },
+      { slug: 'foreign', date: today, sessionLog: false },
+    ]);
+    // makeMultiProjectWiki writes `## next`, not one of lint's required
+    // session-state headings — rewrite both so lint stays clean and the close
+    // axis is the only thing under test.
+    for (const slug of ['mine', 'foreign']) {
+      const ss = join(dir, 'projects', slug, 'session-state.md');
+      writeFileSync(ss, readFileSync(ss, 'utf-8').replace('## next', '## 다음 작업'));
+    }
+    const CWD = join(dir, 'workdir-mine');
+    mkdirSync(CWD, { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'mine', 'index.md'),
+      `---\ntitle: mine\ntype: index\nworking_dir: ${CWD}\n---\n\n# mine\n`,
+    );
+    spawnSync('git', ['init', '-q'], { cwd: dir });
+    spawnSync('git', ['config', 'user.email', 't@t.test'], { cwd: dir });
+    spawnSync('git', ['config', 'user.name', 'test'], { cwd: dir });
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+    fn(dir, CWD);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// F2 regression (session-close-scope-boundary spec §2/§3 review BLOCKER): the
+// PreCompact hook passed resolveGateProjectOverride's cwd-derived value to
+// precompactGateStatus as `projectOverride`, which narrows
+// sessionCloseGlobalStatus to evaluate ONLY the cwd project (`mine`) — so
+// `foreign`'s incomplete close was never evaluated, `close.debt` stayed empty,
+// and the close-debt notice this hook renders from it (the comment right
+// above this call site calls out exactly this: "would turn the demotion into
+// a disappearance") never fired. Distinguishes: a cwd-resolved session where
+// `mine` (this session's own project) is complete and `foreign`'s dangling
+// close still surfaces as a notice (attributionScope: sessionCloseGlobalStatus
+// stays global, so `foreign` is evaluated, found incomplete, and demoted to
+// debt because it is outside `mine`'s scope) from one where it goes fully
+// silent (projectOverride: `foreign` is never evaluated at all, so there is
+// nothing to demote).
+test('E2E: PreCompact surfaces a foreign incomplete close as a notice while the cwd project is complete', () => {
+  withCwdPartitionWiki((dir, CWD) => {
+    const r = runHook('hypo-personal-check.mjs', { cwd: CWD }, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
+    assert.ok(
+      out.systemMessage &&
+        /foreign/.test(out.systemMessage) &&
+        /incomplete session close/.test(out.systemMessage),
+      `foreign's dangling close must surface as a close-debt notice, not vanish: ${r.stdout}`,
+    );
+  });
 });
 
 // ── replay-personal-check-bypass-order (ADR 0022 amendment 2026-05-13) ──
@@ -813,11 +885,22 @@ test('replay-personal-check-bypass-order: wiki-context-critical.json does NOT by
         const out = JSON.parse(r.stdout);
 
         // Pre-fix: would have continue:true + "gate auto-bypassed (context ≥90% critical)".
-        // Post-fix: capacity flag is ignored → normal block path runs.
+        // Post-fix: capacity flag is ignored, AND PreCompact never blocks at all
+        // (spec §1) — the incomplete close still runs the full check, it just
+        // surfaces as an advisory systemMessage instead of decision:'block'.
         assert.equal(
           out.decision,
-          'block',
-          `CRITICAL_FILE must NOT bypass — gate should still block: ${r.stdout}`,
+          undefined,
+          `PreCompact must never set decision:block: ${r.stdout}`,
+        );
+        assert.equal(
+          out.continue,
+          true,
+          `CRITICAL_FILE must NOT bypass the full check — gate should still run: ${r.stdout}`,
+        );
+        assert.ok(
+          (out.systemMessage || '').includes('Session close incomplete'),
+          `the incomplete close must still surface: ${r.stdout}`,
         );
         assert.ok(
           !(out.systemMessage || '').includes('context ≥90% critical'),

@@ -34,6 +34,7 @@ import {
   vaultCommitLockTarget,
   currentDevice,
   withFileLock,
+  resolveGateProjectOverride,
 } from '../../hooks/hypo-shared.mjs';
 import { hashContent, readBaseEntry, advanceBase } from '../../hooks/base-store.mjs';
 import { writeProposal } from '../../hooks/proposal-store.mjs';
@@ -322,6 +323,38 @@ export function runMarkSessionClosed(args) {
   // arg): it both widens the lint scope inside the gate AND is the evidence
   // source for the user-close hard gate below.
   const closeTranscript = resolveTranscriptBySessionId(args.sessionId);
+  // resolveGateProjectOverride (session-close-scope-boundary spec §2/§3): closeScope
+  // above only widens THIS session's accountability set (evidence union for the
+  // marker's attribution) -- it does not narrow closeAccountableScope's base, so a
+  // DIFFERENT project's dangling close files still land in the git-dirty check and
+  // block a `--project=<mine>` mark. Passed below as `attributionScope`: this is
+  // the value that feeds the mine/foreign partition in precompactGateStatus and
+  // demotes the foreign project's own close-file debt to a notice instead of
+  // block, and it also decides which projects the marker this call may go on to
+  // write ends up attesting -- so passing `projectOverride` instead would narrow
+  // sessionCloseGlobalStatus to args.project alone and turn the partition off,
+  // which is the bug this key split fixes (a marker then claimed the demoted
+  // foreign project was closed too, because close.scope was never narrowed).
+  // --project has already passed requireProjectDir's slug + directory check above
+  // when !args.logOnly, so resolveGateProjectOverride's own validation is a
+  // formality here, not the only guard. The `sessionCwd` argument below is dead:
+  // resolveGateProjectOverride returns from its `if (project)` branch before
+  // sessionCwd is ever read, and that branch is exactly the one this ternary's
+  // `args.project && !args.logOnly` guard takes. Kept only because removing it
+  // would suggest sessionCwd narrows this call, which it never has. Scoped to
+  // the explicit --project case only (matching closeScope's own condition
+  // above): with no --project, this call has no attribution evidence to narrow
+  // to yet (markerProjects is decided further down from the transcript), so
+  // leaving attributionScope unset here keeps the global judgment that P2's
+  // sessionCwd close-cwd check already depends on for a no-argument
+  // `--mark-session-closed`.
+  const attributionScope =
+    args.project && !args.logOnly
+      ? resolveGateProjectOverride(args.hypoDir, {
+          project: args.project,
+          sessionCwd: args.sessionCwd || null,
+        })
+      : null;
   const gate = precompactGateStatus(args.hypoDir, {
     ...(args.project && !args.logOnly ? { closeScope: [args.project] } : {}),
     ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
@@ -329,6 +362,7 @@ export function runMarkSessionClosed(args) {
     // P2 (session-close attribution): the marker gate must refuse to attest compact-ready while the
     // session's cwd project has an unstarted close. logOnly exempts it in-gate.
     ...(args.sessionCwd ? { sessionCwd: args.sessionCwd } : {}),
+    ...(attributionScope ? { attributionScope } : {}),
   });
   const status = gate.close;
   if (!gate.ok) {
@@ -1498,13 +1532,27 @@ export function applySessionClose(args) {
     if (commitOutcome.committed) {
       closeTranscript = resolveTranscriptBySessionId(args.sessionId);
       // closeScope: apply KNOWS which project it just closed, and it wrote
-      // that project's files from inside this process — they never appear in the
+      // that project's files from inside this process, they never appear in the
       // transcript as Edit/Write, so `payload.project` is the only signal that puts
       // this close in scope. Without it, apply's own incomplete close could be demoted
       // to a foreign-debt notice and marked green.
+      //
+      // attributionScope (session-close-scope-boundary spec §2/§3): the same
+      // `payload.project` signal, resolved through the shared validator. apply's
+      // launch cwd can differ from payload.project (a supported cross-project
+      // close), so unlike PreCompact/Stop there is no cwd to fall back on here,
+      // and passing one would risk narrowing to the wrong project. Passed as
+      // `attributionScope`, never `projectOverride` — this is closeScope's own
+      // project already, so it changes nothing about which projects end up in
+      // scope, but it is what turns the mine/foreign partition ON: with
+      // `projectOverride` the gate would also narrow sessionCloseGlobalStatus to
+      // `project` alone, going green on a foreign project's incomplete close
+      // instead of demoting it to a notice.
+      const autoMarkerOverride = resolveGateProjectOverride(args.hypoDir, { project });
       gateOk = precompactGateStatus(args.hypoDir, {
         closeScope: [project],
         ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
+        ...(autoMarkerOverride ? { attributionScope: autoMarkerOverride } : {}),
       }).ok;
     }
     const decision = planMarkerDecision({

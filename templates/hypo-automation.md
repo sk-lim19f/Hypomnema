@@ -24,7 +24,7 @@ All 15 hooks registered in `hooks/hooks.json` are listed below, in registration 
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | Injects a one-line resume summary on the first prompt after a session start or cwd change |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | Searches the wiki index for each prompt and injects matched pages as context |
 | `hypo-compact-guard.mjs` | `UserPromptSubmit` | Prompts session close in chat when `/compact` or `/clear` is typed and close is incomplete |
-| `hypo-personal-check.mjs` | `PreCompact` | Hard-gates `/compact`, blocking on missing session-close files, uncommitted wiki changes, or lint blockers |
+| `hypo-personal-check.mjs` | `PreCompact` | Detects missing session-close files, uncommitted wiki changes, or lint blockers and surfaces them as a `systemMessage`; it does not block `/compact` |
 | `hypo-auto-stage.mjs` | `PostToolUse` | Auto-stages a wiki file after it is written |
 | `hypo-web-fetch-ingest.mjs` | `PostToolUse` | Nudges Claude to ingest WebFetch/WebSearch results into `sources/` |
 | `hypo-hot-rebuild.mjs` | `Stop` | Rebuilds root `hot.md`'s pointer table and frontmatter at session end |
@@ -102,7 +102,10 @@ Edit `.hypoignore` in your wiki root to exclude additional files or directories 
 
 ## Lint Gate
 
-`hypo-personal-check.mjs` runs `lint.mjs` before destructive operations.
-If **blocker** errors are found, the operation is blocked until errors are resolved.
+`hypo-personal-check.mjs` runs `lint.mjs` before a compact.
+Blocker errors are reported in its `systemMessage`; the PreCompact hook does not
+stop `/compact` on them. The two places that still refuse on a red gate are
+`crystallize --check-session-close` (it reports the session as not close-complete)
+and the marker writer (`--mark-session-closed` will not stamp a marker).
 
 Run `/hypo:lint` to check and fix issues.
