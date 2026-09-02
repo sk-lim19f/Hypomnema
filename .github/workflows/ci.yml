@@ -250,14 +250,23 @@ jobs:
             if (!('additionalContext' in d)) { console.error('missing additionalContext'); process.exit(1); }
             if (d.continue !== true)         { console.error('expected continue:true');    process.exit(1); }
           "
-      - name: personal-check — no wiki returns block decision
+      # PreCompact reports, it does not block (session-close-scope-boundary §1).
+      # The contract worth replaying is that it still SAYS something: a bare
+      # continue with no systemMessage would be a silent pass, which is the
+      # failure this step exists to catch now that the block is gone.
+      - name: personal-check — no wiki reports without blocking
         run: |
           echo '{}' \
             | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/hypo-personal-check.mjs \
             > /tmp/pwc-block.json
           node -e "
             const d = JSON.parse(require('fs').readFileSync('/tmp/pwc-block.json', 'utf-8'));
-            if (d.decision !== 'block') { console.error('expected decision:block'); process.exit(1); }
+            if (d.decision === 'block') { console.error('PreCompact must not block'); process.exit(1); }
+            if (d.continue !== true)    { console.error('expected continue:true');   process.exit(1); }
+            if (!/Session close incomplete/.test(d.systemMessage || '')) {
+              console.error('expected the incomplete close to be named, got: ' + JSON.stringify(d));
+              process.exit(1);
+            }
           "
       - name: personal-check — HYPO_SKIP_GATE=1 passes through
         run: |
@@ -267,6 +276,13 @@ jobs:
           node -e "
             const d = JSON.parse(require('fs').readFileSync('/tmp/pwc-skip.json', 'utf-8'));
             if (d.continue !== true) { console.error('expected continue:true'); process.exit(1); }
+            // continue:true no longer separates these two cases: since §1 the hook
+            // always continues. What the flag still changes is the message, so
+            // assert THAT or this step stops distinguishing anything.
+            if (!/gate bypassed via HYPO_SKIP_GATE/.test(d.systemMessage || '')) {
+              console.error('expected the bypass notice, got: ' + JSON.stringify(d));
+              process.exit(1);
+            }
           "
 
   uninstall-smoke:
