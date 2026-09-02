@@ -87,7 +87,7 @@ test('feedback projection pure drift → self-heal (auto --write) + continue, no
   );
 });
 
-test('feedback projection conflict (hand-edited block) → still blocks, no auto-merge (ADR 0045)', () => {
+test('feedback projection conflict (hand-edited block) → named in the notice, no auto-merge (ADR 0045)', () => {
   withWiki(
     (dir) => {
       mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
@@ -119,10 +119,12 @@ test('feedback projection conflict (hand-edited block) → still blocks, no auto
         );
         const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
         const out = JSON.parse(r.stdout);
-        assert.equal(out.decision, 'block', `conflict must still block: ${r.stdout}`);
+        // scope-boundary §1: PreCompact no longer blocks. What must survive is that
+        // the condition is DETECTED and NAMED — a silent pass is the regression.
+        assert.notEqual(out.decision, 'block', `PreCompact must not block: ${r.stdout}`);
         assert.ok(
-          /conflict/.test(out.reason || ''),
-          `block reason must name the conflict: ${r.stdout}`,
+          /conflict/.test(out.systemMessage || ''),
+          `notice must name the conflict: ${r.stdout}`,
         );
         // Never auto-merged over the hand edit.
         assert.ok(
@@ -164,9 +166,9 @@ test('feedback projection over cap → still blocks, never auto-writes (ADR 0045
         writeFileSync(claudePath, '# Global\n<learned_behaviors>\n</learned_behaviors>\n');
         const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
         const out = JSON.parse(r.stdout);
-        assert.equal(out.decision, 'block', `over-cap must still block: ${r.stdout}`);
+        assert.notEqual(out.decision, 'block', `PreCompact must not block: ${r.stdout}`);
         assert.ok(
-          /over cap/.test(out.reason || ''),
+          /over cap/.test(out.systemMessage || ''),
           `block reason must name the over-cap: ${r.stdout}`,
         );
         // Self-heal must NOT have run --write: no managed block was materialized.
@@ -201,9 +203,9 @@ test('feedback gate: CLAUDE.md present but WITHOUT its container → BLOCKS (was
         writeFileSync(join(home, '.claude', 'CLAUDE.md'), '# Global\n\nNo container here.\n');
         const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
         const out = JSON.parse(r.stdout);
-        assert.equal(out.decision, 'block', `unbuildable projection must block: ${r.stdout}`);
+        assert.notEqual(out.decision, 'block', `PreCompact must not block: ${r.stdout}`);
         assert.ok(
-          /cannot be built/.test(out.reason || ''),
+          /cannot be built/.test(out.systemMessage || ''),
           `block reason must name the build failure: ${r.stdout}`,
         );
       } finally {
@@ -238,14 +240,12 @@ test('feedback gate: CLAUDE.md exists but is UNREADABLE → BLOCKS, not fail-ope
         try {
           const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
           const out = JSON.parse(r.stdout);
-          assert.equal(
-            out.decision,
-            'block',
-            `unreadable target must block, not fail-open: ${r.stdout}`,
-          );
+          assert.notEqual(out.decision, 'block', `PreCompact must not block: ${r.stdout}`);
+          // The point of this case is NOT fail-open: an unreadable target must still
+          // be reported, just as a notice rather than a block (scope-boundary §1).
           assert.ok(
-            /cannot be built/.test(out.reason || ''),
-            `block reason must name the build failure: ${r.stdout}`,
+            /cannot be built/.test(out.systemMessage || ''),
+            `notice must name the build failure: ${r.stdout}`,
           );
         } finally {
           chmodSync(claudeMdPath, 0o644); // restore so cleanup (rmSync) can remove the tree
@@ -1709,20 +1709,17 @@ test('the hook blocker for a build-failed target names --ensure-container and th
         writeFileSync(claudeMdPath, '# Global\n\nNo container here.\n');
         const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
         const out = JSON.parse(r.stdout);
-        assert.equal(out.decision, 'block');
+        assert.notEqual(out.decision, 'block');
+        const notice = out.systemMessage || '';
         assert.ok(
-          out.reason.includes(claudeMdPath),
-          `blocker reason must name the exact target path: ${out.reason}`,
+          notice.includes(claudeMdPath),
+          `notice must name the exact target path: ${notice}`,
         );
         assert.ok(
-          out.reason.includes('<learned_behaviors></learned_behaviors>'),
-          `blocker reason must name the literal container tag pair: ${out.reason}`,
+          notice.includes('<learned_behaviors></learned_behaviors>'),
+          `notice must name the literal container tag pair: ${notice}`,
         );
-        assert.match(
-          out.reason,
-          /--ensure-container/,
-          'blocker reason must name the remedy command',
-        );
+        assert.match(notice, /--ensure-container/, 'notice must name the remedy command');
       } finally {
         rmSync(home, { recursive: true, force: true });
       }

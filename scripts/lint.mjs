@@ -293,7 +293,11 @@ const issues = [];
 //   W14 design-history-missing → excluded, same reason as W8, and deliberately
 //                             a different id so hypo-shared.mjs's W8-only
 //                             blocker filter never sees it (stays warn, never
-//                             hard-blocks PreCompact).
+//                             enters the close-gate blocker set). Since the
+//                             session-close-scope-boundary change the
+//                             PreCompact hook no longer blocks /compact, so
+//                             that set is what --check-session-close and
+//                             --mark-session-closed read, not a compact stop.
 // NOTE: no gate currently passes --strict (npm run lint / CI / release.yml /
 // crystallize / the close-gate all run plain lint), so promotion is
 // forward-looking: these surface as warnings today. The deliverable is
@@ -590,11 +594,13 @@ for (const rel of closeRootTargets) {
 // regardless of host OS — `hooks/hypo-personal-check.mjs:246` depends on this.
 //
 // W14: design-history.md does not exist at all, but session-log carries a
-// design-relevant entry with nowhere to land. Distinct id from W8 on purpose —
-// hypo-shared.mjs's PreCompact gate filters strictly on `w.id === 'W8'` to
-// hard-block an active project on staleness, and W14 must NOT enter that path
-// (a bootstrapping gap on 14 of 16 live projects would block every one of
-// them). W14 stays a plain warn: never added to STRICT_PROMOTE_IDS, never
+// design-relevant entry with nowhere to land. Distinct id from W8 on purpose:
+// hypo-shared.mjs's close gate filters strictly on `w.id === 'W8'` to make an
+// active project's staleness a gate blocker, and W14 must NOT enter that path
+// (a bootstrapping gap on 14 of 16 live projects would make every one of them
+// a blocker). That blocker set is what --check-session-close reports and what
+// --mark-session-closed refuses on; the PreCompact hook itself no longer stops
+// /compact. W14 stays a plain warn: never added to STRICT_PROMOTE_IDS, never
 // matched by that W8-only filter.
 for (const s of findDesignHistoryStale(args.hypoDir)) {
   if (s.kind === 'missing') {

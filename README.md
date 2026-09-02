@@ -201,7 +201,7 @@ Friction kills personal knowledge systems. If saving a thought takes three click
 |---|---|
 | `SessionStart` | "Where did I leave off?" reading `hot.md` / `session-state.md` |
 | `UserPromptSubmit` | "Do I already know this?" a BM25 lookup, top-3 inject |
-| `PreCompact` | "Did I close the session?" the checklist guard |
+| `PreCompact` | "Did I close the session?" a checklist notice (advisory only; it does not block `/compact`) |
 | `PostToolUse` (Write/Edit/MultiEdit) | `git add` |
 | `Stop` | `git commit && git pull --no-rebase && git push` |
 
@@ -257,7 +257,7 @@ Nine commands cover the full capture → retrieval → consolidation cycle.
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | Auto-stage wiki-file edits |
 | `hypo-auto-commit.mjs` | `Stop` | Auto commit + pull + push |
 | `hypo-hot-rebuild.mjs` | `Stop` | Rebuild the root `hot.md` pointer table (structure + dates) |
-| `hypo-personal-check.mjs` | `PreCompact` | Block compact on an unfinished session-close, an uncommitted or unpushed wiki, malformed `hot.md`, or lint blockers (bypass: `HYPO_SKIP_GATE=1`) |
+| `hypo-personal-check.mjs` | `PreCompact` | Surfaces an unfinished session-close, an uncommitted or unpushed wiki, malformed `hot.md`, or lint blockers as a `systemMessage`; it never blocks `/compact`. Session close is still enforced elsewhere: the Stop hook (`hypo-auto-minimal-crystallize.mjs`) blocks on a substantial session with no verified close, and `--mark-session-closed` still refuses the marker on a red gate |
 | `hypo-session-end.mjs` | `SessionEnd` | Write a SessionEnd marker so SessionStart can detect `source=clear` recovery |
 | `hypo-session-record.mjs` | `Stop` | Record session metadata for the observability score and auto-resume signaling |
 | `hypo-auto-minimal-crystallize.mjs` | `Stop` | After the user signals wrap-up, blocks Stop on a substantial session with no verified close and hands back the `crystallize.mjs --mark-session-closed` command. With uncommitted changes or work still in flight it asks whether to close now instead |
@@ -390,7 +390,7 @@ Place a `hypo-config.md` at the wiki root to make it portable across machines wi
 
 `.hyposcanignore` is a different file with a narrower job. `init` writes one at the root of every new vault, and it only excludes paths from catalog scans (`lint`, `stats`, `query`, `verify`, `doctor`). It is not a privacy boundary: a path matched by `.hyposcanignore` is still committed and still readable by hooks. To actually keep something out of injection and commits, use `.hypoignore`.
 
-> Gate bypass: `HYPO_SKIP_GATE=1` is honored by every gate that can stop you mid-session, not just one: `hypo-personal-check` (PreCompact), `hypo-compact-guard`, `hypo-close-guard`, `hypo-auto-minimal-crystallize`, and the ingest nudge in `hypo-web-fetch-ingest`. Set it for a trivial session you do not want recorded.
+> Gate bypass: `HYPO_SKIP_GATE=1` is honored by every gate that can stop you mid-session: `hypo-compact-guard`, `hypo-close-guard`, `hypo-auto-minimal-crystallize`, and the ingest nudge in `hypo-web-fetch-ingest`. `hypo-personal-check` (PreCompact) also reads the flag, but since that hook never blocks `/compact` anymore, the flag only suppresses the incomplete-close `systemMessage` it would otherwise repeat. Set it for a trivial session you do not want recorded.
 
 > If a session-close write finds its target changed since this session read it, Hypomnema does not overwrite it. It parks the bytes under `<wiki>/.cache/proposals/` and tells you. Review and apply them yourself: `hypomnema proposal list`, then `hypomnema proposal apply <id>` (at a terminal) or `hypomnema proposal discard <id>`. Inside a session, where there is no terminal to type at, the same approval is collected in the conversation: `hypomnema proposal challenge` prints the diffs, you type the line it gives you, and `hypomnema proposal resolve` writes exactly what you saw. There is no auto-apply.
 

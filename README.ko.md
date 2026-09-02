@@ -203,7 +203,7 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 |---|---|
 | `SessionStart` | "어디까지 했더라?" `hot.md` / `session-state.md` 다시 읽기 |
 | `UserPromptSubmit` | "이거 이미 정리해 뒀나?" BM25 룩업, top-3 주입 |
-| `PreCompact` | "세션 정리는 했나?" 체크리스트 가드 |
+| `PreCompact` | "세션 정리는 했나?" 체크리스트 알림 (권고일 뿐, `/compact`를 막지 않음) |
 | `PostToolUse` (Write/Edit/MultiEdit) | `git add` |
 | `Stop` | `git commit && git pull --no-rebase && git push` |
 
@@ -261,7 +261,7 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | 위키 파일 자동 stage |
 | `hypo-auto-commit.mjs` | `Stop` | 자동 commit + pull + push |
 | `hypo-hot-rebuild.mjs` | `Stop` | 루트 `hot.md` 포인터 테이블 재생성 (구조와 날짜) |
-| `hypo-personal-check.mjs` | `PreCompact` | session-close 미완, 위키 커밋/푸시 누락, hot.md 구조 위반, lint 블로커면 compact 차단 (우회: `HYPO_SKIP_GATE=1`) |
+| `hypo-personal-check.mjs` | `PreCompact` | session-close 미완, 위키 커밋/푸시 누락, hot.md 구조 위반, lint 블로커를 `systemMessage`로 알림. `/compact`는 여기서 막지 않음. 세션 마무리 강제는 다른 자리에 남아 있음: Stop 훅(`hypo-auto-minimal-crystallize.mjs`)이 마무리 확인 없는 의미 있는 세션을 막고, `--mark-session-closed`는 여전히 red 게이트에서 마커를 거부함 |
 | `hypo-session-end.mjs` | `SessionEnd` | SessionEnd 마커 기록. 다음 SessionStart가 `source=clear` 복구를 감지하게 함 |
 | `hypo-session-record.mjs` | `Stop` | observability 점수 + auto-resume 신호용 세션 메타데이터 기록 |
 | `hypo-auto-minimal-crystallize.mjs` | `Stop` | 사용자가 마무리를 신호한 뒤, 의미 있는 작업을 했는데 세션 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려줌. 미커밋 변경이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되물음 |
@@ -392,7 +392,7 @@ E. 멈춘 프로젝트 재개.
 
 세 번째 프라이버시 축은 경로가 아니라 페이지 단위로 걸립니다. 페이지 프런트매터에 `visibility_scope: machine:<device>`를 넣으면 그 기기에서만 노출됩니다. `<device>`의 기본값은 hostname이며, hostname이 고정적이지 않은 환경이라면 `HYPO_DEVICE`로 못박으세요. 그러지 않으면 페이지가 자기 기기와도 매치되지 않습니다. 필드를 생략하면 shared입니다.
 
-`HYPO_SKIP_GATE=1`은 세션 중간에 사용자를 막을 수 있는 게이트 전부가 존중합니다. `hypo-personal-check`(PreCompact), `hypo-compact-guard`, `hypo-close-guard`, `hypo-auto-minimal-crystallize`, 그리고 `hypo-web-fetch-ingest`의 ingest 안내까지입니다. 기록할 필요 없는 가벼운 세션에 씁니다.
+`HYPO_SKIP_GATE=1`은 세션 중간에 사용자를 막을 수 있는 게이트가 존중합니다. `hypo-compact-guard`, `hypo-close-guard`, `hypo-auto-minimal-crystallize`, 그리고 `hypo-web-fetch-ingest`의 ingest 안내가 여기 해당합니다. `hypo-personal-check`(PreCompact)도 이 플래그를 읽지만, 이 훅은 이제 `/compact`를 막지 않으므로 플래그는 반복될 뻔한 미완성-마무리 `systemMessage`만 억제합니다. 기록할 필요 없는 가벼운 세션에 씁니다.
 
 > 모델 제공사에게 전송되는 범위: Hypomnema 훅은 위키 본문을 Claude Code의 추가 컨텍스트(`additionalContext`)에 실어 보내고, 이 내용은 프롬프트의 일부로 Claude 모델 제공사로 전송됩니다. `.hypoignore`에 등록된 경로는 모든 주입 훅(`hypo-file-watch`, `hypo-session-start`, `hypo-cwd-change`, `hypo-lookup`)과 `ingest`에서 제외되지만, 등록하지 않은 파일은 전송 대상입니다. (`hypo-auto-stage`/`hypo-auto-commit`은 git 스테이징용 훅이라 컨텍스트를 주입하지는 않지만, 스테이징 판단에도 `.hypoignore`를 참고합니다.) 비밀 정보는 위키에 두지 마시고, `HYPO_DIR` 아래에 민감한 내용을 저장하기 전에 `.hypoignore` 패턴을 먼저 점검하세요.
 

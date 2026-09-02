@@ -39,6 +39,7 @@ import {
   markerPath,
   partitionLintScope,
   precompactGateStatus,
+  resolveGateProjectOverride,
   run,
   runStop,
   runWithHome,
@@ -3190,6 +3191,187 @@ test('IMPR-34: foreign incomplete close is a notice, not a blocker, when scope n
   });
 });
 
+// F1 regression (session-close-scope-boundary spec §2/§3 review BLOCKER): the
+// marker-writing CLI's `--mark-session-closed` path never passes `sessionId`
+// to `precompactGateStatus` (it has no marker to re-read yet on a first mark),
+// so the ONLY way this session's own transcript can put `foreign` into
+// `resolveCloseScope`'s scope Set is signal 2: an Edit/Write the transcript
+// shows touching one of `foreign`'s own close files. Once it is in scope, the
+// old `projectOverride` wiring and the fixed `attributionScope` wiring
+// disagree about what happens next. `projectOverride` narrows
+// `sessionCloseGlobalStatus` to evaluate ONLY `mine`, so `foreign`'s real
+// (incomplete) status is never even computed and the demote-vs-block
+// partition never sees it fail; `attributionScope` leaves the evaluation
+// global, so `foreign` shows up in `failed`, and because it is IN scope the
+// partition classifies it as this session's own responsibility, not foreign
+// debt. Distinguishes: a marker CLI that checks a project before letting the
+// marker attest it, from one that lets an in-scope project's status ride
+// through unchecked. Under the fix this call must BLOCK; under the pre-fix
+// wiring it exits 0 and writes a marker naming `foreign` as closed without
+// ever having looked at its actual status.
+test('E2E: --mark-session-closed blocks on a foreign project this session touched but never actually closed', () => {
+  withClosePartitionWiki(INCIDENT(todayLocal()), [], (dir, _transcript, home) => {
+    const sessionId = 's-f1-e2e-marker';
+    const foreignHot = join(dir, 'projects', 'foreign', 'hot.md');
+    const cleanup = seedCloseTranscript(sessionId, {
+      home,
+      toolUseLines: [
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [{ type: 'tool_use', name: 'Edit', input: { file_path: foreignHot } }],
+          },
+        }),
+      ],
+    });
+    try {
+      const r = runWithHome(
+        'crystallize.mjs',
+        [
+          `--hypo-dir=${dir}`,
+          '--mark-session-closed',
+          `--session-id=${sessionId}`,
+          '--project=mine',
+          '--json',
+        ],
+        home,
+      );
+      assert.equal(
+        r.status,
+        1,
+        `foreign is in this session's own scope (touched via the transcript) and its close ` +
+          `is incomplete -- the gate must check it, not silently pass: ${r.stdout}\n${r.stderr}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false);
+      assert.ok(
+        (out.blockers || []).some((b) => b.type === 'close'),
+        `must block on foreign's own incomplete close, not exit clean: ${JSON.stringify(out)}`,
+      );
+      assert.ok(
+        !existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)),
+        'a blocked gate must never leave a marker behind',
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The false-green this closes (codex pre-commit BLOCKER, 2026-09-02): the global
+// close status only evaluates TODAY-ACTIVE candidates, and a candidate needs a
+// session-state.md to be one at all. resolveGateProjectOverride, meanwhile, only
+// checks that projects/<slug>/ is a directory. So `--project=orphan` against a
+// bare directory used to sail through: the gate never looked at orphan, and the
+// marker writer stamped it anyway from the attribution scope. The old
+// projectOverride path was red here because it called sessionCloseFileStatus on
+// the named slug directly; the attributionScope rewrite lost that, and
+// mustEvaluate restores it.
+//
+// Distinguishes: a slug that IS in the today-active candidate set (the test
+// above) from one that is NOT and can only reach the gate through attribution.
+test('E2E: --mark-session-closed refuses a project that exists on disk but was never a close candidate', () => {
+  withClosePartitionWiki(INCIDENT(todayLocal()), [], (dir, _transcript, home) => {
+    const sessionId = 's-orphan-e2e-marker';
+    // A real directory with no close files at all: not a candidate (no
+    // session-state.md), no today activity, nothing for the gate to have seen.
+    mkdirSync(join(dir, 'projects', 'orphan'), { recursive: true });
+    const cleanup = seedCloseTranscript(sessionId, { home });
+    try {
+      const r = runWithHome(
+        'crystallize.mjs',
+        [
+          `--hypo-dir=${dir}`,
+          '--mark-session-closed',
+          `--session-id=${sessionId}`,
+          '--project=orphan',
+          '--json',
+        ],
+        home,
+      );
+      assert.equal(
+        r.status,
+        1,
+        `orphan reaches the marker through --project, so the gate must evaluate it ` +
+          `and find its close files missing: ${r.stdout}\n${r.stderr}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false);
+      // Name WHY it is red. Exit 1 alone would also pass if the partition broke
+      // and the pre-seeded incomplete `foreign` became a global blocker instead,
+      // which is a different defect wearing the same exit code.
+      const closeBlocker = (out.blockers || []).find((b) => b.type === 'close');
+      assert.ok(closeBlocker, `must be a close blocker: ${JSON.stringify(out)}`);
+      assert.ok(
+        JSON.stringify(closeBlocker).includes('orphan'),
+        `the blocker must name orphan, not some other project: ${JSON.stringify(closeBlocker)}`,
+      );
+      assert.ok(
+        !existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)),
+        'a project the gate found incomplete must not be attested as closed',
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The false-BLOCK this closes (codex round 2, 2026-09-02): resolveCloseScope
+// unions a v4 marker's `projects` into the partition scope, and the first cut of
+// mustEvaluate passed that WHOLE scope as mandatory evaluation targets. A marker
+// from a previous day naming `alpha` then made alpha's stale close block an
+// unrelated `beta` close today. Marker projects are PAST evidence: they belong in
+// the partition scope (so they are not demoted as foreign debt) but not in the
+// set the gate must evaluate for THIS close.
+//
+// Distinguishes: direct evidence for this close attempt (--project, transcript,
+// attributionScope) from a marker's record of a close that already happened.
+test('a previous day marker does not make its project block an unrelated close today', () => {
+  const today = todayLocal();
+  // Local calendar, not toISOString(): the project activity dates this fixture
+  // compares against are local-date (todayLocal), so a UTC slice would put
+  // `stale` on TODAY around the midnight boundary in western timezones and the
+  // fixture would silently stop testing anything.
+  const y = new Date();
+  y.setDate(y.getDate() - 1);
+  const yesterday = `${y.getFullYear()}-${String(y.getMonth() + 1).padStart(2, '0')}-${String(y.getDate()).padStart(2, '0')}`;
+  // `stale` exists and has close files, but its activity is YESTERDAY, so it is
+  // not a today-active candidate. The only thing that can pull it into this
+  // close's evaluation is the marker.
+  const projects = [
+    { slug: 'mine', date: today },
+    { slug: 'stale', date: yesterday, sessionLog: false },
+  ];
+  withClosePartitionWiki(projects, [], (dir) => {
+    const sessionId = 's-crossday-marker';
+    const markerPath = join(dir, '.cache', `session-closed-${sessionId}.marker`);
+    mkdirSync(dirname(markerPath), { recursive: true });
+    writeFileSync(
+      markerPath,
+      JSON.stringify({
+        session_id: sessionId,
+        project: 'stale',
+        projects: ['stale'],
+        closed_at: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+        verification: 'session-close-file-status:ok',
+      }) + '\n',
+    );
+    // sessionId is what makes the gate read the marker at all (the PreCompact hook
+    // passes one; --mark-session-closed does not).
+    const gate = precompactGateStatus(dir, {
+      closeScope: ['mine'],
+      sessionId,
+      claudeHome: join(dir, '.claude-none'),
+    });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      false,
+      `a marker's past project must not be dragged into THIS close's mandatory ` +
+        `evaluation. got ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
 // ── session-cwd close check (session-close attribution, P2) ──────────────────
 // The false-green this closes: a secondary project whose close was NEVER STARTED
 // leaves no today close-activity trace, so the recency-based global status can't
@@ -3613,5 +3795,69 @@ test('IMPR-34: --project override is never partitioned away', () => {
       true,
       'the named project is checked, not demoted',
     );
+  });
+});
+
+// resolveGateProjectOverride (session-close-scope-boundary spec §2): the one
+// place that turns a caller-supplied project name (or a session cwd) into the
+// projectOverride precompactGateStatus's four marker-writing call sites now
+// share. Its own contract is what keeps all four honest, so it gets tested
+// directly rather than only through one call site's behavior.
+suite('resolveGateProjectOverride (session-close-scope-boundary spec §2)');
+
+test('a real project slug resolves to itself', () => {
+  withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir) => {
+    assert.equal(resolveGateProjectOverride(dir, { project: 'mine' }), 'mine');
+  });
+});
+
+test('a syntactically invalid project name is rejected, never narrows the gate', () => {
+  withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir) => {
+    assert.equal(resolveGateProjectOverride(dir, { project: '../etc' }), null);
+    assert.equal(resolveGateProjectOverride(dir, { project: '..' }), null);
+  });
+});
+
+test('a syntactically valid slug with no such project directory is rejected', () => {
+  withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir) => {
+    assert.equal(
+      resolveGateProjectOverride(dir, { project: 'no-such-project' }),
+      null,
+      'a hook-supplied slug that never passed requireProjectDir must not narrow the gate',
+    );
+  });
+});
+
+test('no project, unambiguous cwd → resolves to the one project that owns it', () => {
+  const CWD = '/tmp/rgpo-unambiguous';
+  withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir) => {
+    setWorkingDir(dir, 'mine', CWD);
+    assert.equal(resolveGateProjectOverride(dir, { sessionCwd: CWD }), 'mine');
+  });
+});
+
+test('no project, cwd shared by two distinct projects → declines to null (rejectAmbiguous)', () => {
+  // A monorepo with no working_dir uniqueness invariant: silently picking the
+  // first slug would narrow the gate to a project whose own close may not even
+  // be the one this session cares about (spec §2 / pickProjectByCwd's own tie
+  // rule). null must fall through to the caller's global judgment, not a guess.
+  const CWD = '/tmp/rgpo-ambiguous';
+  withClosePartitionWiki(
+    [
+      { slug: 'mono-a', date: todayLocal() },
+      { slug: 'mono-b', date: todayLocal() },
+    ],
+    [],
+    (dir) => {
+      setWorkingDir(dir, 'mono-a', CWD);
+      setWorkingDir(dir, 'mono-b', CWD);
+      assert.equal(resolveGateProjectOverride(dir, { sessionCwd: CWD }), null);
+    },
+  );
+});
+
+test('no project, no cwd → null (leaves the gate global, never guesses)', () => {
+  withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir) => {
+    assert.equal(resolveGateProjectOverride(dir, {}), null);
   });
 });

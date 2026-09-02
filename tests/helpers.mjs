@@ -187,6 +187,7 @@ const {
   commitTouchedPaths,
   touchedPathsPath,
   vaultCommitLockTarget,
+  resolveGateProjectOverride,
 } = await import(join(HOOKS, 'hypo-shared.mjs'));
 
 function runHook(hookFile, stdinData, extraEnv = {}) {
@@ -823,6 +824,7 @@ export {
   commitTouchedPaths,
   touchedPathsPath,
   vaultCommitLockTarget,
+  resolveGateProjectOverride,
   resolveHypoRoot,
   resolveHypoRootInfo,
   resolveInstallFile,

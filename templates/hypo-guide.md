@@ -88,17 +88,20 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    notice, not a gate. (The documented `/hypo:crystallize` session-close path
    runs this lint automatically, scoped to the files it writes.)
 6. Verify with `/hypo:crystallize` in its `--check-session-close` mode: a dry-run of the
-   **full** PreCompact gate (close files + lint + design-history + feedback
-   projection), sharing one function with the gate. Only declare the
+   **full** set of checks the PreCompact hook itself runs (close files + lint + design-history + feedback
+   projection), sharing one function (`precompactGateStatus`) with that hook. Only declare the
    session closed once it prints **"Compact-ready"**. A "close files updated"
-   check alone is not enough — the real `/compact` gate also blocks on a lint
-   error in a close file or a feedback projection over-cap. (Not a hard
-   guarantee: the live gate can still differ on a context-≥70% prompt,
-   `HYPO_SKIP_GATE`, or a transcript-scoped lint error — pass `--transcript-path`
-   to include the last.) Pass `--session-id=<id>` to also see `marker_present`
+   check alone is not enough to earn that signal: a lint error in a close file
+   or a feedback projection over-cap keeps the check red on its own.
+   The live hook can still see a different set than this check does, because of
+   `HYPO_SKIP_GATE` or a transcript-scoped lint error (pass `--transcript-path`
+   to include the last). Note that neither one stops `/compact` any more: the
+   hook reports what it finds and lets the compact through, so "Compact-ready"
+   is the bar for calling a session closed, not a lock on the command.
+   Pass `--session-id=<id>` to also see `marker_present`
    (step 7). `--project=<slug>` narrows the check to one project (a scoped
    diagnostic, JSON `scope: "project"`): green there means only that slug is
-   close-complete, **not** that `/compact` is globally unblocked. Use the plain
+   close-complete, **not** that every project in the vault is. Use the plain
    check for the go/no-go signal.
 7. Record the session-closed marker. The Stop hook blocks until this
    session's per-session marker exists, and a hand-edit close (writing the files
