@@ -29,6 +29,7 @@ import {
   recordSyncSuccess,
   readSyncLastSuccess,
   classifySyncOp,
+  freshDates,
 } from '../hooks/hypo-shared.mjs';
 import {
   snapshotBase,
@@ -61,12 +62,34 @@ import {
   syncRemote,
   touchedPathsPath,
   vaultCommitLockTarget,
+  runHook,
+  withCleanWiki,
   withGrowthWiki,
   withSyncedWiki,
   withTmpDir,
   withWiki,
   writeMarker,
 } from './helpers.mjs';
+
+// mkdtempSync leaves its directory behind, and five transcript fixtures in this
+// file were each creating one per run with no cleanup — /tmp grew by five every
+// `npm test`. These fixtures hand a PATH to a spawned hook, so withTmpDir's
+// callback scoping does not fit without restructuring each test; registering for
+// deletion at process exit keeps the fixtures as they are and still bounds the
+// growth to one run's worth.
+const TRANSCRIPT_TMP_DIRS = [];
+function transcriptTmpDir() {
+  const d = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+  TRANSCRIPT_TMP_DIRS.push(d);
+  return d;
+}
+process.on('exit', () => {
+  for (const d of TRANSCRIPT_TMP_DIRS) {
+    try {
+      rmSync(d, { recursive: true, force: true });
+    } catch {}
+  }
+});
 
 suite('formatGrowthMetrics()');
 
@@ -2803,7 +2826,7 @@ test("precompactGateStatus: uncommitted change OUTSIDE this session's scope → 
     // earns the demotion below. Without a transcript the gate must fall back
     // to the unscoped blocker instead (see the two attribution-unknown tests
     // further down).
-    const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+    const tdir = transcriptTmpDir();
     const transcript = join(tdir, 't.jsonl');
     writeFileSync(
       transcript,
@@ -2855,7 +2878,7 @@ test('precompactGateStatus: transcript with a corrupt line → a transcript-only
   withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
-    const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+    const tdir = transcriptTmpDir();
     const transcript = join(tdir, 't.jsonl');
     // One well-formed line plus one truncated (mid-write) line: the walk
     // still returns SOME files, but must not be trusted as complete.
@@ -2912,7 +2935,7 @@ test('precompactGateStatus: vault nested under a bigger git repo, my hot.md dirt
     spawnSync('git', ['add', '-A'], { cwd: base });
     spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: base });
     appendFileSync(join(vault, 'hot.md'), '\ndirty\n');
-    const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+    const tdir = transcriptTmpDir();
     const transcript = join(tdir, 't.jsonl');
     writeFileSync(
       transcript,
@@ -2949,7 +2972,7 @@ test('precompactGateStatus: a renamed file landing in scope → still a git bloc
     spawnSync('git', ['-C', dir, 'add', '-A']);
     spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed draft']);
     spawnSync('git', ['-C', dir, 'mv', 'projects/demo/draft.md', 'projects/demo/session-state.md']);
-    const tdir = mkdtempSync(join(tmpdir(), 'hypo-transcript-'));
+    const tdir = transcriptTmpDir();
     const transcript = join(tdir, 't.jsonl');
     writeFileSync(
       transcript,
@@ -3130,6 +3153,329 @@ test('commitWikiChanges: a top-level (non-projects/) path counts as its own proj
     assert.ok(
       /\(1 paths across 1 projects\)/.test(subject),
       `a lone top-level path is its own 1-path/1-project commit: ${subject}`,
+    );
+  });
+});
+
+// ── session-close-scope-boundary spec §2b: structural git demotion under
+//    projectOverride / attributionScope ──────────────────────────────────
+//
+// All six fixtures below require `sessionTouchTrusted === false` (no
+// transcript is passed): with a trusted transcript the EXISTING partition a
+// few tests up already demotes a foreign dirty file, so a fixture that keeps
+// transcript trust would pass before this change too and pin nothing. The
+// gate here is called directly (not through a hook), same style as every
+// other precompactGateStatus test in this suite.
+
+// `slug` becomes an ELIGIBLE project for collectProjectWorkingDirs: index.md
+// present, not `_template`. Committed so it does not itself count as dirty.
+function registerEligibleProject(dir, slug) {
+  mkdirSync(join(dir, 'projects', slug), { recursive: true });
+  writeFileSync(
+    join(dir, 'projects', slug, 'index.md'),
+    `---\ntitle: ${slug}\ntype: project-index\nupdated: 2026-01-01\n---\n# ${slug}\n`,
+  );
+  spawnSync('git', ['-C', dir, 'add', '-A']);
+  spawnSync('git', ['-C', dir, 'commit', '-q', '-m', `register ${slug}`]);
+}
+
+suite('session-close-scope-boundary spec §2b: structural git demotion');
+
+test('precompactGateStatus: projectOverride + no transcript + foreign ELIGIBLE project dirty -> notice, not a git blocker', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'other');
+    writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other session work\n');
+    // 'mine' needs no registered project dir here: the gate never validates
+    // projectOverride against an actual project, that validation belongs to
+    // resolveGateProjectOverride, upstream of this call.
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git'),
+      `a dirty file structurally under a DIFFERENT eligible project must be demoted even without a transcript: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'projects/other/scratch.md'),
+      `the foreign file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+// The four marker-writing paths never pass projectOverride; they pass
+// attributionScope instead (hypo-personal-check.mjs's resolveGateProjectOverride
+// result). §2b's six fixtures above all key off `opts.projectOverride`, which
+// only the check-only `--project` diagnostic ever sets in production. Every
+// caller that actually WRITES a marker routes through attributionScope, so a
+// suite that never tries that key is pinning behavior no production path can
+// reach. Duplicate the first fixture with attributionScope in place of
+// projectOverride, and assert on the ABSENCE of a git blocker (not just the
+// notice string), since a passing notice assertion alone would not catch a
+// regression that also left the blocker in place.
+test('precompactGateStatus: attributionScope + no transcript + foreign ELIGIBLE project dirty -> notice, not a git blocker', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'other');
+    writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other session work\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      attributionScope: 'mine',
+    });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git'),
+      `attributionScope must demote a structurally-foreign dirty file exactly like projectOverride: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'projects/other/scratch.md'),
+      `the foreign file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+// Regression pin for the "which set does isForeign consult" question. This
+// file must land in closeAccountableScope for the fixture to mean anything:
+// registering 'other' as TODAY-active (a log.md entry dated today) puts
+// 'projects/other/hot.md' into closeFileTargetsGlobal (hypo-shared.mjs
+// ~3520-3552), which is closeAccountableScope's base whenever attributionScope
+// (not projectOverride) is the operative key (hypo-shared.mjs ~3757-3761). So
+// this file sits in BOTH candidate sets: closeAccountableScope (via the global
+// base) and, if isForeign wrongly checked that set instead of the narrower
+// transcriptTouched, it would read as "mine" purely because another project
+// closed today, not because THIS session's transcript proved it. The correct
+// guard (transcriptTouched, empty here: no transcript was ever passed) still
+// classifies the file as foreign by path, so it must demote to a notice.
+test('precompactGateStatus: attributionScope + no transcript + a foreign project active TODAY -> its close file still demotes to a notice, not a git blocker', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'other');
+    const today = freshDates()[0];
+    writeFileSync(join(dir, 'log.md'), `## [${today}] session | other\n`);
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'other closed today']);
+    // The ONLY uncommitted file from here on.
+    writeFileSync(join(dir, 'projects', 'other', 'hot.md'), '# other session work\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      attributionScope: 'mine',
+    });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git'),
+      `a file that is in closeAccountableScope ONLY because a different project closed today must still demote by path, not become a git blocker: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'projects/other/hot.md'),
+      `the foreign close file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+test('precompactGateStatus: projectOverride + no transcript + own session-state.md dirty -> still a git blocker', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'mine');
+    writeFileSync(join(dir, 'projects', 'mine', 'session-state.md'), '# wip\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `a dirty file under the OVERRIDE'S OWN project must never be demoted: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('precompactGateStatus: projectOverride + no transcript + pages/mine.md dirty -> still a git blocker', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
+    // Again, 'mine' needs no registered project dir: see the comment on the
+    // first fixture above.
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `a path outside projects/ has no structural "not mine" proof and must stay fail-closed: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('precompactGateStatus: projectOverride + no transcript + projects/_template/x.md dirty -> still a git blocker', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', '_template'), { recursive: true });
+    writeFileSync(join(dir, 'projects', '_template', 'x.md'), '# template scratch\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `_template is excluded from collectProjectWorkingDirs, so it cannot be structurally confirmed as someone else's project: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('precompactGateStatus: projectOverride + no transcript + an unregistered projects/new/x.md dirty -> still a git blocker', () => {
+  withSyncedWiki((dir) => {
+    // No index.md under `new`: it is not yet a real project, so it cannot be
+    // structurally confirmed as someone else's either.
+    mkdirSync(join(dir, 'projects', 'new'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'new', 'x.md'), '# not a registered project yet\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `an unregistered project dir must stay fail-closed: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('precompactGateStatus: projectOverride + no transcript + a literal-backslash filename dirty -> still a git blocker (regression)', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'other');
+    // ONE file whose NAME contains literal backslashes, not a real nested
+    // projects/other/x.md path. posixPath()'s unconditional `\` -> `/`
+    // conversion would misread this as living under projects/other/ and
+    // wrongly demote it; the classifier must run on the RAW porcelain path
+    // instead, where this string never matches the projects/<slug>/ prefix.
+    writeFileSync(join(dir, 'projects\\other\\x.md'), '# literal backslash name\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `a literal-backslash filename must not be reinterpreted as a projects/other/ path: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// A PARTIALLY-parsed transcript (a well-formed line proving this session
+// edited a file structurally under a DIFFERENT project's dir, followed by a
+// truncated trailing line, the ordinary state of an append-in-progress
+// JSONL, not corruption) must still count that file as THIS session's, not
+// foreign-by-path. sessionTouchTrusted is false here (the trailing line fails
+// to parse), so before the fix this fell straight into the path-prefix
+// heuristic and demoted the very file the transcript proves this session
+// touched.
+test('precompactGateStatus: projectOverride + a partially-parsed transcript proving THIS session edited a foreign-path file -> still a git blocker', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'other');
+    writeFileSync(join(dir, 'projects', 'other', 'hot.md'), '# edited by this session\n');
+    const tdir = transcriptTmpDir();
+    const transcript = join(tdir, 't.jsonl');
+    writeFileSync(
+      transcript,
+      [
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [
+              {
+                type: 'tool_use',
+                name: 'Edit',
+                input: { file_path: join(dir, 'projects', 'other', 'hot.md') },
+              },
+            ],
+          },
+        }),
+        '{"type": "assistant", "message": {"content": [{"trunc',
+      ].join('\n') + '\n',
+    );
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+      transcriptPath: transcript,
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `transcript evidence of THIS session's own edit must outrank the foreign-path heuristic: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// ── session-close-scope-boundary spec §4: notice rendered by its own TYPE ──
+//
+// Through the real PreCompact hook (not a direct precompactGateStatus call):
+// this is what actually renders gate.notices into the user-facing
+// systemMessage, and §4 changes that rendering, not the gate itself.
+
+suite('session-close-scope-boundary spec §4: notice rendered by its own TYPE');
+
+test('hypo-personal-check.mjs: a foreign uncommitted file renders its own "outside this session\'s scope" line, not a folded lint line', () => {
+  const CWD = join(tmpdir(), 'hypo-spec4-workdir-test-project');
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'index.md'),
+        `---\ntitle: test-project\ntype: project-index\nupdated: 2026-01-01\nworking_dir: "${CWD}"\n---\n# test-project\n`,
+      );
+      mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+      writeFileSync(
+        join(dir, 'projects', 'other', 'index.md'),
+        '---\ntitle: other\ntype: project-index\nupdated: 2026-01-01\n---\n# other\n',
+      );
+    },
+    (dir) => {
+      // Dirty AFTER withWiki's init commit, with no transcript in the hook
+      // input below: this exercises §2b's cwd-derived attributionScope path
+      // exactly as PreCompact really calls it.
+      writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other session work\n');
+      const r = runHook('hypo-personal-check.mjs', { cwd: CWD }, { HYPO_DIR: dir });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
+      assert.ok(
+        out.systemMessage &&
+          /\[WIKI CHECK\] \d+ uncommitted file\(s\) outside this session's scope \(not blocking\): projects\/other\/scratch\.md/.test(
+            out.systemMessage,
+          ),
+        `the foreign git file must render its own typed line, not fold into a lint sentence: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('hypo-personal-check.mjs: unpushed commits render their own git-sync line, not a folded lint line', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'ahead.md'), '# ahead\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'ahead']);
+    const r = runHook('hypo-personal-check.mjs', {}, { HYPO_DIR: dir });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
+    assert.ok(
+      out.systemMessage && /unpushed commits in /.test(out.systemMessage),
+      `an unpushed commit must render its own git-sync line: ${r.stdout}`,
+    );
+    assert.ok(
+      !/pre-existing lint issue/.test(out.systemMessage || ''),
+      `a git-sync notice must not be folded into the lint sentence: ${r.stdout}`,
+    );
+  });
+});
+
+test('hypo-personal-check.mjs: an unresolved session cwd renders its own close-cwd-unresolved line, not a folded lint line', () => {
+  withCleanWiki((dir) => {
+    // No project in this fixture carries an index.md (buildCleanWikiTree never
+    // writes one), so collectProjectWorkingDirs sees zero projects and any cwd
+    // is, by construction, unresolved.
+    const r = runHook(
+      'hypo-personal-check.mjs',
+      { cwd: join(tmpdir(), 'hypo-spec4-unresolved-cwd') },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
+    assert.ok(
+      out.systemMessage &&
+        /session cwd did not resolve to a unique project/.test(out.systemMessage),
+      `an unresolved cwd must render its own close-cwd-unresolved line: ${r.stdout}`,
+    );
+    assert.ok(
+      !/pre-existing lint issue/.test(out.systemMessage || ''),
+      `a close-cwd-unresolved notice must not be folded into the lint sentence: ${r.stdout}`,
     );
   });
 });

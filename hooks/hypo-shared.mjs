@@ -3589,6 +3589,12 @@ export function partitionLintScope(findings, scope) {
  * every close. Same path policy as the lint-scope matcher above: separators
  * normalized to POSIX, exact prefix at a segment boundary.
  */
+// This function keeps the posixPath() normalization deliberately, unlike
+// isForeign (§2b), which reads the raw porcelain path so a literal-backslash
+// filename cannot be misread as a nested projects/<slug>/ path. Every caller
+// of isUnderProjectDirs would need to be checked before applying the same
+// raw-path treatment here, and that audit has not been done, so the existing
+// behavior stays until it has.
 export function isUnderProjectDirs(file, slugs) {
   const f = posixPath(file);
   return (slugs || []).some((s) => s && (f === `projects/${s}` || f.startsWith(`projects/${s}/`)));
@@ -3707,8 +3713,13 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * compact-ready", codex design review) is replaced by that partition, not
  * restored by it — a marker's own `verified_scope`, attesting exactly what it
  * checked, is still missing (session-close-scope-boundary spec §3, next wave).
- * When a log-only marker governs the session, log-only mode wins and
- * projectOverride is ignored.
+ * Either key ALSO feeds the git-dirty partition (spec §2b): with an untrusted
+ * transcript (missing/corrupt), a dirty file structurally under a DIFFERENT
+ * eligible project's own directory is demoted to a notice, because the path
+ * alone proves it is not this session's; everything else keeps blocking.
+ * When a log-only marker governs the session, log-only mode wins for the
+ * close-status and lint scope (scope selection above); the git-dirty
+ * partition in spec §2b still applies regardless of projectOverride.
  *
  * @param {string} hypoDir
  * opts.sessionCwd (session-cwd close check): the authoritative cwd of the session being
@@ -3769,10 +3780,25 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   // would make almost every real transcript untrusted and defeat the scoping
   // this fix exists to add.
   let sessionTouchTrusted = false;
+  // Transcript-derived files ONLY (not closeAccountableScope's mandatory-files
+  // base, which comes from closeFileTargetsGlobal and would fold every close
+  // file of every eligible project into "this session touched it"). §2b's
+  // isForeign below needs exactly this narrower set: a file this session's own
+  // Edit/Write proves it touched, even on a PARTIALLY-parsed transcript (the
+  // trailing line of an append-in-progress JSONL truncates in the ordinary
+  // course of a live session, not as an exceptional failure), must never be
+  // classified foreign by path prefix alone. Widening this to
+  // closeAccountableScope would re-open the exact foreign-close-file leak
+  // (b) fixed above (a genuinely different project's close file would count
+  // as "touched" just because it shares the mandatory-files base).
+  let transcriptTouched = new Set();
   if (opts.transcriptPath) {
     const widened = extractTouchedWikiFilesWithTrust(opts.transcriptPath, hypoDir);
     sessionTouchTrusted = widened.trusted;
-    for (const f of widened.files) closeAccountableScope.add(f);
+    for (const f of widened.files) {
+      closeAccountableScope.add(f);
+      transcriptTouched.add(f);
+    }
   }
 
   // 1. wiki git state. Uncommitted changes (real unsaved work) BLOCK, but only
@@ -3799,7 +3825,72 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const git = hypoIsClean(hypoDir);
   if (git.uncommitted) {
     const dirty = gitDirtyFiles(hypoDir);
-    if (dirty.length === 0 || !sessionTouchTrusted) {
+    if (dirty.length === 0) {
+      // Enumeration itself failed (or nothing is actually dirty despite the
+      // porcelain status): "cannot attribute" is not "clean", block exactly
+      // as before, override or not.
+      blockers.push({ type: 'git', reason: git.reason });
+    } else if (!sessionTouchTrusted && (opts.projectOverride || opts.attributionScope)) {
+      // session-close-scope-boundary spec §2b: a broken/missing transcript
+      // normally means "cannot attribute, fail closed" (the branch below).
+      // But when the CALLER told us which project is ours (an explicit
+      // --project, or the cwd-derived attributionScope), a dirty file that
+      // lives structurally under a DIFFERENT eligible project's own directory
+      // needs no attribution inference at all: the path alone proves it is
+      // not this session's file. Everything else (this session's own
+      // project, pages/, an unregistered or _template project dir) keeps the
+      // pre-existing fail-closed behavior; only a provably-foreign path is
+      // demoted.
+      const effectiveOverride = opts.projectOverride || opts.attributionScope;
+      // Computed once per gate call, never per file (collectProjectWorkingDirs
+      // walks the projects/ dir and reads every index.md). A throw here (a
+      // readdirSync failure it does not catch itself) must not escape as an
+      // exception, the PreCompact hook's outermost catch would turn that
+      // into a silent, fully-suppressed gate result, the opposite of "fail
+      // closed". Treat any failure as "no eligible projects known", which
+      // makes isForeign() below always false and every dirty file falls
+      // through to the unconditional blocker.
+      let eligibleSlugs = null;
+      try {
+        eligibleSlugs = new Set(collectProjectWorkingDirs(hypoDir).map((p) => p.slug));
+      } catch {
+        eligibleSlugs = null;
+      }
+      // Lexical, on the RAW git-porcelain path, BEFORE posixPath()'s
+      // unconditional `\` -> `/` conversion. A file whose actual NAME
+      // contains a literal backslash (`projects\other\x.md`, one path
+      // segment, no real subdirectory) must not be reinterpreted as living
+      // under `projects/other/` just because posixPath() would rewrite it
+      // that way; testing the raw string here means it never matches this
+      // regex and falls through to fail-closed instead.
+      const isForeign = (f) => {
+        // The transcript already PROVES this session edited f, whatever its
+        // path prefix says: transcript evidence outranks the path-prefix
+        // heuristic below, which only exists to cover files the (untrusted)
+        // transcript could not vouch for either way.
+        if (transcriptTouched.has(posixPath(f))) return false;
+        if (!eligibleSlugs) return false;
+        const m = /^projects\/([^/]+)\/.+$/.exec(f);
+        if (!m) return false;
+        const slug = m[1];
+        return slug !== effectiveOverride && eligibleSlugs.has(slug);
+      };
+      const foreign = dirty.filter(isForeign);
+      const rest = dirty.filter((f) => !isForeign(f));
+      if (rest.length > 0) {
+        blockers.push({
+          type: 'git',
+          reason: `uncommitted changes in ${hypoDir}: ${rest.join(', ')}`,
+        });
+      }
+      for (const f of foreign) {
+        notices.push({
+          type: 'git',
+          file: f,
+          reason: `uncommitted changes outside this session's scope: ${f}`,
+        });
+      }
+    } else if (!sessionTouchTrusted) {
       blockers.push({ type: 'git', reason: git.reason });
     } else {
       const mine = dirty.filter((f) => closeAccountableScope.has(posixPath(f)));
@@ -4004,6 +4095,11 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // monorepo tie pickProjectByCwd declined): we cannot attribute a close
       // responsibility, so we do NOT hard-block (nothing proves there is anything
       // to close). Surface a best-effort notice so the coverage gap is visible.
+      // This reason names --project / --log-only, the crystallize CLI flags:
+      // correct for a --check-session-close caller, but not a lever a
+      // PreCompact hook reader has. The hook renderer (hypo-personal-check.mjs)
+      // builds its own sentence for this notice type instead of echoing this
+      // one verbatim; keep both in sync if the underlying condition changes.
       notices.push({
         type: 'close-cwd-unresolved',
         reason:
