@@ -1033,24 +1033,46 @@ test('dual install: --apply does NOT copy hooks or register settings (no double-
   });
 });
 
-test('dual install + missing metadata: --apply writes fallback with a pkgRoot (no pkgRoot-less file)', () => {
+// IMPR-51 / ADR 0097: `withDualInstall` enables the plugin in settings.json but
+// never writes installed_plugins.json, so the registry lookup fails with reason
+// 'registry-unreadable' — a JUDGMENT FAILURE, not "no plugin installed". With no
+// existing hypo-pkg.json to preserve either, writing PKG_ROOT (this npm/manual
+// checkout) here would persist a GUESS as durable truth — the exact removable
+// copy the dual-install banner tells the user to uninstall. This replaces the
+// prior expectation (a fallback pkgRoot was always written); the fallback must
+// NOT fire when the channel judgment itself failed. hypo-pkg.json may still
+// exist afterward (the unconditional extensions-SHA sync writes one even with
+// zero extensions — see syncExtensions step (4)), so the assertion is on the
+// pkgRoot FIELD, not file existence: doctor already treats a pkgRoot-less file
+// as its own distinct, reported state (`hypo-pkg.json has no pkgRoot field`),
+// never as "resolved to PKG_ROOT".
+test('dual install + missing metadata + unresolvable registry: --apply does not stamp a guessed pkgRoot', () => {
   withDualInstall(true, ({ upgrade, home, wiki }) => {
     const pkgPath = join(home, '.claude', 'hypo-pkg.json');
     assert.equal(existsSync(pkgPath), false, 'precondition: no metadata yet');
     const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
     assert.equal(r.status, 0, `dual-install --apply (missing meta) should exit 0: ${r.stderr}`);
-    assert.ok(existsSync(pkgPath), 'a fallback hypo-pkg.json must be written when none existed');
-    const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    const meta = existsSync(pkgPath) ? JSON.parse(readFileSync(pkgPath, 'utf-8')) : {};
     assert.equal(
-      typeof meta.pkgRoot === 'string' && meta.pkgRoot.length > 0,
-      true,
-      'fallback metadata must carry a pkgRoot — never a pkgRoot-less file (codex CONCERN)',
+      meta.pkgRoot,
+      undefined,
+      'an unresolvable registry judgment must not confirm a guessed PKG_ROOT as the durable pointer',
     );
-    // still no core hooks copied (skip stands; only metadata was written)
+    assert.match(
+      r.stdout,
+      /Cannot positively resolve the enabled plugin's install root/,
+      'must explain why no pkgRoot was written and what unblocks it',
+    );
+    assert.match(
+      r.stdout,
+      /re-run `hypomnema upgrade --apply`/,
+      'recovery guidance must name the concrete next step',
+    );
+    // still no core hooks copied (skip stands; the pkgRoot write was skipped too)
     assert.equal(
       existsSync(join(home, '.claude', 'hooks')),
       false,
-      'fallback metadata write must not also copy core hooks',
+      'the skipped fallback write must not also copy core hooks',
     );
   });
 });
@@ -1170,6 +1192,55 @@ function writeRegistry(home, key, installPath) {
 }
 
 const DUAL_INSTALL_KEY = 'hypomnema@hypomnema'; // matches withDualInstall's settings.json fixture
+
+// Positive control for the missing-metadata guard: once the registry DOES
+// positively resolve a usable root, metadata is still written — the guard is
+// keyed to the judgment-FAILURE case, not to "missing metadata" in general.
+//
+// The recorded root is the REGISTRY's, not this run's PKG_ROOT. An earlier draft
+// of this test asserted PKG_ROOT and called correcting it "a separate concern".
+// It is not separate: PKG_ROOT here is the npm/manual copy the dual-install
+// banner tells the user to uninstall, so stamping it leaves a pointer that
+// dangles the moment they follow that advice — the exact failure this lane
+// exists to close. It also made `init` and `upgrade --apply` disagree in the
+// same state, since init writes the plugin root. Asserting PKG_ROOT here pinned
+// the defect as the contract.
+test("dual install + missing metadata + resolvable registry: --apply records the REGISTRY root, not this run's PKG_ROOT", () => {
+  withDualInstall(true, ({ upgrade, home, wiki, root }) => {
+    withRegistryRoot('9.9.9', (registryRoot) => {
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      assert.equal(existsSync(pkgPath), false, 'precondition: no metadata yet');
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(
+        r.status,
+        0,
+        `dual-install --apply (resolvable registry) should exit 0: ${r.stderr}`,
+      );
+      assert.ok(
+        existsSync(pkgPath),
+        'a fallback hypo-pkg.json must still be written once the registry resolves',
+      );
+      const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      assert.equal(
+        realpathSync(meta.pkgRoot),
+        realpathSync(registryRoot),
+        'the durable pointer must name the registry root, never this npm run',
+      );
+      assert.notEqual(
+        realpathSync(meta.pkgRoot),
+        realpathSync(root),
+        'stamping PKG_ROOT here would dangle as soon as the user uninstalls the npm copy',
+      );
+      assert.equal(meta.pkgVersion, '9.9.9', 'and the version read at that same root');
+      assert.doesNotMatch(
+        r.stdout,
+        /Cannot positively resolve the enabled plugin's install root/,
+        'a resolvable registry must not print the judgment-failure recovery notice',
+      );
+    });
+  });
+});
 
 test('npm-first correction: stale npm pkgRoot + a real registry entry → dualSkip corrects to the registry root', () => {
   withDualInstall(true, ({ upgrade, home, wiki }) => {

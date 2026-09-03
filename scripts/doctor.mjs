@@ -2294,9 +2294,25 @@ function checkPkgIntegrity(claudeHome) {
   // no longer exists and this correctly falls into the silent fresh-install branch.
   if (!existsSync(pkgPath)) return;
   if (!meta || !meta.pkgRoot) {
+    // A missing pkgRoot has two distinct causes with different fixes. Re-running
+    // /hypo:init or /hypo:upgrade only helps the ordinary one (a corrupt or
+    // never-written file). When the enabled plugin's channel judgment itself
+    // failed ('registry-unreadable'/'unresolved'), init/upgrade skip the very
+    // same write on every re-run until the registry is fixed first (see
+    // resolveDurableRoot in init.mjs and the dualSkip branch in upgrade.mjs).
+    const channelJudgmentFailed =
+      hypomnemaPluginEnabled &&
+      (pluginChannel.rootReason === 'registry-unreadable' ||
+        pluginChannel.rootReason === 'unresolved');
     warn(
       'hypo-pkg.json pkgRoot',
-      `hypo-pkg.json has no pkgRoot field — metadata is incomplete; re-run /hypo:init or /hypo:upgrade`,
+      channelJudgmentFailed
+        ? `hypo-pkg.json has no pkgRoot field because the enabled plugin's channel judgment failed ` +
+            `(${pluginChannel.rootReason}): re-running /hypo:init or /hypo:upgrade will skip the same ` +
+            `write until this resolves. Fix: repair or refresh ~/.claude/plugins/installed_plugins.json ` +
+            '(reinstall the plugin, or run `/plugin marketplace update hypomnema` then `/reload-plugins`), ' +
+            'then re-run /hypo:init or /hypo:upgrade to record the confirmed root.'
+        : `hypo-pkg.json has no pkgRoot field — metadata is incomplete; re-run /hypo:init or /hypo:upgrade`,
     );
     return;
   }

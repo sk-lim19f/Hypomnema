@@ -1281,13 +1281,44 @@ if (args.apply) {
     //
     // If the metadata is MISSING or corrupt (status 'missing'; corrupt files are
     // renamed to *.corrupt-*.json by readPkgJson and then read as absent), there is
-    // no plugin identity to preserve. Write minimal fallback metadata pointing at
-    // this (same-version) npm copy so the plugin runtime can resolve a package root
-    // at all — strictly better than the pkgRoot-less file extension sync would
-    // otherwise create, or no file at all. The dual-install banner still tells the
-    // user to resolve the dual install.
+    // no plugin identity to preserve. Write minimal fallback metadata, but ONLY
+    // when the registry POSITIVELY resolves the plugin's root (pluginRegistryRoot
+    // below): a confirmed fact, not a guess. When the registry judgment instead
+    // fails ('registry-unreadable' or 'unresolved', pluginRegistryRoot null), this
+    // write is skipped; the unconditional extensions-SHA sync further down can
+    // still leave a pkgRoot-less hypo-pkg.json on disk in that case, and that is
+    // doctor.mjs's own distinct reported state ("no pkgRoot field"), never read as
+    // "resolved to PKG_ROOT". The dual-install banner still tells the user to
+    // resolve the dual install either way.
     if (pkgJson.status === 'missing') {
-      appliedPkgJson = writePluginModeMetadata();
+      if (pluginRegistryRoot) {
+        // Write the REGISTRY's root, not PKG_ROOT. writePluginModeMetadata()
+        // hardcodes PKG_ROOT — this npm/manual checkout, the very copy the
+        // dual-install banner above tells the user to uninstall — so calling it
+        // here made `upgrade --apply` bake a dangling pointer whenever the
+        // registry was fine and only hypo-pkg.json was missing. init writes the
+        // plugin root in that same state, so the two commands disagreed.
+        // writeDualSkipProvenance re-reads the registry root's package.json and
+        // returns false if it became unreadable since resolution (TOCTOU), so a
+        // false here means nothing was written, not that a guess was.
+        //
+        // It preserves `commands` where writePluginModeMetadata dropped it. That
+        // drop guarded against a manual install's stale SHA map falsely claiming
+        // ~/.claude/commands/hypo. This branch only runs when hypo-pkg.json is
+        // MISSING, so there is no prior map to carry over and the guard has
+        // nothing to do.
+        appliedPkgJson = writeDualSkipProvenance(pkgJsonPath(), pluginRegistryRoot);
+      } else {
+        // pluginRegistryRoot is null here because the registry JUDGMENT FAILED
+        // (reason 'registry-unreadable' or 'unresolved') — hypomnemaPluginEnabled
+        // is true throughout this branch, so this is never "no plugin installed".
+        // With no existing metadata to preserve either, writing PKG_ROOT (this
+        // npm/manual checkout) would persist a GUESS as durable truth — exactly
+        // the removable copy the dual-install banner above tells the user to
+        // uninstall. Leave hypo-pkg.json unwritten instead; the banner below
+        // names the fix.
+        appliedPkgJson = false;
+      }
     } else if (dualSkipWouldCorrect) {
       // npm-first correction: a usable pkgRoot IS already recorded (status
       // 'stale' or 'up-to-date'), but the registry positively resolves a
@@ -1496,6 +1527,33 @@ if (dualSkip) {
     '    risk), re-run with `--allow-dual-install`.',
     '',
   );
+  // The registry judgment failed (registry-unreadable / unresolved) and there
+  // was no existing hypo-pkg.json to preserve, so the guard above left it
+  // unwritten rather than guess PKG_ROOT. Tell the user what unblocks it —
+  // without this, "no metadata written" looks like a silent no-op with no path
+  // forward.
+  if (pkgJson.status === 'missing' && !pluginRegistryRoot) {
+    // hooks/hypo-shared.mjs's resolvePkgRoot() resolves lint/feedback scripts by
+    // self-location first, never through this cache, so those keep working with
+    // or without this file. What actually goes without a root to resolve through:
+    // commands/*.md's resolution chain, and hypo-session-start's update-notifier
+    // and stale-sibling notices (both read hypo-pkg.json directly).
+    const unwrittenClause = args.apply
+      ? 'Leaving hypo-pkg.json UNWRITTEN this run'
+      : 'hypo-pkg.json would be left UNWRITTEN on --apply';
+    lines.push(
+      `⚠ Cannot positively resolve the enabled plugin's install root (${pluginChannel.rootReason}` +
+        ' — checked ~/.claude/plugins/installed_plugins.json), and no existing hypo-pkg.json to' +
+        ` fall back on. ${unwrittenClause} instead of guessing the npm path above: ` +
+        "`commands/*.md`'s resolution chain and the session-start update/sibling notices have no" +
+        ' pkgRoot to read until this is fixed (hooks keep resolving their own root by' +
+        ' self-location regardless).',
+      '  → Fix: repair or refresh ~/.claude/plugins/installed_plugins.json (reinstall the plugin,',
+      '    or run `/plugin marketplace update hypomnema` then `/reload-plugins`),',
+      '    then re-run `hypomnema upgrade --apply` to record the confirmed root.',
+      '',
+    );
+  }
 } else if (dualInstallCoreConflict && args.allowDualInstall) {
   // Override path: the user forced core registration despite the enabled plugin.
   lines.push(
