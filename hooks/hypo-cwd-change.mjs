@@ -110,6 +110,14 @@ process.stdin.on('end', () => {
 
     const ignorePatterns = loadHypoIgnore(HYPO_DIR);
 
+    // This injection is not a licensing surface for the observed-set gate
+    // (see base-store.mjs's recordObserved): a session's tracked
+    // `targets` are fixed at whichever project the OWNING SessionStart hit,
+    // and a cwd move can land here in a different project entirely, so
+    // recording an observation against this read could credit a path outside
+    // that fixed target set. Nothing here calls recordObserved; the guard
+    // stays exactly as conservative for a cwd-change injection as it was
+    // before the observed set existed.
     if (newHit) {
       const fromFile = readIfNotIgnored(newHit.hotPath, ignorePatterns);
       const content =

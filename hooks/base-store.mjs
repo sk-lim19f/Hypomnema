@@ -250,6 +250,190 @@ export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownH
   }
 }
 
+// ── observed set ───────────────────────────────────────────────────────────
+//
+// `targets` never moves except through the two invariants above, so a session
+// that outlives its first snapshot by days sees every intervening legitimate
+// write from OTHER sessions as drift and parks all four overwrite targets.
+// The observed set is a second, additive record: what this session was
+// actually SHOWN by a later SessionStart (resume/compact), kept separate from
+// `targets` so it can only ever widen what a close may write, never narrow or
+// replace the original base. `readBaseEntry`'s shape and `targets`' meaning
+// are unchanged; a consumer that never calls the functions below sees
+// identical behavior to before this section existed.
+//
+// Two guards keep the widening bounded to "what this session was just shown":
+//
+//   - Generation. `observedGeneration` is a per-session counter, bumped once
+//     per SessionStart by `beginObservedGeneration` (BEFORE the first read of
+//     that SessionStart, so it covers everything that SessionStart injects).
+//     `recordObserved` stamps each entry with the CURRENT generation but never
+//     advances it — advancing on every record would put the two files a HIT
+//     SessionStart injects (hot.md, session-state.md) into different
+//     generations, since they are recorded one call apart, and the second call
+//     would expire the first. `readObservedHash` only returns a hash whose
+//     `generation` equals the CURRENT `observedGeneration`; a SessionStart
+//     that bumps the generation and then injects nothing (ignored, scoped out,
+//     absent, no session_id) leaves every existing entry one generation stale,
+//     so it reads back as null everywhere. This is what makes "only the most
+//     recent SessionStart's injection licenses a write" true without an
+//     explicit expiry pass: staleness falls out of the generation compare.
+//   - Tracked-key scoping. Exactly like `advanceBaseForWrite`, `recordObserved`
+//     is a no-op for a key that is not already in `targets` — it cannot mint a
+//     new guarded target, only add provenance to one that was already
+//     snapshotted for this session.
+//
+// One entry per path, not an array: a later observation of the SAME path
+// simply overwrites the old `{generation, hash}` pair, so there is no
+// unbounded growth to cap or dedup.
+
+/**
+ * Bump this session's observed generation. Call once per SessionStart
+ * invocation, before the first `recordObserved` of that invocation — this is
+ * what makes an injection-free SessionStart (resume that hit no target, a
+ * scoped-out file, .hypoignore) expire every prior observation instead of
+ * leaving it licensed forever.
+ *
+ * No-op when the session has no snapshot yet: there is nothing to bump.
+ *
+ * @returns {boolean} true when base.json was updated
+ */
+export function beginObservedGeneration(hypoDir, sessionId) {
+  if (!sessionId) return false;
+  const parsed = readBaseFile(hypoDir, sessionId);
+  if (!parsed) return false;
+  const current = typeof parsed.observedGeneration === 'number' ? parsed.observedGeneration : 0;
+  parsed.observedGeneration = current + 1;
+  try {
+    atomicWrite(basePath(hypoDir, sessionId), JSON.stringify(parsed, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Record that this session was just SHOWN `hash` for `relPath` (the exact
+ * bytes a SessionStart injection read, not a fresh disk re-read — the caller
+ * must pass the hash of the bytes it actually displayed).
+ *
+ * `truncated`: true when the injection sliced the file (2000-char HOT_CHARS /
+ * STATE_CHARS) before showing it, i.e. the caller only passed `hash` of a
+ * prefix's worth of trust even though `hash` itself is the FULL file's hash.
+ * A truncated observation is stored, not dropped, so a parked close can name
+ * the reason (`base-mismatch-truncated-observation`) instead of the plain
+ * `base-mismatch` a bare no-op would produce — but `readObservedHash` below
+ * refuses to hand it out as a licence: seeing 5% of a file is not seeing it.
+ *
+ * No-op, in order: no snapshot for this session; `relPath` is not one of the
+ * four tracked overwrite targets (mirrors `advanceBaseForWrite`'s scoping —
+ * this must not be able to mint a new guarded key). Stamped with the CURRENT
+ * `observedGeneration`, never advancing it: the caller advances once via
+ * `beginObservedGeneration`, not once per recorded target.
+ *
+ * @returns {boolean} true when base.json was updated
+ */
+/**
+ * A safe integer, or null. base.json is on disk and another writer (an older
+ * release, a half-finished write, a hand edit) can leave any shape in it, so a
+ * generation counter is only trusted when it is exactly that: `NaN`, `Infinity`,
+ * `1.5` and `"1"` all read as absent rather than as a value to compare against.
+ */
+function safeGeneration(v) {
+  return Number.isSafeInteger(v) ? v : null;
+}
+
+export function recordObserved(hypoDir, sessionId, relPath, hash, truncated = false) {
+  if (!sessionId) return false;
+  const parsed = readBaseFile(hypoDir, sessionId);
+  if (!parsed) return false;
+  if (!Object.prototype.hasOwnProperty.call(parsed.targets, relPath)) return false;
+  if (typeof hash !== 'string') return false;
+  const generation = typeof parsed.observedGeneration === 'number' ? parsed.observedGeneration : 0;
+  if (!parsed.observed || typeof parsed.observed !== 'object' || Array.isArray(parsed.observed)) {
+    parsed.observed = {};
+  }
+  parsed.observed[relPath] = { generation, hash, truncated: !!truncated };
+  try {
+    atomicWrite(basePath(hypoDir, sessionId), JSON.stringify(parsed, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The hash this session was shown for `relPath`, but ONLY when it was shown
+ * IN FULL during the CURRENT observed generation — the actual enforcement
+ * point of "only the most recent SessionStart's injection licenses a write".
+ * Returns null for: no snapshot, a session whose observed-generation counter
+ * was never created (see below), no observed entry, a malformed entry, a
+ * generation that does not match (stale — superseded by a later SessionStart,
+ * or never refreshed by one that injected nothing), or an entry the injection
+ * itself marked `truncated`.
+ *
+ * The `observedGeneration` check is deliberately ASYMMETRIC with how
+ * `recordObserved` reads the same field: that function normalizes a missing
+ * counter to `0` only to pick a generation to STAMP an entry with. Doing the
+ * same here — treating "no counter" as "generation 0" — would make a session
+ * whose `beginObservedGeneration` call never ran (never bumped past 0) match
+ * an entry `recordObserved` also stamped at 0, and the observed set would
+ * license writes despite the expiry mechanism that is supposed to gate it
+ * never having run at all. So here, "no counter" reads as "no current
+ * generation for anything to match" — null, not 0.
+ *
+ * @returns {string|null}
+ */
+export function readObservedHash(hypoDir, sessionId, relPath) {
+  if (!sessionId) return null;
+  const parsed = readBaseFile(hypoDir, sessionId);
+  if (!parsed) return null;
+  const current = safeGeneration(parsed.observedGeneration);
+  if (current === null) return null;
+  const observed = parsed.observed;
+  if (!observed || typeof observed !== 'object' || Array.isArray(observed)) return null;
+  const entry = observed[relPath];
+  if (!entry || typeof entry !== 'object' || typeof entry.hash !== 'string' || !entry.hash) {
+    return null;
+  }
+  if (safeGeneration(entry.generation) !== current) return null;
+  // `truncated` is checked for a STRICT boolean, and any other shape refuses the
+  // licence rather than falling through to `=== true` being false. A corrupt
+  // `"true"` string used to pass that comparison and hand out a licence for a
+  // sliced observation — the one thing this field exists to deny. Corruption
+  // parks; it never widens.
+  if (entry.truncated !== false) return null;
+  return entry.hash;
+}
+
+/**
+ * Whether this session has a CURRENT-generation observed entry for `relPath`
+ * that exists but was marked `truncated` by `recordObserved` — the one bit
+ * `readObservedHash`'s null collapses away. Consulted only to pick a park
+ * reason (`base-mismatch-truncated-observation` vs plain `base-mismatch`),
+ * never to license a write; a caller must keep treating `readObservedHash`'s
+ * null as "no licence" regardless of what this returns.
+ *
+ * @returns {boolean}
+ */
+export function wasObservedTruncated(hypoDir, sessionId, relPath) {
+  if (!sessionId) return false;
+  const parsed = readBaseFile(hypoDir, sessionId);
+  if (!parsed) return false;
+  const current = safeGeneration(parsed.observedGeneration);
+  if (current === null) return false;
+  const observed = parsed.observed;
+  if (!observed || typeof observed !== 'object' || Array.isArray(observed)) return false;
+  const entry = observed[relPath];
+  if (!entry || typeof entry !== 'object') return false;
+  if (safeGeneration(entry.generation) !== current) return false;
+  // Mirrors readObservedHash's strict check: anything that is not exactly `false`
+  // counts as truncated here. This only picks the park REASON (readObservedHash
+  // has already refused the licence), so erring toward "truncated" names a
+  // narrower cause than the generic mismatch and never unblocks a write.
+  return entry.truncated !== false;
+}
+
 // The four whole-file overwrite targets are prose-and-table markdown documents, and
 // a base-mismatch on one of them always parks. Five predicates lived here that tried
 // to skip the park when a payload "provably" lost nothing, and four rounds of review

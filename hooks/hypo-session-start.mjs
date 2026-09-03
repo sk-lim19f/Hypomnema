@@ -60,7 +60,13 @@ import {
   clearPkgRootNullNotified,
   UPGRADE_APPLY_EITHER,
 } from './version-check.mjs';
-import { snapshotBase, overwriteTargets } from './base-store.mjs';
+import {
+  snapshotBase,
+  overwriteTargets,
+  beginObservedGeneration,
+  recordObserved,
+  hashContent,
+} from './base-store.mjs';
 import { listProposals } from './proposal-store.mjs';
 
 // Privacy guard: refuse to read+inject .hypoignore-matched
@@ -77,12 +83,18 @@ import { listProposals } from './proposal-store.mjs';
 // slicing first could cut the frontmatter off and silently fail open.
 // The root hot.md is a frontmatter-less pointer table, so it reads as '' and
 // passes (shared) unchanged.
+// Returns `{raw, shown}` rather than just the sliced string: the observed-set
+// record must hash the FULL bytes this call just read, not a fresh re-read at
+// record time, or a write that lands in the window between this read and the
+// record call would be credited to this session's observation without ever
+// having been shown to it. `shown` stays the maxChars-sliced display string
+// every existing caller already expects.
 function readIfNotIgnored(path, maxChars, patterns) {
   if (!path) return null;
   if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return null;
   const raw = readFileSync(path, 'utf-8');
   if (!scopeVisible(readVisibilityScope(raw), currentDevice())) return null;
-  return raw.slice(0, maxChars);
+  return { raw, shown: raw.slice(0, maxChars) };
 }
 
 // Scoped-out is not the same as absent. Both make readIfNotIgnored return null,
@@ -600,6 +612,12 @@ process.stdin.on('end', () => {
     // direct-write path.
     if (data.session_id) {
       snapshotBase(HYPO_DIR, data.session_id, overwriteTargets(hit ? hit.proj : null));
+      // Bumps the observed generation on EVERY SessionStart (first run and
+      // resume/compact alike), before the injections below record into it. A
+      // resume that ends up injecting nothing (ignored, scoped out, absent)
+      // still bumps, which is what lets a stale observation from an earlier
+      // resume expire instead of staying licensed for the rest of the session.
+      beginObservedGeneration(HYPO_DIR, data.session_id);
     }
 
     const ignorePatterns = loadHypoIgnore(HYPO_DIR);
@@ -617,8 +635,10 @@ process.stdin.on('end', () => {
       // marker is computed on raw content (staleMarkerForPath), then prepended
       // onto the sliced display content; a no-op when there is no verify_by_date.
       const TODAY = new Date().toISOString().slice(0, 10);
-      let hotContent = readIfNotIgnored(hit.hotPath, HOT_CHARS, ignorePatterns);
-      let stateContent = readIfNotIgnored(hit.statePath, STATE_CHARS, ignorePatterns);
+      const hotRead = readIfNotIgnored(hit.hotPath, HOT_CHARS, ignorePatterns);
+      const stateRead = readIfNotIgnored(hit.statePath, STATE_CHARS, ignorePatterns);
+      let hotContent = hotRead ? hotRead.shown : null;
+      let stateContent = stateRead ? stateRead.shown : null;
       const hotMarker = staleMarkerForPath(hit.hotPath, ignorePatterns, TODAY);
       const stateMarker = staleMarkerForPath(hit.statePath, ignorePatterns, TODAY);
       if (hotContent && hotMarker) hotContent = `${hotMarker}\n${hotContent}`;
@@ -647,6 +667,41 @@ process.stdin.on('end', () => {
             ),
           ),
         );
+        // Observed-set record: this is the actual injection point, so this is
+        // where "this session was SHOWN these bytes" becomes true. Recorded
+        // AFTER the marker write and the console.log above (fail-open
+        // ordering): if this throws, the model has already been shown the
+        // bytes above but no observed-entry lands, so the guard just fails
+        // safe into a park later, rather than the reverse — an entry on disk
+        // claiming an observation the injection never actually emitted.
+        // Gated on `hotContent`/`stateContent` (the same predicate that put
+        // each into `parts` above), not on `hotRead`/`stateRead` alone: an
+        // empty-but-not-ignored file makes `hotRead` a truthy `{raw:'',
+        // shown:''}`, and recording against that would create an observed
+        // entry for bytes the model was never actually shown a line of.
+        // Hash `.raw` (the full file this call just read), never a fresh
+        // `readFileSync` here — that would credit a write landing between the
+        // read above and this line to an observation that never happened.
+        if (data.session_id) {
+          if (hotContent) {
+            recordObserved(
+              HYPO_DIR,
+              data.session_id,
+              join('projects', hit.proj, 'hot.md'),
+              hashContent(hotRead.raw),
+              hotRead.raw.length > HOT_CHARS,
+            );
+          }
+          if (stateContent) {
+            recordObserved(
+              HYPO_DIR,
+              data.session_id,
+              join('projects', hit.proj, 'session-state.md'),
+              hashContent(stateRead.raw),
+              stateRead.raw.length > STATE_CHARS,
+            );
+          }
+        }
       } else {
         // A snapshot that exists but is scoped to another machine must not be
         // reported as "no snapshot yet": the model would treat a resumed project
@@ -701,7 +756,8 @@ process.stdin.on('end', () => {
       return;
     }
 
-    const globalContent = readIfNotIgnored(GLOBAL_HOT, HOT_CHARS, ignorePatterns);
+    const globalRead = readIfNotIgnored(GLOBAL_HOT, HOT_CHARS, ignorePatterns);
+    const globalContent = globalRead ? globalRead.shown : null;
     if (!globalContent) {
       // GLOBAL_HOT exists but is empty or .hypoignore'd — still surface any
       // pending notices (sync state, growth, AND the auto-project offer), which
@@ -722,6 +778,20 @@ process.stdin.on('end', () => {
         ),
       ),
     );
+    // Observed-set record: the MISS branch's root hot.md injection is the one
+    // place a project-less session observes anything at all. Recorded AFTER
+    // the console.log above — see the HIT branch's comment for why (fail-open
+    // ordering). Hashes `.raw`, not a fresh disk read, for the same reason
+    // given there.
+    if (data.session_id) {
+      recordObserved(
+        HYPO_DIR,
+        data.session_id,
+        'hot.md',
+        hashContent(globalRead.raw),
+        globalRead.raw.length > HOT_CHARS,
+      );
+    }
   } catch (err) {
     process.stderr.write(`[hypo-session-start] error: ${err?.message ?? String(err)}\n`);
     console.log(JSON.stringify(outExtra));
