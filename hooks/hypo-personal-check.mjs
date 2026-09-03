@@ -170,45 +170,100 @@ process.stdin.on('end', () => {
     }
   }
 
-  // Non-blocking heads-up about pre-existing lint / out-of-scope design-history
-  // debt in untouched files. Surfaced so it is visible but never blocks compact.
-  // Scoped to the close-target (today-active) projects: debt under one of their
-  // dirs stays listed by filename; debt elsewhere (other projects, shared pages,
-  // root files) folds into a count so the same untouched-file debt does not
-  // re-list its filenames on every compact. Non-file diagnostics (a fail-open
-  // "lint skipped" notice carries no path) are preserved verbatim, never folded.
-  const debtNotices = gate.notices.filter((n) => n.type === 'lint' || n.type === 'design-history');
-  const activeSlugs = (gate.close?.projects || []).map((p) => p.project).filter(Boolean);
-  const nonFileNotices = debtNotices.filter((n) => !n.file);
-  const fileNotices = debtNotices.filter((n) => n.file);
-  const inScopeNotices = fileNotices.filter((n) => isUnderProjectDirs(n.file, activeSlugs));
-  const otherDebtCount = fileNotices.length - inScopeNotices.length;
-  const listed = [
-    ...nonFileNotices.map((n) => n.reason),
-    ...new Set(inScopeNotices.map((n) => n.reason.replace(/ \([^)]*\)$/, ''))),
-  ];
-  let noticeText = '';
-  if (listed.length > 0) {
-    noticeText = `[WIKI CHECK] ${listed.length} pre-existing lint issue(s) in files this session did not touch (not blocking): ${listed
-      .slice(0, 5)
-      .join(', ')}${listed.length > 5 ? ', …' : ''} — clean up when convenient.`;
+  // Non-blocking heads-up, one line per notice TYPE (session-close-scope-boundary
+  // spec §4). gate.notices can carry any of seven types: git, git-sync,
+  // close-debt, close-cwd-unresolved, lint, design-history, feedback. Folding
+  // them all into one "pre-existing lint issue(s)" sentence (the old
+  // renderer) mislabeled git/git-sync/close-cwd-unresolved as lint debt and
+  // dropped close-cwd-unresolved plus most feedback notices outright: visible
+  // but lying about what kind of issue it was and what fixes it. A count that
+  // can grow unbounded (foreign git paths, close-debt projects) is capped and
+  // the rest folds into "+N more", mirroring the existing lint/design-history
+  // fold (a vault-wide lint sweep once produced 125 lines here).
+  const NOTICE_LIST_CAP = 5;
+  const foldNames = (items) =>
+    items.length > NOTICE_LIST_CAP
+      ? `${items.slice(0, NOTICE_LIST_CAP).join(', ')}, +${items.length - NOTICE_LIST_CAP} more`
+      : items.join(', ');
+  const byType = (t) => gate.notices.filter((n) => n.type === t);
+  const noticeLines = [];
+
+  // git: a dirty file outside this session's scope (§2b's structural demotion,
+  // or the trusted-transcript foreign-file demotion above it).
+  const foreignGit = byType('git');
+  if (foreignGit.length > 0) {
+    noticeLines.push(
+      `[WIKI CHECK] ${foreignGit.length} uncommitted file(s) outside this session's scope (not blocking): ${foldNames(foreignGit.map((n) => n.file || n.reason))}.`,
+    );
   }
-  if (otherDebtCount > 0) {
-    const fold = `+${otherDebtCount} pre-existing lint issue(s) elsewhere in the vault (other projects / shared pages, not blocking) — run \`/hypo:lint\` for the full list.`;
-    noticeText = noticeText ? `${noticeText}\n${fold}` : `[WIKI CHECK] ${fold}`;
+  // git-sync / close-cwd-unresolved: single-fact notices, their own `reason`
+  // is already the full sentence.
+  for (const n of byType('git-sync')) noticeLines.push(`[WIKI CHECK] ${n.reason}.`);
+  // close-cwd-unresolved's own `reason` (hypo-shared.mjs) names --project /
+  // --log-only, crystallize CLI flags with no PreCompact-hook equivalent, so
+  // it is not echoed here. This session's own sentence names the one thing a
+  // /compact-time reader can actually do about it: nothing, this is
+  // best-effort and non-blocking.
+  for (const n of byType('close-cwd-unresolved')) {
+    noticeLines.push(
+      `[WIKI CHECK] session cwd did not resolve to a unique project (not blocking): close attribution for this session is best-effort here.`,
+    );
   }
-  // A demoted close: some OTHER session left a project's close incomplete. It no
-  // longer blocks this compact, but it must still be SEEN — a notice list that the
-  // gate silently swallows (suppressOutput when nothing else surfaced) would turn the
-  // demotion into a disappearance, and nobody would ever fix the dangling close
-  // (codex design BLOCKER).
-  const closeDebt = gate.notices.filter((n) => n.type === 'close-debt');
+
+  // close-debt: some OTHER session left a project's close incomplete. It no
+  // longer blocks this compact, but it must still be SEEN: a notice list that
+  // the gate silently swallows (suppressOutput when nothing else surfaced)
+  // would turn the demotion into a disappearance, and nobody would ever fix
+  // the dangling close (codex design BLOCKER).
+  const closeDebt = byType('close-debt');
   if (closeDebt.length > 0) {
-    const line = `[WIKI CHECK] ${closeDebt.length} project(s) with an incomplete session close from another session (not blocking this compact): ${closeDebt
-      .map((n) => n.project)
-      .join(', ')} — each is fixed by that project's next close.`;
-    noticeText = noticeText ? `${noticeText}\n${line}` : line;
+    noticeLines.push(
+      `[WIKI CHECK] ${closeDebt.length} project(s) with an incomplete session close from another session (not blocking this compact): ${foldNames(closeDebt.map((n) => n.project))}, each fixed by that project's next close.`,
+    );
   }
+
+  // lint / design-history: pre-existing debt in files this session did not
+  // touch. Scoped to the close-target (today-active) projects: debt under one
+  // of their dirs stays listed by filename; debt elsewhere (other projects,
+  // shared pages, root files) folds into a count so the same untouched-file
+  // debt does not re-list its filenames on every compact. Non-file
+  // diagnostics (a fail-open "lint skipped" notice carries no path) are
+  // preserved verbatim, never folded. lint and design-history each get their
+  // own line now instead of sharing one "lint issue(s)" sentence.
+  const activeSlugs = (gate.close?.projects || []).map((p) => p.project).filter(Boolean);
+  for (const type of ['lint', 'design-history']) {
+    const debtNotices = byType(type);
+    const nonFileNotices = debtNotices.filter((n) => !n.file);
+    const fileNotices = debtNotices.filter((n) => n.file);
+    const inScopeNotices = fileNotices.filter((n) => isUnderProjectDirs(n.file, activeSlugs));
+    const otherDebtCount = fileNotices.length - inScopeNotices.length;
+    const listed = [
+      ...nonFileNotices.map((n) => n.reason),
+      ...new Set(inScopeNotices.map((n) => n.reason.replace(/ \([^)]*\)$/, ''))),
+    ];
+    if (listed.length > 0) {
+      noticeLines.push(
+        `[WIKI CHECK] ${listed.length} pre-existing ${type} issue(s) in files this session did not touch (not blocking): ${foldNames(listed)}. Clean up when convenient.`,
+      );
+    }
+    if (otherDebtCount > 0) {
+      noticeLines.push(
+        `[WIKI CHECK] +${otherDebtCount} pre-existing ${type} issue(s) elsewhere in the vault (other projects / shared pages, not blocking); run \`/hypo:lint\` for the full list.`,
+      );
+    }
+  }
+
+  // feedback: side-file I/O warnings (a projection target's per-slug sidecar is
+  // unreadable). A drift notice is skipped ONLY when this run actually healed
+  // it (feedbackHealed non-empty, reported once below): when gate.ok is
+  // false (another blocker fired), the self-heal above never runs at all, so
+  // the drift itself was never reported anywhere and must not be dropped here.
+  for (const n of byType('feedback')) {
+    if (feedbackHealed && /^feedback projection drift/.test(n.reason)) continue;
+    noticeLines.push(`[WIKI CHECK] ${n.reason}.`);
+  }
+
+  let noticeText = noticeLines.join('\n');
   // Surface the self-heal so a re-synced projection is not a silent mutation of
   // the user's MEMORY.md / CLAUDE.md (transparency).
   if (feedbackHealed) noticeText = noticeText ? `${noticeText}\n${feedbackHealed}` : feedbackHealed;
