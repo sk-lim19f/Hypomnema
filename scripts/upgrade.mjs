@@ -1302,11 +1302,18 @@ if (args.apply) {
         // returns false if it became unreadable since resolution (TOCTOU), so a
         // false here means nothing was written, not that a guess was.
         //
-        // It preserves `commands` where writePluginModeMetadata dropped it. That
-        // drop guarded against a manual install's stale SHA map falsely claiming
-        // ~/.claude/commands/hypo. This branch only runs when hypo-pkg.json is
-        // MISSING, so there is no prior map to carry over and the guard has
-        // nothing to do.
+        // Drop `commands` on the way through. writeDualSkipProvenance preserves
+        // it (correctly, for the npm-first correction path where a real prior
+        // pointer is being retargeted), but this branch is reached whenever
+        // checkPkgJson reports 'missing' — and that includes a file that EXISTS
+        // with no usable pkgRoot, not just an absent one. Such a file can still
+        // carry a manual install's command SHA map, and no commands were copied
+        // in this dual-install skip, so carrying it over would re-assert
+        // ownership of ~/.claude/commands/hypo that this run never took. That
+        // drop is exactly what writePluginModeMetadata was doing here before,
+        // and it is the one part of it worth keeping.
+        const { commands: _stale, ...keep } = readPkgJsonSafe(pkgJsonPath()) || {};
+        writePkgJsonAtomic(pkgJsonPath(), keep);
         appliedPkgJson = writeDualSkipProvenance(pkgJsonPath(), pluginRegistryRoot);
       } else {
         // pluginRegistryRoot is null here because the registry JUDGMENT FAILED

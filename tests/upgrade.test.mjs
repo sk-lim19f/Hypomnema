@@ -1242,6 +1242,48 @@ test("dual install + missing metadata + resolvable registry: --apply records the
   });
 });
 
+// checkPkgJson reports 'missing' for a file that EXISTS but has no usable
+// pkgRoot, so the dual-skip fallback branch is reached with a real file on disk
+// — not only with none. That file can carry a manual install's command SHA map,
+// and this run copied no commands, so carrying the map over would re-assert
+// ownership of ~/.claude/commands/hypo that the run never took. The writer used
+// here preserves unknown fields by design (the npm-first correction path needs
+// that), so the drop has to happen at this call site.
+test('dual install + a pkgRoot-less file that still carries a commands map: the map is dropped, not carried over', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    withRegistryRoot('9.9.9', (registryRoot) => {
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      // No pkgRoot: checkPkgJson calls this 'missing' even though it exists.
+      writeFileSync(
+        pkgPath,
+        JSON.stringify({
+          commands: { 'hypo/query.md': 'deadbeef' },
+          extensions: { claude: { 'skills/x': 'cafe' } },
+        }),
+      );
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(r.status, 0, `dual-install --apply should exit 0: ${r.stderr}`);
+      const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      assert.equal(
+        realpathSync(meta.pkgRoot),
+        realpathSync(registryRoot),
+        'fixture: the registry root must still be recorded',
+      );
+      assert.equal(
+        'commands' in meta,
+        false,
+        'a stale command SHA map must not survive: this run copied no commands',
+      );
+      assert.equal(
+        typeof meta.extensions,
+        'object',
+        `every other prior field survives the drop (extensions=${JSON.stringify(meta.extensions)})`,
+      );
+    });
+  });
+});
+
 test('npm-first correction: stale npm pkgRoot + a real registry entry → dualSkip corrects to the registry root', () => {
   withDualInstall(true, ({ upgrade, home, wiki }) => {
     withRegistryRoot('9.9.9', (registryRoot) => {
