@@ -60,7 +60,7 @@
  *
  * Scope (public): README.md, README.ko.md, CHANGELOG.md, package.json (npm
  * auto-ships it) + shipped trees commands/ hooks/ scripts/ skills/ templates/
- * docs/ .github/ .claude-plugin/. Excluded: tests/ and qa-runs/ (internal
+ * docs/ .github/ .claude-plugin/. Excluded: tests/ (internal
  * maintainer artifacts — a tracker id in a test description aids traceability
  * and never reaches an installed user), node_modules/, .git/, and the
  * fix-status-verify subsystem (EXCLUDED_FILES — maintainer-only, carries wiki
@@ -134,11 +134,13 @@ const SCOPE_DIRS = [
   '.claude-plugin',
 ];
 
-// Never scanned even when under a scope dir. tests/ and qa-runs/ are
-// internal-maintainer artifacts (a tracker id in a test name aids traceability
-// and never reaches an installed user). The checker's OWN sources are NOT
-// excluded — they use `N` placeholders in their examples so they scan clean.
-const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'tests', 'qa-runs']);
+// Never scanned even when under a scope dir. tests/ is an internal-maintainer
+// artifact (a tracker id in a test name aids traceability and never reaches an
+// installed user). QA run records used to sit in a repo `qa-runs/` and were
+// excluded the same way; they live in the wiki now, so the exclusion is gone
+// with them. The checker's OWN sources are NOT excluded: they use `N`
+// placeholders in their examples so they scan clean.
+const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'tests']);
 // The fix-status-verify subsystem (run only via `npm run fix:verify`, never by a
 // shipped command/hook/skill) is a maintainer evidence-verification tool. Its
 // manifest carries `decisions/NNNN` wiki paths as RUNTIME DATA (resolved against
