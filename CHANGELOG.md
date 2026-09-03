@@ -5,6 +5,56 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-09-03
+
+### New Features
+
+#### English
+
+- `hypomnema capture` handles hooks written in python or bash, not only node. A captured hook records its interpreter, and the command it registers on another machine uses that interpreter. Hooks captured before this keep working unchanged. ([#238](https://github.com/sk-lim19f/Hypomnema/pull/238))
+- `/hypo:doctor` reports a plugin cache directory whose name disagrees with the release inside it, so an install silently running a different release than its version string claims becomes visible. The drifted root is reported, never excluded from resolution. ([#265](https://github.com/sk-lim19f/Hypomnema/pull/265))
+- `/hypo:doctor` reports when the installed plugin cache is running a different commit than the marketplace clone, and tells "behind" apart from "ahead" and from "cannot tell". ([#269](https://github.com/sk-lim19f/Hypomnema/pull/269))
+
+#### 한국어
+
+- `hypomnema capture` 가 node 뿐 아니라 python·bash 로 작성된 훅도 다룹니다. 캡처된 훅이 자기 interpreter 를 기록하고, 다른 머신에 등록되는 커맨드가 그 interpreter 를 씁니다. 이전에 캡처한 훅은 그대로 동작합니다. ([#238](https://github.com/sk-lim19f/Hypomnema/pull/238))
+- `/hypo:doctor` 가 이름과 그 안의 릴리스가 어긋난 플러그인 캐시 디렉터리를 보고합니다. 버전 문자열이 주장하는 것과 다른 릴리스를 조용히 돌리던 설치가 이제 눈에 보입니다. 어긋난 루트는 보고할 뿐 해석에서 배제하지 않습니다. ([#265](https://github.com/sk-lim19f/Hypomnema/pull/265))
+- `/hypo:doctor` 가 설치된 플러그인 캐시와 마켓플레이스 클론의 커밋이 갈렸을 때 그것을 보고하고, "뒤졌다" 와 "앞섰다" 와 "판정 불가" 를 구별합니다. ([#269](https://github.com/sk-lim19f/Hypomnema/pull/269))
+
+### Bug Fixes
+
+#### English
+
+- A session close no longer writes over a page that changed since it read it, in any case: every drifted whole-file overwrite parks for review. `CHANGELOG.md` ships in the npm package, so the README links to it resolve. ([#262](https://github.com/sk-lim19f/Hypomnema/pull/262))
+- Five skills told Claude to pass `--wiki-dir` to scripts that only ever parsed `--hypo-dir`, and none of those scripts rejects an unknown flag, so the value was dropped and the command silently used the default vault instead of the one you named. `crystallize` was among them, so a session close could land in the wrong vault and still report success. ([#266](https://github.com/sk-lim19f/Hypomnema/pull/266))
+- `hypomnema upgrade --apply` repoints the git pre-commit hook in your wiki repo at the install you are actually running, and `/hypo:doctor` reports when that hook names an older one. The hook holds an absolute path baked in at init time, so until now a vault could keep checking every commit against a release from months earlier while the version string read correctly. Installing a release does not repoint it: run the apply step once after updating. ([#267](https://github.com/sk-lim19f/Hypomnema/pull/267))
+- `/compact` is no longer blocked by an unfinished session close. The PreCompact hook reports what it finds and lets the compact through, and a close gate scoped to the project this session is actually closing stops charging one session for another session's unfinished close (decisions/0095). ([#273](https://github.com/sk-lim19f/Hypomnema/pull/273))
+- The session-close gate no longer demotes a file the session itself edited when the transcript is only partially readable, and each pending-work notice names its own type instead of being reported as a lint issue. ([#275](https://github.com/sk-lim19f/Hypomnema/pull/275))
+- A session that spans several days can close again: targets a later session start re-read are no longer parked as stale, while anything it was not shown in full still parks. ([#276](https://github.com/sk-lim19f/Hypomnema/pull/276))
+- When the plugin registry cannot be read, init and upgrade leave the package pointer and the vault's pre-commit hook alone instead of recording the npm copy the dual-install notice asks you to delete, and the drift banner and doctor point at repairing the registry (decisions/0097). ([#277](https://github.com/sk-lim19f/Hypomnema/pull/277))
+
+#### 한국어
+
+- 세션 마무리가 자기가 읽은 뒤 바뀐 페이지를 덮어쓰는 경우가 이제 없습니다. 드리프트된 전체 덮어쓰기는 전부 보류되고 검토를 기다립니다. `CHANGELOG.md` 가 npm 패키지에 실려 README 의 링크가 살아납니다. ([#262](https://github.com/sk-lim19f/Hypomnema/pull/262))
+- 다섯 스킬이 `--hypo-dir` 만 파싱하는 스크립트에 `--wiki-dir` 를 넘기라고 지시했고, 그 스크립트들이 미지정 플래그를 거부하지 않아 값이 버려진 채 지정한 볼트가 아니라 기본 볼트가 쓰였습니다. `crystallize` 가 그중 하나라 세션 마무리가 엉뚱한 볼트에 쓰이고도 성공을 보고할 수 있었습니다. ([#266](https://github.com/sk-lim19f/Hypomnema/pull/266))
+- `hypomnema upgrade --apply` 가 위키 레포의 git pre-commit 훅을 실제로 돌고 있는 설치로 다시 겨눕니다. 그리고 `/hypo:doctor` 가 그 훅이 더 오래된 설치를 가리키면 보고합니다. 이 훅은 init 시점의 절대경로를 들고 있어서, 지금까지는 버전 문자열이 맞게 읽히는 동안에도 볼트가 몇 달 전 릴리스로 모든 커밋을 계속 검사할 수 있었습니다. 릴리스를 설치하는 것만으로는 다시 겨눠지지 않으니 업데이트 후 apply 단계를 한 번 돌리세요. ([#267](https://github.com/sk-lim19f/Hypomnema/pull/267))
+- 세션 마무리가 미완결이어도 `/compact` 가 막히지 않습니다. PreCompact 훅은 찾은 것을 보고만 하고 compact 를 통과시키며, 이 세션이 실제로 닫는 프로젝트로 좁혀진 close 게이트가 남의 세션이 남긴 미완결 close 를 이 세션에 물리지 않습니다 (decisions/0095). ([#273](https://github.com/sk-lim19f/Hypomnema/pull/273))
+- transcript 가 일부만 읽히는 상황에서 세션이 직접 편집한 파일이 강등되지 않고, 남은 작업 notice 가 lint 로 뭉뚱그려지지 않고 각자 유형으로 표시됩니다. ([#275](https://github.com/sk-lim19f/Hypomnema/pull/275))
+- 여러 날 이어진 세션도 close 가 됩니다. 나중 세션 시작이 다시 읽어 보여준 대상은 묵었다고 파킹되지 않고, 전부를 보여주지 못한 것은 그대로 파킹됩니다. ([#276](https://github.com/sk-lim19f/Hypomnema/pull/276))
+- 플러그인 registry 를 못 읽을 때 init 과 upgrade 가 dual install 안내가 지우라고 하는 npm 사본을 기록하지 않고 포인터와 볼트 pre-commit 훅을 그대로 둡니다. drift 배너와 doctor 도 registry 수리를 지목합니다 (decisions/0097). ([#277](https://github.com/sk-lim19f/Hypomnema/pull/277))
+
+### Chores
+
+#### English
+
+- The automation reference installed into a vault no longer claims that no hook makes a network request, lists all 15 registered hooks under their correct events, and corrects five further claims about auto-stage, the Stop chain, FileChanged, and `.hypoignore`. Existing vaults keep their old copy: the file has no update channel yet. ([#263](https://github.com/sk-lim19f/Hypomnema/pull/263))
+- `/hypo:doctor` tells an unreadable plugin registry apart from no plugin at all, so an install it cannot verify is reported instead of being treated as absent (decisions/0097). ([#272](https://github.com/sk-lim19f/Hypomnema/pull/272))
+
+#### 한국어
+
+- 볼트에 설치되는 자동화 참조가 더 이상 "어떤 훅도 네트워크 요청을 하지 않는다" 고 말하지 않고, 등록된 훅 15 개를 각자의 올바른 이벤트 아래 나열하며, auto-stage·Stop 체인·FileChanged·`.hypoignore` 에 대한 다섯 가지 서술을 함께 고칩니다. 기존 볼트는 낡은 사본을 유지합니다. 이 파일에는 아직 갱신 채널이 없습니다. ([#263](https://github.com/sk-lim19f/Hypomnema/pull/263))
+- `/hypo:doctor` 가 읽을 수 없는 플러그인 registry 와 플러그인이 아예 없는 경우를 구별하여, 확인할 수 없는 설치를 부재로 취급하지 않고 보고합니다 (decisions/0097). ([#272](https://github.com/sk-lim19f/Hypomnema/pull/272))
+
 ## [1.7.4] - 2026-08-29
 
 ### New Features
