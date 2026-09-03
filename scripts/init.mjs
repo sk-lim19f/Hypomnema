@@ -954,11 +954,16 @@ function gitSetup(hypoDir, remote, dryRun) {
 
 // ── first commit + push ──────────────────────────────────────────────────────
 
+// Returns true only when THIS run actually created a commit. The
+// channel-unresolved notice keys its "the commit this run just made was
+// unguarded" sentence off that, so a repo that already had commits, a dry run,
+// and a failed commit must all read as false — none of them produced an
+// unguarded commit to warn about.
 function firstCommit(hypoDir, remote, dryRun) {
   const logR = git(hypoDir, ['log', '--oneline', '-1']);
   if (logR.status === 0 && logR.stdout.trim()) {
     log('skipped', 'first commit (repo already has commits)');
-    return;
+    return false;
   }
   const today = new Date().toISOString().slice(0, 10);
   if (!dryRun) {
@@ -966,7 +971,7 @@ function firstCommit(hypoDir, remote, dryRun) {
     const commitR = git(hypoDir, ['commit', '-m', `chore: init hypomnema (${today})`]);
     if (commitR.status !== 0) {
       log('errors', 'first commit failed');
-      return;
+      return false;
     }
     if (remote) {
       const actualOrigin = git(hypoDir, ['remote', 'get-url', 'origin']);
@@ -977,6 +982,7 @@ function firstCommit(hypoDir, remote, dryRun) {
     }
   }
   log('created', `first commit (${today})`);
+  return !dryRun;
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -1031,9 +1037,52 @@ function resolveDurableRoot() {
   if (pluginChannel.root) return pluginChannel.root;
   const recorded = recordedPkgRoot();
   if (usablePkgRoot(recorded)) return recorded;
-  return PKG_ROOT;
+  // pluginChannel.root is null here because the channel JUDGMENT FAILED (reason
+  // 'registry-unreadable' or 'unresolved'), not because no plugin is installed —
+  // hypomnemaPluginEnabled is already true, and that case already returned
+  // above. Falling back to PKG_ROOT would persist a GUESS as if it were the
+  // confirmed durable root; in a dual install PKG_ROOT is the manual/npm
+  // checkout the dual-install notice tells the user to remove, so that guess
+  // dangles the moment they do. A judge returning null here means "cannot
+  // positively resolve", never "resolved to nothing usable exists" — treating
+  // it as the latter is exactly the failure this fix closes.
+  // With no existing usable pointer to preserve either, leave the durable root
+  // UNRESOLVED (null) instead of guessing — the caller below skips writing the
+  // pointer and the pre-commit hook and prints recovery guidance rather than
+  // confirm a guess.
+  return null;
 }
 const durableRoot = resolveDurableRoot();
+// True only when the channel judgment itself failed and there was nothing usable
+// to fall back on (see resolveDurableRoot above) — never true for a genuinely
+// disabled/absent plugin, which resolves to PKG_ROOT and never reaches here.
+const channelUnresolved = durableRoot === null;
+let madeFirstCommit = false;
+
+function channelUnresolvedNotice(madeFirstCommit) {
+  // Step 9 (firstCommit) runs AFTER step 8b skipped the pre-commit hook install,
+  // so a commit this run created went out unguarded, not just future ones. Key
+  // this off what firstCommit actually did, never off the flags that merely make
+  // it eligible: --dry-run writes nothing, a repo with existing commits skips,
+  // and a failed commit produced none. Asserting "just made" in those cases
+  // sends the reader looking for a commit that does not exist.
+  const firstCommitCaveat = madeFirstCommit
+    ? ' The initial commit this run just made in the vault was not checked by that guard ' +
+      'either: it landed before any pre-commit hook existed to check it.'
+    : '';
+  return (
+    `⚠ Cannot positively resolve the enabled Hypomnema plugin's install root ` +
+    `(${pluginChannel.rootReason} — checked ~/.claude/plugins/installed_plugins.json). ` +
+    `Leaving the durable pointer UNSET rather than guessing the npm path at ${PKG_ROOT}: ` +
+    `that path is what a dual install's own notice tells you to remove, and baking it in ` +
+    `now would break every wiki commit the moment you do. hypo-pkg.json's pkgRoot and the ` +
+    `vault's git pre-commit hook are both skipped this run, so this wiki has no pre-commit ` +
+    `.hypoignore guard until this resolves.${firstCommitCaveat}\n` +
+    `  → Fix: repair or refresh ~/.claude/plugins/installed_plugins.json (reinstall the ` +
+    'plugin, or run `/plugin marketplace update hypomnema` then `/reload-plugins`), then ' +
+    're-run `hypomnema init` to record the confirmed root.'
+  );
+}
 
 // Validate hooks.json before any file writes so a bad package leaves no partial state
 const HOOK_MAP = args.hooks || args.codex ? loadHookMap() : null;
@@ -1157,7 +1206,20 @@ if (args.hooks) {
 // so this never clobbers a commands/extensions map written elsewhere.
 // Record hypo-pkg.json against the durable root (the plugin's real cache root in a
 // dual install, PKG_ROOT otherwise), the same root the wiki pre-commit hook uses.
-writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {}, durableRoot);
+// A null durableRoot means the channel judgment failed with nothing usable to
+// preserve (see resolveDurableRoot) — skip the write rather than stamp a guess;
+// channelUnresolvedNotice() above explains why and what closes it. The
+// extensions sync below (step 4b) still runs unconditionally and can leave a
+// pkgRoot-less hypo-pkg.json on disk in this case; that is doctor.mjs's own
+// distinct reported state ("no pkgRoot field"), never a confirmed PKG_ROOT.
+if (!channelUnresolved) {
+  writePkgJson(args.dryRun, commandSHAs ? { commands: commandSHAs } : {}, durableRoot);
+} else {
+  log(
+    'skipped',
+    'hypo-pkg.json pkgRoot (plugin channel judgment failed — see notice above; re-run after fixing the registry)',
+  );
+}
 
 // 4b. user extensions companion sync. Runs after
 // writePkgJson so the per-target SHA map is merged into the same hypo-pkg.json
@@ -1249,23 +1311,35 @@ if (args.hooks) {
 
 // 8b. wiki pre-commit hook (.hypoignore last-line-of-defence guard — §6.8).
 // Point it at the durable install root, not PKG_ROOT, so a dual install does not
-// embed a manual/npm path that dangles once the user uninstalls it.
-installWikiPreCommitHook(
-  args.hypoDir,
-  args.dryRun,
-  args.forceCommands,
-  durableRoot,
-  args.lintStrict,
-);
+// embed a manual/npm path that dangles once the user uninstalls it. A null
+// durableRoot means the channel judgment failed with nothing usable to fall
+// back on — skip installing the hook with a guessed root; an existing hook (if
+// any) is left exactly as-is, and channelUnresolvedNotice() above says what to
+// do next.
+if (!channelUnresolved) {
+  installWikiPreCommitHook(
+    args.hypoDir,
+    args.dryRun,
+    args.forceCommands,
+    durableRoot,
+    args.lintStrict,
+  );
+} else {
+  log(
+    'skipped',
+    `${args.hypoDir} pre-commit hook (plugin channel judgment failed — see notice above)`,
+  );
+}
 
 // 9. first commit + push (skip when cloned from remote — already has commits)
 if (args.gitInit && !args.fromRemote) {
-  firstCommit(args.hypoDir, args.gitRemote, args.dryRun);
+  madeFirstCommit = firstCommit(args.hypoDir, args.gitRemote, args.dryRun);
 }
 
 // ── report ───────────────────────────────────────────────────────────────────
 
 const lines = [];
+if (channelUnresolved) lines.push(channelUnresolvedNotice(madeFirstCommit), '');
 if (results.created.length)
   lines.push(
     `✓ Created (${results.created.length}):\n${results.created.map((p) => `  ${p}`).join('\n')}`,

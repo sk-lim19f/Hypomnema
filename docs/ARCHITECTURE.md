@@ -218,7 +218,8 @@ Hooks inline this logic in `hypo-shared.mjs`. Scripts use `scripts/lib/hypo-root
 2. Creates the vault directory structure: `pages/`, `projects/`, `sources/`, `journal/{daily,weekly,monthly}/`.
 3. Copies `templates/` files: 6 root files (`hypo-config.md`, `index.md`, `hot.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md`) + 4 helpers (`Home.md`, `Overview.md`, `hypo-automation.md`, `hypo-help.md`) + `pages/_index.md` + `projects/_template/`.
 4. Deploys 10 hooks to `~/.claude/hooks/` and merges entries into `~/.claude/settings.json` (idempotent; preserves non-hypo hooks).
-5. Writes `~/.claude/hypo-pkg.json` with `pkgRoot` for upgrade tracking.
+5. Writes `~/.claude/hypo-pkg.json` with `pkgRoot` for upgrade tracking (skipped when the
+   plugin channel judgment fails; see `init.mjs`'s `resolveDurableRoot`).
 6. `git init` + first commit `init: hypomnema wiki`. Pushes to remote when one is provided.
 
 `--dry-run` previews; `--no-hooks` and `--no-git-init` are also supported. Re-running `init` is idempotent — existing files are skipped, never overwritten.

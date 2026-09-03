@@ -19,7 +19,7 @@ import {
   cpSync,
   realpathSync,
 } from 'node:fs';
-import { join, isAbsolute } from 'node:path';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
@@ -28,6 +28,7 @@ import {
   SHELL_MARKER_START,
   SHELL_MARKER_END,
   SHELL_FUNCTION_BODY,
+  wikiPreCommitContent,
 } from '../scripts/lib/git-hooks-dir.mjs';
 import {
   HOME,
@@ -1246,9 +1247,15 @@ test('dual install prefers the user-scope registry entry over a preceding local 
 
 // A relative installPath (e.g. ".") would resolve against the caller's cwd and
 // break the vault hook from any other directory, so it is not a usable durable
-// root; resolution falls back rather than recording a relative pointer.
-test('dual install rejects a relative registry installPath and falls back', () => {
-  withFakeInitInstall(false, ({ init, root, home }) => {
+// root — but the registry itself parsed fine (reason 'unresolved'), which is a
+// channel JUDGMENT FAILURE, never "no plugin installed". IMPR-51 / ADR 0097:
+// with no existing pointer to preserve either, resolution must leave the
+// durable root UNRESOLVED rather than fall back to a guessed PKG_ROOT — a
+// guessed npm path baked into hypo-pkg.json/the pre-commit hook would dangle
+// the moment the dual-install notice's recommended npm uninstall happens.
+// This replaces the prior expectation (fallback to PKG_ROOT was blessed).
+test('dual install + unresolved registry entry (relative installPath) + new vault: no pkgRoot is guessed', () => {
+  withFakeInitInstall(false, ({ init, home }) => {
     const hypoDir = join(tmpdir(), `hypo-init-relpath-${process.pid}-${Date.now()}`);
     try {
       enablePlugin(home);
@@ -1262,17 +1269,20 @@ test('dual install rejects a relative registry installPath and falls back', () =
       );
       const r = runInitFrom(init, [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init'], home);
       assert.equal(r.status, 0, `dual-install init should exit 0: ${r.stderr}`);
-      const meta = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
-      assert.notEqual(
-        meta.pkgRoot,
-        '.',
-        'a relative installPath must never be recorded as pkgRoot',
-      );
-      assert.ok(isAbsolute(meta.pkgRoot), `recorded pkgRoot must be absolute: ${meta.pkgRoot}`);
       assert.equal(
-        realpathSync(meta.pkgRoot),
-        realpathSync(root),
-        'with no usable registry root, resolution falls back to PKG_ROOT',
+        existsSync(join(home, '.claude', 'hypo-pkg.json')),
+        false,
+        'with --no-hooks, nothing else writes hypo-pkg.json — an unresolved registry judgment must leave it absent, not stamp a guessed PKG_ROOT',
+      );
+      assert.match(
+        r.stdout,
+        /Cannot positively resolve the enabled Hypomnema plugin's install root/,
+        'must explain why the pointer was left unset and what unblocks it',
+      );
+      assert.match(
+        r.stdout,
+        /re-run `hypomnema init`/,
+        'recovery guidance must name the concrete next step',
       );
     } finally {
       rmSync(hypoDir, { recursive: true, force: true });
@@ -1317,10 +1327,18 @@ test('dual install refuses to run an older npm init against a newer registry plu
   });
 });
 
-test('dual install falls back when the recorded pkgRoot is not a usable package dir', () => {
+// IMPR-51 / ADR 0097: `enablePlugin` (no installed_plugins.json write) makes the
+// registry lookup fail with reason 'registry-unreadable' — a JUDGMENT FAILURE,
+// never "no plugin installed". The existing pointer here is already unusable
+// (no package.json), so there is nothing valid to preserve either. Confirming
+// it as PKG_ROOT (the old fallback) would bless a GUESS as durable truth; the
+// fix leaves the existing (already-invalid) pointer exactly as recorded,
+// touching nothing, rather than replace one guess with another.
+test('dual install + unusable existing pkgRoot + unreadable registry: pointer is left untouched, not replaced with a guess', () => {
   withFakeInitInstall(false, ({ init, root, home }) => {
     // An existing directory that is NOT a package (no package.json): the runtime
-    // cannot resolve scripts through it, so preservation must NOT bless it.
+    // cannot resolve scripts through it, so preservation must NOT bless it —
+    // but confirming a DIFFERENT guess in its place is exactly as wrong.
     const emptyRoot = mkdtempSync(join(tmpdir(), 'hypo-empty-root-'));
     const hypoDir = join(tmpdir(), `hypo-init-dual-unusable-${process.pid}-${Date.now()}`);
     try {
@@ -1333,9 +1351,19 @@ test('dual install falls back when the recorded pkgRoot is not a usable package 
       assert.equal(r.status, 0, `dual-install init should exit 0: ${r.stderr}`);
       const meta = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
       assert.equal(
+        meta.pkgRoot,
+        emptyRoot,
+        'an unresolvable registry judgment must leave an already-invalid pointer untouched, not confirm PKG_ROOT in its place',
+      );
+      assert.notEqual(
         realpathSync(meta.pkgRoot),
         realpathSync(root),
-        'an existing-but-unusable pkgRoot (no package.json) must fall back to PKG_ROOT, not be preserved',
+        'PKG_ROOT must never be stamped as a substitute guess here',
+      );
+      assert.match(
+        r.stdout,
+        /Cannot positively resolve the enabled Hypomnema plugin's install root/,
+        'must explain why the invalid pointer was left as-is',
       );
     } finally {
       rmSync(emptyRoot, { recursive: true, force: true });
@@ -1344,27 +1372,155 @@ test('dual install falls back when the recorded pkgRoot is not a usable package 
   });
 });
 
-test('dual install writes fallback metadata when no prior pointer exists', () => {
-  withFakeInitInstall(false, ({ init, root, home }) => {
+// IMPR-51 / ADR 0097: same registry failure, but a genuinely NEW vault (no
+// hypo-pkg.json at all) — nothing to preserve. hypo-pkg.json may still end up
+// on disk (the unconditional extensions-SHA sync writes one even with zero
+// extensions), but it must carry no pkgRoot field: a pkgRoot-less file is
+// doctor's own distinct, reported state, never "resolved to PKG_ROOT".
+// The unguarded-first-commit sentence in the channel-unresolved notice must key
+// off what firstCommit ACTUALLY did, not off the flags that merely make it
+// eligible. These two are a pair: the same notice, once where this run created
+// the commit and once where it did not. Without the negative half, conditioning
+// the sentence on `args.gitInit && !args.fromRemote` — which is wrong for
+// --dry-run and for a vault that already has commits — reads as correct.
+test('channel unresolved + a vault that already has commits: the notice does NOT claim this run made one', () => {
+  withFakeInitInstall(false, ({ init, home }) => {
+    const hypoDir = join(tmpdir(), `hypo-init-nocommit-${process.pid}-${Date.now()}`);
+    try {
+      // gitInit stays TRUE here on purpose. `--no-git-init` would make the old
+      // flag-based condition (`args.gitInit && !args.fromRemote`) false too, so
+      // the two halves of this pair would agree under both the old and the new
+      // code and distinguish nothing. The condition this pins is the one where
+      // the flags say "eligible" but firstCommit still produced nothing: a repo
+      // that already has a commit, which firstCommit skips outright.
+      mkdirSync(hypoDir, { recursive: true });
+      spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+      spawnSync('git', ['-C', hypoDir, 'config', 'user.email', 'test@test.com']);
+      spawnSync('git', ['-C', hypoDir, 'config', 'user.name', 'Test']);
+      writeFileSync(join(hypoDir, 'seed.md'), 'seed\n');
+      spawnSync('git', ['-C', hypoDir, 'add', '-A'], { stdio: 'ignore' });
+      spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'seed'], { stdio: 'ignore' });
+      enablePlugin(home);
+      const r = runInitFrom(init, [`--hypo-dir=${hypoDir}`], home);
+      assert.equal(r.status, 0, `init should exit 0: ${r.stderr}`);
+      assert.match(
+        r.stdout,
+        /Cannot positively resolve the enabled Hypomnema plugin's install root/,
+        'fixture: the channel-unresolved notice must actually be printed here',
+      );
+      assert.doesNotMatch(
+        r.stdout,
+        /initial commit this run just made/,
+        'firstCommit skipped a repo that already had commits, so the notice must not send the reader looking for one',
+      );
+    } finally {
+      rmSync(hypoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('channel unresolved + a git-init run: the notice DOES name the unguarded first commit', () => {
+  withFakeInitInstall(false, ({ init, home }) => {
+    const hypoDir = join(tmpdir(), `hypo-init-didcommit-${process.pid}-${Date.now()}`);
+    try {
+      enablePlugin(home);
+      // init runs `git init` itself here, so there is no repo to `git config`
+      // beforehand and HOME is a bare temp dir with no global identity. Without
+      // these, the commit fails and init exits 1 — the assertion below would
+      // then be measuring a failed run, not an unguarded commit.
+      const r = spawnSync(process.execPath, [init, `--hypo-dir=${hypoDir}`], {
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          HYPO_DIR: '',
+          HOME: home,
+          GIT_AUTHOR_NAME: 'Test',
+          GIT_AUTHOR_EMAIL: 'test@test.com',
+          GIT_COMMITTER_NAME: 'Test',
+          GIT_COMMITTER_EMAIL: 'test@test.com',
+        },
+      });
+      assert.equal(r.status, 0, `init should exit 0: ${r.stdout}\n${r.stderr}`);
+      assert.match(
+        r.stdout,
+        /Cannot positively resolve the enabled Hypomnema plugin's install root/,
+        'fixture: the channel-unresolved notice must actually be printed here',
+      );
+      assert.match(
+        r.stdout,
+        /initial commit this run just made/,
+        'a run that DID create the first commit must say that commit went out unguarded',
+      );
+    } finally {
+      rmSync(hypoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('dual install + no prior pointer + unreadable registry: no pkgRoot is guessed', () => {
+  withFakeInitInstall(false, ({ init, home }) => {
     const hypoDir = join(tmpdir(), `hypo-init-dual-fresh-${process.pid}-${Date.now()}`);
     try {
+      // A real git repo, not the `--no-git-init` absence of one: without this
+      // `.git`, hooksDirForInstall no-ops before the channelUnresolved guard on
+      // the pre-commit-hook write ever runs, so the assertion on it below would
+      // pass whether or not that guard exists at all.
+      spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
       enablePlugin(home); // plugin enabled, but no hypo-pkg.json on disk yet
       const r = runInitFrom(init, [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
       assert.equal(r.status, 0, `dual-install init should exit 0: ${r.stderr}`);
       const pkgPath = join(home, '.claude', 'hypo-pkg.json');
-      assert.ok(
-        existsSync(pkgPath),
-        'runtime needs a resolvable pointer — fallback must be written',
-      );
-      const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-      // init derives PKG_ROOT from its own real script path; realpath both sides so
-      // the macOS /var → /private/var symlink does not make an equal path look unequal.
+      const meta = existsSync(pkgPath) ? JSON.parse(readFileSync(pkgPath, 'utf-8')) : {};
       assert.equal(
-        realpathSync(meta.pkgRoot),
-        realpathSync(root),
-        'with no prior pointer to preserve, dual install falls back to its own PKG_ROOT so resolution is not left empty',
+        meta.pkgRoot,
+        undefined,
+        'with no prior pointer to preserve, an unresolvable registry must leave pkgRoot unset rather than guess PKG_ROOT',
+      );
+      assert.equal(
+        existsSync(join(hypoDir, '.git', 'hooks', 'pre-commit')),
+        false,
+        'the channel-judgment-failure guard must also skip the vault pre-commit hook install, not just the pkgRoot write',
+      );
+      assert.match(
+        r.stdout,
+        /Cannot positively resolve the enabled Hypomnema plugin's install root/,
+        'must explain why no pointer was written and what unblocks it',
+      );
+      assert.match(
+        r.stdout,
+        /re-run `hypomnema init`/,
+        'recovery guidance must name the concrete next step',
       );
     } finally {
+      rmSync(hypoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Sibling to the test above: it pins the "skip installing" half of the guard.
+// This pins the other half, "leave an ALREADY-installed hook exactly as-is" —
+// a run that hits channelUnresolved must not touch a hypo-managed pre-commit
+// hook that a prior, successful init already wrote.
+test('dual install + unreadable registry + an existing hypo-managed pre-commit hook: the hook is left byte-identical', () => {
+  withFakeInitInstall(false, ({ init, home }) => {
+    const hypoDir = join(tmpdir(), `hypo-init-dual-existing-hook-${process.pid}-${Date.now()}`);
+    const priorRoot = makePluginRoot(); // stand-in for whatever root the prior successful init used
+    try {
+      spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+      const hookPath = join(hypoDir, '.git', 'hooks', 'pre-commit');
+      writeFileSync(hookPath, wikiPreCommitContent(priorRoot, hypoDir, false), { mode: 0o755 });
+      const beforeSHA = createHash('sha256').update(readFileSync(hookPath)).digest('hex');
+      enablePlugin(home); // plugin enabled, but the registry itself is unreadable
+      const r = runInitFrom(init, [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(r.status, 0, `dual-install init should exit 0: ${r.stderr}`);
+      const afterSHA = createHash('sha256').update(readFileSync(hookPath)).digest('hex');
+      assert.equal(
+        afterSHA,
+        beforeSHA,
+        'an existing hypo-managed pre-commit hook must be left byte-identical when the channel judgment fails',
+      );
+    } finally {
+      rmSync(priorRoot, { recursive: true, force: true });
       rmSync(hypoDir, { recursive: true, force: true });
     }
   });

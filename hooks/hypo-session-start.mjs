@@ -270,13 +270,24 @@ function buildPkgRootDriftNotice() {
     const cache = readCache(cachePath);
     if (pkgRootDriftAlreadyNotified(cache, key)) return '';
     markPkgRootDriftNotified(cachePath, key);
+    // status.cached is null both for a genuinely fresh install (never ran
+    // /hypo:init) AND for the channel-judgment-failure guard (init/upgrade
+    // positively decided to leave pkgRoot unset; see scripts/init.mjs's
+    // resolveDurableRoot). "run /hypo:upgrade and confirm the apply step" is a
+    // dead end in the second case: apply skips the same write until the
+    // registry itself is fixed. Point at that fix directly rather than send the
+    // user in a loop.
+    const recoveryLine = status.cached
+      ? '  → run `/hypo:upgrade` and confirm the apply step to bring hypo-pkg.json back in sync.'
+      : '  → if `/hypo:upgrade` keeps leaving this unwritten, the plugin channel itself cannot be ' +
+        'resolved: repair `~/.claude/plugins/installed_plugins.json` first (reinstall the plugin, or ' +
+        'run `/plugin marketplace update hypomnema` then `/reload-plugins`), then re-run `/hypo:upgrade`.';
     return (
       `[Hypomnema] Package metadata drift: hypo-pkg.json still points at ` +
       `\`${status.cached || '(none)'}\`, but the code actually running resolves to ` +
       `\`${status.self}\`.\n` +
       `  Hooks already resolved the correct root for this session — this is a ` +
-      `heads-up, not a blocker.\n` +
-      `  → run \`/hypo:upgrade\` and confirm the apply step to bring hypo-pkg.json back in sync.`
+      `heads-up, not a blocker.\n${recoveryLine}`
     );
   } catch {
     return '';
