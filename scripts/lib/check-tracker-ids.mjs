@@ -21,7 +21,8 @@
  * FEAT-/IMPR-/PRAC- were once exempt inside shipped code comments; that exemption
  * shipped dangling pointers into the maintainer's private wiki to OSS users, so it
  * was removed. They now block everywhere in scope; the maintainer keeps them only
- * in tests/, qa-runs/, and local notes. The verifier subsystem that legitimately
+ * in tests/ and local notes (QA run records moved to the wiki). The verifier
+ * subsystem that legitimately
  * carries `decisions/NNNN` runtime data is excluded from the scan instead (see the
  * CLI's EXCLUDED_FILES).
  *
