@@ -36,7 +36,13 @@ import {
   withFileLock,
   resolveGateProjectOverride,
 } from '../../hooks/hypo-shared.mjs';
-import { hashContent, readBaseEntry, advanceBase } from '../../hooks/base-store.mjs';
+import {
+  hashContent,
+  readBaseEntry,
+  advanceBase,
+  readObservedHash,
+  wasObservedTruncated,
+} from '../../hooks/base-store.mjs';
 import { writeProposal } from '../../hooks/proposal-store.mjs';
 import {
   recordGateClosed,
@@ -157,13 +163,28 @@ function readTarget(path) {
  * `hash`: 'absent' and 'unknown' both carry `hash: null`, and collapsing them
  * would read never-observed as safe-to-write, defeating the guard entirely.
  *
+ * `observed` is this session's observed set for THIS target: the
+ * hash(es) a later SessionStart actually showed it, on top of the original
+ * base. It only ever widens what may be written, never narrows or replaces
+ * `entry` — a disk hash matching `entry.hash` still passes with `observed`
+ * empty, exactly as before this parameter existed. `case 'unknown'` does not
+ * consult it: with no snapshot at all there is no base for an observation to
+ * extend.
+ *
  * @param {{state: 'hash'|'absent'|'unknown', hash: string|null}} entry
  * @param {string|null|undefined} disk current bytes / absent / unreadable
+ * @param {{hash: string|null, truncated: boolean}} observed what this session
+ *   was shown for THIS target after its first snapshot: the exact hash (or
+ *   `null` when it was never shown anything current), plus whether the one
+ *   shown-but-not-licensing case (a truncated injection) applies — used only
+ *   to pick which park reason to report, never to license a write on its own.
  * @returns {string|null} a conflict reason, or null when this session may write
  */
-function overwriteConflictReason(entry, disk) {
+export function overwriteConflictReason(entry, disk, observed = { hash: null, truncated: false }) {
   // Cannot read what we are about to replace: fail safe, never assume unchanged.
   if (disk === undefined) return 'target-unreadable';
+  const observedHash = observed && observed.hash;
+  const observedTruncated = !!(observed && observed.truncated);
   switch (entry.state) {
     case 'unknown':
       // No snapshot for this (session, target). Someone else's edits could be
@@ -171,11 +192,23 @@ function overwriteConflictReason(entry, disk) {
       return 'base-unknown';
     case 'absent':
       // We observed no file. Creating it is safe; finding one now means another
-      // writer got there first.
-      return disk === null ? null : 'base-absent-target-exists';
+      // writer got there first, UNLESS this session was later shown exactly
+      // those bytes by a resume/compact SessionStart.
+      if (disk === null) return null;
+      if (observedHash && observedHash === hashContent(disk)) return null;
+      return observedTruncated
+        ? 'base-mismatch-truncated-observation'
+        : 'base-absent-target-exists';
     case 'hash':
       if (disk === null) return 'base-hash-target-missing';
-      return hashContent(disk) === entry.hash ? null : 'base-mismatch';
+      if (hashContent(disk) === entry.hash) return null;
+      // Drifted from the original base — still allowed when this session was
+      // shown these exact drifted bytes by a later SessionStart. A truncated
+      // injection never reaches `observedHash` (readObservedHash refuses it),
+      // so it falls through here and gets its own reason instead of the plain
+      // `base-mismatch` a no-observation-at-all case reports.
+      if (observedHash && observedHash === hashContent(disk)) return null;
+      return observedTruncated ? 'base-mismatch-truncated-observation' : 'base-mismatch';
     default:
       return 'base-unknown';
   }
@@ -1081,7 +1114,17 @@ export function applySessionClose(args) {
       // built for should stop being a shared whole-file overwrite target at all and
       // become a locally generated projection of the project files that already own
       // those facts; then two machines never contend over it.
-      const reason = overwriteConflictReason(entry, disk);
+      const observedHash = readObservedHash(args.hypoDir, args.sessionId, relPath);
+      // A truncated observation never comes back as `observedHash` (readObservedHash
+      // refuses it), so this second read is what lets the park reason below tell
+      // "never shown anything current" apart from "shown, but only a slice of it" —
+      // see base-store.mjs's recordObserved/readObservedHash docs.
+      const observedTruncated =
+        !observedHash && wasObservedTruncated(args.hypoDir, args.sessionId, relPath);
+      const reason = overwriteConflictReason(entry, disk, {
+        hash: observedHash,
+        truncated: observedTruncated,
+      });
       if (reason) {
         conflicts.push({
           key,

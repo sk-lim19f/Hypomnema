@@ -29,7 +29,12 @@ import {
   advanceBase,
   advanceBaseForWrite,
   overwriteTargets,
+  beginObservedGeneration,
+  recordObserved,
+  readObservedHash,
+  wasObservedTruncated,
 } from '../hooks/base-store.mjs';
+import { overwriteConflictReason } from '../scripts/lib/crystallize-close-apply.mjs';
 import {
   writeProposal as psWriteProposal,
   listProposals as psListProposals,
@@ -1036,6 +1041,22 @@ await testAsync('FEAT-11 T7: a successful apply leaves the session base untouche
     // Breaking the apply-then-reclose loop is crystallize's idempotent-skip
     // (disk === payload), not a base advance here.
     assert.deepEqual(readBaseEntry(dir, sessionId, rel), before);
+
+    // ISSUE-116 AC4: base staying put is necessary but not sufficient — the close
+    // guard must actually RE-CHECK at close time, not treat "an apply happened"
+    // as a licence to skip re-verification. Apply is an out-of-band human
+    // override, not a SessionStart injection, so this session's observed set is
+    // still empty for `rel` and a close right after this apply must still park.
+    assert.equal(
+      readObservedHash(dir, sessionId, rel),
+      null,
+      'an apply must not have populated the observed set',
+    );
+    assert.equal(
+      overwriteConflictReason(before, readFileSync(target, 'utf-8')),
+      'base-mismatch',
+      'a close right after an out-of-band apply must still park',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -2254,6 +2275,196 @@ test('advanceBaseForWrite with a knownHash advances to it, ignoring on-disk byte
   });
 });
 
+// ── base-store.mjs — observed set (ISSUE-116) ────────────────────────────────
+
+suite('base-store.mjs — observed set (ISSUE-116)');
+
+test('recordObserved is a no-op when the session has no snapshot yet', () => {
+  withBaseWiki((dir) => {
+    assert.equal(recordObserved(dir, 's1', 'hot.md', bsHashContent('x')), false);
+    assert.equal(existsSync(bsBasePath(dir, 's1')), false, 'must not create base.json');
+    assert.equal(readObservedHash(dir, 's1', 'hot.md'), null);
+  });
+});
+
+test('recordObserved is a no-op for a key outside targets (cannot widen the guard)', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    assert.equal(recordObserved(dir, 's1', 'not-a-target.md', bsHashContent('x')), false);
+    const parsed = JSON.parse(readFileSync(bsBasePath(dir, 's1'), 'utf-8'));
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(parsed.observed || {}, 'not-a-target.md'),
+      false,
+      'an untracked key must not be minted into the observed map',
+    );
+    assert.equal(readObservedHash(dir, 's1', 'not-a-target.md'), null);
+  });
+});
+
+test('recordObserved twice in one generation (hot + session-state) keeps both readable', () => {
+  // HIT SessionStart calls recordObserved twice, one call apart, for the same
+  // generation. Neither call may bump the generation itself — if it did, the
+  // second file would land in a different generation and immediately expire.
+  // Both keys mirror what the real HIT branch actually injects: the
+  // PROJECT-scoped hot.md, not the root one (the root only appears in the
+  // MISS branch — see hypo-session-start.mjs:765).
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    beginObservedGeneration(dir, 's1');
+    recordObserved(dir, 's1', join('projects', 'p1', 'hot.md'), bsHashContent('h'));
+    recordObserved(dir, 's1', join('projects', 'p1', 'session-state.md'), bsHashContent('s'));
+    assert.equal(readObservedHash(dir, 's1', join('projects', 'p1', 'hot.md')), bsHashContent('h'));
+    assert.equal(
+      readObservedHash(dir, 's1', join('projects', 'p1', 'session-state.md')),
+      bsHashContent('s'),
+    );
+  });
+});
+
+test('beginObservedGeneration expires an observation no later SessionStart refreshed', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    beginObservedGeneration(dir, 's1'); // generation 1
+    recordObserved(dir, 's1', 'hot.md', bsHashContent('gen1'));
+    assert.equal(readObservedHash(dir, 's1', 'hot.md'), bsHashContent('gen1'));
+
+    beginObservedGeneration(dir, 's1'); // generation 2 — nothing recorded this time
+    assert.equal(
+      readObservedHash(dir, 's1', 'hot.md'),
+      null,
+      'a SessionStart that injects nothing this generation must not keep the prior observation licensed',
+    );
+  });
+});
+
+test('recordObserved(..., truncated=true) is stored but never licenses a write', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    beginObservedGeneration(dir, 's1');
+    recordObserved(dir, 's1', 'hot.md', bsHashContent('sliced'), true);
+    assert.equal(
+      readObservedHash(dir, 's1', 'hot.md'),
+      null,
+      'a truncated observation must never be handed out as a licence',
+    );
+    assert.equal(wasObservedTruncated(dir, 's1', 'hot.md'), true);
+  });
+});
+
+// base.json sits on disk where an older release, a half-finished write, or a
+// hand edit can leave any shape in it. The licence checks must READ that as
+// corruption and park, never fall through a strict-equality comparison into
+// handing out a licence. `truncated: "true"` is the sharp case: it is obviously
+// meant to say "sliced", but `=== true` is false for it, so a check written that
+// way licenses exactly the observation the field exists to deny.
+test('a corrupt observed entry parks instead of licensing (truncated is not a strict boolean)', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    beginObservedGeneration(dir, 's1');
+    const disk = 'bytes on disk';
+    recordObserved(dir, 's1', 'hot.md', bsHashContent(disk), false);
+    assert.equal(
+      readObservedHash(dir, 's1', 'hot.md'),
+      bsHashContent(disk),
+      'fixture: a clean entry must license, or the corruptions below prove nothing',
+    );
+
+    const path = bsBasePath(dir, 's1');
+    const corruptions = [
+      ['truncated as the STRING "true"', (j) => (j.observed['hot.md'].truncated = 'true')],
+      ['truncated missing entirely', (j) => delete j.observed['hot.md'].truncated],
+      ['truncated as 1', (j) => (j.observed['hot.md'].truncated = 1)],
+      ['entry generation as NaN', (j) => (j.observed['hot.md'].generation = NaN)],
+      ['counter as a non-integer', (j) => (j.observedGeneration = 1.5)],
+      ['counter as the STRING "1"', (j) => (j.observedGeneration = '1')],
+      ['hash as an empty string', (j) => (j.observed['hot.md'].hash = '')],
+    ];
+    for (const [label, corrupt] of corruptions) {
+      const j = JSON.parse(readFileSync(path, 'utf-8'));
+      corrupt(j);
+      // NaN is not representable in JSON and serializes to null; that is fine —
+      // null is just as much "not a safe integer", which is what is under test.
+      writeFileSync(path, JSON.stringify(j));
+      assert.equal(
+        readObservedHash(dir, 's1', 'hot.md'),
+        null,
+        `${label} must refuse the licence, not fall through to it`,
+      );
+    }
+  });
+});
+
+test('recordObserved defaults truncated to false when the caller omits it', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    beginObservedGeneration(dir, 's1');
+    recordObserved(dir, 's1', 'hot.md', bsHashContent('full'));
+    assert.equal(readObservedHash(dir, 's1', 'hot.md'), bsHashContent('full'));
+    assert.equal(wasObservedTruncated(dir, 's1', 'hot.md'), false);
+  });
+});
+
+test('wasObservedTruncated goes false, not true, once a later generation expires the entry', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    beginObservedGeneration(dir, 's1');
+    recordObserved(dir, 's1', 'hot.md', bsHashContent('sliced'), true);
+    beginObservedGeneration(dir, 's1'); // a later SessionStart, injecting nothing this time
+    assert.equal(readObservedHash(dir, 's1', 'hot.md'), null);
+    assert.equal(
+      wasObservedTruncated(dir, 's1', 'hot.md'),
+      false,
+      'a stale generation must not report as truncated either — it is simply expired',
+    );
+  });
+});
+
+test('readObservedHash refuses when observedGeneration was never created, regardless of entry.generation', () => {
+  // Simulates beginObservedGeneration never having run for this session (the
+  // bug the ISSUE-116 review found: deleting that call left every base.json
+  // test green). recordObserved's own internal default stamps a MISSING
+  // observedGeneration as 0, but readObservedHash must not mirror that
+  // default when reading it back — if it did, this entry (generation 0)
+  // would match a "current generation" of 0 and license a write despite the
+  // counter that is supposed to gate it never having been created at all.
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    recordObserved(dir, 's1', 'hot.md', bsHashContent('h')); // no beginObservedGeneration call
+    const parsed = JSON.parse(readFileSync(bsBasePath(dir, 's1'), 'utf-8'));
+    assert.equal(parsed.observedGeneration, undefined, 'no beginObservedGeneration call ran');
+    assert.equal(
+      parsed.observed['hot.md'].generation,
+      0,
+      'recordObserved stamped its own local default',
+    );
+    assert.equal(
+      readObservedHash(dir, 's1', 'hot.md'),
+      null,
+      'a missing observedGeneration counter must never license a write',
+    );
+  });
+});
+
+test('a legacy base.json (no observed/observedGeneration) reads exactly as before ISSUE-116', () => {
+  withBaseWiki((dir) => {
+    snapshotBase(dir, 's1', overwriteTargets('p1')); // writes the pre-ISSUE-116 shape
+    assert.equal(
+      readObservedHash(dir, 's1', 'hot.md'),
+      null,
+      'a legacy base.json has no observed hash for anything',
+    );
+    assert.equal(
+      readBaseEntry(dir, 's1', 'hot.md').state,
+      'hash',
+      'targets/readBaseEntry unaffected',
+    );
+
+    beginObservedGeneration(dir, 's1'); // missing observedGeneration normalizes to 0, then bumps to 1
+    const parsed = JSON.parse(readFileSync(bsBasePath(dir, 's1'), 'utf-8'));
+    assert.equal(parsed.observedGeneration, 1);
+  });
+});
+
 // ── FEAT-11 SessionStart base snapshot (T3) ──────────────────────────────────
 
 suite('hypo-session-start.mjs — observed-base snapshot once per session (FEAT-11 T3)');
@@ -2789,6 +3000,364 @@ test('a Write advances the base to the bytes it wrote, not a racy disk re-read',
       'the concurrent bytes must not become our base',
     );
   });
+});
+
+// ── observed set, end-to-end: real hypo-session-start.mjs + real close (ISSUE-116) ──
+//
+// A multi-day session: SessionStart (fresh) → another session writes AND commits
+// (the real vault's hypo-auto-commit does this within seconds, unlike the
+// uncommitted writeFileSync the T4 conflict tests above use on purpose) →
+// SessionStart again with the SAME session_id (resume) → close. Uses the real
+// hypo-session-start.mjs subprocess, not a unit-level base-store call, because
+// the injection point this depends on (recordObserved's call sites) lives there.
+
+suite('observed set — real SessionStart + real close (ISSUE-116)');
+
+function withObservedProject(fn) {
+  const work = mkdtempSync(join(tmpdir(), 'hypo-observed-work-'));
+  try {
+    withWiki(
+      (dir, today) => {
+        writeFileSync(
+          join(dir, 'projects', T4_PROJECT, 'index.md'),
+          `---\ntitle: ${T4_PROJECT}\ntype: project-index\nupdated: ${today}\nworking_dir: "${work}"\n---\n# ${T4_PROJECT}\n`,
+        );
+      },
+      (dir, today) => fn(dir, today, work),
+    );
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+test('AC1: resume that injected the drifted content unparks the target at close', () => {
+  withObservedProject((dir, today, work) => {
+    let r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'ac1-sess' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `first SessionStart stderr: ${r.stderr}`);
+    const baseBefore = readBaseEntry(dir, 'ac1-sess', t4Rel).hash;
+
+    // Another session writes AND commits while this one is away — the normal
+    // multi-day shape (hypo-auto-commit commits every session's writes within
+    // seconds), not the deliberately-uncommitted fixture the T4 conflict tests use.
+    const drifted = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nanother session wrote and committed this.\n`;
+    writeFileSync(t4ProjectHot(dir), drifted);
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-m', 'other session'], { cwd: dir });
+
+    // Resume: SAME session_id, so the base must not move (existence-check), but
+    // the injection this run performs records the drifted bytes as observed.
+    r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'ac1-sess', source: 'resume' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `resume SessionStart stderr: ${r.stderr}`);
+    assert.equal(
+      readBaseEntry(dir, 'ac1-sess', t4Rel).hash,
+      baseBefore,
+      'resume must not move the base itself — only the observed set grows',
+    );
+
+    const mine = `${drifted}\nthis session's own addition after resume.\n`;
+    const { r: closeR, out } = t4Apply(dir, t4Payload(dir, today, mine, 'ac1 resume'), 'ac1-sess');
+    assert.equal(
+      closeR.status,
+      0,
+      `close must succeed once resume observed the drift: ${JSON.stringify(out.conflicts)}`,
+    );
+    assert.deepEqual(out.conflicts, []);
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), mine, 'the close payload must land');
+  });
+});
+
+test('AC5: a committed external write, with no resume in between, still parks (a commit is not a licence)', () => {
+  // The axis the spec explicitly rejects as a licence (커밋 결합): pins that a
+  // commit by itself never substitutes for an actual SessionStart observation.
+  withWiki(null, (dir, today) => {
+    snapshotBase(dir, 's-committed', overwriteTargets(T4_PROJECT));
+    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+    const otherSession = `${observed}\nthe OTHER session wrote AND committed this.\n`;
+    writeFileSync(t4ProjectHot(dir), otherSession);
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-m', 'other session commit'], { cwd: dir });
+
+    const mine = `${observed}\nmy stale payload.\n`;
+    const { r, out } = t4Apply(dir, t4Payload(dir, today, mine, 'ac5 committed'), 's-committed');
+
+    assert.notEqual(
+      r.status,
+      0,
+      'a committed external write is not, by itself, a licence to overwrite',
+    );
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c, `the committed drift must still park: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.reason, 'base-mismatch');
+    assert.equal(
+      readFileSync(t4ProjectHot(dir), 'utf-8'),
+      otherSession,
+      "the other session's commit survives",
+    );
+  });
+});
+
+test('AC8: readBaseEntry reads an observed-bearing base.json the same as before ISSUE-116', () => {
+  withObservedProject((dir, _today, work) => {
+    const r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'ac8-sess' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const parsed = JSON.parse(readFileSync(bsBasePath(dir, 'ac8-sess'), 'utf-8'));
+    assert.ok(
+      parsed.observed && typeof parsed.observed === 'object',
+      'observed map must be present',
+    );
+    const entry = readBaseEntry(dir, 'ac8-sess', t4Rel);
+    assert.equal(entry.state, 'hash');
+    assert.equal(
+      entry.hash,
+      parsed.targets[t4Rel],
+      'readBaseEntry must still read straight off targets',
+    );
+  });
+});
+
+test('a resumed drift that arrived AFTER the observing SessionStart still parks (residual 2)', () => {
+  // The exact-hash comparison, end-to-end. `observed` holding SOME hash for a
+  // target is not a licence by itself — it must be the SAME hash disk carries
+  // right now. A loosened check ("any observation at all → allow") stays green
+  // on every other ISSUE-116 test here because they all drift BEFORE the
+  // observing resume; this one drifts AFTER, so only the exact comparison
+  // still parks it.
+  withObservedProject((dir, today, work) => {
+    let r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'resid2-sess' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `first SessionStart stderr: ${r.stderr}`);
+
+    r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'resid2-sess', source: 'resume' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `resume stderr: ${r.stderr}`);
+    assert.ok(
+      readObservedHash(dir, 'resid2-sess', t4Rel),
+      'the resume must have recorded an observation to begin with',
+    );
+
+    // Only AFTER this session was shown the file does another session write
+    // and commit — the one difference from AC1, where the drift lands BEFORE
+    // the observing resume.
+    const drifted = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nanother session wrote and committed this AFTER the resume observed it.\n`;
+    writeFileSync(t4ProjectHot(dir), drifted);
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-m', 'other session, post-observation'], { cwd: dir });
+
+    const mine = `${drifted}\nSHOULD NOT LAND.\n`;
+    const { r: closeR, out } = t4Apply(
+      dir,
+      t4Payload(dir, today, mine, 'resid2 close'),
+      'resid2-sess',
+    );
+    assert.notEqual(closeR.status, 0, 'drift that arrived after the observation must still park');
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c, `post-observation drift must park: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.reason, 'base-mismatch');
+    assert.equal(
+      readFileSync(t4ProjectHot(dir), 'utf-8'),
+      drifted,
+      "the other session's post-observation write survives",
+    );
+  });
+});
+
+test('a SessionStart that injects nothing this generation expires a prior observation (end-to-end)', () => {
+  // Same shape as base-store.mjs's unit-level expiry test, but crossing the
+  // real hook process boundary: `beginObservedGeneration`'s call site in
+  // hypo-session-start.mjs, not a direct base-store call, is what must bump
+  // the generation on every SessionStart — deleting that call site left this
+  // green (readObservedHash's generation compare then always matches).
+  withObservedProject((dir, today, work) => {
+    let r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'expire-sess' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `first SessionStart stderr: ${r.stderr}`);
+
+    const drifted = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nanother session wrote and committed this.\n`;
+    writeFileSync(t4ProjectHot(dir), drifted);
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-m', 'other session'], { cwd: dir });
+
+    r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'expire-sess', source: 'resume' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `resume stderr: ${r.stderr}`);
+    assert.equal(
+      readObservedHash(dir, 'expire-sess', t4Rel),
+      bsHashContent(drifted),
+      'resume must have observed the drift',
+    );
+
+    // Hide the target from injection so the NEXT SessionStart shows this
+    // session nothing for it — the injection-free resume the expiry
+    // mechanism must expire the prior observation over.
+    writeFileSync(join(dir, '.hypoignore'), `${t4Rel}\n`);
+
+    r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'expire-sess', source: 'resume' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `second resume stderr: ${r.stderr}`);
+    assert.equal(
+      readObservedHash(dir, 'expire-sess', t4Rel),
+      null,
+      'a SessionStart that injected nothing this generation must expire the prior observation',
+    );
+
+    const mine = `${drifted}\nthis session's own addition after the injection-free resume.\n`;
+    const { r: closeR, out } = t4Apply(
+      dir,
+      t4Payload(dir, today, mine, 'expire close'),
+      'expire-sess',
+    );
+    assert.notEqual(closeR.status, 0, 'an expired observation must not license the write');
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(
+      c,
+      `the target must park once its observation expired: ${JSON.stringify(out.conflicts)}`,
+    );
+    assert.equal(c.reason, 'base-mismatch');
+    assert.equal(
+      readFileSync(t4ProjectHot(dir), 'utf-8'),
+      drifted,
+      "the other session's write survives",
+    );
+  });
+});
+
+test('two real SessionStarts (fresh + resume) advance observedGeneration to 2', () => {
+  // Cheap reinforcement of AC8: the generation counter itself must actually
+  // move across two real SessionStart invocations for the same session_id,
+  // not just once at the first snapshot.
+  withObservedProject((dir, _today, work) => {
+    let r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'gen2-sess' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `first SessionStart stderr: ${r.stderr}`);
+    r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'gen2-sess', source: 'resume' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `resume stderr: ${r.stderr}`);
+    const parsed = JSON.parse(readFileSync(bsBasePath(dir, 'gen2-sess'), 'utf-8'));
+    assert.equal(parsed.observedGeneration, 2, 'two SessionStarts must land two generations');
+  });
+});
+
+test('a truncated injection is stored but never licenses a close-time write (end-to-end)', () => {
+  // Real vault shape the spec measured (2026-09-03): 13 of 34 overwrite
+  // targets exceed HOT_CHARS/STATE_CHARS (2000). A file that grows past that
+  // slice gets recorded as observed-but-truncated, and truncated must never
+  // read back as a licence, regardless of how the drift arrived.
+  withObservedProject((dir, today, work) => {
+    let r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'trunc-sess' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `first SessionStart stderr: ${r.stderr}`);
+
+    const big = `${readFileSync(t4ProjectHot(dir), 'utf-8')}${'x'.repeat(2100)}\n`;
+    writeFileSync(t4ProjectHot(dir), big);
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-m', 'grow past the injection slice'], { cwd: dir });
+
+    r = runHook(
+      'hypo-session-start.mjs',
+      { cwd: work, session_id: 'trunc-sess', source: 'resume' },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `resume stderr: ${r.stderr}`);
+    assert.equal(
+      readObservedHash(dir, 'trunc-sess', t4Rel),
+      null,
+      'a truncated injection must not read back as a licence',
+    );
+    assert.equal(wasObservedTruncated(dir, 'trunc-sess', t4Rel), true);
+
+    const mine = `${big}\nthis session's addition after the sliced resume.\n`;
+    const { r: closeR, out } = t4Apply(
+      dir,
+      t4Payload(dir, today, mine, 'truncated close'),
+      'trunc-sess',
+    );
+    assert.notEqual(closeR.status, 0, 'a truncated observation must not license the write');
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c, `the target must park: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.reason, 'base-mismatch-truncated-observation');
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), big, 'the target must stay untouched');
+  });
+});
+
+// The gate is only as good as the promise that nothing automated reaches it. Scan
+// EXECUTABLE code, not prose: a doc comment naming the command is documentation, a
+// call is a bypass.
+test('recordObserved is only ever handed injected bytes, never a fresh disk read', () => {
+  // The observed set licenses a close to overwrite bytes this session was SHOWN.
+  // That guarantee lives entirely in WHICH bytes get hashed at the call site:
+  // `hashContent(read.raw)`, where `read` is the same object the injection
+  // printed. Swapping it for `hashContent(readFileSync(path))` re-reads disk
+  // and would credit a write that landed between the read and this line as an
+  // observation that never happened — silently widening the license to bytes
+  // nobody saw.
+  //
+  // Behavioural tests cannot reach that window: it is inside a single hook
+  // process, between two adjacent statements, with no seam a fixture can drive.
+  // A mutation that made the swap left all 141 proposal-base tests green
+  // (measured 2026-09-03), which is exactly the gap this scan closes. Read
+  // the source, strip comments so a doc example cannot trip it, and pin the
+  // ARGUMENT SHAPE.
+  const src = readFileSync(join(REPO, 'hooks', 'hypo-session-start.mjs'), 'utf-8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+
+  // Every recordObserved(...) call, with its full argument list (the calls are
+  // multi-line, so `[\s\S]` and a lazy quantifier up to the closing paren).
+  const calls = [...src.matchAll(/recordObserved\(([\s\S]*?)\);/g)].map((m) => m[1]);
+  assert.equal(
+    calls.length,
+    3,
+    `expected the 3 known recordObserved call sites (HIT hot, HIT session-state, MISS root hot); found ${calls.length} — a new one must be checked by hand and added here`,
+  );
+
+  for (const args of calls) {
+    assert.match(
+      args,
+      /hashContent\(\s*\w+\.raw\s*\)/,
+      `recordObserved must hash the injected bytes (\`hashContent(<read>.raw)\`); got: ${args.replace(/\s+/g, ' ').trim()}`,
+    );
+    assert.equal(
+      /readFileSync|readIfNotIgnored|hashFile/.test(args),
+      false,
+      `recordObserved must not re-read the file at the call site; got: ${args.replace(/\s+/g, ' ').trim()}`,
+    );
+  }
 });
 
 // ── hypo-shared.mjs — withFileLock (FEAT-11 T5) ──────────────────────────────
@@ -3709,10 +4278,6 @@ test('ISSUE-49: hasTypedUserApproval pins the nonce shape (no wildcard match)', 
   });
 });
 
-// The gate is only as good as the promise that nothing automated reaches it. Scan
-// EXECUTABLE code, not prose: a doc comment naming the command is documentation, a
-// call is a bypass. (hypo-shared legitimately DEFINES the approval matcher; what it
-// must never do is drive an apply.)
 test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never a hook’s', () => {
   const hooksDir = join(REPO, 'hooks');
   for (const name of readdirSync(hooksDir)) {
