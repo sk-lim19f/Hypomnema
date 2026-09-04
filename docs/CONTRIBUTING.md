@@ -45,12 +45,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full breakdown. Short version:
 
 | Path | What lives there |
 |---|---|
-| `commands/` | LLM-facing prompts for `/hypo:*` slash commands |
+| `commands/` | LLM-facing prompts for `/hypo:*` slash commands — each is also an Agent Skill (auto-triggers on its `description`) |
 | `scripts/` | Node.js implementations called by the commands |
 | `scripts/lib/` | Shared helpers for scripts (`frontmatter`, `hypo-root`, `hypo-ignore`) |
 | `hooks/` | Lifecycle hooks + `hooks.json` registry |
 | `hooks/hypo-shared.mjs` | Shared hook utilities — read the deployment constraint below |
-| `skills/<name>/SKILL.md` | Agent Skills (auto-trigger via description match) |
+| `skills/<name>/SKILL.md` | Directory-form Agent Skills — only for a skill needing more than one file (`skills/debate/references/`). The name must not collide with `commands/` |
 | `templates/` | Files copied into new wiki vaults on init |
 | `tests/` | Test suite (no external deps): `harness.mjs`, `helpers.mjs`, `runner.mjs` (entry), and one `<area>.test.mjs` per production area |
 | `docs/` | ARCHITECTURE, CONTRIBUTING |
@@ -77,7 +77,7 @@ Scripts under `scripts/` are not deployed and may freely import from `scripts/li
 
 1. Edit `commands/<name>.md` — the LLM-facing prompt.
 2. Edit `scripts/<name>.mjs` — the Node.js logic.
-3. If the command is new and synthesis-heavy, add `skills/<name>/SKILL.md`.
+3. Do **not** add `skills/<name>/SKILL.md` for it. A `commands/*.md` file is already an Agent Skill and auto-triggers on its `description`; a same-named directory skill claims the same `/hypo:<name>`, and `npm run smoke:plugin` fails on the collision. To change when it auto-triggers, edit that `description`.
 4. Update the command table in `README.md` and `README.ko.md`.
 5. Add coverage to the matching `tests/<area>.test.mjs` (a new command usually means a new area file).
 
@@ -109,10 +109,17 @@ If you need to share new logic, prefer extending an existing helper over adding 
 
 ### Adding an Agent Skill
 
-1. Create `skills/<name>/SKILL.md`.
-2. The frontmatter must include `name`, `description`, and the trigger criteria.
+Use the directory form only when the skill needs more than one file (`skills/debate/references/`).
+Everything else belongs in `commands/`, which loads the same way.
+
+1. Create `skills/<name>/SKILL.md`. **The name must not collide with any `commands/<name>.md`** —
+   both claim `/hypo:<name>`, only one wins, and `npm run smoke:plugin` fails on the pair.
+2. The frontmatter must include a `description` carrying the trigger criteria. `name` is
+   optional — omit it and the directory name is the invocation name (`skills/debate/SKILL.md`
+   does this). If you do set it, it must equal the directory name; `smoke:plugin` fails otherwise.
 3. The skill body is the LLM prompt — keep it focused on the synthesis task.
-4. Add to the skills inventory in `README.md`.
+4. Describe it in the **Claude Agent Skills** section of `README.md` and `README.ko.md`, the way
+   `debate` is described there. (There is no separate skills inventory table.)
 
 ---
 
