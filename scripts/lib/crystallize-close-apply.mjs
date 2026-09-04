@@ -1046,6 +1046,8 @@ function runPreflight(args, payload, project, date) {
  * rather than returning partial lists for the caller to merge, so the ordering
  * of the report lines is the call order, exactly as it was inline.
  *
+ * Replace a whole page, guarded by the base this session observed at start.
+ *
  * The step order inside `overwrite` is load-bearing, not stylistic:
  *
  *   1. idempotent skip (disk already equals the payload)

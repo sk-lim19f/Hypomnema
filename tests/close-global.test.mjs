@@ -19,6 +19,11 @@ import { tmpdir } from 'node:os';
 // crystallize.mjs guards its CLI dispatch behind isMain(), so importing these
 // pure close-pipeline functions does not run the CLI.
 import { planMarkerDecision, closeResultContradiction } from '../scripts/crystallize.mjs';
+// Seeds this session's observed-base record directly (bypassing the real
+// SessionStart hook that normally writes it) so a single test can make the
+// overwrite step 2 conflict-park check see "this session already read the
+// current bytes" without a live session.
+import { snapshotBase } from '../hooks/base-store.mjs';
 import { test, suite } from './harness.mjs';
 import {
   CLOSE_RECONFIRM_MARK,
@@ -2441,6 +2446,88 @@ test('--apply-session-close text output: markerWritten:false prints loud stderr 
       `stderr must mention Stop-chain so the reader knows the session is not closed: ${JSON.stringify(r.stderr)}`,
     );
   });
+});
+
+// printCloseReport's `!ok` branch (crystallize-close-apply.mjs:1801-1815) has no
+// test exercising it: the only text-output apply test above stays on the
+// `ok:true` / markerSkipReason path. Drive BOTH `!ok` lines in one run so a
+// future signature drift on printCloseReport's destructured params (e.g.
+// `postBlocking` renamed at the call site but not the function, or vice
+// versa) throws instead of silently rendering `undefined`.
+test('--apply-session-close text output: ok:false prints both the stale-verification line and the lint-blocker line', () => {
+  withWiki(
+    (dir, today) => {
+      // Stale the project hot.md BEFORE the initial commit (git stays clean).
+      const projHotPath = join(dir, 'projects', 'test-project', 'hot.md');
+      writeFileSync(
+        projHotPath,
+        readFileSync(projHotPath, 'utf-8').replace(`updated: ${today}`, 'updated: 2020-01-01'),
+      );
+    },
+    (dir, today) => {
+      // REQUIRED_PAYLOAD_FIELDS forces `projectHot` to be present, but echoing
+      // the stale on-disk bytes back hits the overwrite's idempotent-skip step
+      // (disk === field.content): nothing refreshes the file, so post-apply
+      // verification still reports it stale — printCloseReport:1801-1809.
+      const staleProjHot = readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8');
+      const payload = {
+        project: 'test-project',
+        date: today,
+        sessionState: {
+          // No `title`: a required frontmatter field. This lands ON DISK (preflight
+          // ignores errors in files about to be overwritten) and only post-apply
+          // lint — scoped to this apply's own payload files — catches it, which is
+          // exactly the blocker printCloseReport:1810-1814 renders.
+          content: `---\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- next\n`,
+        },
+        projectHot: { content: staleProjHot },
+        rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+        sessionLog: { entry: `## [${today}] ok-false text test\n` },
+        log: { entry: `## [${today}] session | test-project: ok-false text\n` },
+      };
+      const payloadPath = join(
+        tmpdir(),
+        `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+      );
+      writeFileSync(payloadPath, JSON.stringify(payload));
+      const cleanup = seedCloseTranscript('s-okfalse-text');
+      // Without a recorded base, overwrite's conflict check (step 2) sees an
+      // 'unknown' base for ANY session id and parks session-state.md instead of
+      // writing it — a real SessionStart hook would have snapshotted this by now,
+      // so seed it directly: "this session already read the current (title-having)
+      // bytes", which is still true for the broken payload below.
+      snapshotBase(dir, 's-okfalse-text', [join('projects', 'test-project', 'session-state.md')]);
+      let r;
+      try {
+        r = run('crystallize.mjs', [
+          `--hypo-dir=${dir}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          '--session-id=s-okfalse-text',
+        ]);
+      } finally {
+        cleanup();
+        rmSync(payloadPath, { force: true });
+      }
+      assert.equal(r.status, 1, `ok:false apply must exit 1: ${r.stdout}\n${r.stderr}`);
+      assert.ok(
+        r.stdout.includes('✗ session-close still incomplete after apply:'),
+        `stdout must report the stale verification: ${JSON.stringify(r.stdout)}`,
+      );
+      assert.ok(
+        r.stdout.includes('hot.md'),
+        `stale reason must name the untouched project hot.md: ${JSON.stringify(r.stdout)}`,
+      );
+      assert.ok(
+        r.stdout.includes('✗ post-apply lint failed:'),
+        `stdout must report the lint blocker: ${JSON.stringify(r.stdout)}`,
+      );
+      assert.ok(
+        r.stdout.includes('Missing required frontmatter field: title'),
+        `lint blocker must name the payload-introduced error: ${JSON.stringify(r.stdout)}`,
+      );
+    },
+  );
 });
 
 test('--apply-session-close routes the marker write through the full gate — refuses on feedback over-cap', () => {
