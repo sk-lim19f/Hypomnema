@@ -1018,18 +1018,45 @@ function runPreflight(args, payload, project, date) {
   const blockingErrors = preflightLint.errors.filter(
     (e) => payloadScope.has(e.file) && !overwriteTargets.has(e.file),
   );
-  if (blockingErrors.length > 0) {
+  // W9 (invalid-YAML frontmatter) legacy-debt policy: the SAME append-target
+  // rule as blockingErrors above, applied to W9 specifically. A pre-existing
+  // broken frontmatter block on an append target (log.md, the session-log
+  // shard) can never be healed by this close, because appendIfAbsent only adds
+  // bytes below the block and never rewrites it. Leaving it unblocked would let
+  // every future close keep appending onto (and reporting success over) a file
+  // post-apply lint can never certify clean, so it is blocked HERE, before a
+  // single byte is written, exactly like a pre-existing lint ERROR in an
+  // append target already does two lines above. Overwrite targets are exempt
+  // for the same reason blockingErrors exempts them: this close is about to
+  // replace their bytes outright, so their PRE-existing frontmatter is moot
+  // (the post-apply check below is what catches a payload that writes its own
+  // broken YAML into one of those). Out-of-scope W9 debt elsewhere in the
+  // vault (this repo's own maintainer vault carries one, under
+  // pages/feedback/) is untouched by this filter and stays a plain warn.
+  //
+  // W9 carries no `id` in the default (non-strict) --json warns lint.mjs
+  // returns, only W8 does (see lint.mjs's `toOut`), so it is matched by its
+  // fixed message prefix instead, the same technique registerPendingTags
+  // above already uses for W10.
+  const blockingW9 = (preflightLint.warns || []).filter(
+    (w) =>
+      INVALID_YAML_WARN_RE.test(w.message || '') &&
+      payloadScope.has(w.file) &&
+      !overwriteTargets.has(w.file),
+  );
+  const allPreflightBlocking = [...blockingErrors, ...blockingW9];
+  if (allPreflightBlocking.length > 0) {
     const out = {
       ok: false,
       stage: 'preflight-lint',
       error: 'lint preflight failed — apply aborted (no payload bytes written)',
-      lint: { ...summarizeLintForOutput(preflightLint), blockingErrors },
+      lint: { ...summarizeLintForOutput(preflightLint), blockingErrors: allPreflightBlocking },
     };
     if (args.json) {
       console.log(JSON.stringify(out, null, 2));
     } else {
       console.log('✗ lint preflight failed — apply aborted (no payload bytes written):');
-      for (const e of blockingErrors) console.log(`  ✗ ${e.file}: ${e.message}`);
+      for (const e of allPreflightBlocking) console.log(`  ✗ ${e.file}: ${e.message}`);
       console.log('  Fix the wiki (run `node scripts/lint.mjs`) and retry.');
     }
     process.exit(1);
@@ -1411,6 +1438,14 @@ function parkOverwriteConflicts(args, conflicts) {
 // than truncated at its first quote (codex stage-2 CONCERN).
 const unknownTagRe = /^Unknown tag: "(.+)" \(not in SCHEMA\.md Tag Vocabulary\)/;
 
+// W9 (invalid-YAML frontmatter) is warn-severity in lint.mjs's default,
+// non-strict classification, and its `id` is stripped from the --json warns
+// this apply reads (only W8 survives toOut without --strict, see lint.mjs).
+// Matched by its fixed message prefix instead, same technique as
+// unknownTagRe above. Shared by runPreflight's append-target legacy-debt
+// check and runPostApplyLint's payload-scope promotion below.
+const INVALID_YAML_WARN_RE = /^Invalid YAML frontmatter: /;
+
 function registerPendingTags(args, preflightLint, hasConflicts) {
   const pendingTags = [];
   for (const w of preflightLint.warns || []) {
@@ -1459,10 +1494,32 @@ function runPostApplyLint(args, payloadScope) {
     postBlocking = postApplyLint.errors;
     postNotice = [];
   } else {
-    ({ blocking: postBlocking, notice: postNotice } = partitionLintScope(
+    const { blocking: errBlocking, notice: errNotice } = partitionLintScope(
       postApplyLint.errors || [],
       payloadScope,
-    ));
+    );
+    // W9 promotion (codex pre-commit review): invalid-YAML frontmatter is
+    // warn-severity, not error, in lint.mjs's default classification, so it
+    // never reached `errors` above without an operator opting into --strict.
+    // A wiki with no --lint-strict pre-commit hook installed could then reach
+    // ok:true and exit 0 with corrupt frontmatter sitting in a file this very
+    // close just wrote. Promote it here to a close-blocking finding, but ONLY
+    // inside payloadScope: this partition is the single source of "this
+    // close's own neighborhood" already used for errors above, so a W9 warn
+    // anywhere else in the vault (this repo's own maintainer vault carries
+    // one, under pages/feedback/) is discarded outright below and never
+    // folded into `postNotice` either. That is untouched, not merely
+    // non-blocking, matching runPreflight's identical scope contract for the
+    // append-target legacy-debt case above. W1 (no-frontmatter) is
+    // deliberately NOT promoted here: a legacy vault's frontmatter-less
+    // log.md is the documented shape --strict itself exempts, and this close
+    // path must keep accepting it.
+    const w9Blocking = partitionLintScope(
+      (postApplyLint.warns || []).filter((w) => INVALID_YAML_WARN_RE.test(w.message || '')),
+      payloadScope,
+    ).blocking;
+    postBlocking = [...errBlocking, ...w9Blocking];
+    postNotice = errNotice;
   }
   const postLintOk = !postApplyCrashed && postBlocking.length === 0;
   return { postApplyLint, postBlocking, postNotice, postLintOk };
