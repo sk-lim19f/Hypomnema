@@ -713,69 +713,40 @@ export function ensureProjectIndex(hypoDir, project, relPath, today) {
   return relPath;
 }
 
-export function applySessionClose(args) {
-  // Option D: early-exit fires only when NO payload was supplied.
-  // Rationale: payload presence is explicit close intent and must always run
-  // the full apply path — the per-entry idempotency (overwrite's step-1 skip +
-  // exact-entry append dedup) keeps re-apply cheap without short-circuiting,
-  // and avoids silent-success when a same-day second close brings new bytes.
-  // Payload-less invocation is treated as a cheap "already complete?" probe.
-  // --force opts out of that probe shortcut only — payload remains required
-  // for any actual apply work (readPayload below surfaces "payload is
-  // required" the same way it always has).
-  if (!args.force && !args.payload) {
-    // No-payload "already complete?" probe uses the
-    // global invariant, not a recency pick.
-    const probe = sessionCloseGlobalStatus(args.hypoDir);
-    if (probe.ok) {
-      const result = {
-        ok: true,
-        alreadyComplete: true,
-        project: probe.project,
-        date: probe.dates[0],
-        message: '오늘 이미 close 완료로 보임 (probe 모드 — payload 미지정).',
-      };
-      if (args.json) {
-        console.log(JSON.stringify(result, null, 2));
-      } else {
-        console.log(`✓ ${result.message}`);
-        console.log(`  project: ${result.project} / date: ${result.date}`);
-      }
-      process.exit(0);
-    }
-    // gate not ok → fall through to readPayload, which surfaces
-    // "payload is required" with the same error shape as before.
-  }
-
-  // ── close authority: BEFORE any write ──────────────────────────────────────
-  // A payload is a claim that the user asked to close. Verify it here, ahead of
-  // readPayload and every byte that follows, because everything after this point
-  // is authoritative: session-state.md and the hot files are overwritten, the
-  // session-log and log.md are appended, and hypo-auto-commit lands the lot in git
-  // on the next Stop whether or not this command commits.
-  //
-  // The gate used to stand at the END, next to the marker (planMarkerDecision).
-  // It refused the MARKER on a close the user never asked for, and let the writes
-  // and the commit through. Worse, it was opt-in BY THE CALLER: with no
-  // --session-id there was no transcript to check, so the check simply did not
-  // run, and the apply reported ok:true with no skip reason at all. The model
-  // chose whether the model got checked. A model that has already decided to close
-  // does not reach for the flag that would stop it.
-  //
-  // So: no verifiable close signal, no close. Zero bytes, no commit, exit 1.
-  //
-  // What this does and does not promise. It promises that THIS entrypoint refuses
-  // a close with no recognized transcript evidence behind it. It does not promise
-  // the model cannot write these files at all: Write and Bash remain outside this
-  // gate, and the evidence predicate itself is coarse (any close signal anywhere in
-  // the transcript counts, so a stale one from earlier in a long session still
-  // passes, and it is the model that authors the AskUserQuestion option labels the
-  // user picks from). Narrowing that (current-turn binding, revocation, consent
-  // that the model did not word) is the follow-up this ADR names; it is not a
-  // reason to leave the default open in the meantime.
-  // Only a payload-bearing call can write. A payload-less one falls through to the
-  // "payload is required" error below without touching a byte, so gating it here
-  // would just replace one refusal with a less accurate one.
+// ── close authority: BEFORE any write ──────────────────────────────────────
+// A payload is a claim that the user asked to close. Verify it here, ahead of
+// readPayload and every byte that follows, because everything after this point
+// is authoritative: session-state.md and the hot files are overwritten, the
+// session-log and log.md are appended, and hypo-auto-commit lands the lot in git
+// on the next Stop whether or not this command commits.
+//
+// The gate used to stand at the END, next to the marker (planMarkerDecision).
+// It refused the MARKER on a close the user never asked for, and let the writes
+// and the commit through. Worse, it was opt-in BY THE CALLER: with no
+// --session-id there was no transcript to check, so the check simply did not
+// run, and the apply reported ok:true with no skip reason at all. The model
+// chose whether the model got checked. A model that has already decided to close
+// does not reach for the flag that would stop it.
+//
+// So: no verifiable close signal, no close. Zero bytes, no commit, exit 1.
+//
+// What this does and does not promise. It promises that THIS entrypoint refuses
+// a close with no recognized transcript evidence behind it. It does not promise
+// the model cannot write these files at all: Write and Bash remain outside this
+// gate, and the evidence predicate itself is coarse (any close signal anywhere in
+// the transcript counts, so a stale one from earlier in a long session still
+// passes, and it is the model that authors the AskUserQuestion option labels the
+// user picks from). Narrowing that (current-turn binding, revocation, consent
+// that the model did not word) is the follow-up this ADR names; it is not a
+// reason to leave the default open in the meantime.
+// Only a payload-bearing call can write. A payload-less one falls through to the
+// "payload is required" error below without touching a byte, so gating it here
+// would just replace one refusal with a less accurate one.
+//
+// Refuses in place (console.log + process.exit(1)) instead of returning a
+// verdict: process.exit never returns, so the caller's flow stops exactly where
+// it stopped before this section was a function of its own.
+function refuseUnlessCloseRequested(args) {
   const closeAuth = args.payload
     ? verifyCloseAuthority(args.sessionId, args.hypoDir)
     : { ok: true };
@@ -796,7 +767,11 @@ export function applySessionClose(args) {
     );
     process.exit(1);
   }
+}
 
+// Read the payload, check its shape, and bind it to THIS session. Exits 1 on any
+// of the three failures; returns the parsed payload otherwise.
+function loadValidatedPayload(args) {
   let payload;
   try {
     payload = readPayload(args.payload);
@@ -856,21 +831,25 @@ export function applySessionClose(args) {
     process.exit(1);
   }
 
-  // Resolve project: payload.project is REQUIRED (B-3, close-gate-hardening). The
-  // old recency fallback (payload.project || probe.project) could, on a same-date
-  // root-hot.md tie, resolve a DIFFERENT project than the one the payload's files
-  // belong to — apply would then write the close into the wrong project (silent
-  // data loss). Validate fail-fast, BEFORE the probe is consulted:
-  //   - missing      → no target to write; abort rather than infer.
-  //   - invalid name → reject (non-string, wrong charset, or dot-only) BEFORE the
-  //                    existsSync(join(...)) path build, so a `../`-style value
-  //                    never reaches a path builder (traversal guard — order is
-  //                    the guard). isValidProjectName is SHARED with createProject
-  //                    so apply accepts exactly the namespace the repo can
-  //                    scaffold (A-Za-z0-9._-, single segment) — no narrower.
-  //   - non-existent → projects/<slug>/ absent; abort rather than create.
-  // A payload.project that merely DIFFERS from the inferred active project is NOT an
-  // error — it is surfaced as a stderr note below and the close proceeds.
+  return payload;
+}
+
+// Resolve project: payload.project is REQUIRED (B-3, close-gate-hardening). The
+// old recency fallback (payload.project || probe.project) could, on a same-date
+// root-hot.md tie, resolve a DIFFERENT project than the one the payload's files
+// belong to — apply would then write the close into the wrong project (silent
+// data loss). Validate fail-fast, BEFORE the probe is consulted:
+//   - missing      → no target to write; abort rather than infer.
+//   - invalid name → reject (non-string, wrong charset, or dot-only) BEFORE the
+//                    existsSync(join(...)) path build, so a `../`-style value
+//                    never reaches a path builder (traversal guard — order is
+//                    the guard). isValidProjectName is SHARED with createProject
+//                    so apply accepts exactly the namespace the repo can
+//                    scaffold (A-Za-z0-9._-, single segment) — no narrower.
+//   - non-existent → projects/<slug>/ absent; abort rather than create.
+// A payload.project that merely DIFFERS from the inferred active project is NOT an
+// error — it is surfaced as a stderr note below and the close proceeds.
+function resolveCloseProject(args, payload) {
   if (payload.project === undefined || payload.project === null) {
     const msg = 'payload.project is required (apply must not infer the close target project)';
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
@@ -911,15 +890,17 @@ export function applySessionClose(args) {
         `project "${probe.project}"; verifying and closing "${payload.project}".\n`,
     );
   }
-  const date = payload.date || todayLocal();
+  return project;
+}
 
-  // Pre-apply freshness-contract gate: the post-apply verification holds
-  // sessionCloseFileStatus's hasSessionLogHeading / hasLogEntry as the
-  // definition of "closed today". Enforce that SAME contract on the payload
-  // BEFORE writing a byte, so a heading the gate won't recognize is rejected
-  // here as a format mismatch — not written and then misdiagnosed downstream as
-  // "stale" (the "not updated" vs "format mismatch" conflation). All checks
-  // exit 1 with stage='pre-apply-verification' and leave the tree untouched.
+// Pre-apply freshness-contract gate: the post-apply verification holds
+// sessionCloseFileStatus's hasSessionLogHeading / hasLogEntry as the
+// definition of "closed today". Enforce that SAME contract on the payload
+// BEFORE writing a byte, so a heading the gate won't recognize is rejected
+// here as a format mismatch — not written and then misdiagnosed downstream as
+// "stale" (the "not updated" vs "format mismatch" conflation). All checks
+// exit 1 with stage='pre-apply-verification' and leave the tree untouched.
+function assertPayloadFreshnessContract(args, payload, project, date) {
   const failPreApply = (msg) => {
     console.log(
       args.json
@@ -957,24 +938,30 @@ export function applySessionClose(args) {
         `close gate recognizes. Fix the entry heading, or omit payload.log to derive it.`,
     );
   }
+}
 
-  // Preflight: lint the wiki BEFORE writing any payload bytes. If lint
-  // has blockers (errors) in files this apply WON'T overwrite, the wiki is in
-  // a degraded state and apply would mask the root cause — abort fail-fast.
-  //
-  // Overwrite-target filter (codex P2 follow-up): errors in files we're about
-  // to fully replace are IGNORED at preflight. Otherwise a bad payload
-  // (post-apply-lint fail) would leave the broken file on disk and the very
-  // next retry — even with a corrected payload — gets dead-locked here. The
-  // post-apply lint is the authoritative check on payload content.
-  //
-  // Append targets (session-log, log.md) are NOT filtered: appending can't
-  // repair existing corruption, so a corrupt session-log must still block.
-  // Warns are informational (not gated) in either pass.
-  //
-  // The filter says "about to be replaced", and the observed-base guard can later
-  // decline to replace one of these. Preflight runs before the guard, so it cannot
-  // know. Harmless: post-apply lint re-scopes the same file and blocks on it there.
+// Preflight: lint the wiki BEFORE writing any payload bytes. If lint
+// has blockers (errors) in files this apply WON'T overwrite, the wiki is in
+// a degraded state and apply would mask the root cause — abort fail-fast.
+//
+// Overwrite-target filter (codex P2 follow-up): errors in files we're about
+// to fully replace are IGNORED at preflight. Otherwise a bad payload
+// (post-apply-lint fail) would leave the broken file on disk and the very
+// next retry — even with a corrected payload — gets dead-locked here. The
+// post-apply lint is the authoritative check on payload content.
+//
+// Append targets (session-log, log.md) are NOT filtered: appending can't
+// repair existing corruption, so a corrupt session-log must still block.
+// Warns are informational (not gated) in either pass.
+//
+// The filter says "about to be replaced", and the observed-base guard can later
+// decline to replace one of these. Preflight runs before the guard, so it cannot
+// know. Harmless: post-apply lint re-scopes the same file and blocks on it there.
+//
+// Returns the payload scope and the A-1 index facts alongside the lint result:
+// both are derived here (before any write) and consumed by the write and
+// post-apply phases.
+function runPreflight(args, payload, project, date) {
   const overwriteTargets = new Set();
   if (payload.sessionState) overwriteTargets.add(join('projects', project, 'session-state.md'));
   if (payload.projectHot) overwriteTargets.add(join('projects', project, 'hot.md'));
@@ -1048,38 +1035,38 @@ export function applySessionClose(args) {
     process.exit(1);
   }
 
-  const applied = [];
-  const skipped = [];
-  // The ACTUAL vault-relative paths this apply wrote, kept separate
-  // from `applied` (whose entries are display strings like `key (relPath)`,
-  // not bare paths). This is the scope handed to commitWikiChanges below;
-  // never the broader `payloadScope` above, which also includes lint/evidence
-  // candidates this apply may not have written a byte to.
-  const appliedPaths = [];
-  // Overwrite targets this apply refused to write because the page moved under
-  // it. T6 turns these into `.cache/proposals/` artifacts; here they are already
-  // enough to withhold the bytes and fail the close.
-  const conflicts = [];
+  return { preflightLint, payloadScope, indexRelPath, indexMissing };
+}
 
-  /**
-   * Replace a whole page, guarded by the base this session observed at start.
-   *
-   * The step order is load-bearing, not stylistic:
-   *
-   *   1. idempotent skip (disk already equals the payload)
-   *   2. conflict (base unknown, or disk drifted away from base)
-   *   3. direct write, then advance the base
-   *
-   * Step 1 must come first for two reasons. It keeps every existing
-   * `--apply-session-close --session-id` test green (they read the payload
-   * straight off disk, so they land here before any base lookup). And it breaks
-   * the apply-then-reclose loop: once a human applies proposal P, disk == proposed
-   * == payload.content, so the next close skips before it can re-raise a conflict.
-   *
-   * There is no caller here without a `--session-id`. verifyCloseAuthority refuses
-   * that at the door, before a byte is written, so a session id is always present
-   * by the time this runs and the base lookup always has something to look up.
-   */
+/**
+ * Replace every whole-page overwrite target, then fill a missing project index.
+ *
+ * `acc` is the shared accumulator bag (`applied` / `skipped` / `appliedPaths` /
+ * `conflicts`) the caller owns; every write phase pushes into the same arrays
+ * rather than returning partial lists for the caller to merge, so the ordering
+ * of the report lines is the call order, exactly as it was inline.
+ *
+ * Replace a whole page, guarded by the base this session observed at start.
+ *
+ * The step order inside `overwrite` is load-bearing, not stylistic:
+ *
+ *   1. idempotent skip (disk already equals the payload)
+ *   2. conflict (base unknown, or disk drifted away from base)
+ *   3. direct write, then advance the base
+ *
+ * Step 1 must come first for two reasons. It keeps every existing
+ * `--apply-session-close --session-id` test green (they read the payload
+ * straight off disk, so they land here before any base lookup). And it breaks
+ * the apply-then-reclose loop: once a human applies proposal P, disk == proposed
+ * == payload.content, so the next close skips before it can re-raise a conflict.
+ *
+ * There is no caller here without a `--session-id`. verifyCloseAuthority refuses
+ * that at the door, before a byte is written, so a session id is always present
+ * by the time this runs and the base lookup always has something to look up.
+ */
+function applyOverwrites(args, payload, project, date, indexRelPath, indexMissing, acc) {
+  const { applied, skipped, appliedPaths, conflicts } = acc;
+
   const overwrite = (key, relPath, field) => {
     if (!field || typeof field.content !== 'string') return; // optional / absent
     const full = join(args.hypoDir, relPath);
@@ -1161,125 +1148,131 @@ export function applySessionClose(args) {
       appliedPaths.push(createdIndex);
     }
   }
+}
 
-  // Append idempotency: dedup by exact-entry presence, not by "any heading
-  // dated today". The freshness gate (sessionCloseFileStatus) is what answers
-  // "was this file touched today?"; that's a different concern and must not
-  // be reused for apply-time dedup, or a legitimate same-day second close gets
-  // silently dropped (Codex review of the apply path — Worker 1 finding 2).
-  const entryAlreadyPresent = (entry) => (content) =>
-    content.includes(entry.endsWith('\n') ? entry.replace(/\n+$/, '') : entry);
+// Append idempotency: dedup by exact-entry presence, not by "any heading
+// dated today". The freshness gate (sessionCloseFileStatus) is what answers
+// "was this file touched today?"; that's a different concern and must not
+// be reused for apply-time dedup, or a legitimate same-day second close gets
+// silently dropped (Codex review of the apply path — Worker 1 finding 2).
+const entryAlreadyPresent = (entry) => (content) =>
+  content.includes(entry.endsWith('\n') ? entry.replace(/\n+$/, '') : entry);
 
-  {
-    const rel = join('projects', project, 'session-log', `${date}.md`);
-    const full = join(args.hypoDir, rel);
-    const isPresent = entryAlreadyPresent(payload.sessionLog.entry);
-    // Serialize dedup + create/append on the daily shard so two concurrent
-    // closes never lose an entry: the second closer takes the lock only after
-    // the first committed, re-reads the shard under the lock, and appends onto
-    // the committed bytes (temp+rename write-isolation is preserved — a partial
-    // write never tears the target). Create and append share ONE lock, so the
-    // "seed a new shard" and "append to an existing shard" branches can't race
-    // each other — only one closer is ever in the create path (closes the
-    // wx-window a bare exclusive-create would leave open).
-    try {
-      const outcome = withFileLock(
-        full,
-        () => {
-          // Fallback-aware idempotency (hybrid cutover): during the month the
-          // shard takes over, today's entry may already live in the legacy monthly
-          // file from an earlier (pre-cutover) close. Treat presence in EITHER the
-          // daily shard or the legacy monthly file as "already written" so a same-day
-          // second close does not duplicate an identical entry across both files —
-          // and so an idempotent re-apply stays a true no-op (no shard is created).
-          for (const cand of sessionLogReadCandidates(project, date)) {
-            const cf = join(args.hypoDir, cand);
-            if (!existsSync(cf)) continue;
-            try {
-              if (isPresent(readFileSync(cf, 'utf-8'))) return 'skipped';
-            } catch {
-              /* unreadable candidate — fall through to the write path */
-            }
+// Append this close's entry to the project's daily session-log shard, pushing the
+// outcome into the shared `acc` bag.
+function appendSessionLogEntry(args, payload, project, date, acc) {
+  const { applied, skipped, appliedPaths, conflicts } = acc;
+  const rel = join('projects', project, 'session-log', `${date}.md`);
+  const full = join(args.hypoDir, rel);
+  const isPresent = entryAlreadyPresent(payload.sessionLog.entry);
+  // Serialize dedup + create/append on the daily shard so two concurrent
+  // closes never lose an entry: the second closer takes the lock only after
+  // the first committed, re-reads the shard under the lock, and appends onto
+  // the committed bytes (temp+rename write-isolation is preserved — a partial
+  // write never tears the target). Create and append share ONE lock, so the
+  // "seed a new shard" and "append to an existing shard" branches can't race
+  // each other — only one closer is ever in the create path (closes the
+  // wx-window a bare exclusive-create would leave open).
+  try {
+    const outcome = withFileLock(
+      full,
+      () => {
+        // Fallback-aware idempotency (hybrid cutover): during the month the
+        // shard takes over, today's entry may already live in the legacy monthly
+        // file from an earlier (pre-cutover) close. Treat presence in EITHER the
+        // daily shard or the legacy monthly file as "already written" so a same-day
+        // second close does not duplicate an identical entry across both files —
+        // and so an idempotent re-apply stays a true no-op (no shard is created).
+        for (const cand of sessionLogReadCandidates(project, date)) {
+          const cf = join(args.hypoDir, cand);
+          if (!existsSync(cf)) continue;
+          try {
+            if (isPresent(readFileSync(cf, 'utf-8'))) return 'skipped';
+          } catch {
+            /* unreadable candidate — fall through to the write path */
           }
-          if (!existsSync(full)) {
-            // A daily shard is a new file most days. Seed minimal valid frontmatter
-            // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
-            // wiki page rather than a W1 "no frontmatter" warning, and write the header
-            // AND the first entry in ONE atomic write — never leave a header-only shard
-            // on disk, which freshness would skip (no dated heading) while derive could
-            // otherwise mistake it for the evidence file. The dated `## [date] ...`
-            // heading lives inside the entry, so freshness / derive / design-history
-            // are unchanged.
-            // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
-            // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
-            // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
-            // machine that first seeds the daily shard is recorded; later same-day
-            // appends do not touch it. The per-session-accurate store is the LOCAL
-            // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
-            // `session_id` is honest naming: the value is the Claude session UUID, and
-            // it is present only on the Stop-chain close path that passes --session-id.
-            const device = currentDevice();
-            const auditFm =
-              (args.sessionId
-                ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n`
-                : '') + `device: ${device}\n`;
-            const header =
-              `---\ntitle: Session Log ${date} (${project})\n` +
-              `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
-              `# Session Log ${date} (${project})\n`;
-            const entry = payload.sessionLog.entry;
-            const body = entry.endsWith('\n') ? entry : `${entry}\n`;
-            atomicWrite(full, `${header}\n${body}`);
-            return 'created';
-          }
-          return appendIfAbsent(full, payload.sessionLog.entry, isPresent) ? 'appended' : 'skipped';
-        },
-        { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
-      );
-      (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
-      if (outcome !== 'skipped') appliedPaths.push(rel);
-    } catch (err) {
-      // Only a lock-TIMEOUT is withheld as a conflict. A real fn() write error
-      // (disk-full, EACCES, mkdir failure) must NOT be masked as a proposal-
-      // pending timeout — rethrow so it hard-fails like the overwrite path does.
-      if (err?.code !== 'ELOCKTIMEOUT') throw err;
-      // Lock-timeout: withhold rather than lose the entry. Recorded as a conflict
-      // so the close goes proposal-pending (ok:false, no marker) and the next
-      // close re-applies. `kind: 'append'` is what T6 branches on to SKIP parking
-      // this: an append conflict never becomes a `.cache/proposals/` artifact —
-      // the lock-timeout is transient and the next close self-heals by
-      // re-appending, whereas a whole-file re-apply would drop this shard's other
-      // entries. It still blocks the close; it just gets no artifact.
-      conflicts.push({
-        key: 'sessionLog',
-        target: rel,
-        reason: 'append-lock-timeout',
-        kind: 'append',
-        baseHash: null,
-        currentHash: null,
-        proposedContent: payload.sessionLog.entry,
-      });
-    }
+        }
+        if (!existsSync(full)) {
+          // A daily shard is a new file most days. Seed minimal valid frontmatter
+          // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
+          // wiki page rather than a W1 "no frontmatter" warning, and write the header
+          // AND the first entry in ONE atomic write — never leave a header-only shard
+          // on disk, which freshness would skip (no dated heading) while derive could
+          // otherwise mistake it for the evidence file. The dated `## [date] ...`
+          // heading lives inside the entry, so freshness / derive / design-history
+          // are unchanged.
+          // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
+          // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
+          // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
+          // machine that first seeds the daily shard is recorded; later same-day
+          // appends do not touch it. The per-session-accurate store is the LOCAL
+          // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
+          // `session_id` is honest naming: the value is the Claude session UUID, and
+          // it is present only on the Stop-chain close path that passes --session-id.
+          const device = currentDevice();
+          const auditFm =
+            (args.sessionId
+              ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n`
+              : '') + `device: ${device}\n`;
+          const header =
+            `---\ntitle: Session Log ${date} (${project})\n` +
+            `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
+            `# Session Log ${date} (${project})\n`;
+          const entry = payload.sessionLog.entry;
+          const body = entry.endsWith('\n') ? entry : `${entry}\n`;
+          atomicWrite(full, `${header}\n${body}`);
+          return 'created';
+        }
+        return appendIfAbsent(full, payload.sessionLog.entry, isPresent) ? 'appended' : 'skipped';
+      },
+      { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
+    );
+    (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
+    if (outcome !== 'skipped') appliedPaths.push(rel);
+  } catch (err) {
+    // Only a lock-TIMEOUT is withheld as a conflict. A real fn() write error
+    // (disk-full, EACCES, mkdir failure) must NOT be masked as a proposal-
+    // pending timeout — rethrow so it hard-fails like the overwrite path does.
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    // Lock-timeout: withhold rather than lose the entry. Recorded as a conflict
+    // so the close goes proposal-pending (ok:false, no marker) and the next
+    // close re-applies. `kind: 'append'` is what T6 branches on to SKIP parking
+    // this: an append conflict never becomes a `.cache/proposals/` artifact —
+    // the lock-timeout is transient and the next close self-heals by
+    // re-appending, whereas a whole-file re-apply would drop this shard's other
+    // entries. It still blocks the close; it just gets no artifact.
+    conflicts.push({
+      key: 'sessionLog',
+      target: rel,
+      reason: 'append-lock-timeout',
+      kind: 'append',
+      baseHash: null,
+      currentHash: null,
+      proposedContent: payload.sessionLog.entry,
+    });
   }
+}
 
-  // log.md: `payload.log` is OPTIONAL (B-1). When the caller supplies it, keep
-  // the explicit appendIfAbsent path (backward-compat: a custom log line, with
-  // the same idempotent dedup). When it is ABSENT, the root log.md entry is a
-  // DERIVABLE artifact: reconstruct the canonical `## [date] session | <project>`
-  // line directly from THIS close's session-log heading (`payload.sessionLog`),
-  // not by re-reading the session-log files. Deriving from the payload is what
-  // makes the per-close entry exact: a same-day second close lands its distinct
-  // heading, and a hybrid daily/monthly session-log split can't hide it (apply
-  // never reads those files for this). The global scan-based deriveRootLogEntries
-  // (the Stop hook) still backfills OTHER projects; calling it here would either
-  // miss the current entry (single-candidate read) or, with a loosened guard,
-  // append onto a deliberately custom payload.log (codex pre-commit review). The
-  // two payload paths are mutually exclusive: deriving on top of a present-but-
-  // malformed payload.log would mask it and weaken the verifier's fail-loud.
-  // log.md is shared across projects and also written by deriveRootLogEntries
-  // (the Stop-hook backfill in hypo-shared.mjs). Both take the SAME lock on
-  // log.md, so a concurrent close's append and this close's append serialize
-  // instead of overwriting each other.
+// log.md: `payload.log` is OPTIONAL (B-1). When the caller supplies it, keep
+// the explicit appendIfAbsent path (backward-compat: a custom log line, with
+// the same idempotent dedup). When it is ABSENT, the root log.md entry is a
+// DERIVABLE artifact: reconstruct the canonical `## [date] session | <project>`
+// line directly from THIS close's session-log heading (`payload.sessionLog`),
+// not by re-reading the session-log files. Deriving from the payload is what
+// makes the per-close entry exact: a same-day second close lands its distinct
+// heading, and a hybrid daily/monthly session-log split can't hide it (apply
+// never reads those files for this). The global scan-based deriveRootLogEntries
+// (the Stop hook) still backfills OTHER projects; calling it here would either
+// miss the current entry (single-candidate read) or, with a loosened guard,
+// append onto a deliberately custom payload.log (codex pre-commit review). The
+// two payload paths are mutually exclusive: deriving on top of a present-but-
+// malformed payload.log would mask it and weaken the verifier's fail-loud.
+// log.md is shared across projects and also written by deriveRootLogEntries
+// (the Stop-hook backfill in hypo-shared.mjs). Both take the SAME lock on
+// log.md, so a concurrent close's append and this close's append serialize
+// instead of overwriting each other.
+function appendRootLogEntry(args, payload, project, date, acc) {
+  const { applied, skipped, appliedPaths, conflicts } = acc;
   const logFull = join(args.hypoDir, 'log.md');
   if (payload.log) {
     try {
@@ -1347,21 +1340,23 @@ export function applySessionClose(args) {
       });
     }
   }
+}
 
-  // T6: park drifted OVERWRITE targets as `.cache/proposals/` artifacts.
-  //
-  // Runs regardless of --json AND regardless of args.sessionId: writing the
-  // artifact is a SIDE EFFECT, not output, so it is conditioned on neither the
-  // report format nor a session context. (In practice an overwrite conflict only
-  // arises with a session id, so a session-less apply just finds no overwrite
-  // conflicts to park — but the loop is unconditional to match that contract.)
-  // Only overwrite conflicts (`kind !== 'append'`) become artifacts. An append
-  // conflict is a transient lock-timeout the NEXT close self-heals by
-  // re-appending; parking it as a whole-file artifact and later re-applying it
-  // (T7 replaces the whole target) would drop every OTHER entry in that
-  // append-only history file. Append conflicts still sit in `conflicts`, so the
-  // close still goes proposal-pending — they just get no artifact and no
-  // human-apply step.
+// T6: park drifted OVERWRITE targets as `.cache/proposals/` artifacts.
+//
+// Runs regardless of --json AND regardless of args.sessionId: writing the
+// artifact is a SIDE EFFECT, not output, so it is conditioned on neither the
+// report format nor a session context. (In practice an overwrite conflict only
+// arises with a session id, so a session-less apply just finds no overwrite
+// conflicts to park — but the loop is unconditional to match that contract.)
+// Only overwrite conflicts (`kind !== 'append'`) become artifacts. An append
+// conflict is a transient lock-timeout the NEXT close self-heals by
+// re-appending; parking it as a whole-file artifact and later re-applying it
+// (T7 replaces the whole target) would drop every OTHER entry in that
+// append-only history file. Append conflicts still sit in `conflicts`, so the
+// close still goes proposal-pending — they just get no artifact and no
+// human-apply step.
+function parkOverwriteConflicts(args, conflicts) {
   const proposals = [];
   const proposalStoreFailures = [];
   const device = currentDevice();
@@ -1396,31 +1391,27 @@ export function applySessionClose(args) {
       );
     }
   }
-  const proposalStoreFailed = proposalStoreFailures.length > 0;
+  return { proposals, proposalStoreFailures };
+}
 
-  // Same-date-tie fix: verify against the SAME project this apply just wrote
-  // (`project` = payload.project || probe.project, resolved at the top). Without
-  // the override, sessionCloseFileStatus re-derives via resolveActiveProject and,
-  // on a same-date root-hot.md tie, can pick a different project — false-failing
-  // a completed close (the 2026-06-09 security-ops-kb incident).
-  const verification = sessionCloseFileStatus(args.hypoDir, { projectOverride: project });
+// B-4 auto-register: lift unknown (non-forbidden) tags surfaced by the PREFLIGHT
+// lint into SCHEMA.md's `### Pending` section so the post-apply lint sees them as
+// known and the close never stalls on a vocabulary gap. The W10 id is hidden in
+// non-strict --json output (lint.mjs toOut), so the unknown-tag warns are matched
+// and the tag extracted from the message string itself — kept in lockstep with
+// lint.mjs's W10 emit (a copy-edit there breaks this; the close-path round-trip
+// test guards it). Forbidden patterns stay hard errors and are filtered out.
+// SCOPE (eventual consistency, intended): this registers PRE-EXISTING wiki debt
+// visible at preflight, NOT a novel tag this very close's payload introduces —
+// that one would surface only at post-apply and lands on the NEXT close. The
+// contract is "must not stall", which warns (not errors) already satisfy; the
+// registration just keeps the vocabulary catching up.
+// The capture is anchored on the FULL message suffix (not `[^"]+`) so a tag that
+// itself contains a `"` — non-forbidden, so reachable — is captured whole rather
+// than truncated at its first quote (codex stage-2 CONCERN).
+const unknownTagRe = /^Unknown tag: "(.+)" \(not in SCHEMA\.md Tag Vocabulary\)/;
 
-  // B-4 auto-register: lift unknown (non-forbidden) tags surfaced by the PREFLIGHT
-  // lint into SCHEMA.md's `### Pending` section so the post-apply lint sees them as
-  // known and the close never stalls on a vocabulary gap. The W10 id is hidden in
-  // non-strict --json output (lint.mjs toOut), so the unknown-tag warns are matched
-  // and the tag extracted from the message string itself — kept in lockstep with
-  // lint.mjs's W10 emit (a copy-edit there breaks this; the close-path round-trip
-  // test guards it). Forbidden patterns stay hard errors and are filtered out.
-  // SCOPE (eventual consistency, intended): this registers PRE-EXISTING wiki debt
-  // visible at preflight, NOT a novel tag this very close's payload introduces —
-  // that one would surface only at post-apply and lands on the NEXT close. The
-  // contract is "must not stall", which warns (not errors) already satisfy; the
-  // registration just keeps the vocabulary catching up.
-  // The capture is anchored on the FULL message suffix (not `[^"]+`) so a tag that
-  // itself contains a `"` — non-forbidden, so reachable — is captured whole rather
-  // than truncated at its first quote (codex stage-2 CONCERN).
-  const unknownTagRe = /^Unknown tag: "(.+)" \(not in SCHEMA\.md Tag Vocabulary\)/;
+function registerPendingTags(args, preflightLint, hasConflicts) {
   const pendingTags = [];
   for (const w of preflightLint.warns || []) {
     const m = unknownTagRe.exec(w.message || '');
@@ -1433,14 +1424,16 @@ export function applySessionClose(args) {
   // a close whose whole point was to write nothing. Registration is
   // eventually-consistent by design, so deferring it to the next close costs
   // nothing (codex W2 CONCERN).
-  if (pendingTags.length > 0 && conflicts.length === 0) {
+  if (pendingTags.length > 0 && !hasConflicts) {
     appendPendingTags(args.hypoDir, pendingTags);
   }
+}
 
-  // Post-apply lint: payload may have introduced a malformed body or
-  // bad frontmatter. Surface as a distinct `stage` so caller can tell "lint
-  // broke" apart from "frontmatter stale". This runs even if the freshness gate
-  // also failed — both failure modes are useful to the caller.
+// Post-apply lint: payload may have introduced a malformed body or
+// bad frontmatter. Surface as a distinct `stage` so caller can tell "lint
+// broke" apart from "frontmatter stale". This runs even if the freshness gate
+// also failed — both failure modes are useful to the caller.
+function runPostApplyLint(args, payloadScope) {
   let postApplyLint;
   let postApplyCrashed = false;
   try {
@@ -1472,48 +1465,39 @@ export function applySessionClose(args) {
     ));
   }
   const postLintOk = !postApplyCrashed && postBlocking.length === 0;
-  // `let` (not const): the close-result invariant self-check below may flip this
-  // to false when the settled close result is internally contradictory.
-  //
-  // A withheld conflict target must fail the close on its own, not merely via the
-  // freshness gate. If the other session already touched that page TODAY, freshness
-  // sees a fresh file and passes — and the close would report ok:true, write the
-  // marker, and drop this session's payload silently. `conflicts` closes that hole.
-  let ok = verification.ok && postLintOk && conflicts.length === 0;
+  return { postApplyLint, postBlocking, postNotice, postLintOk };
+}
 
-  // Scope the non-blocking notice to the close-target project: debt under
-  // projects/<project>/ stays listed; debt elsewhere folds to a count so the
-  // same untouched-file debt does not re-list its filenames on every close.
-  const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
-  const otherDebtCount = postNotice.length - closeScopeNotice.length;
-
-  // Amendment 2026-05-19: auto-write the per-session
-  // closed marker on a verified close. Hook authority is read-only; this is
-  // one of the two writer paths (the other is --mark-session-closed standalone).
-  //
-  // The marker write is governed by the SAME gate as standalone
-  // --mark-session-closed and /compact (precompactGateStatus), NOT just apply's
-  // `ok` + git-clean. Apply's payload preflight/post-apply lint and `ok` still
-  // govern apply SUCCESS (exit code below), but the marker must additionally
-  // clear feedback projection / W8 design-history / hot.md structure, else this
-  // path could issue a marker the standalone path would refuse (the second
-  // divergence codex flagged).
-  //
-  // Apply just wrote the payload, so the tree is dirty by its OWN
-  // writes: the gate's `uncommitted` git blocker would always trip and the
-  // marker would be skipped, deferring the close to a manual --mark-session-closed
-  // ("done but still blocked" regression). Commit the payload HERE, via
-  // the SAME .hypoignore-aware helper the auto-commit Stop hook uses, so the gate sees
-  // a committed tree. Push stays deferred to the Stop hook; the resulting
-  // committed-but-unpushed state is a gate notice, not a blocker, so
-  // this still marks. A commit failure (not a repo / pre-commit reject / git error)
-  // skips the marker WITH a surfaced reason — today's behavior was also "no marker",
-  // but silently.
+// Amendment 2026-05-19: auto-write the per-session
+// closed marker on a verified close. Hook authority is read-only; this is
+// one of the two writer paths (the other is --mark-session-closed standalone).
+//
+// The marker write is governed by the SAME gate as standalone
+// --mark-session-closed and /compact (precompactGateStatus), NOT just apply's
+// `ok` + git-clean. Apply's payload preflight/post-apply lint and `ok` still
+// govern apply SUCCESS (exit code below), but the marker must additionally
+// clear feedback projection / W8 design-history / hot.md structure, else this
+// path could issue a marker the standalone path would refuse (the second
+// divergence codex flagged).
+//
+// Apply just wrote the payload, so the tree is dirty by its OWN
+// writes: the gate's `uncommitted` git blocker would always trip and the
+// marker would be skipped, deferring the close to a manual --mark-session-closed
+// ("done but still blocked" regression). Commit the payload HERE, via
+// the SAME .hypoignore-aware helper the auto-commit Stop hook uses, so the gate sees
+// a committed tree. Push stays deferred to the Stop hook; the resulting
+// committed-but-unpushed state is a gate notice, not a blocker, so
+// this still marks. A commit failure (not a repo / pre-commit reject / git error)
+// skips the marker WITH a surfaced reason — today's behavior was also "no marker",
+// but silently.
+//
+// Returns { markerWritten, markerSkipReason, commitOutcome }. `commitOutcome` is
+// reported by the result JSON: `null` when this apply never reached the commit
+// step at all (ok:false before the writes were even verified), distinct from a
+// commit that ran and reported `committed:false`.
+function runMarkerPhase(args, project, appliedPaths, ok) {
   let markerWritten = false;
   let markerSkipReason = null;
-  // Hoisted so the result JSON below can report it: `null` when this apply never
-  // reached the commit step at all (ok:false before the writes were even
-  // verified), distinct from a commit that ran and reported `committed:false`.
   let commitOutcome = null;
   if (ok && args.sessionId) {
     // Close-gate resolution: apply succeeding (`ok`) IS the resolution, not
@@ -1635,11 +1619,15 @@ export function applySessionClose(args) {
       }
     }
   }
-  // A conflict outranks the downstream gates: verification and lint both describe
-  // a tree this apply declined to finish writing, so naming them would point the
-  // reader at the wrong repair. A proposal-STORE failure outranks even that: the
-  // withheld bytes never reached an artifact, so it is the most urgent repair.
-  let stage = ok
+  return { markerWritten, markerSkipReason, commitOutcome };
+}
+
+// A conflict outranks the downstream gates: verification and lint both describe
+// a tree this apply declined to finish writing, so naming them would point the
+// reader at the wrong repair. A proposal-STORE failure outranks even that: the
+// withheld bytes never reached an artifact, so it is the most urgent repair.
+function resolveCloseStage({ ok, proposalStoreFailed, conflicts, verification, postLintOk }) {
+  return ok
     ? null
     : proposalStoreFailed
       ? 'proposal-store-failed'
@@ -1650,30 +1638,33 @@ export function applySessionClose(args) {
           : !verification.ok
             ? 'post-apply-verification'
             : 'post-apply-lint';
-  // Runtime close-result invariant self-check. When a
-  // marker-write path (args.sessionId present) settles into an internally
-  // contradictory shape — ok:true with the marker silently withheld and no
-  // reason, or a written marker that also carries a skip reason — flip ok:false
-  // and stage-tag it so the existing `process.exit(ok ? 0 : 1)` yields exit 1.
-  // That non-zero exit is the discriminator that separates a genuine
-  // contradiction (a code bug) from a legitimate withhold (exit 0, e.g.
-  // no-user-close-signal). apply is idempotent, so a non-zero re-run is safe.
-  // Unreachable today; this is a regression guard for future refactors.
-  if (args.sessionId) {
-    const contradiction = closeResultContradiction({ ok, markerWritten, markerSkipReason });
-    if (contradiction) {
-      ok = false;
-      stage = contradiction;
-      process.stderr.write(
-        `\n🛑 INTERNAL CONTRADICTION in session-close result: ${contradiction}\n` +
-          `    markerWritten=${markerWritten}, markerSkipReason=${JSON.stringify(markerSkipReason)}.\n` +
-          `    This is a close-pipeline bug, not a normal withhold. Exiting non-zero so it\n` +
-          `    cannot masquerade as a successful close. The applied payload files stand;\n` +
-          `    re-running apply is idempotent once the pipeline is fixed.\n`,
-      );
-    }
-  }
-  const result = {
+}
+
+// The stdout JSON contract of a payload-bearing apply. Takes one bag because it
+// genuinely consumes the whole settled close state; every field below is read
+// straight off it.
+function buildCloseResult({
+  ok,
+  stage,
+  project,
+  date,
+  applied,
+  skipped,
+  commitOutcome,
+  conflicts,
+  proposals,
+  proposalStoreFailed,
+  proposalStoreFailures,
+  verification,
+  sessionId,
+  markerWritten,
+  markerSkipReason,
+  preflightLint,
+  postApplyLint,
+  closeScopeNotice,
+  otherDebtCount,
+}) {
+  return {
     ok,
     stage,
     project,
@@ -1719,7 +1710,7 @@ export function applySessionClose(args) {
     verification,
     // Surface the marker outcome instead of skipping silently, so the
     // caller can tell "closed" from "applied but not marked".
-    ...(args.sessionId ? { markerWritten, markerSkipReason } : {}),
+    ...(sessionId ? { markerWritten, markerSkipReason } : {}),
     lint: {
       preflight: summarizeLintForOutput(preflightLint),
       postApply: summarizeLintForOutput(postApplyLint),
@@ -1734,97 +1725,283 @@ export function applySessionClose(args) {
     notices: [...new Set(closeScopeNotice.map((e) => e.file))],
     otherDebtCount,
   };
+}
+
+// The human-readable (non --json) rendering of the same settled state.
+function printCloseReport({
+  project,
+  date,
+  applied,
+  skipped,
+  conflicts,
+  proposals,
+  ok,
+  markerWritten,
+  markerSkipReason,
+  verification,
+  postLintOk,
+  postBlocking,
+  closeScopeNotice,
+  otherDebtCount,
+}) {
+  console.log(`Session-close apply (project: ${project}, date: ${date}):`);
+  for (const a of applied) console.log(`  ✓ wrote ${a}`);
+  for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
+  // Never let a withheld target read as a skip: `skipped` means "already current",
+  // this means "your bytes are NOT on disk". Overwrite conflicts drifted from base;
+  // an append conflict is a lock-timeout (someone else held the file's lock), which
+  // is transient — the next close re-applies.
+  for (const c of conflicts) {
+    const why =
+      c.kind === 'append'
+        ? 'could not acquire the append lock in time; the next close re-applies'
+        : 'the page changed since this session read it';
+    console.log(`  ⚠ WITHHELD ${c.key} (${c.target}) — ${c.reason}; ${why}`);
+  }
+  for (const p of proposals) {
+    console.log(`  · parked proposal ${p.id} for ${p.target} (review with \`hypomnema proposal\`)`);
+  }
+  if (applied.length > 0 && conflicts.length > 0) {
+    console.log(
+      '\n· partial close: the writes above ARE on disk but NOT committed — this close is\n' +
+        '  ok:false, so no commit and no session-close marker run until the withheld\n' +
+        '  target(s) are resolved and the close re-runs.',
+    );
+  }
+  if (ok) {
+    // When the marker was withheld, qualify the success line so a reader scanning
+    // stdout alone cannot mistake "verified" for "fully closed". markerSkipReason
+    // is non-null exactly when args.sessionId is set and the marker did not land.
+    if (markerSkipReason) {
+      console.log(
+        '\n✓ session-close files verified (all 5 mandatory files fresh, lint clean).' +
+          '\n  session NOT fully closed: the Stop-chain marker was not written (see warning below).',
+      );
+    } else {
+      console.log('\n✓ session-close verified — all 5 mandatory files fresh, lint clean.');
+    }
+  }
+  // When ok:true but the session-close marker was NOT written, the Stop-chain
+  // still sees an open session and will re-prompt at the next Stop. Surface this
+  // loudly so neither the human nor a skill-following model reads "ok:true" as
+  // "session fully closed". Gate on `!markerWritten` too so this "marker NOT
+  // written" line cannot fire on the contradiction-B path (a written marker that
+  // also carried a skip reason) — there the invariant's own 🛑 line already
+  // explains the failure, and this message would contradict markerWritten:true.
+  if (markerSkipReason && !markerWritten) {
+    process.stderr.write(
+      `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
+        `    The 5 mandatory files were applied and verified (ok:true), but the\n` +
+        `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
+        `    closed: the Stop hook will re-prompt until the marker is present.\n` +
+        `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +
+        `    a background task or Agent UUID from a /tmp/... path).\n` +
+        `    Example: crystallize.mjs --apply-session-close --payload=<path>\n` +
+        `             --session-id=<main-conversation-id> --hypo-dir=<path>\n`,
+    );
+  }
+  if (!ok) {
+    if (!verification.ok) {
+      const bad = [
+        ...verification.missing.map((f) => `${f} (missing)`),
+        ...verification.stale.map((f) => `${f} (stale)`),
+      ].join(', ');
+      console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
+      console.log('  Fix the payload (likely an `updated:` field) and retry.');
+    }
+    if (!postLintOk) {
+      console.log('\n✗ post-apply lint failed:');
+      for (const e of postBlocking) console.log(`  ✗ ${e.file}: ${e.message}`);
+      console.log('  Payload introduced a lint blocker — fix the payload content and retry.');
+    }
+  }
+  if (closeScopeNotice.length > 0) {
+    console.log(
+      `\n· ${closeScopeNotice.length} pre-existing lint issue(s) in untouched files (not blocking): ${[
+        ...new Set(closeScopeNotice.map((e) => e.file)),
+      ]
+        .slice(0, 5)
+        .join(', ')}${closeScopeNotice.length > 5 ? ', …' : ''}`,
+    );
+  }
+  if (otherDebtCount > 0) {
+    console.log(
+      `\n· +${otherDebtCount} pre-existing lint issue(s) elsewhere in the vault (other projects / shared pages, not blocking) — run \`node scripts/lint.mjs\` for the full list.`,
+    );
+  }
+}
+
+export function applySessionClose(args) {
+  // Option D: early-exit fires only when NO payload was supplied.
+  // Rationale: payload presence is explicit close intent and must always run
+  // the full apply path — the per-entry idempotency (overwrite's step-1 skip +
+  // exact-entry append dedup) keeps re-apply cheap without short-circuiting,
+  // and avoids silent-success when a same-day second close brings new bytes.
+  // Payload-less invocation is treated as a cheap "already complete?" probe.
+  // --force opts out of that probe shortcut only — payload remains required
+  // for any actual apply work (readPayload below surfaces "payload is
+  // required" the same way it always has).
+  if (!args.force && !args.payload) {
+    // No-payload "already complete?" probe uses the
+    // global invariant, not a recency pick.
+    const probe = sessionCloseGlobalStatus(args.hypoDir);
+    if (probe.ok) {
+      const result = {
+        ok: true,
+        alreadyComplete: true,
+        project: probe.project,
+        date: probe.dates[0],
+        message: '오늘 이미 close 완료로 보임 (probe 모드 — payload 미지정).',
+      };
+      if (args.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`✓ ${result.message}`);
+        console.log(`  project: ${result.project} / date: ${result.date}`);
+      }
+      process.exit(0);
+    }
+    // gate not ok → fall through to readPayload, which surfaces
+    // "payload is required" with the same error shape as before.
+  }
+
+  refuseUnlessCloseRequested(args);
+  const payload = loadValidatedPayload(args);
+  const project = resolveCloseProject(args, payload);
+  const date = payload.date || todayLocal();
+  assertPayloadFreshnessContract(args, payload, project, date);
+  const { preflightLint, payloadScope, indexRelPath, indexMissing } = runPreflight(
+    args,
+    payload,
+    project,
+    date,
+  );
+
+  const applied = [];
+  const skipped = [];
+  // The ACTUAL vault-relative paths this apply wrote, kept separate
+  // from `applied` (whose entries are display strings like `key (relPath)`,
+  // not bare paths). This is the scope handed to commitWikiChanges below;
+  // never the broader `payloadScope` above, which also includes lint/evidence
+  // candidates this apply may not have written a byte to.
+  const appliedPaths = [];
+  // Overwrite targets this apply refused to write because the page moved under
+  // it. T6 turns these into `.cache/proposals/` artifacts; here they are already
+  // enough to withhold the bytes and fail the close.
+  const conflicts = [];
+  // One bag for the four accumulators, passed to every write phase below. They
+  // push into it in call order; nothing is merged back afterwards, so the
+  // report lines keep the exact order the inline version produced.
+  const acc = { applied, skipped, appliedPaths, conflicts };
+
+  applyOverwrites(args, payload, project, date, indexRelPath, indexMissing, acc);
+  appendSessionLogEntry(args, payload, project, date, acc);
+  appendRootLogEntry(args, payload, project, date, acc);
+
+  const { proposals, proposalStoreFailures } = parkOverwriteConflicts(args, conflicts);
+  const proposalStoreFailed = proposalStoreFailures.length > 0;
+
+  // Same-date-tie fix: verify against the SAME project this apply just wrote
+  // (`project` = payload.project || probe.project, resolved at the top). Without
+  // the override, sessionCloseFileStatus re-derives via resolveActiveProject and,
+  // on a same-date root-hot.md tie, can pick a different project — false-failing
+  // a completed close (the 2026-06-09 security-ops-kb incident).
+  const verification = sessionCloseFileStatus(args.hypoDir, { projectOverride: project });
+
+  registerPendingTags(args, preflightLint, conflicts.length > 0);
+
+  const { postApplyLint, postBlocking, postNotice, postLintOk } = runPostApplyLint(
+    args,
+    payloadScope,
+  );
+
+  // `let` (not const): the close-result invariant self-check below may flip this
+  // to false when the settled close result is internally contradictory.
+  //
+  // A withheld conflict target must fail the close on its own, not merely via the
+  // freshness gate. If the other session already touched that page TODAY, freshness
+  // sees a fresh file and passes — and the close would report ok:true, write the
+  // marker, and drop this session's payload silently. `conflicts` closes that hole.
+  let ok = verification.ok && postLintOk && conflicts.length === 0;
+
+  // Scope the non-blocking notice to the close-target project: debt under
+  // projects/<project>/ stays listed; debt elsewhere folds to a count so the
+  // same untouched-file debt does not re-list its filenames on every close.
+  const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
+  const otherDebtCount = postNotice.length - closeScopeNotice.length;
+
+  const { markerWritten, markerSkipReason, commitOutcome } = runMarkerPhase(
+    args,
+    project,
+    appliedPaths,
+    ok,
+  );
+
+  let stage = resolveCloseStage({ ok, proposalStoreFailed, conflicts, verification, postLintOk });
+  // Runtime close-result invariant self-check. When a
+  // marker-write path (args.sessionId present) settles into an internally
+  // contradictory shape — ok:true with the marker silently withheld and no
+  // reason, or a written marker that also carries a skip reason — flip ok:false
+  // and stage-tag it so the existing `process.exit(ok ? 0 : 1)` yields exit 1.
+  // That non-zero exit is the discriminator that separates a genuine
+  // contradiction (a code bug) from a legitimate withhold (exit 0, e.g.
+  // no-user-close-signal). apply is idempotent, so a non-zero re-run is safe.
+  // Unreachable today; this is a regression guard for future refactors.
+  if (args.sessionId) {
+    const contradiction = closeResultContradiction({ ok, markerWritten, markerSkipReason });
+    if (contradiction) {
+      ok = false;
+      stage = contradiction;
+      process.stderr.write(
+        `\n🛑 INTERNAL CONTRADICTION in session-close result: ${contradiction}\n` +
+          `    markerWritten=${markerWritten}, markerSkipReason=${JSON.stringify(markerSkipReason)}.\n` +
+          `    This is a close-pipeline bug, not a normal withhold. Exiting non-zero so it\n` +
+          `    cannot masquerade as a successful close. The applied payload files stand;\n` +
+          `    re-running apply is idempotent once the pipeline is fixed.\n`,
+      );
+    }
+  }
+  const result = buildCloseResult({
+    ok,
+    stage,
+    project,
+    date,
+    applied,
+    skipped,
+    commitOutcome,
+    conflicts,
+    proposals,
+    proposalStoreFailed,
+    proposalStoreFailures,
+    verification,
+    sessionId: args.sessionId,
+    markerWritten,
+    markerSkipReason,
+    preflightLint,
+    postApplyLint,
+    closeScopeNotice,
+    otherDebtCount,
+  });
 
   if (args.json) {
     console.log(JSON.stringify(result, null, 2));
   } else {
-    console.log(`Session-close apply (project: ${project}, date: ${date}):`);
-    for (const a of applied) console.log(`  ✓ wrote ${a}`);
-    for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
-    // Never let a withheld target read as a skip: `skipped` means "already current",
-    // this means "your bytes are NOT on disk". Overwrite conflicts drifted from base;
-    // an append conflict is a lock-timeout (someone else held the file's lock), which
-    // is transient — the next close re-applies.
-    for (const c of conflicts) {
-      const why =
-        c.kind === 'append'
-          ? 'could not acquire the append lock in time; the next close re-applies'
-          : 'the page changed since this session read it';
-      console.log(`  ⚠ WITHHELD ${c.key} (${c.target}) — ${c.reason}; ${why}`);
-    }
-    for (const p of proposals) {
-      console.log(
-        `  · parked proposal ${p.id} for ${p.target} (review with \`hypomnema proposal\`)`,
-      );
-    }
-    if (applied.length > 0 && conflicts.length > 0) {
-      console.log(
-        '\n· partial close: the writes above ARE on disk but NOT committed — this close is\n' +
-          '  ok:false, so no commit and no session-close marker run until the withheld\n' +
-          '  target(s) are resolved and the close re-runs.',
-      );
-    }
-    if (ok) {
-      // When the marker was withheld, qualify the success line so a reader scanning
-      // stdout alone cannot mistake "verified" for "fully closed". markerSkipReason
-      // is non-null exactly when args.sessionId is set and the marker did not land.
-      if (markerSkipReason) {
-        console.log(
-          '\n✓ session-close files verified (all 5 mandatory files fresh, lint clean).' +
-            '\n  session NOT fully closed: the Stop-chain marker was not written (see warning below).',
-        );
-      } else {
-        console.log('\n✓ session-close verified — all 5 mandatory files fresh, lint clean.');
-      }
-    }
-    // When ok:true but the session-close marker was NOT written, the Stop-chain
-    // still sees an open session and will re-prompt at the next Stop. Surface this
-    // loudly so neither the human nor a skill-following model reads "ok:true" as
-    // "session fully closed". Gate on `!markerWritten` too so this "marker NOT
-    // written" line cannot fire on the contradiction-B path (a written marker that
-    // also carried a skip reason) — there the invariant's own 🛑 line already
-    // explains the failure, and this message would contradict markerWritten:true.
-    if (markerSkipReason && !markerWritten) {
-      process.stderr.write(
-        `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
-          `    The 5 mandatory files were applied and verified (ok:true), but the\n` +
-          `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
-          `    closed: the Stop hook will re-prompt until the marker is present.\n` +
-          `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +
-          `    a background task or Agent UUID from a /tmp/... path).\n` +
-          `    Example: crystallize.mjs --apply-session-close --payload=<path>\n` +
-          `             --session-id=<main-conversation-id> --hypo-dir=<path>\n`,
-      );
-    }
-    if (!ok) {
-      if (!verification.ok) {
-        const bad = [
-          ...verification.missing.map((f) => `${f} (missing)`),
-          ...verification.stale.map((f) => `${f} (stale)`),
-        ].join(', ');
-        console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
-        console.log('  Fix the payload (likely an `updated:` field) and retry.');
-      }
-      if (!postLintOk) {
-        console.log('\n✗ post-apply lint failed:');
-        for (const e of postBlocking) console.log(`  ✗ ${e.file}: ${e.message}`);
-        console.log('  Payload introduced a lint blocker — fix the payload content and retry.');
-      }
-    }
-    if (closeScopeNotice.length > 0) {
-      console.log(
-        `\n· ${closeScopeNotice.length} pre-existing lint issue(s) in untouched files (not blocking): ${[
-          ...new Set(closeScopeNotice.map((e) => e.file)),
-        ]
-          .slice(0, 5)
-          .join(', ')}${closeScopeNotice.length > 5 ? ', …' : ''}`,
-      );
-    }
-    if (otherDebtCount > 0) {
-      console.log(
-        `\n· +${otherDebtCount} pre-existing lint issue(s) elsewhere in the vault (other projects / shared pages, not blocking) — run \`node scripts/lint.mjs\` for the full list.`,
-      );
-    }
+    printCloseReport({
+      project,
+      date,
+      applied,
+      skipped,
+      conflicts,
+      proposals,
+      ok,
+      markerWritten,
+      markerSkipReason,
+      verification,
+      postLintOk,
+      postBlocking,
+      closeScopeNotice,
+      otherDebtCount,
+    });
   }
   process.exit(ok ? 0 : 1);
 }
