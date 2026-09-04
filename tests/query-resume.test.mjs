@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
   mkdirSync,
+  mkdtempSync,
   rmSync,
   writeFileSync,
   readFileSync,
@@ -16,9 +17,10 @@ import {
   realpathSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { resolveActiveProject } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
-import { HOME, SCRIPTS, SESSION_TMP_HOME, run, withTmpDir } from './helpers.mjs';
+import { HOME, SCRIPTS, SESSION_TMP_HOME, run, withGrowthWiki, withTmpDir } from './helpers.mjs';
 
 // ── query.mjs smoke tests ────────────────────────────────────────────────────
 
@@ -117,6 +119,19 @@ test('resume picks real project over _template fallback (even when _template is 
     const fooMtime = statSync(fooSS).mtimeMs;
     const newer = new Date(fooMtime + 5000);
     utimesSync(templateSS, newer, newer);
+    // Committed to git here, not because a real vault must always be one
+    // (init --no-git-init is a supported flag; see the non-git-vault
+    // contract test below for what that case actually surfaces), but
+    // because the ISSUE-99 foreign-notice check reports "cannot attribute"
+    // for a non-repo hypoDir, and this fixture used --no-git-init above.
+    // Commit a clean tree here (after the mtime tweak, since git commit does
+    // not touch mtimes) so this unrelated _template-fallback test sees no
+    // notice.
+    spawnSync('git', ['init', '-q'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: hypoDir });
+    spawnSync('git', ['add', '-A'], { cwd: hypoDir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: hypoDir });
     const r = run('resume.mjs', [`--hypo-dir=${hypoDir}`]);
     assert.equal(r.status, 0, `expected exit 0, got ${r.status}; stderr=${r.stderr}`);
     assert.ok(r.stdout.startsWith('Project: foo'), `expected 'Project: foo', got: ${r.stdout}`);
@@ -365,6 +380,17 @@ test('resume.mjs honors process.cwd() for same-date tie (ISSUE-1 wiring)', () =>
     }
     const cwd = betaWd;
     mkdirSync(cwd, { recursive: true });
+    // Committed to git here, not because a real vault must always be one
+    // (init --no-git-init is a supported flag; see the non-git-vault
+    // contract test below for what that case actually surfaces), but
+    // because the ISSUE-99 foreign-notice check reports "cannot attribute"
+    // for a non-repo hypoDir); commit a clean
+    // tree here so this unrelated cwd-tie-break test sees no notice.
+    spawnSync('git', ['init', '-q'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: hypoDir });
+    spawnSync('git', ['add', '-A'], { cwd: hypoDir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: hypoDir });
     const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
       encoding: 'utf-8',
       cwd,
@@ -394,6 +420,17 @@ test('resume.mjs cwd-first: cwd-matched older project wins over a newer non-matc
       );
     }
     mkdirSync(betaWd, { recursive: true });
+    // Committed to git here, not because a real vault must always be one
+    // (init --no-git-init is a supported flag; see the non-git-vault
+    // contract test below for what that case actually surfaces), but
+    // because the ISSUE-99 foreign-notice check reports "cannot attribute"
+    // for a non-repo hypoDir); commit a clean
+    // tree here so this unrelated cwd-first-wins test sees no notice.
+    spawnSync('git', ['init', '-q'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: hypoDir });
+    spawnSync('git', ['add', '-A'], { cwd: hypoDir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: hypoDir });
     const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
       encoding: 'utf-8',
       cwd: betaWd,
@@ -481,6 +518,17 @@ test('resume.mjs mtime-fallback branch cwd no-match: emits the fallback diagnost
     );
     const unrelatedCwd = join(realDir, 'code/elsewhere');
     mkdirSync(unrelatedCwd, { recursive: true });
+    // Committed to git here, not because a real vault must always be one
+    // (init --no-git-init is a supported flag; see the non-git-vault
+    // contract test below for what that case actually surfaces), but
+    // because the ISSUE-99 foreign-notice check reports "cannot attribute"
+    // for a non-repo hypoDir); commit a clean
+    // tree here so this unrelated mtime-fallback test sees no notice.
+    spawnSync('git', ['init', '-q'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: hypoDir });
+    spawnSync('git', ['add', '-A'], { cwd: hypoDir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: hypoDir });
     const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
       encoding: 'utf-8',
       cwd: unrelatedCwd,
@@ -560,6 +608,17 @@ test('resume.mjs md-link branch cwd no-match: emits the fallback diagnostic (ISS
       join(hypoDir, 'projects', 'beta', 'index.md'),
       `---\ntitle: beta\ntype: project-index\nupdated: 2026-06-08\nworking_dir: "${join(realDir, 'code/beta')}"\n---\n# beta\n`,
     );
+    // Committed to git here, not because a real vault must always be one
+    // (init --no-git-init is a supported flag; see the non-git-vault
+    // contract test below for what that case actually surfaces), but
+    // because the ISSUE-99 foreign-notice check reports "cannot attribute"
+    // for a non-repo hypoDir); commit a clean
+    // tree here so this unrelated project-resolution test sees no notice.
+    spawnSync('git', ['init', '-q'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: hypoDir });
+    spawnSync('git', ['add', '-A'], { cwd: hypoDir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: hypoDir });
     const unrelatedCwd = join(realDir, 'code/elsewhere');
     mkdirSync(unrelatedCwd, { recursive: true });
     const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
@@ -614,6 +673,17 @@ test('resume.mjs cwd-first applies to the legacy markdown-link branch (ADR 0044 
       `---\ntitle: beta\ntype: project-index\nupdated: 2026-06-08\nworking_dir: "${betaWd}"\n---\n# beta\n`,
     );
     mkdirSync(betaWd, { recursive: true });
+    // Committed to git here, not because a real vault must always be one
+    // (init --no-git-init is a supported flag; see the non-git-vault
+    // contract test below for what that case actually surfaces), but
+    // because the ISSUE-99 foreign-notice check reports "cannot attribute"
+    // for a non-repo hypoDir); commit a clean
+    // tree here so this unrelated project-resolution test sees no notice.
+    spawnSync('git', ['init', '-q'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: hypoDir });
+    spawnSync('git', ['add', '-A'], { cwd: hypoDir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: hypoDir });
     const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
       encoding: 'utf-8',
       cwd: betaWd,
@@ -656,6 +726,18 @@ test('resume.mjs cwd-first applies to the mtime fallback (no hot.md rows, ADR 00
     const newer = new Date(betaMtime + 5000);
     utimesSync(join(hypoDir, 'projects', 'alpha', 'session-state.md'), newer, newer);
     mkdirSync(betaWd, { recursive: true });
+    // Committed to git here, not because a real vault must always be one
+    // (init --no-git-init is a supported flag; see the non-git-vault
+    // contract test below for what that case actually surfaces), but
+    // because the ISSUE-99 foreign-notice check reports "cannot attribute"
+    // for a non-repo hypoDir); commit a clean
+    // tree here (after the mtime tweak above, since git commit does not touch
+    // mtimes) so this unrelated project-resolution test sees no notice.
+    spawnSync('git', ['init', '-q'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: hypoDir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: hypoDir });
+    spawnSync('git', ['add', '-A'], { cwd: hypoDir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: hypoDir });
     const r = spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${hypoDir}`], {
       encoding: 'utf-8',
       cwd: betaWd,
@@ -665,6 +747,249 @@ test('resume.mjs cwd-first applies to the mtime fallback (no hot.md rows, ADR 00
     assert.ok(
       r.stdout.startsWith('Project: beta'),
       `mtime fallback must honor cwd; got: ${r.stdout}`,
+    );
+  });
+});
+
+// ── resume.mjs — foreign-project uncommitted notice (ISSUE-99) ─────────────
+// A different project's own uncommitted work is not this session's to fix.
+// resume never receives a session_id, so unlike the SessionStart hook it uses
+// the resolved --project as the "own project" boundary instead of an
+// accountable-scope from a transcript.
+
+suite('resume.mjs — foreign-project uncommitted notice (ISSUE-99)');
+
+function withTwoProjectResumeWiki(fn) {
+  withGrowthWiki((dir) => {
+    for (const slug of ['mine', 'theirs']) {
+      const pdir = join(dir, 'projects', slug);
+      mkdirSync(pdir, { recursive: true });
+      writeFileSync(
+        join(pdir, 'session-state.md'),
+        `---\ntitle: ss — ${slug}\ntype: session-state\nupdated: 2026-06-28\n---\n\n## 다음\n- t\n`,
+      );
+    }
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'projects'], { cwd: dir });
+    fn(dir);
+  });
+}
+
+function runResume(dir, extraArgs = []) {
+  return spawnSync(
+    process.execPath,
+    [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, '--project=mine', ...extraArgs],
+    { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+  );
+}
+
+test('resume.mjs: a foreign project surfaces a one-line notice (count + name)', () => {
+  withTwoProjectResumeWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'theirs', 'draft.md'), 'uncommitted draft\n');
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected foreign notice as the first line, got: ${r.stdout}`,
+    );
+  });
+});
+
+test('resume.mjs: own-project changes are excluded from the foreign count', () => {
+  withTwoProjectResumeWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'mine', 'draft.md'), 'my own uncommitted work\n');
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.ok(
+      !/\[WIKI: 현재 프로젝트 외|\[WIKI: 귀속 불명/.test(r.stdout),
+      `own uncommitted change must not read as foreign or unattributed: ${r.stdout}`,
+    );
+  });
+});
+
+test('resume.mjs --json: foreign notice carried as a notice field, absent when clean', () => {
+  withTwoProjectResumeWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'theirs', 'draft.md'), 'uncommitted draft\n');
+    const dirty = runResume(dir, ['--json']);
+    assert.equal(dirty.status, 0, `expected exit 0; stderr=${dirty.stderr}`);
+    const dirtyOut = JSON.parse(dirty.stdout);
+    assert.match(
+      dirtyOut.notice,
+      /현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다/,
+      `expected notice field, got: ${JSON.stringify(dirtyOut)}`,
+    );
+
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'settle'], { cwd: dir });
+    const clean = runResume(dir, ['--json']);
+    assert.equal(clean.status, 0, `expected exit 0; stderr=${clean.stderr}`);
+    const cleanOut = JSON.parse(clean.stdout);
+    assert.ok(
+      !('notice' in cleanOut),
+      `clean vault must carry no notice field: ${JSON.stringify(cleanOut)}`,
+    );
+  });
+});
+
+// Reproduces the 2026-08-27 incident directly (extensions/ai-tone/, not a
+// projects/<slug>/ path) via the resume.mjs CLI: before this fix
+// projectOfPath's null return meant "not one project's work" and got
+// dropped; now it feeds a nameless unattributed count instead.
+test('resume.mjs: an extensions/ai-tone dirty file surfaces as unattributed, not silence', () => {
+  withTwoProjectResumeWiki((dir) => {
+    const toneDir = join(dir, 'extensions', 'ai-tone');
+    mkdirSync(toneDir, { recursive: true });
+    writeFileSync(join(toneDir, 'x.sh'), '#!/bin/sh\necho hi\n');
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 귀속 불명 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected the original-incident file to surface as unattributed, got: ${r.stdout}`,
+    );
+  });
+});
+
+test('resume.mjs: git enumeration failure (not a git repo) yields a distinct notice, not silence', () => {
+  const notARepo = mkdtempSync(join(tmpdir(), 'hypo-issue99-resume-notrepo-'));
+  const pdir = join(notARepo, 'projects', 'mine');
+  mkdirSync(pdir, { recursive: true });
+  writeFileSync(
+    join(pdir, 'session-state.md'),
+    '---\ntitle: ss — mine\ntype: session-state\nupdated: 2026-06-28\n---\n\n## 다음\n- t\n',
+  );
+  try {
+    const r = runResume(notARepo);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 미커밋 변경의 귀속을 확인하지 못했습니다\. git 상태를 근거로 작업 범위를 정하지 마십시오\.\]/,
+      `expected a distinct enumeration-failure notice instead of silence, got: ${r.stdout}`,
+    );
+  } finally {
+    rmSync(notARepo, { recursive: true, force: true });
+  }
+});
+
+// codex 3rd-round review: `listDirtyPaths` used to skip a rename/copy's
+// paired `from` record entirely, keeping only the destination path. A rename
+// OUT of a foreign project and INTO ownProject then vanished completely: the
+// destination reads as "own" and gets excluded, and the origin (the one path
+// that WAS actually foreign) was never looked at.
+test('resume.mjs: a rename OUT of a foreign project (into own) is not silently lost (codex 3rd-round review)', () => {
+  withTwoProjectResumeWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'theirs', 'a.md'), 'seed\n');
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'seed'], { cwd: dir });
+    spawnSync('git', ['mv', 'projects/theirs/a.md', 'projects/mine/a.md'], { cwd: dir });
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `a rename OUT of a foreign project must still surface theirs, got: ${r.stdout}`,
+    );
+  });
+});
+
+// A leading space (or other control char) right above the vault is a valid
+// path segment. `--show-prefix`'s output must only lose its trailing `\n`,
+// never a leading byte that is actually part of the path. trim() strips both
+// ends and would silently break every startsWith(prefix) match below it.
+test('resume.mjs: a leading-space path component above the vault does not silence the notice (prefix trimEnd)', () => {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-issue99-resume-prefixspace-'));
+  try {
+    const vault = join(base, ' weird', 'vault');
+    mkdirSync(join(vault, 'projects', 'mine'), { recursive: true });
+    writeFileSync(
+      join(vault, 'projects', 'mine', 'session-state.md'),
+      '---\ntitle: ss — mine\ntype: session-state\nupdated: 2026-06-28\n---\n\n## 다음\n- t\n',
+    );
+    const theirsDir = join(vault, 'projects', 'theirs');
+    mkdirSync(theirsDir, { recursive: true });
+    writeFileSync(join(theirsDir, 'index.md'), '# theirs\n');
+    spawnSync('git', ['init', '-q'], { cwd: base });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: base });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: base });
+    spawnSync('git', ['add', '-A'], { cwd: base });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: base });
+    writeFileSync(join(theirsDir, 'draft.md'), 'uncommitted draft\n');
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${vault}`, '--project=mine'],
+      { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+    );
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected the foreign notice despite the leading-space path component, got: ${r.stdout}`,
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// A project directory name with a REAL embedded newline (shell command
+// substitution swallows a trailing \n, so this must be built directly with
+// mkdirSync, never `$(printf '\n')`). Without sanitizeProjForPrompt this
+// splits the one-line notice into two printed lines, which is the injection
+// surface the guard exists to close.
+test('resume.mjs: a project directory name with a real newline stays a single-line notice (sanitizeProjForPrompt regression)', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'mine'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'mine', 'session-state.md'),
+      '---\ntitle: ss — mine\ntype: session-state\nupdated: 2026-06-28\n---\n\n## 다음\n- t\n',
+    );
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'mine'], { cwd: dir });
+    const evilSlug = 'ev\nil';
+    const evilDir = join(dir, 'projects', evilSlug);
+    mkdirSync(evilDir, { recursive: true });
+    writeFileSync(join(evilDir, 'draft.md'), 'uncommitted draft\n');
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    const firstLine = r.stdout.split('\n')[0];
+    assert.match(
+      firstLine,
+      /^\[WIKI: 현재 프로젝트 외 projects\/ev il 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]$/,
+      `expected the whole notice on one line with the embedded newline sanitized, got: ${JSON.stringify(r.stdout)}`,
+    );
+  });
+});
+
+// ISSUE-99 follow-up (codex 2nd-round review): `init --no-git-init` is a
+// documented, supported layout (scripts/init.mjs), not an edge case. This
+// pins what resume.mjs actually shows on it today: the enumeration-failure
+// notice fires on EVERY session for a non-git vault, not only when something
+// is genuinely foreign, because `git status` cannot be asked at all. That is
+// a deliberate, accepted tradeoff (see the sibling test above for why
+// checking `.git` existence instead was tried and reverted: it re-silences a
+// vault nested inside a larger host repo). This is not a claim that the
+// behavior is right, only that it is current; changing it starts by making
+// this assertion red.
+test('resume.mjs: init --no-git-init vault reports "cannot attribute" on every session, not silence (documents the accepted tradeoff)', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+    assert.ok(
+      !existsSync(join(hypoDir, '.git')),
+      'fixture sanity: --no-git-init must not create .git',
+    );
+    mkdirSync(join(hypoDir, 'projects', 'mine'), { recursive: true });
+    writeFileSync(
+      join(hypoDir, 'projects', 'mine', 'session-state.md'),
+      '---\ntitle: ss — mine\ntype: session-state\nupdated: 2026-06-28\n---\n\n## 다음\n- t\n',
+    );
+    const r = run('resume.mjs', [`--hypo-dir=${hypoDir}`, '--project=mine']);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 미커밋 변경의 귀속을 확인하지 못했습니다\. git 상태를 근거로 작업 범위를 정하지 마십시오\.\]/,
+      `expected the cannot-attribute notice on a supported non-git vault, got: ${r.stdout}`,
     );
   });
 });
