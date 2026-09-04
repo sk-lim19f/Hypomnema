@@ -628,3 +628,68 @@ test('marketplace name mismatch → exit 1', () => {
     assert.equal(r.status, 1, 'name parity must be enforced');
   });
 });
+
+// A flat `commands/<name>.md` and a directory `skills/<name>/SKILL.md` are the same kind
+// of component to the loader and both claim `/hypo:<name>`. Six such pairs shipped from
+// v1.0.0 until 2026-09-04 while `claude plugin details` listed each of those names twice;
+// `commands/` won all six, so the `skills/` half never reached a user and only cost
+// always-on tokens. Nothing in the tree caught it, hence these two.
+test('command and skill sharing a name → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    // fixture already ships commands/foo.md; give the same name a directory skill
+    mkdirSync(join(dir, 'skills', 'foo'), { recursive: true });
+    writeFileSync(join(dir, 'skills', 'foo', 'SKILL.md'), '# foo\n');
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, `collision must fail: ${r.stdout}\n${r.stderr}`);
+    assert.ok(
+      /name collision.*\bfoo\b/s.test(r.stdout + r.stderr),
+      `should name the colliding component: ${r.stdout}`,
+    );
+  });
+});
+
+// The collision check compares directory names, which only works while a skill's
+// invocation name IS its directory name. A `name:` in the frontmatter overrides that, so
+// the gate pins the premise it depends on.
+test('skill declaring a name different from its directory → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    writeFileSync(
+      join(dir, 'skills', 'demo', 'SKILL.md'),
+      '---\nname: foo\ndescription: x\n---\n\n# demo\n',
+    );
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, `name/directory mismatch must fail: ${r.stdout}\n${r.stderr}`);
+    assert.ok(
+      /declares "name: foo".*directory "demo"/s.test(r.stdout + r.stderr),
+      `should name both sides: ${r.stdout}`,
+    );
+  });
+});
+
+test('skill declaring a name equal to its directory → exit 0', () => {
+  // Negative control: the check must reject a mismatch, not the presence of `name:`.
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    writeFileSync(
+      join(dir, 'skills', 'demo', 'SKILL.md'),
+      '---\nname: demo\ndescription: x\n---\n\n# demo\n',
+    );
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 0, `matching name must pass: ${r.stdout}\n${r.stderr}`);
+  });
+});
+
+test('this repo ships no name shared by commands/ and skills/', () => {
+  // The fixture test above proves the check works; this one proves the repo passes it.
+  // CI already runs `npm run smoke:plugin` against the real tree (the `plugin-channel`
+  // job in ci.yml, and release.yml calls the script directly). This is the same verdict
+  // inside `npm test`, so a reintroduced pair fails locally before it reaches CI.
+  const r = run('smoke-plugin.mjs', []);
+  assert.equal(r.status, 0, `repo plugin surfaces must be valid: ${r.stdout}\n${r.stderr}`);
+  assert.ok(
+    !/name collision/.test(r.stdout + r.stderr),
+    `repo must ship one surface per name: ${r.stdout}`,
+  );
+});

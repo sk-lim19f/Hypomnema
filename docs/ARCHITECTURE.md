@@ -47,7 +47,7 @@ hypomnema/
 │       ├── frontmatter.mjs
 │       ├── hypo-root.mjs
 │       └── hypo-ignore.mjs
-├── skills/                   ← Agent Skills — skills/<name>/SKILL.md
+├── skills/                   ← directory-form Agent Skills (skills/<name>/SKILL.md)
 ├── templates/                ← baseline files copied on init
 │   ├── hypo-config.md, index.md, hot.md, log.md, SCHEMA.md, hypo-guide.md
 │   ├── Home.md, Overview.md, hypo-automation.md, hypo-help.md
@@ -79,15 +79,29 @@ Each user-facing operation is a pair: an LLM-facing prompt + a Node.js script.
 
 **Commands shipped in v1.1:** `init`, `doctor`, `upgrade`, `uninstall`, `ingest`, `query`, `crystallize`, `resume`, `feedback`, `verify`, `lint`, `stats`, `graph`.
 
-The synthesis-heavy commands (`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`) are also exposed as Agent Skills.
+Every one of those files is itself an Agent Skill; see below.
 
 ---
 
 ## Agent Skills
 
-`skills/<name>/SKILL.md` follows the Claude Agent Skills convention. When a conversation matches the skill's description, Claude auto-loads it without needing the slash command.
+A flat `commands/<name>.md` and a directory `skills/<name>/SKILL.md` are the same kind of
+component to the plugin loader: both are Agent Skills, both claim `/hypo:<name>`, and both
+auto-load when a conversation matches their `description`. (That is measured on a plugin
+install. `init`/`upgrade` do not deploy the plugin's own `skills/` at all, so on the npm path
+only `commands/` is installed — into `~/.claude/commands/hypo/` — and whether those copies
+auto-trigger the same way has not been measured.) The directory form is what a skill needs when
+it carries more than one file (`skills/debate/references/`); the flat form is everything else.
 
-> v1.0 originally planned flat `skills/*.md` files; v1.1 switched to `<name>/SKILL.md` for compatibility with the official Agent Skills loader.
+**One name ships from one directory, never both** (in this package; the extensions channel
+under `~/hypomnema/extensions/` is not covered by the gate and can still sync a co-named pair)**.** Shipping a pair does not give you a
+human-facing surface and a model-facing surface: nothing in the frontmatter separates them, only
+one wins, and the loser is dead weight that still costs always-on tokens and still appears in
+`claude plugin details`. Six pairs shipped that way from v1.0.0 until 2026-09-04, and `commands/`
+won every one of them. `scripts/smoke-plugin.mjs` now fails the build on a collision.
+
+> v1.0 originally planned flat `skills/*.md` files and shipped `<name>/SKILL.md` instead; both
+> forms have loaded since v1.0.0. The 2026-09-04 correction is that they are not two surfaces.
 
 ---
 
@@ -385,7 +399,7 @@ If `git status` shows no `.md` changes, the diff step is skipped — Stop hook f
 
 ### Citation convention
 
-The six writer-side skills (`crystallize`, `query`, `ingest`, `verify`, `graph`, `lint`) carry an identical footer instructing Claude to cite wiki pages inline as `[[page-slug]]`, which keeps them connected in the graph. The observability audit does not scan for these inline citations: it scores sessions on tool and command usage recorded by `hypo-session-record` (search / ingest / feedback counts). Counting citations as a signal is a possible future iteration, not current behavior.
+**The convention is current.** It is stated in `commands/query.md`, in `commands/crystallize.md`, and in `templates/hypo-guide.md` §8, which `init` writes into a vault that does not already have it (an existing copy is left alone). What went away on 2026-09-04 is one particular copy of it: an identical footer written into six `skills/*/SKILL.md` files, which were the losing half of the name collision above and never reached anyone. Whether to repeat that footer in the remaining `commands/*.md` is open. The observability audit never depended on it either way: it scores sessions on tool and command usage recorded by `hypo-session-record` (search / ingest / feedback counts), not on inline citations.
 
 ---
 

@@ -436,35 +436,11 @@
     "exec": false
   },
   {
-    "path": "skills/crystallize/SKILL.md",
-    "exec": false
-  },
-  {
     "path": "skills/debate/SKILL.md",
     "exec": false
   },
   {
     "path": "skills/debate/references/orchestration-patterns.md",
-    "exec": false
-  },
-  {
-    "path": "skills/graph/SKILL.md",
-    "exec": false
-  },
-  {
-    "path": "skills/ingest/SKILL.md",
-    "exec": false
-  },
-  {
-    "path": "skills/lint/SKILL.md",
-    "exec": false
-  },
-  {
-    "path": "skills/query/SKILL.md",
-    "exec": false
-  },
-  {
-    "path": "skills/verify/SKILL.md",
     "exec": false
   },
   {

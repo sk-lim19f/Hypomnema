@@ -28,10 +28,12 @@ import { HOME, REPO, SESSION_TMP_HOME, runChecker, withTmpDir } from './helpers.
 // readChecklist — no `[ ] 0.` marker). Reconciling it is logged as #47.
 suite('session-close advisory reflections (#41~#44) — present on shipped surfaces');
 
-const ADVISORY_SURFACES = [
-  join(REPO, 'commands', 'crystallize.md'),
-  join(REPO, 'skills', 'crystallize', 'SKILL.md'),
-];
+// Every shipped surface that can put the model in close mode. `skills/crystallize/SKILL.md`
+// was one of these until 2026-09-04, when it turned out to be the losing half of a
+// commands/skills name collision: it registered but never loaded, so the advisories it
+// carried were never read. It was deleted rather than kept in sync with a file nobody saw.
+// If a second close surface is ever added, it belongs in this list on the same day.
+const ADVISORY_SURFACES = [join(REPO, 'commands', 'crystallize.md')];
 
 // Markers that must appear on every in-scope surface. Keyed by advisory.
 const ADVISORY_MARKERS = {
@@ -110,15 +112,13 @@ const OVERCLOSE_SURFACES = [
     ],
     absent: ['Use when the user is wrapping up a session'], // PR #127 over-trigger wording
   },
-  {
-    file: join(REPO, 'skills', 'crystallize', 'SKILL.md'),
-    present: [
-      'Task completion alone is not a close signal',
-      'Task completion alone does not put you in close mode',
-    ],
-    absent: ['Use when the user signals they are wrapping up'],
-  },
 ];
+
+// A surface list that empties itself passes every loop below without asserting anything.
+test('close-surface lists are not empty', () => {
+  assert.ok(ADVISORY_SURFACES.length > 0, 'ADVISORY_SURFACES must name at least one surface');
+  assert.ok(OVERCLOSE_SURFACES.length > 0, 'OVERCLOSE_SURFACES must name at least one surface');
+});
 
 for (const { file, present, absent } of OVERCLOSE_SURFACES) {
   const rel = file.slice(REPO.length + 1);

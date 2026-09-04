@@ -87,14 +87,49 @@ function smoke(root) {
   if (commandsMd.length === 0) fail('commands/: no *.md command files (only a placeholder?)');
   else notes.push(`commands: ${commandsMd.length}`);
 
-  let skillCount = 0;
+  const skillNames = [];
   if (isDir(join(root, 'skills'))) {
     for (const entry of readdirSync(join(root, 'skills'))) {
-      if (isFile(join(root, 'skills', entry, 'SKILL.md'))) skillCount++;
+      if (isFile(join(root, 'skills', entry, 'SKILL.md'))) skillNames.push(entry);
     }
   }
-  if (skillCount === 0) fail('skills/: no */SKILL.md skills (only a placeholder?)');
-  else notes.push(`skills: ${skillCount}`);
+  if (skillNames.length === 0) fail('skills/: no */SKILL.md skills (only a placeholder?)');
+  else notes.push(`skills: ${skillNames.length}`);
+
+  // The collision check below compares directory names against command filenames. That
+  // only holds while a skill's invocation name IS its directory name. A `name:` in the
+  // frontmatter overrides it, so `skills/bar/SKILL.md` declaring `name: foo` would claim
+  // `/<plugin>:foo` and slip past a directory-name comparison. Rather than reimplement the
+  // loader's name resolution here, keep the premise true: a `name:` must agree with the
+  // directory. Omit it (as `skills/debate/SKILL.md` does) and the directory name stands.
+  for (const entry of skillNames) {
+    const head = readFileSync(join(root, 'skills', entry, 'SKILL.md'), 'utf-8').slice(0, 4096);
+    const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(head);
+    if (!fm) continue;
+    const declared = /^name:[ \t]*(?:"([^"]*)"|'([^']*)'|(.*))$/m.exec(fm[1]);
+    if (!declared) continue;
+    const value = (declared[1] ?? declared[2] ?? declared[3] ?? '').trim();
+    if (value && value !== entry)
+      fail(
+        `skills/${entry}/SKILL.md declares "name: ${value}" but sits in directory ` +
+          `"${entry}". The invocation name must match the directory, or the collision ` +
+          `check below compares the wrong names. Rename the directory or drop the field.`,
+      );
+  }
+
+  // A flat `commands/<name>.md` and a directory `skills/<name>/SKILL.md` are both skill
+  // components to the loader, and both claim the same `/<plugin>:<name>`. Shipping the
+  // pair does not give one surface for people and another for the model: only one wins,
+  // the other is dead weight that still costs always-on tokens and still shows up in the
+  // component inventory. Six such pairs shipped for four months before anyone noticed.
+  const commandNames = new Set(commandsMd.map((f) => f.replace(/\.md$/, '')));
+  const collisions = skillNames.filter((n) => commandNames.has(n)).sort();
+  if (collisions.length > 0)
+    fail(
+      `component name collision: ${collisions.join(', ')} — each exists as both ` +
+        `commands/<name>.md and skills/<name>/SKILL.md, so both register the same ` +
+        `/<plugin>:<name>. Keep exactly one surface per name.`,
+    );
 
   // 3. hooks/hooks.json — every command target AND every `shared` file must be a
   // real regular file on disk. hooks.json is the hook source of truth, so a missing

@@ -289,7 +289,9 @@ PostToolUse 훅 둘은 matcher 없이 등록되고 각자 tool_name으로 거릅
 
 ### Claude Agent Skills
 
-합성이 핵심인 명령어 6개(`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`)는 `skills/<name>/SKILL.md`로도 등록돼 있습니다. 대화 내용이 해당 스킬의 `description`과 맞으면 Claude Agent Skills 메커니즘이 슬래시 명령 없이도 자동으로 호출합니다. 일곱 번째인 `debate`는 스킬로만 있습니다. `commands/` 아래에 파일이 없지만 플러그인이 `skills/`도 함께 싣기 때문에 `/hypo:debate`는 나머지와 똑같이 동작합니다. 세 단계(심문, 검증, 종합)로 구조화된 검토를 실행해 위키 주장을 재검증하거나 되돌리기 어려운 결정을 ADR로 굳힙니다. 위 명령어 표에 없는 것은 그 표가 `commands/` 아래 파일을 세기 때문이지 칠 수 있는 것을 세기 때문이 아닙니다. 명령어를 정확히 몰라도 하려는 일을 말로 적으면 됩니다.
+`commands/` 아래의 모든 파일이 그 자체로 Claude Agent Skill입니다. 대화 내용이 그 `description`과 맞으면 슬래시 명령 없이도 자동으로 호출됩니다. (플러그인 설치에서 실측한 것입니다. npm 경로가 설치하는 `~/.claude/commands/hypo/` 사본도 같은 방식으로 자동 호출되는지는 재 보지 않았습니다.) 합성이 핵심인 여섯(`ingest`, `query`, `crystallize`, `lint`, `verify`, `graph`)에서 이 동작이 가장 잘 드러납니다. `debate`만 반대쪽에 있습니다. `commands/` 아래에 파일이 없고 `skills/debate/SKILL.md`에만 있는데, 플러그인이 `skills/`도 함께 싣기 때문에 `/hypo:debate`는 나머지와 똑같이 동작합니다. 세 단계(심문, 검증, 종합)로 구조화된 검토를 실행해 위키 주장을 재검증하거나 되돌리기 어려운 결정을 ADR로 굳힙니다. 위 명령어 표에 없는 것은 그 표가 `commands/` 아래 파일을 세기 때문이지 칠 수 있는 것을 세기 때문이 아닙니다. 명령어를 정확히 몰라도 하려는 일을 말로 적으면 됩니다.
+
+이름 하나는 두 디렉터리 중 한 곳에서만 출하됩니다. flat `commands/<name>.md`와 디렉터리 `skills/<name>/SKILL.md`는 둘 다 `/hypo:<name>`을 차지하고, 둘을 함께 실어도 사람용 표면과 모델용 표면으로 갈리지 않습니다. 한쪽만 이기고 나머지는 죽은 무게가 됩니다. 충돌이 있으면 `npm run smoke:plugin`이 실패합니다. 이 검사는 이 패키지의 `commands/`와 `skills/`만 봅니다. `~/hypomnema/extensions/`에 둔 직접 만든 확장은 검사하지 않으므로, 스스로 캡처한 `commands/mine.md`와 `skills/mine/`은 여전히 함께 동기화되어 같은 방식으로 충돌할 수 있습니다.
 
 | 이렇게 말하면 | 트리거되는 스킬 |
 |---|---|

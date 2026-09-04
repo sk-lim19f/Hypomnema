@@ -823,6 +823,9 @@ test('prompt surfaces: bundled-script references resolve via CLAUDE_PLUGIN_ROOT/
   // `crystallize` among them, so a close could have been written into a vault the
   // user did not name. The same-named commands/*.md had it right the whole time,
   // which is why this sweeps BOTH surfaces from the one `surfaceFiles` list above.
+  // Those five SKILL.md files were deleted on 2026-09-04 (they were the losing half of
+  // a commands/skills name collision), so the example is now history, not a live file
+  // you can open. The sweep still covers both directories: `skills/` has `debate`.
   //
   // Derive the parsed set, never `src.includes(flag)`: a substring test passes for
   // `--apply`, `--check` and `--mark` against crystallize.mjs, because each is a
@@ -919,8 +922,8 @@ test('prompt surfaces: bundled-script references resolve via CLAUDE_PLUGIN_ROOT/
       `exception), so the value is usually dropped and the run falls through to default ` +
       `vault resolution while reporting success.\n  ${badFlags.join('\n  ')}`,
   );
-  // Guard the guard, per surface rather than by a global count: a threshold like
-  // ">= 5" against the real 24 stays green with five of six skills missing.
+  // Guard the guard, per surface rather than by a global count: any global threshold
+  // stays green while whole surfaces are missing, so assert once per surface instead.
   for (const p of surfaceFiles) {
     const rel = p.slice(REPO.length + 1);
     const code = codeText(readFileSync(p, 'utf8'));
