@@ -484,6 +484,170 @@ function pendingProposalNotice() {
     return '';
   }
 }
+// ── foreign-project uncommitted notice ──────────────────────────────────────
+// Same signal precompactGateStatus already computes for its own gate
+// (closeAccountableScope / sessionTouchTrusted, hypo-shared.mjs), surfaced
+// here instead for the AGENT reading additionalContext: a project this
+// session isn't scoped to may still have uncommitted changes sitting in the
+// shared vault, and without this line the agent has no way to tell those
+// apart from its own unfinished work. Cannot import hypo-shared.mjs's
+// `projectOfPath` / `gitDirtyFiles` here, not a technical constraint (both
+// are simply not exported), but an ownership decision: hypo-shared.mjs
+// belongs to a different lane, so this hook keeps a local, self-contained
+// duplicate rather than adding an export for it. The cost is real: a future
+// fix to gitDirtyFiles (e.g. its rename re-attribution) does not propagate
+// here automatically.
+
+const FOREIGN_GIT_TIMEOUT_MS = 3000;
+// Cap on how many foreign project names the notice spells out. Past this the
+// rest collapse into a count, so one session cannot grow the prompt by however
+// many projects are dirty.
+const FOREIGN_NAME_CAP = 5;
+
+/** `projects/<slug>/...` → `<slug>`; everything else → null. `null` here does
+ * not mean "not one project's work": the caller below folds every non-null
+ * hit into a per-name foreign count and every null hit into a nameless
+ * "unattributed" count, and both feed the same notice. Not the same
+ * classification hypo-auto-commit.mjs's commit message uses for its own
+ * "(N paths across M projects)" count (hypo-shared.mjs's private
+ * `projectOfPath`): that one folds a non-`projects/` path to its first path
+ * segment (`extensions`, `hot.md`, ...) for a tally; this one folds it to
+ * `null` because attribution, not tallying, is the job here. A top-level
+ * segment is not a project name, and this notice must not present it as
+ * one.
+ */
+function projectOfPath(relPath) {
+  const parts = relPath.split('/');
+  return parts[0] === 'projects' && parts.length > 1 && parts[1] ? parts[1] : null;
+}
+
+/** Vault-relative dirty paths (tracked + untracked), normalized to be
+ * relative to `hypoDir` itself via `git rev-parse --show-prefix` (empty when
+ * `hypoDir` IS the repo top level), the same normalization
+ * hypo-shared.mjs's `gitDirtyFiles` applies for staging correctness: without
+ * it, a vault nested under a larger host repo reports paths relative to that
+ * repo's top level, and every one of them would fail to classify as this
+ * vault's own. NUL-separated porcelain so Korean project/page names survive
+ * intact. This also re-attributes a rename/copy's `from` path (codex
+ * 3rd-round review follow-up), the same as gitDirtyFiles does for
+ * staging correctness, so a rename OUT of a foreign project is not silently
+ * lost just because its destination happens to land under `ownProject`.
+ *
+ * Returns `null`, not `[]`, on any git failure (repo missing, `rev-parse` or
+ * `status` non-zero, or a timeout): folding "cannot enumerate" into the same
+ * empty array a truly clean repo returns would render the two identically,
+ * which is the silent failure this notice exists to catch (mirrors
+ * `gitDirtyFiles`'s own contract: "an empty return here just means 'cannot
+ * attribute', not 'clean'"). A clean repo returns `[]`.
+ */
+function listDirtyPaths(hypoDir) {
+  const prefixRes = spawnSync('git', ['-C', hypoDir, 'rev-parse', '--show-prefix'], {
+    encoding: 'utf-8',
+    timeout: FOREIGN_GIT_TIMEOUT_MS,
+  });
+  if (prefixRes.status !== 0) return null;
+  // trimEnd(), not trim(): the prefix is a real path segment, and a leading
+  // space or control char in a directory name is valid there. trim() would
+  // strip it off the front, so the stripped prefix no longer matches the
+  // (untouched) start of every path `git status` reports, and every path
+  // under that directory would wrongly read as "outside the vault" (the
+  // notice going silent for exactly the same reason a missing rename `from`
+  // does below). Only the trailing `\n` `--show-prefix` always appends needs
+  // stripping.
+  const prefix = (prefixRes.stdout || '').trimEnd();
+
+  const r = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall', '-z'], {
+    encoding: 'utf-8',
+    timeout: FOREIGN_GIT_TIMEOUT_MS,
+  });
+  if (r.status !== 0) return null;
+  const out = [];
+  const records = (r.stdout || '').split('\0');
+  const toVaultRelative = (f) => {
+    if (!f) return null;
+    if (!prefix) return f; // hypoDir IS the repo top level, nothing to strip
+    return f.startsWith(prefix) ? f.slice(prefix.length) : null; // outside the vault
+  };
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    if (!rec) continue;
+    const xy = rec.slice(0, 2);
+    const file = rec.slice(3); // destination path for a rename/copy
+    const isRenameOrCopy = xy[0] === 'R' || xy[1] === 'R' || xy[0] === 'C' || xy[1] === 'C';
+    // A rename/copy emits a paired `to\0from` record. Attribute BOTH: the
+    // origin project lost a file just as surely as the destination gained
+    // one, and dropping `from` (as this used to) silently loses that origin
+    // whenever it differs from the destination's project (a rename INTO
+    // ownProject from a foreign one would otherwise vanish entirely). One
+    // rename/copy is therefore counted as up to 2 dirty paths, inflating
+    // foreignCount/unattributedCount by one per cross-project rename; the
+    // name Set below still de-dupes, so the project NAME list does not grow.
+    let fromFile = null;
+    if (isRenameOrCopy) {
+      i++;
+      fromFile = records[i] || null;
+    }
+    const rel = toVaultRelative(file);
+    if (rel) out.push(rel);
+    const relFrom = toVaultRelative(fromFile);
+    if (relFrom) out.push(relFrom);
+  }
+  return out;
+}
+
+/** One-line notice covering two counts: uncommitted paths under a named
+ * project other than `ownProject` (`projects/<slug>/...`, or, when
+ * `ownProject` is null, no cwd-matched project this session, so ANY named
+ * project counts), and uncommitted paths this classifier cannot attribute to
+ * any project at all (everything else, root vault infra, `extensions/`,
+ * `_specs/`, ...). This is attribution, not narrowing, so the
+ * unattributed bucket is surfaced with a count rather than silently dropped
+ * just because it has no project name to show. '' only when enumeration
+ * succeeded and both counts are zero, so the quiet path stays quiet exactly
+ * there. A `null` from `listDirtyPaths` (enumeration failed) gets its own
+ * distinct line instead: the caller must not read "could not tell" as
+ * "nothing foreign".
+ */
+function foreignUncommittedNotice(hypoDir, ownProject) {
+  const dirty = listDirtyPaths(hypoDir);
+  if (dirty === null) {
+    return '[WIKI: 미커밋 변경의 귀속을 확인하지 못했습니다. git 상태를 근거로 작업 범위를 정하지 마십시오.]';
+  }
+  const foreignProjects = new Set();
+  let foreignCount = 0;
+  let unattributedCount = 0;
+  for (const f of dirty) {
+    const slug = projectOfPath(f);
+    if (slug === ownProject) continue;
+    if (slug) {
+      foreignProjects.add(slug);
+      foreignCount++;
+    } else {
+      unattributedCount++;
+    }
+  }
+  if (foreignCount === 0 && unattributedCount === 0) return '';
+  const clauses = [];
+  if (foreignCount > 0) {
+    // The slug comes from a directory name in `git status` output, so it is
+    // untrusted text on its way into a prompt. sanitizeProjForPrompt is the same
+    // guard the hot-cache notices in this file already use; skipping it here would
+    // let a newline or a control char in a project directory name break the
+    // one-line notice apart and inject into the surrounding context. The name list
+    // is also capped, because an unbounded one grows the context by however many
+    // projects happen to be dirty.
+    const all = [...foreignProjects].sort();
+    const shown = all.slice(0, FOREIGN_NAME_CAP).map((s) => `projects/${sanitizeProjForPrompt(s)}`);
+    const names =
+      all.length > FOREIGN_NAME_CAP
+        ? `${shown.join(', ')} 외 ${all.length - FOREIGN_NAME_CAP}개`
+        : shown.join(', ');
+    clauses.push(`현재 프로젝트 외 ${names} 변경 ${foreignCount}건`);
+  }
+  if (unattributedCount > 0) clauses.push(`귀속 불명 변경 ${unattributedCount}건`);
+  return `[WIKI: ${clauses.join(', ')}이 있습니다. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오.]`;
+}
+
 const GLOBAL_HOT = join(HYPO_DIR, 'hot.md');
 const HOT_CHARS = 2000;
 const STATE_CHARS = 2000;
@@ -612,6 +776,17 @@ process.stdin.on('end', () => {
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = sessionMarkerPath(sessionId);
     const hit = findProjectFiles(cwd);
+
+    // ownProject = the cwd-matched project (or null on a MISS, per
+    // foreignUncommittedNotice's docstring). Late-appended into `notices` /
+    // `noticePrefix`, same pattern the MISS branch's suggestLine uses below —
+    // both need `hit` first, which isn't resolved until this line.
+    const foreignNotice = foreignUncommittedNotice(HYPO_DIR, hit ? hit.proj : null);
+    if (foreignNotice) {
+      notices.push(foreignNotice);
+      noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
+      process.stderr.write(`\n\x1b[33m${foreignNotice}\x1b[0m\n`);
+    }
 
     // Observed-base snapshot for the write=proposal gate. Deliberately AFTER gitPull: the base must
     // describe the tree this session actually starts from, remote merges

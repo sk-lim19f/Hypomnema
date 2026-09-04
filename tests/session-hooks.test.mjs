@@ -3901,3 +3901,290 @@ test('opt-out (CI=true) suppresses the PKG_ROOT-null notice', () => {
     rmSync(dirname(standaloneDir), { recursive: true, force: true });
   }
 });
+
+// ── foreign-project uncommitted notice (ISSUE-99) ───────────────────────────
+// The session sees the whole vault's `git status`, but is only accountable
+// for one project (or none). Another project's own uncommitted work must
+// surface as a heads-up, never be silently absorbed into this session's view.
+
+suite('hypo-session-start.mjs — foreign-project uncommitted notice (ISSUE-99)');
+
+function withTwoProjectWiki(fn) {
+  withGrowthWiki((dir) => {
+    const work = mkdtempSync(join(tmpdir(), 'hypo-issue99-work-'));
+    const mineDir = join(dir, 'projects', 'mine');
+    mkdirSync(mineDir, { recursive: true });
+    writeFileSync(
+      join(mineDir, 'index.md'),
+      `---\ntitle: mine\ntype: project-index\nupdated: 2026-06-28\nworking_dir: "${work}"\n---\n# mine\n`,
+    );
+    const theirsDir = join(dir, 'projects', 'theirs');
+    mkdirSync(theirsDir, { recursive: true });
+    writeFileSync(join(theirsDir, 'index.md'), '# theirs (no working_dir, another project)\n');
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'projects'], { cwd: dir });
+    try {
+      fn(dir, work);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+}
+
+function runSessionStartFor(dir, cwd, sessionId) {
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+    input: JSON.stringify({ cwd, session_id: sessionId }),
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+  });
+}
+
+test('a different project surfaces a foreign notice with count and name', () => {
+  withTwoProjectWiki((dir, work) => {
+    writeFileSync(join(dir, 'projects', 'theirs', 'draft.md'), 'uncommitted draft\n');
+    const r = runSessionStartFor(dir, work, 'issue99-foreign');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected foreign notice, got: ${r.stdout}`,
+    );
+  });
+});
+
+test('own-project changes are excluded from the foreign count', () => {
+  withTwoProjectWiki((dir, work) => {
+    writeFileSync(join(dir, 'projects', 'mine', 'draft.md'), 'my own uncommitted work\n');
+    const r = runSessionStartFor(dir, work, 'issue99-own');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !/\[WIKI: 현재 프로젝트 외|\[WIKI: 귀속 불명/.test(r.stdout),
+      `own uncommitted change must not read as foreign or unattributed: ${r.stdout}`,
+    );
+  });
+});
+
+// New contract (ISSUE-99 follow-up): "projects/<slug>/" is named-foreign;
+// everything else that is dirty is "unattributed", not silently dropped. A
+// root-level vault file is "everything else" too. Narrowing it away would
+// repeat the exact silent failure this notice exists to prevent (ADR 0098:
+// attribution surfaces what it cannot place a name on, it does not discard
+// it).
+test('root-level uncommitted changes (shared vault infra) count as unattributed, not silently dropped', () => {
+  withTwoProjectWiki((dir, work) => {
+    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\nupdated: today\n---\n## edited\n');
+    const r = runSessionStartFor(dir, work, 'issue99-root');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !/\[WIKI: 현재 프로젝트 외/.test(r.stdout),
+      `a root-level dirty file must not be misread as a NAMED foreign project: ${r.stdout}`,
+    );
+    assert.match(
+      r.stdout,
+      /\[WIKI: 귀속 불명 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected the root-level file to count in the unattributed bucket, got: ${r.stdout}`,
+    );
+  });
+});
+
+// Reproduces the 2026-08-27 incident directly: the file set that slipped
+// through was extensions/ai-tone/, not a projects/<slug>/ path. Before this
+// fix projectOfPath's null return meant "not one project's work" and the
+// caller dropped it; now null feeds the unattributed count instead.
+test('extensions/ai-tone dirty file surfaces as an unattributed count (2026-08-27 incident)', () => {
+  withTwoProjectWiki((dir, work) => {
+    const toneDir = join(dir, 'extensions', 'ai-tone');
+    mkdirSync(toneDir, { recursive: true });
+    writeFileSync(join(toneDir, 'x.sh'), '#!/bin/sh\necho hi\n');
+    const r = runSessionStartFor(dir, work, 'issue99-aitone');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 귀속 불명 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected the original-incident file to surface as unattributed, got: ${r.stdout}`,
+    );
+  });
+});
+
+test('a _specs/ scratch dirty file also surfaces as unattributed', () => {
+  withTwoProjectWiki((dir, work) => {
+    const specsDir = join(dir, '_specs', 'some-work');
+    mkdirSync(specsDir, { recursive: true });
+    writeFileSync(join(specsDir, 'plan.md'), '# plan\n');
+    const r = runSessionStartFor(dir, work, 'issue99-specs');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 귀속 불명 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected the _specs scratch file to surface as unattributed, got: ${r.stdout}`,
+    );
+  });
+});
+
+test('git enumeration failure (not a git repo) yields a distinct notice, not silence', () => {
+  const notARepo = mkdtempSync(join(tmpdir(), 'hypo-issue99-notrepo-'));
+  const work = mkdtempSync(join(tmpdir(), 'hypo-issue99-notrepo-work-'));
+  try {
+    const r = runSessionStartFor(notARepo, work, 'issue99-norepo');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 미커밋 변경의 귀속을 확인하지 못했습니다\. git 상태를 근거로 작업 범위를 정하지 마십시오\.\]/,
+      `expected a distinct enumeration-failure notice instead of silence, got: ${r.stdout}`,
+    );
+  } finally {
+    rmSync(notARepo, { recursive: true, force: true });
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+// codex review (foreign-notice follow-up): "any" was previously proven with
+// a single dirty project, which cannot distinguish "counts every foreign
+// project" from "counts the first one found". Two foreign projects, both
+// must appear.
+test('MISS (no cwd match): any project-scoped uncommitted change counts as foreign', () => {
+  withTwoProjectWiki((dir) => {
+    writeFileSync(join(dir, 'projects', 'theirs', 'draft.md'), 'uncommitted draft\n');
+    writeFileSync(join(dir, 'projects', 'mine', 'draft.md'), 'uncommitted draft too\n');
+    const unrelatedCwd = mkdtempSync(join(tmpdir(), 'hypo-issue99-unrelated-'));
+    try {
+      const r = runSessionStartFor(dir, unrelatedCwd, 'issue99-miss');
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      assert.match(
+        r.stdout,
+        /\[WIKI: 현재 프로젝트 외 projects\/mine, projects\/theirs 변경 2건이 있습니다\./,
+        `expected BOTH foreign projects counted (not just the first found), got: ${r.stdout}`,
+      );
+    } finally {
+      rmSync(unrelatedCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// codex pre-commit review BLOCKER 2 companion: `git status --porcelain`
+// reports paths relative to the repo TOP LEVEL even under `-C`, not to
+// hypoDir. Without stripping `--show-prefix`, a vault nested under a bigger
+// host repo would never match its own `projects/` paths (permanent silence),
+// and a projects/ directory living OUTSIDE the vault in that same host repo
+// would get misattributed as one of the vault's own projects.
+test('git rev-parse --show-prefix normalization: a vault-outside projects/ path is not misattributed', () => {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-issue99-nested-'));
+  const work = mkdtempSync(join(tmpdir(), 'hypo-issue99-nested-work-'));
+  try {
+    const vault = join(base, 'vault');
+    mkdirSync(vault, { recursive: true });
+    spawnSync('git', ['init', '-q'], { cwd: base });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: base });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: base });
+    const theirsDir = join(vault, 'projects', 'theirs');
+    mkdirSync(theirsDir, { recursive: true });
+    writeFileSync(join(theirsDir, 'index.md'), '# theirs\n');
+    const outsideDir = join(base, 'projects', 'outsider');
+    mkdirSync(outsideDir, { recursive: true });
+    writeFileSync(join(outsideDir, 'file.md'), '# outside the vault entirely\n');
+    spawnSync('git', ['add', '-A'], { cwd: base });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: base });
+    writeFileSync(join(theirsDir, 'draft.md'), 'uncommitted draft\n');
+    appendFileSync(join(outsideDir, 'file.md'), '\ndirty outside\n');
+    const r = runSessionStartFor(vault, work, 'issue99-nested');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected only the in-vault "theirs" change counted, not the outside-vault "outsider" path: ${r.stdout}`,
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+// codex 3rd-round review: `listDirtyPaths` used to skip a rename/copy's
+// paired `from` record entirely, keeping only the destination path. A rename
+// OUT of a foreign project and INTO the cwd-matched project then vanished
+// completely: the destination reads as "own" and gets excluded, and the
+// origin (the one path that WAS actually foreign) was never looked at.
+test('a rename OUT of a foreign project (into own) is not silently lost (codex 3rd-round review)', () => {
+  withTwoProjectWiki((dir, work) => {
+    writeFileSync(join(dir, 'projects', 'theirs', 'a.md'), 'seed\n');
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'seed'], { cwd: dir });
+    spawnSync('git', ['mv', 'projects/theirs/a.md', 'projects/mine/a.md'], { cwd: dir });
+    const r = runSessionStartFor(dir, work, 'issue99-rename');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `a rename OUT of a foreign project must still surface theirs, got: ${r.stdout}`,
+    );
+  });
+});
+
+// A leading space right above the vault is a valid path segment.
+// `--show-prefix`'s output must only lose its trailing `\n`, never a leading
+// byte that is actually part of the path. trim() strips both ends and would
+// silently break every startsWith(prefix) match below it.
+test('a leading-space path component above the vault does not silence the notice (prefix trimEnd)', () => {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-issue99-prefixspace-'));
+  const work = mkdtempSync(join(tmpdir(), 'hypo-issue99-prefixspace-work-'));
+  try {
+    const vault = join(base, ' weird', 'vault');
+    mkdirSync(join(vault, 'projects', 'mine'), { recursive: true });
+    writeFileSync(
+      join(vault, 'projects', 'mine', 'index.md'),
+      `---\ntitle: mine\ntype: project-index\nupdated: 2026-06-28\nworking_dir: "${work}"\n---\n# mine\n`,
+    );
+    const theirsDir = join(vault, 'projects', 'theirs');
+    mkdirSync(theirsDir, { recursive: true });
+    writeFileSync(join(theirsDir, 'index.md'), '# theirs\n');
+    spawnSync('git', ['init', '-q'], { cwd: base });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: base });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: base });
+    spawnSync('git', ['add', '-A'], { cwd: base });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: base });
+    writeFileSync(join(theirsDir, 'draft.md'), 'uncommitted draft\n');
+    const r = runSessionStartFor(vault, work, 'issue99-prefixspace');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected the foreign notice despite the leading-space path component, got: ${r.stdout}`,
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+// A project directory name with a REAL embedded newline (shell command
+// substitution swallows a trailing \n, so this must be built directly with
+// mkdirSync, never `$(printf '\n')`). Without sanitizeProjForPrompt this
+// splits the one-line notice into two printed lines, which is the injection
+// surface the guard exists to close.
+test('a project directory name with a real newline stays a single-line notice (sanitizeProjForPrompt regression)', () => {
+  withTwoProjectWiki((dir, work) => {
+    const evilSlug = 'ev\nil';
+    const evilDir = join(dir, 'projects', evilSlug);
+    mkdirSync(evilDir, { recursive: true });
+    writeFileSync(join(evilDir, 'draft.md'), 'uncommitted draft\n');
+    const r = runSessionStartFor(dir, work, 'issue99-newline');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const firstLine = r.stdout.split('\n')[0];
+    assert.match(
+      firstLine,
+      /\[WIKI: 현재 프로젝트 외 projects\/ev il 변경 1건이 있습니다\. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오\.\]/,
+      `expected the whole notice on one line with the embedded newline sanitized, got: ${JSON.stringify(r.stdout)}`,
+    );
+  });
+});
+
+test('clean vault: no foreign notice at all (quiet at zero)', () => {
+  withTwoProjectWiki((dir, work) => {
+    const r = runSessionStartFor(dir, work, 'issue99-clean');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      !/\[WIKI: 현재 프로젝트 외|\[WIKI: 귀속 불명|\[WIKI: 미커밋 변경의 귀속을/.test(r.stdout),
+      `a clean vault must emit no foreign/unattributed/enumeration-failure notice: ${r.stdout}`,
+    );
+  });
+});

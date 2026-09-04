@@ -29,6 +29,7 @@ When `--project` is omitted, the script prefers the project whose `working_dir` 
 ## Step 2 — Present session state
 
 Show the output from the script:
+- **`[WIKI: ...]` notice**, if present, first and verbatim. It names uncommitted changes elsewhere in the vault (another project, or unattributable to any project) that are not this session's scope. Do not fold this line into the project summary or fetch/edit the paths it names without the user's explicit instruction.
 - **Project** name
 - **Next tasks** from `session-state.md`
 - **Background** from `hot.md` (what was done last session, condensed)
