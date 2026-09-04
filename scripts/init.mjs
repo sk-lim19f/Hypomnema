@@ -173,7 +173,11 @@ Init options:
   --lint-strict          Opt-in: also gate the wiki pre-commit hook on
                          \`lint --strict\` (promotes STRICT_PROMOTE_IDS warnings
                          to a blocking error), sequenced after the .hypoignore
-                         guard. Off by default; re-run init to add or drop it.
+                         guard. Exception: root hot.md/log.md's own
+                         no-frontmatter warning stays a warn even under this
+                         flag, so a legacy vault predating the frontmatter
+                         convention still commits. Off by default; re-run init
+                         to add or drop it.
   --dry-run              Show what would be done without making changes
   --version              Print the installed package version and exit
   --help, -h             Show this help message

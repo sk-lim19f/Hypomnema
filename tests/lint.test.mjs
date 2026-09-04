@@ -1667,6 +1667,131 @@ test('.hyposcanignore flips the same broken link from reported to unscanned', ()
   }
 });
 
+// ── root close targets: W1 no-frontmatter reduced check (ISSUE-98) ──────────
+// close overwrites hot.md/log.md wholesale, and nothing was checking whether
+// that write left a frontmatter block behind at all. These pair with the
+// strict-exemption tests below: this suite proves the check fires (a), the
+// Track E suite proves it stays a warning for a legacy vault under --strict
+// (b), and both directions matter for the same fixture to mean anything.
+
+test('a root close target with no frontmatter block at all is caught as W1', () => {
+  const { warns } = lintWiki({
+    'hot.md': '# Hot Cache\n\nclose overwrote this without a frontmatter block\n',
+  });
+  assert.ok(
+    warns.some((w) => w.file === 'hot.md' && /No closed frontmatter block found/.test(w.message)),
+    `root hot.md missing its frontmatter block must be reported: ${JSON.stringify(warns)}`,
+  );
+});
+
+test('a root close target with an unclosed frontmatter fence is caught as W1', () => {
+  // Same predicate as hooks/hypo-shared.mjs's frontmatterUpdated: a closed
+  // `---`...`---` block, not just an opening fence. An unclosed fence used to
+  // slip past this loop's old open-fence-only check and only fail at the
+  // close gate, with no lint signal pointing at why.
+  const { warns } = lintWiki({
+    'hot.md': '---\ntitle: Hot\n',
+  });
+  assert.ok(
+    warns.some((w) => w.file === 'hot.md' && /No closed frontmatter block found/.test(w.message)),
+    `root hot.md with an unclosed fence must be reported: ${JSON.stringify(warns)}`,
+  );
+});
+
+test('a root close target with an empty frontmatter block is caught as W1', () => {
+  // `---\n---\n` is caught, not skipped. The shared closed-block regex (both
+  // here and in hooks/hypo-shared.mjs's frontmatterUpdated) needs a line of
+  // content between the two fences: its lazy `([\s\S]*?)\r?\n---` requires a
+  // newline before the closing `---` that is not the opening fence's own
+  // newline, and an empty block has none. So `---\n---\n` does not match and
+  // this loop reports it exactly like a missing block, agreeing with the
+  // close gate's own reading of the same bytes rather than silently passing
+  // a frontmatter block with nothing in it.
+  const { warns } = lintWiki({
+    'hot.md': '---\n---\n\n# Hot\n',
+  });
+  assert.ok(
+    warns.some((w) => w.file === 'hot.md' && /No closed frontmatter block found/.test(w.message)),
+    `an empty frontmatter block must trip W1: ${JSON.stringify(warns)}`,
+  );
+});
+
+test('a root close target with a closed fence but broken YAML is caught as W9, and promotes under --strict', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-w9root-'));
+  try {
+    writeFileSync(join(dir, 'SCHEMA.md'), VOCAB_SCHEMA);
+    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\ntitle: Hot Again\n---\n\n# Hot\n');
+    const plain = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${dir}`, '--json'],
+      { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+    );
+    const plainOut = JSON.parse(plain.stdout);
+    assert.equal(plain.status, 0, `W9 is a warn, not an error, by default: ${plain.stdout}`);
+    assert.ok(
+      (plainOut.warns || []).some(
+        (w) => w.file === 'hot.md' && /Invalid YAML frontmatter/.test(w.message),
+      ),
+      `root hot.md with a closed-but-broken block must surface W9: ${JSON.stringify(plainOut.warns)}`,
+    );
+
+    const strict = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${dir}`, '--json', '--strict'],
+      { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+    );
+    const strictOut = JSON.parse(strict.stdout);
+    assert.equal(strict.status, 1, `W9 must promote under --strict: ${strict.stdout}`);
+    assert.ok(
+      (strictOut.errors || []).some((e) => e.file === 'hot.md' && e.id === 'W9'),
+      `root hot.md's W9 must promote to an error under --strict (not exempted): ${JSON.stringify(strictOut.errors)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a legacy root log.md with no frontmatter at all still passes --strict', () => {
+  // Mirrors a real maintainer vault: log.md predates the frontmatter
+  // convention entirely, starting with a heading, not `---`.
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-legacy-'));
+  try {
+    writeFileSync(join(dir, 'SCHEMA.md'), VOCAB_SCHEMA);
+    writeFileSync(join(dir, 'log.md'), '# Wiki Log\n\nappend-only history, no frontmatter\n');
+    const r = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${dir}`, '--json', '--strict'],
+      { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, `a legacy log.md must not fail --strict: ${r.stdout}`);
+    assert.ok(
+      (out.warns || []).some((w) => w.file === 'log.md' && w.id === 'W1'),
+      `log.md must still surface W1 as a warning under --strict: ${JSON.stringify(out.warns)}`,
+    );
+    assert.ok(
+      !(out.errors || []).some((e) => e.file === 'log.md'),
+      `log.md must not be promoted to an error under --strict: ${JSON.stringify(out.errors)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the packaged templates/ vault stays errors:0 warns:0', () => {
+  // Stock hot.md/log.md both carry a real frontmatter block, so the new W1
+  // check must not add a single finding to a vault it was never aimed at.
+  const r = spawnSync(
+    process.execPath,
+    [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${join(REPO, 'templates')}`, '--json'],
+    { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+  );
+  const out = JSON.parse(r.stdout);
+  assert.equal(r.status, 0, `packaged templates/ must stay clean: ${r.stdout}`);
+  assert.equal((out.errors || []).length, 0, `templates/ errors: ${JSON.stringify(out.errors)}`);
+  assert.equal((out.warns || []).length, 0, `templates/ warns: ${JSON.stringify(out.warns)}`);
+});
+
 suite('fix #49: findDesignHistoryStale()');
 
 test('w8-stale: flat session-log.md newer than design-history → stale', () => {
@@ -2247,5 +2372,33 @@ test('strict: W1 no-frontmatter promotes and preserves early-return skip', () =>
     const errs = parsed.errors || [];
     assert.equal(errs.length, 1, `early-return preserved → only W1: ${JSON.stringify(errs)}`);
     assert.equal(errs[0].id, 'W1');
+  });
+});
+
+test('strict: the closeRootTargets W1 exemption does not leak to pages/ (ISSUE-98)', () => {
+  // Same run, same warning id, two files: a legacy root log.md (exempted) and
+  // a pages/ file with the identical defect (not exempted). Only pairing them
+  // in one run proves the exemption is scoped by file, not just by id — a
+  // disabled exemption would fail on log.md too, and a too-wide exemption
+  // would silently pass pages/a.md instead of failing.
+  withTmpDir((root) => {
+    writeFileSync(join(root, 'log.md'), '# Wiki Log\n\nlegacy, no frontmatter\n');
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(join(root, 'pages', 'a.md'), 'plain body, no frontmatter\n');
+    const r = runLintE(root, ['--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 1, `pages/a.md's W1 must still fail --strict: ${r.stdout}`);
+    const errIds = (parsed.errors || []).map((e) => `${e.file}:${e.id}`);
+    assert.deepEqual(
+      errIds,
+      ['pages/a.md:W1'],
+      `only pages/a.md may promote: ${JSON.stringify(parsed.errors)}`,
+    );
+    const warnW1Files = (parsed.warns || []).filter((w) => w.id === 'W1').map((w) => w.file);
+    assert.deepEqual(
+      warnW1Files,
+      ['log.md'],
+      `log.md's W1 must stay a warn: ${JSON.stringify(parsed.warns)}`,
+    );
   });
 });

@@ -287,6 +287,9 @@ const issues = [];
 // defects only.
 //   W1 no-frontmatter / W2 unknown-type / W4 broken-wikilink → promote.
 //   W9 invalid-YAML → promote (frontmatter a real YAML parser rejects).
+//   Exception: the closeRootTargets loop's own W1 findings (hot.md/log.md)
+//   are exempted from this promotion below, scoped by id and by that file
+//   set only; see the comment at that loop and at the promotion site.
 //   W3 missing-updated  → excluded (auto-repaired by --fix).
 //   W8 design-history-stale → excluded (hypo-personal-check handles it; would
 //                             double-gate).
@@ -298,10 +301,12 @@ const issues = [];
 //                             PreCompact hook no longer blocks /compact, so
 //                             that set is what --check-session-close and
 //                             --mark-session-closed read, not a compact stop.
-// NOTE: no gate currently passes --strict (npm run lint / CI / release.yml /
-// crystallize / the close-gate all run plain lint), so promotion is
-// forward-looking: these surface as warnings today. The deliverable is
-// "stop silently green-passing invalid YAML"; the W9 warning satisfies that.
+// NOTE: npm run lint / CI / release.yml / crystallize / the close-gate all
+// run plain lint, not --strict, so promotion is forward-looking there: these
+// still surface as warnings on those paths. But --strict is not unused —
+// init.mjs's --lint-strict wires `lint --strict` into a vault's own
+// pre-commit hook (scripts/init.mjs, pinned by tests/init.test.mjs), so a
+// vault that opts in does gate a commit on these IDs today.
 const STRICT_PROMOTE_IDS = new Set(['W1', 'W2', 'W4', 'W9']);
 
 function issue(severity, rel, msg, fullPath = null, id = null) {
@@ -544,31 +549,55 @@ const validTypes = new Set([...VALID_TYPES, ...parseSchemaTypes(args.hypoDir)]);
 
 for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs, validTypes);
 
-// W4 (broken-wikilink only, NOT the full lintPage) for close's root-level
-// write targets that fall outside pages/projects/journal: hot.md and log.md
-// today. closeFileTargetsGlobal is the one list of what close writes
-// (hooks/hypo-shared.mjs), reused here instead of re-derived, so a future
-// close target is covered automatically. Only the entries NOT already under
-// a scanDir are new; closeFileTargetsGlobal's projects/<slug>/* entries are
-// already linted in full above.
+// W4 (broken-wikilink) plus a reduced W1 (closed frontmatter block presence)
+// and W9 (invalid YAML inside that block), NOT the full lintPage, for close's
+// root-level write targets that fall outside pages/projects/journal: hot.md
+// and log.md today. closeFileTargetsGlobal is the one list of what close
+// writes (hooks/hypo-shared.mjs), reused here instead of re-derived, so a
+// future close target is covered automatically. Only the entries NOT already
+// under a scanDir are new; closeFileTargetsGlobal's projects/<slug>/* entries
+// are already linted in full above.
 //
-// Why link-only and not the full lintPage: measured, not assumed. On the
-// packaged templates/ (hot.md type:reference, log.md type:log, both declared
-// in templates/SCHEMA.md's taxonomy), full lintPage on both files comes back
-// completely clean, so "these types trip W2" is not the reason to hold back.
-// The real reason is that live vaults do not all match the template. A vault
-// whose SCHEMA.md predates the `log` type row (or has none) gets a fresh
-// "Unknown type: log" W2 the moment log.md is run through lintPage, and a
-// vault whose root log.md predates the frontmatter convention entirely (no
-// leading `---` block at all, confirmed against a real maintainer vault)
-// gets a fresh "No frontmatter found" W1. Both W1 and W2 are in
-// STRICT_PROMOTE_IDS, so under --strict a vault that lint has always passed
-// would start failing on a file whose content this fix never touched. Full
-// lintPage stays reserved for pages/projects/journal, where every file was
-// already being linted before this change and there is no such newly-exposed
-// vault. W4 itself stays warn-only outside --strict, and postApply
-// (crystallize.mjs) gates only on errors, so this addition can add a new
-// warning to a close's lint output but can never fail one.
+// Why link-only (plus these two frontmatter checks) and not the full
+// lintPage: measured, not assumed. On the packaged templates/ (hot.md
+// type:reference, log.md type:log, both declared in templates/SCHEMA.md's
+// taxonomy), full lintPage on both files comes back completely clean, so
+// "these types trip W2" is not the reason to hold back. The real reason is
+// that live vaults do not all match the template. A vault whose SCHEMA.md
+// predates the `log` type row (or has none) gets a fresh "Unknown type: log"
+// W2 the moment log.md is run through lintPage. W2 (and the rest of
+// lintPage's field checks) stays out of this loop for exactly that reason:
+// it does not catch a close's whole-file overwrite any better than W4
+// already does, and it would trip on vault-local type taxonomy the write
+// never touched.
+//
+// W1 (no closed frontmatter block) and W9 (invalid YAML inside that block)
+// are the two lintPage checks pulled in on purpose: close's crystallize path
+// overwrites hot.md/log.md wholesale, and a write that drops the frontmatter
+// delimiters or leaves broken YAML behind is exactly the corruption this
+// scan exists to catch, one write earlier than doctor. The W1 predicate here
+// matches hooks/hypo-shared.mjs's frontmatterUpdated exactly (a *closed*
+// `---`...`---` block, not just an opening fence) so this scan and the
+// close-gate's own staleness check agree on what counts as "has frontmatter";
+// an unclosed fence fails both the same way, instead of lint calling it clean
+// while the close gate hard-fails on it. The same measurement above shows why
+// this stays narrow rather than becoming full lintPage: a vault whose root
+// log.md predates the frontmatter convention entirely (no leading `---`
+// block at all, confirmed against a real maintainer vault) would get a fresh
+// W1 the instant this check exists, on content this change never touched.
+// W1 is in STRICT_PROMOTE_IDS, so that vault would start failing `--strict`
+// for a file it always had. The strict-promotion loop below carries a narrow
+// exemption for exactly this case (W1 + this file set only, NOT W9), so a
+// shaped-like-legacy vault keeps passing `--strict` while W1 still fires as a
+// warning here and a genuinely broken close-time write still promotes under
+// `--strict` on pages/projects/journal, where it was always covered. W9 is
+// deliberately NOT exempted: a legacy vault with no frontmatter block at all
+// never reaches the YAML check (there is no block to inspect), so the
+// exemption never needed to cover it, and a root file whose block IS present
+// but broken is exactly the defect this loop exists to promote. W4 and W1
+// both stay warn-only outside `--strict`, and postApply (crystallize.mjs)
+// gates only on errors, so this loop can add a new warning to a close's lint
+// output but can never fail one on its own.
 const closeRootTargets = [...closeFileTargetsGlobal(args.hypoDir)].filter(
   (f) => !f.startsWith('pages/') && !f.startsWith('projects/') && !f.startsWith('journal/'),
 );
@@ -580,6 +609,14 @@ for (const rel of closeRootTargets) {
     content = readFileSync(full, 'utf-8');
   } catch {
     continue;
+  }
+  const fmBlock = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fmBlock) {
+    issue('warn', rel, 'No closed frontmatter block found', null, 'W1');
+  } else {
+    for (const reason of checkYamlInvalid(fmBlock[1])) {
+      issue('warn', rel, `Invalid YAML frontmatter: ${reason}`, null, 'W9');
+    }
   }
   for (const link of extractWikilinks(content)) {
     if (!slugMap.has(link)) {
@@ -699,9 +736,20 @@ if (args.fix) {
 // --strict: promote selected warnings (by stable ID) to errors *before* the
 // errors/warns split, so exit code, counts, plain-text icons, and --json `ok`
 // all derive from the post-promotion severities through the existing paths.
+//
+// Exemption for the closeRootTargets loop's own W1 (see the comment there):
+// a root hot.md/log.md that predates the frontmatter convention is a
+// pre-existing vault shape, not a defect this scan introduced, so promoting
+// it under --strict would fail vaults that lint has always passed. Scoped by
+// BOTH id (W1 only, not W2/W4/W9) AND file (closeRootTargets, the short
+// hot.md/log.md list, not the full closeFileTargetsGlobal) so a future close
+// target under pages/projects/journal stays fully promotable: it is already
+// linted through lintPage above, where this exemption does not apply.
+const closeRootTargetSet = new Set(closeRootTargets);
 if (args.strict) {
   for (const iss of issues) {
     if (iss.severity === 'warn' && iss.id && STRICT_PROMOTE_IDS.has(iss.id)) {
+      if (iss.id === 'W1' && closeRootTargetSet.has(iss.file)) continue;
       iss.severity = 'error';
     }
   }

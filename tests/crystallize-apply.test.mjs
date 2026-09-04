@@ -573,6 +573,93 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
   });
 });
 
+// ── W9 promotion: payload-scope invalid-YAML frontmatter blocks close ─────────
+// W9 (invalid-YAML frontmatter) is warn-severity in lint.mjs's default
+// classification, not error, so it never reached the errors-only preflight/
+// post-apply gate above without an operator opting into --strict. A wiki with
+// no --lint-strict pre-commit hook installed could reach ok:true and exit 0
+// with corrupt frontmatter sitting in a file this very close just wrote.
+// runPreflight/runPostApplyLint (crystallize-close-apply.mjs) now promote a
+// W9 warn to a close-blocking finding, but ONLY inside this close's own
+// payload scope: legacy debt elsewhere in the vault (or a legacy vault's
+// frontmatter-less log.md, W1) must stay untouched.
+suite('W9 promotion: payload-scope invalid-YAML frontmatter blocks close');
+
+test('post-apply: broken YAML in a payload-scope root file (hot.md) → ok:false, exit 1', () => {
+  // "title: hot: broken" is an unquoted top-level value containing ": ", the
+  // exact shape lint.mjs's checkYamlInvalid (W9) narrow detector flags. Not
+  // W1: the frontmatter block itself opens and closes cleanly, only its
+  // content is invalid YAML.
+  withWiki(null, (dir, today) => {
+    const sid = 'w9-promotion-session';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+    const payload = payloadForCleanWiki(dir, today);
+    payload.rootHot = {
+      content: `---\ntitle: hot: broken\ntype: hot\nupdated: ${today}\n---\n\nbody\n`,
+    };
+    const r = runApply(dir, payload, { sessionId: sid });
+    assert.equal(
+      r.status,
+      1,
+      `broken YAML in a payload-scope file must abort the close: ${r.stdout}`,
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.stage, 'post-apply-lint', `stage should be post-apply-lint: ${r.stdout}`);
+    const onDisk = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(
+      onDisk.includes('title: hot: broken'),
+      'apply still writes the payload bytes to disk (post-apply lint runs AFTER the write)',
+    );
+  });
+});
+
+test('post-apply: pre-existing W9 debt OUTSIDE payload scope does not block close', () => {
+  // The promotion is scoped exactly like the existing errors-only gate: a W9
+  // warn under pages/ (this close never wrote there) must stay a non-blocking
+  // notice, never swept into ok:false. Guards the promotion's own scope from
+  // silently widening to the whole vault.
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(
+        join(dir, 'pages', 'w9-debt.md'),
+        '---\ntitle: pre-existing debt\ntype: concept\nupdated: 2026-06-28\nnote: has: a colon\n---\n\nbody\n',
+      );
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 0, `out-of-scope W9 debt must not block the close: ${r.stdout}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+    },
+  );
+});
+
+test('append target with no frontmatter at all (W1, legacy log.md) still does not block close', () => {
+  // The promotion matches ONLY the W9 message prefix. A legacy vault's
+  // frontmatter-less log.md (W1, "No closed frontmatter block found") is a
+  // documented, intentionally-unpromoted shape; this close path must keep
+  // accepting it exactly as before.
+  withWiki(
+    (dir) => {
+      writeFileSync(join(dir, 'log.md'), '# Wiki Log\n\nlegacy, no frontmatter\n');
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload);
+      assert.equal(
+        r.status,
+        0,
+        `W1 in a payload-scope append target must not block the close: ${r.stdout}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+    },
+  );
+});
+
 // ── ISSUE-61: payload↔session binding (cross-session guard) ───────────────────
 // The session-close payload temp path used to be date-based, so two same-day
 // sessions clobbered each other's file; the winner's payload then applied under
