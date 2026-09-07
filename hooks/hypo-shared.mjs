@@ -1592,8 +1592,11 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // invariant that once justified keeping the writer paths fully unscoped
   // ("marker == compact-ready", codex design review) is superseded by that
   // partition, not restored by it — a marker's own `verified_scope`, attesting
-  // exactly what it checked, is still missing (session-close-scope-boundary
-  // spec §3, next wave).
+  // exactly what this function's caller evaluated (never `markerProjects`'
+  // evidence-based attribution), now ships (session-close-scope-boundary
+  // spec §3). The writer is `scripts/lib/crystallize-close-apply.mjs`
+  // (`runMarkSessionClosed` and `runMarkerPhase`); the reader is
+  // `markerCoversArtifact` in `scripts/doctor.mjs`.
   if (opts.projectOverride) {
     const s = sessionCloseFileStatus(hypoDir, { projectOverride: opts.projectOverride });
     return {
@@ -1634,6 +1637,13 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
     hasTodayCloseActivity(hypoDir, p, dates),
   );
 
+  // This branch drops `mustEvaluate` on the floor and reports the recency
+  // project instead, so `projects` here can name a DIFFERENT project than the
+  // caller asked for. No marker is ever written from it, though: `close.fallback`
+  // is an unconditional gate blocker (see the fail-closed guards in the partition
+  // below) and both marker writers only stamp on a green gate. So a marker whose
+  // `verified_scope` names the recency project instead of the requested one is
+  // unreachable, not merely fail-safe — do not write code defending that state.
   if (activeCandidates.length === 0) {
     const legacy = sessionCloseFileStatus(hypoDir);
     return {
@@ -3166,6 +3176,33 @@ export function sessionClosedMarkerPath(hypoDir, sessionId) {
   return join(hypoDir, '.cache', `session-closed-${sanitizeSessionId(sessionId)}.marker`);
 }
 
+// verified_scope (session-close-scope-boundary spec §3) records the scope the
+// gate ABOVE this write actually verified, not merely the attribution the
+// marker's `projects` field carries — those can diverge whenever a gate run
+// widens attribution beyond what it narrowed the check to. The caller
+// decides `kind`: this function only refuses to persist a shape it cannot
+// stand behind. Exported so scripts/doctor.mjs's reader runs the SAME
+// collapse instead of a hand-rolled copy — an unrecognized shape, or a
+// 'project'/'global' scope with an empty `projects` (a narrower-than-nothing
+// claim), reads back as "field absent", never as a false claim.
+export function normalizeVerifiedScope(verifiedScope) {
+  if (!verifiedScope || typeof verifiedScope !== 'object') return null;
+  if (verifiedScope.kind === 'log-only') return { kind: 'log-only' };
+  if (verifiedScope.kind === 'project' || verifiedScope.kind === 'global') {
+    const projects = Array.isArray(verifiedScope.projects)
+      ? [...new Set(verifiedScope.projects.filter((p) => typeof p === 'string' && p))]
+      : [];
+    // An empty projects list under 'project'/'global' asserts a verified
+    // boundary with nothing in it — that is not a narrower claim, it is a
+    // malformed one. Drop it rather than persist a scope nothing can satisfy
+    // by design (verified_scope must only ever tighten, never silently gate
+    // out everything).
+    if (projects.length === 0) return null;
+    return { kind: verifiedScope.kind, projects };
+  }
+  return null;
+}
+
 /**
  * Persist a per-session close proof. Caller MUST verify
  * `sessionCloseFileStatus(hypoDir).ok` before invoking — this helper does NOT
@@ -3175,7 +3212,7 @@ export function sessionClosedMarkerPath(hypoDir, sessionId) {
  *
  * @param {string} hypoDir
  * @param {string} sessionId
- * @param {{project?: string, scope?: string, transcript_path?: string}} info
+ * @param {{project?: string, scope?: string, transcript_path?: string, verifiedScope?: {kind: 'log-only'|'project'|'global', projects?: string[]}}} info
  */
 export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
   if (!sessionId) return;
@@ -3199,6 +3236,7 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
       : info.project
         ? [info.project]
         : [];
+    const verifiedScope = normalizeVerifiedScope(info.verifiedScope);
     const payload = {
       session_id: sessionId,
       project: info.project || projects[0] || null,
@@ -3207,6 +3245,11 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
       transcript_path: info.transcript_path || null,
       closed_at: new Date().toISOString(),
       verification: scope === 'log-only' ? 'log-only-close:ok' : 'session-close-file-status:ok',
+      // Omitted entirely (not even `null`) when the caller passes nothing or
+      // an unrecognized shape, so a marker written by a caller that hasn't
+      // adopted this field reads back byte-identical to before it existed —
+      // doctor's reader treats "field absent" as "no additional scope check".
+      ...(verifiedScope ? { verified_scope: verifiedScope } : {}),
     };
     writeFileSync(sessionClosedMarkerPath(hypoDir, sessionId), JSON.stringify(payload) + '\n');
   } catch (err) {
@@ -3711,8 +3754,12 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * below can tell their own incomplete close from someone else's debt. The
  * invariant that once justified keeping those paths fully unscoped ("marker ==
  * compact-ready", codex design review) is replaced by that partition, not
- * restored by it — a marker's own `verified_scope`, attesting exactly what it
- * checked, is still missing (session-close-scope-boundary spec §3, next wave).
+ * restored by it — a marker's own `verified_scope`, attesting exactly what
+ * this status's caller evaluated (never the marker's `projects`, which is
+ * evidence-based attribution), now ships (session-close-scope-boundary
+ * spec §3). The writer is `scripts/lib/crystallize-close-apply.mjs`
+ * (`runMarkSessionClosed` and `runMarkerPhase`); the reader is
+ * `markerCoversArtifact` in `scripts/doctor.mjs`.
  * Either key ALSO feeds the git-dirty partition (spec §2b): with an untrusted
  * transcript (missing/corrupt), a dirty file structurally under a DIFFERENT
  * eligible project's own directory is demoted to a notice, because the path

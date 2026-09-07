@@ -34,6 +34,7 @@ import {
   collectProjectWorkingDirs,
   detectSessionCloseArtifact,
   localAndUtcDates,
+  normalizeVerifiedScope,
   SESSION_CLOSED_MARKER_STALE_MS,
   isUsablePkgRootLocal,
   selfLocationPkgRootFrom,
@@ -916,14 +917,32 @@ function deriveCommitProjects(hypoDir, hash) {
 //     an artifact with no verifiable scope, so this never matches, ever.
 //   • 'projects' — a project file, or a commit that touched one or more
 //     identifiable projects/<slug>/ paths. EVERY named project must appear
-//     in the marker's own `projects` list.
+//     in the marker's own `projects` list, AND, when the marker carries a
+//     `verified_scope` (session-close-scope-boundary spec §3), in that
+//     scope's own `projects` too — an AND, never an OR. `projects` is
+//     evidence-based attribution; `verified_scope` is what the gate that
+//     wrote this marker actually checked, and the two can diverge (an
+//     unnarrowed gate run can attribute to more projects than it verified).
+//     A `verified_scope` of kind 'log-only' verified no project at all, so it
+//     can never cover a 'projects'-scoped artifact. A marker with NO
+//     `verified_scope` (every marker before this field existed) skips this
+//     extra check entirely — it neither tightens nor loosens the membership
+//     check above, so old markers read back byte-for-byte as before.
 function markerCoversArtifact(marker, artifact) {
   if (!marker.dates.includes(artifact.date)) return false;
   switch (artifact.scope.kind) {
     case 'root-universal':
       return true;
     case 'projects':
-      return artifact.scope.projects.every((p) => marker.projects.includes(p));
+      if (!artifact.scope.projects.every((p) => marker.projects.includes(p))) return false;
+      if (!marker.verifiedScope) return true;
+      // Unreachable for a 'projects' artifact today: a log-only close writes
+      // `projects: []`, so the membership check above already returned false.
+      // Kept deliberately, not by oversight — it states the kind's meaning
+      // (log-only verified no project at all) so this stays correct if
+      // `projects` ever carries something for a log-only close.
+      if (marker.verifiedScope.kind === 'log-only') return false;
+      return artifact.scope.projects.every((p) => marker.verifiedScope.projects.includes(p));
     default:
       return false; // 'unscoped'
   }
@@ -1035,7 +1054,17 @@ function checkSessionCloseArtifacts(hypoDir) {
       // and doctor has no corroborating signal of its own to add, so it
       // must refuse it too rather than re-opening the same hole standalone.
       const projects = Array.isArray(data?.projects) ? data.projects.filter(Boolean) : [];
-      markers.push({ projects: [...new Set(projects)], dates: localAndUtcDates(new Date(ts)) });
+      // verified_scope (session-close-scope-boundary spec §3): the SAME
+      // collapse the writer runs (hooks/hypo-shared.mjs), not a hand-rolled
+      // copy — a shape this reader doesn't recognize, or a 'project'/'global'
+      // scope with an empty `projects`, reads back as "field absent" (`null`),
+      // never as a false claim.
+      const verifiedScope = normalizeVerifiedScope(data?.verified_scope);
+      markers.push({
+        projects: [...new Set(projects)],
+        dates: localAndUtcDates(new Date(ts)),
+        verifiedScope,
+      });
     } catch {
       // corrupt marker — not this check's job to clean up
     }

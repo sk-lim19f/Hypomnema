@@ -1891,6 +1891,38 @@ test('--mark-session-closed stamps the v4 projects discriminator', () => {
   });
 });
 
+// session-close-scope-boundary spec §3 (revised 2026-09-07): --project=<slug>
+// passes `closeScope: [args.project]`, which widens resolveCloseScope's
+// mine/foreign partition (opts.closeScope) — it does NOT narrow
+// sessionCloseGlobalStatus (only opts.projectOverride does, and this call
+// never sets it). So the gate ran unnarrowed, and verified_scope.kind must
+// read 'global', with `projects` the set the gate actually evaluated. This
+// runs the real CLI and reads the marker off disk, unlike the
+// doctor.test.mjs assertions that only exercise markerCoversArtifact against a
+// hand-built payload.
+test('--mark-session-closed --project=<slug>: verified_scope is {kind: global, projects: [<gate-evaluated set>]}', () => {
+  withWiki(null, (dir) => {
+    const cleanup = seedCloseTranscript('s-vs-project');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      '--session-id=s-vs-project',
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+    const marker = JSON.parse(
+      readFileSync(join(dir, '.cache', 'session-closed-s-vs-project.marker'), 'utf-8'),
+    );
+    assert.deepEqual(
+      marker.verified_scope,
+      { kind: 'global', projects: ['test-project'] },
+      `--project never narrows the gate itself, so verified_scope must read 'global': ${JSON.stringify(marker)}`,
+    );
+  });
+});
+
 // ADR 0055 (codex re-review): the exact prior bypass — a model forging
 // <tmpdir>/<sessionId>.jsonl with a close phrase and passing it via
 // --transcript-path. The marker gate resolves STRICTLY from the session id, so
@@ -2009,6 +2041,48 @@ test('--mark-session-closed --transcript-path: lint error only in an UNTOUCHED f
   );
 });
 
+// session-close-scope-boundary spec §3: with NO --project, precompactGateStatus
+// runs unnarrowed above (no closeScope key passed) — the gate ran the global
+// judgment, so verified_scope.kind must read 'global', never 'project'.
+// Attribution still comes from evidence: the transcript edits a mandatory
+// close file (session-state.md), which resolveCloseScope's touched-file signal
+// adds to scope even with no --project flag.
+test('--mark-session-closed with no --project (evidence via touched close file): verified_scope.kind is global', () => {
+  withWiki(null, (dir) => {
+    const closeFileAbs = join(dir, 'projects', 'test-project', 'session-state.md');
+    const cleanup = seedCloseTranscript('s-vs-global', {
+      toolUseLines: [
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [{ type: 'tool_use', name: 'Edit', input: { file_path: closeFileAbs } }],
+          },
+        }),
+      ],
+    });
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      '--session-id=s-vs-global',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+    const marker = JSON.parse(
+      readFileSync(join(dir, '.cache', 'session-closed-s-vs-global.marker'), 'utf-8'),
+    );
+    assert.equal(
+      marker.verified_scope?.kind,
+      'global',
+      `no --project must leave verified_scope.kind as global: ${JSON.stringify(marker)}`,
+    );
+    assert.ok(
+      (marker.verified_scope?.projects || []).includes('test-project'),
+      `verified_scope.projects must carry the evidence-attributed project: ${JSON.stringify(marker)}`,
+    );
+  });
+});
+
 test('--apply-session-close --session-id with an unresolvable transcript → refused before any write (no partial commit)', () => {
   // ADR 0056 used to let apply commit its own payload first and only withhold the
   // marker on a bad transcript. The fix that closed the gate (verifyCloseAuthority,
@@ -2116,6 +2190,255 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
       existsSync(join(dir, '.cache', 'session-closed-s-apply-land.marker')),
       'marker file must exist after a verified close with a user-close signal',
     );
+  });
+});
+
+// A second project with a COMPLETE, fresh close (today session-log heading +
+// today log.md entry), added alongside test-project so the gate-evaluated set
+// has two members and can be told apart from `payload.project` (one member).
+// A single-project fixture cannot regression-test this: gateEvaluatedProjects
+// and `[payload.project]` are the same array, so a writer that stamped the
+// payload's project verbatim instead of the gate's own evaluated set would
+// pass unnoticed. Every close file mirrors buildCleanWikiTree's own
+// test-project shape (same session-state heading lint requires) so this
+// project stays complete and never becomes a lint/close blocker in its own
+// right.
+function addSecondCloseProject(dir, today) {
+  const ym = today.slice(0, 7);
+  const pdir = join(dir, 'projects', 'second-project');
+  mkdirSync(join(pdir, 'session-log'), { recursive: true });
+  writeFileSync(
+    join(pdir, 'session-state.md'),
+    `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- next\n`,
+  );
+  writeFileSync(
+    join(pdir, 'hot.md'),
+    `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot\n`,
+  );
+  writeFileSync(
+    join(pdir, 'session-log', `${ym}.md`),
+    `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] test session\n`,
+  );
+  const logPath = join(dir, 'log.md');
+  writeFileSync(
+    logPath,
+    readFileSync(logPath, 'utf-8') + `## [${today}] session | second-project\n`,
+  );
+  const hotPath = join(dir, 'hot.md');
+  writeFileSync(
+    hotPath,
+    readFileSync(hotPath, 'utf-8') +
+      `| second-project | ${today} | [[projects/second-project/hot]] |\n`,
+  );
+}
+
+// session-close-scope-boundary spec §3 (revised 2026-09-07): runMarkerPhase
+// (apply's auto marker) passes `closeScope: [project]`, which widens
+// resolveCloseScope's partition (opts.closeScope) — it does not narrow
+// sessionCloseGlobalStatus (only opts.projectOverride does, and this call
+// never sets it). So the gate runs unnarrowed and verified_scope.kind must
+// read 'global', with `projects` the set the gate actually evaluated — never
+// `[project]` stamped verbatim from the payload.
+test('--apply-session-close auto marker: verified_scope is {kind: global, projects: [<gate-evaluated set>]}', () => {
+  withWiki(addSecondCloseProject, (dir, today) => {
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] verified-scope auto-marker test\n` },
+      log: { entry: `## [${today}] session | test-project — verified-scope auto-marker\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-vs-apply');
+    try {
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        `--payload=${payloadPath}`,
+        '--session-id=s-vs-apply',
+        '--json',
+      ]);
+      assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+      const marker = JSON.parse(
+        readFileSync(join(dir, '.cache', 'session-closed-s-vs-apply.marker'), 'utf-8'),
+      );
+      assert.equal(
+        marker.verified_scope?.kind,
+        'global',
+        `apply never narrows the gate itself, so verified_scope must read 'global': ${JSON.stringify(marker)}`,
+      );
+      // Sorted comparison: the gate's own evaluation order is not this test's
+      // concern, only membership is — both projects the gate evaluated must be
+      // present, and neither payload.project alone nor an empty set passes.
+      assert.deepEqual(
+        [...(marker.verified_scope?.projects || [])].sort(),
+        ['second-project', 'test-project'],
+        `verified_scope must carry every project the gate evaluated, not just payload.project: ${JSON.stringify(marker)}`,
+      );
+    } finally {
+      cleanup();
+      rmSync(payloadPath, { force: true });
+    }
+  });
+});
+
+// session-close-scope-boundary spec §3 (fix 4, end-to-end): both directions
+// doctor's markerCoversArtifact AND must distinguish, driven by the REAL
+// writer, never a hand-built marker. Pass case: the marker's own
+// verified_scope covers its own project's close artifact.
+test('E2E verified_scope: a real marker with the gate-evaluated project passes doctor', () => {
+  withClosePartitionWiki(
+    [{ slug: 'mine', date: todayLocal() }],
+    [],
+    (dir, _transcript, home, today) => {
+      const sessionId = 's-vs-e2e-pass';
+      const ssPath = join(dir, 'projects', 'mine', 'session-state.md');
+      writeFileSync(
+        ssPath,
+        readFileSync(ssPath, 'utf-8') + `\n> **${today} 마감(1번째 세션).** 첫 마감.\n`,
+      );
+      // HOME pinned to the test's own tmp home: a bare `spawnSync('git', ...)`
+      // would otherwise inherit the developer's real HOME, and git can read
+      // per-user config from there (CLAUDE.md conventions, "every process a
+      // test spawns gets HOME pinned").
+      const gitEnv = { env: { ...process.env, HOME: home } };
+      spawnSync('git', ['-C', dir, 'add', '-A'], gitEnv);
+      spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'close narrative'], gitEnv);
+      spawnSync('git', ['-C', dir, 'push', '-q', 'origin', 'HEAD'], gitEnv);
+      const cleanup = seedCloseTranscript(sessionId, { home });
+      try {
+        const r = runWithHome(
+          'crystallize.mjs',
+          [
+            `--hypo-dir=${dir}`,
+            '--mark-session-closed',
+            `--session-id=${sessionId}`,
+            '--project=mine',
+            '--json',
+          ],
+          home,
+        );
+        assert.equal(r.status, 0, `expected a clean close: ${r.stdout}\n${r.stderr}`);
+        const marker = JSON.parse(
+          readFileSync(join(dir, '.cache', `session-closed-${sessionId}.marker`), 'utf-8'),
+        );
+        assert.ok(
+          (marker.verified_scope?.projects || []).includes('mine'),
+          `the gate evaluated mine, so verified_scope must include it: ${JSON.stringify(marker)}`,
+        );
+        const dr = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+        const out = JSON.parse(dr.stdout);
+        const check = out.find((c) => c.label === 'Session-close artifacts');
+        assert.ok(check, 'doctor check not found');
+        assert.equal(
+          check.status,
+          'pass',
+          `a real writer's verified_scope covering mine's own close artifact must pass doctor: ${check?.detail}`,
+        );
+      } finally {
+        cleanup();
+      }
+    },
+  );
+});
+
+// Warn case: the only reachable way this codebase's writers can attribute a
+// project (`marker.projects`) outside the set the gate evaluated
+// (`verified_scope.projects`) is a transcript naming a projects/<slug>/...
+// close file for a slug with NO directory on disk at gate time —
+// isProjectSlugDirectory then drops it from mustEvaluate/activeCandidates, so
+// it never reaches gate.close.projects, while doctor's git-log scan
+// (deriveCommitProjects) still finds it because that reads the commit TREE,
+// not the current filesystem. A still-present project can never diverge this
+// way: the same existence check that lets a transcript name it also forces it
+// into mustEvaluate.
+test('E2E verified_scope: a real marker attributing a project the gate never evaluated warns in doctor', () => {
+  withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir, _transcript, home) => {
+    const sessionId = 's-vs-e2e-warn';
+    const ghostDir = join(dir, 'projects', 'ghost');
+    mkdirSync(ghostDir, { recursive: true });
+    writeFileSync(
+      join(ghostDir, 'session-state.md'),
+      '---\ntitle: ss\ntype: session-state\nupdated: 2000-01-01\n---\n\n## 다음 작업\n',
+    );
+    // HOME pinned to the test's own tmp home, same reason as the pass case above.
+    const gitEnv = { env: { ...process.env, HOME: home } };
+    spawnSync('git', ['-C', dir, 'add', '-A'], gitEnv);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'closes the session for ghost'], gitEnv);
+    // Remove ghost from the CURRENT tree: isProjectSlugDirectory sees no
+    // directory at gate time, but the commit above still exists in history for
+    // doctor's git-log scan to find.
+    rmSync(ghostDir, { recursive: true, force: true });
+    spawnSync('git', ['-C', dir, 'add', '-A'], gitEnv);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'remove ghost'], gitEnv);
+    spawnSync('git', ['-C', dir, 'push', '-q', 'origin', 'HEAD'], gitEnv);
+    // The transcript names ghost's (now-gone) close file directly —
+    // projectsFromTouchedCloseFiles never checks the filesystem, so this is
+    // the one signal that can attribute a slug without also forcing it into
+    // mustEvaluate.
+    const cleanup = seedCloseTranscript(sessionId, {
+      home,
+      toolUseLines: [
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [
+              {
+                type: 'tool_use',
+                name: 'Edit',
+                input: { file_path: join(dir, 'projects', 'ghost', 'session-state.md') },
+              },
+            ],
+          },
+        }),
+      ],
+    });
+    try {
+      const r = runWithHome(
+        'crystallize.mjs',
+        [
+          `--hypo-dir=${dir}`,
+          '--mark-session-closed',
+          `--session-id=${sessionId}`,
+          '--project=mine',
+          '--json',
+        ],
+        home,
+      );
+      assert.equal(r.status, 0, `expected a clean close: ${r.stdout}\n${r.stderr}`);
+      const marker = JSON.parse(
+        readFileSync(join(dir, '.cache', `session-closed-${sessionId}.marker`), 'utf-8'),
+      );
+      assert.ok(
+        (marker.projects || []).includes('ghost'),
+        `transcript evidence for ghost's close file must attribute the marker to it: ${JSON.stringify(marker)}`,
+      );
+      assert.ok(
+        !(marker.verified_scope?.projects || []).includes('ghost'),
+        `ghost has no directory at gate time, so the gate never evaluated it: ${JSON.stringify(marker)}`,
+      );
+      const dr = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+      const out = JSON.parse(dr.stdout);
+      const check = out.find((c) => c.label === 'Session-close artifacts');
+      assert.ok(check, 'doctor check not found');
+      assert.equal(
+        check.status,
+        'warn',
+        `ghost's marker-attributed-but-never-evaluated close must not pass doctor: ${check?.detail}`,
+      );
+    } finally {
+      cleanup();
+    }
   });
 });
 
@@ -2750,6 +3073,52 @@ test('--log-only: active project not closed today → marker written, project:nu
         'log-only marker must NOT attribute to a project (clobber-safe)',
       );
       assert.equal(marker.scope, 'log-only');
+    },
+  );
+});
+
+// session-close-scope-boundary spec §3: --log-only skips the compact gate's
+// project-close check entirely, so verified_scope must read exactly
+// {kind: 'log-only'} with no `projects` key — there is nothing this path
+// verified a project scope against.
+test('--log-only: verified_scope is exactly {kind: log-only}, no projects key', () => {
+  withWiki(
+    (dir) => {
+      const stale = '2000-01-01';
+      const projDir = join(dir, 'projects', 'test-project');
+      writeFileSync(
+        join(projDir, 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${stale}\n---\n\n## 다음 작업\n\n- next\n`,
+      );
+      writeFileSync(
+        join(projDir, 'hot.md'),
+        `---\ntitle: hot\ntype: reference\nupdated: ${stale}\n---\n\n# Hot\n`,
+      );
+      const ym = todayLocal().slice(0, 7);
+      writeFileSync(
+        join(projDir, 'session-log', `${ym}.md`),
+        `---\ntitle: Session Log\ntype: session-log\nupdated: ${stale}\n---\n\n## [${stale}] old session\n`,
+      );
+    },
+    (dir) => {
+      const cleanup = seedCloseTranscript('s-vs-logonly');
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        '--log-only',
+        '--session-id=s-vs-logonly',
+        '--json',
+      ]);
+      cleanup();
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      const marker = JSON.parse(
+        readFileSync(join(dir, '.cache', 'session-closed-s-vs-logonly.marker'), 'utf-8'),
+      );
+      assert.deepEqual(
+        marker.verified_scope,
+        { kind: 'log-only' },
+        `log-only verified_scope must carry no projects key: ${JSON.stringify(marker)}`,
+      );
     },
   );
 });
