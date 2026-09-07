@@ -864,6 +864,106 @@ test('doctor-close-artifacts: legacy marker with ONLY a flat `project` (no `proj
   });
 });
 
+// verified_scope (session-close-scope-boundary spec §3) is an ADDITIONAL
+// requirement on top of the `projects` membership check above, never a
+// replacement for it. A marker's `projects` is evidence-based attribution;
+// `verified_scope` is what the gate that wrote the marker actually checked,
+// and the two can diverge whenever an unnarrowed gate run attributes to more
+// projects than it verified. These three pin that AND, on the same fixture
+// shape as the pass test above (807) so the only variable is `verified_scope`.
+test('doctor-close-artifacts: verified_scope covering the artifact project → pass', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-abc123.marker'),
+      JSON.stringify({
+        session_id: 'abc123',
+        project: 'demo',
+        projects: ['demo'],
+        verified_scope: { kind: 'project', projects: ['demo'] },
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check?.detail}`);
+  });
+});
+
+// The marker's `projects` (evidence) names `demo`, but `verified_scope` — what
+// the gate that wrote this marker actually checked — names a DIFFERENT
+// project. If the AND were dropped (an OR, or the membership check alone),
+// this would wrongly pass on `projects` alone.
+test('doctor-close-artifacts: verified_scope NOT covering the artifact project → warn (regression: AND, not OR)', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-abc123.marker'),
+      JSON.stringify({
+        session_id: 'abc123',
+        project: 'demo',
+        projects: ['demo'],
+        verified_scope: { kind: 'global', projects: ['other'] },
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `a verified_scope that never named this project must not vouch for it: ${check?.detail}`,
+    );
+  });
+});
+
+// A `log-only` verified_scope means the gate verified no project at all —
+// it can never cover a project-scoped artifact, even if `projects` (evidence)
+// happens to name it.
+test('doctor-close-artifacts: log-only verified_scope never covers a project artifact → warn', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const projDir = join(dir, 'projects', 'demo');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, 'session-state.md'),
+      `> **${recentUtcDate(1)} 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.\n`,
+    );
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-abc123.marker'),
+      JSON.stringify({
+        session_id: 'abc123',
+        project: 'demo',
+        projects: ['demo'],
+        verified_scope: { kind: 'log-only' },
+        closed_at: recentUtcIso(1),
+      }),
+    );
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `a log-only verified_scope must not vouch for a project artifact: ${check?.detail}`,
+    );
+  });
+});
+
 // The marker exists specifically for per-session/per-project precision
 // (hooks/hypo-shared.mjs SESSION_CLOSED_MARKER_STALE_MS comment) — a
 // same-day marker for an UNRELATED project must not silence an unapproved

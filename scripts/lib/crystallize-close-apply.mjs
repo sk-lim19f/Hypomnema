@@ -472,10 +472,31 @@ export function runMarkSessionClosed(args) {
     process.exit(1);
   }
   const markerProject = !args.logOnly && args.project ? args.project : markerProjects[0];
+  // verified_scope (session-close-scope-boundary spec §3, revised 2026-09-07):
+  // records the set the gate ABOVE actually made a row for and evaluated —
+  // never `markerProjects` (evidence-based attribution, `projects` above).
+  // `closeScope: [args.project]` widens resolveCloseScope's mine/foreign
+  // partition (it feeds `opts.closeScope`, never `opts.projectOverride`), so
+  // it does NOT narrow `sessionCloseGlobalStatus`: the gate ran unnarrowed
+  // regardless of --project (resolveGateProjectOverride's own doc comment;
+  // hypo-shared.mjs's sessionCloseGlobalStatus/precompactGateStatus doc
+  // comments). `kind` is therefore always 'global' here. 'project' stays a
+  // shape normalizeVerifiedScope and doctor's reader accept — for a future
+  // writer that DOES pass opts.projectOverride, which none of the four
+  // marker-writing paths do today. The earlier premise here (an explicit
+  // --project earns 'project') was a doctor regression: a transcript-widened
+  // scope can attribute a project the gate never put a row for, and stamping
+  // markerProjects verbatim let that project's close artifacts pass doctor's
+  // correlation unchecked.
+  const evaluatedProjects = (status.projects || []).map((p) => p.project).filter(Boolean);
+  const verifiedScope = args.logOnly
+    ? { kind: 'log-only' }
+    : { kind: 'global', projects: evaluatedProjects };
   writeSessionClosedMarker(args.hypoDir, args.sessionId, {
     project: markerProject,
     projects: args.logOnly ? [] : markerProjects,
     ...(args.logOnly ? { scope: 'log-only' } : {}),
+    verifiedScope,
   });
   // Marker writer swallows IO errors (best-effort, see hypo-shared.mjs). Verify
   // the file actually landed before claiming success — otherwise CLI exits 0
@@ -1613,6 +1634,12 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
     }
     let closeTranscript = null;
     let gateOk = false;
+    // verified_scope evidence (session-close-scope-boundary spec §3, revised
+    // 2026-09-07): the set the gate below actually put a row for, filled in
+    // once the gate below runs. Stays [] on any path that never reaches it
+    // (uncommitted, no transcript) — normalizeVerifiedScope drops an empty
+    // 'global' scope to "field absent" rather than persist a false claim.
+    let gateEvaluatedProjects = [];
     if (commitOutcome.committed) {
       closeTranscript = resolveTranscriptBySessionId(args.sessionId);
       // closeScope: apply KNOWS which project it just closed, and it wrote
@@ -1633,11 +1660,19 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
       // `project` alone, going green on a foreign project's incomplete close
       // instead of demoting it to a notice.
       const autoMarkerOverride = resolveGateProjectOverride(args.hypoDir, { project });
-      gateOk = precompactGateStatus(args.hypoDir, {
+      const gateStatus = precompactGateStatus(args.hypoDir, {
         closeScope: [project],
         ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
         ...(autoMarkerOverride ? { attributionScope: autoMarkerOverride } : {}),
-      }).ok;
+      });
+      gateOk = gateStatus.ok;
+      // `closeScope` above widens the partition, it never narrows
+      // sessionCloseGlobalStatus (only opts.projectOverride does, and this
+      // call never sets it) — so gate.close.projects is the actual evaluated
+      // set, not necessarily just `[project]`.
+      gateEvaluatedProjects = (gateStatus.close.projects || [])
+        .map((p) => p.project)
+        .filter(Boolean);
     }
     const decision = planMarkerDecision({
       ok,
@@ -1664,7 +1699,17 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
     if (decision.write) {
       // apply KNOWS its authoritative payload.project — stamp it as the v4
       // evidence set so PreCompact trusts this marker's scope directly (session-close attribution).
-      writeSessionClosedMarker(args.hypoDir, args.sessionId, { project, projects: [project] });
+      // verified_scope (revised 2026-09-07): `closeScope: [project]` above
+      // widens resolveCloseScope's partition, it does not narrow
+      // sessionCloseGlobalStatus — only opts.projectOverride does, and this
+      // call never sets it. The gate ran unnarrowed, so `kind` is 'global',
+      // with `projects` the set gate.close actually evaluated
+      // (gateEvaluatedProjects), never `[project]` verbatim.
+      writeSessionClosedMarker(args.hypoDir, args.sessionId, {
+        project,
+        projects: [project],
+        verifiedScope: { kind: 'global', projects: gateEvaluatedProjects },
+      });
       // Codex CONCERN: the writer swallows IO errors (best-effort).
       // Verify the file actually landed — mirroring the standalone path — instead of
       // asserting markerWritten=true, so a .cache permission/disk problem surfaces
