@@ -5,6 +5,22 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-09-07
+
+### Bug Fixes
+
+#### English
+
+- Six slash names (`crystallize`, `graph`, `ingest`, `lint`, `query`, `verify`) shipped as both a `commands/*.md` file and a `skills/*/SKILL.md` directory, so each registered twice as a component and the command palette repeated them. Only the `commands/` half ever loaded, so the duplicates are removed with no behavior change, and `smoke:plugin` now fails on a name present in both directories (decisions/0100). ([#282](https://github.com/sk-lim19f/Hypomnema/pull/282))
+- A session close now checks that the root files it writes still carry a usable frontmatter block, and refuses a close that would leave invalid YAML in one of them. ([#281](https://github.com/sk-lim19f/Hypomnema/pull/281))
+- `/hypo:resume` and SessionStart now surface uncommitted vault work that belongs to another project, so a session does not silently adopt it. ([#280](https://github.com/sk-lim19f/Hypomnema/pull/280))
+
+#### 한국어
+
+- 여섯 슬래시 이름(`crystallize`, `graph`, `ingest`, `lint`, `query`, `verify`)이 `commands/*.md` 파일과 `skills/*/SKILL.md` 디렉터리로 둘 다 출하되어 component 가 두 번씩 등록되고 명령 팔레트가 그만큼 반복됐습니다. 실제로 로드된 것은 `commands/` 쪽뿐이라 중복을 동작 변화 없이 지웠고, 이제 한 이름이 두 디렉터리에 다 있으면 `smoke:plugin` 이 실패합니다 (decisions/0100). ([#282](https://github.com/sk-lim19f/Hypomnema/pull/282))
+- 세션 마무리가 자기가 쓰는 루트 파일에 쓸 만한 프론트매터 블록이 남는지 검사하고, 그중 하나에 깨진 YAML 을 남길 마무리를 거절합니다. ([#281](https://github.com/sk-lim19f/Hypomnema/pull/281))
+- `/hypo:resume` 과 SessionStart 가 다른 프로젝트 소관의 미커밋 변경을 한 줄로 알려, 세션이 그것을 조용히 자기 일로 삼지 않게 합니다. ([#280](https://github.com/sk-lim19f/Hypomnema/pull/280))
+
 ## [1.8.0] - 2026-09-03
 
 ### New Features
