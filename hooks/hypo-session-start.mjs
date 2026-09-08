@@ -848,6 +848,7 @@ process.stdin.on('end', () => {
         console.log(
           JSON.stringify(
             buildOutput(
+              'SessionStart',
               `${noticePrefix}${hitPrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}]\n\n${parts.join('\n\n')}`,
               outExtra,
             ),
@@ -911,6 +912,7 @@ process.stdin.on('end', () => {
         console.log(
           JSON.stringify(
             buildOutput(
+              'SessionStart',
               `${noticePrefix}${hitPrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}, ${reason}]`,
               outExtra,
             ),
@@ -935,7 +937,7 @@ process.stdin.on('end', () => {
     if (!existsSync(GLOBAL_HOT)) {
       const notice = notices.join('\n\n');
       if (notice) {
-        console.log(JSON.stringify(buildOutput(notice, outExtra)));
+        console.log(JSON.stringify(buildOutput('SessionStart', notice, outExtra)));
       } else {
         console.log(JSON.stringify(outExtra));
       }
@@ -950,7 +952,7 @@ process.stdin.on('end', () => {
       // would otherwise be silently dropped here.
       const notice = notices.join('\n\n');
       if (notice) {
-        console.log(JSON.stringify(buildOutput(notice, outExtra)));
+        console.log(JSON.stringify(buildOutput('SessionStart', notice, outExtra)));
       } else {
         console.log(JSON.stringify(outExtra));
       }
@@ -959,6 +961,7 @@ process.stdin.on('end', () => {
     console.log(
       JSON.stringify(
         buildOutput(
+          'SessionStart',
           `${noticePrefix}[WIKI HOT CACHE: global — no project matched cwd=${cwd}]\n\n${globalContent}`,
           outExtra,
         ),

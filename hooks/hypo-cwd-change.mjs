@@ -10,7 +10,6 @@ import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs';
 import { join } from 'path';
 import {
   HYPO_DIR,
-  buildOutput,
   loadHypoIgnore,
   isIgnored,
   sessionMarkerPath,
@@ -153,16 +152,17 @@ process.stdin.on('end', () => {
       // working_dir distinct from the vault, surface where wiki files live.
       const vaultOrientation = buildVaultOrientation(newCwd);
       const orientPrefix = vaultOrientation ? `${vaultOrientation}\n\n` : '';
+      // Built inline rather than through buildOutput(): CwdChanged has no
+      // documented context-injection path, so the nested hookSpecificOutput
+      // shape buildOutput() now emits would be wrong for this event. The
+      // follow-up that moves this hook to systemMessage removes these three
+      // literals; until then they keep today's behaviour unchanged.
       console.log(
-        JSON.stringify(
-          buildOutput(
-            `${orientPrefix}[WIKI: cwd changed → project=${sanitizeProjForPrompt(newHit.proj)}]\n\n${content}`,
-            {
-              continue: true,
-              suppressOutput: true,
-            },
-          ),
-        ),
+        JSON.stringify({
+          continue: true,
+          suppressOutput: true,
+          additionalContext: `${orientPrefix}[WIKI: cwd changed → project=${sanitizeProjForPrompt(newHit.proj)}]\n\n${content}`,
+        }),
       );
       return;
     }
@@ -199,9 +199,11 @@ process.stdin.on('end', () => {
     if (!globalContent) {
       if (suggestPrefix) {
         console.log(
-          JSON.stringify(
-            buildOutput(suggestPrefix.trimEnd(), { continue: true, suppressOutput: true }),
-          ),
+          JSON.stringify({
+            continue: true,
+            suppressOutput: true,
+            additionalContext: suggestPrefix.trimEnd(),
+          }),
         );
       } else {
         console.log(JSON.stringify({ continue: true, suppressOutput: true }));
@@ -209,12 +211,11 @@ process.stdin.on('end', () => {
       return;
     }
     console.log(
-      JSON.stringify(
-        buildOutput(
-          `${suggestPrefix}[WIKI: cwd changed → no project match, injecting global hot]\n\n${globalContent}`,
-          { continue: true, suppressOutput: true },
-        ),
-      ),
+      JSON.stringify({
+        continue: true,
+        suppressOutput: true,
+        additionalContext: `${suggestPrefix}[WIKI: cwd changed → no project match, injecting global hot]\n\n${globalContent}`,
+      }),
     );
   } catch (err) {
     process.stderr.write(`[hypo-cwd-change] error: ${err?.message ?? String(err)}\n`);

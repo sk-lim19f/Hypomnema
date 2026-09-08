@@ -163,7 +163,7 @@ Scripts in `scripts/` are not deployed — they run from the package install pat
 | `hypoIsClean()` | Check git status + unpushed commits |
 | `hotMdIsClean()` | Validate `hot.md` structure |
 | `isCompactCommand(prompt)` | Detect `/compact` invocations |
-| `buildOutput(...)` | Format hook output for Claude Code's `additionalContext` channel |
+| `buildOutput(hookEventName, context, extra)` | Build hook output that nests `additionalContext` under `hookSpecificOutput`, keeping control fields as top-level siblings. The event name is required: Claude Code drops a payload whose `hookEventName` does not match the firing event |
 | `SESSION_STATE_NEXT_HEADINGS` | Allowed headings for "next tasks" — `## 다음 이어받기` / `## 다음 작업`. Lint reuses this constant (DRY) |
 
 ---

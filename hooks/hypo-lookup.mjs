@@ -293,10 +293,14 @@ process.stdin.on('end', () => {
         .join(', ');
       console.log(
         JSON.stringify(
-          buildOutput(`[WIKI LOOKUP: miss] "${topic}" — no match. Closest: ${closest || 'none'}`, {
-            continue: true,
-            suppressOutput: true,
-          }),
+          buildOutput(
+            'UserPromptSubmit',
+            `[WIKI LOOKUP: miss] "${topic}" — no match. Closest: ${closest || 'none'}`,
+            {
+              continue: true,
+              suppressOutput: true,
+            },
+          ),
         ),
       );
       return;
@@ -336,7 +340,7 @@ process.stdin.on('end', () => {
         .join(', ');
       console.log(
         JSON.stringify(
-          buildOutput(`[WIKI LOOKUP: index hit but files missing] ${slugs}`, {
+          buildOutput('UserPromptSubmit', `[WIKI LOOKUP: index hit but files missing] ${slugs}`, {
             continue: true,
             suppressOutput: true,
           }),
@@ -362,6 +366,7 @@ process.stdin.on('end', () => {
     console.log(
       JSON.stringify(
         buildOutput(
+          'UserPromptSubmit',
           `[WIKI LOOKUP: ${injected.length} page(s) matched]\n\n` +
             injected.join('\n\n') +
             overflow,

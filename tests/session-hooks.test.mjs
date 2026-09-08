@@ -52,7 +52,9 @@ import {
   drainTouchedPaths,
   formatGrowthMetrics,
   hypoIsClean,
+  injectedContext,
   markerPath,
+  modelContexts,
   payloadForCleanWiki,
   peekTouchedPaths,
   precompactGateStatus,
@@ -976,9 +978,9 @@ test('file-watch refuses to inject .hypoignore-matched file (e.g. .env)', () => 
     const out = JSON.parse(r.stdout);
     assert.equal(out.continue, true);
     assert.equal(
-      out.additionalContext,
-      undefined,
-      `.hypoignore-matched secret leaked into additionalContext: ${out.additionalContext}`,
+      modelContexts(out).length,
+      0,
+      `.hypoignore-matched secret leaked into an injection channel: ${JSON.stringify(modelContexts(out))}`,
     );
     assert.ok(!/sk-leakedvalue/.test(r.stdout), `secret value leaked in stdout: ${r.stdout}`);
   });
@@ -997,8 +999,8 @@ test('file-watch still injects non-ignored wiki file (e.g. hot.md)', () => {
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
     assert.ok(
-      out.additionalContext && /active project state/.test(out.additionalContext),
-      `expected hot.md injection, got: ${out.additionalContext}`,
+      injectedContext(out) && /active project state/.test(injectedContext(out)),
+      `expected hot.md injection, got: ${injectedContext(out)}`,
     );
   });
 });
@@ -1751,7 +1753,7 @@ test('replay-first-prompt-forces-summary: fresh marker forces unconditional summ
   try {
     const r = runFirstPrompt(sid);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout).additionalContext || '';
+    const out = injectedContext(JSON.parse(r.stdout)) || '';
     assert.match(out, /Previously working on demo/, 'must force the resume summary line');
     assert.match(out, /unconditionally/, 'directive must be unconditional (fix #3)');
     // The old "answer only if related / no mention" escape must be gone.
@@ -1767,9 +1769,24 @@ test('replay-first-prompt-forces-summary: cwd-change marker says "Resuming"', ()
   try {
     const r = runFirstPrompt(sid);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout).additionalContext || '';
+    const out = injectedContext(JSON.parse(r.stdout)) || '';
     assert.match(out, /Resuming demo/, 'cwd-change source must phrase as Resuming (fix #13)');
     assert.doesNotMatch(out, /Previously working on/, 'must not use the session-start verb');
+    // The two assertions above only read `verb`, which is set independently of
+    // the cwd-change branch: they pass whether that branch exists or not. These
+    // two are what actually pin it. CwdChanged has no context-injection path, so
+    // nothing was ever placed for the model to summarize; asking it to fill
+    // placeholders from context it never received makes it invent one.
+    assert.doesNotMatch(
+      out,
+      /\[one-line summary\]/,
+      'a cwd move injected no context, so the model must not be handed a placeholder to fill',
+    );
+    assert.doesNotMatch(
+      out,
+      /already injected/,
+      'must not claim context was injected for a cwd move: CwdChanged cannot inject',
+    );
   } finally {
     if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
   }
@@ -1780,7 +1797,7 @@ test('replay-first-prompt-forces-summary: no marker → silent pass-through', ()
   const r = runFirstPrompt(sid); // no marker written
   assert.equal(r.status, 0);
   const out = JSON.parse(r.stdout);
-  assert.equal(out.additionalContext, undefined, 'no marker → no injected directive');
+  assert.equal(modelContexts(out).length, 0, 'no marker → no injected directive');
   assert.equal(out.suppressOutput, true);
 });
 
@@ -1792,7 +1809,7 @@ test('replay-first-prompt-forces-summary: expired marker (>10min) → no directi
   );
   const r = runFirstPrompt(sid);
   assert.equal(r.status, 0);
-  assert.equal(JSON.parse(r.stdout).additionalContext, undefined, 'expired marker injects nothing');
+  assert.equal(modelContexts(JSON.parse(r.stdout)).length, 0, 'expired marker injects nothing');
   assert.equal(existsSync(markerPath(sid)), false, 'expired marker is unlinked');
 });
 
@@ -1815,7 +1832,7 @@ test('replay-cwd-change-triggers-first-prompt: entering a project arms the marke
       assert.equal(m.source, 'cwd-change');
       // The armed marker drives first-prompt to force a "Resuming" line.
       const fp = runFirstPrompt(sid);
-      const out = JSON.parse(fp.stdout).additionalContext || '';
+      const out = injectedContext(JSON.parse(fp.stdout)) || '';
       assert.match(out, /Resuming private/, 'armed marker forces Resuming on next prompt');
     } finally {
       if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
@@ -1829,7 +1846,7 @@ test('replay-first-prompt-forces-summary: no snapshot → fallback line (no lite
   try {
     const r = runFirstPrompt(sid);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout).additionalContext || '';
+    const out = injectedContext(JSON.parse(r.stdout)) || '';
     assert.match(
       out,
       /no prior snapshot yet/,
@@ -1859,7 +1876,7 @@ test('replay-first-prompt-forces-summary: marker.proj is sanitized before interp
   try {
     const r = runFirstPrompt(sid);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout).additionalContext || '';
+    const out = injectedContext(JSON.parse(r.stdout)) || '';
     // The legitimate wrapper close tag appears exactly once at the end of the
     // directive. A smuggled close tag from proj would push that count to ≥2.
     const closes = (out.match(/<\/hypomnema-session-resume>/g) || []).length;
@@ -2003,7 +2020,7 @@ test('file-watch ignores file outside HYPO_DIR even without .hypoignore', () => 
     });
     assert.equal(r.status, 0);
     const out = JSON.parse(r.stdout);
-    assert.equal(out.additionalContext, undefined);
+    assert.equal(modelContexts(out).length, 0);
   });
 });
 
@@ -2102,7 +2119,7 @@ test('session-start injects growth line when cache exists', () => {
     );
     const r = runStart(dir);
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext || '';
+    const ctx = injectedContext(out) || '';
     assert.ok(
       ctx.includes('직전 세션: +4 pages, ~2 updated, 7 wikilinks'),
       `growth prefix missing in additionalContext: ${ctx}`,
@@ -2114,7 +2131,7 @@ test('session-start emits no growth line when cache absent', () => {
   withGrowthWiki((dir) => {
     const r = runStart(dir);
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext || '';
+    const ctx = injectedContext(out) || '';
     assert.ok(!ctx.includes('직전 세션'), `unexpected growth line: ${ctx}`);
   });
 });
@@ -2166,7 +2183,7 @@ test('replay-session-start-exposes-sync-state: open entry surfaces in additional
       }) + '\n',
     );
     const r = runStart(dir);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(ctx.includes('last sync failed'), `sync notice missing: ${ctx}`);
     assert.ok(ctx.includes('network timeout'), `error detail missing: ${ctx}`);
   });
@@ -2186,7 +2203,7 @@ test('replay-session-start-clears-resolved-sync-state: healthy repo clears the e
       }) + '\n',
     );
     const r = runStart(dir);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(!ctx.includes('last sync failed'), `resolved sync should not surface: ${ctx}`);
     assert.ok(!existsSync(p), 'sync-state.json must be cleared once sync is healthy');
   });
@@ -2202,7 +2219,7 @@ test('replay-session-start-surfaces-unreadable-sync-state: corrupt JSONL is not 
         '\nnot-json\n',
     );
     const r = runStart(dir);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(ctx.includes('last sync failed'), `corrupt sync-state must still surface: ${ctx}`);
     assert.ok(existsSync(p), 'unreadable sync-state.json must be preserved for inspection');
   });
@@ -2226,7 +2243,7 @@ test('replay-session-start-preserves-sync-state-when-ahead: unpushed commit keep
       }) + '\n',
     );
     const r = runStart(dir);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(
       ctx.includes('last sync failed'),
       `unresolved push failure must stay surfaced: ${ctx}`,
@@ -2329,7 +2346,7 @@ test('session-start surfaces a conflict entry with manual-merge guidance', () =>
       }) + '\n',
     );
     const r = runStart(dir);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(ctx.includes('remote diverged'), `conflict notice missing: ${ctx}`);
     assert.ok(ctx.includes('pull --no-rebase'), `manual-merge guidance missing: ${ctx}`);
   });
@@ -2354,7 +2371,7 @@ test('session-start surfaces a conflict-unresolved entry with half-merged-tree g
       }) + '\n',
     );
     const r = runStart(dir);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(ctx.includes('remote diverged'), `conflict-unresolved notice missing: ${ctx}`);
     assert.ok(
       /half-merged/.test(ctx),
@@ -2390,7 +2407,7 @@ test("session-start treats an unrecognized conflict-* op as unresolved, without 
       }) + '\n',
     );
     const r = runStart(dir);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(ctx.includes('remote diverged'), `unknown-conflict notice missing: ${ctx}`);
     assert.ok(
       /unresolved/.test(ctx),
@@ -2420,7 +2437,7 @@ test('session-start emits no conflict/half-merged guidance for an unrelated op (
       }) + '\n',
     );
     const r = runStart(dir);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(ctx.includes('last sync failed'), `generic sync notice missing: ${ctx}`);
     assert.ok(
       !ctx.includes('remote diverged'),
@@ -2468,7 +2485,7 @@ test('session-start and doctor render the same wording family for every sync-sta
         join(dir, '.cache', 'sync-state.json'),
         JSON.stringify({ timestamp: '2026-06-19T00:00:00Z', op, error: 'x', host: 'test' }) + '\n',
       );
-      const startCtx = JSON.parse(runStart(dir).stdout).additionalContext || '';
+      const startCtx = injectedContext(JSON.parse(runStart(dir).stdout)) || '';
       const doctorOut = JSON.parse(run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']).stdout);
       const doctorDetail = doctorOut.find((c) => c.label === 'Sync state')?.detail || '';
 
@@ -2747,7 +2764,7 @@ test('session-start: a successful startup pull records sync-last-success without
     );
     // Silent: the existing failure-notice contract is unchanged — no new
     // success line is injected into additionalContext.
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(!ctx.includes('sync-last-success'), `startup pull success must stay silent: ${ctx}`);
   });
 });
@@ -3773,7 +3790,7 @@ test('replay-session-start-injects-clear-recovery-on-source-clear: marker drives
       }) + '\n',
     );
     const r = runStartWithSource(dir, 'clear');
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(ctx.includes('[WIKI_AUTOCLOSE]'), `recovery line missing: ${ctx}`);
     assert.ok(ctx.includes('dying-session-42'), `prev_session_id missing: ${ctx}`);
     assert.ok(ctx.includes('/tmp/transcript-42.jsonl'), `prev_transcript_path missing: ${ctx}`);
@@ -3809,7 +3826,7 @@ test('replay-session-start-removes-corrupt-marker: invalid JSON triggers self-cl
     writeFileSync(p, '{not valid json');
     const r = runStartWithSource(dir, 'clear');
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `corrupt marker must not fire: ${ctx}`);
     assert.ok(!existsSync(p), 'corrupt marker must be unlinked on read failure');
   });
@@ -3837,7 +3854,7 @@ test('replay-session-start-graceful-when-source-clear-but-no-marker: missing mar
   withGrowthWiki((dir) => {
     const r = runStartWithSource(dir, 'clear');
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `recovery line should not fire: ${ctx}`);
   });
 });
@@ -3855,7 +3872,7 @@ test('replay-session-start-ignores-clear-marker-on-source-startup: marker only c
       }) + '\n',
     );
     const r = runStartWithSource(dir, 'startup');
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `marker must not fire on source=startup: ${ctx}`);
     assert.ok(existsSync(p), 'marker must be preserved when source !== clear');
   });
@@ -3875,7 +3892,7 @@ test('replay-session-start-drops-stale-clear-marker: >7 day marker is discarded'
       }) + '\n',
     );
     const r = runStartWithSource(dir, 'clear');
-    const ctx = JSON.parse(r.stdout).additionalContext || '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) || '';
     assert.ok(!ctx.includes('[WIKI_AUTOCLOSE]'), `stale marker must not fire: ${ctx}`);
     assert.ok(!existsSync(p), 'stale marker must be cleaned up');
   });
@@ -3920,7 +3937,7 @@ test('PKG_ROOT null (no provenance sidecar): the banner fires once, then throttl
       assert.match(first.stderr, /Package root unresolved/, `stderr: ${first.stderr}`);
       const out = JSON.parse(first.stdout);
       assert.match(out.systemMessage || '', /Package root unresolved/);
-      assert.match(out.additionalContext || '', /Package root unresolved/);
+      assert.match(injectedContext(out) || '', /Package root unresolved/);
 
       // Same PKG_ROOT-null state, same session cache under the same HOME →
       // notify-once must suppress the second showing.

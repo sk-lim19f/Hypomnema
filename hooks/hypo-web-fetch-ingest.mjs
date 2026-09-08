@@ -15,11 +15,11 @@
  *     graph before adding a new source.
  *
  * Output contract — Claude Code docs, "Add context for Claude":
- *   PostToolUse uses **nested** hookSpecificOutput.additionalContext, NOT
- *   the top-level additionalContext that UserPromptSubmit hooks use.
- *   buildOutput() in hypo-shared.mjs is the top-level helper used by
- *   hypo-first-prompt / hypo-lookup; intentionally not reused here. See
- *   commit 515458f for the per-event matrix this codebase follows.
+ *   PostToolUse uses **nested** hookSpecificOutput.additionalContext, the
+ *   same shape every other injecting event in this codebase now uses.
+ *   buildOutput() in hypo-shared.mjs emits that nested shape given the
+ *   hookEventName, so this hook calls it too instead of building the
+ *   object by hand.
  *
  * URL redaction:
  *   additionalContext lands in the transcript. Query strings and
@@ -41,7 +41,7 @@
  * in-hook failure branch is needed.
  */
 
-import { isGateSkipped } from './hypo-shared.mjs';
+import { isGateSkipped, buildOutput } from './hypo-shared.mjs';
 
 let input = {};
 try {
@@ -58,13 +58,9 @@ try {
 }
 
 const context = buildContext(input);
-const output = { continue: true, suppressOutput: true };
-if (context) {
-  output.hookSpecificOutput = {
-    hookEventName: 'PostToolUse',
-    additionalContext: context,
-  };
-}
+const output = context
+  ? buildOutput('PostToolUse', context, { continue: true, suppressOutput: true })
+  : { continue: true, suppressOutput: true };
 console.log(JSON.stringify(output));
 
 function buildContext(data) {

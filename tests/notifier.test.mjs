@@ -28,6 +28,7 @@ import {
   REPO,
   SCRIPTS,
   SESSION_TMP_HOME,
+  injectedContext,
   run,
   runHook,
   runWithHome,
@@ -903,7 +904,7 @@ test('session-start (D3): stale PATH sibling surfaces a one-shot notice, then th
       assert.match(first.stderr, /1\.1\.0/);
       // additionalContext (LLM-visible) carries it too
       const out = JSON.parse(first.stdout);
-      assert.match(out.additionalContext || '', /Stale install on PATH/);
+      assert.match(injectedContext(out) || '', /Stale install on PATH/);
       // ISSUE-5: and the user-visible channel (systemMessage) carries it as well
       // — stderr alone is invisible on a SessionStart hook that exits 0.
       assert.match(out.systemMessage || '', /Stale install on PATH/);
@@ -1016,7 +1017,7 @@ test('session-start: fresh npm update → systemMessage carries the banner (dual
       `update banner missing from systemMessage: ${JSON.stringify(out.systemMessage)}`,
     );
     // dual emit: the model still sees the same state via additionalContext
-    assert.match(out.additionalContext || '', /Update available! 0\.0\.0 → 999\.0\.0/);
+    assert.match(injectedContext(out) || '', /Update available! 0\.0\.0 → 999\.0\.0/);
   });
 });
 
@@ -1475,7 +1476,7 @@ test('session-start: pkgRoot drift surfaces a one-shot notice, then throttles', 
       const first = runSessionStartAt(hook, home, 'pkgdrift-test');
       assert.match(first.stderr, /Package metadata drift/);
       const out = JSON.parse(first.stdout);
-      assert.match(out.additionalContext || '', /Package metadata drift/);
+      assert.match(injectedContext(out) || '', /Package metadata drift/);
       assert.match(out.systemMessage || '', /Package metadata drift/);
 
       // second start: same tuple already notified → suppressed
@@ -1682,8 +1683,8 @@ test('hooks-stderr-log-format: forced catch emits [hypo-auto-stage] error: + pre
 //
 // Coverage Matrix id (spec §9.1.1): `hook replay (PostToolUse WebFetch)`.
 // PostToolUse uses **nested** hookSpecificOutput.additionalContext (Claude
-// Code docs "Add context for Claude" + 515458f per-event matrix), unlike the
-// UserPromptSubmit hooks that use top-level additionalContext via buildOutput().
+// Code docs "Add context for Claude"), the same shape every injecting hook in
+// this codebase now emits through buildOutput() in hooks/hypo-shared.mjs.
 suite('hypo-web-fetch-ingest.mjs — PostToolUse auto-ingest signal (fix #2)');
 
 function runWebFetchHook(payload, env = {}) {

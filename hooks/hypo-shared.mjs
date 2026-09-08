@@ -5515,12 +5515,36 @@ export function isCloseReconfirmDeclined(transcriptPath) {
   return declined;
 }
 
+// Events Claude Code actually reads additionalContext from, per the "Add
+// context for Claude" docs. A hookEventName outside this set has no
+// documented injection path, so buildOutput still emits the nested shape
+// (the caller may be adding a NEW event later) but warns to stderr.
+const INJECTABLE_EVENTS = new Set(['UserPromptSubmit', 'SessionStart', 'PostToolUse', 'Stop']);
+
 /**
- * Build hook output for Claude Code (additionalContext channel).
- * Codex hooks write systemMessage directly in their own files.
+ * Build hook output for Claude Code (nested hookSpecificOutput.additionalContext
+ * channel). Codex hooks write systemMessage directly in their own files.
+ *
+ * @param {string} hookEventName - the event this hook fires on, e.g. 'UserPromptSubmit'.
+ * @param {string} context - the text to inject.
+ * @param {object} [extra] - control fields (continue, suppressOutput, ...) that
+ *   stay top-level siblings of hookSpecificOutput.
  */
-export function buildOutput(context, extra = {}) {
-  return { ...extra, additionalContext: context };
+export function buildOutput(hookEventName, context, extra = {}) {
+  if (!INJECTABLE_EVENTS.has(hookEventName)) {
+    process.stderr.write(
+      `[hypo] buildOutput: ${hookEventName} has no documented context-injection path\n`,
+    );
+  }
+  // `extra` carries control fields, never context. Dropping the key here is
+  // what makes the nested shape the only channel: without it a caller could
+  // pass `{ additionalContext }` and the spread would put a top-level copy
+  // right back, which is the exact bug this function exists to prevent.
+  const { additionalContext: _shadowed, ...control } = extra;
+  return {
+    ...control,
+    hookSpecificOutput: { hookEventName, additionalContext: context },
+  };
 }
 
 // ── growth metrics (F2 + E4) ───────────────────────────────────────────────
