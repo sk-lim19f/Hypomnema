@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { recordGateClosed, resolutionStamp } from '../hooks/close-gate-store.mjs';
+import { gitDirtyFiles, hypoIsClean } from '../hooks/hypo-shared.mjs';
 import {
   HOME,
   HOOKS,
@@ -375,6 +376,501 @@ test('/clearfoo (no word boundary) → pass-through (not /clear)', () => {
   const out = JSON.parse(r.stdout);
   assert.equal(out.continue, true);
   assert.equal(out.suppressOutput, true);
+});
+
+// ── hypo-compact-guard.mjs — state-table reason assembly ─────────────────
+// (session-close-scope-boundary spec §5): each `reasons` slot (session, git,
+// hot) is dropped or kept independently. The git slot is the new one — it
+// drops only when EVERY dirty file is provably a DIFFERENT eligible
+// project's, via the same classifyForeignOnlyDirty/isForeignProjectFile
+// predicate hypo-shared.mjs's own gate uses. Two DISTINCT registered
+// projects in the fixture below, never one: a single-project fixture cannot
+// tell "mine" and "foreign" apart, so it cannot pin this contract.
+suite('hypo-compact-guard.mjs — state-table reason assembly (spec §5)');
+
+const CG_CWD = join(tmpdir(), 'hypo-cg-spec5-workdir-mine');
+
+// test-project (buildCleanWikiTree's own project) gets a working_dir anchor at
+// CG_CWD so resolveGateProjectOverride({sessionCwd: CG_CWD}) resolves it as
+// `attributionScope`; `other` is a second, DISTINCT registered project (index.md
+// present) that owns none of this session's cwd. Mirrors the CWD/index.md
+// fixture pattern from the spec §4 hypo-personal-check.mjs tests above, kept
+// local here since this suite is hypo-compact-guard.mjs's own hook contract.
+function seedForeignFixture(dir) {
+  writeFileSync(
+    join(dir, 'projects', 'test-project', 'index.md'),
+    `---\ntitle: test-project\ntype: project-index\nupdated: 2026-01-01\nworking_dir: "${CG_CWD}"\n---\n# test-project\n`,
+  );
+  mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+  writeFileSync(
+    join(dir, 'projects', 'other', 'index.md'),
+    '---\ntitle: other\ntype: project-index\nupdated: 2026-01-01\n---\n# other\n',
+  );
+}
+
+test('state table row: last substantial op is ingest, not session (log.md exists) + all-foreign dirty -> session reason kept, git reason dropped', () => {
+  withWiki(
+    (dir, today) => {
+      seedForeignFixture(dir);
+      // Last substantial log.md entry is "ingest", not "session" ->
+      // lastSubstantialOpIsSession() reads false.
+      writeFileSync(join(dir, 'log.md'), `## [${today}] ingest | test-project\n`);
+    },
+    (dir) => {
+      writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other work\n');
+      const r = runHook(
+        'hypo-compact-guard.mjs',
+        { prompt: '/compact', cwd: CG_CWD },
+        { HYPO_DIR: dir },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.ok('additionalContext' in out, `hook must not go silent: ${r.stdout}`);
+      assert.ok(
+        /session log entry missing/.test(out.additionalContext || ''),
+        `session reason must survive: ${r.stdout}`,
+      );
+      assert.ok(
+        !/scratch\.md|uncommitted/.test(out.additionalContext || ''),
+        `an all-foreign dirty set must drop the git reason: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+// This is the OTHER axis of the same state-table row, distinct from the test
+// above. lastSubstantialOpIsSession() reads a MISSING log.md as `true`
+// (fail-open); without the guard added for this fix, that fail-open combined
+// with an all-foreign dirty tree and a clean hot.md would go fully silent
+// instead of surfacing the missing log, in direct contradiction of spec §5
+// row 1 ("session 없음 + all-foreign -> session log entry missing 유지").
+test('state table row: log.md itself does not exist (not just a non-session last entry) + all-foreign dirty + hot clean -> session reason kept, hook is not silent', () => {
+  withWiki(
+    (dir) => {
+      seedForeignFixture(dir);
+      unlinkSync(join(dir, 'log.md'));
+    },
+    (dir) => {
+      writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other work\n');
+      const r = runHook(
+        'hypo-compact-guard.mjs',
+        { prompt: '/compact', cwd: CG_CWD },
+        { HYPO_DIR: dir },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        'additionalContext' in out,
+        `hook must not go fully silent when log.md is absent: ${r.stdout}`,
+      );
+      assert.ok(
+        /session log entry missing/.test(out.additionalContext || ''),
+        `session reason must survive when log.md is absent: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('state table row: hot.md invalid + all-foreign dirty -> hot reason kept, git reason dropped', () => {
+  withWiki(
+    (dir) => {
+      seedForeignFixture(dir);
+      // Mutated pre-commit so hot.md itself is NOT part of the dirty set below
+      // (the row under test is "hot bad + all-foreign dirty", not "hot bad AND
+      // hot dirty too" — the latter would mix a non-foreign dirty file in and
+      // test a different row).
+      const hotPath = join(dir, 'hot.md');
+      writeFileSync(
+        hotPath,
+        readFileSync(hotPath, 'utf-8').replace(/^---\n/, '---\nlast_session: forbidden\n'),
+      );
+    },
+    (dir) => {
+      writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other work\n');
+      const r = runHook(
+        'hypo-compact-guard.mjs',
+        { prompt: '/compact', cwd: CG_CWD },
+        { HYPO_DIR: dir },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        /last_session/.test(out.additionalContext || ''),
+        `hot reason must survive: ${r.stdout}`,
+      );
+      assert.ok(
+        !/scratch\.md|uncommitted/.test(out.additionalContext || ''),
+        `an all-foreign dirty set must drop the git reason: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('state table row: attributionScope resolved but dirty mixes own + foreign -> git reason kept (fail-closed)', () => {
+  withWiki(
+    (dir) => {
+      seedForeignFixture(dir);
+    },
+    (dir) => {
+      writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other work\n');
+      writeFileSync(join(dir, 'projects', 'test-project', 'own.md'), '# own work\n');
+      const r = runHook(
+        'hypo-compact-guard.mjs',
+        { prompt: '/compact', cwd: CG_CWD },
+        { HYPO_DIR: dir },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        /WIKI_AUTOCLOSE/.test(out.additionalContext || ''),
+        `a mixed foreign+own dirty set must still block: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('state table row: attributionScope resolved but a dirty file lives outside any project -> git reason kept', () => {
+  withWiki(
+    (dir) => {
+      seedForeignFixture(dir);
+    },
+    (dir) => {
+      writeFileSync(join(dir, 'root-scratch.md'), '# not under any project\n');
+      const r = runHook(
+        'hypo-compact-guard.mjs',
+        { prompt: '/compact', cwd: CG_CWD },
+        { HYPO_DIR: dir },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        /WIKI_AUTOCLOSE/.test(out.additionalContext || ''),
+        `an unattributable dirty file must still block: ${r.stdout}`,
+      );
+    },
+  );
+});
+
+test('state table row (regression): session ok + hot clean + all-foreign dirty -> silent, no additionalContext', () => {
+  withWiki(
+    (dir) => {
+      seedForeignFixture(dir);
+    },
+    (dir) => {
+      writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other work\n');
+      const r = runHook(
+        'hypo-compact-guard.mjs',
+        { prompt: '/compact', cwd: CG_CWD },
+        { HYPO_DIR: dir },
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.continue, true);
+      assert.equal(
+        out.suppressOutput,
+        true,
+        `every reason demoted must yield silence, not a nudge: ${r.stdout}`,
+      );
+      assert.ok(!('additionalContext' in out), `must not emit additionalContext: ${r.stdout}`);
+    },
+  );
+});
+
+// (cross-review BLOCKER, first-tier cross-review) resolveGateProjectOverride
+// (through collectProjectWorkingDirs' own readdirSync, outside that
+// function's try/catch) can throw on a structurally broken vault, unlike
+// classifyForeignOnlyDirty which is contract-bound to never throw. Before
+// the fix, that throw escaped this hook's git-axis logic straight into the
+// outermost catch, which turns ANY exception into a fully suppressed
+// {suppressOutput:true} — wiping the session-log and hot.md reasons too,
+// not just the git one. `projects` as a FILE (not a directory) is the
+// reproduction: existsSync(projectsDir) passes, then readdirSync throws
+// ENOTDIR. No `.git` directory at all, so hypoIsClean's own git spawn also
+// fails and reports uncommitted:true — the git axis must stay a candidate
+// so this exercises the `if (gitStatus.uncommitted)` branch, not skip it.
+test('resolveGateProjectOverride throwing on a broken vault must not silence the OTHER reasons', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    // `projects` is a file, not a directory: collectProjectWorkingDirs'
+    // readdirSync(projectsDir) throws ENOTDIR once resolveGateProjectOverride
+    // reaches it.
+    writeFileSync(join(dir, 'projects'), 'not a directory\n');
+    const today = todayLocal();
+    // "ingest", not "session" -> lastSubstantialOpIsSession() reads false,
+    // so the session-log reason is the one this BLOCKER also swallowed.
+    writeFileSync(join(dir, 'log.md'), `## [${today}] ingest | test-project\n`);
+    const r = runHook(
+      'hypo-compact-guard.mjs',
+      { prompt: '/compact', cwd: join(dir, 'somewhere') },
+      { HYPO_DIR: dir },
+    );
+    assert.equal(r.status, 0, `hook must never exit non-zero: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    // Must come before the content assertions: a hook that silently
+    // suppresses (the exact BLOCKER this pins) has no additionalContext at
+    // all, and `(out.additionalContext || '').test(...)` on the reasons
+    // below would then pass vacuously instead of catching the regression.
+    assert.ok('additionalContext' in out, `must not go silent on a broken vault: ${r.stdout}`);
+    assert.ok(
+      /session log entry missing/.test(out.additionalContext),
+      `session-log reason must survive a resolveGateProjectOverride throw: ${r.stdout}`,
+    );
+    assert.ok(
+      /git check failed/.test(out.additionalContext),
+      `git reason must survive too, not just session-log: ${r.stdout}`,
+    );
+  });
+});
+
+// A second, separate defense from the one above: resolveGateProjectOverride
+// is scoped INSIDE `if (gitStatus.uncommitted)` because it only ever narrows
+// the git notice — a clean /compact has no git reason to narrow, so it has
+// no business running at all, broken `projects/` entry or not. `projects` is
+// committed as a FILE here (inside withWiki's `mutate`, before the commit),
+// so the working tree is clean at hook time and this test exercises the
+// branch NOT taken, unlike the throw test above which needs uncommitted:true
+// to even reach the call.
+test('a clean /compact never invokes resolveGateProjectOverride, even with a broken projects/ entry sitting there', () => {
+  withWiki(
+    (dir, today) => {
+      // "ingest", not "session": the session reason is the only one this
+      // fixture carries, so seeing it survive proves the hook still ran its
+      // other checks even though it skipped the projects/ scan below.
+      writeFileSync(join(dir, 'log.md'), `## [${today}] ingest | test-project\n`);
+      rmSync(join(dir, 'projects'), { recursive: true, force: true });
+      writeFileSync(join(dir, 'projects'), 'not a directory\n');
+    },
+    (dir) => {
+      const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
+      const out = JSON.parse(r.stdout);
+      assert.ok('additionalContext' in out, `session reason must still surface: ${r.stdout}`);
+      assert.ok(
+        /session log entry missing/.test(out.additionalContext),
+        `session reason must still surface: ${r.stdout}`,
+      );
+      assert.ok(
+        !/resolveGateProjectOverride failed/.test(r.stderr),
+        `a clean /compact must never invoke resolveGateProjectOverride at all: ${r.stderr}`,
+      );
+    },
+  );
+});
+
+// (cross-review BLOCKER, second-tier cross-review) lastSubstantialOpIsSession()
+// and hotMdIsClean() are the other two calls that run on EVERY /compact or
+// /clear, same as resolveGateProjectOverride above but with no `if
+// (gitStatus.uncommitted)` guard around them at all — so an unguarded throw
+// here was reachable on every single prompt, not just the dirty-git ones,
+// wiping ALL THREE reasons (session, git, hot) into the outermost catch's
+// {suppressOutput:true}. A directory in place of the file forces a real
+// EISDIR read failure (not just "file absent", which lastSubstantialOpIsSession
+// already treats as fail-open true — a plain rmSync fixture would not exercise
+// this defect at all).
+test('log.md is a directory (read failure, not "missing") -> hook stays non-silent with the session-log reason', () => {
+  withWiki(
+    (dir) => {
+      rmSync(join(dir, 'log.md'), { force: true });
+      mkdirSync(join(dir, 'log.md'));
+      writeFileSync(join(dir, 'log.md', 'placeholder.md'), '# not a real log.md\n');
+    },
+    (dir) => {
+      const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
+      assert.equal(r.status, 0, `hook must never exit non-zero: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      // Must come first: a silently-suppressed hook has no additionalContext,
+      // and the regex assertion below would then pass vacuously.
+      assert.ok(
+        'additionalContext' in out,
+        `must not go silent when log.md is unreadable: ${r.stdout}`,
+      );
+      assert.ok(
+        /session log entry missing/.test(out.additionalContext),
+        `a read failure on log.md must fall back fail-closed to the session-log reason: ${r.stdout}`,
+      );
+      assert.ok(
+        /lastSubstantialOpIsSession failed/.test(r.stderr),
+        `stderr must name which axis failed: ${r.stderr}`,
+      );
+    },
+  );
+});
+
+test('hot.md is a directory (read failure, not "invalid") -> hook stays non-silent with an "unreadable" hot reason', () => {
+  withWiki(
+    (dir) => {
+      rmSync(join(dir, 'hot.md'), { force: true });
+      mkdirSync(join(dir, 'hot.md'));
+      writeFileSync(join(dir, 'hot.md', 'placeholder.md'), '# not a real hot.md\n');
+    },
+    (dir) => {
+      const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
+      assert.equal(r.status, 0, `hook must never exit non-zero: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        'additionalContext' in out,
+        `must not go silent when hot.md is unreadable: ${r.stdout}`,
+      );
+      assert.ok(
+        /hot\.md unreadable/.test(out.additionalContext),
+        `a read failure on hot.md must say "unreadable", distinct from a format violation like "unexpected H2" or "forbidden field": ${r.stdout}`,
+      );
+      assert.ok(
+        /hotMdIsClean failed/.test(r.stderr),
+        `stderr must name which axis failed: ${r.stderr}`,
+      );
+    },
+  );
+});
+
+// lastSubstantialOpIsSession() reads the module-level LOG_PATH constant
+// (computed once from process.env.HYPO_DIR at import time), so pinning it to
+// a fixture directory in THIS process would have no effect once
+// hypo-shared.mjs is already imported above. Each case runs in a fresh child
+// process instead, exactly like lib-core.test.mjs's resolveHypoRootInfo
+// probes, so HYPO_DIR is read cold.
+function probeLastSubstantialOpIsSession(hypoDir) {
+  const script = `
+    const { lastSubstantialOpIsSession } = await import(${JSON.stringify(join(HOOKS, 'hypo-shared.mjs'))});
+    try {
+      console.log(JSON.stringify({ ok: true, result: lastSubstantialOpIsSession() }));
+    } catch (err) {
+      console.log(JSON.stringify({ ok: false, code: err && err.code, message: err && err.message }));
+    }
+  `;
+  return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: hypoDir },
+  });
+}
+
+// Pins the single-read TOCTOU fix directly on the function that owns it,
+// independent of the hook's own JSON envelope: a missing log.md (ENOENT)
+// must read `false` now, not the old fail-open `true` that forced
+// hypo-compact-guard.mjs to precheck existsSync(LOG_PATH) ahead of the call
+// (the precheck this round removes, since it is what left the check-then-
+// read race open in the first place).
+test('lastSubstantialOpIsSession(): log.md absent (ENOENT) reads false, not the old fail-open true', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-toctou-'));
+  try {
+    const r = probeLastSubstantialOpIsSession(dir);
+    assert.equal(r.status, 0, `probe process should exit 0: ${r.stderr}`);
+    assert.deepEqual(JSON.parse(r.stdout.trim()), { ok: true, result: false });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Only ENOENT folds to `false`. A directory in place of log.md is a real
+// read failure (EISDIR), not "genuinely absent", and must rethrow so the
+// caller's own try/catch (not this function) decides how to fail closed.
+test('lastSubstantialOpIsSession(): log.md is a directory (EISDIR) rethrows, does not fold to a return value', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-toctou-'));
+  try {
+    mkdirSync(join(dir, 'log.md'));
+    const r = probeLastSubstantialOpIsSession(dir);
+    assert.equal(r.status, 0, `probe process should exit 0: ${r.stderr}`);
+    const out = JSON.parse(r.stdout.trim());
+    assert.equal(out.ok, false, `EISDIR must rethrow, not resolve to a value: ${r.stdout}`);
+    assert.equal(out.code, 'EISDIR', `error code must be EISDIR: ${r.stdout}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('additionalContext never carries imperative "Run ... NOW" or "Do NOT wait" phrasing', () => {
+  const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' });
+  const out = JSON.parse(r.stdout);
+  // Guard the negative assertions below against a silently-suppressed hook:
+  // without this, a bug that drops additionalContext entirely (empty string)
+  // would make both regexes below pass vacuously, on a run with nothing to
+  // check phrasing in at all.
+  assert.ok('additionalContext' in out, r.stdout);
+  assert.ok(!/Run .* NOW/i.test(out.additionalContext || ''), r.stdout);
+  assert.ok(!/Do NOT wait/i.test(out.additionalContext || ''), r.stdout);
+});
+
+// ── hypoIsClean / gitDirtyFiles: opts.deadline (session-close-scope-boundary
+//    spec §5). Called directly, no hook process: both spawn `git` themselves,
+//    exactly as hypo-compact-guard.mjs's own call does, and asserting on the
+//    return value pins the contract without also depending on the hook's own
+//    JSON envelope. ──────────────────────────────────────────────────────
+suite('hypoIsClean / gitDirtyFiles: opts.deadline (spec §5)');
+
+test('hypoIsClean(dir): single-arg call is unchanged (no timeout, no second-spawn failure check)', () => {
+  withCleanWiki((dir) => {
+    assert.deepEqual(hypoIsClean(dir), {
+      clean: true,
+      uncommitted: false,
+      ahead: false,
+      reason: undefined,
+    });
+  });
+});
+
+test('hypoIsClean(dir, {deadline}) with a healthy budget returns the identical verdict to the no-deadline call', () => {
+  withCleanWiki((dir) => {
+    const withDeadline = hypoIsClean(dir, { deadline: { end: performance.now() + 5000 } });
+    assert.deepEqual(withDeadline, hypoIsClean(dir));
+  });
+});
+
+test('hypoIsClean(dir, {deadline}) with an already-exhausted budget converts to fail-closed uncommitted:true, not a throw', () => {
+  withCleanWiki((dir) => {
+    const status = hypoIsClean(dir, { deadline: { end: performance.now() - 1 } });
+    assert.equal(status.clean, false);
+    assert.equal(status.uncommitted, true);
+    assert.ok(/deadline exhausted/.test(status.reason || ''), `reason: ${status.reason}`);
+  });
+});
+
+test('gitDirtyFiles(dir, {deadline}) with an already-exhausted budget returns [] (cannot attribute)', () => {
+  withCleanWiki((dir) => {
+    writeFileSync(join(dir, 'dirty.md'), '# dirty\n');
+    assert.deepEqual(gitDirtyFiles(dir, { deadline: { end: performance.now() - 1 } }), []);
+  });
+});
+
+// A deadline built from a non-finite `end` (Infinity or NaN) must fold to the
+// same "budget exhausted, do not spawn" path as an already-past one, not
+// reach spawnSync's `timeout` option as-is. Node throws ERR_OUT_OF_RANGE for
+// a non-finite `timeout`, and neither gitDirtyFiles nor its hook caller
+// catches that: it would escape to the hook's outermost catch and come back
+// as full silence, dropping every other reason in the same reasons array.
+test('gitDirtyFiles(dir, {deadline: {end: Infinity}}) does not throw, returns [] (cannot attribute)', () => {
+  withCleanWiki((dir) => {
+    writeFileSync(join(dir, 'dirty.md'), '# dirty\n');
+    assert.deepEqual(gitDirtyFiles(dir, { deadline: { end: Infinity } }), []);
+  });
+});
+
+// `end: NaN` alone does not distinguish remainingSpawnTimeoutMs's predicate:
+// both Number.isFinite(NaN) and Number.isSafeInteger(NaN) are false, so this
+// assertion passed identically before and after the isFinite->isSafeInteger
+// fix and pinned nothing about it (cross-review-2nd finding). `Number.MAX_VALUE`
+// is the case that actually separates the two: it IS finite (isFinite passes
+// it through) but exceeds Number.MAX_SAFE_INTEGER, spawnSync's own upper
+// bound (only isSafeInteger rejects it). With the guard reverted to
+// isFinite, this reaches spawnSync as an out-of-range `timeout` and throws
+// ERR_OUT_OF_RANGE uncaught (gitDirtyFiles has no try/catch of its own).
+test('gitDirtyFiles(dir, {deadline: {end: Number.MAX_VALUE}}) does not throw, returns [] (cannot attribute)', () => {
+  withCleanWiki((dir) => {
+    writeFileSync(join(dir, 'dirty.md'), '# dirty\n');
+    assert.deepEqual(gitDirtyFiles(dir, { deadline: { end: Number.MAX_VALUE } }), []);
+  });
+});
+
+// Same MAX_VALUE boundary as above, but through hypoIsClean, which DOES wrap
+// its spawns in a try/catch (`:516-518` area) — so an uncaught throw there
+// still comes back as a return value, not an exception. Asserting only
+// `uncommitted: true` (the old form) cannot tell "guard folded this to 0
+// before ever spawning" apart from "spawnSync threw ERR_OUT_OF_RANGE and the
+// generic catch below caught it": both produce `uncommitted: true`. The
+// `reason` string is what differs — "deadline exhausted" only appears on the
+// guard's own early-return branch, before any spawn — so asserting on it is
+// what makes this test go red when the guard is reverted to isFinite.
+test('hypoIsClean(dir, {deadline: {end: Number.MAX_VALUE}}) folds to the deadline-exhausted branch, never reaches spawnSync', () => {
+  withCleanWiki((dir) => {
+    const status = hypoIsClean(dir, { deadline: { end: Number.MAX_VALUE } });
+    assert.equal(status.uncommitted, true);
+    assert.ok(
+      /deadline exhausted/.test(status.reason || ''),
+      `must fold before spawning, not reach spawnSync and get caught by the generic "git check failed" branch: ${JSON.stringify(status)}`,
+    );
+  });
 });
 
 suite('hypo-personal-check.mjs — close-intent enrichment (#20)');

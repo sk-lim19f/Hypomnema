@@ -396,8 +396,23 @@ export function isGateSkipped() {
 // ── state checkers ─────────────────────────────────────────────────────────
 
 export function lastSubstantialOpIsSession() {
-  if (!existsSync(LOG_PATH)) return true;
-  const log = readFileSync(LOG_PATH, 'utf-8');
+  // Single read, no existsSync precheck: a check-then-read pair leaves a race
+  // window where the file exists at the check and is gone by the read, and
+  // the old code treated that ENOENT the same as a stably-missing file
+  // (fail-open, `true`). Only a genuinely absent log.md (ENOENT) folds to
+  // `false` here; any other read failure (EISDIR, EACCES, ...) is a real
+  // problem the caller needs to see, not a silent "no session", so it is
+  // rethrown. hypo-compact-guard.mjs is the only in-repo caller (verified via
+  // grep) and its own try/catch already turns any throw here into
+  // fail-closed ("session log entry missing") plus a stderr line, so this
+  // fail-open-to-fail-closed flip needed no other caller to be re-audited.
+  let log;
+  try {
+    log = readFileSync(LOG_PATH, 'utf-8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return false;
+    throw err;
+  }
   const substantial = log
     .split('\n')
     .filter((l) => /^## \[\d{4}-\d{2}-\d{2}\] (session|ingest)/.test(l));
@@ -414,12 +429,61 @@ export function lastSubstantialOpIsSession() {
 // read it. Callers that gate session-close / compact distinguish the two: they
 // block on `uncommitted` and demote `ahead` to a notice (precompactGateStatus,
 // hypo-compact-guard) so a committed-but-unpushed close is still "compact-ready".
-export function hypoIsClean(dir = HYPO_DIR) {
+// A deadline shared across every git spawn one "am I clean" check can make:
+// `{ end: <performance.now()-based timestamp> }`, built once by a caller that
+// needs to bound hypoIsClean and gitDirtyFiles to a slice of its own hook
+// timeout (session-close-scope-boundary spec §5). remainingSpawnTimeoutMs
+// turns "time left" into what spawnSync's own `timeout` option actually
+// requires — verified on Node 26: `timeout: 0` DISABLES the timeout (waits
+// forever) rather than firing immediately, and a negative or fractional value
+// THROWS ERR_OUT_OF_RANGE. A throw here would escape as an exception through
+// a hook's outermost catch and come back silent, so a caller must never pass
+// a value this function did not produce, and must never spawn once it
+// returns 0.
+// A deadline built from a bad `end` (Infinity, NaN, or already past) must
+// also fold to 0, not just a plain negative one: a caller-supplied
+// `{ end: Infinity }` produces `remaining = Infinity`, and `Infinity` is
+// exactly as unsafe a `timeout` value as a negative or fractional one, same
+// `ERR_OUT_OF_RANGE` throw, just via a different guard. `Number.isFinite`
+// alone is not enough, though: it also passes `Number.MAX_VALUE`, which is
+// finite but still outside spawnSync's documented `timeout` range (0 through
+// `Number.MAX_SAFE_INTEGER`) and throws the same `ERR_OUT_OF_RANGE` (verified
+// directly: `gitDirtyFiles(cwd, { deadline: { end: Number.MAX_VALUE } })`
+// threw before this guard, since MAX_SAFE_INTEGER is exactly spawnSync's
+// upper bound, `Number.isSafeInteger` is the one predicate that matches it.
+//   undefined — no deadline given: omit `timeout` entirely (today's behavior)
+//   0         — budget exhausted, or the deadline itself was not a safe
+//               positive integer: do not spawn
+//   >0        — a whole positive integer number of ms safe to pass as `timeout`
+function remainingSpawnTimeoutMs(deadline) {
+  if (!deadline) return undefined;
+  const remaining = Math.floor(deadline.end - performance.now());
+  return Number.isSafeInteger(remaining) && remaining > 0 ? remaining : 0;
+}
+
+// `opts.deadline` is optional (session-close-scope-boundary spec §5): when
+// omitted, both spawns run exactly as before, no timeout, no status/error
+// check on the second one. hypo-compact-guard.mjs is the only caller that
+// passes one; precompactGateStatus (`:3872`) and all six direct test call
+// sites still pass a bare `dir` and must see byte-identical behavior.
+export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
+  const { deadline } = opts;
   try {
-    const porcelain = spawnSync('git', ['-C', dir, 'status', '--porcelain'], {
-      encoding: 'utf-8',
-    });
-    if (porcelain.status !== 0)
+    const t1 = remainingSpawnTimeoutMs(deadline);
+    if (t1 === 0) {
+      return {
+        clean: false,
+        uncommitted: true,
+        ahead: false,
+        reason: `git check deadline exhausted in ${dir}`,
+      };
+    }
+    const porcelain = spawnSync(
+      'git',
+      ['-C', dir, 'status', '--porcelain'],
+      t1 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t1 },
+    );
+    if (porcelain.error || porcelain.status !== 0)
       return {
         clean: false,
         uncommitted: true,
@@ -427,9 +491,38 @@ export function hypoIsClean(dir = HYPO_DIR) {
         reason: `git check failed in ${dir}`,
       };
     const uncommitted = porcelain.stdout.trim() !== '';
-    const aheadRes = spawnSync('git', ['-C', dir, 'status', '--branch', '--porcelain'], {
-      encoding: 'utf-8',
-    });
+
+    const t2 = remainingSpawnTimeoutMs(deadline);
+    if (t2 === 0) {
+      return {
+        clean: false,
+        uncommitted: true,
+        ahead: false,
+        reason: `git check deadline exhausted in ${dir}`,
+      };
+    }
+    const aheadRes = spawnSync(
+      'git',
+      ['-C', dir, 'status', '--branch', '--porcelain'],
+      t2 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t2 },
+    );
+    // Only enforced when a deadline is in play. Without one this spawn cannot
+    // time out, and its `stdout` (empty on any other kind of failure too) was
+    // already read as "not ahead" before this change — harmless when nothing
+    // can kill the process out from under it. WITH a deadline this spawn CAN
+    // now die from the same budget the first spawn already spent, and a
+    // silent "not ahead" would make the caller's own notification vanish
+    // (spec §5's own regression). The first spawn already fails closed this
+    // way (`porcelain.status !== 0` above); this brings the second spawn to
+    // the same contract, but only where a deadline made it possible to break.
+    if (deadline && (aheadRes.error || aheadRes.status !== 0)) {
+      return {
+        clean: false,
+        uncommitted: true,
+        ahead: false,
+        reason: `git check failed in ${dir}`,
+      };
+    }
     const ahead = /\[ahead \d+\]/.test(aheadRes.stdout || '');
     const reasons = [];
     if (uncommitted) reasons.push(`uncommitted changes in ${dir}`);
@@ -473,18 +566,33 @@ export function hypoIsClean(dir = HYPO_DIR) {
  *   failure (the caller already has its own git-status result via
  *   hypoIsClean and treats that failure as an unconditional blocker; an
  *   empty return here just means "cannot attribute", not "clean").
+ *
+ * `opts.deadline` (session-close-scope-boundary spec §5): the SAME shared
+ * deadline object passed to hypoIsClean, so the two functions' spawns split
+ * one budget instead of each getting their own (which would let the pair
+ * together run twice as long as intended). Omitted, both spawns run exactly
+ * as before — precompactGateStatus's own call (`:3874`) does not pass one.
  */
-function gitDirtyFiles(dir) {
-  const prefixRes = spawnSync('git', ['-C', dir, 'rev-parse', '--show-prefix'], {
-    encoding: 'utf-8',
-  });
-  if (prefixRes.status !== 0) return []; // can't resolve the repo → cannot attribute
+export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
+  const { deadline } = opts;
+  const t1 = remainingSpawnTimeoutMs(deadline);
+  if (t1 === 0) return []; // budget exhausted before the first spawn → cannot attribute
+  const prefixRes = spawnSync(
+    'git',
+    ['-C', dir, 'rev-parse', '--show-prefix'],
+    t1 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t1 },
+  );
+  if (prefixRes.error || prefixRes.status !== 0) return []; // can't resolve the repo → cannot attribute
   const prefix = (prefixRes.stdout || '').trim();
 
-  const porcelain = spawnSync('git', ['-C', dir, 'status', '--porcelain', '-uall', '-z'], {
-    encoding: 'utf-8',
-  });
-  if (porcelain.status !== 0) return [];
+  const t2 = remainingSpawnTimeoutMs(deadline);
+  if (t2 === 0) return [];
+  const porcelain = spawnSync(
+    'git',
+    ['-C', dir, 'status', '--porcelain', '-uall', '-z'],
+    t2 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t2 },
+  );
+  if (porcelain.error || porcelain.status !== 0) return [];
   const out = [];
   const records = (porcelain.stdout || '').split('\0');
   const toDirRelative = (f) => {
@@ -509,6 +617,74 @@ function gitDirtyFiles(dir) {
     if (relFrom) out.push(relFrom);
   }
   return out;
+}
+
+// session-close-scope-boundary spec §2b/§5: the ONE path-prefix rule that
+// decides a dirty file structurally belongs to a DIFFERENT eligible project
+// than the one this call is scoped to. Extracted from precompactGateStatus's
+// former inline closure so hypo-compact-guard.mjs (spec §5) can call the
+// exact same predicate instead of duplicating it — a closure over the gate's
+// local variables cannot be called, or asserted against, from anywhere else.
+//
+// Lexical, on the RAW git-porcelain path `f`, BEFORE posixPath()'s
+// unconditional `\` -> `/` conversion: a file whose actual NAME contains a
+// literal backslash (`projects\other\x.md`, one path segment, no real
+// subdirectory) must not be reinterpreted as living under `projects/other/`
+// just because posixPath() would rewrite it that way — testing the raw
+// string means it never matches the regex below and falls through to
+// "not foreign", the fail-closed default. `transcriptTouched` IS keyed by
+// posix paths (it comes from extractTouchedWikiFiles), so that one check
+// still normalizes `f` before the lookup.
+//
+// @param {string} f - a raw dirty path from gitDirtyFiles/git porcelain
+// @param {{eligibleSlugs: Set<string>|null, effectiveOverride: string|null,
+//   transcriptTouched?: Set<string>}} ctx
+// @returns {boolean}
+export function isForeignProjectFile(
+  f,
+  { eligibleSlugs, effectiveOverride, transcriptTouched = new Set() },
+) {
+  // Transcript evidence outranks the path-prefix heuristic below: it PROVES
+  // this session edited f, whatever its path prefix says. The heuristic only
+  // exists to cover files an untrusted (or absent) transcript could not
+  // vouch for either way.
+  if (transcriptTouched.has(posixPath(f))) return false;
+  if (!eligibleSlugs) return false;
+  const m = /^projects\/([^/]+)\/.+$/.exec(f);
+  if (!m) return false;
+  const slug = m[1];
+  return slug !== effectiveOverride && eligibleSlugs.has(slug);
+}
+
+// session-close-scope-boundary spec §5: hypo-compact-guard.mjs only needs a
+// yes/no on "may I drop my git notice line", never precompactGateStatus's
+// full per-file partition, and the answer must never escape as a throw — this
+// hook's outermost catch turns ANY exception into a fully suppressed
+// {suppressOutput:true}, so a failure inside collectProjectWorkingDirs (a
+// readdirSync it does not itself catch) must come back as data instead.
+//
+// Returns one of two sentinels, never throws:
+//   'foreign-only'   — dirty is non-empty, at least one eligible project is
+//                       known, and EVERY dirty file is provably someone
+//                       else's under isForeignProjectFile.
+//   'unattributable' — anything short of that full proof (no dirty files, no
+//                       eligible project known, project enumeration failed,
+//                       or a mix of foreign and non-foreign files). The
+//                       caller must treat this exactly like today's unscoped
+//                       git blocker/notice — this is the fail-closed default.
+export function classifyForeignOnlyDirty(hypoDir, dirty, { effectiveOverride = null } = {}) {
+  if (!dirty || dirty.length === 0) return 'unattributable'; // vacuous every() must not pass
+  let eligibleSlugs;
+  try {
+    eligibleSlugs = new Set(collectProjectWorkingDirs(hypoDir).map((p) => p.slug));
+  } catch {
+    return 'unattributable';
+  }
+  if (eligibleSlugs.size === 0) return 'unattributable';
+  const allForeign = dirty.every((f) =>
+    isForeignProjectFile(f, { eligibleSlugs, effectiveOverride }),
+  );
+  return allForeign ? 'foreign-only' : 'unattributable';
 }
 
 export function hotMdIsClean(dir = HYPO_DIR) {
@@ -3895,33 +4071,19 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // exception, the PreCompact hook's outermost catch would turn that
       // into a silent, fully-suppressed gate result, the opposite of "fail
       // closed". Treat any failure as "no eligible projects known", which
-      // makes isForeign() below always false and every dirty file falls
-      // through to the unconditional blocker.
+      // makes isForeignProjectFile() below always false and every dirty file
+      // falls through to the unconditional blocker.
       let eligibleSlugs = null;
       try {
         eligibleSlugs = new Set(collectProjectWorkingDirs(hypoDir).map((p) => p.slug));
       } catch {
         eligibleSlugs = null;
       }
-      // Lexical, on the RAW git-porcelain path, BEFORE posixPath()'s
-      // unconditional `\` -> `/` conversion. A file whose actual NAME
-      // contains a literal backslash (`projects\other\x.md`, one path
-      // segment, no real subdirectory) must not be reinterpreted as living
-      // under `projects/other/` just because posixPath() would rewrite it
-      // that way; testing the raw string here means it never matches this
-      // regex and falls through to fail-closed instead.
-      const isForeign = (f) => {
-        // The transcript already PROVES this session edited f, whatever its
-        // path prefix says: transcript evidence outranks the path-prefix
-        // heuristic below, which only exists to cover files the (untrusted)
-        // transcript could not vouch for either way.
-        if (transcriptTouched.has(posixPath(f))) return false;
-        if (!eligibleSlugs) return false;
-        const m = /^projects\/([^/]+)\/.+$/.exec(f);
-        if (!m) return false;
-        const slug = m[1];
-        return slug !== effectiveOverride && eligibleSlugs.has(slug);
-      };
+      // isForeignProjectFile is the extracted, exported predicate (spec §5):
+      // hypo-compact-guard.mjs calls the exact same function on its own git
+      // axis, instead of a second, silently-diverging copy of this rule.
+      const isForeign = (f) =>
+        isForeignProjectFile(f, { eligibleSlugs, effectiveOverride, transcriptTouched });
       const foreign = dirty.filter(isForeign);
       const rest = dirty.filter((f) => !isForeign(f));
       if (rest.length > 0) {

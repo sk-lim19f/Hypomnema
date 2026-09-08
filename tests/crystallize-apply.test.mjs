@@ -27,7 +27,7 @@ import {
   withWiki,
 } from './helpers.mjs';
 
-// ── fix #38: --apply-session-close --payload <json> ───────────────────────────
+// ── fix #38: --apply-session-close --payload=<path|-> ─────────────────────────
 // @fix #38: clean-wiki payload → ok:true, new entries appended (apply dedup is exact-entry, not date-based)
 // @fix #38: idempotent: re-running same payload produces no new bytes (file mtimes unchanged)
 // Idempotent payload-driven entrypoint that writes the 5 mandatory memory files
