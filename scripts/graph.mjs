@@ -22,12 +22,32 @@ import { collectPagesGraph, extractWikilinks } from './lib/wikilink.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
+const ALLOWED_FLAGS = ['--hypo-dir=<path>', '--format=<fmt>', '--min-edges=<n>'];
+
 function parseArgs(argv) {
   const args = { hypoDir: null, format: 'json', minEdges: 0 };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg.startsWith('--format=')) args.format = arg.slice(9);
+    if (arg.startsWith('--hypo-dir=')) {
+      // See lint.mjs's parseArgs for why an empty raw value (--hypo-dir=,
+      // or --hypo-dir="$VAULT" with VAULT unset) is rejected instead of
+      // falling through to the default-resolution branch below.
+      const raw = arg.slice(11);
+      if (!raw) {
+        console.error(`graph.mjs: --hypo-dir requires a non-empty value (got '${arg}')`);
+        console.error(`graph.mjs accepts: ${ALLOWED_FLAGS.join(', ')}`);
+        process.exit(2);
+      }
+      args.hypoDir = expandHome(raw);
+    } else if (arg.startsWith('--format=')) args.format = arg.slice(9);
     else if (arg.startsWith('--min-edges=')) args.minEdges = parseInt(arg.slice(12), 10) || 0;
+    else {
+      // No positional arguments here either, so an unmatched arg is rejected
+      // rather than dropped. See lint.mjs's parseArgs for the background
+      // this closes.
+      console.error(`graph.mjs: unrecognized argument '${arg}'`);
+      console.error(`graph.mjs accepts: ${ALLOWED_FLAGS.join(', ')}`);
+      process.exit(2);
+    }
   }
   if (!args.hypoDir) {
     const info = resolveHypoRootInfo();

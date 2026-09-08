@@ -25,10 +25,17 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 ## Step 2 — Run lint
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/scripts/lint.mjs [--hypo-dir="<path>"] [--json] [--fix]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/lint.mjs --json
 ```
 
+Add `--hypo-dir="<path>"` only when the user gave one (per Step 1); otherwise leave it
+out and the script resolves the root itself.
+
+An unrecognized flag exits 2 instead of being ignored. Do not add `--fix` on this first
+pass; Step 4 covers when to offer it and re-run with it only after the user agrees.
+
 Options:
+- `--hypo-dir=<path>` (optional): Hypomnema root, pass only when the user specified one explicitly
 - `--json` — output results as JSON (useful for tooling)
 - `--fix` — auto-add missing `updated` field (safe repairs only; no other fields are modified)
 

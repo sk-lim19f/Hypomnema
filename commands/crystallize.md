@@ -85,9 +85,11 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs \
   --apply-session-close \
   --payload=/tmp/hypo-session-close-<session-id>.json \
   --session-id=<current-session-id> \
-  --hypo-dir="<path>" \
   --json
 ```
+
+Add `--hypo-dir="<path>"` only when the user specified a Hypomnema directory explicitly;
+otherwise omit it and the script resolves the root itself.
 
 **`--session-id` is required for any close that carries a `--payload`.** It is not a
 switch that turns a check on; omitting it fails the check. Before a single byte is
@@ -182,8 +184,13 @@ If the user says stop, end here. Otherwise continue to Step 5.
 Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install) or reinstall instead of guessing the cache layout.
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs [--hypo-dir="<path>"] [--min-group=2]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --min-group=2
 ```
+
+Add `--hypo-dir="<path>"` only when the user specified a Hypomnema directory explicitly;
+otherwise omit it.
+
+An unrecognized flag exits 2 instead of being ignored.
 
 Show the output to the user. If no candidates are found, tell them Hypomnema looks well-connected and no crystallization is needed.
 
@@ -255,10 +262,15 @@ Show what was created or modified, and offer to run `/hypo:lint` to verify all n
 `--check-session-close` (read-only strict gate, same check PreCompact runs) is still supported as a probe-only verification. Use it when you only want to verify that today's session-close is complete without applying anything:
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --check-session-close [--hypo-dir="<path>"]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --check-session-close
 ```
 
-It reports any file as `missing` or `stale`. For an actual close, prefer `--apply-session-close --payload=<path>` (Step 3) — it bundles freshness + lint into one gate and is the documented dogfood path. (`parseArgs` only accepts the `--payload=<path>` spelling; a space-separated `--payload <path>` is silently ignored and triggers "payload is required".)
+Add `--hypo-dir="<path>"` only when the user specified a Hypomnema directory explicitly;
+otherwise omit it.
+
+An unrecognized flag exits 2 instead of being ignored.
+
+It reports any file as `missing` or `stale`. For an actual close, prefer `--apply-session-close --payload=<path>` (Step 3): it bundles freshness and lint into one gate and is the documented dogfood path. `parseArgs` only accepts the `--payload=<path|->` spelling (a path, or `-` for stdin); a space-separated `--payload <path>` is rejected outright with exit 2, not silently dropped.
 
 Add `--project=<slug>` to scope the check to one project (close status + lint scope) when recency picks the wrong one. This is a project-scoped diagnostic only: a green scoped result (JSON `scope: "project"`) attests that slug is close-complete, **not** that `/compact` is unblocked globally.
 

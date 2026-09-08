@@ -3,6 +3,22 @@ import { isValidProjectName } from './project-create.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
+const ALLOWED_FLAGS = [
+  '--hypo-dir=<path>',
+  '--min-group=<n>',
+  '--check-session-close',
+  '--apply-session-close',
+  '--mark-session-closed',
+  '--log-only',
+  '--session-id=<id>',
+  '--payload=<path|->',
+  '--transcript-path=<path>',
+  '--session-cwd=<path>',
+  '--project=<slug>',
+  '--force',
+  '--json',
+];
+
 export function parseArgs(argv) {
   const args = {
     hypoDir: null,
@@ -19,8 +35,20 @@ export function parseArgs(argv) {
     project: null,
   };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg.startsWith('--min-group=')) args.minGroup = parseInt(arg.slice(12), 10) || 2;
+    if (arg.startsWith('--hypo-dir=')) {
+      // See scripts/lint.mjs's parseArgs for why an empty raw value
+      // (--hypo-dir=, or --hypo-dir="$VAULT" with VAULT unset) is rejected
+      // instead of falling through to resolveHypoRoot() below. For this
+      // script specifically, a silent fallback here means a session-close
+      // apply writes to the wrong vault.
+      const raw = arg.slice(11);
+      if (!raw) {
+        console.error(`crystallize.mjs: --hypo-dir requires a non-empty value (got '${arg}')`);
+        console.error(`crystallize.mjs accepts: ${ALLOWED_FLAGS.join(', ')}`);
+        process.exit(2);
+      }
+      args.hypoDir = expandHome(raw);
+    } else if (arg.startsWith('--min-group=')) args.minGroup = parseInt(arg.slice(12), 10) || 2;
     else if (arg === '--check-session-close') args.checkSessionClose = true;
     else if (arg === '--apply-session-close') args.applySessionClose = true;
     else if (arg === '--mark-session-closed') args.markSessionClosed = true;
@@ -32,6 +60,14 @@ export function parseArgs(argv) {
     else if (arg.startsWith('--project=')) args.project = arg.slice(10);
     else if (arg === '--force') args.force = true;
     else if (arg === '--json') args.json = true;
+    else {
+      // No positional arguments here either, so an unmatched arg is rejected
+      // rather than dropped. See scripts/lint.mjs's parseArgs for the
+      // background this closes.
+      console.error(`crystallize.mjs: unrecognized argument '${arg}'`);
+      console.error(`crystallize.mjs accepts: ${ALLOWED_FLAGS.join(', ')}`);
+      process.exit(2);
+    }
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   // --project=<slug> override (check/mark only). Validate the SYNTAX here so a

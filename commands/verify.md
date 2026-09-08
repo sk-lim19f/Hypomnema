@@ -15,11 +15,22 @@ You are running `/hypo:verify`. Audit wiki pages for overdue or missing `verify_
 
 Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install) or reinstall instead of guessing the cache layout.
 
+If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise
+omit the flag.
+
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs [--hypo-dir="<path>"] [--file=<path>]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs
 ```
 
+Add `--file="<path>"` only to check a single page (for example, right after editing it).
+Omitting it scans the whole vault (`pages/` and `projects/`); the script skips a `--file`
+path it cannot read rather than erroring, so passing one that does not exist reports
+"nothing to verify" instead of failing loudly.
+
+An unrecognized flag exits 2 instead of being ignored.
+
 Options:
+- `--hypo-dir=<path>` (optional): Hypomnema root, pass only when the user specified one explicitly
 - `--file=<path>` — check a single page only (useful after editing a page)
 
 ---

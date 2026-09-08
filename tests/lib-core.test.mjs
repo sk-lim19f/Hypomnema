@@ -410,6 +410,308 @@ test('graph.mjs --format=mermaid: real (empty) vault still renders the normal di
   }
 });
 
+// ── reject unspecified flags (ISSUE-121 F2) ──────────────────────────────────
+//
+// Five SKILL.md files told models to pass --wiki-dir=<path>; no script here
+// ever parsed that flag, so it was silently dropped and every call fell
+// through to the default hypo-dir resolution instead. None of these five
+// CLIs take positional arguments, so any unmatched argv item (a typo'd flag,
+// not just a leading "--" one) is now a hard error (exit 2) rather than a
+// silent no-op.
+
+const { parseArgs: parseCrystallizeArgs } = await import(`${SCRIPTS}/lib/crystallize-args.mjs`);
+
+suite('reject unspecified flags: exit 2, matching flags still work');
+
+test('lint.mjs: typo flag (--wiki-dir) is rejected with exit 2', () => {
+  const r = spawnCli('lint.mjs', ['--wiki-dir=/tmp/nonexistent'], { HOME: SESSION_TMP_HOME });
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stderr: ${r.stderr}`);
+  assert.ok(r.stderr.includes('--wiki-dir'), `stderr should name the rejected flag: ${r.stderr}`);
+  assert.ok(r.stderr.includes('--hypo-dir'), `stderr should list accepted flags: ${r.stderr}`);
+});
+
+test('lint.mjs: known flags (--hypo-dir, --json, --fix, --strict) still parse and exit 0', () => {
+  const validDir = mkdtempSync(join(tmpdir(), 'hypo-reject-flags-lint-'));
+  try {
+    writeFileSync(join(validDir, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('lint.mjs', [`--hypo-dir=${validDir}`, '--json', '--fix', '--strict'], {
+      HOME: SESSION_TMP_HOME,
+    });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}. stderr: ${r.stderr}`);
+  } finally {
+    rmSync(validDir, { recursive: true, force: true });
+  }
+});
+
+test('verify.mjs: typo flag (--wiki-dir) is rejected with exit 2', () => {
+  const r = spawnCli('verify.mjs', ['--wiki-dir=/tmp/nonexistent'], { HOME: SESSION_TMP_HOME });
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stderr: ${r.stderr}`);
+  assert.ok(r.stderr.includes('--wiki-dir'), `stderr should name the rejected flag: ${r.stderr}`);
+});
+
+test('verify.mjs: known flags (--hypo-dir, --json) still parse and exit 0', () => {
+  const validDir = mkdtempSync(join(tmpdir(), 'hypo-reject-flags-verify-'));
+  try {
+    writeFileSync(join(validDir, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('verify.mjs', [`--hypo-dir=${validDir}`, '--json'], {
+      HOME: SESSION_TMP_HOME,
+    });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}. stderr: ${r.stderr}`);
+  } finally {
+    rmSync(validDir, { recursive: true, force: true });
+  }
+});
+
+test('graph.mjs: typo flag (--wiki-dir) is rejected with exit 2', () => {
+  const r = spawnCli('graph.mjs', ['--wiki-dir=/tmp/nonexistent'], { HOME: SESSION_TMP_HOME });
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stderr: ${r.stderr}`);
+  assert.ok(r.stderr.includes('--wiki-dir'), `stderr should name the rejected flag: ${r.stderr}`);
+});
+
+test('graph.mjs: known flags (--hypo-dir, --format, --min-edges) still parse and exit 0', () => {
+  const validDir = mkdtempSync(join(tmpdir(), 'hypo-reject-flags-graph-'));
+  try {
+    writeFileSync(join(validDir, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('graph.mjs', [`--hypo-dir=${validDir}`, '--format=json', '--min-edges=0'], {
+      HOME: SESSION_TMP_HOME,
+    });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}. stderr: ${r.stderr}`);
+  } finally {
+    rmSync(validDir, { recursive: true, force: true });
+  }
+});
+
+test('query.mjs: typo flag (--wiki-dir) is rejected with exit 2', () => {
+  const r = spawnCli('query.mjs', ['--wiki-dir=/tmp/nonexistent', '--q=x'], {
+    HOME: SESSION_TMP_HOME,
+  });
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stderr: ${r.stderr}`);
+  assert.ok(r.stderr.includes('--wiki-dir'), `stderr should name the rejected flag: ${r.stderr}`);
+});
+
+test('query.mjs: known flags (--hypo-dir, --q, --limit, --json) still parse and exit 0', () => {
+  const validDir = mkdtempSync(join(tmpdir(), 'hypo-reject-flags-query-'));
+  try {
+    writeFileSync(join(validDir, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli(
+      'query.mjs',
+      [`--hypo-dir=${validDir}`, '--q=anything', '--limit=5', '--json'],
+      { HOME: SESSION_TMP_HOME },
+    );
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}. stderr: ${r.stderr}`);
+  } finally {
+    rmSync(validDir, { recursive: true, force: true });
+  }
+});
+
+test('crystallize-args.mjs parseArgs: typo flag (--wiki-dir) is rejected with exit 2', () => {
+  const r = spawnSync(
+    process.execPath,
+    [
+      '-e',
+      `import('${SCRIPTS}/lib/crystallize-args.mjs').then(m => m.parseArgs(['node','crystallize.mjs','--wiki-dir=/tmp/nonexistent']))`,
+    ],
+    { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
+  );
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stderr: ${r.stderr}`);
+  assert.ok(r.stderr.includes('--wiki-dir'), `stderr should name the rejected flag: ${r.stderr}`);
+});
+
+test('crystallize-args.mjs parseArgs: known flags still parse without exiting', () => {
+  const args = parseCrystallizeArgs([
+    'node',
+    'crystallize.mjs',
+    '--hypo-dir=/tmp/some-vault',
+    '--min-group=3',
+    '--json',
+    '--force',
+  ]);
+  assert.equal(args.hypoDir, '/tmp/some-vault');
+  assert.equal(args.minGroup, 3);
+  assert.equal(args.json, true);
+  assert.equal(args.force, true);
+});
+
+// A space-separated `--payload <path>` (two argv entries) is not a recognized
+// flag spelling: argv[i] is the bare token `--payload`, which matches nothing
+// in parseArgs' if/else chain and falls to the reject branch. Before this
+// fix, the allowed-list string printed here still called it `--payload=<json>`,
+// which never matched the script's actual contract (a file path, or `-` for
+// stdin) either. Both must now read `<path|->`.
+test('crystallize-args.mjs parseArgs: space-separated --payload <path> is rejected with exit 2, not silently dropped', () => {
+  const r = spawnSync(
+    process.execPath,
+    [
+      '-e',
+      `import('${SCRIPTS}/lib/crystallize-args.mjs').then(m => m.parseArgs(['node','crystallize.mjs','--apply-session-close','--payload','/tmp/x.json']))`,
+    ],
+    { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
+  );
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stderr: ${r.stderr}`);
+  assert.ok(r.stderr.includes('--payload'), `stderr should name the rejected flag: ${r.stderr}`);
+  assert.ok(
+    r.stderr.includes('<path|->'),
+    `stderr's allowed-flag list should describe --payload as <path|-> (file path or stdin), not <json>: ${r.stderr}`,
+  );
+});
+
+// ── --hypo-dir actually overrides default resolution (not just parsed) ──────
+
+test('lint.mjs --hypo-dir: the specified vault is read, not the default-resolved one', () => {
+  const noVaultHome = mkdtempSync(join(tmpdir(), 'hypo-dir-wins-lint-home-'));
+  const explicitVault = mkdtempSync(join(tmpdir(), 'hypo-dir-wins-lint-explicit-'));
+  try {
+    // HOME/HYPO_DIR resolve to nothing; only --hypo-dir points at a real vault.
+    writeFileSync(join(explicitVault, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('lint.mjs', [`--hypo-dir=${explicitVault}`, '--json'], {
+      HOME: noVaultHome,
+      HYPO_DIR: '',
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(
+      JSON.parse(r.stdout).vaultFound,
+      true,
+      `--hypo-dir must be the vault actually scanned, not the unresolved default: ${r.stdout}`,
+    );
+  } finally {
+    rmSync(noVaultHome, { recursive: true, force: true });
+    rmSync(explicitVault, { recursive: true, force: true });
+  }
+});
+
+test('crystallize-args.mjs parseArgs: --hypo-dir wins over HYPO_DIR env default', () => {
+  const orig = process.env.HYPO_DIR;
+  process.env.HYPO_DIR = '/tmp/default-vault-should-not-be-used';
+  try {
+    const args = parseCrystallizeArgs([
+      'node',
+      'crystallize.mjs',
+      '--hypo-dir=/tmp/explicit-vault',
+    ]);
+    assert.equal(
+      args.hypoDir,
+      '/tmp/explicit-vault',
+      'an explicit --hypo-dir must win over the HYPO_DIR env default',
+    );
+  } finally {
+    if (orig === undefined) delete process.env.HYPO_DIR;
+    else process.env.HYPO_DIR = orig;
+  }
+});
+
+// ── empty --hypo-dir= must not silently fall back to the default vault ──────
+//
+// `--hypo-dir="$VAULT"` with VAULT unset (or `--hypo-dir=` typed directly)
+// expands to the empty string. expandHome('') returns '' unchanged, and '' is
+// falsey, so every one of these five parsers used to read that as "no
+// --hypo-dir was given" and fall through to its own default resolution
+// (HYPO_DIR env / marker scan / ~/hypomnema). A crystallize apply that hit
+// this wrote its session close into the wrong vault. Each test below seeds a
+// REAL, different vault at HYPO_DIR so a silent fallback would exit 0 against
+// that vault instead of failing loudly; the fix requires exit 2 regardless.
+
+test('lint.mjs --hypo-dir= (empty value): rejected with exit 2, not silently defaulted', () => {
+  const defaultVault = mkdtempSync(join(tmpdir(), 'hypo-empty-hypodir-default-lint-'));
+  try {
+    writeFileSync(join(defaultVault, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('lint.mjs', ['--hypo-dir=', '--json'], {
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: defaultVault,
+    });
+    assert.equal(
+      r.status,
+      2,
+      `expected exit 2 (empty --hypo-dir must not fall back to the HYPO_DIR default), got ${r.status}. stdout: ${r.stdout} stderr: ${r.stderr}`,
+    );
+    assert.ok(r.stderr.includes('--hypo-dir'), `stderr should name the flag: ${r.stderr}`);
+  } finally {
+    rmSync(defaultVault, { recursive: true, force: true });
+  }
+});
+
+test('verify.mjs --hypo-dir= (empty value): rejected with exit 2, not silently defaulted', () => {
+  const defaultVault = mkdtempSync(join(tmpdir(), 'hypo-empty-hypodir-default-verify-'));
+  try {
+    writeFileSync(join(defaultVault, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('verify.mjs', ['--hypo-dir=', '--json'], {
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: defaultVault,
+    });
+    assert.equal(
+      r.status,
+      2,
+      `expected exit 2 (empty --hypo-dir must not fall back to the HYPO_DIR default), got ${r.status}. stdout: ${r.stdout} stderr: ${r.stderr}`,
+    );
+    assert.ok(r.stderr.includes('--hypo-dir'), `stderr should name the flag: ${r.stderr}`);
+  } finally {
+    rmSync(defaultVault, { recursive: true, force: true });
+  }
+});
+
+test('graph.mjs --hypo-dir= (empty value): rejected with exit 2, not silently defaulted', () => {
+  const defaultVault = mkdtempSync(join(tmpdir(), 'hypo-empty-hypodir-default-graph-'));
+  try {
+    writeFileSync(join(defaultVault, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('graph.mjs', ['--hypo-dir='], {
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: defaultVault,
+    });
+    assert.equal(
+      r.status,
+      2,
+      `expected exit 2 (empty --hypo-dir must not fall back to the HYPO_DIR default), got ${r.status}. stdout: ${r.stdout} stderr: ${r.stderr}`,
+    );
+    assert.ok(r.stderr.includes('--hypo-dir'), `stderr should name the flag: ${r.stderr}`);
+  } finally {
+    rmSync(defaultVault, { recursive: true, force: true });
+  }
+});
+
+test('query.mjs --hypo-dir= (empty value): rejected with exit 2, not silently defaulted', () => {
+  const defaultVault = mkdtempSync(join(tmpdir(), 'hypo-empty-hypodir-default-query-'));
+  try {
+    writeFileSync(join(defaultVault, 'hypo-config.md'), '# marker\n');
+    const r = spawnCli('query.mjs', ['--hypo-dir=', '--q=anything'], {
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: defaultVault,
+    });
+    assert.equal(
+      r.status,
+      2,
+      `expected exit 2 (empty --hypo-dir must not fall back to the HYPO_DIR default), got ${r.status}. stdout: ${r.stdout} stderr: ${r.stderr}`,
+    );
+    assert.ok(r.stderr.includes('--hypo-dir'), `stderr should name the flag: ${r.stderr}`);
+  } finally {
+    rmSync(defaultVault, { recursive: true, force: true });
+  }
+});
+
+test('crystallize-args.mjs parseArgs: --hypo-dir= (empty value) rejected with exit 2, not silently defaulted', () => {
+  const defaultVault = mkdtempSync(join(tmpdir(), 'hypo-empty-hypodir-default-crystallize-'));
+  try {
+    writeFileSync(join(defaultVault, 'hypo-config.md'), '# marker\n');
+    const r = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `import('${SCRIPTS}/lib/crystallize-args.mjs').then(m => m.parseArgs(['node','crystallize.mjs','--hypo-dir=']))`,
+      ],
+      {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: defaultVault },
+      },
+    );
+    assert.equal(
+      r.status,
+      2,
+      `expected exit 2 (empty --hypo-dir must not fall back to the HYPO_DIR default), got ${r.status}. stdout: ${r.stdout} stderr: ${r.stderr}`,
+    );
+    assert.ok(r.stderr.includes('--hypo-dir'), `stderr should name the flag: ${r.stderr}`);
+  } finally {
+    rmSync(defaultVault, { recursive: true, force: true });
+  }
+});
+
 // ── lib/wd-match.mjs (cross-machine project matcher) ─────────────────────────
 
 const { pickProjectByCwd, normalizeWorkingDir } = await import(`${SCRIPTS}/lib/wd-match.mjs`);

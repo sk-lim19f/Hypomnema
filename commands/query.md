@@ -22,14 +22,16 @@ Ask the user what they want to know if it was not provided in the command invoca
 
 Bundled scripts here run via `${CLAUDE_PLUGIN_ROOT}/scripts/`. To resolve that package root: if `${CLAUDE_PLUGIN_ROOT}` is already an absolute path, use it; otherwise read `pkgRoot` from `~/.claude/hypo-pkg.json` (only when non-empty and the target script exists under it); otherwise use the `hypo@hypomnema` (or legacy `hypomnema@hypomnema`) installPath in `~/.claude/plugins/installed_plugins.json`; if none resolve, stop and tell the user to run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install) or reinstall instead of guessing the cache layout.
 
+If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. Otherwise
+omit the flag.
+
 Run full-text search:
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/scripts/query.mjs \
-  --q="<query terms>" \
-  [--hypo-dir="<path>"] \
-  [--limit=10]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/query.mjs --q="<query terms>" --limit=10
 ```
+
+An unrecognized flag exits 2 instead of being ignored.
 
 ---
 
