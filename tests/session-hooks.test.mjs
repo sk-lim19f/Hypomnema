@@ -30,6 +30,8 @@ import {
   readSyncLastSuccess,
   classifySyncOp,
   freshDates,
+  isForeignProjectFile,
+  classifyForeignOnlyDirty,
 } from '../hooks/hypo-shared.mjs';
 import {
   snapshotBase,
@@ -3392,6 +3394,99 @@ test('precompactGateStatus: projectOverride + a partially-parsed transcript prov
     assert.ok(
       (gate.blockers || []).some((b) => b.type === 'git'),
       `transcript evidence of THIS session's own edit must outrank the foreign-path heuristic: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// ── isForeignProjectFile / classifyForeignOnlyDirty (extracted predicates,
+//    session-close-scope-boundary spec §5) ──────────────────────────────────
+//
+// Direct, hook-free unit tests: both predicates are pure fs-sync + string
+// logic with no git spawn, so a plain withTmpDir fixture is enough. Every
+// fixture below registers TWO distinct projects, never one — a single-project
+// fixture cannot tell "mine" from "foreign" apart, which is exactly the shape
+// this repo's own git-attribution tests were flipped-assertion blind with
+// before.
+
+suite('isForeignProjectFile / classifyForeignOnlyDirty (extracted predicates, spec §5)');
+
+test('isForeignProjectFile: a raw literal-backslash filename is never reinterpreted as projects/<slug>/ (regression)', () => {
+  const ctx = { eligibleSlugs: new Set(['other']), effectiveOverride: 'mine' };
+  assert.equal(isForeignProjectFile('projects\\other\\x.md', ctx), false);
+});
+
+test('isForeignProjectFile: a real projects/<slug>/ path IS foreign when slug is a DIFFERENT eligible project', () => {
+  const ctx = { eligibleSlugs: new Set(['mine', 'other']), effectiveOverride: 'mine' };
+  assert.equal(isForeignProjectFile('projects/other/scratch.md', ctx), true);
+});
+
+test("isForeignProjectFile: the override's own project is never foreign", () => {
+  const ctx = { eligibleSlugs: new Set(['mine', 'other']), effectiveOverride: 'mine' };
+  assert.equal(isForeignProjectFile('projects/mine/session-state.md', ctx), false);
+});
+
+test('isForeignProjectFile: transcriptTouched proof outranks the path heuristic', () => {
+  const ctx = {
+    eligibleSlugs: new Set(['mine', 'other']),
+    effectiveOverride: 'mine',
+    transcriptTouched: new Set(['projects/other/hot.md']),
+  };
+  assert.equal(isForeignProjectFile('projects/other/hot.md', ctx), false);
+});
+
+test('classifyForeignOnlyDirty: dirty.length===0 is NOT vacuous-true (fails closed, never "foreign-only")', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'mine'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'mine', 'index.md'), '---\ntitle: mine\n---\n# mine\n');
+    assert.equal(
+      classifyForeignOnlyDirty(dir, [], { effectiveOverride: 'mine' }),
+      'unattributable',
+    );
+  });
+});
+
+test('classifyForeignOnlyDirty: an unlistable projects/ dir (not a directory) returns "unattributable", never throws', () => {
+  withTmpDir((dir) => {
+    // 'projects' exists but is a FILE: existsSync passes, readdirSync inside
+    // collectProjectWorkingDirs throws ENOTDIR. Any hook calling this (the
+    // PreCompact/UserPromptSubmit outermost catch) turns an escaped throw
+    // into a fully suppressed, silent {suppressOutput:true} — exactly the
+    // gap this function's no-throw contract exists to close.
+    writeFileSync(join(dir, 'projects'), 'not a directory');
+    let result;
+    assert.doesNotThrow(() => {
+      result = classifyForeignOnlyDirty(dir, ['projects/mine/x.md'], { effectiveOverride: 'mine' });
+    });
+    assert.equal(result, 'unattributable');
+  });
+});
+
+test('classifyForeignOnlyDirty: two distinct registered projects, dirty all under the OTHER slug -> "foreign-only"', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'mine'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'mine', 'index.md'), '---\ntitle: mine\n---\n# mine\n');
+    writeFileSync(join(dir, 'projects', 'other', 'index.md'), '---\ntitle: other\n---\n# other\n');
+    assert.equal(
+      classifyForeignOnlyDirty(dir, ['projects/other/scratch.md'], { effectiveOverride: 'mine' }),
+      'foreign-only',
+    );
+  });
+});
+
+test('classifyForeignOnlyDirty: two distinct registered projects, dirty mixes own + foreign -> "unattributable"', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'mine'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'mine', 'index.md'), '---\ntitle: mine\n---\n# mine\n');
+    writeFileSync(join(dir, 'projects', 'other', 'index.md'), '---\ntitle: other\n---\n# other\n');
+    assert.equal(
+      classifyForeignOnlyDirty(
+        dir,
+        ['projects/other/scratch.md', 'projects/mine/session-state.md'],
+        { effectiveOverride: 'mine' },
+      ),
+      'unattributable',
     );
   });
 });
