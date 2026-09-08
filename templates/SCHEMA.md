@@ -85,6 +85,16 @@ tags: [tag1, tag2]
 ---
 ```
 
+**`updated` is the day the content or structure changed**, not the day the file was
+last written. Adding a backlink, fixing a typo, or reflowing a line does not move it.
+Staleness comparisons read this field, so a date bumped for a cross-link makes the
+page look fresher than its claims are.
+
+**Nothing enforces this.** `lint` checks only that the field exists (W3), and `--fix`
+fills a missing one with today's date, which records when the gap was closed rather
+than when the content changed. The rule holds only where whoever edits the page
+applies it.
+
 Optional fields (add as needed):
 
 ```yaml
