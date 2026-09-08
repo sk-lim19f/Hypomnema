@@ -36,13 +36,39 @@ import { buildSlugMap } from './lib/slug-resolver.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
+const ALLOWED_FLAGS = ['--hypo-dir=<path>', '--json', '--fix', '--strict'];
+
 function parseArgs(argv) {
   const args = { hypoDir: null, json: false, fix: false, strict: false };
   for (const arg of argv.slice(2)) {
-    if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
-    else if (arg === '--json') args.json = true;
+    if (arg.startsWith('--hypo-dir=')) {
+      // A raw value of '' (either `--hypo-dir=` typed directly or a shell
+      // variable that expanded to nothing, e.g. --hypo-dir="$VAULT" with
+      // VAULT unset) must not fall through to expandHome('') → '' → the
+      // `!args.hypoDir` default-resolution branch below. That silent
+      // fallback is exactly the bug this flag exists to close: a caller who
+      // believes they pointed at a specific vault ends up reading/writing
+      // the default one instead.
+      const raw = arg.slice(11);
+      if (!raw) {
+        console.error(`lint.mjs: --hypo-dir requires a non-empty value (got '${arg}')`);
+        console.error(`lint.mjs accepts: ${ALLOWED_FLAGS.join(', ')}`);
+        process.exit(2);
+      }
+      args.hypoDir = expandHome(raw);
+    } else if (arg === '--json') args.json = true;
     else if (arg === '--fix') args.fix = true;
     else if (arg === '--strict') args.strict = true;
+    else {
+      // lint.mjs takes no positional arguments, so anything unmatched above
+      // (a typo'd flag, "--", a bare "-", a stray word) is a mistake, not a
+      // no-op. Silently dropping it let a wrong flag point at the wrong
+      // vault for months: docs told models to pass --wiki-dir, but no
+      // script here ever parsed that flag.
+      console.error(`lint.mjs: unrecognized argument '${arg}'`);
+      console.error(`lint.mjs accepts: ${ALLOWED_FLAGS.join(', ')}`);
+      process.exit(2);
+    }
   }
   if (!args.hypoDir) {
     const info = resolveHypoRootInfo();

@@ -23,11 +23,14 @@ If the user specified a Hypomnema directory, pass it as `--hypo-dir="<path>"`. O
 ## Step 2 — Run the graph script
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/scripts/graph.mjs \
-  [--hypo-dir="<path>"] \
-  [--format=json|mermaid|dot] \
-  [--min-edges=<n>]
+node ${CLAUDE_PLUGIN_ROOT}/scripts/graph.mjs
 ```
+
+Add `--hypo-dir="<path>"` only when the user gave one (per Step 1). Add `--format=<fmt>`
+and `--min-edges=<n>` only with one concrete value from the Options list below, for
+example `--format=mermaid`; the defaults (`json`, `0`) apply when they are omitted.
+
+An unrecognized flag exits 2 instead of being ignored.
 
 Options:
 - `--format=json` (default) — adjacency list with in/out degree counts
