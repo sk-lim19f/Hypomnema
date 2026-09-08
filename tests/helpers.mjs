@@ -391,6 +391,40 @@ function runApply(dir, payload, { force = false, sessionId = undefined } = {}) {
   }
 }
 
+// ── hookSpecificOutput.additionalContext channel (wave 2 of the nested-output
+// migration) ──────────────────────────────────────────────────────────────
+//
+// buildOutput() (hooks/hypo-shared.mjs) now nests additionalContext under
+// hookSpecificOutput; a couple of not-yet-migrated hooks (hypo-cwd-change.mjs,
+// hypo-file-watch.mjs) still emit it top-level. A test asserting "no context
+// was injected" must check BOTH channels, not just one: a single `??`-based
+// helper that prefers nested would let a real top-level leak hide behind an
+// unrelated nested value, and vice versa. Returns every channel that actually
+// carries a value, so `.length === 0` is the honest "nothing was injected"
+// check regardless of which channel the hook under test uses.
+// The two helpers disagree on an empty or undefined value, and that is
+// deliberate. modelContexts uses `in`, so a present-but-empty key counts as a
+// channel that carried something; injectedContext reads the value, so it reads
+// as nothing. A leak assertion should err toward red, a reachability assertion
+// toward the actual text. Do not "fix" this into a value check: that would stop
+// the leak assertions from catching an empty payload going out.
+function modelContexts(out) {
+  const found = [];
+  if (out?.hookSpecificOutput && 'additionalContext' in out.hookSpecificOutput) {
+    found.push(out.hookSpecificOutput.additionalContext);
+  }
+  if (out && 'additionalContext' in out) found.push(out.additionalContext);
+  return found;
+}
+
+// Positive-assertion counterpart: the first context found, or null when
+// neither channel carries one. Callers that already know exactly one channel
+// applies (the common case) read the actual injected text through this
+// instead of hardcoding which field to look at.
+function injectedContext(out) {
+  return modelContexts(out)[0] ?? null;
+}
+
 function writeExt(hypoDir, type, name, content, manifest) {
   const dir = join(hypoDir, 'extensions', type);
   mkdirSync(dir, { recursive: true });
@@ -783,6 +817,7 @@ export {
   hasSymlinkAncestor,
   hasTypedUserApproval,
   hypoIsClean,
+  injectedContext,
   isCaptureCandidate,
   isClearCommand,
   isCloseGateOpen,
@@ -800,6 +835,7 @@ export {
   makeGitRepo,
   makeMultiProjectWiki,
   markerPath,
+  modelContexts,
   normalizeSkillRelPath,
   pageUsageGuardCachePath,
   pageUsageLoggingAllowed,

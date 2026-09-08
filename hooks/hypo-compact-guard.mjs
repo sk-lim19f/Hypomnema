@@ -35,6 +35,7 @@ import {
   isGateSkipped,
   resolveGateProjectOverride,
   classifyForeignOnlyDirty,
+  buildOutput,
   HYPO_DIR,
 } from './hypo-shared.mjs';
 
@@ -165,16 +166,19 @@ process.stdin.on('end', () => {
       : 'See hypo-guide.md for the session-close checklist.';
 
     console.log(
-      JSON.stringify({
-        continue: true,
-        additionalContext: [
-          `[WIKI_AUTOCLOSE] ${detected} detected: session close incomplete (${reasons.join(', ')}).`,
-          ``,
-          body,
-          ``,
-          `To bypass: set HYPO_SKIP_GATE=1`,
-        ].join('\n'),
-      }),
+      JSON.stringify(
+        buildOutput(
+          'UserPromptSubmit',
+          [
+            `[WIKI_AUTOCLOSE] ${detected} detected: session close incomplete (${reasons.join(', ')}).`,
+            ``,
+            body,
+            ``,
+            `To bypass: set HYPO_SKIP_GATE=1`,
+          ].join('\n'),
+          { continue: true },
+        ),
+      ),
     );
   } catch (err) {
     // Fail-open: any parse/runtime error must not block the user's prompt.

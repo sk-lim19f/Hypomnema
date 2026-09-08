@@ -27,7 +27,9 @@ import {
   buildCleanWikiTree,
   commitTouchedPaths,
   extractTouchedWikiFiles,
+  injectedContext,
   makeMultiProjectWiki,
+  modelContexts,
   payloadForCleanWiki,
   peekTouchedPaths,
   recordTouchedPaths,
@@ -268,11 +270,17 @@ test('HYPO_SKIP_GATE=1 + /compact → pass-through', () => {
   assert.equal(out.suppressOutput, true);
 });
 
-test('/compact with incomplete wiki → additionalContext, not systemMessage', () => {
+test('/compact with incomplete wiki → model channel (nested additionalContext), not systemMessage', () => {
   const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' });
   const out = JSON.parse(r.stdout);
-  assert.ok('additionalContext' in out, 'missing additionalContext field');
-  assert.ok(!('systemMessage' in out), 'must not use deprecated systemMessage field');
+  assert.ok(modelContexts(out).length > 0, 'missing hookSpecificOutput.additionalContext');
+  // systemMessage is a real, correct field on other hooks (PreCompact uses it
+  // below) — it is simply the wrong channel for UserPromptSubmit, which the
+  // model reads from, not the user-facing side channel.
+  assert.ok(
+    !('systemMessage' in out),
+    'UserPromptSubmit must use the model channel, not systemMessage',
+  );
 });
 
 test('/compact with incomplete wiki → continue:true (soft nudge, not block)', () => {
@@ -284,7 +292,7 @@ test('/compact with incomplete wiki → continue:true (soft nudge, not block)', 
 test('/compact with incomplete wiki → additionalContext contains WIKI_AUTOCLOSE', () => {
   const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' });
   const out = JSON.parse(r.stdout);
-  assert.ok(out.additionalContext.includes('WIKI_AUTOCLOSE'), 'missing WIKI_AUTOCLOSE marker');
+  assert.ok(injectedContext(out).includes('WIKI_AUTOCLOSE'), 'missing WIKI_AUTOCLOSE marker');
 });
 
 test('/compact with clean wiki → pass-through', () => {
@@ -322,7 +330,7 @@ test('/compact with uncommitted change → blocks (git axis still enforced, ADR 
     const out = JSON.parse(r.stdout);
     assert.equal(out.continue, true);
     assert.ok(
-      /WIKI_AUTOCLOSE/.test(out.additionalContext || ''),
+      /WIKI_AUTOCLOSE/.test(injectedContext(out) || ''),
       `uncommitted work must still block /compact: ${r.stdout}`,
     );
   });
@@ -342,17 +350,17 @@ suite('replay-compact-guard-detects-slash-clear (ADR 0022 Layer 2)');
 test('replay-compact-guard-detects-slash-clear: /clear with incomplete wiki → WIKI_AUTOCLOSE', () => {
   const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear' });
   const out = JSON.parse(r.stdout);
-  assert.ok('additionalContext' in out, 'missing additionalContext field on /clear');
+  assert.ok(modelContexts(out).length > 0, 'missing additionalContext field on /clear');
   assert.equal(out.continue, true);
-  assert.ok(out.additionalContext.includes('WIKI_AUTOCLOSE'), 'missing WIKI_AUTOCLOSE marker');
-  assert.ok(out.additionalContext.includes('/clear'), 'message must reference /clear');
+  assert.ok(injectedContext(out).includes('WIKI_AUTOCLOSE'), 'missing WIKI_AUTOCLOSE marker');
+  assert.ok(injectedContext(out).includes('/clear'), 'message must reference /clear');
 });
 
 test('/clear with trailing args → still detected', () => {
   const r = runHook('hypo-compact-guard.mjs', { prompt: '/clear something' });
   const out = JSON.parse(r.stdout);
-  assert.ok('additionalContext' in out);
-  assert.ok(out.additionalContext.includes('/clear'));
+  assert.ok(modelContexts(out).length > 0);
+  assert.ok(injectedContext(out).includes('/clear'));
 });
 
 test('HYPO_SKIP_GATE=1 + /clear → pass-through', () => {
@@ -424,13 +432,13 @@ test('state table row: last substantial op is ingest, not session (log.md exists
         { HYPO_DIR: dir },
       );
       const out = JSON.parse(r.stdout);
-      assert.ok('additionalContext' in out, `hook must not go silent: ${r.stdout}`);
+      assert.ok(modelContexts(out).length > 0, `hook must not go silent: ${r.stdout}`);
       assert.ok(
-        /session log entry missing/.test(out.additionalContext || ''),
+        /session log entry missing/.test(injectedContext(out) || ''),
         `session reason must survive: ${r.stdout}`,
       );
       assert.ok(
-        !/scratch\.md|uncommitted/.test(out.additionalContext || ''),
+        !/scratch\.md|uncommitted/.test(injectedContext(out) || ''),
         `an all-foreign dirty set must drop the git reason: ${r.stdout}`,
       );
     },
@@ -458,11 +466,11 @@ test('state table row: log.md itself does not exist (not just a non-session last
       );
       const out = JSON.parse(r.stdout);
       assert.ok(
-        'additionalContext' in out,
+        modelContexts(out).length > 0,
         `hook must not go fully silent when log.md is absent: ${r.stdout}`,
       );
       assert.ok(
-        /session log entry missing/.test(out.additionalContext || ''),
+        /session log entry missing/.test(injectedContext(out) || ''),
         `session reason must survive when log.md is absent: ${r.stdout}`,
       );
     },
@@ -492,11 +500,11 @@ test('state table row: hot.md invalid + all-foreign dirty -> hot reason kept, gi
       );
       const out = JSON.parse(r.stdout);
       assert.ok(
-        /last_session/.test(out.additionalContext || ''),
+        /last_session/.test(injectedContext(out) || ''),
         `hot reason must survive: ${r.stdout}`,
       );
       assert.ok(
-        !/scratch\.md|uncommitted/.test(out.additionalContext || ''),
+        !/scratch\.md|uncommitted/.test(injectedContext(out) || ''),
         `an all-foreign dirty set must drop the git reason: ${r.stdout}`,
       );
     },
@@ -518,7 +526,7 @@ test('state table row: attributionScope resolved but dirty mixes own + foreign -
       );
       const out = JSON.parse(r.stdout);
       assert.ok(
-        /WIKI_AUTOCLOSE/.test(out.additionalContext || ''),
+        /WIKI_AUTOCLOSE/.test(injectedContext(out) || ''),
         `a mixed foreign+own dirty set must still block: ${r.stdout}`,
       );
     },
@@ -539,7 +547,7 @@ test('state table row: attributionScope resolved but a dirty file lives outside 
       );
       const out = JSON.parse(r.stdout);
       assert.ok(
-        /WIKI_AUTOCLOSE/.test(out.additionalContext || ''),
+        /WIKI_AUTOCLOSE/.test(injectedContext(out) || ''),
         `an unattributable dirty file must still block: ${r.stdout}`,
       );
     },
@@ -565,7 +573,7 @@ test('state table row (regression): session ok + hot clean + all-foreign dirty -
         true,
         `every reason demoted must yield silence, not a nudge: ${r.stdout}`,
       );
-      assert.ok(!('additionalContext' in out), `must not emit additionalContext: ${r.stdout}`);
+      assert.ok(modelContexts(out).length === 0, `must not emit additionalContext: ${r.stdout}`);
     },
   );
 });
@@ -602,15 +610,15 @@ test('resolveGateProjectOverride throwing on a broken vault must not silence the
     const out = JSON.parse(r.stdout);
     // Must come before the content assertions: a hook that silently
     // suppresses (the exact BLOCKER this pins) has no additionalContext at
-    // all, and `(out.additionalContext || '').test(...)` on the reasons
+    // all, and `(injectedContext(out) || '').test(...)` on the reasons
     // below would then pass vacuously instead of catching the regression.
-    assert.ok('additionalContext' in out, `must not go silent on a broken vault: ${r.stdout}`);
+    assert.ok(modelContexts(out).length > 0, `must not go silent on a broken vault: ${r.stdout}`);
     assert.ok(
-      /session log entry missing/.test(out.additionalContext),
+      /session log entry missing/.test(injectedContext(out)),
       `session-log reason must survive a resolveGateProjectOverride throw: ${r.stdout}`,
     );
     assert.ok(
-      /git check failed/.test(out.additionalContext),
+      /git check failed/.test(injectedContext(out)),
       `git reason must survive too, not just session-log: ${r.stdout}`,
     );
   });
@@ -637,9 +645,9 @@ test('a clean /compact never invokes resolveGateProjectOverride, even with a bro
     (dir) => {
       const r = runHook('hypo-compact-guard.mjs', { prompt: '/compact' }, { HYPO_DIR: dir });
       const out = JSON.parse(r.stdout);
-      assert.ok('additionalContext' in out, `session reason must still surface: ${r.stdout}`);
+      assert.ok(modelContexts(out).length > 0, `session reason must still surface: ${r.stdout}`);
       assert.ok(
-        /session log entry missing/.test(out.additionalContext),
+        /session log entry missing/.test(injectedContext(out)),
         `session reason must still surface: ${r.stdout}`,
       );
       assert.ok(
@@ -674,11 +682,11 @@ test('log.md is a directory (read failure, not "missing") -> hook stays non-sile
       // Must come first: a silently-suppressed hook has no additionalContext,
       // and the regex assertion below would then pass vacuously.
       assert.ok(
-        'additionalContext' in out,
+        modelContexts(out).length > 0,
         `must not go silent when log.md is unreadable: ${r.stdout}`,
       );
       assert.ok(
-        /session log entry missing/.test(out.additionalContext),
+        /session log entry missing/.test(injectedContext(out)),
         `a read failure on log.md must fall back fail-closed to the session-log reason: ${r.stdout}`,
       );
       assert.ok(
@@ -701,11 +709,11 @@ test('hot.md is a directory (read failure, not "invalid") -> hook stays non-sile
       assert.equal(r.status, 0, `hook must never exit non-zero: ${r.stderr}`);
       const out = JSON.parse(r.stdout);
       assert.ok(
-        'additionalContext' in out,
+        modelContexts(out).length > 0,
         `must not go silent when hot.md is unreadable: ${r.stdout}`,
       );
       assert.ok(
-        /hot\.md unreadable/.test(out.additionalContext),
+        /hot\.md unreadable/.test(injectedContext(out)),
         `a read failure on hot.md must say "unreadable", distinct from a format violation like "unexpected H2" or "forbidden field": ${r.stdout}`,
       );
       assert.ok(
@@ -778,9 +786,9 @@ test('additionalContext never carries imperative "Run ... NOW" or "Do NOT wait" 
   // without this, a bug that drops additionalContext entirely (empty string)
   // would make both regexes below pass vacuously, on a run with nothing to
   // check phrasing in at all.
-  assert.ok('additionalContext' in out, r.stdout);
-  assert.ok(!/Run .* NOW/i.test(out.additionalContext || ''), r.stdout);
-  assert.ok(!/Do NOT wait/i.test(out.additionalContext || ''), r.stdout);
+  assert.ok(modelContexts(out).length > 0, r.stdout);
+  assert.ok(!/Run .* NOW/i.test(injectedContext(out) || ''), r.stdout);
+  assert.ok(!/Do NOT wait/i.test(injectedContext(out) || ''), r.stdout);
 });
 
 // ── hypoIsClean / gitDirtyFiles: opts.deadline (session-close-scope-boundary

@@ -240,15 +240,29 @@ jobs:
             const d = JSON.parse(require('fs').readFileSync('/tmp/cg-pass.json', 'utf-8'));
             if (d.continue !== true) { console.error('expected continue:true'); process.exit(1); }
           "
-      - name: compact-guard — /compact with no wiki produces additionalContext
+      # The shape matters as much as the presence. A top-level additionalContext
+      # is silently ignored for UserPromptSubmit, so a hook can emit the right
+      # text on a channel nobody reads and still exit zero. This step is the one
+      # place CI runs a hook and reads what it actually wrote, so it checks both
+      # that the context is nested and that no top-level copy rode along.
+      - name: compact-guard — /compact with no wiki nests additionalContext
         run: |
           echo '{"prompt":"/compact"}' \
             | HYPO_DIR=/tmp/no-wiki-$RANDOM node hooks/hypo-compact-guard.mjs \
             > /tmp/cg-compact.json
           node -e "
             const d = JSON.parse(require('fs').readFileSync('/tmp/cg-compact.json', 'utf-8'));
-            if (!('additionalContext' in d)) { console.error('missing additionalContext'); process.exit(1); }
-            if (d.continue !== true)         { console.error('expected continue:true');    process.exit(1); }
+            const hso = d.hookSpecificOutput;
+            if (!hso || typeof hso.additionalContext !== 'string' || !hso.additionalContext) {
+              console.error('missing hookSpecificOutput.additionalContext'); process.exit(1);
+            }
+            if (hso.hookEventName !== 'UserPromptSubmit') {
+              console.error('wrong hookEventName: ' + hso.hookEventName); process.exit(1);
+            }
+            if ('additionalContext' in d) {
+              console.error('top-level additionalContext is ignored by Claude Code'); process.exit(1);
+            }
+            if (d.continue !== true) { console.error('expected continue:true'); process.exit(1); }
           "
       # PreCompact reports, it does not block (session-close-scope-boundary §1).
       # The contract worth replaying is that it still SAYS something: a bare

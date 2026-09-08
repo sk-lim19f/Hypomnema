@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { aggregateColdCandidates } from '../scripts/lib/page-usage.mjs';
 import { test, suite } from './harness.mjs';
 import {
+  injectedContext,
   HOME,
   SCRIPTS,
   SESSION_TMP_HOME,
@@ -187,7 +188,7 @@ test('non-owning device: machine-scoped slug excluded from injection, fieldless 
       { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
     );
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext ?? '';
+    const ctx = injectedContext(out) ?? '';
     assert.ok(!ctx.includes('devA-secret'), `machine:devA slug must not leak on devB: ${ctx}`);
     assert.ok(ctx.includes('plain-notes'), `fieldless page must still be injected: ${ctx}`);
   });
@@ -202,7 +203,7 @@ test('owning device: machine-scoped slug is injected', () => {
       { HYPO_DIR: dir, HYPO_DEVICE: 'devA' },
     );
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext ?? '';
+    const ctx = injectedContext(out) ?? '';
     assert.ok(ctx.includes('devA-secret'), `machine:devA slug must be injected on devA: ${ctx}`);
   });
 });
@@ -216,7 +217,7 @@ test('non-owning device whose only match is machine-scoped: clean miss, no leak,
       { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
     );
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext ?? '';
+    const ctx = injectedContext(out) ?? '';
     assert.ok(!ctx.includes('devA-only'), `machine:devA slug must not leak: ${ctx}`);
     assert.ok(
       !ctx.includes('files missing'),
@@ -237,7 +238,7 @@ test('owning device whose only match is machine-scoped: page is injected', () =>
       { prompt: 'quibbleflux widgetry' },
       { HYPO_DIR: dir, HYPO_DEVICE: 'devA' },
     );
-    const ctx = JSON.parse(r.stdout).additionalContext ?? '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) ?? '';
     assert.ok(ctx.includes('devA-only'), `machine:devA page must inject on devA: ${ctx}`);
   });
 });
@@ -259,7 +260,7 @@ test('miss path survives an unstat-able entry in the page tree (buildPageMap ski
       { prompt: 'zzqqxx nomatch' },
       { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
     );
-    const ctx = JSON.parse(r.stdout).additionalContext ?? '';
+    const ctx = injectedContext(JSON.parse(r.stdout)) ?? '';
     assert.ok(
       ctx.includes('LOOKUP: miss'),
       `a dangling symlink must not suppress the clean miss message: ${JSON.stringify(ctx)}`,
@@ -553,7 +554,7 @@ function lookupCtxX10(dir, device) {
     { prompt: 'xyzzy plover' },
     { HYPO_DIR: dir, HYPO_DEVICE: device },
   );
-  return JSON.parse(r.stdout).additionalContext ?? '';
+  return injectedContext(JSON.parse(r.stdout)) ?? '';
 }
 
 function withDeviceX10(device, fn) {
@@ -964,7 +965,7 @@ test('first-prompt does not call a scoped-out project a first session', () => {
   try {
     const r = runFirstPrompt(sid);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout).additionalContext || '';
+    const out = injectedContext(JSON.parse(r.stdout)) || '';
     assert.match(out, /scoped to another machine/, 'must name the scope as the reason');
     assert.doesNotMatch(out, /first session/, 'a scoped-out project is not a first session');
   } finally {
@@ -978,7 +979,7 @@ test('first-prompt still calls a genuinely snapshot-less project a first session
   try {
     const r = runFirstPrompt(sid);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout).additionalContext || '';
+    const out = injectedContext(JSON.parse(r.stdout)) || '';
     assert.match(
       out,
       /first session/,
@@ -1023,7 +1024,7 @@ test('session-start injects a shared state while withholding a scoped-out hot, a
       assert.equal(marker.hasSnapshot, true, 'a partially visible snapshot is still a snapshot');
 
       const fp = runFirstPrompt(sid);
-      const out = JSON.parse(fp.stdout).additionalContext || '';
+      const out = injectedContext(JSON.parse(fp.stdout)) || '';
       assert.ok(
         !/SCOPED_HOT_BODY/.test(out),
         `first-prompt must not read the hidden hotPath for content: ${out}`,
@@ -1082,7 +1083,7 @@ test('session-start stamps scopedOut on the marker it hands to first-prompt', ()
       );
 
       const fp = runFirstPrompt(sid);
-      const out = JSON.parse(fp.stdout).additionalContext || '';
+      const out = injectedContext(JSON.parse(fp.stdout)) || '';
       assert.doesNotMatch(
         out,
         /first session/,

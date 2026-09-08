@@ -9,7 +9,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { readPageUsage, aggregateColdCandidates } from '../scripts/lib/page-usage.mjs';
 import { test, suite } from './harness.mjs';
-import { run, runHook, withTmpDir } from './helpers.mjs';
+import { injectedContext, run, runHook, withTmpDir } from './helpers.mjs';
 
 suite('hypo-lookup.mjs — type-prior boost');
 
@@ -31,7 +31,7 @@ test('PRD entry ranked above plain entry with same keyword', () => {
     writeFileSync(join(dir, 'index.md'), indexContent);
     const r = runHook('hypo-lookup.mjs', { prompt: 'search feature' }, { HYPO_DIR: dir });
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext ?? '';
+    const ctx = injectedContext(out) ?? '';
     const prdPos = ctx.indexOf('prd-search');
     const plainPos = ctx.indexOf('search-notes');
     assert.ok(prdPos !== -1, 'PRD entry should appear in context');
@@ -53,7 +53,7 @@ test('ADR entry ranked above plain entry with same keyword', () => {
     writeFileSync(join(dir, 'index.md'), indexContent);
     const r = runHook('hypo-lookup.mjs', { prompt: 'bm25 scoring' }, { HYPO_DIR: dir });
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext ?? '';
+    const ctx = injectedContext(out) ?? '';
     const adrPos = ctx.indexOf('decisions/0001-use-bm25');
     const plainPos = ctx.indexOf('bm25-notes');
     assert.ok(adrPos !== -1, 'ADR entry should appear in context');
@@ -84,7 +84,7 @@ test('overdue verify_by_date page gets STALE marker injected', () => {
     stalePageVault(dir, 'verify_by_date: 2020-01-01');
     const r = runHook('hypo-lookup.mjs', { prompt: 'widget calibration' }, { HYPO_DIR: dir });
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext ?? '';
+    const ctx = injectedContext(out) ?? '';
     assert.ok(ctx.includes('freshness-notes'), `page should be a HIT: ${ctx}`);
     assert.ok(
       ctx.includes('[STALE verify_by_date=2020-01-01]'),
@@ -98,7 +98,7 @@ test('future verify_by_date page gets no STALE marker', () => {
     stalePageVault(dir, 'verify_by_date: 2099-01-01');
     const r = runHook('hypo-lookup.mjs', { prompt: 'widget calibration' }, { HYPO_DIR: dir });
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext ?? '';
+    const ctx = injectedContext(out) ?? '';
     assert.ok(ctx.includes('freshness-notes'), `page should be a HIT: ${ctx}`);
     assert.ok(!/\[STALE/.test(ctx), `future date must not be STALE: ${ctx}`);
   });
@@ -111,7 +111,7 @@ test('legacy date in verify_by (not verify_by_date) gets no STALE marker', () =>
     stalePageVault(dir, 'verify_by: 2020-01-01');
     const r = runHook('hypo-lookup.mjs', { prompt: 'widget calibration' }, { HYPO_DIR: dir });
     const out = JSON.parse(r.stdout);
-    const ctx = out.additionalContext ?? '';
+    const ctx = injectedContext(out) ?? '';
     assert.ok(ctx.includes('freshness-notes'), `page should be a HIT: ${ctx}`);
     assert.ok(!/\[STALE/.test(ctx), `verify_by date must not be STALE: ${ctx}`);
   });
@@ -149,7 +149,7 @@ test('HIT in a guard-passing vault appends a well-formed page-usage record', () 
       { HYPO_DIR: dir },
     );
     const out = JSON.parse(r.stdout);
-    assert.ok((out.additionalContext ?? '').includes('freshness-notes'), 'expected HIT');
+    assert.ok((injectedContext(out) ?? '').includes('freshness-notes'), 'expected HIT');
     const logPath = join(dir, '.cache', 'page-usage.jsonl');
     assert.ok(existsSync(logPath), 'page-usage.jsonl must be written on guarded HIT');
     const lines = readFileSync(logPath, 'utf-8').trim().split('\n');
@@ -173,7 +173,7 @@ test('fail-closed logging: no coverage → no log, injection still succeeds', ()
     const out = JSON.parse(r.stdout);
     assert.equal(r.status, 0);
     assert.ok(
-      (out.additionalContext ?? '').includes('freshness-notes'),
+      (injectedContext(out) ?? '').includes('freshness-notes'),
       'injection must still work',
     );
     assert.ok(
@@ -196,7 +196,7 @@ test('fail-open injection: append failure does not break the HIT', () => {
     const out = JSON.parse(r.stdout);
     assert.equal(r.status, 0);
     assert.ok(
-      (out.additionalContext ?? '').includes('freshness-notes'),
+      (injectedContext(out) ?? '').includes('freshness-notes'),
       'injection must survive a logging failure',
     );
   });

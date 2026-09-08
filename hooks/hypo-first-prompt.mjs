@@ -8,9 +8,12 @@
  * resume summary into the reply (the old "answer only if related"
  * conditional is removed; the line is injected unconditionally).
  *
- * hot.md / session-state.md content is NOT re-injected here — the upstream
- * hook already placed it in additionalContext. This hook only forces the LLM
- * to lead with the summary line drawn from that context.
+ * hot.md / session-state.md content is NOT re-injected here. On the SessionStart
+ * path the upstream hook already put it in the model's context, and this hook
+ * only forces the LLM to lead with a summary line drawn from it. On the
+ * cwd-change path nothing was injected at all (CwdChanged has no documented
+ * injection path), so that branch asks for a verbatim line instead of a
+ * summary.
  * Marker expires after 10 minutes.
  */
 
@@ -71,23 +74,35 @@ process.stdin.on('end', () => {
     // for the model to fill the placeholders with. Provide a concrete fallback
     // line so the model doesn't leak literal `[one-line summary]` text on a
     // first-ever session (codex v2 review 2026-05-26).
-    const exampleLine = hasSnapshot
-      ? `${verb} ${projSafe}: [one-line summary]. Continue with [next task]?`
-      : scopedOut
-        ? `${projSafe}: this project has a prior snapshot, but it is scoped to another machine and is not visible here. What would you like to work on?`
-        : `${verb} ${projSafe}: no prior snapshot yet — first session. What would you like to start with?`;
-    const fillNote = hasSnapshot
-      ? `Replace the bracketed placeholders using the [HOT] / [SESSION STATE] ` +
-        `context already injected this session — do NOT emit the literal brackets.`
-      : scopedOut
-        ? `Use the line above verbatim. The project has prior work; its snapshot ` +
-          `simply belongs to another machine, so treat it as an existing project ` +
-          `whose history you cannot see from here.`
-        : `Use the line above verbatim — there is no prior snapshot to summarize.`;
+    // A cwd-change marker arms this hook, but CwdChanged has no documented
+    // context-injection path, so no [HOT] / [SESSION STATE] ever reached the
+    // model for that move. Asking for a summary would make the model invent
+    // one, or emit the literal brackets. This is not a temporary branch: the
+    // follow-up that moves the hook to systemMessage sends that text to the
+    // user, not the model, so the model still gets nothing for a cwd move.
+    const cwdMove = marker.source === 'cwd-change';
+    const exampleLine = cwdMove
+      ? `${verb} ${projSafe}. What would you like to work on here?`
+      : hasSnapshot
+        ? `${verb} ${projSafe}: [one-line summary]. Continue with [next task]?`
+        : scopedOut
+          ? `${projSafe}: this project has a prior snapshot, but it is scoped to another machine and is not visible here. What would you like to work on?`
+          : `${verb} ${projSafe}: no prior snapshot yet — first session. What would you like to start with?`;
+    const fillNote = cwdMove
+      ? `Use the line above verbatim. No prior context was injected for this move.`
+      : hasSnapshot
+        ? `Replace the bracketed placeholders using the [HOT] / [SESSION STATE] ` +
+          `context already injected this session — do NOT emit the literal brackets.`
+        : scopedOut
+          ? `Use the line above verbatim. The project has prior work; its snapshot ` +
+            `simply belongs to another machine, so treat it as an existing project ` +
+            `whose history you cannot see from here.`
+          : `Use the line above verbatim — there is no prior snapshot to summarize.`;
 
     console.log(
       JSON.stringify(
         buildOutput(
+          'UserPromptSubmit',
           `<hypomnema-session-resume>\n` +
             `[WIKI SESSION START: project=${projSafe}${snapshotNote}]\n` +
             `\n` +

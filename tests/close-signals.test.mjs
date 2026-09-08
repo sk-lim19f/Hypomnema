@@ -4,11 +4,12 @@
 // build on each other; suites may not — that is what lets the runner shard.
 
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { test, suite } from './harness.mjs';
 import {
+  HOOKS,
   REPO,
   askCloseReconfirmToolUse,
   buildOutput,
@@ -2428,15 +2429,253 @@ test('no env var → false', () => {
 
 suite('buildOutput()');
 
-test('wraps context in additionalContext field', () => {
-  const out = buildOutput('test context');
-  assert.equal(out.additionalContext, 'test context');
+test('wraps context in nested hookSpecificOutput.additionalContext', () => {
+  const out = buildOutput('UserPromptSubmit', 'test context');
+  assert.equal(out.hookSpecificOutput.additionalContext, 'test context');
 });
 
-test('merges extra fields alongside additionalContext', () => {
-  const out = buildOutput('ctx', { continue: true });
+test('merges extra fields alongside hookSpecificOutput, not inside it', () => {
+  const out = buildOutput('UserPromptSubmit', 'ctx', { continue: true });
   assert.equal(out.continue, true);
-  assert.equal(out.additionalContext, 'ctx');
+  assert.equal(out.hookSpecificOutput.additionalContext, 'ctx');
+});
+
+// ── buildOutput() nested contract + hook wiring (wave 2 of the nested-output
+// migration) ─────────────────────────────────────────────────────────────
+// Claude Code docs, "Add context for Claude": UserPromptSubmit/SessionStart/
+// PostToolUse/Stop all read additionalContext from
+// hookSpecificOutput.additionalContext, never from the top level. Wave 1
+// moved every producing hook onto that shape; this suite pins the shape
+// itself and then scans every hook file so a later edit cannot quietly
+// reopen the top-level channel.
+suite('buildOutput() — nested contract + hook wiring (wave 2)');
+
+test('control fields stay top-level siblings of hookSpecificOutput, never nested inside it', () => {
+  const out = buildOutput('UserPromptSubmit', 'ctx', { continue: true, suppressOutput: true });
+  assert.equal(out.continue, true);
+  assert.equal(out.suppressOutput, true);
+  assert.equal(out.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+  assert.equal(out.hookSpecificOutput.additionalContext, 'ctx');
+  // The control fields must not have leaked into the nested object too.
+  assert.equal('continue' in out.hookSpecificOutput, false);
+  assert.equal('suppressOutput' in out.hookSpecificOutput, false);
+});
+
+test('an undocumented event name still gets the nested shape, plus a stderr warning', () => {
+  const undo = captureStderr();
+  try {
+    const out = buildOutput('NotARealEvent', 'ctx');
+    assert.equal(out.hookSpecificOutput.hookEventName, 'NotARealEvent');
+    assert.equal(out.hookSpecificOutput.additionalContext, 'ctx');
+    assert.match(undo.text(), /NotARealEvent has no documented context-injection path/);
+  } finally {
+    undo.restore();
+  }
+});
+
+test('each of the four documented injectable events produces the same nested shape', () => {
+  for (const event of ['UserPromptSubmit', 'SessionStart', 'PostToolUse', 'Stop']) {
+    const undo = captureStderr();
+    try {
+      const out = buildOutput(event, 'x');
+      assert.equal(out.hookSpecificOutput.hookEventName, event);
+      assert.equal(undo.text(), '', `${event} is documented, must not warn: ${undo.text()}`);
+    } finally {
+      undo.restore();
+    }
+  }
+});
+
+// Swaps process.stderr.write for the duration of one check so a stderr-side
+// assertion doesn't have to shell out to a child process just to observe it.
+function captureStderr() {
+  const original = process.stderr.write;
+  let buf = '';
+  process.stderr.write = (chunk) => {
+    buf += chunk;
+    return true;
+  };
+  return {
+    text: () => buf,
+    restore: () => {
+      process.stderr.write = original;
+    },
+  };
+}
+
+// Hooks are copied standalone into ~/.claude/hooks/ (see CLAUDE.md), so a
+// buildOutput(someVariable, ...) call cannot be told apart from a correct one
+// by reading the code at deploy time — the only thing that catches it is
+// scanning the source for the literal shape. A variable first argument slips
+// past every unit test above (they call buildOutput directly with whatever
+// string they like), so this is the only net that catches a hook wiring the
+// wrong argument in.
+const ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT = new Set([
+  // Both still build the pre-nested {continue, suppressOutput, additionalContext}
+  // shape by hand and do not call buildOutput at all. A follow-up PR moves both
+  // onto systemMessage, which removes this exception entirely.
+  'hypo-cwd-change.mjs',
+  'hypo-file-watch.mjs',
+]);
+
+test('buildOutput never puts additionalContext at the top level, for any event or extra', () => {
+  // The source scans above read text, so every one of them has some shape that
+  // slips past. This one reads what the function actually returns, which is the
+  // contract itself: no caller and no formatting trick can satisfy it while
+  // emitting a top-level copy.
+  for (const evt of ['UserPromptSubmit', 'SessionStart', 'PostToolUse', 'Stop', 'CwdChanged']) {
+    for (const extra of [
+      {},
+      { continue: true },
+      { continue: true, suppressOutput: true },
+      // The one key that can actually collide. Without it this test's name
+      // ("for any extra") is a claim it does not check: the spread would put a
+      // top-level copy back and every assertion here would still pass.
+      { continue: true, additionalContext: 'shadow' },
+    ]) {
+      const out = buildOutput(evt, 'ctx', extra);
+      assert.equal(
+        'additionalContext' in out,
+        false,
+        `top-level additionalContext leaked for ${evt} with extra ${JSON.stringify(extra)}`,
+      );
+      assert.equal(out.hookSpecificOutput.additionalContext, 'ctx');
+    }
+  }
+});
+
+// file basename -> set of events it is registered on, straight out of
+// hooks/hooks.json. Files absent from the map (the `shared` modules) are simply
+// not checked, so no separate skip list can rot.
+function hookEventMap() {
+  const cfg = JSON.parse(readFileSync(join(HOOKS, 'hooks.json'), 'utf-8'));
+  const map = new Map();
+  for (const [event, matchers] of Object.entries(cfg.hooks ?? {})) {
+    for (const matcher of matchers) {
+      for (const h of matcher.hooks ?? []) {
+        const file = String(h.command ?? '')
+          .split('/')
+          .pop();
+        if (!file?.endsWith('.mjs')) continue;
+        if (!map.has(file)) map.set(file, new Set());
+        map.get(file).add(event);
+      }
+    }
+  }
+  return map;
+}
+
+test('every buildOutput() call in hooks/ passes its own registered event name as a quoted literal', () => {
+  const offenders = [];
+  const eventsByHook = hookEventMap();
+  // hypo-shared.mjs is buildOutput's own definition, not a call site: its
+  // `export function buildOutput(hookEventName, ...)` matches the same
+  // `buildOutput(` pattern and would be a false positive here.
+  for (const file of readdirSync(HOOKS).filter(
+    (f) => f.endsWith('.mjs') && f !== 'hypo-shared.mjs',
+  )) {
+    const src = readFileSync(join(HOOKS, file), 'utf-8');
+    for (const m of src.matchAll(/buildOutput\(\s*([^,)]+)/g)) {
+      const arg = m[1].trim();
+      if (!/^'[^']*'$/.test(arg)) {
+        offenders.push(`${file}: buildOutput(${arg}, ...)`);
+        continue;
+      }
+      // A quoted literal is not enough. Claude Code drops a hookSpecificOutput
+      // whose hookEventName does not match the event the hook actually fires
+      // on, and it does so silently, which is the exact failure this whole
+      // change exists to close. hooks.json is the source of truth for that
+      // mapping, so read it rather than restating it here.
+      const declared = eventsByHook.get(file);
+      if (!declared) {
+        // Unregistered files are shared modules, which never call buildOutput.
+        // One that does is either a hook missing from hooks.json (it would
+        // never be deployed) or a shared module emitting hook output; both
+        // want a human, not a silent skip.
+        offenders.push(
+          `${file}: calls buildOutput but hooks.json does not register it on any event`,
+        );
+        continue;
+      }
+      if (!declared.has(arg.slice(1, -1))) {
+        offenders.push(
+          `${file}: buildOutput(${arg}, ...) but hooks.json registers it on ${[...declared].join(', ')}`,
+        );
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `buildOutput's first argument must be a quoted event-name literal, found: ${offenders.join(', ')}`,
+  );
+});
+
+test('hypo-shared.mjs mentions additionalContext exactly twice: the strip out of extra and the nested return', () => {
+  // ponytail: line-based comment strip, not a real JS parser. A '//' inside a
+  // string or template literal reads as a comment start here, so anything after
+  // it on that line vanishes from the scan. Zero such literals in this file
+  // today (checked), but if one ever lands next to an additionalContext line
+  // this scan goes quiet: parse properly at that point.
+  const src = readFileSync(join(HOOKS, 'hypo-shared.mjs'), 'utf-8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  // Counted by occurrence, not by line. Counting lines lets a top-level copy
+  // ride along inside the nested return's own line: that stays one "hit" and
+  // fits under prettier's printWidth, so both this scan and lint go green.
+  const hits = src.match(/additionalContext/g) ?? [];
+  assert.equal(
+    hits.length,
+    2,
+    `hypo-shared.mjs must mention additionalContext exactly twice in code, found ${hits.length}. ` +
+      `The two are buildOutput's destructure that strips the key out of extra, and its own nested ` +
+      `return. A third means someone put the top-level channel back.`,
+  );
+  // Which two matters as much as how many: the pair above is only benign
+  // because one strips the key and the other nests it. Two top-level copies
+  // would also count as two.
+  assert.match(src, /const \{ additionalContext: _shadowed, \.\.\.control \} = extra;/);
+  assert.match(src, /hookSpecificOutput: \{ hookEventName, additionalContext: context \}/);
+});
+
+// Asserted in both directions on purpose. A one-way "nobody outside the list
+// offends" check goes quiet the moment the follow-up PR migrates these two: the
+// entries survive as a permanent hole that would wave a future top-level literal
+// straight through. Comparing the full set makes that PR fail here until it
+// deletes them.
+test('exactly the two known legacy hooks emit a top-level additionalContext literal', () => {
+  const emitters = [];
+  for (const file of readdirSync(HOOKS).filter((f) => f.endsWith('.mjs'))) {
+    if (file === 'hypo-shared.mjs') continue;
+    const src = readFileSync(join(HOOKS, file), 'utf-8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/.*$/gm, '');
+    if (/additionalContext\s*:/.test(src)) emitters.push(file);
+  }
+  // The regex above sees a property name, not its depth: a nested
+  // `hookSpecificOutput: { additionalContext }` matches it too. So the set
+  // comparison alone would still pass if a legacy hook grew a nested emitter
+  // while keeping its top-level one. Asserting these two carry no
+  // hookSpecificOutput at all is what makes "matched, therefore top-level"
+  // true for them, without needing to parse the file.
+  for (const file of ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT) {
+    const src = readFileSync(join(HOOKS, file), 'utf-8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/.*$/gm, '');
+    assert.equal(
+      /hookSpecificOutput/.test(src),
+      false,
+      `${file} is on the top-level allow list, so its additionalContext must be the top-level one. ` +
+        `A hookSpecificOutput here means the file now emits both and the set comparison below stops proving anything.`,
+    );
+  }
+  assert.deepEqual(
+    emitters.sort(),
+    [...ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT].sort(),
+    `top-level additionalContext emitters drifted from the expected legacy pair. ` +
+      `A new name means a hook regressed; a missing name means the follow-up migrated it ` +
+      `and must delete it from ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT too. Found: ${emitters.join(', ')}`,
+  );
 });
 
 // ── A1: overdue verify_by_date predicate + STALE marker (freshness) ──────────
