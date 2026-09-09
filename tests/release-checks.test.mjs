@@ -4,6 +4,7 @@
 // build on each other; suites may not — that is what lets the runner shard.
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -16,7 +17,7 @@ import {
   parseSemver,
 } from '../scripts/lib/check-bilingual.mjs';
 import { test, suite } from './harness.mjs';
-import { run, withTmpDir } from './helpers.mjs';
+import { SCRIPTS, SESSION_TMP_HOME, gitRepo, run, withTmpDir } from './helpers.mjs';
 
 // ── check-bilingual: release-doc bilingual rule enforcement ─────────────────
 
@@ -692,4 +693,105 @@ test('this repo ships no name shared by commands/ and skills/', () => {
     !/name collision/.test(r.stdout + r.stderr),
     `repo must ship one surface per name: ${r.stdout}`,
   );
+});
+
+// ── check-release-vehicle.mjs ───────────────────────────────────────────────
+// Semver picks the version from the change kind, but nothing watched for the
+// moment a `feat` on main takes the patch option away. It happened three times:
+// v1.7.1 shipped with 5 feat commits, v1.7.4 with 1, and once the patch line
+// simply stalled. This reports the state; it never blocks.
+
+suite('check-release-vehicle.mjs');
+
+// The script reads the git history of its own cwd, so these drive it against a
+// throwaway repo rather than this checkout. HOME is pinned like every other
+// spawn in this suite: git writes config under it.
+function vehicle(dir, args = []) {
+  return spawnSync(process.execPath, [join(SCRIPTS, 'check-release-vehicle.mjs'), ...args], {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME },
+  });
+}
+
+function commit(dir, subject) {
+  writeFileSync(join(dir, 'f.txt'), subject);
+  spawnSync('git', ['add', '-A'], { cwd: dir, encoding: 'utf-8' });
+  spawnSync('git', ['commit', '-q', '-m', subject], { cwd: dir, encoding: 'utf-8' });
+}
+
+test('a feat since the last tag forces the next release to be a minor', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commit(dir, 'chore: base');
+    spawnSync('git', ['tag', 'v1.0.0'], { cwd: dir, encoding: 'utf-8' });
+    commit(dir, 'fix(x): a bug');
+    commit(dir, 'feat(lint): a new rule');
+    const r = vehicle(dir, ['--json']);
+    assert.equal(r.status, 0, 'the notice never blocks');
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.determined, true);
+    assert.equal(out.minimumBump, 'minor');
+    assert.equal(out.lastTag, 'v1.0.0');
+    assert.equal(out.commitCount, 2);
+    assert.deepEqual(out.feats, ['feat(lint): a new rule']);
+  });
+});
+
+test('only fixes and chores since the last tag leaves patch available', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commit(dir, 'chore: base');
+    spawnSync('git', ['tag', 'v1.0.0'], { cwd: dir, encoding: 'utf-8' });
+    commit(dir, 'fix(x): a bug');
+    commit(dir, 'docs: a word');
+    // Neither of these is a feat, and neither may be mistaken for one: the
+    // prefix has to be the whole type token, not a substring of a word.
+    commit(dir, 'refactor: rename feature flags');
+    commit(dir, 'fix: feature parity with the docs');
+    const out = JSON.parse(vehicle(dir, ['--json']).stdout);
+    assert.equal(out.minimumBump, 'patch');
+    assert.deepEqual(out.feats, [], `no commit here is a feat: ${JSON.stringify(out.feats)}`);
+  });
+});
+
+test('a bare `feat:` with no scope counts', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commit(dir, 'chore: base');
+    spawnSync('git', ['tag', 'v2.0.0'], { cwd: dir, encoding: 'utf-8' });
+    commit(dir, 'feat: something new');
+    const out = JSON.parse(vehicle(dir, ['--json']).stdout);
+    assert.equal(out.minimumBump, 'minor');
+  });
+});
+
+test('a repo with no release tag reports that it cannot tell, not that patch is fine', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commit(dir, 'feat: the very first thing');
+    const r = vehicle(dir, ['--json']);
+    assert.equal(r.status, 0);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.determined, false, 'no tag means no answer');
+    assert.equal(out.reason, 'no-release-tag');
+    assert.equal(out.minimumBump, null, 'an unknown answer must not read as patch');
+  });
+});
+
+test('--github emits an Actions warning only when the answer is minor', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commit(dir, 'chore: base');
+    spawnSync('git', ['tag', 'v1.0.0'], { cwd: dir, encoding: 'utf-8' });
+    commit(dir, 'fix: only a fix');
+    assert.ok(
+      !vehicle(dir, ['--github']).stdout.includes('::warning'),
+      'a patch-eligible line must not warn',
+    );
+    commit(dir, 'feat: now a feature');
+    const withFeat = vehicle(dir, ['--github']).stdout;
+    assert.ok(withFeat.includes('::warning title=Next release must be minor::'), withFeat);
+    assert.ok(withFeat.includes('feat: now a feature'), withFeat);
+  });
 });

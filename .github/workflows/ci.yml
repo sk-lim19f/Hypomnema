@@ -151,11 +151,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The release-vehicle notice reads tags and the log since the last
+          # one. A shallow clone has neither, and the script reports "cannot
+          # tell" rather than a wrong answer, which would make the step useless.
+          fetch-depth: 0
       - uses: actions/setup-node@v5
         with:
           node-version: 20
       - name: All version-carrying files agree (drift caught pre-release)
         run: npm run check:versions
+      - name: What the next release is allowed to be (notice, never blocks)
+        run: node scripts/check-release-vehicle.mjs --github
       - name: Plugin surfaces load-valid (manifest, hooks, commands/skills)
         run: npm run smoke:plugin
 
