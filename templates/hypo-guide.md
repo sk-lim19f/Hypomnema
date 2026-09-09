@@ -164,7 +164,7 @@ Add to root `hot.md` active projects table.
 
 #### Auto-project offer
 
-When SessionStart / CwdChanged injects a line like
+When SessionStart injects a line like
 `[WIKI: cwd '<name>'에 매칭되는 프로젝트가 없습니다. 자동 생성할까요? (Y/n)]`,
 the current working directory is a real project (git repo + a project marker
 like `package.json`) that has no matching wiki project. **Act on it — do not

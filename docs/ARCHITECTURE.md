@@ -128,16 +128,16 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | Hook | Responsibility |
 |---|---|
 | `hypo-session-start` | Inject `index.md`, root `hot.md`, project `hot.md`/`session-state.md`. Run `git pull --ff-only` (silent fail on missing remote) |
-| `hypo-first-prompt` | Marker-based one-shot `hot.md` injection on first user prompt (10-min TTL) — for sessions that bypass `SessionStart` |
+| `hypo-first-prompt` | Reads the marker left by `hypo-session-start` or `hypo-cwd-change` and forces a one-line resume on the first user prompt (10-min TTL). It does not re-read or re-inject `hot.md` |
 | `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each; a page whose `verify_by_date` is overdue gets a `[STALE verify_by_date=…]` marker prepended). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
-| `hypo-compact-guard` | Detect `/compact` invocations → enforce session-close checklist before allowing compact |
+| `hypo-compact-guard` | Detect `/compact` or `/clear` typed in chat and, if session close is incomplete, tell Claude so. It never blocks `/compact` |
 | `hypo-personal-check` | PreCompact detection: lint blockers, uncommitted changes, missing session-log entries surface as a `systemMessage`; `/compact` is never blocked here |
 | `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`) |
 | `hypo-hot-rebuild` | At session stop, regenerate root `hot.md` from recent activity; emit growth metrics + cache for next SessionStart |
 | `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd, device}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
 | `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote) |
-| `hypo-cwd-change` | When working directory changes, re-resolve the active project and inject its `hot.md` |
-| `hypo-file-watch` | Notify on external wiki edits so the in-session view stays consistent |
+| `hypo-cwd-change` | When working directory changes, re-resolve the active project and build `additionalContext` with its `hot.md`; `CwdChanged` has no field Claude Code forwards to the model, so this does not currently reach Claude |
+| `hypo-file-watch` | Build `additionalContext` for a changed wiki file. Two things keep this inert: nothing in this package returns `watchPaths`, so the event has no registered trigger, and `FileChanged` output does not reach the model. The event also fires regardless of who changed the file, so it is not an external-edit signal |
 
 ### Deployment constraint
 
@@ -298,7 +298,7 @@ SessionStart
   ├─► UserPromptSubmit (every prompt)
   │     ├─► hypo-first-prompt.mjs (one-shot, 10min TTL)
   │     ├─► hypo-lookup.mjs (BM25 inject)
-  │     └─► hypo-compact-guard.mjs (block /compact when checklist incomplete)
+  │     └─► hypo-compact-guard.mjs (report incomplete checklist; never blocks /compact)
   │
   ├─► PostToolUse(Write/Edit)
   │     └─► hypo-auto-stage.mjs (git add)
@@ -307,7 +307,7 @@ SessionStart
   │     └─► hypo-personal-check.mjs (lint + session-close gate)
   │
   ├─► CwdChanged
-  │     └─► hypo-cwd-change.mjs (re-inject project hot.md)
+  │     └─► hypo-cwd-change.mjs (builds hot.md context; does not currently reach Claude)
   │
   └─► Stop
         ├─► hypo-hot-rebuild.mjs (regenerate root hot.md + growth cache)
