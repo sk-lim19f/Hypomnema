@@ -31,8 +31,10 @@ All 15 hooks registered in `hooks/hooks.json` are listed below, in registration 
 | `hypo-session-record.mjs` | `Stop` | Appends the completed session to the session index |
 | `hypo-auto-commit.mjs` | `Stop` | Stages, commits, and pushes this session's touched wiki paths |
 | `hypo-auto-minimal-crystallize.mjs` | `Stop` | Blocks `Stop` when the session did substantial work, the user signalled wrap-up, and no close was recorded. A substantial session with no close signal is let through |
-| `hypo-cwd-change.mjs` | `CwdChanged` | Re-injects the matching project's `hot.md` when the working directory changes mid-session |
-| `hypo-file-watch.mjs` | `FileChanged` | Re-injects any vault file changed on disk outside the session, once it passes the ignore and visibility filters |
+| `hypo-cwd-change.mjs` | `CwdChanged` | Builds `additionalContext` with the matching project's `hot.md` when the working directory changes mid-session, but `CwdChanged` has no field Claude Code forwards to the model, so this output does not currently reach Claude |
+| `hypo-file-watch.mjs` | `FileChanged` | Builds `additionalContext` for a changed vault file once it passes the ignore and visibility filters. Nothing in this package registers watch paths, so the event has no trigger here, and `FileChanged` output does not reach Claude either way |
+
+This file is copied into a vault only at `init` time, and no update channel pushes a later fix here into a vault that already exists. So this copy can be older than the shipped one. `hooks/hooks.json` in the package is the source of truth for which hook runs on which event; when this table disagrees with it, the table is what went stale.
 
 Two hooks reach the network; the rest compute locally. There are two separate kinds of
 network traffic here, and only one of them can be turned off.
