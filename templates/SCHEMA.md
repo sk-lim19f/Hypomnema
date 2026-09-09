@@ -2,7 +2,7 @@
 title: Wiki Schema
 type: schema
 updated: YYYY-MM-DD
-version: 2.1
+version: 2.2
 ---
 
 # Wiki Schema
@@ -105,7 +105,19 @@ visibility_scope: shared | machine:<device>
 source: <slug or URL>
 verify_by: <question to re-check at next review>
 verify_by_date: YYYY-MM-DD
+sources_consulted: [slug1, slug2]
 ```
+
+`sources_consulted` belongs on a `synthesis` page and names the pages it condenses.
+`lint` reads it: when the newest `updated` among those sources is later than the
+synthesis's own `updated`, the page is reported as stale (W15), so a synthesis that
+has not absorbed what its sources learned since surfaces without anyone diffing dates
+by hand. A bare slug is enough when it is unique. Resolution covers `pages/`,
+`projects/` and `journal/`, which is narrower than what a wikilink target
+accepts, so a name outside those (a directory, a `sources/` file, a path into
+a code repo) does not resolve. An unresolved name is left out of the staleness
+comparison and reported separately (W16), because a name this field cannot
+resolve is either a typo or a value the field is not meant to hold.
 
 `visibility_scope` is a different axis from `scope`: `scope` is memory lifetime,
 `visibility_scope` is where a page may surface. Omitting it means `shared` (the

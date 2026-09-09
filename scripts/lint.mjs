@@ -13,7 +13,9 @@
  *   --fix               Auto-add missing `updated` field (safe repairs only)
  *   --strict            Promote selected warnings (STRICT_PROMOTE_IDS) to errors
  *                       so they exit 1. Opt-in gate for release-checklist /
- *                       pre-commit; default mode stays byte-identical.
+ *                       pre-commit. Adding the flag did not change what default
+ *                       mode emits; a new warning class still adds warnings
+ *                       there, as every W9..W16 addition has.
  */
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
@@ -30,7 +32,7 @@ import {
 import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
 import { FAILURE_TYPE_ENUM } from './lib/failure-type.mjs';
-import { collectPagesLint, collectPagesLinkable } from './lib/wikilink.mjs';
+import { collectPagesLint, collectPagesLinkable, slugForms } from './lib/wikilink.mjs';
 import { parseFrontmatter, SEQUENCE_ENTRY_RE } from './lib/frontmatter.mjs';
 import { buildSlugMap } from './lib/slug-resolver.mjs';
 
@@ -303,11 +305,33 @@ const VALID_TYPES = [
 
 const issues = [];
 
+// W15 bookkeeping, filled inside lintPage as it already reads+parses every
+// page once. Reused after the main page loop instead of re-reading every file
+// a second time just to compare `updated` dates.
+//   bySlugForm maps every page's slug form (full/bare/dirRel, the same three
+//   forms buildSlugMap derives) to { updated, count }. `count` is how many
+//   pages claim that form, because a shared bare form is NOT the same
+//   ambiguity the wikilink checker lives with: W4 only asks whether a target
+//   exists, while this rule has to pick one page's date. Picking first-wins
+//   would make the verdict depend on directory walk order. A form claimed
+//   twice is treated as unresolvable instead.
+//   `updated` is null for a page that has none (W3's concern), which is
+//   recorded rather than skipped so the source is known to exist.
+//   synthesisPages holds the type:synthesis pages that declare
+//   sources_consulted, collected for the post-loop comparison below.
+// Dates are compared as strings, which is only the same as comparing time
+// when every value is zero-padded YYYY-MM-DD. `2026-3-1 > 2026-12-15` is true
+// lexically and false in fact, so anything off this shape is excluded from the
+// comparison and reported instead of silently deciding the verdict.
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const bySlugForm = new Map();
+const synthesisPages = [];
+
 // Stable warning class IDs (W1..Wn). `--strict` promotes a frozen subset to
 // errors by ID — never by brittle message-text matching. W8 (design-history
-// stale) predates this scheme; hooks/hypo-personal-check.mjs filters `w.id ===
-// 'W8'`, so it must keep that number — the W5..W7 gap is honest history, not a
-// bug. (spec-v1.3.0 Track E)
+// stale) predates this scheme; the close gate in hooks/hypo-shared.mjs filters
+// `w.id === 'W8'`, so it must keep that number. The W5..W7 gap is honest
+// history, not a bug. (spec-v1.3.0 Track E)
 //
 // STRICT_PROMOTE_IDS (OQ-E1, frozen as a code constant): confirmed content
 // defects only.
@@ -327,6 +351,13 @@ const issues = [];
 //                             PreCompact hook no longer blocks /compact, so
 //                             that set is what --check-session-close and
 //                             --mark-session-closed read, not a compact stop.
+//   W15 synthesis-stale     → excluded, same reason as W8/W14 (a freshness
+//                             signal to triage, not a content defect), and
+//                             its own id for the same reason W14 has one: the
+//                             W8-only close-gate filter must not pick it up.
+//   W16 sources-unresolved  → excluded, same reasons as W15. It reports what
+//                             W15 could not read, so promoting one without the
+//                             other would block on the weaker signal.
 // NOTE: npm run lint / CI / release.yml / crystallize / the close-gate all
 // run plain lint, not --strict, so promotion is forward-looking there: these
 // still surface as warnings on those paths. But --strict is not unused —
@@ -416,6 +447,27 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
 
   if (!fm.updated) {
     issue('warn', rel, 'Missing frontmatter field: updated', path, 'W3');
+  }
+
+  // W15 bookkeeping: record this page's slug forms → updated date, and, if it
+  // is itself a synthesis page citing sources, queue it for the post-loop
+  // check. Recorded here (not re-derived after the loop) because content and
+  // fm are already in hand from the reads above.
+  {
+    const noExt = rel.replace(/\.md$/, '').replace(/\\/g, '/');
+    // Deduplicate within one page first. slugForms collapses bare and dirRel
+    // to the same string for a page directly under pages/, so counting raw
+    // values would make every such page look like a two-page collision.
+    for (const form of new Set(Object.values(slugForms(noExt)))) {
+      if (!form) continue;
+      const prior = bySlugForm.get(form);
+      if (prior) prior.count += 1;
+      else bySlugForm.set(form, { updated: fm.updated || null, count: 1 });
+    }
+  }
+  if (fm.type === 'synthesis' && fm.sources_consulted) {
+    const sources = parseTagsField(fm.sources_consulted) || [];
+    if (sources.length > 0) synthesisPages.push({ rel, updated: fm.updated, sources });
   }
 
   // type-conditional required fields
@@ -686,6 +738,81 @@ for (const s of findDesignHistoryStale(args.hypoDir)) {
   );
 }
 
+// W15: synthesis page stale relative to its own sources_consulted. A
+// type:synthesis page absorbs and condenses what other pages already
+// learned; if a listed source has moved on (its `updated` is newer than the
+// synthesis's own `updated`), the synthesis has not caught up. Runs off the
+// bookkeeping lintPage already filled above, so no page is read twice.
+//
+// A source name absent from bySlugForm (a typo, a directory rather than a
+// page, or a path outside the vault) has no date to compare, so W15 cannot
+// judge it either way. W4 does not cover it: that rule reads `[[...]]` out of
+// page bodies and never looks at frontmatter, so an unresolved name here would
+// be reported nowhere. W16 below reports it instead, which is what keeps a
+// page that resolves 4 of its 11 sources from producing a confident-looking
+// W15 built on a third of the evidence.
+// The skip in the loop states that intent; it does not change the outcome. An
+// undefined date loses every comparison it enters, so dropping the guard
+// leaves the same warnings (measured: removing it keeps all four W15 tests
+// green). It stays because the alternative parks undefined in `newest`.
+//
+// Deliberately excluded from STRICT_PROMOTE_IDS, same reasoning as W8/W14: a
+// synthesis lagging its sources is a content-freshness signal for a human to
+// triage, not a defect `--strict` should hard-block a commit on. Given its
+// own id (not W8) so hypo-shared.mjs's `w.id === 'W8'` close-gate filter
+// never mistakes it for a design-history finding.
+for (const { rel, updated, sources } of synthesisPages) {
+  let newest = null;
+  const unresolved = [];
+  for (const source of sources) {
+    const hit = bySlugForm.get(source);
+    // Three ways a source yields no date, kept apart because they tell the
+    // author to do different things. Every one of them lands in W16 below;
+    // removing this branch is what would make W16 stop reporting.
+    if (!hit) {
+      unresolved.push(`${source} (없는 이름)`);
+      continue;
+    }
+    if (hit.count > 1) {
+      unresolved.push(`${source} (${hit.count}개 페이지가 같은 이름)`);
+      continue;
+    }
+    if (!ISO_DATE_RE.test(hit.updated || '')) {
+      unresolved.push(`${source} (updated 없음 또는 YYYY-MM-DD 아님)`);
+      continue;
+    }
+    if (!newest || hit.updated > newest) newest = hit.updated;
+  }
+  const ownDateUsable = ISO_DATE_RE.test(updated || '');
+  if (newest && ownDateUsable && newest > updated) {
+    issue(
+      'warn',
+      rel,
+      `synthesis stale: sources_consulted 최신=${newest} > synthesis updated=${updated}. 새로 쌓인 학습을 반영해 갱신하거나, 반영할 내용이 없으면 updated를 확인하세요`,
+      null,
+      'W15',
+    );
+  }
+  // W16: sources W15 could not compare, reported once per page with the reason
+  // for each. Without this the rule fails open, and silently: a page whose
+  // sources mostly do not resolve still gets a W15 (or no warning at all) with
+  // nothing saying how much of the evidence was actually read. The reasons are
+  // kept apart because the fix differs: a name that resolves to nothing is a
+  // typo or a value this field is not meant to hold, a name claimed by two
+  // pages needs the longer form, and a source with no usable `updated` is W3's
+  // problem on that page. Excluded from STRICT_PROMOTE_IDS and given its own id
+  // for the same reasons as W15.
+  if (unresolved.length > 0) {
+    issue(
+      'warn',
+      rel,
+      `sources_consulted 비교 불가 ${unresolved.length}/${sources.length}: ${unresolved.join(', ')}. 이 소스들은 staleness 비교에서 빠졌습니다`,
+      null,
+      'W16',
+    );
+  }
+}
+
 // W12: project directory missing index.md. SCHEMA.md declares project-index
 // at projects/*/index.md and templates/projects/_template/ ships one, so a
 // project without it is a tooling/vault drift, not a legitimate shape — but
@@ -785,10 +912,12 @@ const errors = issues.filter((i) => i.severity === 'error');
 const warns = issues.filter((i) => i.severity === 'warn');
 
 if (args.json) {
-  // Default mode is byte-identical: only W8 carries an `id` in the JSON payload
-  // (hooks/hypo-personal-check.mjs filters on it). All other IDs stay internal
-  // unless `--strict` is set, where the full ID set is exposed so promoted
-  // findings are traceable to their warning class.
+  // The `id` field, not the warning list, is what default mode holds stable:
+  // only W8 carries one (the close gate in hooks/hypo-shared.mjs filters on
+  // it). Every other id stays internal unless `--strict` is set, where the full
+  // set is exposed so promoted findings are traceable to their warning class.
+  // A new rule does add warnings to default output; that is what a new rule is
+  // for, and W9 through W16 all did it.
   const toOut = ({ severity, file, message, id }) =>
     id && (id === 'W8' || args.strict)
       ? { severity, file, message, id }

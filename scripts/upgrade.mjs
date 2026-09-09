@@ -924,7 +924,7 @@ function applyCommands(commandResults, force) {
     ...existing,
     pkgRoot: PKG_ROOT,
     pkgVersion,
-    schemaVersion: templateSchemaVersion(PKG_ROOT) ?? '2.1',
+    schemaVersion: templateSchemaVersion(PKG_ROOT) ?? '2.2',
     commands: newSHAs,
   });
   return applied;
@@ -950,7 +950,7 @@ function writePluginModeMetadata() {
     ...existing,
     pkgRoot: PKG_ROOT,
     pkgVersion,
-    schemaVersion: templateSchemaVersion(PKG_ROOT) ?? '2.1',
+    schemaVersion: templateSchemaVersion(PKG_ROOT) ?? '2.2',
   });
   return true;
 }
