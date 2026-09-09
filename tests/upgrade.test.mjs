@@ -287,24 +287,32 @@ test('--apply generates migration report for major SCHEMA bump', () => {
       );
       const content = readFileSync(out.migrationReport, 'utf-8');
       assert.ok(content.includes('0.9'), 'migration report should reference old version');
+      // Read the version off the shipped template rather than pinning a literal.
+      // The point of this assertion is "the report names the version we are
+      // upgrading TO", and a literal turns every SCHEMA bump into a failing test
+      // that says nothing about the report.
+      const shipped = readFileSync(join(REPO, 'templates', 'SCHEMA.md'), 'utf-8');
+      const shippedVersion = shipped.match(/^version: (.+)$/m)?.[1]?.trim();
+      assert.ok(shippedVersion, 'templates/SCHEMA.md must carry a version stamp');
       assert.ok(
-        content.includes('2.1'),
-        'migration report should reference the new (current) version 2.1',
+        content.includes(shippedVersion),
+        `migration report should reference the new (current) version ${shippedVersion}`,
       );
     });
   });
 });
 
-// FEAT-1 boundary: SCHEMA 2.0 → 2.1 is an additive minor bump (optional
-// failure_type). A minor bump needs no migration report — nothing to backfill.
-test('--apply: SCHEMA 2.0 → 2.1 is a minor bump with no migration report', () => {
+// An additive bump inside the same major is minor, and a minor bump needs no
+// migration report because there is nothing to backfill. The fixture rolls the
+// wiki back to 2.0 and lets the shipped template be whatever it currently is.
+test('--apply: SCHEMA 2.0 to the shipped version is a minor bump with no migration report', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {
       const hypoDir = join(dir, 'wiki');
       const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
       assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
 
-      // init stamps the current template (2.1); roll the wiki SCHEMA back one minor.
+      // init stamps the current template; roll the wiki SCHEMA back to 2.0.
       const schemaPath = join(hypoDir, 'SCHEMA.md');
       writeFileSync(
         schemaPath,

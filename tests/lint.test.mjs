@@ -2179,6 +2179,315 @@ test('w14-clean: project WITH design-history.md never emits W14, only W8/none', 
   });
 });
 
+// ── W15: synthesis page stale relative to its sources_consulted ─────────────
+// A type:synthesis page absorbs other pages; if a source's `updated` moved
+// past the synthesis's own `updated`, the synthesis has not caught up.
+// `sources_consulted: [name, ...]` uses the same bracket-list shape lint
+// already parses for `tags` (parseTagsField), reused rather than re-invented.
+
+suite('W15/W16: synthesis staleness (sources_consulted)');
+
+test('source newer than synthesis → W15 warn with distinct message and no W8/W14 id', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'source-a.md'),
+      '---\ntitle: source-a\ntype: concept\nupdated: 2026-02-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\nsources_consulted: [source-a]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, `stale synthesis must not fail lint: ${r.stdout}`);
+    assert.equal(parsed.ok, true);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 1, `expected one W15 warn: ${JSON.stringify(parsed.warns)}`);
+    assert.equal(stale[0].file, 'pages/syn.md');
+    assert.ok(!('id' in stale[0]), 'default (non-strict) --json hides ids for anything but W8');
+  });
+});
+
+test('synthesis at least as fresh as every source → no W15 warn', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'source-a.md'),
+      '---\ntitle: source-a\ntype: concept\nupdated: 2026-01-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-01\nsources_consulted: [source-a]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(
+      stale.length,
+      0,
+      `fresh synthesis must not trip W15: ${JSON.stringify(parsed.warns)}`,
+    );
+  });
+});
+
+test('unresolved sources_consulted entry yields no W15 but a W16 naming it', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\nsources_consulted: [does-not-exist]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(
+      stale.length,
+      0,
+      `no date to compare means no staleness verdict: ${JSON.stringify(parsed.warns)}`,
+    );
+    const unres = (parsed.warns || []).filter((w) =>
+      w.message.includes('sources_consulted 비교 불가'),
+    );
+    assert.equal(unres.length, 1, `expected one W16 warn: ${JSON.stringify(parsed.warns)}`);
+    assert.equal(unres[0].file, 'pages/syn.md');
+    assert.ok(
+      unres[0].message.includes('does-not-exist'),
+      `W16 must name the unresolved entry: ${unres[0].message}`,
+    );
+    assert.ok(
+      unres[0].message.includes('1/1'),
+      `W16 must report coverage, not just the fact: ${unres[0].message}`,
+    );
+    assert.ok(
+      unres[0].message.includes('없는 이름'),
+      `W16 must say WHY the source could not be compared: ${unres[0].message}`,
+    );
+  });
+});
+
+test('W15 compares against the NEWEST source, not the first or the oldest', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    // Ordered oldest-first on purpose: a rule that keeps the first date, or
+    // that keeps the minimum, produces no warning here. Only picking the
+    // maximum crosses the synthesis's own 2026-02-01.
+    writeFileSync(
+      join(root, 'pages', 'source-old.md'),
+      '---\ntitle: source-old\ntype: concept\nupdated: 2026-01-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'source-new.md'),
+      '---\ntitle: source-new\ntype: concept\nupdated: 2026-03-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-01\n' +
+        'sources_consulted: [source-old, source-new]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 1, `newest source must win: ${JSON.stringify(parsed.warns)}`);
+    assert.ok(
+      stale[0].message.includes('최신=2026-03-01'),
+      `W15 must report the maximum source date: ${stale[0].message}`,
+    );
+    const unres = (parsed.warns || []).filter((w) =>
+      w.message.includes('sources_consulted 비교 불가'),
+    );
+    assert.equal(unres.length, 0, 'both sources resolve, so no W16');
+  });
+});
+
+test('a source in a subdirectory resolves by bare name and by dir-relative name', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages', 'learnings'), { recursive: true });
+    // Every fixture above puts source and synthesis side by side in pages/,
+    // where slugForms' full/bare/dirRel collapse to one string and the map
+    // cannot be told apart from a bare-only map. Here they differ:
+    // full=pages/learnings/deep, bare=deep, dirRel=learnings/deep.
+    writeFileSync(
+      join(root, 'pages', 'learnings', 'deep.md'),
+      '---\ntitle: deep\ntype: learning\nupdated: 2026-03-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn-bare.md'),
+      '---\ntitle: syn-bare\ntype: synthesis\nupdated: 2026-01-01\nsources_consulted: [deep]\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn-rel.md'),
+      '---\ntitle: syn-rel\ntype: synthesis\nupdated: 2026-01-01\n' +
+        'sources_consulted: [learnings/deep]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const staleFiles = (parsed.warns || [])
+      .filter((w) => w.message.includes('synthesis stale'))
+      .map((w) => w.file)
+      .sort();
+    assert.deepEqual(
+      staleFiles,
+      ['pages/syn-bare.md', 'pages/syn-rel.md'],
+      `both slug forms must resolve: ${JSON.stringify(parsed.warns)}`,
+    );
+    const unres = (parsed.warns || []).filter((w) =>
+      w.message.includes('sources_consulted 비교 불가'),
+    );
+    assert.equal(unres.length, 0, `neither form is unresolved: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+test('a source name claimed by two pages is not compared, and W16 says so', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages', 'a'), { recursive: true });
+    mkdirSync(join(root, 'pages', 'b'), { recursive: true });
+    // Same bare name under two directories. Picking either date would make the
+    // verdict depend on walk order: one of them is newer than the synthesis
+    // and the other is not.
+    writeFileSync(
+      join(root, 'pages', 'a', 'dup.md'),
+      '---\ntitle: dup a\ntype: concept\nupdated: 2026-01-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'b', 'dup.md'),
+      '---\ntitle: dup b\ntype: concept\nupdated: 2026-03-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-01\nsources_consulted: [dup]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 0, `an ambiguous name must not decide staleness: ${r.stdout}`);
+    const unres = (parsed.warns || []).filter((w) =>
+      w.message.includes('sources_consulted 비교 불가'),
+    );
+    assert.equal(unres.length, 1, `expected one W16 warn: ${r.stdout}`);
+    assert.ok(
+      unres[0].message.includes('2개 페이지가 같은 이름'),
+      `W16 must name ambiguity as the reason: ${unres[0].message}`,
+    );
+  });
+});
+
+test('a page directly under pages/ is not mistaken for its own collision', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    // slugForms collapses bare and dirRel to the same string here. Counting raw
+    // values instead of distinct ones would report every such page as a
+    // two-page collision and suppress every W15 in the vault.
+    writeFileSync(
+      join(root, 'pages', 'flat.md'),
+      '---\ntitle: flat\ntype: concept\nupdated: 2026-03-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\nsources_consulted: [flat]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 1, `a flat page must still resolve: ${r.stdout}`);
+    const unres = (parsed.warns || []).filter((w) =>
+      w.message.includes('sources_consulted 비교 불가'),
+    );
+    assert.equal(unres.length, 0, `no ambiguity here: ${r.stdout}`);
+  });
+});
+
+test('a source that exists but has no usable date is reported, not called missing', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    // Present, so calling it a missing name would be wrong. Its date cannot be
+    // compared, so using it would be wrong too.
+    writeFileSync(
+      join(root, 'pages', 'nodate.md'),
+      '---\ntitle: nodate\ntype: concept\n---\n\nbody\n',
+    );
+    // Lexically greater than 2026-02-01, chronologically earlier. A raw string
+    // compare would call the synthesis stale on the strength of this.
+    writeFileSync(
+      join(root, 'pages', 'sloppy.md'),
+      '---\ntitle: sloppy\ntype: concept\nupdated: 2026-3-1\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-01\n' +
+        'sources_consulted: [nodate, sloppy]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 0, `an unusable date must not decide staleness: ${r.stdout}`);
+    const unres = (parsed.warns || []).filter((w) =>
+      w.message.includes('sources_consulted 비교 불가'),
+    );
+    assert.equal(unres.length, 1, `expected one W16 warn: ${r.stdout}`);
+    assert.ok(
+      unres[0].message.includes('2/2'),
+      `both sources are uncomparable: ${unres[0].message}`,
+    );
+    assert.ok(
+      !unres[0].message.includes('없는 이름'),
+      `neither source is missing; both exist: ${unres[0].message}`,
+    );
+  });
+});
+
+test('strict: W16 exposes its id but is not promoted to an error', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\nsources_consulted: [does-not-exist]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json', '--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, 'W16 is excluded from STRICT_PROMOTE_IDS → exit 0');
+    assert.equal(parsed.ok, true);
+    const w16 = (parsed.warns || []).filter((w) => w.id === 'W16');
+    assert.equal(w16.length, 1, `W16 stays a warn under --strict: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+test('synthesis page without sources_consulted never trips W15', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 0);
+  });
+});
+
+test('strict: W15 exposes its id but is not promoted to an error', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'source-a.md'),
+      '---\ntitle: source-a\ntype: concept\nupdated: 2026-02-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\nsources_consulted: [source-a]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json', '--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, 'W15 is excluded from STRICT_PROMOTE_IDS → exit 0');
+    assert.equal(parsed.ok, true);
+    const w15 = (parsed.warns || []).filter((w) => w.id === 'W15');
+    assert.equal(w15.length, 1, `W15 stays a warn under --strict: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
 // ── A-2 (project index lifecycle): W12 missing-index warning ────────────────
 // scripts/lint.mjs: a projects/<slug>/ directory with no index.md warns — never
 // errors, since a hard block would stop /compact for every pre-existing

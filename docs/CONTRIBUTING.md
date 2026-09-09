@@ -129,6 +129,8 @@ Everything else belongs in `commands/`, which loads the same way.
 npm test           # tests/*.test.mjs, sharded across processes — unit + smoke + contract
 npm run lint       # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale
                    # vs session-log) + W14 (design-history missing but session-log implies one)
+                   # + W15 (synthesis older than the newest page in its sources_consulted)
+                   # + W16 (sources_consulted names W15 could not resolve)
 npm run fix:verify # Phase 1 of learned_behavior #6 — verifies fix #N status claims in
                    # a wiki spec against `// @fix #N: <test-name>` anchors, read as a
                    # union across every tests/*.mjs. Maintainer dogfood; needs a wiki at
