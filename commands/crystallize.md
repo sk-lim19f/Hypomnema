@@ -101,7 +101,7 @@ and nothing on disk, in three cases:
 |---|---|
 | `session-id-required` | No `--session-id` was passed. |
 | `transcript-unresolved` | The id resolves to no transcript under `~/.claude/projects/`. |
-| `no-user-close-signal` | The transcript exists, and the user never asked to close. |
+| `no-user-close-signal` | The transcript exists, but no close authority is in force right now. This one string collapses three different gate outcomes, and only one of them means the user never asked. Read `gateReason` (below) before deciding what to do about it. |
 
 A refusal is not a failure to route around. It means the close should not happen: ask
 the user, and re-run only after they say so.
@@ -130,6 +130,15 @@ no session id.
 | `--apply-session-close --payload=<path>` | **Refused**, exit 1, `reason: 'session-id-required'`. Nothing is written and nothing is committed. |
 | `--apply-session-close --payload=<path> --session-id=<id>` | The only apply path. Verifies close authority against that session's transcript **first**; on a refusal nothing is written. On success: per-field idempotent writes (no-op when bytes match), strict verification, lint gate, commit, and the per-session closed marker. Safe to re-run. |
 | `--apply-session-close --force` | Skips the probe early-exit. It does **not** skip the authority check, and `--payload` plus `--session-id` are still required to apply anything. |
+
+When a refusal carries `reason: 'no-user-close-signal'`, the JSON also carries
+`gateReason`, naming which of the three gate checks refused: `no-open` (the
+transcript holds no user close signal at all), `transcript-rewrite-detected`
+(the transcript changed under the gate), or `no-new-open-since-resolution` (the
+close signal predates a resolution already recorded). The collapsed `reason`
+stays the same string in all three cases, so read `gateReason` rather than
+parsing the `Gate detail:` fragment out of `error`. The field is absent for
+every other refusal.
 
 **Two lint gates run automatically, scoped to the files this close writes:**
 
@@ -171,7 +180,12 @@ If `markerWritten: true`: ask: "Session closed. Would you like to also run knowl
 
 - `session-id-required`: you omitted `--session-id`. Pass the main conversation's id and re-run.
 - `transcript-unresolved`: the id resolved no transcript, so it is almost certainly not the main conversation's (a background-task or Agent-thread uuid, most often). Get the right one and re-run.
-- `no-user-close-signal`: the transcript is this session's, and the user never asked to close in wording the gate recognizes (e.g. "세션 마무리까지 진행해줘" falls outside the close-signal set). Re-running the same id changes nothing, because the transcript is unchanged. Confirm intent once with `AskUserQuestion`, header "세션", a single option labelled **세션 마무리** (설명: "이 세션을 마무리하고 close 마커를 기록"). If the user picks it, that answer lands in the transcript as a recognized close signal, so re-running the exact same command now applies **everything**: the writes, the commit, and the marker. If the user declines, the session stays open and nothing is written. Do NOT touch the close-signal matcher itself, and do not hand-write the files to work around the refusal.
+- `no-user-close-signal`: the transcript is this session's, but no close authority is in force. **Branch on `gateReason` before doing anything.** The three cases need three different responses, and treating them alike is what made this refusal look like it had a new cause every time it appeared.
+  - `no-open`: the user genuinely never asked to close in wording the gate recognizes (e.g. "세션 마무리까지 진행해줘" falls outside the close-signal set). Re-running the same id changes nothing, because the transcript is unchanged. Confirm intent once with `AskUserQuestion`, header "세션", a single option labelled **세션 마무리** (설명: "이 세션을 마무리하고 close 마커를 기록"). If the user picks it, that answer lands in the transcript as a recognized close signal, so re-running the exact same command now applies **everything**: the writes, the commit, and the marker. If the user declines, the session stays open and nothing is written.
+  - `no-new-open-since-resolution`: the user DID ask, and that request was already resolved by an earlier close. Asking again makes them answer a question they have already answered. Report that this session is already closed and stop; do not re-prompt.
+  - `transcript-rewrite-detected`: the transcript changed underneath the gate, so the earlier signal can no longer be attested. This is not a statement about what the user wants. Say what happened rather than asking them to repeat themselves, and let a human decide.
+
+  In all three: do NOT touch the close-signal matcher itself, and do not hand-write the files to work around the refusal.
 
 If the apply succeeded but `markerWritten: false`, do NOT say "session closed." Branch on `markerSkipReason` (`compact-gate-not-ok`, `commit-failed: …`, `marker-did-not-land`): surface the reason verbatim and address it (resolve the compact blocker, fix the git / disk issue) before re-running.
 

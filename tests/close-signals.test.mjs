@@ -37,6 +37,11 @@ import {
   withTmpDir,
 } from './helpers.mjs';
 
+// Local, not re-exported through helpers.mjs: this file is the only area that
+// needs the full walk record (helpers hands back isCloseGateOpen, which is just
+// its `.open`). The order tests below assert on `openedAtIndex`.
+const { walkCloseGate } = await import(join(HOOKS, 'hypo-shared.mjs'));
+
 suite('isCompactCommand()');
 
 test('/compact → true', () => {
@@ -1307,6 +1312,271 @@ test('close, then a task-notification replay (origin.kind present) → true (sta
       }),
     ]);
     assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+// A task notification's THIRD delivery shape (ISSUE-114 axis C): the queue
+// records above cover the enqueue and the bare remove, but the corpus's real
+// remove-path delivery lands the prompt again on a `queued_command`
+// attachment (see REMOVE_DELIVERY above), and that attachment branch used to
+// skip the model-caused filter the enqueue branch already applied — a
+// close typed by the user, then this SAME notification arriving through this
+// THIRD shape, flipped the just-opened gate back to closed. All three shapes
+// of the one host event must read neutral, so all three sit in one fixture:
+// an enqueue, its remove, and the remove-path attachment.
+test('close, then a task-notification via enqueue + remove + attachment → true (all three delivery shapes stay neutral)', () => {
+  withTmpDir((dir) => {
+    const notif =
+      '<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>';
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      QOP('enqueue', notif),
+      QOP('remove', notif),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: { type: 'queued_command', prompt: notif, commandMode: 'prompt' },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+// The load-bearing twin, on the SAME attachment branch: a human queues a real
+// change of mind ("keep working"), it gets delivered the same way a close
+// would be, and it must still close the gate. Widening the attachment
+// branch's neutral filter to anything non-close would silently kill this
+// contract along with fixing the task-notification case above, so both live
+// in this file and both must pass together.
+test('close, then a human non-close queued via the remove-path attachment → false (still a change of mind)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      QOP('enqueue', '계속 작업하자'),
+      QOP('remove', '계속 작업하자'),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: '계속 작업하자',
+          commandMode: 'prompt',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// CHANNEL: this branch can OPEN the gate, so it needs the same channel guard
+// the typed path has always had. `origin.kind` says who produced the text, not
+// which channel the record arrived on, and a sidechain / injected / sdk / meta
+// record can carry both a human origin and close words. eventUserText refuses
+// those channels; the opener beside it did not, so one classifier trusted a
+// record the other threw away. Measured 0 of 1340 queued_command attachments
+// carry any of these flags, so both directions below are composed shapes, not
+// observed ones: a guard against a record the host does not mint today.
+for (const flag of [
+  { isSidechain: true },
+  { isMeta: true },
+  { promptSource: 'system' },
+  { promptSource: 'sdk' },
+  { interruptedMessageId: 'msg_1' },
+]) {
+  const label = Object.keys(flag)[0] + '=' + String(Object.values(flag)[0]);
+  test(`a queued close on a model-reachable channel (${label}) does not open the gate`, () => {
+    withTmpDir((dir) => {
+      const p = writeJsonl(dir, [
+        {
+          type: 'attachment',
+          isSidechain: false,
+          userType: 'external',
+          ...flag,
+          attachment: {
+            type: 'queued_command',
+            prompt: '세션 마무리하자',
+            commandMode: 'prompt',
+            origin: { kind: 'human' },
+          },
+        },
+      ]);
+      assert.equal(isCloseGateOpen(p), false);
+    });
+  });
+
+  test(`a queued non-close on a model-reachable channel (${label}) does not close an open gate`, () => {
+    withTmpDir((dir) => {
+      const p = writeJsonl(dir, [
+        USER(CLOSE),
+        {
+          type: 'attachment',
+          isSidechain: false,
+          userType: 'external',
+          ...flag,
+          attachment: {
+            type: 'queued_command',
+            prompt: '계속 작업하자',
+            commandMode: 'prompt',
+            origin: { kind: 'human' },
+          },
+        },
+      ]);
+      assert.equal(isCloseGateOpen(p), true);
+    });
+  });
+}
+
+// A queued prompt is a content-block array whenever the user pasted an image
+// with their words. Measured 8 such deliveries in the corpus, every one
+// origin.kind "human", host 2.1.226 through 2.1.263. Reading only the string
+// shape dropped them to '' and read a real change of mind as nothing, so a
+// close already granted went through even though the user had since said keep
+// going. Both directions are pinned: the non-close must close the gate, and a
+// close spoken the same way must open it.
+test('a queued human non-close arriving as content blocks still closes the gate', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: [
+            { type: 'text', text: '계속 작업하자' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } },
+          ],
+          commandMode: 'prompt',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+test('a queued human close arriving as content blocks still opens the gate', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: [
+            { type: 'text', text: '세션 마무리하자' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } },
+          ],
+          commandMode: 'prompt',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+// The host stamps commandMode on the record itself, and all 1040 measured
+// task-notification attachments carry it. Keying the filter only on the body's
+// '<task-notification>' prefix leaves it resting on a string the host owns: a
+// body that merely gains a line before the tag slips past. This feeds a body
+// that does NOT start with the tag and relies on commandMode alone.
+test('a task-notification identified only by commandMode is still neutral', () => {
+  withTmpDir((dir) => {
+    const body =
+      'Background work finished.\n<task-notification>\n<status>completed</status>\n</task-notification>';
+    // Guard: this body must NOT satisfy the prefix check, or the test measures
+    // the prefix path instead of the commandMode path it exists to cover.
+    assert.equal(body.startsWith('<task-notification>'), false);
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: body,
+          commandMode: 'task-notification',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+// ORDER, on the same attachment branch: a notification body carries whatever
+// text the finished task was named after, and isClosePattern matches on a
+// substring, so a routine `<summary>` can measure true ("wrap up" and "오늘
+// 여기까지" both do). The enqueue branch has always filtered model-caused
+// content BEFORE testing for a close pattern; the attachment branch tested the
+// pattern first. That gap let a model-produced event reach the opener, where a
+// human-origin delivery would set `open` and push `openedAtIndex` forward,
+// manufacturing a close signal the user never gave. This pins the two branches
+// to the same order by feeding the identical body through both shapes and
+// requiring the identical verdict.
+test('a task-notification whose body matches a close pattern opens nothing, on either delivery shape', () => {
+  withTmpDir((dir) => {
+    const notif =
+      '<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n' +
+      '<summary>Background command "wrap up the docs" completed</summary>\n</task-notification>';
+    // Guard the fixture itself: if isClosePattern stops matching this body the
+    // test would pass while measuring nothing at all.
+    assert.equal(isClosePattern(notif), true);
+
+    const viaEnqueue = writeJsonl(dir, [QOP('enqueue', notif)]);
+    const viaAttachment = writeJsonl(dir, [
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: notif,
+          commandMode: 'prompt',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(viaEnqueue), false);
+    assert.equal(isCloseGateOpen(viaAttachment), false);
+  });
+});
+
+// The other half of the order contract: the same body arriving AFTER a real
+// close must not move `openedAtIndex` either. A gate that reads open for the
+// wrong reason is as wrong as one that reads closed, because the resolution
+// comparison keys on that index.
+test('a close-matching task-notification after a real close does not move openedAtIndex', () => {
+  withTmpDir((dir) => {
+    const notif =
+      '<task-notification>\n<status>completed</status>\n' +
+      '<summary>오늘 여기까지 정리한 결과</summary>\n</task-notification>';
+    assert.equal(isClosePattern(notif), true);
+
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: notif,
+          commandMode: 'prompt',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    const walk = walkCloseGate(p);
+    assert.equal(walk.open, true);
+    assert.equal(walk.openedAtIndex, 0); // the user's typed close, not the notification
   });
 });
 

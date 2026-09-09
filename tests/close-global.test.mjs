@@ -2508,6 +2508,12 @@ test('IMPR-15: no-user-close-signal → after an AskUserQuestion 세션 마무�
         'no-user-close-signal',
         `expected the no-signal reason (not transcript-unresolved): ${JSON.stringify(o1)}`,
       );
+      // ISSUE-114 axis B: the collapsed `reason` above stays exactly
+      // 'no-user-close-signal' (existing contract, unchanged), but `gateReason`
+      // now carries closeGateStatus's own reason as a separate, machine-readable
+      // field — here it is the "no-open" case, since this transcript has no
+      // close signal in it at all.
+      assert.match(o1.gateReason, /^no-open:/, `expected a structured gate reason: ${r1.stdout}`);
       assert.deepEqual(o1.applied, []);
       // `null`, not `false`: refused before the commit step is ever reached.
       assert.equal(o1.committed, null, 'refused before the commit step ever ran');
