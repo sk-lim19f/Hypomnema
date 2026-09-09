@@ -630,8 +630,12 @@ const CLOSE_REFUSAL_HELP = [
  * counts (extractUserMessages drops injected, tool, and hook-feedback text).
  *
  *   { ok: true }
- *   { ok: false, reason, error }   reason: session-id-required | transcript-unresolved
- *                                          | no-user-close-signal
+ *   { ok: false, reason, error, gateReason? }   reason: session-id-required |
+ *     transcript-unresolved | no-user-close-signal. `gateReason` is only present
+ *     when `reason` is `no-user-close-signal`, and carries closeGateStatus's own
+ *     reason string (no-open / transcript-rewrite-detected /
+ *     no-new-open-since-resolution) for a caller that wants to tell those three
+ *     apart without parsing `error`.
  */
 function verifyCloseAuthority(sessionId, hypoDir) {
   if (!sessionId) {
@@ -661,6 +665,13 @@ function verifyCloseAuthority(sessionId, hypoDir) {
     return {
       ok: false,
       reason: 'no-user-close-signal',
+      // The user-facing `reason` above stays the single collapsed string
+      // tests and downstream tooling already key on (see this function's own
+      // doc comment). `gateReason` carries closeGateStatus's actual reason
+      // (no-open / transcript-rewrite-detected / no-new-open-since-resolution)
+      // as a separate, machine-readable field, so a caller can tell the three
+      // apart without parsing the "Gate detail: ..." substring out of `error`.
+      gateReason: gateStatus.reason,
       error:
         "session-close apply refused before any wiki write or commit: this session's transcript " +
         'carries no user close signal. The user did not ask to close. ' +
@@ -776,6 +787,11 @@ function refuseUnlessCloseRequested(args) {
       ok: false,
       stage: 'no-user-close-signal',
       reason: closeAuth.reason,
+      // Only set when `reason` is 'no-user-close-signal' (undefined otherwise,
+      // and JSON.stringify drops an undefined-valued key). Lets a caller tell
+      // apart the three closeGateStatus refusals collapsed into that one
+      // `reason` string, without parsing "Gate detail: ..." out of `error`.
+      gateReason: closeAuth.gateReason,
       applied: [],
       // `null`, not `false`: this refusal fires before the commit step is ever
       // reached (see the general result's own `committed` contract below).

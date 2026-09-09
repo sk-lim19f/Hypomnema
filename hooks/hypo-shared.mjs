@@ -5018,6 +5018,48 @@ export function resolveTranscriptBySessionId(
 // dangerous replay/injection paths carry system|sdk|isMeta|isSidechain and are
 // excluded here anyway.
 const COMMAND_INVOCATION_TAG = /<command-(?:name|message|args)>/;
+
+// Text out of a content-block array, or null when the array carries a command
+// invocation (which is a host artifact, not something the user typed as prose).
+// Extracted so the queued_command attachment branch in walkCloseGate can reuse
+// the exact same rule: a queued prompt arrives as this array shape whenever the
+// user pasted an image alongside their words (measured: 8 such deliveries, all
+// origin.kind "human", host versions 2.1.226 through 2.1.263). Reading only
+// `typeof prompt === 'string'` there dropped those to '' and read a real change
+// of mind as nothing at all.
+function contentBlocksText(content) {
+  const texts = content
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text);
+  const text = texts.length ? texts.join('\n') : null;
+  // A command-invocation tag split across adjacent text blocks (e.g.
+  // '<command-na' + 'me>/hypo:crystallize</command-name>') would survive the
+  // '\n'-joined `text` above with a newline spliced into the middle of the
+  // tag name, so the plain check below can miss it entirely. Today's actual
+  // host format sends the whole invocation as ONE string, so this exact
+  // split is not reproducible against a live session yet — but a check for
+  // "did the host format ever put the tag exactly on a block boundary"
+  // should not depend on where a future host happens to cut the blocks. So
+  // also test each run of CONSECUTIVE text blocks joined with no separator.
+  // This must stay scoped to consecutive text blocks only, never the whole
+  // array: joining across a non-text block in between (an image, say) would
+  // synthesize a tag that never existed in the real content, and that is a
+  // different bug, not a fix — it would throw away a genuine close spoken
+  // next to an unrelated attachment. So a non-text block ends the current
+  // run and starts a new one; it never bridges two runs into one string.
+  let tightRun = '';
+  for (const b of content) {
+    if (b && b.type === 'text' && typeof b.text === 'string') {
+      tightRun += b.text;
+      continue;
+    }
+    if (COMMAND_INVOCATION_TAG.test(tightRun)) return null;
+    tightRun = '';
+  }
+  if (COMMAND_INVOCATION_TAG.test(tightRun)) return null;
+  return text;
+}
+
 function eventUserText(obj) {
   if (obj.isMeta === true) return null;
   if (obj.promptSource === 'system' || obj.promptSource === 'sdk') return null;
@@ -5031,35 +5073,9 @@ function eventUserText(obj) {
   if (typeof content === 'string') {
     text = content.startsWith('Stop hook feedback') ? null : content;
   } else if (Array.isArray(content)) {
-    const texts = content
-      .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
-      .map((b) => b.text);
-    text = texts.length ? texts.join('\n') : null;
-    // A command-invocation tag split across adjacent text blocks (e.g.
-    // '<command-na' + 'me>/hypo:crystallize</command-name>') would survive the
-    // '\n'-joined `text` above with a newline spliced into the middle of the
-    // tag name, so the plain check below can miss it entirely. Today's actual
-    // host format sends the whole invocation as ONE string, so this exact
-    // split is not reproducible against a live session yet — but a check for
-    // "did the host format ever put the tag exactly on a block boundary"
-    // should not depend on where a future host happens to cut the blocks. So
-    // also test each run of CONSECUTIVE text blocks joined with no separator.
-    // This must stay scoped to consecutive text blocks only, never the whole
-    // array: joining across a non-text block in between (an image, say) would
-    // synthesize a tag that never existed in the real content, and that is a
-    // different bug, not a fix — it would throw away a genuine close spoken
-    // next to an unrelated attachment. So a non-text block ends the current
-    // run and starts a new one; it never bridges two runs into one string.
-    let tightRun = '';
-    for (const b of content) {
-      if (b && b.type === 'text' && typeof b.text === 'string') {
-        tightRun += b.text;
-        continue;
-      }
-      if (COMMAND_INVOCATION_TAG.test(tightRun)) return null;
-      tightRun = '';
-    }
-    if (COMMAND_INVOCATION_TAG.test(tightRun)) return null;
+    // null from either cause (no text blocks, or a command invocation) means
+    // "no user prose here", which is exactly what this function returns anyway.
+    text = contentBlocksText(content);
   }
   if (text != null && COMMAND_INVOCATION_TAG.test(text)) return null;
   return text;
@@ -5075,6 +5091,20 @@ function isModelReachableRecord(obj) {
     obj.promptSource === 'sdk' ||
     obj.isSidechain === true
   );
+}
+
+// Queue content that carries no fresh USER decision: empty, or a background-task
+// notification the host injects on the model's behalf. Shared by the enqueue
+// branch and the remove-path (queued_command attachment) branch below so a
+// task notification reads as neutral on BOTH delivery shapes of the same host
+// event. Before this was extracted, only the enqueue branch filtered it — the
+// attachment branch treated any non-close prompt, including a task
+// notification, as a change-of-mind close: a close typed by the user opened
+// the gate, then the notification for an unrelated background task landed
+// via this path and flipped it shut again.
+function isModelCausedQueueContent(text) {
+  const c = typeof text === 'string' ? text.trim() : '';
+  return !c || c.startsWith('<task-notification>');
 }
 
 export function walkCloseGate(transcriptPath) {
@@ -5157,7 +5187,7 @@ export function walkCloseGate(transcriptPath) {
         openedAtIndex = i;
       } else if (/^\/clear(?:\s|$)/.test(c)) {
         open = false; // abandons context → close
-      } else if (!c || c.startsWith('<task-notification>')) {
+      } else if (isModelCausedQueueContent(c)) {
         /* model-caused / empty — neutral */
       } else if (isClosePattern(c)) {
         /* NL close via the queue — the open dequeue gap: the producer cannot be
@@ -5174,16 +5204,80 @@ export function walkCloseGate(transcriptPath) {
     // cannot attest a producer, so it does not open (fail-closed). A NON-close
     // queued command (e.g. "keep working") is a fresh user intent and CLOSES
     // a prior open regardless of origin — that is what closes the re-close hole
-    // where a queued "continue" after a close leaves the stale open live.
+    // where a queued "continue" after a close leaves the stale open live. A
+    // task notification is not that: `modelCaused` below filters it out before
+    // this reaches the change-of-mind close, because the model, not the user,
+    // produced it. This delivery path used to skip that filter and let an
+    // unrelated background-task notification flip a just-opened gate shut.
+    //
+    // Scope of "both shapes classify alike": it holds for task notifications and
+    // for empty content, which is what this fix is about. It does not hold for
+    // slash commands. The enqueue branch reads a queued `/compact` as an opener
+    // and `/clear` as a close, and nothing here mirrors that, so the same
+    // command would close the gate if it ever arrived on this path. Measured
+    // 0 of 1321 attachment deliveries carry a slash prompt, so the divergence
+    // is unreachable today rather than fixed; mirroring it would mean copying
+    // an opener that tests already mark a fail-open defect.
     if (o.type === 'attachment' && o.attachment && o.attachment.type === 'queued_command') {
-      const prompt = typeof o.attachment.prompt === 'string' ? o.attachment.prompt : '';
+      // Same channel guard the typed path applies, for the same reason. This
+      // branch can OPEN the gate, and `origin.kind` alone does not say which
+      // channel the record came in on: a sidechain, injected, sdk or meta
+      // record could carry a human origin and close text and mint an approval
+      // the user never gave in this conversation. eventUserText has refused
+      // those channels all along; the opener next to it did not, so one
+      // classifier trusted a record the other threw away. Measured 0 of 1340
+      // queued_command attachments carry any of these flags, so this closes a
+      // shape the corpus has not produced rather than an observed failure.
+      // `interruptedMessageId` rides along because eventUserText refuses it too.
+      if (isModelReachableRecord(o) || o.interruptedMessageId) continue;
+      // A queued prompt arrives as a content-block array whenever the user
+      // pasted an image alongside their words. Reading only the string shape
+      // dropped those to '' and threw away a real change of mind: the gate
+      // stayed open and the close went through anyway. Measured 8 such
+      // deliveries, every one origin.kind "human", host 2.1.226 to 2.1.263.
+      const rawPrompt = o.attachment.prompt;
+      const prompt =
+        typeof rawPrompt === 'string'
+          ? rawPrompt
+          : Array.isArray(rawPrompt)
+            ? (contentBlocksText(rawPrompt) ?? '')
+            : '';
       const humanOrigin = !!(o.attachment.origin && o.attachment.origin.kind === 'human');
-      if (isClosePattern(prompt)) {
+      // The host labels these deliveries on the record itself, and that label is
+      // the authoritative one: every measured task-notification attachment
+      // (1040 of 1040) carries commandMode 'task-notification'. Keying only on
+      // the '<task-notification>' body prefix would leave the whole filter
+      // resting on a string the host owns and can restyle, and a body that
+      // merely gains a line before the tag would slip past it. The queue-op
+      // branch above has no such field to read, so it keeps the body check
+      // alone; here both are available and both are used.
+      const modelCaused =
+        o.attachment.commandMode === 'task-notification' || isModelCausedQueueContent(prompt);
+      // The filter runs FIRST here, exactly as it does in the enqueue branch
+      // above. Order is load-bearing, not cosmetic: a notification body carries
+      // whatever text the finished task was named after, and isClosePattern
+      // matches on a substring ("wrap up", "오늘 여기까지" inside a <summary>
+      // both measure true). Testing isClosePattern first therefore lets a
+      // model-produced event reach the opener, where a human-origin delivery
+      // would set `open` and push `openedAtIndex` forward. That manufactures a
+      // close signal the user never gave, and moves the index the resolution
+      // comparison reads.
+      //
+      // Reachability, so the next reader does not have to re-measure it: no
+      // recorded delivery hits that path. All 1040 task-notification
+      // attachments in the corpus arrive with no `origin`, so `humanOrigin` is
+      // false and the opener is skipped whichever order the two checks run in.
+      // This is a defensive pin against a host that starts stamping origin on
+      // them, not a repair of an observed failure.
+      if (modelCaused) {
+        /* model-caused / empty: neutral, the same filter the enqueue branch
+           above applies to the same host event on its other delivery shape */
+      } else if (isClosePattern(prompt)) {
         if (humanOrigin) {
           open = true;
           openedAtIndex = i;
         }
-      } else if (prompt) {
+      } else {
         open = false;
       }
       continue;
