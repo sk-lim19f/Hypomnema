@@ -24,6 +24,9 @@ import { planMarkerDecision, closeResultContradiction } from '../scripts/crystal
 // overwrite step 2 conflict-park check see "this session already read the
 // current bytes" without a live session.
 import { snapshotBase } from '../hooks/base-store.mjs';
+// The gate's own notion of "today", so the fixture below can place a project
+// strictly outside it instead of guessing with local-yesterday.
+import { freshDates } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import {
   CLOSE_RECONFIRM_MARK,
@@ -3790,19 +3793,29 @@ test('E2E: --mark-session-closed refuses a project that exists on disk but was n
 // attributionScope) from a marker's record of a close that already happened.
 test('a previous day marker does not make its project block an unrelated close today', () => {
   const today = todayLocal();
-  // Local calendar, not toISOString(): the project activity dates this fixture
-  // compares against are local-date (todayLocal), so a UTC slice would put
-  // `stale` on TODAY around the midnight boundary in western timezones and the
-  // fixture would silently stop testing anything.
-  const y = new Date();
-  y.setDate(y.getDate() - 1);
-  const yesterday = `${y.getFullYear()}-${String(y.getMonth() + 1).padStart(2, '0')}-${String(y.getDate()).padStart(2, '0')}`;
-  // `stale` exists and has close files, but its activity is YESTERDAY, so it is
-  // not a today-active candidate. The only thing that can pull it into this
+  // The gate counts BOTH calendar days as today (freshDates / localAndUtcDates in
+  // hooks/hypo-shared.mjs), because some writers stamp local and some stamp UTC.
+  // So local-yesterday is not reliably outside that set. In a UTC+N zone it IS the
+  // UTC day for the first N hours of the local day, which made this fixture's
+  // `stale` a today-active candidate and turned this test red for nine hours every
+  // morning in KST (measured 2026-09-10: red at 08:51 local = 23:51 UTC, green at
+  // 09:06 local = 00:06 UTC). Stepping back from the EARLIEST fresh date keeps
+  // `stale` a genuine non-candidate in every zone, so the marker stays the only
+  // thing that can pull it in, which is what this test is about.
+  const fresh = freshDates();
+  const prev = new Date(`${[...fresh].sort()[0]}T00:00:00Z`);
+  prev.setUTCDate(prev.getUTCDate() - 1);
+  const pastDay = prev.toISOString().slice(0, 10);
+  assert.ok(
+    !fresh.includes(pastDay),
+    `fixture date ${pastDay} must sit outside the gate's today set ${JSON.stringify(fresh)}`,
+  );
+  // `stale` exists and has close files, but its activity is on that past day, so
+  // it is not a today-active candidate. The only thing that can pull it into this
   // close's evaluation is the marker.
   const projects = [
     { slug: 'mine', date: today },
-    { slug: 'stale', date: yesterday, sessionLog: false },
+    { slug: 'stale', date: pastDay, sessionLog: false },
   ];
   withClosePartitionWiki(projects, [], (dir) => {
     const sessionId = 's-crossday-marker';
@@ -3820,11 +3833,30 @@ test('a previous day marker does not make its project block an unrelated close t
     );
     // sessionId is what makes the gate read the marker at all (the PreCompact hook
     // passes one; --mark-session-closed does not).
+    // The marker is written AFTER withClosePartitionWiki's commit, so it stays
+    // untracked and the git axis is dirty here: `gate.ok` is always false in this
+    // test. Take the baseline from gate.close.scope / gate.close.projects, never
+    // from gate.ok, or the assertion goes red for a reason unrelated to close.
     const gate = precompactGateStatus(dir, {
       closeScope: ['mine'],
       sessionId,
       claudeHome: join(dir, '.claude-none'),
     });
+    // Positive baseline first. The absence assertion below only means something
+    // once the marker has actually reached the partition scope; if it has not
+    // (wrong path, session id, TTL, parse failure), `stale` never enters the
+    // picture at all and the absence holds for a reason that has nothing to do
+    // with the defense this test exists to pin. The sibling test further down
+    // carries the same kind of baseline for the same reason.
+    assert.ok(
+      gate.close.scope.includes('stale'),
+      `the marker must reach the partition scope. got ${JSON.stringify(gate.close.scope)}`,
+    );
+    assert.ok(
+      !(gate.close.projects || []).some((p) => p.project === 'stale'),
+      `stale must stay out of the mandatory evaluation set. got ` +
+        `${JSON.stringify(gate.close.projects)}`,
+    );
     assert.equal(
       gate.blockers.some((b) => b.type === 'close'),
       false,

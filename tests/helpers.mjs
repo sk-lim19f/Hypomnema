@@ -524,6 +524,11 @@ function withSyncedWiki(fn) {
 // logEntry?, hotRow? }] — each optional field defaults to `date` (fresh) and can
 // be set to an old date string (or false to omit). Root hot.md rows are built
 // from `hotRow ?? date`; root hot.md frontmatter `updated:` is always today.
+// A `date` meant to be NON-today must be strictly earlier than the smallest of
+// freshDates(): the close gate counts both the local and the UTC calendar day as
+// today, so plain local-yesterday is inside that set for the first N hours of the
+// local day in a UTC+N zone. See tests/close-global.test.mjs, the previous-day
+// marker test, for the fixture that got this wrong.
 function makeMultiProjectWiki(dir, today, projects) {
   mkdirSync(dir, { recursive: true });
   const ym = today.slice(0, 7);

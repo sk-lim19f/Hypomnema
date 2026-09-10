@@ -5,6 +5,36 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2] - 2026-09-10
+
+### Bug Fixes
+
+#### English
+
+- Hook notices reach the model again. They were emitted with a top-level `additionalContext`, which Claude Code silently ignores, so the close gate, the resume contract, and lookup results never arrived. Measured after the fix: a canary planted in a project's `hot.md` came back verbatim from a session with every file tool blocked, and the same canary read as absent on the previous build. ([#287](https://github.com/sk-lim19f/Hypomnema/pull/287))
+- The session-close gate reads a background-task notification the same way on every delivery path, so a task finishing after you asked to close no longer cancels the close. A refusal also reports `gateReason`, naming which check refused. ([#289](https://github.com/sk-lim19f/Hypomnema/pull/289))
+- `lint`, `verify`, `graph`, `query` and `crystallize` exit 2 on an unrecognised flag or an empty `--hypo-dir=`, instead of silently dropping it and falling back to the default vault. Their command docs no longer print placeholder syntax as runnable arguments. ([#286](https://github.com/sk-lim19f/Hypomnema/pull/286))
+- The `/compact` and `/clear` notice no longer orders a session close, no longer fires on another project's uncommitted files, and no longer goes silent when the vault is broken enough to be worth reporting (`decisions/0101`). ([#285](https://github.com/sk-lim19f/Hypomnema/pull/285))
+- `/hypo:doctor` no longer accepts a session-closed marker as proof for a project the close gate never evaluated. The marker records the set the gate actually checked, and the audit requires an artifact's project to be in that set as well as in the marker's attribution. ([#284](https://github.com/sk-lim19f/Hypomnema/pull/284))
+
+#### 한국어
+
+- 훅 알림이 다시 모델에 닿습니다. 최상단 `additionalContext`로 나가고 있었는데 Claude Code가 그것을 조용히 무시해서 close 게이트, 세션 재개 계약, lookup 결과가 도착한 적이 없었습니다. 고친 뒤 실측했습니다. 프로젝트 `hot.md`에 심은 난수를 파일 도구를 전부 막은 세션이 그대로 답했고, 같은 난수를 이전 빌드는 못 읽었습니다. ([#287](https://github.com/sk-lim19f/Hypomnema/pull/287))
+- 세션 마무리 게이트가 background task 알림을 어느 전달 경로로 오든 같게 읽습니다. 마무리를 요청한 뒤 작업이 끝나도 그 마무리가 취소되지 않습니다. 거절할 때는 `gateReason`으로 어느 검사가 거절했는지도 함께 알립니다. ([#289](https://github.com/sk-lim19f/Hypomnema/pull/289))
+- `lint`·`verify`·`graph`·`query`·`crystallize`가 못 알아보는 플래그와 빈 `--hypo-dir=`를 조용히 버리고 기본 볼트로 가는 대신 exit 2를 냅니다. 명령 문서도 placeholder 문법을 실행 가능한 인자처럼 찍지 않습니다. ([#286](https://github.com/sk-lim19f/Hypomnema/pull/286))
+- `/compact`·`/clear` 알림이 세션 마무리를 지시하지 않고, 다른 프로젝트의 미커밋 파일로 뜨지 않으며, 보고할 값어치가 있을 만큼 볼트가 망가졌을 때 조용해지지 않습니다 (`decisions/0101`). ([#285](https://github.com/sk-lim19f/Hypomnema/pull/285))
+- `/hypo:doctor`가 close 게이트가 한 번도 평가하지 않은 프로젝트에 대해 session-closed 마커를 증거로 받지 않습니다. 마커가 게이트의 실제 검사 집합을 기록하고, 감사가 산출물의 프로젝트를 귀속뿐 아니라 그 집합에서도 요구합니다. ([#284](https://github.com/sk-lim19f/Hypomnema/pull/284))
+
+### Chores
+
+#### English
+
+- The shipped `SCHEMA.md` template defines `updated` as the day content changed, not the day the file was written, and states plainly that nothing enforces it. ([#288](https://github.com/sk-lim19f/Hypomnema/pull/288))
+
+#### 한국어
+
+- 출하되는 `SCHEMA.md` 템플릿이 `updated`를 파일을 쓴 날이 아니라 내용이 바뀐 날로 정의하고, 그것을 집행하는 장치가 없다는 사실도 함께 적습니다. ([#288](https://github.com/sk-lim19f/Hypomnema/pull/288))
+
 ## [1.8.1] - 2026-09-07
 
 ### Bug Fixes
