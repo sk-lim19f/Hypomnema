@@ -49,6 +49,22 @@ import {
 
 suite('init.mjs --dry-run');
 
+// A generated hook resolves its install root at commit time, so every fixture
+// that RUNS `git commit` after init needs a HOME describing an install. Left
+// unset, the hook reads the developer's real ~/.claude: green on a machine
+// with Hypomnema installed, "could not resolve the install root" on CI.
+// Measured on PR #294 — six test jobs red, the full suite green locally.
+// The repo checkout is a real install root here: its package.json names
+// hypomnema and carries a version, and hooks/hypo-pre-commit.mjs is exactly
+// where the resolver looks.
+const HOOK_FIXTURE_HOME = (() => {
+  const home = mkdtempSync(join(tmpdir(), 'hypo-init-hookhome-'));
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+  return home;
+})();
+const HOOK_ENV = { ...process.env, HOME: HOOK_FIXTURE_HOME };
+
 test('exits 0 with --dry-run --no-hooks --no-git-init', () => {
   withTmpDir((dir) => {
     const r = run('init.mjs', [
@@ -312,7 +328,7 @@ test('pre-commit hook blocks staged .env file via git commit', () => {
 
     // Make an initial commit so the repo is non-empty
     spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
-    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore', env: HOOK_ENV });
 
     // Stage a file matching .env* pattern
     writeFileSync(join(hypoDir, '.env.local'), 'SECRET=abc\n');
@@ -321,6 +337,7 @@ test('pre-commit hook blocks staged .env file via git commit', () => {
     // git commit must be blocked by the pre-commit hook
     const commitR = spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'should be blocked'], {
       encoding: 'utf-8',
+      env: HOOK_ENV,
     });
     assert.notEqual(commitR.status, 0, 'git commit should fail when .env.local is staged');
     assert.ok(
@@ -389,7 +406,7 @@ test('--lint-strict init: commit is blocked when a staged page fails lint --stri
     assert.equal(r.status, 0, `init failed: ${r.stderr}`);
 
     spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
-    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore', env: HOOK_ENV });
 
     writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
     spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
@@ -397,7 +414,7 @@ test('--lint-strict init: commit is blocked when a staged page fails lint --stri
     const commitR = spawnSync(
       'git',
       ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
-      { encoding: 'utf-8' },
+      { encoding: 'utf-8', env: HOOK_ENV },
     );
     assert.notEqual(
       commitR.status,
@@ -419,7 +436,7 @@ test('default init (no --lint-strict): the same lint violation does NOT block th
     assert.equal(r.status, 0, `init failed: ${r.stderr}`);
 
     spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
-    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore', env: HOOK_ENV });
 
     writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
     spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
@@ -427,7 +444,7 @@ test('default init (no --lint-strict): the same lint violation does NOT block th
     const commitR = spawnSync(
       'git',
       ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
-      { encoding: 'utf-8' },
+      { encoding: 'utf-8', env: HOOK_ENV },
     );
     assert.equal(
       commitR.status,
@@ -509,7 +526,7 @@ test('--lint-strict init with a RELATIVE --hypo-dir still blocks a real lint vio
     assert.equal(r.status, 0, `init failed: ${r.stderr}`);
 
     spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
-    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore', env: HOOK_ENV });
 
     writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
     spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
@@ -520,7 +537,7 @@ test('--lint-strict init with a RELATIVE --hypo-dir still blocks a real lint vio
     const commitR = spawnSync(
       'git',
       ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
-      { encoding: 'utf-8' },
+      { encoding: 'utf-8', env: HOOK_ENV },
     );
     assert.notEqual(
       commitR.status,
