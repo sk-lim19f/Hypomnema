@@ -43,7 +43,7 @@ import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
-import { templateSchemaVersion } from './lib/template-schema-version.mjs';
+import { templateSchemaVersion, schemaVersionDeltas } from './lib/template-schema-version.mjs';
 import {
   readPkgJson as readPkgJsonSafe,
   writePkgJsonAtomic,
@@ -54,13 +54,15 @@ import {
   writeDualSkipProvenance,
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
-import { writeProvenanceSidecar } from './lib/pkg-provenance.mjs';
+import { writeProvenanceSidecar, readProvenanceSidecar } from './lib/pkg-provenance.mjs';
 import { resolvePluginChannel } from './lib/plugin-detect.mjs';
 import {
   resolveGitHooksDir,
   unsafeHookTargetReason,
   parseWikiPreCommitRoot,
   wikiPreCommitContent,
+  oldFormPreCommitContent,
+  uniqueBakPath,
 } from './lib/git-hooks-dir.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 
@@ -555,17 +557,42 @@ function applyGitignoreMigration(result) {
   return appended;
 }
 
-// ── wiki pre-commit hook: install-root self-heal ────────────────────────────
+// ── wiki pre-commit hook: migrate the version-pinned form to the runtime
+// resolver ───────────────────────────────────────────────────────
 //
-// init.mjs bakes an absolute install root into the vault's pre-commit hook
-// (see wikiPreCommitContent in lib/git-hooks-dir.mjs). A plugin-channel upgrade
-// moves PKG_ROOT to a new version directory every release, but nothing ever
-// re-ran init afterward, so the hook keeps calling whatever release happened
-// to be current the day /hypo:init last ran — silently, since the entry-point
-// file the hook calls is often byte-identical across versions while the
-// module graph it pulls in from its own directory is not. Read-only: locates
-// the hook (if any) and, only when it carries our marker in a shape
-// wikiPreCommitContent() could have written, the root currently baked into it.
+// init.mjs used to bake an absolute install root into the vault's pre-commit
+// hook (see the OLD form documented above PRE_COMMIT_WORKER_LINE in
+// lib/git-hooks-dir.mjs). A plugin-channel upgrade moves PKG_ROOT to a new
+// version directory every release, but nothing ever re-ran init afterward, so
+// the hook kept calling whatever release happened to be current the day
+// /hypo:init last ran — silently, since the entry-point file the hook calls is
+// often byte-identical across versions while the module graph it pulls in
+// from its own directory is not. wikiPreCommitContent() no longer bakes a
+// root in at all: the hook resolves it itself, at commit time. So the fix
+// here is not "repoint the baked root at the current install" (there is
+// nothing left to repoint once a hook is on the new form) — it is "rewrite an
+// OLD-form hook onto the new form", once, unconditionally. That migration
+// does not need to know the active install root, which is why it is safe even
+// when the registry cannot positively resolve one right now (see
+// wikiPreCommitNeedsMigration below): the resolver embedded in the rewritten
+// hook will look that up itself, fresh, at every future commit.
+//
+// Read-only: locates the hook (if any) and, only when it carries our marker in
+// a shape isOwnedWikiPreCommitBody() recognizes (old OR new — see
+// lib/git-hooks-dir.mjs), what parseWikiPreCommitRoot() read back from it.
+//
+// Returns `null` when there is nothing of ours to report (no hook, or a hook
+// with no Hypomnema marker at all: some other tool's or the user's own).
+// Returns `{ hookPath, unrecognized: true, root: null }` when our marker IS
+// present but parseWikiPreCommitRoot could not read a body it recognizes: a
+// hand-edited or corrupted hook, or (before this fix) a hook whose OLD-form
+// worker line named an install root that no longer exists. That case used to
+// collapse into the same `null` a genuinely foreign hook gets, which made
+// upgrade.mjs's report skip the "Wiki pre-commit" line entirely and left
+// doctor.mjs reporting the marker-present pass with no root warning beside
+// it: a broken hook (MODULE_NOT_FOUND on every commit) reads as installed
+// and healthy either way. `root: null` here means the same thing it does in
+// applyWikiPreCommitRoot's caller: never attempt the migration write.
 function checkWikiPreCommitRoot(hypoDir) {
   const resolved = resolveGitHooksDir(hypoDir);
   if (!resolved.ok || !resolved.owned) return null;
@@ -578,50 +605,105 @@ function checkWikiPreCommitRoot(hypoDir) {
     return null;
   }
   const parsed = parseWikiPreCommitRoot(content);
-  if (!parsed.ok) return null;
+  if (!parsed.ok) {
+    return parsed.hasMarker ? { hookPath, unrecognized: true, root: null } : null;
+  }
   return { hookPath, root: parsed.root, lintStrict: parsed.lintStrict, hypoDir: parsed.hypoDir };
 }
 
-// Rewrites ONLY the embedded root, reusing the exact writer init.mjs itself
-// uses so the regenerated hook is byte-identical to what a fresh init would
-// produce — the --lint-strict step count (info.lintStrict) is preserved
-// exactly, never collapsed to one step, or the lint gate goes silently dark.
-// The --hypo-dir baked into a --lint-strict hook is preserved from `info`
-// (what parseWikiPreCommitRoot read back), never taken from this run's own
-// --hypo-dir: upgrade can run against a vault with a different --hypo-dir than
-// the one init baked in, and substituting the current run's value would
-// silently repoint the lint gate at an unrelated directory. A non-absolute
-// embedded value is refused rather than trusted (wikiPreCommitContent()
-// re-resolves it against upgrade's own cwd, which is never what a relative
-// value there was meant to mean), leaving the hook untouched for that run.
+// Rewrites an OLD-form hook onto the runtime-resolving form, reusing the exact
+// writer init.mjs itself uses so the regenerated hook is byte-identical to
+// what a fresh init would produce today — the --lint-strict step count
+// (info.lintStrict) is preserved exactly, never collapsed to one step, or the
+// lint gate goes silently dark. The --hypo-dir baked into a --lint-strict hook
+// is preserved from `info` (what parseWikiPreCommitRoot read back), never
+// taken from this run's own --hypo-dir: upgrade can run against a vault with a
+// different --hypo-dir than the one init baked in, and substituting the
+// current run's value would silently repoint the lint gate at an unrelated
+// directory. A non-absolute embedded value is refused rather than trusted
+// (wikiPreCommitContent() re-resolves it against upgrade's own cwd, which is
+// never what a relative value there was meant to mean), leaving the hook
+// untouched for that run.
 //
-// This only self-heals the ROOT. If the vault itself has actually moved, the
-// embedded --hypo-dir is wrong too and no amount of --apply repoints it — only
-// re-running `hypomnema init` rewrites --hypo-dir.
+// `wantRoot` is accepted for call-site compatibility (the caller still
+// computes it for the drift report and JSON output) but is otherwise unused
+// here: the new form never bakes a root, so there is nothing to substitute it
+// into. This only migrates the FORM. If the vault itself has actually moved,
+// the embedded --hypo-dir is wrong too and no amount of --apply fixes that —
+// only re-running `hypomnema init` rewrites --hypo-dir.
 //
 // Returns `{ ok: true }` on a successful rewrite, or `{ ok: false, reason }`
 // naming why the write was refused or failed, so the caller can surface that
 // reason instead of silently reporting "unchanged".
-function applyWikiPreCommitRoot(info, wantRoot) {
+function applyWikiPreCommitRoot(info) {
   const unsafe = unsafeHookTargetReason(info.hookPath);
   if (unsafe) return { ok: false, reason: unsafe };
   if (info.lintStrict && !isAbsolute(info.hypoDir)) {
     return {
       ok: false,
-      reason: `embedded --hypo-dir is not absolute (${info.hypoDir}) — refusing to repoint`,
+      reason: `embedded --hypo-dir is not absolute (${info.hypoDir}) — refusing to migrate`,
     };
   }
   // hypoDir only affects output when lintStrict is true (see
   // wikiPreCommitContent); the fallback here never reaches the written file.
   const hypoDir = info.lintStrict ? info.hypoDir : '.';
-  const newContent = wikiPreCommitContent(wantRoot, hypoDir, info.lintStrict);
+
+  // Require the file ON DISK to already be, byte-for-byte, the exact OLD-form
+  // shape these SAME values (info.root, hypoDir, info.lintStrict) reconstruct.
+  // isOwnedWikiPreCommitBody upstream only validated the SPAN between the
+  // markers; it says nothing about content before the start marker or after
+  // the end one. A hand-crafted file pairing a forged-but-valid span (an
+  // old-form worker line naming a root that does not currently exist — exactly
+  // what isRewritableOldFormInstallRoot's "gone root" branch accepts) with real
+  // content outside that span would otherwise be silently discarded by the
+  // whole-file write below (codex reproduction, 2026-09-11). A legitimate
+  // install this codebase ever wrote IS exactly this reconstruction — nothing
+  // outside the span but the fixed shebang line — so this never refuses a real
+  // migration; see oldFormPreCommitContent's comment in lib/git-hooks-dir.mjs.
+  let currentContent;
+  try {
+    currentContent = readFileSync(info.hookPath, 'utf-8');
+  } catch (e) {
+    return {
+      ok: false,
+      reason: `cannot read hook to verify before migrating (${e.code || e.message})`,
+    };
+  }
+  const expectedOld = oldFormPreCommitContent(info.root, hypoDir, info.lintStrict);
+  if (currentContent !== expectedOld) {
+    return {
+      ok: false,
+      reason:
+        'hook file has content outside the managed marker span, or does not exactly match ' +
+        'the expected legacy shape — refusing to overwrite the whole file. Re-run ' +
+        "`hypomnema init --force-commands` (or the plugin's `/hypo:init --force-commands`) " +
+        'to reinstall the guard by hand',
+    };
+  }
+
+  const newContent = wikiPreCommitContent(hypoDir, info.lintStrict);
+
+  // Safety-net backup of the exact bytes about to be replaced, mirroring
+  // init.mjs's --force-commands convention (a .bak beside the hook). Guarded
+  // through the same symlink/regular-file check as the hook itself: a
+  // pre-existing `.bak` (or `.bak.N`) that is a symlink or non-regular file
+  // must not be written through, matching init's own bak-write guard.
+  const bakPath = uniqueBakPath(info.hookPath);
+  if (!bakPath) {
+    return {
+      ok: false,
+      reason: `refusing to migrate without a safe backup path (a backup name is a symlink or not a regular file)`,
+    };
+  }
+  writeFileSync(bakPath, currentContent);
+
   // A REFUSAL (above) is a soft skip, matching init's contract that an unsafe
   // or unresolvable target is logged and stepped over. A real I/O failure is
   // not that: every other apply write in this file lets the exception through,
   // and init does the same, so swallowing EACCES here would make this one
-  // self-heal quieter than the rest of --apply for no reason. It also reported
-  // the wrong thing: a chmod that fails AFTER the write says "still points at
-  // old" while the file already holds the new root.
+  // migration quieter than the rest of --apply for no reason. It also reported
+  // the wrong thing: a chmod that fails AFTER the write says "still on the old
+  // form" while the file already holds the new one.
   writeFileSync(info.hookPath, newContent);
   chmodSync(info.hookPath, 0o755);
   return { ok: true };
@@ -1080,10 +1162,18 @@ const dualSkipWouldCorrect =
 // dual-install notice tells the user to remove.
 const wikiHookWantRoot = hypomnemaPluginEnabled ? pluginRegistryRoot : PKG_ROOT;
 const wikiPreCommitInfo = checkWikiPreCommitRoot(args.hypoDir);
-const wikiPreCommitDrift =
-  wikiPreCommitInfo !== null &&
-  wikiHookWantRoot !== null &&
-  wikiHookWantRoot !== wikiPreCommitInfo.root;
+// `wikiPreCommitInfo.root` is non-null only for a hook still on the
+// OLD, version-pinned form (see parseWikiPreCommitRoot in
+// lib/git-hooks-dir.mjs) — the NEW, runtime-resolving form never bakes one in,
+// so `root === null` there means "nothing to migrate", not "unresolved".
+// Migrating does not need wikiHookWantRoot at all: unlike the old repoint
+// (which had to pick the CORRECT root to bake in, and had to stay silent when
+// it could not positively resolve one — see the dual-install preserve case
+// below), rewriting onto the resolver form is always a strict improvement,
+// even when this run cannot resolve the active install itself, because the
+// rewritten hook resolves it fresh at every future commit instead of baking
+// in a guess now.
+const wikiPreCommitDrift = wikiPreCommitInfo !== null && wikiPreCommitInfo.root !== null;
 const commands = checkCommands();
 const oldHookRefs = checkOldHookNames(claudeSettingsPath);
 const hypoignore = checkHypoignore(args.hypoDir);
@@ -1209,28 +1299,79 @@ let appliedExtensionsCodex = null;
 if (args.apply) {
   // Downgrade guard: an `--apply` from an OLDER package than the
   // active install would overwrite newer hooks (upgrade.mjs:287 copyFileSync) and
-  // rewrite hypo-pkg.json to the older version. Refuse before the first mutation.
+  // rewrite the version record to the older one. Refuse before the first mutation.
   // A dev workspace re-running its own --apply (incl. the post-commit sync hook)
   // is exempt via realpath'd pkgRoot equality. Exit 2 = refused downgrade.
-  if (!args.allowDowngrade) {
-    const _active = readPkgJsonSafe(pkgJsonPath());
+  //
+  // Scoped to the two branches below that actually write a version-bearing
+  // artifact this run does not own the comparison baseline for, and each
+  // reads the baseline THAT branch actually writes, not a shared one:
+  //   - managesClaudeCore: applyHookFiles + writeProvenanceSidecar write this
+  //     run's own hooks and pkgVersion over the Claude-core hooks dir, whose
+  //     version of record is hypo-pkg.json (pkgJsonPath()) — the artifact
+  //     applyCommands below stamps. An older incoming version there really
+  //     would overwrite newer hooks.
+  //   - args.codex: reached even when managesClaudeCore is false (it is a
+  //     sibling branch, not nested under it — see :1383 below), and inside it
+  //     applyHookFiles(hooksCodex, ...) + writeProvenanceSidecar(codexHooksDir,
+  //     ..., readVersionAtRoot(PKG_ROOT), ...) copy codex hooks and stamp a
+  //     version into codexHooksDir's OWN `.hypo-provenance.json` sidecar, a
+  //     file distinct from hypo-pkg.json. A prior fix compared the codex
+  //     branch against hypo-pkg.json anyway (the Claude plugin's pointer,
+  //     unrelated to what codex hooks record their own version in) and so
+  //     never observed a downgrade there: in a dual install hypo-pkg.json
+  //     stays plugin-owned and un-bumped by a codex apply, so the "downgrade"
+  //     that guard could see was really just the plugin's untouched pointer,
+  //     leaving every SECOND `--apply --codex` refused forever (the codex
+  //     sidecar it should have compared against had already moved on).
+  //     Reading each branch's own artifact is the fix.
+  // A dualSkip run with neither condition true (the plain `--apply` repeat
+  // in a dual install, no `--codex`) copies no hook file and never writes its
+  // own version: writeDualSkipProvenance stamps the REGISTRY's version, not
+  // PKG_ROOT's, so there is nothing here for the guard to protect.
+  if ((managesClaudeCore || args.codex) && !args.allowDowngrade) {
     let _incomingVersion = null;
     try {
       _incomingVersion = JSON.parse(readFileSync(join(PKG_ROOT, 'package.json'), 'utf-8')).version;
     } catch {
       /* unreadable own package.json — cannot prove a downgrade, allow */
     }
-    if (
-      _active &&
-      _active.pkgVersion &&
-      _incomingVersion &&
-      classifyInstall(
-        { pkgRoot: PKG_ROOT, version: _incomingVersion },
-        { pkgRoot: _active.pkgRoot, version: _active.pkgVersion },
-      ) === 'downgrade'
-    ) {
-      console.error(downgradeGuardMessage(_incomingVersion, _active.pkgVersion, 'upgrade --apply'));
-      process.exit(2);
+    // `active` is { pkgRoot, pkgVersion } from whichever baseline the branch
+    // actually writes to. `label` only feeds the error message.
+    const refuseIfDowngrade = (active) => {
+      if (
+        active &&
+        active.pkgRoot &&
+        active.pkgVersion &&
+        _incomingVersion &&
+        classifyInstall(
+          { pkgRoot: PKG_ROOT, version: _incomingVersion },
+          { pkgRoot: active.pkgRoot, version: active.pkgVersion },
+        ) === 'downgrade'
+      ) {
+        console.error(
+          downgradeGuardMessage(_incomingVersion, active.pkgVersion, 'upgrade --apply'),
+        );
+        process.exit(2);
+      }
+    };
+    if (managesClaudeCore) {
+      refuseIfDowngrade(readPkgJsonSafe(pkgJsonPath()));
+    }
+    if (args.codex) {
+      // readProvenanceSidecar returns null on both "no sidecar yet" (first-
+      // ever `--apply --codex`, nothing to downgrade from) and "sidecar
+      // exists but fails to parse" — deliberately treated the same as
+      // absent, fail-open, rather than distinguished: a corrupt sidecar
+      // carries no more of a trustworthy baseline than a missing one, and
+      // the write immediately below this guard (writeProvenanceSidecar at
+      // :~1419) heals it either way. Its {pkgRoot, pkgVersion} shape matches
+      // what refuseIfDowngrade expects, unlike its `hypoSharedSha256`/
+      // `copiedAt` fields, which classifyInstall never reads.
+      const _codexActive = readProvenanceSidecar(codexHooksDir);
+      refuseIfDowngrade(
+        _codexActive && { pkgRoot: _codexActive.pkgRoot, pkgVersion: _codexActive.pkgVersion },
+      );
     }
   }
   // Migration report is vault-side (writes into the Hypomnema root) and applies
@@ -1350,7 +1491,7 @@ if (args.apply) {
   // wikiHookWantRoot is null only when dualSkip cannot positively resolve the
   // registry (preserve case), and wikiPreCommitDrift is already false then.
   if (wikiPreCommitDrift) {
-    const wikiPreCommitResult = applyWikiPreCommitRoot(wikiPreCommitInfo, wikiHookWantRoot);
+    const wikiPreCommitResult = applyWikiPreCommitRoot(wikiPreCommitInfo);
     appliedWikiPreCommitRoot = wikiPreCommitResult.ok;
     if (!wikiPreCommitResult.ok) wikiPreCommitApplyFailReason = wikiPreCommitResult.reason;
   }
@@ -1458,8 +1599,15 @@ if (args.json) {
         wikiPreCommitRoot: wikiPreCommitInfo
           ? {
               current: wikiPreCommitInfo.root,
+              // Not "where the hook will point": the migrated body resolves the
+              // install itself at commit time. This is what THIS run resolved the
+              // active install to, kept as diagnostic output.
               wantRoot: wikiHookWantRoot,
               drift: wikiPreCommitDrift,
+              // true only for "marker present, body unreadable" (see
+              // checkWikiPreCommitRoot above). Absent/false for both a clean
+              // new-form hook and an old-form one this run can still parse.
+              unrecognized: wikiPreCommitInfo.unrecognized === true,
             }
           : null,
         extensions: extCheck,
@@ -1596,6 +1744,12 @@ if (schema.bump === 'none') {
   lines.push(
     `⚠ SCHEMA version    ${schema.installed} → ${schema.current}  [minor update — review and update SCHEMA.md manually]`,
   );
+  // Name what actually changed in the versions between, when this map knows.
+  // A version this map has no entry for (installed predates the map, or a
+  // future bump forgot to add one) leaves the notice as it was above.
+  for (const delta of schemaVersionDeltas(schema.installed, schema.current)) {
+    lines.push(`                    - ${delta}`);
+  }
 }
 
 // hypo-guide.md version stamp. Visibility only — a drift warning,
@@ -1617,7 +1771,7 @@ if (guide.bump === 'none') {
   // (guideDrift) — the message must be actionable, not "cannot compare",
   // since a pre-versioning copy silently reporting "up to date" was the bug.
   lines.push(
-    `⚠ hypo-guide.md     installed copy has no version stamp (pre-versioning stale copy; package=v${guide.current}) — review templates/hypo-guide.md and update your copy manually; --apply does not overwrite it`,
+    `⚠ hypo-guide.md     installed copy has no version stamp (pre-versioning stale copy; package=v${guide.current}) — no stamp means there is no base version to diff a changelog from, so review templates/hypo-guide.md and update your copy manually; --apply does not overwrite it`,
   );
 } else {
   lines.push(
@@ -1735,23 +1889,37 @@ if (dualSkip && dualSkipCorrected) {
 if (wikiPreCommitInfo && wikiPreCommitDrift) {
   if (appliedWikiPreCommitRoot) {
     lines.push(
-      `✓ Wiki pre-commit   hook repointed from ${wikiPreCommitInfo.root} to ${wikiHookWantRoot}`,
+      `✓ Wiki pre-commit   hook migrated off the baked-in root ${wikiPreCommitInfo.root}` +
+        ` — it now resolves the install at commit time and no longer goes stale on a release`,
     );
   } else if (args.apply) {
     // --apply ran but the write was refused or failed — say why, rather than
     // printing the same "run --apply" nudge that already ran and did nothing.
     lines.push(
-      `⚠ Wiki pre-commit   could not repoint hook (${wikiPreCommitApplyFailReason}) — still` +
-        ` points at ${wikiPreCommitInfo.root}, active install is ${wikiHookWantRoot}`,
+      `⚠ Wiki pre-commit   could not migrate hook (${wikiPreCommitApplyFailReason}) —` +
+        ` ${wikiPreCommitInfo.root} is still baked in and goes stale on the next release`,
     );
   } else {
     lines.push(
-      `⚠ Wiki pre-commit   hook points at ${wikiPreCommitInfo.root}, active install is` +
-        ` ${wikiHookWantRoot} — run --apply to repoint it`,
+      `⚠ Wiki pre-commit   hook has ${wikiPreCommitInfo.root} baked in, so it goes stale on` +
+        ` every release — run --apply to migrate it`,
     );
   }
+} else if (wikiPreCommitInfo && wikiPreCommitInfo.unrecognized) {
+  // The marker is here but the body inside it is not one this codebase ever
+  // wrote (hand-edited, corrupted, or an install root so far gone even the
+  // rewrite-safe check above cannot read it). Nothing here is safe to
+  // rewrite automatically, so name the break instead of staying silent about
+  // it the way this branch used to (2026-09-11): a `--apply` that never
+  // prints a Wiki pre-commit line at all reads as "nothing to do" when the
+  // hook is actually failing every commit.
+  lines.push(
+    `⚠ Wiki pre-commit   marker present but the hook body is not recognized (hand-edited,` +
+      ` corrupted, or too stale to read). Run \`hypomnema init --force-commands\` (or the` +
+      ` plugin's \`/hypo:init --force-commands\`) to reinstall the guard`,
+  );
 } else if (wikiPreCommitInfo) {
-  lines.push(`✓ Wiki pre-commit   hook root up to date`);
+  lines.push(`✓ Wiki pre-commit   hook resolves the install at commit time (nothing to migrate)`);
 }
 
 // Slash commands

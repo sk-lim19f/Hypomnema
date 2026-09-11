@@ -246,6 +246,8 @@ Hooks inline this logic in `hypo-shared.mjs`. Scripts use `scripts/lib/hypo-root
 4. Detects drift (e.g., `pkgRoot` no longer exists) and refreshes the pointer.
 5. `--json` output emits `{ schema, hooks, settings, applied }`. `--dry-run` previews; `--apply` commits changes.
 
+The SessionStart hook (`hooks/hypo-session-start.mjs`) is a third writer of this file, outside init/upgrade entirely. `hooks/hypo-shared.mjs`'s `pkgRootDriftStatus` detects drift by comparing the canonicalized `pkgRoot` alone, not `pkgVersion`, so a file whose `pkgRoot` already matches self-location reads as `match` even when its `pkgVersion` is stale. Only a `pkgRoot` mismatch triggers the rewrite (temp file, then rename), and `pkgVersion` is carried along in that same write rather than checked or fixed on its own. The rewrite is guarded by a lockfile, so two sessions self-locating to different install roots at once cannot race each other's write, and it writes nothing on a downgrade (self-location resolves to an older version than the file already records), an incoming version that fails to parse as semver, a lock it could not acquire, or an opted-out session.
+
 ### `/hypo:uninstall`
 
 Removes hypo-prefixed hooks from `~/.claude/hooks/` and matching entries from `~/.claude/settings.json`. **Non-hypo hooks are preserved**. `--apply` also reaches past `~/.claude/`: it strips the marked `claude()` block from the shell rc file(s) init wrote to, and removes the marked pre-commit hook from the wiki's own git repo. Both removals are marker-gated the same way the hooks-dir cleanup is, so a hand-edited block or hook is left in place rather than guessed at.

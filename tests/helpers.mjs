@@ -16,9 +16,13 @@
 
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import {
+  WIKI_PRE_COMMIT_MARKER_START,
+  WIKI_PRE_COMMIT_MARKER_END,
+} from '../scripts/lib/git-hooks-dir.mjs';
 
 const HOME = homedir();
 
@@ -119,6 +123,26 @@ function runWithHome(script, args = [], home) {
     encoding: 'utf-8',
     env: { ...process.env, HYPO_DIR: '', HOME: home },
   });
+}
+
+// Builds a pre-commit hook in the OLD, version-pinned shape wikiPreCommitContent()
+// itself wrote before ISSUE-137 (it now always generates the runtime-resolving
+// form — see lib/git-hooks-dir.mjs). Fixture-only: exercises the backward-compat
+// paths (parseWikiPreCommitRoot's old-form branch, upgrade.mjs's migration to the
+// new form) against a hook shaped like one a real, older Hypomnema install
+// actually left behind. Needed by both tests/git-hooks-dir.test.mjs and
+// tests/upgrade.test.mjs/tests/init.test.mjs (the migration/self-heal fixtures),
+// hence living here rather than in one area file.
+function legacyWikiPreCommitContent(root, hypoDir, lintStrict) {
+  const sq = (p) => `'${p.replace(/'/g, "'\\''")}'`;
+  const absHypoDir = resolve(hypoDir);
+  const steps = [`node ${sq(join(root, 'hooks', 'hypo-pre-commit.mjs'))} || exit 1`];
+  if (lintStrict) {
+    steps.push(
+      `node ${sq(join(root, 'scripts', 'lint.mjs'))} --hypo-dir=${sq(absHypoDir)} --strict || exit 1`,
+    );
+  }
+  return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\n${steps.join('\n')}\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
 }
 
 // ── lib/hypo-root.mjs ────────────────────────────────────────────────────────
@@ -837,6 +861,7 @@ export {
   isSubstantialSession,
   isValidInstallStem,
   isValidSkillDirSegment,
+  legacyWikiPreCommitContent,
   makeGitRepo,
   makeMultiProjectWiki,
   markerPath,

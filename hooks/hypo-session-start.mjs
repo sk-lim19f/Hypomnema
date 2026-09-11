@@ -7,7 +7,7 @@
  *   MISS → inject global hot.md pointer only (no fan-out to all projects)
  */
 
-import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, realpathSync, renameSync } from 'fs';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -39,6 +39,7 @@ import {
   readVisibilityScope,
   pkgRootDriftStatus,
   PKG_ROOT,
+  withFileLock,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -52,6 +53,8 @@ import {
   computeSiblingNotice,
   siblingAlreadyNotified,
   markSiblingNotified,
+  classifyInstall,
+  parseSemver,
   pkgRootDriftAlreadyNotified,
   markPkgRootDriftNotified,
   clearPkgRootDriftNotified,
@@ -237,15 +240,177 @@ function buildSiblingNotice() {
   }
 }
 
+// Full path to the file init/upgrade own writing (hypo-shared.mjs's
+// readCachedPkgRoot reads it but does not export the path). Self-heal below
+// reads and rewrites it directly rather than adding a write path into
+// hypo-shared.mjs, which currently owns only the READ side of this file.
+const HYPO_PKG_JSON_PATH = join(homedir(), '.claude', 'hypo-pkg.json');
+
+// ── self-heal lock ───────────────────────────────────────────────────────────
+// Two sessions can self-locate to two DIFFERENT install roots at once (a dual
+// install, or one upgrade mid-flight while another session already started)
+// and both hit this same homedir()-keyed hypo-pkg.json. Reading it once,
+// comparing, then writing let whichever session finished SECOND clobber
+// whatever the first had just written, even when its own incoming version
+// was itself newer than the file's ORIGINAL value (Codex 3rd-round review,
+// 2026-09-11: reproduced by running a 1.8.2 and a 1.8.1 install against the
+// same HOME; both read the pre-existing 1.0.0, both judged themselves an
+// improvement over it, and whichever wrote last won regardless of which
+// incoming version was actually higher).
+//
+// This used to hand-roll its own `wx` lockfile (write-then-fill), which a
+// Codex 3rd-round review caught publishing an empty lock before the pid was
+// written: a holder preempted inside that window is indistinguishable from a
+// pid-less legacy lock, so a second writer steals it and both run the
+// critical section, which is the exact bug a liveness check is supposed to
+// close. `withFileLock` (below, from hypo-shared.mjs) already exists in this
+// repo, and its own docstring names that same failure mode as the reason it
+// stages the pid into a private sibling first and `linkSync`s it into place
+// atomically. Reuse it instead of repeating the mistake it was written to
+// avoid. `timeoutMs: 150` keeps the bounded, best-effort wait this hook
+// always had (long enough for a sibling session's heal, a handful of sync fs
+// calls, to finish and release; short enough that SessionStart itself never
+// stalls noticeably even under contention); `staleMs: 30000` keeps the same
+// crashed-holder cutoff the old lock used.
+//
+// withFileLock throws ELOCKTIMEOUT when it cannot acquire in time, never a
+// bare Error, so selfHealPkgRoot's caller can tell "lock contention" apart
+// from "fn() itself failed". Either way this hook must fail OPEN: a
+// SessionStart hook must never block or crash a session over a lock it
+// couldn't get, so both outcomes collapse to the caller's `{ healed: false }`
+// via the try/catch already wrapping the read-compare-write below.
+//
+// Known residue in withFileLock itself, inherited here rather than
+// re-solved: a microscopic stat-then-unlink TOCTOU on the stale-steal path
+// (a fresh holder can grab the path in that gap and have its lock removed by
+// the stealer, bounded by staleMs being far above a normal close), a
+// local-filesystem-only guarantee (no network FS atomicity), and a PID-reuse
+// window where a live process happens to reuse a crashed holder's pid and
+// gets treated as the still-alive original (an availability loss, the lock
+// is never stolen from it, not a correctness bug, since two writers still
+// never enter the critical section together).
+
+/**
+ * Self-heal `pkgRoot`/`pkgVersion` in `hypo-pkg.json` in place, once a session
+ * has already detected they disagree with the code's own self-location
+ * (`status`, from pkgRootDriftStatus()). Until now the user's only remaining
+ * job was copying those two values into the file by hand; this does that copy
+ * for them.
+ *
+ * Preserves every other key untouched (`schemaVersion`, `extensions`,
+ * `commands`, ...): this file is shared with init/upgrade's own writes, so a
+ * narrower op than "read the whole object, patch two keys, write the whole
+ * object back" would silently drop state another lane depends on. Mirrors
+ * scripts/lib/pkg-json.mjs's writeDualSkipProvenance in spirit, but cannot
+ * import it — hooks never reach into scripts/.
+ *
+ * Fails closed to `{ healed: false }` on anything short of a verified,
+ * complete write: a lock that could not be acquired (timeout or a genuine
+ * fs error from `withFileLock`), an unreadable/corrupt existing file, a
+ * non-object parse result, no resolvable-and-parseable version at the new
+ * root, a DOWNGRADE (below), or the write itself throwing. The caller must
+ * fall back to the manual `/hypo:upgrade` guidance rather than claim a fix
+ * that never landed.
+ *
+ * Concurrency: the whole read-compare-write runs inside `withFileLock`
+ * (hypo-shared.mjs), which re-reads `hypo-pkg.json` AFTER acquiring the
+ * lock, not before, since a pre-lock snapshot is exactly what let two
+ * concurrent installs race. Losing the lock (ELOCKTIMEOUT, or any other
+ * throw from `withFileLock` or from `fn` itself) is caught by the outer
+ * try/catch and treated as fail-open: this session simply skips the heal,
+ * the same outcome as any other precondition miss below.
+ *
+ * The lock's reach is narrower than the sentence above about sharing this
+ * file with init/upgrade might suggest: it serializes SessionStart heals
+ * against each other, and nothing else. `writePkgJsonAtomic` (what init,
+ * upgrade and writeDualSkipProvenance go through) does not take it, so an
+ * `upgrade --apply` running while another session starts is still a lost
+ * update. The damage is bounded rather than absent: heal refuses a
+ * downgrade, so whichever write lands last leaves `pkgVersion` at the same
+ * value or higher. That bound is the whole argument for leaving it, and it
+ * dies the moment a heal path is allowed to lower the version.
+ *
+ * Downgrade guard: a dual install (e.g. a plugin-scope cache at 1.8.2 and a
+ * project-scope cache at 1.8.1, both reading the SAME `hypo-pkg.json` because
+ * that path is keyed on `homedir()`, not on scope) means a session that
+ * happens to self-locate to the OLDER sibling would otherwise overwrite this
+ * file's `pkgVersion` with a lower number — the one baseline
+ * `scripts/upgrade.mjs`'s downgrade guard and `hooks/version-check.mjs`'s
+ * `computeSiblingNotice` both compare against. `classifyInstall` is the same
+ * judgment those two already trust, but this only blocks the `'downgrade'`
+ * verdict: a comparison that resolves and comes out lower. On `'downgrade'`,
+ * this returns `{ healed: false }` before touching the file, so the normal
+ * failure fallback below fires the original manual-fix guidance instead of
+ * quietly recording the sibling's older version as truth.
+ *
+ * Direction matters for the `'unknown'` verdict (one side's semver failed to
+ * parse), which is why the INCOMING version is checked with `parseSemver`
+ * up front rather than folded into the same `'unknown'` escape hatch as an
+ * unparseable EXISTING value. An unparseable incoming version must never
+ * heal: that would overwrite a good `pkgVersion` with garbage read from a
+ * corrupt `package.json` (Codex 3rd-round review, 2026-09-11: reproduced with
+ * `package.json.version: "not-semver"` against an existing `1.8.2`, which
+ * used to heal to `"not-semver"`). An unparseable EXISTING value with a
+ * valid incoming one is the opposite case, a good value replacing a
+ * corrupted one, and is still allowed through by `classifyInstall`'s
+ * `'unknown'` verdict: there is no valid comparison to protect against
+ * there, and refusing it would leave a broken value in place forever with no
+ * path back to a good one.
+ */
+function selfHealPkgRoot(status) {
+  try {
+    return withFileLock(
+      HYPO_PKG_JSON_PATH,
+      () => {
+        const meta = JSON.parse(readFileSync(HYPO_PKG_JSON_PATH, 'utf-8'));
+        if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return { healed: false };
+        const newVersion = readInstalledVersion(status.self);
+        if (!newVersion || !parseSemver(newVersion)) return { healed: false };
+        const oldVersion = typeof meta.pkgVersion === 'string' ? meta.pkgVersion : null;
+        const incoming = { pkgRoot: status.self, version: newVersion };
+        const active = { pkgRoot: meta.pkgRoot, version: oldVersion };
+
+        if (classifyInstall(incoming, active) === 'downgrade') return { healed: false };
+        const updated = { ...meta, pkgRoot: status.self, pkgVersion: newVersion };
+        // temp + rename in the SAME directory: a crash mid-write leaves only a
+        // throwaway temp file behind, never a torn hypo-pkg.json that the next
+        // session's every hook read of this file would then choke on.
+        const dir = dirname(HYPO_PKG_JSON_PATH);
+        const tmp = join(
+          dir,
+          `.hypo-pkg.json.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`,
+        );
+        writeFileSync(tmp, `${JSON.stringify(updated, null, 2)}\n`);
+        renameSync(tmp, HYPO_PKG_JSON_PATH);
+        return { healed: true, oldVersion, newVersion };
+      },
+      { timeoutMs: 150, staleMs: 30_000, pollMs: 20 },
+    );
+  } catch {
+    // Fail open: a lock timeout (ELOCKTIMEOUT) or any other throw from
+    // withFileLock/fn must not block or crash SessionStart. The caller
+    // treats this exactly like any other heal precondition miss.
+    return { healed: false };
+  }
+}
+
 /**
  * pkgRoot drift notice. hypo-shared.mjs's resolvePkgRoot() already
  * self-corrects PKG_ROOT in memory whenever the code's own resolved location
- * disagrees with the cached hypo-pkg.json — but silent self-correction is the
- * exact failure this closes: the user's own `upgrade` habit stops mattering
- * and nothing ever tells them hypo-pkg.json fell behind. Surfaced once per
- * (cached → self-location) pair via the same notify-once cache the sibling
- * notice above uses — a fresh drift (new self-location) re-notifies, but
- * staying on the same drifted state doesn't nag every session.
+ * disagrees with the cached hypo-pkg.json — but silent self-correction used
+ * to leave the FILE itself stale forever, with nothing but a "please copy
+ * these two values in yourself" notice to show for it. This now does that
+ * copy itself (selfHealPkgRoot above), on the spot, in the same session that
+ * detected the drift.
+ *
+ * Notify-once cache: a successful heal marks the (cached → self-location)
+ * pair notified, but next session's pkgRootDriftStatus() reads back 'match'
+ * from the now-fixed file regardless and clears it on its own — the mark here
+ * only prevents a duplicate "fixed" line within a session that re-checks
+ * drift more than once. A FAILED heal must NOT mark the pair: marking would
+ * suppress the only guidance the user has (the manual `/hypo:upgrade` line)
+ * for a drift that never actually got fixed, on every later session that
+ * hits the same stale pair.
  *
  * Tri-state (pkgRootDriftStatus): 'match' CLEARS any earlier mark (checked
  * FIRST, unconditionally — even under opt-out, so a drift that resolves while
@@ -253,8 +418,9 @@ function buildSiblingNotice() {
  * recurrence once opt-out is lifted); 'unknown' touches nothing (self-location
  * could not be resolved this session — the permanent steady state for the
  * npm/manual channel, not evidence either way); only 'drift' can produce a
- * banner, and opt-out is checked there so an opted-out session never marks a
- * pair as notified it never actually showed.
+ * banner (or attempt a heal), and opt-out is checked there so an opted-out
+ * session never writes a fix — or marks a pair notified — it never actually
+ * showed.
  */
 function buildPkgRootDriftNotice() {
   try {
@@ -269,7 +435,24 @@ function buildPkgRootDriftNotice() {
     const key = `${status.cached || '(none)'}->${status.self}`;
     const cache = readCache(cachePath);
     if (pkgRootDriftAlreadyNotified(cache, key)) return '';
-    markPkgRootDriftNotified(cachePath, key);
+
+    const heal = selfHealPkgRoot(status);
+    if (heal.healed) {
+      markPkgRootDriftNotified(cachePath, key);
+      return (
+        `[Hypomnema] Package metadata drift fixed: hypo-pkg.json pointed at ` +
+        `\`${status.cached || '(none)'}\`` +
+        `${heal.oldVersion ? ` (version ${heal.oldVersion})` : ''}, now synced to ` +
+        `\`${status.self}\` (version ${heal.newVersion}).\n` +
+        `  This was corrected automatically for this session — no action needed.`
+      );
+    }
+
+    // Heal did not land (unreadable/corrupt hypo-pkg.json, no resolvable
+    // version at the new root, or the write itself failed). Do NOT mark this
+    // pair notified here — see the docstring above — and fall back to the
+    // original manual-fix guidance.
+    //
     // status.cached is null both for a genuinely fresh install (never ran
     // /hypo:init) AND for the channel-judgment-failure guard (init/upgrade
     // positively decided to leave pkgRoot unset; see scripts/init.mjs's
@@ -287,7 +470,7 @@ function buildPkgRootDriftNotice() {
       `\`${status.cached || '(none)'}\`, but the code actually running resolves to ` +
       `\`${status.self}\`.\n` +
       `  Hooks already resolved the correct root for this session — this is a ` +
-      `heads-up, not a blocker.\n${recoveryLine}`
+      `heads-up, not a blocker (the automatic fix did not take — see below).\n${recoveryLine}`
     );
   } catch {
     return '';

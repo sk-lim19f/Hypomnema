@@ -65,6 +65,106 @@ test('JSON output is an array of check objects', () => {
   assert.ok('label' in out[0], 'expected label field');
 });
 
+// ── wiki pre-commit hook: runtime-resolving form (ISSUE-137) ────────────────
+// A freshly installed hook never bakes a root in anymore, so it can never
+// structurally disagree with the active install the way the old, version-
+// pinned form could. doctor.mjs must report that fact instead of silently
+// dropping the "git hooks/pre-commit root" check — see scripts/upgrade.mjs's
+// "doctor reports a stale pre-commit root" test (tests/upgrade.test.mjs) for
+// the OLD-form counterpart this mirrors.
+suite('doctor.mjs — wiki pre-commit hook: runtime-resolving form');
+
+test('a freshly installed hook reports as resolved at commit time, not a stale-root warning', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      gitRepo(hypoDir);
+      const initR = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--no-commands'],
+        home,
+      );
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const rootCheck = out.find((c) => c.label === 'git hooks/pre-commit root');
+      assert.ok(rootCheck, `expected a pre-commit root check: ${r.stdout}`);
+      assert.equal(
+        rootCheck.status,
+        'pass',
+        'a freshly generated hook has nothing to go stale, so this must not warn',
+      );
+      assert.match(rootCheck.detail, /resolved at commit time/i);
+    });
+  });
+});
+
+// The check above proves doctor is quiet about a hook that is FINE. On its own
+// that is the weaker half: a doctor that passed everything would satisfy it
+// too. This is the other half, and it is the one that actually shipped broken
+// — a hook whose marker is present but whose body this codebase cannot run
+// read as a clean "guard installed" pass while every real commit died on
+// MODULE_NOT_FOUND. Silence from a health check is a claim, not an absence.
+test('a hook whose marker is present but whose body is unrecognizable warns instead of passing', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      gitRepo(hypoDir);
+      const initR = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--no-commands'],
+        home,
+      );
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // Keep our markers, replace what they wrap with a body no writer here
+      // ever produced. This is what a hand-edit or a partial corruption leaves.
+      const hookPath = join(hypoDir, '.git', 'hooks', 'pre-commit');
+      const original = readFileSync(hookPath, 'utf-8');
+      const startIdx = original.indexOf('# hypo-managed:pre-commit:start');
+      const endIdx = original.indexOf('# hypo-managed:pre-commit:end');
+      assert.ok(
+        startIdx !== -1 && endIdx !== -1,
+        `init must have written both markers for this test to mean anything: ${original}`,
+      );
+      const lineEnd = original.indexOf('\n', startIdx);
+      writeFileSync(
+        hookPath,
+        `${original.slice(0, lineEnd + 1)}echo "something a human wrote"\n${original.slice(endIdx)}`,
+        { mode: 0o755 },
+      );
+
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const rootCheck = out.find((c) => c.label === 'git hooks/pre-commit root');
+      assert.ok(rootCheck, `expected a pre-commit root check: ${r.stdout}`);
+      assert.notEqual(
+        rootCheck.status,
+        'pass',
+        `an unrunnable hook body must not report as a healthy guard: ${JSON.stringify(rootCheck)}`,
+      );
+      // Status alone does not distinguish this branch: turn it off and the
+      // stale-root comparison below it warns too, for an unrelated reason, so
+      // a status-only assertion passes either way (measured 2026-09-11). The
+      // detail text is what separates "we cannot run this body" from "the
+      // root looks old", and telling those apart is the whole point — they
+      // have different fixes (`init --force-commands` vs `upgrade --apply`).
+      assert.match(
+        rootCheck.detail,
+        /not recognized/i,
+        `the warning must name the unreadable body, not some other reason: ${rootCheck.detail}`,
+      );
+      assert.match(
+        rootCheck.detail,
+        /--force-commands/,
+        `the warning must name the command that fixes it: ${rootCheck.detail}`,
+      );
+    });
+  });
+});
+
 // fix #28: doctor gates on extensions baseline existence (ADR 0024)
 test('doctor flags missing extensions baseline dir as failure', () => {
   withTmpDir((dir) => {

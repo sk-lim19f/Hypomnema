@@ -26,16 +26,10 @@
  * that makes the PR pass (`gh pr edit <N> --title ...` / `--body-file <file>`).
  */
 
-import {
-  scanText,
-  BLOCKED_PATTERNS,
-  DECISION_PATTERNS,
-  ATTRIBUTION_PATTERNS,
-} from './check-tracker-ids.mjs';
+import { scanText, BLOCKED_PATTERNS, ATTRIBUTION_PATTERNS } from './check-tracker-ids.mjs';
 import {
   heading,
   stripHtmlComments,
-  changelogSection,
   parseChangelogBody,
   H1_ENGLISH,
   H1_KOREAN,
@@ -43,29 +37,17 @@ import {
   H2_CHECKLIST,
 } from './pr-body.mjs';
 
-// Wiki tracker ids (`ISSUE-N`, `fix #N`, `FEAT-N`, ...): blocked on the whole
-// title and the whole body, no exemption.
+// Wiki tracker ids (`ISSUE-N`, `fix #N`, `FEAT-N`, ..., and the `ADR NNNN` /
+// `decisions/NNNN` wiki-ADR pointers folded into the same set): blocked on the
+// whole title and the whole body, no exemption. The `## Changelog` block used
+// to get its ADR references blanked out before this scan ran, mirroring an
+// ADR carve-out the file gate made for CHANGELOG.md — removed the same day as
+// that carve-out (this repo ships no `decisions/` directory, so the citation
+// the carve-out protected pointed nowhere for anyone outside the maintainer's
+// wiki). The `## Changelog` block is no longer special-cased: it is PR-body
+// text like any other, and BLOCKED_PATTERNS catches an ADR pointer inside it
+// exactly like it catches one anywhere else in the body.
 const PR_TRACKER_PATTERNS = BLOCKED_PATTERNS;
-
-// Wiki ADR pointers (`ADR NNNN`, `decisions/NNNN`) are blocked here too — CLAUDE.md
-// names them as forbidden on a public surface, and a PR title/body is as public as
-// it gets. They were left out of this gate entirely, which meant the ONE rule that
-// spells out `decisions/NNNN` had no enforcement on the ONE surface an agent
-// authors by hand.
-//
-// With ONE exemption, and it is not a hedge: the `## Changelog` block of a merged
-// PR body is collected VERBATIM into CHANGELOG.md, and CHANGELOG.md is itself
-// ADR-exempt in the file gate (a version-history line may cite the decision behind
-// a release). Blocking an ADR ref inside that block would make a line the file gate
-// explicitly allows unwritable through the only path that writes it. So the ADR
-// scan reads a body with exactly that section blanked (maskChangelogSection) — the
-// same carve-out the file gate already makes, in the same place, for the same
-// reason.
-//
-// The COMMIT-MESSAGE gate keeps letting `ADR NNNN` through (judgeMessage scans
-// BLOCKED_PATTERNS only); that is existing, tested behavior and this change does
-// not touch it.
-const PR_DECISION_PATTERNS = DECISION_PATTERNS;
 
 // Tracker ids AND attribution are BOTH scanned on the RAW body (no comment
 // stripping). A body written from the template used to keep an HTML comment
@@ -212,24 +194,6 @@ const ANY_H1 = /^ {0,3}#[ \t]+\S/;
 const isLanguageBlockBoundary = (line) =>
   ANY_H1.test(line) || H2_CHANGELOG.test(line) || H2_CHECKLIST.test(line);
 
-// Blank out the BODY of the `## Changelog` section (the heading line stays, its
-// content lines become empty) so the ADR scan can read everything ELSE in the PR
-// body. Line count is preserved, so a violation's reported line number still
-// points at the line the author wrote.
-//
-// This is the ADR carve-out, and it is exactly the file gate's: CHANGELOG.md is
-// ADR-exempt there, and this block IS CHANGELOG.md's source text. Its boundaries
-// come from the shared reader, so the span exempted here is EXACTLY the span the
-// collector will publish — no more (an ADR pointer outside the block would escape
-// the scan) and no less.
-function maskChangelogSection(rawBody) {
-  const sec = changelogSection(rawBody);
-  if (sec === null) return rawBody;
-  const raw = rawBody.split('\n');
-  for (let i = sec.start + 1; i < sec.end; i++) raw[i] = '';
-  return raw.join('\n');
-}
-
 // The required `##` subheadings inside each language block, per
 // .github/PULL_REQUEST_TEMPLATE.md. A body that carries the H1 but skips a
 // subheading (or fills none of them) has not actually followed the template —
@@ -317,16 +281,16 @@ export function checkPrSurface({ title, body } = {}) {
   const violations = [];
 
   // ── tracker ids + ADR pointers ─────────────────────────────────────────────
-  // Reuses the file gate's scanner and pattern sets, so the two surfaces can never
-  // disagree about what a tracker id is. Three passes, because the ADR set has one
-  // carve-out the tracker set does not: the `## Changelog` block (see
-  // PR_DECISION_PATTERNS / maskChangelogSection).
-  for (const [surface, text, patterns] of [
-    ['title', rawTitle, [...PR_TRACKER_PATTERNS, ...PR_DECISION_PATTERNS]],
-    ['body', rawBody, PR_TRACKER_PATTERNS],
-    ['body', maskChangelogSection(rawBody), PR_DECISION_PATTERNS],
+  // Reuses the file gate's scanner and pattern set, so the two surfaces can never
+  // disagree about what a tracker id is. Two passes (title, body) — no separate
+  // ADR pass and no `## Changelog` mask: that carve-out mirrored the file gate's
+  // CHANGELOG.md exemption, and both are gone now that this repo turns out to
+  // ship no `decisions/` directory for either exemption to point at.
+  for (const [surface, text] of [
+    ['title', rawTitle],
+    ['body', rawBody],
   ]) {
-    for (const h of scanText(text, patterns)) {
+    for (const h of scanText(text, PR_TRACKER_PATTERNS)) {
       violations.push({
         rule: 'tracker-ids',
         surface,

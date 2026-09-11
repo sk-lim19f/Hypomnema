@@ -28,7 +28,6 @@ import {
   SHELL_MARKER_START,
   SHELL_MARKER_END,
   SHELL_FUNCTION_BODY,
-  wikiPreCommitContent,
 } from '../scripts/lib/git-hooks-dir.mjs';
 import {
   HOME,
@@ -38,6 +37,7 @@ import {
   SESSION_TMP_HOME,
   deriveCoreHookBasenames,
   gitRepo,
+  legacyWikiPreCommitContent,
   readCoreHooksConfig,
   run,
   runWithHome,
@@ -48,6 +48,22 @@ import {
 // ── init.mjs smoke tests ─────────────────────────────────────────────────────
 
 suite('init.mjs --dry-run');
+
+// A generated hook resolves its install root at commit time, so every fixture
+// that RUNS `git commit` after init needs a HOME describing an install. Left
+// unset, the hook reads the developer's real ~/.claude: green on a machine
+// with Hypomnema installed, "could not resolve the install root" on CI.
+// Measured on PR #294 — six test jobs red, the full suite green locally.
+// The repo checkout is a real install root here: its package.json names
+// hypomnema and carries a version, and hooks/hypo-pre-commit.mjs is exactly
+// where the resolver looks.
+const HOOK_FIXTURE_HOME = (() => {
+  const home = mkdtempSync(join(tmpdir(), 'hypo-init-hookhome-'));
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+  return home;
+})();
+const HOOK_ENV = { ...process.env, HOME: HOOK_FIXTURE_HOME };
 
 test('exits 0 with --dry-run --no-hooks --no-git-init', () => {
   withTmpDir((dir) => {
@@ -253,6 +269,52 @@ test('init installs .git/hooks/pre-commit with hypo marker', () => {
   });
 });
 
+// upgrade.mjs refuses to migrate a hook that carries our marker AND content
+// outside it, and its refusal message sends the user to `init --force-commands`.
+// That advice was destructive: init's marker branch replaced the whole file with
+// no backup and without even consulting `force`, so following our own recovery
+// instruction is what lost the user's lines. Keep the two in step — whatever
+// upgrade declines to overwrite, init must preserve a copy of.
+test('init preserves a backup when it rewrites a hook that has content outside our marker', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+    const first = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(first.status, 0, `stderr: ${first.stderr}`);
+
+    const hookPath = join(hypoDir, '.git', 'hooks', 'pre-commit');
+    const ours = readFileSync(hookPath, 'utf8');
+    const userLine = 'echo "a line the user added after install"\n';
+    writeFileSync(hookPath, ours + userLine, { mode: 0o755 });
+
+    // Force a rewrite: a different --hypo-dir changes the generated body, so
+    // the `existing === newContent` early return cannot swallow this.
+    const moved = join(dir, 'wiki-moved');
+    const second = run('init.mjs', [
+      `--hypo-dir=${hypoDir}`,
+      '--no-hooks',
+      '--no-git-init',
+      '--lint-strict',
+    ]);
+    assert.equal(second.status, 0, `stderr: ${second.stderr}`);
+    assert.ok(moved, 'unused path kept for clarity of intent');
+
+    const after = readFileSync(hookPath, 'utf8');
+    if (after === ours + userLine) return; // nothing was rewritten; nothing to back up
+
+    const bak = join(hypoDir, '.git', 'hooks', 'pre-commit.bak');
+    assert.ok(
+      existsSync(bak),
+      `rewriting a hook with content outside the marker must leave a backup: ${second.stdout}`,
+    );
+    assert.equal(
+      readFileSync(bak, 'utf8'),
+      ours + userLine,
+      'the backup must be the bytes that were there before, user line included',
+    );
+  });
+});
+
 test('pre-commit hook blocks staged .env file via git commit', () => {
   withTmpDir((dir) => {
     const hypoDir = join(dir, 'wiki');
@@ -266,7 +328,7 @@ test('pre-commit hook blocks staged .env file via git commit', () => {
 
     // Make an initial commit so the repo is non-empty
     spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
-    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore', env: HOOK_ENV });
 
     // Stage a file matching .env* pattern
     writeFileSync(join(hypoDir, '.env.local'), 'SECRET=abc\n');
@@ -275,6 +337,7 @@ test('pre-commit hook blocks staged .env file via git commit', () => {
     // git commit must be blocked by the pre-commit hook
     const commitR = spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'should be blocked'], {
       encoding: 'utf-8',
+      env: HOOK_ENV,
     });
     assert.notEqual(commitR.status, 0, 'git commit should fail when .env.local is staged');
     assert.ok(
@@ -343,7 +406,7 @@ test('--lint-strict init: commit is blocked when a staged page fails lint --stri
     assert.equal(r.status, 0, `init failed: ${r.stderr}`);
 
     spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
-    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore', env: HOOK_ENV });
 
     writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
     spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
@@ -351,7 +414,7 @@ test('--lint-strict init: commit is blocked when a staged page fails lint --stri
     const commitR = spawnSync(
       'git',
       ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
-      { encoding: 'utf-8' },
+      { encoding: 'utf-8', env: HOOK_ENV },
     );
     assert.notEqual(
       commitR.status,
@@ -373,7 +436,7 @@ test('default init (no --lint-strict): the same lint violation does NOT block th
     assert.equal(r.status, 0, `init failed: ${r.stderr}`);
 
     spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
-    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore', env: HOOK_ENV });
 
     writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
     spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
@@ -381,7 +444,7 @@ test('default init (no --lint-strict): the same lint violation does NOT block th
     const commitR = spawnSync(
       'git',
       ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
-      { encoding: 'utf-8' },
+      { encoding: 'utf-8', env: HOOK_ENV },
     );
     assert.equal(
       commitR.status,
@@ -423,20 +486,19 @@ test('--lint-strict init with a RELATIVE --hypo-dir bakes an absolute path into 
     // init.mjs bakes in the physical path — that's still correct and
     // absolute, just not byte-identical to the pre-realpath string.
     const realHypoDir = realpathSync(hypoDir);
+    // The resolver embeds --hypo-dir via JSON.stringify (see lintExtraArgvJs in
+    // lib/git-hooks-dir.mjs), not shell-single-quoting — it is JS-string data
+    // inside the resolver script, not a literal shell argument.
     assert.ok(
-      content.includes(`--hypo-dir=${shellSingleQuoteForTest(realHypoDir)}`),
+      content.includes(JSON.stringify(`--hypo-dir=${realHypoDir}`)),
       `--hypo-dir must be baked in absolute (${realHypoDir}): ${content}`,
     );
     assert.ok(
-      !content.includes(`--hypo-dir='wiki'`) && !content.includes('wiki/wiki'),
+      !content.includes(JSON.stringify('--hypo-dir=wiki')) && !content.includes('wiki/wiki'),
       `--hypo-dir must not stay relative or double up against cwd: ${content}`,
     );
   });
 });
-
-function shellSingleQuoteForTest(p) {
-  return `'${p.replace(/'/g, "'\\''")}'`;
-}
 
 test('--lint-strict init with a RELATIVE --hypo-dir still blocks a real lint violation at commit time', () => {
   withTmpDir((parentDir) => {
@@ -464,7 +526,7 @@ test('--lint-strict init with a RELATIVE --hypo-dir still blocks a real lint vio
     assert.equal(r.status, 0, `init failed: ${r.stderr}`);
 
     spawnSync('git', ['-C', hypoDir, 'add', '.'], { stdio: 'ignore' });
-    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore' });
+    spawnSync('git', ['-C', hypoDir, 'commit', '-m', 'init'], { stdio: 'ignore', env: HOOK_ENV });
 
     writeFileSync(join(hypoDir, 'pages', 'broken.md'), 'no frontmatter here\n');
     spawnSync('git', ['-C', hypoDir, 'add', 'pages/broken.md'], { stdio: 'ignore' });
@@ -475,7 +537,7 @@ test('--lint-strict init with a RELATIVE --hypo-dir still blocks a real lint vio
     const commitR = spawnSync(
       'git',
       ['-C', hypoDir, 'commit', '-m', 'add page missing frontmatter'],
-      { encoding: 'utf-8' },
+      { encoding: 'utf-8', env: HOOK_ENV },
     );
     assert.notEqual(
       commitR.status,
@@ -1117,6 +1179,73 @@ test('dual install preserves an existing plugin-owned pkgRoot', () => {
   });
 });
 
+// codex reproduction (2026-09-11): the recorded-pointer fallback used to accept
+// any absolute, version-bearing pkgRoot, with no check on WHOSE package sat
+// there. A recorded pointer whose package.json name is not "hypomnema" (a
+// corrupted sidecar, or a foreign path that happened to land in it) must not be
+// adopted as the durable root: without a positively-resolved registry to fall
+// back on, init must report the channel as unresolved rather than trust it.
+test('dual install does not preserve a recorded pkgRoot whose package.json name is not "hypomnema"', () => {
+  withFakeInitInstall(false, ({ init, home }) => {
+    const foreignRoot = mkdtempSync(join(tmpdir(), 'hypo-foreign-root-'));
+    writeFileSync(
+      join(foreignRoot, 'package.json'),
+      JSON.stringify({ name: 'someone-elses-package', version: '1.0.0' }),
+    );
+    const hypoDir = join(tmpdir(), `hypo-init-dual-foreign-${process.pid}-${Date.now()}`);
+    try {
+      enablePlugin(home); // plugin enabled, but no registry entry to positively resolve
+      writeFileSync(
+        join(home, '.claude', 'hypo-pkg.json'),
+        JSON.stringify({ pkgRoot: foreignRoot, pkgVersion: '1.0.0' }),
+      );
+      // A real git repo, not --no-git-init: the vault hook is what separates
+      // adoption from refusal here, and its absence only means something if the
+      // run was in a position to install one.
+      mkdirSync(hypoDir, { recursive: true });
+      for (const args of [
+        ['init', hypoDir],
+        ['-C', hypoDir, 'config', 'user.email', 't@example.com'],
+        ['-C', hypoDir, 'config', 'user.name', 'T'],
+      ]) {
+        spawnSync('git', args, { stdio: 'ignore', env: { ...process.env, HOME: home } });
+      }
+      const r = runInitFrom(init, [`--hypo-dir=${hypoDir}`], home);
+      assert.equal(r.status, 0, `dual-install init should exit 0: ${r.stderr}`);
+      // The pointer is LEFT ALONE, not erased: overwriting a value this run
+      // cannot positively resolve would be the guess the sibling test above
+      // ("pointer is left untouched, not replaced with a guess") exists to
+      // forbid. So "was it re-adopted" cannot be read off pkgRoot, which looks
+      // the same either way. What separates adoption from refusal is whether
+      // this run CONFIRMED the root: with the weak predicate it resolves,
+      // stays quiet, and installs the vault hook against the foreign path;
+      // with the strong one it reports the channel unresolved and installs
+      // nothing. That is what these two assertions read.
+      const meta = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.equal(
+        meta.pkgRoot,
+        foreignRoot,
+        'an unresolvable run must not rewrite the recorded pointer at all',
+      );
+      assert.match(
+        r.stdout,
+        /Cannot positively resolve the enabled Hypomnema plugin's install root/,
+        'the channel must read as unresolved, not silently trust the foreign pointer',
+      );
+      // The notice NAMES pre-commit (it says the hook is skipped), so stdout
+      // text cannot tell adoption from refusal here. The file can.
+      assert.equal(
+        existsSync(join(hypoDir, '.git', 'hooks', 'pre-commit')),
+        false,
+        'a run that could not resolve an install root must not install a vault hook that points at one',
+      );
+    } finally {
+      rmSync(foreignRoot, { recursive: true, force: true });
+      rmSync(hypoDir, { recursive: true, force: true });
+    }
+  });
+});
+
 // Register the plugin in BOTH settings.json (enabledPlugins) and the plugin
 // registry (installed_plugins.json) so init can POSITIVELY resolve the plugin's
 // real cache root, rather than trusting whatever pkgRoot is recorded.
@@ -1160,14 +1289,24 @@ test('dual install corrects a stale npm pointer to the registry plugin root', ()
         'pkgRoot must be corrected to the positively-resolved registry plugin root, not the stale/npm pointer',
       );
       assert.notEqual(meta.pkgRoot, stalePointer, 'the stale pointer must not survive');
+      // The pre-commit hook itself no longer bakes ANY root in (ISSUE-137) — it
+      // resolves one at commit time, from the hypo-pkg.json this run just
+      // corrected. So the thing to prove here is that hypo-pkg.json (asserted
+      // above) is what a future commit's resolver would actually read, and
+      // that the hook contains neither the corrected nor the stale root.
       const hook = readFileSync(join(hypoDir, '.git', 'hooks', 'pre-commit'), 'utf-8');
+      assert.match(
+        hook,
+        /node -e '/,
+        `pre-commit must resolve the install root at commit time: ${hook}`,
+      );
       assert.ok(
-        hook.includes(join(pluginRoot, 'hooks', 'hypo-pre-commit.mjs')),
-        `pre-commit must reference the registry plugin root: ${hook}`,
+        !hook.includes(join(pluginRoot, 'hooks', 'hypo-pre-commit.mjs')),
+        `pre-commit must not bake the registry plugin root in: ${hook}`,
       );
       assert.ok(
         !hook.includes(join(realpathSync(root), 'hooks', 'hypo-pre-commit.mjs')),
-        'pre-commit must not reference the manual/npm root',
+        'pre-commit must not reference the manual/npm root either',
       );
     } finally {
       rmSync(pluginRoot, { recursive: true, force: true });
@@ -1508,7 +1647,9 @@ test('dual install + unreadable registry + an existing hypo-managed pre-commit h
     try {
       spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
       const hookPath = join(hypoDir, '.git', 'hooks', 'pre-commit');
-      writeFileSync(hookPath, wikiPreCommitContent(priorRoot, hypoDir, false), { mode: 0o755 });
+      writeFileSync(hookPath, legacyWikiPreCommitContent(priorRoot, hypoDir, false), {
+        mode: 0o755,
+      });
       const beforeSHA = createHash('sha256').update(readFileSync(hookPath)).digest('hex');
       enablePlugin(home); // plugin enabled, but the registry itself is unreadable
       const r = runInitFrom(init, [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
@@ -1526,11 +1667,16 @@ test('dual install + unreadable registry + an existing hypo-managed pre-commit h
   });
 });
 
-// The vault's git pre-commit hook embeds an absolute path to hypo-pre-commit.mjs.
-// In a dual install that path must be the DURABLE (plugin) root, not the manual/npm
-// PKG_ROOT the dual-install notice tells the user to uninstall — otherwise the hook
-// dangles the moment they do and every wiki commit fails.
-test('dual install points the wiki pre-commit hook at the durable plugin root', () => {
+// The vault's git pre-commit hook used to embed an absolute path to
+// hypo-pre-commit.mjs. It no longer bakes any root in at all (ISSUE-137): the
+// hook resolves its own install root at commit time. So a dual install no
+// longer needs a "pick the plugin root, not the manual/npm one" decision made
+// here — the resolver embedded in the hook makes that choice itself, every
+// time it runs (see the dedicated resolver tests in
+// tests/git-hooks-dir.test.mjs). What this test still needs to prove: init
+// writes the runtime-resolving form, and it does so without leaking EITHER
+// root into the file — the failure mode a baked root used to have.
+test('dual install writes a runtime-resolving hook, with no install root baked into it', () => {
   withFakeInitInstall(false, ({ init, root, home }) => {
     const pluginRoot = makePluginRoot();
     const hypoDir = mkdtempSync(join(tmpdir(), 'hypo-init-dual-hook-'));
@@ -1544,13 +1690,18 @@ test('dual install points the wiki pre-commit hook at the durable plugin root', 
       const r = runInitFrom(init, [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
       assert.equal(r.status, 0, `dual-install init should exit 0: ${r.stderr}`);
       const hook = readFileSync(join(hypoDir, '.git', 'hooks', 'pre-commit'), 'utf-8');
+      assert.match(
+        hook,
+        /node -e '/,
+        `pre-commit must resolve the install root at commit time: ${hook}`,
+      );
       assert.ok(
-        hook.includes(join(pluginRoot, 'hooks', 'hypo-pre-commit.mjs')),
-        `pre-commit must reference the durable plugin root's worker: ${hook}`,
+        !hook.includes(join(pluginRoot, 'hooks', 'hypo-pre-commit.mjs')),
+        `pre-commit must not bake the plugin root in — it goes stale on every release: ${hook}`,
       );
       assert.ok(
         !hook.includes(join(realpathSync(root), 'hooks', 'hypo-pre-commit.mjs')),
-        `pre-commit must NOT reference the manual/npm root that will be uninstalled: ${hook}`,
+        `pre-commit must not bake the manual/npm root either: ${hook}`,
       );
     } finally {
       rmSync(pluginRoot, { recursive: true, force: true });
