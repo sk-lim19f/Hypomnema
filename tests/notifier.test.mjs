@@ -4,7 +4,7 @@
 // build on each other; suites may not — that is what lets the runner shard.
 
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   mkdtempSync,
@@ -21,7 +21,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { test, suite } from './harness.mjs';
+import { test, testAsync, suite } from './harness.mjs';
 import {
   HOME,
   HOOKS,
@@ -892,7 +892,12 @@ function seedFreshVersionCache(home) {
 test('session-start (D3): stale PATH sibling surfaces a one-shot notice, then throttles', () => {
   withTmpHome((home) => {
     withFakeCli('1.1.0', ({ binDir }) => {
-      seedActivePkg(home, { pkgRoot: home, pkgVersion: '1.2.1' });
+      // pkgRoot: REPO (not an arbitrary `home`), matching what this REAL repo
+      // hook self-locates to: any other root here reads as pkgRoot drift, and
+      // ISSUE-138's self-heal would then rewrite this very hypo-pkg.json mid-test,
+      // changing active.pkgVersion between the two calls below and defeating the
+      // sibling-notice throttle this test actually exercises.
+      seedActivePkg(home, { pkgRoot: REPO, pkgVersion: '1.2.1' });
       seedFreshVersionCache(home); // no detached worker; see the helper above
       const payload = JSON.stringify({ cwd: home, session_id: 'sib-test' });
       const first = spawnSync(process.execPath, [join(REPO, 'hooks', 'hypo-session-start.mjs')], {
@@ -1617,6 +1622,433 @@ test('session-start: self-location unresolvable (status unknown) leaves an exist
     });
   });
 });
+
+// ── ISSUE-138: pkgRoot-drift self-heal ───────────────────────────────────────
+// The drift notice above used to be pure narration: it told the user two
+// values and asked them to copy one into the other by hand. This closes that
+// loop — the hook itself rewrites hypo-pkg.json's pkgRoot/pkgVersion to the
+// self-located values it already trusts, in place, the moment it detects the
+// mismatch.
+suite('ISSUE-138: pkgRoot-drift self-heal (hypo-pkg.json rewritten in place)');
+
+test('session-start: drift self-heals hypo-pkg.json (pkgRoot + pkgVersion synced to self-location)', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      seedHypoPkg(home, staleRoot); // pkgVersion: '1.0.0' (see seedHypoPkg)
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      const r = runSessionStartAt(hook, home, 'pkgheal-basic');
+      assert.match(r.stderr, /Package metadata drift fixed/, r.stderr);
+      assert.match(r.stderr, /1\.7\.0/);
+
+      const healed = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.equal(healed.pkgRoot, fakeRoot, 'pkgRoot must be rewritten to the self-located root');
+      assert.equal(
+        healed.pkgVersion,
+        '1.7.0',
+        "pkgVersion must be rewritten to that root's own version",
+      );
+
+      // Regression proof for the notify-once cache contract: the next session
+      // now reads the file as already matching, not as a still-open drift
+      // waiting on its notify-once mark.
+      const { status } = probePkgRoot(home, join(fakeRoot, 'hooks', 'hypo-shared.mjs'));
+      assert.equal(status.status, 'match', 'the healed file must self-report as matching');
+    });
+  });
+});
+
+test('session-start: self-heal preserves every other hypo-pkg.json key untouched (extensions, schemaVersion, commands)', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      const claudeDir = join(home, '.claude');
+      mkdirSync(claudeDir, { recursive: true });
+      const extensions = { codex: { hash: 'deadbeef', installedAt: '2026-01-01T00:00:00Z' } };
+      const commands = { '/hypo:init': '1.7.0' };
+      writeFileSync(
+        join(claudeDir, 'hypo-pkg.json'),
+        JSON.stringify({
+          pkgRoot: staleRoot,
+          pkgVersion: '1.0.0',
+          schemaVersion: '2.0',
+          extensions,
+          commands,
+        }),
+      );
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+      const r = runSessionStartAt(hook, home, 'pkgheal-preserve');
+      assert.match(r.stderr, /Package metadata drift fixed/, r.stderr);
+
+      const healed = JSON.parse(readFileSync(join(claudeDir, 'hypo-pkg.json'), 'utf-8'));
+      assert.equal(healed.pkgRoot, fakeRoot);
+      assert.equal(healed.pkgVersion, '1.7.0');
+      assert.equal(
+        healed.schemaVersion,
+        '2.0',
+        'schemaVersion must survive the self-heal untouched',
+      );
+      assert.deepEqual(
+        healed.extensions,
+        extensions,
+        'extensions block must survive byte-for-byte',
+      );
+      assert.deepEqual(healed.commands, commands, 'commands map must survive byte-for-byte');
+    });
+  });
+});
+
+test('session-start: a corrupt hypo-pkg.json cannot be self-healed, and the failed heal is never marked notified', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const claudeDir = join(home, '.claude');
+      mkdirSync(claudeDir, { recursive: true });
+      const pkgPath = join(claudeDir, 'hypo-pkg.json');
+      writeFileSync(pkgPath, '{not json');
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      const first = runSessionStartAt(hook, home, 'pkgheal-corrupt-1');
+      assert.match(first.stderr, /Package metadata drift:/, first.stderr);
+      assert.doesNotMatch(first.stderr, /Package metadata drift fixed/);
+      assert.equal(
+        readFileSync(pkgPath, 'utf-8'),
+        '{not json',
+        'a failed heal must not touch the file',
+      );
+
+      // A second session hitting the SAME unresolvable state must still warn —
+      // marking a failed heal as notified would silence the only guidance the
+      // user has, forever, for a drift that was never actually fixed.
+      const second = runSessionStartAt(hook, home, 'pkgheal-corrupt-2');
+      assert.match(
+        second.stderr,
+        /Package metadata drift:/,
+        'a failed heal must not be marked notified, or this warning silences itself permanently',
+      );
+    });
+  });
+});
+
+test('session-start: opted out (CI) leaves hypo-pkg.json untouched (no silent heal on a muted session)', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      seedHypoPkg(home, staleRoot);
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      const before = readFileSync(pkgPath, 'utf-8');
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      runSessionStartAt(hook, home, 'pkgheal-optout', { CI: 'true' });
+      assert.equal(
+        readFileSync(pkgPath, 'utf-8'),
+        before,
+        'an opted-out session must not self-heal a file the user asked not to hear about',
+      );
+    });
+  });
+});
+
+test('session-start: a healed write leaves no leftover temp file behind', () => {
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      seedHypoPkg(home, staleRoot);
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+      runSessionStartAt(hook, home, 'pkgheal-tmp-cleanup');
+
+      const leftovers = readdirSync(join(home, '.claude')).filter((f) => f.endsWith('.tmp'));
+      assert.deepEqual(leftovers, [], `temp+rename must not leave a stray file: ${leftovers}`);
+    });
+  });
+});
+
+test('session-start: drift self-heal refuses a DOWNGRADE (self-location resolves to an OLDER version than the file already records)', () => {
+  // The real-machine shape this pins: two plugin-scope caches share the SAME
+  // homedir()-keyed hypo-pkg.json (a 1.8.2 user-scope cache and a 1.8.1
+  // project-scope cache). A session that happens to self-locate to the OLDER
+  // sibling must not overwrite the newer recorded pkgVersion — that field is
+  // the one baseline scripts/upgrade.mjs's downgrade guard and
+  // hooks/version-check.mjs's computeSiblingNotice both read as truth, so a
+  // heal that lowers it silently strips two of this repo's three
+  // stale-sibling defenses.
+  withFakePkgInstall('1.1.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      writeFileSync(pkgPath, JSON.stringify({ pkgRoot: staleRoot, pkgVersion: '1.8.2' }));
+      const before = readFileSync(pkgPath, 'utf-8');
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      const r = runSessionStartAt(hook, home, 'pkgheal-downgrade');
+      assert.match(r.stderr, /Package metadata drift:/, r.stderr);
+      assert.doesNotMatch(
+        r.stderr,
+        /Package metadata drift fixed/,
+        'a downgrade must fall back to the manual guidance, never claim a fix',
+      );
+      assert.equal(
+        readFileSync(pkgPath, 'utf-8'),
+        before,
+        'hypo-pkg.json must stay byte-identical: a downgrade must never touch the file',
+      );
+
+      // A second session hitting the same pair must still warn — a failed heal
+      // must not be marked notified, or this guidance silences itself
+      // permanently over a drift that was never actually resolved.
+      const second = runSessionStartAt(hook, home, 'pkgheal-downgrade');
+      assert.match(second.stderr, /Package metadata drift:/, second.stderr);
+      assert.doesNotMatch(second.stderr, /Package metadata drift fixed/);
+    });
+  });
+});
+
+test('session-start: self-heal refuses an unparseable INCOMING version even when the existing pkgVersion is valid', () => {
+  // Codex 3rd-round review, 2026-09-11: self-heal used to fold "incoming
+  // unparseable" into the same 'unknown' verdict as "existing unparseable",
+  // so a corrupt package.json (e.g. mangled by a bad publish) could heal a
+  // perfectly good pkgVersion down to garbage. Direction matters: only a
+  // corrupted EXISTING value may be replaced, never a corrupted INCOMING one.
+  withFakePkgInstall('not-semver', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      writeFileSync(pkgPath, JSON.stringify({ pkgRoot: staleRoot, pkgVersion: '1.8.2' }));
+      const before = readFileSync(pkgPath, 'utf-8');
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      const r = runSessionStartAt(hook, home, 'pkgheal-badincoming');
+      assert.match(r.stderr, /Package metadata drift:/, r.stderr);
+      assert.doesNotMatch(
+        r.stderr,
+        /Package metadata drift fixed/,
+        'an unparseable incoming version must never heal, or a corrupt package.json can overwrite a good pkgVersion with garbage',
+      );
+      assert.equal(
+        readFileSync(pkgPath, 'utf-8'),
+        before,
+        'hypo-pkg.json must stay byte-identical when the incoming version cannot be trusted',
+      );
+    });
+  });
+});
+
+test('session-start: self-heal still recovers when the EXISTING pkgVersion is unparseable and the incoming one is valid', () => {
+  // The opposite direction of the test above: a corrupted EXISTING value with
+  // a valid incoming one is a good value replacing a bad one, and must still
+  // heal, or a once-corrupted pkgVersion could never recover on its own.
+  withFakePkgInstall('1.7.0', (fakeRoot) => {
+    withTmpHome((home) => {
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      writeFileSync(pkgPath, JSON.stringify({ pkgRoot: staleRoot, pkgVersion: 'not-semver' }));
+      const hook = join(fakeRoot, 'hooks', 'hypo-session-start.mjs');
+
+      const r = runSessionStartAt(hook, home, 'pkgheal-badexisting');
+      assert.match(r.stderr, /Package metadata drift fixed/, r.stderr);
+      const healed = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      assert.equal(
+        healed.pkgVersion,
+        '1.7.0',
+        'a corrupted existing value must not block recovery from a valid incoming one',
+      );
+    });
+  });
+});
+
+// Async counterpart to runSessionStartAt: spawn() rather than spawnSync() so
+// two installs can be started concurrently and raced against each other. Same
+// stdin/env contract as runSessionStartAt.
+function spawnSessionStartAt(hookPath, home, sessionId, extraEnv = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [hookPath], {
+      env: { ...process.env, ...NOTIFY_ON, HYPO_DIR: '', HOME: home, ...extraEnv },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
+    child.on('error', reject);
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+    child.stdin.write(JSON.stringify({ cwd: home, session_id: sessionId }));
+    child.stdin.end();
+  });
+}
+
+// The barrier below is NOT in the shipped hook: it patches a THROWAWAY copy
+// of the lower-version install's hook, the same pattern rename-wikilink.test.mjs
+// uses for its own crash injection. It splices a file-sentinel handshake into
+// the SAME spot inside selfHealPkgRoot's withFileLock critical section where
+// the downgrade check runs, right after the stale read this test needs to
+// force: write a "ready" sentinel the parent polls for, then poll for a
+// "release" sentinel the parent writes only once the OTHER session's process
+// has fully exited.
+//
+// This pins the interleave the whole test exists to prove, rather than
+// leaving it to whichever child the OS happens to schedule first (Codex
+// 3rd-round review, 2026-09-11: a plain `Promise.all` spawn of both children
+// does not guarantee `low` reads its stale snapshot before `high` runs at
+// all: if `high` finishes first, even a mutant that deletes the lock
+// entirely reads `high`'s already-written version and correctly refuses to
+// downgrade, so the whole test goes green without the lock doing anything).
+//
+// Anchor-precision assertions: a stale anchor that still happens to match a
+// DIFFERENT, unrelated occurrence would patch a decoy and silently spawn the
+// race with no barrier at all, and the old hold-based version had no way to
+// notice that happened. Assert the anchor appears EXACTLY once (a second
+// occurrence means this patch could be splicing into the wrong spot) and that
+// the replace actually changed the source (a `replace()` that no-ops because
+// the anchor moved would otherwise report success while patching nothing).
+function patchHealHoldForTest(hookPath) {
+  const src = readFileSync(hookPath, 'utf-8');
+  const anchor = "if (classifyInstall(incoming, active) === 'downgrade') return { healed: false };";
+  const occurrences = src.split(anchor).length - 1;
+  assert.equal(
+    occurrences,
+    1,
+    `heal-lock race test anchor must appear exactly once in ${hookPath}, found ${occurrences} (did selfHealPkgRoot change?)`,
+  );
+  const barrier =
+    `if (process.env.HYPO_TEST_HEAL_READY_PATH) {\n` +
+    `      writeFileSync(process.env.HYPO_TEST_HEAL_READY_PATH, String(process.pid));\n` +
+    `      const releasePath = process.env.HYPO_TEST_HEAL_RELEASE_PATH;\n` +
+    `      const deadline = Date.now() + 5000;\n` +
+    `      while (!existsSync(releasePath) && Date.now() < deadline) {\n` +
+    `        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);\n` +
+    `      }\n` +
+    `    }\n    ${anchor}`;
+  const patched = src.replace(anchor, barrier);
+  assert.notEqual(
+    patched,
+    src,
+    `heal-lock race test patch did not change ${hookPath}: the anchor replace was a no-op`,
+  );
+  writeFileSync(hookPath, patched);
+}
+
+await testAsync(
+  'session-start: concurrent self-heal from two installs never regresses pkgVersion below its pre-race value (lockfile serializes the read-compare-write)',
+  async () => {
+    // Reproduces the exact race Codex's 3rd-round review found by running a
+    // 1.8.1 and a 1.8.2 install against the same HOME: both self-heal calls
+    // used to read the same stale 1.0.0 baseline, both judged themselves an
+    // improvement over it, and whichever WROTE LAST won regardless of which
+    // incoming version was actually higher.
+    //
+    // The barrier below forces a deterministic order instead of racing two
+    // `spawn()` calls and hoping the OS schedules them the interesting way:
+    // `low` (1.8.1) is spawned FIRST and patched to read its stale snapshot,
+    // signal "ready", then park inside the SAME withFileLock critical section
+    // until the parent releases it. The parent waits for that ready signal,
+    // THEN spawns `high` (1.8.2), and only releases `low` once `high`'s
+    // process has fully exited. With the real lock intact, `high` can never
+    // even acquire it while `low` is parked holding it, so `high` always
+    // times out (ELOCKTIMEOUT) and fails open within its own bounded
+    // timeoutMs=150; `low` is the one that heals in this test, every run.
+    // That collapses what used to be a probabilistic "either could legitimately
+    // win" outcome into a single deterministic one, which is what makes the
+    // assertions below actually pin the lock rather than merely tolerate two
+    // possible final values.
+    const base = mkdtempSync(join(tmpdir(), 'hypo-fake-pkgroot-race-'));
+    const home = mkdtempSync(join(tmpdir(), 'hypo-home-race-'));
+    try {
+      mkdirSync(join(base, 'install-1.8.2'), { recursive: true });
+      mkdirSync(join(base, 'install-1.8.1'), { recursive: true });
+      const rootHigh = realpathSync(join(base, 'install-1.8.2'));
+      const rootLow = realpathSync(join(base, 'install-1.8.1'));
+      cpSync(HOOKS, join(rootHigh, 'hooks'), { recursive: true });
+      cpSync(HOOKS, join(rootLow, 'hooks'), { recursive: true });
+      writeFileSync(
+        join(rootHigh, 'package.json'),
+        JSON.stringify({ name: 'hypomnema', version: '1.8.2' }),
+      );
+      writeFileSync(
+        join(rootLow, 'package.json'),
+        JSON.stringify({ name: 'hypomnema', version: '1.8.1' }),
+      );
+
+      const staleRoot = join(home, 'stale-root');
+      mkdirSync(staleRoot, { recursive: true });
+      seedHypoPkg(home, staleRoot); // pkgVersion: '1.0.0'
+      seedFreshVersionCache(home);
+
+      const hookHigh = join(rootHigh, 'hooks', 'hypo-session-start.mjs');
+      const hookLow = join(rootLow, 'hooks', 'hypo-session-start.mjs');
+      patchHealHoldForTest(hookLow);
+
+      const readyPath = join(home, 'heal-ready.flag');
+      const releasePath = join(home, 'heal-release.flag');
+
+      const lowPromise = spawnSessionStartAt(hookLow, home, 'pkgrace-low', {
+        HYPO_TEST_HEAL_READY_PATH: readyPath,
+        HYPO_TEST_HEAL_RELEASE_PATH: releasePath,
+      });
+
+      // Wait for `low` to signal it has read its stale snapshot and parked
+      // inside the critical section, before starting `high` at all: a fixed
+      // 100ms head start (the old design) is a guess about scheduling, this
+      // is a fact about it.
+      const readyDeadline = Date.now() + 5000;
+      while (!existsSync(readyPath) && Date.now() < readyDeadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.ok(existsSync(readyPath), 'low session never signaled ready: barrier setup failed');
+
+      const highResult = await spawnSessionStartAt(hookHigh, home, 'pkgrace-high');
+      // Only release `low` once `high`'s process has fully exited: with the
+      // real lock intact this is also the only way `low` ever gets released,
+      // since `high` cannot acquire the lock `low` is holding until then.
+      writeFileSync(releasePath, '1');
+      const lowResult = await lowPromise;
+
+      const final = JSON.parse(readFileSync(join(home, '.claude', 'hypo-pkg.json'), 'utf-8'));
+      assert.ok(
+        final.pkgVersion === '1.8.1' || final.pkgVersion === '1.8.2',
+        `a concurrent heal must never regress pkgVersion back to the stale pre-race value, got ` +
+          `${final.pkgVersion} (high stderr: ${highResult.stderr}; low stderr: ${lowResult.stderr})`,
+      );
+
+      // The assertion above, alone, does NOT pin the lock: a mutant that
+      // deletes the lock entirely lets `high` run to completion (unblocked)
+      // WHILE `low` is parked, then `low`'s later write off its now-stale
+      // in-memory snapshot clobbers `high`'s already-landed 1.8.2 with 1.8.1.
+      // That still satisfies "never regresses to 1.0.0", so the invariant
+      // below is what actually catches it: if `high` logged a completed
+      // heal, its write must be what's on disk afterward, full stop. A
+      // properly locked `low` re-reading under the same lock `high` just
+      // held would see `high`'s write and refuse the downgrade instead of
+      // overwriting it from a stale in-memory copy.
+      if (/Package metadata drift fixed/.test(highResult.stderr)) {
+        assert.equal(
+          final.pkgVersion,
+          '1.8.2',
+          `the 1.8.2 session logged a completed heal, so its write landed; a later 1.8.1 ` +
+            `session must have re-read it under the lock and refused the downgrade, but the ` +
+            `file ended at ${final.pkgVersion} (low stderr: ${lowResult.stderr})`,
+        );
+      }
+
+      assert.equal(
+        existsSync(join(home, '.claude', 'hypo-pkg.json.lock')),
+        false,
+        'the heal lock must be released, not left behind',
+      );
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 // ── #12: unified hook stderr log format ────────────────────────────────────────
 // spec §7.5: every lifecycle hook's fail-open path must emit `[hypo-<name>] error:

@@ -48,6 +48,7 @@ import {
   SHELL_MARKER_END,
   SHELL_FUNCTION_BODY,
   wikiPreCommitContent,
+  uniqueBakPath,
 } from './lib/git-hooks-dir.mjs';
 import { readCoreHooksConfig } from './lib/core-hooks.mjs';
 import {
@@ -61,7 +62,7 @@ import { syncExtensions } from './lib/extensions.mjs';
 import { writeProvenanceSidecar } from './lib/pkg-provenance.mjs';
 import { templateSchemaVersion } from './lib/template-schema-version.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
-import { resolvePluginChannel, usablePkgRoot } from './lib/plugin-detect.mjs';
+import { resolvePluginChannel, isHypomnemaInstallRoot } from './lib/plugin-detect.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -578,8 +579,9 @@ function readPkgVersionAt(root) {
   }
 }
 
-// usablePkgRoot now lives in ./lib/plugin-detect.mjs (imported above), shared with
-// upgrade.mjs's dualSkip provenance correction so both agree on what is real.
+// usablePkgRoot / isHypomnemaInstallRoot now live in ./lib/plugin-detect.mjs
+// (imported above), shared with upgrade.mjs's dualSkip provenance correction so
+// both agree on what is real.
 
 function writePkgJson(dryRun, extraFields = {}, root = PKG_ROOT) {
   const dest = pkgJsonPath();
@@ -759,12 +761,14 @@ function installPkgGitHook(dryRun) {
 // ── wiki pre-commit hook ─────────────────────────────────────────────────────
 //
 // shellSingleQuote and wikiPreCommitContent live in lib/git-hooks-dir.mjs, not
-// here: upgrade.mjs's self-heal (repointing an existing hook at the current
-// durable root) and doctor.mjs's drift check both need to build/parse the
-// exact same body this writer produces, so one copy is shared rather than
-// three independent copies silently drifting apart.
+// here: upgrade.mjs's old-to-new-form migration and doctor.mjs's report both
+// need to build/parse the exact same body this writer produces, so one copy is
+// shared rather than three independent copies silently drifting apart.
+// wikiPreCommitContent no longer takes an install root: the body
+// it generates resolves that itself, at commit time, so there is nothing here
+// for a plugin-channel version bump to make stale.
 
-function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
+function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
   const { dir: hooksDir, skip } = hooksDirForInstall(hypoDir);
   if (!hooksDir) {
     // no git repo — silently skip, as before; anything else is worth surfacing
@@ -772,7 +776,7 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
     return;
   }
   const hookPath = join(hooksDir, 'pre-commit');
-  const newContent = wikiPreCommitContent(root, hypoDir, lintStrict);
+  const newContent = wikiPreCommitContent(hypoDir, lintStrict);
 
   // Before every branch below, including --force: a symlink here would send the
   // write through to an arbitrary external file.
@@ -789,20 +793,17 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
         log('skipped', `${hookPath} (pre-commit up to date)`);
         return;
       }
-      if (!dryRun) {
-        writeFileSync(hookPath, newContent);
-        chmodSync(hookPath, 0o755);
-      }
-      log('merged', `${hookPath} (pre-commit updated)`);
-    } else if (force) {
-      // The .bak is a SECOND write to a DIFFERENT path, so the guard on
-      // hookPath above says nothing about it. Left unchecked, a pre-commit.bak
-      // symlink turns --force-commands into an overwrite of whatever it points
-      // at — deterministically, not as a race.
-      const bakPath = hookPath + '.bak';
-      const unsafeBak = unsafeHookTargetReason(bakPath);
-      if (unsafeBak) {
-        log('skipped', `${bakPath} (${unsafeBak}) — not force-overwriting without a safe backup`);
+      // Back this up first. The marker's presence says our block is IN the
+      // file; it says nothing about what else is, and this branch replaces the
+      // whole file either way. upgrade.mjs refuses exactly this shape (content
+      // outside the marker span) and tells the user to run
+      // `init --force-commands` — so without a backup here, following our own
+      // recovery advice is what destroys their hook. Measured by a codex
+      // reviewer 2026-09-11; the `force` branch below already backed up, this
+      // one did not, and `force` is not even consulted here.
+      const bakPath = uniqueBakPath(hookPath);
+      if (!bakPath) {
+        log('skipped', `${hookPath} (unsafe backup path) — not overwriting without a safe backup`);
         return;
       }
       if (!dryRun) {
@@ -810,7 +811,26 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, root, lintStrict) {
         writeFileSync(hookPath, newContent);
         chmodSync(hookPath, 0o755);
       }
-      log('merged', `${hookPath} (force-overwritten, backup at pre-commit.bak)`);
+      log('merged', `${hookPath} (pre-commit updated, backup at ${basename(bakPath)})`);
+    } else if (force) {
+      // The .bak is a SECOND write to a DIFFERENT path, so the guard on
+      // hookPath above says nothing about it. Left unchecked, a pre-commit.bak
+      // symlink turns --force-commands into an overwrite of whatever it points
+      // at — deterministically, not as a race.
+      const bakPath = uniqueBakPath(hookPath);
+      if (!bakPath) {
+        log(
+          'skipped',
+          `${hookPath} (unsafe backup path) — not force-overwriting without a safe backup`,
+        );
+        return;
+      }
+      if (!dryRun) {
+        writeFileSync(bakPath, existing);
+        writeFileSync(hookPath, newContent);
+        chmodSync(hookPath, 0o755);
+      }
+      log('merged', `${hookPath} (force-overwritten, backup at ${basename(bakPath)})`);
     } else {
       log(
         'skipped',
@@ -1040,7 +1060,12 @@ function resolveDurableRoot() {
   if (!hypomnemaPluginEnabled) return PKG_ROOT;
   if (pluginChannel.root) return pluginChannel.root;
   const recorded = recordedPkgRoot();
-  if (usablePkgRoot(recorded)) return recorded;
+  // isHypomnemaInstallRoot, not the weak usablePkgRoot: this value is about to be
+  // adopted as the durable root and re-recorded (see writePkgJson's `root` param
+  // below), so a recorded pointer that merely resolves a readable version, without
+  // actually being a Hypomnema package, must not be trusted here (see
+  // lib/plugin-detect.mjs's comment on the two predicates).
+  if (isHypomnemaInstallRoot(recorded)) return recorded;
   // pluginChannel.root is null here because the channel JUDGMENT FAILED (reason
   // 'registry-unreadable' or 'unresolved'), not because no plugin is installed —
   // hypomnemaPluginEnabled is already true, and that case already returned
@@ -1321,13 +1346,7 @@ if (args.hooks) {
 // any) is left exactly as-is, and channelUnresolvedNotice() above says what to
 // do next.
 if (!channelUnresolved) {
-  installWikiPreCommitHook(
-    args.hypoDir,
-    args.dryRun,
-    args.forceCommands,
-    durableRoot,
-    args.lintStrict,
-  );
+  installWikiPreCommitHook(args.hypoDir, args.dryRun, args.forceCommands, args.lintStrict);
 } else {
   log(
     'skipped',

@@ -26,10 +26,14 @@
  * carries `decisions/NNNN` runtime data is excluded from the scan instead (see the
  * CLI's EXCLUDED_FILES).
  *
- * `ADR NNNN` / `ADR-NNNN` / `decisions/NNNN` (DECISION_PATTERNS) are dangling
- * pointers into the maintainer's private wiki ADR set. They block everywhere in
- * scope EXCEPT CHANGELOG.md, whose version history legitimately cites the decision
- * behind a release line. The CLI applies these per-file via patternsFor().
+ * `ADR NNNN` / `ADR-NNNN` / `decisions/NNNN` point into the maintainer's private
+ * wiki ADR set the same way ISSUE-/FEAT-/IMPR-/PRAC- point into its trackers, so
+ * they live in BLOCKED_PATTERNS too and block everywhere in scope, with no
+ * per-file exemption. CHANGELOG.md was the one exemption (its version history
+ * "legitimately" cited the decision behind a release line) until it turned out
+ * the repo ships no `decisions/` directory at all: an external reader hits the
+ * exact same dead end on `decisions/NNNN` that they hit on `ISSUE-N`, so the
+ * exemption was blocking nothing but its own contradiction. Removed 2026-09-10.
  *
  * Accepted edge cases (documented, not bugs):
  *   - FALSE POSITIVE: `FOO-ISSUE-N` matches (the `-` gives a word boundary
@@ -39,27 +43,14 @@
  *     safe — none start the word `fix` right before the `#`.
  */
 
-// `ADR NNNN` / `ADR-NNNN` / `decisions/NNNN` point into the maintainer's private
-// wiki ADR set, which an OSS user does not have. The CLI applies this set to every
-// in-scope file EXCEPT CHANGELOG.md (version history may cite a decision); the
-// verifier subsystem that carries decisions/ paths as runtime data is removed by
-// EXCLUDED_FILES first. The ADR matcher tolerates a space, tab, or hyphen between
-// `ADR` and the number. Examples below use `NNNN`, not real digits, so this file
-// scans clean.
-export const DECISION_PATTERNS = [
-  {
-    name: 'ADR NNNN',
-    label: 'wiki ADR pointer',
-    re: /\bADR[ \t-]+\d{3,4}\b/gi,
-  },
-  {
-    name: 'decisions/NNNN',
-    label: 'wiki decisions path',
-    re: /\bdecisions\/\d{3,4}\b/gi,
-  },
-];
-
-// Each entry: a named, /g/i regex over a single line of text.
+// Each entry: a named, /g/i regex over a single line of text. `ADR NNNN` /
+// `ADR-NNNN` / `decisions/NNNN` used to live in a separate DECISION_PATTERNS set
+// that every non-CHANGELOG file gated but CHANGELOG.md, the tag body, and the PR
+// `## Changelog` block did not; now that no surface exempts them, there is no
+// remaining reason to keep two arrays a caller has to remember to concatenate, so
+// they are folded in here. The ADR matcher tolerates a space, tab, or hyphen
+// between `ADR` and the number. Examples below use `N`/`NNNN`, not real digits,
+// so this file scans clean.
 export const BLOCKED_PATTERNS = [
   {
     name: 'ISSUE-N',
@@ -78,6 +69,16 @@ export const BLOCKED_PATTERNS = [
   { name: 'FEAT-N', label: 'wiki feature-tracker id', re: /\bFEAT-\d+\b/gi },
   { name: 'IMPR-N', label: 'wiki improvement-tracker id', re: /\bIMPR-\d+\b/gi },
   { name: 'PRAC-N', label: 'wiki practice-tracker id', re: /\bPRAC-\d+\b/gi },
+  {
+    name: 'ADR NNNN',
+    label: 'wiki ADR pointer',
+    re: /\bADR[ \t-]+\d{3,4}\b/gi,
+  },
+  {
+    name: 'decisions/NNNN',
+    label: 'wiki decisions path',
+    re: /\bdecisions\/\d{3,4}\b/gi,
+  },
 ];
 
 // Tool-attribution markers. A SEPARATE export, deliberately NOT folded into
@@ -130,10 +131,11 @@ export const ATTRIBUTION_PATTERNS = [
 
 // The full tracker-ID set for a no-code public surface (the annotated tag body,
 // republished verbatim by `gh release create --notes-from-tag`). It equals
-// BLOCKED_PATTERNS now that FEAT-/IMPR-/PRAC- live there; ADR/decisions anchors
-// are intentionally allowed in the tag body (release notes cite decisions the way
-// CHANGELOG history does). The CHANGELOG's own surface-ID-0 is held by the section
-// migration + a grep regression test (changelog-pr-guide §5).
+// BLOCKED_PATTERNS, which now includes the ADR/decisions anchors: a release
+// note is exactly the kind of author-written public prose the ADR carve-out
+// used to wave through, and this repo ships no `decisions/` directory for a
+// tag reader to follow. The CHANGELOG's own surface-ID-0 is held by the
+// section migration + a grep regression test (changelog-pr-guide §5).
 export const TAG_BODY_PATTERNS = [...BLOCKED_PATTERNS];
 
 // Strip a leading comment-continuation marker (`*`, `//`, `#`) so a wrapped
@@ -294,11 +296,10 @@ function extraHits(primary, secondary) {
 }
 
 /**
- * Scan a blob of text against `patterns` (default BLOCKED_PATTERNS). Returns hits:
+ * Scan a blob of text against `patterns` (default BLOCKED_PATTERNS, which now
+ * carries the ADR/decisions anchors alongside the tracker ids). Returns hits:
  *   { pattern, label, match, line, col, lineText }
- * `line`/`col` are 1-based. Empty array => clean. The CLI passes the broader
- * [...BLOCKED_PATTERNS, ...DECISION_PATTERNS] set for every in-scope file but the
- * CHANGELOG.
+ * `line`/`col` are 1-based. Empty array => clean.
  *
  * Both the per-line scan and the line-wrap join below run over a NORMALIZED
  * copy of the text (see `normalizeForScan`): zero-width characters removed,

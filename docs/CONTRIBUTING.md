@@ -256,7 +256,7 @@ After both blocks, language-neutral:
 
 - **PR title**: Conventional Commits plus a scope, e.g. `feat(feedback): add failure_type enum`. The type drives the CHANGELOG section (see the classification table below).
 - **Merge commit**: the squash-merge subject carries the PR number (`#123`). That is where `#N` comes from, not the PR title. The two conventions stay separate.
-- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`, `fix #N`) may appear in your local notes and in `tests/` (where they aid test-to-issue traceability and never reach an installed user), but not in shipped code or workflow comments, and never on the published changelog and release surface: not in the CHANGELOG body, not in the PR `## Changelog` block, not in a tag annotation, not in a GitHub Release. The only tracker identifier that ships in those is the PR number `#N`; the lone exception is the ADR carve-out noted below. `check-tracker-ids` gates the file, message, and tag surfaces (`--all`/`--staged` for files, `--commit-msg` for messages, `--tag` for the tag body), and `check-pr-surface` gates the PR title and body; the migration keeps the CHANGELOG body clean. `ADR NNNN` / `decisions/NNNN` are exempt on the changelog surfaces (the CHANGELOG body, the tag body, and the PR `## Changelog` block), where a release line legitimately cites the decision behind it.
+- Internal tracker ids (`FEAT-`, `IMPR-`, `ISSUE-`, `PRAC-`, `fix #N`, `ADR NNNN`, `decisions/NNNN`) may appear in your local notes and in `tests/` (where they aid test-to-issue traceability and never reach an installed user), but not in shipped code or workflow comments, and never on the published changelog and release surface: not in the CHANGELOG body, not in the PR `## Changelog` block, not in a tag annotation, not in a GitHub Release. The only identifier that ships in those is the PR number `#N`. `ADR NNNN` / `decisions/NNNN` used to be exempt on the changelog surfaces, on the theory that a release line legitimately cites the decision behind it; that exemption is gone, because this repo ships no `decisions/` directory for anyone outside the maintainer's private wiki to open — an external reader hits the same dead end on `decisions/NNNN` as on `ISSUE-N`, so the exemption was blocking nothing but its own contradiction. `check-tracker-ids` gates the file, message, and tag surfaces (`--all`/`--staged` for files, `--commit-msg` for messages, `--tag` for the tag body), and `check-pr-surface` gates the PR title and body; the migration keeps the CHANGELOG body clean.
 
 ### The `## Changelog` block
 
@@ -372,6 +372,14 @@ node scripts/bump-version.mjs <new-semver>   # e.g. 1.2.2 or 1.3.0-rc.1
 #     version-consistency gate stay green (the lock carries the version twice).
 npm install --package-lock-only
 
+# 1c. If this release also bumps templates/SCHEMA.md's `version:` frontmatter,
+#     add a matching line to SCHEMA_VERSION_DELTAS in
+#     scripts/lib/template-schema-version.mjs, naming what that version added.
+#     Skipping this is silent: upgrade.mjs's notice just falls back to "review
+#     manually" for that version, with no test failing at bump time except
+#     the one in tests/upgrade.test.mjs that pins the SHIPPED version has an
+#     entry.
+
 # 2. Draft the new CHANGELOG.md section from the merged PRs' `## Changelog`
 #    blocks (see CHANGELOG conventions above). The collector prints a draft for
 #    the range since the last tag; paste it, then finalize the wording by hand,
@@ -406,8 +414,10 @@ git commit -m "chore: release v<version>"
 #    then a Korean summary block. The GitHub Release republishes this body
 #    verbatim, so keep it on the same public surface as the CHANGELOG: PR
 #    numbers (#N) only, no `FEAT-`/`IMPR-`/`ISSUE-`/`PRAC-`/`fix #N` tracker
-#    ids (check-tracker-ids --tag gates it). Like the CHANGELOG, the tag body MAY cite
-#    `ADR NNNN` / `decisions/NNNN` for the decision behind a release.
+#    ids (check-tracker-ids --tag gates it), and no `ADR NNNN` / `decisions/NNNN`
+#    either: this repo ships no `decisions/` directory, so a reader outside the
+#    maintainer's private wiki cannot open either one. Say what changed in
+#    plain prose, or cite the PR number.
 git tag -a v<version> -m "$(cat <<'EOF'
 Hypomnema v<version>: <one-line English summary>
 
@@ -421,7 +431,12 @@ Hypomnema v<version>: <한 줄 한글 요약>
 EOF
 )"
 
-# 6. Rehearse the release locally (same checks CI runs against the tag)
+# 6. Rehearse the release locally (same checks CI runs against the tag).
+#    This is the ONLY gate that runs before the tag object is public. The
+#    release workflow re-runs these, but it starts when the push in step 7
+#    lands, so by then the annotated tag body is already on GitHub: CI can
+#    stop the npm publish and the Release, not the tag. Skip these three and
+#    nothing catches a leaked id until a reader finds it.
 node scripts/check-bilingual.mjs --tag v<version>
 node scripts/check-versions.mjs --tag v<version>
 node scripts/check-tracker-ids.mjs --tag v<version>   # no tracker ids leak into the tag body

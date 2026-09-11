@@ -68,10 +68,13 @@
  * checker's OWN sources are scanned (NOT exempt); their examples use `N`
  * placeholders so they stay clean.
  *
- * ADR scope: `ADR NNNN` / `decisions/NNNN` wiki-ADR pointers (DECISION_PATTERNS)
- * are blocked everywhere in scope EXCEPT CHANGELOG.md, whose version history
- * legitimately cites the decision behind a release line. patternsFor() applies the
- * broader set to every in-scope file but the CHANGELOG.
+ * ADR scope: `ADR NNNN` / `decisions/NNNN` wiki-ADR pointers block everywhere in
+ * scope, CHANGELOG.md included. They were CHANGELOG-exempt until it turned out
+ * this repo ships no `decisions/` directory at all, so the "legitimate citation"
+ * the exemption protected pointed nowhere for anyone outside the maintainer's
+ * wiki, same as the tracker ids the exemption was carved out of. Removed
+ * 2026-09-10 (BLOCKED_PATTERNS in lib/check-tracker-ids.mjs carries the ADR
+ * patterns directly now, so there is no separate set to apply per file).
  */
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
@@ -82,8 +85,6 @@ import {
   scanText,
   stripScissors,
   messageHasGitTemplate,
-  BLOCKED_PATTERNS,
-  DECISION_PATTERNS,
   TAG_BODY_PATTERNS,
   ATTRIBUTION_PATTERNS,
 } from './lib/check-tracker-ids.mjs';
@@ -202,19 +203,6 @@ function isInScope(relPath) {
   return SCOPE_DIRS.includes(p.split('/')[0]);
 }
 
-// `ADR NNNN` / `decisions/NNNN` are dangling pointers into the maintainer's
-// private wiki ADR set, so they are blocked everywhere in scope EXCEPT the
-// CHANGELOG, whose version history legitimately cites the decision behind a
-// release line (and never reaches an installed user as a live link). The verifier
-// subsystem that carries `decisions/` paths as runtime data is already removed by
-// EXCLUDED_FILES, so it is never reached here.
-const ADR_EXEMPT_FILES = new Set(['CHANGELOG.md']);
-function patternsFor(relPath) {
-  return ADR_EXEMPT_FILES.has(toPosix(relPath))
-    ? BLOCKED_PATTERNS
-    : [...BLOCKED_PATTERNS, ...DECISION_PATTERNS];
-}
-
 // Recursively collect in-scope text files under an absolute dir.
 function walk(absDir, acc) {
   let entries;
@@ -297,7 +285,7 @@ function runAll(json) {
     } catch {
       continue;
     }
-    for (const h of scanText(text, patternsFor(rel))) violations.push({ file: rel, ...h });
+    for (const h of scanText(text)) violations.push({ file: rel, ...h });
   }
   process.exit(report(violations, json));
 }
@@ -331,8 +319,7 @@ function runStaged(json) {
     // committed is gated (partial stage safety).
     const show = git(['show', `:${e.path}`]);
     if (show.status !== 0) continue;
-    for (const h of scanText(show.stdout || '', patternsFor(e.path)))
-      violations.push({ file: e.path, ...h });
+    for (const h of scanText(show.stdout || '')) violations.push({ file: e.path, ...h });
   }
   process.exit(report(violations, json));
 }

@@ -18,7 +18,6 @@ import {
 import {
   scanText,
   BLOCKED_PATTERNS,
-  DECISION_PATTERNS,
   TAG_BODY_PATTERNS,
   ATTRIBUTION_PATTERNS,
 } from '../scripts/lib/check-tracker-ids.mjs';
@@ -615,7 +614,6 @@ test('ATTRIBUTION_PATTERNS is a separate export, NOT merged into BLOCKED_PATTERN
   // The doc line that QUOTES a trailer stays clean under the file-scan patterns.
   const doc = 'Do NOT add any "Generated with ..." footer, no Co-Authored-By: line.';
   assert.equal(scanText(doc, BLOCKED_PATTERNS).length, 0);
-  assert.equal(scanText(doc, [...BLOCKED_PATTERNS, ...DECISION_PATTERNS]).length, 0);
   // ...and is caught by the attribution set, which only authored surfaces use.
   assert.ok(scanText(doc, ATTRIBUTION_PATTERNS).length > 0);
 });
@@ -661,7 +659,7 @@ test('CLI --commit-msg: rejects a Claude-Session trailer and a robot footer (exi
 test('CLI --commit-msg: a clean message still passes (attribution scan adds no false positive)', () => {
   withTmpDir((dir) => {
     const f = join(dir, 'MSG');
-    writeFileSync(f, 'feat(ci): gate the PR title and body (#194)\n\nSee PR #50. ADR 0040.\n');
+    writeFileSync(f, 'feat(ci): gate the PR title and body (#194)\n\nSee PR #50.\n');
     const r = runChecker(['--commit-msg', f]);
     assert.equal(r.status, 0, r.stderr);
   });
@@ -716,7 +714,7 @@ test('CLI --commit-range: a clean range passes (exit 0)', () => {
     writeFileSync(join(dir, 'a.txt'), 'one\n');
     const base = commitIn(dir, 'chore: base');
     writeFileSync(join(dir, 'b.txt'), 'two\n');
-    const head = commitIn(dir, 'feat: thing (#101)\n\nSee PR #50. ADR 0040.');
+    const head = commitIn(dir, 'feat: thing (#101)\n\nSee PR #50.');
     const r = runChecker(['--commit-range', `${base}..${head}`], { CHECK_TRACKER_ROOT: dir });
     assert.equal(r.status, 0, r.stderr);
   });
@@ -945,7 +943,7 @@ test('CLI --push-range: a clean push passes (exit 0)', () => {
     writeFileSync(join(dir, 'a.txt'), 'one\n');
     const before = commitIn(dir, 'chore: base');
     writeFileSync(join(dir, 'b.txt'), 'two\n');
-    const after = commitIn(dir, 'feat: thing (#101)\n\nSee PR #50. ADR 0040.');
+    const after = commitIn(dir, 'feat: thing (#101)\n\nSee PR #50.');
     const r = runChecker(['--push-range', `${before}..${after}`], { CHECK_TRACKER_ROOT: dir });
     assert.equal(r.status, 0, r.stderr);
   });
@@ -1080,8 +1078,10 @@ test('CI: the pull_request trigger lists `edited` (else a body edit bypasses the
 
 // ── BLOCKER: ADR / decisions pointers were left out of the PR-surface scan
 // entirely, so the one rule that names `decisions/NNNN` had no enforcement on the
-// one surface an agent writes by hand. The `## Changelog` block keeps the same
-// exemption CHANGELOG.md has in the file gate — and only that block.
+// one surface an agent writes by hand. A later pass gave the `## Changelog`
+// block the same exemption CHANGELOG.md had in the file gate — removed
+// 2026-09-10, both here and there: this repo ships no `decisions/` directory
+// for either citation to resolve against, so there is no block left to exempt.
 suite('PR surface gate — ADR pointers (BLOCKER 4)');
 
 test('PR surface: `ADR NNNN` in the PR BODY is rejected', () => {
@@ -1110,50 +1110,86 @@ test('PR surface: an ADR pointer in the TITLE is rejected', () => {
   );
 });
 
-test('PR surface: an ADR pointer INSIDE the `## Changelog` block is ALLOWED', () => {
-  // The release collector copies this block verbatim into CHANGELOG.md, which is
-  // itself ADR-exempt in the file gate. Blocking it here would make a line the
-  // file gate explicitly allows unwritable through the only path that writes it.
+test('PR surface: an ADR pointer INSIDE the `## Changelog` block is REJECTED (exemption removed)', () => {
+  // Was ALLOWED: the release collector copies this block verbatim into
+  // CHANGELOG.md, which used to be ADR-exempt in the file gate too, on the
+  // theory that a release line legitimately cites the decision behind it.
+  // Removed 2026-09-10 on both surfaces at once — this repo ships no
+  // `decisions/` directory, so `ADR 0058` inside a `## Changelog` line
+  // resolves to nothing for anyone outside the maintainer's wiki, same as
+  // outside the block. A positive assertion, not just a dropped exemption
+  // test: a stale copy of the old "block is exempt" fixture would silently
+  // keep passing if the mask were still applied somewhere.
   const res = checkPrSurface({
     title: GOOD_TITLE,
     body: prBody({
-      changelog: ['- EN: Adopt the projection model from ADR 0031.', '- KO: ADR 0031 반영.'],
+      changelog: ['- EN: Adopt the projection model from ADR 0058.', '- KO: ADR 0058 반영.'],
     }),
   });
   assert.equal(
     res.ok,
-    true,
-    `the changelog block keeps CHANGELOG.md's ADR exemption: ${res.violations.map((v) => v.detail).join(' | ')}`,
+    false,
+    'ADR 0058 inside the Changelog block must now be caught, exactly like anywhere else in the body',
+  );
+  const hit = res.violations.find(
+    (v) => v.rule === 'tracker-ids' && v.surface === 'body' && /ADR 0058/.test(v.detail),
+  );
+  assert.ok(
+    hit,
+    `expected an ADR 0058 violation inside the Changelog block: ${JSON.stringify(res.violations)}`,
   );
 });
 
-test('PR surface: the changelog exemption does NOT leak past the section boundary', () => {
-  // Only the `## Changelog` body is exempt. The section ends at the next heading;
-  // an ADR ref under `## Checklist` is as public as one anywhere else.
+test('PR surface: an ADR pointer under `## Checklist` is rejected the same way as inside `## Changelog`', () => {
+  // There is no section-boundary special case left to prove: an ADR ref is
+  // public wherever it sits in the body, so both spots must fail identically.
   const body = prBody({ changelog: GOOD_CHANGELOG }) + '\n- [x] filed ADR 0031\n';
   const res = checkPrSurface({ title: GOOD_TITLE, body });
-  assert.equal(res.ok, false, 'the exemption must stop at the Changelog section boundary');
+  assert.equal(res.ok, false, 'an ADR ref under Checklist is as public as one anywhere else');
   assert.ok(res.violations.some((v) => /ADR/.test(v.detail)));
 });
 
-test('PR surface: a tracker id inside `## Changelog` is STILL rejected (only ADR is exempt)', () => {
+test('PR surface: a tracker id inside `## Changelog` is rejected (no exemption of any kind)', () => {
   const res = checkPrSurface({
     title: GOOD_TITLE,
     body: prBody({ changelog: ['- EN: Close ISSUE-49.', '- KO: ISSUE-49 종료.'] }),
   });
-  assert.equal(res.ok, false, 'the CHANGELOG exemption covers ADR refs only, never tracker ids');
+  assert.equal(res.ok, false, 'the CHANGELOG block carries no exemption, ADR or otherwise');
   assert.ok(res.violations.some((v) => v.rule === 'tracker-ids' && /ISSUE-49/.test(v.detail)));
 });
 
-test('commit messages still ALLOW `ADR NNNN` (this change does not touch that judgment)', () => {
+test('PR template no longer describes an ADR/decisions carve-out the gate has since removed', () => {
+  // The gate rejects ADR NNNN/decisions/NNNN everywhere in the PR body now,
+  // `## Changelog` included (the tests above pin that). A template that still
+  // told an author "this one block is exempt" would send them straight at a
+  // rejected PR: check-pr-surface.mjs's own author-facing message is the
+  // template's only other advice on this rule, so the two must agree.
+  const tpl = readFileSync(join(REPO, '.github', 'PULL_REQUEST_TEMPLATE.md'), 'utf-8');
+  assert.doesNotMatch(
+    tpl,
+    /carve-out/i,
+    'the template must not describe an ADR/decisions carve-out the gate no longer honors',
+  );
+  assert.doesNotMatch(
+    tpl,
+    /exempt/i,
+    'the template must not describe an ADR-exempt surface the gate no longer honors',
+  );
+});
+
+test('commit messages now REJECT `ADR NNNN` too (exemption removed everywhere, not just PR/file surfaces)', () => {
+  // Was: "commit messages still ALLOW `ADR NNNN`" — judgeMessage's first pass is
+  // a bare `scanText(text)`, which used to mean BLOCKED_PATTERNS-only (no ADR).
+  // BLOCKED_PATTERNS now carries the ADR/decisions anchors directly, so this
+  // pass catches them with no code change to judgeMessage itself. A positive
+  // assertion (exit 1, not 0), because an already-passing expectation here
+  // would not tell us the merge actually reached this call site.
   withTmpDir((dir) => {
     const f = join(dir, 'MSG');
     writeFileSync(f, 'feat: thing (#101)\n\nImplements ADR 0040.\n');
-    assert.equal(
-      runChecker(['--commit-msg', f]).status,
-      0,
-      'the commit-msg gate has always let ADR refs through — that stays true',
-    );
+    const r = runChecker(['--commit-msg', f]);
+    assert.equal(r.status, 1, 'a commit message citing ADR 0040 must now be gated');
+    assert.match(r.stderr, /ADR 0040/);
   });
 });
 

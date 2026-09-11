@@ -19,6 +19,10 @@ import {
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
+import {
+  schemaVersionDeltas,
+  SCHEMA_VERSION_DELTAS,
+} from '../scripts/lib/template-schema-version.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import { wikiPreCommitContent } from '../scripts/lib/git-hooks-dir.mjs';
 import { writeDualSkipProvenance } from '../scripts/lib/pkg-json.mjs';
@@ -31,6 +35,7 @@ import {
   REPO,
   SCRIPTS,
   SESSION_TMP_HOME,
+  legacyWikiPreCommitContent,
   run,
   runWithHome,
   withTmpDir,
@@ -297,6 +302,18 @@ test('--apply generates migration report for major SCHEMA bump', () => {
       assert.ok(
         content.includes(shippedVersion),
         `migration report should reference the new (current) version ${shippedVersion}`,
+      );
+      // SCHEMA_VERSION_DELTAS is filled in by hand at every SCHEMA.md version
+      // bump, and a skipped line breaks nothing: schemaVersionDeltas() just
+      // falls back to the plain "review manually" notice for that version,
+      // silently. This pins that the version templates/SCHEMA.md actually
+      // ships has an entry, so a bump that forgets the delta line fails HERE
+      // instead of degrading a real user's upgrade notice with no test ever
+      // noticing.
+      assert.ok(
+        shippedVersion in SCHEMA_VERSION_DELTAS,
+        `SCHEMA_VERSION_DELTAS (scripts/lib/template-schema-version.mjs) has no entry for the ` +
+          `shipped SCHEMA.md version ${shippedVersion}; add one describing what that version added`,
       );
     });
   });
@@ -636,6 +653,14 @@ test('guide.bump is "unstamped" (counted as drift) when the version line is remo
       assert.ok(
         /hypo-guide\.md\s+installed copy has no version stamp/.test(textR.stdout),
         `text report must give an actionable "no version stamp" warning, not "cannot compare": ${textR.stdout}`,
+      );
+      // ISSUE-139: hypo-guide.md carries no version stamp at all, so there is
+      // no base to diff a per-version delta from (unlike SCHEMA.md below).
+      // The notice must say why, not silently give the same text as a stamped
+      // file would.
+      assert.ok(
+        /no base version to diff/.test(textR.stdout),
+        `unstamped hypo-guide.md notice must explain why no delta can be given: ${textR.stdout}`,
       );
 
       // ISSUE-19: still no write path, even for the unstamped case.
@@ -1250,6 +1275,44 @@ test("dual install + missing metadata + resolvable registry: --apply records the
   });
 });
 
+// codex reproduction (2026-09-11): selectEntry used to accept any registry row
+// whose installPath merely resolved a readable version, with no check on WHOSE
+// package sat there. A row naming a directory with an absolute path, a version,
+// but a foreign (or missing) package.json `name` must not be adopted as the
+// durable root — isHypomnemaInstallRoot is what closes that.
+test('dual install: a registry row whose package.json name is not "hypomnema" is never adopted as the durable root', () => {
+  withDualInstall(true, ({ upgrade, home, wiki, root }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-foreign-registry-'));
+    try {
+      const foreignRoot = join(dir, 'not-hypomnema');
+      mkdirSync(foreignRoot, { recursive: true });
+      writeFileSync(
+        join(foreignRoot, 'package.json'),
+        JSON.stringify({ name: 'someone-elses-package', version: '9.9.9' }),
+      );
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      writeRegistry(home, DUAL_INSTALL_KEY, foreignRoot);
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(r.status, 0, `dual-install --apply should exit 0: ${r.stderr}`);
+      assert.match(
+        r.stdout,
+        /Cannot positively resolve the enabled plugin's install root/,
+        'a foreign-named registry row must read as unresolved, not silently adopted',
+      );
+      if (existsSync(pkgPath)) {
+        const meta = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+        assert.notEqual(
+          meta.pkgRoot,
+          foreignRoot,
+          'the foreign root must never be recorded as the durable pointer',
+        );
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // checkPkgJson reports 'missing' for a file that EXISTS but has no usable
 // pkgRoot, so the dual-skip fallback branch is reached with a real file on disk
 // — not only with none. That file can carry a manual install's command SHA map,
@@ -1544,6 +1607,130 @@ test('correction preserves unrelated existing metadata (commands map, extensions
   });
 });
 
+// Reported bug: a dual install (npm global + plugin, different versions) ran
+// `upgrade --apply` twice in a row and the second call was refused. Cause: the
+// first call's dualSkip correction (writeDualSkipProvenance, tested above)
+// stamps the REGISTRY's version into hypo-pkg.json, not this package's own, so
+// the very next plain `--apply`, still on the dualSkip branch, compared its own
+// (lower) version against the registry version it had just recorded and
+// refused as a downgrade. The fix narrows the guard to the branches that
+// actually copy hooks and stamp THIS run's own version (managesClaudeCore,
+// `--codex`); a plain dualSkip repeat touches neither, so the guard no longer
+// runs for it.
+test('dual install: two consecutive plain --apply calls both exit 0 (no downgrade-guard false positive)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    withRegistryRoot('9.9.9', (registryRoot) => {
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      const first = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(first.status, 0, `first --apply should exit 0: ${first.stderr}`);
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      assert.equal(
+        JSON.parse(readFileSync(pkgPath, 'utf-8')).pkgVersion,
+        '9.9.9',
+        'precondition: the first apply must have recorded the registry version, not this own package version',
+      );
+      // No reset of hypo-pkg.json between the two calls: the fix means the
+      // second run reads whatever the first one left there and still is not
+      // refused.
+      const second = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(
+        second.status,
+        0,
+        `second consecutive --apply should also exit 0, not refuse a downgrade: ${second.stderr}`,
+      );
+      assert.doesNotMatch(second.stderr, /Refusing to upgrade --apply/);
+    });
+  });
+});
+
+// Was a known residual, now closed: the codex downgrade guard used to compare
+// its incoming version against hypo-pkg.json — the Claude plugin's pointer —
+// even though `--codex` never writes a version there. In a dual install that
+// pointer stays stuck at the REGISTRY's version (9.9.9 here, from the
+// dualSkip write earlier in the same run), so the very next `--apply --codex`
+// compared this package's real, lower version against 9.9.9 and refused a
+// downgrade that never happened. The guard now reads the codex hooks dir's
+// own `.hypo-provenance.json` sidecar for the codex branch — the artifact
+// `--codex` actually writes a version into — so a second consecutive
+// `--apply --codex` compares against itself and passes.
+test('dual install: two consecutive --apply --codex calls both exit 0 (codex guard reads its own sidecar, not the plugin pointer)', () => {
+  withDualInstall(true, ({ upgrade, home, wiki }) => {
+    withRegistryRoot('9.9.9', (registryRoot) => {
+      writeRegistry(home, DUAL_INSTALL_KEY, registryRoot);
+      const first = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--codex'], home);
+      assert.equal(first.status, 0, `first --apply --codex should exit 0: ${first.stderr}`);
+      const pkgPath = join(home, '.claude', 'hypo-pkg.json');
+      assert.equal(
+        JSON.parse(readFileSync(pkgPath, 'utf-8')).pkgVersion,
+        '9.9.9',
+        "precondition: the plugin pointer stays at the registry version, not this run's own",
+      );
+      const second = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--codex'], home);
+      assert.equal(
+        second.status,
+        0,
+        `second consecutive --apply --codex should also exit 0, not refuse a downgrade: ${second.stderr}`,
+      );
+      assert.doesNotMatch(second.stderr, /Refusing to upgrade --apply/);
+    });
+  });
+});
+
+// Positive control for the fix above: reading the codex sidecar must still
+// actually enforce a downgrade when one is real, not just always pass. A
+// fabricated sidecar with a different pkgRoot (so the realpath-equality
+// exemption for a dev workspace re-running its own --apply does not fire)
+// and a newer version stands in for an install that really is ahead.
+test('codex downgrade guard refuses a real downgrade read from the codex sidecar', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const codexHooksDir = join(home, '.codex', 'hooks');
+      mkdirSync(codexHooksDir, { recursive: true });
+      writeFileSync(
+        join(codexHooksDir, PROVENANCE_FILENAME),
+        JSON.stringify({ pkgRoot: '/fake/newer/codex-root', pkgVersion: '9.9.9' }),
+      );
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(
+        r.status,
+        2,
+        `a codex sidecar recording a newer version must still refuse: ${r.stdout}`,
+      );
+      assert.match(r.stderr, /Refusing to upgrade --apply/);
+    });
+  });
+});
+
+// Policy pin: a codex sidecar that exists but fails to parse carries no more
+// of a trustworthy baseline than one that was never written, so the guard
+// fail-opens on it exactly like the missing case, rather than refusing on
+// unreadable data it cannot prove is a downgrade from.
+test('codex downgrade guard fail-opens on a corrupted sidecar, same as a missing one', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const codexHooksDir = join(home, '.codex', 'hooks');
+      mkdirSync(codexHooksDir, { recursive: true });
+      writeFileSync(join(codexHooksDir, PROVENANCE_FILENAME), '{not json');
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--apply', '--codex'], home);
+      assert.equal(
+        r.status,
+        0,
+        `a corrupted sidecar must not be read as a downgrade baseline: ${r.stderr}`,
+      );
+    });
+  });
+});
+
 // ── writeDualSkipProvenance TOCTOU refusal (lib/pkg-json.mjs) ───────────────
 // resolveEnabledPluginRoot proves registryRoot usable via a SEPARATE, earlier
 // read; the writer re-reads registryRoot's package.json at write time and must
@@ -1657,27 +1844,41 @@ test('registry root usable at write time: writes the correction and returns true
   }
 });
 
-// ── wiki pre-commit hook: install-root self-heal ────────────────────────────
-// init.mjs bakes an absolute install root into the vault's pre-commit hook. A
-// plugin-channel upgrade moves PKG_ROOT to a new version directory every
-// release, but nothing ever re-runs init afterward, so the hook keeps calling
-// whatever release happened to be current the day /hypo:init last ran, with no
-// signal anywhere (measured 2026-09-01: a vault hook pointed at a release four
-// months stale while the registry and hypo-pkg.json both agreed on the current
-// one). Judged by the SAME rule as the pkgRoot self-heal above: a positively-
-// resolved root that differs from what's embedded gets corrected; an
-// unresolvable one (null) must PRESERVE the existing pointer.
+// ── wiki pre-commit hook: migrate the version-pinned form to the runtime
+// resolver (ISSUE-137) ───────────────────────────────────────────────────────
+// init.mjs used to bake an absolute install root into the vault's pre-commit
+// hook. A plugin-channel upgrade moves PKG_ROOT to a new version directory
+// every release, but nothing ever re-runs init afterward, so the hook kept
+// calling whatever release happened to be current the day /hypo:init last
+// ran, with no signal anywhere (measured 2026-09-01: a vault hook pointed at a
+// release four months stale while the registry and hypo-pkg.json both agreed
+// on the current one). wikiPreCommitContent() no longer bakes a root in at
+// all — the hook resolves one itself, at commit time — so the fix upgrade.mjs
+// applies is no longer "repoint the baked root": it is "rewrite an OLD-form
+// hook onto the new, resolver-based form", unconditionally, whenever one is
+// found. That migration does not need to positively resolve the active
+// install first (see the no-registry-entry test below): the resolver embedded
+// in the rewritten hook looks that up fresh at every future commit, so
+// migrating is a strict improvement even when THIS run cannot resolve one.
 
-suite('upgrade.mjs — wiki pre-commit hook root self-heal');
+suite('upgrade.mjs — wiki pre-commit hook: old-form migration');
 
-// Writes a pre-commit hook via the SAME writer init.mjs itself uses (not a
-// hand-rolled string), so these tests exercise the real body shape and any
-// drift in that shape would show up in test (c)'s byte-identical assertion.
+// Writes a pre-commit hook via legacyWikiPreCommitContent — the OLD,
+// version-pinned shape wikiPreCommitContent() itself generated before
+// ISSUE-137 — so these tests exercise upgrade.mjs's migration path against a
+// hook shaped like one a real, older Hypomnema install actually left behind.
 // `embeddedHypoDir` defaults to `wiki` (the common case: --hypo-dir usually IS
 // the vault's own root) but callers that need to distinguish "preserved the
 // baked-in value" from "substituted this run's --hypo-dir" pass a different
-// one — see test (c) below.
-function seedWikiPreCommitHook(wiki, root, lintStrict, embeddedHypoDir = wiki) {
+// one — see the --lint-strict test below.
+// `createRoot: false` seeds the one shape the rewrite path exists for: a
+// baked-in install root that is GONE (moved, reinstalled, cache pruned). The
+// strict predicate uninstall.mjs still uses rejects that shape on purpose —
+// deleting somebody's hook on the strength of a path nobody can read is not a
+// call this tool gets to make — but refusing to REWRITE it is what left those
+// users with a hook failing every commit, an `upgrade --apply` that printed
+// nothing, and a `doctor` that said pass.
+function seedWikiPreCommitHook(wiki, root, lintStrict, embeddedHypoDir = wiki, createRoot = true) {
   // git init must not read the developer's real ~/.gitconfig: a global
   // core.hooksPath or init.templateDir there would make git look for the hook
   // somewhere other than <wiki>/.git/hooks, and the assertions below (which
@@ -1690,33 +1891,133 @@ function seedWikiPreCommitHook(wiki, root, lintStrict, embeddedHypoDir = wiki) {
   const hooksDir = join(wiki, '.git', 'hooks');
   mkdirSync(hooksDir, { recursive: true });
   const hookPath = join(hooksDir, 'pre-commit');
-  writeFileSync(hookPath, wikiPreCommitContent(root, embeddedHypoDir, lintStrict), {
+  // A real stale root usually still exists: the plugin channel gives every
+  // install its own version-numbered cache directory and never removes a
+  // superseded one. Measured 2026-09-11 on this machine — 1.7.4, 1.8.0, 1.8.1
+  // and 1.8.2 all still present under both install roots, each with its
+  // worker script. So `createRoot` defaults to true and these tests seed the
+  // common shape. Pass false for the other one (npm reinstall, a moved dev
+  // checkout, a hand-pruned cache), which the rewrite path must still migrate.
+  if (createRoot) {
+    mkdirSync(join(root, 'hooks'), { recursive: true });
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'hypomnema', version: '1.6.0' }),
+    );
+    writeFileSync(join(root, 'hooks', 'hypo-pre-commit.mjs'), '');
+  }
+  writeFileSync(hookPath, legacyWikiPreCommitContent(root, embeddedHypoDir, lintStrict), {
     mode: 0o755,
   });
   return hookPath;
 }
 
-test('plugin mode: --apply repoints a stale pre-commit hook at the current install root', () => {
-  withFakeUpgradeInstall(true, ({ upgrade, root, home, wiki }) => {
+test('plugin mode: --apply migrates a stale, version-pinned pre-commit hook onto the runtime-resolving form', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
     const staleRoot = join(tmpdir(), 'hypo-stale-root-4-months-old');
     const hookPath = seedWikiPreCommitHook(wiki, staleRoot, false);
     const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
     assert.equal(r.status, 0, `--apply should exit 0: ${r.stderr}\n${r.stdout}`);
     const hook = readFileSync(hookPath, 'utf-8');
-    assert.ok(
-      hook.includes(join(realpathSync(root), 'hooks', 'hypo-pre-commit.mjs')),
-      `hook must be repointed at the active install root: ${hook}`,
+    assert.match(
+      hook,
+      /node -e '/,
+      `hook must be migrated to resolve the install root at commit time: ${hook}`,
     );
-    assert.ok(!hook.includes(staleRoot), 'the stale root must not survive the correction');
+    assert.ok(!hook.includes(staleRoot), 'the stale root must not survive the migration');
     assert.match(
       r.stdout,
-      /Wiki pre-commit.*repointed/,
-      'report must surface the correction, not silence it',
+      /Wiki pre-commit.*migrated off the baked-in root/,
+      'report must surface the migration, not silence it (and not the "nothing to migrate" line)',
+    );
+    assert.equal(
+      existsSync(`${hookPath}.bak`),
+      true,
+      'a successful migration must leave a .bak of the pre-migration bytes behind',
+    );
+    assert.equal(
+      readFileSync(`${hookPath}.bak`, 'utf-8'),
+      legacyWikiPreCommitContent(staleRoot, wiki, false),
+      'the backup must hold exactly the bytes that were overwritten',
     );
   });
 });
 
-test('dual install: --allow-dual-install does NOT change which root the vault hook gets', () => {
+// codex reproduction (2026-09-11): applyWikiPreCommitRoot used to overwrite the
+// WHOLE hook file unconditionally. isOwnedWikiPreCommitBody only validates the
+// SPAN between the markers, so a hand-crafted file pairing a forged-but-valid
+// old-form marker span (a worker line naming a root that does not currently
+// exist, which isRewritableOldFormInstallRoot's "gone root" branch accepts)
+// with real content OUTSIDE that span passed every prior check, and the
+// migration silently discarded the outside content. The fix requires the file
+// to already be byte-for-byte the exact legacy shape before it may be
+// overwritten whole.
+test('--apply refuses to migrate (and does not touch the file) when content sits outside the managed marker span', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const goneRoot = join(tmpdir(), `hypo-gone-outside-content-${process.pid}`);
+    const hookPath = seedWikiPreCommitHook(wiki, goneRoot, false, wiki, false);
+    const legacyBody = readFileSync(hookPath, 'utf-8');
+    // Splice in a user's own line right after the shebang, outside the marker
+    // span isOwnedWikiPreCommitBody validates.
+    const withOutsideContent = legacyBody.replace(
+      '#!/bin/sh\n',
+      '#!/bin/sh\necho "user-owned deploy check"\n',
+    );
+    writeFileSync(hookPath, withOutsideContent, { mode: 0o755 });
+    const before = readFileSync(hookPath, 'utf-8');
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `--apply should still exit 0 on a soft refusal: ${r.stderr}`);
+    const after = readFileSync(hookPath, 'utf-8');
+    assert.equal(
+      after,
+      before,
+      'a file with content outside the marker span must be left byte-identical, never partially migrated',
+    );
+    assert.equal(
+      existsSync(`${hookPath}.bak`),
+      false,
+      'a refused migration must not leave a backup behind either — nothing was written',
+    );
+    assert.match(
+      r.stdout,
+      /could not migrate hook/,
+      `the refusal must be surfaced, not silent: ${r.stdout}`,
+    );
+  });
+});
+
+// The unit check on parseWikiPreCommitRoot (tests/git-hooks-dir.test.mjs) pins
+// the predicate. It does NOT pin what upgrade does with the answer, and that
+// gap is where this shipped broken once: the strict predicate said "not ours",
+// checkWikiPreCommitRoot turned that into null, and both report branches were
+// gated on non-null, so `--apply` printed no Wiki pre-commit line at all while
+// the hook failed every commit with MODULE_NOT_FOUND. Green units, silent
+// product. This asserts the downstream instead.
+test('--apply migrates an old-form hook whose baked-in root is GONE, and says so', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const goneRoot = join(tmpdir(), `hypo-root-deleted-${process.pid}-${Date.now()}`);
+    const hookPath = seedWikiPreCommitHook(wiki, goneRoot, false, wiki, false);
+    assert.equal(
+      existsSync(goneRoot),
+      false,
+      'fixture must not exist for this test to mean anything',
+    );
+
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `--apply should exit 0: ${r.stderr}\n${r.stdout}`);
+
+    const hook = readFileSync(hookPath, 'utf-8');
+    assert.match(hook, /node -e '/, `a gone root must not block the migration: ${hook}`);
+    assert.ok(!hook.includes(goneRoot), 'the dead root must not survive the migration');
+    assert.match(
+      r.stdout,
+      /Wiki pre-commit.*migrated off the baked-in root/,
+      `the migration must be reported, not silent: ${r.stdout}`,
+    );
+  });
+});
+
+test('dual install: --allow-dual-install does not move the diagnostic wantRoot field, and --apply writes the identical vault hook bytes either way', () => {
   withDualInstall(true, ({ upgrade, home, wiki, root }) => {
     // `--allow-dual-install` means "stop refusing to write the core surface
     // twice". It says nothing about which install a vault's git hook should
@@ -1724,16 +2025,23 @@ test('dual install: --allow-dual-install does NOT change which root the vault ho
     // hook at this npm/manual PKG_ROOT while doctor kept calling that stale
     // against the registry root, so a user following doctor's advice silently
     // undid their own run, and re-running WITH the flag changed nothing
-    // because upgrade already agreed with the manual root. The flag must be
-    // inert here: with and without it, wantRoot is the registry's answer.
-    seedWikiPreCommitHook(wiki, '/some/old/hypomnema/1.6.0', false);
+    // because upgrade already agreed with the manual root. wikiPreCommitRoot's
+    // `wantRoot` is now purely a DIAGNOSTIC field (the migrated hook body
+    // never bakes a root in at all, see below); the title used to claim the
+    // flag does not change "which root the vault hook gets", which this field
+    // alone cannot prove one way or the other. What it actually checks is
+    // narrower: with and without the flag, wantRoot reports the same answer.
+    seedWikiPreCommitHook(wiki, join(tmpdir(), `hypo-stale-1-6-0-${process.pid}`), false);
     const registryRoot = join(home, '.claude', 'plugins', 'cache', 'mp', 'hypo', '9.9.9');
     mkdirSync(registryRoot, { recursive: true });
-    // usablePkgRoot() demands a package.json carrying a version; without it the
-    // resolver returns null for BOTH runs and the comparison below passes while
-    // measuring nothing. That is exactly how the first version of this test
-    // stayed green over a real divergence.
-    writeFileSync(join(registryRoot, 'package.json'), JSON.stringify({ version: '9.9.9' }));
+    // isHypomnemaInstallRoot() demands both a name of "hypomnema" and a package.json
+    // carrying a version; without either the resolver returns null for BOTH runs and
+    // the comparison below passes while measuring nothing. That is exactly how the
+    // first version of this test stayed green over a real divergence.
+    writeFileSync(
+      join(registryRoot, 'package.json'),
+      JSON.stringify({ name: 'hypomnema', version: '9.9.9' }),
+    );
     writeFileSync(
       join(home, '.claude', 'plugins', 'installed_plugins.json'),
       JSON.stringify({
@@ -1768,32 +2076,87 @@ test('dual install: --allow-dual-install does NOT change which root the vault ho
       !String(withFlag).startsWith(root),
       'the manual/npm checkout is never the durable hook root while a plugin install resolves',
     );
+
+    // The field above is a diagnostic, not the artifact. Prove the actual
+    // contract (the flag does not change what --apply WRITES) on the real
+    // output: re-seed the same old-form hook, --apply with and without the
+    // flag, and compare the bytes on disk. The migrated form never bakes a
+    // root in either way (git-hooks-dir.mjs's runtime resolver), so a match
+    // here is expected, but it is the artifact this test was actually named
+    // for, not the wantRoot field alone.
+    const hookPath = join(wiki, '.git', 'hooks', 'pre-commit');
+    const pkgJsonPath = join(home, '.claude', 'hypo-pkg.json');
+    const pkgJsonBefore = existsSync(pkgJsonPath) ? readFileSync(pkgJsonPath, 'utf-8') : null;
+
+    seedWikiPreCommitHook(wiki, join(tmpdir(), `hypo-stale-1-6-0-${process.pid}`), false);
+    const applyWithout = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(applyWithout.status, 0, `--apply failed: ${applyWithout.stderr}`);
+    const hookWithout = readFileSync(hookPath, 'utf-8');
+
+    // Reset hypo-pkg.json to its pre-apply state before the second run. The
+    // first --apply's dual-skip provenance correction bumps its recorded
+    // pkgVersion to the registry root's 9.9.9, and this package's own version
+    // (1.8.2) would then trip upgrade.mjs's UNRELATED downgrade guard on the
+    // second call — an artifact of running --apply twice against the same
+    // fixture, not something this test is measuring.
+    if (pkgJsonBefore === null) rmSync(pkgJsonPath, { force: true });
+    else writeFileSync(pkgJsonPath, pkgJsonBefore);
+
+    seedWikiPreCommitHook(wiki, join(tmpdir(), `hypo-stale-1-6-0-${process.pid}`), false);
+    const applyWith = runUpgrade(
+      upgrade,
+      [`--hypo-dir=${wiki}`, '--apply', '--allow-dual-install'],
+      home,
+    );
+    assert.equal(applyWith.status, 0, `--apply --allow-dual-install failed: ${applyWith.stderr}`);
+    const hookWith = readFileSync(hookPath, 'utf-8');
+
+    assert.equal(
+      hookWith,
+      hookWithout,
+      '--allow-dual-install must not change a single byte of the vault hook --apply writes',
+    );
+    assert.doesNotMatch(
+      hookWithout,
+      /'\/[^']*\/hooks\/hypo-pre-commit\.mjs'/,
+      'the migrated hook must resolve the install root at commit time, never bake an absolute path',
+    );
   });
 });
 
-test('dual install + no registry entry: --apply preserves the hook (null must not become overwrite)', () => {
+test('dual install + no registry entry: --apply still migrates the old-form hook (migrating needs no resolved root)', () => {
   withDualInstall(true, ({ upgrade, home, wiki }) => {
     // Plugin enabled in settings.json, but no installed_plugins.json at all —
-    // resolveEnabledPluginRoot fails open to null, which must read as "cannot
-    // prove a correction is needed", never as "nothing to preserve".
-    const staleRoot = '/some/old/hypomnema/1.6.0';
+    // resolveEnabledPluginRoot fails open to null. Unlike the old repoint
+    // (which had to pick a CORRECT root to bake in, and so had to stay silent
+    // when it could not resolve one), migrating onto the resolver form needs
+    // no root at all: the rewritten hook looks one up itself, fresh, at every
+    // future commit. So an unresolvable registry must NOT block the migration.
+    // Under tmpdir, not a literal "/some/old/...": seedWikiPreCommitHook has
+    // to create this root (the old form is only ours when the root is a real
+    // install), and nothing in this suite may write outside a temp dir.
+    const staleRoot = join(tmpdir(), `hypo-stale-unresolvable-registry-${process.pid}`);
     const hookPath = seedWikiPreCommitHook(wiki, staleRoot, false);
-    const before = readFileSync(hookPath, 'utf-8');
     const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--json'], home);
     assert.equal(r.status, 0, `dual-install --apply should exit 0: ${r.stderr}`);
-    assert.equal(
+    assert.match(
       readFileSync(hookPath, 'utf-8'),
-      before,
-      'an unresolvable registry must preserve the existing hook untouched',
+      /node -e '/,
+      'an unresolvable registry must not stop the old-form hook from being migrated',
     );
-    // Names WHY nothing moved: without this, "preserved" is indistinguishable
-    // from "git init never even created a hook to touch" (a real failure mode
-    // when git init inherits an ambient core.hooksPath / init.templateDir).
+    assert.ok(
+      !readFileSync(hookPath, 'utf-8').includes(staleRoot),
+      'the stale root must not survive the migration',
+    );
+    // Names what WAS actually seeded/parsed before the mutation above, so a
+    // report of "current: null" here would mean "never found the seeded hook
+    // in the first place" rather than "already migrated" — the two must stay
+    // distinguishable even though wantRoot has nothing to do with the outcome.
     const out = JSON.parse(r.stdout);
     assert.equal(
       out.wikiPreCommitRoot?.current,
       staleRoot,
-      'doctor/upgrade must have actually found and parsed the seeded hook',
+      'doctor/upgrade must have actually found and parsed the seeded (pre-migration) hook',
     );
     assert.equal(
       out.wikiPreCommitRoot?.wantRoot,
@@ -1803,8 +2166,8 @@ test('dual install + no registry entry: --apply preserves the hook (null must no
   });
 });
 
-test("plugin mode: --apply on a --lint-strict hook preserves the EMBEDDED --hypo-dir, not this run's", () => {
-  withFakeUpgradeInstall(true, ({ upgrade, root, home, wiki }) => {
+test("plugin mode: --apply on a --lint-strict hook migrates it while preserving the EMBEDDED --hypo-dir, not this run's", () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
     const staleRoot = join(tmpdir(), 'hypo-stale-lintstrict-root');
     // Deliberately NOT `wiki` (the --hypo-dir this run's `--apply` passes), so
     // a regression that substitutes the current run's --hypo-dir for the
@@ -1818,29 +2181,30 @@ test("plugin mode: --apply on a --lint-strict hook preserves the EMBEDDED --hypo
     assert.equal(r.status, 0, `--apply should exit 0: ${r.stderr}\n${r.stdout}`);
     const hook = readFileSync(hookPath, 'utf-8');
     assert.ok(
-      hook.includes(join(realpathSync(root), 'scripts', 'lint.mjs')),
-      `the --lint-strict step must survive the correction, not be dropped: ${hook}`,
+      hook.includes('/scripts/lint.mjs'),
+      `the --lint-strict step must survive the migration, not be dropped: ${hook}`,
     );
     assert.equal(
       hook,
-      wikiPreCommitContent(realpathSync(root), embeddedHypoDir, true),
-      'a corrected --lint-strict hook must keep the embedded --hypo-dir, only the root moves',
+      wikiPreCommitContent(embeddedHypoDir, true),
+      'a migrated --lint-strict hook must keep the embedded --hypo-dir, and bake in no root at all',
     );
     assert.ok(
       !hook.includes(wiki),
       "this run's --hypo-dir must not leak into the hook when it differs from the embedded one",
     );
+    assert.ok(!hook.includes(staleRoot), 'the stale root must not survive the migration');
   });
 });
 
 test('plugin mode: --apply refuses a --lint-strict hook whose embedded --hypo-dir is relative', () => {
   withFakeUpgradeInstall(true, ({ upgrade, root, home, wiki }) => {
     const staleRoot = join(tmpdir(), 'hypo-stale-relative-hypodir-root');
-    // seedWikiPreCommitHook cannot produce this: wikiPreCommitContent() resolves
-    // the value before baking it, so a relative --hypo-dir only ever reaches the
-    // hook through a hand edit. That edit still passes the ownership check
-    // (isOwnedWikiPreCommitBody validates the marker span and line shape, not
-    // whether the path is absolute), so the refusal branch in
+    // seedWikiPreCommitHook cannot produce this: legacyWikiPreCommitContent()
+    // resolves the value before baking it, so a relative --hypo-dir only ever
+    // reaches the hook through a hand edit. That edit still passes the
+    // ownership check (isOwnedWikiPreCommitBody validates the marker span and
+    // line shape, not whether the path is absolute), so the refusal branch in
     // applyWikiPreCommitRoot is reachable in practice, not dead code. Without
     // this test that branch has no red to prove it, and the next refactor that
     // "helpfully" resolve()s the value would silently defeat it: upgrade's cwd
@@ -1918,6 +2282,93 @@ test('doctor reports a stale pre-commit root without excluding it from the activ
   });
 });
 
+// A hook that carries our marker but a body checkWikiPreCommitRoot cannot
+// read (hand-edited, corrupted). Before this fix that state was silent on
+// both surfaces: upgrade.mjs printed no "Wiki pre-commit" line at all, and
+// doctor.mjs's marker-substring check still passed it. This is not the "root
+// gone" case above (that one is now readable, see seedWikiPreCommitHook's
+// comment): it is genuinely unparseable, so unlike a stale root it can never
+// migrate itself; both surfaces must say so instead of staying quiet.
+function seedUnrecognizedWikiPreCommitHook(wiki, root) {
+  const hookPath = seedWikiPreCommitHook(wiki, root, false);
+  const broken = readFileSync(hookPath, 'utf-8').replace('exit 0\n', '');
+  writeFileSync(hookPath, broken, { mode: 0o755 });
+  return hookPath;
+}
+
+test('plugin mode: --apply reports an unreadable-but-marked pre-commit hook instead of staying silent', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    seedUnrecognizedWikiPreCommitHook(wiki, join(tmpdir(), 'hypo-unrecognized-root'));
+    // Not asserting the exit code here: a fresh fixture already carries
+    // unrelated baseline drift (commands, schema, ...) that makes a
+    // check-only run exit non-zero regardless of the pre-commit hook, so it
+    // proves nothing about THIS check. `wikiPreCommitRoot.drift` below is the
+    // narrow assertion.
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    assert.match(
+      r.stdout,
+      /Wiki pre-commit.*not recognized/,
+      `an unparseable-but-marked hook must be named, not silently skipped: ${r.stdout}`,
+    );
+    const json = JSON.parse(runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json'], home).stdout);
+    assert.equal(
+      json.wikiPreCommitRoot?.unrecognized,
+      true,
+      'JSON output must carry the same distinction the text report makes',
+    );
+    assert.equal(
+      json.wikiPreCommitRoot?.drift,
+      false,
+      'an unrecognized body is not the same as drift: there is no root here to migrate',
+    );
+  });
+});
+
+test('plugin mode: --apply never attempts to rewrite an unreadable-but-marked pre-commit hook', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const hookPath = seedUnrecognizedWikiPreCommitHook(
+      wiki,
+      join(tmpdir(), 'hypo-unrecognized-root-apply'),
+    );
+    const before = readFileSync(hookPath, 'utf-8');
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+    assert.equal(r.status, 0, `--apply should exit 0: ${r.stderr}`);
+    assert.equal(
+      readFileSync(hookPath, 'utf-8'),
+      before,
+      '--apply must leave a body it cannot parse byte-for-byte untouched, not guess at a rewrite',
+    );
+  });
+});
+
+test('doctor reports an unreadable-but-marked pre-commit hook, not a silent pass', () => {
+  withFakeUpgradeInstall(true, ({ root, home, wiki }) => {
+    seedUnrecognizedWikiPreCommitHook(wiki, join(tmpdir(), 'hypo-unrecognized-root-doctor'));
+    const doctor = join(root, 'scripts', 'doctor.mjs');
+    const r = spawnSync(process.execPath, [doctor, `--hypo-dir=${wiki}`, '--json'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    const out = JSON.parse(r.stdout);
+    const rootCheck = out.find((c) => c.label === 'git hooks/pre-commit root');
+    assert.ok(
+      rootCheck,
+      `expected a pre-commit root check even for an unparseable body: ${r.stdout}`,
+    );
+    assert.equal(
+      rootCheck.status,
+      'warn',
+      'a hook doctor cannot read must warn, not pass silently, per the marker-only substring check above it',
+    );
+    const markerCheck = out.find((c) => c.label === 'git hooks/pre-commit');
+    assert.equal(
+      markerCheck?.status,
+      'pass',
+      'the marker-substring check stays a pass, the root check next to it is what must now catch this',
+    );
+  });
+});
+
 // ── ISSUE-80: --apply refreshes the provenance sidecar (scripts/lib/pkg-provenance.mjs) ──
 suite('upgrade.mjs — provenance sidecar refresh (ISSUE-80)');
 
@@ -1979,6 +2430,138 @@ test('--apply --codex writes the provenance sidecar into the codex hooks dir (sc
         sidecar.hypoSharedSha256,
         repoHypoSharedSha256(),
         'codex sidecar hash must match the installed hypo-shared.mjs',
+      );
+    });
+  });
+});
+
+// ── ISSUE-139: SCHEMA delta text on the upgrade notice ─────────────────────
+// Before this, the SCHEMA drift notice named only the two version numbers.
+// A user's SCHEMA.md is a translated, hand-extended document, so a raw diff
+// against the shipped template is dominated by noise unrelated to the actual
+// upstream change; the notice now names what each version in between added.
+
+suite('lib/template-schema-version.mjs — schemaVersionDeltas (ISSUE-139)');
+
+// Reads the source text, not the loaded object: by the time the module is
+// imported a key written as `2.10:` has ALREADY collapsed to "2.1", and no
+// runtime check can tell the two apart. The day SCHEMA.md reaches 2.10 the
+// obvious way to add a line is the broken one, and the failure is silent —
+// either 2.1's entry is overwritten or 2.10's text goes to someone upgrading
+// across 2.1. Prettier keeps the quotes once they are there but will not put
+// them there for you, so this is the only place that can catch it.
+test('every SCHEMA_VERSION_DELTAS key with a trailing zero is quoted (2.10 is not 2.1)', () => {
+  const src = readFileSync(join(REPO, 'scripts', 'lib', 'template-schema-version.mjs'), 'utf-8');
+  const block = src.slice(
+    src.indexOf('export const SCHEMA_VERSION_DELTAS'),
+    src.indexOf('function parseMinorVersion'),
+  );
+  assert.ok(block.length > 0, 'could not locate the SCHEMA_VERSION_DELTAS block');
+  const bad = [...block.matchAll(/^\s*(\d+\.\d*0)\s*:/gm)].map((m) => m[1]);
+  assert.deepEqual(
+    bad,
+    [],
+    `these keys are unquoted number literals whose trailing zero is dropped ` +
+      `(${bad.join(', ')}) — quote them: '2.10', not 2.10`,
+  );
+});
+
+test('names the real 2.1 → 2.2 change (sources_consulted, PR #290)', () => {
+  const result = schemaVersionDeltas('2.1', '2.2');
+  assert.equal(result.length, 1, `expected exactly one delta line: ${JSON.stringify(result)}`);
+  assert.ok(
+    result[0].includes('sources_consulted'),
+    `2.1 → 2.2 delta must name sources_consulted: ${result[0]}`,
+  );
+});
+
+test('a multi-minor gap reports every version crossed, not just the endpoint', () => {
+  // Injected map, not SCHEMA_VERSION_DELTAS: this isolates the stepping logic
+  // from how many real bumps happen to exist right now. A version-off-by-one
+  // implementation (e.g. one that only checks installed+1 === current) would
+  // return nothing here since 2.0 → 2.2 is a two-step gap.
+  const injected = { 2.1: 'first change', 2.2: 'second change' };
+  const result = schemaVersionDeltas('2.0', '2.2', injected);
+  assert.deepEqual(
+    result,
+    ['2.1: first change', '2.2: second change'],
+    `expected both in-between versions in ascending order: ${JSON.stringify(result)}`,
+  );
+});
+
+test('a version the map has no entry for yields nothing (no invented text)', () => {
+  const result = schemaVersionDeltas('9.8', '9.9', SCHEMA_VERSION_DELTAS);
+  assert.deepEqual(result, [], `unmapped version range must not fabricate a delta: ${result}`);
+});
+
+test('installed at or after current yields nothing', () => {
+  assert.deepEqual(schemaVersionDeltas('2.2', '2.2'), []);
+  assert.deepEqual(schemaVersionDeltas('2.2', '2.1'), []);
+});
+
+suite('upgrade.mjs — SCHEMA minor-bump notice includes the delta (ISSUE-139)');
+
+test('a single-minor-step bump names the change in the text report', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const schemaPath = join(hypoDir, 'SCHEMA.md');
+      writeFileSync(
+        schemaPath,
+        readFileSync(schemaPath, 'utf-8').replace(/^version: .+$/m, 'version: 2.1'),
+      );
+
+      const jsonR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(jsonR.stdout);
+      assert.equal(
+        out.schema.bump,
+        'minor',
+        `expected minor bump from 2.1: ${JSON.stringify(out.schema)}`,
+      );
+
+      const textR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`], home);
+      assert.ok(
+        /SCHEMA version.*2\.1 → 2\.2/.test(textR.stdout),
+        `text report must still show the version bump: ${textR.stdout}`,
+      );
+      assert.ok(
+        textR.stdout.includes('sources_consulted'),
+        `text report must name what 2.2 added, not just the version numbers: ${textR.stdout}`,
+      );
+    });
+  });
+});
+
+test('a two-minor-step bump still names the in-between change, not just the endpoint', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      // init stamps the current template; roll the wiki SCHEMA back to 2.0,
+      // two minor versions behind whatever templates/SCHEMA.md currently ships.
+      const schemaPath = join(hypoDir, 'SCHEMA.md');
+      writeFileSync(
+        schemaPath,
+        readFileSync(schemaPath, 'utf-8').replace(/^version: .+$/m, 'version: 2.0'),
+      );
+
+      const jsonR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(jsonR.stdout);
+      assert.equal(
+        out.schema.bump,
+        'minor',
+        `expected minor bump from 2.0: ${JSON.stringify(out.schema)}`,
+      );
+
+      const textR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`], home);
+      assert.ok(
+        textR.stdout.includes('sources_consulted'),
+        `text report must name the 2.2 change even when installed is two minors behind: ${textR.stdout}`,
       );
     });
   });

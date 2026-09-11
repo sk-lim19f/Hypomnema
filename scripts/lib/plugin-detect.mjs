@@ -98,14 +98,20 @@ function readPkgVersionAt(root) {
   }
 }
 
-// A pkgRoot is "usable" as a DURABLE install root only if it is an ABSOLUTE path to
-// a real package directory whose package.json carries a version. A relative path
-// (e.g. installPath ".") would be resolved against the caller's cwd and break the
-// vault git hook from any other directory; a version-less package.json cannot be
-// attributed a version without lying. A bare path that merely exists is a pointer
-// the runtime cannot resolve scripts through. Shared by init's registry resolution,
-// its durable-root fallback, and upgrade's dualSkip provenance correction so they
-// all agree on what is real.
+// A pkgRoot is "usable" only if it is an ABSOLUTE path to a real package directory
+// whose package.json carries a version. A relative path (e.g. installPath ".")
+// would be resolved against the caller's cwd and break the vault git hook from any
+// other directory; a version-less package.json cannot be attributed a version
+// without lying. This is the WEAK predicate: it says nothing about WHOSE package
+// sits at that path, only that a version can be read from it. That is enough for a
+// diagnostic that reads and reports (doctor.mjs's per-row leaf-drift scan, which
+// deliberately widens rather than narrows — see leafVersionDrift above), but it is
+// NOT enough for a caller that adopts the path as Hypomnema's own durable identity
+// and writes it to a sidecar (hypo-pkg.json) or a vault's pre-commit hook: nothing
+// here stops a foreign package at an absolute, version-bearing path from being
+// adopted as if it were this one. isHypomnemaInstallRoot below is the strong
+// predicate for that case; keep the two in sync; a change to one's shape
+// (absolute + version) almost certainly belongs in the other too.
 export function usablePkgRoot(pkgRoot) {
   return (
     typeof pkgRoot === 'string' &&
@@ -114,6 +120,26 @@ export function usablePkgRoot(pkgRoot) {
     existsSync(join(pkgRoot, 'package.json')) &&
     readPkgVersionAt(pkgRoot) !== null
   );
+}
+
+// The STRONG predicate: usablePkgRoot, AND the package at that path is literally
+// named "hypomnema". A registry or hypo-pkg.json entry can carry any absolute,
+// version-bearing path — a corrupted sidecar, a hand-edited registry row, or (per
+// the commit-time resolver's own `usable()` in git-hooks-dir.mjs) an attacker's
+// project — so a caller that RECORDS a root as durable identity (init.mjs's
+// resolveDurableRoot, selectEntry below) or WRITES it back to disk (upgrade.mjs's
+// dualSkip provenance correction) must check producer identity, not just
+// "a version is readable here". A caller that only READS for display (doctor.mjs's
+// per-row leaf scan) stays on the weak usablePkgRoot: narrowing it would silence a
+// foreign registry row doctor exists to surface, per the "does NOT exclude"
+// rationale on leafVersionDrift above.
+export function isHypomnemaInstallRoot(pkgRoot) {
+  if (!usablePkgRoot(pkgRoot)) return false;
+  try {
+    return JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8')).name === 'hypomnema';
+  } catch {
+    return false;
+  }
 }
 
 // The version-shaped leaf of a plugin cache path (its last path component), or
@@ -185,10 +211,18 @@ export function leafVersionDrift(pkgRoot) {
 // #269 reimplemented this exact filter-then-prefer-scope rule at its call site,
 // in the opposite order, which silently swaps rows whenever the user row has no
 // gitCommitSha).
+// isHypomnemaInstallRoot, not the weak usablePkgRoot: this is the row
+// resolveEnabledPluginEntry hands to callers that RECORD it as durable identity
+// (init.mjs's resolveDurableRoot, upgrade.mjs's dualSkip provenance write), so a
+// registry row whose installPath merely resolves a readable version, without
+// being a real Hypomnema package, must not be selected here. codex reproduction
+// (2026-09-11): a registry row's package.json carried no `name` field at all and
+// was still adopted as the durable root under the old, name-blind check.
 function selectEntry(entries, scope) {
   return (
     entries.find(
-      (e) => e && (scope === undefined || e.scope === scope) && usablePkgRoot(e.installPath),
+      (e) =>
+        e && (scope === undefined || e.scope === scope) && isHypomnemaInstallRoot(e.installPath),
     ) ?? null
   );
 }

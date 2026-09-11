@@ -12,7 +12,6 @@ import {
   stripScissors,
   messageHasGitTemplate,
   BLOCKED_PATTERNS,
-  DECISION_PATTERNS,
   TAG_BODY_PATTERNS,
   ATTRIBUTION_PATTERNS,
 } from '../scripts/lib/check-tracker-ids.mjs';
@@ -156,26 +155,27 @@ test('scanText allows GitHub refs and lookalikes', () => {
     'see #48',
     'prefix #7',
     'suffix #3',
-    'ADR 0040',
-    'decisions/0040',
     'https://github.com/x/y/issues/3',
   ]) {
     assert.equal(scanText(s).length, 0, `should not flag: ${s}`);
   }
 });
 
-test('scanText with DECISION_PATTERNS flags ADR (space/tab/hyphen) and decisions pointers', () => {
-  const docPatterns = [...BLOCKED_PATTERNS, ...DECISION_PATTERNS];
-  assert.equal(scanText('see ADR 0040 for rationale', docPatterns).length, 1);
-  assert.equal(scanText('ADR\t0019 detail', docPatterns)[0].match, 'ADR\t0019');
-  assert.equal(scanText('hyphen form ADR-0018 here', docPatterns)[0].match, 'ADR-0018');
-  assert.equal(scanText('lives in decisions/0031-foo.md', docPatterns)[0].match, 'decisions/0031');
+test('scanText (default BLOCKED_PATTERNS) flags ADR (space/tab/hyphen) and decisions pointers, everywhere, no exemption', () => {
+  // ADR NNNN / decisions/NNNN used to live in a separate DECISION_PATTERNS set a
+  // caller had to opt into; the CHANGELOG.md exemption that justified keeping
+  // them apart is gone (this repo ships no `decisions/` directory for a
+  // release-history citation to point at), so BLOCKED_PATTERNS carries them
+  // directly now and the bare, no-second-argument call is enough.
+  assert.equal(scanText('see ADR 0040 for rationale').length, 1);
+  assert.equal(scanText('ADR\t0019 detail')[0].match, 'ADR\t0019');
+  assert.equal(scanText('hyphen form ADR-0018 here')[0].match, 'ADR-0018');
+  assert.equal(scanText('lives in decisions/0031-foo.md')[0].match, 'decisions/0031');
   // GitHub refs and tracker ids still behave: PR #N safe, ISSUE-N still caught.
-  assert.equal(scanText('PR #50 and (#9)', docPatterns).length, 0);
-  assert.equal(scanText('ISSUE-7 and ADR 0040', docPatterns).length, 2);
-  // The bare scanText default (BLOCKED_PATTERNS) still never flags ADR refs — only
-  // the CLI's patternsFor() layers DECISION_PATTERNS on for non-CHANGELOG files.
-  assert.equal(scanText('ADR 0040 and decisions/0031 anchor').length, 0);
+  assert.equal(scanText('PR #50 and (#9)').length, 0);
+  assert.equal(scanText('ISSUE-7 and ADR 0040').length, 2);
+  // Both anchors on one line, no other patterns in play: exactly two hits.
+  assert.equal(scanText('ADR 0040 and decisions/0031 anchor').length, 2);
 });
 
 test('default gate AND tag body flag all five tracker prefixes; FEAT/IMPR/PRAC now block in code comments too', () => {
@@ -191,9 +191,16 @@ test('default gate AND tag body flag all five tracker prefixes; FEAT/IMPR/PRAC n
   }
   // A code comment that once cited three trackers is now three hits.
   assert.equal(scanText('// FEAT-17 hardening, see PRAC-18 and IMPR-13').length, 3);
-  // GitHub refs, bare prefixes (no digit), and ADR anchors stay legitimate.
-  assert.equal(scanText('PR #50 (#9) ADR 0040 FEAT- IMPR- PRAC-').length, 0);
-  assert.equal(scanText('PR #50 (#9) ADR 0040', TAG_BODY_PATTERNS).length, 0);
+  // GitHub refs and bare prefixes (no digit) stay legitimate; an ADR anchor no
+  // longer does, in either the default gate or the tag body.
+  assert.equal(scanText('PR #50 (#9) FEAT- IMPR- PRAC-').length, 0);
+  assert.equal(scanText('PR #50 (#9) FEAT- IMPR- PRAC-', TAG_BODY_PATTERNS).length, 0);
+  assert.equal(scanText('PR #50 (#9) ADR 0040').length, 1, 'ADR anchors are gated by default now');
+  assert.equal(
+    scanText('PR #50 (#9) ADR 0040', TAG_BODY_PATTERNS).length,
+    1,
+    'and in the tag body',
+  );
   // TAG_BODY_PATTERNS now equals BLOCKED_PATTERNS (the surface set was folded in).
   assert.deepEqual(
     TAG_BODY_PATTERNS.map((p) => p.name),
@@ -201,7 +208,7 @@ test('default gate AND tag body flag all five tracker prefixes; FEAT/IMPR/PRAC n
   );
 });
 
-test('CHANGELOG.md is tracker-ID-0 across all four prefixes (surface ID 0 regression, §5)', () => {
+test('CHANGELOG.md is tracker-ID-0 across every blocked pattern, ADR/decisions included (surface ID 0 regression, §5)', () => {
   const cl = readFileSync(join(REPO, 'CHANGELOG.md'), 'utf-8');
   const hits = scanText(cl, TAG_BODY_PATTERNS);
   assert.equal(
@@ -219,10 +226,9 @@ test('scanText reports 1-based line/col', () => {
 });
 
 test('scanText catches a tracker token that line-wraps inside a comment', () => {
-  const docPatterns = [...BLOCKED_PATTERNS, ...DECISION_PATTERNS];
   // ADR wrapped across a JSDoc continuation: prefix on line 1, digits on line 2.
   const wrapped = ' * before continuing (ADR\n * 0045) and after';
-  const h = scanText(wrapped, docPatterns);
+  const h = scanText(wrapped);
   assert.equal(h.length, 1, 'wrapped ADR must be caught');
   assert.equal(h[0].match, 'ADR 0045');
   assert.equal(h[0].line, 1, 'reported at the prefix line');
@@ -231,19 +237,15 @@ test('scanText catches a tracker token that line-wraps inside a comment', () => 
   // Separator-flush wraps: the break falls right at `-` / `/` / `#`, where the
   // digit must sit flush — the no-gap join catches these.
   assert.equal(scanText('see ISSUE-\n * 9 here').length, 1, 'ISSUE- separator wrap');
-  assert.equal(
-    scanText('lives in decisions/\n // 0031-foo', docPatterns).length,
-    1,
-    'decisions/ wrap',
-  );
+  assert.equal(scanText('lives in decisions/\n // 0031-foo').length, 1, 'decisions/ wrap');
   assert.equal(scanText('blocks (fix #\n * 37)').length, 1, 'fix #<wrap>N separator wrap');
-  assert.equal(scanText('per FEAT-\n // 1 detail', docPatterns).length, 1, 'FEAT- separator wrap');
+  assert.equal(scanText('per FEAT-\n // 1 detail').length, 1, 'FEAT- separator wrap');
   // The ADR hyphen form can match in BOTH joins; it must be de-duplicated to one.
-  assert.equal(scanText('ref ADR\n -0045 end', docPatterns).length, 1, 'ADR hyphen wrap deduped');
+  assert.equal(scanText('ref ADR\n -0045 end').length, 1, 'ADR hyphen wrap deduped');
   // A non-wrapped token is still counted exactly once (no double-count from the
   // join pass), and a token split by a blank line (not an adjacent wrap) is ignored.
   assert.equal(scanText('one ISSUE-9 here\nplain next line').length, 1);
-  assert.equal(scanText('trailing ADR\n\n0045 far away', docPatterns).length, 0);
+  assert.equal(scanText('trailing ADR\n\n0045 far away').length, 0);
 });
 
 test('messageHasGitTemplate detects editor template / scissors, not -m messages', () => {
@@ -306,7 +308,9 @@ test('a full-width colon confusable ("Co-Authored-By\uFF1A") is still caught (NF
 
 test('normalization adds no false positive on ordinary ASCII prose', () => {
   assert.equal(scanText('normal prose about co-authoring a book', ATTRIBUTION_PATTERNS).length, 0);
-  assert.equal(scanText('see PR #50 and ADR 0040', BLOCKED_PATTERNS).length, 0);
+  // PR #50 stays legitimate; ADR 0040 is a real hit now that BLOCKED_PATTERNS
+  // carries the ADR anchors with no exemption.
+  assert.equal(scanText('see PR #50 and ADR 0040', BLOCKED_PATTERNS).length, 1);
 });
 
 test('a zero-width character inside a tracker id (ISSUE-N) is still caught', () => {
@@ -461,7 +465,9 @@ test('CLI --commit-msg: blocks a leak (exit 1)', () => {
 test('CLI --commit-msg: clean with GitHub refs (exit 0)', () => {
   withTmpDir((dir) => {
     const f = join(dir, 'MSG');
-    writeFileSync(f, 'feat: thing (#101)\n\nSee PR #50 and #48. ADR 0040.\n');
+    // No `ADR NNNN` here on purpose: it is a real hit now (see the ADR-in-
+    // commit-message test below), so it no longer belongs in a "clean" fixture.
+    writeFileSync(f, 'feat: thing (#101)\n\nSee PR #50 and #48.\n');
     assert.equal(runChecker(['--commit-msg', f]).status, 0);
   });
 });
@@ -637,7 +643,7 @@ test('CLI --staged: package.json leak is gated (scope agrees with --all)', () =>
   });
 });
 
-test('CLI --all: ADR / decisions pointers are gated everywhere except CHANGELOG', () => {
+test('CLI --all: ADR / decisions pointers are gated everywhere, CHANGELOG.md included (no exemption)', () => {
   withTmpDir((dir) => {
     // README.md → ADR pointer flagged.
     writeFileSync(join(dir, 'README.md'), 'rationale lives in ADR 0031.\n');
@@ -672,16 +678,24 @@ test('CLI --all: ADR / decisions pointers are gated everywhere except CHANGELOG'
     assert.equal(runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status, 1);
   });
   withTmpDir((dir) => {
-    // CHANGELOG keeps version-history ADR / decisions refs → NOT flagged.
+    // BLOCKER (was): CHANGELOG.md was the one file this scan waved an ADR/
+    // decisions pointer through, on the theory that a release line legitimately
+    // cites the decision behind it. That theory did not survive contact with
+    // this repo's own history: it ships no `decisions/` directory, so
+    // `decisions/0100` resolves to nothing for anyone outside the maintainer's
+    // wiki, exactly like `ISSUE-137` does. The exemption is gone — a positive
+    // assertion, not just an absence of one, because a flipped expectation
+    // that happens to already hold proves nothing (a stale copy-paste of the
+    // old exempt-and-pass fixture would still read green here if the gate
+    // silently kept the exemption).
     writeFileSync(
       join(dir, 'CHANGELOG.md'),
-      '- gate single SoT (ADR 0046), see decisions/0046-foo.md\n',
+      '- gate single SoT (ADR 0046), see decisions/0100-foo.md\n',
     );
-    assert.equal(
-      runChecker(['--all'], { CHECK_TRACKER_ROOT: dir }).status,
-      0,
-      'CHANGELOG ADR / decisions refs must NOT be gated',
-    );
+    const r = runChecker(['--all'], { CHECK_TRACKER_ROOT: dir });
+    assert.equal(r.status, 1, 'CHANGELOG.md ADR / decisions refs must now be gated');
+    assert.match(r.stderr, /ADR 0046/);
+    assert.match(r.stderr, /decisions\/0100/);
   });
 });
 

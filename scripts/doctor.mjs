@@ -543,15 +543,38 @@ function checkGit(hypoDir) {
     // plugin-cache leaf-drift precedent: reporting must never turn into
     // filtering, or a still-real, still-resolvable root looks like it vanished).
     const parsedRoot = parseWikiPreCommitRoot(content);
-    const wantRoot = resolveDurableHookRoot();
-    if (parsedRoot.ok && wantRoot !== null && wantRoot !== parsedRoot.root) {
+    if (parsedRoot.ok && parsedRoot.root === null) {
+      // The runtime-resolving form: the hook looks up its own
+      // install root at commit time, so there is no baked value to compare
+      // against the active install — it cannot structurally go stale the way
+      // the old, version-pinned form could. Report that fact in place of the
+      // stale-root comparison below, rather than falling silent.
+      pass(`${label} root`, 'Resolved at commit time by the hook itself — never goes stale');
+    } else if (!parsedRoot.ok) {
+      // The pass above only checked that our START marker is present, not
+      // that the body it wraps is one this codebase can actually run. This is
+      // the fail-open this branch used to leave: a hand-edited body, a
+      // corrupted one, or (before the rewrite-safe root check) an OLD-form
+      // hook whose baked-in install root no longer existed all read as a
+      // clean "guard installed" pass while the hook fails MODULE_NOT_FOUND on
+      // every real commit.
       warn(
         `${label} root`,
-        `Points at an old install root (${parsedRoot.root}) — the active install is ` +
-          `${wantRoot}. To repoint it, run ${upgradeApplyHint(
-            pluginMode || hypomnemaPluginEnabled,
-          )}.`,
+        'Guard marker present but the hook body is not recognized, it may be failing on ' +
+          `every commit. Run \`hypomnema init --force-commands\` (or the plugin's ` +
+          `\`/hypo:init --force-commands\`) to reinstall it.`,
       );
+    } else {
+      const wantRoot = resolveDurableHookRoot();
+      if (wantRoot !== null && wantRoot !== parsedRoot.root) {
+        warn(
+          `${label} root`,
+          `Points at an old install root (${parsedRoot.root}) — the active install is ` +
+            `${wantRoot}. To repoint it, run ${upgradeApplyHint(
+              pluginMode || hypomnemaPluginEnabled,
+            )}.`,
+        );
+      }
     }
   } else {
     warn(label, 'Exists but not managed by Hypomnema — manual git add can bypass .hypoignore');
