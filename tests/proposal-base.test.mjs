@@ -2062,7 +2062,15 @@ test('every relative import of a registered hook resolves to a file upgrade actu
   const missing = [];
   for (const file of covered) {
     const src = join(HOOKS, file);
-    if (!existsSync(src)) continue;
+    // A dangling entry (something the lists name but that does not exist on
+    // disk) used to `continue` here and pass silently — the title promises
+    // every relative import resolves to a file upgrade copies, but skipping a
+    // missing source file checks nothing about it at all. Fail on the entry
+    // itself instead of quietly excusing it from the scan below.
+    assert.ok(
+      existsSync(src),
+      `hooks.json/shared.json names "${file}" but hooks/${file} does not exist on disk`,
+    );
     const text = readFileSync(src, 'utf-8');
     for (const m of text.matchAll(/from\s+'\.\/([\w.-]+\.mjs)'/g)) {
       if (!covered.has(m[1])) missing.push(`${file} imports ./${m[1]}`);

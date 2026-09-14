@@ -340,6 +340,10 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/hook-inventory.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/hypo-ignore.mjs",
     "exec": false
   },

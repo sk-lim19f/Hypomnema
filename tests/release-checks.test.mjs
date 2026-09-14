@@ -608,6 +608,37 @@ test('empty skills (.gitkeep only) → exit 1', () => {
   });
 });
 
+// A command pointing at the wrong top-level directory (e.g. scripts/ instead of
+// hooks/, the only directory init.mjs ever copies from) used to smoke clean as
+// long as that OTHER file happened to exist: the old check accepted any path
+// after `${CLAUDE_PLUGIN_ROOT}/`. init/upgrade/doctor/uninstall all resolve
+// this exact command to `hooks/foo.mjs` regardless, so a plugin-channel user's
+// smoke-clean install would break the moment a manual/npm user ran the same
+// package. lib/hook-inventory.mjs's extractPluginHookBasename (shared by all
+// five consumers) is what closes this now.
+test('a command target outside hooks/ → exit 1 (major E: one shared command grammar)', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    mkdirSync(join(dir, 'scripts'), { recursive: true });
+    writeFileSync(join(dir, 'scripts', 'foo.mjs'), '// really exists, wrong directory\n');
+    const hooksJson = JSON.parse(readFileSync(join(dir, 'hooks', 'hooks.json'), 'utf-8'));
+    hooksJson.hooks.SessionStart.push({
+      hooks: [{ type: 'command', command: 'node ${CLAUDE_PLUGIN_ROOT}/scripts/foo.mjs' }],
+    });
+    writeFileSync(join(dir, 'hooks', 'hooks.json'), JSON.stringify(hooksJson, null, 2));
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(
+      r.status,
+      1,
+      `a command outside hooks/ must fail even if the file exists: ${r.stdout}`,
+    );
+    assert.ok(
+      /does not match/.test(r.stderr + r.stdout),
+      `should name why the command is rejected: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
 test('missing shared hook file → exit 1', () => {
   withTmpDir((dir) => {
     buildPluginFixture(dir);

@@ -18,6 +18,7 @@ import { homedir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { loadHookInventory } from './lib/hook-inventory.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { readRenameMarker, renameMarkerPath, RENAME_MARKER_REL } from './lib/rename-marker.mjs';
 import {
@@ -154,110 +155,22 @@ function fail(label, detail = '') {
 }
 
 // ── hook map (loaded from hooks/hooks.json — single source of truth) ─────────
-
-let _hookConfig;
-try {
-  _hookConfig = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
-} catch {
-  console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
+//
+// loadHookInventory (scripts/lib/hook-inventory.mjs) is the one parser every
+// hooks.json/shared.json consumer reads through — smoke-plugin, init, upgrade,
+// and uninstall all call the same function. It existence-checks every named
+// file against THIS package's own hooks/ before returning ok:true, so a
+// corrupt or incomplete doctor.mjs's OWN package (never the vault being
+// audited — that stays checkHooks()'s job below) fails here rather than
+// auditing an install against a hook list doctor cannot trust.
+const _hookInventory = loadHookInventory(PKG_ROOT);
+if (!_hookInventory.ok) {
+  console.error(`Error: ${_hookInventory.error}`);
   console.error(PKG_INTEGRITY_HINT);
   process.exit(1);
 }
-if (!_hookConfig || typeof _hookConfig !== 'object' || Array.isArray(_hookConfig)) {
-  console.error('Error: hooks/hooks.json must be a JSON object');
-  console.error(PKG_INTEGRITY_HINT);
-  process.exit(1);
-}
-if (
-  !_hookConfig.hooks ||
-  typeof _hookConfig.hooks !== 'object' ||
-  Array.isArray(_hookConfig.hooks)
-) {
-  console.error('Error: hooks/hooks.json must contain a "hooks" object');
-  console.error(PKG_INTEGRITY_HINT);
-  process.exit(1);
-}
-function _extractCommandFileName(command) {
-  if (typeof command !== 'string') return null;
-  const matches = [...command.matchAll(/(?:^|[\/\\])([^\/\\\s"'`]+\.mjs)(?=$|[\s"'`])/g)];
-  if (matches.length > 0) return matches[matches.length - 1][1];
-  const bare = command.match(/(?:^|\s)([^\/\\\s"'`]+\.mjs)(?=$|[\s"'`])/);
-  return bare ? bare[1] : null;
-}
-
-function _isHookFileName(file) {
-  return typeof file === 'string' && /^[^/\\\s]+\.mjs$/.test(file.trim());
-}
-
-function _isHookGroup(group) {
-  return (
-    group &&
-    typeof group === 'object' &&
-    !Array.isArray(group) &&
-    Array.isArray(group.hooks) &&
-    group.hooks.length > 0 &&
-    group.hooks.every(
-      (hook) =>
-        hook &&
-        typeof hook === 'object' &&
-        !Array.isArray(hook) &&
-        hook.type === 'command' &&
-        _extractCommandFileName(hook.command),
-    )
-  );
-}
-
-// Extract .mjs file names from both old format (string[]) and new format (hook-group object[])
-function _extractFileNames(groups) {
-  return groups.flatMap((group) => {
-    if (typeof group === 'string') return [group.trim()];
-    return group.hooks.map((hook) => _extractCommandFileName(hook.command));
-  });
-}
-
-for (const [event, groups] of Object.entries(_hookConfig.hooks)) {
-  const valid =
-    Array.isArray(groups) &&
-    groups.length > 0 &&
-    groups.every((group) => _isHookFileName(group) || _isHookGroup(group)) &&
-    _extractFileNames(groups).length > 0;
-  if (!valid) {
-    console.error(
-      `Error: hooks/hooks.json "hooks.${event}" must be a non-empty array of .mjs file names or Claude hook groups`,
-    );
-    console.error(PKG_INTEGRITY_HINT);
-    process.exit(1);
-  }
-}
-// The shared-file list used to live at hooks.json's own top-level "shared" key.
-// It moved to a sibling file, hooks/shared.json: the harness began
-// warning on hooks.json's unknown "shared" key once it started validating that
-// file, and "shared" was never part of the harness's own hook-registration
-// schema. Required, not tolerated when absent: a downstream fork with nothing
-// shared still ships hooks/shared.json as `[]`, so a missing file means the
-// package itself is broken, not that there is nothing to track. Checking this
-// file is the whole point of doctor's integrity check: skip it here and a
-// missing shared module (the thing every hook actually imports) reads as a
-// healthy install.
-const _sharedJsonPath = join(HOOKS_SRC, 'shared.json');
-let _sharedConfig;
-try {
-  _sharedConfig = JSON.parse(readFileSync(_sharedJsonPath, 'utf-8'));
-} catch (err) {
-  console.error(`Error: cannot read hooks/shared.json: ${err.message}`);
-  console.error(PKG_INTEGRITY_HINT);
-  process.exit(1);
-}
-if (!Array.isArray(_sharedConfig) || !_sharedConfig.every((f) => _isHookFileName(f))) {
-  console.error('Error: hooks/shared.json must be an array of .mjs file names');
-  console.error(PKG_INTEGRITY_HINT);
-  process.exit(1);
-}
-
-const HOOK_MAP = Object.fromEntries(
-  Object.entries(_hookConfig.hooks).map(([e, gs]) => [e, _extractFileNames(gs)]),
-);
-const SHARED_FILES = _sharedConfig;
+const HOOK_MAP = _hookInventory.hookMap;
+const SHARED_FILES = _hookInventory.shared;
 
 // ── checks ───────────────────────────────────────────────────────────────────
 

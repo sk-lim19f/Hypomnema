@@ -21,6 +21,7 @@
 import { readFileSync, existsSync, statSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { extractPluginHookBasename, isSafeMjsBasename } from './lib/hook-inventory.mjs';
 
 function parseArgs(argv) {
   const args = { root: null };
@@ -135,6 +136,16 @@ function smoke(root) {
   // real regular file on disk. hooks.json is the hook source of truth, so a missing
   // hypo-shared.mjs / version-check.mjs would pass a manifest-only check but break
   // hook imports at runtime.
+  //
+  // Target extraction goes through extractPluginHookBasename (shared with
+  // init/upgrade/doctor/uninstall via lib/hook-inventory.mjs) rather than this
+  // file's own looser `\$\{CLAUDE_PLUGIN_ROOT\}\/(\S+)` capture, which used to
+  // accept ANY path after CLAUDE_PLUGIN_ROOT — so a command wired to
+  // `${CLAUDE_PLUGIN_ROOT}/scripts/foo.mjs` (the wrong directory: init only ever
+  // copies hooks/) smoked clean as long as that file happened to exist, while
+  // init/upgrade/doctor/uninstall all resolve the same command to `hooks/foo.mjs`
+  // and never look in scripts/ at all. `targets` now holds bare hooks/ basenames,
+  // not full relative paths, matching what those four consumers actually see.
   const targets = new Set();
   const hooksPath = join(root, 'hooks', 'hooks.json');
   if (!existsSync(hooksPath)) {
@@ -154,17 +165,24 @@ function smoke(root) {
           for (const group of groups || []) {
             for (const hk of group?.hooks || []) {
               if (hk?.command) {
-                // command looks like `node ${CLAUDE_PLUGIN_ROOT}/hooks/foo.mjs [args]`
-                const m = String(hk.command).match(/\$\{CLAUDE_PLUGIN_ROOT\}\/(\S+)/);
-                if (m) targets.add(m[1]);
+                const base = extractPluginHookBasename(hk.command);
+                if (base) {
+                  targets.add(base);
+                } else if (/\$\{CLAUDE_PLUGIN_ROOT\}/.test(String(hk.command))) {
+                  fail(
+                    `hooks/hooks.json: command "${hk.command}" does not match ` +
+                      `"\${CLAUDE_PLUGIN_ROOT}/hooks/<basename>.mjs"`,
+                  );
+                }
               }
             }
           }
         }
         if (targets.size === 0)
           fail('hooks/hooks.json: no ${CLAUDE_PLUGIN_ROOT} command targets found');
-        for (const rel of targets) {
-          if (!isFile(join(root, rel))) fail(`hooks/hooks.json: target "${rel}" is not a file`);
+        for (const base of targets) {
+          if (!isFile(join(root, 'hooks', base)))
+            fail(`hooks/hooks.json: target "hooks/${base}" is not a file`);
         }
         notes.push(`hook targets: ${targets.size}`);
       }
@@ -199,11 +217,7 @@ function smoke(root) {
         // would act on it. A smoke check that joined first and only asked
         // whether something is there would call that entry valid, because the
         // file it escaped to usually does exist.
-        if (
-          typeof shared !== 'string' ||
-          !/^[\w.-]+\.mjs$/.test(shared) ||
-          shared.startsWith('.')
-        ) {
+        if (!isSafeMjsBasename(shared)) {
           fail(`hooks/shared.json: "${shared}" is not a plain .mjs basename`);
           continue;
         }
@@ -230,12 +244,10 @@ function smoke(root) {
   // belongs to neither list by design. Anything else landing here is a mistake.
   const UNLISTED_OK = new Set(['hypo-pre-commit.mjs']);
   if (targets.size > 0 && Array.isArray(sharedJson)) {
-    const reachable = new Set([
-      ...[...targets]
-        .filter((rel) => rel.startsWith('hooks/'))
-        .map((rel) => rel.slice('hooks/'.length)),
-      ...sharedJson.filter((s) => typeof s === 'string'),
-    ]);
+    // `targets` already holds bare hooks/ basenames (extractPluginHookBasename
+    // only ever matches a path rooted at hooks/), so no prefix-stripping is
+    // needed here anymore.
+    const reachable = new Set([...targets, ...sharedJson.filter((s) => typeof s === 'string')]);
     let unlisted = 0;
     for (const entry of readdirSync(join(root, 'hooks'))) {
       if (!entry.endsWith('.mjs')) continue;
