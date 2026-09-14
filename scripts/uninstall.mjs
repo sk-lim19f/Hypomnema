@@ -51,7 +51,7 @@ import {
   statSync,
   realpathSync,
 } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import {
@@ -74,7 +74,12 @@ import {
   hasSymlinkAncestor,
   buildHookCommand,
 } from './lib/extensions.mjs';
-import { removeProvenanceSidecar } from './lib/pkg-provenance.mjs';
+import {
+  removeProvenanceSidecar,
+  readProvenanceSidecar,
+  provenancePath,
+} from './lib/pkg-provenance.mjs';
+import { loadHookInventory } from './lib/hook-inventory.mjs';
 import {
   hooksDirForInstall,
   unsafeHookTargetReason,
@@ -93,12 +98,6 @@ import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const PKG_ROOT = join(SCRIPT_DIR, '..');
-
-// Shown after every fatal package-integrity error. These conditions mean the
-// shipped hooks/hooks.json is missing or malformed — never a user mistake —
-// so the only useful next step is a re-install of the package.
-const PKG_INTEGRITY_HINT =
-  '→ This indicates a corrupt or incomplete install. Re-install with `npm install -g hypomnema` (or re-install the Claude Code plugin).';
 
 function removeCommands(apply, force) {
   const targetDir = join(HOME, '.claude', 'commands', 'hypo');
@@ -725,53 +724,60 @@ function parseArgs(argv) {
   return args;
 }
 
-// ── hook map (single source of truth) ───────────────────────────────────────
-
-function loadHookFiles() {
-  let cfg;
-  try {
-    cfg = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'hooks.json'), 'utf-8'));
-  } catch {
-    console.error('Error: cannot read hooks/hooks.json');
-    console.error(PKG_INTEGRITY_HINT);
-    process.exit(1);
+// ── hook file set (single source of truth, with a provenance fallback) ──────
+//
+// The normal path reads PKG_ROOT's own hooks.json/shared.json through
+// loadHookInventory (scripts/lib/hook-inventory.mjs) — the same parser every
+// install/uninstall consumer shares, so a command shape one of them would
+// accept (or a trailing-argument command this file's own old `/hooks/(...)$`
+// anchor silently ignored) cannot read differently here.
+//
+// But uninstall is the one command whose whole point is letting someone leave
+// even when the package itself is broken. The other four consumers fail closed
+// on a malformed hooks.json; refusing to run here instead would trade "a few
+// files linger" for "you cannot remove this at all". So when the package list
+// cannot be read, this falls back to the provenance sidecar THIS hooksDir's own
+// last install/upgrade wrote: writeProvenanceSidecar (lib/pkg-provenance.mjs)
+// records `managedFiles`, the exact basename set that run copied, so a hooks.json
+// broken in the CURRENTLY-INSTALLED package does not strand the files a PAST,
+// working package put there.
+//
+// Only when neither the package list nor a provenance record is available does
+// this give up on identifying anything here as ours — `source: 'none'` below
+// never guesses at deletion; the caller names what remains and reports failure
+// via its exit code rather than silently succeeding at nothing.
+function resolveHookFileSet(pkgRoot, hooksDir) {
+  const inv = loadHookInventory(pkgRoot);
+  if (inv.ok) {
+    const files = new Set([...Object.values(inv.hookMap).flat(), ...inv.shared]);
+    return { files, source: 'package', warning: null };
   }
-  if (!cfg?.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
-    console.error('Error: hooks/hooks.json must contain a "hooks" object');
-    console.error(PKG_INTEGRITY_HINT);
-    process.exit(1);
+  const sidecar = readProvenanceSidecar(hooksDir);
+  if (sidecar && Array.isArray(sidecar.managedFiles) && sidecar.managedFiles.length > 0) {
+    return {
+      files: new Set(sidecar.managedFiles),
+      source: 'provenance',
+      warning:
+        `hooks/hooks.json could not be read (${inv.error}). Recovered the managed file list for ` +
+        `${hooksDir} from ${provenancePath(hooksDir)} (recorded at the last install/upgrade) instead.`,
+    };
   }
-
-  const hookFiles = new Set();
-  const normalizedHookMap = {};
-
-  for (const [event, groups] of Object.entries(cfg.hooks)) {
-    const filenames = [];
-    for (const entry of groups) {
-      if (typeof entry === 'string') {
-        // legacy flat format: entry is a filename
-        hookFiles.add(entry);
-        filenames.push(entry);
-      } else if (entry && Array.isArray(entry.hooks)) {
-        // current group format: extract filename from command string
-        for (const h of entry.hooks) {
-          if (h.type === 'command' && typeof h.command === 'string') {
-            const m = h.command.match(/\/hooks\/([^/\s]+\.mjs)$/);
-            if (m) {
-              hookFiles.add(m[1]);
-              filenames.push(m[1]);
-            }
-          }
-        }
-      }
-    }
-    normalizedHookMap[event] = filenames;
-  }
-
-  if (Array.isArray(cfg.shared)) {
-    for (const f of cfg.shared) hookFiles.add(f);
-  }
-  return { hookMap: normalizedHookMap, hookFiles };
+  const present = existsSync(hooksDir)
+    ? readdirSync(hooksDir).filter((f) => f.endsWith('.mjs'))
+    : [];
+  return {
+    files: new Set(),
+    source: 'none',
+    warning:
+      `hooks/hooks.json could not be read (${inv.error}) and no provenance record exists at ` +
+      `${provenancePath(hooksDir)} to recover a managed file list from (an install made before ` +
+      `this sidecar field existed never wrote one). Hook file removal for ${hooksDir} is skipped ` +
+      'entirely.' +
+      (present.length
+        ? ` The following .mjs files are still there and were not evaluated — remove them by ` +
+          `hand after checking what they are: ${present.join(', ')}`
+        : ' No .mjs files were found there either.'),
+  };
 }
 
 // ── hook file removal ────────────────────────────────────────────────────────
@@ -779,14 +785,34 @@ function loadHookFiles() {
 function removeHookFiles(hooksDir, hookFiles, apply) {
   const removed = [],
     missing = [];
+  const skipped = [];
+  // Every name here comes out of a file on disk: hooks.json's event map and
+  // hooks/shared.json. A name is supposed to be a bare basename, but nothing
+  // upstream forces that, and join() resolves `../x.mjs` straight out of the
+  // hooks directory. This function DELETES what it is handed, so it confirms
+  // the containment itself rather than trusting the list it was given. An
+  // out-of-tree name is skipped and named, never removed: a corrupt list is a
+  // reason to leave files alone, not to delete somewhere else.
+  const root = resolve(hooksDir);
+  const inside = (p) => p === root || p.startsWith(root + sep);
   for (const file of hookFiles) {
     const p = join(hooksDir, file);
+    if (!inside(resolve(p))) {
+      skipped.push(file);
+      continue;
+    }
     if (existsSync(p)) {
       if (apply) rmSync(p);
       removed.push(p);
     } else {
       missing.push(p);
     }
+  }
+  if (skipped.length > 0) {
+    console.warn(
+      `Warning: ${skipped.length} hook name(s) resolve outside ${hooksDir} and were left alone: ` +
+        `${skipped.join(', ')}. Remove them by hand after checking what they are.`,
+    );
   }
   // .hypo-provenance.json (scripts/lib/pkg-provenance.mjs) is written next to
   // this exact hooksDir by installHooks/applyHookFiles — same lifecycle as the
@@ -804,7 +830,13 @@ function removeHookFiles(hooksDir, hookFiles, apply) {
 
 // ── settings.json cleanup ────────────────────────────────────────────────────
 
-function stripSettingsJson(settingsPath, hooksDir, hookMap, apply) {
+// `hookFiles` is a flat Set of basenames (not a per-event map): a command
+// string already names the exact hook file (`node <hooksDir>/<file>`), so
+// scoping "ours" by which event a settings.json group happens to sit under adds
+// no protection a flat membership check does not already give — and a flat set
+// is what both the normal (package) and provenance-fallback paths in
+// resolveHookFileSet actually have on hand.
+function stripSettingsJson(settingsPath, hooksDir, hookFiles, apply) {
   if (!existsSync(settingsPath)) return { stripped: [], kept: 0 };
 
   let settings;
@@ -816,17 +848,17 @@ function stripSettingsJson(settingsPath, hooksDir, hookMap, apply) {
 
   if (!settings.hooks || typeof settings.hooks !== 'object') return { stripped: [], kept: 0 };
 
+  const expectedCmds = new Set(
+    [...hookFiles].map((file) => `node ${hooksDir.replace(HOME, '$HOME')}/${file}`),
+  );
+  const isHypoHook = (h) =>
+    h.type === 'command' && typeof h.command === 'string' && expectedCmds.has(h.command);
+
   const stripped = [];
   let changed = false;
 
   for (const [event, groups] of Object.entries(settings.hooks)) {
     if (!Array.isArray(groups)) continue;
-
-    const managed = hookMap[event] ?? [];
-    const isHypoHook = (h) =>
-      h.type === 'command' &&
-      typeof h.command === 'string' &&
-      managed.some((file) => h.command === `node ${hooksDir.replace(HOME, '$HOME')}/${file}`);
 
     const filtered = groups.flatMap((group) => {
       if (!Array.isArray(group.hooks)) return [group];
@@ -873,13 +905,31 @@ if (args.hooksDir && !args.keepShell && !args.keepWikiHook) {
   );
 }
 
-const { hookMap, hookFiles } = loadHookFiles();
-
 const claudeHooksDir = args.hooksDir ?? join(HOME, '.claude', 'hooks');
 const claudeSettings = join(HOME, '.claude', 'settings.json');
 
-const hookResult = removeHookFiles(claudeHooksDir, hookFiles, args.apply);
-const settingsResult = stripSettingsJson(claudeSettings, claudeHooksDir, hookMap, args.apply);
+// A `source: 'none'` resolution (package unreadable AND no provenance record)
+// means hook-file removal for that target was skipped entirely rather than
+// guessed at — this run must not report plain success in that case. Collected
+// across both targets and applied to the exit code once the whole report is
+// printed, so the caller still sees everything else this run did (or would do).
+let hardFailure = false;
+function reportHookSetWarning(set) {
+  if (!set.warning) return;
+  console.error(`Warning: ${set.warning}`);
+  if (set.source === 'none') hardFailure = true;
+}
+
+const claudeHookSet = resolveHookFileSet(PKG_ROOT, claudeHooksDir);
+reportHookSetWarning(claudeHookSet);
+
+const hookResult = removeHookFiles(claudeHooksDir, claudeHookSet.files, args.apply);
+const settingsResult = stripSettingsJson(
+  claudeSettings,
+  claudeHooksDir,
+  claudeHookSet.files,
+  args.apply,
+);
 const commandResult = removeCommands(args.apply, args.forceCommands);
 
 // Wiki-side cleanup: the git pre-commit hook and the shell rc block init.mjs
@@ -946,8 +996,15 @@ let codexExtSettings = { stripped: [] };
 if (args.codex) {
   const codexHooksDir = join(HOME, '.codex', 'hooks');
   const codexSettings = join(HOME, '.codex', 'settings.json');
-  codexHookResult = removeHookFiles(codexHooksDir, hookFiles, args.apply);
-  codexSettingsResult = stripSettingsJson(codexSettings, codexHooksDir, hookMap, args.apply);
+  const codexHookSet = resolveHookFileSet(PKG_ROOT, codexHooksDir);
+  reportHookSetWarning(codexHookSet);
+  codexHookResult = removeHookFiles(codexHooksDir, codexHookSet.files, args.apply);
+  codexSettingsResult = stripSettingsJson(
+    codexSettings,
+    codexHooksDir,
+    codexHookSet.files,
+    args.apply,
+  );
   codexExtResult = removeExtensions('codex', args.apply, args.forceExtensions);
   codexExtSettings = stripExtensionSettings(
     codexSettings,
@@ -1105,3 +1162,10 @@ if (
 }
 
 console.log(lines.join('\n\n'));
+
+// See resolveHookFileSet / reportHookSetWarning above (major D): neither the
+// package's own hooks.json nor a provenance record could identify what to
+// remove for at least one target. The report above already named what remains;
+// this is what tells an automated caller (or a script chaining onto this one)
+// that the run did not fully succeed, rather than exiting 0 on a silent skip.
+if (hardFailure) process.exit(1);

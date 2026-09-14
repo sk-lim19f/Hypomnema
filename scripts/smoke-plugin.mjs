@@ -21,6 +21,7 @@
 import { readFileSync, existsSync, statSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { extractPluginHookBasename, isSafeMjsBasename } from './lib/hook-inventory.mjs';
 
 function parseArgs(argv) {
   const args = { root: null };
@@ -135,6 +136,17 @@ function smoke(root) {
   // real regular file on disk. hooks.json is the hook source of truth, so a missing
   // hypo-shared.mjs / version-check.mjs would pass a manifest-only check but break
   // hook imports at runtime.
+  //
+  // Target extraction goes through extractPluginHookBasename (shared with
+  // init/upgrade/doctor/uninstall via lib/hook-inventory.mjs) rather than this
+  // file's own looser `\$\{CLAUDE_PLUGIN_ROOT\}\/(\S+)` capture, which used to
+  // accept ANY path after CLAUDE_PLUGIN_ROOT — so a command wired to
+  // `${CLAUDE_PLUGIN_ROOT}/scripts/foo.mjs` (the wrong directory: init only ever
+  // copies hooks/) smoked clean as long as that file happened to exist, while
+  // init/upgrade/doctor/uninstall all resolve the same command to `hooks/foo.mjs`
+  // and never look in scripts/ at all. `targets` now holds bare hooks/ basenames,
+  // not full relative paths, matching what those four consumers actually see.
+  const targets = new Set();
   const hooksPath = join(root, 'hooks', 'hooks.json');
   if (!existsSync(hooksPath)) {
     fail('hooks/hooks.json: missing');
@@ -149,34 +161,105 @@ function smoke(root) {
       if (!hooksJson.hooks || typeof hooksJson.hooks !== 'object') {
         fail('hooks/hooks.json: missing top-level "hooks" object');
       } else {
-        const targets = new Set();
         for (const groups of Object.values(hooksJson.hooks)) {
           for (const group of groups || []) {
             for (const hk of group?.hooks || []) {
               if (hk?.command) {
-                // command looks like `node ${CLAUDE_PLUGIN_ROOT}/hooks/foo.mjs [args]`
-                const m = String(hk.command).match(/\$\{CLAUDE_PLUGIN_ROOT\}\/(\S+)/);
-                if (m) targets.add(m[1]);
+                const base = extractPluginHookBasename(hk.command);
+                if (base) {
+                  targets.add(base);
+                } else if (/\$\{CLAUDE_PLUGIN_ROOT\}/.test(String(hk.command))) {
+                  fail(
+                    `hooks/hooks.json: command "${hk.command}" does not match ` +
+                      `"\${CLAUDE_PLUGIN_ROOT}/hooks/<basename>.mjs"`,
+                  );
+                }
               }
             }
           }
         }
         if (targets.size === 0)
           fail('hooks/hooks.json: no ${CLAUDE_PLUGIN_ROOT} command targets found');
-        for (const rel of targets) {
-          if (!isFile(join(root, rel))) fail(`hooks/hooks.json: target "${rel}" is not a file`);
+        for (const base of targets) {
+          if (!isFile(join(root, 'hooks', base)))
+            fail(`hooks/hooks.json: target "hooks/${base}" is not a file`);
         }
         notes.push(`hook targets: ${targets.size}`);
       }
-      // `shared` lists hook-relative support files that the targets import.
-      if (Array.isArray(hooksJson.shared)) {
-        for (const shared of hooksJson.shared) {
-          if (!isFile(join(root, 'hooks', shared)))
-            fail(`hooks/hooks.json: shared file "hooks/${shared}" is not a file`);
-        }
-        notes.push(`shared: ${hooksJson.shared.length}`);
-      }
     }
+  }
+
+  // hooks/shared.json — hook-relative support files that the targets import.
+  // This used to be hooks.json's own "shared" key; it moved to this sibling
+  // file because the harness began warning on that unknown top-level key.
+  // Required, not optional: a downstream fork with nothing shared still ships
+  // hooks/shared.json as `[]`, so a missing file means the package itself is
+  // broken, not that there is nothing to track. Skipping this check on a
+  // missing file is exactly how a missing hypo-shared.mjs (the module every
+  // hook imports) would slip past a "smoke" check whose whole point is
+  // catching that.
+  let sharedJson = null;
+  const sharedPath = join(root, 'hooks', 'shared.json');
+  if (!existsSync(sharedPath)) {
+    fail('hooks/shared.json: missing');
+  } else {
+    try {
+      sharedJson = JSON.parse(readFileSync(sharedPath, 'utf-8'));
+    } catch (err) {
+      fail(`hooks/shared.json: ${err?.message ?? err}`);
+    }
+    if (Array.isArray(sharedJson)) {
+      for (const shared of sharedJson) {
+        // A bare basename, checked before it is joined onto anything. Every
+        // consumer of this list joins each entry onto a hooks directory and
+        // then reads, copies, or deletes the result, so an entry like
+        // `../README.md` names a file outside that directory and one of them
+        // would act on it. A smoke check that joined first and only asked
+        // whether something is there would call that entry valid, because the
+        // file it escaped to usually does exist.
+        if (!isSafeMjsBasename(shared)) {
+          fail(`hooks/shared.json: "${shared}" is not a plain .mjs basename`);
+          continue;
+        }
+        if (!isFile(join(root, 'hooks', shared)))
+          fail(`hooks/shared.json: file "hooks/${shared}" is not a file`);
+      }
+      notes.push(`shared: ${sharedJson.length}`);
+    } else if (sharedJson !== null) {
+      fail('hooks/shared.json: must be a JSON array');
+    }
+  }
+
+  // Both lists checked forward, now check back: every .mjs in hooks/ must be
+  // reachable from one of them. The asymmetry is what makes this gap silent.
+  // init copies the whole directory (readdirSync), while upgrade, doctor and
+  // uninstall all walk `event targets + shared`. So an unlisted module installs
+  // fine and its direct-import tests pass, and then upgrade never refreshes it,
+  // doctor never reports it missing, and uninstall leaves it behind on disk.
+  // Splitting the shared list into its own file added one more place for the
+  // two to drift apart, which is why this closes now.
+  //
+  // hypo-pre-commit.mjs is the one deliberate exception. The vault's pre-commit
+  // wrapper invokes it at <pkgRoot>/hooks/, never the installed copy, so it
+  // belongs to neither list by design. Anything else landing here is a mistake.
+  const UNLISTED_OK = new Set(['hypo-pre-commit.mjs']);
+  if (targets.size > 0 && Array.isArray(sharedJson)) {
+    // `targets` already holds bare hooks/ basenames (extractPluginHookBasename
+    // only ever matches a path rooted at hooks/), so no prefix-stripping is
+    // needed here anymore.
+    const reachable = new Set([...targets, ...sharedJson.filter((s) => typeof s === 'string')]);
+    let unlisted = 0;
+    for (const entry of readdirSync(join(root, 'hooks'))) {
+      if (!entry.endsWith('.mjs')) continue;
+      if (reachable.has(entry) || UNLISTED_OK.has(entry)) continue;
+      unlisted++;
+      fail(
+        `hooks/${entry}: listed in neither hooks.json's event targets nor ` +
+          `hooks/shared.json. init would copy it, but upgrade, doctor and ` +
+          `uninstall all skip it, so it never gets refreshed, reported, or removed.`,
+      );
+    }
+    if (unlisted === 0) notes.push('hooks/ fully listed');
   }
 
   // 4. marketplace.json — name parity + source resolves.

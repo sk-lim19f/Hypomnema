@@ -17,8 +17,19 @@ import {
   cpSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { test, suite } from './harness.mjs';
-import { runWithHome, withTmpDir, withTmpHome, writeExt } from './helpers.mjs';
+import {
+  runWithHome,
+  withTmpDir,
+  withTmpHome,
+  writeExt,
+  REPO,
+  SCRIPTS,
+  HOOKS,
+} from './helpers.mjs';
 
 // ── extensions companion sync (ADR 0024) ──────────────────────
 
@@ -1846,6 +1857,218 @@ test('a copy is NOT written through a symlinked ancestor in the install path', (
     assert.ok(
       (r.stdout + r.stderr).includes('skip-unsafe-path'),
       `the refusal must be reported: ${r.stdout}${r.stderr}`,
+    );
+  });
+});
+
+// uninstall is the one command whose job is letting someone leave, so a broken
+// hooks/hooks.json or hooks/shared.json in the CURRENT package must not make it
+// refuse to run the way init/upgrade/doctor/smoke-plugin now do (they all go
+// through the same lib/hook-inventory.mjs parser, which fails closed). Instead
+// uninstall falls back to the provenance sidecar the last successful
+// install/upgrade wrote at the target hooksDir (lib/pkg-provenance.mjs's
+// `managedFiles`, major D) — and when even that does not exist, it must not
+// stay quiet: the run reports exactly what it could not identify and exits
+// non-zero, rather than silently leaving files behind while reporting success.
+// Local fixture, not a helpers.mjs one: only this area needs a package root
+// whose scripts run against a hooks.json/shared.json we can break.
+suite('uninstall: a broken package hooks.json/shared.json falls back, never silently');
+
+function withFakeUninstallPkg(fn) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-uninst-'));
+  try {
+    const root = join(base, 'lib', 'node_modules', 'hypomnema');
+    mkdirSync(root, { recursive: true });
+    cpSync(SCRIPTS, join(root, 'scripts'), { recursive: true });
+    cpSync(HOOKS, join(root, 'hooks'), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(root, 'package.json'));
+    const home = join(base, 'home');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    fn({ uninstall: join(root, 'scripts', 'uninstall.mjs'), root, home });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+// lib/hook-inventory.mjs's isSafeMjsBasename now rejects a traversal entry like
+// `../not-ours.mjs` in hooks/shared.json outright (it fails the whole package
+// read, tripping the provenance fallback below), so that path can no longer
+// reach removeHookFiles at all. The one remaining way an untrusted name gets
+// there is the fallback itself: readProvenanceSidecar does no basename
+// validation of its own when it reads `managedFiles` back — it trusts that the
+// JSON on disk is what THIS code wrote, which stops being true the moment that
+// file is hand-edited or corrupted. removeHookFiles's own containment check
+// (join + resolve + prefix compare, never join-and-trust) is what still catches
+// that, so this test drives it through a broken hooks.json + a tampered sidecar
+// instead of through shared.json.
+test('a hook name that escapes the hooks directory is skipped, not deleted (provenance fallback)', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    writeFileSync(join(root, 'hooks', 'hooks.json'), '{ not json');
+    const claudeHooks = join(home, '.claude', 'hooks');
+    mkdirSync(claudeHooks, { recursive: true });
+    const outside = join(home, '.claude', 'not-ours.mjs');
+    writeFileSync(outside, '// a file that lives above the hooks dir\n');
+    writeFileSync(
+      join(claudeHooks, '.hypo-provenance.json'),
+      JSON.stringify({ pkgRoot: root, managedFiles: ['../not-ours.mjs', 'hypo-shared.mjs'] }),
+    );
+    const r = spawnSync(process.execPath, [uninstall, '--apply'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.ok(
+      existsSync(outside),
+      `a name resolving outside the hooks dir must not be deleted: ${r.stdout}\n${r.stderr}`,
+    );
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /resolve outside/,
+      `and the skip must be announced: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+// No provenance sidecar exists in this fixture (uninstall never installed
+// anything here), so a missing hooks/shared.json now takes down the WHOLE
+// package read (loadHookInventory fails closed on either file) and lands in
+// resolveHookFileSet's `source: 'none'` branch — the substring this pins is
+// still present because that branch's message embeds the same
+// readCoreHooksConfig error the old, narrower check used to surface on its own.
+test('a missing hooks/shared.json warns instead of silently leaving shared modules behind', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    // Paired half first: with the file present the run says nothing about it,
+    // so the assertion below pins the warning rather than matching noise that
+    // was always there.
+    const ok = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.ok(
+      !/cannot read hooks\/shared\.json/.test(`${ok.stdout}${ok.stderr}`),
+      `a healthy package must not warn: ${ok.stdout}\n${ok.stderr}`,
+    );
+
+    rmSync(join(root, 'hooks', 'shared.json'));
+    const r = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /cannot read hooks\/shared\.json/,
+      `a missing shared list must be announced: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+test('a shared.json that parses but is not an array warns instead of silently keeping shared modules', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    // Paired half first: a well-formed array must not trigger this warning, so the
+    // assertion below pins the new shape check rather than matching noise a healthy
+    // package always printed.
+    const ok = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.ok(
+      !/hooks\/shared\.json must be a JSON array/.test(`${ok.stdout}${ok.stderr}`),
+      `a well-formed shared.json must not warn: ${ok.stdout}\n${ok.stderr}`,
+    );
+
+    // Parses fine as JSON, but is an object rather than the array this file is
+    // supposed to hold. readCoreHooksConfig (the shared parser every install/
+    // uninstall consumer now reads through) catches this with Array.isArray,
+    // failing the whole package read rather than letting a `for...of` slide
+    // past it silently the way uninstall's own old, narrower check once did.
+    writeFileSync(join(root, 'hooks', 'shared.json'), JSON.stringify({ oops: true }));
+    const r = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /hooks\/shared\.json must be a JSON array/,
+      `a non-array shared.json must be announced: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+test('a shared.json array with a non-string entry warns the same way', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    writeFileSync(join(root, 'hooks', 'shared.json'), JSON.stringify(['hypo-shared.mjs', 42]));
+    const r = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /each hooks\/shared\.json entry must be a string/,
+      `an array with a non-string entry must be announced: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+// major D, the `none` branch: the package's own hooks.json is broken AND no
+// provenance sidecar exists at the target hooksDir (an install made before this
+// sidecar field existed, or one that never wrote it). Nothing may be guessed at
+// here — the run must say so and fail loud, not report success while a stray
+// hook file sits untouched with no trace it was ever considered.
+test('no package hooks.json and no provenance record → exit 1, names what remains (major D)', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    writeFileSync(join(root, 'hooks', 'hooks.json'), '{ not json');
+    const claudeHooks = join(home, '.claude', 'hooks');
+    mkdirSync(claudeHooks, { recursive: true });
+    writeFileSync(join(claudeHooks, 'hypo-shared.mjs'), '// stray leftover\n');
+    const r = spawnSync(process.execPath, [uninstall, '--apply'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.notEqual(
+      r.status,
+      0,
+      'no package list and no provenance record must not report plain success',
+    );
+    assert.ok(
+      existsSync(join(claudeHooks, 'hypo-shared.mjs')),
+      'a file that could not be identified as ours must be left alone, not guessed at',
+    );
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /hypo-shared\.mjs/,
+      `the leftover file must be named, not silently dropped: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+// major D, the recovery path: the same broken package, but THIS hooksDir's own
+// last install/upgrade left a provenance sidecar naming what it copied
+// (writeProvenanceSidecar's `managedFiles`). Uninstall must actually use that
+// record to remove the real file, not just detect and warn about the fallback.
+test('a tampered package + a valid provenance sidecar recovers the file set and removes it (major D)', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    writeFileSync(join(root, 'hooks', 'hooks.json'), '{ not json');
+    const claudeHooks = join(home, '.claude', 'hooks');
+    mkdirSync(claudeHooks, { recursive: true });
+    writeFileSync(
+      join(claudeHooks, 'hypo-shared.mjs'),
+      '// installed by a past, working package\n',
+    );
+    writeFileSync(
+      join(claudeHooks, '.hypo-provenance.json'),
+      JSON.stringify({ pkgRoot: root, managedFiles: ['hypo-shared.mjs'] }),
+    );
+    const r = spawnSync(process.execPath, [uninstall, '--apply'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.equal(
+      r.status,
+      0,
+      `a successful provenance recovery must exit 0: ${r.stdout}\n${r.stderr}`,
+    );
+    assert.ok(
+      !existsSync(join(claudeHooks, 'hypo-shared.mjs')),
+      'the file recovered from the provenance sidecar must actually be removed',
     );
   });
 });

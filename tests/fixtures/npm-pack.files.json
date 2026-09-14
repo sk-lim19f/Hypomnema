@@ -244,6 +244,10 @@
     "exec": false
   },
   {
+    "path": "hooks/shared.json",
+    "exec": false
+  },
+  {
     "path": "hooks/version-check-fetch.mjs",
     "exec": false
   },
@@ -333,6 +337,10 @@
   },
   {
     "path": "scripts/lib/git-hooks-dir.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/hook-inventory.mjs",
     "exec": false
   },
   {

@@ -50,7 +50,7 @@ import {
   wikiPreCommitContent,
   uniqueBakPath,
 } from './lib/git-hooks-dir.mjs';
-import { readCoreHooksConfig } from './lib/core-hooks.mjs';
+import { loadHookInventory } from './lib/hook-inventory.mjs';
 import {
   readPkgJson as readPkgJsonSafe,
   writePkgJsonAtomic,
@@ -368,90 +368,19 @@ function writeGitignore(hypoDir, dryRun) {
 // ── hook installation ────────────────────────────────────────────────────────
 
 function loadHookMap() {
-  // Read + parse via the exit-free shared helper; keep init's own validation and
-  // exit(1) behavior below. The helper omits `cfg` only on read/parse failure
-  // (JSON.parse never yields undefined), so key presence discriminates a
-  // read/parse failure from a parsed-but-malformed shape.
-  const res = readCoreHooksConfig(PKG_ROOT);
-  if (!('cfg' in res)) {
-    console.error(`Error: cannot read hooks/hooks.json from package root: ${PKG_ROOT}`);
+  // loadHookInventory (scripts/lib/hook-inventory.mjs) owns the grammar AND the
+  // existence check now: every consumer that installs, refreshes, or removes a
+  // hook file reads through the same parser, and a name on either list that does
+  // not resolve to a real file under hooks/ fails this call before init writes
+  // anything at all (major C — a hook file dropped from the shipped package used
+  // to install a broken settings.json registration with nothing behind it).
+  const res = loadHookInventory(PKG_ROOT);
+  if (!res.ok) {
+    console.error(`Error: ${res.error}`);
     console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }
-  const cfg = res.cfg;
-  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
-    console.error('Error: hooks/hooks.json must be a JSON object');
-    console.error(PKG_INTEGRITY_HINT);
-    process.exit(1);
-  }
-  if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
-    console.error('Error: hooks/hooks.json must contain a "hooks" object');
-    console.error(PKG_INTEGRITY_HINT);
-    process.exit(1);
-  }
-  function _extractCommandFileName(command) {
-    if (typeof command !== 'string') return null;
-    const matches = [...command.matchAll(/(?:^|[\/\\])([^\/\\\s"'`]+\.mjs)(?=$|[\s"'`])/g)];
-    if (matches.length > 0) return matches[matches.length - 1][1];
-    const bare = command.match(/(?:^|\s)([^\/\\\s"'`]+\.mjs)(?=$|[\s"'`])/);
-    return bare ? bare[1] : null;
-  }
-
-  function _isHookFileName(file) {
-    return typeof file === 'string' && /^[^/\\\s]+\.mjs$/.test(file.trim());
-  }
-
-  function _isHookGroup(group) {
-    return (
-      group &&
-      typeof group === 'object' &&
-      !Array.isArray(group) &&
-      Array.isArray(group.hooks) &&
-      group.hooks.length > 0 &&
-      group.hooks.every(
-        (hook) =>
-          hook &&
-          typeof hook === 'object' &&
-          !Array.isArray(hook) &&
-          hook.type === 'command' &&
-          _extractCommandFileName(hook.command),
-      )
-    );
-  }
-
-  // Extract .mjs file names from both old format (string[]) and new format (hook-group object[])
-  function _extractFileNames(groups) {
-    return groups.flatMap((group) => {
-      if (typeof group === 'string') return [group.trim()];
-      return group.hooks.map((hook) => _extractCommandFileName(hook.command));
-    });
-  }
-
-  for (const [event, groups] of Object.entries(cfg.hooks)) {
-    const valid =
-      Array.isArray(groups) &&
-      groups.length > 0 &&
-      groups.every((group) => _isHookFileName(group) || _isHookGroup(group)) &&
-      _extractFileNames(groups).length > 0;
-    if (!valid) {
-      console.error(
-        `Error: hooks/hooks.json "hooks.${event}" must be a non-empty array of .mjs file names or Claude hook groups`,
-      );
-      console.error(PKG_INTEGRITY_HINT);
-      process.exit(1);
-    }
-  }
-  if (
-    cfg.shared !== undefined &&
-    (!Array.isArray(cfg.shared) || !cfg.shared.every((f) => _isHookFileName(f)))
-  ) {
-    console.error('Error: hooks/hooks.json "shared" must be an array of .mjs file names');
-    console.error(PKG_INTEGRITY_HINT);
-    process.exit(1);
-  }
-  return Object.fromEntries(
-    Object.entries(cfg.hooks).map(([event, groups]) => [event, _extractFileNames(groups)]),
-  );
+  return res.hookMap;
 }
 
 function installHooks(targetDir, dryRun) {

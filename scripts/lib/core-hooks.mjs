@@ -1,4 +1,5 @@
-// core-hooks.mjs - read the packaged hooks/hooks.json without side effects.
+// core-hooks.mjs - read the packaged hooks/hooks.json and hooks/shared.json
+// without side effects.
 //
 // The init installer (init.mjs loadHookMap) reads hooks.json, validates it, and
 // calls process.exit(1) on any malformation. That exit-on-error behavior is
@@ -12,28 +13,39 @@
 // hooks type when the result is not ok (better to capture nothing than to
 // capture a core hook).
 //
-// fail-closed: a result is ok only when the file reads, parses, AND has the
-// expected shape (a hooks registration map plus a shared array). A parsed but
-// oddly shaped hooks.json would yield a thin basename set, which is exactly the
-// gap through which a core hook could leak into capture. When the shape is off
-// we still attach the parsed cfg so init can run its own validation and emit its
+// The shared-file list used to live at hooks.json's own top-level "shared" key.
+// It moved to a sibling file, hooks/shared.json: the harness started
+// warning on hooks.json's unknown "shared" key once it began validating that
+// file against its own hook-registration schema, and "shared" was never part of
+// that schema, it was a Hypomnema-only convention the harness never asked for.
+// This module still folds shared.json's contents onto `cfg.shared` after
+// reading it, so every existing caller of deriveCoreHookBasenames keeps working
+// against the same shape without a signature change.
+//
+// fail-closed: a result is ok only when both files read, parse, AND have the
+// expected shape (a hooks registration map, and a shared array). A parsed but
+// oddly shaped input would yield a thin basename set, which is exactly the gap
+// through which a core hook could leak into capture. When the shape is off we
+// still attach the parsed cfg so init can run its own validation and emit its
 // own specific error, but ok is false so capture stays conservative.
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
- * Read and JSON-parse hooks/hooks.json from a package root. No process.exit, no
- * top-level side effects.
+ * Read and JSON-parse hooks/hooks.json and hooks/shared.json from a package
+ * root. No process.exit, no top-level side effects.
  *
  * @param {string} pkgRoot  absolute path to the package root (contains hooks/)
  * @returns {{ ok: true, cfg: object }
  *   | { ok: false, error: string }
  *   | { ok: false, error: string, cfg: * }}
- *   On read or parse failure the `cfg` key is absent. On a successful parse the
- *   `cfg` key is always present (even for null/array/scalar/shape-off inputs),
- *   so a caller can discriminate read/parse failure from shape failure by the
- *   presence of the `cfg` key. `ok` is true only when the shape is as expected.
+ *   On read or parse failure of hooks.json the `cfg` key is absent. Once
+ *   hooks.json parses, `cfg` is always present (even for null/array/scalar/
+ *   shape-off inputs), so a caller can discriminate a hooks.json read/parse
+ *   failure from a shape failure (including a shared.json failure) by the
+ *   presence of the `cfg` key. `ok` is true only when both files' shapes are
+ *   as expected, and when true `cfg.shared` is the parsed shared.json array.
  */
 export function readCoreHooksConfig(pkgRoot) {
   let raw;
@@ -55,15 +67,12 @@ export function readCoreHooksConfig(pkgRoot) {
   if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) {
     return { ok: false, error: 'hooks/hooks.json must contain a "hooks" object', cfg };
   }
-  if (!Array.isArray(cfg.shared)) {
-    return { ok: false, error: 'hooks/hooks.json must contain a "shared" array', cfg };
-  }
   // Nested shape: a structurally odd rung (event not an array, a group without a
-  // hooks array, a hook entry with no string command, a non-string shared element)
-  // is silently skipped by deriveCoreHookBasenames, yielding a THIN reserved set.
-  // That is the gap through which a core hook could leak into reverse-capture, so
-  // validate every rung and fail closed. cfg is still attached so init can run its
-  // own detailed validation and emit its own specific error.
+  // hooks array, a hook entry with no string command) is silently skipped by
+  // deriveCoreHookBasenames, yielding a THIN reserved set. That is the gap
+  // through which a core hook could leak into reverse-capture, so validate
+  // every rung and fail closed. cfg is still attached so init can run its own
+  // detailed validation and emit its own specific error.
   for (const groups of Object.values(cfg.hooks)) {
     if (!Array.isArray(groups)) {
       return { ok: false, error: 'each hooks event must map to an array of groups', cfg };
@@ -86,11 +95,28 @@ export function readCoreHooksConfig(pkgRoot) {
       }
     }
   }
-  for (const file of cfg.shared) {
+
+  let sharedRaw;
+  try {
+    sharedRaw = readFileSync(join(pkgRoot, 'hooks', 'shared.json'), 'utf-8');
+  } catch (err) {
+    return { ok: false, error: `cannot read hooks/shared.json: ${err.message}`, cfg };
+  }
+  let shared;
+  try {
+    shared = JSON.parse(sharedRaw);
+  } catch (err) {
+    return { ok: false, error: `hooks/shared.json is not valid JSON: ${err.message}`, cfg };
+  }
+  if (!Array.isArray(shared)) {
+    return { ok: false, error: 'hooks/shared.json must be a JSON array', cfg };
+  }
+  for (const file of shared) {
     if (typeof file !== 'string') {
-      return { ok: false, error: 'each "shared" entry must be a string', cfg };
+      return { ok: false, error: 'each hooks/shared.json entry must be a string', cfg };
     }
   }
+  cfg.shared = shared;
   return { ok: true, cfg };
 }
 

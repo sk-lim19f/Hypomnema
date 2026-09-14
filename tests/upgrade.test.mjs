@@ -751,6 +751,21 @@ function runUpgrade(upgrade, args, home) {
   });
 }
 
+// A missing hooks/shared.json used to fall back to SHARED_FILES = [], so
+// upgrade's own integrity check stopped tracking hypo-shared.mjs entirely —
+// `checkHookFiles` would report a healthy install even though every deployed
+// hook imports a module the check no longer looks for. Required, not
+// tolerated: a downstream fork with nothing shared still ships
+// hooks/shared.json as `[]`.
+test('missing hooks/shared.json → exit 1, not silently treated as empty', () => {
+  withFakeUpgradeInstall(false, ({ upgrade, root, home, wiki }) => {
+    rmSync(join(root, 'hooks', 'shared.json'));
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
+    assert.match(r.stderr, /cannot read hooks\/shared\.json/);
+  });
+});
+
 test('plugin mode: check reports core surfaces as plugin-managed, not missing', () => {
   withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
     const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);

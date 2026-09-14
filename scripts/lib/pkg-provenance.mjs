@@ -106,6 +106,14 @@ export function provenancePath(hooksDir) {
  * it is a doctor-only freshness signal, not part of the runtime contract
  * (hooks/hypo-shared.mjs never reads this field), so a sidecar the runtime
  * can verify should not be withheld just because the digest step failed.
+ *
+ * `managedFiles` (major D) is the same best-effort shape: the sorted basename
+ * list this run's own copy targeted (every hooks.json event command plus every
+ * hooks/shared.json entry, derived from `pkgRoot` the same way the digest
+ * above is). scripts/uninstall.mjs reads it back as a fallback source of truth
+ * when THIS package's own hooks.json can no longer be read at uninstall time —
+ * the sidecar was written by whatever package last actually ran the copy, so it
+ * names the truth of what is on disk even after the current package rots.
  */
 export function writeProvenanceSidecar(hooksDir, pkgRoot, pkgVersion, hooksSrcDir, dryRun) {
   let hypoSharedSha256;
@@ -115,12 +123,15 @@ export function writeProvenanceSidecar(hooksDir, pkgRoot, pkgVersion, hooksSrcDi
     return null;
   }
   const hooksDigest = computeHooksDigest(pkgRoot, hooksSrcDir);
+  const cfgRes = readCoreHooksConfig(pkgRoot);
+  const managedFiles = cfgRes.ok ? [...deriveCoreHookBasenames(cfgRes.cfg)].sort() : null;
   const dest = provenancePath(hooksDir);
   const data = {
     pkgRoot,
     pkgVersion,
     hypoSharedSha256,
     ...(hooksDigest ? { [HOOKS_DIGEST_FIELD]: hooksDigest } : {}),
+    ...(managedFiles ? { managedFiles } : {}),
     copiedAt: new Date().toISOString(),
   };
   if (!dryRun) atomicWriteJson(dest, data);

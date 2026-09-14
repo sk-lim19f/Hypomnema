@@ -547,11 +547,16 @@ test('--lint-strict init with a RELATIVE --hypo-dir still blocks a real lint vio
   });
 });
 
-// Write a hooks.json into a temp package root and return that root.
-function withPkgHooksJson(content, fn) {
+// Write a hooks.json (and, alongside it, a hooks/shared.json) into a temp
+// package root and return that root. shared.json defaults to a valid empty
+// array so a test that only cares about hooks.json's own shape does not
+// trip the (separate) shared.json validation by accident; pass a specific
+// sharedJson string to exercise that validation on purpose.
+function withPkgHooksJson(content, fn, sharedJson = '[]') {
   withTmpDir((dir) => {
     mkdirSync(join(dir, 'hooks'), { recursive: true });
     writeFileSync(join(dir, 'hooks', 'hooks.json'), content);
+    writeFileSync(join(dir, 'hooks', 'shared.json'), sharedJson);
     fn(dir);
   });
 }
@@ -596,7 +601,7 @@ test('fail-closed: parses to a non-object shape → ok:false but cfg attached', 
 });
 
 test('fail-closed: object missing hooks map → ok:false', () => {
-  withPkgHooksJson('{"shared":["hypo-shared.mjs"]}', (dir) => {
+  withPkgHooksJson('{}', (dir) => {
     const res = readCoreHooksConfig(dir);
     assert.equal(res.ok, false);
     assert.ok('cfg' in res);
@@ -604,19 +609,30 @@ test('fail-closed: object missing hooks map → ok:false', () => {
 });
 
 test('fail-closed: hooks not an object → ok:false', () => {
-  withPkgHooksJson('{"hooks":[],"shared":[]}', (dir) => {
+  withPkgHooksJson('{"hooks":[]}', (dir) => {
     const res = readCoreHooksConfig(dir);
     assert.equal(res.ok, false);
   });
 });
 
-test('fail-closed: missing/non-array shared → ok:false', () => {
-  withPkgHooksJson('{"hooks":{}}', (dir) => {
+test('fail-closed: shared.json missing → ok:false', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'hooks'), { recursive: true });
+    writeFileSync(join(dir, 'hooks', 'hooks.json'), '{"hooks":{}}');
+    // No hooks/shared.json written: readCoreHooksConfig must not silently
+    // treat an absent shared.json as an empty shared list.
     assert.equal(readCoreHooksConfig(dir).ok, false);
   });
-  withPkgHooksJson('{"hooks":{},"shared":"x"}', (dir) => {
-    assert.equal(readCoreHooksConfig(dir).ok, false);
-  });
+});
+
+test('fail-closed: shared.json not an array → ok:false', () => {
+  withPkgHooksJson(
+    '{"hooks":{}}',
+    (dir) => {
+      assert.equal(readCoreHooksConfig(dir).ok, false);
+    },
+    '"x"',
+  );
 });
 
 // A parsed-but-nested-malformed hooks.json would make deriveCoreHookBasenames
@@ -624,7 +640,7 @@ test('fail-closed: missing/non-array shared → ok:false', () => {
 // leak into reverse-capture. Each nested malformation must be fail-closed
 // (ok:false) with cfg still attached for init's own validation.
 test('fail-closed nested: event value not an array -> ok:false, cfg attached', () => {
-  withPkgHooksJson('{"hooks":{"SessionStart":"notarray"},"shared":[]}', (dir) => {
+  withPkgHooksJson('{"hooks":{"SessionStart":"notarray"}}', (dir) => {
     const res = readCoreHooksConfig(dir);
     assert.equal(res.ok, false);
     assert.ok('cfg' in res, 'parsed shape-off input must still attach cfg for init');
@@ -632,39 +648,47 @@ test('fail-closed nested: event value not an array -> ok:false, cfg attached', (
 });
 
 test('fail-closed nested: group hooks not an array -> ok:false', () => {
-  withPkgHooksJson('{"hooks":{"E":[{"hooks":"notarray"}]},"shared":[]}', (dir) => {
+  withPkgHooksJson('{"hooks":{"E":[{"hooks":"notarray"}]}}', (dir) => {
     assert.equal(readCoreHooksConfig(dir).ok, false);
   });
 });
 
 test('fail-closed nested: hook entry has no string command -> ok:false', () => {
-  withPkgHooksJson('{"hooks":{"E":[{"hooks":[{"type":"command"}]}]},"shared":[]}', (dir) => {
+  withPkgHooksJson('{"hooks":{"E":[{"hooks":[{"type":"command"}]}]}}', (dir) => {
     assert.equal(readCoreHooksConfig(dir).ok, false);
   });
-  withPkgHooksJson('{"hooks":{"E":[{"hooks":[42]}]},"shared":[]}', (dir) => {
+  withPkgHooksJson('{"hooks":{"E":[{"hooks":[42]}]}}', (dir) => {
     assert.equal(readCoreHooksConfig(dir).ok, false);
   });
 });
 
-test('fail-closed nested: non-string shared element -> ok:false', () => {
+test('fail-closed: shared.json has a non-string element -> ok:false', () => {
   withPkgHooksJson(
-    '{"hooks":{"E":[{"hooks":[{"type":"command","command":"node $HOME/.claude/hooks/x.mjs"}]}]},"shared":[1]}',
+    '{"hooks":{"E":[{"hooks":[{"type":"command","command":"node $HOME/.claude/hooks/x.mjs"}]}]}}',
     (dir) => {
       assert.equal(readCoreHooksConfig(dir).ok, false);
     },
+    '[1]',
   );
 });
 
-test('nested valid: well-formed groups + hooks + shared -> ok:true, complete basenames', () => {
+test('nested valid: well-formed groups + hooks + shared.json -> ok:true, complete basenames', () => {
   const json =
     '{"hooks":{"SessionStart":[{"hooks":[{"type":"command",' +
-    '"command":"node $HOME/.claude/hooks/core-a.mjs"}]}]},"shared":["core-b.mjs"]}';
-  withPkgHooksJson(json, (dir) => {
-    const res = readCoreHooksConfig(dir);
-    assert.equal(res.ok, true, `well-formed nested config should load: ${res.error}`);
-    const names = deriveCoreHookBasenames(res.cfg);
-    assert.ok(names.has('core-a.mjs') && names.has('core-b.mjs'), 'expected complete basename set');
-  });
+    '"command":"node $HOME/.claude/hooks/core-a.mjs"}]}]}}';
+  withPkgHooksJson(
+    json,
+    (dir) => {
+      const res = readCoreHooksConfig(dir);
+      assert.equal(res.ok, true, `well-formed nested config should load: ${res.error}`);
+      const names = deriveCoreHookBasenames(res.cfg);
+      assert.ok(
+        names.has('core-a.mjs') && names.has('core-b.mjs'),
+        'expected complete basename set',
+      );
+    },
+    '["core-b.mjs"]',
+  );
 });
 
 suite('deriveCoreHookBasenames()');
@@ -858,7 +882,7 @@ test('doc carries the update-check URLs verbatim and names every opt-out variabl
 
 suite('init.mjs — malformed hooks.json still exits 1');
 
-function runInitFromPkg(hooksJson, home, hypoDir) {
+function runInitFromPkg(hooksJson, home, hypoDir, { dropShared = false } = {}) {
   let result;
   withTmpDir((base) => {
     const pkg = join(base, 'pkg');
@@ -867,6 +891,7 @@ function runInitFromPkg(hooksJson, home, hypoDir) {
     cpSync(join(REPO, 'hooks'), join(pkg, 'hooks'), { recursive: true });
     cpSync(join(REPO, 'package.json'), join(pkg, 'package.json'));
     writeFileSync(join(pkg, 'hooks', 'hooks.json'), hooksJson);
+    if (dropShared) rmSync(join(pkg, 'hooks', 'shared.json'));
     result = spawnSync(
       process.execPath,
       [join(pkg, 'scripts', 'init.mjs'), `--hypo-dir=${hypoDir}`, '--no-git-init', '--dry-run'],
@@ -881,7 +906,11 @@ test('unparseable hooks.json → exit 1 (read/parse path)', () => {
     withTmpDir((hypoDir) => {
       const r = runInitFromPkg('{ this is : not json', home, hypoDir);
       assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
-      assert.match(r.stderr, /cannot read hooks\/hooks\.json/);
+      // loadHookMap now forwards loadHookInventory's own error (lib/hook-inventory.mjs,
+      // built on readCoreHooksConfig) verbatim, which distinguishes a read failure
+      // from a parse failure rather than collapsing both into one hardcoded string —
+      // this fixture hits the parse branch.
+      assert.match(r.stderr, /hooks\/hooks\.json is not valid JSON/);
     });
   });
 });
@@ -889,9 +918,60 @@ test('unparseable hooks.json → exit 1 (read/parse path)', () => {
 test('parses but hooks is not an object → exit 1 (init validation retained)', () => {
   withTmpHome((home) => {
     withTmpDir((hypoDir) => {
-      const r = runInitFromPkg('{"hooks":[],"shared":[]}', home, hypoDir);
+      const r = runInitFromPkg('{"hooks":[]}', home, hypoDir);
       assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
       assert.match(r.stderr, /hooks/);
+    });
+  });
+});
+
+// A missing hooks/shared.json used to be tolerated the same way a missing
+// "shared" key on hooks.json was tolerated before the move: treated as "no
+// shared files to track". That is wrong for THIS repo, which always ships
+// shared modules (hypo-shared.mjs and friends) — a missing file here means
+// the package itself is broken (e.g. dropped from `files` in package.json),
+// not that there is nothing shared. A downstream fork with nothing shared
+// still ships hooks/shared.json as `[]`.
+test('missing hooks/shared.json → exit 1 (required, not tolerated)', () => {
+  withTmpHome((home) => {
+    withTmpDir((hypoDir) => {
+      const validHooksJson = readFileSync(join(REPO, 'hooks', 'hooks.json'), 'utf-8');
+      const r = runInitFromPkg(validHooksJson, home, hypoDir, { dropShared: true });
+      assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /cannot read hooks\/shared\.json/);
+    });
+  });
+});
+
+// major C: a hook file hooks.json/shared.json NAMES but that is not actually on
+// disk (dropped from `package.json`'s `files` allowlist, or a partial copy) used
+// to slip past loadHookMap's format-only check entirely — init would scaffold
+// the vault, register the missing hook's event in settings.json, and exit 0,
+// leaving a settings.json entry with nothing behind it. loadHookInventory
+// (lib/hook-inventory.mjs) now existence-checks every name before init's first
+// write, so this fails BEFORE anything is created — never a partial install.
+test('a hook file hooks.json references but that does not exist on disk → exit 1, nothing written (major C)', () => {
+  withTmpHome((home) => {
+    withTmpDir((base) => {
+      const pkg = join(base, 'pkg');
+      const hypoDir = join(base, 'wiki');
+      mkdirSync(pkg, { recursive: true });
+      cpSync(SCRIPTS, join(pkg, 'scripts'), { recursive: true });
+      cpSync(join(REPO, 'hooks'), join(pkg, 'hooks'), { recursive: true });
+      cpSync(join(REPO, 'package.json'), join(pkg, 'package.json'));
+      rmSync(join(pkg, 'hooks', 'hypo-lookup.mjs'));
+      const r = spawnSync(
+        process.execPath,
+        [join(pkg, 'scripts', 'init.mjs'), `--hypo-dir=${hypoDir}`, '--no-git-init'],
+        { encoding: 'utf-8', env: { ...process.env, HYPO_DIR: '', HOME: home } },
+      );
+      assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /hypo-lookup\.mjs is not a file/);
+      assert.ok(!existsSync(hypoDir), 'no partial vault must be scaffolded');
+      assert.ok(
+        !existsSync(join(home, '.claude', 'settings.json')),
+        'no settings.json registration must be written for a hook that does not exist',
+      );
     });
   });
 });

@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   validateChangelog,
@@ -561,12 +561,12 @@ function buildPluginFixture(dir) {
             { hooks: [{ type: 'command', command: 'node ${CLAUDE_PLUGIN_ROOT}/hooks/h.mjs' }] },
           ],
         },
-        shared: ['shared-lib.mjs'],
       },
       null,
       2,
     ),
   );
+  writeFileSync(join(dir, 'hooks', 'shared.json'), JSON.stringify(['shared-lib.mjs'], null, 2));
 }
 
 test('valid plugin surfaces → exit 0', () => {
@@ -608,13 +608,121 @@ test('empty skills (.gitkeep only) → exit 1', () => {
   });
 });
 
+// A command pointing at the wrong top-level directory (e.g. scripts/ instead of
+// hooks/, the only directory init.mjs ever copies from) used to smoke clean as
+// long as that OTHER file happened to exist: the old check accepted any path
+// after `${CLAUDE_PLUGIN_ROOT}/`. init/upgrade/doctor/uninstall all resolve
+// this exact command to `hooks/foo.mjs` regardless, so a plugin-channel user's
+// smoke-clean install would break the moment a manual/npm user ran the same
+// package. lib/hook-inventory.mjs's extractPluginHookBasename (shared by all
+// five consumers) is what closes this now.
+test('a command target outside hooks/ → exit 1 (major E: one shared command grammar)', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    mkdirSync(join(dir, 'scripts'), { recursive: true });
+    writeFileSync(join(dir, 'scripts', 'foo.mjs'), '// really exists, wrong directory\n');
+    const hooksJson = JSON.parse(readFileSync(join(dir, 'hooks', 'hooks.json'), 'utf-8'));
+    hooksJson.hooks.SessionStart.push({
+      hooks: [{ type: 'command', command: 'node ${CLAUDE_PLUGIN_ROOT}/scripts/foo.mjs' }],
+    });
+    writeFileSync(join(dir, 'hooks', 'hooks.json'), JSON.stringify(hooksJson, null, 2));
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(
+      r.status,
+      1,
+      `a command outside hooks/ must fail even if the file exists: ${r.stdout}`,
+    );
+    assert.ok(
+      /does not match/.test(r.stderr + r.stdout),
+      `should name why the command is rejected: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
 test('missing shared hook file → exit 1', () => {
   withTmpDir((dir) => {
     buildPluginFixture(dir);
-    rmSync(join(dir, 'hooks', 'shared-lib.mjs')); // hooks.json.shared still lists it
+    rmSync(join(dir, 'hooks', 'shared-lib.mjs')); // hooks/shared.json still lists it
     const r = run('smoke-plugin.mjs', ['--root', dir]);
     assert.equal(r.status, 1, 'a missing shared file must fail');
     assert.ok(/shared/.test(r.stderr + r.stdout), 'should report missing shared file');
+  });
+});
+
+// hooks/shared.json used to be optional here (an install with nothing shared
+// has none), which meant a package that dropped the file entirely still
+// smoked clean even though its hooks still import hypo-shared.mjs. Required,
+// not optional: a downstream fork with nothing shared still ships
+// hooks/shared.json as `[]`.
+test('missing hooks/shared.json entirely → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    rmSync(join(dir, 'hooks', 'shared.json'));
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'a missing hooks/shared.json must fail');
+    assert.ok(/shared\.json: missing/.test(r.stderr + r.stdout), 'should report the missing file');
+  });
+});
+
+// Every consumer of this list joins each entry onto a hooks directory and then
+// reads, copies, or deletes what comes out. An entry that climbs out of that
+// directory names a file none of them meant to touch, and a check that joins
+// first and only asks "is something there" calls it valid, because the file it
+// escaped to usually exists. The fixture below points at the fixture's own
+// package.json for exactly that reason: it is really there.
+test('a shared.json entry that escapes the hooks directory → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    const shared = JSON.parse(readFileSync(join(dir, 'hooks', 'shared.json'), 'utf-8'));
+    // Paired half: the untouched fixture smokes clean, so the failure below is
+    // this entry and not something the fixture was already unhappy about.
+    assert.equal(run('smoke-plugin.mjs', ['--root', dir]).status, 0);
+    // The escaped path has to name a file that REALLY EXISTS, or this test
+    // passes for the wrong reason: the old check joined first and asked only
+    // whether something was there, so a dangling path failed it too and the
+    // assertion would be reading the wording rather than the behaviour.
+    writeFileSync(join(dir, 'escaped.mjs'), '// outside hooks/\n');
+    writeFileSync(join(dir, 'hooks', 'shared.json'), JSON.stringify([...shared, '../escaped.mjs']));
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'an entry outside hooks/ must fail');
+    assert.ok(
+      /plain \.mjs basename/.test(r.stderr + r.stdout),
+      `should say why it is invalid: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+// Both lists were only ever checked forward. Nothing asked the reverse: is every
+// .mjs in hooks/ actually on one of them? It matters because the consumers
+// disagree. init copies the directory wholesale, while upgrade, doctor and
+// uninstall walk `event targets + shared`, so an unlisted module ships, passes
+// its own direct-import tests, and then silently never gets refreshed, reported
+// missing, or removed. Moving the shared list into its own file added one more
+// seam for the two to drift apart.
+test('an .mjs in hooks/ on neither list → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    // Paired half: the untouched fixture smokes clean, so the failure below is
+    // the new file and not something the fixture was already unhappy about.
+    assert.equal(run('smoke-plugin.mjs', ['--root', dir]).status, 0);
+    writeFileSync(join(dir, 'hooks', 'orphan.mjs'), '// on neither list\n');
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'an unlisted hooks/*.mjs must fail');
+    assert.ok(
+      /orphan\.mjs.*neither/s.test(r.stdout + r.stderr),
+      `should name the file and why: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+// The exception exists so the check can be strict everywhere else. If this ever
+// starts failing, someone widened the allowance rather than listing their file.
+test('hypo-pre-commit.mjs is the one file allowed off both lists', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    writeFileSync(join(dir, 'hooks', 'hypo-pre-commit.mjs'), '// vault wrapper target\n');
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 0, `the documented exception must pass: ${r.stdout}\n${r.stderr}`);
   });
 });
 

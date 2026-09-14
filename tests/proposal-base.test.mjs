@@ -2021,18 +2021,33 @@ test('hasLogEntry: project "foo" must NOT match "foo-bar" (W2 boundary regressio
   );
 });
 
-// ── hooks.json shared coverage ───────────────────────────────────────────────
+// ── hooks/shared.json coverage ───────────────────────────────────────────────
 
-suite('hooks/hooks.json — "shared" covers every intra-hooks import');
+suite('hooks/shared.json — covers every intra-hooks import');
+
+// The shared-file list used to live at hooks.json's own top-level "shared"
+// key. It moved to this sibling file because the harness started warning on
+// an unknown top-level key in hooks.json once it began validating that file
+// against its own hook-registration schema. This guard makes sure it stays
+// moved: a "shared" key reappearing in hooks.json would bring the warning
+// straight back.
+test('hooks/hooks.json carries no top-level "shared" key', () => {
+  const cfg = JSON.parse(readFileSync(join(HOOKS, 'hooks.json'), 'utf-8'));
+  assert.ok(
+    !('shared' in cfg),
+    'hooks/hooks.json must not have a "shared" key; the shared-file list lives in hooks/shared.json',
+  );
+});
 
 test('every relative import of a registered hook resolves to a file upgrade actually copies', () => {
   // `init.mjs installHooks` readdir-copies every hooks/*.mjs, but `upgrade.mjs
-  // checkHookFiles` only walks HOOK_MAP command targets + hooks.json "shared".
-  // A helper missing from "shared" therefore installs fine on a FRESH vault and
-  // breaks only on `upgrade --apply` for existing users: the refreshed hook lands
-  // without its import and Node dies on module resolution, before any best-effort
-  // guard can run. The list is hand-maintained, so pin it mechanically.
+  // checkHookFiles` only walks HOOK_MAP command targets + hooks/shared.json.
+  // A helper missing from shared.json therefore installs fine on a FRESH vault
+  // and breaks only on `upgrade --apply` for existing users: the refreshed hook
+  // lands without its import and Node dies on module resolution, before any
+  // best-effort guard can run. The list is hand-maintained, so pin it mechanically.
   const cfg = JSON.parse(readFileSync(join(HOOKS, 'hooks.json'), 'utf-8'));
+  const shared = JSON.parse(readFileSync(join(HOOKS, 'shared.json'), 'utf-8'));
   const commandFiles = new Set();
   for (const groups of Object.values(cfg.hooks)) {
     for (const group of groups) {
@@ -2043,11 +2058,19 @@ test('every relative import of a registered hook resolves to a file upgrade actu
       }
     }
   }
-  const covered = new Set([...commandFiles, ...cfg.shared]);
+  const covered = new Set([...commandFiles, ...shared]);
   const missing = [];
   for (const file of covered) {
     const src = join(HOOKS, file);
-    if (!existsSync(src)) continue;
+    // A dangling entry (something the lists name but that does not exist on
+    // disk) used to `continue` here and pass silently — the title promises
+    // every relative import resolves to a file upgrade copies, but skipping a
+    // missing source file checks nothing about it at all. Fail on the entry
+    // itself instead of quietly excusing it from the scan below.
+    assert.ok(
+      existsSync(src),
+      `hooks.json/shared.json names "${file}" but hooks/${file} does not exist on disk`,
+    );
     const text = readFileSync(src, 'utf-8');
     for (const m of text.matchAll(/from\s+'\.\/([\w.-]+\.mjs)'/g)) {
       if (!covered.has(m[1])) missing.push(`${file} imports ./${m[1]}`);
@@ -2056,7 +2079,7 @@ test('every relative import of a registered hook resolves to a file upgrade actu
   assert.deepEqual(
     missing,
     [],
-    `intra-hooks imports not covered by hooks.json (add to "shared"): ${missing.join(', ')}`,
+    `intra-hooks imports not covered by hooks/shared.json (add the missing file there): ${missing.join(', ')}`,
   );
 });
 
