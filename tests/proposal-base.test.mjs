@@ -34,7 +34,11 @@ import {
   readObservedHash,
   wasObservedTruncated,
 } from '../hooks/base-store.mjs';
-import { overwriteConflictReason } from '../scripts/lib/crystallize-close-apply.mjs';
+import {
+  overwriteConflictReason,
+  sectionLossReason,
+  conflictWhy,
+} from '../scripts/lib/crystallize-close-apply.mjs';
 import {
   writeProposal as psWriteProposal,
   listProposals as psListProposals,
@@ -149,6 +153,84 @@ test('FEAT-11 T6: proposal-store round-trip, supersede-by-target, idempotent reu
     // A corrupt artifact is skipped by listing, never fatal.
     writeFileSync(join(psProposalsDir(dir), 'junk.json'), '{ not json');
     assert.equal(psListProposals(dir).length, 1, 'malformed artifact is skipped, not fatal');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('FEAT-11 T6: writeProposal stores parkReason + section-loss detail, additively (old artifacts still read)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-ps-'));
+  try {
+    const saved = psWriteProposal(dir, {
+      target: join('projects', 'p', 'hot.md'),
+      baseHash: null,
+      currentAtProposalHash: 'c1',
+      proposedContent: 'ONLY TRACK A',
+      sessionId: 's1',
+      device: 'dev1',
+      parkReason: 'this payload drops 2 of 3 `##` section(s) already on disk',
+      lostSections: ['## Track B', '## Track C'],
+      diskSectionCount: 3,
+    });
+    const read = psReadProposal(dir, saved.id);
+    assert.equal(read.parkReason, 'this payload drops 2 of 3 `##` section(s) already on disk');
+    assert.deepEqual(read.lostSections, ['## Track B', '## Track C']);
+    assert.equal(read.diskSectionCount, 3);
+
+    // A caller with no cause to report (every non-section-loss park omits the
+    // section fields) must not get placeholder nulls where the key was never
+    // sent — the reader must treat "absent" and "recorded as none" the same
+    // way, or a future consumer could mistake one for the other.
+    const plain = psWriteProposal(dir, {
+      target: 'hot.md',
+      baseHash: null,
+      currentAtProposalHash: 'c2',
+      proposedContent: 'X',
+      sessionId: 's1',
+      device: 'dev1',
+    });
+    const readPlain = psReadProposal(dir, plain.id);
+    assert.equal('lostSections' in readPlain, false, 'no section-loss detail sent, none stored');
+    assert.equal('diskSectionCount' in readPlain, false);
+
+    // Backward compat: an artifact written before this field existed (no
+    // parkReason/lostSections/diskSectionCount key at all, hand-written here to
+    // stand in for one) must still list, read, and supersede exactly as it did
+    // before — every reader treats an absent key as "not recorded", never as
+    // malformed.
+    const oldStylePath = join(psProposalsDir(dir), 'pre-existing-old.json');
+    writeFileSync(
+      oldStylePath,
+      JSON.stringify({
+        id: 'pre-existing-old',
+        target: 'legacy.md',
+        baseHash: null,
+        currentAtProposalHash: 'oldhash',
+        proposedContent: 'LEGACY BYTES',
+        sessionId: 's-old',
+        device: 'dev-old',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }),
+    );
+    const listed = psListProposals(dir).find((p) => p.id === 'pre-existing-old');
+    assert.ok(listed, 'an old-style artifact with no parkReason key still lists');
+    assert.equal(listed.parkReason, undefined, 'no crash reading the missing key, just undefined');
+    assert.ok(psReadProposal(dir, 'pre-existing-old'), 'and still reads by id');
+    // A same-session, same-target re-close still supersedes it correctly even
+    // though the old sibling predates this field.
+    psWriteProposal(dir, {
+      target: 'legacy.md',
+      baseHash: null,
+      currentAtProposalHash: 'newhash',
+      proposedContent: 'NEW BYTES',
+      sessionId: 's-old',
+      device: 'dev-old',
+    });
+    assert.equal(
+      psReadProposal(dir, 'pre-existing-old'),
+      null,
+      'the old-style sibling is superseded',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -342,6 +424,19 @@ test('FEAT-11 T6: overwrite conflict parks an artifact with all required fields,
     );
     assert.equal(out.proposals[0].target, 'hot.md');
 
+    // The JSON result is how a `--apply-session-close --json` close (the only
+    // apply path a real close runs — printCloseReport's prose is never
+    // reached) tells a caller WHY a target was withheld. Before this fix the
+    // fixed-up conflictWhy wording only reached printCloseReport's console.log,
+    // which no real close ever executes.
+    const jsonConflict = out.conflicts.find((c) => c.target === 'hot.md');
+    assert.ok(jsonConflict, `hot.md must appear in conflicts[]: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(
+      jsonConflict.why,
+      conflictWhy(jsonConflict),
+      'conflicts[].why must be the same string conflictWhy(c) produces',
+    );
+
     const dirp = join(dir, '.cache', 'proposals');
     const files = readdirSync(dirp).filter((f) => f.endsWith('.json'));
     assert.equal(files.length, 1, `exactly one artifact on disk: ${files}`);
@@ -355,6 +450,7 @@ test('FEAT-11 T6: overwrite conflict parks an artifact with all required fields,
       'sessionId',
       'device',
       'createdAt',
+      'parkReason',
     ]) {
       assert.ok(
         Object.prototype.hasOwnProperty.call(art, k),
@@ -365,6 +461,14 @@ test('FEAT-11 T6: overwrite conflict parks an artifact with all required fields,
     assert.equal(art.sessionId, 's-t6-artifact');
     assert.ok(art.device, 'device must be stamped from currentDevice()');
     assert.ok(art.proposedContent.includes('DRIFTED'), 'proposedContent holds the withheld bytes');
+    // parkReason is the artifact's own copy of the same why, read only by
+    // `hypomnema proposal list`/`apply` — which see this file, never this
+    // close's own stdout.
+    assert.equal(
+      art.parkReason,
+      jsonConflict.why,
+      'the artifact must carry the same human-readable cause as the JSON result',
+    );
     assert.ok(
       !readFileSync(join(dir, 'hot.md'), 'utf-8').includes('DRIFTED'),
       'the withheld target must stay unclobbered on disk',
@@ -2705,6 +2809,347 @@ test('session-id present but NO snapshot → fail-safe conflict (base-unknown, n
     const c = out.conflicts.find((x) => x.target === t4Rel);
     assert.ok(c, `an unobserved base must fail safe: ${JSON.stringify(out.conflicts)}`);
     assert.equal(c.reason, 'base-unknown');
+  });
+});
+
+test('overwriteConflictReason: the "unknown" state always parks (touched-paths escape hatch removed 2026-09-11)', () => {
+  // A prior cut of this guard let a session's own touched-paths record
+  // (hooks/hypo-auto-stage.mjs) waive the park for a target this session's
+  // base.json never got a key for at all. It was removed: hypo-auto-commit
+  // clears touched-paths.json at every Stop once a commit lands (even a
+  // no-op one), so by the time a real close reads it here it is already
+  // empty for any session that crossed a Stop since its last Write/Edit, and
+  // the escape never actually fired. `overwriteConflictReason` now takes only
+  // 3 arguments; this pins that 'unknown' has no way through regardless.
+  const unknown = { state: 'unknown', hash: null };
+  assert.equal(overwriteConflictReason(unknown, 'disk bytes'), 'base-unknown');
+  assert.equal(overwriteConflictReason(unknown, 'disk bytes', undefined), 'base-unknown');
+
+  const absentDrift = { state: 'absent', hash: null };
+  assert.equal(
+    overwriteConflictReason(absentDrift, 'someone else created this'),
+    'base-absent-target-exists',
+  );
+
+  const hashDrift = { state: 'hash', hash: bsHashContent('original') };
+  assert.equal(overwriteConflictReason(hashDrift, 'drifted content'), 'base-mismatch');
+});
+
+// The close report's prose is the only thing a human reading stdout gets, and
+// it used to be a two-way branch on `kind === 'append'`: every overwrite park,
+// whatever its reason, claimed "the page changed since this session read it".
+// For a section-loss park that sentence is actively wrong — the page did not
+// change, the payload dropped sections — and it sends the reader off hunting a
+// concurrent writer that does not exist. Nothing else covers this: every apply
+// in this file runs with --json, so printCloseReport's text path is never
+// executed by the suite. These two assertions test the lookup directly.
+test('conflictWhy: a section-loss park names the dropped sections, not a phantom concurrent writer', () => {
+  const why = conflictWhy({
+    reason: 'section-loss-guard',
+    lostSections: ['## Track B', '## Track C'],
+    diskSectionCount: 3,
+  });
+  assert.ok(why.includes('## Track B') && why.includes('## Track C'), `must name them: ${why}`);
+  assert.ok(why.includes('2 of 3'), `must say how many of how many: ${why}`);
+  assert.ok(
+    !why.includes('the page changed since this session read it'),
+    `must not claim the page changed: ${why}`,
+  );
+  assert.ok(why.includes('restructure'), `must name the escape hatch: ${why}`);
+  // The paired half: a reason that really IS a concurrent-writer case still
+  // says so, so the assertion above pins the lookup rather than banning a
+  // phrase outright.
+  assert.ok(
+    conflictWhy({ reason: 'base-mismatch' }).includes(
+      'the page changed since this session read it',
+    ),
+  );
+});
+
+// Each entry reads the fields its own reason carries, and section-loss needs two
+// the others never set. Now that the JSON path builds `why` for every conflict,
+// a reason pushed without the fields its entry expects would throw inside the
+// close rather than inside a report nobody runs. Losing the close over a
+// sentence is the wrong trade, so the builder degrades instead.
+test('conflictWhy: a mapped reason missing the fields its message reads degrades, it does not throw', () => {
+  // The paired half: with the fields present it still produces the real
+  // sentence, so the assertion below is not just catching a broken lookup.
+  assert.ok(
+    conflictWhy({
+      reason: 'section-loss-guard',
+      lostSections: ['## A', '## B'],
+      diskSectionCount: 3,
+    }).includes('## A'),
+  );
+  const why = conflictWhy({ reason: 'section-loss-guard' });
+  assert.ok(why.includes('section-loss-guard'), `must still name the reason: ${why}`);
+  assert.ok(why.includes('unavailable'), `and say the detail is missing: ${why}`);
+});
+
+test('conflictWhy: an unmapped reason says the cause is undetermined instead of guessing one', () => {
+  const why = conflictWhy({ reason: 'some-future-reason' });
+  assert.ok(why.includes('some-future-reason'), `must echo the reason: ${why}`);
+  assert.ok(
+    !why.includes('the page changed since this session read it'),
+    `an unmapped reason must not inherit another reason's cause: ${why}`,
+  );
+});
+
+test('sectionLossReason: 2+ dropped sections trips at any file size, 1 never does (2026-09-14 fix)', () => {
+  assert.equal(
+    sectionLossReason('# no ## headings here\n', 'anything'),
+    null,
+    'nothing to lose when disk has no ## sections',
+  );
+  const two = '## A\ntext\n## B\ntext\n';
+  assert.equal(
+    sectionLossReason(two, '## A\ntext\n'),
+    null,
+    'losing 1 of 2 stays under the count floor (an ordinary single-section edit)',
+  );
+  const three = '## A\ntext\n## B\ntext\n## C\ntext\n';
+  const loss = sectionLossReason(three, '## A\ntext\n');
+  assert.ok(loss, 'losing 2 of 3 — the security-backoffice incident shape — must fire');
+  assert.deepEqual(loss.lost, ['## B', '## C']);
+  assert.equal(loss.diskCount, 3);
+
+  // This is the gap a codex review found in the OLD abs-count-of-3 gate: losing
+  // exactly 2 sections out of a bigger file (the same incident shape, just on a
+  // file the real vault actually has — hot.md/session-state.md run 4-12
+  // sections) stayed under both the 0.34 ratio floor (2/10 = 0.2) and the old
+  // absolute floor (2 < 3), and passed through untouched. It must now trip on
+  // the count alone.
+  const many = Array.from({ length: 10 }, (_, i) => `## S${i}\ntext`).join('\n');
+  const droppedTwoOfTen = Array.from({ length: 8 }, (_, i) => `## S${i}\ntext`).join('\n');
+  const lossTen = sectionLossReason(many, droppedTwoOfTen);
+  assert.ok(
+    lossTen,
+    'losing 2 of 10 (0.2 ratio, passed the old abs-floor-of-3 gate) must now trip',
+  );
+  assert.equal(lossTen.lost.length, 2);
+});
+
+test('sectionLossReason: an absolute floor trips on a large file the ratio-only gate let through (2026-09-11 fix)', () => {
+  // The ratio floor alone gets LOOSER as a file grows: losing 4 of a real
+  // 12-section session-state.md (4/12 = 0.333) or 3 of a real 9-section
+  // hot.md (3/9 = 0.333) both stay under the 0.34 floor and used to pass
+  // through untouched. Counts pulled from the real vault (2026-09-11,
+  // `grep -c '^## ' <file>` against this repo's own maintainer wiki): project
+  // hot.md files run 4-9 sections, project session-state.md 1-12.
+  const twelve = Array.from({ length: 12 }, (_, i) => `## S${i}\ntext`).join('\n');
+  const droppedFourOfTwelve = Array.from({ length: 8 }, (_, i) => `## S${i}\ntext`).join('\n');
+  const lossTwelve = sectionLossReason(twelve, droppedFourOfTwelve);
+  assert.ok(
+    lossTwelve,
+    'losing 4 of 12 (ratio 0.333, under the old 0.34-only floor) must now trip',
+  );
+  assert.equal(lossTwelve.lost.length, 4);
+
+  const nine = Array.from({ length: 9 }, (_, i) => `## S${i}\ntext`).join('\n');
+  const droppedThreeOfNine = Array.from({ length: 6 }, (_, i) => `## S${i}\ntext`).join('\n');
+  const lossNine = sectionLossReason(nine, droppedThreeOfNine);
+  assert.ok(lossNine, 'losing 3 of 9 (ratio 0.333) must now trip via the absolute floor');
+  assert.equal(lossNine.lost.length, 3);
+});
+
+test('sectionLossReason: moving disk headings into a fenced code block must not hide the loss (2026-09-14 fence bypass)', () => {
+  // Reproduces the bypass: two of disk's three `##` headings survive only as
+  // TEXT inside a fenced ```md block in the payload, never as real headings.
+  // The old line-scan (no fence awareness at all) matched them as present
+  // regardless, and this parked as null: the same drop with no fence at all
+  // parked correctly, so wrapping the dropped headings in a fence was a free
+  // pass around the whole guard.
+  const disk = '# T\n## A\nbody A\n\n## B\nbody B\n\n## C\nbody C\n';
+  const payload = '# T\n## A\nbody A\n\n```md\n## B\n## C\n```\n';
+  const loss = sectionLossReason(disk, payload);
+  assert.ok(
+    loss,
+    'headings moved into a fence are not real headings in the payload, must still park',
+  );
+  assert.deepEqual(loss.lost, ['## B', '## C']);
+  assert.equal(loss.diskCount, 3);
+});
+
+test('sectionLossReason: a duplicated ## heading is counted as a multiset, not deduped away (2026-09-14 dup-collapse bypass)', () => {
+  // Disk carries the same heading line three times; the payload keeps only one
+  // copy. A Set-based extraction collapses disk's three occurrences into one
+  // and reports the heading as "still present", so two real losses were
+  // invisible. Counted as a multiset, this still trips the same MIN_COUNT
+  // floor as any other 2-of-N loss.
+  const disk = '## TODO\ntext\n## TODO\ntext\n## TODO\ntext\n';
+  const payload = '## TODO\ntext\n';
+  const loss = sectionLossReason(disk, payload);
+  assert.ok(
+    loss,
+    'losing 2 of 3 copies of the same heading must trip exactly like 2 distinct headings would',
+  );
+  assert.deepEqual(loss.lost, ['## TODO', '## TODO']);
+  assert.equal(loss.diskCount, 3);
+
+  // The smaller case the dup bug actually hid completely: disk has the heading
+  // twice, payload keeps one. That is a real single-copy loss (correctly
+  // reported as diskCount 2, lost.length 1) and, same as any other
+  // single-section edit, stays under the park floor on its own.
+  const diskTwo = '## TODO\ntext\n## TODO\ntext\n';
+  const payloadOne = '## TODO\ntext\n';
+  const lossTwo = sectionLossReason(diskTwo, payloadOne);
+  assert.equal(
+    lossTwo,
+    null,
+    'a single lost copy of a duplicated heading is an ordinary edit, must not park',
+  );
+});
+
+test('sectionLossReason: false-park guard, a fenced code example carried through unchanged never parks', () => {
+  // The legitimate case fence-awareness must not break: a section whose body
+  // is itself a code sample, carried forward byte-for-byte, must not read as
+  // "the heading vanished" just because the extractor now skips fenced lines.
+  const content =
+    '## A\nbody\n\n## B\n```js\nconst x = 1;\nfunction f() { return x; }\n```\n\n## C\nbody\n';
+  assert.equal(
+    sectionLossReason(content, content),
+    null,
+    'identical content (fence included) must never park regardless of fence-awareness',
+  );
+
+  // Same, but the payload legitimately drops one section (not the incident
+  // shape) while keeping a fenced example elsewhere untouched.
+  const payloadDropsOne =
+    '## A\nbody\n\n## B\n```js\nconst x = 1;\nfunction f() { return x; }\n```\n';
+  assert.equal(
+    sectionLossReason(content, payloadDropsOne),
+    null,
+    'dropping 1 of 3 sections while a fenced example elsewhere is untouched must still stay under the floor',
+  );
+});
+
+test('sectionLossReason: fence forms, tilde, indented, info string, and a too-short close that must not close', () => {
+  const disk = '## A\n## B\n## C\n';
+
+  // Tilde fence (~~~), not just backtick.
+  const payloadTilde = '## A\n~~~\n## B\n## C\n~~~\n';
+  const lossTilde = sectionLossReason(disk, payloadTilde);
+  assert.ok(lossTilde, 'a tilde fence must hide headings exactly like a backtick fence');
+  assert.deepEqual(lossTilde.lost, ['## B', '## C']);
+
+  // Indented fence (<= 3 leading spaces) still recognized as a fence.
+  const payloadIndented = '## A\n  ```md\n## B\n## C\n  ```\n';
+  const lossIndented = sectionLossReason(disk, payloadIndented);
+  assert.ok(lossIndented, 'a fence indented up to 3 spaces must still be recognized as a fence');
+  assert.deepEqual(lossIndented.lost, ['## B', '## C']);
+
+  // A closing fence shorter than the opening does not close it: opened with 4
+  // backticks, a 3-backtick line mid-block must not close it, only the later
+  // 4-backtick line does, so both headings between stay hidden the whole way.
+  const payloadShortClose = '## A\n````md\n## B\n```\n## C\n````\n';
+  const lossShortClose = sectionLossReason(disk, payloadShortClose);
+  assert.ok(lossShortClose, 'a shorter close must not end a longer-opened fence');
+  assert.deepEqual(lossShortClose.lost, ['## B', '## C']);
+});
+
+test('sectionLossReason: an unclosed fence running to EOF is treated as outside, not inside (2026-09-14 design choice)', () => {
+  // No closing fence anywhere after the opening marker. Treated as OUTSIDE
+  // (never fenced at all) is the safe direction: on the disk side it keeps
+  // protecting sections a malformed fence would otherwise hide from the
+  // guard entirely; on the payload side it means a heading is not falsely
+  // reported lost just because a stray fence marker sits above it.
+  const disk = '## A\n## B\n## C\n';
+  const payloadUnclosed = '## A\n```md\n## B\n## C\n'; // opens, never closes
+  assert.equal(
+    sectionLossReason(disk, payloadUnclosed),
+    null,
+    'headings after an unclosed fence must still count as present, not hidden',
+  );
+});
+
+test('ISSUE-76 c3: an overwrite that drops most of the current sections parks, with restructure:true as the escape hatch', () => {
+  withWiki(null, (dir, today) => {
+    const base = readFileSync(t4ProjectHot(dir), 'utf-8');
+    const multiTrack = `${base}\n## Track A\nnote A\n\n## Track B\nnote B\n\n## Track C\nnote C\n`;
+    writeFileSync(t4ProjectHot(dir), multiTrack);
+    // Snapshot AFTER seeding the multi-track content, so the base guard (step 2)
+    // sees no drift at all — this test isolates the section-loss guard (step 3)
+    // from the base-conflict guard (step 2), exactly as the real incident did
+    // (a clean, unopposed overwrite that still threw sections away).
+    snapshotBase(dir, 's-loss', overwriteTargets(T4_PROJECT));
+
+    const onlyTrackA = `${base}\n## Track A\nnote A, updated this session\n`;
+    const { r, out } = t4Apply(
+      dir,
+      t4Payload(dir, today, onlyTrackA, 'dropped two tracks'),
+      's-loss',
+    );
+
+    assert.notEqual(r.status, 0, 'dropping 2 of 3 sections must park, not write silently');
+    assert.equal(
+      readFileSync(t4ProjectHot(dir), 'utf-8'),
+      multiTrack,
+      'target must stay untouched while withheld',
+    );
+    const c = out.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c, `must be reported as a conflict: ${JSON.stringify(out.conflicts)}`);
+    assert.equal(c.reason, 'section-loss-guard');
+    assert.deepEqual(c.lostSections, ['## Track B', '## Track C']);
+    // The JSON result must carry the same prose printCloseReport prints, not
+    // just the raw reason code — a `--json` close (the only kind a real close
+    // runs) had no `why` at all before this fix.
+    assert.equal(c.why, conflictWhy(c));
+    assert.ok(c.why.includes('## Track B') && c.why.includes('## Track C'));
+    const proposalEntry = out.proposals.find((p) => p.target === t4Rel);
+    assert.ok(
+      proposalEntry,
+      'a section-loss park must produce a reviewable proposal, the same door a base conflict already uses',
+    );
+    // The artifact is what `hypomnema proposal list`/`apply` actually read —
+    // neither sees this close's own stdout — so the park reason and the lost-
+    // section detail must live there too, not just in this run's JSON.
+    const art = JSON.parse(readFileSync(proposalEntry.path, 'utf-8'));
+    assert.equal(art.parkReason, c.why, 'the artifact must carry the same why as the JSON result');
+    assert.deepEqual(art.lostSections, c.lostSections);
+    assert.equal(art.diskSectionCount, c.diskSectionCount);
+
+    // The first attempt failed (ok:false), so it never recorded a close-gate
+    // resolution — the same session's ORIGINAL close signal is still open and
+    // reusable for the retry below, exactly like retrying any other parked stage.
+    const payloadWithEscape = t4Payload(dir, today, onlyTrackA, 'deliberate consolidation');
+    payloadWithEscape.projectHot.restructure = true;
+    const { r: r2, out: out2 } = t4Apply(dir, payloadWithEscape, 's-loss');
+
+    assert.equal(r2.status, 0, `restructure:true must let the write through: ${r2.stderr}`);
+    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), onlyTrackA);
+    assert.deepEqual(
+      out2.conflicts,
+      [],
+      'the escape hatch must not leave a phantom conflict behind',
+    );
+    // The waiver must not vanish along with the conflict: the same party the
+    // guard exists to check (the model composing the payload) set the flag,
+    // so the result must say so rather than let it pass silently.
+    assert.deepEqual(
+      out2.restructureWaivers,
+      [{ target: t4Rel, lostSections: ['## Track B', '## Track C'] }],
+      `a real waiver must be reported verbatim: ${JSON.stringify(out2.restructureWaivers)}`,
+    );
+  });
+});
+
+test('restructureWaivers stays empty when restructure:true is set on a field that never had a loss to waive', () => {
+  withWiki(null, (dir, today) => {
+    // Ordinary edit, no section dropped at all: `restructure: true` is set but
+    // has nothing to waive, so it must add no entry (a `true` flag alone is
+    // not evidence of a real waiver).
+    snapshotBase(dir, 's-noop-waiver', overwriteTargets(T4_PROJECT));
+    const onDisk = readFileSync(t4ProjectHot(dir), 'utf-8');
+    const payload = t4Payload(dir, today, `${onDisk}\nadded, nothing dropped\n`, 'no-op flag');
+    payload.projectHot.restructure = true;
+    const { out } = t4Apply(dir, payload, 's-noop-waiver');
+
+    assert.deepEqual(out.conflicts, []);
+    assert.deepEqual(
+      out.restructureWaivers,
+      [],
+      'restructure:true on a field with nothing to lose must not manufacture a waiver',
+    );
   });
 });
 

@@ -1920,14 +1920,16 @@ test('touched-paths accumulated for a DIFFERENT session_id does not leak into th
   });
 });
 
-// ── close-gate resolution wiring (T3, decision 5) ───────────────────────────
-// Resolution is written at the ONE success exit path (`ok`), independent of
-// whether the per-session marker below it actually lands. Both writers go
+// ── close-gate resolution wiring (T3) ──────────────────────────────────────
+// Resolution is written once the per-session marker has actually landed, not
+// at the earlier success exit path (`ok`). An apply that writes and commits
+// but cannot place the marker leaves the close signal unspent, so the retry
+// that finally lands the marker is the run that spends it. Both writers go
 // through `hooks/close-gate-store.mjs`'s Buffer-only contract: a caller that
 // decodes the transcript to a string first would get a `null` stamp and a
 // silent no-write, so every assertion here reads the resolution FILE back
 // off disk rather than trusting a function's return value alone.
-suite('close-gate resolution wiring (T3, decision 5)');
+suite('close-gate resolution wiring (T3)');
 
 test('a successful apply records a real closedAtIndex and closedPrefixSha on disk', () => {
   withCleanWiki((wiki) => {
@@ -1966,7 +1968,7 @@ test('a successful apply records a real closedAtIndex and closedPrefixSha on dis
   });
 });
 
-test('a marker withheld by a real vault-commit failure still gets its close-gate resolution recorded (decision 5)', () => {
+test('a marker withheld by a real vault-commit failure leaves the close signal unspent for a retry', () => {
   withCleanWiki((wiki) => {
     const today = todayLocal();
     // Force the vault's OWN internal commit (crystallize's commitWikiChanges)
@@ -2013,13 +2015,32 @@ test('a marker withheld by a real vault-commit failure still gets its close-gate
       `expected a commit-failed skip reason, got ${JSON.stringify(out.markerSkipReason)}`,
     );
 
-    // This is decision 5 itself: the resolution must exist even though the
-    // marker branch (gated on a clean commit) never wrote anything.
+    // The contract this suite used to assert was the reverse: the resolution
+    // was written at the `ok` exit path regardless of the marker, so a run
+    // that got this far spent the user's close signal even though nothing
+    // marked the session closed. The next run was then refused for having no
+    // new signal, and only a fresh close phrase from the user could get out
+    // of it.
     const gatePath = join(wiki, '.cache', 'close-gate', `${sessionId}.json`);
     assert.ok(
-      existsSync(gatePath),
-      'the resolution file must exist even though the marker was withheld',
+      !existsSync(gatePath),
+      'a withheld marker must leave the close signal unspent, not record a resolution',
     );
+
+    // On its own the assertion above proves nothing: the file does not exist
+    // before the apply either, so it would hold for an apply that never ran.
+    // The retry is the half that distinguishes. Clearing the failing hook and
+    // calling again with the SAME session id reuses the transcript runApply
+    // already seeded, so there is NO fresh close phrase — under the old
+    // contract this second run was refused.
+    rmSync(hookPath);
+    const r2 = runApply(wiki, payload, { sessionId });
+    const out2 = JSON.parse(r2.stdout);
+    assert.equal(out2.ok, true, `the retry must be authorized: ${r2.stdout}\n${r2.stderr}`);
+    assert.equal(out2.markerWritten, true, 'the retry must land the marker it was denied');
+
+    // And the run that lands the marker is the one that spends the signal.
+    assert.ok(existsSync(gatePath), 'the resolution belongs to the run that marked the session');
     const recorded = JSON.parse(readFileSync(gatePath, 'utf-8'));
     assert.equal(recorded.sessionId, sessionId);
     assert.ok(Number.isSafeInteger(recorded.closedAtIndex) && recorded.closedAtIndex >= 1);

@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import {
   mkdtempSync,
   mkdirSync,
+  chmodSync,
   rmSync,
   writeFileSync,
   appendFileSync,
@@ -26,7 +27,7 @@ import { planMarkerDecision, closeResultContradiction } from '../scripts/crystal
 import { snapshotBase } from '../hooks/base-store.mjs';
 // The gate's own notion of "today", so the fixture below can place a project
 // strictly outside it instead of guessing with local-yesterday.
-import { freshDates } from '../hooks/hypo-shared.mjs';
+import { freshDates, sessionClosedMarkerPath } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import {
   CLOSE_RECONFIRM_MARK,
@@ -2780,6 +2781,104 @@ test('--apply-session-close text output: markerWritten:false prints loud stderr 
   });
 });
 
+test('ISSUE-140: a marker withheld by an unrelated gate failure leaves the close signal usable for a retry', () => {
+  // Regression for the close-signal-burn bug: the close-gate resolution used
+  // to be recorded as soon as `ok && sessionId` was true, ahead of whether the
+  // marker itself ever landed. A run that committed the payload but then had
+  // its marker withheld by a gate failure that has nothing to do with the
+  // payload itself (here: the same feedback over-cap fixture as the
+  // markerWritten:false text test above) burned the session's one close
+  // signal anyway. The next apply attempt, with the SAME transcript and no
+  // fresh close phrase, was refused before writing a byte
+  // (`no-user-close-signal` / `no-new-open-since-resolution`) even though no
+  // marker had ever been written and the session was never actually closed.
+  //
+  // This drives that exact two-step reproduction: apply once while the
+  // feedback is still over cap (marker withheld), fix the over-cap without
+  // adding any new close signal to the transcript, then apply again. What it
+  // distinguishes: whether the second apply is authorized at all
+  // (`refuseUnlessCloseRequested` via `verifyCloseAuthority` /
+  // `closeGateStatus`), versus refused outright by a resolution the first,
+  // marker-less run should never have recorded. On the pre-fix code the
+  // second apply exits 1 with `no-new-open-since-resolution`; on the fix it
+  // exits 0 with the marker finally landing.
+  withTmpDir((dir) => {
+    const wiki = join(dir, 'wiki');
+    const today = todayLocal();
+    mkdirSync(wiki, { recursive: true });
+    buildCleanWikiTree(wiki, today);
+    adr47SeedFeedback(wiki, 11); // over the 10-entry cap → compact-gate-not-ok
+    adr47CommitWiki(wiki);
+    const home = adr47ControlledHome(dir);
+    const sessionId = 's-i140-retry';
+    const closeCleanup = seedCloseTranscript(sessionId, { home });
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(wiki, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(wiki, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] ISSUE-140 retry test\n` },
+      log: { entry: `## [${today}] session | test-project: ISSUE-140 retry test\n` },
+    };
+    const payloadPath = join(dir, '.payload.json'); // outside the wiki git tree
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const runApply = () =>
+      spawnSync(
+        process.execPath,
+        [
+          join(SCRIPTS, 'crystallize.mjs'),
+          `--hypo-dir=${wiki}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          `--session-id=${sessionId}`,
+          '--json',
+        ],
+        { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
+      );
+    try {
+      const r1 = runApply();
+      assert.equal(
+        r1.status,
+        0,
+        `first apply must still succeed (the writes land, only the marker is withheld): ${r1.stdout}\n${r1.stderr}`,
+      );
+      const out1 = JSON.parse(r1.stdout);
+      assert.equal(out1.ok, true);
+      assert.equal(out1.markerWritten, false, 'marker must be withheld on the over-cap');
+      assert.equal(out1.markerSkipReason, 'compact-gate-not-ok');
+
+      // Fix the over-cap WITHOUT touching the transcript at all: no new close
+      // phrase, no new open. Commit the fix so the tree is clean going into
+      // the retry.
+      rmSync(join(wiki, 'pages', 'feedback', 'rule-10.md'));
+      spawnSync('git', ['add', '-A'], { cwd: wiki });
+      spawnSync('git', ['commit', '-m', 'fix over-cap'], { cwd: wiki });
+
+      const r2 = runApply();
+      assert.equal(
+        r2.status,
+        0,
+        `retry on the same, never-consumed close signal must be authorized and succeed: ${r2.stdout}\n${r2.stderr}`,
+      );
+      const out2 = JSON.parse(r2.stdout);
+      assert.equal(out2.ok, true);
+      assert.equal(
+        out2.markerWritten,
+        true,
+        `marker must land on retry now that the gate clears: ${JSON.stringify(out2)}`,
+      );
+      assert.equal(out2.markerSkipReason, null);
+    } finally {
+      closeCleanup();
+    }
+  });
+});
+
 // printCloseReport's `!ok` branch (crystallize-close-apply.mjs:1801-1815) has no
 // test exercising it: the only text-output apply test above stays on the
 // `ok:true` / markerSkipReason path. Drive BOTH `!ok` lines in one run so a
@@ -4255,6 +4354,42 @@ test('IMPR-34: --check-session-close renders demoted debt without contradicting 
       assert.equal(out.ok, true, 'and ok never contradicts an empty missing');
     },
   );
+});
+
+// The writer reports whether ITS OWN call landed, and the close path spends the
+// user's close signal on that answer. existsSync alone cannot give it: a marker
+// left by an earlier attempt satisfies the check just as well as one this run
+// wrote, and the reader drops a marker it cannot parse. A write that fails onto
+// a corrupt leftover would then look like a successful close, spend the signal,
+// and have the next Stop delete the marker — leaving a session that can never
+// close again. The write is also atomic now, so the target is never half a file.
+test('writeSessionClosedMarker reports whether this call landed, and replaces a corrupt marker wholesale', () => {
+  withTmpDir((dir) => {
+    const sid = 's-marker-report';
+    const p = sessionClosedMarkerPath(dir, sid);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // A leftover that exists but is not readable as a marker: exactly the state
+    // existsSync cannot tell apart from a healthy one.
+    writeFileSync(p, '{"truncated": ');
+    assert.equal(writeSessionClosedMarker(dir, sid, { project: 'mine' }), true);
+    const after = JSON.parse(readFileSync(p, 'utf-8'));
+    assert.equal(after.project, 'mine', 'the corrupt bytes must be gone, not appended to');
+
+    // The paired half: a write that cannot land must say so rather than leave
+    // the caller to infer success from a file that was already there.
+    const blocked = join(dir, 'blocked');
+    mkdirSync(blocked, { recursive: true });
+    chmodSync(blocked, 0o500);
+    try {
+      assert.equal(
+        writeSessionClosedMarker(blocked, 's-denied', { project: 'mine' }),
+        false,
+        'a write it could not perform must report false',
+      );
+    } finally {
+      chmodSync(blocked, 0o700);
+    }
+  });
 });
 
 // The reader that recovers the scope after a scripted close: marker.project.

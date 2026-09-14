@@ -1549,6 +1549,33 @@ test('a task-notification whose body matches a close pattern opens nothing, on e
   });
 });
 
+// ISSUE-114 option 2: the attachment branch's default used to close on
+// anything the known-machine list did not recognize, which is the same shape
+// bug #289 fixed for <task-notification> specifically — the filter has to be
+// updated by hand every time the host mints a new machine-caused event, and a
+// miss silently retracts a close the user already granted. This fixture is a
+// host event the filter has never seen (not `<task-notification>`, not empty,
+// not `commandMode: 'task-notification'`) and carries no `origin.kind` at
+// all, the shape every unaudited host event has had in this file's other
+// fixtures. It must not close the gate: closing now requires a positive
+// human producer, not merely a content shape the enumeration missed.
+test('a new, unenumerated machine-generated attachment does not close an open gate', () => {
+  withTmpDir((dir) => {
+    const notif = '<agent-status-update>\n<status>idle</status>\n</agent-status-update>';
+    assert.equal(isClosePattern(notif), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: { type: 'queued_command', prompt: notif, commandMode: 'agent-status' },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
 // The other half of the order contract: the same body arriving AFTER a real
 // close must not move `openedAtIndex` either. A gate that reads open for the
 // wrong reason is as wrong as one that reads closed, because the resolution

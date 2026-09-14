@@ -228,13 +228,37 @@ export function deleteProposal(hypoDir, id) {
  * @param {string} fields.sessionId owning session
  * @param {string} fields.device machine identifier (crystallize passes currentDevice())
  * @param {string} [fields.createdAt] ISO timestamp; defaults to now
+ * @param {string} [fields.parkReason] human-readable cause of the park (crystallize's
+ *   conflictWhy(c)) — this is the artifact's own copy of the same string a `--json`
+ *   close now also puts in that close's conflicts[].why, kept here because the T7
+ *   CLI's list/apply/discard/challenge/resolve actions read only the artifact and
+ *   never that close's own stdout. Additive: absent on artifacts written before this
+ *   field existed, and every reader (this module's own readArtifactFile, and the T7
+ *   CLI's actions above) treats an absent value as "no cause recorded", never as
+ *   malformed — none of them requires this key to be present.
+ * @param {string[]} [fields.lostSections] the `##` headings a section-loss park
+ *   dropped (crystallize-close-apply.mjs's sectionLossReason). Present only when
+ *   `parkReason` names that cause; omitted for every other park reason, same as
+ *   `diskSectionCount` below.
+ * @param {number} [fields.diskSectionCount] how many `##` headings disk had at
+ *   park time, alongside `lostSections`.
  * @returns {{id: string, target: string, path: string, supersedeWarnings: string[]}}
  *   `supersedeWarnings` is non-empty only when the new artifact WAS written but an
  *   older same-target sibling could not be removed — a non-fatal condition (the
  *   payload is parked), reported separately from a write failure (which throws).
  */
 export function writeProposal(hypoDir, fields) {
-  const { target, baseHash, currentAtProposalHash, proposedContent, sessionId, device } = fields;
+  const {
+    target,
+    baseHash,
+    currentAtProposalHash,
+    proposedContent,
+    sessionId,
+    device,
+    parkReason,
+    lostSections,
+    diskSectionCount,
+  } = fields;
   const createdAt = fields.createdAt || new Date().toISOString();
 
   // Match on the parsed `target` field, never on the filename slug: two distinct
@@ -266,6 +290,16 @@ export function writeProposal(hypoDir, fields) {
     sessionId: sessionId != null ? String(sessionId) : null,
     device: device != null ? String(device) : null,
     createdAt,
+    // Additive fields (see this function's own doc comment): omitted rather
+    // than stored as `null` when the caller does not pass them, so an artifact
+    // written before this field existed and one written by a caller that
+    // genuinely has no cause to report look identical on disk — both simply
+    // lack the key, and every reader already treats an absent key as "not
+    // recorded", never as a malformed body (readArtifactFile only requires
+    // `id` and `target`; nothing here reads these three as mandatory).
+    ...(parkReason != null ? { parkReason: String(parkReason) } : {}),
+    ...(Array.isArray(lostSections) ? { lostSections } : {}),
+    ...(typeof diskSectionCount === 'number' ? { diskSectionCount } : {}),
   };
   // Write the new artifact DURABLY before removing the old one: a crash in the
   // gap leaves a stale sibling (superseded next close), never a lost payload.
