@@ -5,6 +5,32 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.3] - 2026-09-11
+
+### Bug Fixes
+
+#### English
+
+- The vault pre-commit hook finds the active install when it runs, instead of baking a path in at install time. It now survives a move, a reinstall, or a version bump. When it cannot find one it blocks the commit and prints how to fix it, rather than passing silently. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+- SessionStart repairs a drifted `hypo-pkg.json` pointer itself instead of only warning about it. It refuses a downgrade, refuses a value that is not semver, and serialises against other sessions with a file lock. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+- `upgrade` names what each SCHEMA version added, so a template-update notice says what changed rather than only that something did. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+
+#### 한국어
+
+- 볼트 pre-commit 훅이 설치 경로를 설치 시점에 박아 두는 대신 실행할 때 찾습니다. 설치를 옮기거나 다시 깔거나 버전을 올려도 살아남습니다. 못 찾으면 조용히 통과시키지 않고 커밋을 막으면서 고치는 법을 알려 줍니다. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+- SessionStart 가 어긋난 `hypo-pkg.json` 포인터를 경고만 하지 않고 직접 고칩니다. 다운그레이드와 semver 가 아닌 값은 거부하고, 파일 잠금으로 다른 세션과 직렬화합니다. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+- `upgrade` 가 SCHEMA 버전마다 무엇이 더해졌는지 말해 줍니다. 템플릿 갱신 안내가 무언가 바뀌었다고만 하지 않고 무엇이 바뀌었는지 알려 줍니다. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+
+### Chores
+
+#### English
+
+- Wiki decision pointers are gone from every public surface, this changelog included. The repo ships no directory for them, so they resolved to nothing for any reader outside the maintainer's private notes. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+
+#### 한국어
+
+- 위키 결정 문서 포인터를 이 changelog 를 포함한 모든 공개 표면에서 없앴습니다. 레포가 그 문서를 담은 디렉터리를 출하하지 않아서, 관리자의 개인 기록 밖에 있는 독자에게는 아무것도 가리키지 않는 포인터였습니다. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+
 ## [1.8.2] - 2026-09-10
 
 ### Bug Fixes
