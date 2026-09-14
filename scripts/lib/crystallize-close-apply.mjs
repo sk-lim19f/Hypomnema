@@ -49,6 +49,7 @@ import {
   resolutionStamp,
   closeGateStatus,
 } from '../../hooks/close-gate-store.mjs';
+import { readJournal, recordJournalEntry, clearJournal } from '../../hooks/close-journal.mjs';
 import { requireProjectDir } from './crystallize-close-gate.mjs';
 import { summarizeLintForOutput } from './crystallize-helpers.mjs';
 
@@ -741,7 +742,15 @@ function verifyCloseAuthority(sessionId, hypoDir) {
 // atomicWrite's use case (replacing bytes a reader might already be mid-read
 // of), a `wx` create can never observably tear — the file either doesn't
 // exist yet (nothing to tear) or the open fails outright.
-export function ensureProjectIndex(hypoDir, project, relPath, today) {
+// `sessionId` (optional, added for the close journal) records this create in
+// hooks/close-journal.mjs immediately after the bytes land, so a retry of the
+// SAME close that finds index.md already present (applyOverwrites' retry
+// branch) can tell "I created this and it is still exactly what I left it"
+// apart from a hand edit. Omitted entirely by callers outside a close
+// (tests/crystallize-apply.test.mjs's race-condition check), where there is
+// no session to journal against and recordJournalEntry's own `!sessionId`
+// guard makes the call a no-op.
+export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) {
   const dest = join(hypoDir, relPath);
   const src = join(TEMPLATE_DIR, 'index.md');
   if (!existsSync(src)) return null; // template missing — nothing to scaffold from
@@ -764,6 +773,7 @@ export function ensureProjectIndex(hypoDir, project, relPath, today) {
   } finally {
     closeSync(fd);
   }
+  recordJournalEntry(hypoDir, sessionId, relPath, hashContent(content));
   return relPath;
 }
 
@@ -1353,14 +1363,29 @@ export function sectionLossReason(diskContent, payloadContent) {
  */
 function applyOverwrites(args, payload, project, date, indexRelPath, indexMissing, acc) {
   const { applied, skipped, appliedPaths, conflicts, restructureWaivers } = acc;
+  // Read once per close, not once per field: it is a single small JSON read,
+  // and every skip branch below needs the same session-scoped record.
+  const journal = readJournal(args.hypoDir, args.sessionId);
 
   const overwrite = (key, relPath, field) => {
     if (!field || typeof field.content !== 'string') return; // optional / absent
     const full = join(args.hypoDir, relPath);
     const disk = readTarget(full);
 
-    // (1) idempotent skip — preserves writeIfChanged's contract
+    // (1) idempotent skip — preserves writeIfChanged's contract. "Already
+    // current" collapses two different histories that look identical from
+    // here: disk always held these bytes, or THIS session wrote them in an
+    // earlier, uncommitted attempt at this same close. Only the journal tells
+    // them apart. A record for this path whose hash still matches what is on
+    // disk means the second history — restage it so the retry's commit picks
+    // up bytes an earlier attempt already paid for. No record, or a hash that
+    // no longer matches (someone touched the file since), leaves it out: the
+    // gate should keep blocking on drift it cannot attribute to this close.
     if (disk === field.content) {
+      const journalHash = journal[relPath];
+      if (journalHash && journalHash === hashContent(field.content)) {
+        appliedPaths.push(relPath);
+      }
       skipped.push(`${key} (${relPath})`);
       return;
     }
@@ -1455,8 +1480,15 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
 
     // (4) write, then the content we just wrote IS this session's new base
     atomicWrite(full, field.content);
-    if (args.sessionId)
+    if (args.sessionId) {
       advanceBase(args.hypoDir, args.sessionId, relPath, hashContent(field.content));
+      // Record what THIS write just put down, so a retry after a partial
+      // close (a sibling field conflicts, the commit fails, the process
+      // dies) can tell its own uncommitted bytes apart from someone else's —
+      // see the journal read in step (1) above and the doc comment on
+      // hooks/close-journal.mjs.
+      recordJournalEntry(args.hypoDir, args.sessionId, relPath, hashContent(field.content));
+    }
     applied.push(`${key} (${relPath})`);
     appliedPaths.push(relPath);
   };
@@ -1470,22 +1502,37 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
   // preflight passed, so an aborted close never leaves a half-applied side
   // effect on disk).
   if (indexMissing) {
-    const createdIndex = ensureProjectIndex(args.hypoDir, project, indexRelPath, date);
+    const createdIndex = ensureProjectIndex(
+      args.hypoDir,
+      project,
+      indexRelPath,
+      date,
+      args.sessionId,
+    );
     if (createdIndex) {
       applied.push(`projectIndex (${createdIndex})`);
       appliedPaths.push(createdIndex);
     }
   } else {
-    // The retry path, and the reason the close gate can stay fail-closed on
-    // everything inside the project's own directory. A first attempt that
-    // seeds index.md and then fails to commit leaves it dirty; this run finds
-    // it already there, so the branch above does nothing and the file would
-    // drop out of the commit scope entirely. The gate then blocks on it
-    // forever, since no retry ever picks it back up. Claiming it here costs
-    // nothing when the file is clean (there is nothing to stage) and closes
-    // the deadlock when it is not. `applied` stays untouched: this run wrote
-    // no bytes, it only takes responsibility for committing them.
-    appliedPaths.push(indexRelPath);
+    // The retry path. A first attempt that seeds index.md and then fails to
+    // commit leaves it dirty; this run finds it already there, so the branch
+    // above does nothing and the file would drop out of the commit scope
+    // entirely, blocking the gate forever with no retry ever picking it back
+    // up. Restaging it is only safe when the journal says THIS session wrote
+    // exactly the bytes still on disk — the same rule step (1)'s idempotent
+    // skip applies, reused here because ensureProjectIndex never reaches
+    // step (1) at all (it is a template-seeded create, not a payload
+    // overwrite field). A hand-edited index.md (no journal record, or a
+    // journal record whose hash no longer matches) is left OUT of
+    // appliedPaths on purpose: those are bytes this close never wrote, and
+    // sweeping them into its commit would ship an edit the payload never
+    // carried.
+    const full = join(args.hypoDir, indexRelPath);
+    const disk = readTarget(full);
+    const journalHash = journal[indexRelPath];
+    if (journalHash && typeof disk === 'string' && journalHash === hashContent(disk)) {
+      appliedPaths.push(indexRelPath);
+    }
   }
 }
 
@@ -1504,6 +1551,7 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
   const rel = join('projects', project, 'session-log', `${date}.md`);
   const full = join(args.hypoDir, rel);
   const isPresent = entryAlreadyPresent(payload.sessionLog.entry);
+  const journal = readJournal(args.hypoDir, args.sessionId);
   // Serialize dedup + create/append on the daily shard so two concurrent
   // closes never lose an entry: the second closer takes the lock only after
   // the first committed, re-reads the shard under the lock, and appends onto
@@ -1567,7 +1615,32 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
       { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
     );
     (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
-    if (outcome !== 'skipped') appliedPaths.push(rel);
+    if (outcome !== 'skipped') {
+      appliedPaths.push(rel);
+      // Same journal contract as applyOverwrites: record the FULL file's hash
+      // right after this write, not just the entry, since a retry's own
+      // "already present" skip below reads the whole file back to compare.
+      const written = readTarget(full);
+      if (typeof written === 'string')
+        recordJournalEntry(args.hypoDir, args.sessionId, rel, hashContent(written));
+    } else {
+      // "Already present" collapses the same two histories the overwrite
+      // guard's step (1) does: this entry could have sat in the shard since
+      // before this close ever ran, or THIS session appended it in an
+      // earlier, uncommitted attempt at the same close. Restage only the
+      // second — a journal record whose hash still matches the shard on
+      // disk. (A hybrid-month fallback hit above never reaches here with
+      // `full` matching the journal's recorded target, since the evidence in
+      // that case lives in the legacy monthly file instead — nothing to
+      // restore for the daily shard because this close never wrote one.)
+      const journalHash = journal[rel];
+      if (journalHash) {
+        const disk = readTarget(full);
+        if (typeof disk === 'string' && journalHash === hashContent(disk)) {
+          appliedPaths.push(rel);
+        }
+      }
+    }
   } catch (err) {
     // Only a lock-TIMEOUT is withheld as a conflict. A real fn() write error
     // (disk-full, EACCES, mkdir failure) must NOT be masked as a proposal-
@@ -1610,9 +1683,35 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
 // (the Stop-hook backfill in hypo-shared.mjs). Both take the SAME lock on
 // log.md, so a concurrent close's append and this close's append serialize
 // instead of overwriting each other.
+// log.md is a single shared file both branches below append to, so a
+// "wrote nothing new" outcome from either one needs the same journal-based
+// restore-vs-leave-dirty judgment applyOverwrites' step (1) already makes:
+// this session's own prior, uncommitted append restages; anything else does
+// not. Centralized here rather than duplicated per branch, and rather than
+// merely commented twice, because a fix to one copy silently drifting from
+// the other is exactly the failure mode two near-identical blocks invite.
+function restageOrRecordLogMd(args, logFull, journal, wroteNew, acc) {
+  const { appliedPaths } = acc;
+  if (wroteNew) {
+    appliedPaths.push('log.md');
+    const written = readTarget(logFull);
+    if (typeof written === 'string')
+      recordJournalEntry(args.hypoDir, args.sessionId, 'log.md', hashContent(written));
+    return;
+  }
+  const journalHash = journal['log.md'];
+  if (journalHash) {
+    const disk = readTarget(logFull);
+    if (typeof disk === 'string' && journalHash === hashContent(disk)) {
+      appliedPaths.push('log.md');
+    }
+  }
+}
+
 function appendRootLogEntry(args, payload, project, date, acc) {
-  const { applied, skipped, appliedPaths, conflicts } = acc;
+  const { applied, skipped, conflicts } = acc;
   const logFull = join(args.hypoDir, 'log.md');
+  const journal = readJournal(args.hypoDir, args.sessionId);
   if (payload.log) {
     try {
       const wrote = withFileLock(
@@ -1621,7 +1720,7 @@ function appendRootLogEntry(args, payload, project, date, acc) {
         { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
       );
       (wrote ? applied : skipped).push('log (log.md)');
-      if (wrote) appliedPaths.push('log.md');
+      restageOrRecordLogMd(args, logFull, journal, wrote, acc);
     } catch (err) {
       if (err?.code !== 'ELOCKTIMEOUT') throw err;
       // proposedContent is append-ready root-log bytes (the custom log line).
@@ -1658,7 +1757,7 @@ function appendRootLogEntry(args, payload, project, date, acc) {
         { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
       );
       (wroteAny ? applied : skipped).push('log (log.md, derived)');
-      if (wroteAny) appliedPaths.push('log.md');
+      restageOrRecordLogMd(args, logFull, journal, wroteAny, acc);
     } catch (err) {
       if (err?.code !== 'ELOCKTIMEOUT') throw err;
       // `derived: true` discriminates this from the payload.log conflict above:
@@ -1952,6 +2051,13 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
     } catch (err) {
       commitOutcome = { committed: false, reason: `vault-commit-lock: ${err?.message || err}` };
     }
+    // Once these bytes are committed, the journal's only job (telling a
+    // retry's own uncommitted work apart from someone else's) is done —
+    // clear it rather than let a stale record outlive this close and later
+    // match a coincidence it was never meant to license. A commit that
+    // failed leaves the journal in place on purpose: that is exactly the
+    // case the next retry needs it for.
+    if (commitOutcome.committed) clearJournal(args.hypoDir, args.sessionId);
     let closeTranscript = null;
     let gateOk = false;
     // verified_scope evidence (session-close-scope-boundary spec §3, revised
