@@ -1953,7 +1953,21 @@ function atomicWriteShared(path, content) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
   writeFileSync(tmp, content);
-  renameSync(tmp, path);
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    // The rename is what makes this atomic, so a failure here leaves the
+    // target untouched, which is the point. What it also leaves is the tmp
+    // file, and nothing else ever looks at that name again: the suffix
+    // carries this pid and a fresh random, so the next run picks a
+    // different one and this one sits in the vault forever, close after
+    // close. Take it back out before rethrowing, and do not let the
+    // cleanup hide the real error.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {}
+    throw err;
+  }
 }
 
 // Read the pid the current holder recorded in its lockfile (see withFileLock).
@@ -3391,7 +3405,7 @@ export function normalizeVerifiedScope(verifiedScope) {
  * @param {{project?: string, scope?: string, transcript_path?: string, verifiedScope?: {kind: 'log-only'|'project'|'global', projects?: string[]}}} info
  */
 export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
-  if (!sessionId) return;
+  if (!sessionId) return false;
   try {
     const cacheDir = join(hypoDir, '.cache');
     if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
@@ -3427,9 +3441,24 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
       // doctor's reader treats "field absent" as "no additional scope check".
       ...(verifiedScope ? { verified_scope: verifiedScope } : {}),
     };
-    writeFileSync(sessionClosedMarkerPath(hypoDir, sessionId), JSON.stringify(payload) + '\n');
+    // Atomic, and it reports. Two reasons, and the caller needs both.
+    //
+    // A plain writeFileSync can leave a truncated file behind, and the reader
+    // below drops a marker it cannot parse. That combination turns one failed
+    // write into a session that can never close: the caller sees a file, calls
+    // the close signal spent, and the next Stop deletes the unparseable marker.
+    // temp+rename means the target is either the old bytes or the whole new
+    // ones, never half.
+    //
+    // And existsSync cannot answer the question the caller is really asking.
+    // "A marker file is there" is not "this run put it there" — a corrupt
+    // marker from an earlier attempt satisfies it just as well. So say whether
+    // THIS write landed and let the caller key on that.
+    atomicWriteShared(sessionClosedMarkerPath(hypoDir, sessionId), JSON.stringify(payload) + '\n');
+    return true;
   } catch (err) {
     process.stderr.write(`[hypo] session-closed marker write failed: ${err?.message || err}\n`);
+    return false;
   }
 }
 
@@ -4024,21 +4053,25 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     }
   }
 
-  // 1. wiki git state. Uncommitted changes (real unsaved work) BLOCK, but only
-  //    the ones inside closeAccountableScope, and only when sessionTouchTrusted
-  //    (above) says that scope can actually be trusted: a session's own scoped
-  //    auto-commit (commitWikiChanges, PR #222) can leave the working tree
-  //    non-empty when a DIFFERENT session sharing this vault still has its own
-  //    file dirty, the 2026-08-03 multi-session block. That dirty file is
-  //    human-fixable by whoever owns it, not by this session, so it demotes to
-  //    a notice (listed by path, never silently dropped) instead of refusing
-  //    this session's marker. A dirty file THIS session owns still blocks
-  //    unconditionally (fail-closed is unchanged for scope this session
-  //    actually touched), and so does an unattributable state: a git failure
-  //    gitDirtyFiles can't enumerate (dirty.length === 0 despite
-  //    git.uncommitted === true), OR a scope we cannot trust
-  //    (!sessionTouchTrusted) both fall back to the original unscoped blocker:
-  //    "cannot attribute" is not "clean".
+  // 1. wiki git state. Uncommitted changes (real unsaved work) BLOCK, but a
+  //    file this session cannot be held to still demotes to a notice: a
+  //    session's own scoped auto-commit (commitWikiChanges, PR #222) can
+  //    leave the working tree non-empty when a DIFFERENT session sharing
+  //    this vault still has its own file dirty, the 2026-08-03 multi-session
+  //    block. That dirty file is human-fixable by whoever owns it, not by
+  //    this session, so it demotes to a notice (listed by path, never
+  //    silently dropped) instead of refusing this session's marker. Which
+  //    set decides "not mine" depends on what the caller told us: a
+  //    caller-provided project (--project, or the cwd-derived
+  //    attributionScope) demotes by PATH STRUCTURE alone
+  //    (isForeignProjectFile below), independent of transcript trust; with
+  //    no such scope, only a trusted transcript's closeAccountableScope can
+  //    tell mine from foreign, so an untrusted,
+  //    unscoped session falls back to the original unscoped blocker:
+  //    "cannot attribute" is not "clean". A dirty file THIS session owns
+  //    still blocks unconditionally either way, and so does the
+  //    enumeration-failed case below (dirty.length === 0 despite
+  //    git.uncommitted === true).
   //    Unpushed commits (ahead) DEMOTE to a notice regardless of scope: push is
   //    automatic (auto-commit Stop hook) and its failures are already non-fatal, so
   //    "ahead" is a transient sync state, not a human-fixable blocker. Demoting it
@@ -4053,17 +4086,26 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // porcelain status): "cannot attribute" is not "clean", block exactly
       // as before, override or not.
       blockers.push({ type: 'git', reason: git.reason });
-    } else if (!sessionTouchTrusted && (opts.projectOverride || opts.attributionScope)) {
-      // session-close-scope-boundary spec §2b: a broken/missing transcript
-      // normally means "cannot attribute, fail closed" (the branch below).
-      // But when the CALLER told us which project is ours (an explicit
-      // --project, or the cwd-derived attributionScope), a dirty file that
-      // lives structurally under a DIFFERENT eligible project's own directory
-      // needs no attribution inference at all: the path alone proves it is
-      // not this session's file. Everything else (this session's own
-      // project, pages/, an unregistered or _template project dir) keeps the
-      // pre-existing fail-closed behavior; only a provably-foreign path is
-      // demoted.
+    } else if (opts.projectOverride || opts.attributionScope) {
+      // session-close-scope-boundary spec §2b, revised 2026-09-11: a
+      // caller-provided scope (an explicit --project, or the cwd-derived
+      // attributionScope) proves which project is ours PATH-STRUCTURALLY,
+      // regardless of transcript trust. This used to run only when
+      // !sessionTouchTrusted, on the theory that a trusted transcript could
+      // fall back to closeAccountableScope instead. But closeAccountableScope
+      // is `closeFileTargetsGlobal` whenever opts.projectOverride is unset
+      // (every caller here passes attributionScope, never projectOverride;
+      // see crystallize-close-apply.mjs), which unions in every OTHER
+      // today-active project's own mandatory close files too. That let a
+      // different session's still-dirty close files (session-state.md,
+      // project hot.md, today's session-log shard) block THIS session's
+      // marker even with --project set. A dirty file that lives structurally
+      // under a DIFFERENT eligible project's own
+      // directory needs no attribution inference at all: the path alone
+      // proves it is not this session's file. Everything else (this
+      // session's own project, pages/, an unregistered or _template project
+      // dir) keeps the pre-existing fail-closed behavior; only a
+      // provably-foreign path is demoted.
       const effectiveOverride = opts.projectOverride || opts.attributionScope;
       // Computed once per gate call, never per file (collectProjectWorkingDirs
       // walks the projects/ dir and reads every index.md). A throw here (a
@@ -4085,6 +4127,20 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       const isForeign = (f) =>
         isForeignProjectFile(f, { eligibleSlugs, effectiveOverride, transcriptTouched });
       const foreign = dirty.filter(isForeign);
+      // A dirty file inside the scoped project's OWN directory blocks, even one
+      // this close does not write. An earlier revision demoted those to notices
+      // to escape a deadlock: a close whose commit fails leaves
+      // `projects/<p>/index.md` (seeded by ensureProjectIndex) uncommitted, the
+      // retry skips every payload field as already-current without re-staging
+      // it, and the marker can then never land again no matter how often the
+      // user retries.
+      //
+      // That demotion was far wider than the deadlock it answered. It waved
+      // through every unsaved file in the project, which is exactly the work a
+      // close is supposed to refuse to walk away from. The deadlock is fixed at
+      // its source instead: applyOverwrites re-stages index.md on the retry
+      // path (crystallize-close-apply.mjs), so the file this branch used to
+      // demote is now in the close's own commit scope and never reaches here.
       const rest = dirty.filter((f) => !isForeign(f));
       if (rest.length > 0) {
         blockers.push({
@@ -5201,14 +5257,25 @@ export function walkCloseGate(transcriptPath) {
     // `attachment` of type queued_command with the prompt verbatim). This opens
     // the gate ONLY with an audited human producer — origin.kind "human", present
     // on every 2.1.181+ user delivery (measured). A legacy origin-absent delivery
-    // cannot attest a producer, so it does not open (fail-closed). A NON-close
-    // queued command (e.g. "keep working") is a fresh user intent and CLOSES
-    // a prior open regardless of origin — that is what closes the re-close hole
-    // where a queued "continue" after a close leaves the stale open live. A
-    // task notification is not that: `modelCaused` below filters it out before
-    // this reaches the change-of-mind close, because the model, not the user,
-    // produced it. This delivery path used to skip that filter and let an
-    // unrelated background-task notification flip a just-opened gate shut.
+    // cannot attest a producer, so it does not open (fail-closed). Closing asks
+    // for the same proof: a NON-close queued command (e.g. "keep working") is a
+    // fresh user intent and retracts a prior open, but only with that same
+    // audited human producer. This branch used to close by default instead,
+    // on the theory that anything the model-caused list did not recognise had
+    // to be the user. That default is what let an unrelated background-task
+    // notification flip a just-opened gate shut, and every new machine-minted
+    // event would have needed its own line in that list to stay safe. Requiring
+    // a positive producer means an event this filter has never seen is neutral
+    // rather than hostile. `modelCaused` below still runs first, so a
+    // recognised notification never reaches either decision.
+    //
+    // The enqueue branch above does NOT share this rule: those records carry no
+    // `origin` at all, so requiring one would stop them closing anything. It
+    // keeps the old enumerate-the-machine default, and the re-close hole (a
+    // queued "continue" after a close leaving the stale open live) is closed
+    // there rather than here. The two delivery shapes of one user action are
+    // therefore judged differently on purpose; see the residual noted on the
+    // queue-operation branch.
     //
     // Scope of "both shapes classify alike": it holds for task notifications and
     // for empty content, which is what this fix is about. It does not hold for
@@ -5277,9 +5344,20 @@ export function walkCloseGate(transcriptPath) {
           open = true;
           openedAtIndex = i;
         }
-      } else {
-        open = false;
+      } else if (humanOrigin) {
+        open = false; // an audited human change of mind → close
       }
+      // else: not caught by the known-machine shapes above, not a close
+      // phrase, and no audited human producer either — a host event this
+      // filter does not yet recognize. The old rule closed here by default
+      // (anything not on the model-caused list must be the user), which is
+      // exactly the shape of bug #289 fixed for <task-notification>: a new
+      // kind of unattributed host event would silently retract a close the
+      // user already granted, and every future one would need its own line
+      // in isModelCausedQueueContent to avoid repeating that. Requiring a
+      // POSITIVE human producer to close, instead of enumerating every way to
+      // recognize a machine one, means an event this filter has never seen
+      // still cannot close the gate on its own.
       continue;
     }
 

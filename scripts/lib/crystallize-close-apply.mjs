@@ -49,6 +49,7 @@ import {
   resolutionStamp,
   closeGateStatus,
 } from '../../hooks/close-gate-store.mjs';
+import { readJournal, recordJournalEntry, clearJournal } from '../../hooks/close-journal.mjs';
 import { requireProjectDir } from './crystallize-close-gate.mjs';
 import { summarizeLintForOutput } from './crystallize-helpers.mjs';
 
@@ -137,7 +138,21 @@ function atomicWrite(path, content) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
   writeFileSync(tmp, content);
-  renameSync(tmp, path);
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    // The rename is what makes this atomic, so a failure here leaves the
+    // target untouched, which is the point. What it also leaves is the tmp
+    // file, and nothing else ever looks at that name again: the suffix
+    // carries this pid and a fresh random, so the next run picks a
+    // different one and this one sits in the vault forever, close after
+    // close. Take it back out before rethrowing, and do not let the
+    // cleanup hide the real error.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {}
+    throw err;
+  }
 }
 
 /**
@@ -187,8 +202,14 @@ export function overwriteConflictReason(entry, disk, observed = { hash: null, tr
   const observedTruncated = !!(observed && observed.truncated);
   switch (entry.state) {
     case 'unknown':
-      // No snapshot for this (session, target). Someone else's edits could be
-      // sitting on disk and we would have no way to tell.
+      // No snapshot for this (session, target): someone else's edits could be
+      // sitting on disk with no way to tell, so this always parks. An earlier
+      // cut of this guard let a session's own touched-paths record
+      // (hooks/hypo-auto-stage.mjs) waive that park. It was removed
+      // 2026-09-11: hypo-auto-commit clears touched-paths.json at every Stop
+      // once a commit lands (even a no-op commit), so by the time a close
+      // reads it here it is empty in every real session that has crossed a
+      // Stop since its last Write/Edit — the escape never actually fired.
       return 'base-unknown';
     case 'absent':
       // We observed no file. Creating it is safe; finding one now means another
@@ -492,17 +513,19 @@ export function runMarkSessionClosed(args) {
   const verifiedScope = args.logOnly
     ? { kind: 'log-only' }
     : { kind: 'global', projects: evaluatedProjects };
-  writeSessionClosedMarker(args.hypoDir, args.sessionId, {
+  const markerLanded = writeSessionClosedMarker(args.hypoDir, args.sessionId, {
     project: markerProject,
     projects: args.logOnly ? [] : markerProjects,
     ...(args.logOnly ? { scope: 'log-only' } : {}),
     verifiedScope,
   });
-  // Marker writer swallows IO errors (best-effort, see hypo-shared.mjs). Verify
-  // the file actually landed before claiming success — otherwise CLI exits 0
-  // while next Stop re-blocks, hiding a permission/disk problem.
-  // Codex Worker-2 CONCERN (pre-commit review).
-  if (!existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
+  // The writer reports whether THIS call landed, and that is the question here.
+  // Checking only that a marker file exists cannot tell a write that succeeded
+  // from a leftover, possibly corrupt, marker an earlier attempt left behind —
+  // and the reader drops one it cannot parse, so "it is there" and "the session
+  // is closed" are different claims. The existsSync below stays as the second
+  // half: the writer says it wrote, the disk says it is there.
+  if (!markerLanded || !existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
     const err = 'marker file did not land after write (likely .cache permission/disk issue)';
     console.log(
       args.json
@@ -719,7 +742,15 @@ function verifyCloseAuthority(sessionId, hypoDir) {
 // atomicWrite's use case (replacing bytes a reader might already be mid-read
 // of), a `wx` create can never observably tear — the file either doesn't
 // exist yet (nothing to tear) or the open fails outright.
-export function ensureProjectIndex(hypoDir, project, relPath, today) {
+// `sessionId` (optional, added for the close journal) records this create in
+// hooks/close-journal.mjs immediately after the bytes land, so a retry of the
+// SAME close that finds index.md already present (applyOverwrites' retry
+// branch) can tell "I created this and it is still exactly what I left it"
+// apart from a hand edit. Omitted entirely by callers outside a close
+// (tests/crystallize-apply.test.mjs's race-condition check), where there is
+// no session to journal against and recordJournalEntry's own `!sessionId`
+// guard makes the call a no-op.
+export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) {
   const dest = join(hypoDir, relPath);
   const src = join(TEMPLATE_DIR, 'index.md');
   if (!existsSync(src)) return null; // template missing — nothing to scaffold from
@@ -742,6 +773,7 @@ export function ensureProjectIndex(hypoDir, project, relPath, today) {
   } finally {
     closeSync(fd);
   }
+  recordJournalEntry(hypoDir, sessionId, relPath, hashContent(content));
   return relPath;
 }
 
@@ -1102,6 +1134,200 @@ function runPreflight(args, payload, project, date) {
   return { preflightLint, payloadScope, indexRelPath, indexMissing };
 }
 
+// ── section-loss guard (2026-08-10 incident) ────────────────────────────────
+//
+// The base-store guard above answers "did someone ELSE change this page since
+// I looked at it". It cannot answer "did the payload I am about to write throw
+// away structure that was already here" — a session that legitimately observed
+// its own prior base (no drift, no conflict) can still overwrite a multi-track
+// session-state.md or hot.md with a payload that only carries the ONE track it
+// was working on, silently dropping the others. That is exactly what happened
+// to security-backoffice: three tracks, two of them vanished, and the base
+// guard had nothing to say about it because it was never a conflict in the
+// guard's sense — it was a normal, unopposed overwrite.
+//
+// This is deliberately a COUNT of `##` headings that vanish between disk and
+// payload, not a markdown-aware diff. The block-parser lesson from the base
+// guard above applies here too: a predicate that reads content and claims to
+// know what was "provably" preserved is the thing four review rounds already
+// broke. Counting exact-line survival is cheap, has no false negatives worth
+// chasing (a heading either survives verbatim or it does not), and its one
+// failure mode (a legitimately reworded heading reads as "lost") is exactly
+// what the escape hatch below is for.
+// A ratio floor alone gets LOOSER as a file grows, exactly backwards from what
+// this guard is for: a file running more tracks in parallel is bigger (a bigger
+// denominator), and that is the one where losing a fixed handful of sections
+// should trip sooner, not later. A distribution was counted against the real
+// vault on 2026-09-11 with `grep -c '^## ' <file>` (every LINE starting with
+// `## `, duplicates included) against every hot.md / session-state.md /
+// open-questions.md: project hot.md ran 4-9 such lines (harness's was 9),
+// project session-state.md ran 1-12 (harness's was 12), pages/open-questions.md
+// had 8, root hot.md had 2. That is a different measurement than this guard's
+// own denominator: `h2Headings` below dedupes into a `Set`, so a file that
+// repeats one `## ` heading verbatim reports a smaller count here than the grep
+// tally did. The two agree on every file this repo actually has (none repeats a
+// heading), but the grep number is not proof of what `h2Headings` counts.
+//
+// At a ratio-only gate, losing 4 of a real 12-section session-state.md
+// (4/12 = 0.333) or 3 of a real 9-section hot.md (3/9 = 0.333) both stayed just
+// under a 0.34 floor and passed through untouched — real files, real sizes, a
+// real miss. An absolute floor was added so a bigger file could not buy a bigger
+// free pass just by being bigger, but the first cut of that floor (3) missed the
+// shape it was named for: the security-backoffice incident itself lost 2 of 3
+// tracks, and 2 lost sections clears neither a 3-floor nor, on a 6-12 section
+// file, the 0.34 ratio (2/12 = 0.167). So the floor is 2, matching
+// SECTION_LOSS_MIN_COUNT below — and once the two are equal, the ratio branch
+// can no longer change the outcome: past the MIN_COUNT guard, `lost.length` is
+// always >= 2, which trips the absolute floor unconditionally, so
+// `!ratioTrips && !absTrips` can never be true. The two thresholds and the ratio
+// check that used to sit between them are folded into the one count check below
+// rather than kept as a branch that reads as live but never decides anything.
+const SECTION_LOSS_MIN_COUNT = 2; // an ordinary single-section edit (finishing one track,
+// retiring one open question) stays under this and must not park; 2 or more is
+// the incident's own shape and always trips, at any file size.
+
+// A fence marker line: 0-3 leading spaces (CommonMark still calls that "unindented"),
+// then a run of 3+ backticks or 3+ tildes, then the rest of the line. `m[1]` is the
+// marker run itself (so its first char and length identify what closes it); `m[2]` is
+// whatever follows, an info string on the opening line, and required to be blank
+// (after trim) on a line being checked as a close.
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+/**
+ * Which line indices are inside a fenced code block, for one file's lines.
+ *
+ * A fence opens on any line FENCE_RE matches while not already inside one, and
+ * closes only on a later line whose marker is the SAME character and AT LEAST as
+ * long (a 4-backtick open is not closed by 3 backticks, a CommonMark rule, and the
+ * one this guard's predecessor ignored: the section-loss bypass this closes moved
+ * two `##` headings into a properly-closed ```md fence and the old line-scan still
+ * counted them as real headings because it never looked for a fence at all).
+ *
+ * An opening fence that never finds a matching close before EOF is treated as
+ * NEVER HAVING OPENED (every line from that marker to EOF is unhidden here). That
+ * is the safe direction for a guard whose entire job is "did content silently
+ * disappear": the same function extracts headings from both disk and payload, so
+ * treating an unclosed run as fenced would let it swallow real headings on
+ * whichever side has the malformed markdown: undercounting disk (hiding sections
+ * the guard should have protected) or undercounting payload (reporting a section
+ * as lost when the payload never actually removed it). Treating it as prose
+ * instead only risks the opposite: an occasional false park on a document with a
+ * genuinely broken fence, which is recoverable through the same
+ * `restructure: true` / proposal-resolve door every other park in this guard
+ * already uses, not a silent loss.
+ *
+ * Declined on purpose, not CommonMark-complete: an opening line's info string is
+ * never checked for a stray backtick (CommonMark forbids one in a backtick fence's
+ * info string; this scan does not care), and a fence inside a blockquote or list
+ * item is scanned exactly like a top-level one. Both would need block-context
+ * tracking this guard's own doc comment (above, the base-conflict guard section)
+ * already argues against building here. Getting the two reproduced bypasses closed
+ * cheaply matters more than a complete parser.
+ *
+ * @returns {boolean[]} same length as `lines`, true where the line is fenced
+ */
+function fencedLineMask(lines) {
+  const hidden = new Array(lines.length).fill(false);
+  let openIdx = -1;
+  let fenceChar = null;
+  let fenceLen = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (openIdx === -1) {
+      const m = lines[i].match(FENCE_RE);
+      if (m) {
+        openIdx = i;
+        fenceChar = m[1][0];
+        fenceLen = m[1].length;
+        hidden[i] = true; // tentative, unhidden below if this never closes
+      }
+      continue;
+    }
+    hidden[i] = true; // tentative, unhidden below if this never closes
+    const m = lines[i].match(FENCE_RE);
+    if (m && m[1][0] === fenceChar && m[1].length >= fenceLen && m[2].trim() === '') {
+      openIdx = -1;
+      fenceChar = null;
+      fenceLen = 0;
+    }
+  }
+  if (openIdx !== -1) {
+    for (let i = openIdx; i < lines.length; i++) hidden[i] = false;
+  }
+  return hidden;
+}
+
+/**
+ * Extract this file's `##` section headings, in order, as a MULTISET (every
+ * occurrence kept, none deduped) with fenced-code lines excluded. Only `##`
+ * (not `#`/`###`), the granularity the section-loss incident was measured at.
+ *
+ * Multiset, not a `Set`, because a dedup here silently halves the denominator
+ * a file that legitimately repeats one `## ` heading twice: the old `Set`-based
+ * version counted "## TODO" appearing twice on disk as ONE section, so a
+ * payload that kept only one copy compared as "the heading is still present"
+ * with nothing lost at all: the second bypass this pass closes.
+ *
+ * Known limit, left as-is (see fencedLineMask's own doc comment for the fuller
+ * case against building a real parser here): this still reads every non-fenced
+ * line as prose, so a `## ` line inside an indented (non-fenced) code block, a
+ * blockquote, or a list item is still counted as a real heading. That is a
+ * false positive (an occasional unnecessary park), not the silent-loss failure
+ * mode this guard exists to close, so it is accepted rather than fixed here.
+ * @returns {string[]}
+ */
+function h2Headings(content) {
+  const lines = (content || '').split(/\r?\n/);
+  const hidden = fencedLineMask(lines);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!hidden[i] && /^##\s+\S/.test(lines[i])) out.push(lines[i]);
+  }
+  return out;
+}
+
+/**
+ * Whether `payloadContent` drops enough of `diskContent`'s `##` sections to
+ * warrant withholding the write. Compared as a multiset: each disk occurrence
+ * is matched off against one still-unconsumed payload occurrence of the exact
+ * same line, in disk order, so losing one copy of a heading that appears twice
+ * on disk is visible even though the same title still appears once in the
+ * payload. A "lost" occurrence is one with no remaining payload copy to match,
+ * reworded, split, or genuinely deleted headings all read the same way here
+ * (see the module doc comment above for why that is the accepted
+ * false-positive, not a defect to fix), and a heading moved into a fenced code
+ * block no longer counts as a payload occurrence at all (h2Headings excludes
+ * fenced lines on both sides).
+ *
+ * An ordinary edit that drops a single section (finishing one track, retiring
+ * one open question) must not park; losing 2 or more is the incident's own
+ * shape (security-backoffice lost 2 of its 3 tracks) and trips regardless of
+ * how big the file is. See SECTION_LOSS_MIN_COUNT's comment above for why this
+ * is now a single count check rather than a count-and-ratio pair.
+ *
+ * @returns {{lost: string[], diskCount: number}|null} the lost occurrences
+ *   (duplicates repeated once per lost copy) and how many `##` heading
+ *   occurrences disk had (also a multiset count, not deduped; see
+ *   h2Headings), or null when the write is fine
+ */
+export function sectionLossReason(diskContent, payloadContent) {
+  const diskHeadings = h2Headings(diskContent);
+  if (diskHeadings.length === 0) return null; // nothing to lose
+  const payloadHeadings = h2Headings(payloadContent);
+  const remaining = new Map();
+  for (const h of payloadHeadings) remaining.set(h, (remaining.get(h) || 0) + 1);
+  const lost = [];
+  for (const h of diskHeadings) {
+    const n = remaining.get(h) || 0;
+    if (n > 0) {
+      remaining.set(h, n - 1);
+    } else {
+      lost.push(h);
+    }
+  }
+  if (lost.length < SECTION_LOSS_MIN_COUNT) return null;
+  return { lost, diskCount: diskHeadings.length };
+}
+
 /**
  * Replace every whole-page overwrite target, then fill a missing project index.
  *
@@ -1116,7 +1342,9 @@ function runPreflight(args, payload, project, date) {
  *
  *   1. idempotent skip (disk already equals the payload)
  *   2. conflict (base unknown, or disk drifted away from base)
- *   3. direct write, then advance the base
+ *   3. section-loss guard (payload drops most of disk's `## `
+ *      sections, and this field did not opt out via `restructure: true`)
+ *   4. direct write, then advance the base
  *
  * Step 1 must come first for two reasons. It keeps every existing
  * `--apply-session-close --session-id` test green (they read the payload
@@ -1124,20 +1352,40 @@ function runPreflight(args, payload, project, date) {
  * the apply-then-reclose loop: once a human applies proposal P, disk == proposed
  * == payload.content, so the next close skips before it can re-raise a conflict.
  *
+ * Step 3 runs only once step 2 has already cleared: a base conflict already
+ * withholds the write on its own, and reporting BOTH reasons for the same
+ * withheld byte would tell a resolving human two different stories about why
+ * their proposal review matters.
+ *
  * There is no caller here without a `--session-id`. verifyCloseAuthority refuses
  * that at the door, before a byte is written, so a session id is always present
  * by the time this runs and the base lookup always has something to look up.
  */
 function applyOverwrites(args, payload, project, date, indexRelPath, indexMissing, acc) {
-  const { applied, skipped, appliedPaths, conflicts } = acc;
+  const { applied, skipped, appliedPaths, conflicts, restructureWaivers } = acc;
+  // Read once per close, not once per field: it is a single small JSON read,
+  // and every skip branch below needs the same session-scoped record.
+  const journal = readJournal(args.hypoDir, args.sessionId);
 
   const overwrite = (key, relPath, field) => {
     if (!field || typeof field.content !== 'string') return; // optional / absent
     const full = join(args.hypoDir, relPath);
     const disk = readTarget(full);
 
-    // (1) idempotent skip — preserves writeIfChanged's contract
+    // (1) idempotent skip — preserves writeIfChanged's contract. "Already
+    // current" collapses two different histories that look identical from
+    // here: disk always held these bytes, or THIS session wrote them in an
+    // earlier, uncommitted attempt at this same close. Only the journal tells
+    // them apart. A record for this path whose hash still matches what is on
+    // disk means the second history — restage it so the retry's commit picks
+    // up bytes an earlier attempt already paid for. No record, or a hash that
+    // no longer matches (someone touched the file since), leaves it out: the
+    // gate should keep blocking on drift it cannot attribute to this close.
     if (disk === field.content) {
+      const journalHash = journal[relPath];
+      if (journalHash && journalHash === hashContent(field.content)) {
+        appliedPaths.push(relPath);
+      }
       skipped.push(`${key} (${relPath})`);
       return;
     }
@@ -1189,10 +1437,58 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
       }
     }
 
-    // (3) write, then the content we just wrote IS this session's new base
+    // (3) Section-loss guard: this overwrite would drop most of disk's `## ` sections.
+    // Computed regardless of `restructure`, so a `true` value that waives a REAL
+    // loss can be told apart from one set on a field that never had a loss to
+    // waive. `field.restructure === true` is the escape hatch for a genuine
+    // rewrite (the crystallize skill sets it only when the user confirmed the
+    // sections are meant to go, per commands/crystallize.md) — it is per-FIELD,
+    // not per-close, so consolidating session-state.md on purpose does not also
+    // waive the check on hot.md in the same payload. Without it, this parks
+    // exactly like a base conflict: the SAME human recovery path already
+    // documented for base-mismatch (`hypomnema proposal challenge` /
+    // `proposal resolve`) is the way a genuinely intended restructure gets
+    // applied anyway, so this reuses that door rather than inventing a second
+    // judgment surface for "should this write go through".
+    if (typeof disk === 'string') {
+      const loss = sectionLossReason(disk, field.content);
+      if (loss) {
+        if (field.restructure !== true) {
+          conflicts.push({
+            key,
+            target: relPath,
+            reason: 'section-loss-guard',
+            lostSections: loss.lost,
+            diskSectionCount: loss.diskCount,
+            baseHash: args.sessionId
+              ? readBaseEntry(args.hypoDir, args.sessionId, relPath).hash
+              : null,
+            currentHash: hashContent(disk),
+            proposedContent: field.content,
+          });
+          return; // target bytes untouched
+        }
+        // The waiver is exercised by the party the guard exists to check (the
+        // model composing the payload), so it must leave a trace instead of
+        // vanishing the way an unconditional skip would. Reuses the result-field
+        // shape and "report verbatim" reporting contract the removed
+        // base-unknown touched-override notice used to carry (see git history
+        // and commands/crystallize.md's close-result reporting section).
+        restructureWaivers.push({ target: relPath, lostSections: loss.lost });
+      }
+    }
+
+    // (4) write, then the content we just wrote IS this session's new base
     atomicWrite(full, field.content);
-    if (args.sessionId)
+    if (args.sessionId) {
       advanceBase(args.hypoDir, args.sessionId, relPath, hashContent(field.content));
+      // Record what THIS write just put down, so a retry after a partial
+      // close (a sibling field conflicts, the commit fails, the process
+      // dies) can tell its own uncommitted bytes apart from someone else's —
+      // see the journal read in step (1) above and the doc comment on
+      // hooks/close-journal.mjs.
+      recordJournalEntry(args.hypoDir, args.sessionId, relPath, hashContent(field.content));
+    }
     applied.push(`${key} (${relPath})`);
     appliedPaths.push(relPath);
   };
@@ -1206,10 +1502,36 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
   // preflight passed, so an aborted close never leaves a half-applied side
   // effect on disk).
   if (indexMissing) {
-    const createdIndex = ensureProjectIndex(args.hypoDir, project, indexRelPath, date);
+    const createdIndex = ensureProjectIndex(
+      args.hypoDir,
+      project,
+      indexRelPath,
+      date,
+      args.sessionId,
+    );
     if (createdIndex) {
       applied.push(`projectIndex (${createdIndex})`);
       appliedPaths.push(createdIndex);
+    }
+  } else {
+    // The retry path. A first attempt that seeds index.md and then fails to
+    // commit leaves it dirty; this run finds it already there, so the branch
+    // above does nothing and the file would drop out of the commit scope
+    // entirely, blocking the gate forever with no retry ever picking it back
+    // up. Restaging it is only safe when the journal says THIS session wrote
+    // exactly the bytes still on disk — the same rule step (1)'s idempotent
+    // skip applies, reused here because ensureProjectIndex never reaches
+    // step (1) at all (it is a template-seeded create, not a payload
+    // overwrite field). A hand-edited index.md (no journal record, or a
+    // journal record whose hash no longer matches) is left OUT of
+    // appliedPaths on purpose: those are bytes this close never wrote, and
+    // sweeping them into its commit would ship an edit the payload never
+    // carried.
+    const full = join(args.hypoDir, indexRelPath);
+    const disk = readTarget(full);
+    const journalHash = journal[indexRelPath];
+    if (journalHash && typeof disk === 'string' && journalHash === hashContent(disk)) {
+      appliedPaths.push(indexRelPath);
     }
   }
 }
@@ -1229,6 +1551,7 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
   const rel = join('projects', project, 'session-log', `${date}.md`);
   const full = join(args.hypoDir, rel);
   const isPresent = entryAlreadyPresent(payload.sessionLog.entry);
+  const journal = readJournal(args.hypoDir, args.sessionId);
   // Serialize dedup + create/append on the daily shard so two concurrent
   // closes never lose an entry: the second closer takes the lock only after
   // the first committed, re-reads the shard under the lock, and appends onto
@@ -1292,7 +1615,32 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
       { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
     );
     (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
-    if (outcome !== 'skipped') appliedPaths.push(rel);
+    if (outcome !== 'skipped') {
+      appliedPaths.push(rel);
+      // Same journal contract as applyOverwrites: record the FULL file's hash
+      // right after this write, not just the entry, since a retry's own
+      // "already present" skip below reads the whole file back to compare.
+      const written = readTarget(full);
+      if (typeof written === 'string')
+        recordJournalEntry(args.hypoDir, args.sessionId, rel, hashContent(written));
+    } else {
+      // "Already present" collapses the same two histories the overwrite
+      // guard's step (1) does: this entry could have sat in the shard since
+      // before this close ever ran, or THIS session appended it in an
+      // earlier, uncommitted attempt at the same close. Restage only the
+      // second — a journal record whose hash still matches the shard on
+      // disk. (A hybrid-month fallback hit above never reaches here with
+      // `full` matching the journal's recorded target, since the evidence in
+      // that case lives in the legacy monthly file instead — nothing to
+      // restore for the daily shard because this close never wrote one.)
+      const journalHash = journal[rel];
+      if (journalHash) {
+        const disk = readTarget(full);
+        if (typeof disk === 'string' && journalHash === hashContent(disk)) {
+          appliedPaths.push(rel);
+        }
+      }
+    }
   } catch (err) {
     // Only a lock-TIMEOUT is withheld as a conflict. A real fn() write error
     // (disk-full, EACCES, mkdir failure) must NOT be masked as a proposal-
@@ -1335,9 +1683,35 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
 // (the Stop-hook backfill in hypo-shared.mjs). Both take the SAME lock on
 // log.md, so a concurrent close's append and this close's append serialize
 // instead of overwriting each other.
+// log.md is a single shared file both branches below append to, so a
+// "wrote nothing new" outcome from either one needs the same journal-based
+// restore-vs-leave-dirty judgment applyOverwrites' step (1) already makes:
+// this session's own prior, uncommitted append restages; anything else does
+// not. Centralized here rather than duplicated per branch, and rather than
+// merely commented twice, because a fix to one copy silently drifting from
+// the other is exactly the failure mode two near-identical blocks invite.
+function restageOrRecordLogMd(args, logFull, journal, wroteNew, acc) {
+  const { appliedPaths } = acc;
+  if (wroteNew) {
+    appliedPaths.push('log.md');
+    const written = readTarget(logFull);
+    if (typeof written === 'string')
+      recordJournalEntry(args.hypoDir, args.sessionId, 'log.md', hashContent(written));
+    return;
+  }
+  const journalHash = journal['log.md'];
+  if (journalHash) {
+    const disk = readTarget(logFull);
+    if (typeof disk === 'string' && journalHash === hashContent(disk)) {
+      appliedPaths.push('log.md');
+    }
+  }
+}
+
 function appendRootLogEntry(args, payload, project, date, acc) {
-  const { applied, skipped, appliedPaths, conflicts } = acc;
+  const { applied, skipped, conflicts } = acc;
   const logFull = join(args.hypoDir, 'log.md');
+  const journal = readJournal(args.hypoDir, args.sessionId);
   if (payload.log) {
     try {
       const wrote = withFileLock(
@@ -1346,7 +1720,7 @@ function appendRootLogEntry(args, payload, project, date, acc) {
         { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
       );
       (wrote ? applied : skipped).push('log (log.md)');
-      if (wrote) appliedPaths.push('log.md');
+      restageOrRecordLogMd(args, logFull, journal, wrote, acc);
     } catch (err) {
       if (err?.code !== 'ELOCKTIMEOUT') throw err;
       // proposedContent is append-ready root-log bytes (the custom log line).
@@ -1383,7 +1757,7 @@ function appendRootLogEntry(args, payload, project, date, acc) {
         { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
       );
       (wroteAny ? applied : skipped).push('log (log.md, derived)');
-      if (wroteAny) appliedPaths.push('log.md');
+      restageOrRecordLogMd(args, logFull, journal, wroteAny, acc);
     } catch (err) {
       if (err?.code !== 'ELOCKTIMEOUT') throw err;
       // `derived: true` discriminates this from the payload.log conflict above:
@@ -1420,6 +1794,50 @@ function appendRootLogEntry(args, payload, project, date, acc) {
 // append-only history file. Append conflicts still sit in `conflicts`, so the
 // close still goes proposal-pending — they just get no artifact and no
 // human-apply step.
+// Human-readable park reason, keyed by `c.reason`. Add a line here for every
+// new reason string a `conflicts.push(...)` call introduces (applyOverwrites,
+// the append-lock-timeout sites below) — before this lookup existed, the report
+// only branched on `c.kind === 'append'` and printed one fixed sentence
+// ("the page changed since this session read it") for every other reason,
+// which is a flat lie for `section-loss-guard`: nothing external changed
+// there, the PAYLOAD dropped its own sections. A reason with no entry here
+// falls through to the default below, worded to admit it does not know the
+// cause rather than repeat a specific wrong one.
+const CONFLICT_WHY = {
+  'append-lock-timeout': () =>
+    'could not acquire the append lock in time; the next close re-applies',
+  'base-unknown': () =>
+    'no base snapshot exists for this target for this session, so another writer could be sitting on disk with no way to tell',
+  'base-hash-target-missing': () =>
+    'the page changed since this session read it (it existed at base, and is missing now)',
+  'base-mismatch': () => 'the page changed since this session read it',
+  'base-mismatch-truncated-observation': () =>
+    'the page changed since this session read it, and the last resume/compact only showed a truncated slice of it',
+  'base-absent-target-exists': () =>
+    'the page changed since this session read it (nothing existed at base, another writer created it since)',
+  'target-unreadable': () =>
+    'the target could not be read just now; failing safe rather than assuming it is unchanged',
+  'section-loss-guard': (c) =>
+    `this payload drops ${c.lostSections.length} of ${c.diskSectionCount} \`##\` section(s) already on disk (${c.lostSections.join(', ')}) — the page did not change, the payload did not carry those sections forward. Add the missing sections back into the payload, or set "restructure": true after confirming with the user that dropping them is intended`,
+};
+
+export function conflictWhy(c) {
+  const fn = CONFLICT_WHY[c.reason];
+  if (!fn) return `unrecognized park reason "${c.reason}" — cause not determined`;
+  // An entry reads whatever fields its own reason carries, and the section-loss
+  // one needs two the others never set. That was harmless while this only fed
+  // the text report; the JSON close path now calls it for every conflict, so a
+  // future reason pushed without the fields its entry expects would throw
+  // mid-close and take the whole apply with it. The explanation is the least
+  // important thing happening here: degrade to the raw reason rather than lose
+  // the close over a message.
+  try {
+    return fn(c);
+  } catch {
+    return `${c.reason} (details unavailable)`;
+  }
+}
+
 function parkOverwriteConflicts(args, conflicts) {
   const proposals = [];
   const proposalStoreFailures = [];
@@ -1434,6 +1852,19 @@ function parkOverwriteConflicts(args, conflicts) {
         proposedContent: c.proposedContent, // internal (pre-drop) full page bytes
         sessionId: args.sessionId, // may be null; writeProposal coerces it
         device,
+        // The same human-readable cause the JSON result's conflicts[].why now
+        // carries (buildCloseResult) — stored here too because a proposal
+        // artifact outlives this close's own stdout, and `hypomnema proposal
+        // list`/`apply` reads only the artifact, never this run's JSON. Without
+        // it, the reviewer sees the raw `reason` code and nothing else (codex
+        // 3rd-pass finding: the park-reason wording fix never reached this file).
+        parkReason: conflictWhy(c),
+        // Section-loss detail: only meaningful for that one reason, so only
+        // sent for it — an absent field on every other conflict is the correct
+        // shape, not a gap.
+        ...(c.reason === 'section-loss-guard'
+          ? { lostSections: c.lostSections, diskSectionCount: c.diskSectionCount }
+          : {}),
       });
       proposals.push({ id: saved.id, target: saved.target, path: saved.path });
       // Supersede-delete failure is NON-fatal: the new artifact IS parked, only
@@ -1448,7 +1879,7 @@ function parkOverwriteConflicts(args, conflicts) {
       proposalStoreFailures.push({ target: c.target, key: c.key, error });
       process.stderr.write(
         `\n🛑 PROPOSAL STORE FAILED for ${c.key} (${c.target}): ${error}\n` +
-          `    This close WITHHELD the target (it drifted from your observed base) but\n` +
+          `    This close WITHHELD the target (${conflictWhy(c)}) but\n` +
           `    could NOT write the .cache/proposals/ artifact either. The payload bytes\n` +
           `    are on NEITHER disk NOR a proposal — re-run the close once the .cache/\n` +
           `    directory is writable so the withheld content is not lost.\n`,
@@ -1593,40 +2024,12 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
   let markerWritten = false;
   let markerSkipReason = null;
   let commitOutcome = null;
+  // What the gate waved through on the way to the marker. The demotions are
+  // only honest if the operator can see them, and this is the path that runs
+  // on a real close: `--mark-session-closed` already reported them, while
+  // `--apply-session-close` dropped them on the floor.
+  let gateNotices = [];
   if (ok && args.sessionId) {
-    // Close-gate resolution: apply succeeding (`ok`) IS the resolution, not
-    // whether the per-session marker below happens to land. The marker can
-    // be withheld for reasons that have nothing to do with whether this
-    // apply's own writes were valid (a stale git tree, a feedback-projection
-    // cap, W8 design-history staleness) — none of that should leave the
-    // resolution unrecorded, because the wiki writes already happened, and
-    // re-running the SAME apply with no fresh user close signal is exactly
-    // what this record exists to block. So this sits OUTSIDE and ahead of
-    // the marker's own commit-gated logic below, resolving its own
-    // transcript rather than sharing the marker's `closeTranscript` (which
-    // stays null whenever the commit fails) — a commit failure withholds
-    // the marker but must not also withhold the resolution.
-    //
-    // Best-effort like every other write in this store: resolutionStamp
-    // returns null on anything it cannot read as a Buffer, recordGateClosed
-    // refuses a null stamp, and both fail silently, so a transcript that
-    // vanishes mid-read (or a cache-write failure) can never turn an
-    // otherwise-successful apply into a failure.
-    try {
-      const resolutionTranscriptPath = resolveTranscriptBySessionId(args.sessionId);
-      if (resolutionTranscriptPath) {
-        recordGateClosed(
-          args.hypoDir,
-          args.sessionId,
-          resolutionStamp(readFileSync(resolutionTranscriptPath)),
-        );
-      }
-    } catch {
-      // Unreadable at the moment of a successful close is not this apply's
-      // problem to surface — the resolution just stays unrecorded, same as
-      // if this session had never resolved at all (NO_CONSTRAINT).
-    }
-
     // IO stays lazy so this preserves the exact side-effect order (codex design
     // review): commit first (the only mutation), then resolve the
     // transcript, then run the compact gate with that transcript, then scan the
@@ -1648,6 +2051,13 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
     } catch (err) {
       commitOutcome = { committed: false, reason: `vault-commit-lock: ${err?.message || err}` };
     }
+    // Once these bytes are committed, the journal's only job (telling a
+    // retry's own uncommitted work apart from someone else's) is done —
+    // clear it rather than let a stale record outlive this close and later
+    // match a coincidence it was never meant to license. A commit that
+    // failed leaves the journal in place on purpose: that is exactly the
+    // case the next retry needs it for.
+    if (commitOutcome.committed) clearJournal(args.hypoDir, args.sessionId);
     let closeTranscript = null;
     let gateOk = false;
     // verified_scope evidence (session-close-scope-boundary spec §3, revised
@@ -1682,6 +2092,7 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
         ...(autoMarkerOverride ? { attributionScope: autoMarkerOverride } : {}),
       });
       gateOk = gateStatus.ok;
+      gateNotices = gateStatus.notices || [];
       // `closeScope` above widens the partition, it never narrows
       // sessionCloseGlobalStatus (only opts.projectOverride does, and this
       // call never sets it) — so gate.close.projects is the actual evaluated
@@ -1699,16 +2110,17 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
       transcriptResolved: !!closeTranscript,
       // Scan the signal only when the gate passed AND a transcript resolved —
       // isCloseGateOpen never runs earlier than the original nested `else if`.
-      // Reads the raw walkCloseGate open, not closeGateStatus: this apply's
-      // OWN recordGateClosed call above already ran with this transcript's
-      // full record count as closedAtIndex, and openedAtIndex can never reach
-      // or pass a count taken from the very same transcript (see
-      // closeGateStatus's doc comment) — so gating this diagnostic on .ok
-      // would read false on every apply, unconditionally, not just a stale
-      // one. This field asks a narrower question than closeGateStatus
-      // answers: "did the transcript carry a close signal", not "is this
-      // apply itself still authorized" (verifyCloseAuthority already settled
-      // that, before any byte was written).
+      // Reads the raw walkCloseGate open, not closeGateStatus: closeGateStatus
+      // would also weigh this session's recorded resolution, and the
+      // resolution below is now written ONLY once the marker itself lands
+      // (this change). A retry after a withheld marker (dirty wiki, a
+      // failed commit, a lock timeout) has no resolution recorded yet, but it
+      // still needs THIS check to see the transcript's existing close phrase
+      // as authorization, not a fresh one. This field asks a narrower
+      // question than closeGateStatus answers: "did the transcript carry a
+      // close signal", not "is this apply itself still authorized to run at
+      // all" (verifyCloseAuthority already settled that, before any byte was
+      // written).
       hasUserSignal: gateOk && !!closeTranscript && isCloseGateOpen(closeTranscript),
     });
     markerSkipReason = decision.skipReason;
@@ -1721,7 +2133,7 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
       // call never sets it. The gate ran unnarrowed, so `kind` is 'global',
       // with `projects` the set gate.close actually evaluated
       // (gateEvaluatedProjects), never `[project]` verbatim.
-      writeSessionClosedMarker(args.hypoDir, args.sessionId, {
+      const wrote = writeSessionClosedMarker(args.hypoDir, args.sessionId, {
         project,
         projects: [project],
         verifiedScope: { kind: 'global', projects: gateEvaluatedProjects },
@@ -1730,14 +2142,55 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
       // Verify the file actually landed — mirroring the standalone path — instead of
       // asserting markerWritten=true, so a .cache permission/disk problem surfaces
       // rather than the caller reporting "closed" while the next Stop re-blocks.
-      if (existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
+      // Both halves, for the reason spelled out at the other call site: the
+      // writer's own report rules out a leftover marker standing in for a
+      // write that never happened, and that distinction decides whether the
+      // close signal below gets spent. Spending it on a marker this run did
+      // not write is the failure this whole phase was reordered to avoid.
+      if (wrote && existsSync(sessionClosedMarkerPath(args.hypoDir, args.sessionId))) {
         markerWritten = true;
+        // Close-gate resolution: record it here, ONLY now
+        // that the marker has actually landed on disk, not the moment this
+        // apply's own writes succeeded. Recording it earlier used to sit
+        // right after `ok && args.sessionId`, ahead of commit, gate, and
+        // marker entirely, on the theory that the wiki writes already
+        // happened so the resolution should stick regardless. That let a run
+        // which committed the payload but then had its marker withheld
+        // (compact-gate-not-ok on a dirty wiki, a lock timeout, a disk
+        // failure) burn the session's one close signal anyway: the next run
+        // hit closeGateStatus's `no-new-open-since-resolution` and refused,
+        // with no marker ever written and no way back short of a brand-new
+        // user close phrase. Tying the record to a landed marker means a
+        // withheld marker leaves the signal untouched, so a retry (once the
+        // wiki is clean, or the transient failure clears) is still
+        // authorized by the same close phrase. `closeTranscript` is reused
+        // here rather than re-resolved: `decision.write` can only be true
+        // when `transcriptResolved` was true in `planMarkerDecision`'s inputs
+        // above, so it is guaranteed non-null at this point.
+        //
+        // Best-effort like every other write in this store: resolutionStamp
+        // returns null on anything it cannot read as a Buffer, recordGateClosed
+        // refuses a null stamp, and both fail silently, so a transcript that
+        // vanishes mid-read (or a cache-write failure) can never turn an
+        // otherwise-successful close into a failure.
+        try {
+          recordGateClosed(
+            args.hypoDir,
+            args.sessionId,
+            resolutionStamp(readFileSync(closeTranscript)),
+          );
+        } catch {
+          // Unreadable at the moment of a successful close is not this
+          // apply's problem to surface — the resolution just stays
+          // unrecorded, same as if this session had never resolved at all
+          // (NO_CONSTRAINT).
+        }
       } else {
         markerSkipReason = 'marker-did-not-land';
       }
     }
   }
-  return { markerWritten, markerSkipReason, commitOutcome };
+  return { markerWritten, markerSkipReason, commitOutcome, gateNotices };
 }
 
 // A conflict outranks the downstream gates: verification and lint both describe
@@ -1781,6 +2234,8 @@ function buildCloseResult({
   postApplyLint,
   closeScopeNotice,
   otherDebtCount,
+  gateNotices,
+  restructureWaivers,
 }) {
   return {
     ok,
@@ -1810,7 +2265,16 @@ function buildCloseResult({
     // NO artifact and is re-tried automatically by the next close. `proposedContent`
     // is dropped from the reported shape either way (the artifact / the next close
     // holds the bytes; a whole page or an append entry does not belong in the JSON).
-    conflicts: conflicts.map(({ proposedContent: _drop, ...rest }) => rest),
+    // `why` is the human-readable cause (conflictWhy), the same string
+    // printCloseReport already prints in the non-JSON path — a `--json` close
+    // used to carry only the raw `reason` code here, so the caller had no prose
+    // to surface and the fix to conflictWhy's wording never reached a `--json`
+    // close (which is how every real close runs; printCloseReport is a path a
+    // normal apply never takes).
+    conflicts: conflicts.map((c) => {
+      const { proposedContent: _drop, ...rest } = c;
+      return { ...rest, why: conflictWhy(c) };
+    }),
     // Parked overwrite proposals (id/target/path), one per drifted overwrite
     // target. Empty when only append conflicts (or none) occurred. The T7 CLI
     // lists and applies these; append conflicts never appear here.
@@ -1842,6 +2306,21 @@ function buildCloseResult({
     // scripts/lint.mjs` for the full list).
     notices: [...new Set(closeScopeNotice.map((e) => e.file))],
     otherDebtCount,
+    // Separate from `notices` above, which is lint debt. These are the close
+    // GATE's demotions: what it declined to block on. `--mark-session-closed`
+    // has always reported them and this path did not, so a demotion on the
+    // canonical close path was invisible — the gate's promise is that it never
+    // waves something through silently, and half the paths were breaking it.
+    // A new key rather than a merge into `notices`, whose entries are filename
+    // strings that an existing reader would choke on if they became objects.
+    gateNotices: gateNotices || [],
+    // Always present (possibly empty), same visibility contract as `notices`/
+    // `otherDebtCount` above — a caller should not have to guess whether the
+    // key's absence means "none" or "this apply predates the field". One entry
+    // per overwrite field where `restructure: true` waived a REAL section-loss
+    // trip (a field that carried the flag but never had a loss to waive adds no
+    // entry here — the flag did nothing, which is not this field's job to flag).
+    restructureWaivers,
   };
 }
 
@@ -1861,20 +2340,23 @@ function printCloseReport({
   postBlocking,
   closeScopeNotice,
   otherDebtCount,
+  restructureWaivers,
 }) {
   console.log(`Session-close apply (project: ${project}, date: ${date}):`);
   for (const a of applied) console.log(`  ✓ wrote ${a}`);
   for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
+  // Surfaced unconditionally, success or failure. A waiver is not a normal
+  // write, and burying it behind `ok` would hide it on exactly the runs where
+  // a human is most likely to be reading closely.
+  for (const w of restructureWaivers) {
+    console.log(
+      `  ⚠ restructure:true waived the section-loss guard for ${w.target} — dropped: ${w.lostSections.join(', ')}`,
+    );
+  }
   // Never let a withheld target read as a skip: `skipped` means "already current",
-  // this means "your bytes are NOT on disk". Overwrite conflicts drifted from base;
-  // an append conflict is a lock-timeout (someone else held the file's lock), which
-  // is transient — the next close re-applies.
+  // this means "your bytes are NOT on disk".
   for (const c of conflicts) {
-    const why =
-      c.kind === 'append'
-        ? 'could not acquire the append lock in time; the next close re-applies'
-        : 'the page changed since this session read it';
-    console.log(`  ⚠ WITHHELD ${c.key} (${c.target}) — ${c.reason}; ${why}`);
+    console.log(`  ⚠ WITHHELD ${c.key} (${c.target}) — ${c.reason}; ${conflictWhy(c)}`);
   }
   for (const p of proposals) {
     console.log(`  · parked proposal ${p.id} for ${p.target} (review with \`hypomnema proposal\`)`);
@@ -2007,10 +2489,15 @@ export function applySessionClose(args) {
   // it. T6 turns these into `.cache/proposals/` artifacts; here they are already
   // enough to withhold the bytes and fail the close.
   const conflicts = [];
-  // One bag for the four accumulators, passed to every write phase below. They
+  // Overwrite fields where `restructure: true` waived a REAL section-loss
+  // trip. Kept separate from `conflicts` (these are NOT withheld — bytes were
+  // written) and from `applied` (a plain display string there would drop the
+  // "this was a waiver, not an ordinary write" fact on the floor).
+  const restructureWaivers = [];
+  // One bag for the five accumulators, passed to every write phase below. They
   // push into it in call order; nothing is merged back afterwards, so the
   // report lines keep the exact order the inline version produced.
-  const acc = { applied, skipped, appliedPaths, conflicts };
+  const acc = { applied, skipped, appliedPaths, conflicts, restructureWaivers };
 
   applyOverwrites(args, payload, project, date, indexRelPath, indexMissing, acc);
   appendSessionLogEntry(args, payload, project, date, acc);
@@ -2048,7 +2535,7 @@ export function applySessionClose(args) {
   const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
   const otherDebtCount = postNotice.length - closeScopeNotice.length;
 
-  const { markerWritten, markerSkipReason, commitOutcome } = runMarkerPhase(
+  const { markerWritten, markerSkipReason, commitOutcome, gateNotices } = runMarkerPhase(
     args,
     project,
     appliedPaths,
@@ -2099,6 +2586,8 @@ export function applySessionClose(args) {
     postApplyLint,
     closeScopeNotice,
     otherDebtCount,
+    gateNotices,
+    restructureWaivers,
   });
 
   if (args.json) {
@@ -2119,6 +2608,7 @@ export function applySessionClose(args) {
       postBlocking,
       closeScopeNotice,
       otherDebtCount,
+      restructureWaivers,
     });
   }
   process.exit(ok ? 0 : 1);

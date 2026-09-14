@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import {
   mkdtempSync,
   mkdirSync,
+  chmodSync,
   rmSync,
   writeFileSync,
   appendFileSync,
@@ -23,10 +24,16 @@ import { planMarkerDecision, closeResultContradiction } from '../scripts/crystal
 // SessionStart hook that normally writes it) so a single test can make the
 // overwrite step 2 conflict-park check see "this session already read the
 // current bytes" without a live session.
-import { snapshotBase } from '../hooks/base-store.mjs';
+import { snapshotBase, hashContent } from '../hooks/base-store.mjs';
+// The close journal is what tells a retry's own uncommitted seed apart from a
+// hand edit sitting on the same path — see hooks/close-journal.mjs. Used
+// directly here to build BOTH fixtures below: one where the journal matches
+// (the seed a failed close left behind) and one where it does not (a user
+// edit since).
+import { recordJournalEntry } from '../hooks/close-journal.mjs';
 // The gate's own notion of "today", so the fixture below can place a project
 // strictly outside it instead of guessing with local-yesterday.
-import { freshDates } from '../hooks/hypo-shared.mjs';
+import { freshDates, sessionClosedMarkerPath } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import {
   CLOSE_RECONFIRM_MARK,
@@ -2196,6 +2203,306 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
   });
 });
 
+// index.md is the file the deadlock was FOUND on, not the only file it happens
+// to. Every payload overwrite takes the same retry branch: a first attempt
+// writes the bytes, its commit fails, and the retry finds them already-current
+// and skips the field — which used to drop the path from the commit scope, so
+// the gate blocked on it and no number of retries ever got past. Pinning only
+// index.md would leave the four paths a real close actually carries untested,
+// and a regression there reads as "all green" while the deadlock comes back on
+// session-state.md instead. The fixture writes the payload bytes to disk and
+// records the same hash in the journal, which is the pair a first attempt's own
+// write leaves behind.
+test('--apply-session-close: a retry re-stages payload files a failed commit left dirty', () => {
+  withWiki(null, (dir, today) => {
+    const stateRel = join('projects', 'test-project', 'session-state.md');
+    const hotRel = join('projects', 'test-project', 'hot.md');
+    // Bytes a first attempt wrote and failed to commit. Reading them back as
+    // the payload content is what puts the retry on the already-current branch.
+    const stateContent = `${readFileSync(join(dir, stateRel), 'utf-8')}\n<!-- first attempt -->\n`;
+    const hotContent = `${readFileSync(join(dir, hotRel), 'utf-8')}\n<!-- first attempt -->\n`;
+    writeFileSync(join(dir, stateRel), stateContent);
+    writeFileSync(join(dir, hotRel), hotContent);
+    recordJournalEntry(dir, 's-apply-retry-payload', stateRel, hashContent(stateContent));
+    recordJournalEntry(dir, 's-apply-retry-payload', hotRel, hashContent(hotContent));
+    const before = spawnSync('git', ['status', '--porcelain'], {
+      cwd: dir,
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      before.includes('session-state.md') && before.includes('hot.md'),
+      `fixture must start dirty on both, or this test proves nothing: ${before}`,
+    );
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: { content: stateContent },
+      projectHot: { content: hotContent },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] retry re-stages payload files\n` },
+      log: { entry: `## [${today}] session | test-project — retry re-stages payload files\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-retry-payload');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-retry-payload',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const left = spawnSync('git', ['status', '--porcelain'], {
+      cwd: dir,
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      !left.includes('session-state.md') && !left.includes('projects/test-project/hot.md'),
+      `a retry must carry the bytes its first attempt already wrote, or the gate ` +
+        `blocks on them forever: ${left}`,
+    );
+  });
+});
+
+// The counterpart: the same already-current branch must NOT sweep up a file
+// this session never wrote. Without it the assertion above is satisfied by a
+// retry that simply commits everything dirty, which is the wider bug the
+// journal exists to prevent.
+test('--apply-session-close: a retry leaves an unjournaled payload file uncommitted', () => {
+  withWiki(null, (dir, today) => {
+    const stateRel = join('projects', 'test-project', 'session-state.md');
+    const stateContent = `${readFileSync(join(dir, stateRel), 'utf-8')}\n<!-- someone else -->\n`;
+    writeFileSync(join(dir, stateRel), stateContent);
+    // No recordJournalEntry: these bytes are on disk and match the payload, but
+    // nothing says THIS session wrote them.
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: { content: stateContent },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] unjournaled stays out\n` },
+      log: { entry: `## [${today}] session | test-project — unjournaled stays out\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-unjournaled');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-unjournaled',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const left = spawnSync('git', ['status', '--porcelain'], {
+      cwd: dir,
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      left.includes('session-state.md'),
+      `bytes with no journal record must stay out of this close's commit: ${left}`,
+    );
+  });
+});
+
+// The gate's demotions are only defensible if someone can see them, and this
+// is the path a real close runs. `--mark-session-closed` has always carried
+// them out; `--apply-session-close` reported "notices": [] no matter how many
+// files the gate waved through, so the canonical path was the silent one. The
+// foreign project below is dirty, which the gate demotes to a notice rather
+// than blocking on — the exact case that used to vanish here.
+test('--apply-session-close: a demotion the gate made is visible in the result', () => {
+  withWiki(null, (dir, today) => {
+    seedUndiscoverableProject(dir, 'somebody-else');
+    writeFileSync(join(dir, 'projects', 'somebody-else', 'index.md'), '---\ntitle: edited\n---\n');
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] gate notices reach the result\n` },
+      log: { entry: `## [${today}] session | test-project — gate notices reach the result\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-gate-notices');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-gate-notices',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      (out.gateNotices || []).some((n) => /somebody-else/.test(n.file || n.reason || '')),
+      `the demoted file must be named in gateNotices: ${JSON.stringify(out.gateNotices)}`,
+    );
+  });
+});
+
+// The apply-side half of the close gate staying fail-closed on the project's
+// own directory (tests/session-hooks.test.mjs pins the gate half). A first
+// attempt seeds projects/<p>/index.md and then fails to commit, leaving it
+// dirty. This run finds the file already there, so the seeding branch does
+// nothing on its own — the retry only restages it when hooks/close-journal.mjs
+// says THIS session wrote exactly those bytes (see applyOverwrites' retry
+// branch). The fixture below seeds both the file AND its journal record, the
+// same pair a first attempt's own write would have left: recordJournalEntry
+// is called directly instead of driving a real first apply, because a real
+// first attempt's index.md content is derived from the template at write
+// time, and pinning the exact bytes here makes the journal match explicit
+// rather than incidental. Before this fix the path dropped out of the commit
+// scope entirely, so the gate blocked on it on every retry, forever. The
+// assertion is on git, not on the result JSON: whether the file is CLEAN
+// afterwards is the thing the deadlock turned on, and a run that merely
+// listed it while leaving it uncommitted would pass a shallower check.
+test('--apply-session-close: a retry re-stages an index.md a failed close left behind', () => {
+  withWiki(null, (dir, today) => {
+    const indexRel = join('projects', 'test-project', 'index.md');
+    // The state a failed close leaves: index.md on disk, uncommitted, and this
+    // session's journal recording that IT wrote those exact bytes.
+    const seededIndex = `# test-project\n\nseeded ${today}, never committed\n`;
+    writeFileSync(join(dir, indexRel), seededIndex);
+    recordJournalEntry(dir, 's-apply-retry-index', indexRel, hashContent(seededIndex));
+    assert.ok(
+      spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf-8' }).stdout.includes(
+        'index.md',
+      ),
+      'fixture must actually start dirty, or this test proves nothing',
+    );
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] retry re-stages the seeded index\n` },
+      log: { entry: `## [${today}] session | test-project — retry re-stages the seeded index\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-retry-index');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-retry-index',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const left = spawnSync('git', ['status', '--porcelain'], {
+      cwd: dir,
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      !left.includes('index.md'),
+      `the retry must carry the orphaned index.md into its commit, or the gate ` +
+        `blocks on it forever: ${left}`,
+    );
+  });
+});
+
+// The counterpart to the test above, and the bug the journal-gated retry
+// fixes: without it, the unconditional "index.md is missing → this retry
+// owns committing it" branch swept up whatever bytes happened to be sitting
+// there, including a user's own hand edit made AFTER the failed close seeded
+// the file. Same fixture as above through the failed first close (index.md on
+// disk, journal recording the seed's hash) — then the user edits the file
+// before the retry ever runs. The retry must leave those edited bytes OUT of
+// its commit: the journal's recorded hash no longer matches disk, so this
+// close never claims credit for content it did not write. Asserted on git
+// (the file must still show dirty) rather than on the JSON result, for the
+// same reason the paired test above is: a result that merely omits index.md
+// from `applied` while still committing it would pass a shallower check.
+test('--apply-session-close: a retry leaves a user-edited index.md uncommitted', () => {
+  withWiki(null, (dir, today) => {
+    const indexRel = join('projects', 'test-project', 'index.md');
+    const indexFull = join(dir, indexRel);
+    const seededIndex = `# test-project\n\nseeded ${today}, never committed\n`;
+    writeFileSync(indexFull, seededIndex);
+    recordJournalEntry(dir, 's-apply-retry-index-edited', indexRel, hashContent(seededIndex));
+    // The user's own edit, made after the failed close but before the retry —
+    // the journal above still names the SEEDED bytes' hash, not this one.
+    const editedIndex = `# test-project\n\nedited by the user after the failed close\n`;
+    writeFileSync(indexFull, editedIndex);
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] retry must not swallow the user's index edit\n` },
+      log: {
+        entry: `## [${today}] session | test-project — retry must not swallow the user's index edit\n`,
+      },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-retry-index-edited');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-retry-index-edited',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    assert.equal(
+      readFileSync(indexFull, 'utf-8'),
+      editedIndex,
+      "apply must never touch index.md's bytes when it did not write them",
+    );
+    const left = spawnSync('git', ['status', '--porcelain'], {
+      cwd: dir,
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      left.includes('index.md'),
+      `a user edit made after the failed close must stay uncommitted, not ride in on this ` +
+        `close's own retry: ${left}`,
+    );
+  });
+});
+
 // A second project with a COMPLETE, fresh close (today session-log heading +
 // today log.md entry), added alongside test-project so the gate-evaluated set
 // has two members and can be told apart from `payload.project` (one member).
@@ -2777,6 +3084,104 @@ test('--apply-session-close text output: markerWritten:false prints loud stderr 
       r.stderr.includes('Stop-chain'),
       `stderr must mention Stop-chain so the reader knows the session is not closed: ${JSON.stringify(r.stderr)}`,
     );
+  });
+});
+
+test('ISSUE-140: a marker withheld by an unrelated gate failure leaves the close signal usable for a retry', () => {
+  // Regression for the close-signal-burn bug: the close-gate resolution used
+  // to be recorded as soon as `ok && sessionId` was true, ahead of whether the
+  // marker itself ever landed. A run that committed the payload but then had
+  // its marker withheld by a gate failure that has nothing to do with the
+  // payload itself (here: the same feedback over-cap fixture as the
+  // markerWritten:false text test above) burned the session's one close
+  // signal anyway. The next apply attempt, with the SAME transcript and no
+  // fresh close phrase, was refused before writing a byte
+  // (`no-user-close-signal` / `no-new-open-since-resolution`) even though no
+  // marker had ever been written and the session was never actually closed.
+  //
+  // This drives that exact two-step reproduction: apply once while the
+  // feedback is still over cap (marker withheld), fix the over-cap without
+  // adding any new close signal to the transcript, then apply again. What it
+  // distinguishes: whether the second apply is authorized at all
+  // (`refuseUnlessCloseRequested` via `verifyCloseAuthority` /
+  // `closeGateStatus`), versus refused outright by a resolution the first,
+  // marker-less run should never have recorded. On the pre-fix code the
+  // second apply exits 1 with `no-new-open-since-resolution`; on the fix it
+  // exits 0 with the marker finally landing.
+  withTmpDir((dir) => {
+    const wiki = join(dir, 'wiki');
+    const today = todayLocal();
+    mkdirSync(wiki, { recursive: true });
+    buildCleanWikiTree(wiki, today);
+    adr47SeedFeedback(wiki, 11); // over the 10-entry cap → compact-gate-not-ok
+    adr47CommitWiki(wiki);
+    const home = adr47ControlledHome(dir);
+    const sessionId = 's-i140-retry';
+    const closeCleanup = seedCloseTranscript(sessionId, { home });
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(wiki, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(wiki, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] ISSUE-140 retry test\n` },
+      log: { entry: `## [${today}] session | test-project: ISSUE-140 retry test\n` },
+    };
+    const payloadPath = join(dir, '.payload.json'); // outside the wiki git tree
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const runApply = () =>
+      spawnSync(
+        process.execPath,
+        [
+          join(SCRIPTS, 'crystallize.mjs'),
+          `--hypo-dir=${wiki}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          `--session-id=${sessionId}`,
+          '--json',
+        ],
+        { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
+      );
+    try {
+      const r1 = runApply();
+      assert.equal(
+        r1.status,
+        0,
+        `first apply must still succeed (the writes land, only the marker is withheld): ${r1.stdout}\n${r1.stderr}`,
+      );
+      const out1 = JSON.parse(r1.stdout);
+      assert.equal(out1.ok, true);
+      assert.equal(out1.markerWritten, false, 'marker must be withheld on the over-cap');
+      assert.equal(out1.markerSkipReason, 'compact-gate-not-ok');
+
+      // Fix the over-cap WITHOUT touching the transcript at all: no new close
+      // phrase, no new open. Commit the fix so the tree is clean going into
+      // the retry.
+      rmSync(join(wiki, 'pages', 'feedback', 'rule-10.md'));
+      spawnSync('git', ['add', '-A'], { cwd: wiki });
+      spawnSync('git', ['commit', '-m', 'fix over-cap'], { cwd: wiki });
+
+      const r2 = runApply();
+      assert.equal(
+        r2.status,
+        0,
+        `retry on the same, never-consumed close signal must be authorized and succeed: ${r2.stdout}\n${r2.stderr}`,
+      );
+      const out2 = JSON.parse(r2.stdout);
+      assert.equal(out2.ok, true);
+      assert.equal(
+        out2.markerWritten,
+        true,
+        `marker must land on retry now that the gate clears: ${JSON.stringify(out2)}`,
+      );
+      assert.equal(out2.markerSkipReason, null);
+    } finally {
+      closeCleanup();
+    }
   });
 });
 
@@ -4255,6 +4660,42 @@ test('IMPR-34: --check-session-close renders demoted debt without contradicting 
       assert.equal(out.ok, true, 'and ok never contradicts an empty missing');
     },
   );
+});
+
+// The writer reports whether ITS OWN call landed, and the close path spends the
+// user's close signal on that answer. existsSync alone cannot give it: a marker
+// left by an earlier attempt satisfies the check just as well as one this run
+// wrote, and the reader drops a marker it cannot parse. A write that fails onto
+// a corrupt leftover would then look like a successful close, spend the signal,
+// and have the next Stop delete the marker — leaving a session that can never
+// close again. The write is also atomic now, so the target is never half a file.
+test('writeSessionClosedMarker reports whether this call landed, and replaces a corrupt marker wholesale', () => {
+  withTmpDir((dir) => {
+    const sid = 's-marker-report';
+    const p = sessionClosedMarkerPath(dir, sid);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // A leftover that exists but is not readable as a marker: exactly the state
+    // existsSync cannot tell apart from a healthy one.
+    writeFileSync(p, '{"truncated": ');
+    assert.equal(writeSessionClosedMarker(dir, sid, { project: 'mine' }), true);
+    const after = JSON.parse(readFileSync(p, 'utf-8'));
+    assert.equal(after.project, 'mine', 'the corrupt bytes must be gone, not appended to');
+
+    // The paired half: a write that cannot land must say so rather than leave
+    // the caller to infer success from a file that was already there.
+    const blocked = join(dir, 'blocked');
+    mkdirSync(blocked, { recursive: true });
+    chmodSync(blocked, 0o500);
+    try {
+      assert.equal(
+        writeSessionClosedMarker(blocked, 's-denied', { project: 'mine' }),
+        false,
+        'a write it could not perform must report false',
+      );
+    } finally {
+      chmodSync(blocked, 0o700);
+    }
+  });
 });
 
 // The reader that recovers the scope after a scripted close: marker.project.

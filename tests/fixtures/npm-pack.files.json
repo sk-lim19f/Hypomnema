@@ -168,6 +168,10 @@
     "exec": false
   },
   {
+    "path": "hooks/close-journal.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/hooks.json",
     "exec": false
   },

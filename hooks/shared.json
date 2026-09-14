@@ -4,5 +4,6 @@
   "version-check-fetch.mjs",
   "base-store.mjs",
   "proposal-store.mjs",
-  "close-gate-store.mjs"
+  "close-gate-store.mjs",
+  "close-journal.mjs"
 ]

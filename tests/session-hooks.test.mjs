@@ -3180,11 +3180,20 @@ test('commitWikiChanges: a top-level (non-projects/) path counts as its own proj
 //    projectOverride / attributionScope ──────────────────────────────────
 //
 // All six fixtures below require `sessionTouchTrusted === false` (no
-// transcript is passed): with a trusted transcript the EXISTING partition a
-// few tests up already demotes a foreign dirty file, so a fixture that keeps
-// transcript trust would pass before this change too and pin nothing. The
-// gate here is called directly (not through a hook), same style as every
-// other precompactGateStatus test in this suite.
+// transcript is passed): with a trusted transcript AND no OTHER today-active
+// project sharing the file's mandatory-scope membership, the EXISTING
+// partition a few tests up already demotes a foreign dirty file, so a
+// fixture that keeps transcript trust in that shape would pass before this
+// change too and pin nothing. That "AND" used to matter (ISSUE-130): when
+// the foreign file was also a DIFFERENT today-active project's own
+// mandatory close file (session-state.md, project hot.md, its session-log
+// shard), the trusted-transcript branch used to fall back to
+// closeAccountableScope alone — which is `closeFileTargetsGlobal`'s union
+// over EVERY today-active project whenever `projectOverride` is unset — and
+// wrongly counted that file as "mine". See the ISSUE-130 regression test
+// right after the TODAY-active fixture below, which pins the trusted case.
+// The gate here is called directly (not through a hook), same style as
+// every other precompactGateStatus test in this suite.
 
 // `slug` becomes an ELIGIBLE project for collectProjectWorkingDirs: index.md
 // present, not `_template`. Committed so it does not itself count as dirty.
@@ -3287,6 +3296,66 @@ test('precompactGateStatus: attributionScope + no transcript + a foreign project
   });
 });
 
+// ISSUE-130 regression: the sibling of the fixture above, but with
+// `sessionTouchTrusted === true` (a fully-parseable transcript). Before the
+// fix, a trusted transcript skipped the isForeignProjectFile check entirely
+// and fell back to closeAccountableScope alone, which is
+// `closeFileTargetsGlobal`'s union over every today-active project whenever
+// `projectOverride` is unset (every marker-writing caller passes
+// attributionScope, never projectOverride). `other`'s own mandatory close
+// files landed in that union purely because it was active today, so they
+// read as "mine" and blocked this session's marker even though
+// attributionScope named `mine`. The real-world incident: four unrelated
+// files from a different session (`security-backoffice`) blocked a
+// `--project=hypomnema` close with `markerWritten: false`.
+test('precompactGateStatus: attributionScope + TRUSTED transcript + a foreign project active TODAY -> its close file still demotes to a notice, not a git blocker (ISSUE-130)', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'other');
+    const today = freshDates()[0];
+    writeFileSync(join(dir, 'log.md'), `## [${today}] session | other\n`);
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'other closed today']);
+    // `other`'s own mandatory close files: dirty, uncommitted, and (per the
+    // log.md entry above) inside closeFileTargetsGlobal's today-active union.
+    mkdirSync(join(dir, 'projects', 'other', 'session-log'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'other', 'hot.md'), '# other session work\n');
+    writeFileSync(join(dir, 'projects', 'other', 'session-state.md'), '# other session state\n');
+    writeFileSync(join(dir, 'projects', 'other', 'session-log', `${today}.md`), '# other log\n');
+    // A fully valid transcript (every line parses) proving THIS session only
+    // ever touched its own hot.md -> sessionTouchTrusted becomes true.
+    const tdir = transcriptTmpDir();
+    const transcript = join(tdir, 't.jsonl');
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'hot.md') } }],
+        },
+      }) + '\n',
+    );
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      attributionScope: 'mine',
+      transcriptPath: transcript,
+    });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git'),
+      `a different today-active project's own dirty close files must demote by path even with a trusted transcript: ${JSON.stringify(gate.blockers)}`,
+    );
+    for (const f of [
+      'projects/other/hot.md',
+      'projects/other/session-state.md',
+      `projects/other/session-log/${today}.md`,
+    ]) {
+      assert.ok(
+        (gate.notices || []).some((n) => n.type === 'git' && n.file === f),
+        `${f} must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
+      );
+    }
+  });
+});
+
 test('precompactGateStatus: projectOverride + no transcript + own session-state.md dirty -> still a git blocker', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'mine');
@@ -3298,6 +3367,37 @@ test('precompactGateStatus: projectOverride + no transcript + own session-state.
     assert.ok(
       (gate.blockers || []).some((b) => b.type === 'git'),
       `a dirty file under the OVERRIDE'S OWN project must never be demoted: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// The counterpart to the assertion above: a dirty file inside the override's
+// OWN project blocks, even one this close does not write. A revision in between
+// demoted these to notices to escape a deadlock — a close whose commit fails
+// leaves ensureProjectIndex's index.md uncommitted, the retry skips every
+// payload field as already-current without re-staging it, and the marker can
+// then never land again. That demotion waved through every unsaved file in the
+// project to fix one file we seed ourselves. The deadlock is closed at its
+// source instead: applyOverwrites re-stages index.md on the retry path, so it
+// rides in the close's own commit and never reaches this gate dirty. The
+// apply-side half is pinned in tests/close-global.test.mjs; without it this
+// assertion would be re-creating the deadlock rather than restoring a defense.
+test('precompactGateStatus: projectOverride + no transcript + own index.md dirty -> blocks', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'mine');
+    writeFileSync(
+      join(dir, 'projects', 'mine', 'index.md'),
+      '# seeded by a close whose commit failed\n',
+    );
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    assert.ok(
+      (gate.blockers || []).some(
+        (b) => b.type === 'git' && /projects\/mine\/index\.md/.test(b.reason || ''),
+      ),
+      `an unsaved file in the override's own project must block, and name itself: ${JSON.stringify(gate.blockers)}`,
     );
   });
 });
@@ -3347,6 +3447,34 @@ test('precompactGateStatus: projectOverride + no transcript + an unregistered pr
     assert.ok(
       (gate.blockers || []).some((b) => b.type === 'git'),
       `an unregistered project dir must stay fail-closed: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// The same spoof aimed at the OVERRIDE'S OWN slug. The assertion below covers
+// the foreign direction; the own-project demotion added later opened the exact
+// same hole facing the other way, because its prefix test ran on posixPath(f).
+// One root-level file NAMED `projects\\mine\\x.md` would normalise into
+// `projects/mine/x.md`, look like a leftover of the scoped project, and drop to
+// a notice — a dirty file at the vault root silently stops blocking the marker.
+test('precompactGateStatus: projectOverride + a literal-backslash filename matching the OWN slug -> still a git blocker', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'mine');
+    writeFileSync(
+      join(dir, 'projects\\mine\\x.md'),
+      '# literal backslash name at the vault root\n',
+    );
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git'),
+      `a root file merely NAMED like an own-project path must not demote: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      !(gate.notices || []).some((n) => n.type === 'git' && n.file && n.file.includes('x.md')),
+      `and it must not appear as a leftover notice either: ${JSON.stringify(gate.notices)}`,
     );
   });
 });
