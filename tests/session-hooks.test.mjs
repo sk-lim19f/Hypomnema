@@ -3371,15 +3371,18 @@ test('precompactGateStatus: projectOverride + no transcript + own session-state.
   });
 });
 
-// The counterpart to the assertion above, and the reason the own-project rule
-// is a prefix test rather than a flat `!isForeign`. A close file of the
-// override's own project blocks; a leftover in the SAME directory that this
-// close never writes does not. The file this actually bites on is one we seed
-// ourselves: when a close's commit fails, `ensureProjectIndex`'s index.md is
-// left uncommitted, and the retry skips every payload field as already-current
-// without re-staging it. Blocking on it means the marker can never land again,
-// no matter how many times the user retries.
-test('precompactGateStatus: projectOverride + no transcript + own index.md dirty -> a notice, not a blocker', () => {
+// The counterpart to the assertion above: a dirty file inside the override's
+// OWN project blocks, even one this close does not write. A revision in between
+// demoted these to notices to escape a deadlock — a close whose commit fails
+// leaves ensureProjectIndex's index.md uncommitted, the retry skips every
+// payload field as already-current without re-staging it, and the marker can
+// then never land again. That demotion waved through every unsaved file in the
+// project to fix one file we seed ourselves. The deadlock is closed at its
+// source instead: applyOverwrites re-stages index.md on the retry path, so it
+// rides in the close's own commit and never reaches this gate dirty. The
+// apply-side half is pinned in tests/close-global.test.mjs; without it this
+// assertion would be re-creating the deadlock rather than restoring a defense.
+test('precompactGateStatus: projectOverride + no transcript + own index.md dirty -> blocks', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'mine');
     writeFileSync(
@@ -3391,12 +3394,10 @@ test('precompactGateStatus: projectOverride + no transcript + own index.md dirty
       projectOverride: 'mine',
     });
     assert.ok(
-      !(gate.blockers || []).some((b) => b.type === 'git'),
-      `a non-close leftover in the override's own project must not block: ${JSON.stringify(gate.blockers)}`,
-    );
-    assert.ok(
-      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'projects/mine/index.md'),
-      `and it must still be named in notices rather than vanish: ${JSON.stringify(gate.notices)}`,
+      (gate.blockers || []).some(
+        (b) => b.type === 'git' && /projects\/mine\/index\.md/.test(b.reason || ''),
+      ),
+      `an unsaved file in the override's own project must block, and name itself: ${JSON.stringify(gate.blockers)}`,
     );
   });
 });

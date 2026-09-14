@@ -4127,36 +4127,21 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       const isForeign = (f) =>
         isForeignProjectFile(f, { eligibleSlugs, effectiveOverride, transcriptTouched });
       const foreign = dirty.filter(isForeign);
-      // One more demotion, narrower than the foreign one: a leftover that sits
-      // structurally INSIDE the scoped project's own directory and is not a
-      // file this close writes. The branch this replaced blocked on
-      // `dirty ∩ closeAccountableScope` and demoted the rest, so those were
-      // notices; keying only on `!isForeign` turned them into blockers, and
-      // the first one that hits is a file we create ourselves. A close whose
-      // commit fails leaves `projects/<p>/index.md` (seeded by
-      // ensureProjectIndex) uncommitted, and the retry then skips every
-      // payload field as already-current, never re-stages it, and can never
-      // place its marker again.
+      // A dirty file inside the scoped project's OWN directory blocks, even one
+      // this close does not write. An earlier revision demoted those to notices
+      // to escape a deadlock: a close whose commit fails leaves
+      // `projects/<p>/index.md` (seeded by ensureProjectIndex) uncommitted, the
+      // retry skips every payload field as already-current without re-staging
+      // it, and the marker can then never land again no matter how often the
+      // user retries.
       //
-      // The prefix test is what keeps this from widening into the cases the
-      // assertions below pin as fail-closed: `pages/`, the vault root, an
-      // unregistered or `_template` project dir, a literal-backslash filename.
-      // None of those is under `projects/<scope>/`, so none of them demotes;
-      // "cannot prove whose it is" still blocks.
-      const ownPrefix = `projects/${effectiveOverride}/`;
-      // The prefix test reads the RAW porcelain path, exactly as
-      // isForeignProjectFile's own `projects/<slug>/` match does. Running it on
-      // posixPath(f) instead rewrites a literal-backslash filename sitting at
-      // the vault ROOT — `projects\mine\x.md` is one file, not a directory —
-      // into `projects/mine/x.md`, and this branch would then demote it as a
-      // leftover of the scoped project. The sibling assertions already pin that
-      // spoof in the foreign direction; the scope test has to hold the same
-      // line. Membership below stays on posixPath because closeAccountableScope
-      // is keyed that way.
-      const ownLeftover = (f) =>
-        f.startsWith(ownPrefix) && !closeAccountableScope.has(posixPath(f));
-      const rest = dirty.filter((f) => !isForeign(f) && !ownLeftover(f));
-      const unaccountable = dirty.filter((f) => !isForeign(f) && ownLeftover(f));
+      // That demotion was far wider than the deadlock it answered. It waved
+      // through every unsaved file in the project, which is exactly the work a
+      // close is supposed to refuse to walk away from. The deadlock is fixed at
+      // its source instead: applyOverwrites re-stages index.md on the retry
+      // path (crystallize-close-apply.mjs), so the file this branch used to
+      // demote is now in the close's own commit scope and never reaches here.
+      const rest = dirty.filter((f) => !isForeign(f));
       if (rest.length > 0) {
         blockers.push({
           type: 'git',
@@ -4168,13 +4153,6 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           type: 'git',
           file: f,
           reason: `uncommitted changes outside this session's scope: ${f}`,
-        });
-      }
-      for (const f of unaccountable) {
-        notices.push({
-          type: 'git',
-          file: f,
-          reason: `uncommitted leftover in this project that this close does not write: ${f}`,
         });
       }
     } else if (!sessionTouchTrusted) {

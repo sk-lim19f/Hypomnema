@@ -1475,6 +1475,17 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
       applied.push(`projectIndex (${createdIndex})`);
       appliedPaths.push(createdIndex);
     }
+  } else {
+    // The retry path, and the reason the close gate can stay fail-closed on
+    // everything inside the project's own directory. A first attempt that
+    // seeds index.md and then fails to commit leaves it dirty; this run finds
+    // it already there, so the branch above does nothing and the file would
+    // drop out of the commit scope entirely. The gate then blocks on it
+    // forever, since no retry ever picks it back up. Claiming it here costs
+    // nothing when the file is clean (there is nothing to stage) and closes
+    // the deadlock when it is not. `applied` stays untouched: this run wrote
+    // no bytes, it only takes responsibility for committing them.
+    appliedPaths.push(indexRelPath);
   }
 }
 
@@ -1914,6 +1925,11 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
   let markerWritten = false;
   let markerSkipReason = null;
   let commitOutcome = null;
+  // What the gate waved through on the way to the marker. The demotions are
+  // only honest if the operator can see them, and this is the path that runs
+  // on a real close: `--mark-session-closed` already reported them, while
+  // `--apply-session-close` dropped them on the floor.
+  let gateNotices = [];
   if (ok && args.sessionId) {
     // IO stays lazy so this preserves the exact side-effect order (codex design
     // review): commit first (the only mutation), then resolve the
@@ -1970,6 +1986,7 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
         ...(autoMarkerOverride ? { attributionScope: autoMarkerOverride } : {}),
       });
       gateOk = gateStatus.ok;
+      gateNotices = gateStatus.notices || [];
       // `closeScope` above widens the partition, it never narrows
       // sessionCloseGlobalStatus (only opts.projectOverride does, and this
       // call never sets it) — so gate.close.projects is the actual evaluated
@@ -2067,7 +2084,7 @@ function runMarkerPhase(args, project, appliedPaths, ok) {
       }
     }
   }
-  return { markerWritten, markerSkipReason, commitOutcome };
+  return { markerWritten, markerSkipReason, commitOutcome, gateNotices };
 }
 
 // A conflict outranks the downstream gates: verification and lint both describe
@@ -2111,6 +2128,7 @@ function buildCloseResult({
   postApplyLint,
   closeScopeNotice,
   otherDebtCount,
+  gateNotices,
   restructureWaivers,
 }) {
   return {
@@ -2182,6 +2200,14 @@ function buildCloseResult({
     // scripts/lint.mjs` for the full list).
     notices: [...new Set(closeScopeNotice.map((e) => e.file))],
     otherDebtCount,
+    // Separate from `notices` above, which is lint debt. These are the close
+    // GATE's demotions: what it declined to block on. `--mark-session-closed`
+    // has always reported them and this path did not, so a demotion on the
+    // canonical close path was invisible — the gate's promise is that it never
+    // waves something through silently, and half the paths were breaking it.
+    // A new key rather than a merge into `notices`, whose entries are filename
+    // strings that an existing reader would choke on if they became objects.
+    gateNotices: gateNotices || [],
     // Always present (possibly empty), same visibility contract as `notices`/
     // `otherDebtCount` above — a caller should not have to guess whether the
     // key's absence means "none" or "this apply predates the field". One entry
@@ -2403,7 +2429,7 @@ export function applySessionClose(args) {
   const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
   const otherDebtCount = postNotice.length - closeScopeNotice.length;
 
-  const { markerWritten, markerSkipReason, commitOutcome } = runMarkerPhase(
+  const { markerWritten, markerSkipReason, commitOutcome, gateNotices } = runMarkerPhase(
     args,
     project,
     appliedPaths,
@@ -2454,6 +2480,7 @@ export function applySessionClose(args) {
     postApplyLint,
     closeScopeNotice,
     otherDebtCount,
+    gateNotices,
     restructureWaivers,
   });
 

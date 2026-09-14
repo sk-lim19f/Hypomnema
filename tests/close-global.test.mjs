@@ -2197,6 +2197,112 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
   });
 });
 
+// The gate's demotions are only defensible if someone can see them, and this
+// is the path a real close runs. `--mark-session-closed` has always carried
+// them out; `--apply-session-close` reported "notices": [] no matter how many
+// files the gate waved through, so the canonical path was the silent one. The
+// foreign project below is dirty, which the gate demotes to a notice rather
+// than blocking on — the exact case that used to vanish here.
+test('--apply-session-close: a demotion the gate made is visible in the result', () => {
+  withWiki(null, (dir, today) => {
+    seedUndiscoverableProject(dir, 'somebody-else');
+    writeFileSync(join(dir, 'projects', 'somebody-else', 'index.md'), '---\ntitle: edited\n---\n');
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] gate notices reach the result\n` },
+      log: { entry: `## [${today}] session | test-project — gate notices reach the result\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-gate-notices');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-gate-notices',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      (out.gateNotices || []).some((n) => /somebody-else/.test(n.file || n.reason || '')),
+      `the demoted file must be named in gateNotices: ${JSON.stringify(out.gateNotices)}`,
+    );
+  });
+});
+
+// The apply-side half of the close gate staying fail-closed on the project's
+// own directory (tests/session-hooks.test.mjs pins the gate half). A first
+// attempt seeds projects/<p>/index.md and then fails to commit, leaving it
+// dirty. This run finds the file already there, so the seeding branch does
+// nothing — and before this fix the path dropped out of the commit scope
+// entirely, so the gate blocked on it on every retry, forever. The assertion is
+// on git, not on the result JSON: whether the file is CLEAN afterwards is the
+// thing the deadlock turned on, and a run that merely listed it while leaving
+// it uncommitted would pass a shallower check.
+test('--apply-session-close: a retry re-stages an index.md a failed close left behind', () => {
+  withWiki(null, (dir, today) => {
+    const indexRel = join('projects', 'test-project', 'index.md');
+    // The state a failed close leaves: index.md on disk, uncommitted.
+    writeFileSync(join(dir, indexRel), `# test-project\n\nseeded ${today}, never committed\n`);
+    assert.ok(
+      spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf-8' }).stdout.includes(
+        'index.md',
+      ),
+      'fixture must actually start dirty, or this test proves nothing',
+    );
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
+      sessionLog: { entry: `## [${today}] retry re-stages the seeded index\n` },
+      log: { entry: `## [${today}] session | test-project — retry re-stages the seeded index\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-retry-index');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-retry-index',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const left = spawnSync('git', ['status', '--porcelain'], {
+      cwd: dir,
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      !left.includes('index.md'),
+      `the retry must carry the orphaned index.md into its commit, or the gate ` +
+        `blocks on it forever: ${left}`,
+    );
+  });
+});
+
 // A second project with a COMPLETE, fresh close (today session-log heading +
 // today log.md entry), added alongside test-project so the gate-evaluated set
 // has two members and can be told apart from `payload.project` (one member).
