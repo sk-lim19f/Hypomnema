@@ -441,11 +441,25 @@ function loadHookMap() {
       process.exit(1);
     }
   }
-  if (
-    cfg.shared !== undefined &&
-    (!Array.isArray(cfg.shared) || !cfg.shared.every((f) => _isHookFileName(f)))
-  ) {
-    console.error('Error: hooks/hooks.json "shared" must be an array of .mjs file names');
+  // The shared-file list used to live at hooks.json's own top-level "shared"
+  // key. It moved to a sibling file, hooks/shared.json, because the harness
+  // began warning on hooks.json's unknown "shared" key once it started
+  // validating that file, and "shared" was never part of the harness's own
+  // hook-registration schema. Required, not tolerated when absent: a
+  // downstream fork with nothing shared still ships hooks/shared.json as
+  // `[]`, so a missing file means the package itself is broken, not that
+  // there is nothing to track.
+  const sharedJsonPath = join(PKG_ROOT, 'hooks', 'shared.json');
+  let sharedCfg;
+  try {
+    sharedCfg = JSON.parse(readFileSync(sharedJsonPath, 'utf-8'));
+  } catch (err) {
+    console.error(`Error: cannot read hooks/shared.json: ${err.message}`);
+    console.error(PKG_INTEGRITY_HINT);
+    process.exit(1);
+  }
+  if (!Array.isArray(sharedCfg) || !sharedCfg.every((f) => _isHookFileName(f))) {
+    console.error('Error: hooks/shared.json must be an array of .mjs file names');
     console.error(PKG_INTEGRITY_HINT);
     process.exit(1);
   }

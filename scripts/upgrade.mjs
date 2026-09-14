@@ -209,11 +209,27 @@ for (const [event, groups] of Object.entries(_hookConfig.hooks)) {
     process.exit(1);
   }
 }
-if (
-  _hookConfig.shared !== undefined &&
-  (!Array.isArray(_hookConfig.shared) || !_hookConfig.shared.every((f) => _isHookFileName(f)))
-) {
-  console.error('Error: hooks/hooks.json "shared" must be an array of .mjs file names');
+// The shared-file list used to live at hooks.json's own top-level "shared" key.
+// It moved to a sibling file, hooks/shared.json: the harness began
+// warning on hooks.json's unknown "shared" key once it started validating that
+// file, and "shared" was never part of the harness's own hook-registration
+// schema. Required, not tolerated when absent: a downstream fork with nothing
+// shared still ships hooks/shared.json as `[]`, so a missing file means the
+// package itself is broken, not that there is nothing to track. Checking this
+// file is the whole point of upgrade's integrity check: skip it here and a
+// missing shared module (the thing every hook actually imports) goes
+// unreported while the installed copy is stale.
+const _sharedJsonPath = join(HOOKS_SRC, 'shared.json');
+let _sharedConfig;
+try {
+  _sharedConfig = JSON.parse(readFileSync(_sharedJsonPath, 'utf-8'));
+} catch (err) {
+  console.error(`Error: cannot read hooks/shared.json: ${err.message}`);
+  console.error(PKG_INTEGRITY_HINT);
+  process.exit(1);
+}
+if (!Array.isArray(_sharedConfig) || !_sharedConfig.every((f) => _isHookFileName(f))) {
+  console.error('Error: hooks/shared.json must be an array of .mjs file names');
   console.error(PKG_INTEGRITY_HINT);
   process.exit(1);
 }
@@ -221,7 +237,7 @@ if (
 const HOOK_MAP = Object.fromEntries(
   Object.entries(_hookConfig.hooks).map(([e, gs]) => [e, _extractFileNames(gs)]),
 );
-const SHARED_FILES = _hookConfig.shared ?? [];
+const SHARED_FILES = _sharedConfig;
 
 // ── checks ───────────────────────────────────────────────────────────────────
 

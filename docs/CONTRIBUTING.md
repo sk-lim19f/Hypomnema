@@ -62,8 +62,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full breakdown. Short version:
 
 **Hooks run in `~/.claude/hooks/` in isolation. They cannot import from relative paths.**
 
-- All shared logic must live in `hooks/hypo-shared.mjs`.
-- `hypo-shared.mjs` is declared via the `shared` field in `hooks/hooks.json` and copied alongside each hook at deploy time.
+- Shared logic must live in one of the modules `hooks/shared.json` declares, not only in `hypo-shared.mjs`. That file (a plain JSON array of `.mjs` basenames) is the source of truth for the list and is copied alongside each hook at deploy time. It used to be a `shared` field inside `hooks.json` itself; that moved to this sibling file once the harness started warning on that unknown top-level key.
 - Hook utilities may use **only** Node.js built-ins (`fs`, `path`, `os`, `child_process`, `crypto`).
 - No relative imports, no npm dependencies.
 
@@ -85,7 +84,7 @@ Scripts under `scripts/` are not deployed and may freely import from `scripts/li
 
 1. Edit the hook file in `hooks/`.
 2. If it's new, register it in `hooks/hooks.json` under the correct event key.
-3. Shared utilities go in `hooks/hypo-shared.mjs`.
+3. Shared utilities go in a module listed in `hooks/shared.json`, usually `hypo-shared.mjs`.
 4. Add a contract test in the hook's area file, e.g. `tests/session-hooks.test.mjs` (input → expected `additionalContext` shape).
 5. After your change, run `/hypo:upgrade` in a real Claude Code session and verify the hook fires.
 

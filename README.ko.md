@@ -269,7 +269,7 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 
 PostToolUse 훅 둘은 matcher 없이 등록되고 각자 tool_name으로 거릅니다.
 
-모든 훅은 위키 루트를 `HYPO_DIR` 환경변수 → `hypo-config.md` 스캔 → `~/hypomnema` 기본값 순으로 찾고, `hypo-shared.mjs`(`hooks.json`의 `shared` 필드로 선언)를 공유합니다.
+모든 훅은 위키 루트를 `HYPO_DIR` 환경변수 → `hypo-config.md` 스캔 → `~/hypomnema` 기본값 순으로 찾고, `hypo-shared.mjs`(`hooks/shared.json`에 선언된 `.mjs` 파일명 배열)를 공유합니다.
 
 ### 셋업 & 유지보수
 

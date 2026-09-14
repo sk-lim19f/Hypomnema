@@ -168,14 +168,51 @@ function smoke(root) {
         }
         notes.push(`hook targets: ${targets.size}`);
       }
-      // `shared` lists hook-relative support files that the targets import.
-      if (Array.isArray(hooksJson.shared)) {
-        for (const shared of hooksJson.shared) {
-          if (!isFile(join(root, 'hooks', shared)))
-            fail(`hooks/hooks.json: shared file "hooks/${shared}" is not a file`);
+    }
+  }
+
+  // hooks/shared.json — hook-relative support files that the targets import.
+  // This used to be hooks.json's own "shared" key; it moved to this sibling
+  // file because the harness began warning on that unknown top-level key.
+  // Required, not optional: a downstream fork with nothing shared still ships
+  // hooks/shared.json as `[]`, so a missing file means the package itself is
+  // broken, not that there is nothing to track. Skipping this check on a
+  // missing file is exactly how a missing hypo-shared.mjs (the module every
+  // hook imports) would slip past a "smoke" check whose whole point is
+  // catching that.
+  const sharedPath = join(root, 'hooks', 'shared.json');
+  if (!existsSync(sharedPath)) {
+    fail('hooks/shared.json: missing');
+  } else {
+    let sharedJson = null;
+    try {
+      sharedJson = JSON.parse(readFileSync(sharedPath, 'utf-8'));
+    } catch (err) {
+      fail(`hooks/shared.json: ${err?.message ?? err}`);
+    }
+    if (Array.isArray(sharedJson)) {
+      for (const shared of sharedJson) {
+        // A bare basename, checked before it is joined onto anything. Every
+        // consumer of this list joins each entry onto a hooks directory and
+        // then reads, copies, or deletes the result, so an entry like
+        // `../README.md` names a file outside that directory and one of them
+        // would act on it. A smoke check that joined first and only asked
+        // whether something is there would call that entry valid, because the
+        // file it escaped to usually does exist.
+        if (
+          typeof shared !== 'string' ||
+          !/^[\w.-]+\.mjs$/.test(shared) ||
+          shared.startsWith('.')
+        ) {
+          fail(`hooks/shared.json: "${shared}" is not a plain .mjs basename`);
+          continue;
         }
-        notes.push(`shared: ${hooksJson.shared.length}`);
+        if (!isFile(join(root, 'hooks', shared)))
+          fail(`hooks/shared.json: file "hooks/${shared}" is not a file`);
       }
+      notes.push(`shared: ${sharedJson.length}`);
+    } else if (sharedJson !== null) {
+      fail('hooks/shared.json: must be a JSON array');
     }
   }
 

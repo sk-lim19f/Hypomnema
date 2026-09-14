@@ -265,7 +265,7 @@ Nine commands cover the full capture → retrieval → consolidation cycle.
 
 Both PostToolUse hooks are registered without a matcher and filter on `tool_name` themselves.
 
-All hooks resolve the wiki root via `HYPO_DIR` env → `hypo-config.md` scan → `~/hypomnema` default, and share `hypo-shared.mjs` (declared via `hooks.json`'s `shared` field).
+All hooks resolve the wiki root via `HYPO_DIR` env → `hypo-config.md` scan → `~/hypomnema` default, and share `hypo-shared.mjs` (declared in `hooks/shared.json`, a JSON array of `.mjs` basenames).
 
 When the Stop hook's pull hits a merge conflict it aborts the merge, skips the push, and records the failure. Your local commits are safe, but the machines stop converging until you act: `git -C <your wiki> pull --no-rebase`, fix the conflicts, commit, push. `/hypo:doctor` surfaces a stuck sync.
 

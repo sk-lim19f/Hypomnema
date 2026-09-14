@@ -143,8 +143,7 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 
 Hooks run in an isolated environment at `~/.claude/hooks/`. They **cannot import from relative paths** outside their own directory. Therefore:
 
-- All shared hook logic lives in `hypo-shared.mjs`.
-- `hypo-shared.mjs` is declared via the `shared` field in `hooks.json` and copied alongside hooks at deploy time.
+- Shared hook logic lives in the modules `hooks/shared.json` declares, not only in `hypo-shared.mjs`. That file (a plain JSON array of `.mjs` basenames) is the source of truth for the list and is copied alongside hooks at deploy time. It used to be a `shared` field inside `hooks.json` itself; it moved to this sibling file because the harness started warning on that unknown top-level key once it began validating `hooks.json` against its own hook-registration schema.
 - Hook utilities use **only Node.js built-ins** — no relative imports, no npm dependencies.
 
 Scripts in `scripts/` are not deployed — they run from the package install path — so they can import from `scripts/lib/`.
@@ -503,7 +502,7 @@ Requires `NPM_TOKEN` secret.
 
 ## Plugin manifest
 
-`.claude-plugin/plugin.json` declares the plugin to Claude Code. `hooks/hooks.json` follows the standard plugin hooks schema:
+`.claude-plugin/plugin.json` declares the plugin to Claude Code. `hooks/hooks.json` follows the standard plugin hooks schema, and carries only what that schema knows about: an event-to-hook map, nothing else.
 
 ```json
 {
@@ -519,10 +518,17 @@ Requires `NPM_TOKEN` secret.
         ]
       }
     ]
-  },
-  "shared": ["hypo-shared.mjs"]
+  }
 }
 ```
+
+The shared-file list (helpers a registered hook imports, such as `hypo-shared.mjs`) is Hypomnema's own convention, not something the harness's schema recognizes, so it lives in a sibling file instead: `hooks/shared.json`, a plain JSON array of `.mjs` basenames.
+
+```json
+["hypo-shared.mjs", "version-check.mjs", "..."]
+```
+
+`hooks/hooks.json` is still the source of truth for the event-to-hook map; `hooks/shared.json` is the source of truth for the shared-file list. A hook registered in the former, or a helper listed in the latter, is what init/upgrade deploy. Anything left off either file never reaches an installed copy.
 
 `claude plugin validate .` is run as part of CI's plugin-snapshot checks.
 

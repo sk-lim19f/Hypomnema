@@ -244,6 +244,10 @@
     "exec": false
   },
   {
+    "path": "hooks/shared.json",
+    "exec": false
+  },
+  {
     "path": "hooks/version-check-fetch.mjs",
     "exec": false
   },

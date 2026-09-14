@@ -17,8 +17,19 @@ import {
   cpSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { test, suite } from './harness.mjs';
-import { runWithHome, withTmpDir, withTmpHome, writeExt } from './helpers.mjs';
+import {
+  runWithHome,
+  withTmpDir,
+  withTmpHome,
+  writeExt,
+  REPO,
+  SCRIPTS,
+  HOOKS,
+} from './helpers.mjs';
 
 // ── extensions companion sync (ADR 0024) ──────────────────────
 
@@ -1846,6 +1857,135 @@ test('a copy is NOT written through a symlinked ancestor in the install path', (
     assert.ok(
       (r.stdout + r.stderr).includes('skip-unsafe-path'),
       `the refusal must be reported: ${r.stdout}${r.stderr}`,
+    );
+  });
+});
+
+// uninstall is the one command whose job is letting someone leave, so it does
+// NOT fail closed on a missing hooks/shared.json the way init/upgrade/doctor/
+// smoke-plugin now do. What it must not do is stay quiet: an empty shared list
+// means the shared modules are left behind in ~/.claude/hooks/ while the run
+// still reports success, and nothing would tell the user which files to remove
+// by hand. Local fixture, not a helpers.mjs one: only this area needs a
+// package root whose scripts run against a shared.json we can delete.
+suite('uninstall: shared.json is best-effort but never silent');
+
+function withFakeUninstallPkg(fn) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-uninst-'));
+  try {
+    const root = join(base, 'lib', 'node_modules', 'hypomnema');
+    mkdirSync(root, { recursive: true });
+    cpSync(SCRIPTS, join(root, 'scripts'), { recursive: true });
+    cpSync(HOOKS, join(root, 'hooks'), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(root, 'package.json'));
+    const home = join(base, 'home');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    fn({ uninstall: join(root, 'scripts', 'uninstall.mjs'), root, home });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+// The shape check above accepts any string ending in `.mjs`, and the event map
+// in hooks.json feeds the same set of names. Both end up at join(hooksDir, name)
+// inside a function that calls rmSync, so `../x.mjs` would delete a file one
+// level ABOVE ~/.claude/hooks. The containment test belongs in the deleting
+// function rather than in whichever list happened to supply the name.
+test('a hook name that escapes the hooks directory is skipped, not deleted', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    const outside = join(home, '.claude', 'not-ours.mjs');
+    writeFileSync(outside, '// a file that lives above the hooks dir\n');
+    const shared = JSON.parse(readFileSync(join(root, 'hooks', 'shared.json'), 'utf-8'));
+    writeFileSync(
+      join(root, 'hooks', 'shared.json'),
+      JSON.stringify([...shared, '../not-ours.mjs']),
+    );
+    const r = spawnSync(process.execPath, [uninstall, '--apply', '--yes'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.ok(
+      existsSync(outside),
+      `a name resolving outside the hooks dir must not be deleted: ${r.stdout}\n${r.stderr}`,
+    );
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /resolve outside/,
+      `and the skip must be announced: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+test('a missing hooks/shared.json warns instead of silently leaving shared modules behind', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    // Paired half first: with the file present the run says nothing about it,
+    // so the assertion below pins the warning rather than matching noise that
+    // was always there.
+    const ok = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.ok(
+      !/cannot read hooks\/shared\.json/.test(`${ok.stdout}${ok.stderr}`),
+      `a healthy package must not warn: ${ok.stdout}\n${ok.stderr}`,
+    );
+
+    rmSync(join(root, 'hooks', 'shared.json'));
+    const r = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /cannot read hooks\/shared\.json/,
+      `a missing shared list must be announced: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+test('a shared.json that parses but is not an array warns instead of silently keeping shared modules', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    // Paired half first: a well-formed array must not trigger this warning, so the
+    // assertion below pins the new shape check rather than matching noise a healthy
+    // package always printed.
+    const ok = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.ok(
+      !/must be a JSON array of \.mjs filenames/.test(`${ok.stdout}${ok.stderr}`),
+      `a well-formed shared.json must not warn: ${ok.stdout}\n${ok.stderr}`,
+    );
+
+    // Parses fine as JSON, but is an object rather than the array this file is
+    // supposed to hold. That is the bug this test pins: the shape used to slide past
+    // the catch block (no parse error) and past `Array.isArray` (silently false), so
+    // `for...of` never ran and no shared module was ever removed, with the run
+    // still reporting success.
+    writeFileSync(join(root, 'hooks', 'shared.json'), JSON.stringify({ oops: true }));
+    const r = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /must be a JSON array of \.mjs filenames/,
+      `a non-array shared.json must be announced: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+test('a shared.json array with a non-.mjs-string entry warns the same way', () => {
+  withFakeUninstallPkg(({ uninstall, root, home }) => {
+    writeFileSync(join(root, 'hooks', 'shared.json'), JSON.stringify(['hypo-shared.mjs', 42]));
+    const r = spawnSync(process.execPath, [uninstall], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: home },
+    });
+    assert.match(
+      `${r.stdout}${r.stderr}`,
+      /must be a JSON array of \.mjs filenames/,
+      `an array with a non-.mjs entry must be announced: ${r.stdout}\n${r.stderr}`,
     );
   });
 });

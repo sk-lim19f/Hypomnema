@@ -1593,6 +1593,20 @@ function runDoctorFrom(doctor, args, home) {
   });
 }
 
+// A missing hooks/shared.json used to fall back to SHARED_FILES = [], so
+// doctor's own integrity check stopped tracking hypo-shared.mjs entirely and
+// would report a healthy install even though every deployed hook imports a
+// module the check no longer looks for. Required, not tolerated: a
+// downstream fork with nothing shared still ships hooks/shared.json as `[]`.
+test('missing hooks/shared.json → exit 1, not silently treated as empty', () => {
+  withFakeDoctorInstall(false, ({ doctor, root, home, wiki }) => {
+    rmSync(join(root, 'hooks', 'shared.json'));
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`], home);
+    assert.equal(r.status, 1, `expected exit 1: ${r.stdout}\n${r.stderr}`);
+    assert.match(r.stderr, /cannot read hooks\/shared\.json/);
+  });
+});
+
 test('plugin mode: empty ~/.claude/hooks passes, not fails', () => {
   withFakeDoctorInstall(true, ({ doctor, home, wiki }) => {
     const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);

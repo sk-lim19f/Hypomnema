@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   validateChangelog,
@@ -561,12 +561,12 @@ function buildPluginFixture(dir) {
             { hooks: [{ type: 'command', command: 'node ${CLAUDE_PLUGIN_ROOT}/hooks/h.mjs' }] },
           ],
         },
-        shared: ['shared-lib.mjs'],
       },
       null,
       2,
     ),
   );
+  writeFileSync(join(dir, 'hooks', 'shared.json'), JSON.stringify(['shared-lib.mjs'], null, 2));
 }
 
 test('valid plugin surfaces → exit 0', () => {
@@ -611,10 +611,53 @@ test('empty skills (.gitkeep only) → exit 1', () => {
 test('missing shared hook file → exit 1', () => {
   withTmpDir((dir) => {
     buildPluginFixture(dir);
-    rmSync(join(dir, 'hooks', 'shared-lib.mjs')); // hooks.json.shared still lists it
+    rmSync(join(dir, 'hooks', 'shared-lib.mjs')); // hooks/shared.json still lists it
     const r = run('smoke-plugin.mjs', ['--root', dir]);
     assert.equal(r.status, 1, 'a missing shared file must fail');
     assert.ok(/shared/.test(r.stderr + r.stdout), 'should report missing shared file');
+  });
+});
+
+// hooks/shared.json used to be optional here (an install with nothing shared
+// has none), which meant a package that dropped the file entirely still
+// smoked clean even though its hooks still import hypo-shared.mjs. Required,
+// not optional: a downstream fork with nothing shared still ships
+// hooks/shared.json as `[]`.
+test('missing hooks/shared.json entirely → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    rmSync(join(dir, 'hooks', 'shared.json'));
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'a missing hooks/shared.json must fail');
+    assert.ok(/shared\.json: missing/.test(r.stderr + r.stdout), 'should report the missing file');
+  });
+});
+
+// Every consumer of this list joins each entry onto a hooks directory and then
+// reads, copies, or deletes what comes out. An entry that climbs out of that
+// directory names a file none of them meant to touch, and a check that joins
+// first and only asks "is something there" calls it valid, because the file it
+// escaped to usually exists. The fixture below points at the fixture's own
+// package.json for exactly that reason: it is really there.
+test('a shared.json entry that escapes the hooks directory → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    const shared = JSON.parse(readFileSync(join(dir, 'hooks', 'shared.json'), 'utf-8'));
+    // Paired half: the untouched fixture smokes clean, so the failure below is
+    // this entry and not something the fixture was already unhappy about.
+    assert.equal(run('smoke-plugin.mjs', ['--root', dir]).status, 0);
+    // The escaped path has to name a file that REALLY EXISTS, or this test
+    // passes for the wrong reason: the old check joined first and asked only
+    // whether something was there, so a dangling path failed it too and the
+    // assertion would be reading the wording rather than the behaviour.
+    writeFileSync(join(dir, 'escaped.mjs'), '// outside hooks/\n');
+    writeFileSync(join(dir, 'hooks', 'shared.json'), JSON.stringify([...shared, '../escaped.mjs']));
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'an entry outside hooks/ must fail');
+    assert.ok(
+      /plain \.mjs basename/.test(r.stderr + r.stdout),
+      `should say why it is invalid: ${r.stdout}\n${r.stderr}`,
+    );
   });
 });
 

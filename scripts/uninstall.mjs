@@ -51,7 +51,7 @@ import {
   statSync,
   realpathSync,
 } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import {
@@ -768,9 +768,49 @@ function loadHookFiles() {
     normalizedHookMap[event] = filenames;
   }
 
-  if (Array.isArray(cfg.shared)) {
-    for (const f of cfg.shared) hookFiles.add(f);
+  // The shared-file list used to live at hooks.json's own "shared" key; it
+  // moved to a sibling file, hooks/shared.json, because the
+  // harness began warning on that unknown top-level key. Best-effort: a
+  // missing or malformed shared.json still lets uninstall remove what
+  // hooks.json's own hook map lists, rather than aborting the whole run.
+  //
+  // The other four consumers (init, upgrade, doctor, smoke-plugin) fail closed
+  // on this file; uninstall deliberately does not, because it is the one
+  // command whose whole point is letting someone leave. Refusing to run would
+  // trade "a few files linger" for "you cannot remove this at all". But the
+  // fallback must not be silent: an empty list here means the shared modules
+  // stay in ~/.claude/hooks/ while the run still reports success, and the user
+  // would have no way to know which files to delete by hand.
+  let sharedFiles = [];
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(join(PKG_ROOT, 'hooks', 'shared.json'), 'utf-8'));
+  } catch (err) {
+    console.warn(
+      `Warning: cannot read hooks/shared.json (${err?.message ?? String(err)}). ` +
+        'Shared hook modules will be left in place; remove them by hand if you want a clean uninstall.',
+    );
+    raw = undefined;
   }
+  if (raw !== undefined) {
+    // JSON.parse succeeds on plenty of shapes that are not the array this file is
+    // supposed to hold: an object, a bare string, an array of numbers. None of that
+    // throws above, so without this check a malformed shared.json would slide past
+    // the warning and silently fall through the `Array.isArray` below, leaving every
+    // shared module installed with the run still reporting success.
+    const isValid =
+      Array.isArray(raw) && raw.every((f) => typeof f === 'string' && f.endsWith('.mjs'));
+    if (isValid) {
+      sharedFiles = raw;
+    } else {
+      console.warn(
+        'Warning: hooks/shared.json must be a JSON array of .mjs filenames, but its contents do ' +
+          'not match that shape. Shared hook modules will be left in place; remove them by hand ' +
+          'if you want a clean uninstall.',
+      );
+    }
+  }
+  for (const f of sharedFiles) hookFiles.add(f);
   return { hookMap: normalizedHookMap, hookFiles };
 }
 
@@ -779,14 +819,34 @@ function loadHookFiles() {
 function removeHookFiles(hooksDir, hookFiles, apply) {
   const removed = [],
     missing = [];
+  const skipped = [];
+  // Every name here comes out of a file on disk: hooks.json's event map and
+  // hooks/shared.json. A name is supposed to be a bare basename, but nothing
+  // upstream forces that, and join() resolves `../x.mjs` straight out of the
+  // hooks directory. This function DELETES what it is handed, so it confirms
+  // the containment itself rather than trusting the list it was given. An
+  // out-of-tree name is skipped and named, never removed: a corrupt list is a
+  // reason to leave files alone, not to delete somewhere else.
+  const root = resolve(hooksDir);
+  const inside = (p) => p === root || p.startsWith(root + sep);
   for (const file of hookFiles) {
     const p = join(hooksDir, file);
+    if (!inside(resolve(p))) {
+      skipped.push(file);
+      continue;
+    }
     if (existsSync(p)) {
       if (apply) rmSync(p);
       removed.push(p);
     } else {
       missing.push(p);
     }
+  }
+  if (skipped.length > 0) {
+    console.warn(
+      `Warning: ${skipped.length} hook name(s) resolve outside ${hooksDir} and were left alone: ` +
+        `${skipped.join(', ')}. Remove them by hand after checking what they are.`,
+    );
   }
   // .hypo-provenance.json (scripts/lib/pkg-provenance.mjs) is written next to
   // this exact hooksDir by installHooks/applyHookFiles — same lifecycle as the
