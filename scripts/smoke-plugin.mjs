@@ -135,6 +135,7 @@ function smoke(root) {
   // real regular file on disk. hooks.json is the hook source of truth, so a missing
   // hypo-shared.mjs / version-check.mjs would pass a manifest-only check but break
   // hook imports at runtime.
+  const targets = new Set();
   const hooksPath = join(root, 'hooks', 'hooks.json');
   if (!existsSync(hooksPath)) {
     fail('hooks/hooks.json: missing');
@@ -149,7 +150,6 @@ function smoke(root) {
       if (!hooksJson.hooks || typeof hooksJson.hooks !== 'object') {
         fail('hooks/hooks.json: missing top-level "hooks" object');
       } else {
-        const targets = new Set();
         for (const groups of Object.values(hooksJson.hooks)) {
           for (const group of groups || []) {
             for (const hk of group?.hooks || []) {
@@ -180,11 +180,11 @@ function smoke(root) {
   // missing file is exactly how a missing hypo-shared.mjs (the module every
   // hook imports) would slip past a "smoke" check whose whole point is
   // catching that.
+  let sharedJson = null;
   const sharedPath = join(root, 'hooks', 'shared.json');
   if (!existsSync(sharedPath)) {
     fail('hooks/shared.json: missing');
   } else {
-    let sharedJson = null;
     try {
       sharedJson = JSON.parse(readFileSync(sharedPath, 'utf-8'));
     } catch (err) {
@@ -214,6 +214,40 @@ function smoke(root) {
     } else if (sharedJson !== null) {
       fail('hooks/shared.json: must be a JSON array');
     }
+  }
+
+  // Both lists checked forward, now check back: every .mjs in hooks/ must be
+  // reachable from one of them. The asymmetry is what makes this gap silent.
+  // init copies the whole directory (readdirSync), while upgrade, doctor and
+  // uninstall all walk `event targets + shared`. So an unlisted module installs
+  // fine and its direct-import tests pass, and then upgrade never refreshes it,
+  // doctor never reports it missing, and uninstall leaves it behind on disk.
+  // Splitting the shared list into its own file added one more place for the
+  // two to drift apart, which is why this closes now.
+  //
+  // hypo-pre-commit.mjs is the one deliberate exception. The vault's pre-commit
+  // wrapper invokes it at <pkgRoot>/hooks/, never the installed copy, so it
+  // belongs to neither list by design. Anything else landing here is a mistake.
+  const UNLISTED_OK = new Set(['hypo-pre-commit.mjs']);
+  if (targets.size > 0 && Array.isArray(sharedJson)) {
+    const reachable = new Set([
+      ...[...targets]
+        .filter((rel) => rel.startsWith('hooks/'))
+        .map((rel) => rel.slice('hooks/'.length)),
+      ...sharedJson.filter((s) => typeof s === 'string'),
+    ]);
+    let unlisted = 0;
+    for (const entry of readdirSync(join(root, 'hooks'))) {
+      if (!entry.endsWith('.mjs')) continue;
+      if (reachable.has(entry) || UNLISTED_OK.has(entry)) continue;
+      unlisted++;
+      fail(
+        `hooks/${entry}: listed in neither hooks.json's event targets nor ` +
+          `hooks/shared.json. init would copy it, but upgrade, doctor and ` +
+          `uninstall all skip it, so it never gets refreshed, reported, or removed.`,
+      );
+    }
+    if (unlisted === 0) notes.push('hooks/ fully listed');
   }
 
   // 4. marketplace.json — name parity + source resolves.

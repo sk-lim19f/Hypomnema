@@ -661,6 +661,40 @@ test('a shared.json entry that escapes the hooks directory → exit 1', () => {
   });
 });
 
+// Both lists were only ever checked forward. Nothing asked the reverse: is every
+// .mjs in hooks/ actually on one of them? It matters because the consumers
+// disagree. init copies the directory wholesale, while upgrade, doctor and
+// uninstall walk `event targets + shared`, so an unlisted module ships, passes
+// its own direct-import tests, and then silently never gets refreshed, reported
+// missing, or removed. Moving the shared list into its own file added one more
+// seam for the two to drift apart.
+test('an .mjs in hooks/ on neither list → exit 1', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    // Paired half: the untouched fixture smokes clean, so the failure below is
+    // the new file and not something the fixture was already unhappy about.
+    assert.equal(run('smoke-plugin.mjs', ['--root', dir]).status, 0);
+    writeFileSync(join(dir, 'hooks', 'orphan.mjs'), '// on neither list\n');
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 1, 'an unlisted hooks/*.mjs must fail');
+    assert.ok(
+      /orphan\.mjs.*neither/s.test(r.stdout + r.stderr),
+      `should name the file and why: ${r.stdout}\n${r.stderr}`,
+    );
+  });
+});
+
+// The exception exists so the check can be strict everywhere else. If this ever
+// starts failing, someone widened the allowance rather than listing their file.
+test('hypo-pre-commit.mjs is the one file allowed off both lists', () => {
+  withTmpDir((dir) => {
+    buildPluginFixture(dir);
+    writeFileSync(join(dir, 'hooks', 'hypo-pre-commit.mjs'), '// vault wrapper target\n');
+    const r = run('smoke-plugin.mjs', ['--root', dir]);
+    assert.equal(r.status, 0, `the documented exception must pass: ${r.stdout}\n${r.stderr}`);
+  });
+});
+
 test('marketplace name mismatch → exit 1', () => {
   withTmpDir((dir) => {
     buildPluginFixture(dir);
