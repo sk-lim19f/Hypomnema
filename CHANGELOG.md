@@ -5,6 +5,34 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.4] - 2026-09-14
+
+### Bug Fixes
+
+#### English
+
+- A session close no longer blocks on another project's uncommitted files. It judges the scope the close actually owns, and a dirty file belonging to a different project comes back as a notice naming its path instead of a blocker. ([#296](https://github.com/sk-lim19f/Hypomnema/pull/296))
+- A close that could not write its marker no longer spends the close signal, so the session stays closable. ([#296](https://github.com/sk-lim19f/Hypomnema/pull/296))
+- A close whose commit fails used to deadlock: the retry skipped every field as already-current, dropped those paths from the commit scope, and the gate then blocked on them forever. A close journal records what this session wrote, and a later run reclaims a path only when those exact bytes are still on disk. ([#296](https://github.com/sk-lim19f/Hypomnema/pull/296))
+- The hook file list moved out of `hooks/hooks.json` into its own `hooks/shared.json`, ending the harness warning that fired on every session. ([#297](https://github.com/sk-lim19f/Hypomnema/pull/297))
+- Install, upgrade, doctor and uninstall read that list through one parser instead of five private ones, so a command target outside `hooks/`, a command carrying arguments, and an empty hook map now mean the same thing to all of them. Install refuses to write anything when a listed file is missing from the package, and uninstall falls back to its provenance record when the package list is unreadable rather than exiting with every hook still in place. ([#297](https://github.com/sk-lim19f/Hypomnema/pull/297))
+
+#### 한국어
+
+- 세션 close 가 다른 프로젝트의 미커밋 파일에 더는 막히지 않습니다. close 가 실제로 책임지는 범위로 판정하고, 다른 프로젝트의 dirty 파일은 blocker 가 아니라 경로가 적힌 notice 로 돌아옵니다. ([#296](https://github.com/sk-lim19f/Hypomnema/pull/296))
+- 마커를 못 쓴 close 가 close 신호를 소진하지 않아, 세션을 계속 닫을 수 있습니다. ([#296](https://github.com/sk-lim19f/Hypomnema/pull/296))
+- 커밋에 실패한 close 가 교착에 빠지던 것을 고쳤습니다. 재시도가 모든 필드를 already-current 로 건너뛰면서 그 경로를 커밋 범위에서 빠뜨렸고, 게이트가 영원히 막았습니다. close 저널이 이 세션이 쓴 것을 기록하고, 나중 실행은 그 bytes 가 디스크에 그대로 있을 때만 경로를 되찾습니다. ([#296](https://github.com/sk-lim19f/Hypomnema/pull/296))
+- 훅 파일 목록이 `hooks/hooks.json` 밖으로 나와 `hooks/shared.json` 이 됐습니다. 세션마다 뜨던 하네스 경고가 사라집니다. ([#297](https://github.com/sk-lim19f/Hypomnema/pull/297))
+- 설치와 업그레이드와 진단과 제거가 그 목록을 각자의 reader 다섯 대신 공용 parser 하나로 읽습니다. `hooks/` 밖을 가리키는 command, 인자가 붙은 command, 빈 훅 맵이 이제 넷 모두에게 같은 뜻입니다. 설치는 목록의 파일이 패키지에 없으면 아무것도 쓰지 않고, 제거는 패키지 목록을 못 읽으면 provenance 기록으로 되돌아갑니다. 훅을 전부 남긴 채 종료하지 않습니다. ([#297](https://github.com/sk-lim19f/Hypomnema/pull/297))
+
+### Changelog
+
+- [#296](https://github.com/sk-lim19f/Hypomnema/pull/296) fix(close): scope the dirty gate and let a retry reclaim its own writes
+- [#297](https://github.com/sk-lim19f/Hypomnema/pull/297) fix(hooks): move the shared file list out of hooks.json
+- [#295](https://github.com/sk-lim19f/Hypomnema/pull/295) chore(release): v1.8.3
+
+Contributors: @sk-lim19f
+
 ## [1.8.3] - 2026-09-11
 
 ### Bug Fixes
