@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { spawnSync, spawn } from 'node:child_process';
 import {
   mkdtempSync,
+  appendFileSync,
   mkdirSync,
   rmSync,
   writeFileSync,
@@ -18,7 +19,7 @@ import {
   utimesSync,
   chmodSync,
 } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   hashContent as bsHashContent,
@@ -59,9 +60,18 @@ import {
   applyProposal,
   challengeProposals,
   resolveProposals,
+  reconcileProposals,
+  classifyProposals,
   discardProposal,
   listPending,
 } from '../scripts/proposal.mjs';
+import {
+  readJournal,
+  closeJournalPath,
+  recordHandoffReceipt,
+  recordJournalEntry,
+  clearJournal,
+} from '../hooks/close-journal.mjs';
 import { test, testAsync, suite } from './harness.mjs';
 import {
   HOME,
@@ -2855,7 +2865,10 @@ test('conflictWhy: a section-loss park names the dropped sections, not a phantom
     !why.includes('the page changed since this session read it'),
     `must not claim the page changed: ${why}`,
   );
-  assert.ok(why.includes('restructure'), `must name the escape hatch: ${why}`);
+  assert.ok(
+    why.includes('restructure'),
+    `must still name the flag, now to say it does not land the write: ${why}`,
+  );
   // The paired half: a reason that really IS a concurrent-writer case still
   // says so, so the assertion above pins the lookup rather than banning a
   // phrase outright.
@@ -3062,7 +3075,7 @@ test('sectionLossReason: an unclosed fence running to EOF is treated as outside,
   );
 });
 
-test('ISSUE-76 c3: an overwrite that drops most of the current sections parks, with restructure:true as the escape hatch', () => {
+test('ISSUE-76 c3: an overwrite that drops most of the current sections parks, and restructure:true does not get it out', () => {
   withWiki(null, (dir, today) => {
     const base = readFileSync(t4ProjectHot(dir), 'utf-8');
     const multiTrack = `${base}\n## Track A\nnote A\n\n## Track B\nnote B\n\n## Track C\nnote C\n`;
@@ -3111,24 +3124,38 @@ test('ISSUE-76 c3: an overwrite that drops most of the current sections parks, w
     // The first attempt failed (ok:false), so it never recorded a close-gate
     // resolution — the same session's ORIGINAL close signal is still open and
     // reusable for the retry below, exactly like retrying any other parked stage.
-    const payloadWithEscape = t4Payload(dir, today, onlyTrackA, 'deliberate consolidation');
-    payloadWithEscape.projectHot.restructure = true;
-    const { r: r2, out: out2 } = t4Apply(dir, payloadWithEscape, 's-loss');
+    // This retry used to be the escape hatch: setting `restructure: true` on the
+    // field let the same dropping payload write straight through. ISSUE-149
+    // closed that, because the party setting the flag is the model composing
+    // the payload, which is the same party the guard exists to check. So the
+    // assertions below are deliberately the opposite of what they used to be:
+    // the retry parks too, and the flag changes only which reason is recorded.
+    const payloadWithClaim = t4Payload(dir, today, onlyTrackA, 'deliberate consolidation');
+    payloadWithClaim.projectHot.restructure = true;
+    const { r: r2, out: out2 } = t4Apply(dir, payloadWithClaim, 's-loss');
 
-    assert.equal(r2.status, 0, `restructure:true must let the write through: ${r2.stderr}`);
-    assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), onlyTrackA);
-    assert.deepEqual(
-      out2.conflicts,
-      [],
-      'the escape hatch must not leave a phantom conflict behind',
+    assert.notEqual(r2.status, 0, `restructure:true must NOT let the write through: ${r2.stderr}`);
+    assert.equal(
+      readFileSync(t4ProjectHot(dir), 'utf-8'),
+      multiTrack,
+      'target must stay untouched: a flag the payload set is not human approval',
     );
-    // The waiver must not vanish along with the conflict: the same party the
-    // guard exists to check (the model composing the payload) set the flag,
-    // so the result must say so rather than let it pass silently.
+    const c2 = out2.conflicts.find((x) => x.target === t4Rel);
+    assert.ok(c2, `must still be withheld as a conflict: ${JSON.stringify(out2.conflicts)}`);
+    assert.equal(c2.reason, 'section-loss-guard-restructure-pending');
+    assert.deepEqual(c2.lostSections, ['## Track B', '## Track C']);
+    // Same door as the first attempt: a park a human can review and approve.
+    assert.ok(
+      out2.proposals.find((pr) => pr.target === t4Rel),
+      'the withheld restructure must be parked as a reviewable proposal too',
+    );
+    // The claim must not vanish along with the write it no longer authorises.
+    // It is what tells the reviewing human the drop was deliberate rather than
+    // an omission, so it must survive into the result rather than pass silently.
     assert.deepEqual(
       out2.restructureWaivers,
       [{ target: t4Rel, lostSections: ['## Track B', '## Track C'] }],
-      `a real waiver must be reported verbatim: ${JSON.stringify(out2.restructureWaivers)}`,
+      `a real claim must be reported verbatim: ${JSON.stringify(out2.restructureWaivers)}`,
     );
   });
 });
@@ -4784,4 +4811,603 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
       `${name} must not spawn the session-close apply CLI`,
     );
   }
+});
+
+// ── close handoff receipt: resolve credits the ORIGINATING close, not the
+// approving session ──────────────────────────────────────────────────────
+//
+// A real park (not a synthetic journal) starts every test here: a section-loss
+// trip is what turns EVERY close that retires two or more `##` sections into
+// this path now that `restructure: true` no longer self-approves (it used to
+// be reachable only from a base conflict). Session X parks it, session Y (a
+// later, unrelated session) challenges and resolves it, and X's own reclose
+// must be able to finish without ever re-running as Y.
+suite('close handoff receipt — resolve credits the ORIGINATING close');
+
+// Builds a wiki whose project hot.md carries 3 `## Track` sections (needed to
+// trip the section-loss guard for real) and returns the payload pieces every
+// test in this suite shares.
+function mutateThreeTrackHot(dir, today) {
+  writeFileSync(
+    join(dir, 'projects', 'test-project', 'hot.md'),
+    `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n` +
+      `# Hot\n\n## Track A\n\nnote A\n\n## Track B\n\nnote B\n\n## Track C\n\nnote C\n`,
+  );
+}
+
+function parkingPayload(dir, today, { sibling = true } = {}) {
+  const sessionStatePath = join(dir, 'projects', 'test-project', 'session-state.md');
+  const payload = payloadForCleanWiki(dir, today);
+  // Drops Track B and Track C: a real section-loss trip, marked deliberate —
+  // exactly the shape that now reaches this path from ANY close, not just a
+  // base conflict.
+  payload.projectHot = {
+    content:
+      `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n` +
+      `# Hot\n\n## Track A\n\nnote A (updated)\n`,
+    restructure: true,
+  };
+  if (sibling) {
+    // A field this SAME close writes directly (no conflict): the bug's other
+    // half — a normal direct write left dirty by a partially-parked close.
+    payload.sessionState = {
+      content: `${readFileSync(sessionStatePath, 'utf-8')}- handoff sibling\n`,
+    };
+  }
+  return payload;
+}
+
+// Every direct write a first (parked) close attempt leaves uncommitted,
+// beyond the parked target itself — observed from a real run, not assumed:
+// the project index gets auto-created on a project's first close, and the two
+// append fields always write a fresh entry. All four must land in the SAME
+// commit as the handed-off park once X's reclose finishes.
+function siblingRelPaths(today) {
+  return [
+    join('projects', 'test-project', 'session-state.md'),
+    join('projects', 'test-project', 'index.md'),
+    join('projects', 'test-project', 'session-log', `${today}.md`),
+    'log.md',
+  ];
+}
+
+test("handoff receipt: Y resolves the park X parked; X's reclose commits it and its direct siblings, only X gets the marker", () => {
+  withWiki(mutateThreeTrackHot, (dir, today) => {
+    const sidX = 's-handoff-x';
+    // Known, matching base for every overwrite target: without this the guard
+    // sees "base unknown" and parks on THAT before section-loss is ever
+    // reached (T6's own park test relies on the opposite — no snapshot — to
+    // hit the base-conflict branch instead).
+    snapshotBase(dir, sidX, overwriteTargets('test-project'));
+
+    const projHotPath = join(dir, 'projects', 'test-project', 'hot.md');
+    const sessionStatePath = join(dir, 'projects', 'test-project', 'session-state.md');
+    const originalProjHot = readFileSync(projHotPath, 'utf-8');
+    const payload = parkingPayload(dir, today);
+
+    const r1 = runApply(dir, payload, { sessionId: sidX });
+    assert.notEqual(r1.status, 0, `first close must park: ${r1.stdout}\n${r1.stderr}`);
+    const out1 = JSON.parse(r1.stdout);
+    assert.equal(out1.ok, false);
+    assert.equal(out1.stage, 'proposal-pending');
+    assert.equal(out1.partialConflict, true, `partialConflict expected: ${r1.stdout}`);
+    assert.equal(out1.proposals.length, 1, `exactly one park: ${JSON.stringify(out1.proposals)}`);
+    const proposalId = out1.proposals[0].id;
+    assert.equal(out1.proposals[0].target, join('projects', 'test-project', 'hot.md'));
+    assert.ok(
+      readFileSync(sessionStatePath, 'utf-8').includes('handoff sibling'),
+      'the non-conflicting sibling field was written directly, uncommitted',
+    );
+    assert.equal(
+      readFileSync(projHotPath, 'utf-8'),
+      originalProjHot,
+      'the parked target stays unclobbered on disk',
+    );
+
+    // Session Y — a later, unrelated session — does the challenge and the
+    // approval, naming X as the close this approval resumes.
+    const sidY = 's-handoff-y';
+    const ch = challengeProposals(
+      { hypoDir: dir, sessionId: sidY, ids: [proposalId], closeSessionId: sidX },
+      { stdout: capStream(), stderr: capStream(), now: () => '2026-09-01T00:00:00.000Z' },
+    );
+    assert.equal(ch.ok, true, `challenge should mint: ${JSON.stringify(ch)}`);
+    assert.equal(ch.closeSessionId, sidX);
+
+    // The negative half, in the same fixture so it runs against a REAL park
+    // rather than a hand-built artifact: --close-session-id names which close a
+    // receipt will credit, so a caller must not be able to point it at a close
+    // that never parked this. Without the owner check it is just a label, and
+    // the approved bytes get committed as some other close's work.
+    //
+    // Disabling the check: drop the `resumesClose !== ownerForCompare` branch in
+    // challengeProposals. This assertion goes red while the mint above stays
+    // green, which is the pair that makes it mean something.
+    const wrong = challengeProposals(
+      { hypoDir: dir, sessionId: sidY, ids: [proposalId], closeSessionId: 's-not-the-owner' },
+      { stdout: capStream(), stderr: capStream(), now: () => '2026-09-01T00:00:00.000Z' },
+    );
+    assert.equal(
+      wrong.ok,
+      false,
+      `a close that never parked this must be refused: ${JSON.stringify(wrong)}`,
+    );
+    assert.equal(wrong.reason, 'close-session-not-owner');
+
+    const yTranscript = join(
+      tmpdir(),
+      `hypo-t-${sidY}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.jsonl`,
+    );
+    writeFileSync(
+      yTranscript,
+      `${JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: `apply-proposals ${ch.nonce}` }] },
+      })}\n`,
+    );
+    const rResolve = resolveProposals(
+      { hypoDir: dir, sessionId: sidY },
+      { transcriptPath: yTranscript, stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(rResolve.ok, true, `resolve should apply: ${JSON.stringify(rResolve)}`);
+    assert.equal(
+      readFileSync(projHotPath, 'utf-8'),
+      payload.projectHot.content,
+      'the approved bytes landed on the page',
+    );
+    assert.equal(psReadProposal(dir, proposalId), null, 'the artifact is consumed');
+
+    // The receipt lands in X's journal, never Y's.
+    const journalX = readJournal(dir, sidX);
+    assert.equal(
+      journalX[join('projects', 'test-project', 'hot.md')],
+      bsHashContent(payload.projectHot.content),
+      "X's journal carries the handoff receipt for the resolved target",
+    );
+    assert.equal(
+      existsSync(closeJournalPath(dir, sidY)),
+      false,
+      "Y's own journal gets no entry out of resolving someone else's close",
+    );
+
+    // X re-runs the SAME close. The handed-off park AND every direct sibling
+    // from the first attempt must now be in the commit, and only X gets the
+    // marker.
+    const before = gitHead(dir);
+    const r2 = runApply(dir, payload, { sessionId: sidX });
+    assert.equal(r2.status, 0, `reclose should finish: ${r2.stdout}\n${r2.stderr}`);
+    const out2 = JSON.parse(r2.stdout);
+    assert.equal(out2.ok, true);
+    assert.equal(out2.committed, true);
+    assert.equal(out2.markerWritten, true, `marker must land: ${r2.stdout}`);
+
+    const after = gitHead(dir);
+    assert.notEqual(after, before, 'the reclose must produce a real commit');
+    const changed = spawnSync('git', ['diff', '--name-only', before, after], {
+      cwd: dir,
+      encoding: 'utf-8',
+    })
+      .stdout.trim()
+      .split('\n')
+      .filter(Boolean)
+      .sort();
+    const expected = [join('projects', 'test-project', 'hot.md'), ...siblingRelPaths(today)].sort();
+    assert.deepEqual(
+      changed,
+      expected,
+      `the commit must stage exactly the handed-off park plus its direct siblings, nothing else: ${changed}`,
+    );
+    assert.equal(
+      spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf-8' }).stdout.trim(),
+      '',
+      'the working tree is fully clean after the reclose',
+    );
+
+    assert.ok(
+      existsSync(join(dir, '.cache', `session-closed-${sidX}.marker`)),
+      "X's marker was written",
+    );
+    assert.equal(
+      existsSync(join(dir, '.cache', `session-closed-${sidY}.marker`)),
+      false,
+      'Y never gets a marker for a close it never ran',
+    );
+  });
+});
+
+// negative: a human hand-edit AFTER the approved write lands means the
+// journal receipt no longer describes what is on disk. The reclose must not
+// silently stage bytes nobody reviewed.
+test('handoff receipt: a hand-edit after resolve is not stage-able by hash, and stays dirty', () => {
+  withWiki(mutateThreeTrackHot, (dir, today) => {
+    const sidX = 's-handoff-edit-x';
+    snapshotBase(dir, sidX, overwriteTargets('test-project'));
+    const projHotPath = join(dir, 'projects', 'test-project', 'hot.md');
+    const payload = parkingPayload(dir, today, { sibling: false });
+
+    const r1 = runApply(dir, payload, { sessionId: sidX });
+    assert.notEqual(r1.status, 0);
+    const proposalId = JSON.parse(r1.stdout).proposals[0].id;
+
+    const sidY = 's-handoff-edit-y';
+    const ch = challengeProposals(
+      { hypoDir: dir, sessionId: sidY, ids: [proposalId], closeSessionId: sidX },
+      { stdout: capStream(), stderr: capStream(), now: () => '2026-09-01T00:00:00.000Z' },
+    );
+    const yTranscript = join(
+      tmpdir(),
+      `hypo-t-${sidY}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.jsonl`,
+    );
+    writeFileSync(
+      yTranscript,
+      `${JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: `apply-proposals ${ch.nonce}` }] },
+      })}\n`,
+    );
+    const rResolve = resolveProposals(
+      { hypoDir: dir, sessionId: sidY },
+      { transcriptPath: yTranscript, stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(rResolve.ok, true);
+
+    // A human hand-edits the page AFTER the approved bytes landed.
+    writeFileSync(projHotPath, 'HUMAN HAND EDIT, never reviewed by anyone\n');
+
+    const r2 = runApply(dir, payload, { sessionId: sidX });
+    assert.notEqual(r2.status, 0, `a hand-edit must not silently commit: ${r2.stdout}`);
+    const out2 = JSON.parse(r2.stdout);
+    assert.equal(out2.ok, false);
+    assert.equal(out2.stage, 'proposal-pending', `expected a fresh park, got: ${r2.stdout}`);
+    assert.equal(
+      readFileSync(projHotPath, 'utf-8'),
+      'HUMAN HAND EDIT, never reviewed by anyone\n',
+      'the hand-edited bytes are preserved, not clobbered by the payload',
+    );
+    assert.equal(
+      spawnSync(
+        'git',
+        ['status', '--porcelain', '--', join('projects', 'test-project', 'hot.md')],
+        {
+          cwd: dir,
+          encoding: 'utf-8',
+        },
+      ).stdout.trim(),
+      'M ' + join('projects', 'test-project', 'hot.md'),
+      'the hand-edited page stays dirty; the reclose never staged it',
+    );
+  });
+});
+
+// failure path: the receipt write itself fails. The audit entry and the
+// artifact must both survive so `proposal reconcile` can recover later,
+// without a page ever being re-written or re-reviewed.
+test('handoff receipt failure: resolve refuses close-receipt-failed and keeps the artifact + audit; reconcile recovers it', () => {
+  withWiki(mutateThreeTrackHot, (dir, today) => {
+    const sidX = 's-handoff-fail-x';
+    snapshotBase(dir, sidX, overwriteTargets('test-project'));
+    const projHotPath = join(dir, 'projects', 'test-project', 'hot.md');
+    const payload = parkingPayload(dir, today, { sibling: false });
+
+    const r1 = runApply(dir, payload, { sessionId: sidX });
+    assert.notEqual(r1.status, 0);
+    const proposalId = JSON.parse(r1.stdout).proposals[0].id;
+
+    const sidY = 's-handoff-fail-y';
+    const ch = challengeProposals(
+      { hypoDir: dir, sessionId: sidY, ids: [proposalId], closeSessionId: sidX },
+      { stdout: capStream(), stderr: capStream(), now: () => '2026-09-01T00:00:00.000Z' },
+    );
+    const yTranscript = join(
+      tmpdir(),
+      `hypo-t-${sidY}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.jsonl`,
+    );
+    writeFileSync(
+      yTranscript,
+      `${JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: `apply-proposals ${ch.nonce}` }] },
+      })}\n`,
+    );
+
+    // Block .cache/close-journal so the receipt write fails: a read-only
+    // directory (same trick ISSUE-49 uses on the challenges dir), not a
+    // wipe — X's OTHER journal entries (its own direct appends from r1)
+    // already live there and must survive this failure untouched.
+    const journalDir = join(dir, '.cache', 'close-journal');
+    chmodSync(journalDir, 0o500);
+    let rResolve;
+    try {
+      rResolve = resolveProposals(
+        { hypoDir: dir, sessionId: sidY },
+        { transcriptPath: yTranscript, stdout: capStream(), stderr: capStream() },
+      );
+    } finally {
+      chmodSync(journalDir, 0o700);
+    }
+    assert.equal(
+      rResolve.ok,
+      false,
+      `receipt failure must not report success: ${JSON.stringify(rResolve)}`,
+    );
+    assert.equal(
+      readFileSync(projHotPath, 'utf-8'),
+      payload.projectHot.content,
+      'the approved bytes still landed on the page — this is a bookkeeping failure, not a write failure',
+    );
+    assert.ok(
+      psReadProposal(dir, proposalId),
+      'the artifact survives a receipt failure, not deleted',
+    );
+    const logLines = readFileSync(join(psProposalsDir(dir), 'applied.log'), 'utf-8')
+      .trim()
+      .split('\n');
+    const auditEntry = JSON.parse(logLines[logLines.length - 1]);
+    assert.equal(auditEntry.id, proposalId, 'the audit entry for this write survives too');
+    assert.equal(auditEntry.closeSessionId, sidX);
+    assert.equal(auditEntry.appliedHash, bsHashContent(payload.projectHot.content));
+
+    // Already unblocked above; recover the receipt without touching the page at all.
+    const beforeReconcile = readFileSync(projHotPath, 'utf-8');
+    const rec = reconcileProposals({ hypoDir: dir }, { stdout: capStream(), stderr: capStream() });
+    assert.equal(rec.ok, true, `reconcile should recover: ${JSON.stringify(rec)}`);
+    assert.equal(rec.reconciled.length, 1);
+    assert.equal(rec.reconciled[0].id, proposalId);
+    assert.equal(rec.reconciled[0].closeSessionId, sidX);
+    assert.equal(
+      readFileSync(projHotPath, 'utf-8'),
+      beforeReconcile,
+      'reconcile never rewrites the page',
+    );
+    assert.equal(
+      psReadProposal(dir, proposalId),
+      null,
+      'reconcile removes the now-redundant artifact',
+    );
+    assert.equal(
+      readJournal(dir, sidX)[join('projects', 'test-project', 'hot.md')],
+      bsHashContent(payload.projectHot.content),
+      "X's journal now carries the recovered receipt",
+    );
+
+    // X's reclose finishes without ever re-running as Y.
+    const r2 = runApply(dir, payload, { sessionId: sidX });
+    assert.equal(r2.status, 0, `reclose should finish after reconcile: ${r2.stdout}\n${r2.stderr}`);
+    const out2 = JSON.parse(r2.stdout);
+    assert.equal(out2.ok, true);
+    assert.equal(out2.committed, true);
+    assert.equal(out2.markerWritten, true);
+  });
+});
+
+suite('close-journal: a session id becomes a filename, so it is checked at the sink');
+
+// The session id is interpolated straight into a path. Every CLI entry point
+// validated it, and the hole opened anyway the moment reconcile fed the same
+// function an id read back out of `.cache/proposals/applied.log` instead of
+// typed by a person. Two independent reviewers reproduced it on the same run.
+//
+// Guarding the callers is what produced the gap, so the guard lives in
+// closeJournalPath itself and every consumer here goes through it.
+//
+// Disabling the check: drop the `isValidSessionId` line from closeJournalPath
+// in hooks/close-journal.mjs. Every test below goes red.
+const TRAVERSING_IDS = [
+  '../../../../../Users/nobody/.claude/settings',
+  '../../escape',
+  'a/b',
+  'has space',
+  'dot.in.id',
+  '',
+];
+
+test('closeJournalPath refuses an id that would leave the journal directory', () => {
+  const vault = '/tmp/does-not-need-to-exist';
+  // The control: a real id still resolves, so the assertions below are not
+  // passing because the function refuses everything.
+  assert.equal(
+    closeJournalPath(vault, 'sess-abc_123'),
+    join(vault, '.cache', 'close-journal', 'sess-abc_123.json'),
+    'a well-formed id must still produce its path',
+  );
+  for (const id of TRAVERSING_IDS) {
+    assert.equal(closeJournalPath(vault, id), null, `must refuse ${JSON.stringify(id)}`);
+  }
+});
+
+test('recordHandoffReceipt reports the refusal instead of writing somewhere else', () => {
+  withTmpDir((dir) => {
+    // The exact shape reconcile would hand it from a tampered audit entry: the
+    // path resolves cleanly OUTSIDE the vault, onto a real file.
+    const victim = join(dir, 'victim.json');
+    writeFileSync(victim, '{"keep":"me"}');
+    const escape = `../${basename(dir)}/victim`;
+    const vault = join(dir, 'vault');
+
+    const r = recordHandoffReceipt(vault, escape, 'projects/p/hot.md', 'deadbeef');
+    assert.equal(r.ok, false, `must refuse: ${JSON.stringify(r)}`);
+    assert.match(r.error, /not a usable session id/, `must say why: ${r.error}`);
+    assert.equal(
+      readFileSync(victim, 'utf-8'),
+      '{"keep":"me"}',
+      'the file the traversal pointed at must be untouched',
+    );
+  });
+});
+
+test('the quiet journal writers decline a traversing id rather than following it', () => {
+  withTmpDir((dir) => {
+    const victim = join(dir, 'victim.json');
+    writeFileSync(victim, 'original');
+    const escape = `../${basename(dir)}/victim`;
+    const vault = join(dir, 'vault');
+
+    // recordJournalEntry and clearJournal are best-effort by contract, so they
+    // decline silently. Silently must still mean "did not follow it": the
+    // destructive half of this hole is the rmSync, not only the write.
+    recordJournalEntry(vault, escape, 'projects/p/hot.md', 'deadbeef');
+    assert.equal(readFileSync(victim, 'utf-8'), 'original', 'record must not write through');
+
+    clearJournal(vault, escape);
+    assert.equal(existsSync(victim), true, 'clear must not delete through');
+
+    assert.deepEqual(readJournal(vault, escape), {}, 'read must report nothing, not throw');
+  });
+});
+
+suite('close-journal: concurrent receipts do not overwrite each other');
+
+// recordHandoffReceipt used to be a lock-free read-modify-write. Two resolves
+// handing off to the same close each read the same `paths`, and the second
+// saved a copy that never had the first one's entry. Both returned ok:true. The
+// artifact is deleted the moment a receipt reports ok, and reconcile only ever
+// considers artifacts, so the lost receipt had no way back.
+//
+// This has to cross a process boundary: inside one process the read and the
+// write never interleave, so a single-process version passes with no lock at
+// all and pins nothing.
+//
+// Disabling the check: drop the withFileLock wrapper in recordHandoffReceipt.
+// This test then fails with one of the two targets missing.
+await testAsync('two processes writing receipts for one close keep both entries', async () => {
+  // withTmpDir's callback is synchronous, so awaiting inside it would let the
+  // finally clean up while the children are still writing. Scoped by hand here.
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-journal-race-'));
+  try {
+    const sid = 'race-sess';
+    const writer = join(dir, 'writer.mjs');
+    writeFileSync(
+      writer,
+      `import { recordHandoffReceipt } from ${JSON.stringify(join(HOOKS, 'close-journal.mjs'))};\n` +
+        `const [dir, sid, target] = process.argv.slice(2);\n` +
+        // Each writer OWNS one key and also re-reads the other's. Two writers
+        // adding two DIFFERENT keys is not enough: with enough rounds the last
+        // save almost always happens to carry both, so that version of this
+        // test passes with the lock removed and pins nothing (measured, three
+        // runs). What a lost update actually looks like is a writer saving a
+        // snapshot taken before the other's entry existed, so each process
+        // writes its own key many times and the assertion is that BOTH keys
+        // survive the final save.
+        `for (let i = 0; i < 300; i++) {\n` +
+        `  const r = recordHandoffReceipt(dir, sid, target + '/' + i, 'h' + i);\n` +
+        `  if (!r.ok) { console.error(r.error); process.exit(1); }\n` +
+        `}\n`,
+    );
+
+    const run = (target) =>
+      new Promise((resolve) => {
+        const c = spawn(process.execPath, [writer, dir, sid, target], {
+          stdio: 'inherit',
+          env: { ...process.env, HOME: SESSION_TMP_HOME },
+        });
+        c.on('exit', (code) => resolve(code));
+      });
+
+    const codes = await Promise.all([run('projects/a/hot.md'), run('projects/b/hot.md')]);
+    assert.deepEqual(codes, [0, 0], 'both writers must report success');
+
+    // 300 keys per writer, 600 total. A single lost update drops a whole
+    // snapshot's worth, so the count is the signal rather than any one key.
+    const journal = readJournal(dir, sid);
+    const a = Object.keys(journal).filter((k) => k.startsWith('projects/a/')).length;
+    const b = Object.keys(journal).filter((k) => k.startsWith('projects/b/')).length;
+    assert.equal(a, 300, `every receipt from writer A must survive, got ${a}`);
+    assert.equal(b, 300, `every receipt from writer B must survive, got ${b}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+suite('classifyProposals: three states that look identical from outside');
+
+// A `close-receipt-failed` artifact and an ordinary pending one are the same
+// shape on disk. doctor counted artifacts, so it told the user to review a
+// write a human had already approved and that was already on the page, and the
+// step that actually settles it (`proposal reconcile`) was never mentioned.
+//
+// Both doctor and reconcile now read this one judgment. Deriving it twice is
+// how they would drift, which is the failure this suite exists to stop.
+//
+// Disabling the check: make classifyProposals return `kind: 'pending'` for
+// every artifact. The recoverable and evidence-broken cases below go red while
+// the pending one stays green, which is the trio that makes it discriminate.
+test('an artifact with no audit entry is pending, not recoverable', () => {
+  withBaseWiki((dir) => {
+    psWriteProposal(dir, {
+      target: 'projects/p1/hot.md',
+      proposedContent: 'new',
+      baseHash: 'b',
+      currentHash: 'c',
+      sessionId: 's-owner',
+      parkReason: 'test',
+    });
+    const got = classifyProposals(dir);
+    assert.equal(got.length, 1, `one artifact: ${JSON.stringify(got)}`);
+    assert.equal(got[0].kind, 'pending');
+  });
+});
+
+test('an approved write whose receipt never landed is recoverable, and names the close', () => {
+  withBaseWiki((dir) => {
+    const target = 'projects/p1/hot.md';
+    const full = join(dir, target);
+    mkdirSync(dirname(full), { recursive: true });
+    // The page already carries the approved bytes: that is what makes this
+    // different from a pending proposal, and it is the only thing that does.
+    const applied = 'approved bytes\n';
+    writeFileSync(full, applied);
+    const w = psWriteProposal(dir, {
+      target,
+      proposedContent: applied,
+      baseHash: 'b',
+      currentHash: 'c',
+      sessionId: 's-owner',
+      parkReason: 'test',
+    });
+    appendFileSync(
+      join(dir, '.cache', 'proposals', 'applied.log'),
+      JSON.stringify({
+        id: w.id,
+        target,
+        appliedHash: bsHashContent(applied),
+        closeSessionId: 's-owner',
+      }) + '\n',
+    );
+
+    const got = classifyProposals(dir);
+    assert.equal(got.length, 1, `one artifact: ${JSON.stringify(got)}`);
+    assert.equal(got[0].kind, 'recoverable');
+    assert.equal(got[0].closeSessionId, 's-owner', 'must name the close the receipt belongs to');
+  });
+});
+
+test('an audit entry the page no longer matches is evidence-broken, not recoverable', () => {
+  withBaseWiki((dir) => {
+    const target = 'projects/p1/hot.md';
+    const full = join(dir, target);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, 'someone edited this afterwards\n');
+    const w = psWriteProposal(dir, {
+      target,
+      proposedContent: 'approved bytes\n',
+      baseHash: 'b',
+      currentHash: 'c',
+      sessionId: 's-owner',
+      parkReason: 'test',
+    });
+    appendFileSync(
+      join(dir, '.cache', 'proposals', 'applied.log'),
+      JSON.stringify({
+        id: w.id,
+        target,
+        appliedHash: bsHashContent('approved bytes\n'),
+        closeSessionId: 's-owner',
+      }) + '\n',
+    );
+
+    const got = classifyProposals(dir);
+    assert.equal(got.length, 1, `one artifact: ${JSON.stringify(got)}`);
+    assert.equal(got[0].kind, 'evidence-broken');
+    assert.equal(got[0].reason, 'evidence-mismatch');
+  });
 });
