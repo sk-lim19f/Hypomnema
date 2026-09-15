@@ -51,6 +51,7 @@ Then show the summary line: `Result: N passed, N warnings, N failed`
 For any `✗` failures:
 - Missing Hypomnema root or required directories/files → run `/hypo:init`.
 - 0 hook files installed → run `/hypo:init`.
+- Partial hook files on an npm or manual install (some missing) → run `/hypo:init`; it copies the missing ones. The detail names up to three of them, so report those names rather than only the count.
 - 0 hook registrations in settings.json → run `/hypo:init`.
 - `Hook execution smoke test` failed → show the stderr excerpt in the detail
   verbatim; it names the cause. The repair depends on the channel, and
@@ -65,7 +66,8 @@ For any `✗` failures:
 For `⚠` warnings:
 - Missing `hypo-config.md` → run `/hypo:init` — it creates the config marker.
 - Missing baseline files (`index.md`, `hot.md`, etc.) → run `/hypo:init`.
-- Partial hook files (some missing) → run `/hypo:init` to install missing hooks.
+- Partial hook files on a plugin install (some missing, and `Hook files installed` says the plugin loader supplies them) → leftovers from an earlier non-plugin install. **Read `settings.json hook registrations` before calling it harmless.** Stale files alone do nothing, because the loader is what runs the hooks; stale files plus surviving settings.json entries mean every hook named there fires twice. That check reports the duplicate case on its own, so go by what it says. This one stays a `⚠` on purpose: nothing the user can run copies hooks on that channel, so failing over it would be a red they cannot clear.
+- Hypomnema hooks registered in settings.json while the plugin loader is active → a double registration, not a partial one. Each named hook runs twice per event. Report it and give the user the removal step the detail names; do NOT tell them to run `/hypo:init`, which skips settings.json entirely on this channel.
 - Partial settings.json registrations → run `/hypo:init` to merge missing entries.
 - Missing git remote → `git -C <hypo-dir> remote add origin <url>`.
 - `Installed cache vs marketplace HEAD` says the install is behind → the plugin
