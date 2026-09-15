@@ -1,20 +1,11 @@
-import {
-  existsSync,
-  statSync,
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
-  renameSync,
-  openSync,
-  writeSync,
-  closeSync,
-} from 'fs';
+import { existsSync, statSync, readFileSync, mkdirSync, openSync, writeSync, closeSync } from 'fs';
 import { join, dirname } from 'path';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { expandHome } from './hypo-root.mjs';
 import { isValidProjectName, substituteTokens, TEMPLATE_DIR } from './project-create.mjs';
 import { appendPendingTags, checkForbidden } from './schema-vocab.mjs';
+import { atomicWrite } from '../../hooks/atomic-write.mjs';
 import {
   sessionCloseFileStatus,
   sessionCloseGlobalStatus,
@@ -132,28 +123,12 @@ function readPayload(source) {
 // spinning the full 5s. Not a documented production knob.
 const APPEND_LOCK_TIMEOUT_MS = Number(process.env.HYPO_APPEND_LOCK_TIMEOUT_MS) || 5000;
 
-/** Atomic write via tmp+rename. `<path>.<pid>.<rand>.tmp` so concurrent helpers
- * don't fight over the same shared `<path>.tmp` slot. */
-function atomicWrite(path, content) {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
-  writeFileSync(tmp, content);
-  try {
-    renameSync(tmp, path);
-  } catch (err) {
-    // The rename is what makes this atomic, so a failure here leaves the
-    // target untouched, which is the point. What it also leaves is the tmp
-    // file, and nothing else ever looks at that name again: the suffix
-    // carries this pid and a fresh random, so the next run picks a
-    // different one and this one sits in the vault forever, close after
-    // close. Take it back out before rethrowing, and do not let the
-    // cleanup hide the real error.
-    try {
-      rmSync(tmp, { force: true });
-    } catch {}
-    throw err;
-  }
-}
+// atomicWrite is now the shared hooks/atomic-write.mjs implementation
+// (imported above). Six byte-identical copies of this function used to live
+// in hooks/ and scripts/lib/, and a fix landed in only two of them (#296).
+// this file was one of the four that kept the bug (a rename failure leaked
+// its tmp file forever, because the cleanup called `rmSync` without ever
+// importing it). See hooks/atomic-write.mjs's own doc comment.
 
 /**
  * Read a target's current bytes, distinguishing "absent" from "unreadable" the
@@ -623,6 +598,30 @@ export function closeResultContradiction({ ok, markerWritten, markerSkipReason }
     return 'internal-contradiction:marker-written-with-skip-reason';
   }
   return null;
+}
+
+// A withheld marker with a legitimate reason is not, by itself, a
+// reason to fail the apply. Most of planMarkerDecision's skip branches
+// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved,
+// commit-failed) name a condition THIS SAME SESSION can clear and retry,
+// see the "a marker withheld by a real vault-commit failure leaves the close
+// signal unspent for a retry" test, whose whole point is that ok stays true
+// there and the close signal is not burned. Forcing ok:false on every one of
+// those would resurrect that exact regression's failure mode from the other
+// direction.
+//
+// 'marker-did-not-land' is not one of those. runMarkerPhase only reaches it
+// after `planMarkerDecision` has already returned `write: true`, meaning the
+// compact gate passed, a user close signal was present, and the commit
+// landed. Every precondition `--mark-session-closed` also requires before
+// writing the SAME marker was already satisfied here; the only thing that
+// then failed is the write itself (a `.cache` permission/disk issue), which
+// `--mark-session-closed` already treats as fatal (exit 1). Before this
+// check, `--apply-session-close` was the one entry point that swallowed that
+// exact failure as ok:true. The same failure landing on two different exit
+// codes depending on which command hit it.
+export function markerWriteGenuinelyFailed({ markerWritten, markerSkipReason }) {
+  return markerWritten !== true && markerSkipReason === 'marker-did-not-land';
 }
 
 // What the model should do when the close is refused. Deliberately does NOT name
@@ -1343,7 +1342,8 @@ export function sectionLossReason(diskContent, payloadContent) {
  *   1. idempotent skip (disk already equals the payload)
  *   2. conflict (base unknown, or disk drifted away from base)
  *   3. section-loss guard (payload drops most of disk's `## `
- *      sections, and this field did not opt out via `restructure: true`)
+ *      sections: parks either way; `restructure: true` only changes WHICH
+ *      park reason is recorded, it no longer lets the write through)
  *   4. direct write, then advance the base
  *
  * Step 1 must come first for two reasons. It keeps every existing
@@ -1438,43 +1438,49 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
     }
 
     // (3) Section-loss guard: this overwrite would drop most of disk's `## ` sections.
-    // Computed regardless of `restructure`, so a `true` value that waives a REAL
-    // loss can be told apart from one set on a field that never had a loss to
-    // waive. `field.restructure === true` is the escape hatch for a genuine
-    // rewrite (the crystallize skill sets it only when the user confirmed the
-    // sections are meant to go, per commands/crystallize.md) — it is per-FIELD,
-    // not per-close, so consolidating session-state.md on purpose does not also
-    // waive the check on hot.md in the same payload. Without it, this parks
-    // exactly like a base conflict: the SAME human recovery path already
-    // documented for base-mismatch (`hypomnema proposal challenge` /
-    // `proposal resolve`) is the way a genuinely intended restructure gets
-    // applied anyway, so this reuses that door rather than inventing a second
-    // judgment surface for "should this write go through".
+    // Computed regardless of `restructure`, so a `true` value set on a field that
+    // tripped a REAL loss can be told apart from one set on a field that never had
+    // a loss to waive.
+    //
+    // `field.restructure === true` used to be a full escape hatch: it let the
+    // write through immediately, with only `restructureWaivers` left behind as an
+    // after-the-fact audit trail. That made the flag self-approving:
+    // the party the guard exists to check (the model composing the payload) was
+    // also the only party who could clear it, with no human between the claim and
+    // the disk write. `restructure: true` no longer bypasses anything. It only
+    // picks WHICH park reason applies; either way the bytes are withheld and go
+    // through the SAME human-approval door a base conflict already uses
+    // (`hypomnema proposal challenge` / `proposal resolve`, a nonce a human types
+    // after reviewing the diff). A field that never had a loss to waive still adds
+    // no entry to `restructureWaivers`. The flag did nothing there, which is not
+    // this field's job to flag.
     if (typeof disk === 'string') {
       const loss = sectionLossReason(disk, field.content);
       if (loss) {
-        if (field.restructure !== true) {
-          conflicts.push({
-            key,
-            target: relPath,
-            reason: 'section-loss-guard',
-            lostSections: loss.lost,
-            diskSectionCount: loss.diskCount,
-            baseHash: args.sessionId
-              ? readBaseEntry(args.hypoDir, args.sessionId, relPath).hash
-              : null,
-            currentHash: hashContent(disk),
-            proposedContent: field.content,
-          });
-          return; // target bytes untouched
+        const restructureRequested = field.restructure === true;
+        conflicts.push({
+          key,
+          target: relPath,
+          reason: restructureRequested
+            ? 'section-loss-guard-restructure-pending'
+            : 'section-loss-guard',
+          lostSections: loss.lost,
+          diskSectionCount: loss.diskCount,
+          baseHash: args.sessionId
+            ? readBaseEntry(args.hypoDir, args.sessionId, relPath).hash
+            : null,
+          currentHash: hashContent(disk),
+          proposedContent: field.content,
+        });
+        if (restructureRequested) {
+          // The model's claim is still worth recording, just not as approval:
+          // it tells the human reviewing the parked proposal that the payload
+          // author believed this restructure was intentional, which is exactly
+          // the context `hypomnema proposal challenge` shows them before they
+          // type the nonce.
+          restructureWaivers.push({ target: relPath, lostSections: loss.lost });
         }
-        // The waiver is exercised by the party the guard exists to check (the
-        // model composing the payload), so it must leave a trace instead of
-        // vanishing the way an unconditional skip would. Reuses the result-field
-        // shape and "report verbatim" reporting contract the removed
-        // base-unknown touched-override notice used to carry (see git history
-        // and commands/crystallize.md's close-result reporting section).
-        restructureWaivers.push({ target: relPath, lostSections: loss.lost });
+        return; // target bytes untouched either way
       }
     }
 
@@ -1817,8 +1823,20 @@ const CONFLICT_WHY = {
     'the page changed since this session read it (nothing existed at base, another writer created it since)',
   'target-unreadable': () =>
     'the target could not be read just now; failing safe rather than assuming it is unchanged',
+  // This message used to end with "or set \"restructure\": true after confirming
+  // with the user that dropping them is intended". That instruction stopped
+  // being true the moment the flag stopped authorising the write, and a park
+  // message that hands back a step which no longer lands the bytes is worse
+  // than one that offers nothing. The two real ways out are below.
   'section-loss-guard': (c) =>
-    `this payload drops ${c.lostSections.length} of ${c.diskSectionCount} \`##\` section(s) already on disk (${c.lostSections.join(', ')}) — the page did not change, the payload did not carry those sections forward. Add the missing sections back into the payload, or set "restructure": true after confirming with the user that dropping them is intended`,
+    `this payload drops ${c.lostSections.length} of ${c.diskSectionCount} \`##\` section(s) already on disk (${c.lostSections.join(', ')}). The page did not change, and the payload did not carry those sections forward. Either add the missing sections back into the payload, or, if dropping them is intended, have a human approve the parked write with \`hypomnema proposal challenge\` / \`proposal resolve\`. Setting "restructure": true records that intent for the reviewer; it does not land the write`,
+  // `restructure: true` used to let this write straight through, a
+  // model-set boolean approving its own destructive overwrite, with no human in
+  // the loop. It still parks, exactly like the unset case above; the only
+  // difference is this message, which tells the reviewing human the payload
+  // author already claims the drop is intentional.
+  'section-loss-guard-restructure-pending': (c) =>
+    `this payload drops ${c.lostSections.length} of ${c.diskSectionCount} \`##\` section(s) already on disk (${c.lostSections.join(', ')}) and set "restructure": true. The payload's own claim is not authority to drop them. A human must review the diff and approve it with \`hypomnema proposal challenge\` / \`proposal resolve\` before this write lands`,
 };
 
 export function conflictWhy(c) {
@@ -1859,10 +1877,11 @@ function parkOverwriteConflicts(args, conflicts) {
         // it, the reviewer sees the raw `reason` code and nothing else (codex
         // 3rd-pass finding: the park-reason wording fix never reached this file).
         parkReason: conflictWhy(c),
-        // Section-loss detail: only meaningful for that one reason, so only
-        // sent for it — an absent field on every other conflict is the correct
+        // Section-loss detail: only meaningful for those two reasons, so only
+        // sent for them. An absent field on every other conflict is the correct
         // shape, not a gap.
-        ...(c.reason === 'section-loss-guard'
+        ...(c.reason === 'section-loss-guard' ||
+        c.reason === 'section-loss-guard-restructure-pending'
           ? { lostSections: c.lostSections, diskSectionCount: c.diskSectionCount }
           : {}),
       });
@@ -2317,9 +2336,12 @@ function buildCloseResult({
     // Always present (possibly empty), same visibility contract as `notices`/
     // `otherDebtCount` above — a caller should not have to guess whether the
     // key's absence means "none" or "this apply predates the field". One entry
-    // per overwrite field where `restructure: true` waived a REAL section-loss
-    // trip (a field that carried the flag but never had a loss to waive adds no
-    // entry here — the flag did nothing, which is not this field's job to flag).
+    // per overwrite field where `restructure: true` was claimed on a REAL
+    // section-loss trip (a field that carried the flag but never had a loss to
+    // waive adds no entry here). The claim no longer applies the write:
+    // the matching target is still in `conflicts` above, withheld
+    // pending human approval via `proposal challenge`/`proposal resolve`; this
+    // is only the audit trail of what the payload author asserted.
     restructureWaivers,
   };
 }
@@ -2345,12 +2367,14 @@ function printCloseReport({
   console.log(`Session-close apply (project: ${project}, date: ${date}):`);
   for (const a of applied) console.log(`  ✓ wrote ${a}`);
   for (const s of skipped) console.log(`  · skipped ${s} (already current)`);
-  // Surfaced unconditionally, success or failure. A waiver is not a normal
-  // write, and burying it behind `ok` would hide it on exactly the runs where
-  // a human is most likely to be reading closely.
+  // Surfaced unconditionally, success or failure. `restructure: true` no
+  // longer waives the guard: the target below is still WITHHELD
+  // and shows up in the conflicts loop right after this one. This line only
+  // flags that the payload author claimed the drop was intentional, so a human
+  // reviewing the parked proposal has that context before typing the nonce.
   for (const w of restructureWaivers) {
     console.log(
-      `  ⚠ restructure:true waived the section-loss guard for ${w.target} — dropped: ${w.lostSections.join(', ')}`,
+      `  ⚠ restructure:true claimed for ${w.target}, parked pending human approval. Dropped: ${w.lostSections.join(', ')}`,
     );
   }
   // Never let a withheld target read as a skip: `skipped` means "already current",
@@ -2388,16 +2412,35 @@ function printCloseReport({
   // written" line cannot fire on the contradiction-B path (a written marker that
   // also carried a skip reason) — there the invariant's own 🛑 line already
   // explains the failure, and this message would contradict markerWritten:true.
+  //
+  // Two shapes reach here now, and they need different words. A policy withhold
+  // still leaves ok:true and asks for the right --session-id. A marker write
+  // that genuinely failed flips ok to false, so claiming "(ok:true)" there
+  // would contradict the JSON this same run printed, and pointing at
+  // --session-id would send the user after a problem they do not have.
+  //
+  // Note this whole block only runs on the non-JSON path; the documented
+  // production call is --json, which prints nothing here.
   if (markerSkipReason && !markerWritten) {
+    const diskFailure = markerSkipReason === 'marker-did-not-land';
     process.stderr.write(
       `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
-        `    The 5 mandatory files were applied and verified (ok:true), but the\n` +
-        `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
-        `    closed: the Stop hook will re-prompt until the marker is present.\n` +
-        `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +
-        `    a background task or Agent UUID from a /tmp/... path).\n` +
-        `    Example: crystallize.mjs --apply-session-close --payload=<path>\n` +
-        `             --session-id=<main-conversation-id> --hypo-dir=<path>\n`,
+        (diskFailure
+          ? `    The 5 mandatory files were applied and committed, but writing the\n` +
+            `    per-session Stop-chain marker itself failed. This run reports\n` +
+            `    ok:false and exits 1. The session is NOT closed: the Stop hook\n` +
+            `    will re-prompt until the marker is present.\n` +
+            `    To fix: clear whatever blocks the marker path under .cache/\n` +
+            `    (permissions, a directory sitting where the marker file goes,\n` +
+            `    disk space), then re-run the same close. No fresh close phrase\n` +
+            `    is needed: a close signal is spent only once the marker lands.\n`
+          : `    The 5 mandatory files were applied and verified (ok:true), but the\n` +
+            `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
+            `    closed: the Stop hook will re-prompt until the marker is present.\n` +
+            `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +
+            `    a background task or Agent UUID from a /tmp/... path).\n` +
+            `    Example: crystallize.mjs --apply-session-close --payload=<path>\n` +
+            `             --session-id=<main-conversation-id> --hypo-dir=<path>\n`),
     );
   }
   if (!ok) {
@@ -2489,10 +2532,11 @@ export function applySessionClose(args) {
   // it. T6 turns these into `.cache/proposals/` artifacts; here they are already
   // enough to withhold the bytes and fail the close.
   const conflicts = [];
-  // Overwrite fields where `restructure: true` waived a REAL section-loss
-  // trip. Kept separate from `conflicts` (these are NOT withheld — bytes were
-  // written) and from `applied` (a plain display string there would drop the
-  // "this was a waiver, not an ordinary write" fact on the floor).
+  // Overwrite fields where `restructure: true` was claimed on a REAL
+  // section-loss trip (no longer a waiver, the matching target is
+  // STILL in `conflicts` above, withheld pending human approval). Kept
+  // separate so the audit trail of what the payload author asserted survives
+  // even though it decided nothing.
   const restructureWaivers = [];
   // One bag for the five accumulators, passed to every write phase below. They
   // push into it in call order; nothing is merged back afterwards, so the
@@ -2564,6 +2608,16 @@ export function applySessionClose(args) {
           `    cannot masquerade as a successful close. The applied payload files stand;\n` +
           `    re-running apply is idempotent once the pipeline is fixed.\n`,
       );
+    } else if (ok && markerWriteGenuinelyFailed({ markerWritten, markerSkipReason })) {
+      // Unlike the contradiction above this is not a pipeline bug.
+      // every precondition cleared and the marker write itself still failed, the
+      // one skip reason `--mark-session-closed` also treats as fatal. Unify the
+      // exit code so a caller reading only `$?` cannot see this as a closed
+      // session. The `⚠️ session-close marker NOT written` warning below still
+      // fires unconditionally and names the same reason; this only changes
+      // whether the process exits 0 or 1 over it.
+      ok = false;
+      stage = markerSkipReason;
     }
   }
   const result = buildCloseResult({
