@@ -18,7 +18,8 @@
  *     than overwrites so it never erases the hook's `notifiedFor` marks.
  */
 
-import { readFileSync, writeFileSync, renameSync, mkdirSync, realpathSync, existsSync } from 'fs';
+import { readFileSync, realpathSync, existsSync } from 'fs';
+import { atomicWrite } from './atomic-write.mjs';
 import { dirname, join, delimiter } from 'path';
 import { homedir } from 'os';
 
@@ -246,12 +247,13 @@ export function readCache(path) {
   }
 }
 
-/** Atomic write: tmp file in the same dir, then rename (last-writer-wins). */
+/** Atomic write: tmp file in the same dir, then rename (last-writer-wins).
+ * Delegates to the shared writer so a failure here cleans its temp file up.
+ * It did not before, and the callers below swallow errors, so every failure
+ * left a `<path>.<pid>.<rand>.tmp` nothing would ever pick up again. This is a
+ * per-session cache path, so those accumulated faster than anywhere else. */
 export function writeCacheAtomic(path, obj) {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-  writeFileSync(tmp, JSON.stringify(obj, null, 2));
-  renameSync(tmp, path);
+  atomicWrite(path, JSON.stringify(obj, null, 2));
 }
 
 /**

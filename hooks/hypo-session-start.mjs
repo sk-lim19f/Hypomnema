@@ -7,7 +7,8 @@
  *   MISS → inject global hot.md pointer only (no fan-out to all projects)
  */
 
-import { readFileSync, writeFileSync, existsSync, realpathSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs';
+import { atomicWrite } from './atomic-write.mjs';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -375,13 +376,12 @@ function selfHealPkgRoot(status) {
         // temp + rename in the SAME directory: a crash mid-write leaves only a
         // throwaway temp file behind, never a torn hypo-pkg.json that the next
         // session's every hook read of this file would then choke on.
-        const dir = dirname(HYPO_PKG_JSON_PATH);
-        const tmp = join(
-          dir,
-          `.hypo-pkg.json.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`,
-        );
-        writeFileSync(tmp, `${JSON.stringify(updated, null, 2)}\n`);
-        renameSync(tmp, HYPO_PKG_JSON_PATH);
+        // Shared writer rather than a local temp+rename: this one had no
+        // cleanup, so a failed rename left its temp behind for good. The temp
+        // name loses its leading dot in the trade, so a leaked one would now be
+        // visible in a directory the user reads; that is the point, since the
+        // shared writer is the one that does not leak.
+        atomicWrite(HYPO_PKG_JSON_PATH, `${JSON.stringify(updated, null, 2)}\n`);
         return { healed: true, oldVersion, newVersion };
       },
       { timeoutMs: 150, staleMs: 30_000, pollMs: 20 },

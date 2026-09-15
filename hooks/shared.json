@@ -1,4 +1,5 @@
 [
+  "atomic-write.mjs",
   "hypo-shared.mjs",
   "version-check.mjs",
   "version-check-fetch.mjs",

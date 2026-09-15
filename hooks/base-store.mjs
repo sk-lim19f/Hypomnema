@@ -31,17 +31,9 @@
 // caller treats as fail-safe (proposal), never as "no conflict".
 
 import { createHash } from 'node:crypto';
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  renameSync,
-  closeSync,
-  openSync,
-  writeSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, closeSync, openSync, writeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { atomicWrite } from './atomic-write.mjs';
 
 /** sha256 of a UTF-8 string, hex. */
 export function hashContent(content) {
@@ -66,14 +58,6 @@ export function hashFile(path) {
 /** `<hypoDir>/.cache/sessions/<sessionId>/base.json`. */
 export function basePath(hypoDir, sessionId) {
   return join(hypoDir, '.cache', 'sessions', String(sessionId), 'base.json');
-}
-
-/** Atomic overwrite via tmp+rename, mirroring crystallize's atomicWrite. */
-function atomicWrite(path, content) {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
-  writeFileSync(tmp, content);
-  renameSync(tmp, path);
 }
 
 /** Read and parse base.json. Returns null when absent, unreadable, or malformed. */

@@ -5,7 +5,17 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, suite } from './harness.mjs';
@@ -18,7 +28,9 @@ import {
   expandHome,
   resolveHypoRoot,
   resolveHypoRootInfo,
+  withTmpDir,
 } from './helpers.mjs';
+import { atomicWrite } from '../hooks/atomic-write.mjs';
 
 suite('expandHome()');
 
@@ -920,4 +932,97 @@ test('tier 2 still matches when only one project sits in the cwd chain', () => {
   ];
   // `api` is not a project basename, only `monorepo` matches → single, so it wins.
   assert.equal(pickProjectByCwd(pjs, '/Users/B/monorepo/api'), 'monorepo');
+});
+
+suite('atomicWrite() (the one shared writer, hooks/atomic-write.mjs)');
+
+test('a normal write lands the target and leaves no tmp file', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'nested', 'page.md');
+    atomicWrite(target, 'hello');
+    assert.equal(readFileSync(target, 'utf-8'), 'hello');
+    // No stray `.<pid>.<rand>.tmp` sibling in the directory that received it.
+    const leftovers = readdirSync(join(dir, 'nested')).filter((f) => f !== 'page.md');
+    assert.deepEqual(leftovers, []);
+  });
+});
+
+// The three tests around this one pin cleanup, not atomicity: a naive
+// `writeFileSync(target)` with no temp at all throws on a directory target and
+// creates nothing on an unwritable directory, so it passes them both. This one
+// is the discriminator. A read-only FILE inside a writable directory can be
+// replaced by a rename (rename needs write permission on the directory, not on
+// the file) and cannot be opened for writing directly. So this succeeds only if
+// the write really goes through a temp file and a rename.
+//
+// Disabling the check: replace the body of hooks/atomic-write.mjs's atomicWrite
+// with a direct `writeFileSync(path, content)`. This test goes red with EACCES
+// while the other three stay green, which is the whole point of adding it.
+test('a read-only target is still replaced, which only a temp+rename write can do', () => {
+  withTmpDir((dir) => {
+    const target = join(dir, 'locked.md');
+    writeFileSync(target, 'old');
+    chmodSync(target, 0o444);
+    try {
+      atomicWrite(target, 'new');
+      assert.equal(readFileSync(target, 'utf-8'), 'new');
+      const leftovers = readdirSync(dir).filter((f) => f !== 'locked.md');
+      assert.deepEqual(leftovers, [], `no tmp may survive a success: ${leftovers.join(', ')}`);
+    } finally {
+      chmodSync(target, 0o644);
+    }
+  });
+});
+
+test('a failed rename leaves no tmp file behind (ISSUE-150 regression)', () => {
+  // ISSUE-150: two of the five old per-file copies of this function only
+  // cleaned up the tmp on a RENAME failure; that half is not new, so this
+  // pins it against the shared function too. Force a rename failure without
+  // touching permissions: renameSync(file, existingDirectory) always fails
+  // with EISDIR, old being a file and new being a directory (POSIX rename(2)).
+  withTmpDir((dir) => {
+    const target = join(dir, 'blocked');
+    mkdirSync(target); // target already exists AS A DIRECTORY, not a file
+    assert.throws(() => atomicWrite(target, 'payload'));
+    // The tmp write succeeded (the directory that receives it is writable);
+    // only the rename failed. Nothing but the original directory may remain.
+    assert.deepEqual(readdirSync(dir), ['blocked']);
+    assert.equal(existsSync(target) && statSync(target).isDirectory(), true);
+  });
+});
+
+test('a write that cannot open its tmp file throws and creates nothing', () => {
+  // This is NOT the write-failure half of the tmp cleanup, and the name no
+  // longer claims to be. An EACCES on the directory fails inside
+  // writeFileSync's own open(), before any byte lands on disk, so no tmp
+  // entry exists for the catch to remove and the assertion below passes
+  // whether or not the catch runs at all. Measured: a reconstruction of the
+  // old no-catch copies passes it too.
+  //
+  // What it does pin is worth having on its own. atomicWrite refuses as a
+  // unit, leaving neither a tmp nor a half-made target, so it stays under a
+  // name that says that and not more.
+  //
+  // The cleanup after a write that already put bytes on disk (ENOSPC, EDQUOT)
+  // has no test. Neither Node v26 (argument validation runs before the file is
+  // opened) nor a `ulimit -f` cap (SIGXFSZ kills the process before any catch
+  // can run) gives a portable, in-process way to reach it, and a real
+  // out-of-space filesystem is not something this suite builds. The rename
+  // half above IS pinned, and that is the half both surviving copies already
+  // had; this one is the half the shared function added, still unproven.
+  //
+  // Technique (stripping write permission from a repo-external tmp dir, never
+  // the checkout) follows tests/feedback.test.mjs's `--ensure-container` test.
+  withTmpDir((dir) => {
+    const sub = join(dir, 'readonly');
+    mkdirSync(sub, { recursive: true });
+    const target = join(sub, 'page.md');
+    chmodSync(sub, 0o500); // r-x: mkdirSync's existence check still passes, writeFileSync cannot
+    try {
+      assert.throws(() => atomicWrite(target, 'payload'));
+      assert.deepEqual(readdirSync(sub), []); // no tmp, no target
+    } finally {
+      chmodSync(sub, 0o700); // restore so withTmpDir's cleanup can remove the tree
+    }
+  });
 });
