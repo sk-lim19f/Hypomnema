@@ -749,7 +749,21 @@ function parseArgs(argv) {
 function resolveHookFileSet(pkgRoot, hooksDir) {
   const inv = loadHookInventory(pkgRoot);
   if (inv.ok) {
-    const files = new Set([...Object.values(inv.hookMap).flat(), ...inv.shared]);
+    // Reverse of the install order, so removal mirrors it: entry hooks go
+    // first, the shared modules they import go last. An uninstall interrupted
+    // halfway then leaves entry hooks that are already gone rather than entry
+    // hooks still registered against modules that are, which is the shape that
+    // breaks the next session instead of merely being incomplete.
+    // A Set keeps insertion order, and removeHookFiles iterates it in that order.
+    //
+    // LEGACY_INSTALLED is not part of the install set and never should have
+    // been: init used to copy every `.mjs` in hooks/, which put
+    // hypo-pre-commit.mjs into installs that never invoke it (the vault's
+    // pre-commit wrapper runs the package-root copy). init no longer does that,
+    // so the only copies left are the ones already on disk, and this is the one
+    // command that can take them away.
+    const LEGACY_INSTALLED = ['hypo-pre-commit.mjs'];
+    const files = new Set([...[...inv.ordered].reverse(), ...LEGACY_INSTALLED]);
     return { files, source: 'package', warning: null };
   }
   const sidecar = readProvenanceSidecar(hooksDir);

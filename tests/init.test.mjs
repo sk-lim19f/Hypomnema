@@ -17,12 +17,14 @@ import {
   lstatSync,
   symlinkSync,
   cpSync,
+  readdirSync,
   realpathSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
+import { loadHookInventory } from '../scripts/lib/hook-inventory.mjs';
 import {
   hooksDirForInstall,
   SHELL_MARKER_START,
@@ -2661,3 +2663,78 @@ function countOccurrences(content, needle) {
   }
   return count;
 }
+
+suite('hook install order: one list, three consumers');
+
+// init, upgrade and uninstall each used to derive their own file set, and the
+// three were not even equal: init read the whole hooks/ directory, which
+// installed hypo-pre-commit.mjs into every install even though it is invoked
+// from the package root and upgrade, doctor and uninstall all skip it. So a
+// copy landed that nothing would ever refresh, report, or remove.
+//
+// These pin the property the fix depends on, which no byte comparison catches:
+// the same list, in the same order, reversed for removal.
+//
+// Disabling the check: point init.mjs's installHooks back at
+// readdirSync(HOOKS_SRC), or drop the `.reverse()` in uninstall.mjs's
+// resolveHookFileSet. One test below goes red for each.
+test('installOrder puts every shared module ahead of every entry hook', () => {
+  const inv = loadHookInventory(REPO);
+  assert.ok(inv.ok, `inventory must load: ${inv.error}`);
+  const shared = new Set(inv.shared);
+  const lastShared = Math.max(...inv.ordered.map((f, i) => (shared.has(f) ? i : -1)));
+  const firstEntry = inv.ordered.findIndex((f) => !shared.has(f));
+  assert.ok(lastShared >= 0 && firstEntry >= 0, 'both kinds must be present to compare');
+  assert.ok(
+    lastShared < firstEntry,
+    `shared modules must all precede entry hooks: ${inv.ordered.join(', ')}`,
+  );
+});
+
+test('installOrder carries exactly the listed files, and nothing else in hooks/', () => {
+  const inv = loadHookInventory(REPO);
+  assert.ok(inv.ok, `inventory must load: ${inv.error}`);
+  const onDisk = readdirSync(join(REPO, 'hooks')).filter((f) => f.endsWith('.mjs'));
+  const ordered = new Set(inv.ordered);
+
+  // The one file that is on disk but deliberately not installed. If this set
+  // ever grows, the growth is the finding: every other .mjs in hooks/ has to be
+  // reachable from hooks.json or hooks/shared.json or it never gets refreshed.
+  const NOT_INSTALLED = new Set(['hypo-pre-commit.mjs']);
+  for (const f of onDisk) {
+    if (NOT_INSTALLED.has(f)) {
+      assert.equal(ordered.has(f), false, `${f} must NOT be in the install order`);
+    } else {
+      assert.equal(ordered.has(f), true, `${f} is in hooks/ but not in the install order`);
+    }
+  }
+  assert.equal(ordered.size, onDisk.length - NOT_INSTALLED.size, 'no phantom entries');
+});
+
+test('init installs the ordered list itself, not a directory listing', () => {
+  const src = readFileSync(join(REPO, 'scripts', 'init.mjs'), 'utf-8');
+  const fn = src.slice(src.indexOf('function installHooks('));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.match(body, /inventory\.ordered/, 'installHooks must iterate the canonical order');
+  assert.doesNotMatch(
+    body,
+    /readdirSync\(HOOKS_SRC\)/,
+    'installHooks must not enumerate the hooks directory: that is what installed the unlisted worker',
+  );
+});
+
+test('uninstall removes in the reverse of the install order', () => {
+  const src = readFileSync(join(REPO, 'scripts', 'uninstall.mjs'), 'utf-8');
+  const fn = src.slice(src.indexOf('function resolveHookFileSet('));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.match(
+    body,
+    /\[\.\.\.inv\.ordered\]\.reverse\(\)/,
+    'the removal set must be the install order reversed, so an interrupted uninstall leaves entry hooks gone rather than orphaned',
+  );
+  assert.match(
+    body,
+    /hypo-pre-commit\.mjs/,
+    'uninstall must still take away the copy older versions of init left behind',
+  );
+});

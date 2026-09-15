@@ -146,5 +146,35 @@ export function loadHookInventory(pkgRoot) {
     }
   }
 
-  return { ok: true, hookMap, shared: cfg.shared };
+  return { ok: true, hookMap, shared: cfg.shared, ordered: installOrder(hookMap, cfg.shared) };
+}
+
+/**
+ * The order the hook files must be written to an install, and the reverse of
+ * the order they must be removed in.
+ *
+ * Shared modules first. An entry hook copied ahead of a module it imports is
+ * live against something that may not be there yet if the run is interrupted,
+ * and the session that would have run the repair is the one that then cannot
+ * start. The reverse order leaves the harmless state instead: an updated shared
+ * module under an entry hook that has not caught up.
+ *
+ * It lives here so init, upgrade and uninstall read one list rather than each
+ * deriving its own. They did derive their own, and the three sets were not even
+ * equal: init copied every `.mjs` in the directory, which pulled in
+ * `hypo-pre-commit.mjs` (invoked from the package root, never from the install)
+ * and left a copy in every install that upgrade would not refresh, doctor would
+ * not report, and uninstall would not remove.
+ *
+ * Alphabetical order puts today's shared modules first by luck; a shared module
+ * named later in the alphabet would take that away with nothing failing.
+ */
+export function installOrder(hookMap, shared) {
+  const sharedList = Array.isArray(shared) ? shared.filter((f) => typeof f === 'string') : [];
+  const sharedSet = new Set(sharedList);
+  const entries = [];
+  for (const file of Object.values(hookMap).flat()) {
+    if (!sharedSet.has(file) && !entries.includes(file)) entries.push(file);
+  }
+  return [...sharedList, ...entries];
 }

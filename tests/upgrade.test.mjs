@@ -757,6 +757,39 @@ function runUpgrade(upgrade, args, home) {
 // hook imports a module the check no longer looks for. Required, not
 // tolerated: a downstream fork with nothing shared still ships
 // hooks/shared.json as `[]`.
+// An entry hook copied ahead of a shared module it imports is live against a
+// module that may not exist yet if the run is interrupted; the next session
+// then dies on ERR_MODULE_NOT_FOUND, which is also the session the user would
+// have run the repair from. So the copy order has to put shared modules first,
+// and `applied.hooks` is that order as it actually happened.
+//
+// Alphabetical order puts today's shared modules first by luck. That is exactly
+// why this is pinned: a future shared module named later in the alphabet would
+// take the property away with nothing failing.
+//
+// Disabling the check: flip `[...SHARED_FILES, ...Object.values(HOOK_MAP).flat()]`
+// back to entry-hooks-first in scripts/upgrade.mjs's checkHookFiles.
+test('upgrade copies shared modules before the entry hooks that import them', () => {
+  withFakeUpgradeInstall(false, ({ upgrade, root, home, wiki }) => {
+    // Empty ~/.claude/hooks, so every file counts as missing and gets copied:
+    // `applied.hooks` then holds the whole set in copy order.
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const copied = out.applied?.hooks ?? [];
+    assert.ok(copied.length > 1, `expected a multi-file copy: ${JSON.stringify(out.applied)}`);
+
+    const shared = JSON.parse(readFileSync(join(root, 'hooks', 'shared.json'), 'utf-8'));
+    const lastShared = Math.max(...shared.map((f) => copied.indexOf(f)).filter((i) => i >= 0));
+    const firstEntry = copied.findIndex((f) => !shared.includes(f));
+    assert.ok(lastShared >= 0, `no shared module was copied at all: ${copied.join(', ')}`);
+    assert.ok(firstEntry >= 0, `no entry hook was copied at all: ${copied.join(', ')}`);
+    assert.ok(
+      lastShared < firstEntry,
+      `every shared module must precede every entry hook, got: ${copied.join(', ')}`,
+    );
+  });
+});
+
 test('missing hooks/shared.json → exit 1, not silently treated as empty', () => {
   withFakeUpgradeInstall(false, ({ upgrade, root, home, wiki }) => {
     rmSync(join(root, 'hooks', 'shared.json'));
