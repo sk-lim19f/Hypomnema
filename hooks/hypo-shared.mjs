@@ -18,7 +18,6 @@ import {
   realpathSync,
   openSync,
   unlinkSync,
-  renameSync,
   linkSync,
 } from 'fs';
 import { join, relative, basename, dirname, isAbsolute } from 'path';
@@ -26,6 +25,7 @@ import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
+import { atomicWrite } from './atomic-write.mjs';
 
 const HOME = homedir();
 
@@ -1945,30 +1945,10 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms | 0));
 }
 
-// Commit `content` via temp write + rename so a partial/failed write lands on a
-// throwaway temp and the target is never torn (mirrors crystallize.mjs's
-// atomicWrite). Rename atomicity swaps the directory entry; it is NOT power-loss
-// durable (no fsync) — same as everything else in the vault.
-function atomicWriteShared(path, content) {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
-  writeFileSync(tmp, content);
-  try {
-    renameSync(tmp, path);
-  } catch (err) {
-    // The rename is what makes this atomic, so a failure here leaves the
-    // target untouched, which is the point. What it also leaves is the tmp
-    // file, and nothing else ever looks at that name again: the suffix
-    // carries this pid and a fresh random, so the next run picks a
-    // different one and this one sits in the vault forever, close after
-    // close. Take it back out before rethrowing, and do not let the
-    // cleanup hide the real error.
-    try {
-      rmSync(tmp, { force: true });
-    } catch {}
-    throw err;
-  }
-}
+// Commit via temp write + rename now lives in ./atomic-write.mjs, imported
+// above as `atomicWrite`. It used to be a local copy here (`atomicWriteShared`)
+// that only cleaned up the tmp file on a rename failure; the shared version
+// also cleans up on a write failure. See that file's own doc comment.
 
 // Read the pid the current holder recorded in its lockfile (see withFileLock).
 // Returns null for anything we can't trust as a pid: empty/missing content (a
@@ -2278,7 +2258,7 @@ export function deriveRootLogEntries(hypoDir) {
       });
       if (fresh.length === 0) return 0;
       const sep = current.endsWith('\n') ? '\n' : '\n\n';
-      atomicWriteShared(logPath, current + sep + fresh.map((a) => a.block).join('\n\n') + '\n');
+      atomicWrite(logPath, current + sep + fresh.map((a) => a.block).join('\n\n') + '\n');
       return fresh.length;
     });
   } catch {
@@ -2516,7 +2496,7 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
       // same `null` MUST NOT be treated as empty (see readTouchedPathsFile).
       const merged = new Set(current === null ? [] : current);
       for (const p of incoming) merged.add(p);
-      atomicWriteShared(path, JSON.stringify([...merged]));
+      atomicWrite(path, JSON.stringify([...merged]));
     });
   } catch {
     // best-effort: a hook must never fail a tool call over a cache write
@@ -2653,7 +2633,7 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
           // best-effort
         }
       } else {
-        atomicWriteShared(path, JSON.stringify(remaining));
+        atomicWrite(path, JSON.stringify(remaining));
       }
     });
   } catch {
@@ -3045,7 +3025,7 @@ export function recordSyncSuccess(hypoDir, op) {
         // carry the corruption forward.
       }
       current[op] = { timestamp: new Date().toISOString(), host: hostname() };
-      atomicWriteShared(path, JSON.stringify(current, null, 2) + '\n');
+      atomicWrite(path, JSON.stringify(current, null, 2) + '\n');
     });
   } catch {
     // best-effort: lock timeout or write failure must never break the caller
@@ -3454,7 +3434,7 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
     // "A marker file is there" is not "this run put it there" — a corrupt
     // marker from an earlier attempt satisfies it just as well. So say whether
     // THIS write landed and let the caller key on that.
-    atomicWriteShared(sessionClosedMarkerPath(hypoDir, sessionId), JSON.stringify(payload) + '\n');
+    atomicWrite(sessionClosedMarkerPath(hypoDir, sessionId), JSON.stringify(payload) + '\n');
     return true;
   } catch (err) {
     process.stderr.write(`[hypo] session-closed marker write failed: ${err?.message || err}\n`);

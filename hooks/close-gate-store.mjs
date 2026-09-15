@@ -32,9 +32,10 @@
 // own doc comment for the caller contract.
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { walkCloseGate } from './hypo-shared.mjs';
+import { atomicWrite } from './atomic-write.mjs';
 
 /** `<hypoDir>/.cache/close-gate/<session-id>.json`. */
 export function closeGatePath(hypoDir, sessionId) {
@@ -119,14 +120,6 @@ export function resolutionStamp(rawTranscript, upToIndex = Infinity) {
   }
   const prefixSha = createHash('sha256').update(buf.subarray(0, prefixEnd)).digest('hex');
   return { index, prefixSha };
-}
-
-/** Atomic overwrite via tmp+rename, mirroring base-store's atomicWrite. */
-function atomicWrite(path, content) {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
-  writeFileSync(tmp, content);
-  renameSync(tmp, path);
 }
 
 /**

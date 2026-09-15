@@ -146,8 +146,14 @@ export function writeProvenanceSidecar(hooksDir, pkgRoot, pkgVersion, hooksSrcDi
 // filesystem boundary would fall back to a non-atomic copy+delete.
 function atomicWriteJson(dest, data) {
   const tmp = `${dest}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
+  // The write is inside the try as well as the rename. A write that fails
+  // partway (ENOSPC, EDQUOT) has already created the temp file, and the temp
+  // name carries this pid and a fresh random, so nothing ever picks it up
+  // again: it would sit next to the sidecar forever. Not switched to the
+  // shared hooks/atomic-write.mjs because that one mkdirSync's the parent,
+  // which this path deliberately leaves to its caller.
   try {
+    writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
     renameSync(tmp, dest);
   } catch (err) {
     try {

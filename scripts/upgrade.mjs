@@ -152,6 +152,7 @@ if (!_hookInventory.ok) {
 }
 const HOOK_MAP = _hookInventory.hookMap;
 const SHARED_FILES = _hookInventory.shared;
+const INSTALL_ORDER = _hookInventory.ordered;
 
 // ── checks ───────────────────────────────────────────────────────────────────
 
@@ -213,7 +214,16 @@ function checkGuideVersion(hypoDir) {
 function checkHookFiles(hooksDir) {
   const results = [];
 
-  const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
+  // The canonical order, shared by init and (reversed) by uninstall. Shared
+  // modules come first because applyHookFiles copies one file at a time and an
+  // entry hook imports its shared modules the moment the next event fires it:
+  // copy the entry hook first, get interrupted, and the next SessionStart dies
+  // with ERR_MODULE_NOT_FOUND, which is also the session the repair would have
+  // been run from.
+  //
+  // This is ordering, not atomicity. A half-copied set is still a mix of
+  // versions; what it is not is a set that cannot load.
+  const allFiles = INSTALL_ORDER;
   for (const file of allFiles) {
     const installedPath = join(hooksDir, file);
     const srcPath = join(HOOKS_SRC, file);

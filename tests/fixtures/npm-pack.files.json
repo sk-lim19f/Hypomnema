@@ -160,6 +160,10 @@
     "exec": false
   },
   {
+    "path": "hooks/atomic-write.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/base-store.mjs",
     "exec": false
   },

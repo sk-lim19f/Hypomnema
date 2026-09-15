@@ -3855,6 +3855,13 @@ suite('close-pipeline: closeResultContradiction (runtime invariant self-check)')
 
 // Every legitimate withhold (marker not written, but a real reason recorded) is
 // a VALID outcome, not a contradiction → null.
+//
+// "Legitimate" here is scoped to this one judgment: the result is self
+// consistent, so the invariant has nothing to report. It does not mean the
+// close succeeded. `marker-did-not-land` is in this list and still flips the
+// close to ok:false and exit 1, because that decision lives in a different
+// place (markerWriteGenuinelyFailed, in the apply path). Both statements are
+// true at once; only the word "legitimate" reads like they conflict.
 const LEGIT_WITHHOLDS = [
   'commit-failed: uncommitted',
   'compact-gate-not-ok',

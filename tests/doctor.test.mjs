@@ -10,6 +10,7 @@ import {
   mkdirSync,
   mkdtempSync,
   cpSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -1607,6 +1608,93 @@ test('missing hooks/shared.json → exit 1, not silently treated as empty', () =
   });
 });
 
+// A dual install (plugin enabled, plus hook files left behind by an earlier npm
+// or manual install) lands in the partial branch the moment hooks/shared.json
+// grows by one file, which is what adding the shared atomic writer did. The
+// names have to be printed there too, but the exit code must not move: nothing
+// the user can run copies hooks on this channel, so a fail would be a red they
+// cannot clear.
+//
+// Disabling the check: drop the `coreManagedByPlugin` branch in checkHooks so
+// both channels fail. This test goes red on the status; the npm-channel test
+// below stays green, which is the pair that makes the split mean something.
+test('plugin mode: a partial leftover hook set names the files but does not fail', () => {
+  withFakeDoctorInstall(true, ({ doctor, home, wiki }) => {
+    // Seed every hook file except one, the shape a dual install has right after
+    // the shared list gains an entry.
+    const claudeHooks = join(home, '.claude', 'hooks');
+    mkdirSync(claudeHooks, { recursive: true });
+    const all = readdirSync(HOOKS).filter((f) => f.endsWith('.mjs'));
+    const withheld = 'atomic-write.mjs';
+    assert.ok(all.includes(withheld), `fixture expects ${withheld} in hooks/`);
+    for (const f of all) {
+      if (f !== withheld) cpSync(join(HOOKS, f), join(claudeHooks, f));
+    }
+
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const hookCheck = out.find((c) => c.label === 'Hook files installed');
+    assert.ok(hookCheck, 'Hook files installed check not found');
+    assert.equal(
+      hookCheck.status,
+      'warn',
+      `a partial leftover set on the plugin channel must warn, not fail: ${JSON.stringify(hookCheck)}`,
+    );
+    assert.match(
+      hookCheck.detail,
+      new RegExp(withheld.replace('.', '\\.')),
+      `the missing file must still be named: ${hookCheck.detail}`,
+    );
+  });
+});
+
+// Stale hook FILES on the plugin channel are inert, but stale settings.json
+// REGISTRATIONS are not: the loader registers the same hooks from
+// hooks/hooks.json, so anything still named in settings.json fires a second
+// time per event. The old code read a full leftover set as the healthiest
+// state there is and printed "15/15 registered".
+//
+// Disabling the check: drop the `coreManagedByPlugin && registered > 0` branch
+// in checkSettingsJson so the `registered === total` pass catches it again.
+test('plugin mode: surviving settings.json registrations are reported as duplicates, not as healthy', () => {
+  withFakeDoctorInstall(true, ({ doctor, root, home, wiki }) => {
+    // Register every core hook the npm-channel way, on top of an active plugin.
+    const claudeHooks = join(home, '.claude', 'hooks');
+    mkdirSync(claudeHooks, { recursive: true });
+    const hookMap = JSON.parse(readFileSync(join(root, 'hooks', 'hooks.json'), 'utf-8')).hooks;
+    const settings = { hooks: {} };
+    for (const [event, groups] of Object.entries(hookMap)) {
+      settings.hooks[event] = groups.map((g) => ({
+        hooks: (g.hooks || []).map((h) => ({
+          type: 'command',
+          command: `node $HOME/.claude/hooks/${h.command.split('/').pop()}`,
+        })),
+      }));
+    }
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(settings, null, 2));
+
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'settings.json hook registrations');
+    assert.ok(check, 'settings.json hook registrations check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `a full duplicate registration must not read as healthy: ${JSON.stringify(check)}`,
+    );
+    assert.match(
+      check.detail,
+      /runs twice|fire on top|also registered/,
+      `the detail must say the hooks run twice: ${check.detail}`,
+    );
+    assert.doesNotMatch(
+      check.detail,
+      /run \/hypo:init/,
+      `must not prescribe /hypo:init on a channel where it skips settings.json: ${check.detail}`,
+    );
+  });
+});
+
 test('plugin mode: empty ~/.claude/hooks passes, not fails', () => {
   withFakeDoctorInstall(true, ({ doctor, home, wiki }) => {
     const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
@@ -1651,6 +1739,34 @@ test('regression baseline: npm/manual channel with empty hooks still fails', () 
       'pass',
       'npm/manual channel with 0 settings.json registrations must not silently pass',
     );
+  });
+});
+
+// A partial install (one hook file deleted, the rest present) used to only
+// count the missing file and stay at `warn` (rc=0): a QA session hit exactly
+// this (base-store.mjs deleted) and doctor's own terminal output never said
+// which file, so neither a human nor an rc-gated CI job could act on it.
+// This must name the file and fail (ISSUE-151).
+test('one missing hook file (of many) → Hook files installed names it and fails', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const hooksDir = join(home, '.claude', 'hooks');
+      rmSync(join(hooksDir, 'hypo-personal-check.mjs'));
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'Hook files installed');
+      assert.ok(check, 'expected a Hook files installed check');
+      assert.equal(
+        check.status,
+        'fail',
+        `a single missing hook file must fail, not warn: ${JSON.stringify(check)}`,
+      );
+      assert.match(check.detail, /hypo-personal-check\.mjs/);
+      assert.equal(r.status, 1, 'doctor must exit 1 when a hook file is missing');
+    });
   });
 });
 
@@ -2415,6 +2531,38 @@ test('a hook file other than hypo-shared.mjs changed after copy → hooksDigest 
       );
       assert.match(check.detail, /hooksDigest mismatch/);
       assert.match(check.detail, /hypo-personal-check\.mjs/);
+    });
+  });
+});
+
+// computeHooksDigest returns null both when a hook file is missing/unreadable
+// and when the recompute matched, so a deleted file used to fall into the
+// same "nothing to report" branch as a match: `verified` still showed for an
+// install missing a hook file (ISSUE-152). "Cannot verify" must read as a
+// third, non-silent state, distinct from both `verified` and a diverged-file
+// mismatch.
+test('a hook file deleted after install → hooksDigest cannot verify, not silently verified', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const hooksDir = join(home, '.claude', 'hooks');
+      rmSync(join(hooksDir, 'hypo-personal-check.mjs'));
+      const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(r.stdout);
+      const check = out.find((c) => c.label === 'hooks/.hypo-provenance.json');
+      assert.ok(check, 'expected a hooks/.hypo-provenance.json check');
+      assert.notEqual(
+        check.status,
+        'pass',
+        `a deleted hook file must not read as verified: ${JSON.stringify(check)}`,
+      );
+      assert.match(check.detail, /cannot be recomputed/);
+      assert.ok(
+        !/hooksDigest mismatch:/.test(check.detail),
+        `a missing-file recompute failure must not be worded as a diverged-file mismatch: ${check.detail}`,
+      );
     });
   });
 });

@@ -72,6 +72,14 @@ import {
   hasTypedUserApproval,
   resolveTranscriptBySessionId,
 } from '../hooks/hypo-shared.mjs';
+// hashContent, not hashProposalContent: the close handoff receipt below has to
+// agree with crystallize's own retry check (`journalHash === hashContent(disk)`
+// in scripts/lib/crystallize-close-apply.mjs), so it is hashed with the exact
+// function that check uses, not this module's own hashProposalContent (same
+// algorithm, different function identity; the spec calls for reusing the one
+// the retry actually compares against, not a second implementation of it).
+import { hashContent } from '../hooks/base-store.mjs';
+import { recordHandoffReceipt } from '../hooks/close-journal.mjs';
 
 // ── target-path hardening ─────────────────────────────────────────────────────
 
@@ -168,8 +176,14 @@ export function resolveTargetPath(hypoDir, target) {
  */
 function atomicWrite(path, content) {
   const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-  writeFileSync(tmp, content, { flag: 'wx' });
+  // Write inside the try for the same reason the rename is: a write that fails
+  // after creating the file leaves the temp behind for good. Deliberately NOT
+  // delegated to the shared hooks/atomic-write.mjs — this one opens with `wx`
+  // and names the temp from crypto randomness, which is a stronger defense
+  // against a symlink planted at a guessable path than the shared writer has.
+  // Replacing it would trade a leak fix for weaker containment.
   try {
+    writeFileSync(tmp, content, { flag: 'wx' });
     renameSync(tmp, path);
   } catch (e) {
     try {
@@ -455,13 +469,18 @@ export async function applyProposal({ hypoDir, id }, { isTTY, prompt, stdout, st
  * only authorization sites.
  *
  * @param {{hypoDir: string, id: string, proposal: object, full: string,
- *          displayedHash: string|null}} sel  `displayedHash` is the hash of the bytes
- *          whose diff the approver saw (null when the target was absent).
+ *          displayedHash: string|null, closeSessionId?: string|null}} sel
+ *          `displayedHash` is the hash of the bytes whose diff the approver saw
+ *          (null when the target was absent). `closeSessionId` is the ORIGINATING
+ *          close's session id, present only on the transcript-approved batch path
+ *          (resolveProposals passes challenge.closeSessionId); the TTY `apply <id>`
+ *          path has no such concept and passes none, which is what keeps the
+ *          receipt step below a no-op for that channel.
  * @param {{approval: {via: 'tty'|'transcript', nonce: string|null},
  *          warned?: boolean, stdout?: object, stderr?: object, now?: () => string}} io
  */
 export function writeApprovedProposal(
-  { hypoDir, id, proposal, full, displayedHash },
+  { hypoDir, id, proposal, full, displayedHash, closeSessionId },
   { approval, warned, stdout, stderr, now } = {},
 ) {
   const out = stdout ?? process.stdout;
@@ -526,13 +545,24 @@ export function writeApprovedProposal(
   // (11) audit log: FATAL on failure (it is the apply audit contract). Ordered
   // write→log→delete: the log never lies (recorded only after a real write), and a
   // log failure leaves the proposal alive so a re-apply self-heals the record.
+  const appliedHash = hashContent(proposal.proposedContent);
   try {
     appendApplyLog(hypoDir, {
       id,
       target: proposal.target,
       currentHash: displayedHash,
+      // The hash of the bytes THIS write just put down: reconcileProposals'
+      // only evidence, once the artifact and page are the sole other witnesses
+      // left (see reconcileProposals below), for proving a later disk read is
+      // still the same write this entry describes.
+      appliedHash,
       appliedAt: clock(),
       sessionId: proposal.sessionId ?? null,
+      // The close this write hands its bytes back to, so a reconcile run (or a
+      // human reading the log) can tell which close's journal should have
+      // received a receipt for this entry. `null` on the TTY channel, which has
+      // no close-session concept at all.
+      closeSessionId: closeSessionId ?? null,
       device: proposal.device ?? null,
       // Which authority approved this write, and (for the transcript channel) the
       // one-time nonce the user typed. The audit trail is the only place an
@@ -548,6 +578,31 @@ export function writeApprovedProposal(
         `Proposal kept; re-run apply to complete the audit record.\n`,
     );
     return { ok: false, code: 1, reason: 'log-failed', applied: true };
+  }
+
+  // (11.5) close handoff receipt: credit this write back to the ORIGINATING
+  // close's journal, not the approving session's. Only the transcript-approved
+  // batch path supplies `closeSessionId` (the TTY `apply <id>` path passes
+  // none, so this step is a no-op there: same write, same audit entry, no new
+  // failure mode for that channel). NOT best-effort: unlike
+  // recordJournalEntry's own same-session, same-write record, a lost receipt
+  // here has no fallback. The proposal artifact that is the only other
+  // pointer to this write is deleted in step (12) below the moment this
+  // succeeds, so a swallowed failure would make the bytes unfindable by the
+  // owning close's retry forever.
+  if (closeSessionId) {
+    const receipt = recordHandoffReceipt(hypoDir, closeSessionId, proposal.target, appliedHash);
+    if (!receipt.ok) {
+      err.write(
+        `✗ applied to disk and logged, but FAILED to record the close handoff receipt ` +
+          `(${sanitizeForDisplay(receipt.error, { allowNewlines: false })}).\n` +
+          `    ${shownTarget} now holds the approved bytes, but close ${closeSessionId} cannot\n` +
+          `    see them yet. Do NOT re-run that close: it would only re-park the same\n` +
+          `    conflict. Fix whatever is blocking .cache/close-journal/ and run\n` +
+          `    \`hypomnema proposal reconcile\` to recover the receipt from the audit log.\n`,
+      );
+      return { ok: false, code: 1, reason: 'close-receipt-failed', applied: true };
+    }
   }
 
   // (12) remove the now-applied artifact: a leftover artifact is a non-zero exit
@@ -602,10 +657,16 @@ export function writeApprovedProposal(
  * An unreadable target refuses the whole batch rather than mint a challenge for a
  * diff nobody can be shown.
  *
- * @param {{hypoDir: string, sessionId: string, ids: string[]}} sel
+ * `closeSessionId` names the close this approval will resume, which the caller
+ * only needs to pass when it differs from `sessionId`: a later session (a
+ * fresh one the original close's session is gone from) finishing a park an
+ * earlier session left behind. Defaults to `sessionId`, the common case where
+ * the same session parks, challenges, and resolves its own close.
+ *
+ * @param {{hypoDir: string, sessionId: string, ids: string[], closeSessionId?: string}} sel
  */
 export function challengeProposals(
-  { hypoDir, sessionId, ids },
+  { hypoDir, sessionId, ids, closeSessionId },
   { stdout, stderr, now, nonce } = {},
 ) {
   const out = stdout ?? process.stdout;
@@ -615,6 +676,11 @@ export function challengeProposals(
   if (!isValidSessionId(sessionId)) {
     err.write(`✗ invalid --session-id\n`);
     return { ok: false, code: 2, reason: 'invalid-session-id' };
+  }
+  const resumesClose = closeSessionId != null ? String(closeSessionId) : sessionId;
+  if (!isValidSessionId(resumesClose)) {
+    err.write(`✗ invalid --close-session-id\n`);
+    return { ok: false, code: 2, reason: 'invalid-close-session-id' };
   }
   if (!Array.isArray(ids) || ids.length === 0) {
     err.write(`✗ challenge needs --ids=<id,...> (the proposal ids the close reported)\n`);
@@ -631,6 +697,24 @@ export function challengeProposals(
     if (!proposal) {
       err.write(`✗ no such proposal: ${id}\n`);
       return { ok: false, code: 2, reason: 'not-found' };
+    }
+    // The close being resumed must be the close that parked this. Without this
+    // check `--close-session-id` is just a label the caller picks, and the
+    // receipt it produces credits one close's approved bytes to a different
+    // close, which then commits them as its own work. writeProposal always
+    // stamps the parking session onto the artifact, so the owner is knowable
+    // here; an artifact with no owner (a legacy one, written before that field)
+    // is only allowed to resume itself, which is exactly what it did before
+    // --close-session-id existed.
+    const owner = typeof proposal.sessionId === 'string' ? proposal.sessionId : null;
+    const ownerForCompare = owner === null ? sessionId : owner;
+    if (resumesClose !== ownerForCompare) {
+      err.write(
+        `✗ proposal ${id} was parked by close ${owner === null ? '(unrecorded)' : owner}, ` +
+          `not ${resumesClose}. Approving it can only resume the close that parked it; ` +
+          `pass --close-session-id=${ownerForCompare} or challenge it from that close.\n`,
+      );
+      return { ok: false, code: 2, reason: 'close-session-not-owner' };
     }
     const full = resolveTargetPath(hypoDir, proposal.target);
     if (!full) {
@@ -664,7 +748,13 @@ export function challengeProposals(
   // crypto-random, never Math.random: an approval token a hook could PREDICT would
   // let it pre-plant the phrase and spend an approval the user never gave.
   const minted = nonce ?? randomBytes(16).toString('hex');
-  const record = { nonce: minted, sessionId, mintedAt: clock(), items };
+  const record = {
+    nonce: minted,
+    sessionId,
+    closeSessionId: resumesClose,
+    mintedAt: clock(),
+    items,
+  };
   if (!writeChallenge(hypoDir, record)) {
     err.write(
       `✗ failed to store the approval challenge; nothing to approve.\n` +
@@ -675,7 +765,8 @@ export function challengeProposals(
   }
 
   out.write(
-    `\nTo approve the ${items.length} overwrite(s) above, the USER must type this line in the conversation:\n\n` +
+    `\nThis approval resumes close ${resumesClose}.\n` +
+      `To approve the ${items.length} overwrite(s) above, the USER must type this line in the conversation:\n\n` +
       `    ${APPROVAL_PHRASE} ${minted}\n\n` +
       `Then run: hypomnema proposal resolve --session-id=${sessionId}\n`,
   );
@@ -683,6 +774,7 @@ export function challengeProposals(
     ok: true,
     code: 0,
     nonce: minted,
+    closeSessionId: resumesClose,
     items: items.map(({ id, target }) => ({ id, target })),
   };
 }
@@ -837,7 +929,17 @@ export function resolveProposals(
   const failed = [];
   for (const { item, proposal, full, displayedHash } of plan) {
     const res = writeApprovedProposal(
-      { hypoDir, id: item.id, proposal, full, displayedHash },
+      // readChallenge normalizes closeSessionId to `sessionId` when the record
+      // predates the field (legacy = same session), so this is always a valid
+      // id here, never undefined.
+      {
+        hypoDir,
+        id: item.id,
+        proposal,
+        full,
+        displayedHash,
+        closeSessionId: challenge.closeSessionId,
+      },
       {
         approval: { via: 'transcript', nonce: challenge.nonce },
         warned: false,
@@ -881,6 +983,210 @@ export function resolveProposals(
   out.write(`✓ applied ${written.length} approved proposal(s).\n`);
   out.write(`  The session is NOT closed yet: re-run the close and check markerWritten.\n`);
   return { ok: true, code: 0, written, challengeSpent: true };
+}
+
+/**
+ * Recover a close handoff receipt that `close-receipt-failed` above left
+ * undone, without writing to any page.
+ *
+ * A candidate is a still-pending proposal artifact whose id also has an
+ * `applied.log` entry carrying `appliedHash` and `closeSessionId`, the exact
+ * pair `writeApprovedProposal` leaves behind on that failure (audit written,
+ * artifact kept, per the doc comment there). Nothing else produces this
+ * combination: an ordinary successful write deletes the artifact, and an
+ * ordinary NEVER-applied artifact has no audit entry naming it at all. Three
+ * pieces of evidence must all agree before a receipt is recovered: the
+ * artifact's own `target` must match what the audit entry recorded (defense
+ * against a hand-edited artifact pointing the recovered receipt somewhere
+ * else), and the CURRENT bytes on disk at that target must hash to the exact
+ * `appliedHash` the audit entry recorded (defense against a page that moved
+ * since: reconcile must never certify a receipt for bytes it did not
+ * actually verify are still there). Either mismatch refuses that one
+ * candidate rather than guess; it never writes a page either way.
+ *
+ * @param {{hypoDir: string}} sel
+ */
+/**
+ * What each parked artifact IS, judged from evidence alone. Writes nothing.
+ *
+ * Two callers need this answer and they must not disagree: reconcile, which
+ * acts on it, and doctor, which reports it. A `close-receipt-failed` artifact
+ * looks exactly like an ordinary pending proposal from the outside, so a doctor
+ * that counted artifacts told the user to review a write that a human had
+ * already approved and that is already on the page. Deriving the judgment twice
+ * is how the two drift, so it is derived here once.
+ *
+ * `kind` is one of:
+ *   pending          an ordinary parked proposal awaiting review. No apply yet.
+ *   recoverable      approved and written, but its close handoff receipt never
+ *                    landed. `proposal reconcile` can restore it from evidence.
+ *   evidence-broken  an audit entry claims the write, but the page no longer
+ *                    hashes to it, or the target will not resolve. Neither
+ *                    reconcile nor a re-close can fix this without a human.
+ *
+ * @returns {{kind: string, id: string, target: string, closeSessionId?: string,
+ *   appliedHash?: string, reason?: string}[]}
+ */
+export function classifyProposals(hypoDir) {
+  const logPath = join(proposalsDir(hypoDir), 'applied.log');
+  const latestById = new Map();
+  if (existsSync(logPath)) {
+    try {
+      for (const line of readFileSync(logPath, 'utf-8').split('\n').filter(Boolean)) {
+        try {
+          const entry = JSON.parse(line);
+          if (entry && typeof entry.id === 'string') latestById.set(entry.id, entry);
+        } catch {
+          /* a corrupt audit line is skipped, never fatal */
+        }
+      }
+    } catch {
+      // Unreadable audit log: every artifact reads as ordinary pending, which is
+      // what they were before this evidence existed. reconcile reports the read
+      // failure itself; doctor must not turn it into a different diagnosis.
+      latestById.clear();
+    }
+  }
+
+  const out = [];
+  for (const proposal of listProposals(hypoDir)) {
+    const entry = latestById.get(proposal.id);
+    if (!entry || typeof entry.appliedHash !== 'string' || !entry.closeSessionId) {
+      // No audit entry, or one from a TTY apply which carries no close session:
+      // never handed off, so nothing to recover. An ordinary pending proposal.
+      out.push({ kind: 'pending', id: proposal.id, target: proposal.target });
+      continue;
+    }
+    if (entry.target !== proposal.target) {
+      out.push({ kind: 'pending', id: proposal.id, target: proposal.target });
+      continue;
+    }
+    const full = resolveTargetPath(hypoDir, proposal.target);
+    if (!full) {
+      out.push({
+        kind: 'evidence-broken',
+        id: proposal.id,
+        target: proposal.target,
+        reason: 'unsafe-target',
+      });
+      continue;
+    }
+    const disk = readTarget(full);
+    if (typeof disk !== 'string' || hashContent(disk) !== entry.appliedHash) {
+      out.push({
+        kind: 'evidence-broken',
+        id: proposal.id,
+        target: proposal.target,
+        reason: 'evidence-mismatch',
+      });
+      continue;
+    }
+    out.push({
+      kind: 'recoverable',
+      id: proposal.id,
+      target: proposal.target,
+      closeSessionId: entry.closeSessionId,
+      appliedHash: entry.appliedHash,
+    });
+  }
+  return out;
+}
+
+export function reconcileProposals({ hypoDir }, { stdout, stderr } = {}) {
+  const out = stdout ?? process.stdout;
+  const err = stderr ?? process.stderr;
+
+  const logPath = join(proposalsDir(hypoDir), 'applied.log');
+  let lines = [];
+  if (existsSync(logPath)) {
+    try {
+      lines = readFileSync(logPath, 'utf-8').split('\n').filter(Boolean);
+    } catch (e) {
+      err.write(
+        `✗ could not read the apply audit log: ${sanitizeForDisplay(e.message, { allowNewlines: false })}\n`,
+      );
+      return { ok: false, code: 1, reason: 'audit-unreadable' };
+    }
+  }
+  // Latest entry per proposal id: applied.log is append-only JSONL, and a
+  // proposal can only be reconciled from the write that is STILL what is on
+  // disk. An earlier entry for the same id (superseded, or from a prior
+  // successful cycle) is not that write. A malformed line is skipped, never
+  // fatal: the audit log is written by this same tool but is still a file on
+  // disk, and one bad line must not stop reconcile from looking at the rest.
+  const latestById = new Map();
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry && typeof entry.id === 'string') latestById.set(entry.id, entry);
+    } catch {
+      /* a corrupt audit line is skipped, not fatal to reconcile */
+    }
+  }
+
+  const reconciled = [];
+  const skipped = [];
+  const failed = [];
+
+  // The judgment itself is classifyProposals'. This loop only acts on it, so
+  // doctor's report and reconcile's action can never disagree about what an
+  // artifact is.
+  for (const c of classifyProposals(hypoDir)) {
+    if (c.kind === 'pending') {
+      skipped.push({ id: c.id, reason: 'no-handoff-audit-entry' });
+      continue;
+    }
+    if (c.kind === 'evidence-broken') {
+      failed.push({ id: c.id, target: c.target, reason: c.reason });
+      continue;
+    }
+    const receipt = recordHandoffReceipt(hypoDir, c.closeSessionId, c.target, c.appliedHash);
+    if (!receipt.ok) {
+      failed.push({
+        id: c.id,
+        target: c.target,
+        reason: 'close-receipt-failed',
+        error: receipt.error,
+      });
+      continue;
+    }
+    // Only now is the artifact's job done: the receipt it was standing in
+    // evidence for has landed, so the leftover it represents can finally go,
+    // the same order writeApprovedProposal itself uses (receipt, then delete).
+    if (!deleteProposal(hypoDir, c.id)) {
+      failed.push({ id: c.id, target: c.target, reason: 'artifact-not-removed' });
+      continue;
+    }
+    reconciled.push({ id: c.id, target: c.target, closeSessionId: c.closeSessionId });
+  }
+
+  for (const r of reconciled) {
+    out.write(
+      `✓ reconciled ${r.id} (${sanitizeForDisplay(r.target, { allowNewlines: false })}) into close ${r.closeSessionId}\n`,
+    );
+  }
+  if (failed.length > 0) {
+    err.write(
+      `✗ ${failed.length} proposal(s) could not be reconciled:\n` +
+        failed
+          .map(
+            (f) =>
+              `    ${f.id} (${sanitizeForDisplay(f.target ?? '?', { allowNewlines: false })}): ${f.reason}`,
+          )
+          .join('\n') +
+        '\n',
+    );
+  }
+  if (reconciled.length === 0 && failed.length === 0) {
+    out.write('no receipts needed reconciling\n');
+  }
+  return {
+    ok: failed.length === 0,
+    code: failed.length === 0 ? 0 : 1,
+    reconciled,
+    skipped,
+    failed,
+  };
 }
 
 /**
@@ -949,7 +1255,15 @@ export function listPending({ hypoDir }, { stdout, json } = {}) {
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, cmd: null, id: null, json: false, sessionId: null, ids: [] };
+  const args = {
+    hypoDir: null,
+    cmd: null,
+    id: null,
+    json: false,
+    sessionId: null,
+    closeSessionId: null,
+    ids: [],
+  };
   const positionals = [];
   const rest = argv.slice(2);
   for (let i = 0; i < rest.length; i++) {
@@ -959,6 +1273,9 @@ function parseArgs(argv) {
     else if (a === '--json') args.json = true;
     else if (a === '--session-id') args.sessionId = rest[++i] ?? null;
     else if (a.startsWith('--session-id=')) args.sessionId = a.slice('--session-id='.length);
+    else if (a === '--close-session-id') args.closeSessionId = rest[++i] ?? null;
+    else if (a.startsWith('--close-session-id='))
+      args.closeSessionId = a.slice('--close-session-id='.length);
     else if (a === '--ids') args.ids = splitIds(rest[++i] ?? '');
     else if (a.startsWith('--ids=')) args.ids = splitIds(a.slice('--ids='.length));
     else positionals.push(a);
@@ -993,12 +1310,20 @@ async function main() {
       break;
     case 'challenge':
       result = challengeProposals(
-        { hypoDir: args.hypoDir, sessionId: args.sessionId, ids: args.ids },
+        {
+          hypoDir: args.hypoDir,
+          sessionId: args.sessionId,
+          ids: args.ids,
+          closeSessionId: args.closeSessionId,
+        },
         {},
       );
       break;
     case 'resolve':
       result = resolveProposals({ hypoDir: args.hypoDir, sessionId: args.sessionId }, {});
+      break;
+    case 'reconcile':
+      result = reconcileProposals({ hypoDir: args.hypoDir }, {});
       break;
     case 'discard':
       if (!args.id) {
@@ -1010,8 +1335,9 @@ async function main() {
     default:
       process.stderr.write(
         'usage: hypomnema proposal <list|apply|discard> [id] [--json] [--hypo-dir <path>]\n' +
-          '       hypomnema proposal challenge --session-id <id> --ids <id,...>\n' +
-          '       hypomnema proposal resolve --session-id <id>\n',
+          '       hypomnema proposal challenge --session-id <id> --ids <id,...> [--close-session-id <id>]\n' +
+          '       hypomnema proposal resolve --session-id <id>\n' +
+          '       hypomnema proposal reconcile\n',
       );
       process.exit(2);
   }

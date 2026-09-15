@@ -8,8 +8,9 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { snapshotBase, overwriteTargets } from '../hooks/base-store.mjs';
-import { findBackfillCandidate } from '../hooks/hypo-shared.mjs';
+import { findBackfillCandidate, sessionClosedMarkerPath } from '../hooks/hypo-shared.mjs';
 import { ensureProjectIndex } from '../scripts/crystallize.mjs';
+import { markerWriteGenuinelyFailed } from '../scripts/lib/crystallize-close-apply.mjs';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
@@ -1031,5 +1032,173 @@ test('root hot.md parks on a mismatch even when the payload keeps every disk row
       drifted,
       "the other machine's bytes are left exactly as they were",
     );
+  });
+});
+
+// ── ISSUE-149: restructure:true is no longer a self-approved bypass ──────────
+// A payload that drops most of an overwrite target's `## ` sections used to
+// write straight through the moment `restructure: true` was set on that field
+// (a boolean the SAME model composing the payload also controls), with no
+// human between the claim and the disk write. It now parks exactly like a
+// base conflict: the target is withheld, a `.cache/proposals/` artifact is
+// written, and only `hypomnema proposal challenge` / `proposal resolve` (a
+// human typing a nonce after reviewing the diff) can land it.
+
+suite('ISSUE-149: restructure:true no longer self-approves a destructive overwrite');
+
+test('a real section-loss trip parks whether or not restructure:true is set: the flag only changes the park reason', () => {
+  withWiki(
+    (dir) => {
+      const projHot = join(dir, 'projects', 'test-project', 'hot.md');
+      writeFileSync(
+        projHot,
+        readFileSync(projHot, 'utf-8') +
+          `\n## Track A\nnote A\n\n## Track B\nnote B\n\n## Track C\nnote C\n`,
+      );
+    },
+    (dir, today) => {
+      const sid = 'issue149-restructure-park';
+      snapshotBase(dir, sid, overwriteTargets('test-project'));
+      const hotPath = join(dir, 'projects', 'test-project', 'hot.md');
+      const multiTrack = readFileSync(hotPath, 'utf-8');
+      // Drops Track B and Track C, keeps Track A: the same 2-of-3 shape the
+      // real incident (security-backoffice) tripped on.
+      const onlyTrackA = multiTrack.replace(/\n## Track B[\s\S]*## Track C\nnote C\n/, '\n');
+      const target = join('projects', 'test-project', 'hot.md');
+
+      // Phase 1: no `restructure` flag, the pre-existing guard, unchanged.
+      const payload1 = payloadForCleanWiki(dir, today);
+      payload1.projectHot = { content: onlyTrackA };
+      const r1 = runApply(dir, payload1, { sessionId: sid });
+      const out1 = JSON.parse(r1.stdout);
+      assert.notEqual(r1.status, 0, `dropping 2 of 3 sections must park: ${r1.stdout}`);
+      const c1 = out1.conflicts.find((x) => x.target === target);
+      assert.ok(c1, `must be reported as a conflict: ${JSON.stringify(out1.conflicts)}`);
+      assert.equal(c1.reason, 'section-loss-guard');
+      assert.equal(readFileSync(hotPath, 'utf-8'), multiTrack, 'target must stay untouched');
+
+      // Phase 2: SAME session, SAME drop, but with `restructure: true` set,
+      // this is the exact payload shape that used to write straight through.
+      // The first attempt never reached the marker phase (ok:false), so it
+      // recorded no close-gate resolution; the session's original close
+      // signal is still open for this retry, mirroring every other
+      // park-then-retry test in this suite.
+      const payload2 = payloadForCleanWiki(dir, today);
+      payload2.projectHot = { content: onlyTrackA, restructure: true };
+      payload2.sessionLog.entry = `## [${today}] restructure retry\n`;
+      payload2.log.entry = `## [${today}] session | test-project — restructure retry\n`;
+      const r2 = runApply(dir, payload2, { sessionId: sid });
+      const out2 = JSON.parse(r2.stdout);
+      assert.notEqual(
+        r2.status,
+        0,
+        `restructure:true must NOT let the write through on its own (ISSUE-149): ${r2.stdout}`,
+      );
+      assert.equal(
+        readFileSync(hotPath, 'utf-8'),
+        multiTrack,
+        'target must stay untouched even with restructure:true: a model-set flag is not human approval',
+      );
+      const c2 = out2.conflicts.find((x) => x.target === target);
+      assert.ok(
+        c2,
+        `restructure:true must still be reported as a withheld conflict: ${JSON.stringify(out2.conflicts)}`,
+      );
+      assert.equal(c2.reason, 'section-loss-guard-restructure-pending');
+      assert.ok(
+        /proposal challenge/.test(c2.why),
+        `the park reason must point at the human-approval door: ${c2.why}`,
+      );
+      const proposalEntry = out2.proposals.find((p) => p.target === target);
+      assert.ok(
+        proposalEntry,
+        'the withheld restructure must still be parked as a reviewable proposal, same as any other conflict',
+      );
+      // The model's claim survives as an audit trail even though it no longer
+      // decides anything. The human reviewing the parked proposal sees that
+      // the payload author believed this drop was intentional.
+      assert.deepEqual(
+        out2.restructureWaivers,
+        [{ target, lostSections: ['## Track B', '## Track C'] }],
+        `the restructure claim must still be recorded verbatim: ${JSON.stringify(out2.restructureWaivers)}`,
+      );
+    },
+  );
+});
+
+// ── ISSUE-153: a genuinely failed marker write must not exit 0 ───────────────
+// `--mark-session-closed` already refuses (exit 1) when the marker file fails
+// to land after every precondition (gate ok, user signal, a clean commit) has
+// already cleared. `--apply-session-close` used to swallow that exact same
+// failure as ok:true / exit 0. The same failure landing on two different
+// exit codes depending on which command hit it. The fix is scoped to that one
+// failure mode (`marker-did-not-land`): the OTHER skip reasons
+// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved,
+// commit-failed) are conditions this session can clear and retry, and stay
+// ok:true by design (see "a marker withheld by a real vault-commit failure
+// leaves the close signal unspent for a retry" in tests/close-hooks-gate.test.mjs
+// and the ISSUE-140 test in tests/close-global.test.mjs, both of which pin
+// that ok:true must survive those).
+
+suite('ISSUE-153: a marker write that genuinely fails must not exit 0');
+
+test('markerWriteGenuinelyFailed only flags the disk-level reason, never a policy withhold', () => {
+  assert.equal(
+    markerWriteGenuinelyFailed({ markerWritten: false, markerSkipReason: 'marker-did-not-land' }),
+    true,
+  );
+  for (const reason of [
+    'compact-gate-not-ok',
+    'no-user-close-signal',
+    'transcript-unresolved',
+    'commit-failed: not a repo',
+  ]) {
+    assert.equal(
+      markerWriteGenuinelyFailed({ markerWritten: false, markerSkipReason: reason }),
+      false,
+      `${reason} must stay a legitimate, retryable withhold`,
+    );
+  }
+  assert.equal(
+    markerWriteGenuinelyFailed({ markerWritten: true, markerSkipReason: null }),
+    false,
+    'a landed marker is never a failure',
+  );
+});
+
+test('marker path pre-occupied by a directory → apply exits 1 with ok:false, stage=marker-did-not-land', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = 'issue153-marker-blocked';
+    // Occupies the marker's OWN filename with a directory rather than blocking
+    // `.cache/` itself: every other write under `.cache/` (the base store, the
+    // close journal, the commit) stays reachable, and only the marker's own
+    // atomic rename (which replaces whatever sits at that exact path) hits
+    // EISDIR. This isolates the failure to the one thing ISSUE-153 is about.
+    mkdirSync(sessionClosedMarkerPath(dir, sessionId), { recursive: true });
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog.entry = `## [${today}] issue-153 marker blocked\n`;
+    payload.log.entry = `## [${today}] session | test-project — issue-153\n`;
+    const r = runApply(dir, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.markerWritten, false, `marker write must fail: ${r.stdout}\n${r.stderr}`);
+    assert.equal(
+      out.markerSkipReason,
+      'marker-did-not-land',
+      `expected the disk-level reason: ${r.stdout}`,
+    );
+    // Everything upstream of the marker write still succeeded. This is the
+    // "same failure, different entry point" case, not a broader breakage.
+    assert.equal(
+      out.committed,
+      true,
+      'the payload files must still have committed cleanly: only the marker write failed',
+    );
+    assert.equal(
+      r.status,
+      1,
+      `apply must not exit 0 when the marker genuinely failed to write (ISSUE-153): ${r.stdout}\n${r.stderr}`,
+    );
+    assert.equal(out.ok, false, 'ok must reflect the failed marker write');
+    assert.equal(out.stage, 'marker-did-not-land', `stage must record the cause: ${r.stdout}`);
   });
 });

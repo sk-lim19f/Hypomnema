@@ -45,17 +45,9 @@
 // fatal) and atomic on the write side (tmp+rename), mirroring base-store.
 
 import { createHash } from 'node:crypto';
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  renameSync,
-  readdirSync,
-  unlinkSync,
-  realpathSync,
-} from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
+import { atomicWrite } from './atomic-write.mjs';
 
 /** `<hypoDir>/.cache/proposals/`. */
 export function proposalsDir(hypoDir) {
@@ -130,14 +122,6 @@ export function makeProposalId(createdAt, target) {
     .replace(/[^A-Za-z0-9]/g, '');
   const rand = Math.random().toString(36).slice(2, 8);
   return `${ts}-${slugTarget(target)}-${rand}`;
-}
-
-/** Atomic overwrite via tmp+rename, mirroring base-store's atomicWrite. */
-function atomicWrite(path, content) {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
-  writeFileSync(tmp, content);
-  renameSync(tmp, path);
 }
 
 /**
@@ -446,9 +430,13 @@ function sessionChallengeFiles(hypoDir, sessionId) {
  * un-superseded old nonce would be a second, unreviewed key to the same write).
  *
  * @param {string} hypoDir
- * @param {{nonce: string, sessionId: string, mintedAt: string,
+ * @param {{nonce: string, sessionId: string, closeSessionId?: string, mintedAt: string,
  *          items: Array<{id: string, target: string, proposedHash: string,
  *                        freshness: {state: 'hash'|'absent', hash: string|null}}>}} record
+ *   `closeSessionId` is the session whose close this batch resumes, which the CALLER
+ *   is running challenge FROM when the two differ (a later session finishing a park
+ *   an earlier, possibly gone, session left behind). Optional and additive: a caller
+ *   that omits it is read as "resumes its own session" (see readChallenge).
  * @returns {string|null} the artifact path, or null when the session id is unsafe
  */
 export function writeChallenge(hypoDir, record) {
@@ -509,7 +497,21 @@ export function readChallenge(hypoDir, sessionId) {
       if (!f || (f.state !== 'hash' && f.state !== 'absent')) return null;
       if (f.state === 'hash' && typeof f.hash !== 'string') return null;
     }
-    return parsed;
+    // `closeSessionId` names the close this approval resumes, which can predate
+    // this field (see writeChallenge's doc comment). A record that carries it must
+    // carry a well-formed one: a hand-edited or malformed value here is a REMINT,
+    // the same polarity every other field in this record gets. But a record that
+    // never carried it (every challenge minted before this feature, or one minted
+    // without `--close-session-id`) is read as resuming its OWN session: the
+    // approving session and the parking session were always the same one before
+    // this existed, so treating "absent" as "same session" changes no existing
+    // behavior and needs no migration.
+    if (parsed.closeSessionId !== undefined) {
+      if (typeof parsed.closeSessionId !== 'string' || !isValidSessionId(parsed.closeSessionId)) {
+        return null;
+      }
+    }
+    return { ...parsed, closeSessionId: parsed.closeSessionId ?? sessionId };
   } catch {
     return null;
   }

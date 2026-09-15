@@ -389,8 +389,20 @@ function installHooks(targetDir, dryRun) {
     return;
   }
   if (!dryRun) mkdirSync(targetDir, { recursive: true });
-  for (const file of readdirSync(HOOKS_SRC)) {
-    if (!file.endsWith('.mjs')) continue;
+  // The canonical install order, not a directory listing. Reading the directory
+  // installed whatever happened to sit in hooks/, which is how every install
+  // ended up with a copy of hypo-pre-commit.mjs: it is invoked from the package
+  // root, never from the install, so upgrade would not refresh that copy,
+  // doctor would not report it, and uninstall would not take it away.
+  // installOrder also puts shared modules ahead of the entry hooks that import
+  // them, so an interrupted run cannot leave an entry hook live against a module
+  // that is not there yet.
+  const inventory = loadHookInventory(PKG_ROOT);
+  if (!inventory.ok) {
+    log('errors', `cannot read the hook inventory: ${inventory.error}`);
+    return;
+  }
+  for (const file of inventory.ordered) {
     const dest = join(targetDir, file);
     if (existsSync(dest)) {
       log('skipped', dest);

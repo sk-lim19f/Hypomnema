@@ -40,7 +40,7 @@ import {
   isUsablePkgRootLocal,
   selfLocationPkgRootFrom,
 } from '../hooks/hypo-shared.mjs';
-import { listProposals } from '../hooks/proposal-store.mjs';
+import { classifyProposals } from './proposal.mjs';
 import {
   discoverExtensions,
   parseManifest,
@@ -267,10 +267,16 @@ function checkHooks(coreManagedByPlugin) {
   const claudeHooks = join(HOME, '.claude', 'hooks');
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
 
-  let missing = 0;
-  for (const file of allFiles) {
-    if (!existsSync(join(claudeHooks, file))) missing++;
-  }
+  // A partial install used to only count the missing files, then stay at
+  // `warn` (rc=0). A real QA session hit exactly this: one hook file
+  // deleted, and neither the terminal output nor the exit code said which
+  // one, so an rc-gated CI job could not catch it and a user could not act
+  // on it without re-running upgrade just to find out. Naming the files
+  // reuses the same computation upgrade.mjs already does (checkHookFiles's
+  // per-file `status: 'missing'`), and `fail` gives the exit code something
+  // real to report.
+  const missingFiles = allFiles.filter((file) => !existsSync(join(claudeHooks, file)));
+  const missing = missingFiles.length;
 
   if (missing === 0) {
     pass('Hook files installed', claudeHooks);
@@ -282,7 +288,36 @@ function checkHooks(coreManagedByPlugin) {
       `provided by the plugin loader (hooks/hooks.json) — none copied to ${claudeHooks} (expected)`,
     );
   } else if (missing < allFiles.length) {
-    warn('Hook files installed', `${missing}/${allFiles.length} missing in ${claudeHooks}`);
+    // Naming the files is the part the QA incident actually asked for, so both
+    // channels get it. The exit code is not: on the plugin channel nothing the
+    // user can run copies these files (init.mjs gates installHooks on
+    // `!coreManagedByPlugin`, upgrade.mjs gates applyHookFiles on
+    // `managesClaudeCore`), so a `fail` there is a red the user cannot clear by
+    // doing anything, on every run, forever. Adding one file to
+    // hooks/shared.json is enough to put every dual install in this branch at
+    // once, which is exactly how this release found the problem.
+    //
+    // So the severity follows whether the exit code has an answer. A partial
+    // set on the plugin channel is leftovers from an earlier non-plugin
+    // install: harmless, since the loader supplies the real hooks, and worth
+    // saying out loud without failing over. checkSettingsJson below splits on
+    // the same flag for the same reason.
+    //
+    // The cost of this split: on the plugin channel a partial set stays rc=0,
+    // so an rc-gated check there still cannot see it. The file names are the
+    // only signal in that case, which is why they are printed either way.
+    const examples = missingFiles.slice(0, 3).join(', ');
+    const rest = missing > 3 ? `, +${missing - 3} more` : '';
+    const detail = `${missing}/${allFiles.length} missing in ${claudeHooks}: ${examples}${rest}`;
+    if (coreManagedByPlugin) {
+      warn(
+        'Hook files installed',
+        `${detail} — the plugin loader supplies these, so this copy is leftovers from an ` +
+          `earlier non-plugin install; nothing to fix unless you want the directory clean`,
+      );
+    } else {
+      fail('Hook files installed', `${detail}. Run /hypo:init`);
+    }
   } else {
     fail('Hook files installed', `No hook files found in ${claudeHooks} — run /hypo:init`);
   }
@@ -327,7 +362,32 @@ function checkSettingsJson(coreManagedByPlugin) {
     }
   }
 
-  if (registered === total) {
+  if (coreManagedByPlugin && registered > 0) {
+    // The plugin loader registers these hooks itself, from hooks/hooks.json.
+    // Entries in settings.json on top of that are not a second half of one
+    // install: they are a whole second registration, left over from an earlier
+    // npm or manual install, and every hook they name fires twice per event.
+    //
+    // This branch has to come before the `registered === total` pass below,
+    // which would otherwise read a full duplicate set as the healthiest
+    // possible state and print "15/15 registered". It also has to come before
+    // the partial-warn, whose `/hypo:init` prescription does nothing here:
+    // init.mjs skips mergeSettingsJson entirely on this channel.
+    //
+    // Left as warn rather than fail: doctor has never removed a settings entry
+    // and guessing which hook group belongs to Hypomnema is how it would start
+    // deleting someone else's. Saying the state out loud, with the exact
+    // command prefix to look for, is what doctor can do honestly. The cost is
+    // that an rc-gated check still cannot see a double-firing install.
+    warn(
+      'settings.json hook registrations',
+      `${registered}/${total} Hypomnema hook(s) also registered in settings.json while the plugin ` +
+        `loader is active — these fire on top of the plugin's own, so each one runs twice. ` +
+        `They are leftovers from an earlier npm or manual install: remove the entries whose ` +
+        `command starts with \`node ${hooksDir.replace(HOME, '$HOME')}/hypo-\` from settings.json, ` +
+        `or run /hypo:uninstall before reinstalling the plugin`,
+    );
+  } else if (registered === total) {
     pass('settings.json hook registrations', `${registered}/${total} registered`);
   } else if (registered > 0) {
     warn(
@@ -1224,38 +1284,66 @@ function checkProjectSuggestions(hypoDir) {
 }
 
 function checkProposals(hypoDir) {
-  // Vault-wide count of parked write-proposals (T8). listProposals is the
-  // count source rather than a raw readdir: it already skips malformed and
-  // spoofed-id artifacts, so the number matches exactly what `hypomnema proposal
-  // list/apply/discard` can act on. Surface only: warn (never fail), pass at 0,
-  // because a pending proposal is a normal state awaiting review, not a broken
-  // install, and the check discovers without changing any state.
-  const count = listProposals(hypoDir).length;
-  if (count === 0) {
+  // Surface only: warn (never fail), pass at 0, because a parked proposal is a
+  // normal state awaiting a human rather than a broken install, and this check
+  // discovers without changing anything.
+  //
+  // Not a count of artifacts. Three different states share that shape and want
+  // three different things from the user, and telling them apart needs the
+  // audit log and the page's current hash, which is exactly the judgment
+  // `proposal reconcile` makes. Reuse that judgment rather than derive a second
+  // one here: the failure this closes is a doctor that told the user to review
+  // a write a human had already approved and that was already on the page.
+  const classified = classifyProposals(hypoDir);
+  const pending = classified.filter((c) => c.kind === 'pending');
+  const recoverable = classified.filter((c) => c.kind === 'recoverable');
+  const broken = classified.filter((c) => c.kind === 'evidence-broken');
+
+  if (classified.length === 0) {
     pass('Pending proposals', 'No parked write-proposals');
-  } else {
-    warn(
-      'Pending proposals',
-      `${count} parked write-proposal(s) awaiting review; inspect with \`hypomnema proposal list\``,
+    return;
+  }
+  const parts = [];
+  if (recoverable.length > 0) {
+    parts.push(
+      `${recoverable.length} approved and already written, but their close handoff receipt ` +
+        `never landed: run \`hypomnema proposal reconcile\` (it recovers the receipt from ` +
+        `evidence and writes no page). Do NOT re-run the close first`,
     );
   }
+  if (broken.length > 0) {
+    parts.push(
+      `${broken.length} whose audit entry no longer matches the page (${broken
+        .slice(0, 3)
+        .map((c) => c.target)
+        .join(', ')}): neither reconcile nor a re-close can settle these without a human`,
+    );
+  }
+  if (pending.length > 0) {
+    parts.push(`${pending.length} awaiting review; inspect with \`hypomnema proposal list\``);
+  }
+  warn('Pending proposals', parts.join('. '));
 }
 
 function checkCodexPaths() {
   const codexHooks = join(HOME, '.codex', 'hooks');
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
 
-  let missing = 0;
-  for (const file of allFiles) {
-    if (!existsSync(join(codexHooks, file))) missing++;
-  }
+  // Names the files for the same reason checkHooks above does: a count alone
+  // leaves the user re-running upgrade just to find out which one. The severity
+  // stays warn here rather than following checkHooks to fail, because this
+  // channel is opt-in and nothing reads its exit code.
+  const missingFiles = allFiles.filter((file) => !existsSync(join(codexHooks, file)));
+  const missing = missingFiles.length;
 
   if (missing === 0) {
     pass('Codex hook files installed', codexHooks);
   } else if (missing < allFiles.length) {
+    const examples = missingFiles.slice(0, 3).join(', ');
+    const rest = missing > 3 ? `, +${missing - 3} more` : '';
     warn(
       'Codex hook files installed',
-      `${missing}/${allFiles.length} missing in ${codexHooks} — run /hypo:init --codex`,
+      `${missing}/${allFiles.length} missing in ${codexHooks}: ${examples}${rest} — run /hypo:init --codex`,
     );
   } else {
     fail(
@@ -2233,13 +2321,56 @@ function checkProvenanceSidecar(hooksDir, label) {
 // trusts.
 //
 // Returns null when there is nothing to report (field absent, or digests
-// match), or a ready-to-append reason string naming a few diverged files.
+// match), or a ready-to-append reason string: either a diverged-files
+// mismatch, or the "cannot verify" case below.
 function hooksDigestMismatch(hooksDir, recordedDigest) {
   if (typeof recordedDigest !== 'string' || !recordedDigest) return null;
   const actualDigest = computeHooksDigest(PKG_ROOT, hooksDir);
-  if (actualDigest === null || actualDigest === recordedDigest) return null;
+  if (actualDigest === recordedDigest) return null;
 
   const allFiles = [...Object.values(HOOK_MAP).flat(), ...SHARED_FILES];
+
+  // computeHooksDigest returns null for two different reasons, and neither is
+  // "the digests matched": either hooks.json itself could not be read from
+  // PKG_ROOT, or one of the files it lists could not be read out of hooksDir.
+  // This branch used to be folded into the early return as
+  // `if (actualDigest === null || actualDigest === recordedDigest) return null`,
+  // which reported a failed recompute as nothing-to-report, so a deleted hook
+  // file still printed `verified`. "Could not verify" has to stay a distinct,
+  // non-silent state from "verified". It is not promoted to fail here because
+  // checkProvenanceSidecar keeps this label warn-or-pass, never fail, same as
+  // every other branch in that function, and checkHooks() above already
+  // names the same deletion as a fail, so the exit code is covered there.
+  //
+  // Of those two causes only the second can reach this line: loadHookInventory
+  // reads the same two JSON files at module load and exits 1 when they are bad,
+  // so a doctor that got this far has a readable config. Naming the files is
+  // still best-effort, because it re-reads them a moment after
+  // computeHooksDigest did: a file that vanished in between shows up in the
+  // digest failure and not in this list. When the list comes back empty the
+  // message says that instead of asserting a count of zero unreadable files,
+  // which would read as "nothing is wrong" on the one line that exists to say
+  // otherwise.
+  if (actualDigest === null) {
+    const unreadable = allFiles.filter((file) => {
+      try {
+        readFileSync(join(hooksDir, file));
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    const which = unreadable.length
+      ? `${unreadable.length} hook file(s) unreadable in ${hooksDir} ` +
+        `(e.g. ${unreadable.slice(0, 3).join(', ')})`
+      : `every listed hook file reads back from ${hooksDir} now, so whatever the recompute ` +
+        `could not read has already changed underneath it`;
+    return (
+      `hooksDigest cannot be recomputed. ${which}. Run ` +
+      `${upgradeApplyHint(pluginMode || hypomnemaPluginEnabled)}`
+    );
+  }
+
   const diverged = allFiles.filter((file) => {
     try {
       return !readFileSync(join(hooksDir, file)).equals(readFileSync(join(HOOKS_SRC, file)));
