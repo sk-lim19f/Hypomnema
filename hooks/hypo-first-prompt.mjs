@@ -77,9 +77,9 @@ process.stdin.on('end', () => {
     // A cwd-change marker arms this hook, but CwdChanged has no documented
     // context-injection path, so no [HOT] / [SESSION STATE] ever reached the
     // model for that move. Asking for a summary would make the model invent
-    // one, or emit the literal brackets. This is not a temporary branch: the
-    // follow-up that moves the hook to systemMessage sends that text to the
-    // user, not the model, so the model still gets nothing for a cwd move.
+    // one, or emit the literal brackets. This is not a temporary branch: that
+    // hook has since moved to systemMessage, which is not a model channel
+    // either, so the model still gets nothing for a cwd move.
     const cwdMove = marker.source === 'cwd-change';
     const exampleLine = cwdMove
       ? `${verb} ${projSafe}. What would you like to work on here?`

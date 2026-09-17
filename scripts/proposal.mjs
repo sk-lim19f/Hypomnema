@@ -1092,6 +1092,27 @@ export function classifyProposals(hypoDir) {
   return out;
 }
 
+// There is deliberately no auto-cleanup judge here. One was written: it removed a
+// park whose target already held byte-identical content, on the reasoning that
+// applying it would change nothing, so nothing could be lost.
+//
+// That reasoning is wrong, and the counterexample is a path this file itself
+// creates. `applyProposal` writes the target, THEN appends the audit log. When the
+// append fails it keeps the artifact and prints "re-run apply to complete the audit
+// record" (see its `log-failed` branch). The disk is then exactly: target equals
+// payload, artifact alive, no entry in applied.log. `classifyProposals` reads that
+// as 'pending' and a byte-equality judge reads it as redundant, so the cleanup
+// deletes the very artifact the retry needs. `deleteProposal` is a bare unlink.
+//
+// No stronger predicate rescues it. Separating "audit write failed" from "another
+// session happened to write the same bytes" needs a signal about WHO wrote the
+// target, and nothing on disk carries one: `createdAt` is the park time, mtime does
+// not attribute a writer (and is already rejected below for that reason), and the
+// failed case by definition has no applied.log entry to compare against. Closing
+// this would take a durable write-intent recorded BEFORE the target write, which is
+// a lifecycle change, not a better predicate. Until then `list`'s age and activity
+// columns are the drain, and every removal stays a human's `discard`.
+
 export function reconcileProposals({ hypoDir }, { stdout, stderr } = {}) {
   const out = stdout ?? process.stdout;
   const err = stderr ?? process.stderr;
@@ -1130,7 +1151,9 @@ export function reconcileProposals({ hypoDir }, { stdout, stderr } = {}) {
 
   // The judgment itself is classifyProposals'. This loop only acts on it, so
   // doctor's report and reconcile's action can never disagree about what an
-  // artifact is.
+  // artifact is. Nothing here deletes an artifact it did not first recover a
+  // receipt for; see the note above reconcileProposals for why a 'pending' one
+  // is never removed on its bytes alone.
   for (const c of classifyProposals(hypoDir)) {
     if (c.kind === 'pending') {
       skipped.push({ id: c.id, reason: 'no-handoff-audit-entry' });
@@ -1216,12 +1239,61 @@ export function discardProposal({ hypoDir, id }, { stdout, stderr } = {}) {
 }
 
 /**
- * List pending proposals (id, target, createdAt, plus session/device), oldest
- * first. `--json` emits the array; the human form prints one line each, or a
- * "no pending proposals" notice.
+ * Days between an ISO `createdAt` and `nowMs`, floored at 0, or `null` when
+ * `createdAt` does not parse. Pure so a table test can pin it without a clock.
  */
-export function listPending({ hypoDir }, { stdout, json } = {}) {
+function ageDaysSince(createdAt, nowMs) {
+  const t = Date.parse(createdAt);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((nowMs - t) / 86400000));
+}
+
+/**
+ * Whether the target moved since this was parked, answered by the hash the
+ * artifact already carries rather than by a second, weaker signal.
+ *
+ * mtime was the first thing tried here and it is wrong for this vault: a git
+ * backend with multi-device sync is the design premise (every artifact carries
+ * a `device` field), and clone, pull, checkout and rsync all bump mtime to now
+ * without touching a byte. On the second machine every target would read as
+ * `'changed'`, and a human reading that discards a park that was still
+ * applicable. A discard is an unlink with no way back, so the cheaper signal
+ * fails in the direction that loses bytes.
+ *
+ * `classifyFreshness` already answers this question from
+ * `currentAtProposalHash`, which `listProposals` returns on every body. Reusing
+ * it costs one file read per pending artifact instead of one `stat()`, and it
+ * removes a second implementation of the same judgment from this file.
+ *
+ * Three states: `'gone'` (target absent now, which the apply shell treats as a
+ * create), `'changed'`, `'unchanged'`. An unsafe or unresolvable target, or one
+ * that cannot be read, returns `null` (unknown): guessing would be worse.
+ */
+export function targetActivitySincePark(hypoDir, target, currentAtProposalHash) {
+  const full = resolveTargetPath(hypoDir, target);
+  if (!full) return null;
+  const current = readTarget(full);
+  if (current === undefined) return null;
+  if (current === null) return 'gone';
+  return classifyFreshness({ current, currentAtProposalHash }) === 'fresh'
+    ? 'unchanged'
+    : 'changed';
+}
+
+const ACTIVITY_LABEL = {
+  changed: 'target changed since park',
+  unchanged: 'target unchanged since park',
+  gone: 'target absent, applying would create it',
+};
+
+/**
+ * List pending proposals (id, target, createdAt, age in days, target activity
+ * since park, plus session/device), oldest first. `--json` emits the array;
+ * the human form prints one line each, or a "no pending proposals" notice.
+ */
+export function listPending({ hypoDir }, { stdout, json, now } = {}) {
   const out = stdout ?? process.stdout;
+  const nowMs = now ? now() : Date.now();
   const items = listProposals(hypoDir)
     .map((p) => ({
       id: p.id,
@@ -1229,6 +1301,8 @@ export function listPending({ hypoDir }, { stdout, json } = {}) {
       createdAt: p.createdAt ?? null,
       sessionId: p.sessionId ?? null,
       device: p.device ?? null,
+      ageDays: p.createdAt ? ageDaysSince(p.createdAt, nowMs) : null,
+      targetActivity: targetActivitySincePark(hypoDir, p.target, p.currentAtProposalHash ?? null),
     }))
     .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
 
@@ -1247,7 +1321,11 @@ export function listPending({ hypoDir }, { stdout, json } = {}) {
     const who = it.sessionId
       ? `  (session ${clean(it.sessionId)}, ${clean(it.device ?? '?')})`
       : '';
-    out.write(`${it.id}  ${clean(it.target)}  ${clean(it.createdAt)}${who}\n`);
+    const age = it.ageDays === null ? '' : `, ${it.ageDays}d old`;
+    const activity = ACTIVITY_LABEL[it.targetActivity]
+      ? `, ${ACTIVITY_LABEL[it.targetActivity]}`
+      : '';
+    out.write(`${it.id}  ${clean(it.target)}  ${clean(it.createdAt)}${age}${activity}${who}\n`);
   }
   return { ok: true, code: 0, count: items.length };
 }

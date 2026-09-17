@@ -998,9 +998,66 @@ test('file-watch still injects non-ignored wiki file (e.g. hot.md)', () => {
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
+    // FileChanged has no additionalContext path (its documented output schema
+    // is watchPaths only), so this hook emits systemMessage, not the
+    // additionalContext channel injectedContext() reads.
     assert.ok(
-      injectedContext(out) && /active project state/.test(injectedContext(out)),
-      `expected hot.md injection, got: ${injectedContext(out)}`,
+      out.systemMessage && /active project state/.test(out.systemMessage),
+      `expected hot.md injection via systemMessage, got: ${out.systemMessage}`,
+    );
+  });
+});
+
+// ── ISSUE-125 follow-up: CwdChanged/FileChanged have no additionalContext
+// path at all (documented output schema is watchPaths only), so these two
+// hooks carry their notification in systemMessage instead. Pin the channel
+// directly so a future edit that reverts to additionalContext (nested or
+// top-level) shows up here, not just as a silent notification that never
+// reaches the model. ────────────────────────────────────────────────────
+suite(
+  'hypo-cwd-change.mjs / hypo-file-watch.mjs — notification channel is systemMessage (ISSUE-125)',
+);
+
+test('cwd-change carries its project-hit notification in systemMessage, not additionalContext', () => {
+  withPrivateProject((dir, work) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+      input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/other', session_id: 'test-125-cc' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      typeof out.systemMessage === 'string' && /SECRET_HOT_VALUE/.test(out.systemMessage),
+      `expected the notification in systemMessage, got: ${JSON.stringify(out)}`,
+    );
+    assert.equal(
+      modelContexts(out).length,
+      0,
+      `must not ALSO carry the notification through additionalContext: ${JSON.stringify(modelContexts(out))}`,
+    );
+  });
+});
+
+test('file-watch carries its notification in systemMessage, not additionalContext', () => {
+  withGrowthWiki((dir) => {
+    const hotPath = join(dir, 'hot.md');
+    writeFileSync(hotPath, '# hot\n\nactive project state\n');
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
+      input: JSON.stringify({ file_path: hotPath }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      typeof out.systemMessage === 'string' && /active project state/.test(out.systemMessage),
+      `expected the notification in systemMessage, got: ${JSON.stringify(out)}`,
+    );
+    assert.equal(
+      modelContexts(out).length,
+      0,
+      `must not ALSO carry the notification through additionalContext: ${JSON.stringify(modelContexts(out))}`,
     );
   });
 });

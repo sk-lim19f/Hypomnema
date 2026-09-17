@@ -418,10 +418,13 @@ function runApply(dir, payload, { force = false, sessionId = undefined } = {}) {
 // ── hookSpecificOutput.additionalContext channel (wave 2 of the nested-output
 // migration) ──────────────────────────────────────────────────────────────
 //
-// buildOutput() (hooks/hypo-shared.mjs) now nests additionalContext under
-// hookSpecificOutput; a couple of not-yet-migrated hooks (hypo-cwd-change.mjs,
-// hypo-file-watch.mjs) still emit it top-level. A test asserting "no context
-// was injected" must check BOTH channels, not just one: a single `??`-based
+// buildOutput() (hooks/hypo-shared.mjs) nests additionalContext under
+// hookSpecificOutput. hypo-cwd-change.mjs and hypo-file-watch.mjs used to emit
+// it top-level and no longer do: their events (CwdChanged, FileChanged) have no
+// injection field at all, so they carry their notice in systemMessage instead.
+// Both channels are still read here, and that is now a leak check rather than a
+// migration allowance. A test asserting "no context was injected" must check
+// BOTH channels, not just one: a single `??`-based
 // helper that prefers nested would let a real top-level leak hide behind an
 // unrelated nested value, and vice versa. Returns every channel that actually
 // carries a value, so `.length === 0` is the honest "nothing was injected"
