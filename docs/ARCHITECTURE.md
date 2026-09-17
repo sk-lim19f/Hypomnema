@@ -136,8 +136,8 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | `hypo-hot-rebuild` | At session stop, regenerate root `hot.md` from recent activity; emit growth metrics + cache for next SessionStart |
 | `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd, device}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
 | `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote) |
-| `hypo-cwd-change` | When working directory changes, re-resolve the active project and build `additionalContext` with its `hot.md`; `CwdChanged` has no field Claude Code forwards to the model, so this does not currently reach Claude |
-| `hypo-file-watch` | Build `additionalContext` for a changed wiki file. Two things keep this inert: nothing in this package returns `watchPaths`, so the event has no registered trigger, and `FileChanged` output does not reach the model. The event also fires regardless of who changed the file, so it is not an external-edit signal |
+| `hypo-cwd-change` | When working directory changes, re-resolve the active project and build a notice carrying its `hot.md`; `CwdChanged` has no field Claude Code forwards to the model, so the notice rides `systemMessage` and does not reach Claude. Where `systemMessage` goes on this event is unmeasured |
+| `hypo-file-watch` | Build a `systemMessage` notice for a changed wiki file. Two things keep this inert: nothing in this package returns `watchPaths`, so the event has no registered trigger, and `FileChanged` output does not reach the model. The event also fires regardless of who changed the file, so it is not an external-edit signal |
 
 ### Deployment constraint
 
@@ -308,7 +308,7 @@ SessionStart
   │     └─► hypo-personal-check.mjs (lint + session-close gate)
   │
   ├─► CwdChanged
-  │     └─► hypo-cwd-change.mjs (builds hot.md context; does not currently reach Claude)
+  │     └─► hypo-cwd-change.mjs (builds a hot.md notice on systemMessage; unmeasured)
   │
   └─► Stop
         ├─► hypo-hot-rebuild.mjs (regenerate root hot.md + growth cache)

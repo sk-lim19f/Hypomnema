@@ -62,6 +62,7 @@ import {
   resolveProposals,
   reconcileProposals,
   classifyProposals,
+  targetActivitySincePark,
   discardProposal,
   listPending,
 } from '../scripts/proposal.mjs';
@@ -4786,7 +4787,9 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
       `${name} must not reach into the apply CLI`,
     );
     assert.equal(
-      /\b(resolveProposals|challengeProposals|applyProposal|writeApprovedProposal)\s*\(/.test(code),
+      /\b(resolveProposals|challengeProposals|applyProposal|writeApprovedProposal|reconcileProposals|discardProposal)\s*\(/.test(
+        code,
+      ),
       false,
       `${name} must not call an apply actor`,
     );
@@ -5410,4 +5413,215 @@ test('an audit entry the page no longer matches is evidence-broken, not recovera
     assert.equal(got[0].kind, 'evidence-broken');
     assert.equal(got[0].reason, 'evidence-mismatch');
   });
+});
+
+// ── ISSUE-127: parked proposals get a drain ──────────────────────────────────
+// A park that would be a no-op (current bytes already equal the payload) is
+// mechanically decidable without a human diff review, so `reconcile` removes
+// it with no page write. `list` gets an age and a "did the target move" hint
+// so a human can pick what to drop without reading every stale diff.
+//
+// An ABSENT target is NOT in that set, though the first version of this drain
+// put it there. Absent means the apply would CREATE the page, which is the
+// cleanest thing left to apply, not a dead park: classifyFreshness reads it as
+// 'fresh' and the apply shell announces "target absent, will be created".
+// crystallize parks exactly that shape as `base-hash-target-missing`. A
+// 'pending' artifact has no audit entry naming its bytes, so it is their only
+// copy and deleteProposal is a bare unlink. The assertions below pin absence
+// to "left for a human" in both the judge and the whole reconcile run.
+suite('ISSUE-127: parked proposals get a drain (auto-cleanup + list age/activity)');
+
+test('reconcile never removes a pending artifact, whatever its target currently holds', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t127-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+
+    // The three shapes a byte-equality judge would have sorted differently, plus
+    // the one that motivated removing it. All four must survive.
+    const gone = psWriteProposal(dir, {
+      target: join('pages', 'gone.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'X',
+      sessionId: 's',
+      device: 'd',
+    });
+    writeFileSync(join(dir, 'pages', 'same.md'), 'IDENTICAL');
+    const redundant = psWriteProposal(dir, {
+      target: join('pages', 'same.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'IDENTICAL',
+      sessionId: 's',
+      device: 'd',
+    });
+    writeFileSync(join(dir, 'pages', 'diff.md'), 'CURRENT');
+    const diff = psWriteProposal(dir, {
+      target: join('pages', 'diff.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'PROPOSED',
+      sessionId: 's',
+      device: 'd',
+    });
+    const escaping = psWriteProposal(dir, {
+      target: join('..', 'outside.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'E',
+      sessionId: 's',
+      device: 'd',
+    });
+
+    assert.deepEqual(
+      classifyProposals(dir).map((c) => c.kind),
+      ['pending', 'pending', 'pending', 'pending'],
+      'all four have no audit entry, so all four are pending',
+    );
+
+    const out = capStream();
+    const rec = reconcileProposals({ hypoDir: dir }, { stdout: out, stderr: capStream() });
+    assert.equal(rec.ok, true, `reconcile must not fail: ${JSON.stringify(rec)}`);
+    assert.deepEqual(
+      rec.skipped.map((x) => x.id).sort(),
+      [gone.id, redundant.id, diff.id, escaping.id].sort(),
+      'every pending artifact is skipped, none is cleaned',
+    );
+    assert.equal(
+      'cleaned' in rec,
+      false,
+      'the cleaned bucket is gone from the return shape, not merely left empty',
+    );
+
+    // same.md is the one the removed judge would have taken. Its artifact is the
+    // only copy of bytes that `applyProposal` may have already written while
+    // failing to append the audit log, which is why byte-equality cannot decide.
+    for (const [label, p] of [
+      ['absent-target', gone],
+      ['byte-identical', redundant],
+      ['real diff', diff],
+      ['escaping target', escaping],
+    ]) {
+      assert.ok(psReadProposal(dir, p.id), `${label} artifact must survive reconcile`);
+    }
+
+    assert.equal(readFileSync(join(dir, 'pages', 'same.md'), 'utf-8'), 'IDENTICAL');
+    assert.equal(readFileSync(join(dir, 'pages', 'diff.md'), 'utf-8'), 'CURRENT');
+    assert.equal(existsSync(join(dir, 'pages', 'gone.md')), false, 'reconcile writes no page');
+    assert.doesNotMatch(out.text(), /removed/, 'reconcile announces no removal');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('targetActivitySincePark: gone / unchanged / changed / touched-without-change / unresolvable target', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t127-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+
+    assert.equal(
+      targetActivitySincePark(dir, join('pages', 'nope.md'), null),
+      'gone',
+      'an absent target reads as gone',
+    );
+
+    const unchangedPath = join(dir, 'pages', 'unchanged.md');
+    writeFileSync(unchangedPath, 'x');
+    assert.equal(
+      targetActivitySincePark(dir, join('pages', 'unchanged.md'), hashProposalContent('x')),
+      'unchanged',
+      'bytes equal to the park-time hash read as unchanged',
+    );
+
+    writeFileSync(join(dir, 'pages', 'changed.md'), 'y');
+    assert.equal(
+      targetActivitySincePark(dir, join('pages', 'changed.md'), hashProposalContent('x')),
+      'changed',
+      'bytes different from the park-time hash read as changed',
+    );
+
+    // The input the mtime version got wrong. A checkout or pull rewrites the
+    // file with identical content and a now-timestamp; a human reading
+    // "changed" here would discard a park that is still applicable, and a
+    // discard is an unlink with no way back.
+    const touched = join(dir, 'pages', 'touched.md');
+    writeFileSync(touched, 'x');
+    const later = new Date(Date.now() + 86400000);
+    utimesSync(touched, later, later);
+    assert.equal(
+      targetActivitySincePark(dir, join('pages', 'touched.md'), hashProposalContent('x')),
+      'unchanged',
+      'a future mtime on byte-identical content must NOT read as changed',
+    );
+
+    assert.equal(
+      targetActivitySincePark(dir, join('..', 'outside.md'), null),
+      null,
+      'an unsafe/unresolvable target is unknown, never guessed at',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('listPending surfaces age in days and target activity since park (JSON and human form)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t127-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const createdAt = '2026-01-01T00:00:00.000Z';
+
+    writeFileSync(join(dir, 'pages', 'same.md'), 'x');
+    psWriteProposal(dir, {
+      target: join('pages', 'same.md'),
+      baseHash: null,
+      currentAtProposalHash: hashProposalContent('x'),
+      proposedContent: 'x',
+      sessionId: 's',
+      device: 'd',
+      createdAt,
+    });
+    writeFileSync(join(dir, 'pages', 'moved.md'), 'NOW');
+    psWriteProposal(dir, {
+      target: join('pages', 'moved.md'),
+      baseHash: null,
+      currentAtProposalHash: hashProposalContent('AT PARK'),
+      proposedContent: 'z',
+      sessionId: 's',
+      device: 'd',
+      createdAt,
+    });
+    psWriteProposal(dir, {
+      target: join('pages', 'gone.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'y',
+      sessionId: 's',
+      device: 'd',
+      createdAt,
+    });
+
+    const now = () => Date.parse(createdAt) + 5 * 86400000; // 5 days later, injected clock
+    const j = capStream();
+    const r = listPending({ hypoDir: dir }, { stdout: j, json: true, now });
+    assert.equal(r.count, 3);
+    const arr = JSON.parse(j.text());
+    for (const it of arr) {
+      assert.equal(it.ageDays, 5, `ageDays from the injected clock: ${JSON.stringify(it)}`);
+    }
+    const byTarget = Object.fromEntries(arr.map((it) => [it.target, it]));
+    assert.equal(byTarget[join('pages', 'same.md')].targetActivity, 'unchanged');
+    assert.equal(byTarget[join('pages', 'moved.md')].targetActivity, 'changed');
+    assert.equal(byTarget[join('pages', 'gone.md')].targetActivity, 'gone');
+
+    // All three labels are asserted, not just two. A label nobody renders in a
+    // test ships its typos: 'changed' was the one with no coverage.
+    const human = capStream();
+    listPending({ hypoDir: dir }, { stdout: human, now });
+    assert.match(human.text(), /5d old/, 'the human line shows age in days');
+    assert.match(human.text(), /target absent, applying would create it/, 'gone label');
+    assert.match(human.text(), /target unchanged since park/, 'unchanged label');
+    assert.match(human.text(), /target changed since park/, 'changed label');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -466,6 +466,71 @@ function checkSettingsJson(coreManagedByPlugin) {
   }
 }
 
+// ── dual install (plugin + manual/npm core hook conflict) ────────────────────
+//
+// A plugin-channel install and a manual/npm install can both register
+// the SAME core hooks from two different PKG_ROOTs, and each hooks/hypo-shared.mjs
+// copy resolves its own root by self-location, so nothing forces the two to agree
+// — one hook can call v1.7.0's scripts/ while another in the same session calls
+// v1.7.1's. upgrade.mjs already detects this (dualInstallCoreConflict/dualSkip)
+// and skips double-registering on --apply; the 2026-09-08 policy investigation's
+// recommendation was for doctor to report the same state on every run, not only
+// when upgrade happens to be invoked. `pluginChannel` above is computed once via
+// the SAME resolvePluginChannel() upgrade.mjs and init.mjs call
+// (lib/plugin-detect.mjs) — this reuses that judgment rather than re-deriving it.
+// `hypomnemaPluginEnabled` is `reason !== 'not-enabled'`, so it stays true when the
+// registry could not be read or the enabled key resolved to no install on disk. Both
+// mean settings NAMES a plugin whose files were not located, which is a different
+// state from "two installs are really present". checkPkgIntegrity below asks the same
+// question, so the two share this name rather than each spelling the pair out.
+function channelJudgmentFailed(pluginChannel) {
+  return (
+    pluginChannel.hypomnemaPluginEnabled &&
+    (pluginChannel.rootReason === 'registry-unreadable' ||
+      pluginChannel.rootReason === 'unresolved')
+  );
+}
+
+function checkDualInstall(pluginChannel) {
+  const { pluginMode, hypomnemaPluginEnabled } = pluginChannel;
+  if (pluginMode) {
+    pass(
+      'Dual install (plugin + manual/npm)',
+      'Running as the plugin install — no manual/npm registration to conflict with',
+    );
+    return;
+  }
+  if (!hypomnemaPluginEnabled) {
+    pass('Dual install (plugin + manual/npm)', 'Manual/npm install only — plugin not enabled');
+    return;
+  }
+  // Not a dual install: telling this user to `npm uninstall -g hypomnema` would remove
+  // the only copy they actually have. A stale `enabledPlugins` entry left behind by an
+  // uninstall is exactly this shape.
+  if (channelJudgmentFailed(pluginChannel)) {
+    warn(
+      'Dual install (plugin + manual/npm)',
+      `~/.claude/settings.json enables the Hypomnema plugin, but the registry says ` +
+        `\`${pluginChannel.rootReason}\` — the plugin's files could not be located, so whether this is a ` +
+        `real dual install is UNDETERMINED. Do not remove the npm/manual copy on the strength ` +
+        `of this line: if the plugin is not actually installed, that copy is the only one you ` +
+        `have. Check ~/.claude/plugins/installed_plugins.json, then either re-install the ` +
+        `plugin or drop the stale entry from enabledPlugins.`,
+    );
+    return;
+  }
+  warn(
+    'Dual install (plugin + manual/npm)',
+    'The Hypomnema plugin is ALSO enabled in ~/.claude/settings.json while this is the ' +
+      'manual/npm install — the plugin loader already provides the core hooks, slash ' +
+      'commands, and settings.json wiring, and /hypo:upgrade skips re-registering them by ' +
+      'default (doing so would fire every core hook twice). Pick one install: remove the ' +
+      'npm/manual copy (`npm uninstall -g hypomnema`) and upgrade via `/plugin marketplace ' +
+      'update hypomnema`, or run `hypomnema upgrade --apply --allow-dual-install` to ' +
+      'knowingly register both.',
+  );
+}
+
 function checkGit(hypoDir) {
   if (!existsSync(join(hypoDir, '.git'))) {
     warn(
@@ -1320,7 +1385,13 @@ function checkProposals(hypoDir) {
     );
   }
   if (pending.length > 0) {
-    parts.push(`${pending.length} awaiting review; inspect with \`hypomnema proposal list\``);
+    // No drain to advertise: reconcile never removes a 'pending' artifact (see the
+    // note above reconcileProposals). `list` shows age and target activity so a
+    // human can triage, and every removal is their own `discard`.
+    parts.push(
+      `${pending.length} awaiting review; inspect with \`hypomnema proposal list\` ` +
+        `(it shows each one's age and whether its target moved since)`,
+    );
   }
   warn('Pending proposals', parts.join('. '));
 }
@@ -2412,13 +2483,9 @@ function checkPkgIntegrity(claudeHome) {
     // failed ('registry-unreadable'/'unresolved'), init/upgrade skip the very
     // same write on every re-run until the registry is fixed first (see
     // resolveDurableRoot in init.mjs and the dualSkip branch in upgrade.mjs).
-    const channelJudgmentFailed =
-      hypomnemaPluginEnabled &&
-      (pluginChannel.rootReason === 'registry-unreadable' ||
-        pluginChannel.rootReason === 'unresolved');
     warn(
       'hypo-pkg.json pkgRoot',
-      channelJudgmentFailed
+      channelJudgmentFailed(pluginChannel)
         ? `hypo-pkg.json has no pkgRoot field because the enabled plugin's channel judgment failed ` +
             `(${pluginChannel.rootReason}): re-running /hypo:init or /hypo:upgrade will skip the same ` +
             `write until this resolves. Fix: repair or refresh ~/.claude/plugins/installed_plugins.json ` +
@@ -2534,6 +2601,7 @@ if (rootOk) {
 }
 checkHooks(coreManagedByPlugin);
 checkSettingsJson(coreManagedByPlugin);
+checkDualInstall(pluginChannel);
 checkPkgIntegrity(args.claudeHome);
 checkStaleSibling();
 checkPluginLeafVersion();

@@ -34,6 +34,7 @@ import {
   withGrowthWiki,
   withTmpDir,
   writeMarker,
+  modelContexts,
 } from './helpers.mjs';
 
 // ── visibility scope: currentDevice / predicate / reader ─────────────────────
@@ -337,7 +338,13 @@ test('hypo-file-watch: machine-scoped page is not injected on a non-owning devic
     );
     const out = JSON.parse(r.stdout);
     assert.equal(out.continue, true);
-    assert.ok(!('additionalContext' in out), 'scoped page must not inject on a foreign device');
+    // modelContexts() reads BOTH additionalContext shapes (top-level and the
+    // nested hookSpecificOutput one). Spelling two field names out by hand here
+    // missed the nested one, which is the exact mistake that helper exists to
+    // prevent: a gate that leaks through a channel the assertion does not name
+    // is the same leak.
+    assert.deepEqual(modelContexts(out), [], 'no model-context channel may carry it');
+    assert.ok(!('systemMessage' in out), 'and neither may systemMessage');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -355,8 +362,8 @@ test('hypo-file-watch: machine-scoped page is injected on its owning device', ()
     );
     const out = JSON.parse(r.stdout);
     assert.equal(out.continue, true);
-    assert.ok('additionalContext' in out, 'owning device must still get the injection');
-    assert.ok(out.additionalContext.includes('body text'));
+    assert.ok('systemMessage' in out, 'owning device must still get the notice');
+    assert.ok(out.systemMessage.includes('body text'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -374,7 +381,7 @@ test('hypo-file-watch: a page with no visibility_scope field injects regardless 
       { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
     );
     const out1 = JSON.parse(r1.stdout);
-    assert.ok('additionalContext' in out1, 'unscoped page must inject on any device (devB)');
+    assert.ok('systemMessage' in out1, 'unscoped page must reach any device (devB)');
 
     const r2 = runHook(
       'hypo-file-watch.mjs',
@@ -382,7 +389,7 @@ test('hypo-file-watch: a page with no visibility_scope field injects regardless 
       { HYPO_DIR: dir, HYPO_DEVICE: 'devA' },
     );
     const out2 = JSON.parse(r2.stdout);
-    assert.ok('additionalContext' in out2, 'unscoped page must inject on any device (devA)');
+    assert.ok('systemMessage' in out2, 'unscoped page must reach any device (devA)');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -616,7 +623,8 @@ test('injection surfaces (lookup + query + file-watch) withhold machine:devA fro
         { HYPO_DIR: dir, HYPO_DEVICE: 'devB' },
       ).stdout,
     );
-    assert.ok(!('additionalContext' in fwB), 'file-watch must not inject machine:devA on devB');
+    assert.deepEqual(modelContexts(fwB), [], 'no model-context channel may carry machine:devA');
+    assert.ok(!('systemMessage' in fwB), 'and neither may systemMessage');
     const fwA = JSON.parse(
       runHook(
         'hypo-file-watch.mjs',
@@ -624,7 +632,7 @@ test('injection surfaces (lookup + query + file-watch) withhold machine:devA fro
         { HYPO_DIR: dir, HYPO_DEVICE: 'devA' },
       ).stdout,
     );
-    assert.ok('additionalContext' in fwA, 'file-watch must inject machine:devA on devA');
+    assert.ok('systemMessage' in fwA, 'file-watch must reach devA with machine:devA');
   });
 });
 

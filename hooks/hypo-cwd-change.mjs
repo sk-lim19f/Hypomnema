@@ -32,8 +32,8 @@ const PROJECTS_DIR = join(HYPO_DIR, 'projects');
 const GLOBAL_HOT = join(HYPO_DIR, 'hot.md');
 const MAX_CHARS = 3000;
 
-// Privacy guard: a .hypoignore-matched hot.md must not be
-// re-emitted into additionalContext on cwd change.
+// Privacy guard: a .hypoignore-matched hot.md must not be re-emitted in this
+// hook's output on cwd change, whichever field carries it.
 //
 // Visibility guard: same contract as hypo-file-watch and hypo-session-start. A
 // machine-scoped hot.md stays off every machine but its owner. Scope is read
@@ -152,16 +152,21 @@ process.stdin.on('end', () => {
       // working_dir distinct from the vault, surface where wiki files live.
       const vaultOrientation = buildVaultOrientation(newCwd);
       const orientPrefix = vaultOrientation ? `${vaultOrientation}\n\n` : '';
-      // Built inline rather than through buildOutput(): CwdChanged has no
-      // documented context-injection path, so the nested hookSpecificOutput
-      // shape buildOutput() now emits would be wrong for this event. The
-      // follow-up that moves this hook to systemMessage removes these three
-      // literals; until then they keep today's behaviour unchanged.
+      // Built inline rather than through buildOutput(): CwdChanged's documented
+      // output schema is watchPaths only, so it has no additionalContext path
+      // at all, nested or top-level. The notice rides systemMessage instead.
+      // systemMessage is a COMMON field ("to surface a message to the user on
+      // any platform"), and the reference says some events discard it or deliver
+      // it elsewhere, with each event's own section saying which. That section
+      // has not been read for CwdChanged, and no live session has been measured,
+      // so treat "the user sees this" as open rather than settled.
+      // Whatever it turns out to be, the .hypoignore and visibility guards
+      // above run first, so a withheld page never reaches this line.
       console.log(
         JSON.stringify({
           continue: true,
           suppressOutput: true,
-          additionalContext: `${orientPrefix}[WIKI: cwd changed → project=${sanitizeProjForPrompt(newHit.proj)}]\n\n${content}`,
+          systemMessage: `${orientPrefix}[WIKI: cwd changed → project=${sanitizeProjForPrompt(newHit.proj)}]\n\n${content}`,
         }),
       );
       return;
@@ -202,7 +207,7 @@ process.stdin.on('end', () => {
           JSON.stringify({
             continue: true,
             suppressOutput: true,
-            additionalContext: suggestPrefix.trimEnd(),
+            systemMessage: suggestPrefix.trimEnd(),
           }),
         );
       } else {
@@ -214,7 +219,7 @@ process.stdin.on('end', () => {
       JSON.stringify({
         continue: true,
         suppressOutput: true,
-        additionalContext: `${suggestPrefix}[WIKI: cwd changed → no project match, injecting global hot]\n\n${globalContent}`,
+        systemMessage: `${suggestPrefix}[WIKI: cwd changed → no project match, injecting global hot]\n\n${globalContent}`,
       }),
     );
   } catch (err) {

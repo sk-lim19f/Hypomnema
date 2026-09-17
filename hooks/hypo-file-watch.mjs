@@ -36,9 +36,11 @@ process.stdin.on('end', () => {
       return;
     }
 
-    // Privacy guard: refuse to inject
-    // .hypoignore-matched paths. Without this, `.env*` or other secrets under
-    // HYPO_DIR are re-emitted as additionalContext to the Claude provider.
+    // Privacy guard: refuse to emit .hypoignore-matched paths. Without this,
+    // `.env*` or other secrets under HYPO_DIR are re-emitted in this hook's
+    // output. The guard does not depend on which field carries that output:
+    // where systemMessage goes on FileChanged is unmeasured, so the only safe
+    // assumption is that a matched path must never be put in it.
     const patterns = loadHypoIgnore(HYPO_DIR);
     if (patterns.length > 0 && isIgnored(filePath, HYPO_DIR, patterns)) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
@@ -65,11 +67,18 @@ process.stdin.on('end', () => {
     const content = fileRaw.slice(0, MAX_CHARS);
     const relPath = filePath.replace(HYPO_DIR + '/', '');
 
+    // Built inline rather than through buildOutput(): FileChanged's documented
+    // output schema is watchPaths only, same as CwdChanged, so there is no
+    // additionalContext path here and the notice rides systemMessage. Same
+    // caveat as hypo-cwd-change: systemMessage is a common field whose handling
+    // is stated per event, and that section has not been read for FileChanged. This
+    // hook has no registered trigger at all today, because nothing in this
+    // package returns watchPaths.
     console.log(
       JSON.stringify({
         continue: true,
         suppressOutput: true,
-        additionalContext: `[WIKI FILE UPDATED: ${relPath}]\n\n${content}`,
+        systemMessage: `[WIKI FILE UPDATED: ${relPath}]\n\n${content}`,
       }),
     );
   } catch (err) {

@@ -1439,6 +1439,51 @@ function withDoctorWiki(fn) {
   });
 }
 
+// ── what doctor tells a vault that has parks ────────────────────────────────
+// Nothing asserted any of checkProposals' wording before this. The first version
+// of that wording advertised an auto-drain, and it landed on the `recoverable`
+// bucket, which is empty in the ordinary case: the line vanished exactly when a
+// user had parks. The drain itself is gone now (reconcile never removes a pending
+// artifact), so what has to hold is narrower and more important. The pending line
+// must appear on its own, and it must not promise a removal that no longer happens.
+//
+// Disabling the check: put the pending wording back on the `recoverable.length > 0`
+// branch in scripts/doctor.mjs, or re-add a "reconcile drops ..." clause to it.
+test('doctor: a vault with only pending parks still gets the pending line, promising no auto-removal', () => {
+  withDoctorWiki((dir) => {
+    mkdirSync(join(dir, '.cache', 'proposals'), { recursive: true });
+    const id = '20260101T000000000Z-hot-md-abcdef';
+    writeFileSync(
+      join(dir, '.cache', 'proposals', `${id}.json`),
+      JSON.stringify({
+        id,
+        target: join('pages', 'note.md'),
+        baseHash: null,
+        currentAtProposalHash: null,
+        proposedContent: 'PARKED',
+        sessionId: 's',
+        device: 'd',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Pending proposals');
+    assert.ok(check, 'Pending proposals check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${JSON.stringify(check)}`);
+    assert.match(check.detail, /1 awaiting review/, 'the count reaches a pending-only vault');
+    assert.doesNotMatch(
+      check.detail,
+      /close handoff receipt/,
+      'no recoverable park exists here, so that branch must not have fired',
+    );
+    assert.doesNotMatch(
+      check.detail,
+      /drops|removes/,
+      'reconcile no longer removes a pending artifact, so doctor must not say it does',
+    );
+  });
+});
+
 test('doctor-project-suggestions: no file → pass', () => {
   withDoctorWiki((dir) => {
     const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
@@ -2819,6 +2864,84 @@ test('leafVersionDrift: unreadable manifest is checked:false, not a clean compar
     assert.equal(d.checked, false, 'a manifest with no version was never compared');
     assert.equal(d.drift, false, 'and an uncompared root must not be reported as drifted');
     assert.equal(d.manifestVersion, null);
+  });
+});
+
+// ── dual install detection (ISSUE-81) ───────────────────────────────────────
+//
+// upgrade.mjs already detects a plugin-channel install running alongside a
+// manual/npm one (dualInstallCoreConflict/dualSkip) and skips double-registering
+// on --apply. The 2026-09-08 policy investigation's recommendation was for
+// doctor to report the same state on every run, not only when upgrade happens
+// to be invoked. This reuses resolvePluginChannel() (lib/plugin-detect.mjs) —
+// the SAME function upgrade.mjs and init.mjs call — rather than a second
+// judgment; withFakeDoctorInstall (ISSUE-52 suite above) is reused too, since
+// it is the one fixture that runs a doctor.mjs copy whose own script location
+// actually sits under `.claude/plugins/…`.
+
+suite('doctor.mjs: dual install detection (ISSUE-81)');
+
+test('manual/npm install, plugin not enabled: passes as a single install', () => {
+  withFakeDoctorInstall(false, ({ doctor, home, wiki }) => {
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Dual install (plugin + manual/npm)');
+    assert.ok(check, 'expected a Dual install check');
+    assert.equal(check.status, 'pass', `single manual install must pass: ${check.detail}`);
+    assert.match(check.detail, /plugin not enabled/);
+  });
+});
+
+test('plugin install (doctor itself runs from a plugin cache root): passes', () => {
+  withFakeDoctorInstall(true, ({ doctor, home, wiki }) => {
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Dual install (plugin + manual/npm)');
+    assert.ok(check, 'expected a Dual install check');
+    assert.equal(check.status, 'pass', `plugin-mode run must pass: ${check.detail}`);
+    assert.match(check.detail, /Running as the plugin install/);
+  });
+});
+
+// A real dual install is settings + a registry row + files on disk. The first
+// version of this fixture wrote only settings, which made it the OTHER state:
+// enabledPlugins names a plugin whose files were never found. `hypomnemaPluginEnabled`
+// is `reason !== 'not-enabled'`, so it is true in both, and the check told that user
+// to `npm uninstall -g hypomnema` -- removing the only copy they actually had. The
+// two cases are now separate tests so neither can stand in for the other.
+test('manual/npm install with the plugin ALSO installed and enabled: warns and names both remedies', () => {
+  withFakeDoctorInstall(false, ({ doctor, home, wiki }) => {
+    enablePlugin(home);
+    registerPluginCache(home, '1.8.4', '1.8.4');
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Dual install (plugin + manual/npm)');
+    assert.ok(check, 'expected a Dual install check');
+    assert.equal(check.status, 'warn', `dual install must warn, not pass: ${check.detail}`);
+    assert.match(check.detail, /ALSO enabled/);
+    assert.match(check.detail, /--allow-dual-install/);
+  });
+});
+
+// Disabling the check: drop the `channelJudgmentFailed(pluginChannel)` branch from
+// checkDualInstall in scripts/doctor.mjs. This test then gets the dual-install
+// wording, which is the exact wrong advice: it would tell someone whose plugin
+// files are missing to delete the manual copy they are running on.
+test('settings enables the plugin but no registry row exists: says UNDETERMINED, never advises uninstall', () => {
+  withFakeDoctorInstall(false, ({ doctor, home, wiki }) => {
+    enablePlugin(home); // settings only: no installed_plugins.json, no cache root
+    const r = runDoctorFrom(doctor, [`--hypo-dir=${wiki}`, '--json'], home);
+    const out = JSON.parse(r.stdout);
+    const check = out.find((c) => c.label === 'Dual install (plugin + manual/npm)');
+    assert.ok(check, 'expected a Dual install check');
+    assert.equal(check.status, 'warn', `expected a warn: ${JSON.stringify(check)}`);
+    assert.match(check.detail, /UNDETERMINED/, 'the state must be named as undetermined');
+    assert.doesNotMatch(
+      check.detail,
+      /npm uninstall/,
+      'never advise removing the manual copy when the plugin files were not located',
+    );
+    assert.doesNotMatch(check.detail, /ALSO enabled/, 'this is not the dual-install wording');
   });
 });
 

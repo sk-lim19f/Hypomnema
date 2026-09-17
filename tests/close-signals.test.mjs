@@ -2807,13 +2807,16 @@ function captureStderr() {
 // past every unit test above (they call buildOutput directly with whatever
 // string they like), so this is the only net that catches a hook wiring the
 // wrong argument in.
-const ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT = new Set([
-  // Both still build the pre-nested {continue, suppressOutput, additionalContext}
-  // shape by hand and do not call buildOutput at all. A follow-up PR moves both
-  // onto systemMessage, which removes this exception entirely.
-  'hypo-cwd-change.mjs',
-  'hypo-file-watch.mjs',
-]);
+// Empty, and that is the point. hypo-cwd-change.mjs and hypo-file-watch.mjs
+// were the last two entries: they built the pre-nested {continue,
+// suppressOutput, additionalContext} shape by hand and never called
+// buildOutput. Their events (CwdChanged, FileChanged) have no documented
+// injection field at all, so they now carry their notice in systemMessage and
+// the exception is gone. Leaving a name here after its hook migrates turns the
+// entry into a permanent hole that would wave a future top-level literal
+// straight through, so the set comparison below fails until the name is
+// deleted. Adding a name back is how a regression gets recorded, not excused.
+const ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT = new Set([]);
 
 test('buildOutput never puts additionalContext at the top level, for any event or extra', () => {
   // The source scans above read text, so every one of them has some shape that
@@ -2940,7 +2943,7 @@ test('hypo-shared.mjs mentions additionalContext exactly twice: the strip out of
 // entries survive as a permanent hole that would wave a future top-level literal
 // straight through. Comparing the full set makes that PR fail here until it
 // deletes them.
-test('exactly the two known legacy hooks emit a top-level additionalContext literal', () => {
+test('no hook emits a top-level additionalContext literal', () => {
   const emitters = [];
   for (const file of readdirSync(HOOKS).filter((f) => f.endsWith('.mjs'))) {
     if (file === 'hypo-shared.mjs') continue;
@@ -2955,6 +2958,9 @@ test('exactly the two known legacy hooks emit a top-level additionalContext lite
   // while keeping its top-level one. Asserting these two carry no
   // hookSpecificOutput at all is what makes "matched, therefore top-level"
   // true for them, without needing to parse the file.
+  // No-op while the set is empty, and kept for when it is not: an entry added
+  // back has to prove it really is the top-level shape, or the comparison below
+  // stops meaning what its name says.
   for (const file of ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT) {
     const src = readFileSync(join(HOOKS, file), 'utf-8')
       .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -2969,9 +2975,9 @@ test('exactly the two known legacy hooks emit a top-level additionalContext lite
   assert.deepEqual(
     emitters.sort(),
     [...ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT].sort(),
-    `top-level additionalContext emitters drifted from the expected legacy pair. ` +
-      `A new name means a hook regressed; a missing name means the follow-up migrated it ` +
-      `and must delete it from ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT too. Found: ${emitters.join(', ')}`,
+    `top-level additionalContext emitters drifted from the allow list (now empty). ` +
+      `A new name means a hook regressed; a missing name means a migration must delete it ` +
+      `from ALLOWED_TOP_LEVEL_ADDITIONAL_CONTEXT too. Found: ${emitters.join(', ')}`,
   );
 });
 

@@ -39,7 +39,7 @@ Andrej Karpathy의 "LLM 네이티브 위키" 스케치에서 출발했습니다.
 
 업그레이드 정책 하나만 미리 알아 두세요. `hypomnema upgrade --apply`는 사용자가 직접 편집한 `SCHEMA.md`를 덮어쓰지 않습니다. 스키마가 올라가면 위키 루트에 마이그레이션 보고서만 써 주고, 실제 반영은 사용자가 직접 합니다(코드에서 Option C라고 부르는 정책).
 
-같은 보류 방식이 세션 마무리 파일을 쓸 때에도 적용됩니다. 세션 종료 쓰기의 대상 파일이 이 세션이 읽은 뒤에 바뀌었다면 Hypomnema는 덮어쓰지 않습니다. 그 내용을 `<위키>/.cache/proposals/` 아래에 보류하고 알려 줍니다. 검토와 적용은 직접 하세요. `hypomnema proposal list`로 목록을 보고 터미널에서 `hypomnema proposal apply <id>` 또는 `hypomnema proposal discard <id>`를 씁니다. 세션 안에서는 타이핑할 터미널이 없으므로 같은 승인을 대화에서 받습니다. `hypomnema proposal challenge`가 diff를 보여 주고, 거기 적힌 줄을 직접 입력하면, `hypomnema proposal resolve`가 본 그대로를 씁니다. 자동 적용은 없습니다.
+같은 보류 방식이 세션 마무리 파일을 쓸 때에도 적용됩니다. 세션 종료 쓰기의 대상 파일이 이 세션이 읽은 뒤에 바뀌었다면 Hypomnema는 덮어쓰지 않습니다. 그 내용을 `<위키>/.cache/proposals/` 아래에 보류하고 알려 줍니다. 검토와 적용은 직접 하세요. `hypomnema proposal list`로 목록을 보고 터미널에서 `hypomnema proposal apply <id>` 또는 `hypomnema proposal discard <id>`를 씁니다. 세션 안에서는 타이핑할 터미널이 없으므로 같은 승인을 대화에서 받습니다. `hypomnema proposal challenge`가 diff를 보여 주고, 거기 적힌 줄을 직접 입력하면, `hypomnema proposal resolve`가 본 그대로를 씁니다. 자동 적용은 없습니다. `list`는 보류마다 나이와 대상이 그 뒤에 움직였는지를 함께 보여 주어, diff를 일일이 열지 않고도 버릴 것을 고를 수 있습니다. 스스로 빠지는 것은 없습니다. 모든 제거는 사용자가 돌리는 `discard` 입니다.
 
 자동처럼 보이지만 실제로는 직접 실행해야 하는 기능이 두 가지 있습니다. extensions sync와 역방향 capture입니다. 위키 안 `~/hypomnema/extensions/{agents,commands,hooks,skills}/`에 둔 파일은 `~/.claude/`에 반영되는데(`--codex`를 붙이면 `hooks`·`commands`는 `~/.codex/`에도), 직접 `hypomnema init`, `hypomnema upgrade --apply`, 또는 dry-run이 아닌 `hypomnema capture`를 돌려야만 반영됩니다. 저절로 밀어 넣는 트리거는 없습니다. `hypomnema capture`(또는 `/hypo:capture`)는 반대 방향으로, 직접 만든 command·agent·hook·skill을 위키로 가져오는 경로인데 이것도 마찬가지로 명시적으로 불러야 동작합니다. 자세한 내용은 아래 명령어 표를 보세요.
 
@@ -256,8 +256,8 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | 마커 기반으로 첫 프롬프트에 재개 한 줄을 요구한다(10분 TTL). `hot.md`를 다시 읽지는 않는다 |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT 주입 / MISS면 가까운 슬러그 신호 |
 | `hypo-compact-guard.mjs` | `UserPromptSubmit` | 채팅에 입력된 `/compact`나 `/clear`를 감지해 마무리가 덜 됐으면 알린다. compact 자체는 막지 않는다 |
-| `hypo-cwd-change.mjs` | `CwdChanged` | cwd에 맞는 프로젝트 `hot.md`로 컨텍스트를 만든다. `CwdChanged`에는 Claude Code가 모델로 전달하는 출력 필드가 없어 지금은 닿지 않는다 |
-| `hypo-file-watch.mjs` | `FileChanged` | 바뀐 위키 파일로 컨텍스트를 만든다(`.hypoignore` 준수). 이 패키지는 감시 경로를 등록하지 않아 이벤트가 발생할 계기가 없고, `FileChanged` 출력은 어차피 모델에 안 닿는다 |
+| `hypo-cwd-change.mjs` | `CwdChanged` | cwd에 맞는 프로젝트 `hot.md`로 알림을 만든다. `CwdChanged`는 모델에 닿는 출력 필드를 문서화하지 않아 알림은 `systemMessage`로 나간다. 그것이 이 이벤트에서 어디로 가는지는 미측정이다(아래 전송 안내 참조) |
+| `hypo-file-watch.mjs` | `FileChanged` | 바뀜 위키 파일로 알림을 만든다(`.hypoignore` 준수). 이 패키지는 감시 경로를 등록하지 않아 이벤트가 발생할 계기 자체가 없다. `CwdChanged`와 마찬가지로 모델에 닿는 필드를 문서화하지 않아 알림은 `systemMessage`로 나간다 |
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | 위키 파일 자동 stage |
 | `hypo-auto-commit.mjs` | `Stop` | 자동 commit + pull + push |
 | `hypo-hot-rebuild.mjs` | `Stop` | 루트 `hot.md` 포인터 테이블 재생성 (구조와 날짜) |
@@ -396,7 +396,7 @@ E. 멈춘 프로젝트 재개.
 
 `HYPO_SKIP_GATE=1`은 세션 중간에 사용자를 막을 수 있는 게이트가 존중합니다. `hypo-compact-guard`, `hypo-close-guard`, `hypo-auto-minimal-crystallize`, 그리고 `hypo-web-fetch-ingest`의 ingest 안내가 여기 해당합니다. `hypo-personal-check`(PreCompact)도 이 플래그를 읽지만, 이 훅은 이제 `/compact`를 막지 않으므로 플래그는 반복될 뻔한 미완성-마무리 `systemMessage`만 억제합니다. 기록할 필요 없는 가벼운 세션에 씁니다.
 
-> 모델 제공사에게 전송되는 범위: Hypomnema 훅은 위키 본문을 Claude Code의 추가 컨텍스트(`additionalContext`)에 실어 보내고, 이 내용은 프롬프트의 일부로 Claude 모델 제공사로 전송됩니다. 이 경로가 실제로 모델까지 닿는 것은 `hypo-session-start`와 `hypo-lookup`입니다. `hypo-cwd-change`와 `hypo-file-watch`는 `CwdChanged`와 `FileChanged` 이벤트에서 동작하는데, Claude Code가 이 두 이벤트에는 모델에 닿는 출력 필드를 두지 않아서, 두 훅이 만드는 `additionalContext`는 지금은 전송 전에 버려집니다. `.hypoignore`는 출력이 모델까지 닿는지와 무관하게 이 네 훅 모두와 `ingest`에서 적용됩니다. 등록하지 않은 파일은 모델에 닿는 두 훅이 그대로 전송합니다. (`hypo-auto-stage`/`hypo-auto-commit`은 git 스테이징용 훅이라 컨텍스트를 주입하지는 않지만, 스테이징 판단에도 `.hypoignore`를 참고합니다.) 비밀 정보는 위키에 두지 마시고, `HYPO_DIR` 아래에 민감한 내용을 저장하기 전에 `.hypoignore` 패턴을 먼저 점검하세요.
+> 모델 제공사에게 전송되는 범위: Hypomnema 훅은 위키 본문을 Claude Code의 추가 컨텍스트(`additionalContext`)에 실어 보내고, 이 내용은 프롬프트의 일부로 Claude 모델 제공사로 전송됩니다. 이 경로가 실제로 모델까지 닿는 것은 `hypo-session-start`와 `hypo-lookup`입니다. `hypo-cwd-change`와 `hypo-file-watch`는 `CwdChanged`와 `FileChanged` 이벤트에서 동작합니다. 이 두 이벤트는 문서화된 출력 필드가 `watchPaths` 뿐이라 모델에 닿는 자리가 없고, 그래서 두 훅은 `additionalContext` 대신 `systemMessage`로 알림을 냅니다. `systemMessage`는 공통 필드입니다. 훅 문서는 "어느 플랫폼에서든 사용자에게 메시지를 드러내려면" 그것을 내라고 하고, 일부 이벤트는 그것을 버리거나 다른 곳으로 보내며 어느 쪽인지는 각 이벤트 절이 적는다고 합니다. **우리는 그 두 절을 읽지 못했고 실세션을 재 보지도 않았습니다.** 그래서 이 두 이벤트에서 알림이 사용자에게 닿는지는 열려 있습니다. 어느 쪽이든 모델 컨텍스트 채널은 아닙니다. `hypo-file-watch`는 그와 별개로 트리거 자체가 없습니다. 이 패키지 안에서 `watchPaths`를 내는 자리가 없기 때문입니다. `.hypoignore`는 출력이 모델까지 닿는지와 무관하게 이 네 훅 모두와 `ingest`에서 적용됩니다. 등록하지 않은 파일은 모델에 닿는 두 훅이 그대로 전송합니다. (`hypo-auto-stage`/`hypo-auto-commit`은 git 스테이징용 훅이라 컨텍스트를 주입하지는 않지만, 스테이징 판단에도 `.hypoignore`를 참고합니다.) 비밀 정보는 위키에 두지 마시고, `HYPO_DIR` 아래에 민감한 내용을 저장하기 전에 `.hypoignore` 패턴을 먼저 점검하세요.
 
 > git sync 범위: Hypomnema는 `~/hypomnema/` 위키 자체만 git sync합니다. 단 `init` / `upgrade`는 `~/.claude/` 안의 관리 대상 영역(Hypomnema 자체 hook `~/.claude/hooks/`, 슬래시 커맨드 `~/.claude/commands/hypo/`, `settings.json` 등록)을 설치·SHA 추적하고, extensions companion sync로 위키의 `~/hypomnema/extensions/`에 둔 `agents/`·`commands/`·`hooks/`·`skills/`도 미러링합니다(직접 `init`·`upgrade --apply`·`capture`를 돌릴 때. `--codex`면 `hooks`·`commands` 부분집합만 `~/.codex/`로). 이 관리 대상 바깥에 있는 `~/.claude/` 콘텐츠는 일부러 관리하지 않습니다. 위키를 거치지 않는 기타 agent/skill, 머신 고유 `settings.local.json` 같은 일반 Claude Code 설정의 기기 간 동기화는 [chezmoi](https://www.chezmoi.io/) 같은 별도 dotfiles 매니저를 권합니다.
 
