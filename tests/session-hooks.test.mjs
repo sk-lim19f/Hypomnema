@@ -1439,8 +1439,9 @@ test('file-watch still injects non-ignored wiki file (e.g. hot.md)', () => {
     });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
-    // FileChanged has no additionalContext path (its documented output schema
-    // is watchPaths only), so this hook emits systemMessage, not the
+    // FileChanged has no additionalContext path (the reference documents
+    // watchPaths and systemMessage for this event, neither of which is an
+    // additionalContext path), so this hook emits systemMessage, not the
     // additionalContext channel injectedContext() reads.
     assert.ok(
       out.systemMessage && /active project state/.test(out.systemMessage),
@@ -1450,11 +1451,16 @@ test('file-watch still injects non-ignored wiki file (e.g. hot.md)', () => {
 });
 
 // ── ISSUE-125 follow-up: CwdChanged/FileChanged have no additionalContext
-// path at all (documented output schema is watchPaths only), so these two
+// path at all (the reference documents watchPaths and systemMessage for
+// these events, neither of which is an additionalContext path), so these two
 // hooks carry their notification in systemMessage instead. Pin the channel
 // directly so a future edit that reverts to additionalContext (nested or
-// top-level) shows up here, not just as a silent notification that never
-// reaches the model. ────────────────────────────────────────────────────
+// top-level) shows up here. What these assertions fix is the channel, not
+// where it lands: whether systemMessage reaches the model on these two events
+// is undocumented rather than denied. As of Claude Code 2.1.276 (checked
+// 2026-09-18), tracing the installed binary shows it does not; until the
+// documentation says otherwise, that is the working assumption.
+// ────────────────────────────────────────────────────
 suite(
   'hypo-cwd-change.mjs / hypo-file-watch.mjs — notification channel is systemMessage (ISSUE-125)',
 );
@@ -2238,18 +2244,25 @@ test('replay-first-prompt-forces-summary: cwd-change marker says "Resuming"', ()
     assert.doesNotMatch(out, /Previously working on/, 'must not use the session-start verb');
     // The two assertions above only read `verb`, which is set independently of
     // the cwd-change branch: they pass whether that branch exists or not. These
-    // two are what actually pin it. CwdChanged has no context-injection path, so
-    // nothing was ever placed for the model to summarize; asking it to fill
-    // placeholders from context it never received makes it invent one.
+    // two are what actually pin it. The hook reference does not document
+    // whether CwdChanged's systemMessage reaches the model; as of Claude Code
+    // 2.1.276 (checked 2026-09-18), tracing the installed binary shows it does
+    // not, so this hook does not rely on it either way. Asking the model to
+    // fill placeholders from context that never arrived risks it inventing one.
     assert.doesNotMatch(
       out,
       /\[one-line summary\]/,
-      'a cwd move injected no context, so the model must not be handed a placeholder to fill',
+      'context does not reach the model for a cwd move, so the model must not be handed a placeholder to fill',
     );
     assert.doesNotMatch(
       out,
       /already injected/,
-      'must not claim context was injected for a cwd move: CwdChanged cannot inject',
+      'must not claim confirmed context injection for a cwd move: as of Claude Code 2.1.276, CwdChanged does not reach the model',
+    );
+    assert.match(
+      out,
+      /no prior context was injected for this move/i,
+      'directive must assert that no context arrived, not merely hedge',
     );
   } finally {
     if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));

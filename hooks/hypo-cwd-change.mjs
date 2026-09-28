@@ -155,16 +155,29 @@ process.stdin.on('end', () => {
       // working_dir distinct from the vault, surface where wiki files live.
       const vaultOrientation = buildVaultOrientation(newCwd);
       const orientPrefix = vaultOrientation ? `${vaultOrientation}\n\n` : '';
-      // Built inline rather than through buildOutput(): CwdChanged's documented
-      // output schema is watchPaths only, so it has no additionalContext path
-      // at all, nested or top-level. The notice rides systemMessage instead.
-      // systemMessage is a COMMON field ("to surface a message to the user on
-      // any platform"), and the reference says some events discard it or deliver
-      // it elsewhere, with each event's own section saying which. That section
-      // has not been read for CwdChanged, and no live session has been measured,
-      // so treat "the user sees this" as open rather than settled.
-      // Whatever it turns out to be, the .hypoignore and visibility guards
-      // above run first, so a withheld page never reaches this line.
+      // Built inline rather than through buildOutput(): the hook reference's
+      // CwdChanged section documents watchPaths and systemMessage as the
+      // fields Claude Code reads from that event's output, and neither is an
+      // additionalContext path, so there is no additionalContext path here.
+      // CwdChanged and FileChanged each get their own section and each repeats
+      // this sentence, so the two are not sharing one paragraph (checked
+      // against the published reference 2026-09-21). The notice rides
+      // systemMessage instead. The reference says systemMessage shows as a
+      // brief terminal notification in an interactive session and never
+      // reaches the SDK message stream by name, but it does not say whether
+      // systemMessage reaches the model on this event either way, so treat
+      // that as undocumented rather than denied. As of Claude Code 2.1.276
+      // (checked 2026-09-18), tracing the installed binary shows the only
+      // consumer of this systemMessage is the terminal notification queue: a
+      // low-priority toast (priority 'low', timeoutMs 5000, key 'env-hook')
+      // that a later same-keyed message replaces and that fades after five
+      // seconds, with no branch that forwards it to the model; outside the
+      // interactive REPL (SDK, headless) the injecting function is null, so
+      // the message is simply dropped. Until the documentation says
+      // otherwise, treat this event as not reaching the model.
+      // Whatever the documentation eventually says, the .hypoignore and
+      // visibility guards above run first, so a withheld page never reaches
+      // this line.
       console.log(
         JSON.stringify({
           continue: true,
