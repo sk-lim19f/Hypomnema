@@ -14,6 +14,7 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { randomBytes } from 'crypto';
 import { expandHome } from './hypo-root.mjs';
+import { parseStrictDate } from './time.mjs';
 import { isValidProjectName, substituteTokens, TEMPLATE_DIR } from './project-create.mjs';
 import { appendPendingTags, checkForbidden } from './schema-vocab.mjs';
 import { atomicWrite } from '../../hooks/atomic-write.mjs';
@@ -382,8 +383,14 @@ function validatePayloadShape(payload) {
       errs.push('payload.log, when present, must be { entry: string }');
     }
   }
-  if (payload.date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(payload.date))) {
-    errs.push('payload.date, when present, must be YYYY-MM-DD');
+  // A format-only check reads `2026-09-31` as a valid YYYY-MM-DD literal, but
+  // there is no such day: `new Date('2026-09-31')` silently normalizes to
+  // October 1 instead of failing, so the old regex-only check would have
+  // let a calendar-overflow payload.date through to stamp a session-log
+  // heading and shard filename with a date that does not exist.
+  // parseStrictDate (lib/time.mjs) rejects that case too.
+  if (payload.date !== undefined && parseStrictDate(payload.date) == null) {
+    errs.push('payload.date, when present, must be a real calendar date in YYYY-MM-DD form');
   }
   if (
     payload.sessionId !== undefined &&

@@ -33,8 +33,13 @@ import { findDesignHistoryStale } from './lib/design-history-stale.mjs';
 import { FEEDBACK_SCOPE_RE } from './lib/feedback-scope.mjs';
 import { FAILURE_TYPE_ENUM } from './lib/failure-type.mjs';
 import { collectPagesLint, collectPagesLinkable, slugForms } from './lib/wikilink.mjs';
-import { parseFrontmatter, SEQUENCE_ENTRY_RE } from './lib/frontmatter.mjs';
+import {
+  parseFrontmatter,
+  SEQUENCE_ENTRY_RE,
+  hasBlockListSourcesConsulted,
+} from './lib/frontmatter.mjs';
 import { buildSlugMap } from './lib/slug-resolver.mjs';
+import { parseStrictDate } from './lib/time.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -322,8 +327,11 @@ const issues = [];
 // Dates are compared as strings, which is only the same as comparing time
 // when every value is zero-padded YYYY-MM-DD. `2026-3-1 > 2026-12-15` is true
 // lexically and false in fact, so anything off this shape is excluded from the
-// comparison and reported instead of silently deciding the verdict.
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// comparison and reported instead of silently deciding the verdict. A format
+// check alone is not enough either: `new Date('2026-02-30')` normalizes to
+// March 2 instead of failing, so a calendar-overflow literal used to read as
+// validated. `parseStrictDate` (lib/time.mjs) is used below wherever a date
+// here is judged usable, and rejects that case too.
 const bySlugForm = new Map();
 const synthesisPages = [];
 
@@ -465,9 +473,41 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
       else bySlugForm.set(form, { updated: fm.updated || null, count: 1 });
     }
   }
-  if (fm.type === 'synthesis' && fm.sources_consulted) {
-    const sources = parseTagsField(fm.sources_consulted) || [];
-    if (sources.length > 0) synthesisPages.push({ rel, updated: fm.updated, sources });
+  if (fm.type === 'synthesis') {
+    // The synthesis's own `updated` is present but fails the strict parse
+    // (wrong shape, or calendar overflow like `2026-02-30`). Checked here,
+    // per page, rather than in the sources_consulted comparison loop below:
+    // that loop only sees pages whose sources parsed, so a synthesis with a
+    // block-list sources_consulted, or with none at all, would never be
+    // reported. Without this, such a date drops out of W15 with no warning
+    // naming why. A missing `updated` is W3's alone and is not repeated here.
+    if (fm.updated && parseStrictDate(fm.updated) == null) {
+      issue(
+        'warn',
+        rel,
+        `synthesis 자신의 updated: "${fm.updated}"가 유효한 YYYY-MM-DD 날짜가 아니어서 sources_consulted 비교를 건너뜁니다`,
+        null,
+        'W16',
+      );
+    }
+    // sources_consulted written as a YAML block list (`- item` on its own
+    // line) parses to an empty value under the line-scanner above, which only
+    // reads unindented `key: value` lines: indistinguishable from the field
+    // never being set. Detect that shape from the raw block first, so "wrote
+    // it, wrong syntax" gets its own W16 instead of silently comparing zero
+    // sources and saying nothing.
+    if (hasBlockListSourcesConsulted(fmBlock ? fmBlock[1] : '')) {
+      issue(
+        'warn',
+        rel,
+        'sources_consulted가 YAML 블록 목록으로 쓰여 있어 인식되지 않습니다. 한 줄 흐름 목록으로 쓰세요: sources_consulted: [a, b]',
+        null,
+        'W16',
+      );
+    } else if (fm.sources_consulted) {
+      const sources = parseTagsField(fm.sources_consulted) || [];
+      if (sources.length > 0) synthesisPages.push({ rel, updated: fm.updated, sources });
+    }
   }
 
   // type-conditional required fields
@@ -777,13 +817,14 @@ for (const { rel, updated, sources } of synthesisPages) {
       unresolved.push(`${source} (${hit.count}개 페이지가 같은 이름)`);
       continue;
     }
-    if (!ISO_DATE_RE.test(hit.updated || '')) {
-      unresolved.push(`${source} (updated 없음 또는 YYYY-MM-DD 아님)`);
+    if (parseStrictDate(hit.updated) == null) {
+      unresolved.push(`${source} (updated 없음, 또는 YYYY-MM-DD 형식의 실제 날짜가 아님)`);
       continue;
     }
     if (!newest || hit.updated > newest) newest = hit.updated;
   }
-  const ownDateUsable = ISO_DATE_RE.test(updated || '');
+  // An unusable own `updated` was already reported per page in lintPage.
+  const ownDateUsable = parseStrictDate(updated) != null;
   if (newest && ownDateUsable && newest > updated) {
     issue(
       'warn',
@@ -793,15 +834,22 @@ for (const { rel, updated, sources } of synthesisPages) {
       'W15',
     );
   }
-  // W16: sources W15 could not compare, reported once per page with the reason
-  // for each. Without this the rule fails open, and silently: a page whose
-  // sources mostly do not resolve still gets a W15 (or no warning at all) with
-  // nothing saying how much of the evidence was actually read. The reasons are
-  // kept apart because the fix differs: a name that resolves to nothing is a
-  // typo or a value this field is not meant to hold, a name claimed by two
-  // pages needs the longer form, and a source with no usable `updated` is W3's
-  // problem on that page. Excluded from STRICT_PROMOTE_IDS and given its own id
-  // for the same reasons as W15.
+  // W16 (this emit site): sources W15 could not compare, joined into one warn
+  // per page naming the reason for each. This is one of three shapes W16 now
+  // covers, not the only one: a block-list sources_consulted
+  // (hasBlockListSourcesConsulted, above) and a synthesis's own `updated`
+  // that fails the strict date parse (checked per page in lintPage) are separate
+  // emit sites, so a single page can carry more than one W16 warning at once
+  // (an unparseable own `updated` alongside an unresolved source, for
+  // example). Without this particular emit, the rule fails open, and
+  // silently: a page whose sources mostly do not resolve still gets a W15
+  // (or no warning at all) with nothing saying how much of the evidence was
+  // actually read. The reasons are kept apart because the fix differs: a
+  // name that resolves to nothing is a typo or a value this field is not
+  // meant to hold, a name claimed by two pages needs the longer form, and a
+  // source with no usable `updated` is W3's problem on that page. Excluded
+  // from STRICT_PROMOTE_IDS and given its own id for the same reasons as
+  // W15.
   if (unresolved.length > 0) {
     issue(
       'warn',

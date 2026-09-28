@@ -1064,6 +1064,28 @@ test('payload.sessionId non-string → payload schema invalid', () => {
   });
 });
 
+test('payload.date calendar overflow (2026-09-31) → payload schema invalid, log.md untouched', () => {
+  // A format-only regex reads 2026-09-31 as a valid YYYY-MM-DD literal, but
+  // September has 30 days: `new Date('2026-09-31')` silently normalizes to
+  // October 1 instead of failing, so the check used to let it through to
+  // stamp a session-log heading and shard filename with a date that never
+  // happened.
+  withWiki(null, (dir, today) => {
+    const before = readFileSync(join(dir, 'log.md'), 'utf-8');
+    const payload = payloadForCleanWiki(dir, today);
+    payload.date = '2026-09-31';
+    const r = runApply(dir, payload, { sessionId: 'sid' });
+    assert.equal(r.status, 1, `calendar-overflow date must fail: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.error, 'payload schema invalid');
+    assert.ok(
+      (out.details || []).some((d) => /payload\.date/.test(d) && /real calendar date/.test(d)),
+      `details must say the date does not exist, not only name the format: ${r.stdout}`,
+    );
+    assert.equal(readFileSync(join(dir, 'log.md'), 'utf-8'), before, 'log.md must be untouched');
+  });
+});
+
 test('payload.sessionId null → treated as absent, guard fails open', () => {
   withWiki(null, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
