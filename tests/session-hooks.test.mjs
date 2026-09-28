@@ -1881,6 +1881,29 @@ test('cwd-change offers auto-project for unmatched git+marker new_cwd', () => {
   });
 });
 
+// The MISS branch (no project match, GLOBAL_HOT falls back) rides the same
+// systemMessage toast as the HIT branch, not the model's context, so its
+// wording must not claim to "inject" anything. `work` here carries neither
+// .git nor a project marker, so the auto-project offer stays silent and the
+// systemMessage is only the global-hot notice.
+test('cwd-change MISS branch does not claim to inject the global hot into the model', () => {
+  withAutoProjectEnv((dir, work) => {
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-cwd-change.mjs')], {
+      input: JSON.stringify({ new_cwd: work, old_cwd: '/tmp/elsewhere-no-proj' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: dir, HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(out.systemMessage, `expected a global-hot systemMessage, got: ${r.stdout}`);
+    assert.doesNotMatch(
+      out.systemMessage,
+      /inject/i,
+      `this notice rides a terminal toast, not model injection: ${out.systemMessage}`,
+    );
+  });
+});
+
 // The offer must still surface when GLOBAL_HOT exists but is .hypoignore'd
 // (readIfNotIgnored → null). Previously this branch emitted a bare
 // {continue:true} and dropped the offer.

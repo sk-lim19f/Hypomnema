@@ -5,9 +5,10 @@
  * When any file under HYPO_DIR changes, build a notification of its contents.
  * FileChanged fires for edits from any source: Claude's own Write/Edit/Bash
  * tools as well as an external process (a remote agent, another Claude Code
- * session), not only external ones. As of Claude Code 2.1.276 that
- * notification is a five-second terminal toast and does not reach the model,
- * so this hook does not re-inject anything.
+ * session), not only external ones. Tracing the installed binary (Claude Code
+ * 2.1.276, reconfirmed on 2.1.283) shows that notification is a five-second
+ * terminal toast that does not reach the model, so this hook does not put
+ * anything back in front of the model, only the terminal.
  */
 
 import { readFileSync, existsSync } from 'fs';
@@ -78,23 +79,27 @@ process.stdin.on('end', () => {
     // path, so the notice rides systemMessage. The two events are documented
     // separately, each repeating the sentence for itself (checked against the
     // published reference 2026-09-21). The reference says systemMessage
-    // shows as a brief terminal notification in an interactive session and
-    // never reaches the SDK message stream by name, but it does not say
-    // whether systemMessage reaches the model on this event either way. As
-    // of Claude Code 2.1.276 (checked 2026-09-18), tracing the installed
-    // binary shows the same shared consumer as hypo-cwd-change.mjs: a
-    // low-priority terminal toast with no branch to the model, dropped
-    // entirely outside the interactive REPL. Until the documentation says
-    // otherwise, treat this event as not reaching the model.
+    // "shows the systemMessage as a brief terminal notification" and
+    // "doesn't reach the SDK message stream," but it does not say whether
+    // systemMessage reaches the model on this event either way. As of Claude
+    // Code 2.1.276 (checked 2026-09-18) and reconfirmed on 2.1.283, tracing
+    // the installed binary shows the same shared consumer as
+    // hypo-cwd-change.mjs: a low-priority terminal toast with no branch to
+    // the model, dropped entirely outside the interactive REPL. No
+    // live-session observation of this path exists either way. Until the
+    // documentation says otherwise, treat this event as not reaching the
+    // model.
     // On a stock install this hook still has no registered trigger: its
     // matcher is omitted (not blank), which the reference says matches every
     // watched file while adding nothing to the watch list, and nothing in
     // this package returns watchPaths to seed that list. The watch list is
     // session-global though, not scoped to this plugin: if another hook or
     // plugin seeds it, this matcher-less group fires on every watched file,
-    // not just wiki ones. The HYPO_DIR check above still returns immediately
-    // for anything outside the wiki either way, so a watch seeded elsewhere
-    // cannot make this hook emit non-wiki content.
+    // not just wiki ones. The HYPO_DIR check above (`filePath.startsWith(HYPO_DIR
+    // + '/')`, a string-prefix test that does not resolve symlinks) still
+    // returns immediately for any path that does not start with HYPO_DIR, so
+    // a watch seeded elsewhere still cannot hand this hook non-wiki content
+    // through this path.
     console.log(
       JSON.stringify({
         continue: true,

@@ -1044,10 +1044,11 @@ test('session-start injects a shared state while withholding a scoped-out hot, a
 });
 
 // cwd-change deliberately arms the first-prompt marker only when real content was
-// injected (a forced "Resuming" line with nothing to summarize is empty noise).
-// A scoped-out hot takes that same path, which is correct precisely because the
-// additionalContext placeholder already states the fact: the model is not left
-// silent, it is told the snapshot lives elsewhere.
+// actually found (a forced "Resuming" line with no snapshot behind it would be a
+// false claim, not a summary problem: the line is always verbatim, never a
+// content summary). A scoped-out hot takes that same path, which is correct
+// precisely because the additionalContext placeholder already states the fact:
+// the model is not left silent, it is told the snapshot lives elsewhere.
 test('cwd-change does not arm the resume marker for a scoped-out hot', () => {
   withScopedProject('visibility_scope: machine:devA', (dir, work) => {
     const sid = `t11-cc-marker-${process.pid}-${Date.now()}`;
