@@ -55,6 +55,7 @@ import { join, dirname, resolve, isAbsolute, sep } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { DAY_MS } from './lib/time.mjs';
 import {
   listProposals,
   readProposal,
@@ -1245,7 +1246,7 @@ export function discardProposal({ hypoDir, id }, { stdout, stderr } = {}) {
 function ageDaysSince(createdAt, nowMs) {
   const t = Date.parse(createdAt);
   if (!Number.isFinite(t)) return null;
-  return Math.max(0, Math.floor((nowMs - t) / 86400000));
+  return Math.max(0, Math.floor((nowMs - t) / DAY_MS));
 }
 
 /**

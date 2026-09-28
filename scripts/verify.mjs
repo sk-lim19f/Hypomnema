@@ -19,6 +19,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { DAY_MS } from './lib/time.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -130,7 +131,7 @@ for (const file of files) {
   if (!fm.verify_by) {
     missing.push(entry);
   } else if (fm.verify_by_date && /^\d{4}-\d{2}-\d{2}$/.test(fm.verify_by_date)) {
-    const daysUntil = Math.ceil((new Date(fm.verify_by_date) - new Date(today)) / 86400000);
+    const daysUntil = Math.ceil((new Date(fm.verify_by_date) - new Date(today)) / DAY_MS);
     if (fm.verify_by_date < today) {
       overdue.push({ ...entry, daysOverdue: -daysUntil });
     } else if (daysUntil <= 14) {

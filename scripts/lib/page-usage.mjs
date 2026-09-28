@@ -11,10 +11,10 @@ import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { collectPagesCrystallize, extractWikilinks, slugForms } from './wikilink.mjs';
 import { parseFrontmatter } from './frontmatter.mjs';
+import { DAY_MS } from './time.mjs';
 import { currentDevice, scopeVisible, readVisibilityScope } from '../../hooks/hypo-shared.mjs';
 
 const PAGE_USAGE_REL = '.cache/page-usage.jsonl';
-const DAY_MS = 86400000;
 
 // The distinct link forms a slug may appear as in a [[wikilink]] or in the log:
 // its full path, its basename, and (when nested) the path minus its first
