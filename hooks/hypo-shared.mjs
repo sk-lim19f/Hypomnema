@@ -712,8 +712,12 @@ export function hotMdIsClean(dir = HYPO_DIR) {
 // ── strict session-close verification ────────────────────────────
 // spec §5.2.7 / §8.3 (updated 2026-05-15): session-close = steps 1~6 of the
 // 11-step crystallize checklist (synthesis is steps 7~11). The hard gate
-// (sessionCloseFileStatus) confirms the 5 mandatory files — session-state.md,
-// project hot.md, root hot.md, session-log/YYYY-MM-DD.md, and log.md.
+// (sessionCloseFileStatus) confirms the 4 mandatory files: session-state.md,
+// project hot.md, session-log/YYYY-MM-DD.md, and log.md. Root hot.md is NOT
+// one of them: it became a hook-generated projection, so the close no longer
+// writes it and the gate no longer checks it (see the note at the
+// checkUpdated calls in sessionCloseFileStatus for why its `updated:` field
+// cannot be read as this project's own date).
 // pages/open-questions.md (step 5) is conditional ("변경 시") — it is a
 // cross-project queue, so a session that raises no questions should not be
 // forced to touch it. Gating it would produce false-blocks; spec §5.2.7
@@ -1209,8 +1213,25 @@ export function pickProjectByCwd(projects, cwd, opts = {}) {
 export function collectProjectWorkingDirs(hypoDir) {
   const projectsDir = join(hypoDir, 'projects');
   if (!existsSync(projectsDir)) return [];
+  // existsSync is true for a regular file too, and it says nothing about
+  // permissions, so readdirSync here can still throw ENOTDIR or EACCES. It
+  // used to, and the caller that matters is SessionStart's cwd-to-project
+  // resolution, which runs long before the projection writer. An unguarded
+  // throw there took the whole hook to its top-level catch, which meant the
+  // projection's own scanError branch (the one that tells a person WHICH
+  // directory to fix) could never be reached on the real hook path: it was
+  // dead code for exactly the inputs it existed to report. Degrade to "no
+  // projects" instead. Resolving cwd to a project is a convenience, and the
+  // projection scan re-reads this same directory moments later and surfaces
+  // the real failure with its own notice.
+  let slugs;
+  try {
+    slugs = readdirSync(projectsDir);
+  } catch {
+    return [];
+  }
   const out = [];
-  for (const slug of readdirSync(projectsDir)) {
+  for (const slug of slugs) {
     if (slug === '_template') continue;
     const dir = join(projectsDir, slug);
     try {
@@ -1439,6 +1460,886 @@ function pickByCwd(hypoDir, slugs, cwd) {
   });
 }
 
+// ── root hot.md projection ──────────────────────────────────────────────────
+// Root hot.md stops being a file Claude edits and becomes a deterministic
+// projection of `projects/<slug>/hot.md`: whoever reads it (resolveActiveProject,
+// closeCandidateSlugs, SessionStart's injection) gets a table built fresh off
+// disk, never a hand-maintained one that can drop a row or go stale. The row
+// set comes ONLY from a directory scan, never from parsing the previous root
+// file: that old parse (hypo-hot-rebuild.mjs's retired parsePointerRows) is
+// exactly what let a manually deleted row stay deleted forever.
+//
+// Three functions, split on purpose: scanRootHotProjectionSources does the
+// one directory walk and reports what it saw, INCLUDING whether the walk
+// itself failed; formatRootHotProjection turns scanned rows into the
+// canonical markdown, pure and disk-free; renderRootHotProjection composes
+// the two into the same pure string generator every existing caller already
+// expects, so a scan error there still resolves to "no rows" exactly like
+// before (out of scope for this pure entry point: see writeRootHotProjection
+// for the one caller that DOES act on scanError). writeRootHotProjection is
+// the only thing that ever touches disk, skipping the write entirely when the
+// projection is byte-identical to what is already there (so a no-op run
+// never dirties the file's mtime or trips a git diff), and refusing to write
+// at all when the scan itself failed (a transient read error must not commit
+// an empty/partial table over real content).
+
+const ROOT_HOT_PROJECTS_TEMPLATE_SLUG = '_template';
+
+// This exact sentence has been part of every generated root hot.md since the
+// projection shipped (separately pinned by 'generated body text is pinned' in
+// tests/session-hooks.test.mjs), so its presence on disk is proof the file is
+// already projection-owned and safe to overwrite without a backup. Its
+// absence means a hand-authored file, or one from before this projection
+// existed. See writeRootHotProjection's migration-backup step below.
+const ROOT_HOT_PROJECTION_MARKER = 'generated projection of `projects/*/hot.md`';
+
+// Sits next to hot.md itself so a person who opens the vault root finds it
+// without hunting: `hot.md.pre-projection-backup.md`. Written every time
+// writeRootHotProjection sees content it does not own (readRootHotProjectionOwnership's
+// hash comparison, not a one-shot marker check), and there is no cap: each
+// unowned write that finds the plain suffix already taken gets its own
+// numbered path from nextRootHotBackupPath, without limit.
+export const ROOT_HOT_BACKUP_SUFFIX = '.pre-projection-backup.md';
+
+// Root-anchored (leading `/`) so this only ever matches the backup sitting
+// next to hot.md itself, never an unrelated file elsewhere in the vault that
+// happens to share the tail of the name. The trailing `*` covers every
+// variant nextRootHotBackupPath can produce: the plain suffix, a `-2`/`-3`/...
+// counter, and the timestamp fallback.
+const ROOT_HOT_BACKUP_GITIGNORE_PATTERN = '/hot.md.pre-projection-backup*.md';
+
+// minor fix: atomicWrite's own temp file for a backup write
+// (`<backupPath>.<pid>.<random>.tmp`, see atomic-write.mjs) carries the exact
+// same hand-authored bytes the backup above protects, but the pattern above
+// only matches the FINAL `.md` name. A kill or power loss between that temp
+// write and its rename leaves the temp sitting unignored: no cleanup runs
+// on the next start, and nothing reads or removes it, so `git add -A`
+// exposes it. The glob's `*` matches the `.md` in the middle too (gitignore
+// globs don't stop at `.`, only at `/`), so this one pattern covers the temp
+// name for every backupPath variant nextRootHotBackupPath can produce.
+const ROOT_HOT_BACKUP_TMP_GITIGNORE_PATTERN = '/hot.md.pre-projection-backup*.tmp';
+
+/**
+ * The one recovery sentence for a hand-authored root hot.md that just got
+ * backed up before a projection write replaced it (major fix, codex 3rd-tier
+ * finding 6). Naming the backup file alone is not a recovery path: copying
+ * it back onto root hot.md just gets it replaced again on the next rebuild.
+ * Three writers can trigger this backup: SessionStart's own direct write,
+ * the Stop-hook rebuild (hypo-hot-rebuild.mjs), and project-create's own
+ * `writeRootHotProjection` call. Before this fix only SessionStart's
+ * own write site carried the guidance half of the message; the Stop-hook's
+ * health notice and project-create's warnings named the filename alone,
+ * with no route back to the content. One formatter, used by all three, so
+ * they cannot drift into three different wordings of the same advice (and
+ * so a future fourth call site gets the full message by construction,
+ * not by remembering to copy it). Matches the longer version already
+ * carried in both READMEs; do not change the wording without updating those
+ * too.
+ * @param {string} backupPath absolute path to the migration backup
+ * @returns {string}
+ */
+export function rootHotBackupRecoveryNotice(backupPath) {
+  return (
+    `루트 hot.md 의 이전 내용을 ${basename(backupPath)} 로 백업했습니다 (손으로 편집한 내용이 있었습니다). ` +
+    `루트로 되돌리지 마세요. 다음 훅 실행이 다시 덮어씁니다. 열어 본 뒤 남길 내용을 projects/<slug>/hot.md 나 별도 페이지로 옮기고 백업은 지우세요.`
+  );
+}
+
+const ROOT_HOT_PROJECTION_STATE_FILENAME = 'root-hot-projection-state.json';
+
+function sha256Hex(content) {
+  return createHash('sha256').update(content, 'utf-8').digest('hex');
+}
+
+/**
+ * Durable "did WE write the bytes currently on disk" state, read from
+ * `.cache/`. Replaces a plain `ROOT_HOT_PROJECTION_MARKER` substring check: a
+ * hand-authored hot.md that happens to quote that exact sentence (copied out
+ * of documentation, for instance) used to read as "already ours" under the
+ * substring check and skip the backup step outright, destroying real content
+ * with nothing left to recover it from. A hash of the exact bytes this
+ * function itself last wrote cannot collide by accident the way a fixed
+ * sentence can. Missing or corrupt state resolves to "no prior hash": the
+ * safe direction, since the only cost is one extra (harmless, since it is
+ * never lost) backup on the next write, never a silently skipped one.
+ * @returns {{lastHash: string|null}}
+ */
+function readRootHotProjectionOwnership(hypoDir) {
+  const path = join(hypoDir, '.cache', ROOT_HOT_PROJECTION_STATE_FILENAME);
+  if (!existsSync(path)) return { lastHash: null };
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return { lastHash: typeof parsed?.lastHash === 'string' ? parsed.lastHash : null };
+  } catch {
+    return { lastHash: null };
+  }
+}
+
+/** Best-effort: a failure here only costs one extra backup on the NEXT
+ * write (ownership falls back to "no prior hash"), never a lost one. */
+function writeRootHotProjectionOwnership(hypoDir, hash) {
+  try {
+    atomicWrite(
+      join(hypoDir, '.cache', ROOT_HOT_PROJECTION_STATE_FILENAME),
+      JSON.stringify({ lastHash: hash }),
+    );
+  } catch {
+    // see doc comment above
+  }
+}
+
+// n1 fix (3rd-round codex review): a per-SESSION companion to the global
+// ownership state above. The global hash only proves "SOME session's write
+// is what is on disk right now": any session's writeRootHotProjection call
+// updates it, including one that runs AFTER this session claimed 'hot.md'
+// but BEFORE this session's own Stop. A vault has exactly one root hot.md,
+// so two sessions across DIFFERENT projects race it constantly (measured
+// against 349 real sessions: 2081 overlapping pairs). Without this,
+// hypo-auto-commit.mjs's rootHotProjectionIsCurrent check read "disk matches
+// the last write" as true and staged a SIBLING session's bytes into this
+// session's commit, content this session never produced. Each session's own
+// receipt records the exact digest ITS OWN write last produced, so the
+// commit-time check below can require BOTH the global hash and this
+// session's own receipt to agree with the current disk bytes.
+const ROOT_HOT_PROJECTION_RECEIPT_FILENAME = 'root-hot-projection-receipt.json';
+
+function rootHotProjectionReceiptPath(hypoDir, sessionId) {
+  return join(sessionCacheDir(hypoDir, sessionId), ROOT_HOT_PROJECTION_RECEIPT_FILENAME);
+}
+
+/**
+ * Read the digest THIS session's own write last recorded. Missing, corrupt,
+ * or no session_id all resolve to `null`: the safe direction, since the
+ * only cost of a false `null` is this session's legitimate write sitting
+ * uncommitted for one extra Stop (see rootHotProjectionIsCurrent below),
+ * never a wrongly staged write.
+ * @returns {{digest: string|null}}
+ */
+function readRootHotProjectionReceipt(hypoDir, sessionId) {
+  if (!sessionId) return { digest: null };
+  const path = rootHotProjectionReceiptPath(hypoDir, sessionId);
+  if (!existsSync(path)) return { digest: null };
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return { digest: typeof parsed?.digest === 'string' ? parsed.digest : null };
+  } catch {
+    return { digest: null };
+  }
+}
+
+/**
+ * Best-effort, same shape as writeRootHotProjectionOwnership: a failure here
+ * only costs THIS session's own write not being recognized as current at ITS
+ * OWN Stop (a missing/stale receipt reads as "not proven mine" and excludes
+ * hot.md from this round's commit), never a lost write. The bytes are
+ * already durable on disk either way, and the next SessionStart/Stop that
+ * runs a write re-establishes both records. No-op without a session_id:
+ * there is no per-session file to write one to.
+ */
+function writeRootHotProjectionReceipt(hypoDir, sessionId, digest) {
+  if (!sessionId) return;
+  try {
+    atomicWrite(rootHotProjectionReceiptPath(hypoDir, sessionId), JSON.stringify({ digest }));
+  } catch {
+    // see doc comment above
+  }
+}
+
+/** Does the CURRENT on-disk hot.md match the bytes this function itself last
+ * wrote? See readRootHotProjectionOwnership for why this replaced a
+ * substring check on ROOT_HOT_PROJECTION_MARKER. Exported: hypo-auto-commit.mjs's
+ * scoped-commit wrapper re-runs this at commit time (see
+ * rootHotProjectionIsCurrent below) rather than trusting a session's
+ * touched-paths claim alone. */
+export function ownershipMatches(hypoDir, current) {
+  const { lastHash } = readRootHotProjectionOwnership(hypoDir);
+  return !!lastHash && sha256Hex(current) === lastHash;
+}
+
+/**
+ * Whether the bytes CURRENTLY on disk at the vault's root hot.md are exactly
+ * what writeRootHotProjection itself last wrote or confirmed. This is the
+ * commit-time half of the blocker fix in r5-w1.md: 'hot.md' can sit in a
+ * session's touched-paths set without this session's own write having
+ * actually landed there (a scanError that never clears the pre-write claim,
+ * a lock-timeout on the post-write record, or simply a claim made before a
+ * human's own edit lands mid-session): the claim only ever proves intent,
+ * never the bytes on disk at commit time. hypo-auto-commit.mjs's scoped-commit
+ * wrapper calls this immediately before staging, so a stale claim over
+ * content this session did not actually write is excluded there no matter
+ * how or why it went stale, instead of enumerating every write-outcome
+ * branch and remembering to revoke the claim on each one. A staged content
+ * this rejects is not lost: the next SessionStart or Stop that manages a
+ * successful scan runs writeRootHotProjection again, which backs up
+ * non-owned content through this SAME check before overwriting it, exactly
+ * like any other external edit.
+ *
+ * n1 fix (3rd-round codex review): the global ownership check alone only
+ * proves SOME session's write produced the current bytes, never that THIS
+ * session's did: a sibling session's write between this session's claim and
+ * its own Stop updates the global hash to the SIBLING's digest, and the old
+ * global-only check read that as "current" and staged the sibling's bytes
+ * into this session's commit. `sessionId` is now required to also prove
+ * OWNERSHIP: this session's own receipt (see writeRootHotProjectionReceipt)
+ * must independently match the current disk digest, not just the global
+ * record every session's write shares.
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId the session about to stage hot.md
+ * @returns {boolean} true when there is no root hot.md at all (nothing to
+ *   protect against) or its bytes hash-match both the global ownership hash
+ *   AND this session's own last-recorded receipt; false when it exists, is
+ *   readable, and either does not match, is unreadable, or `sessionId` never
+ *   recorded a matching receipt, none of which can prove THIS session
+ *   produced what is on disk right now.
+ */
+export function rootHotProjectionIsCurrent(hypoDir, sessionId) {
+  const hotPath = join(hypoDir, 'hot.md');
+  if (!existsSync(hotPath)) return true;
+  let content;
+  try {
+    content = readFileSync(hotPath, 'utf-8');
+  } catch {
+    return false; // unreadable: cannot prove it is ours, so do not stage it
+  }
+  if (!ownershipMatches(hypoDir, content)) return false;
+  const { digest } = readRootHotProjectionReceipt(hypoDir, sessionId);
+  return !!digest && digest === sha256Hex(content);
+}
+
+/**
+ * First unused backup path for `hotPath`: the plain suffix if free, else a
+ * numbered variant. Before this, a SECOND external overwrite arriving after
+ * the first migration backup already existed was silently destroyed --
+ * writeRootHotProjection saw the fixed backup filename already taken, skipped
+ * the backup step entirely, and overwrote hot.md anyway. Every later
+ * non-owned overwrite now gets its own place to land instead.
+ */
+function nextRootHotBackupPath(hotPath) {
+  const plain = `${hotPath}${ROOT_HOT_BACKUP_SUFFIX}`;
+  if (!existsSync(plain)) return plain;
+  const stem = ROOT_HOT_BACKUP_SUFFIX.slice(0, -'.md'.length); // '.pre-projection-backup'
+  for (let n = 2; n <= 9999; n++) {
+    const candidate = `${hotPath}${stem}-${n}.md`;
+    if (!existsSync(candidate)) return candidate;
+  }
+  // Practically unreachable (9998 prior collisions), but never reuse a path
+  // silently: a millisecond timestamp is guaranteed distinct from every
+  // numbered candidate already checked above.
+  return `${hotPath}${stem}-${Date.now()}.md`;
+}
+
+/**
+ * Back `content` up next to `hotPath`, unless a backup already holds exactly
+ * these bytes.
+ *
+ * minor fix: the backup and the `.gitignore` update run BEFORE the write that
+ * replaces hot.md, so a write that fails afterwards (disk full, a rename
+ * error) leaves the original in place and the next run sees the same
+ * non-owned file again. Without the content comparison that run made a
+ * SECOND, numbered copy of bytes already sitting in the first one, and a
+ * loop that keeps failing kept minting them. Comparing what is already there
+ * makes the retry converge instead: one backup per distinct content, however
+ * many times the write after it fails.
+ *
+ * Reuses nextRootHotBackupPath's candidate order, so the paths checked here
+ * are exactly the ones a fresh backup could occupy, and an unreadable
+ * candidate counts as "not a match" (the safe direction: one extra copy, not
+ * a skipped one).
+ * `testHooks.beforeBackupWrite` is test-only: called with the fresh backup
+ * path right before its write, so a test can fail the backup alone while the
+ * projection write after it would still succeed. Failing the whole directory
+ * cannot tell "the backup ran and failed" from "the backup never ran", since
+ * the projection write fails there too.
+ * @returns {string} the backup path now holding `content`, fresh or reused
+ */
+function backUpOnce(hotPath, content, testHooks) {
+  const stem = ROOT_HOT_BACKUP_SUFFIX.slice(0, -'.md'.length);
+  const holdsContent = (candidate) => {
+    try {
+      return readFileSync(candidate, 'utf-8') === content;
+    } catch {
+      return false; // unreadable: cannot prove it already holds these bytes
+    }
+  };
+  const plain = `${hotPath}${ROOT_HOT_BACKUP_SUFFIX}`;
+  // The plain name is always taken first, so its absence means no backup
+  // exists yet and the numbered scan below has nothing to find.
+  if (existsSync(plain)) {
+    if (holdsContent(plain)) return plain;
+    for (let n = 2; n <= 9999; n++) {
+      const candidate = `${hotPath}${stem}-${n}.md`;
+      if (!existsSync(candidate)) break;
+      if (holdsContent(candidate)) return candidate;
+    }
+  }
+  const fresh = nextRootHotBackupPath(hotPath);
+  testHooks?.beforeBackupWrite?.(fresh);
+  atomicWrite(fresh, content);
+  return fresh;
+}
+
+/**
+ * Append `pattern` to the vault's own `.gitignore` when it is not already
+ * there. NOT best-effort: called right before the FIRST backup write of a
+ * migration (see writeRootHotProjection), and a failure here propagates like
+ * the backup write's own failure does: a backup file git can see and
+ * auto-commit is not a backup, it is a leak, so the write that would create
+ * one must never proceed once this step has been skipped by a thrown error.
+ * @returns {boolean} true when the file was actually changed
+ */
+function ensureVaultGitignorePattern(hypoDir, pattern) {
+  const path = join(hypoDir, '.gitignore');
+  const content = existsSync(path) ? readFileSync(path, 'utf-8') : '';
+  if (content.split('\n').some((l) => l.trim() === pattern)) return false;
+  const next =
+    content.length > 0 && !content.endsWith('\n')
+      ? `${content}\n${pattern}\n`
+      : `${content}${pattern}\n`;
+  atomicWrite(path, next);
+  return true;
+}
+
+/**
+ * Scan `projects/*\/hot.md` and report both the rows and whether the scan
+ * itself succeeded. Rows come only from directories that carry a `hot.md`: a
+ * project without one yet gets no row, since the table's link column would
+ * otherwise point at a file that does not exist (a broken wikilink under
+ * lint). `_template` is never a row.
+ *
+ * `projects/` itself not existing is NOT a scan error: a fresh vault has no
+ * projects dir yet, and an empty row set is the honest answer for that case.
+ * `scanError` is reserved for `projects/` existing but `readdirSync` failing
+ * (permission error, transient I/O): the one case that used to collapse into
+ * the same empty array as "no projects yet," letting a transient read failure
+ * render (and, through writeRootHotProjection, WRITE) an empty table over a
+ * populated one. A per-project `hot.md` that exists but fails to read is
+ * narrower: the directory walk itself succeeded, so the row is kept with a
+ * blank date (same as before) plus a warning instead of a silently blanked
+ * date.
+ *
+ * Per row: display name is always the slug, never that project's frontmatter
+ * `title`: a project's `title` is that page's own heading text (things like
+ * `hot: hypomnema` or `security-backoffice: Hot Cache`), not a name a human
+ * chose to read in this table's Project column. An earlier version of this
+ * function read `title` here on the mistaken belief that it would agree with
+ * the slug; measured against a real vault it rewrote the Project column on 15
+ * of 38 rows for no actual information gain. Date is that project's
+ * frontmatter `updated`, left BLANK (never defaulted to today) when absent,
+ * unreadable, OR not a well-formed `YYYY-MM-DD` string: a malformed value
+ * (`stale`, `2026-9-1`, a YAML-parsed non-string) is left blank rather than
+ * passed through, because it would otherwise flow unvalidated into a raw
+ * string compare (`r.date > max` below) where a token like `"stale"` sorts
+ * ahead of every real ISO date, and into the root file's own frontmatter
+ * `updated:` (formatRootHotProjection takes the max of every row's date),
+ * leaving a token like `stale` sitting in that field for as long as this
+ * project's row stays malformed. Root hot.md's `updated:` is the max of the
+ * project rows, not the date the file itself was last rewritten. That is why
+ * sessionCloseFileStatus no longer checks this field against today's date:
+ * a sibling project's later row would otherwise fail a close that did
+ * everything right. The test 'n1: root hot.md must not be reported stale by a
+ * sibling project whose row date is the max' pins that exemption.
+ * A malformed value surfacing to a human at all is left to
+ * `hypo:lint`'s wave-3 project-file checks, out of this wave's scope; this
+ * function's job is only to keep the bad token from leaking into ANYTHING it
+ * generates. Rows sort by date
+ * descending, blank dates last, ties broken by slug ascending, so two
+ * machines scanning the same tree produce byte-identical output.
+ * @param {string} hypoDir
+ * @returns {{rows: Array<{slug: string, date: string}>, scanError: boolean, warnings: string[]}}
+ */
+export function scanRootHotProjectionSources(hypoDir) {
+  const projectsDir = join(hypoDir, 'projects');
+  const rows = [];
+  const warnings = [];
+  let scanError = false;
+  if (existsSync(projectsDir)) {
+    let entries = [];
+    try {
+      entries = readdirSync(projectsDir);
+    } catch (err) {
+      scanError = true;
+      warnings.push(`projects/ 디렉터리를 읽지 못했습니다: ${err?.message ?? String(err)}`);
+      entries = [];
+    }
+    for (const slug of entries) {
+      if (slug === ROOT_HOT_PROJECTS_TEMPLATE_SLUG) continue;
+      const hotPath = join(projectsDir, slug, 'hot.md');
+      // Read directly instead of gating on existsSync first: existsSync folds
+      // EVERY stat failure (a permission error, not just "genuinely absent")
+      // into `false`, which used to delete this project's row from the table
+      // exactly like a real ENOENT would, with no warning at all. Only ENOENT
+      // (and ENOTDIR, a parent segment turning out not to be a directory)
+      // means "no hot.md here yet". Every other error (EACCES, EIO, ...)
+      // keeps the row with a blank date and a warning, same as a read failure
+      // that happens after a successful existsSync always did.
+      let content = '';
+      let present = true;
+      try {
+        content = readFileSync(hotPath, 'utf-8');
+      } catch (err) {
+        if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+          present = false;
+        } else {
+          warnings.push(
+            `projects/${slug}/hot.md 를 읽지 못해 날짜를 비웠습니다: ${err?.message ?? String(err)}`,
+          );
+          content = '';
+        }
+      }
+      if (!present) continue;
+      const rawDate = parseFrontmatterField(content, 'updated');
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(rawDate || '') ? rawDate : '';
+      rows.push({ slug, date });
+    }
+  }
+  return { rows: sortRootHotRows(rows), scanError, warnings };
+}
+
+/**
+ * Sort scanned rows date descending, blank dates last, ties broken by slug
+ * ascending, so two directory scans of the same tree agree on row order
+ * regardless of what order the filesystem itself handed the entries back in.
+ * Mutates and returns `rows`.
+ *
+ * The slug tie-break is defence in depth, and a mutation test could not pin
+ * it while this lived inline inside the scan loop above: on this machine
+ * (macOS, APFS), readdirSync returns entries already sorted even when the
+ * filesystem itself does not (measured 2026-09-17: same directory, raw order
+ * "bb zz aa mm", readdirSync order "aa bb mm zz"), so a real directory scan
+ * on this machine always hands this function slug-ascending input, and a
+ * stable sort keeps that order with or without the tie-break. That ordering
+ * is not guaranteed elsewhere: a filesystem like ext4 with `dir_index`
+ * enabled returns entries in hash order, not name order, so the tie-break
+ * is load-bearing there even though it never fires on this machine's tests.
+ * Extracted into its own function so a test can
+ * call it directly against a fixed adversarial input order instead of going
+ * through a live scan. The date comparator's two other axes were always
+ * reachable through a scan (flipping descending to ascending, or swapping the
+ * blank-date placement, each reddens `row order` regardless of input order).
+ * @param {Array<{slug: string, date: string}>} rows
+ * @returns {Array<{slug: string, date: string}>}
+ */
+export function sortRootHotRows(rows) {
+  return rows.sort((a, b) => {
+    if (a.date !== b.date) {
+      if (!a.date) return 1;
+      if (!b.date) return -1;
+      return b.date.localeCompare(a.date);
+    }
+    return a.slug.localeCompare(b.slug);
+  });
+}
+
+/**
+ * Format already-scanned rows into the canonical root hot.md markdown. Pure:
+ * never touches disk. Frontmatter `updated:` is the max row date (or '' when
+ * every row is dateless), never today: a today value would make the same
+ * tree produce different bytes on different days, which is the one property
+ * this projection exists to have. That also means this field is not the date
+ * the file itself was last rewritten, which is why the session-close gate
+ * exempts it. See the note where sessionCloseFileStatus stops short of
+ * checking the root file, and the test that pins that exemption.
+ *
+ * Exported for one reason beyond `renderRootHotProjection`: `scripts/init.mjs`
+ * writes `formatRootHotProjection([])` straight into a brand-new vault as its
+ * root hot.md. There is no template copy to drift from it any more. If init
+ * wrote anything else, the first SessionStart would see bytes it did not
+ * write, back them up, and tell the person their hand edits were preserved,
+ * in a vault nobody has edited yet. tests/init.test.mjs pins that init's
+ * output is exactly this function's.
+ * @param {Array<{slug: string, date: string}>} rows
+ * @returns {string}
+ */
+export function formatRootHotProjection(rows) {
+  const tableRows = rows
+    .map((r) => `| ${r.slug} | ${r.date} | [[projects/${r.slug}/hot]] |`)
+    .join('\n');
+  const updated = rows.reduce((max, r) => (r.date && r.date > max ? r.date : max), '');
+
+  return `---
+title: "Hot Cache: Pointer"
+type: reference
+updated: ${updated}
+tags: [wiki, operations]
+---
+
+# Hot Cache
+
+> Read at session start → navigate to the relevant project session-state.md and hot.md.
+> This "Active Projects" table is a ${ROOT_HOT_PROJECTION_MARKER}, rebuilt at every session start and stop. Update session-state.md and hot.md in the relevant project instead: a hand edit to this table is overwritten by the next session.
+
+## Active Projects
+
+| Project | Last Session | Hot Cache |
+|---|---|---|
+${tableRows}
+
+## Session Start Checklist
+
+1. Check this file for the relevant project link
+2. Read \`projects/<name>/session-state.md\` for next tasks if it exists
+3. Read \`projects/<name>/hot.md\` for project background
+`;
+}
+
+/**
+ * Build the canonical root hot.md content by scanning `projects/*\/hot.md`.
+ * Pure: reads disk, never writes, and stays a plain string return so every
+ * existing caller/test keeps working unchanged. A scan error (see
+ * scanRootHotProjectionSources) resolves to an empty row set here, same as
+ * before this split: this entry point has no way to signal "the scan
+ * failed" to a caller that only wants a string. writeRootHotProjection below
+ * is the one caller that needs that signal and gets it directly from
+ * scanRootHotProjectionSources instead of through this function.
+ * @param {string} hypoDir
+ * @returns {string}
+ */
+export function renderRootHotProjection(hypoDir) {
+  const { rows } = scanRootHotProjectionSources(hypoDir);
+  return formatRootHotProjection(rows);
+}
+
+/**
+ * Regenerate root hot.md and write it only when the bytes actually changed.
+ *
+ * The lock-free body. Every caller goes through writeRootHotProjection below,
+ * which holds the vault commit lock around this whole function; see there for
+ * why the lock has to cover the read as well as the write.
+ *
+ * Called from both hypo-session-start.mjs (SessionStart, before the file is
+ * read by resolveActiveProject/closeCandidateSlugs/the injection below) and
+ * hypo-hot-rebuild.mjs (Stop). Both hooks calling the same function is the
+ * point: there is exactly one generator, not two copies that can drift.
+ *
+ * A scan error (projects/ directory exists but cannot be read) skips the
+ * write entirely and leaves whatever is already on disk untouched: see
+ * scanRootHotProjectionSources.
+ *
+ * The FIRST time this overwrites a file whose bytes do not match what this
+ * function itself last wrote (a hand-authored hot.md, one written before
+ * this projection existed, or ANY later external overwrite, per
+ * ownershipMatches), the existing bytes are backed up next to it
+ * (nextRootHotBackupPath: the plain `hot.md` + ROOT_HOT_BACKUP_SUFFIX name if
+ * free, else a numbered variant, so a second external overwrite after the
+ * first migration backup still lands somewhere instead of being silently
+ * destroyed) before the projection is written. Immediately before that FIRST
+ * backup write, the vault's own `.gitignore` is made to cover the backup
+ * filename pattern if it does not already (ensureVaultGitignorePattern): a
+ * backup file that a scoped auto-commit can see and push is a leak of
+ * whatever secret a person's uncommitted manual notes held, not a backup.
+ * Neither the gitignore update nor the backup write is best-effort: a
+ * failure in either throws out of this function (both call sites already
+ * wrap this in try/catch), which aborts the write, so a person's unsaved
+ * content is never replaced without somewhere ignored-and-recoverable to
+ * find it. Every write after the first sees the ownership hash already
+ * match and skips this step, and an existing backup file is never
+ * overwritten by a later one.
+ * major fix (TOCTOU): the ownership check above reads `hotPath` once, then
+ * this function still has to run ensureVaultGitignorePattern and the backup
+ * write (both real I/O against OTHER files) before it ever gets to the
+ * rename that actually replaces `hotPath`. A human's own save can land in
+ * that gap: it would be read as "ours" by the stale `current` and vanish
+ * with no backup, since atomic rename only ever protects against a reader
+ * seeing a torn write, never against this compare-then-replace race. This
+ * function re-reads `hotPath` a second time, immediately before the
+ * replacing write, and folds ANY bytes that appeared in that gap into the
+ * backup too. That shrinks the race to the two lines directly around the
+ * final `atomicWrite` call below (a read and a rename with nothing else in
+ * between), which is as far as this can be narrowed without an advisory
+ * lock that a person's own editor or shell would not honor anyway (see the
+ * major finding in r5-w1.md for why that is not pursued here).
+ * @param {string} hypoDir
+ * @param {{ beforeFinalWrite?: (hotPath: string) => void, beforeBackupWrite?: (backupPath: string) => void }} [testHooks]
+ *   `beforeBackupWrite` is test-only too: see backUpOnce.
+ *   `beforeFinalWrite` is test-only: called with `hotPath` right after the
+ *   second read below and before the final `atomicWrite`, so a test can
+ *   write NEW bytes to `hotPath` at exactly the point a real concurrent
+ *   writer would need to land in to be missed: genuine two-process timing
+ *   inside one synchronous call cannot be reproduced deterministically
+ *   otherwise. Production callers never pass this.
+ * @param {string|null} [sessionId] n1 fix: when given, this call's own
+ *   digest is recorded as THIS session's receipt (see
+ *   writeRootHotProjectionReceipt), so rootHotProjectionIsCurrent can later
+ *   tell this session's own write apart from a sibling session's. Omitted by
+ *   every caller that does not need commit-time attribution (most existing
+ *   tests, a direct `--json` CLI run).
+ * @returns {{written: boolean, scanError: boolean, lockTimeout: boolean, backedUp: boolean, backupPath: string|null, gitignoreUpdated: boolean, warnings: string[], content: string|null}}
+ *   content is the bytes now on disk (whether this call wrote them or they
+ *   were already there), null only on a scanError. Callers that need to hash
+ *   what actually landed (hypo-hot-rebuild.mjs's advanceBase) use this
+ *   instead of a second, separate scan that could observe different bytes if
+ *   a sibling session writes a project's hot.md in between the two scans.
+ *   `lockTimeout` is true only on the wrapper's own refusal (see
+ *   writeRootHotProjection below): nothing was read, written, or recorded.
+ */
+function writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId) {
+  const { rows, scanError, warnings } = scanRootHotProjectionSources(hypoDir);
+  if (scanError) {
+    return {
+      written: false,
+      scanError: true,
+      lockTimeout: false,
+      backedUp: false,
+      backupPath: null,
+      gitignoreUpdated: false,
+      warnings,
+      content: null,
+    };
+  }
+  const projection = formatRootHotProjection(rows);
+  const hotPath = join(hypoDir, 'hot.md');
+  // BLOCKER fix: only a genuinely absent file (ENOENT) may be treated as "no
+  // prior content to protect". Any other read failure (permissions,
+  // transient I/O) used to fold into the same `null` and skip the backup
+  // step below outright, reproducing the exact data-loss the backup exists
+  // to prevent. Throwing here (rather than returning a sentinel) reuses the
+  // try/catch both call sites already wrap this function in.
+  let current = null;
+  try {
+    current = readFileSync(hotPath, 'utf-8');
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+    current = null;
+  }
+  if (current === projection) {
+    // Establish/refresh ownership even on a no-op write: a vault upgrading
+    // onto this fix has a genuinely-owned hot.md but no prior recorded hash
+    // yet, and this is the cheap place to record one without risking a
+    // spurious backup on the NEXT real write. Best-effort by design (see
+    // writeRootHotProjectionOwnership): a failure here just costs one
+    // extra harmless backup later, never a lost one.
+    writeRootHotProjectionOwnership(hypoDir, sha256Hex(projection));
+    // n1 fix: a no-op still confirms this session's OWN projection algorithm
+    // produced exactly what is on disk right now, so it is legitimate for
+    // this session to also record a receipt for it: the bytes are not
+    // borrowed from whichever session wrote them first, they are identical
+    // regardless of who computed them.
+    writeRootHotProjectionReceipt(hypoDir, sessionId, sha256Hex(projection));
+    return {
+      written: false,
+      scanError: false,
+      lockTimeout: false,
+      backedUp: false,
+      backupPath: null,
+      gitignoreUpdated: false,
+      warnings,
+      content: projection,
+    };
+  }
+  let backedUp = false;
+  let backupPath = null;
+  let gitignoreUpdated = false;
+  const ensureBackupIgnored = () => {
+    // Both patterns, not best-effort either: see the doc comment above --
+    // the second covers atomicWrite's own temp file for the backup write
+    // itself (minor fix, r5-w1.md), which would otherwise carry the same
+    // hand-authored bytes unignored if this process is killed between that
+    // temp write and its rename.
+    const a = ensureVaultGitignorePattern(hypoDir, ROOT_HOT_BACKUP_GITIGNORE_PATTERN);
+    const b = ensureVaultGitignorePattern(hypoDir, ROOT_HOT_BACKUP_TMP_GITIGNORE_PATTERN);
+    return a || b;
+  };
+  if (current !== null && !ownershipMatches(hypoDir, current)) {
+    gitignoreUpdated = ensureBackupIgnored();
+    backupPath = backUpOnce(hotPath, current, testHooks);
+    backedUp = true;
+  }
+  // major fix (TOCTOU narrowing): re-read right before the write that
+  // actually replaces `hotPath`, rather than trusting the `current` read
+  // from above (see this function's own doc comment for why). Anything
+  // that differs from `current` gets its own backup here too, so a save
+  // landing during ensureBackupIgnored/the backup write above is still
+  // caught instead of silently discarded by the rename below. `testHooks`
+  // fires BEFORE this read (a no-op in production) so a test can write new
+  // bytes at exactly the point this read needs to observe them; in
+  // production nothing runs between `current`'s read above and this one.
+  //
+  // What this re-read is NOT: a safety boundary. It is best-effort salvage,
+  // and calling it "a race narrowed to microseconds" overstates it. Work
+  // still happens after this read: the `.gitignore` update and the backup
+  // write below both run against other files, and atomicWrite itself writes a
+  // whole temp file before the rename. A person's save landing anywhere in
+  // there is still replaced with no copy kept, and an editor that saves in
+  // place (truncate, then write) can leave a partial file for this read to
+  // back up, so even a salvaged backup is not guaranteed to hold a complete
+  // document. Nothing here can close that: POSIX rename has no general
+  // compare-and-swap ("replace only if the bytes are still X"), and an
+  // editor honors no advisory lock this file could take. The real fix is to
+  // stop sharing one pathname between a generated file and a hand-edited
+  // one, which this change does not do.
+  testHooks?.beforeFinalWrite?.(hotPath);
+  let latest = current;
+  try {
+    latest = readFileSync(hotPath, 'utf-8');
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+    latest = null;
+  }
+  if (latest !== current && latest !== null && !ownershipMatches(hypoDir, latest)) {
+    if (!gitignoreUpdated) gitignoreUpdated = ensureBackupIgnored();
+    backupPath = backUpOnce(hotPath, latest, testHooks);
+    backedUp = true;
+  }
+  // atomicWrite, not writeFileSync: this write now happens at BOTH
+  // SessionStart and Stop (previously Stop-only), so two sessions starting
+  // around the same time can race this write against each other. A plain
+  // writeFileSync truncates before writing its new bytes, so a reader
+  // (another SessionStart's read of hot.md, or hypo-file-watch, if it ever
+  // gains a trigger) could observe a torn/empty file mid-write; atomicWrite
+  // (temp file + rename) never exposes that state. log.md's append path
+  // (deriveRootLogEntries below) already uses atomicWrite for the same
+  // reason.
+  atomicWrite(hotPath, projection);
+  writeRootHotProjectionOwnership(hypoDir, sha256Hex(projection));
+  writeRootHotProjectionReceipt(hypoDir, sessionId, sha256Hex(projection)); // n1 fix
+  return {
+    written: true,
+    scanError: false,
+    lockTimeout: false,
+    backedUp,
+    backupPath,
+    gitignoreUpdated,
+    warnings,
+    content: projection,
+  };
+}
+
+/**
+ * The locked entry point every caller uses. Holds the vault commit lock
+ * (vaultCommitLockTarget, the same one hypo-auto-commit.mjs and
+ * crystallize.mjs's apply take around stage+commit) across the WHOLE
+ * projection write: the first read of hot.md, the ownership check, the
+ * backup, the replacing rename, and the ownership/receipt records.
+ *
+ * BLOCKER fix: without this the writer took no lock at all, so a sibling
+ * session's rename could land between hypo-auto-commit.mjs's ownership and
+ * receipt check and the `git add` that follows it, inside the auto-commit's
+ * own lock hold. The sibling's bytes then went into THIS session's commit
+ * looking like a normal update, and the touched record that would have
+ * flagged it was gone. One lock shared by the writer and the commit fence is
+ * what makes that check mean anything at commit time. The receipt check
+ * stays regardless: it is the fail-closed half for everything this lock
+ * cannot cover (a lock we failed to take, a person's editor, another tool).
+ *
+ * The lock is NOT reentrant, so nothing inside `writeRootHotProjectionUnlocked`
+ * may take it again, and a caller that already holds it must call the
+ * unlocked form instead. Today no caller holds it: hypo-session-start.mjs
+ * takes it for its own `git pull` and releases before this call,
+ * hypo-hot-rebuild.mjs (Stop) runs before hypo-auto-commit.mjs rather than
+ * inside it, and scripts/lib/project-create.mjs holds no lock.
+ *
+ * A lock timeout is NOT an error here: it returns `lockTimeout: true` with
+ * `written: false` and a warning row, so the caller can say the pointer table
+ * was left as-is and move on. Throwing would turn a busy vault into a failed
+ * `project-create`, and waiting longer would eat a SessionStart's 30s budget
+ * for a file the session can still read the previous version of.
+ * @param {string} hypoDir
+ * @param {{ beforeFinalWrite?: (hotPath: string) => void, beforeBackupWrite?: (backupPath: string) => void }} [testHooks]
+ * @param {string|null} [sessionId]
+ * @returns {{written: boolean, scanError: boolean, lockTimeout: boolean, backedUp: boolean, backupPath: string|null, gitignoreUpdated: boolean, warnings: string[], content: string|null}}
+ */
+export function writeRootHotProjection(hypoDir, testHooks, sessionId) {
+  try {
+    return withFileLock(
+      vaultCommitLockTarget(hypoDir),
+      () => writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId),
+      // Read per call, not at module load, so a test can force a fast
+      // timeout on a lock it holds itself (same env var hypo-auto-commit.mjs
+      // reads for the same lock).
+      { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
+    );
+  } catch (err) {
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    return {
+      written: false,
+      scanError: false,
+      lockTimeout: true,
+      backedUp: false,
+      backupPath: null,
+      gitignoreUpdated: false,
+      warnings: [
+        'root hot.md: 다른 세션이 저장소 잠금을 쥐고 있어 이번에는 갱신하지 않았습니다 (이전 내용을 그대로 둡니다).',
+      ],
+      content: null,
+    };
+  }
+}
+
+const ROOT_HOT_HEALTH_NOTICE_FILENAME = 'root-hot-projection-notice.json';
+
+/**
+ * Leave a durable note for the NEXT SessionStart when the Stop-hook rebuild
+ * (hypo-hot-rebuild.mjs) fails or hits a scan error: Stop's own stdout is
+ * suppressed (`{ suppressOutput: true }`), so a failure there is otherwise
+ * invisible to the user until they go looking at stderr. Best-effort like
+ * every other cache write in this file: a hook must not fail Stop over a
+ * notice file.
+ * @param {string} hypoDir
+ * @param {string} message
+ */
+export function writeRootHotHealthNotice(hypoDir, message) {
+  const path = join(hypoDir, '.cache', ROOT_HOT_HEALTH_NOTICE_FILENAME);
+  try {
+    // Same lock consumeRootHotHealthNotice takes, so this write can never
+    // land inside a concurrent reader's read-then-unlink window (which would
+    // otherwise let this brand-new notice be deleted by a reader that read
+    // the OLD one, or read half-written bytes from atomicWrite's rename).
+    withFileLock(path, () => {
+      atomicWrite(path, JSON.stringify({ message, ts: Date.now() }));
+    });
+  } catch {
+    // best-effort: losing the notice is strictly better than crashing Stop
+    // over it.
+  }
+}
+
+/**
+ * Read and delete a pending root-hot-projection health notice left by a
+ * prior Stop. One-shot (unlinked on read) so it surfaces exactly once, at
+ * the next SessionStart. Returns null when nothing is pending or the file is
+ * unreadable/corrupt.
+ *
+ * Guarded by the same per-target file lock every other read-then-mutate in
+ * this file uses (withFileLock), so two SessionStarts racing this call
+ * (a shared vault, two machines) cannot both read the same notice and both
+ * display it: only the lock holder sees a non-null message, the other finds
+ * the file already gone. This does not make delivery exactly-once across a
+ * crash (a process that dies between the unlink and actually showing the
+ * message still loses it, same as before this lock existed). Only the
+ * concurrent double-read is closed here; a true crash-safe exactly-once
+ * would need a durable ack, which this file does not keep.
+ * @param {string} hypoDir
+ * @returns {string|null}
+ */
+export function consumeRootHotHealthNotice(hypoDir) {
+  const path = join(hypoDir, '.cache', ROOT_HOT_HEALTH_NOTICE_FILENAME);
+  if (!existsSync(path)) return null;
+  try {
+    return withFileLock(path, () => {
+      if (!existsSync(path)) return null; // a concurrent reader already claimed it
+      let message = null;
+      try {
+        const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+        message = parsed && typeof parsed.message === 'string' ? parsed.message : null;
+      } catch {
+        message = null;
+      }
+      try {
+        unlinkSync(path);
+      } catch {
+        // best-effort cleanup: a leftover file just gets read (and re-shown)
+        // again next time, rather than losing anything.
+      }
+      return message;
+    });
+  } catch {
+    // lock-timeout: leave the file exactly as-is, same as every other
+    // lock-timeout path in this file: the notice just waits for the next
+    // reader instead of being lost.
+    return null;
+  }
+}
+
 /**
  * Resolve the active project slug from root hot.md. With a cwd, a project whose
  * working_dir contains it wins (cwd-first); otherwise the
@@ -1461,8 +2362,9 @@ export function resolveActiveProject(hypoDir, cwd = null) {
   if (!existsSync(hotPath)) return null;
   let content;
   try {
-    // Strip HTML comments before parsing so the canonical-format example row
-    // in templates/hot.md (`<!-- Row format: ... -->`) is not picked up as data.
+    // Strip HTML comments before parsing so a commented example row, which
+    // vaults created before the root table became generated still carry
+    // (`<!-- Row format: ... -->`), is not picked up as data.
     content = readFileSync(hotPath, 'utf-8').replace(/<!--[\s\S]*?-->/g, '');
   } catch {
     return null;
@@ -1561,7 +2463,13 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
 
   checkUpdated(join('projects', project, 'session-state.md'));
   checkUpdated(join('projects', project, 'hot.md'));
-  checkUpdated('hot.md');
+  // Root hot.md is deliberately not checked here. Its `updated:` is a max
+  // across every project row (see formatRootHotProjection), not this project's
+  // own date, so a sibling project's later row would push the field past today
+  // and stale-flag a session that did everything right. The pointer table is a
+  // projection the hooks regenerate; it is not a file this close writes.
+  // Pinned by 'n1: root hot.md must not be reported stale by a sibling project
+  // whose row date is the max' in tests/session-hooks.test.mjs.
 
   // session-log: daily shard, with legacy monthly fallback: must
   // carry a today-dated heading in whichever file holds it. Daily-first read
@@ -1652,6 +2560,17 @@ function closeCandidateSlugs(hypoDir, dates) {
     try {
       entries = readdirSync(projectsDir);
     } catch {
+      // Swallowing this is the same shape as the fail-open hasTornCloseIntent
+      // was hardened out of (a judgment that could not be made reading as
+      // "nothing found"), and it is deliberate only because this is one of
+      // THREE unioned sources, not the whole answer: an unreadable projects/
+      // still leaves today's log.md entries and today's root hot.md rows to
+      // name the same slug. A close goes unnoticed only when all three miss it
+      // at once. Signalling the uncertainty instead would mean carrying a
+      // scanError out through sessionCloseGlobalStatus, whose result is read
+      // in five places, so it is a separate change rather than a line here.
+      // If you are adding a FOURTH source or removing one of the other two,
+      // this comment stops being true and the gate needs the scanError.
       entries = [];
     }
     for (const p of entries) {
@@ -1704,10 +2623,12 @@ function closeCandidateSlugs(hypoDir, dates) {
 //     the "next tasks" section (a cross-block incident: editing one project's
 //     tracker bumped session-state and blocked an unrelated project's /compact).
 //   - project hot.md `updated:`    — project-create stamps the template `updated: today`.
-//   - root hot.md ROW date         — project-create inserts a today-dated row, and
-//     hypo-hot-rebuild defaults a row to today when a project hot.md is missing.
-// (Root hot.md *frontmatter* was already never a signal — it is shared and
-// hypo-hot-rebuild stamps it today every session.)
+//   - root hot.md ROW date:         project-create inserts a today-dated row. Root
+//     hot.md's row set is now a directory-scan projection (renderRootHotProjection):
+//     a row's date is that project's own hot.md `updated:`, left BLANK rather than
+//     defaulted to today when absent or malformed.
+// (Root hot.md *frontmatter* was already never a signal: it is shared, and it is
+// now the MAX row date across the projection, never today.)
 //
 // Tradeoff (documented, accepted): apply writes session-state.md FIRST, then the
 // project files, then the session-log + log entry. A process crash before the
@@ -2343,71 +3264,228 @@ export function appendSyncFailure(hypoDir, op, error) {
   }
 }
 
+const syncGit = (hypoDir, ...args) =>
+  spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
+
 /**
- * Pull + push the wiki against its remote, guaranteeing the working tree is
- * never left half-merged. Called by the auto-commit Stop hook after a local
- * commit succeeds.
+ * The tree-mutating half of a sync: `git pull --no-rebase`, plus the abort
+ * that keeps the working tree from being left half-merged.
  *
- * Failure policy (v1.4 "sync hardening"):
- *   - clean fast-forward / conflict-free merge → push.
+ * Split out of syncRemote (review r5-w4 major 2) so a caller can hold the
+ * vault commit lock across this and NOT across the push. This half has to
+ * stay inside the lock: it rewrites files another session could be reading,
+ * staging, or committing at the same moment. See hypo-auto-commit.mjs for the
+ * other side of that split.
+ *
+ * Failure policy (v1.4 "sync hardening"), unchanged by the split:
+ *   - clean fast-forward / conflict-free merge → `{pulled: true}`, caller pushes.
  *   - MERGE CONFLICT (`git pull --no-rebase` leaves unmerged paths): abort the
  *     merge so the tree returns to the just-committed local state ("ours"),
- *     record op='conflict', and do NOT push (a diverged branch cannot
- *     fast-forward, so the push would only add a noisy second failure). No data
- *     is lost: ours stays committed locally, "theirs" stays on the remote, and
- *     the divergence is surfaced by session-start + doctor until the user merges
- *     manually. Inline auto-resolution (preserving the losing version as a
- *     `.conflict-*` sibling) is deferred.
+ *     record op='conflict', and report `{conflict: true}` so the caller does
+ *     NOT push (a diverged branch cannot fast-forward, so the push would only
+ *     add a noisy second failure). No data is lost: ours stays committed
+ *     locally, "theirs" stays on the remote, and the divergence is surfaced by
+ *     session-start + doctor until the user merges manually. Inline
+ *     auto-resolution (preserving the losing version as a `.conflict-*`
+ *     sibling) is deferred.
  *   - non-conflict pull failure (network/auth: no unmerged paths) → record
- *     op='pull', then still attempt push (a transient pull blip should not block
- *     an otherwise-pushable commit); record op='push' if that also fails.
+ *     op='pull' and report `{pulled: false, conflict: false}`; the caller still
+ *     pushes, since a transient pull blip should not block an otherwise
+ *     pushable commit.
  *
- * Best-effort: never throws — a sync failure must not break the Stop hook.
+ * Best-effort: never throws. A sync failure must not break the Stop hook. A
+ * throw is reported as `{pulled: false, conflict: false}`, which lets the
+ * caller attempt the push, exactly as the combined function did.
+ *
+ * @param {string} hypoDir
+ * @returns {{pulled: boolean, conflict: boolean}}
+ */
+export function pullRemote(hypoDir) {
+  const git = (...args) => syncGit(hypoDir, ...args);
+  try {
+    const pull = git('pull', '--no-rebase', '-q');
+    if (pull.status === 0) {
+      recordSyncSuccess(hypoDir, 'pull');
+      return { pulled: true, conflict: false };
+    }
+    // A merge conflict leaves unmerged index entries; a network/auth failure
+    // leaves none. Only the former must be aborted to keep the tree clean.
+    const unmerged = git('ls-files', '-u');
+    const hasConflict = unmerged.status === 0 && (unmerged.stdout || '').trim().length > 0;
+    if (hasConflict) {
+      // Abort to return the tree to the just-committed local state. Verify the
+      // abort actually cleaned up: if it fails (filesystem/concurrent-mutation
+      // edge), the tree may still be half-merged, so record that distinctly
+      // ('conflict-unresolved') rather than masking it as a clean abort.
+      const abort = git('merge', '--abort');
+      const stillUnmerged = git('ls-files', '-u');
+      const aborted = abort.status === 0 && (stillUnmerged.stdout || '').trim().length === 0;
+      appendSyncFailure(
+        hypoDir,
+        aborted ? 'conflict' : 'conflict-unresolved',
+        pull.stderr || pull.stdout,
+      );
+      return { pulled: false, conflict: true };
+    }
+    appendSyncFailure(hypoDir, 'pull', pull.stderr || pull.stdout);
+    return { pulled: false, conflict: false };
+  } catch {
+    // best-effort: never break the Stop hook
+    return { pulled: false, conflict: false };
+  }
+}
+
+/**
+ * Pin WHAT the push will send and WHERE, so the push itself carries no
+ * ambiguity about either.
+ *
+ * Meant to be called from inside the vault commit lock, right after the
+ * commit and the pull that this session performed. A bare `git push` resolves
+ * its source at push time, from whatever HEAD is then: release the lock, let a
+ * sibling session commit, and the push sends the SIBLING's newer commit rather
+ * than the one this session just made and verified. Reading the OID here, still
+ * under the lock, makes that impossible: the push sends this exact object or it
+ * sends nothing.
+ *
+ * `oid` defaults to HEAD, which is correct for the Stop hook's use even though
+ * the commit it made has its own sha: a non-conflicting `git pull --no-rebase`
+ * can add a merge commit on top, and pushing the pre-merge sha would be
+ * rejected as a non-fast-forward. HEAD under the lock, after the pull,
+ * contains this session's commit and nothing a sibling added afterwards.
+ *
+ * Destination comes from the current branch's configured upstream, read as a
+ * full `refs/heads/<name>` so no `push.default` mode, no `remote.<n>.push`
+ * refspec, and no branch-name-to-remote-name guess gets to reinterpret it.
+ * Returns null when the branch is detached or has no upstream: a null target
+ * makes pushRemote decline to push at all, which is the safe end of the trade.
+ * Pushing SOMETHING under an unresolvable destination is how a vault ends up
+ * with a branch nobody meant to publish.
+ *
+ * Best-effort: never throws.
+ *
+ * @param {string} hypoDir
+ * @param {string} [oid] the exact commit to send; defaults to current HEAD
+ * @returns {{remote: string, remoteRef: string, oid: string}|null}
+ */
+export function resolvePushTarget(hypoDir, oid) {
+  try {
+    const branch = syncGit(hypoDir, 'symbolic-ref', '--quiet', '--short', 'HEAD');
+    if (branch.status !== 0) return null; // detached HEAD: no branch, no upstream
+    const name = (branch.stdout || '').trim();
+    if (!name) return null;
+    // for-each-ref, not `rev-parse @{upstream}`: this yields the remote NAME and
+    // the remote-side ref SEPARATELY and already fully qualified
+    // (`refs/heads/main`), where `@{upstream}` yields one `origin/main` string a
+    // caller has to split on the first slash and then guess whether the rest is
+    // a branch (it is not, for a remote whose name contains a slash, or a ref
+    // outside refs/heads).
+    const up = syncGit(
+      hypoDir,
+      'for-each-ref',
+      '--format=%(upstream:remotename)%09%(upstream:remoteref)',
+      `refs/heads/${name}`,
+    );
+    if (up.status !== 0) return null;
+    const [remote, remoteRef] = (up.stdout || '').trim().split('\t');
+    if (!remote || !remoteRef) return null; // no upstream configured
+    const head = syncGit(hypoDir, 'rev-parse', oid || 'HEAD');
+    if (head.status !== 0) return null;
+    const resolved = (head.stdout || '').trim();
+    if (!/^[0-9a-f]{40}$/.test(resolved)) return null;
+    return { remote, remoteRef, oid: resolved };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The network half of a sync: push one pinned commit to one pinned
+ * destination.
+ *
+ * Runs OUTSIDE the vault commit lock (review r5-w4 major 2). Holding the lock
+ * across a network round trip made one session's Stop own the vault for up to
+ * a minute, and a sibling SessionStart needs that same lock twice (its own
+ * `git pull` and the root hot.md projection write), each with a 5s timeout,
+ * out of a 30s hook budget.
+ *
+ * The earlier justification for putting the push outside the lock was that
+ * a push changes nothing locally. Half of that is closed here and half is not:
+ *
+ *   - CLOSED: "a push sends whatever HEAD is at push time". It sends `target`
+ *     and only `target`, decided under the lock by resolvePushTarget.
+ *   - OPEN, and it stays open: a client-side `pre-push` hook is an arbitrary
+ *     program that git runs inside this `git push`, with the working tree and
+ *     the index right there. A user whose pre-push builds, formats, or stages
+ *     anything is mutating the vault from outside the lock, racing the
+ *     projection write and the commit fence exactly as a pull would. This is
+ *     not theoretical: tests/session-hooks.test.mjs observes the lock boundary
+ *     THROUGH a pre-push hook, so the mechanism is exercised on every run.
+ *     `--no-verify` would close it and is deliberately not used: it overrides
+ *     the user's own push policy, which is not this hook's call to make, and it
+ *     would blind the one observation point the boundary has. Closing it for
+ *     real means either pushing from a scratch clone or taking the lock back
+ *     across the network, both bigger than this fix.
+ *
+ * Callers must not call this after a pullRemote that reported `conflict`:
+ * pushing from a diverged branch only records a second, redundant failure.
+ *
+ * Best-effort: never throws.
+ *
+ * @param {string} hypoDir
+ * @param {{remote: string, remoteRef: string, oid: string}|null} target
+ * @returns {{pushed: boolean}}
+ */
+export function pushRemote(hypoDir, target) {
+  try {
+    if (!target || !target.remote || !target.remoteRef || !target.oid) {
+      // No destination this function is willing to name. Not pushing is the
+      // conservative outcome and it is recorded like any other push failure, so
+      // session-start and doctor surface it instead of letting a vault look
+      // synced while it silently never pushes again.
+      appendSyncFailure(
+        hypoDir,
+        'push',
+        'push destination could not be resolved (detached HEAD, or the current branch has no upstream); nothing was pushed',
+      );
+      return { pushed: false };
+    }
+    const push = syncGit(hypoDir, 'push', target.remote, `${target.oid}:${target.remoteRef}`);
+    if (push.status === 0) {
+      recordSyncSuccess(hypoDir, 'push');
+      return { pushed: true };
+    }
+    appendSyncFailure(hypoDir, 'push', push.stderr || push.stdout);
+    return { pushed: false };
+  } catch {
+    // best-effort: never break the Stop hook
+    return { pushed: false };
+  }
+}
+
+/**
+ * Pull + push the wiki against its remote, guaranteeing the working tree is
+ * never left half-merged.
+ *
+ * The two halves in their original order, for every caller that does not hold
+ * the vault commit lock and so has no reason to care where the boundary is.
+ * hypo-auto-commit.mjs does hold it and calls pullRemote/pushRemote itself;
+ * see there. The ordering guarantee lives here as well as there: a conflicting
+ * pull returns before the push, so a diverged branch is never pushed from.
+ *
+ * Best-effort: never throws. A sync failure must not break the Stop hook.
  *
  * @param {string} hypoDir
  * @returns {{pulled: boolean, pushed: boolean, conflict: boolean}}
  */
 export function syncRemote(hypoDir) {
-  const git = (...args) =>
-    spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
-  const result = { pulled: false, pushed: false, conflict: false };
-  try {
-    const pull = git('pull', '--no-rebase', '-q');
-    if (pull.status === 0) {
-      result.pulled = true;
-      recordSyncSuccess(hypoDir, 'pull');
-    } else {
-      // A merge conflict leaves unmerged index entries; a network/auth failure
-      // leaves none. Only the former must be aborted to keep the tree clean.
-      const unmerged = git('ls-files', '-u');
-      const hasConflict = unmerged.status === 0 && (unmerged.stdout || '').trim().length > 0;
-      if (hasConflict) {
-        // Abort to return the tree to the just-committed local state. Verify the
-        // abort actually cleaned up: if it fails (filesystem/concurrent-mutation
-        // edge), the tree may still be half-merged, so record that distinctly
-        // ('conflict-unresolved') rather than masking it as a clean abort.
-        const abort = git('merge', '--abort');
-        const stillUnmerged = git('ls-files', '-u');
-        const aborted = abort.status === 0 && (stillUnmerged.stdout || '').trim().length === 0;
-        appendSyncFailure(
-          hypoDir,
-          aborted ? 'conflict' : 'conflict-unresolved',
-          pull.stderr || pull.stdout,
-        );
-        result.conflict = true;
-        return result; // do not push from a diverged branch
-      }
-      appendSyncFailure(hypoDir, 'pull', pull.stderr || pull.stdout);
-    }
-    const push = git('push');
-    if (push.status === 0) {
-      result.pushed = true;
-      recordSyncSuccess(hypoDir, 'push');
-    } else appendSyncFailure(hypoDir, 'push', push.stderr || push.stdout);
-  } catch {
-    // best-effort — never break the Stop hook
-  }
-  return result;
+  const { pulled, conflict } = pullRemote(hypoDir);
+  if (conflict) return { pulled: false, pushed: false, conflict: true };
+  // Resolved here rather than left to the push: the target is what makes the
+  // push unambiguous, and a caller of this combined form has no other place to
+  // decide it. HEAD right after the pull, which is what a bare `git push` would
+  // have sent anyway, minus the window between this line and the push itself.
+  const { pushed } = pushRemote(hypoDir, resolvePushTarget(hypoDir));
+  return { pulled, pushed, conflict: false };
 }
 
 // ── touched-paths (scope the auto-commit to session-touched paths) ───────────
@@ -2429,7 +3507,12 @@ export function syncRemote(hypoDir) {
 // No session_id → never accumulate, and never fall back to a shared "default"
 // bucket: a path recorded under the wrong key could leak between sessions.
 
-/** Directory holding one session's cache artifacts, incl. touched-paths.json. */
+/** Directory holding one session's cache artifacts: touched-paths.json and,
+ * since the n1 fix above, root-hot-projection-receipt.json. Neither is
+ * cleaned up when a session ends normally or dies mid-session, same as
+ * every other file already living here before this fix. An abandoned
+ * receipt from a crashed session is inert: nothing ever reads it again,
+ * since no other session shares that same session_id to look it up under. */
 function sessionCacheDir(hypoDir, sessionId) {
   return join(hypoDir, '.cache', 'sessions', sanitizeSessionId(sessionId));
 }
@@ -2464,10 +3547,20 @@ function readTouchedPathsFile(path) {
 }
 
 /**
- * Accumulate vault-relative touched paths for `sessionId`. Best-effort,
- * dedup-on-insert, JSON array (not delimiter-joined — survives non-ASCII and
- * any byte a filename can legally hold). No-op without a session_id: never
- * accumulate into a shared bucket.
+ * Accumulate vault-relative touched paths for `sessionId`. Best-effort in the
+ * sense that it never throws, but no longer silent about it: it now reports
+ * whether the accumulation actually landed, because a caller that treats a
+ * write as accounted-for the moment it calls this (root hot.md's projection
+ * writers, see hypo-session-start.mjs / hypo-hot-rebuild.mjs) needs to know
+ * when that assumption was wrong. A lock-timeout or write failure used to be
+ * indistinguishable from success: the write would go through, this would
+ * swallow the error, and the file would sit dirty with nothing in ANY
+ * session's touched-paths set to bring it into an auto-commit, orphaned
+ * until some unrelated write happens to touch the same path again. Dedup-on-
+ * insert, JSON array (not delimiter-joined, survives non-ASCII and any byte
+ * a filename can legally hold). No-op (and reports true, nothing to fail)
+ * without a session_id or with an empty path list: never accumulate into a
+ * shared bucket, and an empty call isn't a failure.
  *
  * Read-merge-write is guarded by the per-session file lock (the SAME lock
  * `drainTouchedPaths` takes), so a PostToolUse hook accumulating concurrently
@@ -2478,13 +3571,16 @@ function readTouchedPathsFile(path) {
  * @param {string} hypoDir
  * @param {string|null|undefined} sessionId
  * @param {string|string[]} relPaths one or more vault-relative paths
+ * @returns {boolean} true when the accumulation is durably recorded (or there
+ *   was nothing to record); false when a lock-timeout or write failure means
+ *   the caller cannot assume this path is in ANY session's touched-paths set.
  */
 export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
-  if (!sessionId) return;
+  if (!sessionId) return true;
   const incoming = (Array.isArray(relPaths) ? relPaths : [relPaths]).filter(
     (p) => typeof p === 'string' && p.length > 0,
   );
-  if (incoming.length === 0) return;
+  if (incoming.length === 0) return true;
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
     withFileLock(path, () => {
@@ -2498,11 +3594,37 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
       for (const p of incoming) merged.add(p);
       atomicWrite(path, JSON.stringify([...merged]));
     });
+    return true;
   } catch {
-    // best-effort: a hook must never fail a tool call over a cache write
-    // (includes a lock-timeout — a dropped accumulation here is the same
-    // fail-safe shape as every other best-effort cache write in this file).
+    // Never throws out to the caller (a hook must not fail a tool call over
+    // a cache write, includes a lock-timeout), but no longer silent: the
+    // false return is what lets a caller decide whether to trust this write
+    // as accounted for.
+    return false;
   }
+}
+
+/**
+ * Fail-closed pre-claim for a write that MUST have a session to be
+ * accounted for, unlike recordTouchedPaths' every other caller. The generic
+ * function above returns `true` on a missing session_id, correct for a
+ * best-effort accumulate (there is nothing to accumulate, so nothing failed),
+ * but the root-hot-projection pre-claim (hypo-session-start.mjs /
+ * hypo-hot-rebuild.mjs) uses that same `true` to decide whether to go ahead
+ * and write hot.md at all. A missing session_id there must not read as
+ * "claimed": it would let hot.md be rewritten with no session's
+ * touched-paths set able to ever bring the change into a commit, an orphan
+ * write no different from a genuine lock-timeout, just for a different
+ * reason. Every other property (locking, dedup, atomic merge) is identical;
+ * this only tightens the missing-session_id case to `false`.
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @param {string|string[]} relPaths
+ * @returns {boolean}
+ */
+export function claimProjectionWrite(hypoDir, sessionId, relPaths) {
+  if (!sessionId) return false;
+  return recordTouchedPaths(hypoDir, sessionId, relPaths);
 }
 
 /**
@@ -2768,10 +3890,14 @@ function projectOfPath(relPath) {
  *
  * @param {string} hypoDir
  * @param {string[]} [paths] vault-relative paths this caller wrote/owns this close
- * @returns {{committed: boolean, scoped?: number, reason?: string}} committed:true
- *   when a commit was created OR nothing needed committing (scoped:0 in the
- *   latter case); committed:false (with reason) on a real failure: not a git
- *   repo, or git status/add/commit erroring.
+ * @returns {{committed: boolean, scoped?: number, sha?: string|null, reason?: string}}
+ *   committed:true when a commit was created OR nothing needed committing
+ *   (scoped:0 in the latter case); committed:false (with reason) on a real
+ *   failure: not a git repo, or git status/add/commit erroring. `sha` is the
+ *   commit this call created, and is present ONLY on that branch: a
+ *   `scoped: 0` success created no commit, so it carries no sha rather than
+ *   an unrelated HEAD a caller could tell someone to revert. It is `null`
+ *   when the commit succeeded but reading its hash did not.
  */
 export function commitWikiChanges(hypoDir, paths) {
   const git = (...args) =>
@@ -2873,7 +3999,17 @@ export function commitWikiChanges(hypoDir, paths) {
       committed: false,
       reason: `git commit failed: ${(commit.stderr || '').trim() || 'unknown'}`,
     };
-  return { committed: true, scoped: stagedFiles.length };
+  // MAJOR fix: name the commit this call just created. A caller that has to
+  // tell a user how to take it back (close-gate-store.mjs's
+  // hostTagWarningWithUndo) cannot derive it afterwards: on a shared vault
+  // HEAD by then may be a concurrent session's commit, and reverting that
+  // undoes someone else's work. Read right here, still inside the caller's
+  // lock hold. `null` when rev-parse somehow fails: an undo instruction with
+  // no target is a smaller failure than one with the wrong target, and the
+  // commit itself did succeed, so this must not turn into `committed: false`.
+  const head = git('rev-parse', 'HEAD');
+  const sha = head.status === 0 ? (head.stdout || '').trim() || null : null;
+  return { committed: true, scoped: stagedFiles.length, sha };
 }
 
 /**
@@ -3382,14 +4518,17 @@ export function normalizeVerifiedScope(verifiedScope) {
  *
  * @param {string} hypoDir
  * @param {string} sessionId
- * @param {{project?: string, scope?: string, transcript_path?: string, verifiedScope?: {kind: 'log-only'|'project'|'global', projects?: string[]}}} info
+ * @param {{project?: string, scope?: string, transcript_path?: string, verifiedScope?: {kind: 'log-only'|'project'|'global', projects?: string[]}, hostTagWarning?: string}} info
+ *   `hostTagWarning` is optional and, when present, is persisted as
+ *   `host_tag_warning` (see the payload below): the close-time residual a
+ *   reader of this file after the fact would otherwise have no record of.
  */
 export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
   if (!sessionId) return false;
   try {
     const cacheDir = join(hypoDir, '.cache');
     if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
-    // scope distinguishes a project close (the 5 mandatory files were verified
+    // scope distinguishes a project close (the 4 mandatory files were verified
     // fresh) from a log-only close (a non-project session, no project
     // attribution). Readers (precompactGateStatus / --check-session-close) key
     // the gate semantics on this field, so it must be recorded.
@@ -3420,6 +4559,13 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
       // adopted this field reads back byte-identical to before it existed —
       // doctor's reader treats "field absent" as "no additional scope check".
       ...(verifiedScope ? { verified_scope: verifiedScope } : {}),
+      // Same omit-when-absent contract. Set only when this close survived a
+      // HOST_TAG_NAMES-shaped queue item reading as neutral rather than a
+      // retraction (see walkCloseGate's neutralizedHostTagName and
+      // closeGateStatus's hostTagWarning): a caller inspecting the marker
+      // after the fact can then see the same residual the close-time console
+      // output already warned about once.
+      ...(info.hostTagWarning ? { host_tag_warning: info.hostTagWarning } : {}),
     };
     // Atomic, and it reports. Two reasons, and the caller needs both.
     //
@@ -5020,12 +6166,28 @@ export function resolveTranscriptBySessionId(
  *
  * Fail-closed: any read/parse error → not open.
  *
- * @returns {{open: boolean, openedAtIndex: number}} `openedAtIndex` is the
- *   position, in the FATAL-filtered record array this walk builds internally
- *   (blank lines dropped, non-object JSON values dropped, first parse failure
- *   returns early), of the most recent event that opened the gate, or -1 if
- *   none ever did. `close-gate-store.mjs`'s `resolutionStamp` counts records
- *   by the same definition, so the two indices are comparable.
+ * @returns {{open: boolean, openedAtIndex: number, retractedByUnknownTagName: string|null, neutralizedHostTagName: string|null}}
+ *   `openedAtIndex` is the position, in the FATAL-filtered record array this
+ *   walk builds internally (blank lines dropped, non-object JSON values
+ *   dropped, first parse failure returns early), of the most recent event
+ *   that opened the gate, or -1 if none ever did. `close-gate-store.mjs`'s
+ *   `resolutionStamp` counts records by the same definition, so the two
+ *   indices are comparable. `retractedByUnknownTagName` names the tag (e.g.
+ *   `"any-new-host-tag"`) when the CURRENT `open: false` came from a
+ *   tag-shaped queue enqueue that is not one of `HOST_TAG_NAMES`, so a caller
+ *   can tell a maintainer which name to add; null whenever the current state
+ *   has another explanation or the gate is open. `neutralizedHostTagName`
+ *   names a `HOST_TAG_NAMES` tag (e.g. `"agent-message"`) that most recently
+ *   read as neutral, rather than a retraction, since the LAST event that
+ *   opened the gate, so a caller can warn that the close now in effect
+ *   survived a shape a person could also have pasted verbatim. Reset to null
+ *   by every event that (re)opens the gate, so it never survives past the
+ *   open it describes; null when nothing neutral has happened since that
+ *   open. Do NOT read it when `open` is false: the events that CLOSE the
+ *   gate (popAll, `/clear`, an unregistered tag, an attachment retraction, a
+ *   declined reconfirm) leave this field untouched, so on a closed gate it
+ *   can still name a tag from the open that was already retracted. Every
+ *   consumer today reads it only on an open gate.
  */
 // Genuine user text of a record, or null when the record is on a channel the
 // honest-but-drifting model can reach (so it is never user intent — NEUTRAL).
@@ -5133,23 +6295,192 @@ function isModelReachableRecord(obj) {
 // notification the host injects on the model's behalf. Shared by the enqueue
 // branch and the remove-path (queued_command attachment) branch below so a
 // task notification reads as neutral on BOTH delivery shapes of the same host
-// event. Before this was extracted, only the enqueue branch filtered it — the
+// event. Before this was extracted, only the enqueue branch filtered it: the
 // attachment branch treated any non-close prompt, including a task
-// notification, as a change-of-mind close: a close typed by the user opened
-// the gate, then the notification for an unrelated background task landed
-// via this path and flipped it shut again.
+// notification, as a change-of-mind close, so a close typed by the user
+// opened the gate and the notification for an unrelated background task then
+// flipped it shut again.
+//
+// The prefix check used to be a literal `<task-notification>` string, which
+// missed two other host-minted tags this file had never been taught by name:
+// a subagent hand-back (`<agent-message from="...">`) and a cross-session
+// message (`<cross-session-message from="...">`). Measured 2026-09-17
+// against ~4.6K enqueue records across 431 transcripts (the corpus is live
+// and grows every session, so these counts are a snapshot, not a
+// reproducible figure; the ratios are what hold): task-notification (no
+// attributes) ~3890, agent-message (attributed) ~166, cross-session-message
+// (attributed) ~27, plain user prose ~518, slash commands ~53. Of the
+// records that start with `<` (~4.1K), exactly these three distinct tag
+// names occur, all host-minted.
+//
+// A first attempt widened the match to ANY leading tag name (`<name ...>` or
+// `<name>`, attributes optional), on the reasoning that a fourth host tag
+// would then read as neutral without a code change. That widening was
+// reverted: a queue-operation enqueue has no `origin` or `commandMode` field
+// to fall back on, so a leading-tag check is the ONLY signal this branch has,
+// and it cannot tell a host tag from a person's own bracketed text. Two
+// shapes a person can plausibly type or paste both matched the wide version:
+// a label like `<TODO> 계속 작업해줘`, and an unterminated prefix such as
+// `<please keep working` (the regex needed only a following space, not a
+// closing `>`). Both would have read as model-caused and neutral, silently
+// dropping a real change of mind instead of closing the gate. So the match
+// stays a closed allowlist of the three names this corpus has actually
+// produced (HOST_TAG_NAMES below), not a name-shaped pattern. A fourth host
+// tag this file has not been taught by name still falls through to the
+// enqueue branch's `else open = false` and retracts a close; that is the same
+// residual the enqueue branch's own comment already carries for any
+// unrecognized shape, not a new one this allowlist introduces.
+//
+// The slash-command ~53 does NOT mean "handled above, never reaches here".
+// Only `/clear` (~3) is caught by the branch above this one. The other ~50
+// (`/hypo:resume` ~40, `/reload-plugins` ~8, `/resume` ~1, `/operations…`
+// ~1) DO reach this filter, read as not-machine (no leading `<`), and fall
+// through to the enqueue branch's `else open = false`, same as any other
+// unrecognized non-close text. That classification is not obviously wrong
+// for `/hypo:resume` (typed by a human resuming work), but a queued
+// `/reload-plugins` right after a close retracts that close the same way,
+// and this file has never separately reasoned about whether that one
+// should. Confirmed against `walkCloseGate` directly: `close, then enqueue
+// "/reload-plugins"` reads false (closed), same as `/hypo:resume` and
+// `/clear`; only `/compact` reads true.
+//
+// None of the ~518 plain-prose records carry any of six known
+// machine-marker substrings (`[Subagent`, `hand-back`, `SYSTEM
+// NOTIFICATION`, `task-notification`, `Caveat:`, `automated`) in their first
+// 200 characters; some are as short as "reply with ok". So on the ENQUEUE
+// channel, in this corpus, one of these three leading tags separates
+// machine-caused content from user prose with zero false positives and zero
+// false negatives at this sample, but that separation is scoped to the
+// three names it checks, by design: it says nothing about a tag this corpus
+// has not produced.
+//
+// This predicate must not be reused on the typed (eventUserText) channel
+// either. 61 records that channel accepts as genuine user prose start with a
+// host tag too (`<bash-input>` ~24, `<bash-stdout>` ~24,
+// `<local-command-stdout>` ~13); `<bash-input>` is the user's own `!`
+// command. Those shapes do not occur on the queue channel today, so the two
+// channels read the same prefix in opposite directions and must stay on
+// separate predicates.
+//
+// Attachment-side note: this same function backstops the queued_command
+// branch below, but that branch now only reaches it when it has no producer
+// signal at all. `origin.kind` "human" overrides this body check there
+// entirely (see that branch's comment) rather than being weighed against it,
+// because a human-authored prompt can start with one of these three strings
+// too, by coincidence or by paste, and a producer field the host stamps is
+// stronger evidence than a string the host also mints. Measured: of 1796
+// queued_command attachments, 0 carry both a host-tag-shaped prefix and
+// origin.kind "human", so this ordering changes 0 outcomes at this sample;
+// it is a defense against a shape the corpus has not produced yet.
+//
+// ENQUEUE-BRANCH REVERSION (2026-09-18): a prior pass (codex cross-review
+// round 5, blocker) changed this branch to close on every non-empty,
+// non-close body, tag-shaped or not. Its reasoning still holds as a fact:
+// `queue-operation enqueue` carries no `origin` or `commandMode` field, so a
+// HOST_TAG_NAMES match here was never PROOF of a host producer, only a
+// corpus fact that no other producer had used the shape yet. What moved is
+// the judgment about which mistake costs more, once the corpus this file
+// actually runs against was measured. Of 433 sessions carrying a close
+// signal, 95 (21.9%, snapshot of a live and growing corpus, so the count
+// drifts but the ratio held at measurement time) hit that retraction, and 66
+// of those repeated the reconfirm five times or more, a friction this
+// file's own users hit daily. The event that retraction was defending
+// against, a person typing or pasting a HOST_TAG_NAMES shape verbatim, has
+// not been observed in this corpus at all; the trade was a confirmed daily
+// cost against an unmeasured one. A codex design consultation split the two
+// failure directions by recoverability instead of by which reading is more
+// often right: a commit opened by mistake is auditable and revertable in
+// git, while a permission closed by mistake just keeps asking the same user
+// to reconfirm a decision they already made. So the enqueue branch below
+// calls this function again and reads a HOST_TAG_NAMES match as neutral, the
+// same shape it read before the amendment. The residual that reopens, a
+// pasted tag keeping a spent close alive, is not guessed against on every
+// gate read; it is named once, via `neutralizedHostTagName` below, and
+// surfaced once at commit time by crystallize-close-apply.mjs rather than on
+// every read that would otherwise repeat the same nag the measurement above
+// found costly. This function's host-tag branch was already authoritative
+// for the queued_command attachment branch below (it never adopted the
+// amendment), which has `origin.kind` and `commandMode` to weigh a tag match
+// against, signals the enqueue shape does not carry.
+//
+// Exported so close-gate-store.mjs's `closeGateStatus` can tell a KNOWN host
+// tag apart from an unrecognized one when it names the culprit in its
+// `no-open` reason string: the advice differs (a known tag closing the gate
+// is the enqueue-branch fix above working as intended; an unrecognized one is
+// the "which tag to add" diagnostic that already existed).
+export const HOST_TAG_NAMES = ['task-notification', 'agent-message', 'cross-session-message'];
+// Capturing, not `(?:`, so hostTagNameOf below reads the matched name off the
+// same regex that decides neutrality. Two places in walkCloseGate need that
+// name, and giving either one its own pattern is how HOST_TAG_NAMES grows in
+// one of them and not the other.
+const HOST_TAG_PREFIX = new RegExp(`^<(${HOST_TAG_NAMES.join('|')})(?=[\\s>])`);
 function isModelCausedQueueContent(text) {
   const c = typeof text === 'string' ? text.trim() : '';
-  return !c || c.startsWith('<task-notification>');
+  return !c || HOST_TAG_PREFIX.test(c);
+}
+
+// The allowlisted tag name a queued body starts with, or null when it starts
+// with anything else. Diagnostic only, exactly like TAG_SHAPE_PREFIX below:
+// it never decides the gate, it only lets walkCloseGate say WHICH tag read as
+// neutral. Both neutral enqueue branches call this rather than re-deriving
+// the name, so adding a fourth name to HOST_TAG_NAMES moves both at once.
+function hostTagNameOf(text) {
+  const m = HOST_TAG_PREFIX.exec(typeof text === 'string' ? text.trim() : '');
+  return m ? m[1] : null;
+}
+
+// Diagnostic only, never a gate decision on its own. HOST_TAG_PREFIX above is
+// the closed allowlist that actually decides neutrality; this is deliberately
+// wider, so it also matches a name the allowlist has not been taught
+// (`<any-new-host-tag ...>`) and a human's own bracketed paste (`<TODO>`,
+// `<please keep working`). It exists so the enqueue branch below can NAME a
+// retraction's shape in closeGateStatus's `no-open` reason string, closing a
+// gap a codex cross-review named: nothing today tells a maintainer the
+// allowlist has gone stale, so a fourth host tag silently retracts real
+// closes until someone reads this corpus by hand and notices.
+const TAG_SHAPE_PREFIX = /^<([A-Za-z][\w-]*)(?:[\s>]|$)/;
+
+/**
+ * The tag name of a tag-shaped body whose name is NOT in HOST_TAG_NAMES, or
+ * null (no tag shape at all, or a registered one). This is the fail-closed
+ * judgment the enqueue branch runs FIRST, ahead of the close-phrase check:
+ * see that branch for why an unregistered tag must retract even when its body
+ * reads like a close.
+ *
+ * Deliberately not the negation of hostTagNameOf: that one requires `[\s>]`
+ * after the name, so a bare `<task-notification` (no bracket, nothing after)
+ * misses it. Matching TAG_SHAPE_PREFIX and then checking the NAME against the
+ * allowlist keeps such a body out of this retraction, leaving it to the same
+ * final `else` that already closed on it before this function existed.
+ */
+function unregisteredTagNameOf(text) {
+  const m = TAG_SHAPE_PREFIX.exec(typeof text === 'string' ? text.trim() : '');
+  if (!m) return null;
+  return HOST_TAG_NAMES.includes(m[1]) ? null : m[1];
+}
+
+// The fail-closed shape of this walk's return, built fresh on every call.
+// A shared module-level constant would hand every caller the same object, so
+// one caller stashing or mutating what it got back would reach into the next
+// call's answer. The three early returns below all use this so a caller
+// destructuring the two diagnostic fields gets `null`, not `undefined`, on
+// the paths that never walk a record (see this function's @returns).
+function closedGateResult() {
+  return {
+    open: false,
+    openedAtIndex: -1,
+    retractedByUnknownTagName: null,
+    neutralizedHostTagName: null,
+  };
 }
 
 export function walkCloseGate(transcriptPath) {
-  if (!transcriptPath) return { open: false, openedAtIndex: -1 };
+  if (!transcriptPath) return closedGateResult();
   let raw;
   try {
     raw = readFileSync(transcriptPath, 'utf-8');
   } catch {
-    return { open: false, openedAtIndex: -1 };
+    return closedGateResult();
   }
   // FATAL: a non-empty line that will not parse means the transcript is being
   // appended to (a half-written record) or is corrupt. Skipping it would let a
@@ -5164,7 +6495,7 @@ export function walkCloseGate(transcriptPath) {
     try {
       o = JSON.parse(line);
     } catch {
-      return { open: false, openedAtIndex: -1 };
+      return closedGateResult();
     }
     if (o === null || typeof o !== 'object') continue;
     recs.push(o);
@@ -5196,6 +6527,21 @@ export function walkCloseGate(transcriptPath) {
   const markedAskIds = new Set();
   let open = false;
   let openedAtIndex = -1;
+  // Names the tag-shaped queue item that most recently retracted a close (one
+  // NOT in HOST_TAG_NAMES, the only shape that still retracts), so
+  // closeGateStatus's `no-open` reason can surface it instead of leaving it as
+  // a fact only a transcript dump reveals. Cleared at every OTHER state change
+  // so it never survives past the retraction it explains; see the enqueue
+  // branch's final `else` for where it is set.
+  let retractedByUnknownTagName = null;
+  // Names a HOST_TAG_NAMES tag that most recently read as neutral, rather
+  // than a retraction, since the last event that opened the gate: the
+  // residual the enqueue-branch reversion above accepts. Reset to null by
+  // every `open = true` assignment below so it only ever describes the close
+  // currently in effect, never one already resolved by a later close phrase.
+  // Read once, at commit time, by crystallize-close-apply.mjs's warn-once
+  // path; see closeGateStatus for where it turns into a message.
+  let neutralizedHostTagName = null;
 
   for (let i = 0; i < recs.length; i++) {
     const o = recs[i];
@@ -5213,22 +6559,125 @@ export function walkCloseGate(transcriptPath) {
     // an NL queued command is handled by its queued_command attachment below.
     if (o.type === 'queue-operation') {
       if (o.operation === 'popAll') {
+        // Unconditional close, and that is deliberate. A 2026-09-17 attempt to
+        // read this branch's content the way the enqueue branch below does was
+        // reverted: the measurement behind it was truncated and wrong.
+        //
+        // What the corpus actually holds (~66 popAll records, live corpus so a
+        // snapshot): 0 have missing or empty content, 63 carry content identical
+        // to the preceding enqueue, 2 follow an enqueue with different content,
+        // 1 follows a `remove`. None start with a host tag, so a content check
+        // would change the outcome of exactly 0 of them while newly letting a
+        // user's own `<TODO> ...` paste through as neutral.
+        //
+        // The one record that looked machine-authored is worse than useless as
+        // evidence. Read untruncated it is 465 chars: this hook's own relayed
+        // notice with the USER'S question appended by the host after a blank
+        // line ("...back in sync.\n\n업데이트했는데 이렇게 에러 뜨는 이유는?").
+        // All 4 records carrying that relay prefix are such composites. Treating
+        // the prefix as proof of machine authorship reads a real retraction as
+        // neutral, which keeps a spent close alive and lets crystallize apply
+        // writes the user already took back. Condition-hit accuracy was 0 of 5.
+        //
+        // This channel cannot do better: a queue-operation record's keys are
+        // content/operation/sessionId/timestamp/type, with no origin and no
+        // promptSource, so there is nothing here that attests a producer. Until
+        // the host stamps one, popAll closes and the user re-confirms.
         open = false;
+        retractedByUnknownTagName = null; // a fully-understood close, no diagnostic needed
         continue;
       }
       if (o.operation !== 'enqueue') continue;
       const c = typeof o.content === 'string' ? o.content.trim() : '';
+      // Judged ahead of the branch chain so the fail-closed branch below can
+      // read it without running the regex twice.
+      const unregisteredTag = unregisteredTagNameOf(c);
       if (/^\/compact(?:\s|$)/.test(c)) {
         open = true; // a user compaction preserves the work → open
         openedAtIndex = i;
+        retractedByUnknownTagName = null;
+        neutralizedHostTagName = null;
       } else if (/^\/clear(?:\s|$)/.test(c)) {
         open = false; // abandons context → close
-      } else if (isModelCausedQueueContent(c)) {
-        /* model-caused / empty — neutral */
+        retractedByUnknownTagName = null;
+      } else if (!c) {
+        /* empty: neutral. Empty content names no producer in either
+           direction: there is no text to be a host tag, a close phrase, or a
+           person's own words, so this is one of the two cases the enqueue
+           branch grants for free; see the HOST_TAG_NAMES branch below for the
+           other. */
+      } else if (unregisteredTag) {
+        /* MAJOR fix (fail-closed): a tag-shaped body whose name is NOT in
+           HOST_TAG_NAMES retracts the close, and that judgment now runs
+           BEFORE the close-phrase branch below. It used to run after, in the
+           final `else`, which meant an unregistered tag whose body happened
+           to carry close wording (`<future-host>오늘은 여기까지 하자</future-host>`)
+           fell into the isClosePattern branch instead and did neither: it
+           left the previous close standing AND named nothing, so
+           closeGateStatus returned no warning on any of its three surfaces
+           and the apply that followed looked ordinary.
+
+           Fail-closed means the unknown shape is treated as the user's own
+           retraction until someone proves otherwise by registering the tag.
+           What that opens: a genuine host notification from a tag this build
+           has never heard of now costs the user one re-confirmation of their
+           close. The reason string names the tag so the fix (add it to
+           HOST_TAG_NAMES) is one edit away; see closeGateStatus's `no-open`
+           wording. */
+        retractedByUnknownTagName = unregisteredTag;
+        open = false;
       } else if (isClosePattern(c)) {
-        /* NL close via the queue — the open dequeue gap: the producer cannot be
-           attributed (a peer/model enqueue wears the same shape), so no open */
-      } else open = false; // a queued non-close user intent → close (change of mind)
+        /* NL close via the queue: the open dequeue gap. The producer cannot be
+           attributed (a peer/model enqueue wears the same shape), so no open.
+
+           Ordered AHEAD of the host-tag branch below on purpose. A body that
+           is both host-tag shaped and close worded must not open the gate off
+           a shape a person can paste, and this is the branch that refuses to
+           open; putting the host-tag branch first would change nothing about
+           that outcome but would spread the no-open reasoning over two
+           places. What the order did cost is a warning that never fired:
+           isClosePattern is an unanchored substring match, so a genuine host
+           notification whose body happens to carry close wording
+           (`<agent-message from="worker">오늘은 여기까지 진행했습니다</agent-message>`)
+           lands here rather than below, and left neutralizedHostTagName unset.
+           So name the tag here too. The gate decision is untouched (both
+           branches are no-ops on `open`); only the naming widens.
+
+           What that accepts: a real host notification with close-worded prose
+           now also raises the commit-time warning, which is a false alarm.
+           That is one line per apply, not the per-read nag the enqueue-branch
+           reversion note above was measured against, so the two costs are not
+           the same size, and the alternative (an anchored close match here)
+           would trade a false alarm for a missed one. */
+        const hostTag = hostTagNameOf(c);
+        if (hostTag) neutralizedHostTagName = hostTag;
+      } else if (isModelCausedQueueContent(c)) {
+        /* a body shaped like one of HOST_TAG_NAMES: neutral, the same filter
+           the queued_command attachment branch below applies to the same
+           host event on its other delivery shape. This branch has no
+           `origin` field, so a host tag's own shape is not PROOF of a host
+           producer, it only reflects what this corpus has actually produced
+           on this channel (see the doc comment above
+           isModelCausedQueueContent, and the enqueue-branch reversion note
+           right above it for why this reads neutral again rather than
+           closing). Name the tag so a caller can warn once, at commit time,
+           that this close survived a shape a person could also have pasted;
+           see neutralizedHostTagName's own doc comment above. */
+        // isModelCausedQueueContent above matched HOST_TAG_PREFIX on a body
+        // the empty-content branch has already excluded, so this is never
+        // null here; the guard only avoids clobbering a live value on a
+        // mismatch that should not occur.
+        const hostTag = hostTagNameOf(c);
+        if (hostTag) neutralizedHostTagName = hostTag;
+      } else {
+        // Every other non-empty, non-close, non-host-tag-shaped queued item
+        // → close (change of mind). Name the tag here, if there is one, so
+        // closeGateStatus's `no-open` reason can tell a maintainer which
+        // shape closed it: see this field's own doc comment above.
+        const tagShape = TAG_SHAPE_PREFIX.exec(c);
+        retractedByUnknownTagName = tagShape ? tagShape[1] : null;
+        open = false;
+      }
       continue;
     }
 
@@ -5290,42 +6739,64 @@ export function walkCloseGate(transcriptPath) {
             ? (contentBlocksText(rawPrompt) ?? '')
             : '';
       const humanOrigin = !!(o.attachment.origin && o.attachment.origin.kind === 'human');
-      // The host labels these deliveries on the record itself, and that label is
-      // the authoritative one: every measured task-notification attachment
+      // The host labels these deliveries on the record itself, and that label
+      // is the authoritative one: every measured task-notification attachment
       // (1040 of 1040) carries commandMode 'task-notification'. Keying only on
       // the '<task-notification>' body prefix would leave the whole filter
       // resting on a string the host owns and can restyle, and a body that
-      // merely gains a line before the tag would slip past it. The queue-op
-      // branch above has no such field to read, so it keeps the body check
-      // alone; here both are available and both are used.
-      const modelCaused =
-        o.attachment.commandMode === 'task-notification' || isModelCausedQueueContent(prompt);
-      // The filter runs FIRST here, exactly as it does in the enqueue branch
-      // above. Order is load-bearing, not cosmetic: a notification body carries
-      // whatever text the finished task was named after, and isClosePattern
-      // matches on a substring ("wrap up", "오늘 여기까지" inside a <summary>
-      // both measure true). Testing isClosePattern first therefore lets a
-      // model-produced event reach the opener, where a human-origin delivery
-      // would set `open` and push `openedAtIndex` forward. That manufactures a
-      // close signal the user never gave, and moves the index the resolution
-      // comparison reads.
+      // merely gains a line before the tag would slip past it. It is checked
+      // first, ahead of `humanOrigin` too: it is the strongest signal this
+      // record has, host-stamped rather than read out of prose either side
+      // could shape.
+      const modelCaused = o.attachment.commandMode === 'task-notification';
+      // A codex cross-review on this exact branch found that a prior pass
+      // (meant to close a DIFFERENT major finding, an over-wide tag regex)
+      // left `humanOrigin` never winning here at all: `isModelCausedQueueContent`
+      // ran first for every case, so an audited human prompt that merely
+      // STARTS WITH one of the three known tag names (`<agent-message ...>`,
+      // `<cross-session-message ...>`) still read as neutral and a real
+      // change of mind was silently dropped. The old "0 of 1796 carry both"
+      // count was an observed-corpus fact, not a schema guarantee: a user
+      // can paste one of these three strings verbatim without any host
+      // change, so "it hasn't happened yet" was never a structural argument.
       //
-      // Reachability, so the next reader does not have to re-measure it: no
-      // recorded delivery hits that path. All 1040 task-notification
-      // attachments in the corpus arrive with no `origin`, so `humanOrigin` is
-      // false and the opener is skipped whichever order the two checks run in.
-      // This is a defensive pin against a host that starts stamping origin on
-      // them, not a repair of an observed failure.
+      // This branch closes that gap for the half of it that carries no new
+      // risk: a human origin paired with text that is NOT a close phrase
+      // always retracts, whatever the body looks like, because retracting is
+      // the safe direction (worst case: the user re-confirms a close they
+      // still want).
+      //
+      // It deliberately does NOT extend the same reordering to a close-phrase
+      // body: `isModelCausedQueueContent(prompt)` still runs, further down,
+      // before `isClosePattern` gets to open anything, exactly as the enqueue
+      // branch above does. A body that both matches a known tag shape AND a
+      // close phrase (a task-notification's own `<summary>` can legitimately
+      // say "wrap up") stays neutral there even with a stray human origin.
+      // That ordering is what `close-signals.test.mjs`'s "task-notification
+      // whose body matches a close pattern opens nothing" fixture pins, and
+      // it exists to stop a mislabeled host notification from manufacturing
+      // an open nobody asked for. Reordering that direction too would trade a
+      // same-severity gap (a dropped close) for a worse one (a granted close
+      // nobody typed), so it stays as it was.
       if (modelCaused) {
-        /* model-caused / empty: neutral, the same filter the enqueue branch
-           above applies to the same host event on its other delivery shape */
+        /* strongest signal, host-stamped: decided before either heuristic
+           below, and before humanOrigin gets a say */
+      } else if (humanOrigin && !isClosePattern(prompt)) {
+        open = false; // an audited human change of mind → close, whatever the body looks like
+        retractedByUnknownTagName = null;
+      } else if (isModelCausedQueueContent(prompt)) {
+        /* model-caused / empty, OR a human-origin close-phrase body that still
+           reads as one of the three known tag shapes (see the comment above):
+           neutral, the same filter the enqueue branch above applies to the
+           same host event on its other delivery shape */
       } else if (isClosePattern(prompt)) {
         if (humanOrigin) {
           open = true;
           openedAtIndex = i;
+          retractedByUnknownTagName = null;
+          neutralizedHostTagName = null;
         }
-      } else if (humanOrigin) {
-        open = false; // an audited human change of mind → close
+        /* else: no open, producer cannot be attributed */
       }
       // else: not caught by the known-machine shapes above, not a close
       // phrase, and no audited human producer either — a host event this
@@ -5362,8 +6833,11 @@ export function walkCloseGate(transcriptPath) {
       if (isClosePattern(userText)) {
         open = true;
         openedAtIndex = i;
+        retractedByUnknownTagName = null;
+        neutralizedHostTagName = null;
       } else if (isCloseRetractionPattern(userText)) {
         open = false;
+        retractedByUnknownTagName = null;
       }
       continue;
     }
@@ -5414,14 +6888,17 @@ export function walkCloseGate(transcriptPath) {
         // rejection.
         if (sawDecline && markedAskIds.has(b.tool_use_id)) {
           open = false;
+          retractedByUnknownTagName = null;
         } else if (sawClose) {
           open = true;
           openedAtIndex = i;
+          retractedByUnknownTagName = null;
+          neutralizedHostTagName = null;
         }
       }
     }
   }
-  return { open, openedAtIndex };
+  return { open, openedAtIndex, retractedByUnknownTagName, neutralizedHostTagName };
 }
 
 /**

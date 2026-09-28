@@ -51,6 +51,7 @@ import {
   uniqueBakPath,
 } from './lib/git-hooks-dir.mjs';
 import { loadHookInventory } from './lib/hook-inventory.mjs';
+import { formatRootHotProjection } from '../hooks/hypo-shared.mjs';
 import {
   readPkgJson as readPkgJsonSafe,
   writePkgJsonAtomic,
@@ -301,6 +302,22 @@ function copyTemplate(srcName, destPath, dryRun, transform) {
     writeFileSync(destPath, content);
   }
   log('created', destPath);
+}
+
+// Root hot.md is generated, not copied. The hooks rebuild it from
+// projects/*/hot.md with formatRootHotProjection, and the first rebuild in a new
+// vault treats any bytes it did not produce as a hand edit (backup file plus a
+// notice). A templates/hot.md kept equal to the generator by hand was a second
+// copy of that body, and every edit to the generator had to be mirrored into it.
+// Writing the generator's own empty-vault output here leaves one body.
+function writeRootHot(hypoDir, dryRun) {
+  const dest = join(hypoDir, 'hot.md');
+  if (existsSync(dest)) {
+    log('skipped', dest);
+    return;
+  }
+  if (!dryRun) writeFileSync(dest, formatRootHotProjection([]));
+  log('created', dest);
 }
 
 // ── hypo-config.md ───────────────────────────────────────────────────────────
@@ -1093,7 +1110,7 @@ if (args.fromRemote) {
 
   // 2. template files
   copyTemplate('index.md', join(args.hypoDir, 'index.md'), args.dryRun);
-  copyTemplate('hot.md', join(args.hypoDir, 'hot.md'), args.dryRun);
+  writeRootHot(args.hypoDir, args.dryRun);
   copyTemplate('log.md', join(args.hypoDir, 'log.md'), args.dryRun);
   copyTemplate('SCHEMA.md', join(args.hypoDir, 'SCHEMA.md'), args.dryRun);
   copyTemplate('hypo-guide.md', join(args.hypoDir, 'hypo-guide.md'), args.dryRun);

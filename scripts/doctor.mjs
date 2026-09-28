@@ -41,6 +41,7 @@ import {
   selfLocationPkgRootFrom,
 } from '../hooks/hypo-shared.mjs';
 import { classifyProposals } from './proposal.mjs';
+import { listProposalsChecked, orphanTmpTargetName } from '../hooks/proposal-store.mjs';
 import {
   discoverExtensions,
   parseManifest,
@@ -325,6 +326,49 @@ function checkHooks(coreManagedByPlugin) {
   checkProvenanceSidecar(claudeHooks, 'hooks/.hypo-provenance.json');
 }
 
+// Registrations for a hook this package still ships, under an event hooks.json
+// no longer maps it to. The forward walk in checkSettingsJson only asks whether
+// each live hook is registered, so an install that kept the four pre-orchestrator
+// Stop entries next to hypo-stop.mjs read as fully registered while each of those
+// steps ran twice per Stop. Same boundary as upgrade.mjs's
+// checkRetiredRegistrations, which is what removes them: the exact `$HOME`-form
+// command init writes, a basename in this package's hooks.json or shared.json,
+// and an event whose HOOK_MAP entry does not list it. Anything else (a user's own
+// hook, a hypo-ext-* extension, a command with arguments) is not ours to name.
+function retiredRegistrations(settings, hooksDir) {
+  const shipped = new Set([...Object.values(HOOK_MAP).flat(), ...SHARED_FILES]);
+  const prefix = `node ${hooksDir.replace(HOME, '$HOME')}/`;
+  const found = [];
+  for (const [event, groups] of Object.entries(settings.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    const live = new Set(HOOK_MAP[event] || []);
+    for (const g of groups) {
+      if (!g || typeof g !== 'object' || !Array.isArray(g.hooks)) continue;
+      for (const h of g.hooks) {
+        if (typeof h?.command !== 'string' || !h.command.startsWith(prefix)) continue;
+        const file = h.command.slice(prefix.length);
+        if (shipped.has(file) && !live.has(file)) found.push({ event, file, cmd: h.command });
+      }
+    }
+  }
+  return found;
+}
+
+function reportRetiredRegistrations(label, retired, remedy) {
+  if (retired.length === 0) {
+    pass(label, 'None');
+    return;
+  }
+  const names = retired.map((r) => `${r.event}: ${r.file}`);
+  warn(
+    label,
+    `${retired.length} registration(s) for a hook hooks/hooks.json no longer registers under ` +
+      `that event. Each still fires on its own, on top of whatever runs it now (the Stop steps ` +
+      `are spawned by hypo-stop.mjs), so it runs twice. ${remedy}: ` +
+      `${names.slice(0, 4).join(', ')}${names.length > 4 ? `, +${names.length - 4} more` : ''}`,
+  );
+}
+
 function checkSettingsJson(coreManagedByPlugin) {
   const settingsPath = join(HOME, '.claude', 'settings.json');
   if (!existsSync(settingsPath)) {
@@ -410,6 +454,11 @@ function checkSettingsJson(coreManagedByPlugin) {
   // so they are intentionally absent from HOOK_MAP. Excluded here; their
   // integrity (SHA + manifest + entry match) is checked separately in E5.
   const isExtCommand = (cmd) => /(?:^|[/\s])hypo-ext-[^/\s]+\.mjs(?=$|["'\s])/.test(cmd);
+  // Retired registrations get their own line with a prescription that works
+  // (upgrade --apply removes them); listing them here as well would print the
+  // same entry twice under a remedy that does not.
+  const retired = retiredRegistrations(settings, hooksDir);
+  const retiredCmds = new Set(retired.map((r) => r.cmd));
   const expectedCmds = new Set(
     Object.entries(HOOK_MAP).flatMap(([, files]) =>
       files.map((f) => `node ${hooksDir.replace(HOME, '$HOME')}/${f}`),
@@ -425,7 +474,8 @@ function checkSettingsJson(coreManagedByPlugin) {
           typeof h.command === 'string' &&
           /hypo-[^/]+\.mjs/.test(h.command) &&
           !isExtCommand(h.command) &&
-          !expectedCmds.has(h.command)
+          !expectedCmds.has(h.command) &&
+          !retiredCmds.has(h.command)
         ) {
           stale.push(h.command);
         }
@@ -440,6 +490,15 @@ function checkSettingsJson(coreManagedByPlugin) {
   } else {
     pass('settings.json stale hypo-* entries', 'None');
   }
+  reportRetiredRegistrations(
+    'settings.json retired hook registrations',
+    retired,
+    // upgrade --apply leaves settings.json alone on the plugin channel, so it
+    // is not a remedy there.
+    coreManagedByPlugin
+      ? 'Remove them from settings.json by hand'
+      : 'Run /hypo:upgrade (or `hypomnema upgrade --apply`) to remove them',
+  );
 
   // duplicate hypo-* entries per event
   const dupes = [];
@@ -1353,6 +1412,30 @@ function checkProposals(hypoDir) {
   // normal state awaiting a human rather than a broken install, and this check
   // discovers without changing anything.
   //
+  // Ask the store directly FIRST, before classifying anything. `ok: false`
+  // means `.cache/proposals` itself could not be listed (permission denied,
+  // or a file sitting where the directory should be): the backlog is
+  // unmeasured, not zero. classifyProposals reads listProposals underneath,
+  // which folds that same readdir failure into `[]` (right for its own
+  // callers, which want a best-effort listing, wrong for a health check), so
+  // classifying first and asking the store second let an unmeasured backlog
+  // slip through the `classified.length === 0` gate below and report a
+  // lying pass. This warn branch used to read
+  // `inventory.ok ? inventory.unreadable : []`, which threw away `ok: false`
+  // entirely and fell straight into that same lying pass.
+  const inventory = listProposalsChecked(hypoDir);
+  if (!inventory.ok) {
+    warn(
+      'Pending proposals',
+      `${join(hypoDir, '.cache', 'proposals')} could not be listed (permission denied, or a ` +
+        `file sitting where the directory should be): the parked write-proposal count is ` +
+        `unmeasured here, not zero. Run \`ls -la ${join(hypoDir, '.cache', 'proposals')}\` to ` +
+        `see what is blocking it, then fix the permissions or remove the stray file.`,
+    );
+    return;
+  }
+  const unreadable = inventory.unreadable;
+
   // Not a count of artifacts. Three different states share that shape and want
   // three different things from the user, and telling them apart needs the
   // audit log and the page's current hash, which is exactly the judgment
@@ -1364,7 +1447,7 @@ function checkProposals(hypoDir) {
   const recoverable = classified.filter((c) => c.kind === 'recoverable');
   const broken = classified.filter((c) => c.kind === 'evidence-broken');
 
-  if (classified.length === 0) {
+  if (classified.length === 0 && unreadable.length === 0) {
     pass('Pending proposals', 'No parked write-proposals');
     return;
   }
@@ -1393,7 +1476,106 @@ function checkProposals(hypoDir) {
         `(it shows each one's age and whether its target moved since)`,
     );
   }
+  if (unreadable.length > 0) {
+    parts.push(
+      `${unreadable.length} candidate file(s) in .cache/proposals could not be read or ` +
+        `parsed (corrupt, permission-denied, or hand-edited): ${unreadable
+          .slice(0, 3)
+          .join(', ')}${unreadable.length > 3 ? `, +${unreadable.length - 3} more` : ''}; ` +
+        `neither \`proposal list\` nor \`proposal reconcile\` sees these. Run ` +
+        `\`ls -la ${join(hypoDir, '.cache', 'proposals')}\` to see the rest and open each file ` +
+        `directly`,
+    );
+  }
+  // Separate sentence, not folded into the wording above: an orphan tmp file
+  // is a subset of `unreadable` (a name can sit in both arrays, see
+  // scanProposalFiles), but it is not corrupt and not hand-edited. It is a
+  // complete proposal body whose rename from `<id>.json.<pid>.<rand>.tmp` to
+  // `<id>.json` never landed, so the fix is `mv`, not deletion.
+  const orphanTmp = inventory.orphanTmp || [];
+  if (orphanTmp.length > 0) {
+    const proposalsDir = join(hypoDir, '.cache', 'proposals');
+    const hints = orphanTmp
+      .slice(0, 3)
+      .map(
+        (name) =>
+          `mv "${join(proposalsDir, name)}" "${join(proposalsDir, orphanTmpTargetName(name))}"`,
+      )
+      .join('; ');
+    parts.push(
+      `${orphanTmp.length} of the file(s) above are recoverable, not corrupt: a writer finished ` +
+        `serializing a proposal body but crashed before the rename to its \`.json\` name landed. ` +
+        `Restore with, e.g., \`${hints}\`${orphanTmp.length > 3 ? ` (+${orphanTmp.length - 3} more, same pattern: drop the \`.<pid>.<rand>.tmp\` suffix)` : ''}`,
+    );
+  }
   warn('Pending proposals', parts.join('. '));
+}
+
+/**
+ * Surface leftover `.cache/close-intent/` records: crystallize-close-apply's
+ * torn-set witness (see closeIntentPath's doc comment there). A record
+ * outlives its close only when that close crashed between writeCloseIntent
+ * and clearCloseIntent, so every one found here means an interrupted apply,
+ * never a normal state to leave silent. Read-only: whether an aged-out
+ * record gets deleted is hasTornCloseIntent's call, made the next time a
+ * close actually runs the probe, not doctor's.
+ */
+function checkCloseIntent(hypoDir) {
+  const dir = join(hypoDir, '.cache', 'close-intent');
+  if (!existsSync(dir)) {
+    pass('Close-intent records', 'No leftover .cache/close-intent/ records');
+    return;
+  }
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch (e) {
+    // The same failure hasTornCloseIntent treats as 'unreadable' rather than
+    // silently torn: this check cannot tell either, so it says so instead of
+    // reporting a clean count that might be a lie.
+    warn(
+      'Close-intent records',
+      `${dir} could not be listed (${e.code || e.message}): whether a leftover record is sitting ` +
+        `there is unmeasured, not zero, and every no-payload close probe against this vault treats ` +
+        `an unreadable directory as unresolved (payload required) until this is fixed. Run ` +
+        `\`ls -la ${dir}\` to see what is blocking it.`,
+    );
+    return;
+  }
+  const records = names.filter((n) => n.endsWith('.json'));
+  if (records.length === 0) {
+    pass('Close-intent records', 'No leftover .cache/close-intent/ records');
+    return;
+  }
+  let unreadableCount = 0;
+  let oldestMinutes = null;
+  for (const name of records) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(dir, name), 'utf-8'));
+      const ts = Date.parse(parsed?.startedAt);
+      if (Number.isFinite(ts)) {
+        const minutes = Math.round((Date.now() - ts) / 60_000);
+        if (oldestMinutes === null || minutes > oldestMinutes) oldestMinutes = minutes;
+        continue;
+      }
+    } catch {
+      // falls through to unreadableCount below
+    }
+    unreadableCount++;
+  }
+  const parts = [
+    `${records.length} record(s) in .cache/close-intent/, left behind by a close that began ` +
+      `writing and never called clearCloseIntent (a crash or a killed session mid-apply, or a close that ended ok:false before its commit landed)`,
+  ];
+  if (oldestMinutes !== null) parts.push(`oldest is ${oldestMinutes} minute(s) old`);
+  if (unreadableCount > 0) {
+    parts.push(
+      `${unreadableCount} could not be read or parsed, so its age is unknown; every no-payload ` +
+        `close probe for this vault treats an unreadable record the same as a torn one (payload ` +
+        `required) until it is removed`,
+    );
+  }
+  warn('Close-intent records', parts.join('; '));
 }
 
 function checkCodexPaths() {
@@ -1470,6 +1652,11 @@ function checkCodexPaths() {
       `0/${total} registered — run /hypo:init --codex`,
     );
   }
+  reportRetiredRegistrations(
+    'Codex settings.json retired hook registrations',
+    retiredRegistrations(settings, hooksDir),
+    'Run `hypomnema upgrade --apply --codex` to remove them',
+  );
 }
 
 // ── extensions integrity (E5) ─────────────────────────────────────
@@ -2614,6 +2801,7 @@ if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkProposals(args.hypoDir);
+if (rootOk) checkCloseIntent(args.hypoDir);
 if (rootOk) checkFeedbackProjection(args.hypoDir, args.claudeHome, args.projectId);
 checkGit(args.hypoDir);
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * hypo-auto-commit.mjs — Stop hook
+ * hypo-auto-commit.mjs: Stop chain stage 3 (spawned by hypo-stop.mjs)
  *
  * At session end: stage this session's touched paths, commit if any, then
  * pull+push to sync remote.
@@ -31,11 +31,15 @@
 import { spawnSync } from 'child_process';
 import {
   HYPO_DIR,
-  syncRemote,
+  pullRemote,
+  pushRemote,
+  resolvePushTarget,
   commitWikiChanges,
   commitTouchedPaths,
   vaultCommitLockTarget,
   withFileLock,
+  rootHotProjectionIsCurrent,
+  writeRootHotHealthNotice,
 } from './hypo-shared.mjs';
 
 function hasRemote() {
@@ -76,6 +80,27 @@ const sessionId = input.session_id || input.sessionId || null;
 // lock file, so the two nest without any ordering conflict (vault lock is
 // always acquired first here; accumulation elsewhere only ever takes the
 // per-session lock, never the vault lock).
+//
+// The PUSH is deliberately not in here (review r5-w4 major 2). `git pull
+// --no-rebase` rewrites working-tree files, so it stays under the lock with
+// the commit. `git push` changes nothing locally, and it is a network round
+// trip with a 30s spawn timeout: holding the vault lock across it let one
+// session's Stop own the vault for up to a minute, while a sibling
+// SessionStart needs that same lock TWICE (its own `git pull` and the root
+// hot.md projection write) at 5s each, out of a 30s hook budget. The pushable
+// decision is made inside the lock and acted on after it is released.
+//
+// "The push changes nothing locally" was the whole justification for that
+// split, and it was only half true (codex major). What the push sends is
+// decided at push time from HEAD, so a sibling session that commits in the
+// window between the unlock and the push moves HEAD, and a bare `git push`
+// sends THEIR commit instead of the one this hook just made and verified.
+// So the target is pinned inside the lock, not just the decision to push:
+// `pushTarget` names one commit object and one fully-qualified remote ref, and
+// pushRemote sends exactly that or declines. See pushRemote's own comment for
+// the half this does NOT close: a client-side pre-push hook still runs
+// arbitrary code, from outside the lock, on this working tree.
+let pushTarget = null;
 try {
   withFileLock(
     vaultCommitLockTarget(HYPO_DIR),
@@ -84,17 +109,55 @@ try {
       // success — clear exactly what committed, ALL under one hold of the
       // per-session lock. See commitTouchedPaths's docstring for why a
       // commit failure or a same-path race can't lose anything under this.
-      const result = commitTouchedPaths(HYPO_DIR, sessionId, (paths) =>
-        commitWikiChanges(HYPO_DIR, paths),
-      );
+      const result = commitTouchedPaths(HYPO_DIR, sessionId, (paths) => {
+        // BLOCKER fix (r5-w1.md): 'hot.md' being IN this session's
+        // touched-paths set only ever proves this session once intended to
+        // write it, never that the bytes on disk right now are what it
+        // actually wrote: a scan error at SessionStart, a lock-timeout on
+        // the post-write record, or a claim simply outliving a later
+        // mid-session edit can all leave the claim standing over content
+        // this session never produced. Re-verify at this last possible
+        // moment, right before staging, instead of trying to revoke the
+        // claim on every branch that can go wrong upstream: a mismatch means
+        // whatever is on disk did not come from this session's own write, so
+        // it is dropped from THIS commit rather than swept in. It is not
+        // lost: the next SessionStart/Stop that manages a successful scan
+        // backs it up through the same ownership check before overwriting.
+        // n1 fix: sessionId, not just HYPO_DIR, since a sibling session's write
+        // updates the global ownership hash too, so this session's own
+        // receipt must independently confirm it produced the current bytes.
+        const scoped = rootHotProjectionIsCurrent(HYPO_DIR, sessionId)
+          ? paths
+          : paths.filter((p) => p !== 'hot.md');
+        if (scoped.length !== paths.length) {
+          writeRootHotHealthNotice(
+            HYPO_DIR,
+            '루트 hot.md이 이번 세션이 실제로 쓴 내용과 달라 이번 커밋에서 제외했습니다. 다음 세션 시작/종료 시 다시 확인됩니다.',
+          );
+        }
+        return commitWikiChanges(HYPO_DIR, scoped);
+      });
       if (!result.committed) return;
 
       if (hasRemote()) {
         // pull/push failures must not stop the session, but they can no longer be
-        // swallowed silently — syncRemote records each to .cache/sync-state.json and,
-        // on a merge conflict, aborts the merge so the tree is never left half-merged
-        // (part of the v1.4 sync hardening). session-start + doctor surface the result next session.
-        syncRemote(HYPO_DIR);
+        // swallowed silently: pullRemote/pushRemote record each to
+        // .cache/sync-state.json and, on a merge conflict, the pull aborts the merge
+        // so the tree is never left half-merged (part of the v1.4 sync hardening).
+        // session-start + doctor surface the result next session.
+        //
+        // A conflicting pull leaves this branch diverged, so the push is
+        // suppressed rather than deferred: the same ordering guarantee
+        // syncRemote has always had, now carried across the lock boundary by
+        // this target instead of by a `return`.
+        //
+        // Resolved AFTER the pull, not from `result.sha`: a clean
+        // `git pull --no-rebase` can land a merge commit on top of ours, and
+        // pushing the pre-merge sha would be rejected as a non-fast-forward.
+        // HEAD here is still under the lock, so it is this session's commit
+        // (plus whatever the pull brought down) and nothing a sibling added
+        // after the unlock.
+        if (!pullRemote(HYPO_DIR).conflict) pushTarget = resolvePushTarget(HYPO_DIR);
       }
     },
     { timeoutMs: VAULT_LOCK_TIMEOUT_MS },
@@ -104,7 +167,14 @@ try {
   // never entered the critical section, so commitTouchedPaths never ran —
   // the touched-paths file is untouched on disk, and the next Stop retries
   // this session's commit from the same scope. Best-effort, like every
-  // other step in this hook.
+  // other step in this hook. `pushTarget` is still null here, so a lock
+  // we never took can never turn into a push.
 }
+
+// Outside the lock on purpose: see the note above the try block. Guarded by a
+// target resolved only after a successful commit and a non-conflicting pull,
+// so the set of cases that push is exactly the set that pushed before this
+// split, and what each one sends is fixed before the lock goes.
+if (pushTarget) pushRemote(HYPO_DIR, pushTarget);
 
 console.log(JSON.stringify({ continue: true, suppressOutput: true }));

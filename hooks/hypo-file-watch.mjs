@@ -3,7 +3,10 @@
  * hypo-file-watch.mjs — FileChanged hook
  *
  * When a hot.md inside the wiki is modified externally (e.g. by a remote
- * agent or another Claude Code session), re-inject its contents.
+ * agent or another Claude Code session), build a notification of its
+ * contents (n3 fix: Claude Code 2.1.276's `systemMessage` does not reach the
+ * model, only a 5-second terminal toast, so "re-inject" overstated what this
+ * hook can actually do).
  */
 
 import { readFileSync, existsSync } from 'fs';

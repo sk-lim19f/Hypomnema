@@ -2,8 +2,11 @@
 /**
  * hypo-cwd-change.mjs — CwdChanged hook
  *
- * When the working directory changes mid-session, re-inject the matching
- * project hot.md. Skips if still within the same project subtree.
+ * When the working directory changes mid-session, display a notification for
+ * the matching project hot.md (n3 fix: Claude Code 2.1.276's `systemMessage`
+ * does not reach the model, only a 5-second terminal toast, so "re-inject"
+ * overstated what this hook can actually do). Skips if still within the same
+ * project subtree.
  */
 
 import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs';

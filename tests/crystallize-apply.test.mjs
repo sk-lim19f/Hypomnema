@@ -4,18 +4,40 @@
 // build on each other; suites may not — that is what lets the runner shard.
 
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import {
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  unlinkSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { snapshotBase, overwriteTargets } from '../hooks/base-store.mjs';
-import { findBackfillCandidate, sessionClosedMarkerPath } from '../hooks/hypo-shared.mjs';
+import { snapshotBase, overwriteTargets, advanceBaseForWrite } from '../hooks/base-store.mjs';
+import { closeGateStatus } from '../hooks/close-gate-store.mjs';
+import {
+  findBackfillCandidate,
+  sessionClosedMarkerPath,
+  vaultCommitLockTarget,
+} from '../hooks/hypo-shared.mjs';
 import { ensureProjectIndex } from '../scripts/crystallize.mjs';
-import { markerWriteGenuinelyFailed } from '../scripts/lib/crystallize-close-apply.mjs';
-import { test, suite } from './harness.mjs';
+import {
+  markerWriteGenuinelyFailed,
+  commitShaForUndo,
+  closeIntentPath,
+  writeCloseIntent,
+  clearCloseIntent,
+} from '../scripts/lib/crystallize-close-apply.mjs';
+import { test, testAsync, suite } from './harness.mjs';
 import {
   HOME,
   REPO,
   SESSION_TMP_HOME,
+  buildCleanWikiTree,
   hasLogEntry,
   makeMultiProjectWiki,
   payloadForCleanWiki,
@@ -55,7 +77,7 @@ test('a second apply of an unchanged payload: applied:[], skipped names every fi
     assert.equal(out.ok, true, `second apply must still succeed: ${second.stdout}`);
     assert.deepEqual(out.applied, [], 'nothing new to write on an identical re-run');
     assert.ok(
-      ['sessionState', 'projectHot', 'rootHot', 'sessionLog', 'log'].every((k) =>
+      ['sessionState', 'projectHot', 'sessionLog', 'log'].every((k) =>
         out.skipped.some((s) => s.startsWith(k)),
       ),
       `skipped must name every field the payload carries: ${JSON.stringify(out.skipped)}`,
@@ -257,6 +279,288 @@ test('probe (#39): no payload + gate ok → exit 0 with alreadyComplete', () => 
     assert.equal(out.ok, true);
     assert.equal(out.alreadyComplete, true, `alreadyComplete flag must be set: ${r.stdout}`);
     assert.equal(out.date, today);
+  });
+});
+
+// major finding: applyOverwrites writes session-state.md, project hot.md, and
+// open-questions.md as three separate atomicWrite calls; a SIGKILL between the
+// first rename and the second leaves the set torn even though each individual
+// write is itself torn-proof. If the untouched target already carried today's
+// date for an unrelated reason, sessionCloseFileStatus's freshness check alone
+// cannot see the gap. writeCloseIntent/clearCloseIntent leave a durable
+// witness for exactly this: a leftover record from a run that never reached
+// its own clear.
+// Disabling the check: make hasTornCloseIntent always return false (the
+// pre-fix behavior). This test goes red (alreadyComplete flips back to true)
+// while the plain "no leftover record" probe test above stays green, which is
+// the pair that isolates this one path from the general probe mechanics.
+test('probe (#39): a leftover close-intent record refuses the alreadyComplete shortcut', () => {
+  withWiki(null, (dir) => {
+    const intentDir = join(dir, '.cache', 'close-intent');
+    mkdirSync(intentDir, { recursive: true });
+    // Shaped exactly like writeCloseIntent's own record, but for a hash that
+    // cannot match whatever `hot.md` actually holds on disk: this is the
+    // "died mid-set, one target never got its bytes" case the record exists
+    // to catch, without needing a real crash to reproduce it.
+    writeFileSync(
+      join(intentDir, 'crashed-session.json'),
+      JSON.stringify({
+        v: 1,
+        targets: [{ relPath: join('projects', 'test-project', 'hot.md'), hash: '0'.repeat(64) }],
+      }),
+    );
+
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.ok(!out.alreadyComplete, `a torn close-intent must never read as complete: ${r.stdout}`);
+    assert.equal(out.ok, false, `must fall through to the normal payload-required refusal`);
+    assert.ok(
+      /payload is required/.test(out.error || ''),
+      `must surface the same refusal a stale gate does: ${r.stdout}`,
+    );
+  });
+});
+
+// Companion to the test above, flipped by the final cross-review: a live
+// close-intent record whose hash DOES match disk used to read as clean. That
+// is the state a close leaves when it dies after its writes and before its
+// commit (or ends ok:false): every target already holds the new bytes, so a
+// hash comparison alone cannot tell it from a finished close. A live record
+// now blocks the probe on its presence; only an expired one stops counting
+// (the expiry test below is the negative control that keeps "any file at all
+// blocks forever" from passing).
+// Disabling the check: in hasTornCloseIntent, return 'clean' instead of
+// 'uncommitted' when every target matched. alreadyComplete flips back to true.
+test('probe (#39): a live close-intent record whose hash matches disk still refuses alreadyComplete', () => {
+  withWiki(null, (dir) => {
+    const hotPath = join(dir, 'projects', 'test-project', 'hot.md');
+    const hash = createHash('sha256').update(readFileSync(hotPath, 'utf-8'), 'utf-8').digest('hex');
+    const intentDir = join(dir, '.cache', 'close-intent');
+    mkdirSync(intentDir, { recursive: true });
+    writeFileSync(
+      join(intentDir, 'applied-not-committed.json'),
+      JSON.stringify({
+        v: 1,
+        attemptId: 'abc',
+        phase: 'applied',
+        targets: [{ relPath: join('projects', 'test-project', 'hot.md'), hash }],
+        startedAt: new Date().toISOString(),
+      }),
+    );
+
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      !out.alreadyComplete,
+      `files that landed without their commit must never read as complete: ${r.stdout}`,
+    );
+    assert.ok(
+      /payload is required/.test(out.error || ''),
+      `must surface the same refusal a torn set does: ${r.stdout}`,
+    );
+  });
+});
+
+// Final cross-review finding: the record used to be cleared right after
+// applyOverwrites, before the log appends and the commit. A close that got
+// that far and no further left today-dated files, no record, and no commit,
+// and the next probe answered alreadyComplete. An append lock timeout is a
+// real close that stops in exactly that window (targets written, commit never
+// run, ok:false), so it stands in for a crash there without killing a process.
+// Disabling the check: move clearCloseIntent back to directly after
+// applyOverwrites. The record is gone after the failed close and the probe
+// answers alreadyComplete:true.
+test('an ok:false close keeps its close-intent record (phase applied) and the probe refuses to call it complete', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = 's-intent-kept';
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] locked-out entry\n\nbody\n` };
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    const shardLock = `${shard}.lock`;
+    writeFileSync(shardLock, '');
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300';
+    let r;
+    try {
+      r = runApply(dir, payload, { sessionId });
+    } finally {
+      delete process.env.HYPO_APPEND_LOCK_TIMEOUT_MS;
+      rmSync(shardLock, { force: true });
+    }
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false, `precondition: the close must end ok:false: ${r.stdout}`);
+    assert.ok(
+      out.applied.length > 0 && out.committed === null,
+      `precondition: bytes were written and the commit never ran: ${r.stdout}`,
+    );
+    const intentPath = closeIntentPath(dir, sessionId);
+    assert.ok(existsSync(intentPath), 'an ok:false close must leave its close-intent record');
+    assert.equal(JSON.parse(readFileSync(intentPath, 'utf-8')).phase, 'applied');
+
+    const probe = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    const probeOut = JSON.parse(probe.stdout);
+    assert.ok(
+      !probeOut.alreadyComplete,
+      `an uncommitted close must never read as complete: ${probe.stdout}`,
+    );
+  });
+});
+
+// The other half: a close whose commit landed retires its own record, so the
+// record above really is "not committed" and not "every close leaves one".
+// Disabling the check: drop the clearCloseIntent call after runMarkerPhase.
+// The record survives this successful close and the assertion below fails.
+test('a committed close removes its close-intent record', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = 's-intent-cleared';
+    const r = runApply(dir, payloadForCleanWiki(dir, today), { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.committed, true, `precondition: the commit must land: ${r.stdout}`);
+    assert.ok(
+      !existsSync(closeIntentPath(dir, sessionId)),
+      'a close whose commit landed must remove its close-intent record',
+    );
+  });
+});
+
+// tier1 major finding 1a: hasTornCloseIntent used to fail OPEN on a directory
+// it could not list at all (any readdirSync error, not just the ordinary
+// "never written yet" ENOENT), so an EACCES/ENOTDIR on .cache/close-intent
+// made a possibly-torn set look clean to the one check built to catch it. A
+// file sitting where the directory should be reproduces the "cannot list"
+// case without chmod (readdirSync throws ENOTDIR), so this holds under root too.
+//
+// Disabling the check: in hasTornCloseIntent's readdirSync catch, return
+// 'clean' unconditionally instead of checking e.code === 'ENOENT'. This test
+// goes red (alreadyComplete flips back to true) while the plain "no leftover
+// record" probe test above stays green, isolating this path from ordinary
+// probe mechanics.
+test('probe (#39, tier1 major-1a): an unreadable .cache/close-intent never reads as clean, falls through to payload-required', () => {
+  withWiki(null, (dir) => {
+    const cacheDir = join(dir, '.cache');
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(join(cacheDir, 'close-intent'), 'a file, not a directory');
+
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      !out.alreadyComplete,
+      `an unreadable close-intent directory must never read as complete: ${r.stdout}`,
+    );
+    assert.equal(out.ok, false, `must fall through to the normal payload-required refusal`);
+    assert.ok(
+      /payload is required/.test(out.error || ''),
+      `must surface the same refusal a torn set does: ${r.stdout}`,
+    );
+  });
+});
+
+// tier1 major finding 1b: a close-intent record survives forever if the
+// session that wrote it crashed (it never calls clearCloseIntent), so
+// without an expiry, one dead session's leftover record blocks every LATER
+// session's no-payload probe permanently. A record older than
+// CLOSE_INTENT_MAX_AGE_MS must stop counting as torn and get deleted, so the
+// vault self-heals instead of staying stuck asking for a payload forever.
+//
+// Disabling the check: in hasTornCloseIntent, remove the `Date.now() -
+// startedAt > CLOSE_INTENT_MAX_AGE_MS` branch (or hardcode it to `false`) so
+// an old record is compared against disk like any other. This test goes red
+// (alreadyComplete stays false, and the record is never deleted) while the
+// unreadable-directory test above stays green.
+test('probe (#39, tier1 major-1b): a close-intent record past its expiry window is deleted and does not block alreadyComplete', () => {
+  withWiki(null, (dir, today) => {
+    const intentDir = join(dir, '.cache', 'close-intent');
+    mkdirSync(intentDir, { recursive: true });
+    const recordPath = join(intentDir, 'dead-session.json');
+    const staleStartedAt = new Date(Date.now() - 31 * 60 * 1000).toISOString(); // just past the 30-minute window
+    writeFileSync(
+      recordPath,
+      JSON.stringify({
+        v: 1,
+        // A hash that cannot match disk: if expiry did not fire, this would
+        // read as torn, the same as the plain leftover-record test above.
+        targets: [{ relPath: join('projects', 'test-project', 'hot.md'), hash: '0'.repeat(64) }],
+        startedAt: staleStartedAt,
+      }),
+    );
+
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `an expired record must not block the probe: ${r.stdout}`);
+    assert.equal(
+      out.alreadyComplete,
+      true,
+      `still eligible once its record has expired: ${r.stdout}`,
+    );
+    assert.equal(out.date, today);
+    assert.ok(!existsSync(recordPath), 'the expired record must be deleted, not merely ignored');
+  });
+});
+
+// codex 3rd-tier finding 4: hasTornCloseIntent's implementation already
+// treats a truncated record and a non-array `targets` as `sawUnreadable`
+// (never silently `clean`), but before these two tests, nothing in this
+// suite pinned either shape: only a hash-mismatch ('torn') and an ENOTDIR
+// directory ('unreadable', tier1 major-1a above) were covered. A regression
+// that let a JSON.parse failure fall through to 'clean' (or dropped the
+// `Array.isArray` guard) would pass every existing test in this file.
+//
+// Disabling the check: in hasTornCloseIntent, remove the `try { JSON.parse
+// } catch { sawUnreadable = true }` branch (let a parse failure throw, or
+// silently treat it as no record). This test goes red (alreadyComplete
+// flips back to true) while the plain "no leftover record" probe test above
+// stays green.
+test('probe (#39, finding 4): a truncated close-intent record reads as unreadable, never clean', () => {
+  withWiki(null, (dir) => {
+    const intentDir = join(dir, '.cache', 'close-intent');
+    mkdirSync(intentDir, { recursive: true });
+    // Not valid JSON at all: exactly what a transcript half-written mid-crash
+    // looks like on disk, not a shape any writer here ever intentionally produces.
+    writeFileSync(
+      join(intentDir, 'truncated-session.json'),
+      '{"v":1,"attemptId":"abc","targets":[{"relPath":"pro',
+    );
+
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      !out.alreadyComplete,
+      `a truncated close-intent record must never read as complete: ${r.stdout}`,
+    );
+    assert.equal(out.ok, false, `must fall through to the normal payload-required refusal`);
+    assert.ok(
+      /payload is required/.test(out.error || ''),
+      `must surface the same refusal a torn set does: ${r.stdout}`,
+    );
+  });
+});
+
+// Disabling the check: in hasTornCloseIntent, drop the `!Array.isArray(parsed.targets)`
+// half of the shape guard (accept any `parsed.targets`, including `null`).
+// This test goes red (alreadyComplete flips back to true, and the `for (const
+// t of parsed.targets)` loop below it would throw on a real close instead) while
+// the truncated-JSON test above stays green, isolating this specific shape gap.
+test('probe (#39, finding 4): a close-intent record with targets:null reads as unreadable, never clean', () => {
+  withWiki(null, (dir) => {
+    const intentDir = join(dir, '.cache', 'close-intent');
+    mkdirSync(intentDir, { recursive: true });
+    writeFileSync(
+      join(intentDir, 'null-targets-session.json'),
+      JSON.stringify({
+        v: 1,
+        attemptId: 'abc',
+        targets: null,
+        startedAt: new Date().toISOString(),
+      }),
+    );
+
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.ok(!out.alreadyComplete, `targets:null must never read as complete: ${r.stdout}`);
+    assert.equal(out.ok, false, `must fall through to the normal payload-required refusal`);
+    assert.ok(
+      /payload is required/.test(out.error || ''),
+      `must surface the same refusal a torn set does: ${r.stdout}`,
+    );
   });
 });
 
@@ -586,16 +890,21 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
 // frontmatter-less log.md, W1) must stay untouched.
 suite('W9 promotion: payload-scope invalid-YAML frontmatter blocks close');
 
-test('post-apply: broken YAML in a payload-scope root file (hot.md) → ok:false, exit 1', () => {
+test('post-apply: broken YAML in a payload-scope file (project hot.md) → ok:false, exit 1', () => {
   // "title: hot: broken" is an unquoted top-level value containing ": ", the
   // exact shape lint.mjs's checkYamlInvalid (W9) narrow detector flags. Not
   // W1: the frontmatter block itself opens and closes cleanly, only its
   // content is invalid YAML.
+  //
+  // The root hot.md carried this before it left the payload. The axis the
+  // suite tests is in-payload-scope versus out-of-scope, not root versus
+  // project, so the broken bytes move to a file the payload still writes.
+  const projHotRel = join('projects', 'test-project', 'hot.md');
   withWiki(null, (dir, today) => {
     const sid = 'w9-promotion-session';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
     const payload = payloadForCleanWiki(dir, today);
-    payload.rootHot = {
+    payload.projectHot = {
       content: `---\ntitle: hot: broken\ntype: hot\nupdated: ${today}\n---\n\nbody\n`,
     };
     const r = runApply(dir, payload, { sessionId: sid });
@@ -607,7 +916,7 @@ test('post-apply: broken YAML in a payload-scope root file (hot.md) → ok:false
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.equal(out.stage, 'post-apply-lint', `stage should be post-apply-lint: ${r.stdout}`);
-    const onDisk = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    const onDisk = readFileSync(join(dir, projHotRel), 'utf-8');
     assert.ok(
       onDisk.includes('title: hot: broken'),
       'apply still writes the payload bytes to disk (post-apply lint runs AFTER the write)',
@@ -1004,34 +1313,342 @@ test('apply on a project that already has an index.md leaves it byte-for-byte un
 
 suite('every whole-file base-mismatch parks');
 
-test('root hot.md parks on a mismatch even when the payload keeps every disk row', () => {
+test('an overwrite target parks on a mismatch even when the payload keeps every disk line', () => {
+  // The root hot.md used to be the target here, because a pointer table is
+  // where "the payload is a superset of disk" shows up naturally. That file is
+  // no longer an overwrite target, so the same shape moves to the project
+  // hot.md: a foreign write lands after the snapshot, the payload carries every
+  // byte of it plus one more, and the close still parks rather than write.
+  const projHotRel = join('projects', 'test-project', 'hot.md');
   withWiki(null, (dir, today) => {
     const sid = 'mismatch-parks';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    // A different machine appends its own row directly on disk, after the base
-    // snapshot: the normal multi-machine pointer-table pattern, and the exact shape
-    // the deleted predicates used to wave through.
-    const betaRow = `| beta-project | ${today} | [[projects/beta-project/hot]] |`;
-    const original = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    const drifted = `${original.trimEnd()}\n${betaRow}\n`;
-    writeFileSync(join(dir, 'hot.md'), drifted);
+    const original = readFileSync(join(dir, projHotRel), 'utf-8');
+    const drifted = `${original.trimEnd()}\n\n## Added by the other machine\n`;
+    writeFileSync(join(dir, projHotRel), drifted);
 
-    const gammaRow = `| gamma-project | ${today} | [[projects/gamma-project/hot]] |`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.rootHot = { content: `${drifted.trimEnd()}\n${gammaRow}\n` };
+    payload.projectHot = { content: `${drifted.trimEnd()}\n\n## And by this session\n` };
 
     const r = runApply(dir, payload, { sessionId: sid });
     assert.notEqual(r.status, 0, 'a drifted overwrite must not write');
     const out = JSON.parse(r.stdout);
-    const c = out.conflicts.find((x) => x.target === 'hot.md');
-    assert.ok(c, `root hot.md must park: ${JSON.stringify(out.conflicts)}`);
+    const c = out.conflicts.find((x) => x.target === projHotRel);
+    assert.ok(c, `${projHotRel} must park: ${JSON.stringify(out.conflicts)}`);
     assert.equal(c.reason, 'base-mismatch');
     assert.equal(
-      readFileSync(join(dir, 'hot.md'), 'utf-8'),
+      readFileSync(join(dir, projHotRel), 'utf-8'),
       drifted,
       "the other machine's bytes are left exactly as they were",
     );
+  });
+});
+
+// The other half of the same change: the root pointer table can no longer park,
+// because nothing in a close writes it any more. An installed copy running the
+// previous `commands/crystallize.md` still composes `rootHot` into every
+// payload, and that payload must close cleanly while leaving the file alone.
+//
+// Three things are pinned at once, and they fail separately. A re-added
+// `overwrite('rootHot', ...)` reddens the disk assertion. A re-added base
+// snapshot for hot.md (plus that overwrite) reddens the conflicts assertion. A
+// silent drop of the field, which is what a bare delete would have produced,
+// reddens the notices assertion.
+test('a legacy payload carrying rootHot closes clean, writes nothing to hot.md, and says so', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 'legacy-roothot';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
+
+    const payload = payloadForCleanWiki(dir, today);
+    payload.rootHot = { content: `${before.trimEnd()}\n| ghost | ${today} | [[x]] |\n` };
+
+    const r = runApply(dir, payload, { sessionId: sid });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `an obsolete field must not fail the close: ${r.stdout}`);
+    assert.deepEqual(out.conflicts ?? [], [], `rootHot must not park: ${r.stdout}`);
+    assert.equal(
+      readFileSync(join(dir, 'hot.md'), 'utf-8'),
+      before,
+      'the root pointer table must be left exactly as the hooks last wrote it',
+    );
+    assert.ok(
+      !(out.applied ?? []).some((a) => a.startsWith('rootHot')),
+      `rootHot must not be reported as written: ${JSON.stringify(out.applied)}`,
+    );
+    assert.ok(
+      (out.notices ?? []).some((n) => /rootHot was ignored/.test(n)),
+      `the ignored field must be reported, not dropped in silence: ${JSON.stringify(out.notices)}`,
+    );
+  });
+});
+
+// ── local edit protection: reapplying a payload must not bury a hand edit ────
+// applySessionClose's overwrite guard already parks a FOREIGN write (a
+// different session/machine moved the target since this session's base). A
+// hand edit through THIS session's own Write/Edit tool legitimately advances
+// the base too (advanceBaseForWrite, wired from hypo-auto-stage.mjs), by
+// design, so a session that edits a target directly and then composes ITS
+// NEXT payload from that edit does not park on its own work. The gap: reapply
+// the SAME, now-stale payload after such an edit, and disk-equals-base reads
+// as "nothing to protect": the edit is buried with no proposal, no notice.
+// `readAppliedHash` (base-store's "applied set") closes it: it tracks what
+// THIS overwrite call itself last wrote, which a hand edit never touches.
+
+suite('local edit protection: reapplying a payload must not bury a hand edit');
+
+test('a hand edit after a successful apply parks a reapply of the SAME payload, and survives it', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 'local-edit-reapply';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+
+    const rel = join('projects', 'test-project', 'session-state.md');
+    const target = join(dir, rel);
+    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionState = { content: appliedContent };
+
+    const r1 = runApply(dir, payload, { sessionId: sid });
+    assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
+    assert.equal(readFileSync(target, 'utf-8'), appliedContent);
+
+    // A hand edit through this session's own Write/Edit tool: it changes disk
+    // AND advances the base, exactly as hypo-auto-stage.mjs's PostToolUse
+    // hook does after a real Edit call (advanceBaseForWrite is the production
+    // wiring; this test calls it directly instead of spawning that hook).
+    // Committed via git before the reapply, mirroring the 2026-08-06
+    // security-backoffice repro (workspace cleaned, then the same payload
+    // re-applied).
+    const handEdited = appliedContent.replace('applied by payload', 'hand-edited after apply');
+    writeFileSync(target, handEdited);
+    advanceBaseForWrite(dir, sid, rel, target);
+    // HOME pinned to SESSION_TMP_HOME (review r5-w3 minor): every process a
+    // test spawns must not see the developer's real $HOME, same rule
+    // makeGitRepo() already follows elsewhere in this suite.
+    spawnSync('git', ['add', '-A'], { cwd: dir, env: { ...process.env, HOME: SESSION_TMP_HOME } });
+    spawnSync('git', ['commit', '-m', 'hand edit'], {
+      cwd: dir,
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+
+    // r1 already spent this session's one close signal (the marker landed).
+    // A real second close needs a fresh close phrase from the user, so seed
+    // one (a second transcript record past the one the first apply resolved)
+    // rather than reuse r1's now-consumed seed. This is orthogonal to the
+    // bug under test; without it the reapply refuses at the authority gate,
+    // before ever reaching the overwrite guard this test means to exercise.
+    const cleanup2 = seedCloseTranscript(sid, {
+      toolUseLines: [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: '수정 반영해서 다시 세션 마무리 해줘' },
+        }),
+      ],
+    });
+    try {
+      // Reapply the SAME (now-stale) payload object: it still asks for
+      // `appliedContent`, which is no longer what is on disk.
+      const r2 = runApply(dir, payload, { sessionId: sid });
+      assert.notEqual(r2.status, 0, 'a reapply that would bury a local edit must not exit 0');
+      const out2 = JSON.parse(r2.stdout);
+      const c = out2.conflicts.find((x) => x.target === rel);
+      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.equal(c.reason, 'will-overwrite-local-change');
+      assert.equal(
+        readFileSync(target, 'utf-8'),
+        handEdited,
+        'the hand edit must survive the reapply untouched',
+      );
+    } finally {
+      cleanup2();
+    }
+  });
+});
+
+test('a reapply with NO intervening edit still writes a genuinely new payload through (no false park)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = 'local-edit-no-edit-inbetween';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+
+    const rel = join('projects', 'test-project', 'session-state.md');
+    const target = join(dir, rel);
+    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionState = { content: appliedContent };
+
+    const r1 = runApply(dir, payload, { sessionId: sid });
+    assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
+
+    // A genuinely NEW payload for the same field, no hand edit in between --
+    // the ordinary "second close in the same session" case invariant 2 exists
+    // for. It must still write through. Needs its own fresh close phrase for
+    // the same reason as the sibling test above: r1 already spent this
+    // session's close signal.
+    const cleanup2 = seedCloseTranscript(sid, {
+      toolUseLines: [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: '한 번 더 세션 마무리 해줘' },
+        }),
+      ],
+    });
+    try {
+      const payload2 = payloadForCleanWiki(dir, today);
+      const updatedContent = appliedContent.replace('applied by payload', 'second close, no edit');
+      payload2.sessionState = { content: updatedContent };
+      const r2 = runApply(dir, payload2, { sessionId: sid });
+      assert.equal(
+        r2.status,
+        0,
+        `second, genuinely-new payload must apply: ${r2.stdout}\n${r2.stderr}`,
+      );
+      assert.equal(readFileSync(target, 'utf-8'), updatedContent);
+    } finally {
+      cleanup2();
+    }
+  });
+});
+
+test('a hand edit folded into a genuinely new payload STILL parks (review r5-w3 blocker 2 supersedes r4-w4 major 1)', () => {
+  // r4-w4 major 1 narrowed the guard to `payloadHash === appliedHash` so that
+  // a payload folding the hand edit in, plus a legitimate new close on top,
+  // would pass with no park. This test used to assert exactly that (r2.status
+  // === 0). review r5-w3 blocker 2 found the hole that narrowing opened: from
+  // hashes alone, `overwriteConflictReason` cannot tell "this new payload
+  // folds the edit in" from "this new payload is unrelated bytes that still
+  // ignore the edit": both are simply "payload != old applied bytes". So ANY
+  // payload change parked was the wrong fix in the other direction: it let an
+  // ignored-edit payload through unchallenged. The guard now parks on ANY
+  // drift from `appliedHash`, folded-in or not, and a human decides through
+  // `proposal challenge`/`proposal resolve`: this is the accepted friction
+  // cost, not a bug.
+  withWiki(null, (dir, today) => {
+    const sid = 'local-edit-folded-payload';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+
+    const rel = join('projects', 'test-project', 'session-state.md');
+    const target = join(dir, rel);
+    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionState = { content: appliedContent };
+
+    const r1 = runApply(dir, payload, { sessionId: sid });
+    assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
+
+    const handEdited = appliedContent.replace('applied by payload', 'hand-edited after apply');
+    writeFileSync(target, handEdited);
+    advanceBaseForWrite(dir, sid, rel, target);
+    // HOME pinned to SESSION_TMP_HOME (review r5-w3 minor): every process a
+    // test spawns must not see the developer's real $HOME, same rule
+    // makeGitRepo() already follows elsewhere in this suite.
+    spawnSync('git', ['add', '-A'], { cwd: dir, env: { ...process.env, HOME: SESSION_TMP_HOME } });
+    spawnSync('git', ['commit', '-m', 'hand edit'], {
+      cwd: dir,
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+
+    const cleanup2 = seedCloseTranscript(sid, {
+      toolUseLines: [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: '수정 반영해서 다시 세션 마무리 해줘' },
+        }),
+      ],
+    });
+    try {
+      // The new payload FOLDS the hand edit in (keeps "hand-edited after
+      // apply") and adds a genuinely new close on top, neither identical to
+      // the first apply's bytes nor to the hand edit alone. It still parks:
+      // the guard has no way to credit it for folding the edit in.
+      const folded = handEdited.replace('- next', '- next\n- folded the hand edit in, plus this');
+      const payload2 = payloadForCleanWiki(dir, today);
+      payload2.sessionState = { content: folded };
+      const r2 = runApply(dir, payload2, { sessionId: sid });
+      assert.notEqual(
+        r2.status,
+        0,
+        `a payload folding the hand edit in must still park, not apply: ${r2.stdout}\n${r2.stderr}`,
+      );
+      const out2 = JSON.parse(r2.stdout);
+      const c = out2.conflicts.find((x) => x.target === rel);
+      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.equal(c.reason, 'will-overwrite-local-change');
+      assert.equal(
+        readFileSync(target, 'utf-8'),
+        handEdited,
+        'the hand edit must survive untouched: the folded payload never lands',
+      );
+    } finally {
+      cleanup2();
+    }
+  });
+});
+
+test('a genuinely different payload that does NOT fold the hand edit in also parks (review r5-w3 blocker 2)', () => {
+  // This is the actual hole review r5-w3 named: r4-w4's `payloadHash ===
+  // appliedHash` narrowing only caught the exact stale reapply. A payload
+  // that changed for some OTHER reason and simply never accounted for the
+  // hand edit (unlike the sibling test above, this one does not even
+  // contain the edit's text) used to pass the narrowed check by merely being
+  // different from the old applied bytes, silently discarding the edit with
+  // no proposal. It must now park exactly like the exact-reapply and the
+  // folded-payload cases.
+  withWiki(null, (dir, today) => {
+    const sid = 'local-edit-unrelated-payload';
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+
+    const rel = join('projects', 'test-project', 'session-state.md');
+    const target = join(dir, rel);
+    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionState = { content: appliedContent };
+
+    const r1 = runApply(dir, payload, { sessionId: sid });
+    assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
+
+    const handEdited = appliedContent.replace('applied by payload', 'hand-edited after apply');
+    writeFileSync(target, handEdited);
+    advanceBaseForWrite(dir, sid, rel, target);
+    spawnSync('git', ['add', '-A'], { cwd: dir, env: { ...process.env, HOME: SESSION_TMP_HOME } });
+    spawnSync('git', ['commit', '-m', 'hand edit'], {
+      cwd: dir,
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+
+    const cleanup2 = seedCloseTranscript(sid, {
+      toolUseLines: [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: '완전히 다른 내용으로 다시 세션 마무리 해줘' },
+        }),
+      ],
+    });
+    try {
+      // Different from BOTH the original apply and the hand edit, and does
+      // NOT carry "hand-edited after apply" forward at all: the shape review
+      // r5-w3 blocker 2 called out as unprotected.
+      const unrelated = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\nunrelated new content, does not mention the edit\n\n## 다음 작업\n\n- something else\n`;
+      const payload2 = payloadForCleanWiki(dir, today);
+      payload2.sessionState = { content: unrelated };
+      const r2 = runApply(dir, payload2, { sessionId: sid });
+      assert.notEqual(
+        r2.status,
+        0,
+        `an unrelated payload that ignores the hand edit must park, not apply: ${r2.stdout}\n${r2.stderr}`,
+      );
+      const out2 = JSON.parse(r2.stdout);
+      const c = out2.conflicts.find((x) => x.target === rel);
+      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.equal(c.reason, 'will-overwrite-local-change');
+      assert.equal(
+        readFileSync(target, 'utf-8'),
+        handEdited,
+        'the hand edit must survive: the unrelated payload never lands, and is not silently discarded',
+      );
+    } finally {
+      cleanup2();
+    }
   });
 });
 
@@ -1201,4 +1818,688 @@ test('marker path pre-occupied by a directory → apply exits 1 with ok:false, s
     assert.equal(out.ok, false, 'ok must reflect the failed marker write');
     assert.equal(out.stage, 'marker-did-not-land', `stage must record the cause: ${r.stdout}`);
   });
+});
+
+// ── hostTagWarning: one warning, three consumers, wired end to end ──────────
+// closeGateStatus computes this once (see tests/close-gate-store.test.mjs's
+// own "B residual" suite, which pins that it is present or absent there). What
+// that suite does NOT reach is applySessionClose's own wiring: eleven call
+// sites thread the same value from verifyCloseAuthority through
+// runMarkerPhase, buildCloseResult, and printCloseReport, and nothing pinned
+// that the value actually lands in the marker file, the --json result, and
+// the console rendering it is supposed to reach. Three separate tests, one
+// per consumer, plus a negative control, so cutting any one wire fails on its
+// own rather than hiding behind the other two.
+
+const HOST_TAG_ENQUEUE = JSON.stringify({
+  type: 'queue-operation',
+  operation: 'enqueue',
+  content: '<agent-message from="peer">still working</agent-message>',
+});
+
+// Mirrors helpers.mjs's runApply, minus the forced --json flag: the console
+// (human-readable) rendering only ever prints on the non-json path, and
+// runApply always adds --json. The caller seeds and cleans up its own
+// transcript with seedCloseTranscript, same as runApply does internally; kept
+// local since only this suite needs a non-json apply runner.
+function runApplyConsole(dir, payload, sessionId) {
+  const payloadPath = join(
+    tmpdir(),
+    `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+  );
+  writeFileSync(payloadPath, JSON.stringify(payload));
+  try {
+    return run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      `--session-id=${sessionId}`,
+    ]);
+  } finally {
+    // After run() returns, not before: the child reads this file. Left behind,
+    // one payload per invocation accumulates in the session temp dir for the
+    // life of the machine, which is the kind of litter a shard-parallel suite
+    // multiplies.
+    unlinkSync(payloadPath);
+  }
+}
+
+suite('crystallize-close-apply: hostTagWarning reaches marker, json, and console exactly once');
+
+test('marker file carries host_tag_warning naming the tag when the close survived a host-tag-shaped queue item', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = `hosttag-marker-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    try {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload, { sessionId });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true, `apply must succeed: ${r.stdout}\n${r.stderr}`);
+      const marker = JSON.parse(readFileSync(sessionClosedMarkerPath(dir, sessionId), 'utf-8'));
+      assert.match(
+        marker.host_tag_warning,
+        /<agent-message/,
+        `marker must name the neutralized tag: ${JSON.stringify(marker)}`,
+      );
+      // This call site is a SEPARATE hostTagWarningWithUndo invocation from
+      // the top-level one (runMarkerPhase's own, ahead of the marker write),
+      // so wiring the top-level call alone does not prove this one is wired
+      // too. Same real-commit-sha requirement as the --json test below.
+      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf-8' });
+      const sha = head.stdout.trim();
+      assert.ok(
+        marker.host_tag_warning.includes(`git -C ${dir} revert ${sha}`),
+        `marker's own undo must name the real commit, not a generic lookup: ${marker.host_tag_warning}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('--json result carries hostTagWarning naming the tag and a revert path', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = `hosttag-json-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    try {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload, { sessionId });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true, `apply must succeed: ${r.stdout}\n${r.stderr}`);
+      assert.match(out.hostTagWarning, /<agent-message/, `--json result: ${r.stdout}`);
+      assert.match(
+        out.hostTagWarning,
+        /revert/,
+        `--json result must point at the undo path: ${r.stdout}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// major finding: hostTagWarningWithUndo's `commit-and-marker` revert
+// instruction is only actionable when it names a real commit sha. Before
+// this call site was wired, applySessionClose's own top-level call never
+// passed a 5th argument at all, so this always fell to the generic
+// "find it with `git log -1`" fallback even though the exact sha this
+// close's own commit made was sitting right there in `commitOutcome`.
+// Disabling the check: pass `undefined` instead of `commitShaForUndo(commitOutcome)`
+// at the top-level `hostTagWarningWithUndo` call site. This test goes red
+// (the message falls back to the generic `git log -1` instruction) while the
+// generic "/revert/" test above stays green, since that assertion cannot
+// tell a real sha apart from the fallback wording.
+test('--json result names the ACTUAL commit sha in its revert instruction, not a generic lookup', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = `hosttag-sha-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    try {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload, { sessionId });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true, `apply must succeed: ${r.stdout}\n${r.stderr}`);
+      assert.equal(out.committed, true, `this close must have made a real commit: ${r.stdout}`);
+      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf-8' });
+      const sha = head.stdout.trim();
+      assert.ok(
+        out.hostTagWarning.includes(`git -C ${dir} revert ${sha}`),
+        `must name THIS close's own commit, not fall back to a generic lookup: ${out.hostTagWarning}`,
+      );
+      assert.equal(
+        /find it with/.test(out.hostTagWarning),
+        false,
+        `a known sha must never fall back to the "caller did not say" wording: ${out.hostTagWarning}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('console output prints the warning exactly once, alongside the commit that just made it', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = `hosttag-console-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    try {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApplyConsole(dir, payload, sessionId);
+      assert.equal(r.status, 0, `apply must succeed: ${r.stdout}\n${r.stderr}`);
+      const occurrences = (r.stdout.match(/this close was granted while a queued item/g) || [])
+        .length;
+      assert.equal(
+        occurrences,
+        1,
+        `the warning must print exactly once, not on every gate read: ${r.stdout}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The other marker writer. `--mark-session-closed` is the path a model takes
+// after closing by hand, and it reached this suite with no warning wiring at
+// all: the gate status was consulted only inside the refusal branch, so a
+// close that survived a pasted host tag wrote its marker and said nothing.
+// Its undo is also the one that differs most, since this entry point makes no
+// commit for anyone to revert.
+test('--mark-session-closed warns too, with the marker-only undo (it makes no commit)', () => {
+  withWiki(null, (dir) => {
+    const sessionId = `hosttag-mark-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    try {
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        `--session-id=${sessionId}`,
+        '--project=test-project',
+        '--json',
+      ]);
+      assert.equal(r.status, 0, `expected a clean mark: ${r.stdout}\n${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+      assert.match(
+        out.hostTagWarning,
+        /<agent-message/,
+        `the standalone marker path must surface the residual too: ${r.stdout}`,
+      );
+      assert.ok(
+        out.hostTagWarning.includes(sessionClosedMarkerPath(dir, sessionId)),
+        `the undo must name the marker this run wrote: ${r.stdout}`,
+      );
+      assert.equal(
+        /revert the commit/.test(out.hostTagWarning),
+        false,
+        `this path makes no commit, so it must not send anyone to revert one: ${r.stdout}`,
+      );
+      const marker = JSON.parse(readFileSync(sessionClosedMarkerPath(dir, sessionId), 'utf-8'));
+      assert.match(
+        marker.host_tag_warning,
+        /<agent-message/,
+        `the marker must record it too: ${JSON.stringify(marker)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The condition the warning hangs off is "this run put something on disk",
+// not `ok`. 'marker-did-not-land' is where those two come apart: the payload
+// is already committed to the vault's history and only the marker write
+// failed, which flips ok to false. Gating on `ok` there silenced the warning
+// on the one path where the bytes a user may not have asked for are already
+// in git.
+test('a landed commit with a blocked marker still warns, and offers only the undo it can honor', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = `hosttag-nomarker-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    try {
+      // Same technique as the marker-did-not-land test above: occupy the
+      // marker's own filename with a directory so only its atomic rename
+      // fails, and everything upstream (including the commit) still succeeds.
+      mkdirSync(sessionClosedMarkerPath(dir, sessionId), { recursive: true });
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload, { sessionId });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false, `the blocked marker must fail the close: ${r.stdout}`);
+      assert.equal(out.stage, 'marker-did-not-land', `stage: ${r.stdout}`);
+      assert.equal(out.committed, true, `the payload must still have committed: ${r.stdout}`);
+      assert.match(
+        out.hostTagWarning,
+        /<agent-message/,
+        `ok:false must not silence the warning once the commit landed: ${r.stdout}`,
+      );
+      assert.match(out.hostTagWarning, /revert/, `the commit is revertable: ${r.stdout}`);
+      // No marker landed here, so the undo must not tell anyone to delete one.
+      assert.equal(
+        out.hostTagWarning.includes(sessionClosedMarkerPath(dir, sessionId)),
+        false,
+        `no marker was written on this path: ${r.stdout}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('an ordinary close with no host-tag-shaped queue item carries the warning in none of marker, json, or console', () => {
+  withWiki(null, (dir, today) => {
+    const jsonSessionId = `hosttag-none-json-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const payloadJson = payloadForCleanWiki(dir, today);
+    // No toolUseLines: runApply auto-seeds an ordinary close transcript for
+    // this fresh id (see helpers.mjs's runApply doc comment), no host tag in it.
+    const rJson = runApply(dir, payloadJson, { sessionId: jsonSessionId });
+    const outJson = JSON.parse(rJson.stdout);
+    assert.equal(outJson.ok, true, `apply must succeed: ${rJson.stdout}\n${rJson.stderr}`);
+    assert.equal(
+      'hostTagWarning' in outJson,
+      false,
+      `--json result must omit the key entirely on an ordinary close: ${rJson.stdout}`,
+    );
+    const marker = JSON.parse(readFileSync(sessionClosedMarkerPath(dir, jsonSessionId), 'utf-8'));
+    assert.equal(
+      'host_tag_warning' in marker,
+      false,
+      `marker must omit the key entirely on an ordinary close: ${JSON.stringify(marker)}`,
+    );
+
+    const consoleSessionId = `hosttag-none-console-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanupConsole = seedCloseTranscript(consoleSessionId);
+    try {
+      const payloadConsole = payloadForCleanWiki(dir, today);
+      payloadConsole.sessionLog.entry = `## [${today}] second re-applied session (no host tag)\n`;
+      payloadConsole.log.entry = `## [${today}] session | test-project: second re-applied (no host tag)\n`;
+      const rConsole = runApplyConsole(dir, payloadConsole, consoleSessionId);
+      assert.equal(
+        rConsole.status,
+        0,
+        `apply must succeed: ${rConsole.stdout}\n${rConsole.stderr}`,
+      );
+      assert.doesNotMatch(
+        rConsole.stdout,
+        /this close was granted while a queued item/,
+        `an ordinary close must not print the host-tag warning: ${rConsole.stdout}`,
+      );
+    } finally {
+      cleanupConsole();
+    }
+  });
+});
+
+// ── markerGateReason: the late no-user-close-signal race actually reaches
+// the --json result (2nd cross-review CONCERN n1) ──────────────────────────
+// runMarkerPhase's `hasUserSignal` is computed from a SECOND, LATE read of the
+// transcript (resolveTranscriptBySessionId + isCloseGateOpen, both called after
+// the commit; see that field's own doc comment in crystallize-close-apply.mjs),
+// deliberately distinct from verifyCloseAuthority's EARLY read before any byte
+// is written. `markerGateReason` is filled in only when that late read finds
+// the gate closed even though the early one found it open: a close signal that
+// got retracted while this apply's own commit was landing. Before this test, a
+// grep for `markerGateReason` and `Gate detail` across every `tests/*.test.mjs`
+// turned up zero assertions, so the field could go back to always being `null`
+// (the same failure shape hostTagWarning's own suite above exists to catch)
+// and no test would notice.
+//
+// Reaching that late-closed state without a wall-clock guess: hold the same
+// lock runMarkerPhase's commit step takes (`vaultCommitLockTarget`) before the
+// child even starts. verifyCloseAuthority runs before any write and never
+// touches that lock, so the child still passes it against the OPEN transcript
+// and writes its payload files. Only afterwards does it try to acquire the
+// commit lock we are holding, and it blocks there deterministically. That
+// block is the signal to append an unregistered host-tag-shaped retraction to
+// the transcript before releasing the lock, so the LATE read (after the
+// child's own commit runs) sees a different transcript than the early one did.
+function withHeldCommitLock(dir) {
+  const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true });
+  writeFileSync(lockPath, String(process.pid));
+  return () => {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* already released, or never created */
+    }
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const UNREGISTERED_HOST_TAG_ENQUEUE = JSON.stringify({
+  type: 'queue-operation',
+  operation: 'enqueue',
+  content: '<any-new-host-tag foo="x">something</any-new-host-tag>',
+});
+
+suite('crystallize-close-apply: markerGateReason (late no-user-close-signal race)');
+
+await testAsync(
+  '--json result carries markerGateReason matching closeGateStatus, naming the unregistered tag',
+  async () => {
+    // Built by hand rather than withWiki/withTmpDir: both clean up with a
+    // synchronous `finally` right after invoking the callback, which would run
+    // before this async body's awaited work (the spawned child, the poll loop)
+    // ever finishes.
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-gatereason-'));
+    const today = todayLocal();
+    try {
+      buildCleanWikiTree(dir, today);
+      spawnSync('git', ['init'], { cwd: dir, encoding: 'utf-8' });
+      spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+      spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+      spawnSync('git', ['add', '-A'], { cwd: dir, encoding: 'utf-8' });
+      spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, encoding: 'utf-8' });
+
+      const sessionId = `gatereason-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+      const cleanupTranscript = seedCloseTranscript(sessionId);
+      const transcriptPath = join(
+        SESSION_TMP_HOME,
+        '.claude',
+        'projects',
+        'hypo-test-proj',
+        `${sessionId}.jsonl`,
+      );
+      const payload = payloadForCleanWiki(dir, today);
+      const sentinel = `## [${today}] gate-reason re-applied\n`;
+      payload.sessionLog.entry = sentinel;
+      const payloadPath = join(
+        tmpdir(),
+        `hypo-payload-gatereason-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+      );
+      writeFileSync(payloadPath, JSON.stringify(payload));
+
+      const releaseLock = withHeldCommitLock(dir);
+      try {
+        const child = spawn(
+          process.execPath,
+          [
+            join(REPO, 'scripts', 'crystallize.mjs'),
+            `--hypo-dir=${dir}`,
+            '--apply-session-close',
+            `--payload=${payloadPath}`,
+            `--session-id=${sessionId}`,
+            '--json',
+          ],
+          { env: { ...process.env, HOME: SESSION_TMP_HOME } },
+        );
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d) => (stdout += d));
+        child.stderr.on('data', (d) => (stderr += d));
+        const exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+
+        // The payload writes land before the child ever tries for the commit
+        // lock (see this file's own ordering comment on runMarkerPhase), so
+        // the session-log file carrying our sentinel is the deterministic
+        // proof the child is now blocked on the lock we hold.
+        const sessionLogPath = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+        const deadline = Date.now() + 4000;
+        let landed = false;
+        while (Date.now() < deadline) {
+          if (
+            existsSync(sessionLogPath) &&
+            readFileSync(sessionLogPath, 'utf-8').includes('gate-reason')
+          ) {
+            landed = true;
+            break;
+          }
+          await sleep(10);
+        }
+        assert.ok(
+          landed,
+          'timed out waiting for the child apply to write its payload before appending the retraction',
+        );
+        writeFileSync(transcriptPath, UNREGISTERED_HOST_TAG_ENQUEUE + '\n', { flag: 'a' });
+        releaseLock();
+
+        const code = await exited;
+        assert.equal(
+          code,
+          0,
+          `apply must still exit 0 (a withheld marker is not a failure): ${stdout}\n${stderr}`,
+        );
+        const out = JSON.parse(stdout);
+        assert.equal(out.ok, true, `the payload commit itself must still succeed: ${stdout}`);
+        assert.equal(
+          out.committed,
+          true,
+          `the commit must have landed before the late re-read: ${stdout}`,
+        );
+        assert.equal(
+          out.markerWritten,
+          false,
+          `the marker must be withheld once the late re-read finds the gate closed: ${stdout}`,
+        );
+        assert.equal(out.markerSkipReason, 'no-user-close-signal', `stdout: ${stdout}`);
+
+        // Independently compute what closeGateStatus reports for this same
+        // (now-retracted) transcript, and require markerGateReason to be
+        // exactly that string, not just look similar to it.
+        const independentStatus = closeGateStatus({
+          transcriptPath,
+          hypoDir: dir,
+          sessionId,
+        });
+        assert.equal(
+          out.markerGateReason,
+          independentStatus.reason,
+          `markerGateReason must be closeGateStatus's own reason string, verbatim: ${stdout}`,
+        );
+        assert.match(
+          out.markerGateReason,
+          /<any-new-host-tag\.\.\.>/,
+          `an unregistered host-tag-shaped retraction must name the tag: ${stdout}`,
+        );
+      } finally {
+        releaseLock();
+        cleanupTranscript();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+// ── codex 3rd-tier finding 1: sha:null must not collapse into "nothing to
+// revert" ─────────────────────────────────────────────────────────────────
+// commitWikiChanges' own `sha` field is `null` in two DIFFERENT histories: a
+// genuine `scoped: 0` no-op never sets it at all (the key is absent, i.e.
+// `undefined`), while a REAL commit whose `rev-parse HEAD` afterwards failed
+// sets it to the literal `null` (commitWikiChanges' own doc comment).
+// commitShaForUndo used to return `commitOutcome.sha` verbatim on any
+// `scoped !== 0` outcome, so the failed-rev-parse case passed `null`
+// straight through and hostTagWarningWithUndo read it exactly like the true
+// no-op: "nothing needs reverting" for a commit that, in fact, just landed.
+suite(
+  'commitShaForUndo: a real commit with sha:null must not read as "nothing to revert" (finding 1)',
+);
+
+// Disabling the check: change `return commitOutcome.sha ?? undefined;` back
+// to `return commitOutcome.sha;`. This test goes red (returns `null` instead
+// of `undefined`) while the no-op and genuine-sha tests below stay green,
+// which is the pair that isolates this one branch from the other two.
+test('a real commit (scoped>0) whose sha came back null (failed rev-parse) returns undefined, not null', () => {
+  assert.equal(
+    commitShaForUndo({ committed: true, scoped: 3, sha: null }),
+    undefined,
+    'a real commit with an unreadable sha must fall to the "look it up yourself" wording, never the no-op one',
+  );
+});
+
+test('a true no-op commit (scoped:0, no sha field at all) still returns null', () => {
+  assert.equal(
+    commitShaForUndo({ committed: true, scoped: 0 }),
+    null,
+    'the genuine no-op case must be untouched by this fix',
+  );
+});
+
+test('a real commit with a genuine sha string passes it through unchanged', () => {
+  assert.equal(
+    commitShaForUndo({ committed: true, scoped: 2, sha: 'abc123deadbeef' }),
+    'abc123deadbeef',
+  );
+});
+
+test('no commitOutcome at all (apply never reached the commit step) returns undefined', () => {
+  assert.equal(commitShaForUndo(null), undefined);
+});
+
+// ── codex 3rd-tier finding 2: a close-intent write failure must refuse the
+// close before any target file is touched ──────────────────────────────────
+// writeCloseIntent used to swallow every failure (lock timeout, EACCES, a
+// full disk under .cache/) and applyOverwrites ran regardless. The witness
+// this record exists to provide never landed, and a crash between the
+// first and second target write then left hasTornCloseIntent's next probe
+// with nothing to find, so a torn set read as a clean, finished close.
+suite('close-intent write failure refuses the close before any target write (finding 2)');
+
+// Disabling the check: after `writeCloseIntent(...)`, drop the `if
+// (!intentResult.ok) { ...; process.exit(1); }` block (call it and ignore
+// the result, the pre-fix behavior). This test goes red (`ok` flips to
+// true, session-state.md is overwritten) while every ordinary apply test
+// elsewhere in this file stays green, since none of them occupy the intent
+// path with a directory.
+test('an intent path occupied by a directory refuses the close before session-state.md is touched', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = 's-intent-blocked';
+    const intentPath = closeIntentPath(dir, sessionId);
+    // Occupies the EXACT path writeCloseIntent's atomicWrite must rename
+    // onto: a plain file rename can never land on an existing directory
+    // (EISDIR), forcing a real, reproducible write failure with no need to
+    // wait out a lock timeout.
+    mkdirSync(intentPath, { recursive: true });
+
+    const statePath = join(dir, 'projects', 'test-project', 'session-state.md');
+    const stateBefore = readFileSync(statePath, 'utf-8');
+
+    const payload = payloadForCleanWiki(dir, today);
+    const r = runApply(dir, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      out.ok,
+      false,
+      `a close-intent write failure must refuse the close, not proceed: ${r.stdout}`,
+    );
+    assert.equal(out.stage, 'close-intent-write-failed', `stage: ${r.stdout}`);
+    assert.deepEqual(out.applied, [], 'nothing should have been written on this path');
+    assert.equal(
+      out.committed,
+      null,
+      'this refusal fires before the commit step, same contract as every other pre-write refusal',
+    );
+    assert.equal(
+      readFileSync(statePath, 'utf-8'),
+      stateBefore,
+      'no target file may be touched once the witness itself failed to write',
+    );
+  });
+});
+
+// ── codex 3rd-tier finding 3: a same-session retry must not clear a NEWER
+// live intent record ────────────────────────────────────────────────────────
+// write and clear each hold the path lock only briefly, and (before this
+// fix) carried no generation identifier at all. Attempt A writes an intent,
+// attempt B (same sessionId, e.g. a retried apply after resume) overwrites
+// the SAME path with its own newer intent, and when A finally finishes and
+// clears, it used to remove whatever sat at that path, B's still-live
+// record included, with no way to tell "my own record" from "someone
+// else's that happens to share my path".
+suite('a same-session retry must not clear a newer live close-intent record (finding 3)');
+
+// Disabling the check: in clearCloseIntent, call `unlinkSync(path)` directly
+// instead of `unlinkCloseIntentIfMatching(path, attemptId)` (the pre-fix
+// path-only delete). This test goes red (B's record is deleted by A's
+// clear) while the "own clear still works" test below stays green, which is
+// the pair that isolates the match-before-delete guard from clearCloseIntent
+// simply working at all.
+test("attempt A's clear leaves attempt B's newer record on disk untouched", () => {
+  withWiki(null, (dir) => {
+    const sessionId = 's-retry-race';
+    const path = closeIntentPath(dir, sessionId);
+    const targetsA = [{ relPath: 'projects/test-project/hot.md', hash: '0'.repeat(64) }];
+    const targetsB = [{ relPath: 'projects/test-project/session-state.md', hash: '1'.repeat(64) }];
+
+    const attemptA = writeCloseIntent(dir, sessionId, targetsA);
+    assert.equal(
+      attemptA.ok,
+      true,
+      `attempt A's own write must succeed: ${JSON.stringify(attemptA)}`,
+    );
+
+    // Attempt B overwrites the SAME path (same sessionId ⇒ same
+    // closeIntentPath) with its own newer intent, exactly as a retried
+    // apply for this session would.
+    const attemptB = writeCloseIntent(dir, sessionId, targetsB);
+    assert.equal(
+      attemptB.ok,
+      true,
+      `attempt B's own write must succeed: ${JSON.stringify(attemptB)}`,
+    );
+    assert.notEqual(
+      attemptA.attemptId,
+      attemptB.attemptId,
+      'two writes must mint two distinct attempt identities',
+    );
+
+    // Attempt A finishes (or crashes and retries elsewhere) and clears with
+    // its OWN (now stale) attemptId.
+    clearCloseIntent(dir, sessionId, attemptA.attemptId);
+
+    assert.ok(existsSync(path), "attempt B's still-live record must survive attempt A's clear");
+    const onDisk = JSON.parse(readFileSync(path, 'utf-8'));
+    assert.equal(
+      onDisk.attemptId,
+      attemptB.attemptId,
+      "the surviving record must still be attempt B's own, byte for byte",
+    );
+  });
+});
+
+test("attempt B's own clear (with its own attemptId) does remove its own record", () => {
+  withWiki(null, (dir) => {
+    const sessionId = 's-retry-race-own-clear';
+    const path = closeIntentPath(dir, sessionId);
+    const targets = [{ relPath: 'projects/test-project/hot.md', hash: '0'.repeat(64) }];
+
+    const attempt = writeCloseIntent(dir, sessionId, targets);
+    assert.equal(attempt.ok, true);
+    clearCloseIntent(dir, sessionId, attempt.attemptId);
+    assert.ok(!existsSync(path), 'a matching attemptId must still clear its own record');
+  });
+});
+
+// ── final cross-review finding: doctor guidance reaches a plugin-only user ──
+// The close console and commands/crystallize.md told every user to run
+// `hypomnema doctor`. That bin ships only with the npm install, so a person who
+// installed the plugin alone was sent to a command they do not have. Both forms
+// are named now, with no guess at runtime about which install this is.
+suite('close points at doctor in both install forms');
+
+// Disabling the check: set DOCTOR_HINT in crystallize-close-apply.mjs back to
+// '`hypomnema doctor`'. The unreadable-proposal line loses `/hypo:doctor`.
+test('the console close report names /hypo:doctor and hypomnema doctor for an unreadable proposal file', () => {
+  withWiki(null, (dir, today) => {
+    const proposalsDir = join(dir, '.cache', 'proposals');
+    mkdirSync(proposalsDir, { recursive: true });
+    writeFileSync(join(proposalsDir, 'broken.json'), '{not json');
+    const sessionId = 's-doctor-hint';
+    const cleanup = seedCloseTranscript(sessionId);
+    const payloadPath = join(tmpdir(), `hypo-payload-doctor-${process.pid}.json`);
+    writeFileSync(payloadPath, JSON.stringify(payloadForCleanWiki(dir, today)));
+    let r;
+    try {
+      r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        `--payload=${payloadPath}`,
+        `--session-id=${sessionId}`,
+      ]);
+    } finally {
+      cleanup();
+      rmSync(payloadPath, { force: true });
+    }
+    const line = r.stdout.split('\n').find((l) => l.includes('could not be read or parsed'));
+    assert.ok(line, `precondition: the unreadable-proposal line must print: ${r.stdout}`);
+    assert.ok(
+      line.includes('`/hypo:doctor`') && line.includes('`hypomnema doctor`'),
+      `the line must name both the slash command and the npm bin: ${line}`,
+    );
+  });
+});
+
+// Disabling the check: put `hypomnema doctor` back as the only form in the
+// parkedTotal / parkedUnreadable bullets of commands/crystallize.md.
+test('commands/crystallize.md tells the model to offer /hypo:doctor alongside hypomnema doctor', () => {
+  const md = readFileSync(join(REPO, 'commands', 'crystallize.md'), 'utf-8');
+  for (const field of ['parkedTotal', 'parkedUnreadable']) {
+    const bullet = md.split('\n').find((l) => l.startsWith(`- **\`${field}\`**`));
+    assert.ok(bullet, `precondition: the ${field} bullet must exist`);
+    assert.ok(
+      bullet.includes('`/hypo:doctor`') && bullet.includes('`hypomnema doctor`'),
+      `the ${field} bullet must name both doctor forms: ${bullet}`,
+    );
+  }
 });

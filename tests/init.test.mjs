@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
 import { loadHookInventory } from '../scripts/lib/hook-inventory.mjs';
+import { formatRootHotProjection } from '../hooks/hypo-shared.mjs';
 import {
   hooksDirForInstall,
   SHELL_MARKER_START,
@@ -166,6 +167,37 @@ test('init creates .gitignore with .cache/ entry', () => {
     assert.ok(existsSync(gitignorePath), '.gitignore should be created');
     const content = readFileSync(gitignorePath, 'utf8');
     assert.ok(content.includes('.cache/'), '.gitignore should exclude .cache/');
+  });
+});
+
+// Root hot.md is the hooks' generated projection. A new vault has no
+// .cache/root-hot-projection-state.json yet, so the first rebuild can only
+// recognize the file as its own if the bytes already equal what it would write;
+// any difference costs the person a backup file and a "your hand edits were
+// preserved" notice on a file nobody touched. init writes the generator's
+// empty-vault output directly, so this compares the file a fresh init leaves on
+// disk, not a template.
+test('fresh init writes root hot.md byte-identical to the empty-vault projection', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(
+      readFileSync(join(hypoDir, 'hot.md'), 'utf-8'),
+      formatRootHotProjection([]),
+      'root hot.md from init must be exactly formatRootHotProjection([])',
+    );
+  });
+});
+
+test('init does not overwrite an existing root hot.md', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(join(hypoDir, 'hot.md'), 'my own notes\n');
+    const r = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(readFileSync(join(hypoDir, 'hot.md'), 'utf-8'), 'my own notes\n');
   });
 });
 

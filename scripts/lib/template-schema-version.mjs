@@ -40,6 +40,7 @@ export function templateSchemaVersion(pkgRoot) {
 // file's text and rejects that shape rather than trusting the convention.
 export const SCHEMA_VERSION_DELTAS = {
   2.2: 'documents `sources_consulted` on `type: synthesis` pages (lint W15/W16 read it to flag a synthesis that has fallen behind the pages it condenses)',
+  2.3: 'root `hot.md` is now a generated projection of `projects/*/hot.md` that the hooks rebuild at every session start and stop: session close no longer updates it by hand, and the pointer-table section describes the generated row format',
 };
 
 function parseMinorVersion(v) {

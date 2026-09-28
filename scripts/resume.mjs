@@ -119,8 +119,9 @@ function resolveActiveProject(hypoDir, cwd = null) {
   const hotPath = join(hypoDir, 'hot.md');
   if (!existsSync(hotPath)) return null;
 
-  // Strip HTML comments before parsing so the canonical-format example row
-  // in templates/hot.md (`<!-- Row format: ... -->`) is not picked up as data.
+  // Strip HTML comments before parsing so a commented example row, which
+  // vaults created before the root table became generated still carry
+  // (`<!-- Row format: ... -->`), is not picked up as data.
   const content = readFileSync(hotPath, 'utf-8').replace(/<!--[\s\S]*?-->/g, '');
   // Canonical hot.md uses wikilinks: | name | date | [[projects/slug/hot]] |
   // Pick the most recent row by the date column when present.

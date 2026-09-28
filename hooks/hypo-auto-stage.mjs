@@ -48,7 +48,19 @@ if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
     // hypo-auto-commit.mjs drains this at Stop instead of sweeping the whole
     // working tree, so another session's concurrent writes to this vault
     // never land in THIS session's commit.
-    recordTouchedPaths(HYPO_DIR, input.session_id, rel);
+    const recorded = recordTouchedPaths(HYPO_DIR, input.session_id, rel);
+    if (!recorded) {
+      // A lock-timeout or write failure here leaves the file just written
+      // with nothing in ANY session's touched-paths set to bring it into an
+      // auto-commit: it sits dirty until an unrelated later write to the
+      // same path happens to succeed. This hook's stdout is not suppressed
+      // wholesale like the Stop hooks, but its own output is a fixed
+      // continue/suppressOutput payload below, so stderr is the only channel
+      // available to surface this.
+      process.stderr.write(
+        `[hypo-auto-stage] ${rel} 를 이번 세션의 커밋 범위에 기록하지 못했습니다\n`,
+      );
+    }
 
     // Write=proposal gate provenance: when this session's own write lands on one of
     // the overwrite targets it snapshotted at start, advance that target's base so

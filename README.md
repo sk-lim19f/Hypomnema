@@ -209,7 +209,11 @@ Once installed, you stop _managing_ the wiki. It just accumulates.
 
 ### 4. Why a `hot.md` cache for resume
 
-The most expensive part of a paused project isn't redoing the work, it's rebuilding context. Reading `session-log/` from scratch costs minutes and tokens; reading a one-page `hot.md` costs neither. So we cache the most recent state explicitly: the root `hot.md` pointer table rebuilds on `Stop`, while each project's own `hot.md` is written by crystallize; both get injected on `SessionStart`. Resume is O(1).
+The most expensive part of a paused project isn't redoing the work, it's rebuilding context. Reading `session-log/` from scratch costs minutes and tokens; reading a one-page `hot.md` costs neither. So we cache the most recent state explicitly: the root `hot.md` pointer table is a projection rebuilt from every project's own `hot.md` on both `SessionStart` and `Stop`, never hand-edited, while each project's own `hot.md` is written by crystallize; both get injected on `SessionStart`. Resume is O(1).
+
+The root `hot.md` is a generated file, not a place to edit by hand. Whatever you type into it will be replaced the next time a hook rebuilds the projection (the next `SessionStart` or `Stop`), because the projection has no way to tell "content worth keeping" from "content in the way": there's no general-purpose compare-and-swap for a file rename, and your editor doesn't honor the advisory lock the hook takes. The first time the projection overwrites content it doesn't recognize as its own, it backs that content up next to the file as `hot.md.pre-projection-backup.md` (or `-2.md`, `-3.md`, ... if more than one has piled up), so nothing is silently discarded. But that backup is a best-effort save, not a safety guarantee: a save that lands mid-rewrite, or an editor that saves in place, can still leave a partial or missing copy. Treat it as a rescue net, not a place to write.
+
+Don't copy a backup back into the root `hot.md`. The next hook run will just replace it again. Instead: open the backup, read it, move whatever's worth keeping into the right project's `projects/<slug>/hot.md` or a standalone page (you decide which project it belongs to, the hook can't), then delete the backup. To see how many have piled up across the vault, list them from the vault root: `ls hot.md.pre-projection-backup*.md`.
 
 ### 5. Why a feedback → behavior pipeline
 
@@ -248,19 +252,16 @@ Nine commands cover the full capture → retrieval → consolidation cycle.
 | Hook | Event | Role |
 |---|---|---|
 | `hypo-close-guard.mjs` | `PreToolUse` | When a Write/Edit/MultiEdit looks like a session-close write and the transcript carries no close signal from you, ask before it lands |
-| `hypo-session-start.mjs` | `SessionStart` | Inject `hot.md` / `session-state.md` + `git pull --ff-only` |
+| `hypo-session-start.mjs` | `SessionStart` | `git pull --ff-only`, rebuild the root `hot.md` projection, inject `hot.md` / `session-state.md` |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | Marker-based one-shot request for a resume line on the first prompt (10-min TTL). It does not re-read `hot.md` |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT inject / MISS → closest-slug signal |
 | `hypo-compact-guard.mjs` | `UserPromptSubmit` | Detect a typed `/compact` or `/clear` and report an incomplete session close. It never blocks the compact |
 | `hypo-cwd-change.mjs` | `CwdChanged` | Build a notice from the matching project's `hot.md`. `CwdChanged` documents no output field that reaches the model, so the notice rides `systemMessage`; where that lands on this event is unmeasured (see the transmission note below) |
 | `hypo-file-watch.mjs` | `FileChanged` | Build a notice for a changed wiki file (honors `.hypoignore`). Nothing in this package registers watch paths, so the event has no trigger here at all; like `CwdChanged` it documents no field that reaches the model, and the notice rides `systemMessage` |
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | Auto-stage wiki-file edits |
-| `hypo-auto-commit.mjs` | `Stop` | Auto commit + pull + push |
-| `hypo-hot-rebuild.mjs` | `Stop` | Rebuild the root `hot.md` pointer table (structure + dates) |
-| `hypo-personal-check.mjs` | `PreCompact` | Surfaces an unfinished session-close, an uncommitted or unpushed wiki, malformed `hot.md`, or lint blockers as a `systemMessage`; it never blocks `/compact`. Session close is still enforced elsewhere: the Stop hook (`hypo-auto-minimal-crystallize.mjs`) blocks on a substantial session with no verified close, and `--mark-session-closed` still refuses the marker on a red gate |
+| `hypo-stop.mjs` | `Stop` | The only registered `Stop` hook. Runs four stages in order, not in parallel: rebuild the root `hot.md` projection (`SessionStart` calls the same generator), record session metadata for the observability score and auto-resume signaling, commit + pull + push, then, after the user signals wrap-up, block `Stop` on a substantial session with no verified close and hand back the `crystallize.mjs --mark-session-closed` command (with uncommitted changes or work still in flight it asks whether to close now instead) |
+| `hypo-personal-check.mjs` | `PreCompact` | Surfaces an unfinished session-close, an uncommitted or unpushed wiki, malformed `hot.md`, or lint blockers as a `systemMessage`; it never blocks `/compact`. Session close is still enforced elsewhere: `hypo-stop.mjs`'s crystallize stage blocks on a substantial session with no verified close, and `--mark-session-closed` still refuses the marker on a red gate |
 | `hypo-session-end.mjs` | `SessionEnd` | Write a SessionEnd marker so SessionStart can detect `source=clear` recovery |
-| `hypo-session-record.mjs` | `Stop` | Record session metadata for the observability score and auto-resume signaling |
-| `hypo-auto-minimal-crystallize.mjs` | `Stop` | After the user signals wrap-up, blocks Stop on a substantial session with no verified close and hands back the `crystallize.mjs --mark-session-closed` command. With uncommitted changes or work still in flight it asks whether to close now instead |
 | `hypo-web-fetch-ingest.mjs` | `PostToolUse(WebFetch/WebSearch)` | Inject a `/hypo:ingest` nudge into `additionalContext` after a WebFetch (URL redacted of query/hash/userinfo) or a WebSearch |
 
 Both PostToolUse hooks are registered without a matcher and filter on `tool_name` themselves.

@@ -33,7 +33,12 @@ import { snapshotBase, hashContent } from '../hooks/base-store.mjs';
 import { recordJournalEntry } from '../hooks/close-journal.mjs';
 // The gate's own notion of "today", so the fixture below can place a project
 // strictly outside it instead of guessing with local-yesterday.
-import { freshDates, sessionClosedMarkerPath } from '../hooks/hypo-shared.mjs';
+import {
+  freshDates,
+  sessionClosedMarkerPath,
+  vaultCommitLockTarget,
+} from '../hooks/hypo-shared.mjs';
+import { createProject } from '../scripts/lib/project-create.mjs';
 import { test, suite } from './harness.mjs';
 import {
   CLOSE_RECONFIRM_MARK,
@@ -2109,7 +2114,6 @@ test('--apply-session-close --session-id with an unresolvable transcript → ref
       projectHot: {
         content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] auto-mark test\n` },
       log: { entry: `## [${today}] session | test-project — auto-mark\n` },
     };
@@ -2168,7 +2172,6 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
       projectHot: {
         content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] auto-mark landed test\n` },
       log: { entry: `## [${today}] session | test-project — auto-mark landed\n` },
     };
@@ -2238,7 +2241,6 @@ test('--apply-session-close: a retry re-stages payload files a failed commit lef
       date: today,
       sessionState: { content: stateContent },
       projectHot: { content: hotContent },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] retry re-stages payload files\n` },
       log: { entry: `## [${today}] session | test-project — retry re-stages payload files\n` },
     };
@@ -2287,7 +2289,6 @@ test('--apply-session-close: a retry leaves an unjournaled payload file uncommit
       projectHot: {
         content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] unjournaled stays out\n` },
       log: { entry: `## [${today}] session | test-project — unjournaled stays out\n` },
     };
@@ -2336,7 +2337,6 @@ test('--apply-session-close: a demotion the gate made is visible in the result',
       projectHot: {
         content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] gate notices reach the result\n` },
       log: { entry: `## [${today}] session | test-project — gate notices reach the result\n` },
     };
@@ -2402,7 +2402,6 @@ test('--apply-session-close: a retry re-stages an index.md a failed close left b
       projectHot: {
         content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] retry re-stages the seeded index\n` },
       log: { entry: `## [${today}] session | test-project — retry re-stages the seeded index\n` },
     };
@@ -2465,7 +2464,6 @@ test('--apply-session-close: a retry leaves a user-edited index.md uncommitted',
       projectHot: {
         content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] retry must not swallow the user's index edit\n` },
       log: {
         entry: `## [${today}] session | test-project — retry must not swallow the user's index edit\n`,
@@ -2560,7 +2558,6 @@ test('--apply-session-close auto marker: verified_scope is {kind: global, projec
       projectHot: {
         content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] verified-scope auto-marker test\n` },
       log: { entry: `## [${today}] session | test-project — verified-scope auto-marker\n` },
     };
@@ -2776,7 +2773,6 @@ test('IMPR-15: no-user-close-signal → after an AskUserQuestion 세션 마무�
         projectHot: {
           content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
         },
-        rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
         sessionLog: { entry: `## [${today}] impr15 rerun test\n` },
         log: { entry: `## [${today}] session | test-project: impr15 rerun\n` },
       };
@@ -3048,7 +3044,6 @@ test('--apply-session-close text output: markerWritten:false prints loud stderr 
       projectHot: {
         content: readFileSync(join(wiki, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] marker-warning text test\n` },
       log: { entry: `## [${today}] session | test-project: marker-warning text\n` },
     };
@@ -3127,7 +3122,6 @@ test('ISSUE-140: a marker withheld by an unrelated gate failure leaves the close
       projectHot: {
         content: readFileSync(join(wiki, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] ISSUE-140 retry test\n` },
       log: { entry: `## [${today}] session | test-project: ISSUE-140 retry test\n` },
     };
@@ -3218,7 +3212,6 @@ test('--apply-session-close text output: ok:false prints both the stale-verifica
           content: `---\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- next\n`,
         },
         projectHot: { content: staleProjHot },
-        rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
         sessionLog: { entry: `## [${today}] ok-false text test\n` },
         log: { entry: `## [${today}] session | test-project: ok-false text\n` },
       };
@@ -3289,7 +3282,6 @@ test('--apply-session-close routes the marker write through the full gate — re
       projectHot: {
         content: readFileSync(join(wiki, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
-      rootHot: { content: readFileSync(join(wiki, 'hot.md'), 'utf-8') },
       sessionLog: { entry: `## [${today}] test session\n` },
       log: { entry: `## [${today}] session | test-project\n` },
     };
@@ -4801,5 +4793,65 @@ test('no project, cwd shared by two distinct projects → declines to null (reje
 test('no project, no cwd → null (leaves the gate global, never guesses)', () => {
   withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir) => {
     assert.equal(resolveGateProjectOverride(dir, {}), null);
+  });
+});
+
+// finding 6: createProject's own hot.md-row report collapsed two different
+// reasons into one `skipped.push('hot.md row')` line: "the table was already
+// current" and "another session held the vault lock, so this run never even
+// checked". Only `warnings` (an array a caller may not read at all) carried
+// the lock reason. A caller reading `skipped`/`created` alone could not tell
+// "row not needed" apart from "row not attempted".
+suite('project-create.mjs: hot.md row reporting names a lock timeout, not a generic skip');
+
+test('a held vault lock reports "hot.md row (lock timeout)", distinct from an ordinary skip', () => {
+  withTmpDir((dir) => {
+    const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+    process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200'; // fail fast instead of the 5s default
+    try {
+      // Same technique as writeRootHotProjection's own lock-refusal test
+      // (tests/session-hooks.test.mjs): the lock file's content is a live
+      // pid, so the acquire below polls and times out rather than stealing it.
+      const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+      mkdirSync(dirname(lockPath), { recursive: true });
+      writeFileSync(lockPath, String(process.pid));
+
+      const result = createProject({
+        hypoDir: dir,
+        name: 'locked-out',
+        workingDir: '/tmp/locked-out',
+      });
+
+      assert.ok(
+        result.skipped.includes('hot.md row (lock timeout)'),
+        `expected the lock-specific label: ${JSON.stringify(result.skipped)}`,
+      );
+      assert.ok(
+        !result.created.includes('hot.md row'),
+        `a lock refusal must never also read as created: ${JSON.stringify(result.created)}`,
+      );
+      assert.ok(
+        result.warnings.some((w) => w.includes('잠금')),
+        `the lock refusal must still be visible in warnings too: ${JSON.stringify(result.warnings)}`,
+      );
+    } finally {
+      if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+      else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
+    }
+  });
+});
+
+test('an ordinary create (no lock contention) still reports the plain "hot.md row" skip label', () => {
+  // Contrast half: with no lock held, an unchanged table (or a fresh one that
+  // writeRootHotProjection did create) must NOT pick up the lock-specific
+  // label: proves the new branch is scoped to lockTimeout, not swallowing
+  // the ordinary case too.
+  withTmpDir((dir) => {
+    const result = createProject({ hypoDir: dir, name: 'plain-create', workingDir: '/tmp/plain' });
+    assert.ok(
+      !result.skipped.includes('hot.md row (lock timeout)') &&
+        !result.created.includes('hot.md row (lock timeout)'),
+      `an uncontended create must never report a lock timeout: ${JSON.stringify(result)}`,
+    );
   });
 });

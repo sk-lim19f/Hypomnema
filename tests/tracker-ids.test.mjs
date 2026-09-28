@@ -51,7 +51,7 @@ const GUARD_PHRASES = [
   'none performs an automatic action', // no-auto contract (not merely the word "advisory")
   'writes on its own', // closing reminder: none writes on its own
   'must not run `--mark-session-closed`', // #44 must not bypass the gate
-  'Any real close still requires all 5 mandatory files', // gate still applies
+  'Any real close still requires all 4 mandatory files', // gate still applies
 ];
 
 for (const surface of ADVISORY_SURFACES) {

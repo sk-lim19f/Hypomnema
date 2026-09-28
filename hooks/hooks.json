@@ -98,35 +98,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-hot-rebuild.mjs",
-            "timeout": 30
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-session-record.mjs",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-auto-commit.mjs",
-            "timeout": 60
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-auto-minimal-crystallize.mjs",
-            "timeout": 10
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-stop.mjs",
+            "timeout": 120
           }
         ]
       }

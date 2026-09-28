@@ -16,10 +16,12 @@ import {
   symlinkSync,
   unlinkSync,
   cpSync,
+  chmodSync,
+  statSync,
 } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createProject, substituteTokens, insertHotRow } from '../scripts/lib/project-create.mjs';
+import { createProject, substituteTokens } from '../scripts/lib/project-create.mjs';
 import { writeProvenanceSidecar, provenancePath } from '../scripts/lib/pkg-provenance.mjs';
 import {
   buildProjectSuggestionLine,
@@ -28,16 +30,30 @@ import {
   computeSessionGrowth,
   recordSyncSuccess,
   readSyncLastSuccess,
+  readSyncState,
+  resolvePushTarget,
+  pushRemote,
   classifySyncOp,
   freshDates,
   isForeignProjectFile,
   classifyForeignOnlyDirty,
+  renderRootHotProjection,
+  formatRootHotProjection,
+  writeRootHotProjection,
+  scanRootHotProjectionSources,
+  sortRootHotRows,
+  writeRootHotHealthNotice,
+  consumeRootHotHealthNotice,
+  ROOT_HOT_BACKUP_SUFFIX,
+  resolveActiveProject,
+  claimProjectionWrite,
+  rootHotProjectionIsCurrent,
+  sessionCloseFileStatus,
 } from '../hooks/hypo-shared.mjs';
 import {
   snapshotBase,
   readBaseEntry,
   advanceBase,
-  hashContent,
   overwriteTargets,
 } from '../hooks/base-store.mjs';
 import { test, suite } from './harness.mjs';
@@ -62,6 +78,7 @@ import {
   run,
   runApply,
   runFirstPrompt,
+  todayLocal,
   runStop,
   syncRemote,
   touchedPathsPath,
@@ -151,101 +168,88 @@ test('hot-rebuild emits no growth line when wiki is clean', () => {
   });
 });
 
-suite('hypo-hot-rebuild.mjs — parsePointerRows row format');
+suite('hypo-hot-rebuild.mjs: directory-scan row format (ISSUE-115 wave 1)');
 
-test('valid wikilink row is preserved in rebuilt hot.md', () => {
+// ISSUE-115 wave 1 retired parsePointerRows: the row set no longer comes from
+// parsing the PREVIOUS root file at all, so these two tests (formerly named
+// for the retired parser) now pin the replacement contract: a row survives
+// rebuild exactly when a real `projects/<slug>/hot.md` backs it, regardless of
+// what shape (or garbage) the old root file's row was in.
+test('a row backed by a real project hot.md survives rebuild', () => {
   withTmpDir((dir) => {
-    const hotContent = [
-      '---',
-      'title: Hot Cache — Pointer',
-      'type: reference',
-      'updated: 2026-01-01',
-      'tags: [wiki, operations]',
-      '---',
-      '',
-      '# Hot Cache',
-      '',
-      '> Read at session start',
-      '',
-      '## Active Projects',
-      '',
-      '| Project | Last Session | Hot Cache |',
-      '|---|---|---|',
-      '| my-project | 2026-01-01 | [[projects/my-project/hot]] |',
-      '',
-      '## Session Start Checklist',
-      '',
-      '1. Check this file',
-    ].join('\n');
-    writeFileSync(join(dir, 'hot.md'), hotContent);
+    mkdirSync(join(dir, 'projects', 'my-project'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'my-project', 'hot.md'),
+      '---\ntitle: my-project\nupdated: 2026-01-01\n---\n# Hot\n',
+    );
+    writeFileSync(
+      join(dir, 'hot.md'),
+      '---\ntitle: Hot Cache: Pointer\ntype: reference\nupdated: 2026-01-01\ntags: [wiki, operations]\n---\n\n' +
+        '# Hot Cache\n\n> Read at session start\n\n## Active Projects\n\n' +
+        '| Project | Last Session | Hot Cache |\n|---|---|---|\n',
+    );
     writeFileSync(join(dir, 'hypo-config.md'), '# config');
     const r = runStop('hypo-hot-rebuild.mjs', dir);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const result = readFileSync(join(dir, 'hot.md'), 'utf-8');
     assert.ok(
       result.includes('[[projects/my-project/hot]]'),
-      'valid wikilink row must be preserved',
+      `a project with a real hot.md must get a row: ${result}`,
     );
   });
 });
 
-test('markdown link row is silently excluded when mixed with a valid wikilink row', () => {
+test('a row in the OLD root file with no backing project directory does not survive rebuild', () => {
   withTmpDir((dir) => {
-    // mixed table: one valid wikilink row + one markdown link row
-    const hotContent = [
-      '---',
-      'title: Hot Cache — Pointer',
-      'type: reference',
-      'updated: 2026-01-01',
-      'tags: [wiki, operations]',
-      '---',
-      '',
-      '# Hot Cache',
-      '',
-      '> Read at session start',
-      '',
-      '## Active Projects',
-      '',
-      '| Project | Last Session | Hot Cache |',
-      '|---|---|---|',
-      '| valid-project | 2026-01-01 | [[projects/valid-project/hot]] |',
-      '| bad-project | 2026-01-01 | [projects/bad-project/hot](projects/bad-project/hot.md) |',
-      '',
-      '## Session Start Checklist',
-      '',
-      '1. Check this file',
-    ].join('\n');
-    writeFileSync(join(dir, 'hot.md'), hotContent);
+    // valid-project has a real projects/valid-project/hot.md; bad-project only
+    // ever existed as a row in the old root file (any shape, whether wikilink
+    // or markdown link, no longer matters, since the old file's rows are never
+    // read). Directory-scan is the only source of truth for wave 1.
+    mkdirSync(join(dir, 'projects', 'valid-project'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'valid-project', 'hot.md'),
+      '---\ntitle: valid-project\nupdated: 2026-01-01\n---\n# Hot\n',
+    );
+    writeFileSync(
+      join(dir, 'hot.md'),
+      '---\ntitle: Hot Cache: Pointer\ntype: reference\nupdated: 2026-01-01\ntags: [wiki, operations]\n---\n\n' +
+        '# Hot Cache\n\n> Read at session start\n\n## Active Projects\n\n' +
+        '| Project | Last Session | Hot Cache |\n|---|---|---|\n' +
+        '| valid-project | 2026-01-01 | [[projects/valid-project/hot]] |\n' +
+        '| bad-project | 2026-01-01 | [projects/bad-project/hot](projects/bad-project/hot.md) |\n',
+    );
     writeFileSync(join(dir, 'hypo-config.md'), '# config');
     const r = runStop('hypo-hot-rebuild.mjs', dir);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const result = readFileSync(join(dir, 'hot.md'), 'utf-8');
     assert.ok(
       result.includes('[[projects/valid-project/hot]]'),
-      'valid wikilink row must be preserved',
+      `a real project's row must survive: ${result}`,
     );
     assert.ok(
       !result.includes('bad-project'),
-      'markdown link row must be excluded from rebuilt output',
+      `a row with no backing project directory must not survive: ${result}`,
     );
   });
 });
 
-suite('hypo-hot-rebuild.mjs — same-session base advance (root hot.md drift fix)');
+suite('hypo-hot-rebuild.mjs: the rebuild touches no base (root hot.md drift fix)');
 
-// hot-rebuild rewrites hot.md with a direct writeFileSync, which
+// hot-rebuild rewrites hot.md through writeRootHotProjection (atomicWrite),
 // hypo-auto-stage's PostToolUse-based advanceBaseForWrite never sees (it only
-// fires for a Write/Edit/MultiEdit TOOL call). Before this fix, that write
-// left the session's observed base for hot.md pointing at the pre-rebuild
-// bytes, so a later --apply-session-close with the (correct, post-rebuild)
-// content parked as a false 'base-mismatch' conflict against its own
-// session's edit.
+// fires for a Write/Edit/MultiEdit TOOL call). That write used to leave the
+// session's observed base for hot.md pointing at the pre-rebuild bytes, so a
+// close carrying the (correct, post-rebuild) content parked a false
+// 'base-mismatch' conflict against its own session's edit. The first fix was to
+// advance the base from inside the hook; the fix that removed the contention is
+// this one: the root hot.md is not an overwrite target at all any more, so no
+// session snapshots it, no close writes it, and the hook has no base to keep.
 //
 // The stale row seeded below has nothing to do with a date rollover (it is a
 // deliberately wrong literal date), so this pins the general case: ANY
-// same-day rewrite hot-rebuild makes must still keep the base in sync, not
-// only one triggered by the calendar turning over at midnight.
-test('hot-rebuild advances this session base to the bytes it just wrote, so a matching apply does not park', () => {
+// same-day rewrite hot-rebuild makes must leave the base alone, not only one
+// triggered by the calendar turning over at midnight.
+test('hot-rebuild rewrites hot.md, mints no base entry for it, and a close after it does not park', () => {
   withWiki(
     (dir, today) => {
       const rootHotPath = join(dir, 'hot.md');
@@ -260,8 +264,11 @@ test('hot-rebuild advances this session base to the bytes it just wrote, so a ma
     (dir, today) => {
       const sid = 'sess-hotrebuild-advance';
       snapshotBase(dir, sid, overwriteTargets('test-project'));
-      const baseBefore = readBaseEntry(dir, sid, 'hot.md');
-      assert.equal(baseBefore.state, 'hash', 'snapshotBase must have recorded a base for hot.md');
+      assert.equal(
+        readBaseEntry(dir, sid, 'hot.md').state,
+        'unknown',
+        'fixture: the root pointer table must not be one of the snapshotted targets',
+      );
 
       const r = runStop('hypo-hot-rebuild.mjs', dir, { session_id: sid });
       assert.equal(r.status, 0, `stderr: ${r.stderr}`);
@@ -272,36 +279,29 @@ test('hot-rebuild advances this session base to the bytes it just wrote, so a ma
         'hot-rebuild must have corrected the stale row',
       );
 
-      // Assertion 1: the base now matches what hot-rebuild actually wrote.
-      const baseAfter = readBaseEntry(dir, sid, 'hot.md');
+      // Assertion 1: the rewrite left no base behind. `advanceBase` mints a key
+      // whether or not the target was tracked, so a re-added call here shows up
+      // as a 'hash' state on a file `snapshotBase` never recorded.
       assert.equal(
-        baseAfter.hash,
-        hashContent(disk),
-        'hot-rebuild must advance this session base to the bytes it just wrote',
+        readBaseEntry(dir, sid, 'hot.md').state,
+        'unknown',
+        'the rebuild must not mint a base entry for a file no session snapshots',
       );
-      assert.notEqual(
-        baseAfter.hash,
-        baseBefore.hash,
-        'the base must have MOVED off the stale snapshot',
-      );
-
-      // Assertion 2: an apply carrying VALID BUT BYTE-DISTINCT content (one
-      // trailing newline off disk, the exact shape that reproduced the false
-      // park during the investigation) actually reaches the base check
-      // instead of short-circuiting on it. A payload byte-identical to disk
-      // would hit crystallize.mjs's idempotent skip BEFORE the base is ever
-      // consulted, so it would pass here even with a stale base and prove
-      // nothing about the advance this test exists to pin.
-      const proposed = disk.endsWith('\n') ? disk.slice(0, -1) : `${disk}\n`;
+      // Assertion 2: the close that follows the rewrite still succeeds. This is
+      // the failure the whole change exists to remove: the hook rewrites the
+      // table mid-session, and the close must neither park it nor write it. An
+      // installed copy on the previous command file still sends `rootHot`, so
+      // that is the payload used here.
       const payload = payloadForCleanWiki(dir, today);
-      payload.rootHot = { content: proposed };
+      payload.rootHot = { content: `${disk.trimEnd()}\n` };
       const r2 = runApply(dir, payload, { sessionId: sid });
       const out = JSON.parse(r2.stdout);
       assert.equal(out.ok, true, `apply must not park: ${r2.stdout}`);
       assert.deepEqual(out.conflicts ?? [], [], `no conflict expected: ${r2.stdout}`);
-      assert.ok(
-        (out.applied ?? []).some((a) => a.includes('rootHot')),
-        `rootHot must have gone through the base check and been written, not merely skipped: ${r2.stdout}`,
+      assert.equal(
+        readFileSync(join(dir, 'hot.md'), 'utf-8'),
+        disk,
+        "the close must leave the hook's bytes exactly as they were",
       );
     },
   );
@@ -309,24 +309,21 @@ test('hot-rebuild advances this session base to the bytes it just wrote, so a ma
 
 test('hot-rebuild leaves the base untouched when the file is already canonical (no write, no advance)', () => {
   withTmpDir((dir) => {
-    // Byte-exact match to rebuild()'s own canonical template (hooks/hypo-hot-
-    // rebuild.mjs), computed the same way it computes `today` (UTC, not
-    // local), so canonical === current and this hook is a true no-op. Reusing
-    // buildCleanWikiTree()'s simpler hot.md here would NOT be a no-op: its
-    // shape already differs structurally from the canonical template, so
-    // rebuild() would always rewrite it regardless of date.
+    // Built from the SAME generator hot-rebuild.mjs itself calls
+    // (renderRootHotProjection), not a hand-duplicated copy of its template --
+    // a second copy would silently drift from the real output shape and stop
+    // proving anything the moment one of them changed. A real backing project
+    // is required: the generator's row set comes only from a directory scan
+    // (ISSUE-115 wave 1), so a hand-written row with no
+    // `projects/my-project/hot.md` behind it would never round-trip as a
+    // no-op.
+    mkdirSync(join(dir, 'projects', 'my-project'), { recursive: true });
     const rebuildToday = new Date().toISOString().slice(0, 10);
     writeFileSync(
-      join(dir, 'hot.md'),
-      `---\ntitle: Hot Cache — Pointer\ntype: reference\nupdated: ${rebuildToday}\ntags: [wiki, operations]\n---\n\n` +
-        `# Hot Cache\n\n> Read at session start → navigate to the relevant project session-state.md and hot.md.\n` +
-        `> Update at session close: project session-state.md, project hot.md, and this file's "Active Projects" table.\n\n` +
-        `## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n` +
-        `| my-project | ${rebuildToday} | [[projects/my-project/hot]] |\n\n` +
-        `## Session Start Checklist\n\n1. Check this file for the relevant project link\n` +
-        `2. Read \`projects/<name>/session-state.md\` for next tasks if it exists\n` +
-        `3. Read \`projects/<name>/hot.md\` for project background\n`,
+      join(dir, 'projects', 'my-project', 'hot.md'),
+      `---\ntitle: my-project\nupdated: ${rebuildToday}\n---\n# Hot\n`,
     );
+    writeFileSync(join(dir, 'hot.md'), renderRootHotProjection(dir));
     writeFileSync(join(dir, 'hypo-config.md'), '# config');
 
     const sid = 'sess-hotrebuild-noop';
@@ -574,6 +571,195 @@ test('hypo-hot-rebuild.mjs feeds its own hot.md write into the scoped commit', (
   });
 });
 
+// Sibling of the hot-rebuild test above, for the OTHER call site. Without
+// this, SessionStart's own projection write never lands in any session's
+// touched-paths set: writeRootHotProjection at Stop sees disk already equals
+// the projection SessionStart just wrote (a no-op, so hot-rebuild records
+// nothing touched either), and hypo-auto-commit only ever commits its
+// touched-paths set, so the write this hook makes would sit forever as an
+// uncommitted, unattributable dirty file, blocking the close gate and
+// PreCompact. This is the BLOCKER this test exists to pin: it failed red
+// before recordTouchedPaths was added to hypo-session-start.mjs's projection
+// call.
+test('hypo-session-start.mjs feeds its own hot.md write into the scoped commit', () => {
+  withGrowthWiki((dir) => {
+    // A real project so the projection actually differs from withGrowthWiki's
+    // empty-row hot.md (a no-op write records nothing touched, same reasoning
+    // as the hot-rebuild sibling test above).
+    mkdirSync(join(dir, 'projects', 'p1'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'p1', 'hot.md'),
+      '---\ntitle: hot\nupdated: 2020-01-01\n---\n',
+    );
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed p1'], { cwd: dir });
+    const sessionId = 'sess-sessionstart-hotproj';
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: dir, session_id: sessionId }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, sessionId), 'utf-8'));
+    assert.ok(
+      touched.includes('hot.md'),
+      `SessionStart's own hot.md write must be recorded as touched: ${JSON.stringify(touched)}`,
+    );
+    // end-to-end: without that record, auto-commit would never see this write
+    // at all, since hot-rebuild's own Stop-time write is a no-op (disk already
+    // matches the projection SessionStart just wrote).
+    const commitRes = runStop('hypo-auto-commit.mjs', dir, { session_id: sessionId });
+    assert.equal(commitRes.status, 0, `stderr: ${commitRes.stderr}`);
+    const committed = spawnSync(
+      'git',
+      ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
+      { encoding: 'utf-8' },
+    ).stdout;
+    assert.ok(
+      /^hot\.md$/m.test(committed),
+      `SessionStart's hot.md write must reach the scoped commit: ${committed}`,
+    );
+  });
+});
+
+// ── BLOCKER fix (r5-w1.md, review round 5): a stale 'hot.md' claim over
+// content this session never actually wrote must not be swept into its
+// commit ──
+//
+// hypo-session-start.mjs's pre-write claim (claimProjectionWrite, taken
+// BEFORE writeRootHotProjection ever runs) used to survive a scanError or a
+// thrown read failure with nothing on that path alone to revoke it: 'hot.md'
+// stayed in the touched-paths set even though this session's own write never
+// landed. The fix re-verifies ownership at the LAST possible moment, inside
+// hypo-auto-commit.mjs's scoped-commit wrapper (rootHotProjectionIsCurrent),
+// instead of trying to remember to revoke the claim on every upstream branch
+// that can go wrong.
+test('hypo-auto-commit.mjs: a stale hot.md claim over content this session never wrote is excluded from the commit', () => {
+  withGrowthWiki((dir) => {
+    // withGrowthWiki's own seed commit already carries a hand-authored hot.md
+    // with no ownership hash ever recorded for it: the same shape a
+    // scanError-preserved stale claim protects a human's bytes against.
+    const seeded = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    const humanEdit = '# private notes written while the claim sat stale\n';
+    writeFileSync(join(dir, 'hot.md'), humanEdit);
+    // Stand in for the stale claim itself: a scanError-skipped SessionStart
+    // write leaves exactly this: 'hot.md' claimed, nothing this session
+    // actually produced backing it up.
+    recordTouchedPaths(dir, 'sess-stale-claim', ['hot.md']);
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-stale-claim' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const staged = spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(
+      !/hot\.md/.test(staged),
+      `a stale claim must not stage content this session never wrote: ${staged}`,
+    );
+    const head = spawnSync('git', ['-C', dir, 'show', 'HEAD:hot.md'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.equal(
+      head,
+      seeded,
+      "HEAD's hot.md must stay the seed commit's content, never the human edit",
+    );
+    assert.equal(
+      readFileSync(join(dir, 'hot.md'), 'utf-8'),
+      humanEdit,
+      'the human edit itself must survive on disk: excluded from THIS commit, not destroyed',
+    );
+    assert.equal(
+      consumeRootHotHealthNotice(dir),
+      '루트 hot.md이 이번 세션이 실제로 쓴 내용과 달라 이번 커밋에서 제외했습니다. 다음 세션 시작/종료 시 다시 확인됩니다.',
+      'the exclusion must leave a durable notice for the next SessionStart',
+    );
+  });
+});
+
+// n1 (codex, 3rd-round): the sibling of the test above, but the content that
+// replaces a session's own bytes comes from ANOTHER SESSION's legitimate
+// write, not a human hand-edit. The old global-only ownership check could
+// not tell the two apart: a sibling session's write also updates the
+// global hash, so it read as "current" and staged the sibling's bytes into
+// this session's commit. Two sessions racing the one shared root hot.md is
+// not rare: measured across 349 real sessions, 2081 pairs overlap in time.
+test("n1: session A's stale claim is excluded once session B's own write replaces the bytes on disk", () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'p1'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'p1', 'hot.md'),
+      '---\ntitle: hot\nupdated: 2026-01-01\n---\n',
+    );
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed p1'], { cwd: dir });
+
+    const sessA = 'sess-n1-a';
+    const sessB = 'sess-n1-b';
+    const rA = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: dir, session_id: sessA }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(rA.status, 0, `stderr: ${rA.stderr}`);
+    const bytesAfterA = readFileSync(join(dir, 'hot.md'), 'utf-8');
+
+    // A second project appears and session B's own SessionStart regenerates
+    // the projection with different bytes, racing ahead of A's own Stop and
+    // becoming the new global "last write" A's stale claim would otherwise
+    // ride along with.
+    mkdirSync(join(dir, 'projects', 'p2'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'p2', 'hot.md'),
+      '---\ntitle: hot\nupdated: 2026-02-02\n---\n',
+    );
+    const rB = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: dir, session_id: sessB }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(rB.status, 0, `stderr: ${rB.stderr}`);
+    const bytesAfterB = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.notEqual(bytesAfterB, bytesAfterA, 'fixture: B must actually change the bytes on disk');
+
+    // Session A now Stops. Its OWN claim ('hot.md', made before B ever ran)
+    // is still sitting in A's touched-paths set.
+    const headBefore = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    const commitRes = runStop('hypo-auto-commit.mjs', dir, { session_id: sessA });
+    assert.equal(commitRes.status, 0, `stderr: ${commitRes.stderr}`);
+
+    // Read what the commit CONTAINS, not what is left staged. `git diff
+    // --cached` is empty both when hot.md was correctly excluded and when it
+    // was swept in and committed, so asserting on it cannot tell the two
+    // apart: this assertion passed even with the exclusion gate forced fully
+    // open. The commit's own file list is the only thing that distinguishes
+    // them.
+    const headAfter = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    assert.notEqual(
+      headAfter,
+      headBefore,
+      'fixture: A must actually produce a commit, or the file-list assertion below measures nothing',
+    );
+    const committed = spawnSync(
+      'git',
+      ['-C', dir, 'show', '--pretty=format:', '--name-only', 'HEAD'],
+      { encoding: 'utf-8' },
+    ).stdout;
+    assert.ok(
+      !/(^|\n)hot\.md(\n|$)/.test(committed),
+      `A's stale claim must not put B's bytes in A's commit: ${committed}`,
+    );
+    assert.equal(
+      readFileSync(join(dir, 'hot.md'), 'utf-8'),
+      bytesAfterB,
+      "B's bytes must survive untouched: A's Stop must not overwrite them either",
+    );
+  });
+});
+
 // Codex pre-commit review (BLOCKER, 2 rounds) on the first cut of this suite:
 //
 //   1a. drain-before-lock: the Stop hook used to drain (delete) the session's
@@ -649,6 +835,261 @@ test('hypo-auto-commit.mjs: a lock-timeout on the vault lock leaves the session 
       trackedAfterRetry.includes('pages/mine.md'),
       `retry must commit the preserved scope: ${trackedAfterRetry}`,
     );
+  });
+});
+
+// major (review r5-w4 2): the push is the one step of this hook that must NOT
+// run under the vault lock. It is a network round trip with a 30s spawn
+// timeout, and a sibling SessionStart needs the same lock twice (its own `git
+// pull` and the root hot.md projection write) at 5s each, out of a 30s hook
+// budget: a Stop that holds the lock across a push can spend 10s of a sibling
+// session's start on lock waits and still leave it with a stale pointer table.
+// Asking the push itself where the lock stood is the only way to observe the
+// boundary from outside: a pre-push hook fires while `git push` is running, so
+// what it sees IS what a sibling session would have seen at that moment.
+test('hypo-auto-commit.mjs: the push runs with the vault lock released, not held across the network round trip', () => {
+  withSyncedWiki((dir) => {
+    const probePath = join(dir, '..', 'push-lock-probe.json');
+    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+    const prePush = join(dir, '.git', 'hooks', 'pre-push');
+    mkdirSync(dirname(prePush), { recursive: true });
+    writeFileSync(
+      prePush,
+      `#!/bin/sh\n"${process.execPath}" -e "const fs=require('fs');fs.writeFileSync('${probePath}',JSON.stringify({lockHeld:fs.existsSync('${lockPath}')}))"\nexit 0\n`,
+    );
+    chmodSync(prePush, 0o755);
+
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# mine\n');
+    recordTouchedPaths(dir, 'sess-push-lock', 'pages/mine.md');
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-push-lock' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+
+    assert.ok(
+      existsSync(probePath),
+      'the push never ran, so this test measured nothing: check that the commit succeeded and a remote exists',
+    );
+    const probe = JSON.parse(readFileSync(probePath, 'utf-8'));
+    assert.equal(
+      probe.lockHeld,
+      false,
+      'the vault lock was still held while git push was running: a sibling session start would have waited on it',
+    );
+    // The push still has to have actually happened: a boundary that is clean
+    // because nothing was pushed proves nothing.
+    // `@{upstream}`, not `origin/HEAD`: withSyncedWiki's bare remote has no
+    // symbolic HEAD, but `push -u` set the tracking branch.
+    const remoteHead = spawnSync('git', ['-C', dir, 'rev-parse', '@{upstream}'], {
+      encoding: 'utf-8',
+    });
+    const localHead = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf-8' });
+    assert.equal(
+      remoteHead.stdout.trim(),
+      localHead.stdout.trim(),
+      `the commit must have reached the remote: ${remoteHead.stdout} vs ${localHead.stdout}`,
+    );
+  });
+});
+
+const revParse = (dir, rev) =>
+  spawnSync('git', ['-C', dir, 'rev-parse', rev], { encoding: 'utf-8' }).stdout.trim();
+
+// blocker (codex): Stop used to carry four separate registrations, and Claude
+// Code runs every hook matched by an event in parallel. hypo-hot-rebuild.mjs was
+// written against an order it did not have: it writes root hot.md and only then
+// claims it into the session's touched-paths set, so hypo-auto-commit could take
+// the vault lock in between and commit without it. Nothing failed, so nothing
+// said so, and the fresh bytes just stayed uncommitted.
+//
+// hypo-stop.mjs is the single registration now and its STAGES list is the order.
+// Nothing checks that order at runtime, so this is what holds it: run the real
+// orchestrator and ask whether the projection hot-rebuild wrote reached the
+// commit auto-commit made. Reorder STAGES and this goes red; it is the only
+// place outside that array where the order is written down.
+test('hypo-stop.mjs: the projection hot-rebuild writes reaches the commit auto-commit makes (the Stop chain is ordered)', () => {
+  withSyncedWiki((dir) => {
+    // A project hot.md makes the root projection differ from the fixture's
+    // empty table, so the rebuild stage actually writes and claims `hot.md`.
+    mkdirSync(join(dir, 'projects', 'alpha'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'alpha', 'hot.md'),
+      `---\ntitle: alpha\nupdated: ${todayLocal()}\n---\n\n# alpha\n`,
+    );
+    const before = revParse(dir, 'HEAD');
+
+    const r = runStop('hypo-stop.mjs', dir, { session_id: 'sess-stop-order' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+
+    // One load-bearing assertion, deliberately: an earlier `HEAD moved` assert
+    // would die first and leave the ordering claim itself never evaluated. The
+    // empty list IS the no-commit case, and the message says so.
+    const after = revParse(dir, 'HEAD');
+    const committed =
+      after === before
+        ? []
+        : spawnSync('git', ['-C', dir, 'show', '--name-only', '--format=', 'HEAD'], {
+            encoding: 'utf-8',
+          })
+            .stdout.split('\n')
+            .map((l) => l.trim())
+            .filter(Boolean);
+    assert.ok(
+      committed.includes('hot.md'),
+      after === before
+        ? 'the Stop chain made no commit at all: auto-commit ran before hot-rebuild claimed hot.md, so its scope was empty'
+        : `the Stop commit left hot.md out, so the rebuild landed after it: ${committed.join(', ')}`,
+    );
+  });
+});
+
+// Final cross-review finding: a stage that exited non-zero or was killed was
+// written to stderr only, and the reply stayed `continue: true, suppressOutput:
+// true`, a clean Stop to anyone reading it. hot-rebuild dying after its rename
+// and before it claims the path leaves a changed, uncommitted hot.md behind
+// exactly that reply. The orchestrator runs copied next to stub stages here, so
+// each failure shape is produced on purpose: one exits 3, one kills itself.
+// The last two still run, which is the fail-open decision this must not undo.
+// Disabling the check: drop the `messages.push(...)` of the failure summary in
+// hypo-stop.mjs. systemMessage disappears and suppressOutput goes back to true.
+test('hypo-stop.mjs: a stage that exits non-zero or is killed is named in systemMessage, and the chain still runs past it', () => {
+  withTmpDir((dir) => {
+    const hooksDir = join(dir, 'hooks');
+    mkdirSync(hooksDir);
+    cpSync(join(HOOKS, 'hypo-stop.mjs'), join(hooksDir, 'hypo-stop.mjs'));
+    const ranPath = join(dir, 'ran.log');
+    const ok = `import { appendFileSync } from 'node:fs'; appendFileSync(${JSON.stringify(ranPath)}, process.argv[1] + '\\n'); console.log(JSON.stringify({ continue: true, suppressOutput: true }));`;
+    writeFileSync(join(hooksDir, 'hypo-hot-rebuild.mjs'), 'process.exit(3);\n');
+    writeFileSync(
+      join(hooksDir, 'hypo-session-record.mjs'),
+      "process.kill(process.pid, 'SIGKILL');\n",
+    );
+    writeFileSync(join(hooksDir, 'hypo-auto-commit.mjs'), ok);
+    writeFileSync(join(hooksDir, 'hypo-auto-minimal-crystallize.mjs'), ok);
+
+    const r = spawnSync(process.execPath, [join(hooksDir, 'hypo-stop.mjs')], {
+      input: JSON.stringify({ session_id: 'sess-stop-fail' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const reply = JSON.parse(r.stdout.trim().split('\n').pop());
+    const msg = reply.systemMessage || '';
+    assert.ok(
+      /hypo-hot-rebuild\.mjs exited 3/.test(msg) &&
+        /hypo-session-record\.mjs was killed by SIGKILL/.test(msg),
+      `each failed stage must be named with how it ended: ${r.stdout}`,
+    );
+    assert.equal(
+      reply.suppressOutput,
+      false,
+      'a reply that reports a failure must not be suppressed',
+    );
+    assert.equal(
+      reply.continue,
+      true,
+      'a failed stage must not stop the session (no block, no halt)',
+    );
+    assert.equal(reply.decision, undefined);
+    const ran = existsSync(ranPath) ? readFileSync(ranPath, 'utf-8') : '';
+    assert.ok(
+      ran.includes('hypo-auto-commit.mjs') && ran.includes('hypo-auto-minimal-crystallize.mjs'),
+      `the stages after a failed one must still run: ${ran}`,
+    );
+  });
+});
+
+// Closure-check finding: the timeout branch of stageFailure had no test. The one
+// above only produces an exit code and a signal. A stage that hangs is killed by
+// spawnSync at its own budget and reported as ETIMEDOUT, and without the
+// dedicated branch it would read as "failed to run: spawnSync ... ETIMEDOUT",
+// which does not say the stage was still working when it was cut off.
+// session-record is the stub because its budget (10s) is the shortest.
+// Disabling the check: drop the `res.error?.code === 'ETIMEDOUT'` line in
+// stageFailure. The message falls through to the generic spawn-failure wording.
+test('hypo-stop.mjs: a stage that hangs past its budget is reported as timed out, and the chain still runs past it', () => {
+  withTmpDir((dir) => {
+    const hooksDir = join(dir, 'hooks');
+    mkdirSync(hooksDir);
+    cpSync(join(HOOKS, 'hypo-stop.mjs'), join(hooksDir, 'hypo-stop.mjs'));
+    const ranPath = join(dir, 'ran.log');
+    const ok = `import { appendFileSync } from 'node:fs'; appendFileSync(${JSON.stringify(ranPath)}, process.argv[1] + '\\n'); console.log(JSON.stringify({ continue: true, suppressOutput: true }));`;
+    writeFileSync(join(hooksDir, 'hypo-hot-rebuild.mjs'), ok);
+    writeFileSync(join(hooksDir, 'hypo-session-record.mjs'), 'setInterval(() => {}, 1000);\n');
+    writeFileSync(join(hooksDir, 'hypo-auto-commit.mjs'), ok);
+    writeFileSync(join(hooksDir, 'hypo-auto-minimal-crystallize.mjs'), ok);
+
+    const r = spawnSync(process.execPath, [join(hooksDir, 'hypo-stop.mjs')], {
+      input: JSON.stringify({ session_id: 'sess-stop-timeout' }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+      timeout: 60000,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const reply = JSON.parse(r.stdout.trim().split('\n').pop());
+    assert.match(
+      reply.systemMessage || '',
+      /hypo-session-record\.mjs timed out after 10000ms/,
+      `a hung stage must be named as timed out: ${r.stdout}`,
+    );
+    assert.equal(reply.suppressOutput, false);
+    assert.equal(reply.continue, true);
+    const ran = existsSync(ranPath) ? readFileSync(ranPath, 'utf-8') : '';
+    assert.ok(
+      ran.includes('hypo-auto-commit.mjs') && ran.includes('hypo-auto-minimal-crystallize.mjs'),
+      `the stages after a hung one must still run: ${ran}`,
+    );
+  });
+});
+
+// major (codex): the push runs outside the vault lock, and the justification for
+// that was "a push changes nothing locally". What it SENDS was still decided at
+// push time, from HEAD. Let a sibling session commit in the window between the
+// unlock and the push, and a bare `git push` publishes the sibling's commit
+// instead of the one this session made and verified under the lock.
+//
+// So the target is pinned under the lock. This drives the two apart directly:
+// resolve while the approved commit is HEAD, move HEAD, then push, and ask the
+// remote which one it got.
+test('pushRemote: the push sends the OID resolved under the lock, not the HEAD a sibling session moved on to', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'ours.md'), '# ours\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'ours']);
+    // Still inside the critical section, conceptually: this is where
+    // hypo-auto-commit.mjs resolves its target, right after its own commit and
+    // pull, with the vault lock still held.
+    const target = resolvePushTarget(dir);
+    const approved = revParse(dir, 'HEAD');
+
+    // The lock is gone; a sibling session on the same vault commits.
+    writeFileSync(join(dir, 'pages', 'theirs.md'), '# theirs\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'sibling']);
+    const sibling = revParse(dir, 'HEAD');
+    assert.notEqual(sibling, approved, 'fixture: the sibling commit must have moved HEAD');
+
+    const res = pushRemote(dir, target);
+    assert.equal(res.pushed, true, 'the push must have happened, or this test measured nothing');
+    assert.equal(
+      revParse(dir, '@{upstream}'),
+      approved,
+      `the remote must hold the commit approved under the lock (${approved}), not the sibling's (${sibling})`,
+    );
+  });
+});
+
+// The other end of the same fix: when no destination can be named, nothing is
+// pushed. A vault with an unset upstream, a non-standard `push.default`, or a
+// detached HEAD is exactly where a bare `git push` would publish something
+// nobody chose, so declining is the answer, and it is recorded rather than
+// silent so doctor and session-start still surface it.
+test('pushRemote: a branch with no upstream resolves no target, pushes nothing, and records why', () => {
+  withGrowthWiki((dir) => {
+    assert.equal(resolvePushTarget(dir), null, 'no upstream must resolve no destination');
+    assert.equal(pushRemote(dir, null).pushed, false);
+    const ops = readSyncState(dir).entries.map((e) => e.op);
+    assert.deepEqual(ops, ['push'], `the decline must be recorded as a push failure: ${ops}`);
   });
 });
 
@@ -1682,40 +2123,6 @@ test('substituteTokens replaces all four tokens', () => {
     { name: 'demo', started: '2026-05-21', workingDir: '/repo/demo', today: '2026-05-21' },
   );
   assert.equal(out, 'name=demo started=2026-05-21 wd=/repo/demo upd=2026-05-21');
-});
-
-test('insertHotRow adds a row under the table separator, idempotently', () => {
-  const hot =
-    '# Hot\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n';
-  const once = insertHotRow(hot, 'demo', '2026-05-21');
-  assert.ok(once.includes('| demo | 2026-05-21 | [[projects/demo/hot]] |'));
-  const twice = insertHotRow(once, 'demo', '2026-05-21');
-  assert.equal(twice, once, 're-insert should be a no-op');
-});
-
-test('insertHotRow returns null when no table is present', () => {
-  assert.equal(insertHotRow('# Hot\nno table here\n', 'demo', '2026-05-21'), null);
-});
-
-// The row must land in the Active Projects table even when an unrelated table
-// appears earlier in hot.md.
-test('insertHotRow targets the Active Projects table, not an earlier table', () => {
-  const hot =
-    '## Other\n\n| A | B | C |\n|---|---|---|\n| x | y | z |\n\n' +
-    '## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n';
-  const out = insertHotRow(hot, 'demo', '2026-05-21');
-  const lines = out.split('\n');
-  const rowIdx = lines.findIndex((l) => l.includes('[[projects/demo/hot]]'));
-  const apIdx = lines.findIndex((l) => /^##\s+Active Projects/.test(l));
-  assert.ok(rowIdx > apIdx, 'row must be inside the Active Projects section');
-  // the earlier "## Other" table must be untouched
-  assert.ok(out.includes('| x | y | z |'), 'unrelated table preserved');
-});
-
-test('insertHotRow returns null when Active Projects has no table in scope', () => {
-  // a table exists, but it is above Active Projects (which has no table of its own)
-  const hot = '## Other\n\n| A |\n|---|\n\n## Active Projects\n\n(no table yet)\n';
-  assert.equal(insertHotRow(hot, 'demo', '2026-05-21'), null);
 });
 
 test('createProject scaffolds files, hot row, and log entry with substitution', () => {
@@ -3143,6 +3550,32 @@ test('commitWikiChanges: empty scope (no paths supplied) → committed:true, no-
   });
 });
 
+// MAJOR fix: a caller that has to tell a user how to take this commit back
+// (close-gate-store.mjs's hostTagWarningWithUndo) cannot find it afterwards on
+// a shared vault, where HEAD by then may belong to a concurrent session. The
+// commit names itself here or the undo instruction has no target.
+test('commitWikiChanges: a real commit returns its own sha, and a no-op returns none', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'undo-me.md'), '# committed by this close\n');
+    const res = commitWikiChanges(dir, ['undo-me.md']);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.match(res.sha || '', /^[0-9a-f]{40}$/, `expected a full sha: ${JSON.stringify(res)}`);
+    // The sha must name THIS commit, not merely some commit: compare against
+    // the hash git itself records for the revision that carries the file.
+    const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    assert.equal(res.sha, head);
+    // A second call with nothing left to commit is still a success, but it
+    // created no commit, and carrying a sha there would point the undo at the
+    // commit above, which this call did not make.
+    const noop = commitWikiChanges(dir, ['undo-me.md']);
+    assert.equal(noop.committed, true, JSON.stringify(noop));
+    assert.equal(noop.scoped, 0);
+    assert.equal(noop.sha, undefined, `a no-op must name no commit: ${JSON.stringify(noop)}`);
+  });
+});
+
 test('commitWikiChanges: stale scope (path never actually changed) → committed:true, no-op (ISSUE-69)', () => {
   withSyncedWiki((dir) => {
     // `stale.md` is not in the fixture at all — the INTERSECT(supplied,
@@ -4484,4 +4917,1534 @@ test('clean vault: no foreign notice at all (quiet at zero)', () => {
       `a clean vault must emit no foreign/unattributed/enumeration-failure notice: ${r.stdout}`,
     );
   });
+});
+
+// ── ISSUE-115 wave 1: root hot.md projection ────────────────────────────────
+//
+// Root hot.md stops being a file Claude hand-edits and becomes a deterministic
+// projection of projects/<slug>/hot.md. renderRootHotProjection (pure) and
+// writeRootHotProjection (the only writer) live in hooks/hypo-shared.mjs; both
+// hypo-session-start.mjs (SessionStart) and hypo-hot-rebuild.mjs (Stop) call
+// writeRootHotProjection instead of the retired row-parsing rebuild(). This
+// suite owns both call sites since neither has its own area file and both are
+// already covered by hypo-session-start.mjs fixtures a few suites up.
+
+suite(
+  'hypo-shared.mjs / hypo-session-start.mjs / hypo-hot-rebuild.mjs: root hot.md projection (ISSUE-115 wave 1)',
+);
+
+function projectionWikiDir() {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-hotproj-'));
+  mkdirSync(join(dir, 'projects'), { recursive: true });
+  return dir;
+}
+
+function writeProjectHotFixture(dir, slug, { title, updated } = {}) {
+  const projDir = join(dir, 'projects', slug);
+  mkdirSync(projDir, { recursive: true });
+  const fm = ['---'];
+  if (title !== undefined) fm.push(`title: ${title}`);
+  if (updated !== undefined) fm.push(`updated: ${updated}`);
+  fm.push('---');
+  writeFileSync(join(projDir, 'hot.md'), `${fm.join('\n')}\n# Hot\n`);
+}
+
+test('AC1: a manually deleted root hot.md row comes back after SessionStart', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
+    // Root already carries the alpha row (as a prior projection/rebuild would
+    // have left it), then a user deletes the row by hand.
+    writeRootHotProjection(dir);
+    assert.ok(readFileSync(join(dir, 'hot.md'), 'utf-8').includes('[[projects/alpha/hot]]'));
+    writeFileSync(
+      join(dir, 'hot.md'),
+      '---\ntitle: Hot Cache\nupdated: 2026-09-10\n---\n\n# Hot Cache\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
+    );
+    assert.ok(!readFileSync(join(dir, 'hot.md'), 'utf-8').includes('alpha'));
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(
+      after.includes('[[projects/alpha/hot]]'),
+      `deleted row must be regenerated by SessionStart, got: ${after}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('AC2: a new project directory gets a row without the root file being touched by hand', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeRootHotProjection(dir); // establish an empty-but-present root file
+    writeProjectHotFixture(dir, 'brandnew', { title: 'Brand New', updated: '2026-09-15' });
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(
+      after.includes('[[projects/brandnew/hot]]'),
+      `new project row must appear after SessionStart, got: ${after}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('AC3: _template never becomes a row', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, '_template', { title: 'Template', updated: '2026-09-16' });
+    writeProjectHotFixture(dir, 'real', { title: 'Real', updated: '2026-09-01' });
+    const content = renderRootHotProjection(dir);
+    assert.ok(!content.includes('_template'), `_template leaked into the projection: ${content}`);
+    assert.ok(content.includes('[[projects/real/hot]]'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Nothing pinned the sort rule itself before this: flipping the comparator
+// (descending -> ascending, swapping which end blank dates land on, or
+// dropping the slug tie-break) left the whole suite green, since AC5 only
+// checks that two renders of ONE tree agree with each other and the
+// `updated:` assertion is a max, which is order-independent. Spec 3.3
+// mandates: date descending, blank dates last, ties broken by slug ascending.
+test('row order: date descending, blank dates last, ties broken by slug ascending', () => {
+  const dir = projectionWikiDir();
+  try {
+    // Same day twice (zed/alpha, so a slug-ascending tie-break is the only
+    // thing that could put alpha before zed), a distinct earlier day, and one
+    // dateless project that must sort last regardless of its slug.
+    writeProjectHotFixture(dir, 'zed', { updated: '2026-09-10' });
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeProjectHotFixture(dir, 'older', { updated: '2026-01-01' });
+    writeProjectHotFixture(dir, 'nodate', {});
+    const content = renderRootHotProjection(dir);
+    const slugOrder = content
+      .split('\n')
+      .filter((l) => l.includes('[[projects/'))
+      .map((l) => l.match(/\[\[projects\/([^/]+)\/hot\]\]/)[1]);
+    assert.deepEqual(
+      slugOrder,
+      ['alpha', 'zed', 'older', 'nodate'],
+      `expected date-descending order with a slug tie-break and blank-last, got: ${JSON.stringify(slugOrder)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Same rule, but through the axis a user actually experiences: which project
+// resolveActiveProject picks when two projects tie on today's date. Spec §8
+// names this explicitly as a risk (insertion order -> slug-ascending changes
+// which project wins a same-day tie), so it gets its own assertion distinct
+// from the row-order array above.
+test('row order tie-break is user-visible: resolveActiveProject picks the slug-ascending winner on a same-day tie', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'zed', { updated: '2026-09-10' });
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeRootHotProjection(dir);
+    assert.equal(
+      resolveActiveProject(dir),
+      'alpha',
+      "on a same-day tie, resolveActiveProject must pick the slug-ascending winner (the projection's sort order), not insertion order",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('AC4: a project hot.md with no `updated` gets a blank date, never today', () => {
+  const dir = projectionWikiDir();
+  const today = todayLocal();
+  try {
+    writeProjectHotFixture(dir, 'dateless', { title: 'Dateless' }); // no `updated:`
+    const content = renderRootHotProjection(dir);
+    const row = content.split('\n').find((l) => l.includes('[[projects/dateless/hot]]'));
+    assert.ok(row, `expected a row for dateless, got: ${content}`);
+    assert.match(row, /^\|\s*dateless\s*\|\s*\|\s*\[\[projects\/dateless\/hot\]\]\s*\|$/, row);
+    assert.ok(!row.includes(today), `date column must stay blank, not today: ${row}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A malformed `updated:` value (not a well-formed YYYY-MM-DD string) must not
+// leak anywhere: not into the row's date column, and not into root
+// frontmatter's `updated:` via the row-date-max reduce. Before the ISO
+// validation was added, `parseFrontmatterField(...) || ''` only caught
+// absent/empty values, so a token like `stale` flowed straight into a raw
+// string compare (`'stale' > '2026-01-02'` is true in JS) and could win the
+// max, writing `updated: stale` into root hot.md's own frontmatter. Root
+// hot.md is regenerated every SessionStart and Stop, so a person editing the
+// bad value away by hand gets overwritten again on the next session; the bad
+// token would sit there until the offending project's own `updated:` is
+// fixed. sessionCloseFileStatus still checks this field against today's
+// date exactly like a project-owned file (see the 'n1' test below), so a
+// malformed sibling row does not just sit unnoticed, it can also stale-flag
+// an otherwise current close.
+test('a malformed `updated:` value does not pollute root frontmatter or the row date, and does not hide the project', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'bad', { updated: 'stale' });
+    writeProjectHotFixture(dir, 'good', { updated: '2026-01-02' });
+    const content = renderRootHotProjection(dir);
+    assert.match(
+      content,
+      /^updated:\s*2026-01-02$/m,
+      `root frontmatter updated: must be the real max (2026-01-02), never the malformed token: ${content}`,
+    );
+    const badRow = content.split('\n').find((l) => l.includes('[[projects/bad/hot]]'));
+    assert.ok(badRow, `expected a row for bad even with a malformed date, got: ${content}`);
+    assert.match(
+      badRow,
+      /^\|\s*bad\s*\|\s*\|\s*\[\[projects\/bad\/hot\]\]\s*\|$/,
+      `malformed date must render as blank, not leak through: ${badRow}`,
+    );
+    writeRootHotProjection(dir);
+    assert.equal(
+      resolveActiveProject(dir),
+      'good',
+      'a malformed sibling row must not stop resolveActiveProject from picking the well-dated project',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// n1: root hot.md must not go stale from a SIBLING project's date. Root
+// hot.md's `updated:` is the max across every project row (see
+// formatRootHotProjection), so a vault with two or more projects can carry a
+// row that is not today even on a session where the active project's own
+// close is fully current. `sessionCloseFileStatus` still runs `checkUpdated`
+// against root hot.md exactly like every project-owned file (see
+// hooks/hypo-shared.mjs:2188), so that non-today max wrongly marks root
+// hot.md stale and blocks an otherwise-complete close.
+//
+// This assertion is RED right now on purpose: `checkUpdated('hot.md')` for
+// the root file has not been removed from sessionCloseFileStatus yet (that
+// removal lives in a sibling change to hooks/hypo-shared.mjs's
+// sessionCloseFileStatus, tracked separately from this projection wave).
+// Once that removal lands, root hot.md stops being gated against today's
+// date and this test goes green with no edit needed here.
+test('n1: root hot.md must not be reported stale by a sibling project whose row date is the max', () => {
+  const dir = projectionWikiDir();
+  const today = todayLocal();
+  try {
+    // 'active' is the project actually being closed this session: every one
+    // of its own files is current. 'other' only exists to push the root
+    // projection's row-date max past today.
+    writeProjectHotFixture(dir, 'active', { title: 'Active', updated: today });
+    writeProjectHotFixture(dir, 'other', { title: 'Other', updated: '2099-01-01' });
+    writeRootHotProjection(dir);
+    assert.match(
+      readFileSync(join(dir, 'hot.md'), 'utf-8'),
+      /^updated: 2099-01-01$/m,
+      "fixture precondition: root hot.md's updated: must be the sibling's later date, not today",
+    );
+
+    const activeDir = join(dir, 'projects', 'active');
+    mkdirSync(join(activeDir, 'session-log'), { recursive: true });
+    writeFileSync(
+      join(activeDir, 'session-state.md'),
+      `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## next\n`,
+    );
+    writeFileSync(
+      join(activeDir, 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] session\n`,
+    );
+    writeFileSync(join(dir, 'log.md'), `## [${today}] session | active\n`);
+
+    const status = sessionCloseFileStatus(dir, { projectOverride: 'active' });
+    assert.ok(
+      !status.stale.includes('hot.md'),
+      `root hot.md must not go stale from a sibling project's row date: ${JSON.stringify(status)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('AC5: generating twice off the same tree produces byte-identical output', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
+    writeProjectHotFixture(dir, 'beta', { title: 'Beta' }); // dateless
+    const first = renderRootHotProjection(dir);
+    const second = renderRootHotProjection(dir);
+    assert.equal(first, second, 'two renders of the same tree must be byte-identical');
+    assert.match(
+      first,
+      /^updated: 2026-09-10$/m,
+      `frontmatter updated: must be the row-date max (2026-09-10), not today: ${first}`,
+    );
+    // Re-run through the actual write path too: a no-op second write must not
+    // touch the file (no today-drift smuggled in via a write-time stamp).
+    writeRootHotProjection(dir);
+    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    const wroteAgain = writeRootHotProjection(dir);
+    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.equal(wroteAgain.written, false, 'a second write on an unchanged tree must be a no-op');
+    assert.equal(before, after, 'file bytes must not move on a no-op regenerate');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('AC6: SessionStart creates root hot.md when it does not exist at all', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
+    assert.ok(!existsSync(join(dir, 'hot.md')));
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(existsSync(join(dir, 'hot.md')), 'SessionStart must create a missing root hot.md');
+    assert.ok(readFileSync(join(dir, 'hot.md'), 'utf-8').includes('[[projects/alpha/hot]]'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// This used to pin an ordering: the projection had to land before
+// snapshotBase so the session would observe its own fresh bytes as the base
+// for root hot.md. That ordering stopped mattering when root hot.md left
+// base-store's `overwriteTargets`. There is no base to observe, so what this
+// test pins now is the other half of the same contract: the SessionStart write
+// mints nothing. Its sibling on the Stop path is 'hot-rebuild rewrites hot.md,
+// mints no base entry for it, and a close after it does not park'. Both are
+// needed: a re-added advanceBase in either hook would be invisible to the other
+// one's test.
+test('AC7: the SessionStart projection write mints no base entry for root hot.md', () => {
+  const dir = projectionWikiDir();
+  const sessionId = 'hotproj-order-check';
+  try {
+    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+      input: JSON.stringify({ cwd: dir, session_id: sessionId }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    // The write itself still has to happen. Asserting only on the base would
+    // also pass in a build where SessionStart stopped writing the file at all.
+    assert.ok(
+      readFileSync(join(dir, 'hot.md'), 'utf-8').includes('[[projects/alpha/hot]]'),
+      'SessionStart must still write the projection',
+    );
+    const base = readBaseEntry(dir, sessionId, 'hot.md');
+    assert.equal(
+      base.state,
+      'unknown',
+      `the projection write must not mint a base entry for a file no session snapshots, got: ${JSON.stringify(base)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the Stop-hook rebuild path (hypo-hot-rebuild.mjs) also uses the projection generator', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
+    writeFileSync(
+      join(dir, 'hot.md'),
+      '---\ntitle: stale\nupdated: 2000-01-01\n---\n\n# Hot\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
+    );
+    const r = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(
+      after.includes('[[projects/alpha/hot]]'),
+      `Stop-hook rebuild must regenerate via the directory scan, got: ${after}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// n2 fix (codex, 3rd-round review): createProject used to hand-insert its row
+// (insertHotRow), which left the ownership hash pointing at whatever a
+// SESSION's own projection write last produced, never at the hand-inserted
+// bytes. Every normal project-create therefore made the very NEXT
+// SessionStart/Stop read root hot.md as externally edited, back it up, and
+// fire a "손으로 편집한 내용이 있었습니다" false alarm at the user. Now
+// createProject calls the canonical writeRootHotProjection itself, so the
+// ownership hash is correct the moment the row lands and there is nothing
+// left for the next write to mistake for a hand edit.
+test('project-create.mjs regenerates the row via the canonical projection, leaving ownership correct for the next write', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeRootHotProjection(dir); // empty-but-present root file, as init would leave it
+    createProject({
+      name: 'freshly-created',
+      workingDir: '/tmp/nonexistent-work-dir',
+      hypoDir: dir,
+    });
+    const content = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    const rowMatches = [...content.matchAll(/\[\[projects\/freshly-created\/hot\]\]/g)];
+    assert.equal(
+      rowMatches.length,
+      1,
+      `expected exactly one row for freshly-created, got ${rowMatches.length}: ${content}`,
+    );
+    // The regression this test exists to pin: the NEXT write (a real
+    // SessionStart/Stop, standing in here) must be a clean no-op, not a
+    // false "external edit" backup over content createProject itself wrote.
+    const next = writeRootHotProjection(dir);
+    assert.equal(
+      next.written,
+      false,
+      'the next write must see its own bytes already on disk, not rewrite them',
+    );
+    assert.equal(
+      next.backedUp,
+      false,
+      "createProject's own row must never be mistaken for a hand edit and backed up",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the blank-date regex claim in the spec holds: resolveActiveProject still matches a dateless row', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'onlyblank', { title: 'Only Blank' }); // no updated:
+    writeRootHotProjection(dir);
+    const content = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.match(content, /\|\s*onlyblank\s*\|\s*\|\s*\[\[projects\/onlyblank\/hot\]\]\s*\|/);
+    const resolved = resolveActiveProject(dir);
+    assert.equal(
+      resolved,
+      'onlyblank',
+      "a blank-date row must still be matched by resolveActiveProject (spec §3.3's optional date group)",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Spec correction (post-implementation): the design originally read a
+// project's frontmatter `title` for the Project column, on the observation
+// that the real vault's ROOT table already matched its slugs 1:1. That
+// observation was about the root table, not about `title`: measured against
+// the real vault, `title` is that page's own heading text (`hot: hypomnema`,
+// `security-backoffice: Hot Cache`), not a name meant for this column, and
+// reading it rewrote 15 of 38 rows for no information gain. The slug is now
+// the only source for the Project column; `title` is never read for it.
+test("display name is always the slug, never that project hot.md's frontmatter title", () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'hypomnema', { title: 'hot: hypomnema', updated: '2026-09-17' });
+    const content = renderRootHotProjection(dir);
+    const row = content.split('\n').find((l) => l.includes('[[projects/hypomnema/hot]]'));
+    assert.ok(row, `expected a row for hypomnema, got: ${content}`);
+    assert.match(
+      row,
+      /^\|\s*hypomnema\s*\|\s*2026-09-17\s*\|\s*\[\[projects\/hypomnema\/hot\]\]\s*\|$/,
+      `Project column must be the slug, not the frontmatter title: ${row}`,
+    );
+    assert.ok(!row.includes('hot: hypomnema'), `frontmatter title leaked into the row: ${row}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Sibling of AC1, but at the file level instead of the row level: AC1 proves a
+// single DELETED row comes back; this proves an external process overwriting
+// the WHOLE file with arbitrary content (not just a missing row, content
+// that isn't even a valid pointer table) is replaced wholesale by the next
+// SessionStart's projection, exactly as any other projection consumer expects
+// a derived file to behave. Nothing else pins this today: it was previously
+// (incidentally) exercised by tests/proposal-base.test.mjs's session_id/base
+// fixture, which this task moved off of hot.md once hot.md became a
+// projection target (see the proposal_base_fix note in this task's report).
+test('SessionStart overwrites an arbitrary external write to root hot.md with the projection', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
+    writeFileSync(join(dir, 'hot.md'), '# some other process wrote this, not a pointer table\n');
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    assert.ok(
+      !after.includes('some other process wrote this'),
+      `an arbitrary external write to hot.md must not survive SessionStart: ${after}`,
+    );
+    assert.ok(
+      after.includes('[[projects/alpha/hot]]'),
+      `SessionStart must have replaced it with the real projection: ${after}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The 'hot-rebuild leaves the base untouched...' no-op test above builds its
+// fixture FROM renderRootHotProjection itself, which proves idempotency but
+// pins nothing about the generator's actual body text: that fixture would
+// track a silently changed body with zero red anywhere. This is the string
+// that gets injected into the model's context on every MISS-branch
+// SessionStart (hypo-session-start.mjs's GLOBAL_HOT read), so a silent change
+// to it is a silent change to what every session is told about this file.
+// Pins only the parts a human is meant to act on (the two headings and the
+// table header), not the whole body, so an unrelated wording tweak elsewhere
+// does not have to touch this test.
+test('generated body text is pinned: headings and table header', () => {
+  const dir = projectionWikiDir();
+  try {
+    const content = renderRootHotProjection(dir);
+    assert.match(content, /^# Hot Cache$/m, `H1 heading must be present: ${content}`);
+    // The frontmatter title must match what init writes (formatRootHotProjection([])) byte for byte. When the two
+    // drift, a fresh vault gets the template title from init and then the generator
+    // rewrites it on the first SessionStart, which the ownership check reads as a
+    // foreign write and backs up. That leaves an empty backup file in every new vault.
+    assert.match(
+      content,
+      /^title: "Hot Cache: Pointer"$/m,
+      `generator title must match what init writes exactly: ${content}`,
+    );
+    assert.match(content, /^## Active Projects$/m, `Active Projects heading missing: ${content}`);
+    assert.match(
+      content,
+      /^## Session Start Checklist$/m,
+      `Session Start Checklist heading missing: ${content}`,
+    );
+    assert.match(
+      content,
+      /^\| Project \| Last Session \| Hot Cache \|$/m,
+      `table header must be present: ${content}`,
+    );
+    assert.match(
+      content,
+      /generated projection of `projects\/\*\/hot\.md`/,
+      `the hand-off-to-the-generator notice must be present: ${content}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── BLOCKER fix: back up (not destroy) hand-authored content on migration ──
+//
+// Before this fix, writeRootHotProjection read the existing hot.md only to
+// compare it against the fresh projection, then replaced it outright the
+// first time SessionStart or the Stop rebuild ran against a real vault. A
+// person's own notes in root hot.md, committed or not, had no recovery path.
+
+test('BLOCKER: a hand-authored hot.md is backed up, byte for byte, on the first projection write', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
+    const manual = '# My hand-written notes\n\nDo not touch this file, Claude.\n';
+    writeFileSync(join(dir, 'hot.md'), manual);
+    const result = writeRootHotProjection(dir);
+    assert.equal(result.written, true);
+    assert.equal(
+      result.backedUp,
+      true,
+      'the first overwrite of a non-projection file must back it up',
+    );
+    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    assert.equal(result.backupPath, backupPath);
+    assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
+    assert.equal(
+      readFileSync(backupPath, 'utf-8'),
+      manual,
+      'the backup must hold the exact pre-migration bytes',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('BLOCKER: the FIRST migration backup is never replaced, and a SECOND external overwrite gets its own backup instead of being silently destroyed', () => {
+  // Before the fix this pins, a fixed backup filename meant the SECOND
+  // external overwrite found the name already taken, skipped the backup
+  // step entirely, and was overwritten with nothing to recover it from: the
+  // exact data loss this test used to accept as "expected" (result.backedUp
+  // === false on the second call). It must now land in a NEW, numbered
+  // backup file instead.
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeFileSync(join(dir, 'hot.md'), '# first manual content\n');
+    writeRootHotProjection(dir); // migrates: backs up "# first manual content\n"
+    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    const firstBackupBytes = readFileSync(backupPath, 'utf-8');
+    assert.equal(firstBackupBytes, '# first manual content\n');
+
+    // A second external stomp with content that still has no marker (same
+    // shape as 'SessionStart overwrites an arbitrary external write' above,
+    // just probing the backup instead of the row content).
+    writeFileSync(join(dir, 'hot.md'), '# second manual overwrite, no marker\n');
+    const result = writeRootHotProjection(dir);
+    assert.equal(
+      result.backedUp,
+      true,
+      'a second non-owned overwrite must ALSO be backed up, not silently destroyed',
+    );
+    assert.notEqual(
+      result.backupPath,
+      backupPath,
+      'the second backup must land at a DIFFERENT path than the first',
+    );
+    assert.equal(
+      readFileSync(backupPath, 'utf-8'),
+      firstBackupBytes,
+      'the ORIGINAL pre-migration content must survive untouched',
+    );
+    assert.equal(
+      readFileSync(result.backupPath, 'utf-8'),
+      '# second manual overwrite, no marker\n',
+      'the SECOND overwrite must also be recoverable, not lost',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('BLOCKER: once a hot.md carries the projection marker, further writes never back it up again', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeRootHotProjection(dir); // already projection-owned from the start, no prior manual content
+    assert.ok(!existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)));
+    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' }); // force a real second write
+    const result = writeRootHotProjection(dir);
+    assert.equal(result.written, true);
+    assert.equal(
+      result.backedUp,
+      false,
+      'a file that already carries the marker is never backed up',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Final cross-review finding: this used to make the whole directory 0500, so
+// the backup and the projection write failed together in the same parent.
+// Deleting the backUpOnce call outright still threw, still kept the original,
+// and still left no backup, so the test passed without the defense. The
+// failure is now injected into the backup write alone; the projection write
+// after it would succeed, which the retry at the end proves.
+// Disabling the check: delete `backupPath = backUpOnce(hotPath, current,
+// testHooks)` in writeRootHotProjectionUnlocked. The projection then replaces
+// the hand-authored file and the first assertion fails.
+test('BLOCKER: a failed backup write aborts the transition, the pre-migration file survives untouched', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    const manual = '# hand-authored, must survive a failed migration\n';
+    writeFileSync(join(dir, 'hot.md'), manual);
+    const injected = new Error('injected backup write failure');
+    let backupAttempts = 0;
+    let thrown = null;
+    try {
+      writeRootHotProjection(dir, {
+        beforeBackupWrite: () => {
+          backupAttempts++;
+          throw injected;
+        },
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.equal(
+      readFileSync(join(dir, 'hot.md'), 'utf-8'),
+      manual,
+      'a failed backup must stop the projection from replacing the hand-authored file',
+    );
+    assert.equal(thrown, injected, 'the backup failure must propagate, not be swallowed');
+    assert.equal(backupAttempts, 1);
+    assert.ok(
+      !existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)),
+      'a failed migration must not leave a half-written backup file behind either',
+    );
+    // Control: the same directory takes the projection once the backup can be
+    // written, so the refusal above came from the backup alone.
+    const retry = writeRootHotProjection(dir);
+    assert.equal(retry.written, true);
+    assert.equal(readFileSync(retry.backupPath, 'utf-8'), manual);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('major-2: a hand-authored hot.md that coincidentally quotes the projection marker sentence is still backed up, not silently adopted as ours', () => {
+  // Before this fix, ownership was decided by a plain substring check on the
+  // marker sentence. A person's own file that happened to quote that exact
+  // sentence (copied out of documentation, say) read as "already ours" and
+  // skipped the backup outright: the marker collision this test pins
+  // against. Ownership is now a hash of the exact bytes this function itself
+  // last wrote, so a substring match alone can never pass it.
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    const manual =
+      '# Notes\n\nSomeone pasted "generated projection of `projects/*/hot.md`" into their own draft here.\n';
+    writeFileSync(join(dir, 'hot.md'), manual);
+    const result = writeRootHotProjection(dir);
+    assert.equal(
+      result.backedUp,
+      true,
+      'a marker-sentence substring match must not be treated as ownership',
+    );
+    assert.equal(readFileSync(result.backupPath, 'utf-8'), manual);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('major-2: the migration backup is added to the vault .gitignore so a scoped commit can never pick it up', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeFileSync(join(dir, 'hot.md'), '# hand-authored, must never be auto-committed\n');
+    const result = writeRootHotProjection(dir);
+    assert.equal(result.backedUp, true);
+    assert.equal(result.gitignoreUpdated, true);
+    const gitignore = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    assert.ok(
+      gitignore.includes('/hot.md.pre-projection-backup*.md'),
+      `expected the backup pattern in .gitignore, got: ${gitignore}`,
+    );
+    // A second migration-triggering write must not touch .gitignore again --
+    // the pattern is already there.
+    writeFileSync(join(dir, 'hot.md'), '# a second stomp\n');
+    const second = writeRootHotProjection(dir);
+    assert.equal(second.gitignoreUpdated, false, 'the pattern is already present, nothing to add');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── major 1: scan errors are distinct from "genuinely no sources" ──────────
+
+test('major-1: no projects/ directory at all is not a scan error', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-hotproj-noprojectsdir-'));
+  try {
+    const scan = scanRootHotProjectionSources(dir);
+    assert.equal(scan.scanError, false, 'a fresh vault with no projects/ yet is not a scan error');
+    assert.deepEqual(scan.rows, []);
+    const result = writeRootHotProjection(dir);
+    assert.equal(result.scanError, false);
+    assert.equal(result.written, true, 'an empty table is still written the first time');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('major-1: a project directory that exists but has no hot.md produces no row (distinct from a deleted-row-only-in-root case)', () => {
+  const dir = projectionWikiDir();
+  try {
+    mkdirSync(join(dir, 'projects', 'ghost'), { recursive: true }); // no hot.md inside
+    writeProjectHotFixture(dir, 'real', { updated: '2026-09-10' });
+    const { rows, scanError } = scanRootHotProjectionSources(dir);
+    assert.equal(scanError, false);
+    assert.deepEqual(
+      rows.map((r) => r.slug),
+      ['real'],
+      'a project directory with no hot.md must not produce a row, even though the directory itself exists',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('major-1: readdirSync failure on projects/ is a scan error, and the write leaves the existing root file untouched', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeRootHotProjection(dir); // establish a real prior root file
+    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    chmodSync(join(dir, 'projects'), 0o000);
+    try {
+      const scan = scanRootHotProjectionSources(dir);
+      assert.equal(scan.scanError, true);
+      assert.ok(scan.warnings.length > 0, 'a scan error must produce at least one warning');
+      const result = writeRootHotProjection(dir);
+      assert.equal(result.written, false, 'a scan error must never write');
+      assert.equal(result.scanError, true);
+      const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
+      assert.equal(
+        after,
+        before,
+        'a scan error must leave the existing root file byte-for-byte untouched, not replace it with an empty table',
+      );
+    } finally {
+      chmodSync(join(dir, 'projects'), 0o755);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('major-1: a per-project hot.md read failure keeps the row with a blank date and reports a warning instead of staying silent', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'unreadable', { updated: '2026-09-10' });
+    const hotPath = join(dir, 'projects', 'unreadable', 'hot.md');
+    chmodSync(hotPath, 0o000);
+    try {
+      const scan = scanRootHotProjectionSources(dir);
+      assert.deepEqual(scan.rows, [{ slug: 'unreadable', date: '' }]);
+      assert.ok(
+        scan.warnings.some((w) => w.includes('unreadable')),
+        `expected a warning naming the unreadable project, got: ${JSON.stringify(scan.warnings)}`,
+      );
+    } finally {
+      chmodSync(hotPath, 0o644);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('major-1: a project directory that cannot be traversed (EACCES) keeps the row with a warning instead of silently disappearing', () => {
+  // Before this fix, the per-row gate was `existsSync(hotPath)`, which folds
+  // EVERY stat failure into `false`: indistinguishable from "no hot.md
+  // here". A permission error on the PROJECT DIRECTORY itself (not the file)
+  // hits exactly that path: existsSync can't even traverse into the
+  // directory, so the row vanished from the table with no warning at all.
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'locked', { updated: '2026-09-10' });
+    const projectDir = join(dir, 'projects', 'locked');
+    chmodSync(projectDir, 0o000);
+    try {
+      const scan = scanRootHotProjectionSources(dir);
+      assert.deepEqual(
+        scan.rows,
+        [{ slug: 'locked', date: '' }],
+        'an inaccessible project directory must not silently drop its row',
+      );
+      assert.ok(
+        scan.warnings.some((w) => w.includes('locked')),
+        `expected a warning naming the inaccessible project, got: ${JSON.stringify(scan.warnings)}`,
+      );
+    } finally {
+      chmodSync(projectDir, 0o755);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── major 4: mutation-resistant assertions on top of the ACs above ─────────
+
+test("major-4 tie-break: sortRootHotRows pins slug-ascending against a fixed adversarial input order, not this runtime's readdirSync order", () => {
+  // Deliberately built in reverse of what a real readdirSync on this runtime
+  // would ever hand the scan (see sortRootHotRows's own docstring): a mutation
+  // that deletes the tie-break or reverses it stays green when this only runs
+  // through a live directory scan, since that scan already arrives
+  // slug-ascending. Calling the sort directly against 'zed' before 'alpha' is
+  // what actually exercises the branch.
+  const sorted = sortRootHotRows([
+    { slug: 'zed', date: '2026-09-10' },
+    { slug: 'alpha', date: '2026-09-10' },
+  ]);
+  assert.deepEqual(
+    sorted.map((r) => r.slug),
+    ['alpha', 'zed'],
+    "same-date rows must sort slug-ascending regardless of the input array's own order",
+  );
+});
+
+test('major-4 no-op write suppression: a no-op write never touches the file on disk, not just its return value', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
+    writeRootHotProjection(dir);
+    const before = statSync(join(dir, 'hot.md'));
+    const result = writeRootHotProjection(dir);
+    const after = statSync(join(dir, 'hot.md'));
+    assert.equal(result.written, false);
+    // A mutation that always calls atomicWrite and only fakes the boolean
+    // result would still pass an assertion on the return value alone: an
+    // atomicWrite is a temp-file-then-rename, and a rename onto an existing
+    // path swaps the directory entry to a NEW inode even when the bytes end
+    // up byte-identical. Pinning the inode (and mtime, belt-and-suspenders)
+    // is what a same-bytes-only check cannot catch.
+    assert.equal(
+      after.ino,
+      before.ino,
+      'a no-op write must not replace the inode: atomicWrite must not have run at all',
+    );
+    assert.equal(after.mtimeMs, before.mtimeMs, 'a no-op write must not bump mtime either');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── health notice: Stop-time failures reach the next SessionStart ──────────
+
+test('writeRootHotHealthNotice / consumeRootHotHealthNotice: one-shot, unlinked on read', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-hotproj-notice-'));
+  try {
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'nothing pending yet');
+    writeRootHotHealthNotice(dir, 'a stop-time failure happened');
+    assert.equal(consumeRootHotHealthNotice(dir), 'a stop-time failure happened');
+    assert.equal(
+      consumeRootHotHealthNotice(dir),
+      null,
+      'a notice must be consumed exactly once, not re-shown on the next SessionStart too',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('claimProjectionWrite: a missing session_id is fail-closed (false), unlike the generic best-effort recordTouchedPaths', () => {
+  const dir = projectionWikiDir();
+  try {
+    assert.equal(
+      claimProjectionWrite(dir, null, ['hot.md']),
+      false,
+      'no session_id must never read as "claimed" for a write nothing can account for',
+    );
+    assert.equal(
+      recordTouchedPaths(dir, null, ['hot.md']),
+      true,
+      'the generic accumulate function is unaffected: still true, nothing to accumulate',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('major-3 E2E: a held touched-paths lock makes SessionStart skip the write cleanly, root bytes untouched, all three channels report it', () => {
+  // Real end-to-end run of the hook (not a direct function call), holding the
+  // SAME per-session lock claimProjectionWrite itself takes: the shape a
+  // lock-timeout actually has in production, not a lock-timeout test that
+  // only ever exercised the auto-commit vault lock (a DIFFERENT lock target).
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeRootHotProjection(dir); // establish a real prior root file + ownership state
+    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    // A second project so the projection WOULD differ if the write went
+    // through: a no-op write can't be told apart from "skipped" otherwise.
+    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' });
+
+    const lockPath = `${touchedPathsPath(dir, 'test-growth')}.lock`; // runStart's fixed session_id
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, 'held by another writer\n');
+    try {
+      const r = runStart(dir);
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        readFileSync(join(dir, 'hot.md'), 'utf-8'),
+        before,
+        'root bytes must be byte-for-byte unchanged when the pre-claim fails',
+      );
+      assert.ok(
+        out.systemMessage && out.systemMessage.includes('건너뛰었습니다'),
+        `expected the skip notice in systemMessage: ${JSON.stringify(out)}`,
+      );
+      assert.ok(
+        r.stderr.includes('건너뛰었습니다'),
+        `expected the skip notice on stderr too: ${r.stderr}`,
+      );
+      const ctx = injectedContext(out) || '';
+      assert.ok(
+        ctx.includes('건너뛰었습니다'),
+        `expected the skip notice folded into additionalContext too: ${ctx}`,
+      );
+    } finally {
+      rmSync(lockPath, { force: true });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('major-2/3: a Stop-hook rebuild that hits a scan error leaves a health notice the next SessionStart surfaces as a systemMessage', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeRootHotProjection(dir); // establish a real prior root file
+    chmodSync(join(dir, 'projects'), 0o000);
+    try {
+      const stop = runStop('hypo-hot-rebuild.mjs', dir);
+      assert.equal(stop.status, 0, `stderr: ${stop.stderr}`);
+    } finally {
+      chmodSync(join(dir, 'projects'), 0o755);
+    }
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      out.systemMessage && out.systemMessage.length > 0,
+      `expected the prior Stop's scan-error notice to surface as a systemMessage, got: ${JSON.stringify(out)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── major-3 gap: SessionStart's and Stop's OWN result-consuming branches ───
+// The tests above exercise scanRootHotProjectionSources / writeRootHotProjection
+// directly, or Stop's health-notice relay one hop removed from where it is
+// produced. None of them run the branch that reads `result.warnings` /
+// `result.gitignoreUpdated` / `result.lockTimeout` off THIS call's own
+// return value inside hypo-session-start.mjs or hypo-hot-rebuild.mjs:
+// deleting those checks leaves every test above green. chmodSync 0o000 is
+// root- and Windows-unsafe (the same reason the parkedTotal fix below moves
+// off it), so these force the same error codes portably: ENOTDIR (a file
+// where a directory is expected) and EISDIR (a directory where a file is
+// expected).
+//
+// SessionStart's own `else if (result.scanError)` branch (~line 1091) was
+// dead code until the guard that now precedes it.
+// `collectProjectWorkingDirs` (called earlier, for hit/miss project
+// resolution) used to do an unguarded `readdirSync(projects/)`, and
+// `scanError` is set by `scanRootHotProjectionSources` for exactly the same
+// condition (projects/ itself unreadable). So the crash always happened
+// first, caught only by the hook's own outer try/catch, which logs to stderr
+// and prints the untouched default `outExtra`: the branch that names the
+// unreadable directory could never fire for the one input it exists to
+// report. That readdirSync is wrapped now (hooks/hypo-shared.mjs, inside
+// collectProjectWorkingDirs, degrading to "no projects"), and the test
+// directly below is what pins the guard: it asserts the scanError notice
+// actually reaches the person, which is false again the moment the guard
+// comes off.
+
+test('an unreadable projects/ reaches the scanError notice instead of taking the whole hook to its top-level catch', () => {
+  const dir = projectionWikiDir();
+  try {
+    rmSync(join(dir, 'projects'), { recursive: true, force: true });
+    writeFileSync(join(dir, 'projects'), 'not a directory\n'); // readdirSync throws ENOTDIR
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true);
+    // Two worlds this tells apart. Without the guard in
+    // collectProjectWorkingDirs, cwd-to-project resolution throws first and
+    // the hook lands in its top-level catch: still exit 0, but the person is
+    // told nothing about WHICH directory to fix. With it, the projection's
+    // own scanError branch runs and names the path and the check command.
+    // Surviving is not the property under test here; being diagnosable is.
+    assert.ok(
+      !r.stderr.includes('[hypo-session-start] error:'),
+      `expected no top-level crash, got: ${r.stderr}`,
+    );
+    assert.ok(
+      out.systemMessage && out.systemMessage.includes('projects/ 디렉터리를 읽을 수 없어'),
+      `expected the scanError notice to reach the person, got: ${JSON.stringify(out)}`,
+    );
+    assert.ok(
+      out.systemMessage.includes(join(dir, 'projects')),
+      `expected the notice to name the directory to check, got: ${out.systemMessage}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("major-3: SessionStart's own warnings branch (EISDIR on a project hot.md) reaches systemMessage through the real hook", () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    const hotPath = join(dir, 'projects', 'alpha', 'hot.md');
+    rmSync(hotPath, { force: true });
+    mkdirSync(hotPath); // readFileSync throws EISDIR, distinct from ENOENT/ENOTDIR ("absent")
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      out.systemMessage && out.systemMessage.includes('alpha'),
+      `expected SessionStart's own warnings notice naming the project, got: ${JSON.stringify(out)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("major-3: SessionStart's own gitignoreUpdated branch records .gitignore in this session's own touched-paths", () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeFileSync(
+      join(dir, 'hot.md'),
+      '# hand-authored, must trigger a first-time migration backup\n',
+    );
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'test-growth'), 'utf-8'));
+    assert.ok(
+      touched.includes('.gitignore'),
+      `expected the migration's .gitignore write in this session's own touched-paths, got: ${JSON.stringify(touched)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("major-3: SessionStart's own lockTimeout branch reaches systemMessage through the real hook and drops its own pre-write claim", () => {
+  const dir = projectionWikiDir();
+  const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+  process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200'; // fail fast instead of the 5s default
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeRootHotProjection(dir); // establish a real prior root file
+    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' }); // so a write WOULD differ
+    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, String(process.pid));
+    try {
+      const r = runStart(dir);
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        readFileSync(join(dir, 'hot.md'), 'utf-8'),
+        before,
+        'the real hook must not have replaced root hot.md while the lock was held elsewhere',
+      );
+      assert.ok(
+        out.systemMessage && out.systemMessage.includes('잠금을 얻지 못했습니다'),
+        `expected the real hook's own lockTimeout notice, got: ${JSON.stringify(out)}`,
+      );
+      const touched = existsSync(touchedPathsPath(dir, 'test-growth'))
+        ? JSON.parse(readFileSync(touchedPathsPath(dir, 'test-growth'), 'utf-8'))
+        : [];
+      assert.ok(
+        !touched.includes('hot.md'),
+        'a lock refusal must drop its own pre-write claim, not leave hot.md falsely claimed',
+      );
+    } finally {
+      rmSync(lockPath, { force: true });
+    }
+  } finally {
+    if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+    else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("major-3: Stop's own lockTimeout branch leaves a health notice the next SessionStart surfaces", () => {
+  const dir = projectionWikiDir();
+  const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+  process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200';
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeRootHotProjection(dir);
+    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
+    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' });
+    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, String(process.pid));
+    try {
+      const stop = runStop('hypo-hot-rebuild.mjs', dir);
+      assert.equal(stop.status, 0, `stderr: ${stop.stderr}`);
+      assert.equal(
+        readFileSync(join(dir, 'hot.md'), 'utf-8'),
+        before,
+        "Stop's own rebuild must not have replaced root hot.md while the lock was held elsewhere",
+      );
+    } finally {
+      rmSync(lockPath, { force: true });
+    }
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      out.systemMessage && out.systemMessage.includes('잠금을 얻지 못했습니다'),
+      `expected the prior Stop's own lockTimeout notice to surface, got: ${JSON.stringify(out)}`,
+    );
+  } finally {
+    if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+    else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── MAJOR fix: a migration backup must reach the person, not just the disk ─
+//
+// Before this fix, `backedUp`/`backupPath` came back from writeRootHotProjection
+// but neither call site (SessionStart's own write, or the Stop-hook rebuild)
+// ever read them. The backup file itself was never lost, but its EXISTENCE
+// was: it is gitignored, so `git status` never shows it either, and a person
+// who had just hand-edited root hot.md would see their edit silently replaced
+// with no trace of where it went.
+
+test('MAJOR: a hand-authored root hot.md backed up during SessionStart itself is named in systemMessage', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    const manual = '# My hand-written notes\n\nDo not touch this file, Claude.\n';
+    writeFileSync(join(dir, 'hot.md'), manual);
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
+    assert.ok(
+      out.systemMessage && out.systemMessage.includes(basename(backupPath)),
+      `expected the backup filename in systemMessage, got: ${JSON.stringify(out)}`,
+    );
+    // Naming the file is not yet a recovery path: copying the backup back
+    // onto root hot.md is the one thing that does NOT work, so the notice
+    // has to say where the content actually goes. Two worlds this tells
+    // apart: "the notice names the file" and "the notice also says what to
+    // do with it".
+    assert.ok(
+      out.systemMessage.includes('projects/<slug>/hot.md'),
+      `expected the notice to name where the content should go, got: ${out.systemMessage}`,
+    );
+    assert.ok(
+      out.systemMessage.includes('루트로 되돌리지 마세요'),
+      `expected the notice to warn against copying it back, got: ${out.systemMessage}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('MAJOR: a hand-authored root hot.md backed up by the Stop-hook rebuild is named in the next SessionStart systemMessage', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    const manual = '# My hand-written notes\n\nDo not touch this file, Claude.\n';
+    writeFileSync(join(dir, 'hot.md'), manual);
+    const stop = runStop('hypo-hot-rebuild.mjs', dir);
+    assert.equal(stop.status, 0, `stderr: ${stop.stderr}`);
+    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
+    // Stop's own rebuild already regenerated hot.md into the canonical
+    // projection, so this SessionStart's own write is a no-op: the
+    // systemMessage seen here can only be the health notice Stop left behind
+    // (consumeRootHotHealthNotice), proving that delivery path names the file
+    // too, not just SessionStart's own direct-write path above.
+    const r = runStart(dir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      out.systemMessage && out.systemMessage.includes(basename(backupPath)),
+      `expected the prior Stop's backup notice to name the file in systemMessage, got: ${JSON.stringify(out)}`,
+    );
+    // codex 3rd-tier finding 6: naming the file is not yet a recovery path.
+    // Before that fix, Stop's own health notice named ONLY the backup
+    // filename, with no guidance at all. This is the ONE assertion pair that
+    // catches a regression here: `out.systemMessage.includes(basename(...))`
+    // alone (the assertion above) still passes even if the guidance sentence
+    // never reaches this surface, since the filename is present either way.
+    assert.ok(
+      out.systemMessage.includes('projects/<slug>/hot.md'),
+      `expected the Stop-hook notice to also say where the content should go, got: ${out.systemMessage}`,
+    );
+    assert.ok(
+      out.systemMessage.includes('루트로 되돌리지 마세요'),
+      `expected the Stop-hook notice to also warn against copying it back, got: ${out.systemMessage}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// codex 3rd-tier finding 6, third writer: project-create's own
+// writeRootHotProjection call can trigger the exact same migration backup a
+// hand-authored root hot.md would (whoever ran `hypomnema project new` or
+// answered a project-creation offer right after hand-editing root hot.md),
+// but before this fix `backedUp`/`backupPath` were read by neither
+// createProject's own `warnings` array nor its CLI's console output. The
+// backup landed on disk and the person's edit vanished from the pointer
+// table with no route back to it anywhere this call site's own output
+// reaches.
+test('MAJOR: a hand-authored root hot.md backed up by createProject reaches the SAME recovery guidance in `warnings`', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    const manual = '# My hand-written notes\n\nDo not touch this file, Claude.\n';
+    writeFileSync(join(dir, 'hot.md'), manual);
+
+    const result = createProject({ hypoDir: dir, name: 'beta', workingDir: '/tmp/beta' });
+
+    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
+    // Naming the file alone is not a recovery path (see the two Stop/
+    // SessionStart tests above for why); both assertions below must hold,
+    // not just the filename one, or a regression that drops the guidance
+    // sentence while keeping the filename passes silently.
+    const notice = result.warnings.find((w) => w.includes(basename(backupPath)));
+    assert.ok(
+      notice,
+      `expected createProject's warnings to name the backup file, got: ${JSON.stringify(result.warnings)}`,
+    );
+    assert.ok(
+      notice.includes('projects/<slug>/hot.md'),
+      `expected the notice to say where the content should go, got: ${notice}`,
+    );
+    assert.ok(
+      notice.includes('루트로 되돌리지 마세요'),
+      `expected the notice to warn against copying it back, got: ${notice}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── MAJOR fix (r5-w1.md): narrow the ownership-check-to-final-write TOCTOU ─
+//
+// The ownership check reads hotPath once, then this function still runs
+// ensureVaultGitignorePattern and (when a backup is needed) the backup write
+// itself before ever reaching the rename that replaces hotPath: real I/O
+// against OTHER files that a human's own save can land inside. A second read
+// immediately before that rename catches anything that appeared in that
+// window instead of silently discarding it. `beforeFinalWrite` is a
+// test-only hook (see writeRootHotProjection's own doc comment) that lets a
+// test write new bytes at exactly the point a real concurrent writer would
+// need to land in: genuine two-process timing inside one synchronous call
+// cannot be reproduced deterministically any other way.
+
+test('MAJOR: bytes that land between the ownership check and the final write are backed up too, not silently discarded', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'p1', { updated: '2026-01-01' });
+    writeRootHotProjection(dir); // establishes ownership over the current projection
+    writeProjectHotFixture(dir, 'p2', { updated: '2026-01-02' }); // forces the NEXT write to differ
+    const hotPath = join(dir, 'hot.md');
+    const raceContent = '# a human save landing mid-write, must not be lost\n';
+    const result = writeRootHotProjection(dir, {
+      beforeFinalWrite: () => writeFileSync(hotPath, raceContent),
+    });
+    assert.equal(result.written, true);
+    assert.equal(
+      result.backedUp,
+      true,
+      'content that appears between the ownership check and the final write must still be backed up',
+    );
+    assert.equal(
+      readFileSync(result.backupPath, 'utf-8'),
+      raceContent,
+      'the backup must hold the RACE content, not the earlier (already-owned) current content',
+    );
+    assert.equal(
+      readFileSync(hotPath, 'utf-8'),
+      result.content,
+      'the final file must still land on the correct fresh projection, race notwithstanding',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeRootHotProjection: no interloping write between the two reads never backs up on a false positive', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'p1', { updated: '2026-01-01' });
+    writeRootHotProjection(dir);
+    writeProjectHotFixture(dir, 'p2', { updated: '2026-01-02' });
+    let hookCalls = 0;
+    const result = writeRootHotProjection(dir, {
+      beforeFinalWrite: () => {
+        hookCalls++;
+      },
+    });
+    assert.equal(hookCalls, 1, 'the test hook must fire exactly once per write');
+    assert.equal(
+      result.backedUp,
+      false,
+      'ownership already matched current content going in, so the second read must not invent a backup',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── BLOCKER fix: the projection writer runs inside the vault commit lock ──
+//
+// The writer used to take no lock at all, so a sibling session could replace
+// root hot.md between hypo-auto-commit.mjs's ownership/receipt check and the
+// `git add` right after it, inside the auto-commit's own lock hold: the
+// sibling's bytes went into this session's commit and the record that would
+// have flagged them was gone. Holding the SAME lock the commit fence holds is
+// what makes that check mean anything. What this suite can pin without two
+// real processes is the fence itself: with the lock held, the writer declines
+// to touch the file at all.
+//
+// Deliberately no `suite()` of its own: these belong to the root hot.md
+// projection suite opened above, and splitting it here would move every test
+// below into a new selection unit for no gain.
+
+test('BLOCKER: a held vault lock makes the projection decline to write, and say so', () => {
+  const dir = projectionWikiDir();
+  const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+  process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200'; // fail fast instead of the 5s default
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-01-01' });
+    const hotPath = join(dir, 'hot.md');
+    const sentinel = '# whoever holds the lock owns this file right now\n';
+    writeFileSync(hotPath, sentinel);
+    // Take the lock the way withFileLock itself publishes one: the file's
+    // content is the holder's pid, and ours is alive, so the acquire below
+    // polls and times out rather than stealing it.
+    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, String(process.pid));
+
+    const result = writeRootHotProjection(dir, undefined, 'sess-locked-out');
+
+    assert.equal(result.lockTimeout, true, `expected a lock refusal: ${JSON.stringify(result)}`);
+    assert.equal(result.written, false);
+    assert.equal(
+      readFileSync(hotPath, 'utf-8'),
+      sentinel,
+      'the writer must not replace bytes it could not take the lock for',
+    );
+    assert.equal(
+      existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)),
+      false,
+      'no backup either: the writer never ran, so it had nothing to back up',
+    );
+    assert.ok(
+      result.warnings.some((w) => w.includes('잠금')),
+      `the refusal must be visible to a caller: ${JSON.stringify(result.warnings)}`,
+    );
+  } finally {
+    if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+    else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the lock is released again: a second write right after a normal one still lands', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-01-01' });
+    const first = writeRootHotProjection(dir, undefined, 'sess-a');
+    assert.equal(first.written, true, JSON.stringify(first));
+    // A writer that leaked its lock would make this one time out instead, so
+    // this is the other half of the pin above: the fence must not be a
+    // one-shot that wedges every later session.
+    writeProjectHotFixture(dir, 'beta', { updated: '2026-01-02' });
+    const second = writeRootHotProjection(dir, undefined, 'sess-b');
+    assert.equal(second.lockTimeout, false, JSON.stringify(second));
+    assert.equal(second.written, true, JSON.stringify(second));
+    assert.match(readFileSync(join(dir, 'hot.md'), 'utf-8'), /beta/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── minor fix: a failing retry stops stacking identical backups ───────────
+
+test('minor: a repeated backup of the SAME manual content reuses the first backup instead of numbering a new one', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-01-01' });
+    const manual = '# hand-written, and the write after the backup keeps failing\n';
+    writeFileSync(join(dir, 'hot.md'), manual);
+    const first = writeRootHotProjection(dir);
+    assert.equal(first.backedUp, true, JSON.stringify(first));
+    // Put the same manual bytes back, exactly as a failed write would leave
+    // them, and let the next run see a non-owned file again.
+    writeFileSync(join(dir, 'hot.md'), manual);
+    const second = writeRootHotProjection(dir);
+    assert.equal(second.backedUp, true, 'the content is still protected');
+    assert.equal(
+      second.backupPath,
+      first.backupPath,
+      'identical content must land in the backup that already holds it, not a numbered copy',
+    );
+    assert.equal(
+      existsSync(join(dir, 'hot.md.pre-projection-backup-2.md')),
+      false,
+      'no second copy of bytes already backed up',
+    );
+    // A DIFFERENT manual edit still gets its own place to land: dedup must not
+    // become "one backup forever".
+    writeFileSync(join(dir, 'hot.md'), '# a different hand edit\n');
+    const third = writeRootHotProjection(dir);
+    assert.equal(third.backedUp, true);
+    assert.notEqual(third.backupPath, first.backupPath);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── minor fix (r5-w1.md): the backup's own temp file is gitignored too ────
+
+test("minor: the pre-projection backup .gitignore pattern also covers atomicWrite's own temp file for that backup", () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    writeFileSync(
+      join(dir, 'hot.md'),
+      '# hand-authored, must never leak via a crash-mid-backup temp\n',
+    );
+    const result = writeRootHotProjection(dir);
+    assert.equal(result.backedUp, true);
+    const gitignore = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    assert.ok(
+      gitignore.includes('/hot.md.pre-projection-backup*.tmp'),
+      `expected the backup TEMP pattern in .gitignore, got: ${gitignore}`,
+    );
+    // Prove the pattern actually matches the real temp name atomicWrite
+    // leaves behind on a crash, not just that some string got appended.
+    spawnSync('git', ['init', '-q'], { cwd: dir });
+    const tempName = `hot.md${ROOT_HOT_BACKUP_SUFFIX}.${process.pid}.abc123xy.tmp`;
+    writeFileSync(join(dir, tempName), 'leftover from a crashed backup write\n');
+    const check = spawnSync('git', ['-C', dir, 'check-ignore', '-q', tempName]);
+    assert.equal(check.status, 0, `git must recognize ${tempName} as ignored by the new pattern`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── rootHotProjectionIsCurrent: the commit-time half of the BLOCKER fix ───
+
+test('rootHotProjectionIsCurrent: true when there is no root hot.md at all', () => {
+  const dir = projectionWikiDir();
+  try {
+    assert.equal(rootHotProjectionIsCurrent(dir), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('rootHotProjectionIsCurrent: true right after a legitimate write, false after an external edit', () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    // n1 fix: sessionId now flows through both sides: the write records
+    // THIS session's receipt, and the check reads that same session's receipt.
+    writeRootHotProjection(dir, undefined, 'sess-legit');
+    assert.equal(rootHotProjectionIsCurrent(dir, 'sess-legit'), true);
+    writeFileSync(join(dir, 'hot.md'), '# someone edited this directly\n');
+    assert.equal(rootHotProjectionIsCurrent(dir, 'sess-legit'), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// n1 fix (3rd-round codex review): the global ownership hash used to be the
+// ONLY thing this function checked, so any session's write satisfied it --
+// including a SIBLING session's, never this one's own. Each session's own
+// receipt now has to independently agree with what is on disk.
+test("n1: rootHotProjectionIsCurrent is false for session A once session B's write replaces the bytes A itself wrote", () => {
+  const dir = projectionWikiDir();
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-01-01' });
+    writeRootHotProjection(dir, undefined, 'sess-a');
+    writeProjectHotFixture(dir, 'beta', { updated: '2026-02-02' }); // forces B's write to differ
+    writeRootHotProjection(dir, undefined, 'sess-b');
+    assert.equal(
+      rootHotProjectionIsCurrent(dir, 'sess-a'),
+      false,
+      "A's own receipt still points at A's earlier digest, not B's bytes now on disk",
+    );
+    assert.equal(
+      rootHotProjectionIsCurrent(dir, 'sess-b'),
+      true,
+      "B's own receipt matches exactly what B itself just wrote",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

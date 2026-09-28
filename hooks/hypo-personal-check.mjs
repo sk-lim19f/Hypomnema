@@ -322,7 +322,7 @@ process.stdin.on('end', () => {
       `  [ ] 7. index.md  — update Projects section if needed`,
       `  [ ] 8. log.md    — append ## [${today}] session | <project-name>`,
       `  [ ] 9. hot.md    — update projects/<name>/hot.md (no exceptions)`,
-      `  [ ] 10. root hot.md — update ~/hypomnema/hot.md active project table`,
+      `  [ ] 10. root hot.md: generated automatically from projects/*/hot.md; no manual edit needed`,
       `  [ ] 11. updated: field — verify today's date on all touched .md files`,
       `  [ ] 12. lint — run /hypo:lint; fix errors in files YOU touched`,
       `           (other projects' / shared-page debt is reported as non-blocking notice)`,

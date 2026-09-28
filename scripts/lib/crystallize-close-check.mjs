@@ -185,7 +185,6 @@ export function runSessionCloseCheck(args) {
     ? [
         `projects/${close.project}/session-state.md`,
         `projects/${close.project}/hot.md`,
-        'hot.md',
         sessionLogShardPath(close.project, close.dates[0]),
         'log.md',
       ]

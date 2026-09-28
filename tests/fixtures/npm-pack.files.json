@@ -244,6 +244,10 @@
     "exec": false
   },
   {
+    "path": "hooks/hypo-stop.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/hypo-web-fetch-ingest.mjs",
     "exec": false
   },
@@ -501,10 +505,6 @@
   },
   {
     "path": "templates/gitignore",
-    "exec": false
-  },
-  {
-    "path": "templates/hot.md",
     "exec": false
   },
   {
