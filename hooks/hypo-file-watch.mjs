@@ -98,8 +98,11 @@ process.stdin.on('end', () => {
     // not just wiki ones. The HYPO_DIR check above (`filePath.startsWith(HYPO_DIR
     // + '/')`, a string-prefix test that does not resolve symlinks) still
     // returns immediately for any path that does not start with HYPO_DIR, so
-    // a watch seeded elsewhere still cannot hand this hook non-wiki content
-    // through this path.
+    // a watch seeded elsewhere cannot point this hook at a path outside the
+    // wiki. A symlink living inside the wiki is a separate case: its path
+    // still starts with HYPO_DIR and passes the check above, but
+    // readFileSync follows it, so whatever that link points to, inside the
+    // wiki or not, is what actually gets emitted.
     console.log(
       JSON.stringify({
         continue: true,
