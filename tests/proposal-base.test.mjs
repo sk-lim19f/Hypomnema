@@ -1607,6 +1607,71 @@ test('FEAT-11 T7: discard removes the proposal and leaves the target unchanged',
   }
 });
 
+// discardProposal's two failure branches were previously exercised only by the
+// success path above. Disabling the not-found check (ignore readProposal's null)
+// goes red with a TypeError on `proposal.target`; disabling the delete-failed
+// check (ignore deleteProposal's false) goes red because r.ok flips true.
+test('FEAT-11 T7: discard reports not-found when the artifact vanished before discard ran', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const saved = psWriteProposal(dir, {
+      target: join('pages', 'note.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'PROPOSED',
+      sessionId: 's7',
+      device: 'd7',
+    });
+    // A well-formed id (isValidProposalId passes) whose file is gone by the time
+    // discard reads it: another discard already won the race, or a human deleted
+    // it by hand. readProposal's existsSync check is what returns null here, not
+    // the id-format guard the invalid-id path already covers.
+    unlinkSync(join(dir, '.cache', 'proposals', `${saved.id}.json`));
+    const r = discardProposal(
+      { hypoDir: dir, id: saved.id },
+      { stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'not-found');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('FEAT-11 T7: discard reports delete-failed when the store directory refuses the unlink', () => {
+  // root ignores directory perms, and Windows chmod-on-dir doesn't block unlink,
+  // so the unlink would succeed and there would be nothing to fail against:
+  // skip rather than assert a false negative (same guard the lock-timeout test uses).
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const saved = psWriteProposal(dir, {
+      target: join('pages', 'note.md'),
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'PROPOSED',
+      sessionId: 's7',
+      device: 'd7',
+    });
+    const proposalsPath = join(dir, '.cache', 'proposals');
+    chmodSync(proposalsPath, 0o555); // dir non-writable → deleteProposal's unlink fails EACCES
+    try {
+      const r = discardProposal(
+        { hypoDir: dir, id: saved.id },
+        { stdout: capStream(), stderr: capStream() },
+      );
+      assert.equal(r.ok, false);
+      assert.equal(r.reason, 'delete-failed');
+    } finally {
+      chmodSync(proposalsPath, 0o755); // restore so cleanup below can remove the tree
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('FEAT-11 T7: list is oldest-first and reports the empty case', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-t7-'));
   try {
@@ -6558,6 +6623,143 @@ test('an audit entry the page no longer matches is evidence-broken, not recovera
   });
 });
 
+// reconcileProposals recovers a 'recoverable' artifact by writing the receipt
+// THEN deleting the now-redundant artifact (same order writeApprovedProposal
+// uses). The receipt write and the delete are two different failure surfaces;
+// this pins the delete side. Disabling the check: make reconcileProposals treat
+// a false deleteProposal as success (drop the `if (!deleteProposal(...))`
+// guard), and rec.ok flips true and the reason assertion below goes red.
+// It also pins the order and the way back: the receipt must already be in the
+// owning close's journal while the artifact is still on disk, and a second
+// reconcile after the directory is writable again must finish the job. Delete
+// first, receipt second would leave neither behind if the receipt then failed,
+// and reconcile only walks artifacts. Disabling that check: move the
+// recordHandoffReceipt call below the deleteProposal branch, and the journal
+// assertion goes red.
+test('reconcile reports artifact-not-removed when a recovered receipt cannot delete its artifact', () => {
+  // root ignores directory perms, and Windows chmod-on-dir doesn't block unlink,
+  // so the unlink would succeed and there would be nothing to fail against:
+  // skip rather than assert a false negative (same guard the lock-timeout test uses).
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withBaseWiki((dir) => {
+    const target = 'projects/p1/hot.md';
+    const full = join(dir, target);
+    const applied = 'approved bytes\n';
+    writeFileSync(full, applied);
+    const w = psWriteProposal(dir, {
+      target,
+      proposedContent: applied,
+      baseHash: 'b',
+      currentHash: 'c',
+      sessionId: 's-owner',
+      parkReason: 'test',
+    });
+    appendFileSync(
+      join(dir, '.cache', 'proposals', 'applied.log'),
+      JSON.stringify({
+        id: w.id,
+        target,
+        appliedHash: bsHashContent(applied),
+        closeSessionId: 's-owner',
+      }) + '\n',
+    );
+
+    const proposalsPath = join(dir, '.cache', 'proposals');
+    chmodSync(proposalsPath, 0o555); // dir non-writable → deleteProposal's unlink fails EACCES
+    try {
+      const rec = reconcileProposals(
+        { hypoDir: dir },
+        { stdout: capStream(), stderr: capStream() },
+      );
+      assert.equal(rec.ok, false);
+      assert.equal(rec.failed.length, 1, `expected one failure: ${JSON.stringify(rec.failed)}`);
+      assert.equal(rec.failed[0].reason, 'artifact-not-removed');
+      assert.equal(rec.failed[0].id, w.id);
+      assert.equal(rec.reconciled.length, 0, 'a delete failure must not also count as reconciled');
+      assert.equal(
+        readJournal(dir, 's-owner')[target],
+        bsHashContent(applied),
+        'the receipt is written before the delete is attempted',
+      );
+      assert.ok(psReadProposal(dir, w.id), 'the artifact survives the failed delete');
+    } finally {
+      chmodSync(proposalsPath, 0o755); // restore so withBaseWiki's cleanup can remove the tree
+    }
+    const again = reconcileProposals(
+      { hypoDir: dir },
+      { stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(
+      again.ok,
+      true,
+      `a retry once the directory is writable settles it: ${JSON.stringify(again)}`,
+    );
+    assert.equal(again.reconciled.length, 1);
+    assert.equal(psReadProposal(dir, w.id), null, 'the retry removes the artifact');
+  });
+});
+
+// The other half of the order. The test above blocks the delete, which proves
+// the receipt already landed but cannot tell "receipt, then delete" from
+// "delete, then receipt regardless". This one blocks only the receipt and
+// leaves the delete free to succeed: if reconcile ever deleted first, the
+// artifact would be gone with no receipt written, and reconcile only walks
+// artifacts, so nothing could bring that close's bytes back.
+// Disabling the check: move the deleteProposal branch above the
+// recordHandoffReceipt call, and the artifact-survives assertion goes red.
+test('reconcile reports close-receipt-failed and keeps the artifact when the receipt cannot be written', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withBaseWiki((dir) => {
+    const target = 'projects/p1/hot.md';
+    const full = join(dir, target);
+    const applied = 'approved bytes\n';
+    writeFileSync(full, applied);
+    const w = psWriteProposal(dir, {
+      target,
+      proposedContent: applied,
+      baseHash: 'b',
+      currentHash: 'c',
+      sessionId: 's-owner',
+      parkReason: 'test',
+    });
+    appendFileSync(
+      join(dir, '.cache', 'proposals', 'applied.log'),
+      JSON.stringify({
+        id: w.id,
+        target,
+        appliedHash: bsHashContent(applied),
+        closeSessionId: 's-owner',
+      }) + '\n',
+    );
+
+    const journalDir = join(dir, '.cache', 'close-journal');
+    mkdirSync(journalDir, { recursive: true });
+    chmodSync(journalDir, 0o500); // receipt write fails; the proposals dir stays writable
+    try {
+      const rec = reconcileProposals(
+        { hypoDir: dir },
+        { stdout: capStream(), stderr: capStream() },
+      );
+      assert.equal(rec.ok, false);
+      assert.equal(rec.failed.length, 1, `expected one failure: ${JSON.stringify(rec.failed)}`);
+      assert.equal(rec.failed[0].reason, 'close-receipt-failed');
+      assert.ok(
+        psReadProposal(dir, w.id),
+        'the artifact must survive a failed receipt, or the close has no way back',
+      );
+    } finally {
+      chmodSync(journalDir, 0o700);
+    }
+    const again = reconcileProposals(
+      { hypoDir: dir },
+      { stdout: capStream(), stderr: capStream() },
+    );
+    assert.equal(again.ok, true, `retry settles it: ${JSON.stringify(again)}`);
+    assert.equal(readJournal(dir, 's-owner')[target], bsHashContent(applied));
+    assert.equal(psReadProposal(dir, w.id), null);
+  });
+});
+
 // ── ISSUE-127: parked proposals get a drain ──────────────────────────────────
 // A park that would be a no-op (current bytes already equal the payload) is
 // mechanically decidable without a human diff review, so `reconcile` removes
@@ -6764,6 +6966,97 @@ test('listPending surfaces age in days and target activity since park (JSON and 
     assert.match(human.text(), /target absent, applying would create it/, 'gone label');
     assert.match(human.text(), /target unchanged since park/, 'unchanged label');
     assert.match(human.text(), /target changed since park/, 'changed label');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ageDaysSince (proposal.mjs, not exported) is only reachable through listPending's
+// injected clock. The prior fixture parked at exactly 5.0 days elapsed, where
+// floor/ceil/round all agree on 5, so it could not tell the rounding apart from
+// either alternative. This table picks fractions that separate them, plus the
+// two non-fraction edges (future clock, unparsable createdAt).
+//
+// Disabling the check: swap ageDaysSince's `Math.floor` for `Math.ceil` in
+// scripts/proposal.mjs and the below-5, point-4 and point-6 rows are all wrong
+// (5/6/6 for 4/5/5); swap it for `Math.round` and below-5 and point-6 are wrong
+// (5 and 6). The loop stops at the first failure, which is below-5 either way.
+// Dropping the `Number.isFinite` guard is caught only by the human-readable line
+// at the end: in JSON a NaN serializes to null, so the JSON row cannot see it.
+test('ageDays is floor, not ceil or round: fractional-day table, future clamp, unparsable createdAt', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-t127-age-'));
+  try {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    const createdAt = '2026-01-01T00:00:00.000Z';
+    const base = Date.parse(createdAt);
+
+    const cases = [
+      { label: 'below-5', deltaDays: 4.99, wantAgeDays: 4 },
+      { label: 'exactly-5', deltaDays: 5, wantAgeDays: 5 },
+      { label: 'point-4', deltaDays: 5.4, wantAgeDays: 5 }, // ceil would say 6
+      { label: 'point-6', deltaDays: 5.6, wantAgeDays: 5 }, // ceil AND round would both say 6
+    ];
+    for (const c of cases) {
+      const target = join('pages', `${c.label}.md`);
+      psWriteProposal(dir, {
+        target,
+        baseHash: null,
+        currentAtProposalHash: null,
+        proposedContent: 'x',
+        sessionId: 's',
+        device: 'd',
+        createdAt,
+      });
+      const now = () => base + c.deltaDays * 86400000;
+      const j = capStream();
+      listPending({ hypoDir: dir }, { stdout: j, json: true, now });
+      const entry = JSON.parse(j.text()).find((it) => it.target === target);
+      assert.equal(entry.ageDays, c.wantAgeDays, `${c.label}: elapsed ${c.deltaDays}d`);
+    }
+
+    // Clock skew or a hand-edited createdAt ahead of now must clamp to 0, never
+    // go negative (Math.max(0, ...) in ageDaysSince).
+    const futureTarget = join('pages', 'future.md');
+    psWriteProposal(dir, {
+      target: futureTarget,
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'x',
+      sessionId: 's',
+      device: 'd',
+      createdAt: '2026-01-10T00:00:00.000Z',
+    });
+    const jf = capStream();
+    listPending({ hypoDir: dir }, { stdout: jf, json: true, now: () => base });
+    const future = JSON.parse(jf.text()).find((it) => it.target === futureTarget);
+    assert.equal(future.ageDays, 0, 'a createdAt in the future clamps to 0, never negative');
+
+    // An unparsable createdAt must report null, not NaN or a thrown error.
+    const badTarget = join('pages', 'bad-date.md');
+    psWriteProposal(dir, {
+      target: badTarget,
+      baseHash: null,
+      currentAtProposalHash: null,
+      proposedContent: 'x',
+      sessionId: 's',
+      device: 'd',
+      createdAt: 'not-a-real-timestamp',
+    });
+    const jb = capStream();
+    listPending({ hypoDir: dir }, { stdout: jb, json: true, now: () => base });
+    const bad = JSON.parse(jb.text()).find((it) => it.target === badTarget);
+    assert.equal(bad.ageDays, null, 'an unparsable createdAt must not throw');
+    // The JSON row above passes with or without the guard (JSON.stringify(NaN)
+    // is null), so the guard is pinned on the path a person reads. Only the
+    // bad-date line: the other rows legitimately print "Nd old".
+    const hb = capStream();
+    listPending({ hypoDir: dir }, { stdout: hb, now: () => base });
+    const badLine = hb
+      .text()
+      .split('\n')
+      .find((l) => l.includes('bad-date.md'));
+    assert.ok(badLine, `bad-date line listed: ${hb.text()}`);
+    assert.doesNotMatch(badLine, /NaN|d old/, 'an unparsable createdAt must not print an age');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

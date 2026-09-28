@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
+import { DAY_MS } from './time.mjs';
 
 // session-log headings appear in two shapes in the wild: bracketed
 // `## [YYYY-MM-DD]` (spec convention) and bare `## YYYY-MM-DD` (some entries,
@@ -132,7 +133,7 @@ export function findDesignHistoryStale(hypoDir) {
     const lastDH = maxDate(parseDates(dhText, DESIGN_HISTORY_DATE_RE));
 
     if (!lastDH || lastSession > lastDH) {
-      const diffDays = lastDH ? Math.round((lastSession - lastDH) / (1000 * 60 * 60 * 24)) : null;
+      const diffDays = lastDH ? Math.round((lastSession - lastDH) / DAY_MS) : null;
       stale.push({
         project: name,
         kind: 'stale',

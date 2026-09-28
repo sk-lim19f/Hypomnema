@@ -18,6 +18,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadSessionEntries, auditEntries } from './session-audit.mjs';
+import { DAY_MS } from './lib/time.mjs';
 
 function parseArgs(argv) {
   const args = {
@@ -46,7 +47,7 @@ function isoWeek(date) {
   const dayNum = d.getUTCDay() || 7;
   d.setUTCDate(d.getUTCDate() + 4 - dayNum);
   const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-  const week = Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
+  const week = Math.ceil(((d - yearStart) / DAY_MS + 1) / 7);
   return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
 }
 

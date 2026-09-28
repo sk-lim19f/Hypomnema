@@ -28,6 +28,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
+import { DAY_MS } from './lib/time.mjs';
 
 const HOME = homedir();
 
@@ -220,7 +221,7 @@ export function auditEntries(entries, { maxAgeDays = 30, limit = 50, now = Date.
     const lines = readTranscriptLines(entry.transcript_path);
     const metrics = computeMetrics(lines);
     const recordedAt = entry.recorded_at ? Date.parse(entry.recorded_at) : NaN;
-    const ageDays = Number.isFinite(recordedAt) ? (now - recordedAt) / (24 * 60 * 60 * 1000) : NaN;
+    const ageDays = Number.isFinite(recordedAt) ? (now - recordedAt) / DAY_MS : NaN;
     const classification = classify(metrics, ageDays, maxAgeDays);
     results.push({
       session_id: entry.session_id,
