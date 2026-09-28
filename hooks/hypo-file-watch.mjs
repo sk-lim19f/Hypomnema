@@ -2,11 +2,13 @@
 /**
  * hypo-file-watch.mjs — FileChanged hook
  *
- * When a hot.md inside the wiki is modified externally (e.g. by a remote
- * agent or another Claude Code session), build a notification of its
- * contents (n3 fix: Claude Code 2.1.276's `systemMessage` does not reach the
- * model, only a 5-second terminal toast, so "re-inject" overstated what this
- * hook can actually do).
+ * When any file under HYPO_DIR changes, build a notification of its contents.
+ * FileChanged fires for edits from any source: Claude's own Write/Edit/Bash
+ * tools as well as an external process (a remote agent, another Claude Code
+ * session), not only external ones. Tracing the installed binary (Claude Code
+ * 2.1.276, reconfirmed on 2.1.283) shows that notification is a five-second
+ * terminal toast that does not reach the model, so this hook does not put
+ * anything back in front of the model, only the terminal.
  */
 
 import { readFileSync, existsSync } from 'fs';
@@ -42,8 +44,9 @@ process.stdin.on('end', () => {
     // Privacy guard: refuse to emit .hypoignore-matched paths. Without this,
     // `.env*` or other secrets under HYPO_DIR are re-emitted in this hook's
     // output. The guard does not depend on which field carries that output:
-    // where systemMessage goes on FileChanged is unmeasured, so the only safe
-    // assumption is that a matched path must never be put in it.
+    // whether or not the systemMessage terminal notification documented for
+    // FileChanged actually appears on a given machine is unmeasured, so the
+    // only safe assumption is that a matched path must never be put in it.
     const patterns = loadHypoIgnore(HYPO_DIR);
     if (patterns.length > 0 && isIgnored(filePath, HYPO_DIR, patterns)) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
@@ -70,13 +73,36 @@ process.stdin.on('end', () => {
     const content = fileRaw.slice(0, MAX_CHARS);
     const relPath = filePath.replace(HYPO_DIR + '/', '');
 
-    // Built inline rather than through buildOutput(): FileChanged's documented
-    // output schema is watchPaths only, same as CwdChanged, so there is no
-    // additionalContext path here and the notice rides systemMessage. Same
-    // caveat as hypo-cwd-change: systemMessage is a common field whose handling
-    // is stated per event, and that section has not been read for FileChanged. This
-    // hook has no registered trigger at all today, because nothing in this
-    // package returns watchPaths.
+    // Built inline rather than through buildOutput(): the hook reference's
+    // FileChanged section documents the same two fields as its CwdChanged
+    // section (watchPaths, systemMessage), and neither is an additionalContext
+    // path, so the notice rides systemMessage. The two events are documented
+    // separately, each repeating the sentence for itself (checked against the
+    // published reference 2026-09-21). The reference says systemMessage
+    // "shows the systemMessage as a brief terminal notification" and
+    // "doesn't reach the SDK message stream," but it does not say whether
+    // systemMessage reaches the model on this event either way. As of Claude
+    // Code 2.1.276 (checked 2026-09-18) and reconfirmed on 2.1.283, tracing
+    // the installed binary shows the same shared consumer as
+    // hypo-cwd-change.mjs: a low-priority terminal toast with no branch to
+    // the model, dropped entirely outside the interactive REPL. No
+    // live-session observation of this path exists either way. Until the
+    // documentation says otherwise, treat this event as not reaching the
+    // model.
+    // On a stock install this hook still has no registered trigger: its
+    // matcher is omitted (not blank), which the reference says matches every
+    // watched file while adding nothing to the watch list, and nothing in
+    // this package returns watchPaths to seed that list. The watch list is
+    // session-global though, not scoped to this plugin: if another hook or
+    // plugin seeds it, this matcher-less group fires on every watched file,
+    // not just wiki ones. The HYPO_DIR check above (`filePath.startsWith(HYPO_DIR
+    // + '/')`, a string-prefix test that does not resolve symlinks) still
+    // returns immediately for any path that does not start with HYPO_DIR, so
+    // a watch seeded elsewhere cannot point this hook at a path outside the
+    // wiki. A symlink living inside the wiki is a separate case: its path
+    // still starts with HYPO_DIR and passes the check above, but
+    // readFileSync follows it, so whatever that link points to, inside the
+    // wiki or not, is what actually gets emitted.
     console.log(
       JSON.stringify({
         continue: true,

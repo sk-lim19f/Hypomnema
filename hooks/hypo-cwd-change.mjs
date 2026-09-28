@@ -3,9 +3,10 @@
  * hypo-cwd-change.mjs — CwdChanged hook
  *
  * When the working directory changes mid-session, display a notification for
- * the matching project hot.md (n3 fix: Claude Code 2.1.276's `systemMessage`
+ * the matching project hot.md. Tracing the installed binary (Claude Code
+ * 2.1.276, reconfirmed on 2.1.283) shows the `systemMessage` this hook emits
  * does not reach the model, only a 5-second terminal toast, so "re-inject"
- * overstated what this hook can actually do). Skips if still within the same
+ * overstates what this hook can actually do. Skips if still within the same
  * project subtree.
  */
 
@@ -101,7 +102,7 @@ process.stdin.on('end', () => {
     const oldCwd = data.old_cwd || data.old_directory || data.previous_cwd || '';
     const sessionId = data.session_id || 'default';
 
-    // Skip re-injection if still in the same project
+    // Skip re-notifying if still in the same project
     const oldHit = oldCwd ? findProjectHot(oldCwd) : null;
     const newHit = findProjectHot(newCwd);
 
@@ -112,13 +113,13 @@ process.stdin.on('end', () => {
 
     const ignorePatterns = loadHypoIgnore(HYPO_DIR);
 
-    // This injection is not a licensing surface for the observed-set gate
-    // (see base-store.mjs's recordObserved): a session's tracked
+    // Reading this hot.md is not a licensing surface for the observed-set
+    // gate (see base-store.mjs's recordObserved): a session's tracked
     // `targets` are fixed at whichever project the OWNING SessionStart hit,
     // and a cwd move can land here in a different project entirely, so
     // recording an observation against this read could credit a path outside
     // that fixed target set. Nothing here calls recordObserved; the guard
-    // stays exactly as conservative for a cwd-change injection as it was
+    // stays exactly as conservative for a cwd-change notice as it was
     // before the observed set existed.
     if (newHit) {
       const fromFile = readIfNotIgnored(newHit.hotPath, ignorePatterns);
@@ -128,10 +129,12 @@ process.stdin.on('end', () => {
           ? '(hot.md for this project is scoped to another machine and is not visible here)'
           : '(no hot.md yet — will be created at session close)');
       // arm the first-prompt marker so the NEXT user prompt re-triggers
-      // hypo-first-prompt, which forces a "Resuming <project>" summary line.
-      // Only arm when real hot content was actually injected — if hot.md is
-      // missing or .hypoignore'd (fromFile null), there is nothing for the LLM
-      // to summarize, so forcing "Resuming" would be empty noise.
+      // hypo-first-prompt, which forces Claude's reply to lead with a
+      // "Resuming <project>" line, verbatim rather than a content summary
+      // (see hypo-first-prompt.mjs's cwdMove branch). Only arm when real hot
+      // content was actually found; if hot.md is missing or .hypoignore'd
+      // (fromFile null), there is no snapshot to resume from, so claiming
+      // "Resuming" would be false.
       if (fromFile) {
         try {
           writeFileSync(
@@ -155,16 +158,30 @@ process.stdin.on('end', () => {
       // working_dir distinct from the vault, surface where wiki files live.
       const vaultOrientation = buildVaultOrientation(newCwd);
       const orientPrefix = vaultOrientation ? `${vaultOrientation}\n\n` : '';
-      // Built inline rather than through buildOutput(): CwdChanged's documented
-      // output schema is watchPaths only, so it has no additionalContext path
-      // at all, nested or top-level. The notice rides systemMessage instead.
-      // systemMessage is a COMMON field ("to surface a message to the user on
-      // any platform"), and the reference says some events discard it or deliver
-      // it elsewhere, with each event's own section saying which. That section
-      // has not been read for CwdChanged, and no live session has been measured,
-      // so treat "the user sees this" as open rather than settled.
-      // Whatever it turns out to be, the .hypoignore and visibility guards
-      // above run first, so a withheld page never reaches this line.
+      // Built inline rather than through buildOutput(): the hook reference's
+      // CwdChanged section documents watchPaths and systemMessage as the
+      // fields Claude Code reads from that event's output, and neither is an
+      // additionalContext path, so there is no additionalContext path here.
+      // CwdChanged and FileChanged each get their own section and each repeats
+      // this sentence, so the two are not sharing one paragraph (checked
+      // against the published reference 2026-09-21). The notice rides
+      // systemMessage instead. The reference says systemMessage "shows the
+      // systemMessage as a brief terminal notification" and "doesn't reach
+      // the SDK message stream," but it does not say whether systemMessage
+      // reaches the model on this event either way, so treat that as
+      // undocumented rather than denied. As of Claude Code 2.1.276 (checked
+      // 2026-09-18) and reconfirmed on 2.1.283, tracing the installed binary
+      // shows the only consumer of this systemMessage is the terminal
+      // notification queue: a low-priority toast (priority 'low', timeoutMs
+      // 5000, key 'env-hook') that a later same-keyed message replaces and
+      // that fades after five seconds, with no branch that forwards it to the
+      // model; outside the interactive REPL (SDK, headless) the injecting
+      // function is null, so the message is simply dropped. No live-session
+      // observation of this path exists either way. Until the documentation
+      // says otherwise, treat this event as not reaching the model.
+      // Whatever the documentation eventually says, the .hypoignore and
+      // visibility guards above run first, so a withheld page never reaches
+      // this line.
       console.log(
         JSON.stringify({
           continue: true,
@@ -222,7 +239,7 @@ process.stdin.on('end', () => {
       JSON.stringify({
         continue: true,
         suppressOutput: true,
-        systemMessage: `${suggestPrefix}[WIKI: cwd changed → no project match, injecting global hot]\n\n${globalContent}`,
+        systemMessage: `${suggestPrefix}[WIKI: cwd changed → no project match, global hot notice]\n\n${globalContent}`,
       }),
     );
   } catch (err) {

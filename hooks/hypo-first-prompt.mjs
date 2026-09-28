@@ -11,9 +11,12 @@
  * hot.md / session-state.md content is NOT re-injected here. On the SessionStart
  * path the upstream hook already put it in the model's context, and this hook
  * only forces the LLM to lead with a summary line drawn from it. On the
- * cwd-change path nothing was injected at all (CwdChanged has no documented
- * injection path), so that branch asks for a verbatim line instead of a
- * summary.
+ * cwd-change path this hook does not rely on any context having reached the
+ * model. The hook reference does not document whether CwdChanged's
+ * systemMessage reaches the model; as of Claude Code 2.1.276 (checked
+ * 2026-09-18), tracing the installed binary shows it does not (see the
+ * transmission note in README.md), so that branch asks for a verbatim line
+ * instead of a summary.
  * Marker expires after 10 minutes.
  */
 
@@ -74,12 +77,15 @@ process.stdin.on('end', () => {
     // for the model to fill the placeholders with. Provide a concrete fallback
     // line so the model doesn't leak literal `[one-line summary]` text on a
     // first-ever session (codex v2 review 2026-05-26).
-    // A cwd-change marker arms this hook, but CwdChanged has no documented
-    // context-injection path, so no [HOT] / [SESSION STATE] ever reached the
-    // model for that move. Asking for a summary would make the model invent
-    // one, or emit the literal brackets. This is not a temporary branch: that
-    // hook has since moved to systemMessage, which is not a model channel
-    // either, so the model still gets nothing for a cwd move.
+    // A cwd-change marker arms this hook. The hook reference does not
+    // document whether CwdChanged's systemMessage reaches the model; as of
+    // Claude Code 2.1.276 (checked 2026-09-18), tracing the installed binary
+    // shows it does not (see the transmission note in README.md), so this
+    // hook does not rely on [HOT] / [SESSION STATE] having reached the model
+    // for that move. Asking for a summary on context that never arrived
+    // would risk the model inventing one, or emitting the literal brackets.
+    // This is not a temporary branch: it holds until the documentation says
+    // otherwise.
     const cwdMove = marker.source === 'cwd-change';
     const exampleLine = cwdMove
       ? `${verb} ${projSafe}. What would you like to work on here?`

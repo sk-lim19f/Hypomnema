@@ -1393,11 +1393,12 @@ export function findBackfillCandidate(cwd, hypoDir = HYPO_DIR) {
 
 /**
  * When the session cwd is a project working_dir distinct from the vault root,
- * the wiki/knowledge files live in the VAULT, not in this cwd. SessionStart and
- * CwdChanged inject hot.md/session-state content but never the vault's absolute
- * path, so the AI re-discovers it each session and can wrongly conclude a wiki
- * file is missing after checking only the code repo (a real misjudgment seen in
- * a dev-repo session, 2026-06-23).
+ * the wiki/knowledge files live in the VAULT, not in this cwd. SessionStart puts
+ * hot.md/session-state content in the model's context, and CwdChanged surfaces
+ * the same content as a terminal notification the model does not see, but
+ * neither carries the vault's absolute path, so the AI re-discovers it each
+ * session and can wrongly conclude a wiki file is missing after checking only
+ * the code repo (a real misjudgment seen in a dev-repo session, 2026-06-23).
  *
  * Returns a one-line "look in the vault, not here" orientation carrying the
  * absolute vault path, or '' when cwd is anywhere inside the vault tree (the
