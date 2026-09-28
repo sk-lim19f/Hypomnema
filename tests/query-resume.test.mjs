@@ -71,10 +71,39 @@ test('resume on fresh-init vault: graceful "no active project found" — no slug
     const hypoDir = join(dir, 'wiki');
     const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
     assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
-    // Sanity: the template comment example IS present in the generated hot.md.
-    const hot = readFileSync(join(hypoDir, 'hot.md'), 'utf-8');
+    // The commented example row is what makes the slug-leak assertion below
+    // mean anything: resume.mjs strips HTML comments, so without a comment
+    // holding the literal `<slug>` placeholder there is nothing left to leak
+    // and the assertion passes for free. The template used to ship these two
+    // lines; it no longer does, because root hot.md is now a generated
+    // projection. Vaults scaffolded before that change still carry them, so
+    // this fixture is the real back-compat input, written out by hand rather
+    // than borrowed from whatever the template happens to say today.
+    const hotPath = join(hypoDir, 'hot.md');
+    // Two things decide whether stripping comments matters at all, and the
+    // template's own example row had neither: the link has to be in wikilink
+    // brackets, and the date column has to be a real date. `projects/<slug>/hot
+    // (wikilink)` with a literal `YYYY-MM-DD` never matched resolveActiveProject's
+    // row regex, so stripping it changed nothing and the leak assertion below
+    // passed for free. Written the way a hand-kept vault actually writes an
+    // example row, it parses, and `<slug>` reaches the output unless the strip
+    // runs first.
+    const legacyComment =
+      '<!-- Row format: | Project Name | 2026-01-02 | [[projects/<slug>/hot]] | -->\n';
+    writeFileSync(hotPath, readFileSync(hotPath, 'utf-8') + legacyComment);
+    const hot = readFileSync(hotPath, 'utf-8');
     assert.ok(/<!--[\s\S]*?Row format[\s\S]*?-->/.test(hot), 'expected comment in hot.md');
+    assert.ok(hot.includes('<slug>'), 'the fixture must carry a slug placeholder to leak');
     const r = run('resume.mjs', [`--hypo-dir=${hypoDir}`]);
+    // Checked FIRST, and against the placeholder the fixture actually plants.
+    // The earlier form looked for `"slug"`, which the real leak never contains,
+    // and it sat behind the message assertion, so with the comment strip turned
+    // off the test reddened on the message and this line never ran at all. The
+    // property in the test's own name has to be the one that fails.
+    assert.ok(
+      !r.stdout.includes('<slug>') && !r.stderr.includes('<slug>'),
+      `slug placeholder must not leak: stdout=${r.stdout} stderr=${r.stderr}`,
+    );
     assert.equal(
       r.status,
       1,
@@ -83,10 +112,6 @@ test('resume on fresh-init vault: graceful "no active project found" — no slug
     assert.ok(
       r.stderr.includes('no active project found'),
       `expected matrix message in stderr: ${r.stderr}`,
-    );
-    assert.ok(
-      !r.stdout.includes('slug') && !r.stderr.includes('"slug"'),
-      `slug placeholder must not leak: stdout=${r.stdout} stderr=${r.stderr}`,
     );
     // The mtime-fallback branch runs with zero candidate projects here (_template is
     // skipped). warnCwdFallback must stay silent — there is nothing to "fall back to

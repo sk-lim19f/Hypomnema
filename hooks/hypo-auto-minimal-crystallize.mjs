@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 /**
- * hypo-auto-minimal-crystallize.mjs — Stop hook (Layer 3)
+ * hypo-auto-minimal-crystallize.mjs: Stop chain stage 4, last (Layer 3)
+ *
+ * Spawned by hypo-stop.mjs, which is the only Stop registration. This stage runs
+ * last on purpose: it is the only one that can emit `decision: "block"`, and its
+ * close gate reads the committed state stage 3 (hypo-auto-commit) produced.
  *
  * Last hook in the Stop chain: a final-line defense that blocks `Stop` when
  * the current session did substantial work (mutation, or a high-volume

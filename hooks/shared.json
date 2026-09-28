@@ -6,5 +6,9 @@
   "base-store.mjs",
   "proposal-store.mjs",
   "close-gate-store.mjs",
-  "close-journal.mjs"
+  "close-journal.mjs",
+  "hypo-hot-rebuild.mjs",
+  "hypo-session-record.mjs",
+  "hypo-auto-commit.mjs",
+  "hypo-auto-minimal-crystallize.mjs"
 ]

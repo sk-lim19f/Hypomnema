@@ -34,7 +34,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { walkCloseGate } from './hypo-shared.mjs';
+import { sessionClosedMarkerPath, walkCloseGate } from './hypo-shared.mjs';
 import { atomicWrite } from './atomic-write.mjs';
 
 /** `<hypoDir>/.cache/close-gate/<session-id>.json`. */
@@ -375,19 +375,61 @@ export function readResolution(hypoDir, sessionId, rawTranscript) {
  * doing so.
  *
  * @param {{transcriptPath: string|null, hypoDir: string, sessionId: string|null}} args
- * @returns {{ok: boolean, open: boolean, reason: string|null}}
+ * @returns {{ok: boolean, open: boolean, reason: string|null, hostTagWarning?: string}}
+ *   `hostTagWarning` is present on any result whose gate reads OPEN and whose
+ *   `walkCloseGate` reported a `neutralizedHostTagName`: the close in effect
+ *   survived a HOST_TAG_NAMES-shaped queue item reading as neutral rather
+ *   than a retraction. Not gated on `ok`, because the two `ok: false` returns
+ *   below that still read open (transcript-rewrite-detected,
+ *   no-new-open-since-resolution) reach a caller which keeps going on the raw
+ *   `isCloseGateOpen` boolean (`runMarkSessionClosed`), and that caller needs
+ *   the same residual named. See the field's own doc comment in
+ *   hypo-shared.mjs for why that reading is accepted rather than closed on.
+ *   It states WHAT happened and nothing about undoing it: the undo differs per
+ *   entry point, so a caller pairs this with `hostTagWarningWithUndo` below
+ *   and surfaces the pair exactly once per run.
  */
 export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
-  const { open, openedAtIndex } = walkCloseGate(transcriptPath ?? null);
+  const { open, openedAtIndex, retractedByUnknownTagName, neutralizedHostTagName } = walkCloseGate(
+    transcriptPath ?? null,
+  );
   if (!open) {
     return {
       ok: false,
       open: false,
       reason:
         'no-open: this session carries no close signal in its transcript yet — ' +
-        'ask the user whether they actually want to close before treating this as one.',
+        'ask the user whether they actually want to close before treating this as one.' +
+        // Names the retraction's shape when walkCloseGate found one. A tag
+        // shaped queue item only ever retracts here when it is NOT one of
+        // HOST_TAG_NAMES (a known host tag reads as neutral instead, see the
+        // enqueue-branch reversion note in hypo-shared.mjs), so this is
+        // always the "which tag to add" diagnostic, never a known tag
+        // retracting a close that was already judged expected.
+        (retractedByUnknownTagName
+          ? ` A queued item shaped like a host tag ("<${retractedByUnknownTagName}...>") retracted ` +
+            'the last close BECAUSE that tag is not in HOST_TAG_NAMES (hooks/hypo-shared.mjs). ' +
+            'That is fail-closed and applies even when the item itself reads like a close phrase: ' +
+            'an unregistered tag cannot be attributed to the host, so it counts as the user taking ' +
+            'the close back. If it is a genuine host notification rather than something the user ' +
+            'typed, add it to HOST_TAG_NAMES; until then the user has to confirm the close again.'
+          : ''),
     };
   }
+
+  // Computed once here, past the `!open` return above, so every return that
+  // still reads the gate as open can carry it without repeating the message.
+  // Not itself a reason to refuse anything: walkCloseGate already chose to
+  // read this shape as neutral, not a retraction (see its own doc comment).
+  // This is the one-time surfacing of the residual that reading accepts, and
+  // it stops at WHAT happened; see hostTagWarningWithUndo below for why the
+  // undo instructions are not baked in here.
+  const hostTagWarning = neutralizedHostTagName
+    ? `this close was granted while a queued item shaped like a known host tag ` +
+      `("<${neutralizedHostTagName}...>") stayed neutral instead of retracting it. If a person ` +
+      'typed or pasted that tag verbatim, rather than the host sending it, this close may not ' +
+      'reflect a decision the user actually made.'
+    : null;
 
   let rawTranscript = null;
   try {
@@ -400,7 +442,7 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
   if (closedAtIndex === null) {
     // NO_CONSTRAINT: no valid resolution record exists for this session, so
     // the open found above is unconstrained.
-    return { ok: true, open: true, reason: null };
+    return { ok: true, open: true, reason: null, ...(hostTagWarning ? { hostTagWarning } : {}) };
   }
   if (prefixMatches === false) {
     // Checked ahead of the index comparison on purpose, even though
@@ -414,10 +456,11 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
         'transcript-rewrite-detected: the recorded resolution no longer matches this ' +
         "transcript's history — treat this session's prior resolution as untrustworthy " +
         'and confirm the close with the user again.',
+      ...(hostTagWarning ? { hostTagWarning } : {}),
     };
   }
   if (openedAtIndex >= closedAtIndex) {
-    return { ok: true, open: true, reason: null };
+    return { ok: true, open: true, reason: null, ...(hostTagWarning ? { hostTagWarning } : {}) };
   }
   return {
     ok: false,
@@ -425,5 +468,61 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
     reason:
       'no-new-open-since-resolution: this session already resolved its last close signal — ' +
       'a fresh close phrase from the user is needed before this can pass again.',
+    ...(hostTagWarning ? { hostTagWarning } : {}),
   };
+}
+
+// The undo half of a `hostTagWarning`, which closeGateStatus deliberately
+// leaves out: what a run can actually take back differs by entry point, and a
+// message naming a commit the run never made sends the reader after nothing.
+// `kind` says what THIS run did:
+//   'commit-and-marker'   a close apply that committed and landed its marker
+//   'commit-only'         a close apply that committed, marker never landed
+//   'marker-only'         --mark-session-closed: a marker, no commit at all
+//   'uncommitted-writes'  bytes on disk, no commit and no marker
+// A null or unrecognized `kind` means the run left nothing to undo, and so
+// nothing to warn about either: the answer is null and the caller stays
+// quiet. `commitSha` is the commit hash for the two committing kinds
+// (commitWikiChanges returns it as `sha`); see the comment inside for what
+// each of its three states produces. The marker path is derived from
+// sessionClosedMarkerPath rather than
+// written out here, so it cannot drift from the file the writer actually
+// creates; an earlier version of this text hardcoded a `.cache/
+// session-closed-<id>.json` path that no writer has ever produced (the
+// `.json` under `.cache/close-gate/` is this file's own resolution record, a
+// different file), and the model relaying it sent users to delete something
+// that was not there.
+export function hostTagWarningWithUndo(warning, kind, hypoDir, sessionId, commitSha) {
+  if (!warning || !kind) return null;
+  const marker = sessionClosedMarkerPath(hypoDir, sessionId);
+  // MAJOR fix: "git revert" with no target was an instruction a reader could
+  // only carry out by guessing, and the obvious guess (HEAD) is wrong the
+  // moment a concurrent session on the same vault commits after this one:
+  // reverting HEAD then undoes that session's work instead. `commitSha` is
+  // commitWikiChanges's own `sha` for the commit THIS close made, so the
+  // instruction names it. Three states, deliberately distinguished:
+  //   a string    that commit exists; name it in a runnable command
+  //   null        the commit was a no-op (`scoped: 0`), nothing to revert
+  //   undefined   the caller did not say, so say what is known and no more,
+  //               rather than inventing a target
+  const revert =
+    typeof commitSha === 'string' && commitSha
+      ? `revert the commit this close just made (\`git -C ${hypoDir} revert ${commitSha}\`)`
+      : commitSha === null
+        ? 'nothing needs reverting (this close changed no tracked file, so git created no commit)'
+        : `revert the commit this close just made in the wiki repo (find it with \`git -C ${hypoDir} log -1\` and check it is this close's own commit before reverting: on a shared vault another session may have committed after it)`;
+  const undo = {
+    'commit-and-marker':
+      `To undo it: ${revert}, delete ` + `${marker}, and ask the user whether they meant to close.`,
+    'commit-only':
+      `To undo it: ${revert} and ask ` +
+      'the user whether they meant to close. No marker was written, so there is none to delete.',
+    'marker-only':
+      `To undo it: delete ${marker} and ask the user whether they meant to close. This run wrote ` +
+      'only that marker and made no commit, so there is nothing to revert.',
+    'uncommitted-writes':
+      'Nothing to revert: this run made no commit and wrote no marker. The files it did write are ' +
+      'still uncommitted in the wiki working tree, so check git status there before closing again.',
+  }[kind];
+  return undo ? `${warning} ${undo}` : null;
 }

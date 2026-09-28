@@ -11,10 +11,12 @@ import { withTmpDir } from './helpers.mjs';
 import {
   closeGatePath,
   closeGateStatus,
+  hostTagWarningWithUndo,
   readResolution,
   recordGateClosed,
   resolutionStamp,
 } from '../hooks/close-gate-store.mjs';
+import { sessionClosedMarkerPath } from '../hooks/hypo-shared.mjs';
 
 const SESSION = 'sess-1';
 
@@ -610,4 +612,249 @@ test('(e) polarity invariant: a forged resolution file never passes MORE than an
       false,
     );
   });
+});
+
+// --- no-open reason: unrecognized-tag diagnostic (closeGateStatus's own
+// assembly, not walkCloseGate's raw field. close-signals.test.mjs already
+// pins that walkCloseGate returns the right tag name; this pins that
+// closeGateStatus actually puts it in the reason string a caller reads) ---
+
+suite('close-gate-store: closeGateStatus no-open reason, unrecognized-tag diagnostic');
+
+test('no-open reason names the tag when an unregistered host-shaped tag retracted the close', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      closeRecord(),
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content: '<any-new-host-tag foo="x">something</any-new-host-tag>',
+      }),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, false);
+    assert.equal(result.open, false);
+    assert.match(result.reason, /^no-open:/); // existing consumers key on this prefix; must not move
+    assert.match(result.reason, /<any-new-host-tag\.\.\.>/); // names the tag so a maintainer knows what to add
+    assert.match(result.reason, /HOST_TAG_NAMES/);
+  });
+});
+
+// MAJOR fix (fail-closed): the same unregistered tag, with close wording in
+// its body. It used to hit the close-phrase branch first, which neither
+// retracted nor named anything: the previous close stayed in effect and all
+// three warning surfaces (marker, JSON, console) went quiet, so the apply and
+// commit that followed looked like an ordinary close.
+test('an unregistered tag retracts even when its own body reads like a close phrase', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      closeRecord(),
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content: '<future-host from="somewhere">오늘은 여기까지 하고 마무리하자</future-host>',
+      }),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, false, `an unregistered tag must not leave the close standing`);
+    assert.equal(result.open, false);
+    assert.match(result.reason, /^no-open:/);
+    assert.match(result.reason, /<future-host\.\.\.>/); // names the tag
+    assert.match(result.reason, /HOST_TAG_NAMES/); // and where to register it
+    // The cost this choice puts on the user is stated, not hidden: they have
+    // to confirm the close again until the tag is registered.
+    assert.match(result.reason, /confirm the close again/);
+  });
+});
+
+test('a REGISTERED host tag with close wording still stays neutral (the fail-closed rule is about the allowlist)', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      closeRecord(),
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content: '<agent-message from="worker">오늘은 여기까지 진행했습니다</agent-message>',
+      }),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, true, `a known host tag must keep reading as neutral`);
+    assert.equal(result.open, true);
+    assert.match(result.hostTagWarning, /<agent-message\.\.\.>/);
+  });
+});
+
+test('no-open reason carries no tag diagnostic when the retraction is ordinary prose', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      closeRecord(),
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content: 'still working on this, keep going',
+      }),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, false);
+    assert.equal(result.open, false);
+    assert.match(result.reason, /^no-open:/);
+    assert.equal(/HOST_TAG_NAMES/.test(result.reason), false); // no tag-shaped culprit to name
+  });
+});
+
+// A 2026-09 pass (codex cross-review round 5, blocker) made a KNOWN host tag
+// retract a close on the enqueue channel too, and this test used to pin that
+// (as a diagnostic requirement: name it differently from an unregistered
+// tag). Reverted 2026-09-18; see hooks/hypo-shared.mjs's enqueue-branch
+// reversion note for why a known host tag reads neutral again. The residual
+// that reopens (a person could paste the same shape) is not a `no-open`
+// reason anymore, because the close no longer fails: it is `hostTagWarning`
+// on the `ok: true` result instead. See the suite below for that pin.
+test('a KNOWN host tag no longer retracts on the enqueue channel (stays open, ok:true)', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      closeRecord(),
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content: '<task-notification>\n<status>completed</status>\n</task-notification>',
+      }),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, true);
+    assert.equal(result.open, true);
+    assert.equal(result.reason, null);
+  });
+});
+
+// --- hostTagWarning: the B residual, surfaced once instead of closed on ---
+//
+// B accepts that a person who types or pastes a HOST_TAG_NAMES shape
+// verbatim reads the same as the host actually sending it (see
+// hooks/hypo-shared.mjs's enqueue-branch reversion note for why that is
+// judged cheaper than the alternative). This suite pins that the risk is not
+// silently absorbed: closeGateStatus names it on the `ok: true` result, so a
+// caller that only checks `.ok` still has a way to see it.
+
+suite('close-gate-store: closeGateStatus, hostTagWarning (B residual, surfaced once)');
+
+test('ok:true carries hostTagWarning naming the tag when a KNOWN host tag stayed neutral after the close', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      closeRecord(),
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content: '<agent-message from="peer">still working</agent-message>',
+      }),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, true);
+    assert.equal(result.open, true);
+    assert.match(result.hostTagWarning, /<agent-message\.\.\.>/);
+    // States WHAT happened and stops there. The undo is not baked in, because
+    // what a run can take back depends on what that run did; see the
+    // hostTagWarningWithUndo suite below for the half this one leaves out.
+    assert.equal(/revert|delete/.test(result.hostTagWarning), false);
+  });
+});
+
+test('ok:true carries no hostTagWarning on an ordinary close with no host-tag-shaped queue item', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(hypoDir, closeRecord());
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.ok, true);
+    assert.equal(result.open, true);
+    assert.equal(result.hostTagWarning, undefined);
+  });
+});
+
+// --- hostTagWarningWithUndo: the undo half, one wording per entry point ---
+//
+// The warning's first version carried its own undo, naming a
+// `.cache/session-closed-<id>.json` file no writer has ever produced (the
+// marker is `.marker`; the `.json` is this file's own resolution record under
+// `.cache/close-gate/`). crystallize.md tells the model to relay that string
+// verbatim, so the wrong path reached the user and was persisted into the
+// marker. Nothing measured the path, because every assertion looked for
+// /revert/. These do measure it, and they get the expected value from
+// sessionClosedMarkerPath rather than re-typing it, so a change to the naming
+// rule moves the test with the code instead of against it.
+
+suite('close-gate-store: hostTagWarningWithUndo (per-path undo, derived marker path)');
+
+test('commit-and-marker names both halves, and the marker path is the one the writer creates', () => {
+  const out = hostTagWarningWithUndo('WARN.', 'commit-and-marker', '/vault', 'sess-1');
+  assert.match(out, /^WARN\. /);
+  assert.match(out, /revert/);
+  assert.ok(
+    out.includes(sessionClosedMarkerPath('/vault', 'sess-1')),
+    `must name the real marker path, got: ${out}`,
+  );
+  // The resolution record is a different file; pointing at it would send the
+  // user to delete the wrong thing.
+  assert.equal(out.includes(closeGatePath('/vault', 'sess-1')), false);
+});
+
+test('marker-only offers no revert (that path makes no commit) and names the marker', () => {
+  const out = hostTagWarningWithUndo('WARN.', 'marker-only', '/vault', 'sess-1');
+  assert.ok(out.includes(sessionClosedMarkerPath('/vault', 'sess-1')), out);
+  // It may SAY there is nothing to revert; what it must never do is send the
+  // reader after a commit this entry point does not make.
+  assert.equal(/revert the commit/.test(out), false, out);
+  assert.match(out, /nothing to revert/);
+});
+
+test('commit-only offers the revert and no marker to delete (the write never landed)', () => {
+  const out = hostTagWarningWithUndo('WARN.', 'commit-only', '/vault', 'sess-1');
+  assert.match(out, /revert/);
+  assert.equal(
+    out.includes(sessionClosedMarkerPath('/vault', 'sess-1')),
+    false,
+    `no marker landed on this path: ${out}`,
+  );
+});
+
+test('uncommitted-writes points at neither, and says the bytes are still uncommitted', () => {
+  const out = hostTagWarningWithUndo('WARN.', 'uncommitted-writes', '/vault', 'sess-1');
+  assert.equal(out.includes(sessionClosedMarkerPath('/vault', 'sess-1')), false, out);
+  assert.match(out, /uncommitted/);
+});
+
+// MAJOR fix: "git revert" used to name no commit, so the only way to act on
+// it was to guess HEAD, which on a shared vault is whatever session
+// committed last, and reverting that undoes someone else's work.
+test('a commit sha makes the undo a runnable command against THAT commit', () => {
+  const sha = 'a'.repeat(40);
+  const out = hostTagWarningWithUndo('WARN.', 'commit-and-marker', '/vault', 'sess-1', sha);
+  assert.ok(out.includes(`git -C /vault revert ${sha}`), `must name the commit: ${out}`);
+  assert.ok(out.includes(sessionClosedMarkerPath('/vault', 'sess-1')), out);
+});
+
+test('a no-op commit (scoped:0, sha null) says there is nothing to revert rather than naming one', () => {
+  const out = hostTagWarningWithUndo('WARN.', 'commit-only', '/vault', 'sess-1', null);
+  assert.match(out, /no tracked file/);
+  assert.equal(/git -C \/vault revert [0-9a-f]/.test(out), false, `no target to invent: ${out}`);
+});
+
+test('an unknown sha sends the reader to identify the commit, never to a guessed one', () => {
+  const out = hostTagWarningWithUndo('WARN.', 'commit-only', '/vault', 'sess-1');
+  assert.match(out, /git -C \/vault log -1/);
+  // HEAD is exactly the guess that undoes another session's commit, so it must
+  // not appear as an instruction.
+  assert.equal(/revert HEAD/.test(out), false, out);
+});
+
+test('no warning, or nothing this run can undo, returns null (the caller stays quiet)', () => {
+  assert.equal(hostTagWarningWithUndo(null, 'commit-and-marker', '/vault', 'sess-1'), null);
+  assert.equal(hostTagWarningWithUndo('WARN.', null, '/vault', 'sess-1'), null);
+  // An unrecognized kind is the same answer: silence beats an undo instruction
+  // this file cannot stand behind.
+  assert.equal(hostTagWarningWithUndo('WARN.', 'made-up-kind', '/vault', 'sess-1'), null);
 });

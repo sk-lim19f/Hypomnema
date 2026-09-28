@@ -1266,9 +1266,18 @@ test('upgrade-codex-core-hooks-mirror: wiki-*.mjs → hypo-*.mjs rename on codex
         !allCmds.some((c) => c.includes('wiki-shared.mjs')),
         'no codex settings entry must still reference wiki-shared.mjs after apply',
       );
+      // The rename lands on hypo-shared.mjs, a shared module the package ships
+      // but no event in hooks.json registers, so the retirement step that runs
+      // after the rename removes it. Before that step existed the renamed entry
+      // stayed registered and this asserted it was present.
       assert.ok(
-        allCmds.some((c) => c.includes('$HOME/.codex/hooks/hypo-shared.mjs')),
-        'codex settings must now reference $HOME/.codex/hooks/hypo-shared.mjs',
+        !allCmds.some((c) => c.includes('$HOME/.codex/hooks/hypo-shared.mjs')),
+        'the renamed hypo-shared.mjs entry must be retired, not left registered',
+      );
+      assert.deepEqual(
+        applyJson.applied.retiredSettingsCodex,
+        [`${eventName}: hypo-shared.mjs`],
+        'the retirement must name exactly the renamed shared-module entry',
       );
       assert.ok(
         existsSync(join(cdxHooks, 'hypo-shared.mjs')),
@@ -1304,18 +1313,25 @@ test('upgrade-codex-core-hooks-mirror: legacy wiki-only settings yields no dupli
       // settings file is in the shape a v1.0/v1.1 user upgrading to v1.2 would
       // have (no hypo-* references at all).
       const cfg = JSON.parse(readFileSync(cdxSettingsPath, 'utf-8'));
+      // Only hooks init still registers under an event can be rewritten here.
+      // hypo-hot-rebuild.mjs and hypo-auto-commit.mjs had wiki-* names too, but
+      // they are Stop steps hypo-stop.mjs spawns now, not registrations, so a
+      // fresh init writes nothing for them to rewrite. They come back below as
+      // `retiredLegacy`.
       const rewriteMap = {
         'hypo-session-start.mjs': 'wiki-session-start.mjs',
         'hypo-first-prompt.mjs': 'wiki-first-prompt.mjs',
         'hypo-lookup.mjs': 'wiki-lookup.mjs',
         'hypo-compact-guard.mjs': 'wiki-compact-guard.mjs',
         'hypo-auto-stage.mjs': 'wiki-auto-stage.mjs',
-        'hypo-hot-rebuild.mjs': 'wiki-hot-rebuild.mjs',
-        'hypo-auto-commit.mjs': 'wiki-auto-commit.mjs',
         'hypo-cwd-change.mjs': 'wiki-cwd-change.mjs',
         'hypo-file-watch.mjs': 'wiki-file-watch.mjs',
         'hypo-personal-check.mjs': 'personal-wiki-check.mjs',
       };
+      // What a v1.0/v1.1 codex install really had under Stop: the two legacy
+      // names. The rename lands them on hypo-*.mjs names Stop no longer maps,
+      // so they must end up retired, leaving hypo-stop.mjs as the one Stop entry.
+      const retiredLegacy = ['wiki-hot-rebuild.mjs', 'wiki-auto-commit.mjs'];
       for (const groups of Object.values(cfg.hooks || {})) {
         for (const g of Array.isArray(groups) ? groups : []) {
           for (const h of g.hooks || []) {
@@ -1326,6 +1342,11 @@ test('upgrade-codex-core-hooks-mirror: legacy wiki-only settings yields no dupli
             }
           }
         }
+      }
+      for (const legacy of retiredLegacy) {
+        cfg.hooks.Stop.push({
+          hooks: [{ type: 'command', command: `node $HOME/.codex/hooks/${legacy}` }],
+        });
       }
       writeFileSync(cdxSettingsPath, JSON.stringify(cfg, null, 2) + '\n');
 
@@ -1341,7 +1362,7 @@ test('upgrade-codex-core-hooks-mirror: legacy wiki-only settings yields no dupli
       assert.equal(rCheck.status, 1, 'wiki-only codex settings must exit 1 in dry-run');
       const checkJson = JSON.parse(rCheck.stdout);
       assert.ok(
-        checkJson.oldHookRefsCodex.length >= Object.keys(rewriteMap).length,
+        checkJson.oldHookRefsCodex.length >= Object.keys(rewriteMap).length + retiredLegacy.length,
         'every legacy ref must be detected in oldHookRefsCodex',
       );
 
@@ -1384,7 +1405,7 @@ test('upgrade-codex-core-hooks-mirror: legacy wiki-only settings yields no dupli
       // No legacy wiki-*.mjs reference may survive (round-2 worker 1 NIT) — a
       // mutation that drops one rename step would leave a legacy command in
       // place AND append the modern one; the duplicate-only check misses that.
-      for (const legacy of Object.values(rewriteMap)) {
+      for (const legacy of [...Object.values(rewriteMap), ...retiredLegacy]) {
         const lingering = [...cmdCounts.keys()].filter((c) => c.includes(legacy));
         assert.equal(
           lingering.length,
@@ -1392,6 +1413,17 @@ test('upgrade-codex-core-hooks-mirror: legacy wiki-only settings yields no dupli
           `no legacy ${legacy} reference must survive apply (found: ${JSON.stringify(lingering)})`,
         );
       }
+
+      // The renamed Stop entries are retired, not kept: hypo-stop.mjs already
+      // runs those steps, so a surviving entry would run its step twice.
+      const stopCmds = (cfgAfter.hooks.Stop || [])
+        .flatMap((g) => g.hooks || [])
+        .map((h) => h.command);
+      assert.deepEqual(
+        stopCmds,
+        ['node $HOME/.codex/hooks/hypo-stop.mjs'],
+        'codex Stop must hold the orchestrator alone after the rename and retirement',
+      );
 
       // Idempotency: a second --apply --codex syncs nothing new on top.
       const rAgain = runWithHome(

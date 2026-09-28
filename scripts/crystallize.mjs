@@ -12,13 +12,13 @@
  * Options:
  *   --hypo-dir=<path>        Hypomnema root (default: resolved via HYPO_DIR / hypo-config.md / ~/hypomnema)
  *   --min-group=<n>          Min pages per tag group to report (default: 2)
- *   --check-session-close    Verify the strict session-close memory files — 5 mandatory + open-questions conditional
+ *   --check-session-close    Verify the strict session-close memory files: 4 mandatory + open-questions conditional
  *   --project=<slug>         Override the recency-inferred project on --check / --mark (single segment
  *                            [A-Za-z0-9._-]+, projects/<slug>/ must exist). On --check it NARROWS the
  *                            gate to that one project — a project-scoped diagnostic, NOT a global
  *                            compact-ready verdict. On --mark it is ATTRIBUTION only; the gate stays
  *                            global (the marker == compact-ready invariant). Ignored on --apply.
- *   --apply-session-close    Apply a JSON payload that updates the 5 mandatory memory files
+ *   --apply-session-close    Apply a JSON payload that updates the 4 mandatory memory files
  *                            (+ optional open-questions). Idempotent — re-running with the same
  *                            payload is a no-op. Always finishes with the strict gate check.
  *
@@ -40,7 +40,6 @@
  *     "date":         "YYYY-MM-DD",                   // optional — defaults to today (local)
  *     "sessionState": { "content": "<full file>" },   // overwrite (idempotent: identical bytes → skip)
  *     "projectHot":   { "content": "<full file>" },   // overwrite
- *     "rootHot":      { "content": "<full file>" },   // overwrite
  *     "sessionLog":   { "entry":   "## [date] ..." }, // append, skip if heading already present
  *     "log":          { "entry":   "## [date] session | <project> ..." }, // OPTIONAL (B-1): omit it and apply derives the root log.md entry from this close's sessionLog heading; supply it only for a deliberately custom log line
  *     "openQuestions":{ "content": "<full file>" }    // optional overwrite
@@ -53,7 +52,7 @@
  * Lint gates:
  *   • Preflight — runs `lint.mjs --json` BEFORE any payload byte is written.
  *     Errors in files this payload will OVERWRITE (sessionState/projectHot/
- *     rootHot/openQuestions) are filtered out — they're about to be replaced,
+ *     openQuestions) are filtered out: they're about to be replaced,
  *     and not filtering them dead-locks the documented "fix payload and retry"
  *     recovery after a post-apply-lint failure (codex P2). Errors in any other
  *     file → exit 1 with stage='preflight-lint', no apply occurs. PreCompact's

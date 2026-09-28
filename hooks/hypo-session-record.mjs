@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * hypo-session-record.mjs — Stop hook
+ * hypo-session-record.mjs: Stop chain stage 2 (spawned by hypo-stop.mjs)
  *
  * Appends an entry to ~/hypomnema/.cache/sessions/index.jsonl for each
  * completed session. The index.jsonl is the **primary** source for

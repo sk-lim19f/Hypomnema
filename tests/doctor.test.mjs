@@ -14,6 +14,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -295,6 +296,61 @@ test('doctor-settings-integrity: stale hypo-* entry → warn', () => {
     const staleCheck = out.find((c) => c.label === 'settings.json stale hypo-* entries');
     assert.ok(staleCheck, 'stale check not found');
     assert.equal(staleCheck.status, 'warn', `expected warn: ${staleCheck.detail}`);
+  });
+});
+
+// The forward check counts live HOOK_MAP entries, so a settings.json install
+// that kept the four pre-orchestrator Stop registrations next to hypo-stop.mjs
+// reads as fully registered while each of those steps runs twice per Stop. The
+// reverse check has to name them, on both targets, and leave a hook the package
+// never shipped alone.
+test('doctor-settings-integrity: retired Stop registrations → warn on claude and codex', () => {
+  withTmpHome((home) => {
+    const settingsFor = (root) => ({
+      hooks: {
+        Stop: [
+          { hooks: [{ type: 'command', command: `node $HOME/${root}/hooks/hypo-stop.mjs` }] },
+          {
+            hooks: [{ type: 'command', command: `node $HOME/${root}/hooks/hypo-hot-rebuild.mjs` }],
+          },
+          {
+            hooks: [{ type: 'command', command: `node $HOME/${root}/hooks/hypo-auto-commit.mjs` }],
+          },
+          { hooks: [{ type: 'command', command: `node $HOME/${root}/hooks/my-own-stop.mjs` }] },
+        ],
+      },
+    });
+    for (const root of ['.claude', '.codex']) {
+      mkdirSync(join(home, root), { recursive: true });
+      writeFileSync(join(home, root, 'settings.json'), JSON.stringify(settingsFor(root)));
+    }
+    const r = runWithHome(
+      'doctor.mjs',
+      [`--hypo-dir=${NONEXISTENT_WIKI}`, '--codex', '--json'],
+      home,
+    );
+    const out = JSON.parse(r.stdout);
+    for (const label of [
+      'settings.json retired hook registrations',
+      'Codex settings.json retired hook registrations',
+    ]) {
+      const c = out.find((x) => x.label === label);
+      assert.ok(c, `${label} check not found`);
+      assert.equal(c.status, 'warn', `${label} must warn: ${c.detail}`);
+      assert.match(
+        c.detail,
+        /^2 registration\(s\)/,
+        `${label} must count exactly two: ${c.detail}`,
+      );
+      assert.ok(
+        c.detail.includes('Stop: hypo-hot-rebuild.mjs') &&
+          c.detail.includes('Stop: hypo-auto-commit.mjs') &&
+          !c.detail.includes('my-own-stop.mjs'),
+        `${label} must name the two retired steps and not the foreign hook: ${c.detail}`,
+      );
+    }
+    const stale = out.find((x) => x.label === 'settings.json stale hypo-* entries');
+    assert.equal(stale.status, 'pass', `retired entries must not be listed twice: ${stale.detail}`);
   });
 });
 
@@ -1480,6 +1536,217 @@ test('doctor: a vault with only pending parks still gets the pending line, promi
       check.detail,
       /drops|removes/,
       'reconcile no longer removes a pending artifact, so doctor must not say it does',
+    );
+  });
+});
+
+// codex r5-w4 major #1 sibling: a candidate `.json` file that sits in a
+// perfectly listable .cache/proposals but never parses into an artifact
+// (corrupt body, id/filename mismatch, permission denied) must not fold into
+// the same "No parked write-proposals" pass the check gives a genuinely
+// empty store. checkProposals only sees this through listProposalsChecked's
+// `unreadable` array; folding that into the same `classified.length === 0`
+// gate as an empty backlog is exactly the silent-zero the store itself
+// guards against (see the comment above listProposalsChecked).
+//
+// Disabling the check: change `if (classified.length === 0 && unreadable.length === 0) {`
+// back to `if (classified.length === 0) {` in scripts/doctor.mjs. This test goes
+// red (status reads 'pass') while the wording test below stays green, which is the
+// pair that isolates "folded into empty" from "named but worded wrong".
+test('doctor: a vault whose only proposal candidate is unreadable still warns, never passes as empty', () => {
+  withDoctorWiki((dir) => {
+    mkdirSync(join(dir, '.cache', 'proposals'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'proposals', 'broken.json'), '{ not valid json');
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Pending proposals');
+    assert.ok(check, 'Pending proposals check not found');
+    assert.notEqual(
+      check.status,
+      'pass',
+      `a store with zero readable proposals but one unreadable candidate must not read as empty: ${JSON.stringify(check)}`,
+    );
+    assert.equal(check.status, 'warn', `expected warn: ${JSON.stringify(check)}`);
+  });
+});
+
+// Same fixture, a different judgment: even once the check correctly warns
+// instead of passing, the message still has to name the file. "1 candidate
+// unreadable" with no filename leaves a human nothing to go look at by hand.
+//
+// Disabling the check: in the `unreadable.length > 0` branch of checkProposals,
+// drop the interpolated filenames (for example replace `unreadable` with an
+// empty array before `.slice(0, 3).join(', ')` runs). This test goes red
+// (the filename no longer appears) while the warn-vs-pass test above stays
+// green, since the branch still fires, it just stops naming the file.
+test('doctor: the pending-proposals warning names the unreadable file and says it could not be read', () => {
+  withDoctorWiki((dir) => {
+    mkdirSync(join(dir, '.cache', 'proposals'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'proposals', 'broken.json'), '{ not valid json');
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Pending proposals');
+    assert.ok(check, 'Pending proposals check not found');
+    assert.match(
+      check.detail,
+      /broken\.json/,
+      'the unreadable filename must appear in the warning',
+    );
+    assert.match(
+      check.detail,
+      /could not be read or parsed/,
+      'the warning must say why the file could not be used, not just name it',
+    );
+  });
+});
+
+// tier1 blocker #1: `listProposalsChecked`'s `ok: false` means the store
+// could not be enumerated at all (unmeasured), not that it holds zero
+// proposals. The old code read `inventory.ok ? inventory.unreadable : []`,
+// which discarded `ok: false` and let `classified.length === 0 &&
+// unreadable.length === 0` fall through to the same pass a genuinely empty
+// vault gets. A FILE sitting where `.cache/proposals` should be a directory
+// reproduces this without chmod (readdirSync throws ENOTDIR, which no root
+// override bypasses the way chmod 000 does).
+//
+// Disabling the check: remove the `if (!inventory.ok) { warn(...); return;
+// }` early branch in checkProposals and go back to reading
+// `inventory.ok ? inventory.unreadable : []`. This test goes red (status
+// reads 'pass') while every other Pending proposals test in this file stays
+// green.
+test('doctor: a .cache/proposals that cannot even be listed warns as unmeasured, never passes as empty', () => {
+  withDoctorWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'proposals'), 'a file, not a directory');
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Pending proposals');
+    assert.ok(check, 'Pending proposals check not found');
+    assert.equal(
+      check.status,
+      'warn',
+      `an unmeasured store must warn, not pass as empty: ${JSON.stringify(check)}`,
+    );
+    assert.doesNotMatch(
+      check.detail,
+      /No parked write-proposals/,
+      'an unmeasured store must not read as a genuinely empty one',
+    );
+  });
+});
+
+// tier1 minor finding 2: unreadable[] carries orphan-tmp filenames (a rename
+// that never landed) with no wording anywhere distinguishing them from a
+// genuinely corrupt candidate, so a user closing a session or running doctor
+// was told to treat a complete, recoverable proposal body the same as
+// hand-edited garbage. `orphanTmp` is the new channel; this pins that doctor
+// actually surfaces it as a distinct, recoverable line, not folded into the
+// generic wording.
+//
+// Disabling the check: in checkProposals, delete the `orphanTmp.length > 0`
+// block (or read `inventory.unreadable` instead of `inventory.orphanTmp`).
+// This test goes red (no recoverable-rename-orphan sentence appears) while
+// the unreadable-filename test above stays green, isolating the new channel
+// from the pre-existing one it sits beside.
+test('doctor: a leaked proposal rename-orphan gets its own recovery line, not the generic corrupt-file wording', () => {
+  withDoctorWiki((dir) => {
+    const proposalsDir = join(dir, '.cache', 'proposals');
+    mkdirSync(proposalsDir, { recursive: true });
+    const orphan = 'aabbcc-dead-target-x1y2z3.json.99999.abcd1234.tmp';
+    const orphanPath = join(proposalsDir, orphan);
+    writeFileSync(
+      orphanPath,
+      JSON.stringify({ id: 'aabbcc-dead-target-x1y2z3', target: 'pages/dead.md' }),
+    );
+    // Past PROPOSAL_TMP_GRACE_MS so scanProposalFiles reads it as orphaned,
+    // not a writer still in flight.
+    const old = new Date(Date.now() - 5 * 60 * 1000);
+    utimesSync(orphanPath, old, old);
+
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Pending proposals');
+    assert.ok(check, 'Pending proposals check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${JSON.stringify(check)}`);
+    assert.match(
+      check.detail,
+      /recoverable, not corrupt/,
+      `must name the orphan as recoverable, distinct from the generic corrupt-file wording: ${check.detail}`,
+    );
+    assert.match(check.detail, /mv "/, `must offer the mv command to restore it: ${check.detail}`);
+  });
+});
+
+// tier1 major finding 1c: a leftover `.cache/close-intent/` record is the
+// direct disk-visible symptom of finding 1's crashed-session case, and (a)'s
+// fix makes an unreadable one silently fall through to full-apply forever
+// (never "clean") rather than mislabel it clean. A human debugging "why does
+// this vault keep demanding a payload" needs a place that names the record,
+// not just the close's own transient console output.
+//
+// No new suite() here: this stays inside the enclosing suite so the tests
+// that already followed it (doctor-project-suggestions below) keep their
+// original suite membership rather than being silently reassigned to a suite
+// named only for this block.
+test('doctor: no .cache/close-intent/ directory at all → pass', () => {
+  withDoctorWiki((dir) => {
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Close-intent records');
+    assert.ok(check, 'Close-intent records check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${JSON.stringify(check)}`);
+  });
+});
+
+test('doctor: a leftover close-intent record warns and names its count and age', () => {
+  withDoctorWiki((dir) => {
+    const intentDir = join(dir, '.cache', 'close-intent');
+    mkdirSync(intentDir, { recursive: true });
+    const startedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    writeFileSync(
+      join(intentDir, 'crashed-session.json'),
+      JSON.stringify({ v: 1, targets: [], startedAt }),
+    );
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Close-intent records');
+    assert.ok(check, 'Close-intent records check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${JSON.stringify(check)}`);
+    assert.match(check.detail, /1 record\(s\)/, `must name the count: ${check.detail}`);
+    assert.match(
+      check.detail,
+      /oldest is \d+ minute\(s\) old/,
+      `must name the age: ${check.detail}`,
+    );
+  });
+});
+
+test('doctor: a close-intent record that cannot be parsed still warns, and names it as unreadable', () => {
+  withDoctorWiki((dir) => {
+    const intentDir = join(dir, '.cache', 'close-intent');
+    mkdirSync(intentDir, { recursive: true });
+    writeFileSync(join(intentDir, 'broken.json'), '{ not valid json');
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Close-intent records');
+    assert.ok(check, 'Close-intent records check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${JSON.stringify(check)}`);
+    assert.match(
+      check.detail,
+      /could not be read or parsed/,
+      `must call out the unreadable record, not just the count: ${check.detail}`,
+    );
+  });
+});
+
+// ENOTDIR reproduces "the directory itself cannot be listed" without chmod
+// (root-safe, unlike chmod 0o000), matching the ENOTDIR test used for
+// .cache/proposals above.
+test('doctor: a .cache/close-intent that cannot even be listed warns as unmeasured', () => {
+  withDoctorWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'close-intent'), 'a file, not a directory');
+    const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const check = JSON.parse(r.stdout).find((c) => c.label === 'Close-intent records');
+    assert.ok(check, 'Close-intent records check not found');
+    assert.equal(check.status, 'warn', `expected warn: ${JSON.stringify(check)}`);
+    assert.match(
+      check.detail,
+      /could not be listed/,
+      `an unmeasured directory must say so, not silently pass as clean: ${check.detail}`,
     );
   });
 });

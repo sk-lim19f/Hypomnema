@@ -832,6 +832,361 @@ test('measured: <task-notification> enqueue (model-caused) → false', () => {
   });
 });
 
+// isModelCausedQueueContent used to key on the literal `<task-notification>`
+// string with NO attribute, so an enqueue wearing a different host tag, or
+// the same shape of tag WITH an attribute, fell through to the branch's
+// "else open = false" and retracted a close the user already gave, one line
+// at a time as each new host-minted tag got discovered (the same shape bug
+// #289 fixed for the attachment branch, and the attachment branch's own
+// regression test for it: "a new, unenumerated machine-generated attachment
+// does not close an open gate"). Two attributed shapes hit exactly this gap,
+// a subagent hand-back (`<agent-message from="...">`) and a cross-session
+// message (`<cross-session-message from="...">`); the corpus counts behind
+// that live in one place, isModelCausedQueueContent's own doc comment in
+// hooks/hypo-shared.mjs, and are deliberately not repeated here. Two copies
+// of one measurement drift apart, and the copy in a test is the one nobody
+// re-measures. Both fixtures below use those exact tag names and attribute
+// shape, not a fabricated one, since isModelCausedQueueContent's fix is
+// specifically "accept a space after the tag name, not just `>`".
+// A later pass (codex cross-review round 5, blocker) changed the enqueue
+// branch to close on these two shapes too, on the reasoning that neither is
+// PROOF of a host producer here: `queue-operation enqueue` carries no
+// `origin` or `commandMode` field, so this leading-tag check is the ONLY
+// signal the branch has, and a person who types or pastes `<agent-message
+// from="x">계속 해줘` verbatim produces the identical shape with zero host
+// involvement. That reasoning still holds; what changed is the judgment
+// about which mistake costs more, once measured against the corpus this
+// file actually runs against: the enqueue-branch reversion note in
+// hooks/hypo-shared.mjs (2026-09-18) has the numbers (21.9% of
+// close-carrying sessions hit this retraction, 66 of them five times or
+// more, against a frequency this corpus has never measured for the event it
+// guarded against). Both fixtures below pin the restored behavior: a known
+// host tag reads neutral, and the residual this accepts (a pasted tag
+// keeping a spent close alive) is surfaced once at commit time via
+// closeGateStatus's `hostTagWarning`, not re-guessed on every gate read.
+test('close, then a subagent hand-back enqueue (<agent-message from=...>) stays neutral (HOST_TAG_NAMES match; the pasted-tag residual is warned once at commit time, not here)', () => {
+  withTmpDir((dir) => {
+    const handback =
+      '<agent-message from="a5bd34706c2ef947d">\n[Subagent hand-back] done with the task.\n</agent-message>';
+    assert.equal(isClosePattern(handback), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', handback), QOP('dequeue')]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+test('close, then a cross-session message enqueue (<cross-session-message from=...>) stays neutral (HOST_TAG_NAMES match)', () => {
+  withTmpDir((dir) => {
+    const msg =
+      '<cross-session-message from="peer-session-id">status update from another session</cross-session-message>';
+    assert.equal(isClosePattern(msg), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', msg), QOP('dequeue')]);
+    assert.equal(isCloseGateOpen(p), true);
+  });
+});
+
+// NEW (2026-09-18, B residual pin): the path B reopens really exists and is
+// named on the return value, not silently absorbed. A close followed by a
+// KNOWN host tag stays open, and walkCloseGate names which tag read as
+// neutral so a caller can warn once about it: see closeGateStatus's
+// `hostTagWarning` (tests/close-gate-store.test.mjs) for where that name
+// turns into a message. This pins the existence of the path and the naming,
+// not the absence of the path: asserting `open: true` alone (as the two
+// fixtures above do) cannot tell "neutral because of a known host tag" apart
+// from "neutral because nothing happened at all".
+test('close, then a known host tag enqueue → neutralizedHostTagName names it, and a later close phrase clears it again', () => {
+  withTmpDir((dir) => {
+    const handback = '<agent-message from="a5bd34706c2ef947d">still working</agent-message>';
+    const p1 = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', handback), QOP('dequeue')]);
+    const r1 = walkCloseGate(p1);
+    assert.equal(r1.open, true);
+    assert.equal(r1.neutralizedHostTagName, 'agent-message');
+
+    // A fresh close phrase resets it: the name only ever describes the close
+    // CURRENTLY in effect, never one a later close phrase superseded.
+    const p2 = writeJsonl(dir, [
+      USER(CLOSE),
+      QOP('enqueue', handback),
+      QOP('dequeue'),
+      USER(CLOSE),
+    ]);
+    const r2 = walkCloseGate(p2);
+    assert.equal(r2.open, true);
+    assert.equal(r2.neutralizedHostTagName, null);
+  });
+});
+
+// The overlap the two fixtures above deliberately exclude with their
+// `isClosePattern(x) === false` guards: a body that is BOTH host-tag shaped
+// and close worded. isClosePattern is an unanchored substring match, and a
+// real host notification can relay close-worded prose, so this shape lands in
+// the close-pattern branch rather than the host-tag one. Both branches are
+// no-ops on the gate, so the gate reading is the same either way, and until
+// the close-pattern branch started naming the tag too, this was the one way
+// to keep a close alive on a host-tag shape with the commit-time warning
+// never firing. The guarded fixtures above stay as they are: they pin the
+// non-overlapping case, which is the common one.
+test('close, then a host-tag enqueue whose BODY is close worded: still neutral, and still names the tag', () => {
+  withTmpDir((dir) => {
+    const relay = '<agent-message from="peer">오늘은 여기 함수부터 다시 봐줘</agent-message>';
+    // The precondition that makes this fixture different from the two above.
+    assert.equal(isClosePattern(relay), true);
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', relay), QOP('dequeue')]);
+    const r = walkCloseGate(p);
+    assert.equal(r.open, true);
+    assert.equal(r.neutralizedHostTagName, 'agent-message');
+  });
+});
+
+// The three early returns (no path, unreadable, first unparseable line) are
+// the fail-closed answers, and a caller destructuring the walk's four
+// declared fields got `undefined` for the two diagnostic ones there. A caller
+// that treats `undefined` as "no tag" happens to be right today, which is
+// exactly why this went unnoticed; the contract is that the shape does not
+// change with the exit.
+test('the fail-closed early returns carry all four declared fields, and a fresh object each time', () => {
+  withTmpDir((dir) => {
+    const missing = join(dir, 'nope', 'not-here.jsonl');
+    const corrupt = join(dir, 'corrupt.jsonl');
+    writeFileSync(corrupt, '{ this is not json\n');
+    for (const [label, path] of [
+      ['no transcript path', null],
+      ['unreadable path', missing],
+      ['first line does not parse', corrupt],
+    ]) {
+      const r = walkCloseGate(path);
+      assert.deepEqual(
+        r,
+        {
+          open: false,
+          openedAtIndex: -1,
+          retractedByUnknownTagName: null,
+          neutralizedHostTagName: null,
+        },
+        label,
+      );
+    }
+    // Not a shared constant: a caller that mutates what it got back must not
+    // reach into the next call's answer.
+    const a = walkCloseGate(null);
+    a.open = true;
+    assert.equal(walkCloseGate(null).open, false);
+  });
+});
+
+// BOUNDARY, outside the fix above. HOST_TAG_PREFIX is a closed allowlist of the
+// three tag names this corpus has actually minted, not a name-shaped pattern:
+// see its doc comment for why a wider match was tried and reverted. These four
+// pin the boundary on both sides: the three allowlisted names stay neutral
+// (already covered above and by the pre-existing task-notification fixture),
+// while a tag this file has never been taught by name, and text a human can
+// plausibly type or paste that merely starts with `<`, must NOT read as
+// model-caused. A cross-review flagged the previous wide regex for exactly
+// this: it neutralized human input, silently, with no error surfaced anywhere.
+test('close, then an unrecognized host-shaped tag enqueue (<any-new-host-tag foo=...>) does NOT stay neutral (allowlist residual, documented trade-off)', () => {
+  withTmpDir((dir) => {
+    const tag = '<any-new-host-tag foo="x">something</any-new-host-tag>';
+    assert.equal(isClosePattern(tag), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', tag), QOP('dequeue')]);
+    // Falls through to the enqueue branch's "else open = false", same as any
+    // other unrecognized non-close text: not a new failure mode, the same
+    // residual the branch already carries for anything it has not been
+    // taught. Until this tag is added to HOST_TAG_NAMES, it retracts a close.
+    const result = walkCloseGate(p);
+    assert.equal(result.open, false);
+    // MAJOR FIX: this used to fail silently, in the sense that nothing on the
+    // return value said WHY: a maintainer had to read the raw transcript by
+    // hand to learn a fourth host tag needed adding. `retractedByUnknownTagName`
+    // names it, so `closeGateStatus`'s `no-open` reason can surface it too.
+    assert.equal(result.retractedByUnknownTagName, 'any-new-host-tag');
+  });
+});
+
+test('close, then a human-typed bracketed label enqueue ("  <TODO> 계속 작업해줘") retracts the close (regression: the wide regex used to neutralize this)', () => {
+  withTmpDir((dir) => {
+    const label = '  <TODO> 계속 작업해줘';
+    assert.equal(isClosePattern(label), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', label), QOP('dequeue')]);
+    const result = walkCloseGate(p);
+    assert.equal(result.open, false);
+    // The diagnostic fires here too, by design: this file cannot tell a real
+    // host tag it has not been taught from a person's own bracketed paste, so
+    // both name a candidate. A maintainer reading "TODO" in the reason string
+    // and finding it is not a real host event just does nothing; the cost is
+    // noise, not a wrong action (see the enqueue branch's comment).
+    assert.equal(result.retractedByUnknownTagName, 'TODO');
+  });
+});
+
+test('close, then an unterminated angle-bracket prefix enqueue ("<please keep working") retracts the close (no ">" needed to trigger the old bug)', () => {
+  withTmpDir((dir) => {
+    const text = '<please keep working';
+    assert.equal(isClosePattern(text), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', text), QOP('dequeue')]);
+    const result = walkCloseGate(p);
+    assert.equal(result.open, false);
+    assert.equal(result.retractedByUnknownTagName, 'please');
+  });
+});
+
+// NEGATIVE case for the same diagnostic: ordinary prose that starts with
+// neither `<` nor anything tag-shaped must not name a tag that does not
+// exist. Without this, a future change that widens TAG_SHAPE_PREFIX too far
+// could start attaching a bogus tag name to every plain retraction and no
+// test here would catch it.
+//
+// The Korean fixture below is the shape a real user actually types (measured
+// corpus is majority-Korean), so it stays. But it contains no [A-Za-z]
+// character at all, and TAG_SHAPE_PREFIX requires one, so this fixture
+// cannot fail even if the `^<` anchor is dropped entirely from the regex
+// (confirmed: dropping `^<` and keeping only `[A-Za-z][\w-]*` still leaves
+// this test green, because there is no ASCII letter anywhere in the input
+// for the unanchored pattern to find). It was pinning nothing about the
+// anchor. The English fixture right after it has ASCII letters an unanchored
+// match COULD seize on, so it is the one that actually distinguishes an
+// anchored TAG_SHAPE_PREFIX from an unanchored one.
+test('close, then plain human prose retracts the close with no tag name attached', () => {
+  withTmpDir((dir) => {
+    const text = '아직 할 일 남았어, 계속 진행해줘';
+    assert.equal(isClosePattern(text), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', text), QOP('dequeue')]);
+    const result = walkCloseGate(p);
+    assert.equal(result.open, false);
+    assert.equal(result.retractedByUnknownTagName, null);
+  });
+});
+
+// Same negative case, ASCII prose. This is the fixture that actually exercises
+// the `^<` anchor: it has no leading `<` (so the anchored TAG_SHAPE_PREFIX
+// never engages), but "still" and "working" and "keep" and "going" are all
+// `[A-Za-z][\w-]*` matches an UNANCHORED version of the same character class
+// would seize on anywhere in the string. If `^<` is ever dropped from
+// TAG_SHAPE_PREFIX, this test is the one that goes red.
+test('close, then plain ASCII human prose retracts the close with no tag name attached', () => {
+  withTmpDir((dir) => {
+    const text = 'still working on this, keep going';
+    assert.equal(isClosePattern(text), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('enqueue', text), QOP('dequeue')]);
+    const result = walkCloseGate(p);
+    assert.equal(result.open, false);
+    assert.equal(result.retractedByUnknownTagName, null);
+  });
+});
+
+// ISOLATED, attachment branch only: no preceding enqueue/remove of the same
+// text, so the ONLY event that can close this gate is the attachment record
+// itself. If the attachment branch's own body-shape check ever regresses to
+// the old wide tag-name regex, this is the fixture that catches it.
+//
+// A prior version of this suite also carried a "full measured lifecycle"
+// fixture (enqueue, remove, then this same attachment) meant to pin the
+// realistic delivery shape. Sabotage found it discriminated nothing: with
+// `<TODO>` never matching HOST_TAG_PREFIX's three-name allowlist, the
+// preceding `QOP('enqueue', label)` already closes the gate on the
+// fail-closed unregistered-tag branch (already pinned on its own by "close,
+// then a human-typed bracketed label enqueue" above), so removing the
+// ENTIRE attachment branch left that fixture green while this one alone
+// went red. Removed rather than kept as a redundant no-op assertion.
+test('a human-origin queued_command attachment (no preceding enqueue) whose prompt starts with "<TODO>" closes on its own', () => {
+  withTmpDir((dir) => {
+    const label = '<TODO> 계속 작업해줘';
+    assert.equal(isClosePattern(label), false); // guard: not a close phrase either
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: label,
+          commandMode: 'prompt',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// MAJOR FIX, order between humanOrigin and the body-shape allowlist. Before
+// this pass, `isModelCausedQueueContent(prompt)` ran ahead of `humanOrigin`
+// for every prompt, so an audited human producer never won against a body
+// that merely STARTS WITH one of the three ALLOWLISTED names
+// (`agent-message`, `cross-session-message`, `task-notification`), as
+// opposed to `<TODO>` above, which was never on that allowlist and so never
+// exercised this order at all. A real host `<agent-message>` this corpus has
+// only ever seen with no origin (measured, see HOST_TAG_PREFIX's doc
+// comment), but a human can paste that exact string, and the old order read
+// it as model-caused regardless. This fixture pins the fix: a non-close
+// human-origin prompt closes even when its body starts with an allowlisted
+// tag name.
+test('a human-origin queued_command attachment whose prompt starts with an allowlisted host tag name still closes when it is not a close phrase (origin outranks the body-shape allowlist)', () => {
+  withTmpDir((dir) => {
+    const body = '<agent-message from="peer">아직 할 일이 남았으니 계속 진행해줘</agent-message>';
+    assert.equal(body.startsWith('<agent-message'), true); // guard: this body IS on the allowlist
+    assert.equal(isClosePattern(body), false); // guard: this fixture is about the retraction path, not the opener
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: body,
+          commandMode: 'prompt',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// The other half of the same order fix, and the reason it stays an ORDER fix
+// rather than a blanket "humanOrigin always wins": when the SAME
+// allowlisted-tag-shaped body also reads as a close phrase (a real host
+// notification's own `<summary>` can say "wrap up" or "오늘 여기까지"), the
+// body-shape allowlist still runs ahead of the opener, exactly as it does
+// for `<task-notification>` in the fixture above this suite already pins.
+// Reordering this direction too would let a mislabeled host notification
+// manufacture an open nobody asked for, trading a dropped-close gap for a
+// granted-close one.
+// MINOR FIX (codex cross-review round 5): this fixture used to carry no
+// preceding open, so its `isCloseGateOpen(p) === false` assertion could not
+// tell "stayed neutral" apart from "never opened at all": a `false` reads
+// the same either way, and the title's actual claim (a same-body close phrase
+// does not override an EXISTING open) went unpinned. A real close now
+// precedes the fixture record, and the assertion reads `walkCloseGate`
+// directly so it can confirm the ORIGINAL open survives (`openedAtIndex === 0`,
+// the CLOSE record's own index), not merely that some open is present.
+test('a human-origin queued_command attachment whose prompt starts with an allowlisted host tag name and also reads as a close phrase stays neutral (body-shape still wins on the opener path)', () => {
+  withTmpDir((dir) => {
+    const body = '<agent-message from="peer">오늘 여기까지, 위키에도 저장해줘</agent-message>';
+    assert.equal(body.startsWith('<agent-message'), true); // guard: this body IS on the allowlist
+    assert.equal(isClosePattern(body), true); // guard: this fixture is about the OPENER path
+    const p = writeJsonl(dir, [
+      USER(CLOSE),
+      {
+        type: 'attachment',
+        isSidechain: false,
+        userType: 'external',
+        attachment: {
+          type: 'queued_command',
+          prompt: body,
+          commandMode: 'prompt',
+          origin: { kind: 'human' },
+        },
+      },
+    ]);
+    const result = walkCloseGate(p);
+    // Neutral means the attachment record neither opened nor closed anything
+    // ON ITS OWN: the ORIGINAL close from index 0 is what is still standing.
+    assert.equal(result.open, true);
+    assert.equal(result.openedAtIndex, 0);
+  });
+});
+
 test('measured: /clear enqueue → false (abandons context; not a close)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [QOP('enqueue', '/clear')]);
@@ -866,6 +1221,30 @@ test('acceptance: /compact enqueue THEN remove → true (remove is delivery, so 
 test('acceptance: popAll carrying /compact → false (event model: popAll is a cancellation)', () => {
   withTmpDir((dir) => {
     const p = writeJsonl(dir, [QOP('popAll', '/compact')]);
+    assert.equal(isCloseGateOpen(p), false);
+  });
+});
+
+// MINOR FIX (codex cross-review round 5): this comment used to describe a
+// content-aware popAll (read the body the way the enqueue branch does, so a
+// relayed feedback body would stay neutral instead of retracting a real
+// close) as the CURRENT design, with "the other two fixtures below" pinning
+// it. That attempt was tried on 2026-09-17 and reverted the same day
+// (hooks/hypo-shared.mjs's own doc comment on the `popAll` branch has the
+// full measurement: of ~66 popAll records, a content check would have
+// changed the outcome of exactly 0 of them, while newly letting a person's
+// own `<TODO> ...` paste through as neutral). No fixtures pinning a
+// content-aware popAll ever landed in this file; the prose describing them
+// was left behind by the revert. popAll closes UNCONDITIONALLY, reading only
+// `operation === 'popAll'`, never `content`: the single test above already
+// pins this (a popAll carrying `/compact`, content that would OPEN the gate
+// on the enqueue path, still closes here), and the empty-content case below
+// pins the other half: unlike an empty enqueue (neutral, nothing to
+// attribute), an empty popAll still closes, because popAll's decision was
+// never about content in the first place.
+test('a popAll with no content closes an existing open (unconditional, unlike an empty enqueue)', () => {
+  withTmpDir((dir) => {
+    const p = writeJsonl(dir, [USER(CLOSE), QOP('popAll')]);
     assert.equal(isCloseGateOpen(p), false);
   });
 });
@@ -1130,6 +1509,15 @@ test('acceptance: model-origin text on the same correlated lifecycle → false (
 // origin.kind:"task-notification" is what marks it model-caused; note it is the
 // same promptSource:"system" the user's own queued text is replayed under, which
 // is exactly why the dequeue GAP above cannot be closed on promptSource alone.
+//
+// A 2026-09 pass (codex cross-review round 5, blocker) flipped this fixture to
+// `false`, closing on the reasoning that the tag-shaped enqueue body is not PROOF
+// of model authorship (a person can paste the same shape). That reasoning still
+// holds; it was reverted 2026-09-18 once measured against the corpus this file
+// actually runs against, see the enqueue-branch reversion note in
+// hooks/hypo-shared.mjs for the numbers. The residual it reopens is now warned
+// once at commit time (closeGateStatus's `hostTagWarning`) rather than closed on
+// every gate read.
 test('acceptance: close, then a model-caused <task-notification> lifecycle → true (must STAY granted)', () => {
   withTmpDir((dir) => {
     const notif =
@@ -1296,6 +1684,10 @@ test('close, then a queued non-close (read off the enqueue) → false', () => {
 // The negative twin: a task-notification replay wears promptSource:"system" too,
 // but carries origin.kind, so it is attributable as model-caused and stays
 // NEUTRAL — the user's close must survive the model's own background work.
+//
+// A 2026-09 pass (codex cross-review round 5, blocker) flipped this to `false`;
+// reverted 2026-09-18 along with the lifecycle fixture above, same reasoning,
+// see hooks/hypo-shared.mjs's enqueue-branch reversion note.
 test('close, then a task-notification replay (origin.kind present) → true (stays granted)', () => {
   withTmpDir((dir) => {
     const notif =
@@ -1324,6 +1716,12 @@ test('close, then a task-notification replay (origin.kind present) → true (sta
 // THIRD shape, flipped the just-opened gate back to closed. All three shapes
 // of the one host event must read neutral, so all three sit in one fixture:
 // an enqueue, its remove, and the remove-path attachment.
+//
+// A 2026-09 pass (codex cross-review round 5, blocker) flipped this to `false`
+// (the enqueue step alone closed it, so this fixture stopped isolating the
+// attachment branch at all); reverted 2026-09-18 along with the two fixtures
+// above, same reasoning, see hooks/hypo-shared.mjs's enqueue-branch reversion
+// note.
 test('close, then a task-notification via enqueue + remove + attachment → true (all three delivery shapes stay neutral)', () => {
   withTmpDir((dir) => {
     const notif =

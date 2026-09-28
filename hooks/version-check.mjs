@@ -166,7 +166,7 @@ export function selectPluginVersion(plugins) {
  *
  *  Lives here because both hooks and scripts need it and the dependency only
  *  runs one way (scripts import hooks, never the reverse). This file is already
- *  in hooks.json's `shared` list, so it reaches every standalone install.
+ *  listed in hooks/shared.json, so it reaches every standalone install.
  *
  *  Use UPGRADE_APPLY_EITHER when the target channel is genuinely unknown, e.g.
  *  an instruction about a DIFFERENT machine. */

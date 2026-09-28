@@ -10,7 +10,14 @@
  *   2. copy templates/projects/_template/*.md with token substitution
  *        <project-name> → name, <started> → date, <working_dir> → cwd,
  *        YYYY-MM-DD     → today  (frontmatter `updated:` only)
- *   3. append a row to root hot.md "Active Projects" table
+ *   3. regenerate root hot.md's "Active Projects" table via the canonical
+ *      projection (writeRootHotProjection, hooks/hypo-shared.mjs), which
+ *      picks up this project's own row from the directory scan step 2 just
+ *      wrote, never a hand-inserted row. A direct table edit here (the old
+ *      insertHotRow) left the ownership hash pointing at whatever a
+ *      session's projection write last produced, so the next SessionStart or
+ *      Stop read this edit as external and backed it up with a false "손으로
+ *      편집한 내용이 있었습니다" alarm on every normal project creation.
  *   4. append a `## [today] project-create | <name>` entry to log.md
  *
  * Idempotent: existing files/rows/entries are preserved, never overwritten or
@@ -25,6 +32,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { join, dirname, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './hypo-root.mjs';
+import { writeRootHotProjection, rootHotBackupRecoveryNotice } from '../../hooks/hypo-shared.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(SCRIPT_DIR, '..', '..');
@@ -55,35 +63,6 @@ export function substituteTokens(content, { name, started, workingDir, today }) 
     .join(workingDir)
     .split('YYYY-MM-DD')
     .join(today);
-}
-
-/**
- * Insert a project row into the root hot.md "Active Projects" table.
- * Idempotent: returns the original content unchanged if a row already links
- * to `[[projects/<name>/hot]]`. Returns null if the table cannot be located.
- * @returns {string|null} new content, or null when no table marker is found
- */
-export function insertHotRow(content, name, today) {
-  const link = `[[projects/${name}/hot]]`;
-  if (content.includes(link)) return content; // already present
-  const lines = content.split('\n');
-  // Scope the search to the "## Active Projects" section so a table appearing
-  // earlier in hot.md can't capture the row. Start looking from the heading;
-  // stop at the next H2 so we never cross sections.
-  const headingIdx = lines.findIndex((l) => /^##\s+Active Projects\s*$/.test(l));
-  if (headingIdx === -1) return null;
-  let sepIdx = -1;
-  for (let i = headingIdx + 1; i < lines.length; i++) {
-    if (/^##\s/.test(lines[i])) break; // next section — table not found in scope
-    if (/^\|\s*-{2,}\s*\|/.test(lines[i])) {
-      sepIdx = i;
-      break;
-    }
-  }
-  if (sepIdx === -1) return null;
-  const row = `| ${name} | ${today} | ${link} |`;
-  lines.splice(sepIdx + 1, 0, row);
-  return lines.join('\n');
 }
 
 /**
@@ -162,21 +141,38 @@ export function createProject(opts) {
     created.push(`projects/${name}/${file}`);
   }
 
-  // root hot.md pointer row
-  const hotPath = join(hypoDir, 'hot.md');
-  if (existsSync(hotPath)) {
-    const orig = readFileSync(hotPath, 'utf-8');
-    const next = insertHotRow(orig, name, today);
-    if (next === null) {
-      warnings.push('root hot.md: no Active Projects table found — add row manually');
-    } else if (next !== orig) {
-      writeFileSync(hotPath, next);
-      created.push('hot.md row');
-    } else {
-      skipped.push('hot.md row');
-    }
+  // root hot.md pointer row: regenerate via the canonical projection (n2 fix,
+  // see this function's own doc comment above) rather than hand-inserting a
+  // row. The directory scan already sees this project's own hot.md, written
+  // by the TEMPLATE_FILES loop above, so the new row lands in the same pass.
+  const hotResult = writeRootHotProjection(hypoDir);
+  if (hotResult.scanError) {
+    warnings.push('root hot.md: projects/ 디렉터리를 읽지 못해 표를 갱신하지 못했습니다');
+  } else if (hotResult.lockTimeout) {
+    // Distinct from the plain "already current" skip below: the row was
+    // never even attempted this run because another session held the vault
+    // lock, not because there was nothing new to write. `warnings` already
+    // carries writeRootHotProjection's own lock-busy message; this label is
+    // what lets a caller reading only `skipped` tell "not created" apart
+    // from "could not check whether it needed creating".
+    skipped.push('hot.md row (lock timeout)');
+  } else if (hotResult.written) {
+    created.push('hot.md row');
   } else {
-    warnings.push('root hot.md missing — skipped pointer row');
+    skipped.push('hot.md row');
+  }
+  if (hotResult.warnings.length > 0) warnings.push(...hotResult.warnings);
+  // MAJOR fix (codex 3rd-tier finding 6): a hand-authored root hot.md this
+  // scaffold's own writeRootHotProjection call just backed up never reached
+  // the user at all here. `backedUp`/`backupPath` were read by
+  // SessionStart and the Stop-hook rebuild but silently dropped on this
+  // third writer, the one call site with the least excuse for it (`main`'s
+  // own CLI output prints every entry in `warnings`). Same shared sentence
+  // the other two writers use, so a person who created a project right
+  // after hand-editing root hot.md gets the SAME recovery guidance, not a
+  // silently vanished edit.
+  if (hotResult.backedUp && hotResult.backupPath) {
+    warnings.push(rootHotBackupRecoveryNotice(hotResult.backupPath));
   }
 
   // log.md entry

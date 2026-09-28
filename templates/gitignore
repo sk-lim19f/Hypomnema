@@ -12,3 +12,14 @@
 # match the staging name, and a crash between the link and its cleanup leaves one
 # behind — where `git add -A` would happily pick it up.
 *.lock.*.tmp
+
+# Migration backup of a hand-authored root hot.md, written the first time
+# writeRootHotProjection takes over a file it does not already own (see
+# hooks/hypo-shared.mjs). Never tracked: it can hold whatever a person's own
+# uncommitted notes held, and a scoped auto-commit must never pick it up.
+/hot.md.pre-projection-backup*.md
+# atomicWrite's own temp file for the backup write above
+# (`<backupPath>.<pid>.<random>.tmp`): carries the same hand-authored bytes
+# until the rename that produces the file matched above, so a kill or power
+# loss mid-write must not leave it exposed to `git add -A` either.
+/hot.md.pre-projection-backup*.tmp

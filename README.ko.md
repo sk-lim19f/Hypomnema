@@ -211,7 +211,11 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 
 ### 4. 왜 재개에 `hot.md` 캐시를 쓰는가
 
-멈춘 프로젝트에서 가장 비싼 건 일을 다시 하는 게 아니라 컨텍스트를 다시 쌓는 일입니다. `session-log/`를 처음부터 다시 읽으면 분 단위 시간과 토큰이 들지만, 한 페이지짜리 `hot.md`를 읽는 건 둘 다 들지 않습니다. 그래서 최근 상태를 프로젝트별 `hot.md`에 따로 캐싱합니다. 세션 마무리(`crystallize`)가 다시 만들고 `SessionStart`가 주입합니다. 재개는 O(1)입니다.
+멈춘 프로젝트에서 가장 비싼 건 일을 다시 하는 게 아니라 컨텍스트를 다시 쌓는 일입니다. `session-log/`를 처음부터 다시 읽으면 분 단위 시간과 토큰이 들지만, 한 페이지짜리 `hot.md`를 읽는 건 둘 다 들지 않습니다. 그래서 최근 상태를 명시적으로 캐싱합니다. `hot.md`는 두 층입니다. 프로젝트별 `hot.md`는 세션 마무리(`crystallize`)가 쓰고, 볼트 루트의 `hot.md`는 그 파일들을 훑어 만드는 포인터 표입니다. 루트 쪽은 `SessionStart`와 `Stop`에서 훅이 다시 만드니 손으로 고치지 마세요. 둘 다 `SessionStart`에 주입됩니다. 재개는 O(1)입니다.
+
+루트 `hot.md`는 훅이 만들어 내는 결과물이지, 손으로 편집하는 자리가 아닙니다. 거기 직접 써 넣은 내용은 다음번 재생성(다음 `SessionStart`나 `Stop`) 때 사라집니다. 훅이 만든 내용인지 사람이 쓴 내용인지 구분해서 판단할 방법이 없기 때문입니다. 파일 rename에는 범용 compare and swap이 없고, 편집기도 훅이 잡은 advisory lock을 따르지 않습니다. 그래서 훅은 자기가 쓴 내용인지 먼저 확인하고, 아니라고 판단되면 그 내용을 버리는 대신 `hot.md.pre-projection-backup.md`(둘 이상 쌓이면 `-2.md`, `-3.md`, ...)로 같은 자리에 백업해 둡니다. 다만 이 백업은 보장이 아니라 최선을 다한 구조일 뿐입니다. 재작성 도중에 저장이 겹치거나, 편집기가 제자리 저장 방식을 쓰면 백업이 일부만 담기거나 아예 안 남을 수도 있습니다. 안전망이지 쓰는 자리가 아니라는 뜻입니다.
+
+백업을 다시 루트 `hot.md`로 되돌리지 마세요. 다음 훅 실행이 곧바로 또 덮어씁니다. 대신 백업 파일을 열어 읽어 보고, 남길 내용은 해당 프로젝트의 `projects/<slug>/hot.md`나 별도 페이지로 옮긴 뒤(어느 프로젝트 것인지는 훅이 판단 못 하니 사람이 정합니다) 백업을 지우세요. 볼트 전체에 얼마나 쌓였는지 보려면 볼트 루트에서 `ls hot.md.pre-projection-backup*.md`를 실행하면 됩니다.
 
 ### 5. 왜 feedback → behavior 파이프라인인가
 
@@ -252,20 +256,17 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | 훅 | 이벤트 | 역할 |
 |---|---|---|
 | `hypo-close-guard.mjs` | `PreToolUse` | Write/Edit/MultiEdit가 세션 마무리 쓰기로 보이는데 트랜스크립트에 사용자의 마무리 신호가 없으면, 파일이 바뀌기 전에 확인을 받음 |
-| `hypo-session-start.mjs` | `SessionStart` | `hot.md` / `session-state.md` 주입 + `git pull --ff-only` |
+| `hypo-session-start.mjs` | `SessionStart` | `git pull --ff-only`, 루트 `hot.md` 투영 재생성, `hot.md` / `session-state.md` 주입 |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | 마커 기반으로 첫 프롬프트에 재개 한 줄을 요구한다(10분 TTL). `hot.md`를 다시 읽지는 않는다 |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT 주입 / MISS면 가까운 슬러그 신호 |
 | `hypo-compact-guard.mjs` | `UserPromptSubmit` | 채팅에 입력된 `/compact`나 `/clear`를 감지해 마무리가 덜 됐으면 알린다. compact 자체는 막지 않는다 |
 | `hypo-cwd-change.mjs` | `CwdChanged` | cwd에 맞는 프로젝트 `hot.md`로 알림을 만든다. `CwdChanged`는 모델에 닿는 출력 필드를 문서화하지 않아 알림은 `systemMessage`로 나간다. 그것이 이 이벤트에서 어디로 가는지는 미측정이다(아래 전송 안내 참조) |
 | `hypo-file-watch.mjs` | `FileChanged` | 바뀜 위키 파일로 알림을 만든다(`.hypoignore` 준수). 이 패키지는 감시 경로를 등록하지 않아 이벤트가 발생할 계기 자체가 없다. `CwdChanged`와 마찬가지로 모델에 닿는 필드를 문서화하지 않아 알림은 `systemMessage`로 나간다 |
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | 위키 파일 자동 stage |
-| `hypo-auto-commit.mjs` | `Stop` | 자동 commit + pull + push |
-| `hypo-hot-rebuild.mjs` | `Stop` | 루트 `hot.md` 포인터 테이블 재생성 (구조와 날짜) |
-| `hypo-personal-check.mjs` | `PreCompact` | session-close 미완, 위키 커밋/푸시 누락, hot.md 구조 위반, lint 블로커를 `systemMessage`로 알림. `/compact`는 여기서 막지 않음. 세션 마무리 강제는 다른 자리에 남아 있음: Stop 훅(`hypo-auto-minimal-crystallize.mjs`)이 마무리 확인 없는 의미 있는 세션을 막고, `--mark-session-closed`는 여전히 red 게이트에서 마커를 거부함 |
-| `hypo-session-end.mjs` | `SessionEnd` | SessionEnd 마커 기록. 다음 SessionStart가 `source=clear` 복구를 감지하게 함 |
-| `hypo-session-record.mjs` | `Stop` | observability 점수 + auto-resume 신호용 세션 메타데이터 기록 |
-| `hypo-auto-minimal-crystallize.mjs` | `Stop` | 사용자가 마무리를 신호한 뒤, 의미 있는 작업을 했는데 세션 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려줌. 미커밋 변경이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되물음 |
-| `hypo-web-fetch-ingest.mjs` | `PostToolUse(WebFetch/WebSearch)` | WebFetch/WebSearch 뒤 `additionalContext`에 `/hypo:ingest` 권유 주입 (URL의 query/hash/userinfo 제거) |
+| `hypo-stop.mjs` | `Stop` | 등록된 유일한 `Stop` 훅이다. 네 단계를 병렬이 아니라 순서대로 돌린다: 루트 `hot.md` 투영 재생성(`SessionStart`도 같은 생성기를 부른다), observability 점수와 auto-resume 신호용 세션 메타데이터 기록, commit + pull + push, 그리고 사용자가 마무리를 신호한 뒤 의미 있는 작업을 했는데 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려준다(미커밋 변경이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되묻는다) |
+| `hypo-personal-check.mjs` | `PreCompact` | session-close 미완, 위키 커밋/푸시 누락, hot.md 구조 위반, lint 블로커를 `systemMessage`로 알린다. `/compact`는 여기서 막지 않는다. 세션 마무리 강제는 다른 자리에 남아 있다: `hypo-stop.mjs`의 crystallize 단계가 마무리 확인 없는 의미 있는 세션을 막고, `--mark-session-closed`는 여전히 red 게이트에서 마커를 거부한다 |
+| `hypo-session-end.mjs` | `SessionEnd` | SessionEnd 마커를 기록해 다음 SessionStart가 `source=clear` 복구를 감지하게 한다 |
+| `hypo-web-fetch-ingest.mjs` | `PostToolUse(WebFetch/WebSearch)` | WebFetch/WebSearch 뒤 `additionalContext`에 `/hypo:ingest` 권유를 주입한다(URL의 query/hash/userinfo는 제거) |
 
 PostToolUse 훅 둘은 matcher 없이 등록되고 각자 tool_name으로 거릅니다.
 

@@ -355,7 +355,6 @@ function payloadForCleanWiki(dir, today) {
       content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
     },
     projectHot: { content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8') },
-    rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
     sessionLog: { entry: `## [${today}] re-applied session\n` },
     log: { entry: `## [${today}] session | test-project — re-applied\n` },
   };

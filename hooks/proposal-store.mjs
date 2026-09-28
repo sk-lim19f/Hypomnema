@@ -4,7 +4,7 @@
 // SessionStart-chain hook (T8's session-start surface) counts pending proposals,
 // so the store must sit where a hook can import it without reaching up into
 // scripts/. scripts/ (crystallize, the T7 CLI) already imports from hooks/, never
-// the reverse. Registered in hooks.json `shared` alongside base-store.
+// the reverse. Registered in hooks/shared.json alongside base-store.
 //
 // When crystallize's close path finds that an OVERWRITE target drifted away from
 // the base this session observed at start, it withholds the bytes rather than
@@ -45,7 +45,7 @@
 // fatal) and atomic on the write side (tmp+rename), mirroring base-store.
 
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, unlinkSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, realpathSync, statSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { atomicWrite } from './atomic-write.mjs';
 
@@ -142,9 +142,95 @@ function readArtifactFile(path) {
 }
 
 /**
+ * Scan an already-`readdirSync`'d proposals dir once, splitting `.json` entries
+ * into parsed artifacts and everything readArtifactFile would not hand back.
+ * "Everything else" covers three cases indistinguishably (unreadable bytes, a
+ * body that is not the artifact shape, an id that does not match its own
+ * filename), so a caller that needs to tell those apart already has the
+ * filename in hand to go look. Shared by listProposals and
+ * listProposalsChecked so a directory is walked and each file parsed exactly
+ * once per call, not twice.
+ */
+// atomicWrite's OWN temp-file name (`<path>.<pid>.<rand>.tmp`; see
+// atomic-write.mjs), so a `.json.<pid>.<rand>.tmp` sitting in this store is
+// a completed artifact body whose rename never landed: the process that
+// wrote it died in the gap between `writeFileSync` and `renameSync`. That
+// gap holds real, already-serialized proposal bytes, not empty scratch
+// space, so a scan that only ever looked for `.json` names read a vault
+// with nothing BUT one of these as `parkedTotal: 0`, the same silent-zero
+// this file's own listProposalsChecked doc comment already warns about, just
+// reached through a different failure than a corrupt `.json`.
+const PROPOSAL_TMP_RE = /\.json\.\d+\.[a-z0-9]+\.tmp$/;
+// A live writer's tmp file looks identical to an orphan for the instant
+// between its own writeFileSync and renameSync, so only a tmp file idle
+// longer than this counts as unfinished. writeProposal's write is a single
+// synchronous JSON.stringify + one syscall pair, so anything past a few
+// seconds is already generous; a full minute gives slow disks and CI
+// runners headroom without leaving a real crash unreported for long.
+const PROPOSAL_TMP_GRACE_MS = 60_000;
+
+/**
+ * The filename an orphan tmp's body would have landed at if its rename had
+ * finished. Shared with `checkProposals` (doctor.mjs) so its recovery hint
+ * names the same target this store would have produced, rather than a second
+ * copy of PROPOSAL_TMP_RE's suffix that could drift from this one.
+ */
+export function orphanTmpTargetName(name) {
+  return name.replace(PROPOSAL_TMP_RE, '.json');
+}
+
+function scanProposalFiles(dir, names) {
+  const proposals = [];
+  const unreadable = [];
+  // Subset of `unreadable`: filenames that matched PROPOSAL_TMP_RE past the
+  // grace period. A caller keeping only `unreadable` cannot tell a corrupt
+  // artifact from a complete proposal body whose rename never landed, and the
+  // two have different fixes (discard vs. `mv` back to its `.json` name).
+  // Kept as an ADDITIONAL array rather than removed from `unreadable`, so the
+  // existing `unreadable.length` contract (what `--json` consumers already
+  // parse) does not shrink out from under them; a name can legitimately sit
+  // in both.
+  const orphanTmp = [];
+  for (const name of names) {
+    if (PROPOSAL_TMP_RE.test(name)) {
+      let stale = true;
+      try {
+        stale = Date.now() - statSync(join(dir, name)).mtimeMs > PROPOSAL_TMP_GRACE_MS;
+      } catch {
+        stale = false; // vanished mid-scan: the writer's own rename just landed, not an orphan
+      }
+      if (stale) {
+        unreadable.push(name);
+        orphanTmp.push(name);
+      }
+      continue;
+    }
+    if (!name.endsWith('.json')) continue;
+    const path = join(dir, name);
+    const parsed = readArtifactFile(path);
+    // A well-formed artifact's `id` field equals its filename stem and is itself
+    // id-safe. A mismatch means the body was hand-edited or corrupt; trusting its
+    // `id` would let a spoofed value drive supersede or T7 apply against the wrong
+    // file, so skip it (it stays on disk but is never acted on).
+    if (parsed && isValidProposalId(parsed.id) && parsed.id === name.slice(0, -'.json'.length)) {
+      proposals.push({ ...parsed, _path: path });
+    } else {
+      unreadable.push(name);
+    }
+  }
+  return { proposals, unreadable, orphanTmp };
+}
+
+/**
  * List parked proposals, newest artifacts included, malformed ones skipped.
  * Each entry is the parsed body plus `_path` (absolute) so callers (the T7 CLI)
  * can act on the exact file without re-deriving the path.
+ *
+ * A file this could not parse is silently absent from the result, same as
+ * before: every existing caller here acts on whatever IS readable and treats
+ * one bad artifact as no reason to fail a supersede scan or a T7 listing. A
+ * caller that needs to know a bad file exists at all, rather than just not
+ * see it, wants listProposalsChecked below, not this.
  *
  * @returns {Array<object>} parsed artifacts; empty when the dir is absent/empty
  */
@@ -157,20 +243,64 @@ export function listProposals(hypoDir) {
   } catch {
     return [];
   }
-  const out = [];
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue;
-    const path = join(dir, name);
-    const parsed = readArtifactFile(path);
-    // A well-formed artifact's `id` field equals its filename stem and is itself
-    // id-safe. A mismatch means the body was hand-edited or corrupt; trusting its
-    // `id` would let a spoofed value drive supersede or T7 apply against the wrong
-    // file, so skip it (it stays on disk but is never acted on).
-    if (parsed && isValidProposalId(parsed.id) && parsed.id === name.slice(0, -'.json'.length)) {
-      out.push({ ...parsed, _path: path });
-    }
+  return scanProposalFiles(dir, names).proposals;
+}
+
+/**
+ * Same enumeration as listProposals, but keeps THREE states apart that all
+ * look like "nothing to review" from a bare count: an absent store (zero
+ * proposals were ever parked, `ok: true, proposals: [], unreadable: []`); a
+ * `readdirSync` failure on the store itself, permissions or a file sitting
+ * where the directory should be (the count is unmeasured, not zero, `ok:
+ * false`); and, the gap this once shared with listProposals, a `.json`
+ * candidate that sat right there in a perfectly listable directory but came
+ * back corrupt, permission-denied, or hand-edited into an unrecognizable
+ * shape. That third case used to fold into the same `[]` listProposals
+ * returns for "no proposals", so a vault with one chmod-000 artifact and zero
+ * readable ones reported `parkedTotal: 0` with no line of output anywhere
+ * naming the file: a silent success over a backlog that was never actually
+ * empty. `unreadable` is exactly those filenames (relative, `.json`
+ * included), so a caller can print "N candidate(s) unreadable, run doctor" even
+ * when the readable count is zero.
+ *
+ * listProposals above still gates on `existsSync` and stays fail-open on ANY
+ * stat or readdir failure: every one of its callers (the supersede scan in
+ * writeProposal, the T7 CLI's ordinary listing) wants "proposals I can act on
+ * right now", never a three-way judgment, and none of them has anywhere to
+ * put an `ok: false`. This function exists because `checkProposals` and the
+ * close report DO have somewhere to put it, and folding "could not tell" into
+ * "empty" is exactly the silent-zero this file's own docblock warns about.
+ * `existsSync` cannot make that call: it returns false for every stat
+ * failure, not just ENOENT, so it cannot tell "never created" apart from
+ * "could not be examined" (see the errno check below).
+ *
+ * @returns {{ok: boolean, proposals: object[], unreadable: string[], orphanTmp: string[]}}
+ *   `orphanTmp` is the subset of `unreadable` whose rename never landed (see
+ *   `orphanTmpTargetName`): a complete proposal body, recoverable with `mv`,
+ *   not a corrupt file to discard.
+ */
+export function listProposalsChecked(hypoDir) {
+  const dir = proposalsDir(hypoDir);
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch (e) {
+    // ENOENT is the only errno that means "no store was ever created" (zero
+    // proposals, ok: true). Every other errno (EACCES, ENOTDIR when a file
+    // sits where the directory should be, ELOOP, ...) means the store could
+    // not be examined at all, so the count is unmeasured, not zero.
+    //
+    // Cost accepted: a vault that has never parked anything now throws and
+    // catches one ENOENT on every listProposalsChecked call, instead of the
+    // existsSync precheck this replaced. In exchange, there is no longer a
+    // window between "does it exist" and "list it" where the directory could
+    // change underneath the two calls, and a real access failure can no
+    // longer masquerade as "never created".
+    if (e && e.code === 'ENOENT') return { ok: true, proposals: [], unreadable: [], orphanTmp: [] };
+    return { ok: false, proposals: [], unreadable: [], orphanTmp: [] };
   }
-  return out;
+  const { proposals, unreadable, orphanTmp } = scanProposalFiles(dir, names);
+  return { ok: true, proposals, unreadable, orphanTmp };
 }
 
 /**

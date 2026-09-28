@@ -15,6 +15,9 @@ import {
   existsSync,
   cpSync,
   realpathSync,
+  lstatSync,
+  symlinkSync,
+  unlinkSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -265,6 +268,18 @@ test('--apply text report lists the appended .gitignore entry and counts it', ()
       );
       const m = r.stdout.match(/Result: (\d+) update\(s\) applied/);
       assert.ok(m && Number(m[1]) >= 1, `applied count must include gitignore: ${r.stdout}`);
+      // The completion line used to say only "Run /hypo:doctor to verify", a
+      // slash command a shell/npm-only user (no Claude Code session, so no
+      // slash-command surface at all) cannot run. Name both forms, with no
+      // runtime guess about which one applies to the reader.
+      assert.match(
+        r.stdout,
+        /Verify with `\/hypo:doctor` in Claude Code, or `hypomnema doctor` with the npm CLI/,
+        `completion line must name both doctor surfaces: ${r.stdout}`,
+      );
+      // Never spell a call the slash command does not make (tests/notifier.test.mjs's
+      // shipped-surface sweep bans this literal tree-wide).
+      assert.doesNotMatch(r.stdout, /\/hypo:upgrade\s+--apply/, r.stdout);
     });
   });
 });
@@ -292,6 +307,14 @@ test('--apply generates migration report for major SCHEMA bump', () => {
       );
       const content = readFileSync(out.migrationReport, 'utf-8');
       assert.ok(content.includes('0.9'), 'migration report should reference old version');
+      // Same as the v1→v2 body: the doctor step must work on a plugin install.
+      // Disabling the check: drop the `/hypo:doctor` half of the generic
+      // major-bump checklist line in upgrade.mjs.
+      assert.match(
+        content,
+        /^- \[ \] Run doctor .*`\/hypo:doctor`.*`hypomnema doctor`/m,
+        'major-bump checklist must give the doctor step for both install paths',
+      );
       // Read the version off the shipped template rather than pinning a literal.
       // The point of this assertion is "the report names the version we are
       // upgrading TO", and a literal turns every SCHEMA bump into a failing test
@@ -383,6 +406,14 @@ test('--apply migration report v1→v2 includes SCHEMA 2.0 feedback fields guida
         'v1→v2 report must explain the SCHEMA 2.0 change',
       );
       assert.ok(body.includes('semver-major'), 'v1→v2 report must explain why the bump is major');
+      // A plugin install has no `hypomnema` binary, so the doctor step names the
+      // slash command too. Disabling the check: drop the `/hypo:doctor` half of
+      // the v1→v2 checklist line in upgrade.mjs.
+      assert.match(
+        body,
+        /^- \[ \] Run doctor .*`\/hypo:doctor`.*`hypomnema doctor`/m,
+        'v1→v2 checklist must give the doctor step for both install paths',
+      );
       for (const field of [
         'status',
         'scope',
@@ -574,6 +605,18 @@ test('guide.bump is non-none and the report warns when installed hypo-guide.md i
         /hypo-guide\.md.*package template changed/.test(textR.stdout),
         `text report must warn about stale hypo-guide.md: ${textR.stdout}`,
       );
+      // The warning used to name a package-relative path (`templates/hypo-guide.md`)
+      // that does not exist under a vault root, since init never copies templates/
+      // into the vault, so a person running upgrade from their vault (the common
+      // case) had nothing to open. Both sides must be absolute, and runnable together.
+      assert.ok(
+        textR.stdout.includes(out.guide.pkgPath) && textR.stdout.includes(out.guide.hypoPath),
+        `guide drift line must name both copies by absolute path: ${textR.stdout}`,
+      );
+      assert.ok(
+        textR.stdout.includes(`diff "${out.guide.pkgPath}" "${out.guide.hypoPath}"`),
+        `guide drift line must give one runnable diff command: ${textR.stdout}`,
+      );
     });
   });
 });
@@ -661,6 +704,14 @@ test('guide.bump is "unstamped" (counted as drift) when the version line is remo
       assert.ok(
         /no base version to diff/.test(textR.stdout),
         `unstamped hypo-guide.md notice must explain why no delta can be given: ${textR.stdout}`,
+      );
+      // The unstamped line is the other branch of the same warning, and it
+      // needs the same absolute-path diff as the stamped one: a vault root has
+      // no templates/ directory to compare against. Disabling the check: put
+      // the old `templates/hypo-guide.md` wording back on the unstamped line.
+      assert.ok(
+        textR.stdout.includes(`diff "${out.guide.pkgPath}" "${out.guide.hypoPath}"`),
+        `unstamped guide line must give one runnable diff command: ${textR.stdout}`,
       );
 
       // ISSUE-19: still no write path, even for the unstamped case.
@@ -2556,10 +2607,19 @@ test('a single-minor-step bump names the change in the text report', () => {
       const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
       assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
 
+      // One minor below whatever templates/SCHEMA.md ships, so the step stays a
+      // single one across future bumps. This used to pin 2.1 → 2.2 and silently
+      // became a two-step fixture when 2.3 shipped. The real 2.1 → 2.2 wording
+      // is pinned separately by 'names the real 2.1 → 2.2 change'.
+      const shipped = readFileSync(join(REPO, 'templates', 'SCHEMA.md'), 'utf-8')
+        .match(/^version: (.+)$/m)[1]
+        .trim();
+      const [major, minor] = shipped.split('.').map(Number);
+      const prev = `${major}.${minor - 1}`;
       const schemaPath = join(hypoDir, 'SCHEMA.md');
       writeFileSync(
         schemaPath,
-        readFileSync(schemaPath, 'utf-8').replace(/^version: .+$/m, 'version: 2.1'),
+        readFileSync(schemaPath, 'utf-8').replace(/^version: .+$/m, `version: ${prev}`),
       );
 
       const jsonR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
@@ -2567,17 +2627,17 @@ test('a single-minor-step bump names the change in the text report', () => {
       assert.equal(
         out.schema.bump,
         'minor',
-        `expected minor bump from 2.1: ${JSON.stringify(out.schema)}`,
+        `expected minor bump from ${prev}: ${JSON.stringify(out.schema)}`,
       );
 
       const textR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`], home);
       assert.ok(
-        /SCHEMA version.*2\.1 → 2\.2/.test(textR.stdout),
+        textR.stdout.includes(`SCHEMA version    ${prev} → ${shipped}`),
         `text report must still show the version bump: ${textR.stdout}`,
       );
       assert.ok(
-        textR.stdout.includes('sources_consulted'),
-        `text report must name what 2.2 added, not just the version numbers: ${textR.stdout}`,
+        textR.stdout.includes(SCHEMA_VERSION_DELTAS[shipped]),
+        `text report must name what ${shipped} added, not just the version numbers: ${textR.stdout}`,
       );
     });
   });
@@ -2610,6 +2670,213 @@ test('a two-minor-step bump still names the in-between change, not just the endp
       assert.ok(
         textR.stdout.includes('sources_consulted'),
         `text report must name the 2.2 change even when installed is two minors behind: ${textR.stdout}`,
+      );
+    });
+  });
+});
+
+// ── retired settings.json registrations ─────────────────────────────────────
+//
+// Stop used to register four hooks directly. They are now steps that
+// hooks/hypo-stop.mjs spawns in order, and hooks.json's Stop names only the
+// orchestrator. applySettingsJson only ever ADDS what HOOK_MAP lists, so a
+// settings.json install upgraded across that change kept its four old Stop
+// entries and gained hypo-stop.mjs on top: each old step then ran twice per
+// Stop (once directly, once from the orchestrator). The fixture is that
+// install, plus a legacy wiki-*.mjs spelling of one of them (the rename lands
+// it on a retired name, which only the apply-time re-check can see) and a
+// hook the package never shipped sharing a group with a retired one.
+suite('upgrade.mjs: retired settings.json registrations');
+
+test('--apply removes Stop registrations the orchestrator replaced, and nothing else', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const cmdFor = (file) => `node $HOME/.claude/hooks/${file}`;
+      const cfg = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      cfg.hooks.Stop.push(
+        { hooks: [{ type: 'command', command: cmdFor('hypo-hot-rebuild.mjs') }] },
+        {
+          hooks: [
+            { type: 'command', command: cmdFor('hypo-session-record.mjs') },
+            { type: 'command', command: cmdFor('my-own-stop.mjs') },
+          ],
+        },
+        { hooks: [{ type: 'command', command: cmdFor('hypo-auto-minimal-crystallize.mjs') }] },
+        { hooks: [{ type: 'command', command: cmdFor('wiki-auto-commit.mjs') }] },
+      );
+      writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + '\n');
+
+      const checkR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const check = JSON.parse(checkR.stdout);
+      assert.deepEqual(
+        check.retiredSettings.map((r) => `${r.event}: ${r.file}`).sort(),
+        [
+          'Stop: hypo-auto-minimal-crystallize.mjs',
+          'Stop: hypo-hot-rebuild.mjs',
+          'Stop: hypo-session-record.mjs',
+        ],
+        'dry run must name exactly the shipped hooks HOOK_MAP.Stop no longer lists',
+      );
+      assert.equal(checkR.status, 1, 'retired registrations must count as drift');
+
+      const applyR = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--json'],
+        home,
+      );
+      assert.equal(applyR.status, 0, `upgrade --apply failed: ${applyR.stderr}`);
+      assert.equal(
+        JSON.parse(applyR.stdout).applied.retiredSettings.length,
+        4,
+        'apply must also retire the entry the wiki-auto-commit.mjs rename produced',
+      );
+
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const stopCmds = after.hooks.Stop.flatMap((g) => g.hooks).map((h) => h.command);
+      assert.deepEqual(
+        stopCmds.sort(),
+        [cmdFor('hypo-stop.mjs'), cmdFor('my-own-stop.mjs')].sort(),
+        'Stop must keep the orchestrator once and the foreign hook, and lose every retired step',
+      );
+
+      const againR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      assert.deepEqual(JSON.parse(againR.stdout).retiredSettings, []);
+    });
+  });
+});
+
+// ── settings.json is committed with one atomic write, not three ────────────
+//
+// Rename, add, and retire used to each open settingsPath with a plain
+// writeFileSync (truncate-in-place, no temp file). A crash between any two of
+// those three calls left valid JSON that was only half-migrated. One example:
+// a legacy Stop entry renamed to its new basename with nothing left to retire
+// it, so the orchestrator and the step it replaced both fired on every Stop.
+//
+// This is proven by swapping settingsPath for a symlink before --apply runs.
+// A plain writeFileSync opens through a symlink (follows it, like any other
+// open()) and rewrites the TARGET file, leaving the symlink itself in place.
+// A rename-based atomic write (temp file plus renameSync, see
+// hooks/atomic-write.mjs) replaces whatever directory entry sits at that
+// path, symlink or not, so the symlink is gone afterward. Reverting the
+// merged apply path back to three separate writeFileSync calls turns this
+// red: the symlink would survive.
+suite('upgrade.mjs: settings.json is committed with one atomic write');
+
+test('--apply replaces a symlinked settings.json with a real file, not a truncate-in-place write', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const cmdFor = (file) => `node $HOME/.claude/hooks/${file}`;
+      // Same shape as the retired-registrations fixture above: one entry that
+      // needs only retiring, one legacy name that needs renaming and then
+      // retiring. So the --apply run below actually exercises rename AND
+      // retire in the same pass, and the write this test watches really happens.
+      const cfg = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      cfg.hooks.Stop.push(
+        { hooks: [{ type: 'command', command: cmdFor('hypo-hot-rebuild.mjs') }] },
+        { hooks: [{ type: 'command', command: cmdFor('wiki-auto-commit.mjs') }] },
+      );
+      writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + '\n');
+
+      // Swap settingsPath for a symlink to the same bytes, kept elsewhere in
+      // the same directory.
+      const realPath = join(home, '.claude', 'settings.real.json');
+      writeFileSync(realPath, readFileSync(settingsPath, 'utf-8'));
+      unlinkSync(settingsPath);
+      symlinkSync(realPath, settingsPath);
+      assert.ok(
+        lstatSync(settingsPath).isSymbolicLink(),
+        'fixture setup: settingsPath must start as a symlink',
+      );
+
+      const applyR = runWithHome(
+        'upgrade.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--json'],
+        home,
+      );
+      assert.equal(applyR.status, 0, `--apply failed: ${applyR.stderr}`);
+      const applied = JSON.parse(applyR.stdout).applied;
+      assert.ok(
+        applied.hookNameRenames.length > 0 && applied.retiredSettings.length > 0,
+        `fixture must exercise both rename and retire in the same pass: ${applyR.stdout}`,
+      );
+
+      assert.equal(
+        lstatSync(settingsPath).isSymbolicLink(),
+        false,
+        'settings.json must be a plain file after --apply: a rename-based atomic write replaces ' +
+          'whatever sits at that path, while three separate writeFileSync calls would write through ' +
+          'the symlink and leave it in place',
+      );
+
+      // Functional correctness survives the atomicity fix: both outcomes are
+      // present in the file that actually landed on disk.
+      const after = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const stopCmds = after.hooks.Stop.flatMap((g) => g.hooks).map((h) => h.command);
+      assert.ok(
+        !stopCmds.includes(cmdFor('hypo-hot-rebuild.mjs')) &&
+          !stopCmds.includes(cmdFor('wiki-auto-commit.mjs')) &&
+          !stopCmds.includes(cmdFor('hypo-auto-commit.mjs')),
+        `retired, and renamed-then-retired, Stop entries must both be gone: ${JSON.stringify(stopCmds)}`,
+      );
+    });
+  });
+});
+
+// ── the root hot.md rewrite has to reach vaults that already exist ──────────
+//
+// init never touches an existing SCHEMA.md or hypo-guide.md, and upgrade only
+// compares their frontmatter `version:` against the package's. The rewrite that
+// made root hot.md a generated file changed both bodies (session close no
+// longer updates it by hand), so a vault carrying the copies from before it
+// (SCHEMA 2.2, guide 1) must be told, or it keeps reading the old instruction
+// while upgrade says "up to date". Literal old versions on purpose: they are
+// the stamps those pre-rewrite copies carry.
+suite('upgrade.mjs: root hot.md rewrite reaches existing vaults');
+
+test('a vault with the pre-rewrite SCHEMA.md and hypo-guide.md is told both changed', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      for (const [file, old] of [
+        ['SCHEMA.md', '2.2'],
+        ['hypo-guide.md', '1'],
+      ]) {
+        const p = join(hypoDir, file);
+        writeFileSync(p, readFileSync(p, 'utf-8').replace(/^version: .+$/m, `version: ${old}`));
+      }
+
+      const jsonR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+      const out = JSON.parse(jsonR.stdout);
+      assert.equal(
+        out.schema.bump,
+        'minor',
+        `SCHEMA 2.2 must read as behind: ${JSON.stringify(out.schema)}`,
+      );
+      assert.notEqual(
+        out.guide.bump,
+        'none',
+        `guide 1 must read as behind: ${JSON.stringify(out.guide)}`,
+      );
+      assert.equal(jsonR.status, 1, 'both must count as drift');
+
+      const textR = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`], home);
+      assert.match(
+        textR.stdout,
+        /generated projection of `projects\/\*\/hot\.md`/,
+        `SCHEMA notice must name what changed, not only the versions: ${textR.stdout}`,
       );
     });
   });

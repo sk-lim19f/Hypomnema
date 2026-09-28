@@ -66,6 +66,7 @@ import {
   uniqueBakPath,
 } from './lib/git-hooks-dir.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
+import { atomicWrite } from '../hooks/atomic-write.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -76,6 +77,14 @@ const PKG_ROOT = join(SCRIPT_DIR, '..');
 // so the only useful next step is a re-install of the package.
 const PKG_INTEGRITY_HINT =
   '→ This indicates a corrupt or incomplete install. Re-install with `npm install -g hypomnema` (or re-install the Claude Code plugin).';
+// Where to send a person to verify after --apply. Named both ways, with no
+// runtime guess: the `hypomnema` bin comes only with the npm install, so a
+// plugin-only user has `/hypo:doctor` and nothing else, and a shell user with
+// the npm CLI may have no slash-command surface at all. Same convention
+// scripts/lib/crystallize-close-apply.mjs's own DOCTOR_HINT already uses for
+// the same reason; kept as a separate local constant here rather than an
+// import, since that file is not this task's to change.
+const DOCTOR_HINT = '`/hypo:doctor` in Claude Code, or `hypomnema doctor` with the npm CLI';
 const HOOKS_SRC = join(PKG_ROOT, 'hooks');
 const COMMANDS_SRC = join(PKG_ROOT, 'commands');
 const TEMPLATES = join(PKG_ROOT, 'templates');
@@ -275,6 +284,51 @@ function checkSettingsJson(settingsPath, hooksDir) {
   return results;
 }
 
+// Every .mjs basename this package still ships, entry hook or shared module.
+// checkRetiredRegistrations uses it as the line between a registration we wrote
+// and have since withdrawn, and a hook somebody else put in the same directory.
+const SHIPPED_HOOK_FILES = new Set(INSTALL_ORDER);
+
+// The reverse of checkSettingsJson. That walk asks whether every live
+// HOOK_MAP entry is registered; it never asks whether a registration is still
+// live, so a settings.json install that predates a hook moving out of an event
+// keeps the old entry forever. The Stop orchestrator made that concrete: four
+// Stop hooks became steps that hypo-stop.mjs spawns, and an install that kept
+// their old Stop entries ran each of them twice per Stop.
+//
+// A registration is retired only when all three hold:
+//   - its command is exactly `node <hooksDir>/<file>` in the `$HOME` form
+//     init and checkSettingsJson write (no arguments, no subdirectory);
+//   - `<file>` is a basename this package still ships (SHIPPED_HOOK_FILES);
+//   - HOOK_MAP[event] no longer lists `<file>`.
+// A hook this package never shipped, a hypo-ext-* extension, and anything with
+// a different command shape fail the first two tests and are left alone.
+function checkRetiredRegistrations(settingsPath, hooksDir) {
+  if (!existsSync(settingsPath)) return [];
+  let settings;
+  try {
+    settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+  } catch {
+    return [];
+  }
+  const prefix = `node ${hooksDir.replace(HOME, '$HOME')}/`;
+  const found = [];
+  for (const [event, groups] of Object.entries(settings.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    const live = new Set(HOOK_MAP[event] || []);
+    for (const group of groups) {
+      if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) continue;
+      for (const hook of group.hooks) {
+        const cmd = hook?.command;
+        if (typeof cmd !== 'string' || !cmd.startsWith(prefix)) continue;
+        const file = cmd.slice(prefix.length);
+        if (SHIPPED_HOOK_FILES.has(file) && !live.has(file)) found.push({ event, file, cmd });
+      }
+    }
+  }
+  return found;
+}
+
 // ── apply actions ────────────────────────────────────────────────────────────
 
 // `hooksDir` is the target the stale/missing paths in `hookResults` already point
@@ -293,41 +347,162 @@ function applyHookFiles(hookResults, hooksDir) {
   return applied;
 }
 
-function applySettingsJson(settingsResults, settingsPath) {
+// ── settings.json apply: rename + add + retire as one atomic write ──────────
+//
+// These three used to be three separate `writeFileSync` calls (rename below,
+// then this file's former applySettingsJson, then its former
+// applyRetiredRegistrations), run one after another against the same file. A
+// crash mid-write could truncate the JSON; a crash BETWEEN any two of them
+// left VALID JSON that was only half-migrated. One example: a legacy Stop
+// entry renamed to its new basename with nothing left to retire it, so both
+// hypo-stop.mjs (the orchestrator) and the step it replaced fired on every
+// Stop. The retire step made that window concrete when it was added: it is
+// the step most likely to be skipped by exactly this kind of interruption.
+//
+// The fix is not three atomic writes in a row (that still leaves the
+// between-writes window) but one in-memory transform committed once. Each
+// step below reads the value the step before it just produced, never a
+// precomputed check-time snapshot. That is what keeps the self-heal
+// applySettingsJson used to need a fresh disk re-read for: a legacy
+// wiki-auto-commit.mjs entry the rename step just turned into
+// hypo-auto-commit.mjs is visible to the retire step as exactly that name,
+// in the same pass, because it is reading the same object the rename step
+// wrote into.
+
+function migrateHookNamesInSettings(settings) {
+  const applied = [];
+  for (const [event, groups] of Object.entries(settings.hooks || {})) {
+    for (const group of Array.isArray(groups) ? groups : []) {
+      for (const hook of group.hooks || []) {
+        for (const [oldName, newName] of Object.entries(HOOK_RENAMES)) {
+          if ((hook.command || '').includes(oldName)) {
+            hook.command = hook.command.replace(oldName, newName);
+            applied.push(`${event}: ${oldName} → ${newName}`);
+          }
+        }
+      }
+    }
+  }
+  return applied;
+}
+
+// Copies a renamed hook's bytes onto its new basename when the old file is
+// still on disk and the new one is not yet there. A file-system side effect,
+// not a settings.json write, so it stays separate from the atomic commit
+// below; existsSync guards make repeat runs a no-op.
+function copyRenamedHookFiles(hooksDir) {
+  for (const [oldName, newName] of Object.entries(HOOK_RENAMES)) {
+    const oldPath = join(hooksDir, oldName);
+    const newPath = join(hooksDir, newName);
+    const srcPath = join(HOOKS_SRC, newName);
+    if (existsSync(oldPath) && !existsSync(newPath) && existsSync(srcPath)) {
+      copyFileSync(srcPath, newPath);
+    }
+  }
+}
+
+// Adds every HOOK_MAP entry `settings` does not yet register, judged against
+// `settings` itself (already carrying whatever the rename step above just
+// rewrote) rather than a precomputed checkSettingsJson() list. A name the
+// rename just produced reads as already-present here, in the same pass.
+function addMissingRegistrations(settings, hooksDir) {
+  if (!settings.hooks) settings.hooks = {};
+  const applied = [];
+  for (const [event, files] of Object.entries(HOOK_MAP)) {
+    if (!Array.isArray(settings.hooks[event])) settings.hooks[event] = [];
+    for (const file of files) {
+      const cmd = `node ${hooksDir.replace(HOME, '$HOME')}/${file}`;
+      const alreadyPresent = settings.hooks[event]
+        .flatMap((g) => g.hooks || [])
+        .some((h) => h.command === cmd);
+      if (alreadyPresent) continue;
+      settings.hooks[event].push({ hooks: [{ type: 'command', command: cmd }] });
+      applied.push(`${event}: ${file}`);
+    }
+  }
+  return applied;
+}
+
+// The reverse of the add step above, judged the same way: against `settings`
+// as the add step just left it, never a precomputed checkRetiredRegistrations()
+// list computed before the rename ran. A registration is retired only when
+// all three hold, mirroring checkRetiredRegistrations's contract:
+//   - its command is exactly `node <hooksDir>/<file>` in the `$HOME` form
+//     init and checkSettingsJson write (no arguments, no subdirectory);
+//   - `<file>` is a basename this package still ships (SHIPPED_HOOK_FILES);
+//   - HOOK_MAP[event] no longer lists `<file>`.
+// This is why a legacy wiki-auto-commit.mjs entry the rename step turns into
+// hypo-auto-commit.mjs is still caught here even though hypo-auto-commit.mjs
+// never appeared in any precomputed retired list: this function never reads
+// one, only the settings the two steps above already produced. Only the
+// matching hook entries go; a group loses its whole entry only when nothing
+// else is left in it, and other keys on the group (matcher) stay with what
+// remains.
+function removeRetiredRegistrations(settings, hooksDir) {
+  const prefix = `node ${hooksDir.replace(HOME, '$HOME')}/`;
+  const retired = [];
+  for (const [event, groups] of Object.entries(settings.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    const live = new Set(HOOK_MAP[event] || []);
+    for (const group of groups) {
+      if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) continue;
+      for (const hook of group.hooks) {
+        const cmd = hook?.command;
+        if (typeof cmd !== 'string' || !cmd.startsWith(prefix)) continue;
+        const file = cmd.slice(prefix.length);
+        if (SHIPPED_HOOK_FILES.has(file) && !live.has(file)) retired.push({ event, file, cmd });
+      }
+    }
+  }
+  if (retired.length === 0) return [];
+  const doomed = new Set(retired.map((r) => `${r.event}\n${r.cmd}`));
+  for (const [event, groups] of Object.entries(settings.hooks)) {
+    if (!Array.isArray(groups)) continue;
+    const kept = [];
+    for (const group of groups) {
+      if (group && typeof group === 'object' && Array.isArray(group.hooks)) {
+        const before = group.hooks.length;
+        group.hooks = group.hooks.filter((h) => !doomed.has(`${event}\n${h?.command}`));
+        if (before > 0 && group.hooks.length === 0) continue;
+      }
+      kept.push(group);
+    }
+    if (kept.length === 0) delete settings.hooks[event];
+    else settings.hooks[event] = kept;
+  }
+  return retired.map((r) => `${r.event}: ${r.file}`);
+}
+
+// The one place settings.json is mutated by --apply: rename, add, and retire
+// merged into a single in-memory transform, committed with exactly one
+// atomicWrite (temp file plus rename, see hooks/atomic-write.mjs). So there is
+// no window where the file on disk reflects only some of the three, and a
+// crash mid-write lands on a throwaway temp name instead of a torn
+// settings.json. Known gap this does not close: no lock guards settingsPath,
+// so a user hand-editing it in another program at the same moment can still
+// have their edit overwritten by whichever write lands last. That is the same
+// exposure the old three-write version had, just narrowed from three windows
+// to one.
+function applySettingsJsonTransform(settingsPath, hooksDir) {
   let settings = {};
   if (existsSync(settingsPath)) {
     try {
       settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
     } catch {
-      return [];
+      return { renamed: [], added: [], retired: [] };
     }
   }
   if (!settings.hooks) settings.hooks = {};
 
-  const applied = [];
-  for (const s of settingsResults) {
-    if (s.status !== 'missing') continue;
-    if (!Array.isArray(settings.hooks[s.event])) settings.hooks[s.event] = [];
-    // re-check the current parsed settings before appending.
-    // applyHookNameMigration may have rewritten a legacy wiki-*.mjs command to
-    // exactly `s.cmd` between checkSettingsJson and now — appending without
-    // this guard creates a duplicate registration (codex 2-worker review
-    // reproduced 11 duplicate hypo-*.mjs entries on a wiki-only legacy settings
-    // file). The precheck list is allowed to be stale; the apply path must
-    // self-heal against the on-disk truth.
-    const alreadyPresent = settings.hooks[s.event]
-      .flatMap((g) => g.hooks || [])
-      .some((h) => h.command === s.cmd);
-    if (alreadyPresent) continue;
-    settings.hooks[s.event].push({ hooks: [{ type: 'command', command: s.cmd }] });
-    applied.push(`${s.event}: ${s.file}`);
-  }
+  const renamed = migrateHookNamesInSettings(settings);
+  const added = addMissingRegistrations(settings, hooksDir);
+  const retired = removeRetiredRegistrations(settings, hooksDir);
 
-  if (applied.length > 0) {
-    mkdirSync(join(settingsPath, '..'), { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  if (renamed.length > 0 || added.length > 0 || retired.length > 0) {
+    atomicWrite(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   }
-  return applied;
+  if (renamed.length > 0) copyRenamedHookFiles(hooksDir);
+  return { renamed, added, retired };
 }
 
 // Rename map: old wiki-*.mjs → new hypo-*.mjs
@@ -370,45 +545,12 @@ function checkOldHookNames(settingsPath) {
   return found;
 }
 
-function applyHookNameMigration(oldRefs, settingsPath, hooksDir) {
-  if (!existsSync(settingsPath)) return [];
-
-  let settings;
-  try {
-    settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-  } catch {
-    return [];
-  }
-
-  const applied = [];
-  for (const [event, groups] of Object.entries(settings.hooks || {})) {
-    for (const group of Array.isArray(groups) ? groups : []) {
-      for (const hook of group.hooks || []) {
-        for (const [oldName, newName] of Object.entries(HOOK_RENAMES)) {
-          if ((hook.command || '').includes(oldName)) {
-            hook.command = hook.command.replace(oldName, newName);
-            applied.push(`${event}: ${oldName} → ${newName}`);
-          }
-        }
-      }
-    }
-  }
-
-  if (applied.length > 0) {
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
-    // Copy renamed hook files to the target hooks dir (~/.claude/hooks or
-    // ~/.codex/hooks per the caller — codex mirror).
-    for (const [oldName, newName] of Object.entries(HOOK_RENAMES)) {
-      const oldPath = join(hooksDir, oldName);
-      const newPath = join(hooksDir, newName);
-      const srcPath = join(HOOKS_SRC, newName);
-      if (existsSync(oldPath) && !existsSync(newPath) && existsSync(srcPath)) {
-        copyFileSync(srcPath, newPath);
-      }
-    }
-  }
-  return applied;
-}
+// The write path used to live here as its own function (its own
+// writeFileSync). It is now the rename step inside applySettingsJsonTransform
+// above (migrateHookNamesInSettings + copyRenamedHookFiles), merged with the
+// add and retire steps into one atomic commit. checkOldHookNames above stays:
+// it is read-only, used for the report and for deciding whether there is
+// anything for --apply to do.
 
 // ── .hypoignore migration — ensure required runtime patterns are present ─────
 //
@@ -719,7 +861,7 @@ checklist below is manual:
       hard-required fields above
 - [ ] Run \`hypomnema feedback-sync --check\` to verify the MEMORY/CLAUDE
       projection still resolves cleanly
-- [ ] Run \`hypomnema doctor\` to verify installation health
+- [ ] Run doctor to verify installation health (\`/hypo:doctor\` in Claude Code, or \`hypomnema doctor\` with the npm CLI)
 - [ ] **Re-run \`hypomnema lint\` after backfilling — confirm 0 feedback errors
       remain (including the conditional \`claude-learned\` fields above)**
 
@@ -754,7 +896,7 @@ remaining steps are manual:
 
 - [ ] Compare your \`SCHEMA.md\` (v${fromVersion}) with the package template (v${toVersion}) and merge changes manually
 - [ ] Re-check all \`adr\` and \`learning\` pages for new required frontmatter fields once SCHEMA is updated
-- [ ] Run \`/hypo:doctor\` to verify installation health
+- [ ] Run doctor to verify installation health (\`/hypo:doctor\` in Claude Code, or \`hypomnema doctor\` with the npm CLI)
 `;
 
   const content = `---
@@ -1116,6 +1258,7 @@ const wikiPreCommitInfo = checkWikiPreCommitRoot(args.hypoDir);
 const wikiPreCommitDrift = wikiPreCommitInfo !== null && wikiPreCommitInfo.root !== null;
 const commands = checkCommands();
 const oldHookRefs = checkOldHookNames(claudeSettingsPath);
+const retiredSettings = checkRetiredRegistrations(claudeSettingsPath, claudeHooksDir);
 const hypoignore = checkHypoignore(args.hypoDir);
 const gitignore = checkGitignore(args.hypoDir);
 
@@ -1125,6 +1268,9 @@ const gitignore = checkGitignore(args.hypoDir);
 const hooksCodex = args.codex ? checkHookFiles(codexHooksDir) : null;
 const settingsCodex = args.codex ? checkSettingsJson(codexSettingsPath, codexHooksDir) : null;
 const oldHookRefsCodex = args.codex ? checkOldHookNames(codexSettingsPath) : null;
+const retiredSettingsCodex = args.codex
+  ? checkRetiredRegistrations(codexSettingsPath, codexHooksDir)
+  : null;
 
 // Extensions companion. Read-only check; the apply
 // happens below, AFTER applyCommands, so the per-target SHA map merges into the
@@ -1228,6 +1374,8 @@ let appliedHookNameRenames = [];
 let appliedHooksCodex = [];
 let appliedSettingsCodex = [];
 let appliedHookNameRenamesCodex = [];
+let appliedRetiredSettings = [];
+let appliedRetiredSettingsCodex = [];
 let appliedCommands = [];
 let appliedHypoignore = [];
 let appliedGitignore = [];
@@ -1325,13 +1473,13 @@ if (args.apply) {
     });
   }
   if (managesClaudeCore) {
-    if (oldHookRefs.length > 0) {
-      appliedHookNameRenames = applyHookNameMigration(
-        oldHookRefs,
-        claudeSettingsPath,
-        claudeHooksDir,
-      );
-    }
+    // Rename, add, and retire all commit through one atomicWrite inside this
+    // call. See applySettingsJsonTransform's own comment for why they are no
+    // longer three separate writeFileSync calls.
+    const claudeSettingsResult = applySettingsJsonTransform(claudeSettingsPath, claudeHooksDir);
+    appliedHookNameRenames = claudeSettingsResult.renamed;
+    appliedSettings = claudeSettingsResult.added;
+    appliedRetiredSettings = claudeSettingsResult.retired;
     appliedHooks = applyHookFiles(hooks, claudeHooksDir);
     // Refresh every run managesClaudeCore is true, not only when a stale hook
     // was actually copied above: applyHookFiles OVERWRITES (never skips) a
@@ -1339,7 +1487,6 @@ if (args.apply) {
     // must still keep the sidecar's pkgVersion truthful, same reasoning as
     // installHooks's own refresh-every-run comment.
     writeProvenanceSidecar(claudeHooksDir, PKG_ROOT, readVersionAtRoot(PKG_ROOT), HOOKS_SRC, false);
-    appliedSettings = applySettingsJson(settings, claudeSettingsPath);
     // applyCommands handles the single atomic hypo-pkg.json write (pkgRoot, version, schema, commands map)
     appliedCommands = applyCommands(commands, args.forceCommands);
     appliedPkgJson = true;
@@ -1435,19 +1582,15 @@ if (args.apply) {
     appliedWikiPreCommitRoot = wikiPreCommitResult.ok;
     if (!wikiPreCommitResult.ok) wikiPreCommitApplyFailReason = wikiPreCommitResult.reason;
   }
-  // codex core hooks + settings + wiki-*→hypo-* rename mirror. Same order
-  // as the claude side (rename first so subsequent hook copy can find renamed targets).
+  // codex core hooks + settings + wiki-*→hypo-* rename mirror. Same merged,
+  // single-write transform as the claude side above.
   if (args.codex) {
-    if (oldHookRefsCodex.length > 0) {
-      appliedHookNameRenamesCodex = applyHookNameMigration(
-        oldHookRefsCodex,
-        codexSettingsPath,
-        codexHooksDir,
-      );
-    }
+    const codexSettingsResult = applySettingsJsonTransform(codexSettingsPath, codexHooksDir);
+    appliedHookNameRenamesCodex = codexSettingsResult.renamed;
+    appliedSettingsCodex = codexSettingsResult.added;
+    appliedRetiredSettingsCodex = codexSettingsResult.retired;
     appliedHooksCodex = applyHookFiles(hooksCodex, codexHooksDir);
     writeProvenanceSidecar(codexHooksDir, PKG_ROOT, readVersionAtRoot(PKG_ROOT), HOOKS_SRC, false);
-    appliedSettingsCodex = applySettingsJson(settingsCodex, codexSettingsPath);
   }
   // After applyCommands wrote hypo-pkg.json — merges extensions.<target> alongside.
   appliedExtensions = syncExtensions({
@@ -1486,7 +1629,8 @@ const codexCoreDrift =
   (staleHooksCodex.length > 0 ||
     missingSettingsCodex.length > 0 ||
     invalidSettingsCodex ||
-    (oldHookRefsCodex?.length ?? 0) > 0);
+    (oldHookRefsCodex?.length ?? 0) > 0 ||
+    (retiredSettingsCodex?.length ?? 0) > 0);
 
 // Claude core-surface drift (hooks/settings/commands/rename/metadata). In plugin
 // mode these are plugin-managed, so they must NOT count as drift — otherwise the
@@ -1501,6 +1645,7 @@ const claudeCoreDrift =
   missingSettings.length > 0 ||
   invalidSettings ||
   oldHookRefs.length > 0 ||
+  retiredSettings.length > 0 ||
   staleCommands.length > 0 ||
   userModifiedCommands.length > 0 ||
   orphanedCommands.length > 0 ||
@@ -1534,6 +1679,7 @@ if (args.json) {
         pkgJson,
         commands,
         oldHookRefs,
+        retiredSettings,
         hypoignore,
         gitignore,
         wikiPreCommitRoot: wikiPreCommitInfo
@@ -1556,6 +1702,7 @@ if (args.json) {
         hooksCodex,
         settingsCodex,
         oldHookRefsCodex,
+        retiredSettingsCodex,
         applied: {
           hooks: appliedHooks,
           settings: appliedSettings,
@@ -1570,6 +1717,8 @@ if (args.json) {
           hooksCodex: appliedHooksCodex,
           settingsCodex: appliedSettingsCodex,
           hookNameRenamesCodex: appliedHookNameRenamesCodex,
+          retiredSettings: appliedRetiredSettings,
+          retiredSettingsCodex: appliedRetiredSettingsCodex,
         },
         migrationReport: migrationPath,
       },
@@ -1710,12 +1859,18 @@ if (guide.bump === 'none') {
   // install) but predates the version stamp entirely. Counted as drift above
   // (guideDrift) — the message must be actionable, not "cannot compare",
   // since a pre-versioning copy silently reporting "up to date" was the bug.
+  //
+  // Name both sides by their ABSOLUTE path, not the package-relative
+  // `templates/hypo-guide.md`. A person running upgrade from their vault root
+  // (the common case) has no `templates/` there at all, since init never
+  // copies that directory into the vault, so the old wording sent them
+  // looking for a file that does not exist on the machine they are standing on.
   lines.push(
-    `⚠ hypo-guide.md     installed copy has no version stamp (pre-versioning stale copy; package=v${guide.current}) — no stamp means there is no base version to diff a changelog from, so review templates/hypo-guide.md and update your copy manually; --apply does not overwrite it`,
+    `⚠ hypo-guide.md     installed copy has no version stamp (pre-versioning stale copy; package=v${guide.current}). No stamp means there is no base version to diff a changelog from, so compare and merge by hand: \`diff "${guide.pkgPath}" "${guide.hypoPath}"\`. --apply does not overwrite it`,
   );
 } else {
   lines.push(
-    `⚠ hypo-guide.md     v${guide.installed} → v${guide.current}  [package template changed — review templates/hypo-guide.md and update your copy manually; --apply does not overwrite it]`,
+    `⚠ hypo-guide.md     v${guide.installed} → v${guide.current}  [package template changed, compare and merge by hand: \`diff "${guide.pkgPath}" "${guide.hypoPath}"\`; --apply does not overwrite it]`,
   );
 }
 
@@ -1776,6 +1931,28 @@ if (managesClaudeCore) {
   );
 }
 if (settingsCodex) pushSettingsSummary(settingsCodex, ' (codex)', invalidSettingsCodex);
+
+// Registrations a settings.json install still carries for a hook this package
+// has since moved out of that event (checkRetiredRegistrations). Silent when
+// there are none: the settings line above already says the live set is whole.
+// Under --apply this reports what was removed, which can include an entry the
+// pre-apply check could not name (a legacy wiki-*.mjs rename that landed on a
+// retired hook).
+function pushRetiredSummary(checked, applied, label) {
+  const entries = args.apply ? applied : checked.map((r) => `${r.event}: ${r.file}`);
+  if (entries.length === 0) return;
+  const colR = `settings.json${label}`.padEnd(20);
+  lines.push(
+    args.apply
+      ? `✓ ${colR}removed ${entries.length} retired registration(s):`
+      : `⚠ ${colR}${entries.length} retired registration(s) still fire. --apply removes them:`,
+  );
+  for (const e of entries) lines.push(`    - ${e}`);
+}
+if (managesClaudeCore) pushRetiredSummary(retiredSettings, appliedRetiredSettings, '');
+if (retiredSettingsCodex) {
+  pushRetiredSummary(retiredSettingsCodex, appliedRetiredSettingsCodex, ' (codex)');
+}
 
 // Package metadata
 if (dualSkip && dualSkipCorrected) {
@@ -2080,6 +2257,7 @@ const claudeCoreCount = managesClaudeCore
     missingSettings.length +
     (invalidSettings ? 1 : 0) +
     oldHookRefs.length +
+    retiredSettings.length +
     staleCommands.length +
     userModifiedCommands.length +
     orphanedCommands.length +
@@ -2114,7 +2292,8 @@ const totalDrift =
   staleHooksCodex.length +
   missingSettingsCodex.length +
   (invalidSettingsCodex ? 1 : 0) +
-  (oldHookRefsCodex?.length ?? 0);
+  (oldHookRefsCodex?.length ?? 0) +
+  (retiredSettingsCodex?.length ?? 0);
 if (totalDrift === 0) {
   lines.push('Result: Hypomnema is up to date');
 } else if (args.apply) {
@@ -2136,8 +2315,10 @@ if (totalDrift === 0) {
     appliedExtCount +
     appliedHooksCodex.length +
     appliedSettingsCodex.length +
-    appliedHookNameRenamesCodex.length;
-  lines.push(`Result: ${total} update(s) applied. Run /hypo:doctor to verify.`);
+    appliedHookNameRenamesCodex.length +
+    appliedRetiredSettings.length +
+    appliedRetiredSettingsCodex.length;
+  lines.push(`Result: ${total} update(s) applied. Verify with ${DOCTOR_HINT}.`);
 } else {
   lines.push(`Result: ${totalDrift} item(s) need updating — run with --apply to install`);
 }
