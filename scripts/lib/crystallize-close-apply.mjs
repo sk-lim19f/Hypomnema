@@ -3797,6 +3797,23 @@ function printCloseReport({
   // production call is --json, which prints nothing here.
   if (markerSkipReason && !markerWritten) {
     const diskFailure = markerSkipReason === 'marker-did-not-land';
+    // The two receipt stages also flip ok to false, and their recoveries are
+    // opposite: one is about what is committed, the other about writing under
+    // .cache/. Neither is the policy withhold the fallback text below describes.
+    const receiptFailure =
+      markerSkipReason === 'receipt-proof-mismatch'
+        ? `    The 4 mandatory files were applied, but the close checkpoint receipt\n` +
+          `    could not prove them against the commit (see mismatches[] in --json\n` +
+          `    output). This run reports ok:false and exits 1. The session is NOT closed.\n` +
+          `    To fix: check the listed paths with git status, commit the ones you\n` +
+          `    have reviewed, then re-run the same close. No fresh close phrase is needed.\n`
+        : markerSkipReason === 'receipt-write-failed'
+          ? `    The 4 mandatory files were applied and committed, but writing the close\n` +
+            `    checkpoint receipt under .cache/sessions/<session-id>/ failed. This run\n` +
+            `    reports ok:false and exits 1. The session is NOT closed.\n` +
+            `    To fix: clear whatever blocks that directory (permissions, disk space),\n` +
+            `    then re-run the same close. No fresh close phrase is needed.\n`
+          : null;
     process.stderr.write(
       `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
         // MAJOR FIX (codex cross-review round 5): only present when the reason
@@ -3806,22 +3823,23 @@ function printCloseReport({
         // the user only that the marker was withheld, never why the gate read
         // the transcript that way.
         (markerGateReason ? `    Gate detail: ${markerGateReason}\n` : '') +
-        (diskFailure
-          ? `    The 4 mandatory files were applied and committed, but writing the\n` +
-            `    per-session Stop-chain marker itself failed. This run reports\n` +
-            `    ok:false and exits 1. The session is NOT closed: the Stop hook\n` +
-            `    will re-prompt until the marker is present.\n` +
-            `    To fix: clear whatever blocks the marker path under .cache/\n` +
-            `    (permissions, a directory sitting where the marker file goes,\n` +
-            `    disk space), then re-run the same close. No fresh close phrase\n` +
-            `    is needed: a close signal is spent only once the marker lands.\n`
-          : `    The 4 mandatory files were applied and verified (ok:true), but the\n` +
-            `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
-            `    closed: the Stop hook will re-prompt until the marker is present.\n` +
-            `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +
-            `    a background task or Agent UUID from a /tmp/... path).\n` +
-            `    Example: crystallize.mjs --apply-session-close --payload=<path>\n` +
-            `             --session-id=<main-conversation-id> --hypo-dir=<path>\n`),
+        (receiptFailure ??
+          (diskFailure
+            ? `    The 4 mandatory files were applied and committed, but writing the\n` +
+              `    per-session Stop-chain marker itself failed. This run reports\n` +
+              `    ok:false and exits 1. The session is NOT closed: the Stop hook\n` +
+              `    will re-prompt until the marker is present.\n` +
+              `    To fix: clear whatever blocks the marker path under .cache/\n` +
+              `    (permissions, a directory sitting where the marker file goes,\n` +
+              `    disk space), then re-run the same close. No fresh close phrase\n` +
+              `    is needed: a close signal is spent only once the marker lands.\n`
+            : `    The 4 mandatory files were applied and verified (ok:true), but the\n` +
+              `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
+              `    closed: the Stop hook will re-prompt until the marker is present.\n` +
+              `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +
+              `    a background task or Agent UUID from a /tmp/... path).\n` +
+              `    Example: crystallize.mjs --apply-session-close --payload=<path>\n` +
+              `             --session-id=<main-conversation-id> --hypo-dir=<path>\n`)),
     );
   }
   if (!ok) {

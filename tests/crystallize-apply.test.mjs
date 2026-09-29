@@ -2140,6 +2140,34 @@ test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is wi
   });
 });
 
+// The console path reads the same stage and must not fall back to the policy
+// withhold text, which claims ok:true and sends the user after --session-id.
+test('the console report for receipt-proof-mismatch says ok:false and points at the commit, not at --session-id', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const payload = payloadForCleanWiki(dir, today);
+    payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
+    const sessionId = `s-hypoignore-mismatch-console-${process.pid}`;
+    const cleanup = seedCloseTranscript(sessionId);
+    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
+    let r;
+    try {
+      r = runApplyConsole(dir, payload, sessionId);
+    } finally {
+      cleanup();
+    }
+    assert.equal(r.status, 1, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.match(r.stderr, /reason: receipt-proof-mismatch/);
+    assert.match(r.stderr, /could not prove them against the commit/);
+    assert.doesNotMatch(
+      r.stderr,
+      /\(ok:true\)/,
+      'a failed receipt must not be reported as ok:true',
+    );
+    assert.doesNotMatch(r.stderr, /--session-id=<main-conversation-id>/);
+  });
+});
+
 // design.md test 5 / row d, the positive half: a skipped (idempotent,
 // disk-already-matches) target whose bytes are ALREADY IN THE COMMIT (this
 // exact session's own prior, successful close) still certifies on a
