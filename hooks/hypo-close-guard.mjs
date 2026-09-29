@@ -32,7 +32,8 @@
  *
  * KNOWN WINDOW: the structural signal is only alive for one turn. Stop's
  * auto-commit chain (hypo-auto-commit.mjs → commitTouchedPaths) commits and
- * then CLEARS a session's touched-paths set every time Stop runs. Write
+ * then CLEARS a session's touched-paths set every time Stop runs (only a
+ * path `.hypoignore` keeps out of the commit stays). Write
  * session-state.md in turn 1 and hot.md in turn 2 (Stop runs in between) and
  * the touched-paths file no longer has the first path — structuralHit reads
  * false. This is accepted, not fixed: a real close writes both files in the

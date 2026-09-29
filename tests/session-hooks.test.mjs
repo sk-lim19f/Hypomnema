@@ -68,6 +68,7 @@ import {
   commitWikiChanges,
   drainTouchedPaths,
   formatGrowthMetrics,
+  gitHead,
   hypoIsClean,
   injectedContext,
   markerPath,
@@ -81,6 +82,7 @@ import {
   runFirstPrompt,
   todayLocal,
   runStop,
+  seedCloseTranscript,
   syncRemote,
   touchedPathsPath,
   vaultCommitLockTarget,
@@ -1290,24 +1292,48 @@ test('commitTouchedPaths: one lock across peek+commit+clear — clears on succes
   });
 });
 
-// design.md v5 §4 / test 36: a `committed: true` result must clear only
-// `result.committedPaths`, not the whole peeked scope, a path this session
-// touched but that never actually committed (here, `.hypoignore`) must keep
-// blocking as a known, unresolved session write instead of reading as
-// resolved because a SIBLING path in the same peek committed.
-test('commitTouchedPaths: a partial committedPaths result clears only what landed, keeping a .hypoignore-dropped path tracked', () => {
+// A `committed: true` result retires the whole peeked scope EXCEPT the paths
+// the commit reports as `ignoredPaths` (dirty, but kept out by `.hypoignore`).
+// Those must keep blocking as a known, unresolved session write instead of
+// reading as resolved because a SIBLING path in the same peek committed.
+test('commitTouchedPaths: a committed result keeps only its ignoredPaths tracked', () => {
   withGrowthWiki((dir) => {
     recordTouchedPaths(dir, 'sess-ct-partial', ['landed.md', 'ignored.md']);
     const res = commitTouchedPaths(dir, 'sess-ct-partial', (paths) => {
       assert.deepEqual(paths.sort(), ['ignored.md', 'landed.md'].sort());
-      return { committed: true, committedPaths: ['landed.md'] };
+      return { committed: true, committedPaths: ['landed.md'], ignoredPaths: ['ignored.md'] };
     });
     assert.equal(res.committed, true);
     assert.deepEqual(
       JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-ct-partial'), 'utf-8')),
       ['ignored.md'],
-      'only the committed path is cleared; the dropped one stays tracked',
+      'the landed path is retired; the .hypoignore-dropped one stays tracked',
     );
+  });
+});
+
+// The other half: a claimed path that is neither committed nor ignored (a
+// claim that was already clean at Stop, or one the caller deliberately left
+// out of the scope) is NOT unresolved work. Keeping it would let a path
+// another session later edits block, or be swept into, this session's next
+// commit.
+test('commitTouchedPaths: a committed result retires every path it does not report as ignored, even one it did not commit', () => {
+  withGrowthWiki((dir) => {
+    recordTouchedPaths(dir, 'sess-ct-retire', ['landed.md', 'already-clean.md', 'left-out.md']);
+    const res = commitTouchedPaths(dir, 'sess-ct-retire', () => ({
+      committed: true,
+      committedPaths: ['landed.md'],
+      ignoredPaths: [],
+    }));
+    assert.equal(res.committed, true);
+    assert.ok(
+      !existsSync(touchedPathsPath(dir, 'sess-ct-retire')),
+      'nothing ignored → the whole scope is retired, not just the committed subset',
+    );
+    // A stand-in that reports no ignoredPaths at all keeps nothing either.
+    recordTouchedPaths(dir, 'sess-ct-legacy', ['a.md', 'b.md']);
+    commitTouchedPaths(dir, 'sess-ct-legacy', () => ({ committed: true }));
+    assert.ok(!existsSync(touchedPathsPath(dir, 'sess-ct-legacy')));
   });
 });
 
@@ -1339,6 +1365,181 @@ test('hypo-auto-commit.mjs: a .hypoignore-dropped touched path is NOT swept off 
       ['secret.md'],
       'the ignored path must still be tracked as an unresolved session write',
     );
+  });
+});
+
+// ── Stop retires everything it did not keep out of the commit ─────────────
+//
+// commitTouchedPaths used to retire only the paths that landed in the commit.
+// A claim that was already clean at Stop (SessionStart's root hot.md claim
+// over a file a person then committed by hand) or one the auto-commit wrapper
+// deliberately left out (rootHotProjectionIsCurrent said no) then stayed for
+// the whole session. A sibling session that later left that path dirty would
+// block this session's close as a "known session write", and this session's
+// next Stop would sweep the sibling's edit into its own commit. Only a path
+// `.hypoignore` keeps out of the commit is still unresolved work.
+
+function touchedOnDisk(dir, sessionId) {
+  const p = touchedPathsPath(dir, sessionId);
+  return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
+}
+
+function gitOut(dir, ...args) {
+  return spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8' }).stdout;
+}
+
+// One project whose hot.md row makes the root projection differ from the
+// fixture's empty table, so SessionStart's projection write is a real change.
+function seedProjectForRootProjection(dir, slug) {
+  mkdirSync(join(dir, 'projects', slug), { recursive: true });
+  writeFileSync(
+    join(dir, 'projects', slug, 'hot.md'),
+    '---\ntitle: hot\nupdated: 2026-01-01\n---\n',
+  );
+  spawnSync('git', ['-C', dir, 'add', '-A']);
+  spawnSync('git', ['-C', dir, 'commit', '-q', '-m', `seed ${slug}`]);
+}
+
+function startRootHotSession(dir, sessionId) {
+  const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+    input: JSON.stringify({ cwd: dir, session_id: sessionId }),
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+  });
+  assert.equal(r.status, 0, `session-start stderr: ${r.stderr}`);
+}
+
+test("Stop: SessionStart's hot.md claim is retired at the first Stop even though hot.md was already committed by hand", () => {
+  withGrowthWiki((dir) => {
+    seedProjectForRootProjection(dir, 'p1');
+    const sid = 'sess-retire-clean-claim';
+    startRootHotSession(dir, sid);
+    assert.ok(
+      touchedOnDisk(dir, sid).includes('hot.md'),
+      'fixture: the real SessionStart claim path must have claimed hot.md',
+    );
+    // The person commits the projection by hand in the same turn, so hot.md is
+    // clean by the time Stop runs and never lands in the auto-commit itself.
+    spawnSync('git', ['-C', dir, 'add', 'hot.md']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'hand commit']);
+    assert.equal(gitOut(dir, 'status', '--porcelain', '--', 'hot.md'), '', 'fixture: hot.md clean');
+
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.deepEqual(
+      touchedOnDisk(dir, sid),
+      [],
+      'a claim over an already-clean file is not unresolved work and must not outlive the first Stop',
+    );
+  });
+});
+
+test("Stop: a hot.md claim the wrapper left out (another session's bytes on disk) is retired, so this session's close is not blocked on it", () => {
+  withGrowthWiki((dir) => {
+    seedProjectForRootProjection(dir, 'p1');
+    const sessA = 'sess-retire-left-out-a';
+    const sessB = 'sess-retire-left-out-b';
+    startRootHotSession(dir, sessA);
+    // Session B changes the projection bytes after A claimed hot.md, so A's
+    // ownership check at Stop says no and hot.md is dropped from A's commit.
+    seedProjectForRootProjection(dir, 'p2');
+    startRootHotSession(dir, sessB);
+    const bBytes = readFileSync(join(dir, 'hot.md'), 'utf-8');
+
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sessA });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(readFileSync(join(dir, 'hot.md'), 'utf-8'), bBytes, "B's bytes stay on disk");
+    assert.notEqual(
+      gitOut(dir, 'status', '--porcelain', '--', 'hot.md'),
+      '',
+      "fixture: hot.md is still dirty because of B's write",
+    );
+    assert.deepEqual(touchedOnDisk(dir, sessA), [], 'the left-out claim must be retired too');
+
+    // The consequence a checkpoint gate sees: B's dirty hot.md is not A's.
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: sessA,
+    });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'known-session-write'),
+      `A must not be blocked on a file B left dirty: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('Stop: a page committed by hand is not swept back in when another session later leaves it dirty', () => {
+  withGrowthWiki((dir) => {
+    const sid = 'sess-no-sweep-a';
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# x, written by session A\n');
+    recordTouchedPaths(dir, sid, ['pages/x.md']);
+    spawnSync('git', ['-C', dir, 'add', 'pages/x.md']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'hand commit x']);
+
+    const r1 = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+    assert.equal(r1.status, 0, `stderr: ${r1.stderr}`);
+    assert.deepEqual(touchedOnDisk(dir, sid), [], 'the clean claim is retired at the first Stop');
+
+    // Another session edits the same page and leaves it uncommitted.
+    appendFileSync(join(dir, 'pages', 'x.md'), "session B's unsaved edit\n");
+    const headBefore = gitHead(dir);
+    const r2 = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+    assert.equal(r2.status, 0, `stderr: ${r2.stderr}`);
+    assert.equal(gitHead(dir), headBefore, "A's next Stop must not commit B's edit");
+    assert.notEqual(
+      gitOut(dir, 'status', '--porcelain', '--', 'pages/x.md'),
+      '',
+      "B's edit must still be sitting uncommitted",
+    );
+  });
+});
+
+test('Stop: a .hypoignore-dropped touched path stays tracked while its clean and committed siblings are retired', () => {
+  withGrowthWiki((dir) => {
+    const sid = 'sess-keep-ignored';
+    writeFileSync(join(dir, '.hypoignore'), 'secret.md\n');
+    writeFileSync(join(dir, 'clean.md'), '# committed by hand\n');
+    spawnSync('git', ['-C', dir, 'add', 'clean.md', '.hypoignore']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'hand commit clean']);
+    writeFileSync(join(dir, 'secret.md'), '# private\n');
+    writeFileSync(join(dir, 'public.md'), '# public\n');
+    recordTouchedPaths(dir, sid, ['secret.md', 'clean.md', 'public.md']);
+
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(
+      /(^|\n)public\.md(\n|$)/.test(gitOut(dir, 'show', '--name-only', '--pretty=format:', 'HEAD')),
+      'fixture: public.md must have been committed, or the retire branch is not what ran',
+    );
+    assert.deepEqual(
+      touchedOnDisk(dir, sid),
+      ['secret.md'],
+      'only the .hypoignore-dropped dirty path is still unresolved',
+    );
+  });
+});
+
+test("checkpointMode: a known-session-write on a .hypoignore'd file says how to get out, and one on an ordinary file does not", () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), 'secret.md\n');
+    spawnSync('git', ['-C', dir, 'add', '.hypoignore']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'ignore secret']);
+    writeFileSync(join(dir, 'secret.md'), '# private\n');
+    writeFileSync(join(dir, 'mine.md'), '# ordinary\n');
+    recordTouchedPaths(dir, 'sess-ignored-hint', ['secret.md', 'mine.md']);
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-ignored-hint',
+    });
+    const secret = (gate.blockers || []).find((b) => b.file === 'secret.md');
+    const mine = (gate.blockers || []).find((b) => b.file === 'mine.md');
+    assert.ok(secret && mine, `both files must block: ${JSON.stringify(gate.blockers)}`);
+    assert.match(secret.reason, /\.hypoignore 대상이라 자동 커밋되지 않는다/);
+    assert.match(secret.reason, /\.hypoignore 에서 빼야 close 가 된다/);
+    assert.ok(!/\.hypoignore/.test(mine.reason), `no hint on an ordinary file: ${mine.reason}`);
   });
 });
 
@@ -3736,43 +3937,80 @@ test('checkpointMode omitted (Stop/PreCompact/check): the existing unscoped git 
   });
 });
 
-// design.md test 25: the SAME vault state (a dirty file THIS session's own
-// touched-paths still names) must make BOTH marker-writing paths' gate
-// calls refuse, since both pass `checkpointMode: true, sessionId` to the
-// exact same shared function. If a future edit dropped `checkpointMode`
-// from only ONE call site, that one path would fall back to the unscoped
-// git blocker (still refuses here, since the dirty file has no
-// attributionScope) OR, on a scope-bearing call, could diverge from the
-// other. This pins today's actual behavior at the function each writer
-// calls, using the SAME minimal option shape both `runMarkerPhase` and
-// `runMarkSessionClosed` pass (`closeScope`, `checkpointMode`, `sessionId`).
-test('checkpointMode: the same known-session-write vault state yields the same gate verdict for both marker-writing call shapes', () => {
-  withSyncedWiki((dir) => {
-    writeFileSync(join(dir, 'mine.md'), '# this session wrote this, not yet committed\n');
-    recordTouchedPaths(dir, 'sess-checkpoint-equiv', ['mine.md']);
-    const applyShapeGate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      closeScope: ['test-project'],
-      checkpointMode: true,
-      sessionId: 'sess-checkpoint-equiv',
-    });
-    const markShapeGate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      closeScope: ['test-project'],
-      checkpointMode: true,
-      sessionId: 'sess-checkpoint-equiv',
-    });
-    assert.equal(applyShapeGate.ok, markShapeGate.ok);
-    assert.deepEqual(
-      (applyShapeGate.blockers || []).map((b) => b.type).sort(),
-      (markShapeGate.blockers || []).map((b) => b.type).sort(),
-      `both marker-writing paths must reach the same blocker set: ${JSON.stringify({ apply: applyShapeGate.blockers, mark: markShapeGate.blockers })}`,
+// Both marker-writing entry points (`--apply-session-close` and
+// `--mark-session-closed`) run the shared gate in checkpointMode, so a dirty
+// root file that belongs to ANOTHER session must not stop either one from
+// issuing the close receipt: it stays a notice, and the file stays dirty and
+// uncommitted. Each entry point runs in its own identical vault (same
+// baseline, same foreign dirty index.md, same transcript with a person's
+// close signal), spawned as the real CLI. Also the positive end to end for
+// "a foreign dirty root file does not block the receipt".
+test("crystallize --apply-session-close and --mark-session-closed both issue a receipt past another session's dirty root file", () => {
+  const closeWithForeignDirtyIndex = (mode) => {
+    let result;
+    withWiki(
+      (dir) => writeFileSync(join(dir, 'index.md'), '# index\n'),
+      (dir, today) => {
+        appendFileSync(join(dir, 'index.md'), "\nanother session's unsaved edit\n");
+        const sid = `s-foreign-index-${mode}`;
+        const cleanup = seedCloseTranscript(sid);
+        const flags = [`--hypo-dir=${dir}`, `--session-id=${sid}`, '--json'];
+        let payloadPath = null;
+        if (mode === 'apply') {
+          const project = join(dir, 'projects', 'test-project');
+          payloadPath = join(
+            tmpdir(),
+            `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+          );
+          writeFileSync(
+            payloadPath,
+            JSON.stringify({
+              project: 'test-project',
+              date: today,
+              sessionState: { content: readFileSync(join(project, 'session-state.md'), 'utf-8') },
+              projectHot: { content: readFileSync(join(project, 'hot.md'), 'utf-8') },
+              sessionLog: { entry: `## [${today}] foreign dirty index\n` },
+              log: { entry: `## [${today}] session | test-project: foreign dirty index\n` },
+            }),
+          );
+          flags.push('--apply-session-close', `--payload=${payloadPath}`);
+        } else {
+          flags.push('--mark-session-closed', '--project=test-project');
+        }
+        const r = run('crystallize.mjs', flags);
+        cleanup();
+        if (payloadPath) rmSync(payloadPath, { force: true });
+        assert.equal(r.status, 0, `${mode} must succeed: ${r.stdout}\n${r.stderr}`);
+        const receiptPath = join(dir, '.cache', 'sessions', sid, 'close-receipt.json');
+        assert.ok(existsSync(receiptPath), `${mode} must issue a receipt`);
+        result = {
+          receipt: JSON.parse(readFileSync(receiptPath, 'utf-8')),
+          out: JSON.parse(r.stdout),
+          indexStatus: gitOut(dir, 'status', '--porcelain', '--', 'index.md'),
+          indexCommitted: gitOut(dir, 'log', '--format=%H', '--', 'index.md').trim().split('\n')
+            .length,
+        };
+      },
     );
+    return result;
+  };
+  const apply = closeWithForeignDirtyIndex('apply');
+  const mark = closeWithForeignDirtyIndex('mark');
+  // The two entry points certify different strengths (apply verified the
+  // payload bytes it wrote, mark has no payload), but both issue one.
+  for (const [mode, res, certification] of [
+    ['apply', apply, 'committed-close-checkpoint'],
+    ['mark', mark, 'committed-close-files'],
+  ]) {
+    assert.equal(res.receipt.certification, certification, `${mode} receipt`);
+    assert.equal(res.out.ok, true, `${mode}: ${JSON.stringify(res.out)}`);
+    assert.match(res.indexStatus, /^ M index\.md/, `${mode}: index.md stays dirty, uncommitted`);
+    assert.equal(res.indexCommitted, 1, `${mode}: index.md has only its baseline commit`);
     assert.ok(
-      (applyShapeGate.blockers || []).some((b) => b.type === 'known-session-write'),
-      'this fixture must actually exercise the known-session-write blocker, not a vacuous pass',
+      JSON.stringify(res.out).includes('index.md'),
+      `${mode}: the foreign dirty file must be surfaced (as an unresolved notice): ${JSON.stringify(res.out)}`,
     );
-  });
+  }
 });
 
 test('checkpointMode: root hot.md structure blocker still fires (only the git axis changes)', () => {
@@ -4009,6 +4247,31 @@ test('commitWikiChanges: committedPaths is [] on every no-op (empty scope, stale
     assert.deepEqual(commitWikiChanges(dir, []).committedPaths, []);
     assert.deepEqual(commitWikiChanges(dir, ['stale-never-changed.md']).committedPaths, []);
     assert.deepEqual(commitWikiChanges(dir, ['nonexistent.md']).committedPaths, []);
+  });
+});
+
+test('commitWikiChanges: ignoredPaths lists only supplied paths that are dirty AND .hypoignore-matched', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), 'secret.md\nnever-touched.md\n');
+    writeFileSync(join(dir, 'secret.md'), '# private\n');
+    writeFileSync(join(dir, 'public.md'), '# public\n');
+    const mixed = commitWikiChanges(dir, ['secret.md', 'public.md', 'never-touched.md']);
+    assert.equal(mixed.committed, true, JSON.stringify(mixed));
+    assert.deepEqual(mixed.committedPaths, ['public.md']);
+    assert.deepEqual(
+      mixed.ignoredPaths,
+      ['secret.md'],
+      'an ignored path that is not dirty has nothing unresolved and must not be listed',
+    );
+
+    // Only-ignored scope: still a success with no commit, and still reports it.
+    const onlyIgnored = commitWikiChanges(dir, ['secret.md']);
+    assert.equal(onlyIgnored.committed, true);
+    assert.equal(onlyIgnored.scoped, 0);
+    assert.deepEqual(onlyIgnored.ignoredPaths, ['secret.md']);
+
+    assert.deepEqual(commitWikiChanges(dir, []).ignoredPaths, []);
+    assert.deepEqual(commitWikiChanges(dir, ['stale-never-changed.md']).ignoredPaths, []);
   });
 });
 

@@ -3663,7 +3663,7 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
  * sitting in this session's touched-paths set before this call ran", the
  * second case is a SECOND SessionStart on the same (resumed) session_id,
  * where an earlier invocation's still-unresolved claim must survive this
- * invocation's own failure, not be swept away by it (design.md v5 boost).
+ * invocation's own failure, not be swept away by it.
  *
  * @param {string} hypoDir
  * @param {string|null|undefined} sessionId
@@ -3760,7 +3760,7 @@ export function peekTouchedPaths(hypoDir, sessionId) {
 /**
  * Like `peekTouchedPaths`, but does not collapse "corrupt" and "lock
  * timeout" into the same silent `[]` an unreadable-vs-empty caller cannot
- * tell apart. A `checkpointMode` gate (design.md v4 §4) MUST block on
+ * tell apart. A `checkpointMode` gate MUST block on
  * either, an unreadable touched-paths set could be hiding a real
  * still-dirty write this session made, so reading it as "empty, nothing
  * outstanding" would let a checkpoint certify over exactly the write it
@@ -3893,20 +3893,22 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
  * ever written to the corrupt file; it is left exactly as it was for a
  * human or a future recovery pass to look at.
  *
- * design.md v5 §4: a `committed: true` result no longer clears the WHOLE
- * peeked scope, only `result.committedPaths`, the subset `commitFn` reports
- * as having actually landed in the commit. A path `.hypoignore` (or a stale
- * INTERSECT drop, see `commitWikiChanges`) excluded from the commit stays in
- * the touched-paths set, still blocking as a known, unresolved session
- * write, instead of silently reading as "resolved" because its siblings
- * committed. A `commitFn` that reports no `committedPaths` at all (an older
- * or test-only stand-in for `commitWikiChanges`) falls back to the
- * pre-existing whole-scope clear, so this narrows nothing for a caller that
- * predates the field.
+ * A `committed: true` result clears the whole peeked scope EXCEPT
+ * `result.ignoredPaths`: the paths `commitFn` reports as still dirty but kept
+ * out of the commit by `.hypoignore`. Those stay in the touched-paths set,
+ * still blocking as a known, unresolved session write, instead of reading as
+ * "resolved" because their siblings committed. Everything else is retired,
+ * including a claim that was already clean at Stop time or that the caller
+ * deliberately left out of the scope (the root hot.md projection claim when
+ * its bytes are not this session's own): keeping those would let a path
+ * another session later edits be blocked on, or swept into, this session's
+ * next commit. A `commitFn` that reports no `ignoredPaths` (an older or
+ * test-only stand-in for `commitWikiChanges`) keeps nothing, the plain
+ * whole-scope clear.
  *
  * @param {string} hypoDir
  * @param {string|null|undefined} sessionId
- * @param {(paths: string[]) => {committed: boolean, committedPaths?: string[], [k: string]: unknown}} commitFn
+ * @param {(paths: string[]) => {committed: boolean, ignoredPaths?: string[], [k: string]: unknown}} commitFn
  * @returns {{committed: boolean, [k: string]: unknown}} whatever `commitFn` returned,
  *   or `{committed: false, reason: 'touched-paths-lock-timeout'}` if the lock
  *   itself could not be acquired (commitFn never ran; the file is untouched)
@@ -3930,11 +3932,9 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
         // call for this session can have landed since `current` was read
         // (it takes this exact lock too), so the set on disk right now is
         // EXACTLY `current`, the removal below needs no re-read.
-        const toRemove = Array.isArray(result.committedPaths)
-          ? new Set(result.committedPaths)
-          : new Set(current); // back-compat: no committedPaths reported → clear everything, as before
-        if (toRemove.size > 0) {
-          const remaining = current.filter((p) => !toRemove.has(p));
+        const keep = new Set(Array.isArray(result.ignoredPaths) ? result.ignoredPaths : []);
+        const remaining = current.filter((p) => keep.has(p));
+        if (remaining.length < current.length) {
           try {
             if (remaining.length === 0) {
               rmSync(path, { force: true });
@@ -3942,7 +3942,7 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
               atomicWrite(path, JSON.stringify(remaining));
             }
           } catch {
-            // best-effort: the committed paths just linger on disk; the next
+            // best-effort: the retired paths just linger on disk; the next
             // Stop re-peeks them and re-runs commitFn, a clean no-op.
           }
         }
@@ -4002,7 +4002,7 @@ function projectOfPath(relPath) {
  *
  * @param {string} hypoDir
  * @param {string[]} [paths] vault-relative paths this caller wrote/owns this close
- * @returns {{committed: boolean, scoped?: number, sha?: string|null, committedPaths?: string[], reason?: string}}
+ * @returns {{committed: boolean, scoped?: number, sha?: string|null, committedPaths?: string[], ignoredPaths?: string[], reason?: string}}
  *   committed:true when a commit was created OR nothing needed committing
  *   (scoped:0 in the latter case); committed:false (with reason) on a real
  *   failure: not a git repo, or git status/add/commit erroring. `sha` is the
@@ -4013,9 +4013,12 @@ function projectOfPath(relPath) {
  *   is present on every `committed: true` outcome, `[]` for a no-op, and
  *   names exactly the paths THIS call actually staged into the commit (the
  *   rename-collapsed destination set `git diff --cached --name-only` itself
- *   reports), so a caller clearing a per-session pending-write set (Stop's
- *   `commitTouchedPaths`) can retire only what truly landed, not the whole
- *   scope it offered (a `.hypoignore`d or stale path never lands).
+ *   reports). `ignoredPaths` (also on every `committed: true` outcome) names
+ *   the supplied paths that ARE dirty but were kept out of the commit only
+ *   because `.hypoignore` matches them, so a caller clearing a per-session
+ *   pending-write set (Stop's `commitTouchedPaths`) can keep exactly those as
+ *   unresolved. A stale or already-clean supplied path is never listed:
+ *   nothing about it is left unresolved.
  */
 export function commitWikiChanges(hypoDir, paths) {
   const git = (...args) =>
@@ -4026,7 +4029,8 @@ export function commitWikiChanges(hypoDir, paths) {
   const supplied = new Set(
     (Array.isArray(paths) ? paths : []).filter((p) => typeof p === 'string' && p.length > 0),
   );
-  if (supplied.size === 0) return { committed: true, scoped: 0, committedPaths: [] };
+  if (supplied.size === 0)
+    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths: [] };
 
   // `-z`: NUL-separated records with verbatim paths — no surrounding quotes and
   // no octal escaping, so non-ASCII paths (Korean page names are normal input
@@ -4041,6 +4045,7 @@ export function commitWikiChanges(hypoDir, paths) {
   const ignorePatterns = loadHypoIgnore(hypoDir);
   const scoped = []; // pathspec for `git add -A` — worktree/index paths only
   const commitScope = []; // pathspec for the final diff/commit --only (superset)
+  const ignoredPaths = []; // supplied, dirty, but excluded by .hypoignore
   const records = (porcelain.stdout || '').split('\0');
   for (let i = 0; i < records.length; i++) {
     const rec = records[i];
@@ -4059,8 +4064,10 @@ export function commitWikiChanges(hypoDir, paths) {
     }
     if (!file) continue;
     if (!supplied.has(file)) continue; // out of this caller's scope
-    if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns))
+    if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns)) {
+      ignoredPaths.push(file);
       continue;
+    }
     scoped.push(file);
     commitScope.push(file);
     // A rename's `from` path is the SAME change as its destination — without
@@ -4075,7 +4082,7 @@ export function commitWikiChanges(hypoDir, paths) {
     if (isRename && fromFile) commitScope.push(fromFile);
   }
   if (scoped.length === 0 && commitScope.length === 0)
-    return { committed: true, scoped: 0, committedPaths: [] };
+    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
 
   if (scoped.length > 0) {
     const add = git('add', '-A', '--', ...scoped);
@@ -4092,7 +4099,8 @@ export function commitWikiChanges(hypoDir, paths) {
   // staged file would slip into the commit here.
   const staged = git('diff', '--cached', '--name-only', '-z', '--', ...commitScope);
   const stagedFiles = (staged.stdout || '').split('\0').filter(Boolean);
-  if (stagedFiles.length === 0) return { committed: true, scoped: 0, committedPaths: [] };
+  if (stagedFiles.length === 0)
+    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
 
   const projects = new Set(stagedFiles.map(projectOfPath));
   const today = new Date().toISOString().slice(0, 10);
@@ -4128,7 +4136,13 @@ export function commitWikiChanges(hypoDir, paths) {
   // commit itself did succeed, so this must not turn into `committed: false`.
   const head = git('rev-parse', 'HEAD');
   const sha = head.status === 0 ? (head.stdout || '').trim() || null : null;
-  return { committed: true, scoped: stagedFiles.length, sha, committedPaths: stagedFiles };
+  return {
+    committed: true,
+    scoped: stagedFiles.length,
+    sha,
+    committedPaths: stagedFiles,
+    ignoredPaths,
+  };
 }
 
 /**
@@ -5336,7 +5350,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   //    a committed-but-unpushed close marks AND compacts, instead of the close writer
   //    committing its own payload and then being blocked by its own (unpushed) commit.
   const git = hypoIsClean(hypoDir);
-  // checkpointMode (contract "게이트" 절, design v3 §G 대체): a marker-writing
+  // checkpointMode: a marker-writing
   // path's own gate call, replacing the whole git axis above with a narrower
   // question: "is there an uncommitted write THIS session is known to still
   // own". Everything else (close files, cwd, hot structure, lint, W8,
@@ -5366,12 +5380,19 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           });
         } else {
           const touchedSet = new Set((touched.paths || []).map(posixPath));
+          const ignorePatterns = loadHypoIgnore(hypoDir);
           for (const f of dirty) {
             if (touchedSet.has(posixPath(f))) {
+              // A touched file .hypoignore keeps out of every commit stays
+              // dirty forever on its own: say how to get out.
+              const ignoredHint =
+                ignorePatterns.length > 0 && isIgnored(join(hypoDir, f), hypoDir, ignorePatterns)
+                  ? ' (.hypoignore 대상이라 자동 커밋되지 않는다. 손으로 커밋하거나 .hypoignore 에서 빼야 close 가 된다)'
+                  : '';
               blockers.push({
                 type: 'known-session-write',
                 file: f,
-                reason: `this session's own write is still uncommitted: ${f}`,
+                reason: `this session's own write is still uncommitted: ${f}${ignoredHint}`,
               });
             } else {
               notices.push({
