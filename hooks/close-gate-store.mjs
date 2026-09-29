@@ -35,6 +35,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { sessionClosedMarkerPath, walkCloseGate } from './hypo-shared.mjs';
+import { receiptPath } from './close-receipt.mjs';
 import { atomicWrite } from './atomic-write.mjs';
 
 /** `<hypoDir>/.cache/close-gate/<session-id>.json`. */
@@ -492,9 +493,23 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
 // `.json` under `.cache/close-gate/` is this file's own resolution record, a
 // different file), and the model relaying it sent users to delete something
 // that was not there.
+//
+// A close now also files a receipt (`hooks/close-receipt.mjs`) alongside the
+// compat marker, and deleting the marker alone would leave that receipt
+// standing: readReceiptStrict still reads it as valid, so a new Stop would
+// keep treating the session as closed even after the marker it was told to
+// delete is gone. Undo has to name both files or it does not actually undo
+// anything a receipt-aware reader honors. `commit-and-marker` and
+// `marker-only` are the two kinds whose write path always lands the receipt
+// BEFORE the marker (design.md v2 §B/§D), so by the time either kind's text
+// is composed the receipt is guaranteed to exist and the message just names
+// it. `commit-only` is the one kind where the receipt write and the marker
+// write can fail independently, so its wording checks the receipt path on
+// disk rather than assume either way.
 export function hostTagWarningWithUndo(warning, kind, hypoDir, sessionId, commitSha) {
   if (!warning || !kind) return null;
   const marker = sessionClosedMarkerPath(hypoDir, sessionId);
+  const receipt = receiptPath(hypoDir, sessionId);
   // MAJOR fix: "git revert" with no target was an instruction a reader could
   // only carry out by guessing, and the obvious guess (HEAD) is wrong the
   // moment a concurrent session on the same vault commits after this one:
@@ -511,15 +526,23 @@ export function hostTagWarningWithUndo(warning, kind, hypoDir, sessionId, commit
       : commitSha === null
         ? 'nothing needs reverting (this close changed no tracked file, so git created no commit)'
         : `revert the commit this close just made in the wiki repo (find it with \`git -C ${hypoDir} log -1\` and check it is this close's own commit before reverting: on a shared vault another session may have committed after it)`;
+  // Named only when there is a valid receipt path to name at all (a bad
+  // session id has no receipt directory to file one under, same edge case
+  // `receiptPath` itself refuses). `both` reads naturally whether or not
+  // that path is reachable, so the two kinds below stay correct either way.
+  const both = receipt ? `${marker} and ${receipt}` : marker;
   const undo = {
     'commit-and-marker':
-      `To undo it: ${revert}, delete ` + `${marker}, and ask the user whether they meant to close.`,
+      `To undo it: ${revert}, delete ` + `${both}, and ask the user whether they meant to close.`,
     'commit-only':
-      `To undo it: ${revert} and ask ` +
-      'the user whether they meant to close. No marker was written, so there is none to delete.',
+      `To undo it: ${revert} and ask the user whether they meant to close. No marker was ` +
+      'written, so there is none to delete.' +
+      (receipt && existsSync(receipt)
+        ? ` A close receipt landed at ${receipt} and should be deleted too.`
+        : ''),
     'marker-only':
-      `To undo it: delete ${marker} and ask the user whether they meant to close. This run wrote ` +
-      'only that marker and made no commit, so there is nothing to revert.',
+      `To undo it: delete ${both} and ask the user whether they meant to close. This run wrote ` +
+      'no commit, so there is nothing to revert.',
     'uncommitted-writes':
       'Nothing to revert: this run made no commit and wrote no marker. The files it did write are ' +
       'still uncommitted in the wiki working tree, so check git status there before closing again.',

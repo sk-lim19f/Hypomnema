@@ -103,15 +103,22 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    diagnostic, JSON `scope: "project"`): green there means only that slug is
    close-complete, **not** that every project in the vault is. Use the plain
    check for the go/no-go signal.
-7. Record the session-closed marker. The Stop hook blocks until this
-   session's per-session marker exists, and a hand-edit close (writing the files
-   directly + committing) never writes it; the marker is written only by the
-   crystallize writer, never by the hook (bypass guard). Normal path:
-   close via `/hypo:crystallize` (`--apply-session-close --session-id=<id> --transcript-path=<path>`),
-   which writes the marker once the gate is green. Hand-edit recovery: after
-   committing the files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
-   Both writers gate the marker on the SAME `precompactGateStatus` as `/compact`,
-   so the marker only lands when step 6 would print **"Compact-ready"**.
+7. Record the close checkpoint. The Stop hook blocks until this session's close
+   receipt (`.cache/sessions/<id>/close-receipt.json`) is valid, and a hand-edit
+   close (writing the files directly + committing) never writes one; the receipt
+   is filed only by the crystallize writer, never by the hook (bypass guard). A
+   compat marker (`.cache/session-closed-<id>.marker`) is written right after the
+   receipt, for consumers that have not been updated to read the receipt itself.
+   The receipt certifies only what it names: that the file versions this close
+   wrote are in a specific commit. It does not certify that every change this
+   session made is saved, so the Stop hook still surfaces any other uncommitted
+   vault change as a separate notice, once per close, even after the checkpoint
+   is recorded. Normal path: close via `/hypo:crystallize`
+   (`--apply-session-close --session-id=<id> --transcript-path=<path>`), which files the
+   checkpoint once the gate is green. Hand-edit recovery: after committing the
+   files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
+   Both writers gate the checkpoint on the SAME `precompactGateStatus` as
+   `/compact`, so it only lands when step 6 would print **"Compact-ready"**.
    `--session-id` is not optional on the apply path. Before it writes anything, the
    apply reads that session's transcript for evidence the **user** asked to close, and
    refuses the whole close (exit 1, nothing on disk, nothing committed) when the id is

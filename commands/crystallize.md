@@ -109,11 +109,19 @@ and nothing on disk, in three cases:
 A refusal is not a failure to route around. It means the close should not happen: ask
 the user, and re-run only after they say so.
 
-On a verified close (`ok: true` + clean git tree) the apply also writes the per-session
-marker `HYPO_DIR/.cache/session-closed-<id>.marker`, which tells the Stop-chain Layer 3
-hook (`hypo-auto-minimal-crystallize`) that the session is closed so it stops
-re-prompting. Running crystallize purely for **synthesis** carries no payload and needs
-no session id.
+On a verified close (`ok: true` + clean git tree) the apply first files a commit-backed
+close receipt at `HYPO_DIR/.cache/sessions/<id>/close-receipt.json`, then writes the
+per-session compat marker `HYPO_DIR/.cache/session-closed-<id>.marker` as a projection of
+it. The receipt is the thing the Stop-chain Layer 3 hook (`hypo-auto-minimal-crystallize`)
+actually checks: it proves only that the file versions it names are in a specific commit,
+never that every change this session made is saved. Stop stops re-prompting for the close
+procedure itself, and still surfaces any other uncommitted vault change separately, once per
+receipt, as a notice rather than a repeat of "session-close incomplete". A shared append
+target (`log.md`, a session-log shard) is checked by containment, not byte-for-byte: the
+receipt only confirms this close's own entry is in the file, and the commit that lands it
+carries the whole file as it stood at commit time, including any other session's
+already-dirty bytes in the same file. Running crystallize purely for **synthesis** carries
+no payload and needs no session id.
 
 > **Source rule for `--session-id`:** use only the main conversation's session id
 > (the id shown in the `[WIKI_AUTOCLOSE]` block reason, or the injected

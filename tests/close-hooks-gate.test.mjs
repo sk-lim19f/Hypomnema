@@ -2296,6 +2296,62 @@ test('a SCHEMA.md side effect whose bytes changed since the failed commit is NOT
   );
 });
 
+// The same defense on the OTHER close-intent side-effect witness
+// (applyOverwrites' `priorIndex` fallback): a first attempt that seeds a
+// brand-new project's index.md (ensureProjectIndex) and then fails to commit
+// leaves both the file AND a close-intent side-effect record (path, kind:
+// 'create', bytesSha256) behind. A hand edit between attempts must not let
+// the retry trust that recorded witness, same rule as the SCHEMA.md pair
+// above, on the sibling file it protects.
+test('an index.md side effect whose bytes changed since the failed commit is NOT restaged', () => {
+  withWiki(null, (dir, today) => {
+    const hooksDir = join(dir, '.git', 'hooks');
+    mkdirSync(hooksDir, { recursive: true });
+    const hookPath = join(hooksDir, 'pre-commit');
+    writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+    chmodSync(hookPath, 0o755);
+
+    const sessionId = 's-index-sideeffect-drift';
+    const payload = payloadForCleanWiki(dir, today);
+    const cleanup = seedCloseTranscript(sessionId);
+    const r1 = runApply(dir, payload, { sessionId });
+    cleanup();
+    const out1 = JSON.parse(r1.stdout);
+    assert.equal(out1.ok, true, `attempt 1 must still report ok: ${r1.stdout}\n${r1.stderr}`);
+    assert.ok(
+      (out1.applied || []).some((a) => a.startsWith('projectIndex (')),
+      `precondition: attempt 1 must seed a new project index.md, uncommitted: ${r1.stdout}`,
+    );
+    const indexRel = join('projects', 'test-project', 'index.md');
+    const indexPath = join(dir, indexRel);
+    assert.ok(existsSync(indexPath), 'precondition: index.md landed on disk');
+
+    // A hand edit changes index.md's bytes after the failed attempt, so the
+    // recorded side-effect hash no longer matches disk.
+    writeFileSync(indexPath, readFileSync(indexPath, 'utf-8') + '\n<!-- hand edit -->\n');
+
+    rmSync(hookPath);
+    const cleanup2 = seedCloseTranscript(sessionId);
+    const r2 = runApply(dir, payload, { sessionId });
+    cleanup2();
+    const out2 = JSON.parse(r2.stdout);
+    // index.md stays out of this close's scope entirely (still dirty, still
+    // unexplained), regardless of whether the marker lands.
+    assert.ok(
+      gitDirtyFiles(dir).includes(indexRel.split('\\').join('/')),
+      `index.md must remain dirty: ${JSON.stringify(gitDirtyFiles(dir))}`,
+    );
+    if (out2.markerWritten) {
+      const receiptPath = join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json');
+      const receipt = JSON.parse(readFileSync(receiptPath, 'utf-8'));
+      assert.ok(
+        !(receipt.entries || []).some((e) => e.path === indexRel.split('\\').join('/')),
+        'a drifted side effect must never be proven as committed',
+      );
+    }
+  });
+});
+
 test('SessionEnd(reason="clear") records a close-gate resolution', () => {
   withTmpDir((dir) => {
     const sessionId = 's-t3-clear';

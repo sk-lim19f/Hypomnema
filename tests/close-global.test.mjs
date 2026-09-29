@@ -13,6 +13,7 @@ import {
   writeFileSync,
   appendFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -39,6 +40,11 @@ import {
   sessionClosedMarkerPath,
   vaultCommitLockTarget,
 } from '../hooks/hypo-shared.mjs';
+import {
+  RECEIPT_SCHEMA_VERSION,
+  CERT_CHECKPOINT,
+  writeReceiptAtomic,
+} from '../hooks/close-receipt.mjs';
 import { createProject } from '../scripts/lib/project-create.mjs';
 import { test, suite } from './harness.mjs';
 import {
@@ -1015,6 +1021,60 @@ function writeSessionClosedMarkerFile(dir, sessionId, closedAt) {
   return path;
 }
 
+// The same shape a receipt-aware writer stamps (hooks/hypo-shared.mjs's
+// writeSessionClosedMarker `receiptGeneration` field): Stop's legacy-closed
+// branch keys on this field's ABSENCE, so a marker that names one must never
+// be accepted through that branch even when no matching receipt exists.
+function writeMarkerWithReceiptGeneration(dir, sessionId, generation) {
+  const path = join(dir, '.cache', `session-closed-${sessionId}.marker`);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify({
+      session_id: sessionId,
+      project: 'demo',
+      closed_at: new Date().toISOString(),
+      verification: 'session-close-file-status:ok',
+      receipt_generation: generation,
+    }) + '\n',
+  );
+  return path;
+}
+
+// A STRICT-valid close receipt (readReceiptStrict checks schema version,
+// certification, session id match, repo.toplevel against the real git repo,
+// and commit reachability from HEAD): real git plumbing, not a hand-typed
+// shape, so a mismatch in any of those fields would make a test built on
+// this prove nothing (it would read 'invalid', not 'valid', and every
+// scenario below collapses to the same branch).
+function writeValidReceipt(
+  dir,
+  sessionId,
+  { scopeMode = 'project', projects = ['demo'], entries = [], generation } = {},
+) {
+  const toplevel = spawnSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], {
+    encoding: 'utf-8',
+  }).stdout.trim();
+  const commit = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], {
+    encoding: 'utf-8',
+  }).stdout.trim();
+  const receipt = {
+    schemaVersion: RECEIPT_SCHEMA_VERSION,
+    certification: CERT_CHECKPOINT,
+    generation: generation || `gen-${Math.random().toString(36).slice(2, 10)}`,
+    sessionId,
+    repo: { toplevel, prefix: '' },
+    commit,
+    scope: { mode: scopeMode, projects },
+    entries,
+    skipped: { lint: false, feedback: false },
+    createdAt: new Date().toISOString(),
+  };
+  const result = writeReceiptAtomic(dir, sessionId, receipt);
+  assert.ok(result.ok, `fixture must actually write a valid receipt: ${JSON.stringify(result)}`);
+  return receipt;
+}
+
 test('replay-auto-minimal-crystallize-on-incomplete-close: hi-only transcript → continue', () => {
   withGrowthWiki((dir) => {
     const transcript = writeTranscript(dir, [
@@ -1339,6 +1399,238 @@ test('replay-auto-minimal-crystallize-on-incomplete-close: read-only ≥5 + clos
     assert.equal(out.continue, true, 'valid marker overrides a substantial read-only session');
     assert.equal(out.decision, undefined);
   });
+});
+
+// ── ISSUE-171 wave 3b: Stop's receipt-first verdict (contract.md "Stop 판정
+// 순서"), end to end through the real hook process ──────────────────────
+suite('hypo-auto-minimal-crystallize.mjs, receipt-first Stop verdict');
+
+test('Stop: a valid receipt with a close signal continues; no receipt and no marker still blocks', () => {
+  withGrowthWiki((dir) => {
+    // A: a valid close receipt for this session.
+    writeValidReceipt(dir, 's-receipt-valid');
+    const rA = runAutoMinimal(dir, {
+      session_id: 's-receipt-valid',
+      transcript_path: writeTranscript(dir, [
+        {
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        },
+        { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+      ]),
+      stop_hook_active: false,
+    });
+    assert.equal(rA.status, 0, `stderr: ${rA.stderr}`);
+    const outA = JSON.parse(rA.stdout);
+    assert.equal(outA.continue, true, `a valid receipt must continue: ${JSON.stringify(outA)}`);
+    assert.equal(outA.decision, undefined);
+
+    // B: same session shape, no receipt at all and no compat marker either.
+    const rB = runAutoMinimal(dir, {
+      session_id: 's-receipt-none',
+      transcript_path: writeTranscript(dir, [
+        {
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        },
+        { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+      ]),
+      stop_hook_active: false,
+    });
+    assert.equal(rB.status, 0, `stderr: ${rB.stderr}`);
+    const outB = JSON.parse(rB.stdout);
+    assert.equal(
+      outB.decision,
+      'block',
+      `no receipt and no marker must still nudge the close: ${JSON.stringify(outB)}`,
+    );
+  });
+});
+
+test('Stop: a compat marker naming an unresolvable receiptGeneration still blocks; a receiptGeneration-less marker is legacy-closed', () => {
+  withGrowthWiki((dir) => {
+    // A: the marker names a receipt generation, but no receipt file exists at
+    // all under it (deleted, corrupted, or never landed): the marker alone
+    // must never be trusted once it makes that promise.
+    writeMarkerWithReceiptGeneration(dir, 's-marker-orphan', 'gen-orphan-does-not-exist');
+    const rA = runAutoMinimal(dir, {
+      session_id: 's-marker-orphan',
+      transcript_path: writeTranscript(dir, [
+        {
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        },
+        { type: 'user', message: { role: 'user', content: '세션 마무리하자' } },
+      ]),
+      stop_hook_active: false,
+    });
+    assert.equal(rA.status, 0, `stderr: ${rA.stderr}`);
+    const outA = JSON.parse(rA.stdout);
+    assert.equal(
+      outA.decision,
+      'block',
+      `a marker promising a receipt that is not there must not be honored: ${JSON.stringify(outA)}`,
+    );
+
+    // B: an old-shape marker with no receiptGeneration field at all, accepted
+    // exactly as it was before receipts existed (legacy-closed, time-boxed by
+    // readSessionClosedMarker's own 7-day TTL).
+    writeSessionClosedMarkerFile(dir, 's-marker-legacy');
+    const rB = runAutoMinimal(dir, {
+      session_id: 's-marker-legacy',
+      transcript_path: writeTranscript(dir, [
+        {
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        },
+        { type: 'user', message: { role: 'user', content: '세션 마무리하자' } },
+      ]),
+      stop_hook_active: false,
+    });
+    assert.equal(rB.status, 0, `stderr: ${rB.stderr}`);
+    const outB = JSON.parse(rB.stdout);
+    assert.equal(
+      outB.continue,
+      true,
+      `a receiptGeneration-less marker must still be legacy-closed: ${JSON.stringify(outB)}`,
+    );
+    assert.equal(outB.decision, undefined);
+  });
+});
+
+test('Stop: the unresolved-changes notice fires once per receipt generation, and again only once the list changes', () => {
+  withGrowthWiki((dir) => {
+    const sessionId = 's-unresolved-notice';
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    // A dirty file the receipt's (empty) entries list never certifies.
+    writeFileSync(join(dir, 'stray-a.md'), '# stray a\n');
+    writeValidReceipt(dir, sessionId, { entries: [] });
+
+    const r1 = runAutoMinimal(dir, {
+      session_id: sessionId,
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    const out1 = JSON.parse(r1.stdout);
+    assert.equal(out1.continue, true, `valid receipt must continue: ${JSON.stringify(out1)}`);
+    assert.match(
+      out1.systemMessage || '',
+      /stray-a\.md/,
+      `the first Stop with an unresolved dirty file must notice it: ${JSON.stringify(out1)}`,
+    );
+
+    const r2 = runAutoMinimal(dir, {
+      session_id: sessionId,
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    const out2 = JSON.parse(r2.stdout);
+    assert.equal(out2.continue, true);
+    assert.equal(
+      out2.systemMessage,
+      undefined,
+      `the SAME unresolved list on the SAME generation must not repeat: ${JSON.stringify(out2)}`,
+    );
+
+    // The unresolved list changes → the notice fires again.
+    writeFileSync(join(dir, 'stray-b.md'), '# stray b\n');
+    const r3 = runAutoMinimal(dir, {
+      session_id: sessionId,
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    const out3 = JSON.parse(r3.stdout);
+    assert.match(
+      out3.systemMessage || '',
+      /stray-b\.md/,
+      `a changed unresolved list must notice again: ${JSON.stringify(out3)}`,
+    );
+  });
+});
+
+test('Stop: a valid receipt still blocks when the session cwd project has an unstarted close (close-cwd)', () => {
+  const CWD = '/tmp/cwdproj-stop-receipt';
+  withClosePartitionWiki(
+    [
+      { slug: 'recency-proj', date: todayLocal() },
+      { slug: 'cwd-proj', date: todayLocal(), sessionLog: false, logEntry: false, hotRow: false },
+    ],
+    [],
+    (dir) => {
+      setWorkingDir(dir, 'cwd-proj', CWD);
+      const sessionId = 's-cwd-receipt';
+      writeValidReceipt(dir, sessionId, { projects: ['recency-proj'] });
+      const transcript = join(dir, '.cache', 'stop-cwd-transcript.jsonl');
+      writeFileSync(
+        transcript,
+        [
+          JSON.stringify({
+            type: 'assistant',
+            message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+          }),
+          JSON.stringify({
+            type: 'user',
+            message: { role: 'user', content: '오늘은 이만 마무리하자' },
+          }),
+        ].join('\n') + '\n',
+      );
+      const r = runAutoMinimal(dir, {
+        session_id: sessionId,
+        transcript_path: transcript,
+        cwd: CWD,
+        stop_hook_active: false,
+      });
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.decision,
+        'block',
+        `a valid receipt must not override an unstarted cwd-project close: ${JSON.stringify(out)}`,
+      );
+    },
+  );
+});
+
+test('Stop: a log-only receipt continues without a cwd re-check, even when the cwd project close is incomplete', () => {
+  const CWD = '/tmp/cwdproj-stop-logonly';
+  withClosePartitionWiki(
+    [
+      { slug: 'recency-proj', date: todayLocal() },
+      { slug: 'cwd-proj', date: todayLocal(), sessionLog: false, logEntry: false, hotRow: false },
+    ],
+    [],
+    (dir) => {
+      setWorkingDir(dir, 'cwd-proj', CWD);
+      const sessionId = 's-cwd-logonly-receipt';
+      writeValidReceipt(dir, sessionId, { scopeMode: 'log-only', projects: [] });
+      const transcript = join(dir, '.cache', 'stop-logonly-transcript.jsonl');
+      writeFileSync(
+        transcript,
+        [
+          JSON.stringify({
+            type: 'assistant',
+            message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+          }),
+          JSON.stringify({ type: 'user', message: { role: 'user', content: '세션 마무리하자' } }),
+        ].join('\n') + '\n',
+      );
+      const r = runAutoMinimal(dir, {
+        session_id: sessionId,
+        transcript_path: transcript,
+        cwd: CWD,
+        stop_hook_active: false,
+      });
+      const out = JSON.parse(r.stdout);
+      assert.equal(
+        out.continue,
+        true,
+        `a log-only receipt must exempt the cwd re-check: ${JSON.stringify(out)}`,
+      );
+      assert.equal(out.decision, undefined);
+    },
+  );
 });
 
 // ── conditional-close-reconfirm ──────────────────────────────────────────
@@ -1887,6 +2179,84 @@ test('--mark-session-closed with ok gate + clean git → exit 0, marker created'
   });
 });
 
+// design.md v5 §1 / v2 §F, on the OTHER writer entry point: a session that
+// already carries a valid receipt and compat marker (from an earlier
+// successful --mark) sends a fresh --mark-session-closed, and the gate then
+// blocks it (this session's own touched-paths still name a dirty file, the
+// same known-session-write shape the ADR Q2 regression test above covers).
+// Invalidation happens at the gate call itself, before the gate's ok/not-ok
+// verdict is known, so a run that goes on to be REFUSED must still have
+// invalidated the prior proof: a stale "closed" receipt must never survive
+// a close attempt this session itself disavowed by trying again.
+test('--mark-session-closed invalidates the prior receipt and marker even when the retry itself is refused', () => {
+  withWiki(null, (dir) => {
+    const sessionId = 's-mark-invalidate-on-blocked-retry';
+    const cleanup1 = seedCloseTranscript(sessionId);
+    const r1 = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      `--session-id=${sessionId}`,
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup1();
+    assert.equal(r1.status, 0, `first mark must succeed: ${r1.stdout}\n${r1.stderr}`);
+    const markerPath = join(dir, '.cache', `session-closed-${sessionId}.marker`);
+    const receiptDir = join(dir, '.cache', 'sessions', sessionId);
+    const receiptPath = join(receiptDir, 'close-receipt.json');
+    assert.ok(existsSync(markerPath), 'precondition: a marker exists');
+    assert.ok(existsSync(receiptPath), 'precondition: a receipt exists');
+
+    // A dirty root file this SAME session's touched-paths still names, the
+    // known-session-write blocker checkpointMode never demotes.
+    appendFileSync(join(dir, 'hot.md'), '\ndirty\n');
+    recordTouchedPaths(dir, sessionId, ['hot.md']);
+
+    const cleanup2 = seedCloseTranscript(sessionId);
+    const r2 = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      `--session-id=${sessionId}`,
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup2();
+    assert.equal(r2.status, 1, `retry must be refused by the dirty-git blocker: ${r2.stdout}`);
+    const out2 = JSON.parse(r2.stdout);
+    assert.ok(
+      (out2.blockers || []).some((b) => b.type === 'known-session-write'),
+      `expected a known-session-write blocker: ${JSON.stringify(out2)}`,
+    );
+
+    assert.equal(
+      existsSync(markerPath),
+      false,
+      'the old marker must no longer sit at its plain path',
+    );
+    assert.equal(
+      existsSync(receiptPath),
+      false,
+      'the old receipt must no longer sit at its plain path',
+    );
+    const invalidatedMarkers = readdirSync(join(dir, '.cache')).filter((n) =>
+      n.startsWith(`session-closed-${sessionId}.marker.invalidated-`),
+    );
+    assert.equal(
+      invalidatedMarkers.length,
+      1,
+      `expected one invalidated marker: ${invalidatedMarkers}`,
+    );
+    const invalidatedReceipts = readdirSync(receiptDir).filter((n) =>
+      n.startsWith('close-receipt.json.invalidated-'),
+    );
+    assert.equal(
+      invalidatedReceipts.length,
+      1,
+      `expected one invalidated receipt: ${readdirSync(receiptDir)}`,
+    );
+  });
+});
+
 // design.md test 28 ("--mark: append 파일이 dirty(Bash 로 덧붙임) 대 HEAD 와 같음. 보류
 // 대 영수증"): a session-log shard modified directly on disk (simulating a
 // Bash append, no commit) must withhold the whole certification, even though
@@ -1915,6 +2285,47 @@ test('--mark-session-closed: a dirty (uncommitted) session-log shard withholds t
     assert.ok(
       !existsSync(join(dir, '.cache', 'session-closed-s-mark-dirty-append.marker')),
       'no marker may land while a target this project needs is uncommitted',
+    );
+  });
+});
+
+// design.md test 8 / v2 §I: the counterpart to the worktree-dirty case above,
+// on the OTHER half of the disagreement `markCloseWorktreeProofEntry` guards
+// against: the file is STAGED (index differs from HEAD) but the worktree
+// matches the index exactly (a plain `git add`, no further edit), so a
+// worktree-only diff check would call this clean. `git status --porcelain`
+// still names the path (a non-blank index column), which is the one thing
+// that catches this: the worktree comparison a later commit diff would run
+// only ever sees "what's on disk now", never "what's staged but never
+// committed", so this withhold is the only place a staged-only drift is
+// ever caught at all.
+test('--mark-session-closed: a close file staged but not committed withholds the certification (index differs from HEAD)', () => {
+  withWiki(null, (dir) => {
+    const cleanup = seedCloseTranscript('s-mark-staged-only');
+    const ssRel = join('projects', 'test-project', 'session-state.md');
+    const ssPath = join(dir, ssRel);
+    writeFileSync(ssPath, readFileSync(ssPath, 'utf-8') + '\nstaged only, never committed\n');
+    spawnSync('git', ['-C', dir, 'add', '--', ssRel]);
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      '--session-id=s-mark-staged-only',
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(
+      r.status,
+      1,
+      `a staged-only close file must withhold the certification: ${r.stdout}`,
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, 'incomplete');
+    assert.ok((out.incompleteProjects || []).includes('test-project'));
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'session-closed-s-mark-staged-only.marker')),
+      'no marker may land while a close file is only staged, not committed',
     );
   });
 });

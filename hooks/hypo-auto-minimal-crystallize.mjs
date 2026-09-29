@@ -21,8 +21,17 @@
  *        calls (Read/Grep/Glob/Bash) — 6a, so read-only review/debug sessions
  *        are also nudged to close. Pure Q&A / incidental lookups still skip.
  *   4. no recent user close-intent → continue       (close-intent gate, see below)
- *   5. readSessionClosedMarker(session_id) valid
- *                                  → continue       (close already verified)
+ *   5. close verdict for session_id (contract.md "Stop 판정 순서"):
+ *        a. readReceiptStrict valid            → continue (cwd/log-only exemption unchanged)
+ *        b. receipt missing/invalid, compat marker valid with NO receiptGeneration
+ *                                               → continue (legacy-closed, marker's own 7-day TTL)
+ *        c. compat marker names a receiptGeneration but the receipt is missing/invalid
+ *                                               → fall through to block (close not verified)
+ *        d. no marker at all                   → fall through to block
+ *      A valid receipt only certifies the files it names (design.md's
+ *      checkpoint contract), so branch (a) also fires an unresolved-changes
+ *      systemMessage once per receipt generation (see notifyUnresolved).
+ *      This is never a block, only a notice riding along on the continue reply.
  *   6. otherwise                   → decision:block
  *
  * Close-intent gate (added after PR-C dogfooding revealed every-turn block —
@@ -59,8 +68,8 @@
  * mode the per-session marker was introduced to prevent.
  */
 
-import { existsSync } from 'fs';
-import { join } from 'path';
+import { existsSync, readFileSync } from 'fs';
+import { join, dirname } from 'path';
 import {
   HYPO_DIR,
   PKG_ROOT,
@@ -74,10 +83,60 @@ import {
   isCloseReconfirmDeclined,
   CLOSE_RECONFIRM_MARK,
   resolveGateProjectOverride,
+  gitDirtyFiles,
 } from './hypo-shared.mjs';
+import { readReceiptStrict, receiptPath } from './close-receipt.mjs';
+import { atomicWrite } from './atomic-write.mjs';
 
-function emitContinue() {
-  console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+// Carrying a systemMessage does not turn this into a block: the session is
+// still free to end, the message just rides along on the same continue reply
+// (hooks/hypo-stop.mjs merges every stage's systemMessage into one).
+function emitContinue(systemMessage) {
+  const out = { continue: true, suppressOutput: !systemMessage };
+  if (systemMessage) out.systemMessage = systemMessage;
+  console.log(JSON.stringify(out));
+}
+
+// design.md's checkpoint contract: a valid receipt proves only the files it
+// names are committed, never that the rest of the session's work was saved.
+// A dirty path outside that list is unresolved and worth telling the user
+// about, but only once per receipt generation, or again once the list
+// itself changes -- never on every Stop turn a long session produces. State
+// lives next to the receipt it is keyed to (`.cache/sessions/<sid>/`), so an
+// invalidated/replaced receipt (a fresh close attempt) starts this notice
+// fresh too.
+function notifyUnresolved(hypoDir, sessionId, receipt) {
+  const certified = new Set((receipt.entries || []).map((e) => e && e.path));
+  const dirty = gitDirtyFiles(hypoDir)
+    .filter((f) => !certified.has(f))
+    .sort();
+  if (dirty.length === 0) return null;
+  const rp = receiptPath(hypoDir, sessionId);
+  if (!rp) return null;
+  const notifyPath = join(dirname(rp), 'unresolved-notified.json');
+  let prior = null;
+  try {
+    prior = JSON.parse(readFileSync(notifyPath, 'utf-8'));
+  } catch {
+    prior = null;
+  }
+  const sameList =
+    prior &&
+    prior.generation === receipt.generation &&
+    Array.isArray(prior.files) &&
+    prior.files.length === dirty.length &&
+    prior.files.every((f, i) => f === dirty[i]);
+  if (sameList) return null;
+  try {
+    atomicWrite(notifyPath, JSON.stringify({ generation: receipt.generation, files: dirty }));
+  } catch {
+    // Best-effort: a failed write only means this same notice repeats next
+    // turn, never that it silently stops appearing.
+  }
+  return (
+    `[WIKI_AUTOCLOSE] close checkpoint 확인됨 (session_id=${sessionId}). 다만 이 체크포인트가 ` +
+    `증명하지 않는 미해결 변경이 있습니다: ${dirty.join(', ')}`
+  );
 }
 
 function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
@@ -269,28 +328,51 @@ process.stdin.on('end', () => {
       }
     };
 
-    // 5. close already verified for this session_id — but a project marker only
-    // attests the project(s) it recorded. If THIS session's cwd project still has
-    // an unstarted close, honoring the marker would end the session green while
-    // that project stays open (the session-cwd false-green). So re-check the cwd
-    // project before accepting a project marker. A log-only marker (non-project
-    // session) is exempt, and without a cwd signal we accept the marker as before
-    // (back-compat with payloads that carry no cwd).
+    // 5. close verdict for this session_id (contract.md "Stop 판정 순서"). A
+    // valid receipt only attests the project(s)/scope it recorded, same as
+    // the old marker-only check did: if THIS session's cwd project still has
+    // an unstarted close, honoring it would end the session green while that
+    // project stays open (the session-cwd false-green), so the cwd re-check
+    // below is unchanged from before receipts existed, only its trigger moved.
     if (sessionId) {
-      const marker = readSessionClosedMarker(HYPO_DIR, sessionId);
-      if (marker) {
-        if (marker.scope === 'log-only' || !sessionCwd) {
-          emitContinue();
+      const receipt = readReceiptStrict(HYPO_DIR, sessionId);
+      if (receipt.status === 'valid') {
+        const isLogOnly = receipt.receipt?.scope?.mode === 'log-only';
+        if (isLogOnly || !sessionCwd) {
+          emitContinue(notifyUnresolved(HYPO_DIR, sessionId, receipt.receipt));
           return;
         }
         gate = computeGate();
         const cwdBlocked = !!gate?.blockers?.some((b) => b.type === 'close-cwd');
         if (!cwdBlocked) {
-          emitContinue();
+          emitContinue(notifyUnresolved(HYPO_DIR, sessionId, receipt.receipt));
           return;
         }
-        // marker present but the session's cwd project close is incomplete: fall
-        // through to block, reusing the gate computed above.
+        // valid receipt, but the session's cwd project close is incomplete:
+        // fall through to block, reusing the gate computed above.
+      } else {
+        // No usable receipt (missing, or invalid/corrupt/unreachable). A
+        // compat marker that names NO receiptGeneration is a legacy writer's
+        // proof (or one that skipped the receipt entirely) and is accepted
+        // exactly as before, time-boxed by readSessionClosedMarker's own
+        // 7-day TTL. A marker that DOES name a receiptGeneration promises a
+        // receipt that is not there to find, so that close is not verified:
+        // fall through to block, never trust the marker alone in that case.
+        const marker = readSessionClosedMarker(HYPO_DIR, sessionId);
+        if (marker && !marker.receipt_generation) {
+          if (marker.scope === 'log-only' || !sessionCwd) {
+            emitContinue();
+            return;
+          }
+          gate = computeGate();
+          const cwdBlocked = !!gate?.blockers?.some((b) => b.type === 'close-cwd');
+          if (!cwdBlocked) {
+            emitContinue();
+            return;
+          }
+          // legacy marker present but the session's cwd project close is
+          // incomplete: fall through to block, reusing the gate above.
+        }
       }
     }
 
