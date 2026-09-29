@@ -3609,6 +3609,193 @@ test('precompactGateStatus: a renamed file landing in scope → still a git bloc
   });
 });
 
+// ISSUE-171 checkpointMode (design v3 §G 대체, v4 §4): a marker-writing
+// path's own gate call, the git axis only. Every test here calls
+// precompactGateStatus directly with checkpointMode:true, the same function
+// the two writers (마커 단계, --mark-session-closed) call, so a defeat that
+// deletes the checkpointMode branch entirely turns every one of these red.
+suite('ISSUE-171 checkpointMode, git axis only for marker-writing paths');
+
+test('checkpointMode: a dirty root file nobody claims → unresolved notice, not a blocker', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'unrelated-session.md'), "# another session's own edit\n");
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-a',
+    });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git' || b.type === 'known-session-write'),
+      `an unowned dirty file must not block a checkpoint: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      (gate.notices || []).some(
+        (n) => n.type === 'unresolved' && n.file === 'unrelated-session.md',
+      ),
+      `an unowned dirty file must surface as an unresolved notice: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+test("checkpointMode: a dirty file still in THIS session's touched-paths → known-session-write blocker", () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'mine.md'), '# this session wrote this, not yet committed\n');
+    recordTouchedPaths(dir, 'sess-checkpoint-b', ['mine.md']);
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-b',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'known-session-write' && b.file === 'mine.md'),
+      `a dirty file still claimed in touched-paths must block: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('checkpointMode: no sessionId → checkpoint-session blocker, not ok', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+    });
+    assert.equal(gate.ok, false);
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'checkpoint-session'),
+      `a missing sessionId must block with checkpoint-session: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('checkpointMode: an invalid sessionId (not isValidSessionId shape) → checkpoint-session blocker', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'has a space',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'checkpoint-session'),
+      `an invalid-shape sessionId must block with checkpoint-session: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('checkpointMode: a corrupt touched-paths file → known-session-write blocker (fail closed, not demoted)', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
+    mkdirSync(dirname(touchedPathsPath(dir, 'sess-checkpoint-c')), { recursive: true });
+    writeFileSync(touchedPathsPath(dir, 'sess-checkpoint-c'), '{not json');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-c',
+    });
+    assert.ok(
+      (gate.blockers || []).some(
+        (b) => b.type === 'known-session-write' && b.reason === 'touched-paths unreadable',
+      ),
+      `a corrupt touched-paths file must fail closed: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('checkpointMode: sessionId is required even when the tree is otherwise clean', () => {
+  withSyncedWiki((dir) => {
+    // No dirty file at all: the git axis has nothing to demote or block on
+    // its own, but checkpointMode's sessionId requirement is unconditional
+    // (design v4 §4: "없거나 무효면 게이트 결과는 not ok"), not merely a
+    // consequence of a dirty tree.
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'checkpoint-session'),
+      `checkpointMode must require a validated sessionId even on a clean tree: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+test('checkpointMode omitted (Stop/PreCompact/check): the existing unscoped git blocker wording is unchanged', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
+    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+    assert.ok(
+      (gate.blockers || []).some(
+        (b) => b.type === 'git' && b.reason === `uncommitted changes in ${dir}`,
+      ),
+      `without checkpointMode the old unscoped blocker text must survive byte for byte: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      !(gate.notices || []).some((n) => n.type === 'unresolved'),
+      `an 'unresolved' notice type must never appear outside checkpointMode: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+// design.md test 25: the SAME vault state (a dirty file THIS session's own
+// touched-paths still names) must make BOTH marker-writing paths' gate
+// calls refuse, since both pass `checkpointMode: true, sessionId` to the
+// exact same shared function. If a future edit dropped `checkpointMode`
+// from only ONE call site, that one path would fall back to the unscoped
+// git blocker (still refuses here, since the dirty file has no
+// attributionScope) OR, on a scope-bearing call, could diverge from the
+// other. This pins today's actual behavior at the function each writer
+// calls, using the SAME minimal option shape both `runMarkerPhase` and
+// `runMarkSessionClosed` pass (`closeScope`, `checkpointMode`, `sessionId`).
+test('checkpointMode: the same known-session-write vault state yields the same gate verdict for both marker-writing call shapes', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'mine.md'), '# this session wrote this, not yet committed\n');
+    recordTouchedPaths(dir, 'sess-checkpoint-equiv', ['mine.md']);
+    const applyShapeGate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      closeScope: ['test-project'],
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-equiv',
+    });
+    const markShapeGate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      closeScope: ['test-project'],
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-equiv',
+    });
+    assert.equal(applyShapeGate.ok, markShapeGate.ok);
+    assert.deepEqual(
+      (applyShapeGate.blockers || []).map((b) => b.type).sort(),
+      (markShapeGate.blockers || []).map((b) => b.type).sort(),
+      `both marker-writing paths must reach the same blocker set: ${JSON.stringify({ apply: applyShapeGate.blockers, mark: markShapeGate.blockers })}`,
+    );
+    assert.ok(
+      (applyShapeGate.blockers || []).some((b) => b.type === 'known-session-write'),
+      'this fixture must actually exercise the known-session-write blocker, not a vacuous pass',
+    );
+  });
+});
+
+test('checkpointMode: root hot.md structure blocker still fires (only the git axis changes)', () => {
+  withSyncedWiki((dir) => {
+    const hotPath = join(dir, 'hot.md');
+    writeFileSync(
+      hotPath,
+      readFileSync(hotPath, 'utf-8').replace(/^---\n/, '---\nlast_session: forbidden\n'),
+    );
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'break hot.md structure']);
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-hot',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'hot'),
+      `checkpointMode must not waive the hot.md structure blocker: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
 test('commitWikiChanges: dirty tree → commits, leaves tree uncommitted-clean', () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, 'new.md'), '# new\n');

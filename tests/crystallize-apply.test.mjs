@@ -14,6 +14,8 @@ import {
   existsSync,
   unlinkSync,
   rmSync,
+  statSync,
+  readdirSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -21,6 +23,7 @@ import { snapshotBase, overwriteTargets, advanceBaseForWrite } from '../hooks/ba
 import { closeGateStatus } from '../hooks/close-gate-store.mjs';
 import {
   findBackfillCandidate,
+  rootLogEntry,
   sessionClosedMarkerPath,
   vaultCommitLockTarget,
 } from '../hooks/hypo-shared.mjs';
@@ -1805,40 +1808,36 @@ test('markerWriteGenuinelyFailed only flags the disk-level reason, never a polic
   );
 });
 
-test('marker path pre-occupied by a directory → apply exits 1 with ok:false, stage=marker-did-not-land', () => {
+// ISSUE-171 interaction: `refuseUnlessCloseRequested` now calls
+// `invalidateCloseArtifacts` for THIS session's own marker path the moment a
+// new close is authorized, before any write (design.md v5 §1). That call
+// renames away whatever currently sits at `sessionClosedMarkerPath` (file
+// or directory, contents irrelevant, a plain rename to a fresh name never
+// cares about the source's type), so a directory pre-occupying the marker's
+// own filename (ISSUE-153's original fixture) is cleared before this apply
+// ever reaches the marker write. The scenario below is what that leaves
+// behind: the stray directory self-heals and the close now succeeds, rather
+// than the old disk-level EISDIR this test used to pin.
+test('marker path pre-occupied by a directory is invalidated away before the marker write (ISSUE-171 self-heal)', () => {
   withWiki(null, (dir, today) => {
     const sessionId = 'issue153-marker-blocked';
-    // Occupies the marker's OWN filename with a directory rather than blocking
-    // `.cache/` itself: every other write under `.cache/` (the base store, the
-    // close journal, the commit) stays reachable, and only the marker's own
-    // atomic rename (which replaces whatever sits at that exact path) hits
-    // EISDIR. This isolates the failure to the one thing ISSUE-153 is about.
     mkdirSync(sessionClosedMarkerPath(dir, sessionId), { recursive: true });
     const payload = payloadForCleanWiki(dir, today);
     payload.sessionLog.entry = `## [${today}] issue-153 marker blocked\n`;
     payload.log.entry = `## [${today}] session | test-project — issue-153\n`;
     const r = runApply(dir, payload, { sessionId });
     const out = JSON.parse(r.stdout);
-    assert.equal(out.markerWritten, false, `marker write must fail: ${r.stdout}\n${r.stderr}`);
-    assert.equal(
-      out.markerSkipReason,
-      'marker-did-not-land',
-      `expected the disk-level reason: ${r.stdout}`,
-    );
-    // Everything upstream of the marker write still succeeded. This is the
-    // "same failure, different entry point" case, not a broader breakage.
-    assert.equal(
-      out.committed,
-      true,
-      'the payload files must still have committed cleanly: only the marker write failed',
-    );
     assert.equal(
       r.status,
-      1,
-      `apply must not exit 0 when the marker genuinely failed to write (ISSUE-153): ${r.stdout}\n${r.stderr}`,
+      0,
+      `the stray directory is invalidated away before the marker write, so this close now succeeds: ${r.stdout}\n${r.stderr}`,
     );
-    assert.equal(out.ok, false, 'ok must reflect the failed marker write');
-    assert.equal(out.stage, 'marker-did-not-land', `stage must record the cause: ${r.stdout}`);
+    assert.equal(out.ok, true);
+    assert.equal(out.markerWritten, true, `marker write must land: ${r.stdout}`);
+    assert.equal(out.committed, true);
+    // The invalidated directory is renamed aside, not deleted: the marker
+    // filename itself is now a plain file again.
+    assert.equal(statSync(sessionClosedMarkerPath(dir, sessionId)).isDirectory(), false);
   });
 });
 
@@ -2052,20 +2051,32 @@ test('--mark-session-closed warns too, with the marker-only undo (it makes no co
 // failed, which flips ok to false. Gating on `ok` there silenced the warning
 // on the one path where the bytes a user may not have asked for are already
 // in git.
-test('a landed commit with a blocked marker still warns, and offers only the undo it can honor', () => {
+test('a landed commit with a blocked receipt still warns, and offers only the undo it can honor', () => {
   withWiki(null, (dir, today) => {
     const sessionId = `hosttag-nomarker-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
     const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
     try {
-      // Same technique as the marker-did-not-land test above: occupy the
-      // marker's own filename with a directory so only its atomic rename
-      // fails, and everything upstream (including the commit) still succeeds.
-      mkdirSync(sessionClosedMarkerPath(dir, sessionId), { recursive: true });
+      // ISSUE-171 interaction: occupying the marker's OWN filename with a
+      // directory (the old ISSUE-153 technique) no longer blocks anything:
+      // `refuseUnlessCloseRequested` invalidates (renames away) whatever
+      // sits at THIS session's own marker path the moment the close is
+      // authorized, before any write, so the stray directory is cleared
+      // long before the marker write runs (see the self-heal test above).
+      // To reach the same SHAPE this test cares about (commit lands, the
+      // compat marker never does, hostTagWarning still surfaces with no
+      // marker-deletion instruction), block the RECEIPT write instead: a
+      // plain file occupying `.cache/sessions/<sid>/` makes
+      // `writeReceiptAtomic`'s directory create fail (ENOTDIR), which
+      // withholds the marker exactly as a disk-level failure would, without
+      // ever creating (or needing to survive) a directory at the marker path.
+      const sessionCacheDir = join(dir, '.cache', 'sessions', sessionId);
+      mkdirSync(dirname(sessionCacheDir), { recursive: true });
+      writeFileSync(sessionCacheDir, 'occupied by a file, not a directory\n');
       const payload = payloadForCleanWiki(dir, today);
       const r = runApply(dir, payload, { sessionId });
       const out = JSON.parse(r.stdout);
-      assert.equal(out.ok, false, `the blocked marker must fail the close: ${r.stdout}`);
-      assert.equal(out.stage, 'marker-did-not-land', `stage: ${r.stdout}`);
+      assert.equal(out.ok, false, `the blocked receipt must fail the close: ${r.stdout}`);
+      assert.equal(out.stage, 'receipt-write-failed', `stage: ${r.stdout}`);
       assert.equal(out.committed, true, `the payload must still have committed: ${r.stdout}`);
       assert.match(
         out.hostTagWarning,
@@ -2082,6 +2093,193 @@ test('a landed commit with a blocked marker still warns, and offers only the und
     } finally {
       cleanup();
     }
+  });
+});
+
+// design.md v2 §C / test row c ("커밋 경합"): `.hypoignore` makes a REAL,
+// deterministic version of "the committed bytes differ from what this close
+// expected", without needing true process concurrency. hot.md's new content
+// is written to disk like any ordinary overwrite, but `.hypoignore` makes
+// `commitWikiChanges` permanently exclude it from staging, so the commit
+// this apply makes still carries HEAD's OLD hot.md bytes. The receipt must
+// catch that divergence and withhold, never certify a version that was
+// never actually committed.
+test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is withheld (receipt-proof-mismatch)', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const payload = payloadForCleanWiki(dir, today);
+    payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
+    const sessionId = 's-hypoignore-mismatch';
+    // A base snapshot for hot.md, matching current disk, so the overwrite
+    // guard's conflict check (a real, separate concern) sees a legitimate
+    // base and takes the write path, not a park: this test is about the
+    // COMMIT diverging from the write, not about the observed-base guard.
+    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
+    const r = runApply(dir, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      r.status,
+      1,
+      `an ignored, never-committed overwrite must withhold the receipt: ${r.stdout}\n${r.stderr}`,
+    );
+    assert.equal(out.ok, false);
+    assert.equal(out.markerSkipReason, 'receipt-proof-mismatch', `stage: ${r.stdout}`);
+    assert.ok(
+      (out.mismatches || []).some((m) => m.path === 'projects/test-project/hot.md'),
+      `the mismatch must name the ignored target: ${JSON.stringify(out.mismatches)}`,
+    );
+    assert.ok(
+      !existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)),
+      'no compat marker may land on an uncertified close',
+    );
+  });
+});
+
+// design.md test 5 / row d, the positive half: a skipped (idempotent,
+// disk-already-matches) target whose bytes are ALREADY IN THE COMMIT (this
+// exact session's own prior, successful close) still certifies on a
+// same-day re-apply. The negative half (a skip that matches only dirty
+// disk, never committed) is
+// "--apply-session-close: a retry leaves an unjournaled payload file uncommitted, receipt withheld"
+// in tests/close-global.test.mjs.
+test('a skipped target whose bytes are already committed (idempotent same-session re-apply) still issues a receipt', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = 's-skip-already-committed';
+    const payload = payloadForCleanWiki(dir, today);
+    const cleanup1 = seedCloseTranscript(sessionId);
+    const r1 = runApply(dir, payload, { sessionId });
+    cleanup1();
+    const out1 = JSON.parse(r1.stdout);
+    assert.equal(out1.ok, true, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
+    assert.equal(out1.markerWritten, true);
+
+    // Re-apply the SAME payload. sessionState and projectHot are both
+    // idempotent skips now (disk already matches, and it is THIS commit,
+    // not just dirty disk); only the append targets (session-log, log.md)
+    // are already-present skips too, since the entry text is unchanged.
+    // A second, distinct close phrase (attempt 1 already spent the first):
+    // seedCloseTranscript overwrites the file, so the fixture repeats the
+    // same opening line and adds a fresh one after it.
+    const cleanup2 = seedCloseTranscript(sessionId, {
+      toolUseLines: [
+        JSON.stringify({ type: 'user', message: { role: 'user', content: '세션 마무리 해줘' } }),
+      ],
+    });
+    const r2 = runApply(dir, payload, { sessionId });
+    cleanup2();
+    const out2 = JSON.parse(r2.stdout);
+    assert.equal(
+      out2.ok,
+      true,
+      `idempotent re-apply must still certify: ${r2.stdout}\n${r2.stderr}`,
+    );
+    assert.equal(out2.markerWritten, true, 'a fresh receipt must be issued for the re-apply');
+  });
+});
+
+// design.md test 35 / row e: a payload whose session-log entry carries TWO
+// dated headings derives TWO root-log blocks (design.md v5 §3), and the
+// proof must cover both, not just the first. Here heading A's exact line
+// already sits in log.md with a DIFFERENT body underneath (from an earlier,
+// unrelated write): `appendIfAbsent`'s heading-only absence check treats A
+// as already present and skips writing THIS close's own block for it, while
+// heading B (untouched) writes normally. The commit lands with B's real
+// block but never THIS close's own A block, so the receipt must withhold.
+test('two derived log.md headings, one already occupied by a different body, withholds the receipt', () => {
+  withWiki(null, (dir, today) => {
+    const entryA = rootLogEntry('test-project', today, 'change A');
+    const entryB = rootLogEntry('test-project', today, 'change B');
+    const logPath = join(dir, 'log.md');
+    // A different session's own block already sits under heading A's exact
+    // line: the heading matches, the body (arrow-link target) does not.
+    writeFileSync(
+      logPath,
+      `${readFileSync(logPath, 'utf-8')}\n${entryA.heading}\n${'→'} [[pages/unrelated]]\n`,
+    );
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog.entry = `## [${today}] change A\nfirst\n\n## [${today}] change B\nsecond\n`;
+    delete payload.log;
+    const sessionId = 's-two-headings-one-missing';
+    const r = runApply(dir, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(
+      r.status,
+      1,
+      `a derived block this close never actually wrote must withhold: ${r.stdout}\n${r.stderr}`,
+    );
+    assert.equal(out.ok, false);
+    assert.equal(out.markerSkipReason, 'receipt-proof-mismatch', `stage: ${r.stdout}`);
+    const logContent = readFileSync(logPath, 'utf-8');
+    assert.ok(logContent.includes(entryB.block), 'block B must still have been written');
+    assert.ok(
+      !logContent.includes(entryA.block),
+      "this close's own block A must never have landed (the heading was already taken)",
+    );
+  });
+});
+
+// design.md test 33 / row f: a session with a VALID receipt from an earlier
+// close sends a newly-authorized close (a fresh user close phrase) with a
+// malformed payload. Authorization is checked (and passes) before payload
+// shape validation, so `refuseUnlessCloseRequested` invalidates the prior
+// receipt and compat marker before the malformed payload is even parsed,
+// a botched retry must never leave a stale "closed" proof standing.
+test('a newly-authorized close with a malformed payload invalidates the prior receipt and marker', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = 's-invalidate-on-bad-retry';
+    const payload = payloadForCleanWiki(dir, today);
+    const cleanup1 = seedCloseTranscript(sessionId);
+    const r1 = runApply(dir, payload, { sessionId });
+    cleanup1();
+    const out1 = JSON.parse(r1.stdout);
+    assert.equal(out1.ok, true, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
+    const receiptDir = join(dir, '.cache', 'sessions', sessionId);
+    const markerPath = sessionClosedMarkerPath(dir, sessionId);
+    assert.ok(existsSync(join(receiptDir, 'close-receipt.json')), 'precondition: a receipt exists');
+    assert.ok(existsSync(markerPath), 'precondition: a marker exists');
+
+    const badPayloadPath = join(
+      tmpdir(),
+      `hypo-bad-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(badPayloadPath, JSON.stringify({ project: 'test-project', date: today }));
+    const cleanup2 = seedCloseTranscript(sessionId, {
+      toolUseLines: [
+        JSON.stringify({ type: 'user', message: { role: 'user', content: '세션 마무리 해줘' } }),
+      ],
+    });
+    const r2 = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${badPayloadPath}`,
+      `--session-id=${sessionId}`,
+      '--json',
+    ]);
+    cleanup2();
+    assert.equal(r2.status, 1, `a malformed payload must refuse: ${r2.stdout}\n${r2.stderr}`);
+
+    assert.equal(
+      existsSync(join(receiptDir, 'close-receipt.json')),
+      false,
+      'the old receipt must no longer sit at its plain path',
+    );
+    assert.equal(
+      existsSync(markerPath),
+      false,
+      'the old marker must no longer sit at its plain path',
+    );
+    const invalidatedReceipts = readdirSync(receiptDir).filter((n) =>
+      n.startsWith('close-receipt.json.invalidated-'),
+    );
+    assert.equal(
+      invalidatedReceipts.length,
+      1,
+      `expected one invalidated receipt: ${readdirSync(receiptDir)}`,
+    );
+    const invalidatedMarkers = readdirSync(join(dir, '.cache')).filter((n) =>
+      n.startsWith(`session-closed-${sessionId}.marker.invalidated-`),
+    );
+    assert.equal(invalidatedMarkers.length, 1, 'expected one invalidated marker');
   });
 });
 

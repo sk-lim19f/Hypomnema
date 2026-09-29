@@ -26,6 +26,7 @@ import { spawnSync } from 'child_process';
 import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { atomicWrite } from './atomic-write.mjs';
+import { isValidSessionId } from './proposal-store.mjs';
 
 const HOME = homedir();
 
@@ -4640,6 +4641,14 @@ export function normalizeVerifiedScope(verifiedScope) {
  *   `hostTagWarning` is optional and, when present, is persisted as
  *   `host_tag_warning` (see the payload below): the close-time residual a
  *   reader of this file after the fact would otherwise have no record of.
+ *   `receiptGeneration`: when a caller wrote a close
+ *   receipt (`hooks/close-receipt.mjs`) for this session BEFORE calling this
+ *   function, it passes that receipt's `generation` here. A new Stop keys its
+ *   `legacy-closed` acceptance on this field's ABSENCE: a marker written by
+ *   an old build (or a caller that skipped the receipt) has no generation and
+ *   is accepted as a weaker, time-limited proof; a marker that carries one
+ *   promises a receipt exists, and Stop refuses to trust the marker alone
+ *   when that receipt is missing, invalid, or unreachable.
  */
 export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
   if (!sessionId) return false;
@@ -4684,6 +4693,10 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
       // after the fact can then see the same residual the close-time console
       // output already warned about once.
       ...(info.hostTagWarning ? { host_tag_warning: info.hostTagWarning } : {}),
+      // Omit-when-absent, same contract as the two fields above: a marker
+      // written with no receipt behind it (or by a caller that predates the
+      // receipt writer) must read back exactly as it always has.
+      ...(info.receiptGeneration ? { receipt_generation: info.receiptGeneration } : {}),
     };
     // Atomic, and it reports. Two reasons, and the caller needs both.
     //
@@ -5323,7 +5336,60 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   //    a committed-but-unpushed close marks AND compacts, instead of the close writer
   //    committing its own payload and then being blocked by its own (unpushed) commit.
   const git = hypoIsClean(hypoDir);
-  if (git.uncommitted) {
+  // checkpointMode (contract "게이트" 절, design v3 §G 대체): a marker-writing
+  // path's own gate call, replacing the whole git axis above with a narrower
+  // question: "is there an uncommitted write THIS session is known to still
+  // own". Everything else (close files, cwd, hot structure, lint, W8,
+  // feedback) is untouched below; Stop, PreCompact and check never set this.
+  if (opts.checkpointMode) {
+    if (!isValidSessionId(opts.sessionId)) {
+      blockers.push({
+        type: 'checkpoint-session',
+        reason: 'checkpointMode requires a validated sessionId',
+      });
+    } else if (git.uncommitted) {
+      const dirty = gitDirtyFiles(hypoDir);
+      if (dirty.length === 0) {
+        // Enumeration itself failed (or nothing is actually dirty despite the
+        // porcelain status): fail closed exactly like the unscoped path below.
+        blockers.push({ type: 'git', reason: git.reason });
+      } else {
+        const touched = readTouchedPathsStrict(hypoDir, opts.sessionId);
+        if (touched.state === 'unreadable') {
+          // Corrupt file or a lock timeout: cannot tell "this session's own
+          // write" from "someone else's", so fail closed rather than let a
+          // damaged touched-paths file silently downgrade every dirty file
+          // to a notice.
+          blockers.push({
+            type: 'known-session-write',
+            reason: 'touched-paths unreadable',
+          });
+        } else {
+          const touchedSet = new Set((touched.paths || []).map(posixPath));
+          for (const f of dirty) {
+            if (touchedSet.has(posixPath(f))) {
+              blockers.push({
+                type: 'known-session-write',
+                file: f,
+                reason: `this session's own write is still uncommitted: ${f}`,
+              });
+            } else {
+              notices.push({
+                type: 'unresolved',
+                file: f,
+                reason: `uncommitted changes, ownership unknown: ${f}`,
+              });
+            }
+          }
+        }
+      }
+    } else if (git.ahead) {
+      notices.push({
+        type: 'git-sync',
+        reason: `unpushed commits in ${hypoDir} (push deferred to Stop hook)`,
+      });
+    }
+  } else if (git.uncommitted) {
     const dirty = gitDirtyFiles(hypoDir);
     if (dirty.length === 0) {
       // Enumeration itself failed (or nothing is actually dirty despite the
