@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
-import { DAY_MS } from './time.mjs';
+import { DAY_MS, parseStrictDate } from './time.mjs';
 
 // session-log headings appear in two shapes in the wild: bracketed
 // `## [YYYY-MM-DD]` (spec convention) and bare `## YYYY-MM-DD` (some entries,
@@ -24,12 +24,38 @@ const DESIGN_HISTORY_DATE_RE = /^## (\d{4}-\d{2}-\d{2})/gm;
 const NO_ADR_MARKER_RE = /ADR\s*없음/;
 const ADR_REF_RE = /ADR\s+\d{4}|decisions\/\d{4}/;
 
-function isValidDate(literal) {
-  // The regex matches digit-shaped YYYY-MM-DD literals but cannot reject
-  // semantically invalid ones like 2026-13-01 or 2026-02-30. JavaScript's Date
-  // constructor returns an Invalid Date for those, which would later crash
-  // `toISOString()` with RangeError and poison `>` comparisons inside maxDate.
-  // Filter at the parse boundary so callers never see one.
+// Two separate date validators, one per side of the comparison, because a
+// filter that is too eager to REJECT does opposite things to the two sides:
+// dropping a design-history heading only removes a candidate for lastDH
+// (pushes the verdict toward MORE staleness, safe), but dropping a
+// session-log heading can empty sessionDates entirely and erase the finding
+// altogether (an actually-stale or actually-missing project reads as clean).
+// Both filters stay conservative in the direction that never hides a real
+// gap: reject on the design-history side, accept on the session-log side.
+
+// design-history heading dates: strict. `new Date('2026-13-01')` is an
+// Invalid Date (would crash `toISOString()` with RangeError and poison `>`
+// comparisons inside maxDate), but `new Date('2026-02-30')` silently
+// normalizes to March 2 instead of failing, so a plain Invalid-Date check let
+// a calendar-overflow heading through looking like a real, later date and
+// made a stale design-history read as caught up. parseStrictDate (lib/time.mjs)
+// rejects both classes by round-tripping year/month/day through a UTC Date and
+// checking they come back unchanged.
+function isValidDesignHistoryDate(literal) {
+  return parseStrictDate(literal) != null;
+}
+
+// session-log heading dates: the pre-strict-parser check, kept on purpose.
+// Tightening this side to parseStrictDate looked like the same fix, but a
+// project whose only design-relevant entry carries a calendar-overflow
+// heading (`## [2026-02-30]`) would then filter out of sessionDates
+// entirely, and with it BOTH the W8 stale verdict and the W14 missing
+// verdict that depend on sessionDates being non-empty (reviewer repro: a
+// project stale at base with lastSession 2026-03-02 > design-history
+// 2026-02-20 produced no finding at all once this side went strict). This
+// side accepts anything `new Date` can parse at all, so it still errs toward
+// reporting rather than toward silence.
+function isValidSessionLogDate(literal) {
   return !Number.isNaN(new Date(literal).getTime());
 }
 
@@ -38,7 +64,7 @@ function parseDates(text, pattern) {
   pattern.lastIndex = 0;
   let m;
   while ((m = pattern.exec(text)) !== null) {
-    if (isValidDate(m[1])) dates.push(new Date(m[1]));
+    if (isValidDesignHistoryDate(m[1])) dates.push(new Date(m[1]));
   }
   return dates;
 }
@@ -60,7 +86,7 @@ function parseSessionDates(text) {
     // Exclude only an explicit no-design-change entry. An entry carrying both
     // the marker and an ADR reference is treated as a design entry (included).
     if (NO_ADR_MARKER_RE.test(body) && !ADR_REF_RE.test(body)) continue;
-    if (isValidDate(headings[i].literal)) dates.push(new Date(headings[i].literal));
+    if (isValidSessionLogDate(headings[i].literal)) dates.push(new Date(headings[i].literal));
   }
   return dates;
 }

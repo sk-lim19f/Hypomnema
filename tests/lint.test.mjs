@@ -1900,10 +1900,8 @@ test('w8-edge: invalid date headings (## [2026-13-01]) are filtered, no Invalid 
 });
 
 test('w8-edge: design-history with only invalid dates → stale with diffDays=null', () => {
-  // Use month-out-of-range (truly Invalid Date in JS); JS auto-normalizes
-  // overflows in the day field (2026-02-30 → 2026-03-02) but ISO 8601 strict
-  // parsing rejects month > 12 with NaN — that is the path findDesignHistoryStale
-  // must filter to avoid poisoning maxDate.
+  // Month-out-of-range: a plain `new Date()` check already rejected this
+  // (Invalid Date), so this pins the case that predates the strict parser.
   withTmpDir((root) => {
     setupDhProject(root, 'p9', {
       dh: '## 2026-13-01\ninvalid only\n',
@@ -1913,6 +1911,55 @@ test('w8-edge: design-history with only invalid dates → stale with diffDays=nu
     assert.equal(stale.length, 1);
     assert.equal(stale[0].lastDesignHistory, '(없음)');
     assert.equal(stale[0].diffDays, null);
+  });
+});
+
+test('w8-edge: calendar-overflow heading (## 2026-02-30) is filtered, not normalized to March 2', () => {
+  // `new Date('2026-02-30')` does not produce an Invalid Date: it silently
+  // normalizes to March 2. A design-history heading with this literal used to
+  // read as a real, later date and could make a stale record look caught up.
+  // parseStrictDate (scripts/lib/time.mjs) rejects it by round-tripping
+  // year/month/day through Date.UTC and checking the calendar holds.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p10', {
+      dh: '## 2026-02-30\ninvalid only\n',
+      sessionLogMd: '## [2026-05-20] s\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastDesignHistory, '(없음)');
+    assert.equal(stale[0].diffDays, null);
+  });
+});
+
+test('w8-edge: calendar-overflow session-log heading (## [2026-02-30]) still counts, no lost finding', () => {
+  // Tightening the session-log side to the same strict parser as the
+  // design-history side emptied sessionDates for a project whose only entry
+  // carried a calendar-overflow date, and both the W8 stale verdict and the
+  // W14 missing verdict silently disappeared with it. The session-log side
+  // stays lenient on purpose: `new Date('2026-02-30')` normalizes to March 2
+  // instead of failing, and that later date is exactly what should trip this
+  // stale comparison against `## 2026-02-20` in design-history.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p11', {
+      dh: '## 2026-02-20\nfoo\n',
+      sessionLogMd: '## [2026-02-30] s\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].kind, 'stale');
+    assert.equal(stale[0].lastSession, '2026-03-02');
+    assert.equal(stale[0].lastDesignHistory, '2026-02-20');
+  });
+});
+
+test('w14-missing: calendar-overflow session-log heading with no design-history.md still reports missing', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p12', { sessionLogMd: '## [2026-09-31] s\n' });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].kind, 'missing');
+    assert.equal(stale[0].lastDesignHistory, null);
   });
 });
 
@@ -2485,6 +2532,266 @@ test('strict: W15 exposes its id but is not promoted to an error', () => {
     assert.equal(parsed.ok, true);
     const w15 = (parsed.warns || []).filter((w) => w.id === 'W15');
     assert.equal(w15.length, 1, `W15 stays a warn under --strict: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+test('calendar-overflow source updated (2026-02-30) is not compared, and W16 says so', () => {
+  // A format-only check reads 2026-02-30 as a valid YYYY-MM-DD literal, and
+  // `new Date('2026-02-30')` normalizes it to March 2 instead of failing, so
+  // this source used to win the "newest" comparison outright. It must land
+  // in the same "no usable updated" bucket as a missing date.
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'source-a.md'),
+      '---\ntitle: source-a\ntype: concept\nupdated: 2026-02-30\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\nsources_consulted: [source-a]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 0, `an unparseable source date must not win W15: ${r.stdout}`);
+    const unres = (parsed.warns || []).filter((w) =>
+      w.message.includes('sources_consulted 비교 불가'),
+    );
+    assert.equal(unres.length, 1, `expected one W16 warn: ${JSON.stringify(parsed.warns)}`);
+    assert.ok(
+      unres[0].message.includes('source-a') && unres[0].message.includes('실제 날짜가 아님'),
+      `W16 must name the calendar-invalid source: ${unres[0].message}`,
+    );
+  });
+});
+
+test('calendar-overflow synthesis updated (2026-02-30) skips W15 and W16 names its own field', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'source-a.md'),
+      '---\ntitle: source-a\ntype: concept\nupdated: 2026-03-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-30\nsources_consulted: [source-a]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 0, 'an unparseable own date must not compare at all');
+    const ownWarn = (parsed.warns || []).filter(
+      (w) => w.file === 'pages/syn.md' && w.message.includes('synthesis 자신의 updated'),
+    );
+    assert.equal(
+      ownWarn.length,
+      1,
+      `W16 must name the synthesis's own invalid updated: ${JSON.stringify(parsed.warns)}`,
+    );
+    assert.ok(
+      ownWarn[0].message.includes('2026-02-30'),
+      `W16 must include the bad value: ${ownWarn[0].message}`,
+    );
+    const strict = JSON.parse(run('lint.mjs', [`--hypo-dir=${root}`, '--json', '--strict']).stdout);
+    const ownStrict = [...(strict.warns || []), ...(strict.errors || [])].filter((w) =>
+      w.message.includes('synthesis 자신의 updated'),
+    );
+    assert.deepEqual(
+      ownStrict.map((w) => w.id),
+      ['W16'],
+      `the own-date warning must carry id W16: ${JSON.stringify(ownStrict)}`,
+    );
+  });
+});
+
+test('invalid synthesis updated is reported even when sources_consulted is a block list', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-30\n' +
+        'sources_consulted:\n  - source-a\n---\n\nbody\n',
+    );
+    const parsed = JSON.parse(run('lint.mjs', [`--hypo-dir=${root}`, '--json']).stdout);
+    const mine = (parsed.warns || []).filter((w) => w.file === 'pages/syn.md');
+    assert.equal(
+      mine.filter((w) => w.message.includes('synthesis 자신의 updated')).length,
+      1,
+      `the own-date W16 must not be hidden by the block-list W16: ${JSON.stringify(mine)}`,
+    );
+    assert.equal(mine.filter((w) => w.message.includes('블록 목록')).length, 1);
+  });
+});
+
+test('invalid synthesis updated is reported even with no sources_consulted at all', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-30\n---\n\nbody\n',
+    );
+    const parsed = JSON.parse(run('lint.mjs', [`--hypo-dir=${root}`, '--json']).stdout);
+    const own = (parsed.warns || []).filter(
+      (w) => w.file === 'pages/syn.md' && w.message.includes('synthesis 자신의 updated'),
+    );
+    assert.equal(own.length, 1, `expected the own-date W16: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+test('a valid year below 100 (0001-01-01) is not rejected as a calendar overflow', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 0001-01-01\n---\n\nbody\n',
+    );
+    const parsed = JSON.parse(run('lint.mjs', [`--hypo-dir=${root}`, '--json']).stdout);
+    const own = (parsed.warns || []).filter((w) => w.message.includes('synthesis 자신의 updated'));
+    assert.equal(own.length, 0, `0001-01-01 is a real date: ${JSON.stringify(own)}`);
+  });
+});
+
+test('missing synthesis updated is W3 only, not duplicated as a W16', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'source-a.md'),
+      '---\ntitle: source-a\ntype: concept\nupdated: 2026-01-15\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nsources_consulted: [source-a]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const ownWarn = (parsed.warns || []).filter((w) =>
+      w.message.includes('synthesis 자신의 updated'),
+    );
+    assert.equal(ownWarn.length, 0, 'a missing updated is W3 alone, never repeated in W16');
+    const w3 = (parsed.warns || []).filter(
+      (w) => w.file === 'pages/syn.md' && w.message.includes('Missing frontmatter field: updated'),
+    );
+    assert.equal(w3.length, 1, `expected the usual W3: ${JSON.stringify(parsed.warns)}`);
+  });
+});
+
+suite('W16: sources_consulted written as a YAML block list');
+
+test('block list with items on their own indented lines is detected', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\n' +
+        'sources_consulted:\n  - source-a\n  - source-b\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    const block = (parsed.warns || []).filter(
+      (w) => w.file === 'pages/syn.md' && w.message.includes('블록 목록'),
+    );
+    assert.equal(block.length, 1, `expected one block-list W16: ${JSON.stringify(parsed.warns)}`);
+    assert.ok(
+      block[0].message.includes('[a, b]'),
+      `W16 must point at the flow-list fix: ${block[0].message}`,
+    );
+    const strict = JSON.parse(run('lint.mjs', [`--hypo-dir=${root}`, '--json', '--strict']).stdout);
+    const blockStrict = [...(strict.warns || []), ...(strict.errors || [])].filter((w) =>
+      w.message.includes('블록 목록'),
+    );
+    assert.deepEqual(
+      blockStrict.map((w) => w.id),
+      ['W16'],
+      `the block-list warning must carry id W16: ${JSON.stringify(blockStrict)}`,
+    );
+  });
+});
+
+test('block list with a dash at column 0 (no leading space) is detected', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\n' +
+        'sources_consulted:\n- source-a\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const block = (parsed.warns || []).filter(
+      (w) => w.file === 'pages/syn.md' && w.message.includes('블록 목록'),
+    );
+    assert.equal(block.length, 1, `expected the column-0 dash to still count: ${r.stdout}`);
+  });
+});
+
+test('a comment line and a blank line before the first item do not hide the block list', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-01-01\n' +
+        'sources_consulted:\n  # imported citations\n\n  - source-a\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    const block = (parsed.warns || []).filter(
+      (w) => w.file === 'pages/syn.md' && w.message.includes('블록 목록'),
+    );
+    assert.equal(block.length, 1, `a leading comment/blank line must not hide it: ${r.stdout}`);
+  });
+});
+
+test('a block list under a different key does not trip the sources_consulted detector', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'source-a.md'),
+      '---\ntitle: source-a\ntype: concept\nupdated: 2026-01-01\n---\n\nbody\n',
+    );
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-01\n' +
+        'tags:\n  - foo\n  - bar\nsources_consulted: [source-a]\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    const block = (parsed.warns || []).filter((w) => w.message.includes('블록 목록'));
+    assert.equal(
+      block.length,
+      0,
+      `a block list on a different key must not false-positive: ${JSON.stringify(parsed.warns)}`,
+    );
+    const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
+    assert.equal(stale.length, 0, 'the real flow-list sources_consulted still compares normally');
+  });
+});
+
+test("an empty sources_consulted: immediately followed by another top-level key's block list is not misread", () => {
+  // sources_consulted here has no value and no items of its own: the very
+  // next line is the NEXT top-level key (tags:), and that key's own block
+  // list sits below it. The detector must stop at that first non-blank line
+  // instead of reading past it into `- foo`, or an empty sources_consulted
+  // would falsely read as "written as a block list".
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(
+      join(root, 'pages', 'syn.md'),
+      '---\ntitle: syn\ntype: synthesis\nupdated: 2026-02-01\n' +
+        'sources_consulted:\ntags:\n  - foo\n---\n\nbody\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0);
+    const block = (parsed.warns || []).filter((w) => w.message.includes('블록 목록'));
+    assert.equal(
+      block.length,
+      0,
+      `an empty sources_consulted followed by another key's block list must not false-positive: ${JSON.stringify(parsed.warns)}`,
+    );
   });
 });
 
