@@ -104,7 +104,7 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    close-complete, **not** that every project in the vault is. Use the plain
    check for the go/no-go signal.
 7. Record the close checkpoint. The Stop hook blocks until this session's close
-   receipt (`.cache/sessions/<id>/close-receipt.json`) is valid, and a hand-edit
+   checkpoint receipt (`.cache/sessions/<id>/close-receipt.json`) is valid, and a hand-edit
    close (writing the files directly + committing) never writes one; the receipt
    is filed only by the crystallize writer, never by the hook (bypass guard). A
    compat marker (`.cache/session-closed-<id>.marker`) is written right after the
@@ -117,8 +117,13 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    (`--apply-session-close --session-id=<id> --transcript-path=<path>`), which files the
    checkpoint once the gate is green. Hand-edit recovery: after committing the
    files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
-   Both writers gate the checkpoint on the SAME `precompactGateStatus` as
-   `/compact`, so it only lands when step 6 would print **"Compact-ready"**.
+   Both writers gate the checkpoint on `precompactGateStatus`, the gate `/compact`
+   uses, with one difference: the git check is narrower. The checkpoint blocks
+   only on an uncommitted file this session itself wrote, and reports any other
+   uncommitted vault file (another session's, or one of unknown ownership) as a
+   notice. So it can land while step 6 still shows a git blocker for someone
+   else's dirty file, but never while a file this session wrote is uncommitted.
+   Every other check (close files, hot.md, lint, feedback) is the same as step 6.
    `--session-id` is not optional on the apply path. Before it writes anything, the
    apply reads that session's transcript for evidence the **user** asked to close, and
    refuses the whole close (exit 1, nothing on disk, nothing committed) when the id is
