@@ -4275,6 +4275,50 @@ test('commitWikiChanges: ignoredPaths lists only supplied paths that are dirty A
   });
 });
 
+// A vault nested inside a larger repository: porcelain names repository-root
+// paths (vault/log.md) while callers name vault paths (log.md). Unmatched, the
+// call used to report a no-op success, and Stop then retired the claim with
+// nothing committed.
+test('commitWikiChanges: a vault nested inside a larger repository commits its vault-relative paths', () => {
+  withTmpDir((root) => {
+    const g = (...a) => spawnSync('git', ['-C', root, ...a], { encoding: 'utf-8' });
+    g('init', '-q');
+    g('config', 'user.email', 't@example.invalid');
+    g('config', 'user.name', 't');
+    const vault = join(root, 'vault');
+    mkdirSync(join(vault, 'pages'), { recursive: true });
+    writeFileSync(join(root, 'outside.md'), '# outside\n');
+    writeFileSync(join(vault, 'pages', 'old.md'), '# old\n');
+    g('add', '-A');
+    g('commit', '-q', '-m', 'init');
+
+    writeFileSync(join(vault, 'log.md'), '# log\n');
+    writeFileSync(join(root, 'outside.md'), '# outside, changed\n');
+    const r = commitWikiChanges(vault, ['log.md', 'outside.md']);
+    assert.equal(r.committed, true, JSON.stringify(r));
+    assert.equal(r.scoped, 1, JSON.stringify(r));
+    assert.deepEqual(r.committedPaths, ['log.md']);
+    const status = g('status', '--porcelain').stdout;
+    assert.doesNotMatch(status, /vault\/log\.md/, `vault/log.md must be committed: ${status}`);
+    assert.match(
+      status,
+      / M outside\.md/,
+      'a path outside the vault is out of scope even if named',
+    );
+
+    // A rename inside the nested vault commits both halves.
+    g('mv', 'vault/pages/old.md', 'vault/pages/new.md');
+    const mv = commitWikiChanges(vault, ['pages/new.md']);
+    assert.equal(mv.committed, true, JSON.stringify(mv));
+    assert.deepEqual(mv.committedPaths, ['pages/new.md']);
+    assert.equal(
+      g('status', '--porcelain', '--', 'vault').stdout,
+      '',
+      'no rename residue left staged',
+    );
+  });
+});
+
 // ── session-close-scope-boundary spec §2b: structural git demotion under
 //    projectOverride / attributionScope ──────────────────────────────────
 //

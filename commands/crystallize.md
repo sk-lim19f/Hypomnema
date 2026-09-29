@@ -109,7 +109,7 @@ and nothing on disk, in three cases:
 A refusal is not a failure to route around. It means the close should not happen: ask
 the user, and re-run only after they say so.
 
-On a verified close (`ok: true`, and no uncommitted vault file that this session itself wrote)
+On a verified close (`ok: true`, and no uncommitted vault file this session wrote through Write or Edit since its last auto-commit)
 the apply first files a commit-backed close checkpoint receipt at
 `HYPO_DIR/.cache/sessions/<id>/close-receipt.json`, then writes the per-session compat marker
 `HYPO_DIR/.cache/session-closed-<id>.marker` as a projection of it. If the marker does not land,

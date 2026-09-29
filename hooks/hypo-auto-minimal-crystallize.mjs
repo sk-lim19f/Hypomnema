@@ -139,7 +139,11 @@ function notifyUnresolved(hypoDir, sessionId, receipt) {
   const parts = [];
   if (uncertified.length > 0) parts.push(uncertified.join(', '));
   if (changedAfter.length > 0) {
-    parts.push(`[close 체크포인트 뒤 바뀜, 지금 내용은 커밋되지 않음: ${changedAfter.join(', ')}]`);
+    // No ownership test here: a shared append target such as log.md is in
+    // nearly every receipt, and another session's append makes it dirty too.
+    parts.push(
+      `[close 체크포인트 뒤 바뀜(이 세션 또는 다른 세션), 지금 내용은 커밋되지 않음: ${changedAfter.join(', ')}]`,
+    );
   }
   return (
     `[WIKI_AUTOCLOSE] close checkpoint 확인됨 (session_id=${sessionId}). 다만 이 체크포인트가 ` +

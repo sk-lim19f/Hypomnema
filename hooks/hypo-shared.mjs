@@ -4040,6 +4040,19 @@ export function commitWikiChanges(hypoDir, paths) {
   const porcelain = git('status', '--porcelain', '-uall', '-z');
   if (porcelain.status !== 0)
     return { committed: false, reason: `git status failed in ${hypoDir}` };
+  // porcelain paths are repository-root relative, while `supplied` and every
+  // pathspec below are vault relative (git resolves pathspecs against -C). A
+  // vault nested inside a larger repository therefore needs its prefix
+  // stripped before matching, the same rule gitDirtyFiles uses; a record
+  // outside the vault is out of scope.
+  const prefixRes = git('rev-parse', '--show-prefix');
+  if (prefixRes.status !== 0)
+    return { committed: false, reason: `git rev-parse --show-prefix failed in ${hypoDir}` };
+  const prefix = (prefixRes.stdout || '').replace(/\n$/, '');
+  const toVaultRelative = (f) => {
+    if (!f || !prefix) return f || null;
+    return f.startsWith(prefix) ? f.slice(prefix.length) : null;
+  };
   // `.hypoignore` is the project privacy boundary. `git add -A` ignores it, so
   // enumerate changed paths, drop ignored ones, then stage explicitly.
   const ignorePatterns = loadHypoIgnore(hypoDir);
@@ -4051,7 +4064,7 @@ export function commitWikiChanges(hypoDir, paths) {
     const rec = records[i];
     if (!rec) continue;
     const xy = rec.slice(0, 2);
-    const file = rec.slice(3); // `XY <path>`; the destination path for a rename/copy
+    const file = toVaultRelative(rec.slice(3)); // `XY <path>`; the destination for a rename/copy
     const isRename = xy[0] === 'R' || xy[1] === 'R';
     // A rename OR copy emits two records (`to\0from`); consume the trailing
     // `from`. Copy `C` records only appear under `status.renames=copies`, but
@@ -4060,7 +4073,7 @@ export function commitWikiChanges(hypoDir, paths) {
     let fromFile = null;
     if (isRename || xy[0] === 'C' || xy[1] === 'C') {
       i++;
-      fromFile = records[i] || null;
+      fromFile = toVaultRelative(records[i] || null);
     }
     if (!file) continue;
     if (!supplied.has(file)) continue; // out of this caller's scope
@@ -4097,7 +4110,8 @@ export function commitWikiChanges(hypoDir, paths) {
   // pathspec (commitScope, the rename-aware superset of `scoped`) — this step
   // must not widen back to whole-tree either, or another session's already-
   // staged file would slip into the commit here.
-  const staged = git('diff', '--cached', '--name-only', '-z', '--', ...commitScope);
+  // `--relative`: name the staged paths from the vault, like everything above.
+  const staged = git('diff', '--cached', '--name-only', '--relative', '-z', '--', ...commitScope);
   const stagedFiles = (staged.stdout || '').split('\0').filter(Boolean);
   if (stagedFiles.length === 0)
     return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };

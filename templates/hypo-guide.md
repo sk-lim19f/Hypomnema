@@ -119,10 +119,11 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
    Both writers gate the checkpoint on `precompactGateStatus`, the gate `/compact`
    uses, with one difference: the git check is narrower. The checkpoint blocks
-   only on an uncommitted file this session itself wrote, and reports any other
-   uncommitted vault file (another session's, or one of unknown ownership) as a
-   notice. So it can land while step 6 still shows a git blocker for someone
-   else's dirty file, but never while a file this session wrote is uncommitted.
+   only on an uncommitted file this session wrote through Write or Edit since its
+   last auto-commit, and reports any other uncommitted vault file (another
+   session's, one of unknown ownership, or one this session changed through a
+   shell command) as a notice. So it can land while step 6 still shows a git
+   blocker for someone else's dirty file.
    Every other check (close files, hot.md, lint, feedback) is the same as step 6.
    `--session-id` is not optional on the apply path. Before it writes anything, the
    apply reads that session's transcript for evidence the **user** asked to close, and
