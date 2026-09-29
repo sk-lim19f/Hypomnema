@@ -10,5 +10,6 @@
   "hypo-hot-rebuild.mjs",
   "hypo-session-record.mjs",
   "hypo-auto-commit.mjs",
-  "hypo-auto-minimal-crystallize.mjs"
+  "hypo-auto-minimal-crystallize.mjs",
+  "close-receipt.mjs"
 ]

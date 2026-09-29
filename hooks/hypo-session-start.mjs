@@ -1055,7 +1055,7 @@ process.stdin.on('end', () => {
       // accumulate call, or this write proceeds with nothing able to ever
       // bring it into a commit (see claimProjectionWrite's own doc comment).
       const claimed = claimProjectionWrite(HYPO_DIR, data.session_id, ['hot.md']);
-      if (!claimed) {
+      if (!claimed.ok) {
         const msg =
           '루트 hot.md 갱신을 건너뛰었습니다: 이번 세션의 커밋 범위에 기록하지 못해 갱신 후 미커밋 파일로 남을 수 있었습니다.';
         notices.push(msg);
@@ -1078,8 +1078,12 @@ process.stdin.on('end', () => {
             // of starting the session on a stale table with no explanation,
             // and drop the pre-write claim: no write happened, so an
             // uncleared 'hot.md' claim would later sweep in whatever the
-            // session that DID hold the lock wrote.
-            clearTouchedPaths(HYPO_DIR, data.session_id, ['hot.md']);
+            // session that DID hold the lock wrote. Only when THIS call is
+            // the one that added the claim: a resumed session_id whose
+            // earlier SessionStart already claimed 'hot.md' (still
+            // unresolved from that run) must not have its own claim erased
+            // by this run's failure.
+            if (claimed.added) clearTouchedPaths(HYPO_DIR, data.session_id, ['hot.md']);
             const msg =
               '루트 hot.md 를 갱신하지 못했습니다: 다른 세션이 이 저장소를 쓰는 중이라 잠금을 얻지 못했습니다. 이번 세션은 이전 포인터 표를 그대로 읽습니다 (다음 세션 시작이나 종료 때 다시 시도합니다).';
             notices.push(msg);
@@ -1165,8 +1169,9 @@ process.stdin.on('end', () => {
           // happened. Clear it: an uncleared 'hot.md' claim left in this
           // session's touched-paths set would sweep in whatever ANOTHER
           // session or a human writes to hot.md next as if this session had
-          // made that change.
-          clearTouchedPaths(HYPO_DIR, data.session_id, ['hot.md']);
+          // made that change. Only when THIS call is the one that added the
+          // claim (see the lockTimeout branch above for why).
+          if (claimed.added) clearTouchedPaths(HYPO_DIR, data.session_id, ['hot.md']);
           // catch-message-accuracy fix (r5-w1.md): writeRootHotProjection can
           // throw from several different steps here (reading the existing
           // file, writing the migration backup, updating .gitignore, or the

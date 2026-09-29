@@ -49,6 +49,7 @@ import {
   claimProjectionWrite,
   rootHotProjectionIsCurrent,
   sessionCloseFileStatus,
+  readTouchedPathsStrict,
 } from '../hooks/hypo-shared.mjs';
 import {
   snapshotBase,
@@ -1210,6 +1211,42 @@ test('clearTouchedPaths: a corrupt/unreadable touched-paths file is left intact,
   });
 });
 
+// design.md v4 §4 / test 29: readTouchedPathsStrict must NOT collapse
+// "corrupt" and "lock timeout" into peekTouchedPaths's silent `[]`, a
+// checkpointMode gate blocks on 'unreadable' exactly where peekTouchedPaths's
+// callers fail-safe to an empty, best-effort commit scope instead.
+test('readTouchedPathsStrict: ok (non-empty) vs. empty (absent/no-session) vs. unreadable (corrupt) are three distinct states', () => {
+  withGrowthWiki((dir) => {
+    assert.deepEqual(
+      readTouchedPathsStrict(dir, null),
+      { state: 'empty', paths: [] },
+      'no session_id is empty, not unreadable',
+    );
+    assert.deepEqual(
+      readTouchedPathsStrict(dir, 'sess-strict-absent'),
+      { state: 'empty', paths: [] },
+      'no touched-paths file at all is empty',
+    );
+
+    recordTouchedPaths(dir, 'sess-strict-ok', 'pages/a.md');
+    assert.deepEqual(readTouchedPathsStrict(dir, 'sess-strict-ok'), {
+      state: 'ok',
+      paths: ['pages/a.md'],
+    });
+
+    recordTouchedPaths(dir, 'sess-strict-corrupt', 'pages/a.md');
+    writeFileSync(touchedPathsPath(dir, 'sess-strict-corrupt'), '{ not valid json');
+    assert.deepEqual(
+      readTouchedPathsStrict(dir, 'sess-strict-corrupt'),
+      { state: 'unreadable', paths: [] },
+      'a corrupt file must read as unreadable, never silently as empty',
+    );
+    // peekTouchedPaths keeps its own contract: fail-safe to [] regardless of
+    // WHY nothing came back, this is the exact case it must stay blind to.
+    assert.deepEqual(peekTouchedPaths(dir, 'sess-strict-corrupt'), []);
+  });
+});
+
 test('commitTouchedPaths: one lock across peek+commit+clear — clears on success, retains on failure, never treats a corrupt file as empty (codex FIX 2)', () => {
   withGrowthWiki((dir) => {
     // Success: commitFn reports committed → the whole peeked scope is cleared.
@@ -1250,6 +1287,58 @@ test('commitTouchedPaths: one lock across peek+commit+clear — clears on succes
     assert.deepEqual(corruptScope, [], 'a corrupt scope commits nothing (empty, safe no-op)');
     assert.ok(existsSync(pc), 'commitTouchedPaths must never delete a corrupt file');
     assert.equal(readFileSync(pc, 'utf-8'), '{ corrupt', 'corrupt file left byte-identical');
+  });
+});
+
+// design.md v5 §4 / test 36: a `committed: true` result must clear only
+// `result.committedPaths`, not the whole peeked scope, a path this session
+// touched but that never actually committed (here, `.hypoignore`) must keep
+// blocking as a known, unresolved session write instead of reading as
+// resolved because a SIBLING path in the same peek committed.
+test('commitTouchedPaths: a partial committedPaths result clears only what landed, keeping a .hypoignore-dropped path tracked', () => {
+  withGrowthWiki((dir) => {
+    recordTouchedPaths(dir, 'sess-ct-partial', ['landed.md', 'ignored.md']);
+    const res = commitTouchedPaths(dir, 'sess-ct-partial', (paths) => {
+      assert.deepEqual(paths.sort(), ['ignored.md', 'landed.md'].sort());
+      return { committed: true, committedPaths: ['landed.md'] };
+    });
+    assert.equal(res.committed, true);
+    assert.deepEqual(
+      JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-ct-partial'), 'utf-8')),
+      ['ignored.md'],
+      'only the committed path is cleared; the dropped one stays tracked',
+    );
+  });
+});
+
+// Same distinction, end to end: a real .hypoignore'd file recorded as
+// touched by this session must still block as a known session write after
+// the real auto-commit hook runs, since it was never actually committed ,
+// unlike before design.md v5 §4, where any committed:true result cleared the
+// WHOLE peeked scope, silently untracking the ignored file too.
+test('hypo-auto-commit.mjs: a .hypoignore-dropped touched path is NOT swept off the touched-paths set by a sibling commit', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), 'secret.md\n');
+    writeFileSync(join(dir, 'secret.md'), '# private\n');
+    writeFileSync(join(dir, 'public.md'), '# public\n');
+    recordTouchedPaths(dir, 'sess-hypoignore-e2e', ['secret.md', 'public.md']);
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-hypoignore-e2e' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const committed = spawnSync(
+      'git',
+      ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
+      { encoding: 'utf-8' },
+    ).stdout;
+    assert.ok(/public\.md/.test(committed), `public.md must be committed: ${committed}`);
+    assert.ok(!/secret\.md/.test(committed), `secret.md must stay uncommitted: ${committed}`);
+    const remaining = JSON.parse(
+      readFileSync(touchedPathsPath(dir, 'sess-hypoignore-e2e'), 'utf-8'),
+    );
+    assert.deepEqual(
+      remaining,
+      ['secret.md'],
+      'the ignored path must still be tracked as an unresolved session write',
+    );
   });
 });
 
@@ -3702,6 +3791,40 @@ test('commitWikiChanges: a top-level (non-projects/) path counts as its own proj
   });
 });
 
+// design.md v5 §4 / ISSUE-171 wave 1: `committedPaths` names exactly what
+// landed, so a caller that later retires a per-session pending-write record
+// (commitTouchedPaths, below) can retire only that, not the whole offered
+// scope, a scope path that never actually committed (ignored, stale, never
+// changed) is a DIFFERENT case from one that did, and only committedPaths
+// tells them apart.
+test('commitWikiChanges: committedPaths names exactly what landed, full scope vs. a .hypoignore-dropped path', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'public.md'), '# public\n');
+    const full = commitWikiChanges(dir, ['public.md']);
+    assert.equal(full.committed, true, JSON.stringify(full));
+    assert.deepEqual(full.committedPaths, ['public.md']);
+
+    writeFileSync(join(dir, '.hypoignore'), 'secret.md\n');
+    writeFileSync(join(dir, 'secret.md'), '# private\n');
+    writeFileSync(join(dir, 'public2.md'), '# public2\n');
+    const partial = commitWikiChanges(dir, ['secret.md', 'public2.md']);
+    assert.equal(partial.committed, true, JSON.stringify(partial));
+    assert.deepEqual(
+      partial.committedPaths,
+      ['public2.md'],
+      'an ignored path in scope must be absent from committedPaths, not merely absent from the commit',
+    );
+  });
+});
+
+test('commitWikiChanges: committedPaths is [] on every no-op (empty scope, stale scope, and nothing-to-commit)', () => {
+  withSyncedWiki((dir) => {
+    assert.deepEqual(commitWikiChanges(dir, []).committedPaths, []);
+    assert.deepEqual(commitWikiChanges(dir, ['stale-never-changed.md']).committedPaths, []);
+    assert.deepEqual(commitWikiChanges(dir, ['nonexistent.md']).committedPaths, []);
+  });
+});
+
 // ── session-close-scope-boundary spec §2b: structural git demotion under
 //    projectOverride / attributionScope ──────────────────────────────────
 //
@@ -5834,18 +5957,38 @@ test('writeRootHotHealthNotice / consumeRootHotHealthNotice: one-shot, unlinked 
   }
 });
 
-test('claimProjectionWrite: a missing session_id is fail-closed (false), unlike the generic best-effort recordTouchedPaths', () => {
+test('claimProjectionWrite: a missing session_id is fail-closed (ok:false), unlike the generic best-effort recordTouchedPaths', () => {
   const dir = projectionWikiDir();
   try {
-    assert.equal(
+    assert.deepEqual(
       claimProjectionWrite(dir, null, ['hot.md']),
-      false,
+      { ok: false, added: false },
       'no session_id must never read as "claimed" for a write nothing can account for',
     );
     assert.equal(
       recordTouchedPaths(dir, null, ['hot.md']),
       true,
       'the generic accumulate function is unaffected: still true, nothing to accumulate',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// design.md v5 boost: the caller (hypo-session-start.mjs) must be able to
+// tell "I just claimed this" from "this was already claimed by an earlier
+// SessionStart on the same (resumed) session_id", only the FIRST call may
+// be undone by that caller's own failure handling.
+test('claimProjectionWrite: `added` distinguishes a fresh claim from one already held by this session', () => {
+  const dir = projectionWikiDir();
+  try {
+    const first = claimProjectionWrite(dir, 'sess-added', ['hot.md']);
+    assert.deepEqual(first, { ok: true, added: true }, 'first claim on this path is newly added');
+    const second = claimProjectionWrite(dir, 'sess-added', ['hot.md']);
+    assert.deepEqual(
+      second,
+      { ok: true, added: false },
+      'a repeat claim of an already-held path reports ok but NOT added',
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -6056,6 +6199,64 @@ test("major-3: SessionStart's own lockTimeout branch reaches systemMessage throu
     } finally {
       rmSync(lockPath, { force: true });
     }
+  } finally {
+    if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+    else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// design.md v5 boost, test 37: the SAME distinction as the test above, but
+// for the SECOND SessionStart on a resumed session_id, a fresh claim's own
+// failure drops it (test above), while a REPEAT claim's failure must not
+// drop a claim an EARLIER, already-successful call on the same session_id
+// still holds. `runStart` always uses session_id 'test-growth', so calling
+// it twice models a resume.
+test("v5 boost / test 37: a second SessionStart's failed write, on an ALREADY-claimed path, leaves the earlier claim in place (only a NEWLY-added claim is ever reverted)", () => {
+  const dir = projectionWikiDir();
+  const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+  process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200'; // fail fast instead of the 5s default
+  try {
+    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    // First SessionStart: no lock held, the write succeeds. 'hot.md' is now
+    // claimed in 'test-growth's touched-paths set, uncommitted (no Stop ran).
+    const r1 = runStart(dir);
+    assert.equal(r1.status, 0, `stderr: ${r1.stderr}`);
+    const touchedAfterFirst = JSON.parse(
+      readFileSync(touchedPathsPath(dir, 'test-growth'), 'utf-8'),
+    );
+    assert.ok(
+      touchedAfterFirst.includes('hot.md'),
+      `fixture: the first run must claim hot.md: ${JSON.stringify(touchedAfterFirst)}`,
+    );
+
+    // Second SessionStart, SAME session_id: force this run's own write to
+    // fail (vault lock held elsewhere). Its own claimProjectionWrite call
+    // sees 'hot.md' already present, so `added` is false this time.
+    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' }); // so a write WOULD differ
+    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, String(process.pid));
+    try {
+      const r2 = runStart(dir);
+      assert.equal(r2.status, 0, `stderr: ${r2.stderr}`);
+      const out2 = JSON.parse(r2.stdout);
+      assert.ok(
+        out2.systemMessage && out2.systemMessage.includes('잠금을 얻지 못했습니다'),
+        `expected the second run's own lockTimeout notice: ${JSON.stringify(out2)}`,
+      );
+    } finally {
+      rmSync(lockPath, { force: true });
+    }
+
+    const touchedAfterSecond = JSON.parse(
+      readFileSync(touchedPathsPath(dir, 'test-growth'), 'utf-8'),
+    );
+    assert.ok(
+      touchedAfterSecond.includes('hot.md'),
+      "the FIRST run's still-unresolved claim must survive the SECOND run's own failure: " +
+        JSON.stringify(touchedAfterSecond),
+    );
   } finally {
     if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
     else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;

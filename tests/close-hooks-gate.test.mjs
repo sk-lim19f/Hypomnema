@@ -154,6 +154,53 @@ test('freshness: when NEITHER daily nor monthly carries today, the gap is report
   });
 });
 
+// design.md v5 §2 / ISSUE-171: a `--mark-session-closed` certification must
+// prove the SAME file/date freshness itself trusted, not re-derive a
+// possibly-DIFFERENT candidate (local vs. UTC, daily vs. monthly). These pin
+// which candidate `sessionLogEvidence` reports for each of the three
+// freshness fixtures directly above, and that it is null when not ok.
+test('sessionCloseFileStatus: sessionLogEvidence names the daily shard when that is what satisfied freshness', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    rmSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`));
+    writeFileSync(
+      join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
+      `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] daily-shard session\n`,
+    );
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    assert.deepEqual(st.sessionLogEvidence, {
+      path: join('projects', 'test-project', 'session-log', `${today}.md`),
+      date: today,
+    });
+  });
+});
+
+test('sessionCloseFileStatus: sessionLogEvidence names the legacy monthly file when the daily shard does not exist', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today); // seeds the monthly file only
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    assert.deepEqual(st.sessionLogEvidence, {
+      path: join('projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+      date: today,
+    });
+  });
+});
+
+test('sessionCloseFileStatus: sessionLogEvidence is null when nothing satisfies freshness', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    writeFileSync(
+      join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n`,
+    );
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    assert.equal(st.sessionLogEvidence, null);
+  });
+});
+
 test('apply: a new daily shard is created with seeded frontmatter (lint-clean, not monthly)', () => {
   withWiki(null, (dir, today) => {
     // buildCleanWikiTree seeds the monthly file with today's heading; the payload

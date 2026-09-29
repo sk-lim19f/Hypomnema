@@ -176,6 +176,10 @@
     "exec": false
   },
   {
+    "path": "hooks/close-receipt.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/hooks.json",
     "exec": false
   },
