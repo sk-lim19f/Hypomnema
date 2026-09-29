@@ -4,17 +4,17 @@
 // spec: a name/shape contract plus its follow-up rounds). Not reproduced
 // here since this file ships publicly and the spec does not.
 //
-// What this replaces: a session-close marker used to certify "this session's
-// work is saved" by comparing disk snapshots taken at different times, which
-// a concurrent writer can always defeat (two sessions can rewrite the same
-// bytes back to a snapshot-matching state with neither having saved anything
-// the other didn't already have). This module certifies a narrower, provable
-// claim instead: "the file versions named in this receipt are all present,
-// byte-for-byte, in commit C, which is reachable from the current branch
-// history". It says nothing about files it does not name, and nothing about
-// whether the rest of the session's work was ever saved at all, callers
-// (Stop, PreCompact, doctor) must keep surfacing unresolved changes
-// separately, never read a valid receipt as "the vault is clean".
+// What this replaces: a session-close marker used to infer "this session's
+// work is saved" from git cleanliness at close time (a clean tree was read
+// as nothing left to save). Cleanliness is a property of the whole tree at
+// one instant, so another session's commit or edit changes the answer
+// without this session's own bytes being saved or lost. This module
+// certifies a narrower, provable claim instead: "the file versions named in this receipt are all present, byte-for-byte,
+// in commit C, which is reachable from the current branch history". It says
+// nothing about files it does not name, and nothing about whether the rest
+// of the session's work was ever saved at all, callers (Stop, PreCompact,
+// doctor) must keep surfacing unresolved changes separately, never read a
+// valid receipt as "the vault is clean".
 //
 // Node built-ins only, per the hooks/ convention (this file is copied
 // standalone into `~/.claude/hooks/` on install; `scripts/` may import it,
@@ -24,20 +24,20 @@
 // rather than re-deriving a shape check: a session id reaches this module the
 // same way it reaches the proposal store, straight off `--session-id`, and it
 // becomes a filename component here exactly as it does there. The receipt
-// directory name (`.cache/sessions/<sessionId>/`) is deliberately the SAME
-// convention `hooks/base-store.mjs`'s `basePath` uses (`String(sessionId)`,
-// no separate sanitize step), for any id `isValidSessionId` accepts
-// (`[A-Za-z0-9_-]+`, no dot), `sanitizeSessionId` (hypo-shared.mjs) is a
-// no-op, so the two conventions already agree; this file just skips the
-// redundant pass rather than importing a second sanitizer for the same
-// no-op.
+// directory name (`.cache/sessions/<id>/`) follows the same rule as
+// hypo-shared.mjs's per-session cache directory: `sanitizeSessionId`, which
+// caps the id at 128 characters. `isValidSessionId` has no length cap, so an
+// id longer than 128 maps to a truncated directory name; two such ids that
+// share their first 128 characters share a directory, and
+// `readReceiptStrict`'s session id comparison rejects the other session's
+// receipt.
 
 import { existsSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { atomicWrite } from './atomic-write.mjs';
-import { sessionClosedMarkerPath } from './hypo-shared.mjs';
+import { sessionClosedMarkerPath, sanitizeSessionId } from './hypo-shared.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
 
 export const RECEIPT_SCHEMA_VERSION = 1;
@@ -45,6 +45,10 @@ export const RECEIPT_SCHEMA_VERSION = 1;
 export const CERT_CHECKPOINT = 'committed-close-checkpoint';
 /** Certification value `--mark-session-closed` (no payload, weaker proof) issues. */
 export const CERT_CLOSE_FILES = 'committed-close-files';
+
+// A full object id: 40 hex (sha1) or 64 hex (sha256 repositories). One
+// pattern for the receipt's commit field and for a tree entry's blob oid.
+const OID_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 
 const GIT_TIMEOUT_MS = 30000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -77,45 +81,64 @@ function catFileBuffer(hypoDir, oid) {
 }
 
 /**
- * Look up one path's tree entry inside `commit`. `-r --full-tree` so a nested
- * path resolves in one call without walking subtrees by hand, and the exact
- * matching path is picked out of the (possibly multi-line, if pathspec were
- * ambiguous) output rather than trusting "first line".
+ * Look up one path's tree entry inside `commit`. `-r` so a nested path
+ * resolves in one call without walking subtrees by hand. `--full-tree` is
+ * deliberately absent: a receipt path is relative to the vault, and the vault
+ * may be a subdirectory of the repository, so git must resolve the pathspec
+ * against `-C hypoDir` (the vault), not the repository root. `-z` keeps a
+ * non-ASCII path byte-exact (no quotepath escaping) and splits records on NUL.
+ * The exact matching path is picked out of the (possibly multi-record, if the
+ * pathspec were ambiguous) output rather than trusting "first record".
  * @returns {{ok: true, present: false}|{ok: true, present: true, mode: string, oid: string}|{ok: false, reason: string}}
  */
 function lsTreeEntry(hypoDir, commit, path) {
-  const res = gitText(hypoDir, ['ls-tree', '-r', '--full-tree', commit, '--', path]);
+  const res = gitText(hypoDir, ['ls-tree', '-r', '-z', commit, '--', path]);
   if (res.error) return { ok: false, reason: `git-error: ${res.error.message}` };
   if (res.status !== 0) {
     return { ok: false, reason: `ls-tree-failed: ${(res.stderr || '').trim() || 'unknown'}` };
   }
-  const lines = (res.stdout || '').split('\n').filter(Boolean);
-  if (lines.length === 0) return { ok: true, present: false };
+  const records = (res.stdout || '').split('\0').filter(Boolean);
+  if (records.length === 0) return { ok: true, present: false };
   // `<mode> <type> <oid>\t<path>`, tab-separated path field, exact match only
   // (a pathspec that happened to match a sibling would otherwise silently pass).
-  const line = lines.find((l) => l.slice(l.indexOf('\t') + 1) === path);
-  if (!line) return { ok: false, reason: 'ls-tree-path-mismatch' };
-  const head = line.slice(0, line.indexOf('\t'));
-  const m = /^(\d+)\s+\S+\s+([0-9a-f]{40,64})$/.exec(head);
-  if (!m) return { ok: false, reason: 'ls-tree-parse-failed' };
+  const record = records.find((r) => r.slice(r.indexOf('\t') + 1) === path);
+  if (!record) return { ok: false, reason: 'ls-tree-path-mismatch' };
+  const head = record.slice(0, record.indexOf('\t'));
+  const m = /^(\d+) \S+ (\S+)$/.exec(head);
+  if (!m || !OID_RE.test(m[2])) return { ok: false, reason: 'ls-tree-parse-failed' };
   return { ok: true, present: true, mode: m[1], oid: m[2] };
 }
 
-// Minimal, deliberately narrow mirror of `scripts/lib/schema-vocab.mjs`'s
-// `**Pending**:` extraction. `scripts/` cannot be imported from `hooks/`
-// (dependency direction is one-way the other way), so this is a small,
-// separately-maintained duplicate scoped to exactly what a schema-pending
-// entry needs: the backtick tokens on the FIRST `**Pending**:` data line
-// found anywhere in the blob. It does not bound itself to the "## Tag
-// Vocabulary" H2 section the way the real parser does, so it is strictly
-// more permissive, acceptable here because it only ever WIDENS what counts
-// as "already pending" for a verification check, never narrows a write.
+// Copy of `scripts/lib/schema-vocab.mjs`'s section bounds for the
+// `**Pending**:` data line. `scripts/` cannot be imported from `hooks/`
+// (dependency direction is one-way the other way), so the four patterns below
+// are a separately-maintained duplicate and must be kept in step with it. The
+// walk is the same: the "## Tag Vocabulary" H2 section (ended by the next
+// H2), inside it the "### Pending" subsection (ended by the next H3), inside
+// that the first `**Pending**:` data line. A `**Pending**:` line anywhere
+// outside that subsection is not pending vocabulary and is ignored, so a
+// receipt can never be satisfied by a line the real parser would not read.
+const VOCAB_HEADER_RE = /^##\s+(?:\d+\.\s+)?Tag\s+(?:Vocabulary|Taxonomy)\s*$/m;
+const NEXT_H2_RE = /^##\s+/m;
+const PENDING_HEADING_RE = /^###[ \t]+Pending\b.*$/im;
+const NEXT_H3_RE = /^###[ \t]+/m;
 const PENDING_DATA_RE = /^\*\*Pending[^*]*\*\*:.*$/im;
 const BACKTICK_TOKEN_RE = /`([^`]+)`/g;
 
 function parsePendingTags(content) {
   const tags = new Set();
-  const m = PENDING_DATA_RE.exec(content || '');
+  const text = content || '';
+  const header = VOCAB_HEADER_RE.exec(text);
+  if (!header) return tags;
+  const rest = text.slice(header.index + header[0].length);
+  const nextH2 = NEXT_H2_RE.exec(rest);
+  const section = nextH2 ? rest.slice(0, nextH2.index) : rest;
+  const heading = PENDING_HEADING_RE.exec(section);
+  if (!heading) return tags;
+  const afterHeading = section.slice(heading.index + heading[0].length);
+  const nextH3 = NEXT_H3_RE.exec(afterHeading);
+  const sub = nextH3 ? afterHeading.slice(0, nextH3.index) : afterHeading;
+  const m = PENDING_DATA_RE.exec(sub);
   if (!m) return tags;
   for (const tok of m[0].matchAll(BACKTICK_TOKEN_RE)) {
     const t = tok[1].trim();
@@ -133,7 +156,7 @@ function parsePendingTags(content) {
  */
 export function receiptPath(hypoDir, sessionId) {
   if (!isValidSessionId(sessionId)) return null;
-  return join(hypoDir, '.cache', 'sessions', String(sessionId), 'close-receipt.json');
+  return join(hypoDir, '.cache', 'sessions', sanitizeSessionId(sessionId), 'close-receipt.json');
 }
 
 /**
@@ -172,7 +195,7 @@ export function readReceiptStrict(hypoDir, sessionId) {
   if (String(receipt.sessionId) !== String(sessionId)) {
     return { status: 'invalid', reason: 'session-id-mismatch' };
   }
-  if (typeof receipt.commit !== 'string' || !/^[0-9a-f]{40}$/.test(receipt.commit)) {
+  if (typeof receipt.commit !== 'string' || !OID_RE.test(receipt.commit)) {
     return { status: 'invalid', reason: 'malformed-commit' };
   }
   if (!Array.isArray(receipt.entries)) {
@@ -212,8 +235,8 @@ export function readReceiptStrict(hypoDir, sessionId) {
  * Verify every proof entry against the actual git objects in `commit`. This
  * is the one place bytes/mode/append/pending claims get checked against
  * reality, a caller must never accept `appliedPaths.length === 0` or a
- * commit helper's bare success as content proof (see design.md); this
- * function is what closes that gap by reading the committed tree itself.
+ * commit helper's bare success as content proof; this function is what
+ * closes that gap by reading the committed tree itself.
  *
  * @param {string} hypoDir
  * @param {string} commit a commit-ish (full sha expected in practice)
@@ -291,7 +314,8 @@ export function verifyEntriesInCommit(hypoDir, commit, entries) {
       // the decoded string. This does not weaken the raw-byte rule above ,
       // overwrite/create still hash the untouched Buffer, it only means an
       // append entry cannot detect a change OUTSIDE the block it names, which
-      // is the documented limit of "append" as a proof kind (design.md v2 C).
+      // is the documented limit of "append" as a proof kind (containment of
+      // the named blocks, not equality of the whole file).
       const text = buf.toString('utf-8');
       const missing = blocks.some((b) => typeof b !== 'string' || !b || !text.includes(b));
       if (missing) mismatches.push({ path, reason: 'append-incomplete' });
@@ -365,8 +389,7 @@ function invalidateOne(path) {
 
 /**
  * Invalidate this session's prior close artifacts before a new close
- * request is accepted (design.md v5 §1): the compat MARKER first, the
- * RECEIPT second. If the process dies between the two renames, only the
+ * request is accepted: the compat MARKER first, the RECEIPT second. If the process dies between the two renames, only the
  * receipt is left, never a marker with no backing receipt, which would let
  * an old-Stop reader treat a stale marker as fresh. `<name>.invalidated-<ts>`
  * (not `.marker` at the end) so doctor's marker-file scan and the

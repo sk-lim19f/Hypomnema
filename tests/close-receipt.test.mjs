@@ -35,7 +35,11 @@ import {
   writeReceiptAtomic,
   invalidateCloseArtifacts,
 } from '../hooks/close-receipt.mjs';
-import { sessionClosedMarkerPath, writeSessionClosedMarker } from '../hooks/hypo-shared.mjs';
+import {
+  sessionClosedMarkerPath,
+  writeSessionClosedMarker,
+  sanitizeSessionId,
+} from '../hooks/hypo-shared.mjs';
 
 function withTmpDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-close-receipt-'));
@@ -107,6 +111,21 @@ test('receiptPath: a valid session id resolves under .cache/sessions/<id>/, an i
     assert.equal(receiptPath(dir, 'has.dot'), null, 'a dot is rejected, same as isValidSessionId');
     assert.equal(receiptPath(dir, ''), null);
     assert.equal(receiptPath(dir, null), null);
+  });
+});
+
+test('receiptPath: an id longer than 128 characters lands in the same directory sanitizeSessionId names (the rule hypo-shared.mjs uses for the session cache dir)', () => {
+  withTmpDir((dir) => {
+    const longId = 'a'.repeat(200);
+    assert.equal(
+      receiptPath(dir, longId),
+      join(dir, '.cache', 'sessions', sanitizeSessionId(longId), 'close-receipt.json'),
+    );
+    assert.equal(sanitizeSessionId(longId).length, 128, 'fixture: the id must actually be capped');
+    assert.notEqual(
+      receiptPath(dir, longId),
+      join(dir, '.cache', 'sessions', longId, 'close-receipt.json'),
+    );
   });
 });
 
@@ -218,6 +237,40 @@ test('readReceiptStrict: a well-formed receipt whose commit is HEAD itself is va
     const result = readReceiptStrict(dir, 'sess-valid');
     assert.equal(result.status, 'valid', JSON.stringify(result));
     assert.equal(result.receipt.sessionId, 'sess-valid');
+  });
+});
+
+test('readReceiptStrict: a 64-hex commit id from a sha256 repository is valid, and its entries verify', () => {
+  withTmpDir((dir) => {
+    const init = git(dir, ['init', '-q', '--object-format=sha256']);
+    assert.equal(init.status, 0, `fixture: this git cannot create a sha256 repo: ${init.stderr}`);
+    git(dir, ['config', 'user.email', 't@t.test']);
+    git(dir, ['config', 'user.name', 'test']);
+    writeFileSync(join(dir, 'a.md'), '# a\n');
+    const commit = commitAll(dir, 'init');
+    assert.equal(commit.length, 64, `fixture: expected a sha256 commit id, got ${commit}`);
+    const { mode, oid } = blobOid(dir, commit, 'a.md');
+    assert.equal(oid.length, 64);
+    const entries = [{ path: 'a.md', kind: 'overwrite', expected: { blob: oid, mode } }];
+    writeReceiptAtomic(dir, 'sess-sha256', baseReceipt(dir, 'sess-sha256', commit, entries));
+    const result = readReceiptStrict(dir, 'sess-sha256');
+    assert.equal(result.status, 'valid', JSON.stringify(result));
+    assert.deepEqual(verifyEntriesInCommit(dir, commit, entries), { ok: true, mismatches: [] });
+  });
+});
+
+test('readReceiptStrict: a commit that is neither 40 nor 64 hex is malformed-commit', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commitAll(dir, 'init');
+    for (const bad of ['a'.repeat(41), 'a'.repeat(63), 'a'.repeat(65), 'A'.repeat(40)]) {
+      writeReceiptAtomic(dir, 'sess-oid', baseReceipt(dir, 'sess-oid', bad, []));
+      assert.deepEqual(
+        readReceiptStrict(dir, 'sess-oid'),
+        { status: 'invalid', reason: 'malformed-commit' },
+        `commit ${bad.length} chars must be rejected`,
+      );
+    }
   });
 });
 
@@ -419,6 +472,124 @@ test('create: a path expected present but missing from the commit is missing-ent
       ]),
       { ok: false, mismatches: [{ path: 'never-existed.md', reason: 'missing-entry' }] },
     );
+  });
+});
+
+test('schema-pending: a **Pending**: line outside the Tag Vocabulary / Pending subsection proves nothing', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(
+      join(dir, 'SCHEMA.md'),
+      [
+        '**Pending**: `before-vocab`',
+        '',
+        '## Tag Vocabulary',
+        '',
+        '### Pending (auto-registered)',
+        '',
+        '**Pending**: `real-tag`',
+        '',
+        '### Notes',
+        '',
+        '**Pending**: `sibling-h3-tag`',
+        '',
+        '## Later',
+        '',
+        '**Pending**: `later-h2-tag`',
+        '',
+      ].join('\n'),
+    );
+    const commit = commitAll(dir, 'schema');
+    const check = (tag) =>
+      verifyEntriesInCommit(dir, commit, [
+        { path: 'SCHEMA.md', kind: 'schema-pending', expected: { tags: [tag] } },
+      ]);
+    assert.deepEqual(check('real-tag'), { ok: true, mismatches: [] });
+    for (const stray of ['before-vocab', 'sibling-h3-tag', 'later-h2-tag']) {
+      assert.deepEqual(
+        check(stray),
+        { ok: false, mismatches: [{ path: 'SCHEMA.md', reason: 'schema-pending-missing' }] },
+        `${stray} sits outside the Pending subsection and must not count`,
+      );
+    }
+
+    // The subsection ends at the next H3: an empty Pending block followed by a
+    // sibling H3 that carries a data line registers nothing.
+    writeFileSync(
+      join(dir, 'SCHEMA.md'),
+      '## Tag Vocabulary\n\n### Pending (auto-registered)\n\nprose only\n\n### Notes\n\n**Pending**: `sibling-h3-tag`\n',
+    );
+    const emptyPendingCommit = commitAll(dir, 'schema-empty-pending');
+    assert.deepEqual(
+      verifyEntriesInCommit(dir, emptyPendingCommit, [
+        { path: 'SCHEMA.md', kind: 'schema-pending', expected: { tags: ['sibling-h3-tag'] } },
+      ]),
+      { ok: false, mismatches: [{ path: 'SCHEMA.md', reason: 'schema-pending-missing' }] },
+    );
+  });
+});
+
+suite('close-receipt.mjs, verifyEntriesInCommit: a vault nested inside a larger repository');
+
+// The vault is `<repo>/vault/`, so `git rev-parse --show-prefix` is `vault/`.
+// A receipt path is relative to the vault; a lookup that resolved it against
+// the repository root would report every entry as missing.
+function withNestedVault(fn) {
+  withTmpDir((repo) => {
+    gitRepo(repo);
+    const vault = join(repo, 'vault');
+    mkdirSync(vault);
+    fn(repo, vault);
+  });
+}
+
+test('nested vault: vault-relative overwrite, append, and absent entries verify against the commit', () => {
+  withNestedVault((repo, vault) => {
+    writeFileSync(join(vault, 'state.md'), '# v1\n');
+    mkdirSync(join(vault, 'projects'));
+    writeFileSync(join(vault, 'projects', 'log.md'), '## entry\n\nbody\n');
+    writeFileSync(join(repo, 'state.md'), '# a DIFFERENT file at the repo root\n');
+    const commit = commitAll(repo, 'nested');
+    assert.equal(git(vault, ['rev-parse', '--show-prefix']).stdout.trim(), 'vault/');
+
+    const oid = git(vault, ['rev-parse', `${commit}:./state.md`]).stdout.trim();
+    const result = verifyEntriesInCommit(vault, commit, [
+      { path: 'state.md', kind: 'overwrite', expected: { blob: oid, mode: '100644' } },
+      {
+        path: 'projects/log.md',
+        kind: 'append',
+        expected: { entryBlocks: ['## entry\n\nbody\n'] },
+      },
+      { path: 'never-there.md', kind: 'absent', expected: {} },
+    ]);
+    assert.deepEqual(result, { ok: true, mismatches: [] });
+
+    // The repo-root file of the same name is a different blob: the lookup must
+    // be the vault's, not the root's.
+    const rootOid = git(repo, ['rev-parse', `${commit}:state.md`]).stdout.trim();
+    assert.notEqual(rootOid, oid, 'fixture: the two state.md files must differ');
+    assert.deepEqual(
+      verifyEntriesInCommit(vault, commit, [
+        { path: 'state.md', kind: 'overwrite', expected: { blob: rootOid, mode: '100644' } },
+      ]),
+      { ok: false, mismatches: [{ path: 'state.md', reason: 'blob-mismatch' }] },
+    );
+  });
+});
+
+test('nested vault: a non-ASCII path is matched byte-exact (no quotepath escaping), and the receipt reads as valid', () => {
+  withNestedVault((repo, vault) => {
+    const rel = '프로젝트/상태.md';
+    mkdirSync(join(vault, '프로젝트'));
+    writeFileSync(join(vault, rel), '# 상태\n');
+    const commit = commitAll(repo, 'non-ascii');
+    const oid = git(vault, ['rev-parse', `${commit}:./${rel}`]).stdout.trim();
+    const entries = [{ path: rel, kind: 'overwrite', expected: { blob: oid, mode: '100644' } }];
+    assert.deepEqual(verifyEntriesInCommit(vault, commit, entries), { ok: true, mismatches: [] });
+
+    writeReceiptAtomic(vault, 'sess-nested', baseReceipt(vault, 'sess-nested', commit, entries));
+    const read = readReceiptStrict(vault, 'sess-nested');
+    assert.equal(read.status, 'valid', JSON.stringify(read));
   });
 });
 

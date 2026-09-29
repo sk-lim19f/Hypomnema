@@ -44,6 +44,8 @@ import {
   RECEIPT_SCHEMA_VERSION,
   CERT_CHECKPOINT,
   writeReceiptAtomic,
+  readReceiptStrict,
+  verifyEntriesInCommit,
 } from '../hooks/close-receipt.mjs';
 import { createProject } from '../scripts/lib/project-create.mjs';
 import { test, suite } from './harness.mjs';
@@ -1551,6 +1553,59 @@ test('Stop: the unresolved-changes notice fires once per receipt generation, and
   });
 });
 
+test('Stop: a path the receipt names but that is dirty now is reported as changed after the close checkpoint, never dropped from the notice', () => {
+  withGrowthWiki((dir) => {
+    const sessionId = 's-unresolved-certified';
+    const transcript = writeTranscript(dir, [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]);
+    // hot.md is in the receipt's entries and committed at HEAD, so the receipt is
+    // valid; editing it afterwards leaves bytes on disk that no commit holds.
+    writeValidReceipt(dir, sessionId, {
+      entries: [{ path: 'hot.md', kind: 'overwrite', expected: {} }],
+    });
+    appendFileSync(join(dir, 'hot.md'), '\nedited after the close checkpoint\n');
+
+    const r1 = runAutoMinimal(dir, {
+      session_id: sessionId,
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    const out1 = JSON.parse(r1.stdout);
+    assert.equal(out1.continue, true, `valid receipt must continue: ${JSON.stringify(out1)}`);
+    assert.match(
+      out1.systemMessage || '',
+      /close 체크포인트 뒤 바뀜[^\]]*hot\.md/,
+      `a certified-but-dirty path must be reported as changed after the checkpoint: ${JSON.stringify(out1)}`,
+    );
+
+    // Once per generation and list, same as an uncertified path.
+    const r2 = runAutoMinimal(dir, {
+      session_id: sessionId,
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(JSON.parse(r2.stdout).systemMessage, undefined);
+
+    // An uncertified dirty path is listed apart from the certified one.
+    writeFileSync(join(dir, 'stray-c.md'), '# stray c\n');
+    const r3 = runAutoMinimal(dir, {
+      session_id: sessionId,
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    const msg3 = JSON.parse(r3.stdout).systemMessage || '';
+    assert.match(msg3, /stray-c\.md/);
+    assert.match(msg3, /close 체크포인트 뒤 바뀜[^\]]*hot\.md/);
+    assert.doesNotMatch(
+      msg3,
+      /close 체크포인트 뒤 바뀜[^\]]*stray-c\.md/,
+      'an uncertified path must not be labelled as changed after the checkpoint',
+    );
+  });
+});
+
 test('Stop: a valid receipt still blocks when the session cwd project has an unstarted close (close-cwd)', () => {
   const CWD = '/tmp/cwdproj-stop-receipt';
   withClosePartitionWiki(
@@ -2176,6 +2231,50 @@ test('--mark-session-closed with ok gate + clean git → exit 0, marker created'
     assert.equal(receipt.certification, 'committed-close-files');
     assert.equal(receipt.generation, marker.receipt_generation);
     assert.ok((receipt.entries || []).some((e) => e.path === 'projects/test-project/hot.md'));
+  });
+});
+
+// The vault is a subdirectory of a larger repository (`git rev-parse
+// --show-prefix` is `vault/`), the layout where a repository-root lookup of a
+// vault-relative receipt path finds nothing. --mark must still issue a receipt
+// and Stop must still read it as valid.
+test('--mark-session-closed in a vault nested inside a larger repository: the receipt is issued and reads as valid', () => {
+  withTmpDir((outer) => {
+    const vault = join(outer, 'vault');
+    mkdirSync(vault, { recursive: true });
+    buildCleanWikiTree(vault, todayLocal());
+    const g = (args) => spawnSync('git', ['-C', outer, ...args], { encoding: 'utf-8' });
+    g(['init', '-q']);
+    g(['config', 'user.email', 'test@test.com']);
+    g(['config', 'user.name', 'Test']);
+    g(['add', '-A']);
+    assert.equal(g(['commit', '-q', '-m', 'init']).status, 0);
+    assert.equal(
+      spawnSync('git', ['-C', vault, 'rev-parse', '--show-prefix'], {
+        encoding: 'utf-8',
+      }).stdout.trim(),
+      'vault/',
+      'fixture: the vault must be nested',
+    );
+
+    const cleanup = seedCloseTranscript('s-nested-mark');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${vault}`,
+      '--mark-session-closed',
+      '--session-id=s-nested-mark',
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const read = readReceiptStrict(vault, 's-nested-mark');
+    assert.equal(read.status, 'valid', JSON.stringify(read));
+    assert.ok(
+      (read.receipt.entries || []).some((e) => e.path === 'projects/test-project/hot.md'),
+      `entries must be vault-relative: ${JSON.stringify(read.receipt.entries)}`,
+    );
+    const verified = verifyEntriesInCommit(vault, read.receipt.commit, read.receipt.entries);
+    assert.equal(verified.ok, true, JSON.stringify(verified));
   });
 });
 

@@ -501,7 +501,7 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
 // delete is gone. Undo has to name both files or it does not actually undo
 // anything a receipt-aware reader honors. `commit-and-marker` and
 // `marker-only` are the two kinds whose write path always lands the receipt
-// BEFORE the marker (design.md v2 §B/§D), so by the time either kind's text
+// BEFORE the marker, so by the time either kind's text
 // is composed the receipt is guaranteed to exist and the message just names
 // it. `commit-only` is the one kind where the receipt write and the marker
 // write can fail independently, so its wording checks the receipt path on

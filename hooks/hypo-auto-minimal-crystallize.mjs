@@ -21,15 +21,15 @@
  *        calls (Read/Grep/Glob/Bash) — 6a, so read-only review/debug sessions
  *        are also nudged to close. Pure Q&A / incidental lookups still skip.
  *   4. no recent user close-intent → continue       (close-intent gate, see below)
- *   5. close verdict for session_id (contract.md "Stop 판정 순서"):
+ *   5. close verdict for session_id, in this order:
  *        a. readReceiptStrict valid            → continue (cwd/log-only exemption unchanged)
  *        b. receipt missing/invalid, compat marker valid with NO receiptGeneration
  *                                               → continue (legacy-closed, marker's own 7-day TTL)
  *        c. compat marker names a receiptGeneration but the receipt is missing/invalid
  *                                               → fall through to block (close not verified)
  *        d. no marker at all                   → fall through to block
- *      A valid receipt only certifies the files it names (design.md's
- *      checkpoint contract), so branch (a) also fires an unresolved-changes
+ *      A valid receipt only certifies the files it names (the checkpoint
+ *      contract), so branch (a) also fires an unresolved-changes
  *      systemMessage once per receipt generation (see notifyUnresolved).
  *      This is never a block, only a notice riding along on the continue reply.
  *   6. otherwise                   → decision:block
@@ -97,19 +97,20 @@ function emitContinue(systemMessage) {
   console.log(JSON.stringify(out));
 }
 
-// design.md's checkpoint contract: a valid receipt proves only the files it
-// names are committed, never that the rest of the session's work was saved.
-// A dirty path outside that list is unresolved and worth telling the user
-// about, but only once per receipt generation, or again once the list
-// itself changes -- never on every Stop turn a long session produces. State
-// lives next to the receipt it is keyed to (`.cache/sessions/<sid>/`), so an
-// invalidated/replaced receipt (a fresh close attempt) starts this notice
-// fresh too.
+// The checkpoint contract: a valid receipt proves only the files it names were
+// committed at the receipt's commit, never that the rest of the session's work
+// was saved, and never that a named file still has those bytes. Every dirty
+// path is unresolved: a path outside the receipt's entries was never certified,
+// and a path inside them differs from HEAD now, so the bytes on disk are
+// committed nowhere (the receipt's commit is an ancestor of HEAD). The second
+// kind is listed apart as changed after the close checkpoint. The notice fires
+// once per receipt generation, or again once the dirty list itself changes,
+// never on every Stop turn a long session produces. State lives next to the
+// receipt it is keyed to (`.cache/sessions/<sid>/`), so an invalidated or
+// replaced receipt (a fresh close attempt) starts this notice fresh too.
 function notifyUnresolved(hypoDir, sessionId, receipt) {
   const certified = new Set((receipt.entries || []).map((e) => e && e.path));
-  const dirty = gitDirtyFiles(hypoDir)
-    .filter((f) => !certified.has(f))
-    .sort();
+  const dirty = gitDirtyFiles(hypoDir).sort();
   if (dirty.length === 0) return null;
   const rp = receiptPath(hypoDir, sessionId);
   if (!rp) return null;
@@ -133,9 +134,16 @@ function notifyUnresolved(hypoDir, sessionId, receipt) {
     // Best-effort: a failed write only means this same notice repeats next
     // turn, never that it silently stops appearing.
   }
+  const uncertified = dirty.filter((f) => !certified.has(f));
+  const changedAfter = dirty.filter((f) => certified.has(f));
+  const parts = [];
+  if (uncertified.length > 0) parts.push(uncertified.join(', '));
+  if (changedAfter.length > 0) {
+    parts.push(`[close 체크포인트 뒤 바뀜, 지금 내용은 커밋되지 않음: ${changedAfter.join(', ')}]`);
+  }
   return (
     `[WIKI_AUTOCLOSE] close checkpoint 확인됨 (session_id=${sessionId}). 다만 이 체크포인트가 ` +
-    `증명하지 않는 미해결 변경이 있습니다: ${dirty.join(', ')}`
+    `증명하지 않는 미해결 변경이 있습니다: ${parts.join(' ')}`
   );
 }
 
@@ -328,7 +336,7 @@ process.stdin.on('end', () => {
       }
     };
 
-    // 5. close verdict for this session_id (contract.md "Stop 판정 순서"). A
+    // 5. close verdict for this session_id (order in the file header). A
     // valid receipt only attests the project(s)/scope it recorded, same as
     // the old marker-only check did: if THIS session's cwd project still has
     // an unstarted close, honoring it would end the session green while that
