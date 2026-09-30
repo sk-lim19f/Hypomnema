@@ -2519,14 +2519,15 @@ test('--mark-session-closed still recovers a marker-only broken state (receipt c
 // 대 영수증"): a session-log shard modified directly on disk (simulating a
 // Bash append, no commit) must withhold the whole certification, even though
 // session-state.md and hot.md are both fine.
-test('--mark-session-closed: a dirty (uncommitted) session-log shard withholds the certification', () => {
-  withWiki(null, (dir, today) => {
+test('--mark-session-closed: a dirty (uncommitted) append target withholds the certification', () => {
+  withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-mark-dirty-append');
-    // buildCleanWikiTree seeds the LEGACY MONTHLY shard, not the daily one:
-    // sessionLogEvidence.path (sessionLogReadCandidates' second candidate)
-    // resolves to this file, so this is the one the proof actually names.
-    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`);
-    appendFileSync(shard, '\nappended by Bash, never committed\n');
+    // The append target is the vault-root log.md (one of the proof's four files),
+    // not the session-log shard. The checkpoint gate now refuses any dirty file in
+    // the project folder being closed before this proof runs, so the shard fixture
+    // moved to the test below. A root file with no touched-paths record only
+    // demotes to a notice, which is what lets the proof still reach `incomplete`.
+    appendFileSync(join(dir, 'log.md'), '\nappended by Bash, never committed\n');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -2547,6 +2548,40 @@ test('--mark-session-closed: a dirty (uncommitted) session-log shard withholds t
   });
 });
 
+// The original fixture of the test above (design.md test 28): a session-log shard
+// modified on disk with no commit. It sits inside the project folder being
+// closed, so the gate refuses it before the proof runs: exit 1, ok:false, the
+// file named in blockers[], no marker, no receipt.
+test('--mark-session-closed: a dirty session-log shard in the project folder is refused by the gate', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = 's-mark-dirty-shard';
+    const cleanup = seedCloseTranscript(sessionId);
+    // buildCleanWikiTree seeds the LEGACY MONTHLY shard, not the daily one.
+    const shardRel = join('projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`);
+    appendFileSync(join(dir, shardRel), '\nappended by Bash, never committed\n');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      `--session-id=${sessionId}`,
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 1, `the gate must refuse a dirty project file: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(
+      (out.blockers || []).some((b) => b.file === shardRel),
+      `blockers must name the dirty shard: ${JSON.stringify(out.blockers)}`,
+    );
+    assert.ok(!existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)), 'no marker');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json')),
+      'no receipt',
+    );
+  });
+});
+
 // design.md test 8 / v2 §I: the counterpart to the worktree-dirty case above,
 // on the OTHER half of the disagreement `markCloseWorktreeProofEntry` guards
 // against: the file is STAGED (index differs from HEAD) but the worktree
@@ -2560,10 +2595,14 @@ test('--mark-session-closed: a dirty (uncommitted) session-log shard withholds t
 test('--mark-session-closed: a close file staged but not committed withholds the certification (index differs from HEAD)', () => {
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-mark-staged-only');
-    const ssRel = join('projects', 'test-project', 'session-state.md');
-    const ssPath = join(dir, ssRel);
-    writeFileSync(ssPath, readFileSync(ssPath, 'utf-8') + '\nstaged only, never committed\n');
-    spawnSync('git', ['-C', dir, 'add', '--', ssRel]);
+    // The staged file is the vault-root log.md, not session-state.md: the gate
+    // refuses a dirty file in the project folder being closed before the proof
+    // runs (the test below keeps that fixture), and only a root file still
+    // reaches the `incomplete` proof.
+    const logRel = 'log.md';
+    const logPath = join(dir, logRel);
+    writeFileSync(logPath, readFileSync(logPath, 'utf-8') + '\nstaged only, never committed\n');
+    spawnSync('git', ['-C', dir, 'add', '--', logRel]);
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -2584,6 +2623,39 @@ test('--mark-session-closed: a close file staged but not committed withholds the
     assert.ok(
       !existsSync(join(dir, '.cache', 'session-closed-s-mark-staged-only.marker')),
       'no marker may land while a close file is only staged, not committed',
+    );
+  });
+});
+
+// The original fixture of the test above: session-state.md, inside the project
+// folder being closed, staged but not committed. The gate refuses it first.
+test('--mark-session-closed: a staged-only session-state.md in the project folder is refused by the gate', () => {
+  withWiki(null, (dir) => {
+    const sessionId = 's-mark-staged-project-file';
+    const cleanup = seedCloseTranscript(sessionId);
+    const ssRel = join('projects', 'test-project', 'session-state.md');
+    const ssPath = join(dir, ssRel);
+    writeFileSync(ssPath, readFileSync(ssPath, 'utf-8') + '\nstaged only, never committed\n');
+    spawnSync('git', ['-C', dir, 'add', '--', ssRel]);
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--mark-session-closed',
+      `--session-id=${sessionId}`,
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 1, `the gate must refuse a staged project file: ${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.ok(
+      (out.blockers || []).some((b) => b.file === ssRel),
+      `blockers must name the staged file: ${JSON.stringify(out.blockers)}`,
+    );
+    assert.ok(!existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)), 'no marker');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json')),
+      'no receipt',
     );
   });
 });
@@ -3026,20 +3098,30 @@ test('--apply-session-close: a retry re-stages payload files a failed commit lef
 // silently certifying a file this session never committed.
 test('--apply-session-close: a retry leaves an unjournaled payload file uncommitted, receipt withheld', () => {
   withWiki(null, (dir, today) => {
-    const stateRel = join('projects', 'test-project', 'session-state.md');
-    const stateContent = `${readFileSync(join(dir, stateRel), 'utf-8')}\n<!-- someone else -->\n`;
-    writeFileSync(join(dir, stateRel), stateContent);
-    // No recordJournalEntry: these bytes are on disk and match the payload, but
-    // nothing says THIS session wrote them.
+    // The unjournaled file is the vault-root log.md, not session-state.md. The
+    // checkpoint gate refuses any dirty file in the project folder being closed
+    // before the receipt proof runs (the test below keeps that fixture), and a
+    // root file with no touched-paths record only demotes to a notice, so this
+    // is the fixture that still reaches receipt-proof-mismatch.
+    const heading = `## [${today}] session | test-project \u2014 unjournaled stays out`;
+    const logPath = join(dir, 'log.md');
+    writeFileSync(
+      logPath,
+      `${readFileSync(logPath, 'utf-8')}\n${heading}\n→ [[projects/test-project/hot]]\n`,
+    );
+    // No recordJournalEntry: these bytes are on disk and match what the payload
+    // would append, but nothing says THIS session wrote them.
     const payload = {
       project: 'test-project',
       date: today,
-      sessionState: { content: stateContent },
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
       projectHot: {
         content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
       },
       sessionLog: { entry: `## [${today}] unjournaled stays out\n` },
-      log: { entry: `## [${today}] session | test-project — unjournaled stays out\n` },
+      log: { entry: `${heading}\n` },
     };
     const payloadPath = join(
       tmpdir(),
@@ -3059,10 +3141,64 @@ test('--apply-session-close: a retry leaves an unjournaled payload file uncommit
     assert.equal(
       r.status,
       1,
-      `the receipt must be withheld (session-state.md's expected bytes never landed in the commit): ${r.stdout}\n${r.stderr}`,
+      `the receipt must be withheld (log.md's expected bytes never landed in the commit): ${r.stdout}\n${r.stderr}`,
     );
     assert.equal(out.ok, false);
     assert.equal(out.markerSkipReason, 'receipt-proof-mismatch', `stage: ${r.stdout}`);
+    const left = spawnSync('git', ['status', '--porcelain'], {
+      cwd: dir,
+      encoding: 'utf-8',
+    }).stdout;
+    assert.match(
+      left,
+      /^ M log\.md$/m,
+      `bytes with no journal record must stay out of this close's commit: ${left}`,
+    );
+  });
+});
+
+// The original fixture of the test above: session-state.md, inside the project
+// folder being closed, holds unjournaled bytes. The gate now refuses it before
+// the receipt proof: the marker is skipped as compact-gate-not-ok, no receipt is
+// filed, and the file still stays out of the commit.
+test('--apply-session-close: an unjournaled session-state.md in the project folder is refused by the gate', () => {
+  withWiki(null, (dir, today) => {
+    const stateRel = join('projects', 'test-project', 'session-state.md');
+    const stateContent = `${readFileSync(join(dir, stateRel), 'utf-8')}\n<!-- someone else -->\n`;
+    writeFileSync(join(dir, stateRel), stateContent);
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: { content: stateContent },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      sessionLog: { entry: `## [${today}] unjournaled stays out\n` },
+      log: { entry: `## [${today}] session | test-project \u2014 unjournaled stays out\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const sessionId = 's-apply-unjournaled-gate';
+    const cleanup = seedCloseTranscript(sessionId);
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      `--session-id=${sessionId}`,
+      '--json',
+    ]);
+    cleanup();
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.markerSkipReason, 'compact-gate-not-ok', `stage: ${r.stdout}\n${r.stderr}`);
+    assert.equal(out.markerWritten, false);
+    assert.ok(!existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)), 'no marker');
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json')),
+      'no receipt may be filed behind a refused gate',
+    );
     const left = spawnSync('git', ['status', '--porcelain'], {
       cwd: dir,
       encoding: 'utf-8',

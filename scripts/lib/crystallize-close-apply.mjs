@@ -3903,7 +3903,8 @@ function printCloseReport({
     const diskFailure = markerSkipReason === 'marker-did-not-land';
     // The two receipt stages also flip ok to false, and their recoveries are
     // opposite: one is about what is committed, the other about writing under
-    // .cache/. Neither is the policy withhold the fallback text below describes.
+    // .cache/. Neither is the policy withhold the fallback text below describes,
+    // and neither is the gate refusal (compact-gate-not-ok), which stays ok:true.
     const receiptFailure =
       markerSkipReason === 'receipt-proof-mismatch'
         ? `    The 4 mandatory files were applied, but the close checkpoint receipt\n` +
@@ -3917,7 +3918,20 @@ function printCloseReport({
             `    reports ok:false and exits 1. The session is NOT closed.\n` +
             `    To fix: clear whatever blocks that directory (permissions, disk space),\n` +
             `    then re-run the same close. No fresh close phrase is needed.\n`
-          : null;
+          : // A gate refusal keeps ok:true (the files verified) but the marker was denied
+            // by a compact-gate blocker. It is not a session-id problem and not a receipt
+            // problem, so it gets its own words.
+            markerSkipReason === 'compact-gate-not-ok'
+            ? `    The 4 mandatory files were applied and verified, but the compact gate\n` +
+              `    refused the per-session Stop-chain marker because a gate blocker\n` +
+              `    remains. The session is NOT fully closed: the Stop hook will re-prompt\n` +
+              `    until the marker is present. This is not a --session-id problem.\n` +
+              `    To fix: resolve the gate blocker (run git status in the vault: commit\n` +
+              `    or revert an uncommitted file in the project folder being closed, or\n` +
+              `    clear whichever other blocker the gate names), then re-run the same\n` +
+              `    close. No fresh close phrase is needed: a close signal is spent only\n` +
+              `    once the marker lands.\n`
+            : null;
     process.stderr.write(
       `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
         // MAJOR FIX (codex cross-review round 5): only present when the reason

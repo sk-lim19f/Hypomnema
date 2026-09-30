@@ -2201,26 +2201,26 @@ test('the console report for marker-did-not-land names the marker, not the recei
 // never actually committed.
 test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is withheld (receipt-proof-mismatch)', () => {
   withWiki(null, (dir, today) => {
-    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    // The ignored target is the vault-root log.md, not a file under
+    // projects/test-project/. The checkpoint gate blocks any dirty file in the
+    // project folder being closed before the receipt proof runs, so a hot.md
+    // fixture no longer reaches receipt-proof-mismatch (the next test pins that
+    // refusal). A root file with no touched-paths record only demotes to a
+    // notice, which is what lets this proof still see the divergence.
+    writeFileSync(join(dir, '.hypoignore'), 'log.md\n');
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
     const sessionId = 's-hypoignore-mismatch';
-    // A base snapshot for hot.md, matching current disk, so the overwrite
-    // guard's conflict check (a real, separate concern) sees a legitimate
-    // base and takes the write path, not a park: this test is about the
-    // COMMIT diverging from the write, not about the observed-base guard.
-    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
     const r = runApply(dir, payload, { sessionId });
     const out = JSON.parse(r.stdout);
     assert.equal(
       r.status,
       1,
-      `an ignored, never-committed overwrite must withhold the receipt: ${r.stdout}\n${r.stderr}`,
+      `an ignored, never-committed append must withhold the receipt: ${r.stdout}\n${r.stderr}`,
     );
     assert.equal(out.ok, false);
     assert.equal(out.markerSkipReason, 'receipt-proof-mismatch', `stage: ${r.stdout}`);
     assert.ok(
-      (out.mismatches || []).some((m) => m.path === 'projects/test-project/hot.md'),
+      (out.mismatches || []).some((m) => m.path === 'log.md'),
       `the mismatch must name the ignored target: ${JSON.stringify(out.mismatches)}`,
     );
     assert.ok(
@@ -2230,16 +2230,42 @@ test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is wi
   });
 });
 
-// The console path reads the same stage and must not fall back to the policy
-// withhold text, which claims ok:true and sends the user after --session-id.
-test('the console report for receipt-proof-mismatch says ok:false and points at the commit, not at --session-id', () => {
+// The original fixture of the test above: hot.md sits inside the project folder
+// being closed. Since the gate blocks any dirty file there, the close is now
+// refused one step earlier, as compact-gate-not-ok, with no marker and no receipt.
+test('a .hypoignore-excluded hot.md in the project folder is refused by the gate (compact-gate-not-ok), no marker, no receipt', () => {
   withWiki(null, (dir, today) => {
     writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
     const payload = payloadForCleanWiki(dir, today);
     payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
+    const sessionId = 's-hypoignore-gate-refusal';
+    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
+    const r = runApply(dir, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.markerSkipReason, 'compact-gate-not-ok', `stage: ${r.stdout}\n${r.stderr}`);
+    assert.equal(out.markerWritten, false);
+    assert.ok(
+      !existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)),
+      'no marker may land while the project folder has an uncommitted file',
+    );
+    assert.equal(
+      existsSync(receiptPath(dir, sessionId)),
+      false,
+      'no receipt may be filed behind a refused gate',
+    );
+  });
+});
+
+// The console path reads the same stage and must not fall back to the policy
+// withhold text, which claims ok:true and sends the user after --session-id.
+test('the console report for receipt-proof-mismatch says ok:false and points at the commit, not at --session-id', () => {
+  withWiki(null, (dir, today) => {
+    // Root log.md ignored, for the reason given in the receipt-proof-mismatch
+    // JSON test above: a project-folder file is refused at the gate instead.
+    writeFileSync(join(dir, '.hypoignore'), 'log.md\n');
+    const payload = payloadForCleanWiki(dir, today);
     const sessionId = `s-hypoignore-mismatch-console-${process.pid}`;
     const cleanup = seedCloseTranscript(sessionId);
-    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
     let r;
     try {
       r = runApplyConsole(dir, payload, sessionId);
@@ -2253,6 +2279,37 @@ test('the console report for receipt-proof-mismatch says ok:false and points at 
       r.stderr,
       /\(ok:true\)/,
       'a failed receipt must not be reported as ok:true',
+    );
+    assert.doesNotMatch(r.stderr, /--session-id=<main-conversation-id>/);
+  });
+});
+
+// A gate refusal is neither a policy withhold nor a receipt failure. The console
+// report used to fall through to the policy text ("(ok:true) ... re-run with the
+// correct --session-id"), which is wrong here: the session id is fine, a
+// blocker in the vault is what stopped the marker.
+test('the console report for compact-gate-not-ok names the gate blocker, not --session-id or a new close phrase', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const payload = payloadForCleanWiki(dir, today);
+    payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
+    const sessionId = `s-hypoignore-gate-console-${process.pid}`;
+    const cleanup = seedCloseTranscript(sessionId);
+    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
+    let r;
+    try {
+      r = runApplyConsole(dir, payload, sessionId);
+    } finally {
+      cleanup();
+    }
+    assert.match(r.stderr, /reason: compact-gate-not-ok/, `stderr: ${r.stderr}`);
+    assert.match(r.stderr, /gate blocker/);
+    assert.match(r.stderr, /commit\s+or revert/);
+    assert.match(r.stderr, /No fresh close phrase/);
+    assert.doesNotMatch(
+      r.stderr,
+      /\(ok:true\)/,
+      'a gate refusal is not the ok:true policy withhold',
     );
     assert.doesNotMatch(r.stderr, /--session-id=<main-conversation-id>/);
   });
