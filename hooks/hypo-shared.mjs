@@ -3926,24 +3926,23 @@ export function peekTouchedPaths(hypoDir, sessionId) {
 }
 
 /**
- * Like `peekTouchedPaths`, but does not collapse "corrupt" and "lock
- * timeout" into the same silent `[]` an unreadable-vs-empty caller cannot
- * tell apart. A `checkpointMode` gate MUST block on
- * either, an unreadable touched-paths set could be hiding a real
- * still-dirty write this session made, so reading it as "empty, nothing
- * outstanding" would let a checkpoint certify over exactly the write it
- * exists to catch. `peekTouchedPaths` itself is unchanged: its callers
- * already treat its `[]` as fail-safe-to-no-scope for a best-effort
- * commit attempt, which is the correct behavior there and would be wrong
- * here.
+ * Like `peekTouchedPaths`, but does not collapse "corrupt", "lock timeout"
+ * and "empty" into the same silent `[]`. A `checkpointMode` gate treats
+ * the three differently: a lock timeout is transient (another writer holds
+ * the lock right now) and blocks so the retry reads the real set; a corrupt
+ * file stays corrupt on every retry, so the gate reads it as "no record"
+ * and says so in a notice instead of refusing forever. `peekTouchedPaths`
+ * itself is unchanged: its callers already treat its `[]` as
+ * fail-safe-to-no-scope for a best-effort commit attempt.
  *
  * @param {string} hypoDir
  * @param {string|null|undefined} sessionId
- * @returns {{state: 'ok'|'empty'|'unreadable', paths: string[]}}
+ * @returns {{state: 'ok'|'empty'|'unreadable'|'locked', paths: string[]}}
  *   'ok': a non-empty set was read. 'empty': no session_id, or the file is
  *   absent/genuinely empty. 'unreadable': the file exists but is corrupt, or
- *   the per-session lock could not be acquired, paths is always `[]` here,
- *   since nothing safely known could be returned.
+ *   the lock could not be taken for a reason other than a timeout (an
+ *   unwritable directory). 'locked': the per-session lock timed out. paths
+ *   is always `[]` unless 'ok', since nothing safely known could be returned.
  */
 export function readTouchedPathsStrict(hypoDir, sessionId) {
   if (!sessionId) return { state: 'empty', paths: [] };
@@ -3954,8 +3953,8 @@ export function readTouchedPathsStrict(hypoDir, sessionId) {
       if (result === null) return { state: 'unreadable', paths: [] };
       return result.length === 0 ? { state: 'empty', paths: [] } : { state: 'ok', paths: result };
     });
-  } catch {
-    return { state: 'unreadable', paths: [] };
+  } catch (err) {
+    return { state: err?.code === 'ELOCKTIMEOUT' ? 'locked' : 'unreadable', paths: [] };
   }
 }
 
@@ -5613,7 +5612,8 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   // checkpointMode: a marker-writing
   // path's own gate call, replacing the whole git axis above with a narrower
   // question: "is there an uncommitted write THIS session is known to still
-  // own". Everything else (close files, cwd, hot structure, lint, W8,
+  // own, or any uncommitted file in the project folder being closed".
+  // Everything else (close files, cwd, hot structure, lint, W8,
   // feedback) is untouched below; Stop, PreCompact and check never set this.
   if (opts.checkpointMode) {
     if (!isValidSessionId(opts.sessionId)) {
@@ -5629,16 +5629,45 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         blockers.push({ type: 'git', reason: git.reason });
       } else {
         const touched = readTouchedPathsStrict(hypoDir, opts.sessionId);
-        if (touched.state === 'unreadable') {
-          // Corrupt file or a lock timeout: cannot tell "this session's own
-          // write" from "someone else's", so fail closed rather than let a
-          // damaged touched-paths file silently downgrade every dirty file
-          // to a notice.
+        if (touched.state === 'locked') {
+          // Another writer holds this session's touched-paths lock right now
+          // (usually this session's own Stop auto-commit). Transient, so
+          // block: the retry reads the real set instead of guessing.
           blockers.push({
             type: 'known-session-write',
-            reason: 'touched-paths unreadable',
+            reason: 'touched-paths lock timed out (다른 쓰기가 끝난 뒤 다시 시도하면 된다)',
           });
         } else {
+          // A corrupt set reads as "no record". It would read the same on
+          // every retry, and nothing clears it, so blocking on it refused
+          // every close for good. The project folder rule below does not
+          // depend on the record, so that folder stays protected; only the
+          // ownership of files outside it goes unjudged, and the notice
+          // says so.
+          if (touched.state === 'unreadable') {
+            notices.push({
+              type: 'touched-paths-unreadable',
+              reason:
+                'touched-paths unreadable: ownership of dirty files outside the project folder being closed was not judged (touched-paths 기록을 읽지 못해 프로젝트 폴더 밖 파일의 소유를 판정하지 못했다)',
+            });
+          }
+          // The project folder this close is closing blocks on any dirty
+          // file, recorded or not, as the gate did before checkpointMode.
+          // The record is not complete enough to be the only guard there: a
+          // failed record (a hash sidecar or list write that did not land)
+          // leaves this session's own write unlisted, and a close that died
+          // between creating a new project's index.md and writing it leaves
+          // an empty file no session ever recorded. Root files and other
+          // projects' folders keep the record-only rule, since those are
+          // where another session's dirty file stopped a close for good.
+          // With no project named (a --mark without --project), whose folder
+          // it is cannot be told, so every projects/ file blocks. A log-only
+          // close names no project by design, so none does.
+          const closeSlug = opts.projectOverride || opts.attributionScope || null;
+          const inClosedProject = (f) =>
+            closeSlug
+              ? f.startsWith(`projects/${closeSlug}/`)
+              : !logOnly && f.startsWith('projects/');
           const touchedSet = new Set((touched.paths || []).map(posixPath));
           const driftedSet = new Set(
             readTouchedPathsDrifted(hypoDir, opts.sessionId).map(posixPath),
@@ -5660,6 +5689,14 @@ export function precompactGateStatus(hypoDir, opts = {}) {
                 type: 'known-session-write',
                 file: f,
                 reason: `this session's own write is still uncommitted: ${f}${ignoredHint}`,
+              });
+            } else if (inClosedProject(posixPath(f))) {
+              blockers.push({
+                type: 'git',
+                file: f,
+                reason: closeSlug
+                  ? `uncommitted file in the project folder being closed: ${f} (close 하는 프로젝트 폴더 안의 미커밋 파일은 이 세션의 쓰기 기록에 없어도 막는다. 커밋하거나 되돌려야 close 가 된다)`
+                  : `uncommitted file under projects/ and this close names no project: ${f} (close 하는 프로젝트를 알 수 없어 projects/ 아래 미커밋 파일은 쓰기 기록에 없어도 막는다. --project 로 프로젝트를 지정하거나, 커밋하거나 되돌려야 close 가 된다)`,
               });
             } else {
               notices.push({

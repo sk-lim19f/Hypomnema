@@ -4029,21 +4029,171 @@ test('checkpointMode: an invalid sessionId (not isValidSessionId shape) → chec
   });
 });
 
-test('checkpointMode: a corrupt touched-paths file → known-session-write blocker (fail closed, not demoted)', () => {
+// A corrupt touched-paths set used to block every checkpoint outright, and
+// nothing clears it, so the retry the blocker pointed at was refused the same
+// way forever. It now reads as "no record": the project folder being closed
+// still blocks (that rule never needed the record), a root file demotes to a
+// notice like any unrecorded one, and a separate notice says ownership outside
+// the folder went unjudged.
+test('checkpointMode: a corrupt touched-paths file → the closed project folder still blocks, a root file demotes, and an unjudged-ownership notice is added', () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'note.md'), '# unrecorded\n');
     mkdirSync(dirname(touchedPathsPath(dir, 'sess-checkpoint-c')), { recursive: true });
     writeFileSync(touchedPathsPath(dir, 'sess-checkpoint-c'), '{not json');
     const gate = precompactGateStatus(dir, {
       claudeHome: join(dir, '.claude-none'),
       checkpointMode: true,
       sessionId: 'sess-checkpoint-c',
+      attributionScope: 'demo',
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'git' && b.file === 'projects/demo/note.md'),
+      `the closed project folder must still block on a corrupt record: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      !(gate.blockers || []).some(
+        (b) => b.file === 'unrelated-session.md' || /touched-paths/.test(b.reason),
+      ),
+      `a corrupt record must not block by itself or on a root file: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.ok(
+      (gate.notices || []).some(
+        (n) => n.type === 'unresolved' && n.file === 'unrelated-session.md',
+      ),
+      `the root file must demote to an unresolved notice: ${JSON.stringify(gate.notices)}`,
+    );
+    assert.ok(
+      (gate.notices || []).some((n) => n.type === 'touched-paths-unreadable'),
+      `the unjudged ownership must be said in a notice: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+// A lock timeout is not a corrupt record: another writer holds the lock right
+// now, the retry reads the real set, so it keeps blocking.
+test('checkpointMode: a touched-paths lock timeout blocks (transient, unlike a corrupt record)', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
+    const tp = touchedPathsPath(dir, 'sess-checkpoint-lock');
+    mkdirSync(dirname(tp), { recursive: true });
+    // A live holder (this very process), so withFileLock waits and times out
+    // rather than stealing it.
+    writeFileSync(`${tp}.lock`, String(process.pid));
+    assert.deepEqual(readTouchedPathsStrict(dir, 'sess-checkpoint-lock'), {
+      state: 'locked',
+      paths: [],
+    });
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-lock',
     });
     assert.ok(
       (gate.blockers || []).some(
-        (b) => b.type === 'known-session-write' && b.reason === 'touched-paths unreadable',
+        (b) => b.type === 'known-session-write' && /lock timed out/.test(b.reason),
       ),
-      `a corrupt touched-paths file must fail closed: ${JSON.stringify(gate.blockers)}`,
+      `a lock timeout must block: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// The touched-paths record is not complete enough to be the only guard on the
+// project folder being closed: a record write that failed, or a close that
+// died between creating a new project's index.md and writing it, leaves a
+// dirty file there that no session recorded. That folder blocks on any dirty
+// file; root files and other projects' folders keep the record-only rule.
+test('checkpointMode: an unrecorded dirty file in the closed project folder blocks, under either scope key', () => {
+  for (const key of ['attributionScope', 'projectOverride']) {
+    withSyncedWiki((dir) => {
+      mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+      // The shape a close leaves when it dies right after openSync('wx').
+      writeFileSync(join(dir, 'projects', 'demo', 'index.md'), '');
+      const gate = precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        checkpointMode: true,
+        sessionId: 'sess-checkpoint-proj',
+        [key]: 'demo',
+      });
+      const b = (gate.blockers || []).find((x) => x.file === 'projects/demo/index.md');
+      assert.ok(
+        b && b.type === 'git' && /project folder being closed/.test(b.reason),
+        `${key}: an unrecorded dirty file in the closed project must block: ${JSON.stringify(gate.blockers)}`,
+      );
+      assert.ok(
+        !(gate.notices || []).some((n) => n.file === 'projects/demo/index.md'),
+        `${key}: it must not also demote to a notice: ${JSON.stringify(gate.notices)}`,
+      );
+    });
+  }
+});
+
+test('checkpointMode: the same unrecorded file in a DIFFERENT project folder, or at the root, is a notice', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'other', 'index.md'), '');
+    writeFileSync(join(dir, 'index.md'), "# another session's root edit\n");
+    // A folder whose name only starts with the closed slug is not that folder.
+    mkdirSync(join(dir, 'projects', 'demo-two'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo-two', 'index.md'), '');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-other',
+      attributionScope: 'demo',
+    });
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git' || b.type === 'known-session-write'),
+      `files outside the closed project folder must not block: ${JSON.stringify(gate.blockers)}`,
+    );
+    for (const f of ['projects/other/index.md', 'index.md', 'projects/demo-two/index.md']) {
+      assert.ok(
+        (gate.notices || []).some((n) => n.type === 'unresolved' && n.file === f),
+        `${f} must be an unresolved notice: ${JSON.stringify(gate.notices)}`,
+      );
+    }
+  });
+});
+
+// No project named (a --mark-session-closed without --project): whose folder a
+// projects/ file is cannot be told, so every unrecorded one blocks rather than
+// the gate failing open. A log-only close names no project by design, so none
+// does. Root files are a notice either way.
+test('checkpointMode: with no project scope every unrecorded projects/ file blocks, and a log-only close blocks none', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'any'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'any', 'note.md'), '# unrecorded\n');
+    writeFileSync(join(dir, 'root-note.md'), '# unrecorded\n');
+    const unscoped = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-noscope',
+    });
+    const b = (unscoped.blockers || []).find((x) => x.file === 'projects/any/note.md');
+    assert.ok(
+      b && b.type === 'git' && /names no project/.test(b.reason),
+      `an unscoped checkpoint must block an unrecorded projects/ file: ${JSON.stringify(unscoped.blockers)}`,
+    );
+    assert.ok(
+      (unscoped.notices || []).some((n) => n.type === 'unresolved' && n.file === 'root-note.md'),
+      `a root file stays a notice without a scope: ${JSON.stringify(unscoped.notices)}`,
+    );
+    const logOnly = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-checkpoint-logonly',
+      logOnly: true,
+    });
+    assert.ok(
+      !(logOnly.blockers || []).some((x) => x.type === 'git' || x.type === 'known-session-write'),
+      `a log-only checkpoint must not block on projects/ files: ${JSON.stringify(logOnly.blockers)}`,
+    );
+    assert.ok(
+      (logOnly.notices || []).some(
+        (n) => n.type === 'unresolved' && n.file === 'projects/any/note.md',
+      ),
+      `the projects/ file is a notice under log-only: ${JSON.stringify(logOnly.notices)}`,
     );
   });
 });
@@ -4155,6 +4305,89 @@ test("crystallize --apply-session-close and --mark-session-closed both issue a r
       JSON.stringify(res.out).includes('index.md'),
       `${mode}: the foreign dirty file must be surfaced (as an unresolved notice): ${JSON.stringify(res.out)}`,
     );
+  }
+});
+
+// The test above leaves the other session's index.md edit unstaged, which a
+// plain `git commit` never sweeps either, so it cannot tell a close that
+// commits only its own paths from one that commits everything staged. A real
+// other session's edit goes through its PostToolUse: hypo-auto-stage.mjs runs
+// `git add` on the file and records it in THAT session's touched-paths. This
+// variant does exactly that, so the other session's change is staged in the
+// shared index when this session's close commits. It must stay staged,
+// uncommitted, and still recorded for its own session.
+test("crystallize --apply-session-close and --mark-session-closed leave another session's STAGED root file out of the close commit", () => {
+  const closeWithForeignStagedIndex = (mode) => {
+    let result;
+    withWiki(
+      (dir) => writeFileSync(join(dir, 'index.md'), '# index\n'),
+      (dir, today) => {
+        const other = `s-other-stager-${mode}`;
+        appendFileSync(join(dir, 'index.md'), "\nanother session's staged edit\n");
+        const staged = runHook(
+          'hypo-auto-stage.mjs',
+          {
+            session_id: other,
+            tool_name: 'Edit',
+            tool_input: { file_path: join(dir, 'index.md') },
+          },
+          { HYPO_DIR: dir },
+        );
+        assert.equal(staged.status, 0, `auto-stage: ${staged.stderr}`);
+        assert.match(
+          gitOut(dir, 'status', '--porcelain', '--', 'index.md'),
+          /^M {2}index\.md/,
+          'fixture: the other session staged index.md',
+        );
+        assert.deepEqual(peekTouchedPaths(dir, other), ['index.md'], 'fixture: recorded for it');
+        const sid = `s-foreign-staged-${mode}`;
+        const cleanup = seedCloseTranscript(sid);
+        const flags = [`--hypo-dir=${dir}`, `--session-id=${sid}`, '--json'];
+        let payloadPath = null;
+        if (mode === 'apply') {
+          const project = join(dir, 'projects', 'test-project');
+          payloadPath = join(
+            tmpdir(),
+            `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+          );
+          writeFileSync(
+            payloadPath,
+            JSON.stringify({
+              project: 'test-project',
+              date: today,
+              sessionState: { content: readFileSync(join(project, 'session-state.md'), 'utf-8') },
+              projectHot: { content: readFileSync(join(project, 'hot.md'), 'utf-8') },
+              sessionLog: { entry: `## [${today}] foreign staged index\n` },
+              log: { entry: `## [${today}] session | test-project: foreign staged index\n` },
+            }),
+          );
+          flags.push('--apply-session-close', `--payload=${payloadPath}`);
+        } else {
+          flags.push('--mark-session-closed', '--project=test-project');
+        }
+        const r = run('crystallize.mjs', flags);
+        cleanup();
+        if (payloadPath) rmSync(payloadPath, { force: true });
+        assert.equal(r.status, 0, `${mode} must succeed: ${r.stdout}\n${r.stderr}`);
+        const receiptPath = join(dir, '.cache', 'sessions', sid, 'close-receipt.json');
+        assert.ok(existsSync(receiptPath), `${mode} must issue a receipt`);
+        result = {
+          out: JSON.parse(r.stdout),
+          indexStatus: gitOut(dir, 'status', '--porcelain', '--', 'index.md'),
+          indexCommitted: gitOut(dir, 'log', '--format=%H', '--', 'index.md').trim().split('\n')
+            .length,
+          otherTouched: peekTouchedPaths(dir, other),
+        };
+      },
+    );
+    return result;
+  };
+  for (const mode of ['apply', 'mark']) {
+    const res = closeWithForeignStagedIndex(mode);
+    assert.equal(res.out.ok, true, `${mode}: ${JSON.stringify(res.out)}`);
+    assert.match(res.indexStatus, /^M {2}index\.md/, `${mode}: index.md stays staged, uncommitted`);
+    assert.equal(res.indexCommitted, 1, `${mode}: index.md has only its baseline commit`);
+    assert.deepEqual(res.otherTouched, ['index.md'], `${mode}: still recorded for its own session`);
   }
 });
 
