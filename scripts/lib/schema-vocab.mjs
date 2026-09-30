@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { atomicWrite } from '../../hooks/atomic-write.mjs';
 
 const VOCAB_HEADER_RE = /^##\s+(?:\d+\.\s+)?Tag\s+(?:Vocabulary|Taxonomy)\s*$/m;
 const TYPE_TAXONOMY_HEADER_RE = /^##\s+(?:\d+\.\s+)?Page\s+Type\s+Taxonomy\s*$/m;
@@ -87,18 +88,27 @@ function backtickList(tags) {
 // section so a close never stalls on a vocabulary gap and the next lint sees them
 // as known (B-4). Pending lives INSIDE the "## Tag Vocabulary" H2 section because
 // parseSchemaVocab is H2-bounded — placing it elsewhere would not widen the vocab.
-// No-ops (returns []) when SCHEMA.md or the Tag Vocabulary header is absent, when
-// every tag is already in the vocabulary, or when a tag is forbidden — registering
-// a forbidden pattern is pointless (lint errors on it before the vocab check) and
-// would only pollute Pending. Idempotent: re-running with the same tags writes
-// nothing (they are already in the parsed vocabulary on the second call).
+// No-ops (`{ tags: [], content: null }`) when SCHEMA.md or the Tag Vocabulary
+// header is absent, when every tag is already in the vocabulary, or when a tag is
+// forbidden: registering a forbidden pattern is pointless (lint errors on it
+// before the vocab check) and would only pollute Pending. Idempotent: re-running
+// with the same tags writes nothing (they are already in the parsed vocabulary on
+// the second call).
+//
+// Returns `{ tags, content }`: `tags` is the same registered-tag list this
+// helper always returned, and `content` is the exact bytes just written (or
+// `null` on a no-op): a close-receipt caller needs the written version to
+// hash for its proof entry, and re-reading the file a moment later cannot
+// tell that read apart from a concurrent writer's edit landing in between.
+// Writes via `atomicWrite` (temp + rename), not a bare `writeFileSync`, so a
+// reader can never observe a half-written SCHEMA.md.
 export function appendPendingTags(hypoDir, tags) {
   const path = join(hypoDir, 'SCHEMA.md');
-  if (!existsSync(path)) return [];
+  if (!existsSync(path)) return { tags: [], content: null };
   const content = readFileSync(path, 'utf-8');
 
   const headerMatch = VOCAB_HEADER_RE.exec(content);
-  if (!headerMatch) return [];
+  if (!headerMatch) return { tags: [], content: null };
 
   const current = parseSchemaVocab(hypoDir);
   const seen = new Set();
@@ -115,7 +125,7 @@ export function appendPendingTags(hypoDir, tags) {
     seen.add(t);
     newTags.push(t);
   }
-  if (newTags.length === 0) return [];
+  if (newTags.length === 0) return { tags: [], content: null };
 
   const sectionStart = headerMatch.index + headerMatch[0].length;
   const rest = content.slice(sectionStart);
@@ -166,8 +176,9 @@ export function appendPendingTags(hypoDir, tags) {
     }
   }
 
-  writeFileSync(path, content.slice(0, sectionStart) + newSection + content.slice(sectionEnd));
-  return newTags;
+  const nextContent = content.slice(0, sectionStart) + newSection + content.slice(sectionEnd);
+  atomicWrite(path, nextContent);
+  return { tags: newTags, content: nextContent };
 }
 
 // Derive the set of valid immediate subdirectories under pages/ from the

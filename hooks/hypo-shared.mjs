@@ -26,6 +26,7 @@ import { spawnSync } from 'child_process';
 import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { atomicWrite } from './atomic-write.mjs';
+import { isValidSessionId } from './proposal-store.mjs';
 
 const HOME = homedir();
 
@@ -2224,8 +2225,9 @@ function writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId) {
  *
  * The lock is NOT reentrant, so nothing inside `writeRootHotProjectionUnlocked`
  * may take it again, and a caller that already holds it must call the
- * unlocked form instead. Today no caller holds it: hypo-session-start.mjs
- * takes it for its own `git pull` and releases before this call,
+ * unlocked form instead, as claimAndWriteRootHotProjection (below) does.
+ * hypo-session-start.mjs takes it for its own `git pull` and releases it
+ * before calling claimAndWriteRootHotProjection,
  * hypo-hot-rebuild.mjs (Stop) runs before hypo-auto-commit.mjs rather than
  * inside it, and scripts/lib/project-create.mjs holds no lock.
  *
@@ -2251,18 +2253,84 @@ export function writeRootHotProjection(hypoDir, testHooks, sessionId) {
     );
   } catch (err) {
     if (err?.code !== 'ELOCKTIMEOUT') throw err;
-    return {
-      written: false,
-      scanError: false,
-      lockTimeout: true,
-      backedUp: false,
-      backupPath: null,
-      gitignoreUpdated: false,
-      warnings: [
-        'root hot.md: 다른 세션이 저장소 잠금을 쥐고 있어 이번에는 갱신하지 않았습니다 (이전 내용을 그대로 둡니다).',
-      ],
-      content: null,
-    };
+    return rootHotLockTimeoutResult();
+  }
+}
+
+function rootHotLockTimeoutResult() {
+  return {
+    written: false,
+    scanError: false,
+    lockTimeout: true,
+    backedUp: false,
+    backupPath: null,
+    gitignoreUpdated: false,
+    warnings: [
+      'root hot.md: 다른 세션이 저장소 잠금을 쥐고 있어 이번에는 갱신하지 않았습니다 (이전 내용을 그대로 둡니다).',
+    ],
+    content: null,
+  };
+}
+
+/**
+ * SessionStart's root hot.md write: claim 'hot.md' in this session's
+ * touched-paths set and write the projection inside ONE hold of the vault
+ * lock. Lock order is vault, then per-session (the claim), the same order
+ * hypo-auto-commit.mjs takes them in.
+ *
+ * The claim used to be taken before the lock. A Stop for the same session_id
+ * (the same session run by two processes) could take the vault lock in that
+ * gap, find hot.md claimed but still clean, commit nothing, and retire the
+ * claim. The write that followed then left hot.md dirty with no claim, so the
+ * checkpoint gate read it as ownerless and let the close through. Inside the
+ * lock, a Stop either runs entirely before the claim or waits until the write
+ * has landed.
+ *
+ * Kept from the unlocked sequence: a failed claim skips the write
+ * (`claimFailed: true`, `result: null`), and a write that throws drops the
+ * claim only when this call is the one that added it, before the lock is
+ * released, then rethrows. A vault lock timeout now returns before any claim
+ * is made, so there is nothing to drop.
+ *
+ * `testHooks.afterClaim` runs right after a successful claim, still inside
+ * the lock (a no-op in production); the rest of `testHooks` goes to the
+ * writer as with writeRootHotProjection.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @param {{ afterClaim?: () => void, beforeFinalWrite?: (hotPath: string) => void, beforeBackupWrite?: (backupPath: string) => void }} [testHooks]
+ * @returns {{claimFailed: boolean, result: ReturnType<typeof writeRootHotProjection>|null}}
+ */
+export function claimAndWriteRootHotProjection(hypoDir, sessionId, testHooks) {
+  // Checked before the lock: without a session_id the claim can only fail,
+  // and a busy vault must not turn that into a lock-timeout notice instead.
+  if (!sessionId) return { claimFailed: true, result: null };
+  try {
+    return withFileLock(
+      vaultCommitLockTarget(hypoDir),
+      () => {
+        const claim = claimProjectionWrite(hypoDir, sessionId, ['hot.md']);
+        if (!claim.ok) return { claimFailed: true, result: null };
+        testHooks?.afterClaim?.();
+        try {
+          return {
+            claimFailed: false,
+            result: writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId),
+          };
+        } catch (err) {
+          // No write happened, so a claim this call added would let whatever
+          // another session or a person writes to hot.md next be committed
+          // as this session's change. An earlier invocation's claim on the
+          // same (resumed) session_id is left alone.
+          if (claim.added) clearTouchedPaths(hypoDir, sessionId, ['hot.md']);
+          throw err;
+        }
+      },
+      { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
+    );
+  } catch (err) {
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    return { claimFailed: false, result: rootHotLockTimeoutResult() };
   }
 }
 
@@ -2440,6 +2508,7 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
       dates,
       stale: [],
       missing: ['hot.md (no active project in pointer table)'],
+      sessionLogEvidence: null,
     };
   }
 
@@ -2477,6 +2546,13 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
   // order short-circuits on the small shard. When no match is found, the gap is
   // reported under the canonical daily shard for the local date (dates[0]).
   let sessionLogOk = false;
+  // The candidate that actually satisfied freshness, captured so a caller
+  // that must certify a SPECIFIC committed version (a close receipt) knows
+  // which of the (up to) four local/UTC × daily/monthly candidates is the
+  // one this check actually trusted, rather than re-deriving (and possibly
+  // picking a DIFFERENT one, since `closeFileTargetsForProject` recomputes
+  // both dates independently) which file to prove.
+  let sessionLogEvidence = null;
   for (const date of dates) {
     for (const rel of sessionLogReadCandidates(project, date)) {
       const full = join(hypoDir, rel);
@@ -2489,6 +2565,7 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
       }
       if (hasSessionLogHeading(content, date)) {
         sessionLogOk = true;
+        sessionLogEvidence = { path: rel, date };
         break;
       }
     }
@@ -2514,7 +2591,14 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
     if (content && !logFresh) stale.push('log.md');
   }
 
-  return { ok: stale.length === 0 && missing.length === 0, project, dates, stale, missing };
+  return {
+    ok: stale.length === 0 && missing.length === 0,
+    project,
+    dates,
+    stale,
+    missing,
+    sessionLogEvidence,
+  };
 }
 
 // ── global session-close gate ────────────────
@@ -3576,6 +3660,126 @@ function readTouchedPathsFile(path) {
  *   was nothing to record); false when a lock-timeout or write failure means
  *   the caller cannot assume this path is in ANY session's touched-paths set.
  */
+/**
+ * Shared read-merge-write body for accumulating touched paths, factored out
+ * so `recordTouchedPaths` and `claimProjectionWrite` cannot drift on the
+ * merge itself, only on what each reports about the outcome. Runs OUTSIDE
+ * any lock; every caller wraps it in `withFileLock(path, ...)`.
+ *
+ * A corrupt/unreadable file (`readTouchedPathsFile` returns `null`) is
+ * recovered from here, not preserved: an accumulate is additive by nature
+ * (there is nothing salvageable to merge with), so starting fresh from
+ * `incoming` is the correct best-effort behavior, unlike `clearTouchedPaths`,
+ * where the same `null` MUST NOT be treated as empty (see
+ * `readTouchedPathsFile`).
+ *
+ * @returns {{added: boolean}} whether at least one of `incoming` was NOT
+ *   already present in the set before this call, the bit a pre-write claim
+ *   needs to tell "I just claimed this" from "this was already claimed",
+ *   e.g. by an earlier SessionStart invocation in the same resumed session.
+ */
+function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor) {
+  const path = touchedPathsPath(hypoDir, sessionId);
+  const current = readTouchedPathsFile(path);
+  const merged = new Set(current === null ? [] : current);
+  let added = false;
+  for (const p of incoming) {
+    if (!merged.has(p)) added = true;
+    merged.add(p);
+  }
+  // Hashes first, the set second. A failure between the two leaves a hash
+  // for a path the set may not hold (never read: only paths in the set are
+  // looked up) or the previous hash of a path the set already held (at worst
+  // a false drift, which keeps the path out of the commit and blocks, never
+  // one that sweeps foreign bytes in).
+  const hashPath = touchedHashesPath(hypoDir, sessionId);
+  const hashes = readTouchedHashesFile(hashPath);
+  for (const p of incoming) {
+    const h = hashFor(p);
+    if (h === undefined) delete hashes[p];
+    else hashes[p] = h;
+  }
+  atomicWrite(hashPath, JSON.stringify(hashes));
+  atomicWrite(path, JSON.stringify([...merged]));
+  return { added };
+}
+
+/**
+ * Where the per-path content hashes recorded alongside a session's
+ * touched-paths set live: `{ "<vault-relative path>": "<sha256 hex>" | null }`,
+ * `null` meaning the file did not exist when it was recorded. A separate file
+ * rather than a new shape for touched-paths.json, so every reader of that
+ * array (hypo-close-guard.mjs parses it itself) keeps working unchanged, and a
+ * set written before hashes existed simply has no entry here.
+ *
+ * What the hash is for: the set records that this session wrote a path, not
+ * which bytes. When a clear after a successful commit fails, the stale claim
+ * outlives its commit, and a later edit by ANOTHER session to that same path
+ * would be swept into this session's next commit. Comparing the bytes on disk
+ * with the bytes recorded here at commit time is what tells the two apart
+ * (see commitTouchedPaths).
+ */
+export function touchedHashesPath(hypoDir, sessionId) {
+  return join(sessionCacheDir(hypoDir, sessionId), 'touched-hashes.json');
+}
+
+/** Absent, corrupt, or not an object all read as `{}`: no hash recorded for
+ * any path, which is exactly how a set from before hashes existed behaves. */
+function readTouchedHashesFile(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** sha256 of a vault file's bytes, `null` when it does not exist, `undefined`
+ * when it exists but cannot be read (nothing trustworthy to record). */
+function vaultFileHash(hypoDir, relPath) {
+  try {
+    return sha256Hex(readFileSync(join(hypoDir, relPath)));
+  } catch (err) {
+    return err?.code === 'ENOENT' ? null : undefined;
+  }
+}
+
+/** sha256 of a vault path's blob in HEAD, `null` when HEAD has no such path
+ * (or there is no HEAD to read). `./` makes git resolve the path from the
+ * vault, which may sit below the repository root. */
+function headFileHash(hypoDir, relPath) {
+  const r = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', `HEAD:./${relPath}`], {
+    timeout: 30000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return r.status === 0 && r.stdout ? sha256Hex(r.stdout) : null;
+}
+
+/** Whether a hash was recorded for `relPath` and the bytes on disk no longer
+ * match it. A path with no recorded hash never counts as drifted. */
+function recordedHashDrifted(hypoDir, hashes, relPath) {
+  return Object.hasOwn(hashes, relPath) && vaultFileHash(hypoDir, relPath) !== hashes[relPath];
+}
+
+/** Drop hash entries for paths no longer in the set. Best-effort: a leftover
+ * entry is never read (lookups are by paths in the set) and is overwritten
+ * the next time that path is recorded. */
+function pruneTouchedHashes(hypoDir, sessionId, remaining) {
+  const hashPath = touchedHashesPath(hypoDir, sessionId);
+  try {
+    if (remaining.length === 0) {
+      rmSync(hashPath, { force: true });
+      return;
+    }
+    const hashes = readTouchedHashesFile(hashPath);
+    const kept = {};
+    for (const p of remaining) if (Object.hasOwn(hashes, p)) kept[p] = hashes[p];
+    atomicWrite(hashPath, JSON.stringify(kept));
+  } catch {
+    // best-effort, see above
+  }
+}
+
 export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
   if (!sessionId) return true;
   const incoming = (Array.isArray(relPaths) ? relPaths : [relPaths]).filter(
@@ -3584,17 +3788,9 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
   if (incoming.length === 0) return true;
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
-    withFileLock(path, () => {
-      const current = readTouchedPathsFile(path);
-      // A corrupt/unreadable file (current === null) is recovered from here,
-      // not preserved: an accumulate is additive by nature (there is nothing
-      // salvageable to merge with), so starting fresh from `incoming` is the
-      // correct best-effort behavior — unlike clearTouchedPaths, where the
-      // same `null` MUST NOT be treated as empty (see readTouchedPathsFile).
-      const merged = new Set(current === null ? [] : current);
-      for (const p of incoming) merged.add(p);
-      atomicWrite(path, JSON.stringify([...merged]));
-    });
+    withFileLock(path, () =>
+      mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, (p) => vaultFileHash(hypoDir, p)),
+    );
     return true;
   } catch {
     // Never throws out to the caller (a hook must not fail a tool call over
@@ -3618,14 +3814,42 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
  * write no different from a genuine lock-timeout, just for a different
  * reason. Every other property (locking, dedup, atomic merge) is identical;
  * this only tightens the missing-session_id case to `false`.
+ *
+ * Returns `added` alongside the old boolean (now `ok`) so a caller that must
+ * later UNDO a failed write (hypo-session-start.mjs's SessionStart, on a
+ * `writeRootHotProjection` lock-timeout or thrown failure) can tell "this
+ * call is the one that put the claim there" from "the claim was already
+ * sitting in this session's touched-paths set before this call ran", the
+ * second case is a SECOND SessionStart on the same (resumed) session_id,
+ * where an earlier invocation's still-unresolved claim must survive this
+ * invocation's own failure, not be swept away by it.
+ *
  * @param {string} hypoDir
  * @param {string|null|undefined} sessionId
  * @param {string|string[]} relPaths
- * @returns {boolean}
+ * @returns {{ok: boolean, added: boolean}}
  */
 export function claimProjectionWrite(hypoDir, sessionId, relPaths) {
-  if (!sessionId) return false;
-  return recordTouchedPaths(hypoDir, sessionId, relPaths);
+  if (!sessionId) return { ok: false, added: false };
+  const incoming = (Array.isArray(relPaths) ? relPaths : [relPaths]).filter(
+    (p) => typeof p === 'string' && p.length > 0,
+  );
+  if (incoming.length === 0) return { ok: true, added: false };
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    // No hash for a projection claim: it is taken BEFORE the write, so the
+    // bytes it will cover are not known yet, and a hash refreshed after the
+    // write could itself fail and leave the claim looking drifted over this
+    // session's own write. Root hot.md's ownership is checked per session by
+    // its receipt at Stop instead (rootHotProjectionIsCurrent). Deleting the
+    // entry also drops a hash an earlier Edit of the same path left behind.
+    const { added } = withFileLock(path, () =>
+      mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, () => undefined),
+    );
+    return { ok: true, added };
+  } catch {
+    return { ok: false, added: false };
+  }
 }
 
 /**
@@ -3661,6 +3885,7 @@ export function drainTouchedPaths(hypoDir, sessionId) {
       if (result === null) return []; // corrupt/unreadable: leave the file for inspection, never delete
       try {
         rmSync(path, { force: true });
+        pruneTouchedHashes(hypoDir, sessionId, []);
       } catch {
         // best-effort
       }
@@ -3694,6 +3919,66 @@ export function peekTouchedPaths(hypoDir, sessionId) {
     return withFileLock(path, () => {
       const result = readTouchedPathsFile(path);
       return result === null ? [] : result;
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Like `peekTouchedPaths`, but does not collapse "corrupt", "lock timeout"
+ * and "empty" into the same silent `[]`. A `checkpointMode` gate treats
+ * the three differently: a lock timeout is transient (another writer holds
+ * the lock right now) and blocks so the retry reads the real set; a corrupt
+ * file stays corrupt on every retry, so the gate reads it as "no record"
+ * and says so in a notice instead of refusing forever. `peekTouchedPaths`
+ * itself is unchanged: its callers already treat its `[]` as
+ * fail-safe-to-no-scope for a best-effort commit attempt.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @returns {{state: 'ok'|'empty'|'unreadable'|'locked', paths: string[]}}
+ *   'ok': a non-empty set was read. 'empty': no session_id, or the file is
+ *   absent/genuinely empty. 'unreadable': the file exists but is corrupt, or
+ *   the lock could not be taken for a reason other than a timeout (an
+ *   unwritable directory). 'locked': the per-session lock timed out. paths
+ *   is always `[]` unless 'ok', since nothing safely known could be returned.
+ */
+export function readTouchedPathsStrict(hypoDir, sessionId) {
+  if (!sessionId) return { state: 'empty', paths: [] };
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    return withFileLock(path, () => {
+      const result = readTouchedPathsFile(path);
+      if (result === null) return { state: 'unreadable', paths: [] };
+      return result.length === 0 ? { state: 'empty', paths: [] } : { state: 'ok', paths: result };
+    });
+  } catch (err) {
+    return { state: err?.code === 'ELOCKTIMEOUT' ? 'locked' : 'unreadable', paths: [] };
+  }
+}
+
+/**
+ * The paths in a session's touched-paths set whose bytes on disk no longer
+ * match the hash recorded for them (see touchedHashesPath): another write
+ * landed after this session recorded the path, so Stop keeps it out of the
+ * auto-commit. A separate reader, not a new field on readTouchedPathsStrict,
+ * so that function's `{state, paths}` shape stays exactly what its callers
+ * compare against. Only for wording a blocker; `[]` on no session_id or a
+ * lock timeout, since readTouchedPathsStrict already decides whether to block.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @returns {string[]}
+ */
+export function readTouchedPathsDrifted(hypoDir, sessionId) {
+  if (!sessionId) return [];
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    return withFileLock(path, () => {
+      const current = readTouchedPathsFile(path) || [];
+      const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+      return current.filter((p) => recordedHashDrifted(hypoDir, hashes, p));
     });
   } catch {
     return [];
@@ -3758,6 +4043,7 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
       } else {
         atomicWrite(path, JSON.stringify(remaining));
       }
+      pruneTouchedHashes(hypoDir, sessionId, remaining);
     });
   } catch {
     // lock-timeout or unexpected error: leave the file as-is. Safe per the
@@ -3802,9 +4088,29 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
  * ever written to the corrupt file; it is left exactly as it was for a
  * human or a future recovery pass to look at.
  *
+ * A `committed: true` result clears the whole peeked scope EXCEPT
+ * `result.ignoredPaths`: the paths `commitFn` reports as still dirty but kept
+ * out of the commit by `.hypoignore`. Those stay in the touched-paths set,
+ * still blocking as a known, unresolved session write, instead of reading as
+ * "resolved" because their siblings committed. Everything else is retired,
+ * including a claim that was already clean at Stop time or that the caller
+ * deliberately left out of the scope (the root hot.md projection claim when
+ * its bytes are not this session's own): keeping those would let a path
+ * another session later edits be blocked on, or swept into, this session's
+ * next commit. A `commitFn` that reports no `ignoredPaths` (an older or
+ * test-only stand-in for `commitWikiChanges`) keeps nothing, the plain
+ * whole-scope clear.
+ *
+ * `commitFn` does not always get the whole set. A path whose bytes on disk
+ * differ from the hash recorded for it (touchedHashesPath) is left out, and
+ * is then either retired (HEAD already holds the recorded bytes, or the file
+ * is clean) or kept alongside `ignoredPaths` (another write landed after the
+ * record). The same-session case this also catches, a Bash rewrite of a
+ * path after its last Edit, is left out too: the conservative direction.
+ *
  * @param {string} hypoDir
  * @param {string|null|undefined} sessionId
- * @param {(paths: string[]) => {committed: boolean, [k: string]: unknown}} commitFn
+ * @param {(paths: string[]) => {committed: boolean, ignoredPaths?: string[], [k: string]: unknown}} commitFn
  * @returns {{committed: boolean, [k: string]: unknown}} whatever `commitFn` returned,
  *   or `{committed: false, reason: 'touched-paths-lock-timeout'}` if the lock
  *   itself could not be acquired (commitFn never ran; the file is untouched)
@@ -3822,18 +4128,55 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
         // delete it.
         return commitFn([]);
       }
-      const result = commitFn(current);
+      // Content check before the commit, for every path that has a recorded
+      // hash (see touchedHashesPath). Bytes still equal to what this session
+      // recorded go into the scope. Anything else is left out of THIS commit,
+      // because the bytes on disk are no longer the ones this session wrote:
+      //   - HEAD already holds the recorded bytes: an old claim whose commit
+      //     landed but whose clear failed. Retired, so another session's
+      //     later edit of the path is never swept in under it.
+      //   - HEAD already holds the bytes on disk: nothing is dirty. Retired.
+      //   - neither: some other write landed after this session recorded the
+      //     path. Kept, so the checkpoint gate still blocks on it and says
+      //     why (readTouchedPathsDrifted), instead of the path reading as
+      //     ownerless.
+      // A path with no recorded hash (a set from before hashes existed, a
+      // projection claim, an unreadable file) goes into the scope as before.
+      const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+      const scope = [];
+      const driftKept = [];
+      for (const p of current) {
+        if (!recordedHashDrifted(hypoDir, hashes, p)) {
+          scope.push(p);
+          continue;
+        }
+        const head = headFileHash(hypoDir, p);
+        if (head === hashes[p] || head === vaultFileHash(hypoDir, p)) continue;
+        driftKept.push(p);
+      }
+      const result = commitFn(scope);
       if (result && result.committed && current.length > 0) {
         // Still under the SAME lock acquired above: no recordTouchedPaths
         // call for this session can have landed since `current` was read
         // (it takes this exact lock too), so the set on disk right now is
-        // EXACTLY `current` — clearing it needs no re-read or set
-        // difference, just remove what we already know is the whole thing.
-        try {
-          rmSync(path, { force: true });
-        } catch {
-          // best-effort: the committed paths just linger on disk; the next
-          // Stop re-peeks them and re-runs commitFn, a clean no-op.
+        // EXACTLY `current`, the removal below needs no re-read.
+        const keep = new Set([
+          ...(Array.isArray(result.ignoredPaths) ? result.ignoredPaths : []),
+          ...driftKept,
+        ]);
+        const remaining = current.filter((p) => keep.has(p));
+        if (remaining.length < current.length) {
+          try {
+            if (remaining.length === 0) {
+              rmSync(path, { force: true });
+            } else {
+              atomicWrite(path, JSON.stringify(remaining));
+            }
+            pruneTouchedHashes(hypoDir, sessionId, remaining);
+          } catch {
+            // best-effort: the retired paths just linger on disk; the next
+            // Stop re-peeks them and re-runs commitFn, a clean no-op.
+          }
         }
       }
       return result;
@@ -3891,14 +4234,23 @@ function projectOfPath(relPath) {
  *
  * @param {string} hypoDir
  * @param {string[]} [paths] vault-relative paths this caller wrote/owns this close
- * @returns {{committed: boolean, scoped?: number, sha?: string|null, reason?: string}}
+ * @returns {{committed: boolean, scoped?: number, sha?: string|null, committedPaths?: string[], ignoredPaths?: string[], reason?: string}}
  *   committed:true when a commit was created OR nothing needed committing
  *   (scoped:0 in the latter case); committed:false (with reason) on a real
  *   failure: not a git repo, or git status/add/commit erroring. `sha` is the
  *   commit this call created, and is present ONLY on that branch: a
  *   `scoped: 0` success created no commit, so it carries no sha rather than
  *   an unrelated HEAD a caller could tell someone to revert. It is `null`
- *   when the commit succeeded but reading its hash did not.
+ *   when the commit succeeded but reading its hash did not. `committedPaths`
+ *   is present on every `committed: true` outcome, `[]` for a no-op, and
+ *   names exactly the paths THIS call actually staged into the commit (the
+ *   rename-collapsed destination set `git diff --cached --name-only` itself
+ *   reports). `ignoredPaths` (also on every `committed: true` outcome) names
+ *   the supplied paths that ARE dirty but were kept out of the commit only
+ *   because `.hypoignore` matches them, so a caller clearing a per-session
+ *   pending-write set (Stop's `commitTouchedPaths`) can keep exactly those as
+ *   unresolved. A stale or already-clean supplied path is never listed:
+ *   nothing about it is left unresolved.
  */
 export function commitWikiChanges(hypoDir, paths) {
   const git = (...args) =>
@@ -3909,7 +4261,8 @@ export function commitWikiChanges(hypoDir, paths) {
   const supplied = new Set(
     (Array.isArray(paths) ? paths : []).filter((p) => typeof p === 'string' && p.length > 0),
   );
-  if (supplied.size === 0) return { committed: true, scoped: 0 };
+  if (supplied.size === 0)
+    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths: [] };
 
   // `-z`: NUL-separated records with verbatim paths — no surrounding quotes and
   // no octal escaping, so non-ASCII paths (Korean page names are normal input
@@ -3919,17 +4272,31 @@ export function commitWikiChanges(hypoDir, paths) {
   const porcelain = git('status', '--porcelain', '-uall', '-z');
   if (porcelain.status !== 0)
     return { committed: false, reason: `git status failed in ${hypoDir}` };
+  // porcelain paths are repository-root relative, while `supplied` and every
+  // pathspec below are vault relative (git resolves pathspecs against -C). A
+  // vault nested inside a larger repository therefore needs its prefix
+  // stripped before matching, the same rule gitDirtyFiles uses; a record
+  // outside the vault is out of scope.
+  const prefixRes = git('rev-parse', '--show-prefix');
+  if (prefixRes.status !== 0)
+    return { committed: false, reason: `git rev-parse --show-prefix failed in ${hypoDir}` };
+  const prefix = (prefixRes.stdout || '').replace(/\n$/, '');
+  const toVaultRelative = (f) => {
+    if (!f || !prefix) return f || null;
+    return f.startsWith(prefix) ? f.slice(prefix.length) : null;
+  };
   // `.hypoignore` is the project privacy boundary. `git add -A` ignores it, so
   // enumerate changed paths, drop ignored ones, then stage explicitly.
   const ignorePatterns = loadHypoIgnore(hypoDir);
   const scoped = []; // pathspec for `git add -A` — worktree/index paths only
   const commitScope = []; // pathspec for the final diff/commit --only (superset)
+  const ignoredPaths = []; // supplied, dirty, but excluded by .hypoignore
   const records = (porcelain.stdout || '').split('\0');
   for (let i = 0; i < records.length; i++) {
     const rec = records[i];
     if (!rec) continue;
     const xy = rec.slice(0, 2);
-    const file = rec.slice(3); // `XY <path>`; the destination path for a rename/copy
+    const file = toVaultRelative(rec.slice(3)); // `XY <path>`; the destination for a rename/copy
     const isRename = xy[0] === 'R' || xy[1] === 'R';
     // A rename OR copy emits two records (`to\0from`); consume the trailing
     // `from`. Copy `C` records only appear under `status.renames=copies`, but
@@ -3938,12 +4305,14 @@ export function commitWikiChanges(hypoDir, paths) {
     let fromFile = null;
     if (isRename || xy[0] === 'C' || xy[1] === 'C') {
       i++;
-      fromFile = records[i] || null;
+      fromFile = toVaultRelative(records[i] || null);
     }
     if (!file) continue;
     if (!supplied.has(file)) continue; // out of this caller's scope
-    if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns))
+    if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns)) {
+      ignoredPaths.push(file);
       continue;
+    }
     scoped.push(file);
     commitScope.push(file);
     // A rename's `from` path is the SAME change as its destination — without
@@ -3957,7 +4326,8 @@ export function commitWikiChanges(hypoDir, paths) {
     // in at all: the caller must name it explicitly if it wants it in scope.
     if (isRename && fromFile) commitScope.push(fromFile);
   }
-  if (scoped.length === 0 && commitScope.length === 0) return { committed: true, scoped: 0 };
+  if (scoped.length === 0 && commitScope.length === 0)
+    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
 
   if (scoped.length > 0) {
     const add = git('add', '-A', '--', ...scoped);
@@ -3972,9 +4342,11 @@ export function commitWikiChanges(hypoDir, paths) {
   // pathspec (commitScope, the rename-aware superset of `scoped`) — this step
   // must not widen back to whole-tree either, or another session's already-
   // staged file would slip into the commit here.
-  const staged = git('diff', '--cached', '--name-only', '-z', '--', ...commitScope);
+  // `--relative`: name the staged paths from the vault, like everything above.
+  const staged = git('diff', '--cached', '--name-only', '--relative', '-z', '--', ...commitScope);
   const stagedFiles = (staged.stdout || '').split('\0').filter(Boolean);
-  if (stagedFiles.length === 0) return { committed: true, scoped: 0 };
+  if (stagedFiles.length === 0)
+    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
 
   const projects = new Set(stagedFiles.map(projectOfPath));
   const today = new Date().toISOString().slice(0, 10);
@@ -4010,7 +4382,13 @@ export function commitWikiChanges(hypoDir, paths) {
   // commit itself did succeed, so this must not turn into `committed: false`.
   const head = git('rev-parse', 'HEAD');
   const sha = head.status === 0 ? (head.stdout || '').trim() || null : null;
-  return { committed: true, scoped: stagedFiles.length, sha };
+  return {
+    committed: true,
+    scoped: stagedFiles.length,
+    sha,
+    committedPaths: stagedFiles,
+    ignoredPaths,
+  };
 }
 
 /**
@@ -4523,6 +4901,14 @@ export function normalizeVerifiedScope(verifiedScope) {
  *   `hostTagWarning` is optional and, when present, is persisted as
  *   `host_tag_warning` (see the payload below): the close-time residual a
  *   reader of this file after the fact would otherwise have no record of.
+ *   `receiptGeneration`: when a caller wrote a close
+ *   receipt (`hooks/close-receipt.mjs`) for this session BEFORE calling this
+ *   function, it passes that receipt's `generation` here. A new Stop keys its
+ *   `legacy-closed` acceptance on this field's ABSENCE: a marker written by
+ *   an old build (or a caller that skipped the receipt) has no generation and
+ *   is accepted as a weaker, time-limited proof; a marker that carries one
+ *   promises a receipt exists, and Stop refuses to trust the marker alone
+ *   when that receipt is missing, invalid, or unreachable.
  */
 export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
   if (!sessionId) return false;
@@ -4567,6 +4953,10 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
       // after the fact can then see the same residual the close-time console
       // output already warned about once.
       ...(info.hostTagWarning ? { host_tag_warning: info.hostTagWarning } : {}),
+      // Omit-when-absent, same contract as the two fields above: a marker
+      // written with no receipt behind it (or by a caller that predates the
+      // receipt writer) must read back exactly as it always has.
+      ...(info.receiptGeneration ? { receipt_generation: info.receiptGeneration } : {}),
     };
     // Atomic, and it reports. Two reasons, and the caller needs both.
     //
@@ -5109,7 +5499,7 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * cwd yields a best-effort notice, not a block. apply never passes it (its launch
  * cwd may differ from the authoritative payload.project).
  *
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, logOnly?: boolean, closeScope?: string[]}} [opts]
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[]}} [opts]
  * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
@@ -5128,7 +5518,20 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   // below. Exempting only the close blocker would still let an unrelated project's
   // stale design-history / lint block the non-project session (codex design
   // BLOCKER). git / hot / lint(self) / feedback all still apply — not a bypass.
-  const marker = opts.sessionId ? readSessionClosedMarker(hypoDir, opts.sessionId) : null;
+  // opts.closeMarker, when the key is set, is the marker the caller already
+  // judged with closeCheckpointState (hooks/close-receipt.mjs): the marker of a
+  // finished close, or null when the close is broken or open. Stop, PreCompact
+  // and --check-session-close pass it, so a marker whose receipt is missing or
+  // invalid never sets log-only mode or attribution here. It is injected rather
+  // than computed because close-receipt.mjs imports this module. Without it the
+  // raw marker is read as before (the apply paths, which invalidate this
+  // session's marker before they reach this gate).
+  const marker =
+    opts.closeMarker !== undefined
+      ? opts.closeMarker
+      : opts.sessionId
+        ? readSessionClosedMarker(hypoDir, opts.sessionId)
+        : null;
   const logOnly = opts.logOnly === true || marker?.scope === 'log-only';
 
   // Paths this session is accountable for at THIS close: the same signals the
@@ -5206,7 +5609,112 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   //    a committed-but-unpushed close marks AND compacts, instead of the close writer
   //    committing its own payload and then being blocked by its own (unpushed) commit.
   const git = hypoIsClean(hypoDir);
-  if (git.uncommitted) {
+  // checkpointMode: a marker-writing
+  // path's own gate call, replacing the whole git axis above with a narrower
+  // question: "is there an uncommitted write THIS session is known to still
+  // own, or any uncommitted file in the project folder being closed".
+  // Everything else (close files, cwd, hot structure, lint, W8,
+  // feedback) is untouched below; Stop, PreCompact and check never set this.
+  if (opts.checkpointMode) {
+    if (!isValidSessionId(opts.sessionId)) {
+      blockers.push({
+        type: 'checkpoint-session',
+        reason: 'checkpointMode requires a validated sessionId',
+      });
+    } else if (git.uncommitted) {
+      const dirty = gitDirtyFiles(hypoDir);
+      if (dirty.length === 0) {
+        // Enumeration itself failed (or nothing is actually dirty despite the
+        // porcelain status): fail closed exactly like the unscoped path below.
+        blockers.push({ type: 'git', reason: git.reason });
+      } else {
+        const touched = readTouchedPathsStrict(hypoDir, opts.sessionId);
+        if (touched.state === 'locked') {
+          // Another writer holds this session's touched-paths lock right now
+          // (usually this session's own Stop auto-commit). Transient, so
+          // block: the retry reads the real set instead of guessing.
+          blockers.push({
+            type: 'known-session-write',
+            reason: 'touched-paths lock timed out (다른 쓰기가 끝난 뒤 다시 시도하면 된다)',
+          });
+        } else {
+          // A corrupt set reads as "no record". It would read the same on
+          // every retry, and nothing clears it, so blocking on it refused
+          // every close for good. The project folder rule below does not
+          // depend on the record, so that folder stays protected; only the
+          // ownership of files outside it goes unjudged, and the notice
+          // says so.
+          if (touched.state === 'unreadable') {
+            notices.push({
+              type: 'touched-paths-unreadable',
+              reason:
+                'touched-paths unreadable: ownership of dirty files outside the project folder being closed was not judged (touched-paths 기록을 읽지 못해 프로젝트 폴더 밖 파일의 소유를 판정하지 못했다)',
+            });
+          }
+          // The project folder this close is closing blocks on any dirty
+          // file, recorded or not, as the gate did before checkpointMode.
+          // The record is not complete enough to be the only guard there: a
+          // failed record (a hash sidecar or list write that did not land)
+          // leaves this session's own write unlisted, and a close that died
+          // between creating a new project's index.md and writing it leaves
+          // an empty file no session ever recorded. Root files and other
+          // projects' folders keep the record-only rule, since those are
+          // where another session's dirty file stopped a close for good.
+          // With no project named (a --mark without --project), whose folder
+          // it is cannot be told, so every projects/ file blocks. A log-only
+          // close names no project by design, so none does.
+          const closeSlug = opts.projectOverride || opts.attributionScope || null;
+          const inClosedProject = (f) =>
+            closeSlug
+              ? f.startsWith(`projects/${closeSlug}/`)
+              : !logOnly && f.startsWith('projects/');
+          const touchedSet = new Set((touched.paths || []).map(posixPath));
+          const driftedSet = new Set(
+            readTouchedPathsDrifted(hypoDir, opts.sessionId).map(posixPath),
+          );
+          const ignorePatterns = loadHypoIgnore(hypoDir);
+          for (const f of dirty) {
+            if (touchedSet.has(posixPath(f))) {
+              // A touched file .hypoignore keeps out of every commit stays
+              // dirty forever on its own: say how to get out. A file whose
+              // bytes changed after this session recorded it is kept out of
+              // the auto-commit (commitTouchedPaths), so say that too.
+              const ignoredHint =
+                ignorePatterns.length > 0 && isIgnored(join(hypoDir, f), hypoDir, ignorePatterns)
+                  ? ' (.hypoignore 대상이라 자동 커밋되지 않는다. 손으로 커밋하거나 .hypoignore 에서 빼야 close 가 된다)'
+                  : driftedSet.has(posixPath(f))
+                    ? ' (이 세션이 기록한 뒤 다른 쓰기가 이 파일을 바꿔서 자동 커밋에서 빠진다. 지금 내용이 맞는지 확인하고 손으로 커밋해야 close 가 된다)'
+                    : '';
+              blockers.push({
+                type: 'known-session-write',
+                file: f,
+                reason: `this session's own write is still uncommitted: ${f}${ignoredHint}`,
+              });
+            } else if (inClosedProject(posixPath(f))) {
+              blockers.push({
+                type: 'git',
+                file: f,
+                reason: closeSlug
+                  ? `uncommitted file in the project folder being closed: ${f} (close 하는 프로젝트 폴더 안의 미커밋 파일은 이 세션의 쓰기 기록에 없어도 막는다. 커밋하거나 되돌려야 close 가 된다)`
+                  : `uncommitted file under projects/ and this close names no project: ${f} (close 하는 프로젝트를 알 수 없어 projects/ 아래 미커밋 파일은 쓰기 기록에 없어도 막는다. --project 로 프로젝트를 지정하거나, 커밋하거나 되돌려야 close 가 된다)`,
+              });
+            } else {
+              notices.push({
+                type: 'unresolved',
+                file: f,
+                reason: `uncommitted changes, ownership unknown: ${f}`,
+              });
+            }
+          }
+        }
+      }
+    } else if (git.ahead) {
+      notices.push({
+        type: 'git-sync',
+        reason: `unpushed commits in ${hypoDir} (push deferred to Stop hook)`,
+      });
+    }
+  } else if (git.uncommitted) {
     const dirty = gitDirtyFiles(hypoDir);
     if (dirty.length === 0) {
       // Enumeration itself failed (or nothing is actually dirty despite the

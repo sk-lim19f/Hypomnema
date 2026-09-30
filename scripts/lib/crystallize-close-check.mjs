@@ -3,10 +3,10 @@ import { dirname, join } from 'path';
 import {
   precompactGateStatus,
   resolveTranscriptBySessionId,
-  readSessionClosedMarker,
   sessionLogShardPath,
 } from '../../hooks/hypo-shared.mjs';
 import { requireProjectDir, deriveTouchedProject } from './crystallize-close-gate.mjs';
+import { closeCheckpointState, isCloseComplete } from '../../hooks/close-receipt.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
 // commands as `node <SELF_SCRIPT> ...` rather than a bare `crystallize` bin,
@@ -53,7 +53,16 @@ export function runSessionCloseCheck(args) {
     args.transcriptPath ||
     (args.sessionId ? resolveTranscriptBySessionId(args.sessionId) : null) ||
     null;
+  // This session's close verdict, the same closeCheckpointState Stop blocks on.
+  // Read first, and only once: readSessionClosedMarker (inside it) unlinks an
+  // expired or corrupt marker as it reads, exactly as the next Stop would.
+  const checkpoint = args.sessionId ? closeCheckpointState(args.hypoDir, args.sessionId) : null;
+  const closeComplete = isCloseComplete(checkpoint);
+  // The gate takes the marker only from a finished close, so a marker whose
+  // receipt is missing or invalid cannot switch it into log-only mode.
+  const gateMarker = checkpoint ? { closeMarker: closeComplete ? checkpoint.marker : null } : {};
   let status = precompactGateStatus(args.hypoDir, {
+    ...gateMarker,
     ...(args.project
       ? { projectOverride: args.project }
       : checkTranscript
@@ -85,6 +94,7 @@ export function runSessionCloseCheck(args) {
     inferredProject = deriveTouchedProject(args.hypoDir, checkTranscript);
     if (inferredProject) {
       status = precompactGateStatus(args.hypoDir, {
+        ...gateMarker,
         projectOverride: inferredProject,
         ...(args.sessionId ? { sessionId: args.sessionId } : {}),
       });
@@ -93,20 +103,20 @@ export function runSessionCloseCheck(args) {
   const close = status.close;
   const scopedProject = args.project || inferredProject;
 
-  // When a --session-id is supplied, report whether THIS session's
-  // per-session marker (the Stop-chain completion signal) exists. This is a
-  // separate field, NOT folded into `ok`: `ok` stays the compact-
-  // readiness verdict. A green gate with marker_present=false is exactly the
-  // hand-edit close state: close is compact-ready but the Stop hook will
-  // still block until the marker is written.
-  //
-  // Use the SAME reader the Stop hook gates on (readSessionClosedMarker), not
-  // raw file existence: a stale/corrupt marker file exists on disk but the hook
-  // rejects (and unlinks) it, so raw existsSync would report marker_present=true
-  // while /compact's Stop still blocks — the exact incoherence this ADR closes
-  // (codex pre-commit CONCERN). readSessionClosedMarker unlinks an invalid
-  // marker as it reads, matching the hook's behavior on the next Stop.
-  const markerObj = args.sessionId ? readSessionClosedMarker(args.hypoDir, args.sessionId) : null;
+  // When a --session-id is supplied, report THIS session's close verdict. Two
+  // separate fields, neither folded into `ok` (`ok` stays the compact-readiness
+  // verdict):
+  //   close_state     closeCheckpointState's state, the one Stop blocks on.
+  //                   Only 'closed' and 'legacy-closed' are a finished close;
+  //                   'broken' means receipt and marker disagree.
+  //   marker_present  kept byte-for-byte for existing readers: whether a
+  //                   non-expired marker file exists, as readSessionClosedMarker
+  //                   reads it. It does NOT mean the close is finished (a marker
+  //                   whose receipt is gone still counts here); read close_state
+  //                   for that.
+  // A green gate with an unfinished close_state is the hand-edit close state:
+  // compact-ready, but the Stop hook still blocks until the close is recorded.
+  const markerObj = checkpoint ? checkpoint.marker : null;
   const markerPresent = args.sessionId ? markerObj !== null : null;
 
   // Scope of this check (codex design review finding 2 — the scope must be
@@ -116,7 +126,8 @@ export function runSessionCloseCheck(args) {
   // log-only marker governs the session, the gate runs in log-only mode and the
   // --project override is IGNORED — surface that rather than implying X was
   // checked (it was not).
-  const logOnlyWon = scopedProject != null && markerObj?.scope === 'log-only';
+  const logOnlyWon =
+    scopedProject != null && closeComplete && checkpoint.marker?.scope === 'log-only';
   const scope = scopedProject ? (logOnlyWon ? 'log-only' : 'project') : 'global';
 
   if (args.json) {
@@ -150,7 +161,14 @@ export function runSessionCloseCheck(args) {
                 ...(logOnlyWon ? { project_override_ignored: true } : {}),
               }
             : {}),
-          ...(args.sessionId ? { session_id: args.sessionId, marker_present: markerPresent } : {}),
+          ...(args.sessionId
+            ? {
+                session_id: args.sessionId,
+                marker_present: markerPresent,
+                close_state: checkpoint.state,
+                ...(checkpoint.reason ? { close_state_reason: checkpoint.reason } : {}),
+              }
+            : {}),
         },
         null,
         2,
@@ -207,14 +225,17 @@ export function runSessionCloseCheck(args) {
     console.log('');
     for (const n of status.notices) console.log(`  · ${n.reason}`);
   }
-  // Surface the per-session marker state (separate from compact-
-  // readiness) so a green-but-unmarked close is visible at verify time.
+  // Surface the per-session close verdict (separate from compact-
+  // readiness) so a green-but-unrecorded close is visible at verify time.
   if (args.sessionId) {
+    const markCmd = `node "${SELF_SCRIPT}" --mark-session-closed --session-id=${args.sessionId}${args.transcriptPath ? ` --transcript-path="${args.transcriptPath}"` : ''}`;
     console.log('');
     console.log(
-      markerPresent
-        ? `  ✓ session-closed marker present (session_id: ${args.sessionId}).`
-        : `  · session-closed marker absent (session_id: ${args.sessionId}) — the Stop hook will block until it is written. Run \`node "${SELF_SCRIPT}" --mark-session-closed --session-id=${args.sessionId}${args.transcriptPath ? ` --transcript-path="${args.transcriptPath}"` : ''}\`.`,
+      closeComplete
+        ? `  ✓ session close recorded (${checkpoint.state}, session_id: ${args.sessionId}).`
+        : checkpoint.state === 'broken'
+          ? `  · session close checkpoint broken (session_id: ${args.sessionId}): ${checkpoint.reason}. The Stop hook will block until the close is recorded again. Run \`${markCmd}\`.`
+          : `  · session-closed marker absent (session_id: ${args.sessionId}): the Stop hook will block until it is written. Run \`${markCmd}\`.`,
     );
   }
   console.log('');

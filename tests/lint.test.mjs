@@ -896,20 +896,32 @@ test('B-4: appendPendingTags round-trips into parseSchemaVocab and is idempotent
     writeFileSync(join(dir, 'SCHEMA.md'), VOCAB_SCHEMA);
     assert.ok(!parseSchemaVocab(dir).has('new-tag-a'), 'precondition: tag absent');
     const added = appendPendingTags(dir, ['new-tag-a', 'new-tag-b']);
-    assert.deepEqual([...added].sort(), ['new-tag-a', 'new-tag-b']);
+    assert.deepEqual([...added.tags].sort(), ['new-tag-a', 'new-tag-b']);
+    assert.ok(
+      added.content && added.content.includes('new-tag-a'),
+      'written content must carry the new tag',
+    );
     const vocab = parseSchemaVocab(dir);
     assert.ok(vocab.has('new-tag-a') && vocab.has('new-tag-b'), 'pending tags not in vocab');
     assert.ok(vocab.has('wiki') && vocab.has('concept'), 'existing vocab clobbered');
     // idempotent: a second register of the same tags writes nothing new
-    assert.equal(appendPendingTags(dir, ['new-tag-a', 'new-tag-b']).length, 0, 'not idempotent');
+    assert.equal(
+      appendPendingTags(dir, ['new-tag-a', 'new-tag-b']).tags.length,
+      0,
+      'not idempotent',
+    );
     // forbidden patterns are filtered out (registering them is pointless)
-    assert.equal(appendPendingTags(dir, ['BadTag']).length, 0, 'forbidden tag registered');
+    assert.equal(appendPendingTags(dir, ['BadTag']).tags.length, 0, 'forbidden tag registered');
     assert.ok(!parseSchemaVocab(dir).has('BadTag'), 'forbidden tag leaked into vocab');
     // edge tags (codex stage-2): a `"` is non-forbidden and must round-trip; a
     // backtick can't be serialized and is skipped WITHOUT corrupting siblings.
-    assert.deepEqual(appendPendingTags(dir, ['has"quote']), ['has"quote']);
+    assert.deepEqual(appendPendingTags(dir, ['has"quote']).tags, ['has"quote']);
     assert.ok(parseSchemaVocab(dir).has('has"quote'), 'quote tag did not round-trip');
-    assert.equal(appendPendingTags(dir, ['bad`tick']).length, 0, 'backtick tag must be skipped');
+    assert.equal(
+      appendPendingTags(dir, ['bad`tick']).tags.length,
+      0,
+      'backtick tag must be skipped',
+    );
     assert.ok(!parseSchemaVocab(dir).has('bad`tick'), 'backtick tag leaked into vocab');
     assert.ok(parseSchemaVocab(dir).has('new-tag-a'), 'sibling tag lost after edge-case calls');
     // no-op when SCHEMA.md has no Tag Vocabulary header
@@ -918,7 +930,11 @@ test('B-4: appendPendingTags round-trips into parseSchemaVocab and is idempotent
       join(dir2, 'SCHEMA.md'),
       '---\ntitle: S\ntype: schema\n---\n# Schema\n\n## 1. Other\n',
     );
-    assert.equal(appendPendingTags(dir2, ['x']).length, 0, 'must no-op without a vocab header');
+    assert.equal(
+      appendPendingTags(dir2, ['x']).tags.length,
+      0,
+      'must no-op without a vocab header',
+    );
     rmSync(dir2, { recursive: true, force: true });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -937,7 +953,7 @@ test('B-4: appendPendingTags fills a pre-existing empty Pending block (template 
         '**Meta**: `wiki`\n\n### Pending (auto-registered)\n\nAuto-registered tags land here.\n\n' +
         '### Forbidden patterns\n\n| Pattern | Reason |\n|---|---|\n| PascalCase (`Jenkins`) | x |\n\n## 5. Next\n',
     );
-    assert.deepEqual(appendPendingTags(dir, ['fresh-tag']), ['fresh-tag']);
+    assert.deepEqual(appendPendingTags(dir, ['fresh-tag']).tags, ['fresh-tag']);
     const vocab = parseSchemaVocab(dir);
     assert.ok(vocab.has('fresh-tag'), 'tag not added to empty Pending block');
     assert.ok(vocab.has('wiki'), 'existing vocab lost');
@@ -997,6 +1013,50 @@ test('B-4: apply-session-close auto-registers a preflight unknown tag; re-lint c
       assert.ok(
         !lout.warns.some((w) => /Unknown tag: "weird"tag"/.test(w.message)),
         `re-lint still warns on the quote tag: ${lr.stdout}`,
+      );
+    },
+  );
+});
+
+// design.md v3 §D / test row a: the mirror of the test above, with ONE
+// difference, SCHEMA.md is dirty (uncommitted) against HEAD before the
+// close runs. registerPendingTagsLocked must defer registration entirely
+// rather than layer a new write onto bytes it cannot attribute.
+test('B-4: apply-session-close defers a preflight unknown tag when SCHEMA.md is already dirty', () => {
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'SCHEMA.md'),
+        '---\ntitle: SCHEMA\ntype: schema\n---\n# Schema\n\n## 4. Tag Vocabulary\n\n' +
+          '**Meta**: `wiki`, `concept`\n\n## 5. Next\n',
+      );
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(
+        join(dir, 'pages', 'note3.md'),
+        '---\ntitle: N3\ntype: concept\nupdated: 2026-06-27\ntags: [dirty-schema-tag]\n---\nbody\n',
+      );
+    },
+    (dir, today) => {
+      assert.ok(!parseSchemaVocab(dir).has('dirty-schema-tag'), 'precondition: tag unknown');
+      // Dirty AFTER the fixture's own commit, from a source outside this
+      // close (a hand edit, or another session), not a prior attempt of
+      // this same close.
+      writeFileSync(
+        join(dir, 'SCHEMA.md'),
+        readFileSync(join(dir, 'SCHEMA.md'), 'utf-8') + '\n<!-- unrelated dirty edit -->\n',
+      );
+      const r = runApply(dir, payloadForCleanWiki(dir, today));
+      assert.equal(r.status, 0, `apply must not stall on the vocab gap: ${r.stdout}\n${r.stderr}`);
+      assert.ok(
+        !parseSchemaVocab(dir).has('dirty-schema-tag'),
+        'a dirty SCHEMA.md must not be registered into (this close never wrote the tag)',
+      );
+      const status = spawnSync('git', ['-C', dir, 'status', '--porcelain', '--', 'SCHEMA.md'], {
+        encoding: 'utf-8',
+      });
+      assert.ok(
+        (status.stdout || '').trim() !== '',
+        'the unrelated dirty edit must still sit uncommitted, untouched by this close',
       );
     },
   );

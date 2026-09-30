@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { recordGateClosed, resolutionStamp } from '../hooks/close-gate-store.mjs';
 import { gitDirtyFiles, hypoIsClean } from '../hooks/hypo-shared.mjs';
+import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 import {
   HOME,
   HOOKS,
@@ -151,6 +152,53 @@ test('freshness: when NEITHER daily nor monthly carries today, the gap is report
       reported.length === 1 && /\/\d{4}-\d{2}-\d{2}\.md$/.test(reported[0]),
       `gap must be reported as the daily shard, got: ${JSON.stringify(reported)}`,
     );
+  });
+});
+
+// design.md v5 §2 / ISSUE-171: a `--mark-session-closed` certification must
+// prove the SAME file/date freshness itself trusted, not re-derive a
+// possibly-DIFFERENT candidate (local vs. UTC, daily vs. monthly). These pin
+// which candidate `sessionLogEvidence` reports for each of the three
+// freshness fixtures directly above, and that it is null when not ok.
+test('sessionCloseFileStatus: sessionLogEvidence names the daily shard when that is what satisfied freshness', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    rmSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`));
+    writeFileSync(
+      join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
+      `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] daily-shard session\n`,
+    );
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    assert.deepEqual(st.sessionLogEvidence, {
+      path: join('projects', 'test-project', 'session-log', `${today}.md`),
+      date: today,
+    });
+  });
+});
+
+test('sessionCloseFileStatus: sessionLogEvidence names the legacy monthly file when the daily shard does not exist', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today); // seeds the monthly file only
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    assert.deepEqual(st.sessionLogEvidence, {
+      path: join('projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+      date: today,
+    });
+  });
+});
+
+test('sessionCloseFileStatus: sessionLogEvidence is null when nothing satisfies freshness', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    writeFileSync(
+      join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n`,
+    );
+    const st = sessionCloseFileStatus(dir, { projectOverride: 'test-project' });
+    assert.equal(st.sessionLogEvidence, null);
   });
 });
 
@@ -947,6 +995,42 @@ test('no close intent → systemMessage does NOT include close-intent note', () 
     !out.systemMessage.includes('Close intent'),
     'systemMessage should not mention close intent when absent',
   );
+});
+
+// PreCompact scopes its gate by this session's close marker only when the
+// shared close verdict calls that close finished. A log-only marker whose
+// receipt was never filed is broken, so the gate must stay in project mode and
+// still report the project's missing close file. Without the injected verdict
+// the raw marker read would switch to log-only and drop that line.
+test('a log-only marker whose receipt is missing does not switch PreCompact to log-only', () => {
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-s-pc-broken.marker'),
+      JSON.stringify({
+        session_id: 's-pc-broken',
+        project: null,
+        scope: 'log-only',
+        transcript_path: null,
+        closed_at: new Date().toISOString(),
+        verification: 'log-only-close:ok',
+        receipt_generation: 'gen-never-filed',
+      }) + '\n',
+    );
+    rmSync(join(dir, 'projects', 'test-project', 'session-state.md'), { force: true });
+    const r = runHook(
+      'hypo-personal-check.mjs',
+      { session_id: 's-pc-broken', cwd: dir },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, r.stdout);
+    assert.match(
+      out.systemMessage || '',
+      /projects\/test-project\/session-state\.md \(missing\)/,
+      `a broken log-only marker must not hide the project's close files: ${r.stdout}`,
+    );
+  });
 });
 
 suite('hypo-personal-check.mjs — contract');
@@ -2109,6 +2193,198 @@ test('a failed apply leaves no close-gate resolution behind', () => {
 
     const gatePath = join(wiki, '.cache', 'close-gate', `${sessionId}.json`);
     assert.equal(existsSync(gatePath), false, 'a failed apply must leave no resolution file');
+  });
+});
+
+// design.md v2 §D retry restage: a first attempt registers an unknown tag
+// into SCHEMA.md's Pending block and then fails to commit (same pre-commit
+// hook technique as the vault-commit-failure test above), leaving SCHEMA.md
+// dirty with a real, unfinished side effect. The retry must recognize its
+// OWN write (byte-for-byte, via the close-intent `sideEffects` record) and
+// restage it into this attempt's commit and proof, rather than treat it as
+// unexplained drift forever.
+test('a SCHEMA.md pending-tag registration a failed commit left behind is restaged by the retry (design.md v2 §D)', () => {
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'SCHEMA.md'),
+        '---\ntitle: SCHEMA\ntype: schema\n---\n# Schema\n\n## 4. Tag Vocabulary\n\n' +
+          '**Meta**: `wiki`, `concept`\n\n## 5. Next\n',
+      );
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(
+        join(dir, 'pages', 'note.md'),
+        '---\ntitle: N\ntype: concept\nupdated: 2026-06-27\ntags: [brand-new-tag]\n---\nbody\n',
+      );
+    },
+    (dir, today) => {
+      assert.ok(!parseSchemaVocab(dir).has('brand-new-tag'), 'precondition: tag unknown');
+
+      const hooksDir = join(dir, '.git', 'hooks');
+      mkdirSync(hooksDir, { recursive: true });
+      const hookPath = join(hooksDir, 'pre-commit');
+      writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+      chmodSync(hookPath, 0o755);
+
+      const sessionId = 's-schema-sideeffect-retry';
+      const payload = payloadForCleanWiki(dir, today);
+      const cleanup = seedCloseTranscript(sessionId);
+      const r1 = runApply(dir, payload, { sessionId });
+      cleanup();
+      const out1 = JSON.parse(r1.stdout);
+      assert.equal(
+        out1.ok,
+        true,
+        `attempt 1 must still report ok (only the marker/commit is withheld): ${r1.stdout}\n${r1.stderr}`,
+      );
+      assert.ok(
+        /^commit-failed:/.test(out1.markerSkipReason || ''),
+        `expected a commit-failed skip on attempt 1: ${JSON.stringify(out1.markerSkipReason)}`,
+      );
+      assert.ok(
+        parseSchemaVocab(dir).has('brand-new-tag'),
+        'attempt 1 must still have registered the tag on disk, just uncommitted',
+      );
+      const dirtyBefore = gitDirtyFiles(dir);
+      assert.ok(
+        dirtyBefore.includes('SCHEMA.md'),
+        `SCHEMA.md must be left dirty after the blocked commit: ${JSON.stringify(dirtyBefore)}`,
+      );
+
+      rmSync(hookPath);
+      const cleanup2 = seedCloseTranscript(sessionId);
+      const r2 = runApply(dir, payload, { sessionId });
+      cleanup2();
+      const out2 = JSON.parse(r2.stdout);
+      assert.equal(out2.ok, true, `retry must succeed: ${r2.stdout}\n${r2.stderr}`);
+      assert.equal(out2.markerWritten, true, 'retry must land the marker');
+      assert.equal(gitDirtyFiles(dir).includes('SCHEMA.md'), false, 'SCHEMA.md must be committed');
+
+      const receiptPath = join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json');
+      const receipt = JSON.parse(readFileSync(receiptPath, 'utf-8'));
+      const schemaEntry = (receipt.entries || []).find((e) => e.path === 'SCHEMA.md');
+      assert.ok(
+        schemaEntry,
+        `receipt must prove SCHEMA.md was committed: ${JSON.stringify(receipt)}`,
+      );
+      assert.deepEqual(schemaEntry.expected.tags, ['brand-new-tag']);
+    },
+  );
+});
+
+// The contrast half: if the dirty SCHEMA.md's bytes no longer match what the
+// failed attempt recorded (someone else edited it in the meantime), the
+// retry must NOT trust it as its own side effect.
+test('a SCHEMA.md side effect whose bytes changed since the failed commit is NOT restaged', () => {
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'SCHEMA.md'),
+        '---\ntitle: SCHEMA\ntype: schema\n---\n# Schema\n\n## 4. Tag Vocabulary\n\n' +
+          '**Meta**: `wiki`, `concept`\n\n## 5. Next\n',
+      );
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(
+        join(dir, 'pages', 'note.md'),
+        '---\ntitle: N\ntype: concept\nupdated: 2026-06-27\ntags: [brand-new-tag-2]\n---\nbody\n',
+      );
+    },
+    (dir, today) => {
+      const hooksDir = join(dir, '.git', 'hooks');
+      mkdirSync(hooksDir, { recursive: true });
+      const hookPath = join(hooksDir, 'pre-commit');
+      writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+      chmodSync(hookPath, 0o755);
+
+      const sessionId = 's-schema-sideeffect-drift';
+      const payload = payloadForCleanWiki(dir, today);
+      const cleanup = seedCloseTranscript(sessionId);
+      const r1 = runApply(dir, payload, { sessionId });
+      cleanup();
+      assert.ok(
+        parseSchemaVocab(dir).has('brand-new-tag-2'),
+        'precondition: attempt 1 registered the tag, uncommitted',
+      );
+
+      // A hand edit changes SCHEMA.md's bytes after the failed attempt, so
+      // the recorded side-effect hash no longer matches disk.
+      const schemaPath = join(dir, 'SCHEMA.md');
+      writeFileSync(schemaPath, readFileSync(schemaPath, 'utf-8') + '\n<!-- hand edit -->\n');
+
+      rmSync(hookPath);
+      const cleanup2 = seedCloseTranscript(sessionId);
+      const r2 = runApply(dir, payload, { sessionId });
+      cleanup2();
+      const out2 = JSON.parse(r2.stdout);
+      // SCHEMA.md stays out of this close's scope entirely (still dirty,
+      // still unexplained), so the run itself is unaffected either way, but
+      // it must never be swept into the commit or the receipt.
+      assert.equal(gitDirtyFiles(dir).includes('SCHEMA.md'), true, 'SCHEMA.md must remain dirty');
+      if (out2.markerWritten) {
+        const receiptPath = join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json');
+        const receipt = JSON.parse(readFileSync(receiptPath, 'utf-8'));
+        assert.ok(
+          !(receipt.entries || []).some((e) => e.path === 'SCHEMA.md'),
+          'a drifted side effect must never be proven as committed',
+        );
+      }
+    },
+  );
+});
+
+// The same defense on the OTHER close-intent side-effect witness
+// (applyOverwrites' `priorIndex` fallback): a first attempt that seeds a
+// brand-new project's index.md (ensureProjectIndex) and then fails to commit
+// leaves both the file AND a close-intent side-effect record (path, kind:
+// 'create', bytesSha256) behind. A hand edit between attempts must not let
+// the retry trust that recorded witness, same rule as the SCHEMA.md pair
+// above, on the sibling file it protects.
+test('an index.md side effect whose bytes changed since the failed commit is NOT restaged', () => {
+  withWiki(null, (dir, today) => {
+    const hooksDir = join(dir, '.git', 'hooks');
+    mkdirSync(hooksDir, { recursive: true });
+    const hookPath = join(hooksDir, 'pre-commit');
+    writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+    chmodSync(hookPath, 0o755);
+
+    const sessionId = 's-index-sideeffect-drift';
+    const payload = payloadForCleanWiki(dir, today);
+    const cleanup = seedCloseTranscript(sessionId);
+    const r1 = runApply(dir, payload, { sessionId });
+    cleanup();
+    const out1 = JSON.parse(r1.stdout);
+    assert.equal(out1.ok, true, `attempt 1 must still report ok: ${r1.stdout}\n${r1.stderr}`);
+    assert.ok(
+      (out1.applied || []).some((a) => a.startsWith('projectIndex (')),
+      `precondition: attempt 1 must seed a new project index.md, uncommitted: ${r1.stdout}`,
+    );
+    const indexRel = join('projects', 'test-project', 'index.md');
+    const indexPath = join(dir, indexRel);
+    assert.ok(existsSync(indexPath), 'precondition: index.md landed on disk');
+
+    // A hand edit changes index.md's bytes after the failed attempt, so the
+    // recorded side-effect hash no longer matches disk.
+    writeFileSync(indexPath, readFileSync(indexPath, 'utf-8') + '\n<!-- hand edit -->\n');
+
+    rmSync(hookPath);
+    const cleanup2 = seedCloseTranscript(sessionId);
+    const r2 = runApply(dir, payload, { sessionId });
+    cleanup2();
+    const out2 = JSON.parse(r2.stdout);
+    // index.md stays out of this close's scope entirely (still dirty, still
+    // unexplained), regardless of whether the marker lands.
+    assert.ok(
+      gitDirtyFiles(dir).includes(indexRel.split('\\').join('/')),
+      `index.md must remain dirty: ${JSON.stringify(gitDirtyFiles(dir))}`,
+    );
+    if (out2.markerWritten) {
+      const receiptPath = join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json');
+      const receipt = JSON.parse(readFileSync(receiptPath, 'utf-8'));
+      assert.ok(
+        !(receipt.entries || []).some((e) => e.path === indexRel.split('\\').join('/')),
+        'a drifted side effect must never be proven as committed',
+      );
+    }
   });
 });
 

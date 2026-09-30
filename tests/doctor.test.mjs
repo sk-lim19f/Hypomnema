@@ -36,6 +36,11 @@ import {
 } from './helpers.mjs';
 import { PROVENANCE_FILENAME, EXPECTED_PKG_NAME } from '../scripts/lib/pkg-provenance.mjs';
 import {
+  RECEIPT_SCHEMA_VERSION,
+  CERT_CHECKPOINT,
+  writeReceiptAtomic,
+} from '../hooks/close-receipt.mjs';
+import {
   resolveEnabledPluginRoot,
   resolveEnabledPluginEntry,
   resolvePluginChannel,
@@ -983,6 +988,175 @@ test('doctor-close-artifacts: v4 marker WITH a `projects` array covering the pro
     const check = doctorCloseArtifactCheck(dir);
     assert.ok(check, 'check not found');
     assert.equal(check.status, 'pass', `expected pass: ${check?.detail}`);
+  });
+});
+
+// doctor judges each marker with closeCheckpointState, the verdict Stop blocks
+// on, so a marker that promises a receipt covers an artifact only when that
+// receipt is there and valid. Same fixture as the v4 pass test above; the only
+// variable is receipt_generation and whether its receipt exists.
+function demoCloseArtifactWithMarker(dir, markerFields) {
+  const projDir = join(dir, 'projects', 'demo');
+  mkdirSync(projDir, { recursive: true });
+  writeFileSync(
+    join(projDir, 'session-state.md'),
+    `> **${recentUtcDate(1)} 마감(13번째 세션).** 세 스트림을 처음으로 병렬로 굴렸다.\n`,
+  );
+  mkdirSync(join(dir, '.cache'), { recursive: true });
+  writeFileSync(
+    join(dir, '.cache', 'session-closed-sessgen.marker'),
+    JSON.stringify({
+      session_id: 'sessgen',
+      project: 'demo',
+      projects: ['demo'],
+      closed_at: recentUtcIso(1),
+      ...markerFields,
+    }),
+  );
+}
+
+test('doctor-close-artifacts: a marker naming a receipt generation whose receipt is missing covers nothing → warn naming the broken checkpoint', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    demoCloseArtifactWithMarker(dir, { receipt_generation: 'gen-never-filed' });
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'warn', `a broken checkpoint must not vouch: ${check?.detail}`);
+    assert.match(check.detail, /close checkpoint is broken: sessgen \(/);
+    assert.ok(
+      existsSync(join(dir, '.cache', 'session-closed-sessgen.marker')),
+      'doctor must not unlink the marker it judged',
+    );
+  });
+});
+
+test('doctor-close-artifacts: the same marker beside its valid receipt (closed) covers the artifact → pass', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    gitRepo(dir);
+    const git = (args) =>
+      spawnSync('git', ['-C', dir, ...args], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+    git(['add', '-A']);
+    assert.equal(git(['commit', '-q', '-m', 'init']).status, 0, 'fixture commit');
+    const written = writeReceiptAtomic(dir, 'sessgen', {
+      schemaVersion: RECEIPT_SCHEMA_VERSION,
+      certification: CERT_CHECKPOINT,
+      generation: 'gen-filed',
+      sessionId: 'sessgen',
+      repo: { toplevel: git(['rev-parse', '--show-toplevel']).stdout.trim() },
+      commit: git(['rev-parse', 'HEAD']).stdout.trim(),
+      scope: { mode: 'project', projects: ['demo'] },
+      entries: [{ path: 'log.md', kind: 'append', expected: { entryBlocks: ['entry'] } }],
+      skipped: { lint: false, feedback: false },
+      createdAt: new Date().toISOString(),
+    });
+    assert.equal(written.ok, true, JSON.stringify(written));
+    demoCloseArtifactWithMarker(dir, { receipt_generation: 'gen-filed' });
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check?.detail}`);
+  });
+});
+
+// A receipt with no marker beside it is a half-finished close. The artifact walk
+// above starts from close artifacts and then reads markers, so it never sees
+// this state: doctor enumerates the receipts themselves. No close artifact is
+// planted here on purpose, the state must surface on its own.
+function fileDemoReceipt(dir, sessionId) {
+  gitRepo(dir);
+  const git = (args) =>
+    spawnSync('git', ['-C', dir, ...args], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+  git(['add', '-A']);
+  assert.equal(git(['commit', '-q', '-m', 'init']).status, 0, 'fixture commit');
+  const written = writeReceiptAtomic(dir, sessionId, {
+    schemaVersion: RECEIPT_SCHEMA_VERSION,
+    certification: CERT_CHECKPOINT,
+    generation: 'gen-half',
+    sessionId,
+    repo: { toplevel: git(['rev-parse', '--show-toplevel']).stdout.trim() },
+    commit: git(['rev-parse', 'HEAD']).stdout.trim(),
+    scope: { mode: 'project', projects: ['demo'] },
+    entries: [{ path: 'log.md', kind: 'append', expected: { entryBlocks: ['entry'] } }],
+    skipped: { lint: false, feedback: false },
+    createdAt: new Date().toISOString(),
+  });
+  assert.equal(written.ok, true, JSON.stringify(written));
+}
+
+function doctorCheckpointCheck(dir) {
+  const { out } = runDoctorJson(dir);
+  return out.find((c) => c.label === 'Session-close checkpoint');
+}
+
+test('doctor-close-checkpoint: a receipt with no marker is a broken checkpoint → warn naming the session and the recovery command', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-half');
+    const { r, out } = runDoctorJson(dir);
+    const check = out.find((c) => c.label === 'Session-close checkpoint');
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.equal(check.status, 'warn', check.detail);
+    assert.match(check.detail, /sess-half/);
+    assert.match(check.detail, /--mark-session-closed --session-id=sess-half/);
+    assert.equal(r.status, 0, `warn must not exit nonzero: ${r.stdout}\n${r.stderr}`);
+    assert.equal(
+      existsSync(join(dir, '.cache', 'session-closed-sess-half.marker')),
+      false,
+      'doctor must not write the marker it found missing',
+    );
+  });
+});
+
+// --mark-session-closed refuses a receipt whose commit left the branch's
+// history, so doctor must not offer it there: it names the other exit instead.
+test('doctor-close-checkpoint: a markerless receipt whose commit left the history does not offer --mark-session-closed', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-rewritten');
+    const amend = spawnSync('git', ['-C', dir, 'commit', '-q', '--amend', '-m', 'rewritten'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(amend.status, 0, `fixture amend: ${amend.stderr}`);
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must still surface');
+    assert.equal(check.status, 'warn', check.detail);
+    assert.match(check.detail, /sess-rewritten/);
+    assert.match(check.detail, /no longer in this branch's history/);
+    assert.doesNotMatch(check.detail, /--mark-session-closed --session-id=sess-rewritten/);
+  });
+});
+
+test('doctor-close-checkpoint: a receipt beside its matching marker (closed) raises nothing', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-ok');
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-sess-ok.marker'),
+      JSON.stringify({
+        session_id: 'sess-ok',
+        projects: ['demo'],
+        receipt_generation: 'gen-half',
+        closed_at: recentUtcIso(0),
+      }),
+    );
+    assert.equal(doctorCheckpointCheck(dir), undefined);
+  });
+});
+
+test('doctor-close-checkpoint: a markerless receipt older than the marker window is not reported', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-old');
+    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    utimesSync(join(dir, '.cache', 'sessions', 'sess-old', 'close-receipt.json'), old, old);
+    assert.equal(doctorCheckpointCheck(dir), undefined);
   });
 });
 

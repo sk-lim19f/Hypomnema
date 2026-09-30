@@ -42,10 +42,8 @@ import {
   PKG_ROOT,
   withFileLock,
   vaultCommitLockTarget,
-  writeRootHotProjection,
+  claimAndWriteRootHotProjection,
   recordTouchedPaths,
-  clearTouchedPaths,
-  claimProjectionWrite,
   consumeRootHotHealthNotice,
   rootHotBackupRecoveryNotice,
 } from './hypo-shared.mjs';
@@ -1049,13 +1047,50 @@ process.stdin.on('end', () => {
     // call itself failed." Claiming it first and skipping the write on a
     // failed claim means hot.md is never rewritten without something able to
     // account for that rewrite at close time.
+    //
+    // The claim and the write share one hold of the vault lock
+    // (claimAndWriteRootHotProjection). Claimed first and locked second, a
+    // Stop for the same session_id could take the lock in between, retire
+    // the still-unwritten claim, and leave the write that followed with no
+    // claim at all.
     if (existsSync(HYPO_DIR)) {
-      // claimProjectionWrite, not recordTouchedPaths: a missing session_id
-      // must read as "not claimed" here, unlike every other best-effort
-      // accumulate call, or this write proceeds with nothing able to ever
-      // bring it into a commit (see claimProjectionWrite's own doc comment).
-      const claimed = claimProjectionWrite(HYPO_DIR, data.session_id, ['hot.md']);
-      if (!claimed) {
+      // A missing session_id reads as "not claimed" here (claimProjectionWrite
+      // underneath), unlike every other best-effort accumulate call, or this
+      // write proceeds with nothing able to ever bring it into a commit.
+      let outcome;
+      let writeError = null;
+      try {
+        // n1 fix: session_id goes along so this session's own digest lands in
+        // ITS OWN receipt, not just the shared global ownership record (see
+        // writeRootHotProjection's doc comment).
+        outcome = claimAndWriteRootHotProjection(HYPO_DIR, data.session_id);
+      } catch (err) {
+        writeError = err;
+      }
+      if (writeError) {
+        // BLOCKER fix: writeRootHotProjection now throws instead of
+        // silently treating an unreadable existing hot.md as absent. The
+        // claim this call added was already dropped inside the lock (see
+        // claimAndWriteRootHotProjection), so no stale 'hot.md' claim is
+        // left to sweep in whatever another session or a person writes next.
+        // catch-message-accuracy fix (r5-w1.md): the write can throw from
+        // several different steps (reading the existing file, writing the
+        // migration backup, updating .gitignore, or the final atomic write
+        // itself), not only a read failure: wording this as "읽을 수 없어"
+        // (could not read) misnamed a disk-full or backup-write failure as
+        // something it was not. What stays true regardless of which step
+        // failed is that the atomic write never ran, so the old file is
+        // untouched.
+        const err = writeError;
+        const msg = `루트 hot.md 갱신에 실패해 이전 파일을 그대로 두었습니다: ${err?.message ?? String(err)}`;
+        notices.push(msg);
+        noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
+        outExtra = {
+          ...outExtra,
+          systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
+        };
+        process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
+      } else if (outcome.claimFailed) {
         const msg =
           '루트 hot.md 갱신을 건너뛰었습니다: 이번 세션의 커밋 범위에 기록하지 못해 갱신 후 미커밋 파일로 남을 수 있었습니다.';
         notices.push(msg);
@@ -1066,116 +1101,86 @@ process.stdin.on('end', () => {
         };
         process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
       } else {
-        try {
-          // n1 fix: pass session_id so this session's own digest lands in
-          // ITS OWN receipt, not just the shared global ownership record --
-          // see writeRootHotProjection's doc comment.
-          const result = writeRootHotProjection(HYPO_DIR, undefined, data.session_id);
-          if (result.lockTimeout) {
-            // BLOCKER fix, the other half: the projection writer now holds the
-            // vault lock, so a vault busy with another session's commit can
-            // leave this session on the previous pointer table. Say so instead
-            // of starting the session on a stale table with no explanation,
-            // and drop the pre-write claim: no write happened, so an
-            // uncleared 'hot.md' claim would later sweep in whatever the
-            // session that DID hold the lock wrote.
-            clearTouchedPaths(HYPO_DIR, data.session_id, ['hot.md']);
-            const msg =
-              '루트 hot.md 를 갱신하지 못했습니다: 다른 세션이 이 저장소를 쓰는 중이라 잠금을 얻지 못했습니다. 이번 세션은 이전 포인터 표를 그대로 읽습니다 (다음 세션 시작이나 종료 때 다시 시도합니다).';
-            notices.push(msg);
-            noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-            outExtra = {
-              ...outExtra,
-              systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-            };
-            process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-          } else if (result.scanError) {
-            const msg =
-              '루트 hot.md 갱신 실패: projects/ 디렉터리를 읽을 수 없어 이전 파일을 그대로 두었습니다.' +
-              ` 권한과 경로를 확인하고(\`ls -ld ${join(HYPO_DIR, 'projects')}\`), 고치면 다음 세션 시작이나 종료 때 자동으로 다시 시도합니다.`;
-            notices.push(msg);
-            noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-            outExtra = {
-              ...outExtra,
-              systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-            };
-            process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-          } else if (result.warnings.length > 0) {
-            // major-1/3: a per-project read failure no longer disappears
-            // silently: it kept its row (blank date) in the table already
-            // written above, but the reason must still reach a human.
-            const msg =
-              `루트 hot.md 갱신 중 일부 프로젝트를 읽지 못했습니다:\n${result.warnings.join('\n')}\n` +
-              '해당 파일의 권한과 경로를 확인하면 다음 세션 시작이나 종료 때 자동으로 다시 읽습니다.';
-            notices.push(msg);
-            noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-            outExtra = {
-              ...outExtra,
-              systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-            };
-            process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
+        const { result } = outcome;
+        if (result.lockTimeout) {
+          // BLOCKER fix, the other half: the projection writer holds the
+          // vault lock, so a vault busy with another session's commit can
+          // leave this session on the previous pointer table. Say so instead
+          // of starting the session on a stale table with no explanation.
+          // No claim to drop: it is taken inside the same lock, so a lock
+          // timeout means this run never claimed anything, and a resumed
+          // session_id's earlier, still-unresolved 'hot.md' claim is left
+          // exactly as it was.
+          const msg =
+            '루트 hot.md 를 갱신하지 못했습니다: 다른 세션이 이 저장소를 쓰는 중이라 잠금을 얻지 못했습니다. 이번 세션은 이전 포인터 표를 그대로 읽습니다 (다음 세션 시작이나 종료 때 다시 시도합니다).';
+          notices.push(msg);
+          noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
+          outExtra = {
+            ...outExtra,
+            systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
+          };
+          process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
+        } else if (result.scanError) {
+          const msg =
+            '루트 hot.md 갱신 실패: projects/ 디렉터리를 읽을 수 없어 이전 파일을 그대로 두었습니다.' +
+            ` 권한과 경로를 확인하고(\`ls -ld ${join(HYPO_DIR, 'projects')}\`), 고치면 다음 세션 시작이나 종료 때 자동으로 다시 시도합니다.`;
+          notices.push(msg);
+          noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
+          outExtra = {
+            ...outExtra,
+            systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
+          };
+          process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
+        } else if (result.warnings.length > 0) {
+          // major-1/3: a per-project read failure no longer disappears
+          // silently: it kept its row (blank date) in the table already
+          // written above, but the reason must still reach a human.
+          const msg =
+            `루트 hot.md 갱신 중 일부 프로젝트를 읽지 못했습니다:\n${result.warnings.join('\n')}\n` +
+            '해당 파일의 권한과 경로를 확인하면 다음 세션 시작이나 종료 때 자동으로 다시 읽습니다.';
+          notices.push(msg);
+          noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
+          outExtra = {
+            ...outExtra,
+            systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
+          };
+          process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
+        }
+        if (result.gitignoreUpdated) {
+          // Best-effort: the gitignore change itself already landed on
+          // disk (writeRootHotProjection would have thrown otherwise); a
+          // failure to also claim it only risks THIS one infra file
+          // showing up as an unattributed dirty file at close, not the
+          // backup it protects (which is gitignored either way).
+          const gClaimed = recordTouchedPaths(HYPO_DIR, data.session_id, ['.gitignore']);
+          if (!gClaimed) {
+            process.stderr.write(
+              '[hypo-session-start] .gitignore 갱신(백업 유출 방지 패턴)을 커밋 범위에 기록하지 못했습니다\n',
+            );
           }
-          if (result.gitignoreUpdated) {
-            // Best-effort: the gitignore change itself already landed on
-            // disk (writeRootHotProjection would have thrown otherwise); a
-            // failure to also claim it only risks THIS one infra file
-            // showing up as an unattributed dirty file at close, not the
-            // backup it protects (which is gitignored either way).
-            const gClaimed = recordTouchedPaths(HYPO_DIR, data.session_id, ['.gitignore']);
-            if (!gClaimed) {
-              process.stderr.write(
-                '[hypo-session-start] .gitignore 갱신(백업 유출 방지 패턴)을 커밋 범위에 기록하지 못했습니다\n',
-              );
-            }
-          }
-          if (result.backedUp && result.backupPath) {
-            // MAJOR fix: the backup itself was never in question (it lands
-            // on disk and is gitignored either way), only whether a human
-            // ever learns it exists. Before this, `backedUp`/`backupPath`
-            // reached neither `notices` nor `systemMessage`: the backup file
-            // is gitignored, so it does not even show up in `git status`, and
-            // a person who had just hand-edited root hot.md would see their
-            // edit silently replaced with no trace of where it went. Naming
-            // only the file (basename), not its full path: the vault root is
-            // already implied by the session, and nothing else here leaks a
-            // full filesystem path into a notice. This branch should be rare
-            // once rootHot leaves the close payload/overwrite targets: with
-            // no scripted writer left that targets this file, a backup only
-            // happens when a person edits it by hand, so this notice does
-            // not become noise on every session.
-            // Naming the file is not a recovery path on its own: copying the
-            // backup back onto root hot.md just gets it replaced again on the
-            // next rebuild. rootHotBackupRecoveryNotice (hooks/hypo-shared.mjs)
-            // is the one sentence that says what actually recovers the
-            // content, shared with the Stop-hook rebuild and project-create so
-            // the three writers cannot drift into different wordings.
-            const msg = rootHotBackupRecoveryNotice(result.backupPath);
-            notices.push(msg);
-            noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-            outExtra = {
-              ...outExtra,
-              systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-            };
-            process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-          }
-        } catch (err) {
-          // BLOCKER fix: writeRootHotProjection now throws instead of
-          // silently treating an unreadable existing hot.md as absent, so
-          // this session's own pre-claim above is stale: no write actually
-          // happened. Clear it: an uncleared 'hot.md' claim left in this
-          // session's touched-paths set would sweep in whatever ANOTHER
-          // session or a human writes to hot.md next as if this session had
-          // made that change.
-          clearTouchedPaths(HYPO_DIR, data.session_id, ['hot.md']);
-          // catch-message-accuracy fix (r5-w1.md): writeRootHotProjection can
-          // throw from several different steps here (reading the existing
-          // file, writing the migration backup, updating .gitignore, or the
-          // final atomic write itself), not only a read failure: wording
-          // this as "읽을 수 없어" (could not read) misnamed a disk-full or
-          // backup-write failure as something it was not. What stays true
-          // regardless of which step failed is that the atomic write never
-          // ran, so the old file is untouched.
-          const msg = `루트 hot.md 갱신에 실패해 이전 파일을 그대로 두었습니다: ${err?.message ?? String(err)}`;
+        }
+        if (result.backedUp && result.backupPath) {
+          // MAJOR fix: the backup itself was never in question (it lands
+          // on disk and is gitignored either way), only whether a human
+          // ever learns it exists. Before this, `backedUp`/`backupPath`
+          // reached neither `notices` nor `systemMessage`: the backup file
+          // is gitignored, so it does not even show up in `git status`, and
+          // a person who had just hand-edited root hot.md would see their
+          // edit silently replaced with no trace of where it went. Naming
+          // only the file (basename), not its full path: the vault root is
+          // already implied by the session, and nothing else here leaks a
+          // full filesystem path into a notice. This branch should be rare
+          // once rootHot leaves the close payload/overwrite targets: with
+          // no scripted writer left that targets this file, a backup only
+          // happens when a person edits it by hand, so this notice does
+          // not become noise on every session.
+          // Naming the file is not a recovery path on its own: copying the
+          // backup back onto root hot.md just gets it replaced again on the
+          // next rebuild. rootHotBackupRecoveryNotice (hooks/hypo-shared.mjs)
+          // is the one sentence that says what actually recovers the
+          // content, shared with the Stop-hook rebuild and project-create so
+          // the three writers cannot drift into different wordings.
+          const msg = rootHotBackupRecoveryNotice(result.backupPath);
           notices.push(msg);
           noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
           outExtra = {

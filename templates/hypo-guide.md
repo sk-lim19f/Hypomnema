@@ -87,31 +87,58 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    projects / shared pages you did not author is reported as a non-blocking
    notice, not a gate. (The documented `/hypo:crystallize` session-close path
    runs this lint automatically, scoped to the files it writes.)
-6. Verify with `/hypo:crystallize` in its `--check-session-close` mode: a dry-run of the
+6. Check with `/hypo:crystallize` in its `--check-session-close` mode: a dry-run of the
    **full** set of checks the PreCompact hook itself runs (close files + lint + design-history + feedback
-   projection), sharing one function (`precompactGateStatus`) with that hook. Only declare the
-   session closed once it prints **"Compact-ready"**. A "close files updated"
-   check alone is not enough to earn that signal: a lint error in a close file
-   or a feedback projection over-cap keeps the check red on its own.
+   projection), sharing one function (`precompactGateStatus`) with that hook. Its
+   **"Compact-ready"** line is a diagnostic of the whole vault, not the bar for calling a
+   session closed. It goes red for anything in the vault, including an uncommitted file
+   another session wrote, so on a shared vault a normal close can finish while it is still
+   red. A "close files updated" check alone is not enough to turn it green: a lint error in
+   a close file or a feedback projection over-cap keeps it red on its own.
    The live hook can still see a different set than this check does, because of
    `HYPO_SKIP_GATE` or a transcript-scoped lint error (pass `--transcript-path`
-   to include the last). Note that neither one stops `/compact` any more: the
-   hook reports what it finds and lets the compact through, so "Compact-ready"
-   is the bar for calling a session closed, not a lock on the command.
-   Pass `--session-id=<id>` to also see `marker_present`
-   (step 7). `--project=<slug>` narrows the check to one project (a scoped
+   to include the last). Neither one stops `/compact` any more: the hook reports what it
+   finds and lets the compact through.
+   Pass `--session-id=<id>` to also see `marker_present` and `close_state` (step 7).
+   `--project=<slug>` narrows the check to one project (a scoped
    diagnostic, JSON `scope: "project"`): green there means only that slug is
    close-complete, **not** that every project in the vault is. Use the plain
-   check for the go/no-go signal.
-7. Record the session-closed marker. The Stop hook blocks until this
-   session's per-session marker exists, and a hand-edit close (writing the files
-   directly + committing) never writes it; the marker is written only by the
-   crystallize writer, never by the hook (bypass guard). Normal path:
-   close via `/hypo:crystallize` (`--apply-session-close --session-id=<id> --transcript-path=<path>`),
-   which writes the marker once the gate is green. Hand-edit recovery: after
-   committing the files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
-   Both writers gate the marker on the SAME `precompactGateStatus` as `/compact`,
-   so the marker only lands when step 6 would print **"Compact-ready"**.
+   check when you want to know whether the whole vault is clean.
+7. Record the close checkpoint. The Stop hook blocks until this session's close
+   checkpoint receipt (`.cache/sessions/<id>/close-receipt.json`) is valid, and a hand-edit
+   close (writing the files directly + committing) never writes one; the receipt
+   is filed only by the crystallize writer, never by the hook (bypass guard). A
+   compat marker (`.cache/session-closed-<id>.marker`) is written right after the
+   receipt, for consumers that have not been updated to read the receipt itself.
+   The receipt certifies only what it names: that the file versions this close
+   wrote are in a specific commit. It does not certify that every change this
+   session made is saved, so the Stop hook still surfaces any other uncommitted
+   vault change as a separate notice, once per close, even after the checkpoint
+   is recorded. Normal path: close via `/hypo:crystallize`
+   (`--apply-session-close --session-id=<id> --transcript-path=<path>`), which files the
+   checkpoint once the gate is green. Hand-edit recovery: after committing the
+   files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
+   Both writers gate the checkpoint on `precompactGateStatus`, the gate `/compact`
+   uses, with one difference: the git check is narrower. An uncommitted file
+   inside the project folder being closed (`projects/<project>/`) blocks whether
+   or not this session has a record of writing it. An uncommitted file at the
+   root or in another project's folder blocks only when this session wrote it
+   through Write or Edit since its last auto-commit, and is otherwise a notice
+   (another session's, one of unknown ownership, or one this session changed
+   through a shell command). If the record of this session's writes cannot be
+   read, the check does not block on it and adds a notice that it could not
+   determine ownership. So it can land while step 6 still shows a git blocker
+   for someone else's dirty file.
+   Every other check (close files, hot.md, lint, feedback) is the same as step 6.
+   **The session is closed once the checkpoint receipt is issued**: the writer's result
+   reports `markerWritten: true` (apply) or `ok: true` (`--mark`), and
+   `--check-session-close --session-id=<id>` then reports `close_state: closed`. Declare the
+   close on that, not on "Compact-ready". If the writer reports the marker as not written, or
+   `close_state` is anything other than `closed`, the session is still open whatever step 6 says.
+   If `close_state` is `broken` because the commit an earlier close proved was dropped from
+   history (a reset or rebase), `--mark-session-closed` refuses with
+   `prior-checkpoint-rewritten` and leaves the old receipt alone: restore that commit, or ask
+   the user to close again with a new payload.
    `--session-id` is not optional on the apply path. Before it writes anything, the
    apply reads that session's transcript for evidence the **user** asked to close, and
    refuses the whole close (exit 1, nothing on disk, nothing committed) when the id is

@@ -17,6 +17,7 @@ import {
   resolutionStamp,
 } from '../hooks/close-gate-store.mjs';
 import { sessionClosedMarkerPath } from '../hooks/hypo-shared.mjs';
+import { receiptPath } from '../hooks/close-receipt.mjs';
 
 const SESSION = 'sess-1';
 
@@ -789,7 +790,13 @@ test('ok:true carries no hostTagWarning on an ordinary close with no host-tag-sh
 
 suite('close-gate-store: hostTagWarningWithUndo (per-path undo, derived marker path)');
 
-test('commit-and-marker names both halves, and the marker path is the one the writer creates', () => {
+// ISSUE-171: a close now files a close receipt (hooks/close-receipt.mjs)
+// alongside the compat marker, and readReceiptStrict honors that receipt on
+// its own -- deleting only the marker would leave a still-valid receipt
+// behind, and a new Stop would keep treating the session as closed. Both
+// writer entry points land the receipt before the marker, so undo must name
+// BOTH paths, never the marker alone.
+test('commit-and-marker names both the marker AND the receipt, and offers a revert', () => {
   const out = hostTagWarningWithUndo('WARN.', 'commit-and-marker', '/vault', 'sess-1');
   assert.match(out, /^WARN\. /);
   assert.match(out, /revert/);
@@ -797,14 +804,19 @@ test('commit-and-marker names both halves, and the marker path is the one the wr
     out.includes(sessionClosedMarkerPath('/vault', 'sess-1')),
     `must name the real marker path, got: ${out}`,
   );
+  assert.ok(
+    out.includes(receiptPath('/vault', 'sess-1')),
+    `must also name the receipt path, got: ${out}`,
+  );
   // The resolution record is a different file; pointing at it would send the
   // user to delete the wrong thing.
   assert.equal(out.includes(closeGatePath('/vault', 'sess-1')), false);
 });
 
-test('marker-only offers no revert (that path makes no commit) and names the marker', () => {
+test('marker-only offers no revert (that path makes no commit) and names both the marker AND the receipt', () => {
   const out = hostTagWarningWithUndo('WARN.', 'marker-only', '/vault', 'sess-1');
   assert.ok(out.includes(sessionClosedMarkerPath('/vault', 'sess-1')), out);
+  assert.ok(out.includes(receiptPath('/vault', 'sess-1')), out);
   // It may SAY there is nothing to revert; what it must never do is send the
   // reader after a commit this entry point does not make.
   assert.equal(/revert the commit/.test(out), false, out);
@@ -819,6 +831,28 @@ test('commit-only offers the revert and no marker to delete (the write never lan
     false,
     `no marker landed on this path: ${out}`,
   );
+  // No receipt landed either on a bare '/vault' (nothing on disk to find), so
+  // 'commit-only' must not invent one to name.
+  assert.equal(out.includes(receiptPath('/vault', 'sess-1')), false, out);
+});
+
+// commit-only's marker and receipt writes can fail independently (the
+// marker write can fail on its own even after the receipt already landed,
+// see crystallize-close-apply.mjs's `marker-did-not-land` branch): unlike
+// the other two kinds, this one checks disk rather than assume either way.
+test('commit-only names the receipt too when one actually landed on disk', () => {
+  withTmpDir((dir) => {
+    const rp = receiptPath(dir, SESSION);
+    mkdirSync(dirname(rp), { recursive: true });
+    writeFileSync(rp, '{}');
+    const out = hostTagWarningWithUndo('WARN.', 'commit-only', dir, SESSION);
+    assert.ok(out.includes(rp), `must name the landed receipt: ${out}`);
+    assert.equal(
+      out.includes(sessionClosedMarkerPath(dir, SESSION)),
+      false,
+      `still no marker on this path: ${out}`,
+    );
+  });
 });
 
 test('uncommitted-writes points at neither, and says the bytes are still uncommitted', () => {

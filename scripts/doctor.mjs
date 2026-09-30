@@ -37,6 +37,7 @@ import {
   localAndUtcDates,
   normalizeVerifiedScope,
   SESSION_CLOSED_MARKER_STALE_MS,
+  sessionClosedMarkerPath,
   isUsablePkgRootLocal,
   selfLocationPkgRootFrom,
 } from '../hooks/hypo-shared.mjs';
@@ -66,6 +67,7 @@ import {
   computeHooksDigest,
 } from './lib/pkg-provenance.mjs';
 import { resolveCliOnPath, classifyInstall, upgradeApplyHint } from '../hooks/version-check.mjs';
+import { closeCheckpointState, isCloseComplete } from '../hooks/close-receipt.mjs';
 import {
   enabledHypomnemaPluginKey,
   usablePkgRoot,
@@ -1169,6 +1171,10 @@ function checkSessionCloseArtifacts(hypoDir) {
   // already-expired marker can't vouch for anything.
   const cacheDir = join(hypoDir, '.cache');
   const markers = [];
+  // Markers closeCheckpointState does not call a finished close (the receipt
+  // they name is missing, invalid or another generation, or a valid receipt
+  // disagrees with them). They cover nothing, and the warning says why.
+  const brokenMarkers = [];
   let cacheEntries = [];
   if (existsSync(cacheDir)) {
     try {
@@ -1183,6 +1189,19 @@ function checkSessionCloseArtifacts(hypoDir) {
       const data = JSON.parse(readFileSync(join(cacheDir, file), 'utf-8'));
       const ts = Date.parse(data?.closed_at || '');
       if (!Number.isFinite(ts) || Date.now() - ts > SESSION_CLOSED_MARKER_STALE_MS) continue;
+      // The same verdict Stop blocks on, fed the marker parsed above so the
+      // reader never unlinks anything. The file name carries the sanitized id,
+      // which can differ from the real one; the marker body carries the real
+      // one, and the receipt's own session id check needs exactly that.
+      const sessionId =
+        typeof data?.session_id === 'string' && data.session_id
+          ? data.session_id
+          : file.slice('session-closed-'.length, -'.marker'.length);
+      const checkpoint = closeCheckpointState(hypoDir, sessionId, { marker: data });
+      if (!isCloseComplete(checkpoint)) {
+        brokenMarkers.push({ sessionId, reason: checkpoint.reason });
+        continue;
+      }
       // ONLY the v4 `projects` array counts as project-scope evidence. A
       // legacy flat `project` field can be a recency-derived misattribution
       // (the P1 bug resolveCloseScope's own doc comment describes) — the
@@ -1222,6 +1241,15 @@ function checkSessionCloseArtifacts(hypoDir) {
     .map((a) => `${a.where}${a.date ? ` (${a.date})` : ''}`)
     .join(', ');
   const extra = unmatched.length > 5 ? ` (+${unmatched.length - 5} more)` : '';
+  const brokenNote =
+    brokenMarkers.length > 0
+      ? `. ${brokenMarkers.length} session-closed marker(s) did not count because their close ` +
+        `checkpoint is broken: ` +
+        brokenMarkers
+          .slice(0, 3)
+          .map((b) => `${b.sessionId} (${b.reason})`)
+          .join('; ')
+      : '';
   // Not necessarily UNAPPROVED — an approved log-only marker (deliberately
   // empty `projects`) or one scoped to a different project would ALSO land
   // here, since neither covers a specific project's artifact. Both readings
@@ -1231,7 +1259,65 @@ function checkSessionCloseArtifacts(hypoDir) {
     'Session-close artifacts',
     `${unmatched.length} close artifact(s) with no session-closed marker covering their ` +
       `date and project scope — may be an unapproved hand-made close, or an approved close ` +
-      `whose marker doesn't attribute this project: ${sample}${extra}`,
+      `whose marker doesn't attribute this project: ${sample}${extra}${brokenNote}`,
+  );
+}
+
+// A close receipt with no session-closed marker beside it is a half-finished
+// close (the run stopped before the marker landed, or only the marker was
+// invalidated). checkSessionCloseArtifacts starts from close artifacts and
+// then walks markers, so this state is invisible to it. Enumerate the
+// receipts instead, judge each markerless one with the verdict Stop blocks
+// on, and stay silent otherwise. Same 7-day window as the marker walk, read
+// off the receipt file's mtime.
+function checkHalfClosedReceipts(hypoDir) {
+  const sessionsDir = join(hypoDir, '.cache', 'sessions');
+  let dirs = [];
+  try {
+    dirs = readdirSync(sessionsDir);
+  } catch {
+    return; // no sessions directory, or unreadable: nothing to judge
+  }
+  const broken = [];
+  for (const name of dirs) {
+    const file = join(sessionsDir, name, 'close-receipt.json');
+    try {
+      if (Date.now() - statSync(file).mtimeMs > SESSION_CLOSED_MARKER_STALE_MS) continue;
+      // The directory name is the sanitized id; the receipt body carries the real one.
+      const body = JSON.parse(readFileSync(file, 'utf-8'));
+      const sessionId =
+        typeof body?.sessionId === 'string' && body.sessionId ? body.sessionId : name;
+      if (existsSync(sessionClosedMarkerPath(hypoDir, sessionId))) continue;
+      const checkpoint = closeCheckpointState(hypoDir, sessionId, { marker: null });
+      if (checkpoint.state !== 'broken') continue;
+      // --mark-session-closed refuses a receipt whose commit is no longer an
+      // ancestor of HEAD (history rewritten), so do not offer it for that case.
+      const commit = typeof body?.commit === 'string' ? body.commit : '';
+      const rewritten =
+        /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit) &&
+        spawnSync('git', ['-C', hypoDir, 'rev-parse', '--verify', '--quiet', 'HEAD']).status ===
+          0 &&
+        spawnSync('git', ['-C', hypoDir, 'merge-base', '--is-ancestor', commit, 'HEAD']).status !==
+          0;
+      broken.push({ sessionId, reason: checkpoint.reason, rewritten });
+    } catch {
+      // unreadable or corrupt receipt: not this check's job to diagnose
+    }
+  }
+  if (broken.length === 0) return;
+  const crystallize = join(PKG_ROOT, 'scripts', 'crystallize.mjs');
+  warn(
+    'Session-close checkpoint',
+    `${broken.length} session(s) hold a close receipt but no session-closed marker: ` +
+      broken
+        .slice(0, 3)
+        .map((b) =>
+          b.rewritten
+            ? `${b.sessionId} (${b.reason}; the commit it certified is no longer in this branch's history). Restore that commit, or ask the user to close again and apply it with /hypo:crystallize`
+            : `${b.sessionId} (${b.reason}). Recover with: node "${crystallize}" --mark-session-closed --session-id=${b.sessionId}`,
+        )
+        .join('; ') +
+      (broken.length > 3 ? ` (+${broken.length - 3} more)` : ''),
   );
 }
 
@@ -2798,6 +2884,7 @@ if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
 if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
+if (rootOk) checkHalfClosedReceipts(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkProposals(args.hypoDir);
