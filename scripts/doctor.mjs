@@ -1289,7 +1289,17 @@ function checkHalfClosedReceipts(hypoDir) {
         typeof body?.sessionId === 'string' && body.sessionId ? body.sessionId : name;
       if (existsSync(sessionClosedMarkerPath(hypoDir, sessionId))) continue;
       const checkpoint = closeCheckpointState(hypoDir, sessionId, { marker: null });
-      if (checkpoint.state === 'broken') broken.push({ sessionId, reason: checkpoint.reason });
+      if (checkpoint.state !== 'broken') continue;
+      // --mark-session-closed refuses a receipt whose commit is no longer an
+      // ancestor of HEAD (history rewritten), so do not offer it for that case.
+      const commit = typeof body?.commit === 'string' ? body.commit : '';
+      const rewritten =
+        /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit) &&
+        spawnSync('git', ['-C', hypoDir, 'rev-parse', '--verify', '--quiet', 'HEAD']).status ===
+          0 &&
+        spawnSync('git', ['-C', hypoDir, 'merge-base', '--is-ancestor', commit, 'HEAD']).status !==
+          0;
+      broken.push({ sessionId, reason: checkpoint.reason, rewritten });
     } catch {
       // unreadable or corrupt receipt: not this check's job to diagnose
     }
@@ -1301,9 +1311,10 @@ function checkHalfClosedReceipts(hypoDir) {
     `${broken.length} session(s) hold a close receipt but no session-closed marker: ` +
       broken
         .slice(0, 3)
-        .map(
-          (b) =>
-            `${b.sessionId} (${b.reason}). Recover with: node "${crystallize}" --mark-session-closed --session-id=${b.sessionId}`,
+        .map((b) =>
+          b.rewritten
+            ? `${b.sessionId} (${b.reason}; the commit it certified is no longer in this branch's history). Restore that commit, or ask the user to close again and apply it with /hypo:crystallize`
+            : `${b.sessionId} (${b.reason}). Recover with: node "${crystallize}" --mark-session-closed --session-id=${b.sessionId}`,
         )
         .join('; ') +
       (broken.length > 3 ? ` (+${broken.length - 3} more)` : ''),

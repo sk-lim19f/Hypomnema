@@ -1113,6 +1113,26 @@ test('doctor-close-checkpoint: a receipt with no marker is a broken checkpoint â
   });
 });
 
+// --mark-session-closed refuses a receipt whose commit left the branch's
+// history, so doctor must not offer it there: it names the other exit instead.
+test('doctor-close-checkpoint: a markerless receipt whose commit left the history does not offer --mark-session-closed', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-rewritten');
+    const amend = spawnSync('git', ['-C', dir, 'commit', '-q', '--amend', '-m', 'rewritten'], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+    assert.equal(amend.status, 0, `fixture amend: ${amend.stderr}`);
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must still surface');
+    assert.equal(check.status, 'warn', check.detail);
+    assert.match(check.detail, /sess-rewritten/);
+    assert.match(check.detail, /no longer in this branch's history/);
+    assert.doesNotMatch(check.detail, /--mark-session-closed --session-id=sess-rewritten/);
+  });
+});
+
 test('doctor-close-checkpoint: a receipt beside its matching marker (closed) raises nothing', () => {
   withTmpDir((dir) => {
     baseWiki(dir);
