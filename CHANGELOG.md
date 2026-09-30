@@ -5,6 +5,42 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-09-30
+
+### New Features
+#### English
+- Stop hooks now run as one ordered chain, so the Stop commit no longer misses files the same Stop just rebuilt, and a failed step is reported instead of passing as a clean Stop. upgrade removes the old Stop registrations on npm installs so no step runs twice. A close that dies before its commit is no longer read as finished, and a subagent hand-back no longer cancels a close the user approved. Plugin users are pointed at `/hypo:doctor` and `/hypo:crystallize` wherever an npm-only command was named. The root `hot.md` is now generated from the projects' own `hot.md` at every session start and stop instead of being edited by hand at session close; whenever it finds root `hot.md` content it did not write, it saves that content as `hot.md.pre-projection-backup.md` before overwriting. ([#301](https://github.com/sk-lim19f/Hypomnema/pull/301))
+#### 한국어
+- Stop 훅이 순서대로 한 줄로 돌아, 같은 Stop 이 방금 다시 만든 파일을 Stop 커밋이 빠뜨리지 않고 실패한 단계는 정상 종료처럼 넘어가지 않고 보고됩니다. npm 설치에서 upgrade 가 옛 Stop 등록을 지워 어느 단계도 두 번 돌지 않습니다. 커밋 전에 죽은 close 를 끝난 것으로 읽지 않고, 서브에이전트 결과 반환이 사용자가 승인한 close 를 취소하지 않습니다. npm 전용 명령을 안내하던 자리마다 plugin 사용자에게 `/hypo:doctor` 와 `/hypo:crystallize` 를 함께 알려 줍니다. 루트 `hot.md` 는 이제 세션 close 때 손으로 고치지 않고, 세션을 시작하고 멈출 때마다 각 프로젝트의 `hot.md` 로 다시 만들어집니다. 생성기가 직접 쓰지 않은 내용을 발견하면, 덮어쓰기 전에 그 내용을 `hot.md.pre-projection-backup.md` 로 저장합니다. ([#301](https://github.com/sk-lim19f/Hypomnema/pull/301))
+
+### Bug Fixes
+#### English
+- Session close no longer fails on another session's uncommitted root files: it issues a commit-backed close checkpoint receipt that certifies only the files this close wrote, blocks on this session's recorded writes and on uncommitted files in the project being closed, and reports the rest as notices; Stop, `--check-session-close` (new `close_state`), doctor and PreCompact now agree on when a close is finished. ([#305](https://github.com/sk-lim19f/Hypomnema/pull/305))
+- lint and session close now reject dates that do not exist on the calendar (such as `2026-02-30`), and warn (W16) when a synthesis page's own `updated` is not a real date or when `sources_consulted` is written as a YAML block list ([#304](https://github.com/sk-lim19f/Hypomnema/pull/304))
+- `doctor` now reports a plugin-plus-manual install on every run, and says the state is undetermined instead of advising an uninstall when the plugin's files cannot be located. `proposal list` shows each parked proposal's age and whether its target changed since it was parked. `hypo-cwd-change` and `hypo-file-watch` moved their notices onto a field the host does not ignore. ([#300](https://github.com/sk-lim19f/Hypomnema/pull/300))
+- A proposal you approve now finishes the close that parked it, instead of leaving that close stuck re-running with nothing to show for it. `"restructure": true` no longer lets a payload approve its own destructive overwrite; a human approves the parked write. `doctor` names the hook files it reports missing, tells a real double registration apart from a healthy install, and distinguishes an approved-but-unfinished proposal from one awaiting review. New `hypomnema proposal reconcile` recovers an interrupted handoff without rewriting any page. ([#299](https://github.com/sk-lim19f/Hypomnema/pull/299))
+#### 한국어
+- 다른 세션의 미커밋 루트 파일 때문에 session close 가 실패하지 않습니다. close 는 이 close 가 쓴 파일만 증명하는 커밋 기반 close checkpoint receipt 를 발급하고, 이 세션이 기록한 쓰기와 close 하는 프로젝트 폴더의 미커밋 파일만 막으며 나머지는 알림으로 보고합니다. Stop, `--check-session-close`(새 `close_state`), doctor, PreCompact 가 close 완료 판정을 같이 합니다. ([#305](https://github.com/sk-lim19f/Hypomnema/pull/305))
+- lint 와 세션 종료가 달력에 없는 날짜(`2026-02-30` 등)를 거절하고, synthesis 페이지 자신의 `updated` 가 실제 날짜가 아니거나 `sources_consulted` 를 YAML 블록 목록으로 쓴 경우 W16 경고를 냅니다 ([#304](https://github.com/sk-lim19f/Hypomnema/pull/304))
+- `doctor`가 플러그인과 수동 설치의 공존을 매 실행 보고하고, 플러그인 파일을 못 찾으면 제거를 권하는 대신 판정 불가라고 말합니다. `proposal list`가 보류된 제안마다 나이와 대상이 파킹 이후 바뀌었는지를 보여 줍니다. `hypo-cwd-change`와 `hypo-file-watch`는 호스트가 무시하지 않는 필드로 알림을 옮겼습니다. ([#300](https://github.com/sk-lim19f/Hypomnema/pull/300))
+- 승인한 proposal이 그것을 park한 close를 실제로 끝냅니다. 전에는 그 close가 아무 성과 없이 재실행만 반복했습니다. `"restructure": true`로 payload가 자기 파괴적 덮어쓰기를 승인할 수 없고, 파킹된 쓰기는 사람이 승인합니다. `doctor`가 누락된 훅 파일의 이름을 대고, 진짜 이중 등록을 정상 설치와 가르고, 승인됐지만 안 끝난 proposal을 검토 대기 중인 것과 구별합니다. 새 `hypomnema proposal reconcile`이 중단된 handoff를 페이지 수정 없이 복구합니다. ([#299](https://github.com/sk-lim19f/Hypomnema/pull/299))
+
+### Chores
+#### English
+- The README and docs now say that the `cd` and file-change notices are brief terminal notifications that do not reach Claude, that the resume cue fires only when Claude moves directories in-session, and when the auto-project offer actually reaches Claude. The no-match notice no longer claims to inject the global `hot.md`. ([#303](https://github.com/sk-lim19f/Hypomnema/pull/303))
+#### 한국어
+- README 와 문서가 `cd` 알림과 파일 변경 알림은 Claude 에게 닿지 않는 짧은 터미널 알림이라는 것, 재개 신호는 Claude 가 세션 안에서 디렉터리를 옮길 때만 걸린다는 것, 프로젝트 자동 생성 제안이 실제로 Claude 에게 닿는 조건을 사실대로 설명합니다. 매칭되는 프로젝트가 없을 때의 알림도 더 이상 전역 `hot.md` 를 주입한다고 말하지 않습니다. ([#303](https://github.com/sk-lim19f/Hypomnema/pull/303))
+
+### Changelog
+- [#305](https://github.com/sk-lim19f/Hypomnema/pull/305) fix(close): certify only what a close wrote, so another session's uncommitted files no longer block it
+- [#304](https://github.com/sk-lim19f/Hypomnema/pull/304) fix(lint): reject calendar-overflow dates, and warn when a synthesis's own updated is not a real date or sources_consulted is a block list
+- [#303](https://github.com/sk-lim19f/Hypomnema/pull/303) docs(hooks): say what the cd and file-change notices actually reach, and when the auto-project offer shows
+- [#302](https://github.com/sk-lim19f/Hypomnema/pull/302) refactor(scripts): share one day-length constant, and pin proposal age and failure branches with tests
+- [#301](https://github.com/sk-lim19f/Hypomnema/pull/301) feat(hooks,close,upgrade): run Stop as one ordered chain, and keep close-intent until the commit
+- [#300](https://github.com/sk-lim19f/Hypomnema/pull/300) fix(doctor,hooks): report a dual install without guessing, and stop parking bytes from being auto-deleted
+- [#299](https://github.com/sk-lim19f/Hypomnema/pull/299) fix(close): carry approved proposals back to their close, and stop the writers that reported success while doing nothing
+Contributors: @sk-lim19f
+
 ## [1.8.4] - 2026-09-14
 
 ### Bug Fixes
