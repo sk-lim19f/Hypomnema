@@ -2225,8 +2225,9 @@ function writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId) {
  *
  * The lock is NOT reentrant, so nothing inside `writeRootHotProjectionUnlocked`
  * may take it again, and a caller that already holds it must call the
- * unlocked form instead. Today no caller holds it: hypo-session-start.mjs
- * takes it for its own `git pull` and releases before this call,
+ * unlocked form instead, as claimAndWriteRootHotProjection (below) does.
+ * hypo-session-start.mjs takes it for its own `git pull` and releases it
+ * before calling claimAndWriteRootHotProjection,
  * hypo-hot-rebuild.mjs (Stop) runs before hypo-auto-commit.mjs rather than
  * inside it, and scripts/lib/project-create.mjs holds no lock.
  *
@@ -2252,18 +2253,84 @@ export function writeRootHotProjection(hypoDir, testHooks, sessionId) {
     );
   } catch (err) {
     if (err?.code !== 'ELOCKTIMEOUT') throw err;
-    return {
-      written: false,
-      scanError: false,
-      lockTimeout: true,
-      backedUp: false,
-      backupPath: null,
-      gitignoreUpdated: false,
-      warnings: [
-        'root hot.md: 다른 세션이 저장소 잠금을 쥐고 있어 이번에는 갱신하지 않았습니다 (이전 내용을 그대로 둡니다).',
-      ],
-      content: null,
-    };
+    return rootHotLockTimeoutResult();
+  }
+}
+
+function rootHotLockTimeoutResult() {
+  return {
+    written: false,
+    scanError: false,
+    lockTimeout: true,
+    backedUp: false,
+    backupPath: null,
+    gitignoreUpdated: false,
+    warnings: [
+      'root hot.md: 다른 세션이 저장소 잠금을 쥐고 있어 이번에는 갱신하지 않았습니다 (이전 내용을 그대로 둡니다).',
+    ],
+    content: null,
+  };
+}
+
+/**
+ * SessionStart's root hot.md write: claim 'hot.md' in this session's
+ * touched-paths set and write the projection inside ONE hold of the vault
+ * lock. Lock order is vault, then per-session (the claim), the same order
+ * hypo-auto-commit.mjs takes them in.
+ *
+ * The claim used to be taken before the lock. A Stop for the same session_id
+ * (the same session run by two processes) could take the vault lock in that
+ * gap, find hot.md claimed but still clean, commit nothing, and retire the
+ * claim. The write that followed then left hot.md dirty with no claim, so the
+ * checkpoint gate read it as ownerless and let the close through. Inside the
+ * lock, a Stop either runs entirely before the claim or waits until the write
+ * has landed.
+ *
+ * Kept from the unlocked sequence: a failed claim skips the write
+ * (`claimFailed: true`, `result: null`), and a write that throws drops the
+ * claim only when this call is the one that added it, before the lock is
+ * released, then rethrows. A vault lock timeout now returns before any claim
+ * is made, so there is nothing to drop.
+ *
+ * `testHooks.afterClaim` runs right after a successful claim, still inside
+ * the lock (a no-op in production); the rest of `testHooks` goes to the
+ * writer as with writeRootHotProjection.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @param {{ afterClaim?: () => void, beforeFinalWrite?: (hotPath: string) => void, beforeBackupWrite?: (backupPath: string) => void }} [testHooks]
+ * @returns {{claimFailed: boolean, result: ReturnType<typeof writeRootHotProjection>|null}}
+ */
+export function claimAndWriteRootHotProjection(hypoDir, sessionId, testHooks) {
+  // Checked before the lock: without a session_id the claim can only fail,
+  // and a busy vault must not turn that into a lock-timeout notice instead.
+  if (!sessionId) return { claimFailed: true, result: null };
+  try {
+    return withFileLock(
+      vaultCommitLockTarget(hypoDir),
+      () => {
+        const claim = claimProjectionWrite(hypoDir, sessionId, ['hot.md']);
+        if (!claim.ok) return { claimFailed: true, result: null };
+        testHooks?.afterClaim?.();
+        try {
+          return {
+            claimFailed: false,
+            result: writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId),
+          };
+        } catch (err) {
+          // No write happened, so a claim this call added would let whatever
+          // another session or a person writes to hot.md next be committed
+          // as this session's change. An earlier invocation's claim on the
+          // same (resumed) session_id is left alone.
+          if (claim.added) clearTouchedPaths(hypoDir, sessionId, ['hot.md']);
+          throw err;
+        }
+      },
+      { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
+    );
+  } catch (err) {
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    return { claimFailed: false, result: rootHotLockTimeoutResult() };
   }
 }
 
@@ -3611,7 +3678,8 @@ function readTouchedPathsFile(path) {
  *   needs to tell "I just claimed this" from "this was already claimed",
  *   e.g. by an earlier SessionStart invocation in the same resumed session.
  */
-function mergeIncomingTouchedPaths(path, incoming) {
+function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor) {
+  const path = touchedPathsPath(hypoDir, sessionId);
   const current = readTouchedPathsFile(path);
   const merged = new Set(current === null ? [] : current);
   let added = false;
@@ -3619,8 +3687,97 @@ function mergeIncomingTouchedPaths(path, incoming) {
     if (!merged.has(p)) added = true;
     merged.add(p);
   }
+  // Hashes first, the set second. A failure between the two leaves a hash
+  // for a path the set may not hold (never read: only paths in the set are
+  // looked up) or the previous hash of a path the set already held (at worst
+  // a false drift, which keeps the path out of the commit and blocks, never
+  // one that sweeps foreign bytes in).
+  const hashPath = touchedHashesPath(hypoDir, sessionId);
+  const hashes = readTouchedHashesFile(hashPath);
+  for (const p of incoming) {
+    const h = hashFor(p);
+    if (h === undefined) delete hashes[p];
+    else hashes[p] = h;
+  }
+  atomicWrite(hashPath, JSON.stringify(hashes));
   atomicWrite(path, JSON.stringify([...merged]));
   return { added };
+}
+
+/**
+ * Where the per-path content hashes recorded alongside a session's
+ * touched-paths set live: `{ "<vault-relative path>": "<sha256 hex>" | null }`,
+ * `null` meaning the file did not exist when it was recorded. A separate file
+ * rather than a new shape for touched-paths.json, so every reader of that
+ * array (hypo-close-guard.mjs parses it itself) keeps working unchanged, and a
+ * set written before hashes existed simply has no entry here.
+ *
+ * What the hash is for: the set records that this session wrote a path, not
+ * which bytes. When a clear after a successful commit fails, the stale claim
+ * outlives its commit, and a later edit by ANOTHER session to that same path
+ * would be swept into this session's next commit. Comparing the bytes on disk
+ * with the bytes recorded here at commit time is what tells the two apart
+ * (see commitTouchedPaths).
+ */
+export function touchedHashesPath(hypoDir, sessionId) {
+  return join(sessionCacheDir(hypoDir, sessionId), 'touched-hashes.json');
+}
+
+/** Absent, corrupt, or not an object all read as `{}`: no hash recorded for
+ * any path, which is exactly how a set from before hashes existed behaves. */
+function readTouchedHashesFile(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** sha256 of a vault file's bytes, `null` when it does not exist, `undefined`
+ * when it exists but cannot be read (nothing trustworthy to record). */
+function vaultFileHash(hypoDir, relPath) {
+  try {
+    return sha256Hex(readFileSync(join(hypoDir, relPath)));
+  } catch (err) {
+    return err?.code === 'ENOENT' ? null : undefined;
+  }
+}
+
+/** sha256 of a vault path's blob in HEAD, `null` when HEAD has no such path
+ * (or there is no HEAD to read). `./` makes git resolve the path from the
+ * vault, which may sit below the repository root. */
+function headFileHash(hypoDir, relPath) {
+  const r = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', `HEAD:./${relPath}`], {
+    timeout: 30000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return r.status === 0 && r.stdout ? sha256Hex(r.stdout) : null;
+}
+
+/** Whether a hash was recorded for `relPath` and the bytes on disk no longer
+ * match it. A path with no recorded hash never counts as drifted. */
+function recordedHashDrifted(hypoDir, hashes, relPath) {
+  return Object.hasOwn(hashes, relPath) && vaultFileHash(hypoDir, relPath) !== hashes[relPath];
+}
+
+/** Drop hash entries for paths no longer in the set. Best-effort: a leftover
+ * entry is never read (lookups are by paths in the set) and is overwritten
+ * the next time that path is recorded. */
+function pruneTouchedHashes(hypoDir, sessionId, remaining) {
+  const hashPath = touchedHashesPath(hypoDir, sessionId);
+  try {
+    if (remaining.length === 0) {
+      rmSync(hashPath, { force: true });
+      return;
+    }
+    const hashes = readTouchedHashesFile(hashPath);
+    const kept = {};
+    for (const p of remaining) if (Object.hasOwn(hashes, p)) kept[p] = hashes[p];
+    atomicWrite(hashPath, JSON.stringify(kept));
+  } catch {
+    // best-effort, see above
+  }
 }
 
 export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
@@ -3631,7 +3788,9 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
   if (incoming.length === 0) return true;
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
-    withFileLock(path, () => mergeIncomingTouchedPaths(path, incoming));
+    withFileLock(path, () =>
+      mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, (p) => vaultFileHash(hypoDir, p)),
+    );
     return true;
   } catch {
     // Never throws out to the caller (a hook must not fail a tool call over
@@ -3678,7 +3837,15 @@ export function claimProjectionWrite(hypoDir, sessionId, relPaths) {
   if (incoming.length === 0) return { ok: true, added: false };
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
-    const { added } = withFileLock(path, () => mergeIncomingTouchedPaths(path, incoming));
+    // No hash for a projection claim: it is taken BEFORE the write, so the
+    // bytes it will cover are not known yet, and a hash refreshed after the
+    // write could itself fail and leave the claim looking drifted over this
+    // session's own write. Root hot.md's ownership is checked per session by
+    // its receipt at Stop instead (rootHotProjectionIsCurrent). Deleting the
+    // entry also drops a hash an earlier Edit of the same path left behind.
+    const { added } = withFileLock(path, () =>
+      mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, () => undefined),
+    );
     return { ok: true, added };
   } catch {
     return { ok: false, added: false };
@@ -3718,6 +3885,7 @@ export function drainTouchedPaths(hypoDir, sessionId) {
       if (result === null) return []; // corrupt/unreadable: leave the file for inspection, never delete
       try {
         rmSync(path, { force: true });
+        pruneTouchedHashes(hypoDir, sessionId, []);
       } catch {
         // best-effort
       }
@@ -3792,6 +3960,33 @@ export function readTouchedPathsStrict(hypoDir, sessionId) {
 }
 
 /**
+ * The paths in a session's touched-paths set whose bytes on disk no longer
+ * match the hash recorded for them (see touchedHashesPath): another write
+ * landed after this session recorded the path, so Stop keeps it out of the
+ * auto-commit. A separate reader, not a new field on readTouchedPathsStrict,
+ * so that function's `{state, paths}` shape stays exactly what its callers
+ * compare against. Only for wording a blocker; `[]` on no session_id or a
+ * lock timeout, since readTouchedPathsStrict already decides whether to block.
+ *
+ * @param {string} hypoDir
+ * @param {string|null|undefined} sessionId
+ * @returns {string[]}
+ */
+export function readTouchedPathsDrifted(hypoDir, sessionId) {
+  if (!sessionId) return [];
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    return withFileLock(path, () => {
+      const current = readTouchedPathsFile(path) || [];
+      const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+      return current.filter((p) => recordedHashDrifted(hypoDir, hashes, p));
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Remove exactly `paths` from a session's touched-paths set — a set
  * difference, not a clear, and NOT a drain: any path a concurrent
  * PostToolUse (or Stop-chain generator) accumulated before this call is read
@@ -3849,6 +4044,7 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
       } else {
         atomicWrite(path, JSON.stringify(remaining));
       }
+      pruneTouchedHashes(hypoDir, sessionId, remaining);
     });
   } catch {
     // lock-timeout or unexpected error: leave the file as-is. Safe per the
@@ -3906,6 +4102,13 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
  * test-only stand-in for `commitWikiChanges`) keeps nothing, the plain
  * whole-scope clear.
  *
+ * `commitFn` does not always get the whole set. A path whose bytes on disk
+ * differ from the hash recorded for it (touchedHashesPath) is left out, and
+ * is then either retired (HEAD already holds the recorded bytes, or the file
+ * is clean) or kept alongside `ignoredPaths` (another write landed after the
+ * record). The same-session case this also catches, a Bash rewrite of a
+ * path after its last Edit, is left out too: the conservative direction.
+ *
  * @param {string} hypoDir
  * @param {string|null|undefined} sessionId
  * @param {(paths: string[]) => {committed: boolean, ignoredPaths?: string[], [k: string]: unknown}} commitFn
@@ -3926,13 +4129,42 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
         // delete it.
         return commitFn([]);
       }
-      const result = commitFn(current);
+      // Content check before the commit, for every path that has a recorded
+      // hash (see touchedHashesPath). Bytes still equal to what this session
+      // recorded go into the scope. Anything else is left out of THIS commit,
+      // because the bytes on disk are no longer the ones this session wrote:
+      //   - HEAD already holds the recorded bytes: an old claim whose commit
+      //     landed but whose clear failed. Retired, so another session's
+      //     later edit of the path is never swept in under it.
+      //   - HEAD already holds the bytes on disk: nothing is dirty. Retired.
+      //   - neither: some other write landed after this session recorded the
+      //     path. Kept, so the checkpoint gate still blocks on it and says
+      //     why (readTouchedPathsDrifted), instead of the path reading as
+      //     ownerless.
+      // A path with no recorded hash (a set from before hashes existed, a
+      // projection claim, an unreadable file) goes into the scope as before.
+      const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+      const scope = [];
+      const driftKept = [];
+      for (const p of current) {
+        if (!recordedHashDrifted(hypoDir, hashes, p)) {
+          scope.push(p);
+          continue;
+        }
+        const head = headFileHash(hypoDir, p);
+        if (head === hashes[p] || head === vaultFileHash(hypoDir, p)) continue;
+        driftKept.push(p);
+      }
+      const result = commitFn(scope);
       if (result && result.committed && current.length > 0) {
         // Still under the SAME lock acquired above: no recordTouchedPaths
         // call for this session can have landed since `current` was read
         // (it takes this exact lock too), so the set on disk right now is
         // EXACTLY `current`, the removal below needs no re-read.
-        const keep = new Set(Array.isArray(result.ignoredPaths) ? result.ignoredPaths : []);
+        const keep = new Set([
+          ...(Array.isArray(result.ignoredPaths) ? result.ignoredPaths : []),
+          ...driftKept,
+        ]);
         const remaining = current.filter((p) => keep.has(p));
         if (remaining.length < current.length) {
           try {
@@ -3941,6 +4173,7 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
             } else {
               atomicWrite(path, JSON.stringify(remaining));
             }
+            pruneTouchedHashes(hypoDir, sessionId, remaining);
           } catch {
             // best-effort: the retired paths just linger on disk; the next
             // Stop re-peeks them and re-runs commitFn, a clean no-op.
@@ -5407,15 +5640,22 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           });
         } else {
           const touchedSet = new Set((touched.paths || []).map(posixPath));
+          const driftedSet = new Set(
+            readTouchedPathsDrifted(hypoDir, opts.sessionId).map(posixPath),
+          );
           const ignorePatterns = loadHypoIgnore(hypoDir);
           for (const f of dirty) {
             if (touchedSet.has(posixPath(f))) {
               // A touched file .hypoignore keeps out of every commit stays
-              // dirty forever on its own: say how to get out.
+              // dirty forever on its own: say how to get out. A file whose
+              // bytes changed after this session recorded it is kept out of
+              // the auto-commit (commitTouchedPaths), so say that too.
               const ignoredHint =
                 ignorePatterns.length > 0 && isIgnored(join(hypoDir, f), hypoDir, ignorePatterns)
                   ? ' (.hypoignore 대상이라 자동 커밋되지 않는다. 손으로 커밋하거나 .hypoignore 에서 빼야 close 가 된다)'
-                  : '';
+                  : driftedSet.has(posixPath(f))
+                    ? ' (이 세션이 기록한 뒤 다른 쓰기가 이 파일을 바꿔서 자동 커밋에서 빠진다. 지금 내용이 맞는지 확인하고 손으로 커밋해야 close 가 된다)'
+                    : '';
               blockers.push({
                 type: 'known-session-write',
                 file: f,

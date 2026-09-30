@@ -47,6 +47,7 @@ import {
   ROOT_HOT_BACKUP_SUFFIX,
   resolveActiveProject,
   claimProjectionWrite,
+  claimAndWriteRootHotProjection,
   rootHotProjectionIsCurrent,
   sessionCloseFileStatus,
   readTouchedPathsStrict,
@@ -1518,6 +1519,150 @@ test('Stop: a .hypoignore-dropped touched path stays tracked while its clean and
       ['secret.md'],
       'only the .hypoignore-dropped dirty path is still unresolved',
     );
+  });
+});
+
+// ── SessionStart claims and writes root hot.md under one vault lock hold ──
+//
+// The claim used to be taken before the vault lock. A Stop for the same
+// session_id that won the lock in between found hot.md claimed but clean,
+// committed nothing, and retired the claim; the write that followed left
+// hot.md dirty with no claim, which the checkpoint gate reads as ownerless.
+// afterClaim runs that Stop at exactly that point.
+test('claimAndWriteRootHotProjection: a same-session Stop that runs right after the claim cannot retire it before the write lands', () => {
+  withGrowthWiki((dir) => {
+    seedProjectForRootProjection(dir, 'p1');
+    const sid = 'sess-claim-write-one-lock';
+    let stop = null;
+    const out = claimAndWriteRootHotProjection(dir, sid, {
+      afterClaim: () => {
+        stop = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-commit.mjs')], {
+          input: JSON.stringify({ session_id: sid }),
+          encoding: 'utf-8',
+          env: {
+            ...process.env,
+            HOME: SESSION_TMP_HOME,
+            HYPO_DIR: dir,
+            HYPO_VAULT_LOCK_TIMEOUT_MS: '300',
+          },
+        });
+      },
+    });
+    assert.ok(stop, 'fixture: the injected Stop must have run between the claim and the write');
+    assert.equal(stop.status, 0, `stop stderr: ${stop.stderr}`);
+    assert.equal(out.claimFailed, false);
+    assert.equal(out.result.written, true, 'fixture: the projection write must be a real change');
+    assert.notEqual(
+      gitOut(dir, 'status', '--porcelain', '--', 'hot.md'),
+      '',
+      'fixture: the write leaves hot.md dirty',
+    );
+    assert.ok(
+      touchedOnDisk(dir, sid).includes('hot.md'),
+      `the claim must survive the Stop that ran in between: ${JSON.stringify(touchedOnDisk(dir, sid))}`,
+    );
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: sid,
+    });
+    assert.ok(
+      (gate.blockers || []).some((b) => b.type === 'known-session-write' && b.file === 'hot.md'),
+      `hot.md must block as this session's own write, not pass as ownerless: ${JSON.stringify(gate)}`,
+    );
+  });
+});
+
+// ── a claim's recorded bytes decide what Stop may commit under it ─────────
+//
+// The touched-paths set says a session wrote a path, not which bytes. When
+// the clear after a successful commit failed, the stale claim outlived its
+// commit and the next Stop committed whatever another session had since
+// written to that path. The hash recorded with each path tells them apart.
+
+test("Stop: a stale claim whose bytes HEAD already holds is retired, and another session's later edit is not swept into this session's commit", () => {
+  withGrowthWiki((dir) => {
+    const sid = 'sess-stale-claim';
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'y.md'), '# y, written by session A\n');
+    recordTouchedPaths(dir, sid, ['pages/y.md']);
+    // A's commit lands but the clear after it fails: the claim stays.
+    spawnSync('git', ['-C', dir, 'add', 'pages/y.md']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'A commit, clear failed']);
+    assert.deepEqual(touchedOnDisk(dir, sid), ['pages/y.md'], 'fixture: the stale claim is there');
+    // Another session edits the same page and leaves it uncommitted.
+    appendFileSync(join(dir, 'pages', 'y.md'), "session B's unsaved edit\n");
+    const headBefore = gitHead(dir);
+
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(gitHead(dir), headBefore, "A's Stop must not commit B's edit");
+    assert.notEqual(
+      gitOut(dir, 'status', '--porcelain', '--', 'pages/y.md'),
+      '',
+      "B's edit must still be sitting uncommitted",
+    );
+    assert.deepEqual(touchedOnDisk(dir, sid), [], 'the stale claim is retired');
+  });
+});
+
+test('Stop: a claim whose bytes changed after the record, and are not in HEAD either, stays out of the commit and blocks with the cause', () => {
+  withGrowthWiki((dir) => {
+    const sid = 'sess-drifted-claim';
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'z.md'), '# z, written by session A\n');
+    recordTouchedPaths(dir, sid, ['pages/z.md']);
+    writeFileSync(join(dir, 'pages', 'z.md'), '# z, replaced by a write nobody recorded\n');
+    const headBefore = gitHead(dir);
+
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(
+      gitHead(dir),
+      headBefore,
+      'bytes this session did not record must not be committed',
+    );
+    assert.deepEqual(touchedOnDisk(dir, sid), ['pages/z.md'], 'the claim is kept, not retired');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: sid,
+    });
+    const b = (gate.blockers || []).find((x) => x.file === 'pages/z.md');
+    assert.ok(b && b.type === 'known-session-write', `z.md must block: ${JSON.stringify(gate)}`);
+    assert.match(b.reason, /기록한 뒤 다른 쓰기가 이 파일을 바꿔서 자동 커밋에서 빠진다/);
+  });
+});
+
+test('Stop: a path the same session records again after a second edit is committed with its latest bytes', () => {
+  withGrowthWiki((dir) => {
+    const sid = 'sess-rerecorded';
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'w.md'), '# w, first edit\n');
+    recordTouchedPaths(dir, sid, ['pages/w.md']);
+    writeFileSync(join(dir, 'pages', 'w.md'), '# w, second edit\n');
+    recordTouchedPaths(dir, sid, ['pages/w.md']);
+
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(gitOut(dir, 'show', 'HEAD:pages/w.md'), '# w, second edit\n');
+    assert.deepEqual(touchedOnDisk(dir, sid), []);
+  });
+});
+
+test('Stop: a touched-paths set written before hashes existed still commits its paths', () => {
+  withGrowthWiki((dir) => {
+    const sid = 'sess-no-hashes';
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'v.md'), '# v\n');
+    const p = touchedPathsPath(dir, sid);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(['pages/v.md']));
+
+    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(gitOut(dir, 'show', 'HEAD:pages/v.md'), '# v\n');
+    assert.deepEqual(touchedOnDisk(dir, sid), []);
   });
 });
 
@@ -4281,7 +4426,11 @@ test('commitWikiChanges: ignoredPaths lists only supplied paths that are dirty A
 // nothing committed.
 test('commitWikiChanges: a vault nested inside a larger repository commits its vault-relative paths', () => {
   withTmpDir((root) => {
-    const g = (...a) => spawnSync('git', ['-C', root, ...a], { encoding: 'utf-8' });
+    const g = (...a) =>
+      spawnSync('git', ['-C', root, ...a], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
     g('init', '-q');
     g('config', 'user.email', 't@example.invalid');
     g('config', 'user.name', 't');
