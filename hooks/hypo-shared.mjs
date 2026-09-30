@@ -5267,7 +5267,7 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * cwd yields a best-effort notice, not a block. apply never passes it (its launch
  * cwd may differ from the authoritative payload.project).
  *
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, logOnly?: boolean, closeScope?: string[]}} [opts]
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[]}} [opts]
  * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
@@ -5286,7 +5286,20 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   // below. Exempting only the close blocker would still let an unrelated project's
   // stale design-history / lint block the non-project session (codex design
   // BLOCKER). git / hot / lint(self) / feedback all still apply — not a bypass.
-  const marker = opts.sessionId ? readSessionClosedMarker(hypoDir, opts.sessionId) : null;
+  // opts.closeMarker, when the key is set, is the marker the caller already
+  // judged with closeCheckpointState (hooks/close-receipt.mjs): the marker of a
+  // finished close, or null when the close is broken or open. Stop, PreCompact
+  // and --check-session-close pass it, so a marker whose receipt is missing or
+  // invalid never sets log-only mode or attribution here. It is injected rather
+  // than computed because close-receipt.mjs imports this module. Without it the
+  // raw marker is read as before (the apply paths, which invalidate this
+  // session's marker before they reach this gate).
+  const marker =
+    opts.closeMarker !== undefined
+      ? opts.closeMarker
+      : opts.sessionId
+        ? readSessionClosedMarker(hypoDir, opts.sessionId)
+        : null;
   const logOnly = opts.logOnly === true || marker?.scope === 'log-only';
 
   // Paths this session is accountable for at THIS close: the same signals the

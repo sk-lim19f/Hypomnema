@@ -33,11 +33,15 @@
 // receipt.
 
 import { existsSync, readFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, isAbsolute } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { atomicWrite } from './atomic-write.mjs';
-import { sessionClosedMarkerPath, sanitizeSessionId } from './hypo-shared.mjs';
+import {
+  sessionClosedMarkerPath,
+  sanitizeSessionId,
+  readSessionClosedMarker,
+} from './hypo-shared.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
 
 export const RECEIPT_SCHEMA_VERSION = 1;
@@ -49,6 +53,16 @@ export const CERT_CLOSE_FILES = 'committed-close-files';
 // A full object id: 40 hex (sha1) or 64 hex (sha256 repositories). One
 // pattern for the receipt's commit field and for a tree entry's blob oid.
 const OID_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+// A git tree entry mode as ls-tree prints it (100644, 100755, 120000, ...).
+const TREE_MODE_RE = /^[0-7]{6}$/;
+
+// The proof kinds a receipt WRITER actually emits (scripts/lib/
+// crystallize-close-apply.mjs: the apply path's write phases and
+// buildMarkCloseProof). verifyEntriesInCommit also understands 'absent', but no
+// writer files one, so a stored receipt that names it was not written by us.
+const RECEIPT_ENTRY_KINDS = new Set(['overwrite', 'create', 'append', 'schema-pending']);
 
 const GIT_TIMEOUT_MS = 30000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -159,10 +173,47 @@ export function receiptPath(hypoDir, sessionId) {
   return join(hypoDir, '.cache', 'sessions', sanitizeSessionId(sessionId), 'close-receipt.json');
 }
 
+function isPlainObject(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+function isNonEmptyStringArray(v) {
+  return Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'string' && x);
+}
+
+/**
+ * One receipt entry's shape: a vault-relative path that cannot climb out of
+ * the vault, a kind a writer emits, and an `expected` that gives
+ * verifyEntriesInCommit something to compare. An overwrite/create whose
+ * `expected` names neither a sha256 nor a blob oid would verify as a match
+ * against any committed bytes, so it is rejected here too.
+ */
+function isWellFormedEntry(entry) {
+  if (!isPlainObject(entry)) return false;
+  const { path, kind, expected } = entry;
+  if (typeof path !== 'string' || !path || isAbsolute(path) || /^[\\/]/.test(path)) return false;
+  if (path.split(/[\\/]/).includes('..')) return false;
+  if (!RECEIPT_ENTRY_KINDS.has(kind) || !isPlainObject(expected)) return false;
+  if (kind === 'overwrite' || kind === 'create') {
+    const { bytesSha256, blob, mode } = expected;
+    if (
+      bytesSha256 !== undefined &&
+      !(typeof bytesSha256 === 'string' && SHA256_HEX_RE.test(bytesSha256))
+    )
+      return false;
+    if (blob !== undefined && !(typeof blob === 'string' && OID_RE.test(blob))) return false;
+    if (mode !== undefined && !(typeof mode === 'string' && TREE_MODE_RE.test(mode))) return false;
+    return bytesSha256 !== undefined || blob !== undefined;
+  }
+  if (kind === 'append') return isNonEmptyStringArray(expected.entryBlocks);
+  return isNonEmptyStringArray(expected.tags); // schema-pending
+}
+
 /**
  * Read and strictly validate a session's close receipt: parse, schema
- * version, certification value, session id match, repo identity, and commit
- * reachability from the CURRENT branch history. Any failure at any step is
+ * version, certification value, session id match, entry shape (see
+ * isWellFormedEntry), repo identity, and commit reachability from the CURRENT
+ * branch history. Any failure at any step is
  * `invalid`, never silently treated as `missing`, a caller must be able to
  * tell "no receipt was ever written" from "a receipt exists but cannot be
  * trusted", since the two call for different user-facing advice.
@@ -200,6 +251,16 @@ export function readReceiptStrict(hypoDir, sessionId) {
   }
   if (!Array.isArray(receipt.entries)) {
     return { status: 'invalid', reason: 'malformed-entries' };
+  }
+  // Shape only, no git objects: Stop reads this on every close-intent turn, and
+  // the byte-level check belongs to verifyEntriesInCommit at write time. What
+  // this rules out is a receipt that certifies nothing (no entries) or an entry
+  // verifyEntriesInCommit would have waved through without checking anything.
+  if (receipt.entries.length === 0) {
+    return { status: 'invalid', reason: 'empty-entries' };
+  }
+  if (receipt.entries.some((e) => !isWellFormedEntry(e))) {
+    return { status: 'invalid', reason: 'malformed-entry' };
   }
   if (
     !receipt.repo ||
@@ -395,12 +456,104 @@ function invalidateOne(path) {
  * (not `.marker` at the end) so doctor's marker-file scan and the
  * legacy-closed acceptance path (which only look at names ending `.marker`)
  * never pick an invalidated file back up.
+ *
+ * `testHooks.afterFirstRename` runs between the two renames. It exists so a
+ * test can stop the process at that exact point and see which artifact is
+ * already gone; production callers never pass it.
+ * @param {{afterFirstRename?: () => void}} [testHooks]
  * @returns {{ok: boolean, reason?: string}}
  */
-export function invalidateCloseArtifacts(hypoDir, sessionId) {
+export function invalidateCloseArtifacts(hypoDir, sessionId, testHooks = {}) {
   const markerResult = invalidateOne(sessionClosedMarkerPath(hypoDir, sessionId));
   if (!markerResult.ok) return markerResult;
+  testHooks.afterFirstRename?.();
   const receipt = receiptPath(hypoDir, sessionId);
   if (!receipt) return { ok: true }; // invalid session id: nothing filed under it to invalidate
   return invalidateOne(receipt);
+}
+
+/** The two states that count as "this session's close is done". */
+const CLOSE_COMPLETE_STATES = new Set(['closed', 'legacy-closed']);
+
+/** @returns {boolean} true when `checkpoint` (a closeCheckpointState result) is a finished close. */
+export function isCloseComplete(checkpoint) {
+  return !!checkpoint && CLOSE_COMPLETE_STATES.has(checkpoint.state);
+}
+
+/**
+ * The one verdict on "is this session's close done", shared by Stop, the
+ * `--check-session-close` diagnostic, doctor, and the PreCompact gate so the
+ * four cannot drift apart. It pairs the receipt with the compat marker that
+ * projects it:
+ *
+ *   closed         the receipt is valid, and a marker names that same receipt
+ *                  generation.
+ *   legacy-closed  no receipt, and a marker that names no receipt generation
+ *                  (an older writer; the marker's own 7-day TTL still applies).
+ *   broken         the two disagree: a marker promises a receipt that is
+ *                  missing, invalid, or a different generation, or a valid
+ *                  receipt has no marker or a mismatched one (a close that
+ *                  stopped between its two writes, or an invalidation that
+ *                  moved only one of them). An invalid receipt with no marker
+ *                  is broken too: something was filed and cannot be trusted.
+ *   open           neither a receipt nor a marker.
+ *
+ * Only `closed` and `legacy-closed` are a finished close (isCloseComplete).
+ * `reason` is one human-readable line for `broken` and `open`, else null.
+ *
+ * A session id that isValidSessionId rejects has no receipt path at all, so
+ * its receipt reads as missing rather than invalid: no receipt can ever be
+ * filed under it, and a legacy marker for it stays legacy-closed.
+ *
+ * `opts.marker`, when the key is present, is used instead of reading the
+ * marker: readSessionClosedMarker unlinks an expired or corrupt marker as it
+ * reads, and doctor (a read-only health check) must not mutate the vault, so
+ * it reads the raw file itself and passes the parsed object (or null) here.
+ *
+ * @param {string} hypoDir
+ * @param {string} sessionId
+ * @param {{marker?: object|null}} [opts]
+ * @returns {{state: 'closed'|'legacy-closed'|'broken'|'open', reason: string|null,
+ *   receipt: object|null, marker: object|null}}
+ */
+export function closeCheckpointState(hypoDir, sessionId, opts = {}) {
+  const marker =
+    'marker' in opts ? opts.marker || null : readSessionClosedMarker(hypoDir, sessionId);
+  const read = receiptPath(hypoDir, sessionId)
+    ? readReceiptStrict(hypoDir, sessionId)
+    : { status: 'missing' };
+  const receipt = read.status === 'valid' ? read.receipt : null;
+  const markerGen = (marker && marker.receipt_generation) || null;
+  const result = (state, reason = null) => ({ state, reason, receipt, marker });
+
+  if (receipt) {
+    if (!marker) {
+      return result(
+        'broken',
+        'a valid close receipt has no session-closed marker (the close stopped before the marker landed, or only the marker was invalidated)',
+      );
+    }
+    if (
+      typeof receipt.generation !== 'string' ||
+      !receipt.generation ||
+      markerGen !== receipt.generation
+    ) {
+      return result(
+        'broken',
+        `the session-closed marker names receipt generation ${markerGen || '(none)'}, but the close receipt is generation ${receipt.generation || '(none)'}`,
+      );
+    }
+    return result('closed');
+  }
+  if (read.status === 'invalid') {
+    return result('broken', `the close receipt is invalid (${read.reason})`);
+  }
+  if (markerGen) {
+    return result(
+      'broken',
+      `the session-closed marker names receipt generation ${markerGen}, but no close receipt exists`,
+    );
+  }
+  if (marker) return result('legacy-closed');
+  return result('open', 'no close receipt and no session-closed marker for this session');
 }

@@ -34,12 +34,15 @@ import {
   verifyEntriesInCommit,
   writeReceiptAtomic,
   invalidateCloseArtifacts,
+  closeCheckpointState,
+  isCloseComplete,
 } from '../hooks/close-receipt.mjs';
 import {
   sessionClosedMarkerPath,
   writeSessionClosedMarker,
   sanitizeSessionId,
 } from '../hooks/hypo-shared.mjs';
+import { SESSION_TMP_HOME } from './helpers.mjs';
 
 function withTmpDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-close-receipt-'));
@@ -50,8 +53,14 @@ function withTmpDir(fn) {
   }
 }
 
+// HOME pinned like every other spawned child: git reads ~/.gitconfig, and a
+// fixture must not depend on (or write near) the developer's real one.
 function git(dir, args, opts = {}) {
-  return spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8', ...opts });
+  return spawnSync('git', ['-C', dir, ...args], {
+    encoding: 'utf-8',
+    ...opts,
+    env: { ...process.env, HOME: SESSION_TMP_HOME, ...opts.env },
+  });
 }
 
 function gitRepo(dir) {
@@ -85,7 +94,16 @@ function blobOid(dir, commit, relPath) {
   return { mode: m[1], oid: m[2] };
 }
 
-function baseReceipt(dir, sessionId, commit, entries) {
+// One writer-shaped entry (the --mark-session-closed shape): enough for
+// readReceiptStrict's entry-shape check, so a test aimed at a different field
+// fails for that field's reason and not for an empty entries list.
+const WRITER_SHAPED_ENTRY = Object.freeze({
+  path: 'log.md',
+  kind: 'overwrite',
+  expected: { bytesSha256: 'a'.repeat(64) },
+});
+
+function baseReceipt(dir, sessionId, commit, entries = [WRITER_SHAPED_ENTRY]) {
   return {
     schemaVersion: RECEIPT_SCHEMA_VERSION,
     certification: CERT_CHECKPOINT,
@@ -169,7 +187,7 @@ test('readReceiptStrict: a receipt filed under a DIFFERENT session id than the o
   withTmpDir((dir) => {
     gitRepo(dir);
     const commit = commitAll(dir, 'init');
-    const receipt = baseReceipt(dir, 'sess-owner', commit, []);
+    const receipt = baseReceipt(dir, 'sess-owner', commit);
     const w = writeReceiptAtomic(dir, 'sess-owner', receipt);
     assert.equal(w.ok, true, JSON.stringify(w));
     // Copy the exact bytes into a DIFFERENT session's directory, the file
@@ -187,7 +205,7 @@ test('readReceiptStrict: an unknown schemaVersion is invalid, never assumed forw
   withTmpDir((dir) => {
     gitRepo(dir);
     const commit = commitAll(dir, 'init');
-    const receipt = { ...baseReceipt(dir, 'sess-v', commit, []), schemaVersion: 999 };
+    const receipt = { ...baseReceipt(dir, 'sess-v', commit), schemaVersion: 999 };
     writeReceiptAtomic(dir, 'sess-v', receipt);
     assert.deepEqual(readReceiptStrict(dir, 'sess-v'), {
       status: 'invalid',
@@ -200,7 +218,7 @@ test('readReceiptStrict: repo.toplevel not matching this git repo is invalid (a 
   withTmpDir((dir) => {
     gitRepo(dir);
     const commit = commitAll(dir, 'init');
-    const receipt = baseReceipt(dir, 'sess-repo', commit, []);
+    const receipt = baseReceipt(dir, 'sess-repo', commit);
     receipt.repo.toplevel = '/nonexistent/other/vault';
     writeReceiptAtomic(dir, 'sess-repo', receipt);
     assert.deepEqual(readReceiptStrict(dir, 'sess-repo'), {
@@ -217,7 +235,7 @@ test('readReceiptStrict: a commit dropped from branch history (reset --hard) is 
     writeFileSync(join(dir, 'b.md'), '# b\n');
     const droppedCommit = commitAll(dir, 'second');
     git(dir, ['reset', '--hard', 'HEAD~1']); // droppedCommit is no longer on any branch
-    const receipt = baseReceipt(dir, 'sess-dropped', droppedCommit, []);
+    const receipt = baseReceipt(dir, 'sess-dropped', droppedCommit);
     writeReceiptAtomic(dir, 'sess-dropped', receipt);
     assert.deepEqual(readReceiptStrict(dir, 'sess-dropped'), {
       status: 'invalid',
@@ -230,9 +248,7 @@ test('readReceiptStrict: a well-formed receipt whose commit is HEAD itself is va
   withTmpDir((dir) => {
     gitRepo(dir);
     const commit = commitAll(dir, 'init');
-    const receipt = baseReceipt(dir, 'sess-valid', commit, [
-      { path: 'a.md', kind: 'absent', expected: {} },
-    ]);
+    const receipt = baseReceipt(dir, 'sess-valid', commit);
     writeReceiptAtomic(dir, 'sess-valid', receipt);
     const result = readReceiptStrict(dir, 'sess-valid');
     assert.equal(result.status, 'valid', JSON.stringify(result));
@@ -264,11 +280,78 @@ test('readReceiptStrict: a commit that is neither 40 nor 64 hex is malformed-com
     gitRepo(dir);
     commitAll(dir, 'init');
     for (const bad of ['a'.repeat(41), 'a'.repeat(63), 'a'.repeat(65), 'A'.repeat(40)]) {
-      writeReceiptAtomic(dir, 'sess-oid', baseReceipt(dir, 'sess-oid', bad, []));
+      writeReceiptAtomic(dir, 'sess-oid', baseReceipt(dir, 'sess-oid', bad));
       assert.deepEqual(
         readReceiptStrict(dir, 'sess-oid'),
         { status: 'invalid', reason: 'malformed-commit' },
         `commit ${bad.length} chars must be rejected`,
+      );
+    }
+  });
+});
+
+suite('close-receipt.mjs, readReceiptStrict: entry shape');
+
+// Every kind a writer emits, in the exact shape the writer files it
+// (scripts/lib/crystallize-close-apply.mjs). The contrast rows below each break
+// one field of one of these, so a rejection names the field, not the fixture.
+const WRITER_ENTRIES = [
+  { path: 'projects/demo/hot.md', kind: 'overwrite', expected: { bytesSha256: 'b'.repeat(64) } },
+  { path: 'projects/demo/index.md', kind: 'create', expected: { bytesSha256: 'c'.repeat(64) } },
+  { path: 'log.md', kind: 'append', expected: { entryBlocks: ['## [2026-09-30] session\n'] } },
+  { path: 'SCHEMA.md', kind: 'schema-pending', expected: { tags: ['new-tag'] } },
+];
+
+function readWithEntries(dir, sessionId, entries) {
+  const commit = git(dir, ['rev-parse', 'HEAD']).stdout.trim();
+  writeReceiptAtomic(dir, sessionId, baseReceipt(dir, sessionId, commit, entries));
+  return readReceiptStrict(dir, sessionId);
+}
+
+test('readReceiptStrict: every writer-shaped entry kind is valid, and an empty entries list is empty-entries', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commitAll(dir, 'init');
+    const ok = readWithEntries(dir, 'sess-shape-ok', WRITER_ENTRIES);
+    assert.equal(ok.status, 'valid', JSON.stringify(ok));
+    assert.deepEqual(readWithEntries(dir, 'sess-shape-empty', []), {
+      status: 'invalid',
+      reason: 'empty-entries',
+    });
+  });
+});
+
+test('readReceiptStrict: an entry with a bad path, an unwritten kind, or an expected that proves nothing is malformed-entry', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commitAll(dir, 'init');
+    const [overwrite, create, append, pending] = WRITER_ENTRIES;
+    const bad = {
+      'empty path': { ...overwrite, path: '' },
+      'non-string path': { ...overwrite, path: 7 },
+      'absolute path': { ...overwrite, path: '/etc/hot.md' },
+      'backslash-rooted path': { ...overwrite, path: '\\hot.md' },
+      'parent segment': { ...overwrite, path: 'projects/../../hot.md' },
+      'windows parent segment': { ...overwrite, path: 'projects\\..\\hot.md' },
+      'absent kind (no writer files it)': { path: 'a.md', kind: 'absent', expected: {} },
+      'unknown kind': { ...overwrite, kind: 'replace' },
+      'missing expected': { path: 'a.md', kind: 'overwrite' },
+      'array expected': { ...overwrite, expected: [] },
+      'overwrite with nothing to compare': { ...overwrite, expected: {} },
+      'overwrite with a short sha256': { ...overwrite, expected: { bytesSha256: 'b'.repeat(63) } },
+      'create with a bad blob oid': { ...create, expected: { blob: 'xyz' } },
+      'create with a bad mode': { ...create, expected: { bytesSha256: 'c'.repeat(64), mode: 644 } },
+      'append with no blocks': { ...append, expected: { entryBlocks: [] } },
+      'append with an empty block': { ...append, expected: { entryBlocks: [''] } },
+      'schema-pending with no tags': { ...pending, expected: { tags: [] } },
+      'schema-pending with a non-string tag': { ...pending, expected: { tags: [1] } },
+      'null entry': null,
+    };
+    for (const [label, entry] of Object.entries(bad)) {
+      assert.deepEqual(
+        readWithEntries(dir, 'sess-shape-bad', [...WRITER_ENTRIES, entry]),
+        { status: 'invalid', reason: 'malformed-entry' },
+        `${label} must be rejected`,
       );
     }
   });
@@ -599,7 +682,7 @@ test('writeReceiptAtomic: writes, and a re-read reproduces the exact receipt; an
   withTmpDir((dir) => {
     gitRepo(dir);
     const commit = commitAll(dir, 'init');
-    const receipt = baseReceipt(dir, 'sess-write', commit, []);
+    const receipt = baseReceipt(dir, 'sess-write', commit);
     const res = writeReceiptAtomic(dir, 'sess-write', receipt);
     assert.equal(res.ok, true, JSON.stringify(res));
     assert.deepEqual(JSON.parse(readFileSync(res.path, 'utf-8')), receipt);
@@ -621,7 +704,7 @@ test('invalidateCloseArtifacts: renames the compat marker and the receipt, marke
     const commit = commitAll(dir, 'init');
     const sessionId = 'sess-invalidate';
     writeSessionClosedMarker(dir, sessionId, { project: 'demo' });
-    const receipt = baseReceipt(dir, sessionId, commit, []);
+    const receipt = baseReceipt(dir, sessionId, commit);
     const written = writeReceiptAtomic(dir, sessionId, receipt);
     assert.equal(written.ok, true);
 
@@ -650,5 +733,156 @@ test('invalidateCloseArtifacts: renames the compat marker and the receipt, marke
     // A NEW marker written after invalidation must not collide with, or be
     // shadowed by, the renamed-away one; readSessionClosedMarker must find
     // nothing at the canonical path until a fresh one is written there.
+  });
+});
+
+test('invalidateCloseArtifacts: a stop right after the first rename leaves the receipt, never a marker without its receipt', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    const commit = commitAll(dir, 'init');
+    const sessionId = 'sess-invalidate-order';
+    writeSessionClosedMarker(dir, sessionId, { project: 'demo' });
+    assert.equal(writeReceiptAtomic(dir, sessionId, baseReceipt(dir, sessionId, commit)).ok, true);
+    const stop = new Error('stopped between the two renames');
+    assert.throws(
+      () =>
+        invalidateCloseArtifacts(dir, sessionId, {
+          afterFirstRename: () => {
+            throw stop;
+          },
+        }),
+      (e) => e === stop,
+    );
+    assert.equal(
+      existsSync(sessionClosedMarkerPath(dir, sessionId)),
+      false,
+      'the marker must be the FIRST artifact renamed away',
+    );
+    assert.equal(
+      existsSync(receiptPath(dir, sessionId)),
+      true,
+      'the receipt must still be in place when the process stops after one rename',
+    );
+  });
+});
+
+suite('close-receipt.mjs, closeCheckpointState');
+
+function writeMarker(dir, sessionId, fields = {}) {
+  mkdirSync(join(dir, '.cache'), { recursive: true });
+  writeFileSync(
+    sessionClosedMarkerPath(dir, sessionId),
+    JSON.stringify({
+      session_id: sessionId,
+      project: 'demo',
+      projects: ['demo'],
+      scope: 'project',
+      closed_at: new Date().toISOString(),
+      verification: 'session-close-file-status:ok',
+      ...fields,
+    }) + '\n',
+  );
+}
+
+function writeGenReceipt(dir, sessionId, generation) {
+  const commit = git(dir, ['rev-parse', 'HEAD']).stdout.trim();
+  const w = writeReceiptAtomic(dir, sessionId, {
+    ...baseReceipt(dir, sessionId, commit),
+    generation,
+  });
+  assert.equal(w.ok, true, JSON.stringify(w));
+}
+
+test('closeCheckpointState: closed only when the receipt is valid AND the marker names its generation', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commitAll(dir, 'init');
+    writeGenReceipt(dir, 'sess-cp', 'gen-1');
+    writeMarker(dir, 'sess-cp', { receipt_generation: 'gen-1' });
+    const cp = closeCheckpointState(dir, 'sess-cp');
+    assert.equal(cp.state, 'closed', JSON.stringify(cp));
+    assert.equal(cp.reason, null);
+    assert.equal(cp.receipt.generation, 'gen-1');
+    assert.equal(cp.marker.receipt_generation, 'gen-1');
+    assert.equal(isCloseComplete(cp), true);
+  });
+});
+
+test('closeCheckpointState: a valid receipt with no marker, a legacy marker, or another generation is broken', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commitAll(dir, 'init');
+    // (a) the close stopped after the receipt and before the marker.
+    writeGenReceipt(dir, 'sess-cp-nomarker', 'gen-1');
+    const a = closeCheckpointState(dir, 'sess-cp-nomarker');
+    assert.equal(a.state, 'broken', JSON.stringify(a));
+    assert.match(a.reason, /no session-closed marker/);
+    assert.equal(isCloseComplete(a), false);
+    // (b) a marker that names no generation beside a valid receipt.
+    writeGenReceipt(dir, 'sess-cp-legacy-marker', 'gen-1');
+    writeMarker(dir, 'sess-cp-legacy-marker');
+    assert.equal(closeCheckpointState(dir, 'sess-cp-legacy-marker').state, 'broken');
+    // (c) a marker from a different close generation.
+    writeGenReceipt(dir, 'sess-cp-othergen', 'gen-new');
+    writeMarker(dir, 'sess-cp-othergen', { receipt_generation: 'gen-old' });
+    const c = closeCheckpointState(dir, 'sess-cp-othergen');
+    assert.equal(c.state, 'broken');
+    assert.match(c.reason, /gen-old.*gen-new/);
+  });
+});
+
+test('closeCheckpointState: a marker naming a generation with the receipt missing or invalid is broken; an invalid receipt alone is broken', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    commitAll(dir, 'init');
+    writeMarker(dir, 'sess-cp-orphan', { receipt_generation: 'gen-x' });
+    const orphan = closeCheckpointState(dir, 'sess-cp-orphan');
+    assert.equal(orphan.state, 'broken', JSON.stringify(orphan));
+    assert.match(orphan.reason, /no close receipt exists/);
+
+    writeMarker(dir, 'sess-cp-invalid', { receipt_generation: 'gen-x' });
+    mkdirSync(join(dir, '.cache', 'sessions', 'sess-cp-invalid'), { recursive: true });
+    writeFileSync(receiptPath(dir, 'sess-cp-invalid'), '{ not json');
+    const invalid = closeCheckpointState(dir, 'sess-cp-invalid');
+    assert.equal(invalid.state, 'broken');
+    assert.match(invalid.reason, /parse-error/);
+
+    mkdirSync(join(dir, '.cache', 'sessions', 'sess-cp-invalid-alone'), { recursive: true });
+    writeFileSync(receiptPath(dir, 'sess-cp-invalid-alone'), '{ not json');
+    assert.equal(closeCheckpointState(dir, 'sess-cp-invalid-alone').state, 'broken');
+  });
+});
+
+test('closeCheckpointState: legacy-closed for a generation-less marker with no receipt, open for neither', () => {
+  withTmpDir((dir) => {
+    writeMarker(dir, 'sess-cp-legacy');
+    const legacy = closeCheckpointState(dir, 'sess-cp-legacy');
+    assert.equal(legacy.state, 'legacy-closed', JSON.stringify(legacy));
+    assert.equal(legacy.reason, null);
+    assert.equal(legacy.receipt, null);
+    assert.equal(isCloseComplete(legacy), true);
+
+    // An id isValidSessionId rejects has no receipt path: its receipt is
+    // missing, not invalid, so a legacy marker for it stays legacy-closed.
+    writeMarker(dir, 'has.dot');
+    assert.equal(closeCheckpointState(dir, 'has.dot').state, 'legacy-closed');
+
+    const open = closeCheckpointState(dir, 'sess-cp-none');
+    assert.equal(open.state, 'open');
+    assert.ok(open.reason);
+    assert.equal(isCloseComplete(open), false);
+  });
+});
+
+test('closeCheckpointState: opts.marker replaces the marker read, so an expired marker file is left on disk', () => {
+  withTmpDir((dir) => {
+    writeMarker(dir, 'sess-cp-expired', { closed_at: '2000-01-01T00:00:00.000Z' });
+    const path = sessionClosedMarkerPath(dir, 'sess-cp-expired');
+    const injected = closeCheckpointState(dir, 'sess-cp-expired', { marker: null });
+    assert.equal(injected.state, 'open');
+    assert.equal(existsSync(path), true, 'an injected marker must not trigger the unlinking read');
+    // Contrast: the default read expires (and unlinks) the same file.
+    assert.equal(closeCheckpointState(dir, 'sess-cp-expired').state, 'open');
+    assert.equal(existsSync(path), false);
   });
 });

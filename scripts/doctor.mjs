@@ -66,6 +66,7 @@ import {
   computeHooksDigest,
 } from './lib/pkg-provenance.mjs';
 import { resolveCliOnPath, classifyInstall, upgradeApplyHint } from '../hooks/version-check.mjs';
+import { closeCheckpointState, isCloseComplete } from '../hooks/close-receipt.mjs';
 import {
   enabledHypomnemaPluginKey,
   usablePkgRoot,
@@ -1169,6 +1170,10 @@ function checkSessionCloseArtifacts(hypoDir) {
   // already-expired marker can't vouch for anything.
   const cacheDir = join(hypoDir, '.cache');
   const markers = [];
+  // Markers closeCheckpointState does not call a finished close (the receipt
+  // they name is missing, invalid or another generation, or a valid receipt
+  // disagrees with them). They cover nothing, and the warning says why.
+  const brokenMarkers = [];
   let cacheEntries = [];
   if (existsSync(cacheDir)) {
     try {
@@ -1183,6 +1188,19 @@ function checkSessionCloseArtifacts(hypoDir) {
       const data = JSON.parse(readFileSync(join(cacheDir, file), 'utf-8'));
       const ts = Date.parse(data?.closed_at || '');
       if (!Number.isFinite(ts) || Date.now() - ts > SESSION_CLOSED_MARKER_STALE_MS) continue;
+      // The same verdict Stop blocks on, fed the marker parsed above so the
+      // reader never unlinks anything. The file name carries the sanitized id,
+      // which can differ from the real one; the marker body carries the real
+      // one, and the receipt's own session id check needs exactly that.
+      const sessionId =
+        typeof data?.session_id === 'string' && data.session_id
+          ? data.session_id
+          : file.slice('session-closed-'.length, -'.marker'.length);
+      const checkpoint = closeCheckpointState(hypoDir, sessionId, { marker: data });
+      if (!isCloseComplete(checkpoint)) {
+        brokenMarkers.push({ sessionId, reason: checkpoint.reason });
+        continue;
+      }
       // ONLY the v4 `projects` array counts as project-scope evidence. A
       // legacy flat `project` field can be a recency-derived misattribution
       // (the P1 bug resolveCloseScope's own doc comment describes) — the
@@ -1222,6 +1240,15 @@ function checkSessionCloseArtifacts(hypoDir) {
     .map((a) => `${a.where}${a.date ? ` (${a.date})` : ''}`)
     .join(', ');
   const extra = unmatched.length > 5 ? ` (+${unmatched.length - 5} more)` : '';
+  const brokenNote =
+    brokenMarkers.length > 0
+      ? `. ${brokenMarkers.length} session-closed marker(s) did not count because their close ` +
+        `checkpoint is broken: ` +
+        brokenMarkers
+          .slice(0, 3)
+          .map((b) => `${b.sessionId} (${b.reason})`)
+          .join('; ')
+      : '';
   // Not necessarily UNAPPROVED — an approved log-only marker (deliberately
   // empty `projects`) or one scoped to a different project would ALSO land
   // here, since neither covers a specific project's artifact. Both readings
@@ -1231,7 +1258,7 @@ function checkSessionCloseArtifacts(hypoDir) {
     'Session-close artifacts',
     `${unmatched.length} close artifact(s) with no session-closed marker covering their ` +
       `date and project scope — may be an unapproved hand-made close, or an approved close ` +
-      `whose marker doesn't attribute this project: ${sample}${extra}`,
+      `whose marker doesn't attribute this project: ${sample}${extra}${brokenNote}`,
   );
 }
 

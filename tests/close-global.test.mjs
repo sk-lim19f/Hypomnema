@@ -1049,10 +1049,24 @@ function writeMarkerWithReceiptGeneration(dir, sessionId, generation) {
 // shape, so a mismatch in any of those fields would make a test built on
 // this prove nothing (it would read 'invalid', not 'valid', and every
 // scenario below collapses to the same branch).
+//
+// The compat marker that projects the receipt is written alongside by default
+// (receipt_generation = the receipt's generation), since that pair is what a
+// finished close leaves behind and what closeCheckpointState calls 'closed'.
+// `marker: false` leaves the receipt alone: the half-landed close.
+// The default entry is writer-shaped (readReceiptStrict rejects an empty or
+// malformed entries list); a test that needs a specific certified path passes
+// its own.
 function writeValidReceipt(
   dir,
   sessionId,
-  { scopeMode = 'project', projects = ['demo'], entries = [], generation } = {},
+  {
+    scopeMode = 'project',
+    projects = ['demo'],
+    entries = [{ path: 'log.md', kind: 'append', expected: { entryBlocks: ['fixture entry'] } }],
+    generation,
+    marker = true,
+  } = {},
 ) {
   const toplevel = spawnSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], {
     encoding: 'utf-8',
@@ -1074,6 +1088,23 @@ function writeValidReceipt(
   };
   const result = writeReceiptAtomic(dir, sessionId, receipt);
   assert.ok(result.ok, `fixture must actually write a valid receipt: ${JSON.stringify(result)}`);
+  if (marker) {
+    const path = join(dir, '.cache', `session-closed-${sessionId}.marker`);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        session_id: sessionId,
+        project: projects[0] || null,
+        projects,
+        scope: scopeMode === 'log-only' ? 'log-only' : 'project',
+        closed_at: new Date().toISOString(),
+        verification:
+          scopeMode === 'log-only' ? 'log-only-close:ok' : 'session-close-file-status:ok',
+        receipt_generation: receipt.generation,
+      }) + '\n',
+    );
+  }
   return receipt;
 }
 
@@ -1500,6 +1531,51 @@ test('Stop: a compat marker naming an unresolvable receiptGeneration still block
   });
 });
 
+test('Stop: a valid receipt without its marker, or beside a marker of another generation, blocks and says the checkpoint is broken', () => {
+  withGrowthWiki((dir) => {
+    const closeTurn = () =>
+      writeTranscript(dir, [
+        {
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        },
+        { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+      ]);
+    // A: the close wrote its receipt and stopped before the marker landed.
+    writeValidReceipt(dir, 's-receipt-no-marker', { marker: false });
+    const outA = JSON.parse(
+      runAutoMinimal(dir, {
+        session_id: 's-receipt-no-marker',
+        transcript_path: closeTurn(),
+        stop_hook_active: false,
+      }).stdout,
+    );
+    assert.equal(
+      outA.decision,
+      'block',
+      `a receipt alone must not end the session: ${JSON.stringify(outA)}`,
+    );
+    assert.match(
+      outA.reason,
+      /no session-closed marker/,
+      'the block must name why the close is not accepted',
+    );
+
+    // B: the marker is from a different close generation than the receipt.
+    writeValidReceipt(dir, 's-receipt-other-gen', { generation: 'gen-receipt', marker: false });
+    writeMarkerWithReceiptGeneration(dir, 's-receipt-other-gen', 'gen-marker');
+    const outB = JSON.parse(
+      runAutoMinimal(dir, {
+        session_id: 's-receipt-other-gen',
+        transcript_path: closeTurn(),
+        stop_hook_active: false,
+      }).stdout,
+    );
+    assert.equal(outB.decision, 'block', JSON.stringify(outB));
+    assert.match(outB.reason, /gen-marker.*gen-receipt/);
+  });
+});
+
 test('Stop: the unresolved-changes notice fires once per receipt generation, and again only once the list changes', () => {
   withGrowthWiki((dir) => {
     const sessionId = 's-unresolved-notice';
@@ -1507,9 +1583,9 @@ test('Stop: the unresolved-changes notice fires once per receipt generation, and
       { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
       { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
     ]);
-    // A dirty file the receipt's (empty) entries list never certifies.
+    // A dirty file the receipt's entries list never certifies.
     writeFileSync(join(dir, 'stray-a.md'), '# stray a\n');
-    writeValidReceipt(dir, sessionId, { entries: [] });
+    writeValidReceipt(dir, sessionId);
 
     const r1 = runAutoMinimal(dir, {
       session_id: sessionId,
@@ -1563,7 +1639,13 @@ test('Stop: a path the receipt names but that is dirty now is reported as change
     // hot.md is in the receipt's entries and committed at HEAD, so the receipt is
     // valid; editing it afterwards leaves bytes on disk that no commit holds.
     writeValidReceipt(dir, sessionId, {
-      entries: [{ path: 'hot.md', kind: 'overwrite', expected: {} }],
+      entries: [
+        {
+          path: 'hot.md',
+          kind: 'overwrite',
+          expected: { bytesSha256: hashContent(readFileSync(join(dir, 'hot.md'), 'utf-8')) },
+        },
+      ],
     });
     appendFileSync(join(dir, 'hot.md'), '\nedited after the close checkpoint\n');
 
@@ -4156,6 +4238,98 @@ test('--check-session-close --session-id reports marker presence without alterin
     const o2 = JSON.parse(r2.stdout);
     assert.equal(o2.marker_present, true, `marker present must report true: ${r2.stdout}`);
     assert.equal(o1.ok, o2.ok, 'marker_present must not change the compact-ready ok verdict');
+  });
+});
+
+test('--check-session-close --session-id reports close_state from the shared verdict; marker_present keeps its old meaning', () => {
+  withWiki(null, (dir) => {
+    const check = (sid) =>
+      JSON.parse(
+        run('crystallize.mjs', [
+          `--hypo-dir=${dir}`,
+          '--check-session-close',
+          `--session-id=${sid}`,
+          '--json',
+        ]).stdout,
+      );
+    const open = check('s-cs-open');
+    assert.equal(open.close_state, 'open');
+    assert.equal(open.marker_present, false);
+
+    writeSessionClosedMarkerFile(dir, 's-cs-legacy');
+    const legacy = check('s-cs-legacy');
+    assert.equal(legacy.close_state, 'legacy-closed');
+    assert.equal(legacy.marker_present, true);
+    assert.equal(legacy.close_state_reason, undefined);
+
+    writeValidReceipt(dir, 's-cs-closed');
+    assert.equal(check('s-cs-closed').close_state, 'closed');
+
+    // The marker promises a receipt that is not there: marker_present stays
+    // true (a marker file IS there), close_state says the close is not done.
+    writeMarkerWithReceiptGeneration(dir, 's-cs-orphan', 'gen-missing');
+    const orphan = check('s-cs-orphan');
+    assert.equal(orphan.marker_present, true);
+    assert.equal(orphan.close_state, 'broken');
+    assert.match(orphan.close_state_reason, /no close receipt exists/);
+
+    writeValidReceipt(dir, 's-cs-halfway', { marker: false });
+    assert.equal(check('s-cs-halfway').close_state, 'broken');
+  });
+});
+
+test('--check-session-close --project=<X>: a log-only marker whose receipt is missing does NOT switch the gate to log-only', () => {
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-s-logonly-broken.marker'),
+      JSON.stringify({
+        session_id: 's-logonly-broken',
+        project: null,
+        scope: 'log-only',
+        transcript_path: null,
+        closed_at: new Date().toISOString(),
+        verification: 'log-only-close:ok',
+        receipt_generation: 'gen-never-filed',
+      }) + '\n',
+    );
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--project=test-project',
+      '--session-id=s-logonly-broken',
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.close_state, 'broken', r.stdout);
+    assert.equal(out.scope, 'project', `a broken log-only marker must not win: ${r.stdout}`);
+    assert.equal(out.project_override_ignored, undefined);
+    assert.equal(out.project, 'test-project', 'the project was actually checked');
+  });
+});
+
+test('precompactGateStatus: opts.closeMarker replaces the raw marker read, so a rejected marker cannot set log-only mode', () => {
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-s-gate-inject.marker'),
+      JSON.stringify({
+        session_id: 's-gate-inject',
+        project: null,
+        scope: 'log-only',
+        closed_at: new Date().toISOString(),
+        verification: 'log-only-close:ok',
+        receipt_generation: 'gen-never-filed',
+      }) + '\n',
+    );
+    const raw = precompactGateStatus(dir, { sessionId: 's-gate-inject' });
+    assert.equal(raw.close.project, null, 'fixture: the raw read does take the log-only marker');
+    const judged = precompactGateStatus(dir, { sessionId: 's-gate-inject', closeMarker: null });
+    assert.equal(
+      judged.close.project,
+      'test-project',
+      'closeMarker: null must leave project mode on',
+    );
   });
 });
 

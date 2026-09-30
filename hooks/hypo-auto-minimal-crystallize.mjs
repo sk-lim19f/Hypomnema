@@ -21,13 +21,15 @@
  *        calls (Read/Grep/Glob/Bash) — 6a, so read-only review/debug sessions
  *        are also nudged to close. Pure Q&A / incidental lookups still skip.
  *   4. no recent user close-intent → continue       (close-intent gate, see below)
- *   5. close verdict for session_id, in this order:
- *        a. readReceiptStrict valid            → continue (cwd/log-only exemption unchanged)
- *        b. receipt missing/invalid, compat marker valid with NO receiptGeneration
- *                                               → continue (legacy-closed, marker's own 7-day TTL)
- *        c. compat marker names a receiptGeneration but the receipt is missing/invalid
- *                                               → fall through to block (close not verified)
- *        d. no marker at all                   → fall through to block
+ *   5. close verdict for session_id, closeCheckpointState (close-receipt.mjs):
+ *        a. closed: valid receipt + a marker naming its generation
+ *                                               → continue (cwd/log-only exemption unchanged)
+ *        b. legacy-closed: no receipt, marker with NO receiptGeneration
+ *                                               → continue (marker's own 7-day TTL)
+ *        c. broken: receipt and marker disagree (a marker promising a missing,
+ *           invalid or different receipt, or a valid receipt with no marker or
+ *           a mismatched one)                  → fall through to block, naming why
+ *        d. open: neither                       → fall through to block
  *      A valid receipt only certifies the files it names (the checkpoint
  *      contract), so branch (a) also fires an unresolved-changes
  *      systemMessage once per receipt generation (see notifyUnresolved).
@@ -74,7 +76,6 @@ import {
   HYPO_DIR,
   PKG_ROOT,
   isSubstantialSession,
-  readSessionClosedMarker,
   extractUserMessages,
   isClosePattern,
   isGateSkipped,
@@ -85,7 +86,7 @@ import {
   resolveGateProjectOverride,
   gitDirtyFiles,
 } from './hypo-shared.mjs';
-import { readReceiptStrict, receiptPath } from './close-receipt.mjs';
+import { closeCheckpointState, isCloseComplete, receiptPath } from './close-receipt.mjs';
 import { atomicWrite } from './atomic-write.mjs';
 
 // Carrying a systemMessage does not turn this into a block: the session is
@@ -167,6 +168,12 @@ function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
   // label can't drift out of sync silently. The decline label ("아직, 계속")
   // stays a literal here — it is matched by the tolerant DECLINE regex in
   // isCloseReconfirmDeclined, not by an exact-mark check.
+  // A broken checkpoint (receipt and marker disagree) is not "never closed":
+  // say so, whichever wording the block takes, so the rerun is understood as
+  // re-issuing both artifacts rather than as a first close.
+  const brokenNote = opts.brokenReason
+    ? ` 이전 close 체크포인트가 깨져 있어 완료로 보지 않았습니다: ${opts.brokenReason}. close 를 다시 실행하면 영수증과 마커를 함께 새로 씁니다.`
+    : '';
   if (opts.reconfirm) {
     console.log(
       JSON.stringify({
@@ -177,7 +184,8 @@ function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
           `임의로 닫지 말고 AskUserQuestion으로 사용자에게 지금 세션을 닫을지 물어보세요. ` +
           `선택지는 "${CLOSE_RECONFIRM_MARK}"와 "아직, 계속"으로 제시합니다. 사용자가 ` +
           `"${CLOSE_RECONFIRM_MARK}"를 고른 뒤에만 세션 마무리를 진행하세요. 그전에는 ` +
-          `마커를 쓰거나 종료 명령을 실행하지 마세요.`,
+          `마커를 쓰거나 종료 명령을 실행하지 마세요.` +
+          brokenNote,
         stopReason: 'session-close incomplete (Layer 3, reconfirm)',
       }),
     );
@@ -247,7 +255,7 @@ function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
   console.log(
     JSON.stringify({
       decision: 'block',
-      reason,
+      reason: reason + brokenNote,
       stopReason: 'session-close incomplete (Layer 3)',
     }),
   );
@@ -319,6 +327,10 @@ process.stdin.on('end', () => {
     // (a project marker whose cwd project is complete) still short-circuits without
     // paying the gate cost, unless a cwd signal makes the cwd check meaningful.
     let gate = null;
+    // This session's close verdict (step 5), read once and shared with the
+    // gate so its log-only and attribution reading uses the same marker Stop
+    // judged, never one the verdict rejected.
+    let checkpoint = null;
     const computeGate = () => {
       try {
         // resolveGateProjectOverride (session-close-scope-boundary spec §2/§3): Stop
@@ -333,6 +345,9 @@ process.stdin.on('end', () => {
           ...(transcriptPath ? { transcriptPath } : {}),
           ...(sessionCwd ? { sessionCwd } : {}),
           ...(sessionId ? { sessionId } : {}),
+          ...(checkpoint
+            ? { closeMarker: isCloseComplete(checkpoint) ? checkpoint.marker : null }
+            : {}),
           ...(attributionScope ? { attributionScope } : {}),
         });
       } catch {
@@ -340,51 +355,38 @@ process.stdin.on('end', () => {
       }
     };
 
-    // 5. close verdict for this session_id (order in the file header). A
-    // valid receipt only attests the project(s)/scope it recorded, same as
-    // the old marker-only check did: if THIS session's cwd project still has
-    // an unstarted close, honoring it would end the session green while that
-    // project stays open (the session-cwd false-green), so the cwd re-check
-    // below is unchanged from before receipts existed, only its trigger moved.
+    // 5. close verdict for this session_id (order in the file header), from
+    // closeCheckpointState, the same verdict check, doctor and PreCompact use.
+    // A finished close only attests the project(s)/scope it recorded: if THIS
+    // session's cwd project still has an unstarted close, honoring it would end
+    // the session green while that project stays open (the session-cwd
+    // false-green), so the cwd re-check below still runs. A broken checkpoint
+    // (receipt and marker disagree) falls through to block and says why.
+    let brokenReason = null;
     if (sessionId) {
-      const receipt = readReceiptStrict(HYPO_DIR, sessionId);
-      if (receipt.status === 'valid') {
-        const isLogOnly = receipt.receipt?.scope?.mode === 'log-only';
+      checkpoint = closeCheckpointState(HYPO_DIR, sessionId);
+      if (isCloseComplete(checkpoint)) {
+        const { receipt, marker } = checkpoint;
+        // A legacy close has no receipt, so no certified file list to compare
+        // the dirty tree against: no unresolved-changes notice, same as before.
+        const notice = () => (receipt ? notifyUnresolved(HYPO_DIR, sessionId, receipt) : undefined);
+        const isLogOnly = receipt
+          ? receipt.scope?.mode === 'log-only'
+          : marker.scope === 'log-only';
         if (isLogOnly || !sessionCwd) {
-          emitContinue(notifyUnresolved(HYPO_DIR, sessionId, receipt.receipt));
+          emitContinue(notice());
           return;
         }
         gate = computeGate();
         const cwdBlocked = !!gate?.blockers?.some((b) => b.type === 'close-cwd');
         if (!cwdBlocked) {
-          emitContinue(notifyUnresolved(HYPO_DIR, sessionId, receipt.receipt));
+          emitContinue(notice());
           return;
         }
-        // valid receipt, but the session's cwd project close is incomplete:
+        // finished close, but the session's cwd project close is incomplete:
         // fall through to block, reusing the gate computed above.
-      } else {
-        // No usable receipt (missing, or invalid/corrupt/unreachable). A
-        // compat marker that names NO receiptGeneration is a legacy writer's
-        // proof (or one that skipped the receipt entirely) and is accepted
-        // exactly as before, time-boxed by readSessionClosedMarker's own
-        // 7-day TTL. A marker that DOES name a receiptGeneration promises a
-        // receipt that is not there to find, so that close is not verified:
-        // fall through to block, never trust the marker alone in that case.
-        const marker = readSessionClosedMarker(HYPO_DIR, sessionId);
-        if (marker && !marker.receipt_generation) {
-          if (marker.scope === 'log-only' || !sessionCwd) {
-            emitContinue();
-            return;
-          }
-          gate = computeGate();
-          const cwdBlocked = !!gate?.blockers?.some((b) => b.type === 'close-cwd');
-          if (!cwdBlocked) {
-            emitContinue();
-            return;
-          }
-          // legacy marker present but the session's cwd project close is
-          // incomplete: fall through to block, reusing the gate above.
-        }
+      } else if (checkpoint.state === 'broken') {
+        brokenReason = checkpoint.reason;
       }
     }
 
@@ -420,7 +422,11 @@ process.stdin.on('end', () => {
       return;
     }
 
-    emitBlock(sessionId, transcriptPath, gate, { reconfirm: workIncomplete, sessionCwd });
+    emitBlock(sessionId, transcriptPath, gate, {
+      reconfirm: workIncomplete,
+      sessionCwd,
+      brokenReason,
+    });
   } catch (err) {
     // Fail-open on any unexpected error.
     process.stderr.write(`[hypo-auto-minimal-crystallize] error: ${err?.message ?? String(err)}\n`);

@@ -35,6 +35,7 @@ import {
   isUnderProjectDirs,
   resolveGateProjectOverride,
 } from './hypo-shared.mjs';
+import { closeCheckpointState, isCloseComplete } from './close-receipt.mjs';
 
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
@@ -118,9 +119,16 @@ process.stdin.on('end', () => {
 
   let gate;
   try {
+    // The marker only scopes this gate (log-only mode, attribution) when
+    // closeCheckpointState calls this session's close finished, the verdict
+    // Stop uses too. A marker whose receipt is missing or invalid is ignored.
+    const checkpoint = sessionId ? closeCheckpointState(HYPO_DIR, sessionId) : null;
     gate = precompactGateStatus(HYPO_DIR, {
       transcriptPath,
       ...(sessionId ? { sessionId } : {}),
+      ...(checkpoint
+        ? { closeMarker: isCloseComplete(checkpoint) ? checkpoint.marker : null }
+        : {}),
       ...(sessionCwd ? { sessionCwd } : {}),
       ...(attributionScope ? { attributionScope } : {}),
     });
