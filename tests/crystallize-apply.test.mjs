@@ -2244,6 +2244,12 @@ test('a .hypoignore-excluded hot.md in the project folder is refused by the gate
     const out = JSON.parse(r.stdout);
     assert.equal(out.markerSkipReason, 'compact-gate-not-ok', `stage: ${r.stdout}\n${r.stderr}`);
     assert.equal(out.markerWritten, false);
+    // The result names the checkpoint gate's own blocker, so a caller does not
+    // have to reach for --check-session-close, which judges a wider git axis.
+    assert.ok(
+      (out.gateBlockers || []).some((b) => b.file === 'projects/test-project/hot.md'),
+      `gateBlockers must name the refused file: ${JSON.stringify(out.gateBlockers)}`,
+    );
     assert.ok(
       !existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)),
       'no marker may land while the project folder has an uncommitted file',

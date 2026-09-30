@@ -3267,6 +3267,9 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
   // on a real close: `--mark-session-closed` already reported them, while
   // `--apply-session-close` dropped them on the floor.
   let gateNotices = [];
+  // What the gate refused on, so a compact-gate-not-ok result names its own
+  // blockers instead of sending the caller to a different, wider check.
+  let gateBlockers = [];
   if (ok && args.sessionId) {
     // IO stays lazy so this preserves the exact side-effect order (codex design
     // review): commit first (the only mutation), then resolve the
@@ -3360,6 +3363,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
       });
       gateOk = gateStatus.ok;
       gateNotices = gateStatus.notices || [];
+      gateBlockers = gateStatus.ok ? [] : gateStatus.blockers || [];
       gateSkipped = gateStatus.skipped || gateSkipped;
       // `closeScope` above widens the partition, it never narrows
       // sessionCloseGlobalStatus (only opts.projectOverride does, and this
@@ -3560,6 +3564,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     markerGateReason,
     commitOutcome,
     gateNotices,
+    gateBlockers,
     receiptMismatches,
   };
 }
@@ -3611,6 +3616,7 @@ function buildCloseResult({
   closeScopeNotice,
   otherDebtCount,
   gateNotices,
+  gateBlockers,
   restructureWaivers,
   obsoleteNotices,
   hostTagWarning,
@@ -3727,6 +3733,10 @@ function buildCloseResult({
     // A new key rather than a merge into `notices`, whose entries are filename
     // strings that an existing reader would choke on if they became objects.
     gateNotices: gateNotices || [],
+    // The checkpoint gate's own blockers when it refused the marker
+    // (markerSkipReason compact-gate-not-ok); empty otherwise. --check-session-close
+    // judges the whole vault on a wider git axis, so it is not a substitute.
+    gateBlockers: gateBlockers || [],
     // Always present (possibly empty), same visibility contract as `notices`/
     // `otherDebtCount` above — a caller should not have to guess whether the
     // key's absence means "none" or "this apply predates the field". One entry
@@ -4195,6 +4205,7 @@ export function applySessionClose(args) {
     markerGateReason,
     commitOutcome,
     gateNotices,
+    gateBlockers,
     receiptMismatches,
   } = runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, {
     preflightLint,
@@ -4286,6 +4297,7 @@ export function applySessionClose(args) {
     closeScopeNotice,
     otherDebtCount,
     gateNotices,
+    gateBlockers,
     restructureWaivers,
     obsoleteNotices,
     hostTagWarning: hostTagNotice,
