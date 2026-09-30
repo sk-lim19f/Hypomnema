@@ -44,6 +44,7 @@ import {
   CERT_CLOSE_FILES,
   RECEIPT_SCHEMA_VERSION,
   invalidateCloseArtifacts,
+  receiptPath,
   verifyEntriesInCommit,
   writeReceiptAtomic,
 } from '../../hooks/close-receipt.mjs';
@@ -535,6 +536,31 @@ export function buildMarkCloseProof(hypoDir, markerProjects, logOnly) {
 }
 
 /**
+ * Take back the receipt at this session's path, but only if it is the one this
+ * close filed. A different `generation` on disk belongs to another close of the
+ * same session that landed in the meantime, and removing it would undo a close
+ * that did succeed. An absent file is left alone (nothing of ours to take back).
+ * A file that cannot be read or parsed is treated as ours: the rename that put
+ * it there is what made it unreadable to the re-read, and no other close writes
+ * a partial receipt (all writers are temp+rename).
+ * @returns {{ok: true, withdrawn: boolean} | {ok: false, reason: string}}
+ */
+export function withdrawOwnReceipt(hypoDir, sessionId, generation) {
+  const path = receiptPath(hypoDir, sessionId);
+  if (!path || !existsSync(path)) return { ok: true, withdrawn: false };
+  try {
+    const onDisk = JSON.parse(readFileSync(path, 'utf-8'));
+    if (typeof onDisk?.generation === 'string' && onDisk.generation !== generation) {
+      return { ok: true, withdrawn: false };
+    }
+  } catch {
+    // Unreadable or unparseable: fall through and withdraw.
+  }
+  const retracted = invalidateCloseArtifacts(hypoDir, sessionId);
+  return retracted.ok ? { ok: true, withdrawn: true } : { ok: false, reason: retracted.reason };
+}
+
+/**
  * File the close checkpoint receipt, then the compat marker that projects it,
  * and take the receipt back if the marker does not land. The two writers
  * (`--apply-session-close` and `--mark-session-closed`) share this so they
@@ -553,8 +579,13 @@ export function buildMarkCloseProof(hypoDir, markerProjects, logOnly) {
  * disk says it is there, and a leftover file from an earlier attempt satisfies
  * neither on its own.
  *
+ * A receipt write that reports failure after its rename (the re-read failed or
+ * did not match) may still have left this close's receipt on disk, and a
+ * transient re-read error would let it stand as valid with no marker. That
+ * branch takes the receipt back too, through `withdrawOwnReceipt`.
+ *
  * @returns {{ok: true} |
- *   {ok: false, reason: 'receipt-write-failed', writeReason: string} |
+ *   {ok: false, reason: 'receipt-write-failed', writeReason: string, retractFailed?: string} |
  *   {ok: false, reason: 'marker-did-not-land', retractFailed?: string}}
  *   `retractFailed` is set only when withdrawing the receipt failed too, which
  *   leaves a valid receipt behind a run that reports failure.
@@ -562,7 +593,17 @@ export function buildMarkCloseProof(hypoDir, markerProjects, logOnly) {
 export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker) {
   const written = writeReceiptAtomic(hypoDir, sessionId, receipt);
   if (!written.ok) {
-    return { ok: false, reason: 'receipt-write-failed', writeReason: written.reason };
+    // Only the re-read reasons mean the rename happened. 'write-failed' and
+    // 'invalid-session-id' never put this close's bytes at the path.
+    const withdrawal = written.reason.startsWith('reread-')
+      ? withdrawOwnReceipt(hypoDir, sessionId, receipt.generation)
+      : { ok: true };
+    return {
+      ok: false,
+      reason: 'receipt-write-failed',
+      writeReason: written.reason,
+      ...(withdrawal.ok ? {} : { retractFailed: withdrawal.reason }),
+    };
   }
   let wrote = false;
   try {
@@ -879,7 +920,12 @@ export function runMarkSessionClosed(args) {
       );
       if (landed.ok) return { ok: true };
       return landed.reason === 'receipt-write-failed'
-        ? { ok: false, reason: 'write-failed', writeReason: landed.writeReason }
+        ? {
+            ok: false,
+            reason: 'write-failed',
+            writeReason: landed.writeReason,
+            ...(landed.retractFailed ? { retractFailed: landed.retractFailed } : {}),
+          }
         : {
             ok: false,
             reason: 'marker-did-not-land',
@@ -897,7 +943,10 @@ export function runMarkSessionClosed(args) {
         : receiptResult.reason === 'mismatch'
           ? `proof mismatch: ${JSON.stringify(receiptResult.mismatches)}`
           : receiptResult.reason === 'write-failed'
-            ? `receipt write failed: ${receiptResult.writeReason}`
+            ? `receipt write failed: ${receiptResult.writeReason}` +
+              (receiptResult.retractFailed
+                ? `; withdrawing what it may have left failed too (${receiptResult.retractFailed}), so a stale receipt may remain`
+                : '')
             : receiptResult.reason === 'vault-commit-lock-timeout'
               ? 'another close or commit held the vault-commit lock past the timeout; re-run shortly'
               : 'no commit identity (not a git repository, or no commit exists yet)';
@@ -3428,7 +3477,12 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
             }
           } else if (landed.reason === 'receipt-write-failed') {
             markerSkipReason = 'receipt-write-failed';
-            receiptMismatches = [{ path: '(receipt)', reason: landed.writeReason }];
+            receiptMismatches = [
+              { path: '(receipt)', reason: landed.writeReason },
+              ...(landed.retractFailed
+                ? [{ path: '(receipt)', reason: `retract-failed: ${landed.retractFailed}` }]
+                : []),
+            ];
           } else {
             markerSkipReason = 'marker-did-not-land';
             // The receipt was withdrawn. Only when even that failed is there

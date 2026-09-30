@@ -34,6 +34,7 @@ import { receiptPath } from '../hooks/close-receipt.mjs';
 import {
   buildMarkCloseProof,
   landReceiptThenMarker,
+  withdrawOwnReceipt,
   markerWriteGenuinelyFailed,
   commitShaForUndo,
   closeIntentPath,
@@ -2101,6 +2102,95 @@ test('a landed commit with a blocked receipt still warns, and offers only the un
   });
 });
 
+// The marker writer cannot be made to fail from outside once the close has
+// started: the invalidation at the top of a close renames away whatever sits at
+// the marker path, and the receipt lands before the marker is tried. A git
+// post-commit hook runs in exactly the gap between the two (after that
+// invalidation, after the commit this apply makes, before the receipt and the
+// marker), so a hook that puts a directory at the marker path makes the marker
+// write fail every time, through the real CLI and with no test seam in the
+// production code.
+function blockMarkerAfterCommit(dir, sessionId) {
+  const markerPath = sessionClosedMarkerPath(dir, sessionId);
+  const hookDir = join(dir, '.git', 'hooks');
+  mkdirSync(hookDir, { recursive: true });
+  const hook = join(hookDir, 'post-commit');
+  writeFileSync(hook, `#!/bin/sh\nmkdir -p '${dirname(markerPath)}' && mkdir '${markerPath}'\n`, {
+    mode: 0o755,
+  });
+  return { markerPath, hook };
+}
+
+// Disabling the check: in landReceiptThenMarker delete the
+// invalidateCloseArtifacts call in the marker-did-not-land branch. The receipt
+// then stays behind, and the "no receipt" assertion below goes red.
+test('a marker that cannot land after the commit fails with stage marker-did-not-land, withdraws the receipt, and the retry lands', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = `mdnl-json-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    try {
+      const { markerPath, hook } = blockMarkerAfterCommit(dir, sessionId);
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApply(dir, payload, { sessionId });
+      const out = JSON.parse(r.stdout);
+      assert.equal(r.status, 1, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+      assert.equal(out.ok, false);
+      assert.equal(out.stage, 'marker-did-not-land', `stage: ${r.stdout}`);
+      assert.equal(out.markerSkipReason, 'marker-did-not-land');
+      assert.equal(out.markerWritten, false);
+      assert.equal(out.committed, true, `the payload still committed: ${r.stdout}`);
+      assert.equal(
+        existsSync(receiptPath(dir, sessionId)),
+        false,
+        'the receipt filed before the failed marker must be withdrawn',
+      );
+      assert.equal(existsSync(markerPath), false, 'the blocker at the marker path was cleared');
+      assert.equal(
+        out.mismatches,
+        undefined,
+        `the withdrawal worked, so nothing is reported beside the stage: ${r.stdout}`,
+      );
+      // The close signal is unspent, so the same close needs no fresh phrase.
+      unlinkSync(hook);
+      const retry = runApply(dir, payload, { sessionId });
+      const retryOut = JSON.parse(retry.stdout);
+      assert.equal(retryOut.ok, true, `retry: ${retry.stdout}\n${retry.stderr}`);
+      assert.equal(retryOut.markerWritten, true);
+      assert.ok(existsSync(receiptPath(dir, sessionId)), 'the retry files the receipt');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('the console report for marker-did-not-land names the marker, not the receipt or the policy withhold', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = `mdnl-console-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      blockMarkerAfterCommit(dir, sessionId);
+      const r = runApplyConsole(dir, payloadForCleanWiki(dir, today), sessionId);
+      assert.equal(r.status, 1, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+      assert.match(r.stderr, /session-close marker NOT written \(reason: marker-did-not-land\)/);
+      assert.match(r.stderr, /Stop-chain marker itself failed/);
+      assert.match(r.stderr, /a directory sitting where the marker file goes/);
+      assert.match(r.stderr, /No fresh close phrase\s+is needed/);
+      assert.equal(
+        /receipt could not prove|checkpoint receipt under/.test(r.stderr),
+        false,
+        `it must not borrow the receipt-stage wording: ${r.stderr}`,
+      );
+      assert.equal(
+        /re-run with the correct main-conversation --session-id/.test(r.stderr),
+        false,
+        `it must not send anyone after a --session-id problem: ${r.stderr}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 // design.md v2 §C / test row c ("커밋 경합"): `.hypoignore` makes a REAL,
 // deterministic version of "the committed bytes differ from what this close
 // expected", without needing true process concurrency. hot.md's new content
@@ -2855,6 +2945,81 @@ test('a receipt that cannot be written never reaches the marker writer', () => {
     assert.equal(out.ok, false);
     assert.equal(out.reason, 'receipt-write-failed');
     assert.equal(called, false, 'no marker may be written without a receipt behind it');
+  });
+});
+
+// A receipt whose write reports failure AFTER the rename (the re-read failed)
+// can still be on disk. umask 0o777 makes the temp file 0000, so the rename
+// lands and the re-read gets EACCES: the write "failed" with the receipt in
+// place. A transient re-read error would otherwise leave a valid receipt with
+// no marker behind it.
+// Disabling the check: in landReceiptThenMarker make the `reread-` branch return
+// `{ ok: true }` instead of calling withdrawOwnReceipt.
+test('a receipt whose re-read fails is withdrawn, and the marker writer is never reached', () => {
+  if (process.getuid?.() === 0) return; // root reads a 0000 file, so the failure cannot be injected
+  withTmpDir((dir) => {
+    const sid = `lrm-reread-${process.pid}`;
+    const rp = receiptPath(dir, sid);
+    mkdirSync(dirname(rp), { recursive: true }); // created before the umask change, at a usable mode
+    let called = false;
+    const old = process.umask(0o777);
+    let out;
+    try {
+      out = landReceiptThenMarker(dir, sid, fakeReceipt(sid), () => {
+        called = true;
+        return true;
+      });
+    } finally {
+      process.umask(old);
+    }
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, 'receipt-write-failed');
+    assert.match(
+      out.writeReason,
+      /^reread-failed/,
+      `the failure must be the re-read: ${out.writeReason}`,
+    );
+    assert.equal(out.retractFailed, undefined, 'the withdrawal itself worked');
+    assert.equal(called, false);
+    assert.equal(
+      existsSync(rp),
+      false,
+      'a receipt the write could not confirm must not stay valid',
+    );
+    assert.ok(
+      readdirSync(dirname(rp)).some((f) => f.startsWith('close-receipt.json.invalidated-')),
+      'the withdrawn receipt is renamed aside, not deleted',
+    );
+  });
+});
+
+// Disabling the check: in withdrawOwnReceipt delete the `onDisk.generation !==
+// generation` early return.
+test('withdrawOwnReceipt leaves a receipt that another close of the same session filed', () => {
+  withTmpDir((dir) => {
+    const sid = `lrm-foreign-${process.pid}`;
+    const rp = receiptPath(dir, sid);
+    mkdirSync(dirname(rp), { recursive: true });
+    const theirs = { ...fakeReceipt(sid), generation: 'o'.repeat(32) };
+    writeFileSync(rp, JSON.stringify(theirs));
+    const marker = sessionClosedMarkerPath(dir, sid);
+    writeFileSync(marker, '{}');
+    const out = withdrawOwnReceipt(dir, sid, 'g'.repeat(32));
+    assert.deepEqual(out, { ok: true, withdrawn: false });
+    assert.ok(existsSync(rp), 'the other close receipt must survive');
+    assert.ok(existsSync(marker), 'and so must the marker that projects it');
+  });
+});
+
+test('withdrawOwnReceipt takes back a receipt of the same generation, and treats an absent one as nothing to do', () => {
+  withTmpDir((dir) => {
+    const sid = `lrm-own-${process.pid}`;
+    const rp = receiptPath(dir, sid);
+    assert.deepEqual(withdrawOwnReceipt(dir, sid, 'g'.repeat(32)), { ok: true, withdrawn: false });
+    mkdirSync(dirname(rp), { recursive: true });
+    writeFileSync(rp, JSON.stringify(fakeReceipt(sid)));
+    assert.deepEqual(withdrawOwnReceipt(dir, sid, 'g'.repeat(32)), { ok: true, withdrawn: true });
+    assert.equal(existsSync(rp), false);
   });
 });
 
