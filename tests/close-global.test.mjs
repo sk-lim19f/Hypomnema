@@ -45,6 +45,7 @@ import {
   CERT_CHECKPOINT,
   writeReceiptAtomic,
   readReceiptStrict,
+  closeCheckpointState,
   verifyEntriesInCommit,
 } from '../hooks/close-receipt.mjs';
 import { createProject } from '../scripts/lib/project-create.mjs';
@@ -2435,6 +2436,82 @@ test('--mark-session-closed invalidates the prior receipt and marker even when t
       1,
       `expected one invalidated receipt: ${readdirSync(receiptDir)}`,
     );
+  });
+});
+
+// A close that landed, then a history rewrite (amend, reset, rebase) dropped the
+// commit its receipt proved. The receipt now reads invalid (commit-unreachable),
+// so Stop tells the model to run --mark-session-closed. Certifying today's other
+// close files with a fresh receipt would report "closed" while the original close
+// record is gone, so --mark refuses and leaves the old receipt and marker alone.
+function markOnce(dir, sessionId) {
+  const cleanup = seedCloseTranscript(sessionId);
+  const r = run('crystallize.mjs', [
+    `--hypo-dir=${dir}`,
+    '--mark-session-closed',
+    `--session-id=${sessionId}`,
+    '--project=test-project',
+    '--json',
+  ]);
+  cleanup();
+  return r;
+}
+
+test('--mark-session-closed refuses with prior-checkpoint-rewritten when the receipt commit left the history, and touches nothing', () => {
+  withWiki(null, (dir) => {
+    const sessionId = 's-mark-rewritten-history';
+    const r1 = markOnce(dir, sessionId);
+    assert.equal(r1.status, 0, `first mark must succeed: ${r1.stdout}\n${r1.stderr}`);
+    const markerPath = join(dir, '.cache', `session-closed-${sessionId}.marker`);
+    const receiptDir = join(dir, '.cache', 'sessions', sessionId);
+    const receiptFile = join(receiptDir, 'close-receipt.json');
+    const receiptBefore = readFileSync(receiptFile, 'utf-8');
+    const markerBefore = readFileSync(markerPath, 'utf-8');
+    const priorCommit = JSON.parse(receiptBefore).commit;
+
+    // Amend HEAD: the same tree under a new commit id, so the receipt's commit is
+    // no longer an ancestor of HEAD (what a reset or rebase does to it).
+    const amend = spawnSync(
+      'git',
+      ['-C', dir, 'commit', '-q', '--amend', '--allow-empty', '-m', 'rewritten'],
+      { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
+    );
+    assert.equal(amend.status, 0, `fixture amend failed: ${amend.stderr}`);
+    assert.equal(readReceiptStrict(dir, sessionId).reason, 'commit-unreachable', 'fixture');
+
+    const r2 = markOnce(dir, sessionId);
+    assert.equal(r2.status, 1, `must refuse: ${r2.stdout}\n${r2.stderr}`);
+    const out = JSON.parse(r2.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, 'prior-checkpoint-rewritten');
+    assert.equal(out.prior_commit, priorCommit);
+    assert.equal(
+      readFileSync(receiptFile, 'utf-8'),
+      receiptBefore,
+      'old receipt must stay in place',
+    );
+    assert.equal(readFileSync(markerPath, 'utf-8'), markerBefore, 'old marker must stay in place');
+    assert.deepEqual(
+      readdirSync(receiptDir).filter((n) => n.includes('.invalidated-')),
+      [],
+      'nothing may be set aside',
+    );
+  });
+});
+
+test('--mark-session-closed still recovers a marker-only broken state (receipt commit still in the history)', () => {
+  withWiki(null, (dir) => {
+    const sessionId = 's-mark-marker-lost';
+    const r1 = markOnce(dir, sessionId);
+    assert.equal(r1.status, 0, `first mark must succeed: ${r1.stdout}\n${r1.stderr}`);
+    const markerPath = join(dir, '.cache', `session-closed-${sessionId}.marker`);
+    rmSync(markerPath);
+    assert.equal(closeCheckpointState(dir, sessionId).state, 'broken', 'fixture');
+
+    const r2 = markOnce(dir, sessionId);
+    assert.equal(r2.status, 0, `marker-only breakage must recover: ${r2.stdout}\n${r2.stderr}`);
+    assert.equal(JSON.parse(r2.stdout).ok, true);
+    assert.equal(closeCheckpointState(dir, sessionId).state, 'closed');
   });
 });
 

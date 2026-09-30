@@ -37,6 +37,7 @@ import {
   localAndUtcDates,
   normalizeVerifiedScope,
   SESSION_CLOSED_MARKER_STALE_MS,
+  sessionClosedMarkerPath,
   isUsablePkgRootLocal,
   selfLocationPkgRootFrom,
 } from '../hooks/hypo-shared.mjs';
@@ -1259,6 +1260,53 @@ function checkSessionCloseArtifacts(hypoDir) {
     `${unmatched.length} close artifact(s) with no session-closed marker covering their ` +
       `date and project scope — may be an unapproved hand-made close, or an approved close ` +
       `whose marker doesn't attribute this project: ${sample}${extra}${brokenNote}`,
+  );
+}
+
+// A close receipt with no session-closed marker beside it is a half-finished
+// close (the run stopped before the marker landed, or only the marker was
+// invalidated). checkSessionCloseArtifacts starts from close artifacts and
+// then walks markers, so this state is invisible to it. Enumerate the
+// receipts instead, judge each markerless one with the verdict Stop blocks
+// on, and stay silent otherwise. Same 7-day window as the marker walk, read
+// off the receipt file's mtime.
+function checkHalfClosedReceipts(hypoDir) {
+  const sessionsDir = join(hypoDir, '.cache', 'sessions');
+  let dirs = [];
+  try {
+    dirs = readdirSync(sessionsDir);
+  } catch {
+    return; // no sessions directory, or unreadable: nothing to judge
+  }
+  const broken = [];
+  for (const name of dirs) {
+    const file = join(sessionsDir, name, 'close-receipt.json');
+    try {
+      if (Date.now() - statSync(file).mtimeMs > SESSION_CLOSED_MARKER_STALE_MS) continue;
+      // The directory name is the sanitized id; the receipt body carries the real one.
+      const body = JSON.parse(readFileSync(file, 'utf-8'));
+      const sessionId =
+        typeof body?.sessionId === 'string' && body.sessionId ? body.sessionId : name;
+      if (existsSync(sessionClosedMarkerPath(hypoDir, sessionId))) continue;
+      const checkpoint = closeCheckpointState(hypoDir, sessionId, { marker: null });
+      if (checkpoint.state === 'broken') broken.push({ sessionId, reason: checkpoint.reason });
+    } catch {
+      // unreadable or corrupt receipt: not this check's job to diagnose
+    }
+  }
+  if (broken.length === 0) return;
+  const crystallize = join(PKG_ROOT, 'scripts', 'crystallize.mjs');
+  warn(
+    'Session-close checkpoint',
+    `${broken.length} session(s) hold a close receipt but no session-closed marker: ` +
+      broken
+        .slice(0, 3)
+        .map(
+          (b) =>
+            `${b.sessionId} (${b.reason}). Recover with: node "${crystallize}" --mark-session-closed --session-id=${b.sessionId}`,
+        )
+        .join('; ') +
+      (broken.length > 3 ? ` (+${broken.length - 3} more)` : ''),
   );
 }
 
@@ -2825,6 +2873,7 @@ if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
 if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
+if (rootOk) checkHalfClosedReceipts(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkProposals(args.hypoDir);

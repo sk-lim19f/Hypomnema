@@ -119,18 +119,26 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    checkpoint once the gate is green. Hand-edit recovery: after committing the
    files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
    Both writers gate the checkpoint on `precompactGateStatus`, the gate `/compact`
-   uses, with one difference: the git check is narrower. The checkpoint blocks
-   only on an uncommitted file this session wrote through Write or Edit since its
-   last auto-commit, and reports any other uncommitted vault file (another
-   session's, one of unknown ownership, or one this session changed through a
-   shell command) as a notice. So it can land while step 6 still shows a git
-   blocker for someone else's dirty file.
+   uses, with one difference: the git check is narrower. An uncommitted file
+   inside the project folder being closed (`projects/<project>/`) blocks whether
+   or not this session has a record of writing it. An uncommitted file at the
+   root or in another project's folder blocks only when this session wrote it
+   through Write or Edit since its last auto-commit, and is otherwise a notice
+   (another session's, one of unknown ownership, or one this session changed
+   through a shell command). If the record of this session's writes cannot be
+   read, the check does not block on it and adds a notice that it could not
+   determine ownership. So it can land while step 6 still shows a git blocker
+   for someone else's dirty file.
    Every other check (close files, hot.md, lint, feedback) is the same as step 6.
    **The session is closed once the checkpoint receipt is issued**: the writer's result
    reports `markerWritten: true` (apply) or `ok: true` (`--mark`), and
    `--check-session-close --session-id=<id>` then reports `close_state: closed`. Declare the
    close on that, not on "Compact-ready". If the writer reports the marker as not written, or
    `close_state` is anything other than `closed`, the session is still open whatever step 6 says.
+   If `close_state` is `broken` because the commit an earlier close proved was dropped from
+   history (a reset or rebase), `--mark-session-closed` refuses with
+   `prior-checkpoint-rewritten` and leaves the old receipt alone: restore that commit, or ask
+   the user to close again with a new payload.
    `--session-id` is not optional on the apply path. Before it writes anything, the
    apply reads that session's transcript for evidence the **user** asked to close, and
    refuses the whole close (exit 1, nothing on disk, nothing committed) when the id is

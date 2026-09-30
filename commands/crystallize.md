@@ -109,15 +109,19 @@ and nothing on disk, in three cases:
 A refusal is not a failure to route around. It means the close should not happen: ask
 the user, and re-run only after they say so.
 
-On a verified close (`ok: true`, and no uncommitted vault file this session wrote through Write or Edit since its last auto-commit)
+On a verified close (`ok: true`, no uncommitted file in the project folder being closed, and no uncommitted file elsewhere that this session wrote through Write or Edit since its last auto-commit)
 the apply first files a commit-backed close checkpoint receipt at
 `HYPO_DIR/.cache/sessions/<id>/close-receipt.json`, then writes the per-session compat marker
 `HYPO_DIR/.cache/session-closed-<id>.marker` as a projection of it. If the marker does not land,
 the receipt is withdrawn again, so a run that reports the marker as failed never leaves a valid
-receipt behind. The checkpoint gate reads git more narrowly than `/compact` does: it blocks only
-on an uncommitted file this session itself wrote, and reports any other uncommitted vault file
-(another session's, or one of unknown ownership) as a notice. So the checkpoint can land while
-`/compact` still waits on someone else's dirty file. The checkpoint receipt is the thing the
+receipt behind. The checkpoint gate reads git more narrowly than `/compact` does. An uncommitted
+file inside the project folder being closed (`projects/<project>/`) blocks whether or not this
+session has a record of writing it. An uncommitted file at the vault root or in another project's
+folder blocks only when this session wrote it through Write or Edit since its last auto-commit;
+otherwise it is reported as a notice. If the record of what this session wrote cannot be read, the
+gate does not block on it: it treats the session as having no record and adds a notice that it could
+not determine who owns those files. So the checkpoint can land while `/compact` still waits on
+someone else's dirty file. The checkpoint receipt is the thing the
 Stop-chain Layer 3 hook (`hypo-auto-minimal-crystallize`) actually checks: it proves only that
 the file versions it names are in a specific commit, never that every change this session made
 is saved. (It has nothing to do with the `close-receipt-failed` result of `proposal resolve`
@@ -172,7 +176,7 @@ Both gates judge only the **payload files** (the 4 mandatory close files + `open
 >
 > `--mark-session-closed` files the checkpoint receipt only when session-state.md, hot.md, the session-log entry and log.md of every project it attributes are already **committed**, so commit them first. On any failure it prints `ok: false` and exits 1 without a marker.
 >
-> The `stage` table in Step 4 belongs to `--apply-session-close`. `--mark-session-closed` has no `stage` field. A refusal after the receipt proof carries a `reason` instead (and `error` in prose), so branch on that:
+> The `stage` table in Step 4 belongs to `--apply-session-close`. `--mark-session-closed` has no `stage` field. A refusal after the receipt proof carries a `reason` instead (and `error` in prose), and so does `prior-checkpoint-rewritten`, which comes before the gate runs. Branch on that:
 >
 > | `reason` | What broke | How to recover |
 > |---|---|---|
@@ -181,6 +185,7 @@ Both gates judge only the **payload files** (the 4 mandatory close files + `open
 > | `no-commit-identity` | The vault has no readable commit to certify against (not a git repository, or no commit exists yet). | Commit the close files so the vault has a HEAD, then re-run. |
 > | `write-failed` | Writing the checkpoint receipt under `.cache/sessions/<session-id>/` failed; `writeReason` names the error. If `retractFailed` is also present, taking back what the write may have left failed too and a stale receipt may remain there. | Fix what blocks that directory (a file where the directory should be, permissions, disk space), remove any stale `close-receipt.json` it names, then re-run. |
 > | `marker-did-not-land` | The receipt was filed but the marker file itself did not land. The receipt is withdrawn again; `retractFailed` is present only when that failed too. | Fix what blocks the marker path under `.cache/` (permissions, a directory sitting where the marker goes, disk space), then re-run. |
+> | `prior-checkpoint-rewritten` | This session had filed a close receipt earlier, and the commit it proved is no longer in the branch history (a hard reset or a rebase dropped it). The command refuses before it touches anything: the old receipt and marker stay where they are, and the result carries `prior_commit`. Issuing a new receipt over today's other close files would report "closed" while the original close record stays lost. A receipt that is missing or unparsable does not trigger this, and neither does one whose commit is still in the history but whose marker is gone (that one recovers with this command as usual). | Restore the dropped commit (for example from `git reflog`), or ask the user to request the close again and run `--apply-session-close` with a new payload. Do not retry `--mark-session-closed`: it refuses the same way until the history holds that commit again. |
 > | `vault-commit-lock-timeout` | Another close or commit held the vault-commit lock past the timeout. | Re-run the same command a moment later. |
 >
 > Three refusals come before the receipt proof and carry no `reason`. A gate refusal (`blockers[]` plus `missing` and `stale`, with `error: 'session-close gate not satisfied'`) means the same close-file, lint or feedback checks as `--check-session-close` found something this session owns: fix it and re-run. A `skipReason` of `no-user-close-signal` (with `gateReason` when the gate has one) or `no-attribution-evidence` means the transcript shows no close request, or nothing ties this session to a project (pass `--project=<slug>` or `--log-only`). A bare `error` with none of these fields means the prior receipt or marker could not be set aside; fix the permission or disk problem under `.cache/` it names.
@@ -235,7 +240,7 @@ If `markerWritten: true`: ask: "Session closed. Would you like to also run knowl
 - `transcript-unresolved`: the id resolved no transcript, so it is almost certainly not the main conversation's (a background-task or Agent-thread uuid, most often). Get the right one and re-run.
 - `no-user-close-signal`: the transcript is this session's, but no close authority is in force. **Branch on `gateReason` before doing anything.** The three cases need three different responses, and treating them alike is what made this refusal look like it had a new cause every time it appeared.
   - `no-open`: the user genuinely never asked to close in wording the gate recognizes (e.g. "세션 마무리까지 진행해줘" falls outside the close-signal set). Re-running the same id changes nothing, because the transcript is unchanged. Confirm intent once with `AskUserQuestion`, header "세션", a single option labelled **세션 마무리** (설명: "이 세션을 마무리하고 close 마커를 기록"). If the user picks it, that answer lands in the transcript as a recognized close signal, so re-running the exact same command now applies **everything**: the writes, the commit, and the marker. If the user declines, the session stays open and nothing is written.
-  - `no-new-open-since-resolution`: the user DID ask, and that request was already resolved by an earlier close. Asking again makes them answer a question they have already answered. Report that this session is already closed and stop; do not re-prompt. On the apply path, a resolution is recorded only once the session-close marker itself lands, so this reason cannot appear for a session whose apply was never marked closed. `/clear` is the one exception: it ends the session as surely as a close apply does, so `hypo-session-end.mjs` records the same resolution on a `/clear` directly, with no marker involved at all. So a session that never ran an apply, but was ended with `/clear`, can still carry a recorded resolution.
+  - `no-new-open-since-resolution`: the user DID ask, and that request was already resolved by an earlier close. Asking again makes them answer a question they have already answered. Before you say anything, read `close_state` from `--check-session-close --session-id=<id>`. If it is `closed` (or `legacy-closed`), report that this session is already closed and stop; do not re-prompt. If it is `broken`, do **not** say the session is already closed: the earlier close's proof no longer holds (a commit it named was dropped by a reset or rebase, or the receipt and marker disagree). Tell the user so and ask them to request the close again, then run `--apply-session-close` with a new payload. On the apply path, a resolution is recorded only once the session-close marker itself lands, so this reason cannot appear for a session whose apply was never marked closed. `/clear` is the one exception: it ends the session as surely as a close apply does, so `hypo-session-end.mjs` records the same resolution on a `/clear` directly, with no marker involved at all. So a session that never ran an apply, but was ended with `/clear`, can still carry a recorded resolution.
   - `transcript-rewrite-detected`: the transcript changed underneath the gate, so the earlier signal can no longer be attested. This is not a statement about what the user wants. Say what happened rather than asking them to repeat themselves, and let a human decide.
 
   In all three: do NOT touch the close-signal matcher itself, and do not hand-write the files to work around the refusal.

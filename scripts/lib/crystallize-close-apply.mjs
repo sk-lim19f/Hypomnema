@@ -620,6 +620,29 @@ export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker) 
   };
 }
 
+// The commit a session's OLD close receipt certified, when that commit is no
+// longer an ancestor of HEAD (a `git reset --hard` or rebase dropped it).
+// Reads the receipt JSON itself instead of readReceiptStrict: that returns no
+// receipt object once the commit is unreachable, which is exactly this case.
+// A missing or unparsable file, a commit field that is not an object id, or a
+// repository git cannot resolve HEAD in all return null, so --mark keeps its
+// old behavior there.
+function priorReceiptCommitRewritten(hypoDir, sessionId) {
+  const path = receiptPath(hypoDir, sessionId);
+  if (!path || !existsSync(path)) return null;
+  let commit;
+  try {
+    commit = JSON.parse(readFileSync(path, 'utf-8'))?.commit;
+  } catch {
+    return null;
+  }
+  if (typeof commit !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit)) return null;
+  const git = (...a) => spawnSync('git', ['-C', hypoDir, ...a], { encoding: 'utf-8' });
+  if (git('rev-parse', '--verify', '--quiet', 'HEAD').status !== 0) return null;
+  const ancestry = git('merge-base', '--is-ancestor', commit, 'HEAD');
+  return ancestry.error || ancestry.status === 0 ? null : commit;
+}
+
 // ── session-close marker (amendment 2026-05-19) ───────────────
 // Standalone marker writer. Used when the LLM closes the session via direct
 // Write tool calls (not --apply-session-close). Hook `hypo-auto-minimal-
@@ -706,6 +729,33 @@ export function runMarkSessionClosed(args) {
   // receipt/marker for THIS session must not keep certifying a close once a
   // fresh `--mark-session-closed` is attempted, whether or not this attempt
   // goes on to succeed.
+  // The one exception is a prior receipt whose commit history no longer
+  // contains (reset/rebase): invalidating it and certifying today's other
+  // close files would report "closed" while the original close record is gone.
+  // Refuse before anything is touched so the old receipt stays as evidence.
+  const rewritten = priorReceiptCommitRewritten(args.hypoDir, args.sessionId);
+  if (rewritten) {
+    const msg =
+      `--mark-session-closed refused: the commit this session's earlier close proved ` +
+      `(${rewritten}) is no longer in the branch history. Restore that commit, or ask the ` +
+      `user to close again and run --apply-session-close with a new payload.`;
+    console.log(
+      args.json
+        ? JSON.stringify(
+            {
+              ok: false,
+              session_id: args.sessionId,
+              reason: 'prior-checkpoint-rewritten',
+              prior_commit: rewritten,
+              error: msg,
+            },
+            null,
+            2,
+          )
+        : `✗ ${msg}`,
+    );
+    process.exit(1);
+  }
   const invalidated = invalidateCloseArtifacts(args.hypoDir, args.sessionId);
   if (!invalidated.ok) {
     const msg =
