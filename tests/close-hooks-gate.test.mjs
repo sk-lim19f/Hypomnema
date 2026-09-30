@@ -997,6 +997,42 @@ test('no close intent → systemMessage does NOT include close-intent note', () 
   );
 });
 
+// PreCompact scopes its gate by this session's close marker only when the
+// shared close verdict calls that close finished. A log-only marker whose
+// receipt was never filed is broken, so the gate must stay in project mode and
+// still report the project's missing close file. Without the injected verdict
+// the raw marker read would switch to log-only and drop that line.
+test('a log-only marker whose receipt is missing does not switch PreCompact to log-only', () => {
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-s-pc-broken.marker'),
+      JSON.stringify({
+        session_id: 's-pc-broken',
+        project: null,
+        scope: 'log-only',
+        transcript_path: null,
+        closed_at: new Date().toISOString(),
+        verification: 'log-only-close:ok',
+        receipt_generation: 'gen-never-filed',
+      }) + '\n',
+    );
+    rmSync(join(dir, 'projects', 'test-project', 'session-state.md'), { force: true });
+    const r = runHook(
+      'hypo-personal-check.mjs',
+      { session_id: 's-pc-broken', cwd: dir },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.continue, true, r.stdout);
+    assert.match(
+      out.systemMessage || '',
+      /projects\/test-project\/session-state\.md \(missing\)/,
+      `a broken log-only marker must not hide the project's close files: ${r.stdout}`,
+    );
+  });
+});
+
 suite('hypo-personal-check.mjs — contract');
 
 test('output is always valid JSON', () => {
