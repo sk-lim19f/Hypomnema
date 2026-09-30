@@ -172,7 +172,7 @@ function emitBlock(sessionId, transcriptPath, gate = null, opts = {}) {
   // say so, whichever wording the block takes, so the rerun is understood as
   // re-issuing both artifacts rather than as a first close.
   const brokenNote = opts.brokenReason
-    ? ` 이전 close 체크포인트가 깨져 있어 완료로 보지 않았습니다: ${opts.brokenReason}. close 를 다시 실행하면 영수증과 마커를 함께 새로 씁니다. --mark-session-closed 가 prior-checkpoint-rewritten 으로 거부되면 이전 close 가 증명한 커밋이 히스토리에서 사라진 것이니, 그 커밋을 되살리거나 사용자에게 다시 close 를 요청받아 새 payload 로 --apply-session-close 를 실행하세요.`
+    ? ` 이전 close 체크포인트가 깨져 있어 완료로 보지 않았습니다: ${opts.brokenReason}. close 를 다시 실행하면 영수증과 마커를 함께 새로 씁니다. --mark-session-closed 가 prior-checkpoint-rewritten 으로 거부되면 이전 close 가 증명한 커밋이 히스토리에서 사라진 것이니, 그 커밋을 되살리거나 사용자에게 다시 close 를 요청받아 /hypo:crystallize 로 새 close 를 적용하세요.`
     : '';
   if (opts.reconfirm) {
     console.log(
