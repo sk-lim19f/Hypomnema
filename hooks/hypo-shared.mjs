@@ -27,7 +27,17 @@ import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { atomicWrite } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
-import { scopeVisible, sessionViewPathsOf } from './session-entries.mjs';
+import {
+  GITIGNORE_BLOCK,
+  LEGACY_TRACK_ID,
+  buildBaselineEntry,
+  isGeneratedViewPath,
+  mergeAdditiveGitignore,
+  narrowestVisibilityScope,
+  parseSessionEntry,
+  scopeVisible,
+  sessionViewPathsOf,
+} from './session-entries.mjs';
 
 const HOME = homedir();
 
@@ -1837,6 +1847,514 @@ export function localChangesOn(hypoDir, relPaths) {
   ]);
   const unstaged = names(['diff', '--name-only', '-z', '--relative', '--', ...specs]);
   return { staged: staged ?? [...relPaths], unstaged: unstaged ?? [...relPaths] };
+}
+
+// ── catching up with a migration commit ──────────────────────────────────────
+// Another machine's migration (or rollback) commit changes paths this machine may hold local edits
+// on. git then refuses to fast-forward or merge, and reports no unmerged path, so no conflict
+// resolution would ever see it. `clearGeneratedPathsBlockingPull` clears that block first and sets
+// the bytes it removes aside; `shareLegacyBytes` publishes them afterwards as additional baseline
+// entries so a memory that lived only on this machine reaches the others. None of these takes the
+// vault commit lock: the caller holds it, and the lock is not reentrant.
+
+const PULL_ARCHIVE_REL = join('.cache', 'pull-archive.json');
+const GENERATED_VIEWS_RECORD_REL = join('.cache', 'generated-views.json');
+const PROJECT_VIEW_RE = /^projects\/([^/]+)\/(hot|session-state)\.md$/;
+const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}/;
+const BASELINE_FILE_RE = /-baseline-[0-9a-f]{16}\.md$/;
+
+function gitOut(hypoDir, args) {
+  const r = vaultGit(hypoDir, args);
+  return r.status === 0 ? r.stdout : null;
+}
+
+// `git show <rev>:./<path>` as text, `null` when git cannot produce it (no such path or revision).
+function gitShowText(hypoDir, rev, relPath) {
+  const r = spawnSync('git', ['-C', hypoDir, 'show', revPathArg(rev, relPath)], {
+    encoding: 'utf-8',
+    timeout: 30000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return r.status === 0 ? r.stdout : null;
+}
+
+function readTextOrNull(path) {
+  try {
+    return readFileSync(path, 'utf-8');
+  } catch (err) {
+    if (err?.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+const literalSpecs = (paths) => paths.map((p) => `:(literal)${p}`);
+
+// A project is hidden by `.hypoignore` when its session entries are (isIgnored's second look
+// covers a pattern on either view path or on the project directory).
+const projectHiddenByHypoignore = (hypoDir, slug, patterns) =>
+  patterns.length > 0 &&
+  isIgnored(join(hypoDir, 'projects', slug, 'sessions', 'x.md'), hypoDir, patterns);
+
+const isAncestorOfHead = (hypoDir, sha) =>
+  vaultGit(hypoDir, ['merge-base', '--is-ancestor', sha, 'HEAD']).status === 0;
+
+/**
+ * Whether the branch's upstream already carries the session-entries `.gitignore` block, read from
+ * `@{u}`'s tree (a failed `pull --ff-only` has still fetched it). False without an upstream.
+ */
+export function upstreamIsMigrated(hypoDir) {
+  const shown = gitShowText(hypoDir, '@{u}', '.gitignore');
+  const first = GITIGNORE_BLOCK.split('\n')[0];
+  return shown !== null && shown.split('\n').some((l) => l.trim() === first);
+}
+
+// `.cache/pull-archive.json`: {v: 2, stage: 'archived'|'merged', targetSha, gitignoreLines,
+// views: [{relPath, kind: 'stage'|'worktree', backupPath, sha256, companionRev}]}. A record of any
+// other shape counts as no record.
+function readPullArchive(hypoDir) {
+  let rec;
+  try {
+    rec = JSON.parse(readFileSync(join(hypoDir, PULL_ARCHIVE_REL), 'utf-8'));
+  } catch {
+    return null;
+  }
+  const okView = (v) =>
+    v && ['relPath', 'backupPath', 'sha256'].every((k) => typeof v[k] === 'string');
+  if (
+    rec?.v !== 2 ||
+    !['archived', 'merged'].includes(rec.stage) ||
+    typeof rec.targetSha !== 'string' ||
+    !Array.isArray(rec.views) ||
+    !Array.isArray(rec.gitignoreLines)
+  ) {
+    return null;
+  }
+  return {
+    v: 2,
+    stage: rec.stage,
+    targetSha: rec.targetSha,
+    gitignoreLines: rec.gitignoreLines.filter((l) => typeof l === 'string'),
+    views: rec.views.filter(okView),
+  };
+}
+
+const writePullArchive = (hypoDir, rec) =>
+  atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), `${JSON.stringify(rec, null, 2)}\n`);
+
+const viewKey = (v) => `${v.relPath}\0${v.kind}\0${v.sha256}`;
+
+function mergeViews(...lists) {
+  const seen = new Map();
+  for (const v of lists.flat()) if (!seen.has(viewKey(v))) seen.set(viewKey(v), v);
+  return [...seen.values()];
+}
+
+/**
+ * Append the lines of `lines` that the working-tree `.gitignore` does not have, at the end (the
+ * file stays uncommitted). Returns the lines it added.
+ */
+export function restoreGitignoreLines(hypoDir, lines) {
+  const path = join(hypoDir, '.gitignore');
+  const current = readTextOrNull(path) ?? '';
+  const have = new Set(current.split('\n'));
+  const missing = [...new Set(lines)].filter((l) => !have.has(l));
+  if (!missing.length) return [];
+  const lead = current === '' || current.endsWith('\n') ? '' : '\n';
+  atomicWrite(path, `${current}${lead}${missing.join('\n')}\n`);
+  return missing;
+}
+
+/** Mark the archive record `merged`: the caller's merge landed. No record, no change. */
+export function markPullArchiveMerged(hypoDir) {
+  const rec = readPullArchive(hypoDir);
+  if (rec) writePullArchive(hypoDir, { ...rec, stage: 'merged' });
+}
+
+/**
+ * The step before `merge --ff-only <targetRev>` or `pull --no-rebase` takes in a migration (or
+ * rollback) commit: clear what would block it, without ever migrating this machine. Returns
+ * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], gitignoreLines[]}`.
+ *
+ * The paths looked at are the ones `targetRev` changes since its merge-base with HEAD (so a
+ * diverged history counts only what is coming in). A local change on any of them that is not a
+ * generated view or `.gitignore` stops everything (`reason: 'other-dirty'`), and so does a
+ * `.gitignore` edit that is not a pure addition (`deferred: 'gitignore'`); both leave the vault
+ * untouched. Otherwise: an ignored project's generated paths that `targetRev` deletes are backed
+ * up even when clean (the merge deletes them from the working tree), and go to `localOnly[]`
+ * only; every blocked generated path gets its working-tree bytes, and its staged bytes when
+ * staged, backed up and listed in `archived[]` (and in `.cache/pull-archive.json`, written first);
+ * staged target paths are unstaged; the blocked paths are restored to HEAD (or removed when HEAD
+ * lacks them); and a path `targetRev` adds as tracked that exists here untracked is cleared
+ * (backed up unless its bytes are what this machine's generator last wrote), because git
+ * overwrites such a file silently. `gitignoreLines` are the uncommitted `.gitignore` additions the
+ * caller appends back after the merge (`restoreGitignoreLines`).
+ *
+ * `testHooks.afterArchive` runs after the archive record is written and the stage is released,
+ * before any working-tree path is restored. `testHooks.beforeBackupWrite` goes to the backups.
+ */
+export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
+  const { testHooks } = opts;
+  const stop = (extra) => ({
+    ok: false,
+    backups: [],
+    archived: [],
+    localOnly: [],
+    gitignoreLines: [],
+    ...extra,
+  });
+
+  // 1. A previous run that stopped before the merge: put its `.gitignore` lines back and carry its
+  // archived bytes into this run. The `.gitignore` write is a restore, so it is safe before the
+  // checks below.
+  const prior = readPullArchive(hypoDir);
+  const recovered =
+    prior && prior.stage === 'archived' && !isAncestorOfHead(hypoDir, prior.targetSha)
+      ? prior
+      : null;
+  if (recovered) restoreGitignoreLines(hypoDir, recovered.gitignoreLines);
+
+  const targetSha = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', `${targetRev}^{commit}`]);
+  const headSha = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+  if (!targetSha || !headSha) return stop({ reason: 'revision-unreadable' });
+  const target = targetSha.trim();
+  const head = headSha.trim();
+
+  // 2. What `target` brings in.
+  const base = gitOut(hypoDir, ['merge-base', 'HEAD', target])?.trim();
+  if (!base) return stop({ reason: 'no-merge-base' });
+  const diff = gitOut(hypoDir, [
+    'diff',
+    '--no-renames',
+    '--name-status',
+    '-z',
+    '--relative',
+    base,
+    target,
+  ]);
+  if (diff === null) return stop({ reason: 'diff-failed' });
+  const tokens = diff.split('\0').filter(Boolean);
+  const incoming = [];
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    incoming.push({ status: tokens[i][0], path: tokens[i + 1] });
+  }
+  const targetPaths = incoming.map((c) => c.path);
+
+  // 3. Which of them carry local changes. Anything but generated views and `.gitignore` is not
+  // ours to move.
+  const changes = localChangesOn(hypoDir, targetPaths);
+  const staged = new Set(changes.staged);
+  const dirty = new Set([...changes.staged, ...changes.unstaged]);
+  const blocked = targetPaths.filter((p) => dirty.has(p));
+  if (blocked.some((p) => p !== '.gitignore' && !isGeneratedViewPath(p))) {
+    return stop({ reason: 'other-dirty' });
+  }
+
+  // 4. `.gitignore`: only a pure addition (stage and working tree alike) can be set aside.
+  let gitignoreLines = [];
+  if (blocked.includes('.gitignore')) {
+    const headText = gitShowText(hypoDir, 'HEAD', '.gitignore') ?? '';
+    const targetText = gitShowText(hypoDir, target, '.gitignore') ?? '';
+    const stageText = staged.has('.gitignore')
+      ? (gitShowText(hypoDir, ':0', '.gitignore') ?? '')
+      : headText;
+    const added = [];
+    for (const text of [readTextOrNull(join(hypoDir, '.gitignore')) ?? '', stageText]) {
+      if (!mergeAdditiveGitignore(headText, text, targetText).ok) {
+        return stop({
+          deferred: 'gitignore',
+          reason: 'gitignore-not-additive',
+          notice:
+            '스테이징됐거나 커밋되지 않은 .gitignore 변경이 순수 추가가 아니어서 이행 커밋을 받지 못했습니다. 그 변경을 커밋하거나 되돌리세요',
+        });
+      }
+      const own = mergeAdditiveGitignore(headText, text, headText);
+      added.push(...own.merged.slice(headText.length).split('\n').filter(Boolean));
+    }
+    gitignoreLines = [...new Set(added)];
+  }
+
+  const patterns = loadHypoIgnore(hypoDir);
+  const hidden = (relPath) => {
+    const m = PROJECT_VIEW_RE.exec(relPath);
+    return m !== null && projectHiddenByHypoignore(hypoDir, m[1], patterns);
+  };
+  const backups = [];
+  const localOnly = [];
+  const fresh = [];
+  const backUp = (relPath, kind, text) => {
+    const backupPath = backUpGeneratedPath(join(hypoDir, relPath), text, testHooks);
+    backups.push(backupPath);
+    return { relPath, kind, backupPath };
+  };
+
+  // 5. An ignored project's generated path that `target` deletes: the merge removes it from the
+  // working tree even when clean, so keep a local copy. It is never shared.
+  for (const { status, path } of incoming) {
+    if (status !== 'D' || !hidden(path) || dirty.has(path)) continue;
+    const text = readTextOrNull(join(hypoDir, path)) ?? gitShowText(hypoDir, 'HEAD', path);
+    if (text !== null) localOnly.push(backUp(path, 'worktree', text));
+  }
+
+  // 6. Blocked generated paths: the working-tree bytes, and the staged bytes of a staged path.
+  for (const path of blocked.filter(isGeneratedViewPath)) {
+    const versions = [];
+    const work = readTextOrNull(join(hypoDir, path));
+    if (work !== null) versions.push(['worktree', work]);
+    const stagedText = staged.has(path) ? gitShowText(hypoDir, ':0', path) : null;
+    if (stagedText !== null) versions.push(['stage', stagedText]);
+    for (const [kind, text] of versions) {
+      const where = backUp(path, kind, text);
+      if (hidden(path)) localOnly.push(where);
+      else fresh.push({ ...where, sha256: sha256Hex(text), companionRev: head });
+    }
+  }
+  const archivedViews = mergeViews(recovered?.views ?? [], fresh);
+  if (prior || archivedViews.length || gitignoreLines.length) {
+    try {
+      writePullArchive(hypoDir, {
+        v: 2,
+        stage: 'archived',
+        targetSha: target,
+        gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
+        views: mergeViews(prior?.views ?? [], archivedViews),
+      });
+    } catch {
+      return stop({ reason: 'archive-write-failed', backups });
+    }
+  }
+  const unstage = blocked.filter((p) => staged.has(p));
+  if (
+    unstage.length &&
+    vaultGit(hypoDir, ['reset', '-q', '--', ...literalSpecs(unstage)]).status !== 0
+  ) {
+    return stop({ reason: 'unstage-failed', backups, localOnly });
+  }
+  testHooks?.afterArchive?.();
+
+  // 7. Put the working tree where `target` can land. Bytes of a blocked path are already backed
+  // up. A path HEAD lacks is removed instead of restored.
+  const restore = blocked.filter((p) => pathInHead(hypoDir, p));
+  for (const p of blocked.filter((q) => !restore.includes(q)))
+    rmSync(join(hypoDir, p), { force: true });
+  // A path `target` adds as tracked, held here as an untracked file: git overwrites it without a
+  // word (rollback commits do this to every view), so move it out first.
+  const owned = (() => {
+    try {
+      return (
+        JSON.parse(readFileSync(join(hypoDir, GENERATED_VIEWS_RECORD_REL), 'utf-8')).views ?? {}
+      );
+    } catch {
+      return {};
+    }
+  })();
+  for (const { status, path } of incoming) {
+    if (status !== 'A' || !isGeneratedViewPath(path) || blocked.includes(path)) continue;
+    if (pathInHead(hypoDir, path)) continue;
+    const text = readTextOrNull(join(hypoDir, path));
+    if (text === null) continue;
+    if (owned[path] !== sha256Hex(text)) backUp(path, 'worktree', text);
+    rmSync(join(hypoDir, path), { force: true });
+  }
+  if (restore.length) {
+    const r = vaultGit(hypoDir, ['checkout', 'HEAD', '--', ...literalSpecs(restore)]);
+    if (r.status !== 0) {
+      return stop({ reason: 'checkout-failed', backups, localOnly, archived: archivedViews });
+    }
+  }
+  return { ok: true, backups, archived: archivedViews, localOnly, gitignoreLines };
+}
+
+// The date of an additional baseline: the larger `updated:` of the two old files, else the day git
+// last changed either one, else today (local). Same order as the baseline the generator builds.
+function legacyBaselineDate(hypoDir, slug, texts) {
+  const updated = texts
+    .map((t) => ISO_DAY_RE.exec(frontmatterUpdated(t) ?? '')?.[0])
+    .filter(Boolean)
+    .sort();
+  if (updated.length) return updated.at(-1);
+  const committed = ['hot', 'session-state']
+    .map((name) => {
+      const out = gitOut(hypoDir, [
+        'log',
+        '-1',
+        '--format=%cs',
+        '--',
+        `:(literal)projects/${slug}/${name}.md`,
+      ]);
+      return out === null ? null : ISO_DAY_RE.exec(out.trim())?.[0];
+    })
+    .filter(Boolean)
+    .sort();
+  if (committed.length) return committed.at(-1);
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+// Write `text` at `abs` unless something is already there (a link fails on an existing name, so
+// a concurrent writer is never overwritten). 'same' when the existing bytes are these bytes.
+function publishNoClobber(abs, text) {
+  const tmp = `${abs}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  atomicWrite(tmp, text);
+  try {
+    linkSync(tmp, abs);
+    return 'published';
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw err;
+    return readTextOrNull(abs) === text ? 'same' : 'conflict';
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+// The baseline entries HEAD already has for `slug`, parsed: [{summary, legacy}].
+function committedBaselines(hypoDir, slug) {
+  const dir = `projects/${slug}/sessions/`;
+  const listed = gitOut(hypoDir, ['ls-tree', '--name-only', '-z', 'HEAD', dir]);
+  const found = [];
+  for (const name of (listed ?? '').split('\0').filter((n) => BASELINE_FILE_RE.test(n))) {
+    const text = gitShowText(hypoDir, 'HEAD', `${dir}${name.split('/').at(-1)}`);
+    const parsed = text === null ? null : parseSessionEntry(text);
+    if (parsed?.ok) {
+      found.push({ summary: parsed.entry.summary, legacy: parsed.entry.bodies[LEGACY_TRACK_ID] });
+    }
+  }
+  return found;
+}
+
+/**
+ * Publish the old generated-file bytes `archived` set aside as additional baseline entries
+ * (`projects/<p>/sessions/<date>-baseline-<h16>.md`) in one commit, so a memory that only this
+ * machine held reaches the others. `archived` is `[{relPath, kind, backupPath, sha256,
+ * companionRev}]`; the bytes come from `backupPath` (a missing or changed backup is skipped with a
+ * notice). The root `hot.md` and `.hypoignore`d projects are skipped. Per project, one pair
+ * (`hot.md` text, `session-state.md` text) is built per kind; the side that was not archived comes
+ * from `companionRev`'s tree. A pair is not made when HEAD already has a baseline whose summary
+ * and `legacy` sections are byte-equal to it (frontmatter included, so a changed `machine_note` is
+ * a different memory). A path whose file is already there with the same bytes (published, not yet
+ * committed) is committed without being written again. Returns `{created: [relPath], skipped:
+ * [relPath], notices: [string]}`. The caller holds the vault commit lock.
+ */
+export function shareLegacyBytes(hypoDir, archived) {
+  const created = [];
+  const skipped = [];
+  const notices = [];
+  const patterns = loadHypoIgnore(hypoDir);
+  const projects = new Map();
+  for (const el of archived ?? []) {
+    const m = PROJECT_VIEW_RE.exec(el?.relPath ?? '');
+    if (
+      !m ||
+      !isGeneratedViewPath(el.relPath) ||
+      projectHiddenByHypoignore(hypoDir, m[1], patterns)
+    ) {
+      skipped.push(el?.relPath);
+      continue;
+    }
+    const text = (() => {
+      try {
+        return readFileSync(el.backupPath, 'utf-8');
+      } catch {
+        return null;
+      }
+    })();
+    if (text === null || (el.sha256 && sha256Hex(text) !== el.sha256)) {
+      skipped.push(el.relPath);
+      notices.push(
+        `${el.relPath}의 백업(${el.backupPath})이 없거나 달라져 추가 기준선을 만들지 않았습니다.`,
+      );
+      continue;
+    }
+    const kinds = projects.get(m[1]) ?? { worktree: {}, stage: {} };
+    projects.set(m[1], kinds);
+    const group = el.kind === 'stage' ? kinds.stage : kinds.worktree;
+    group[m[2]] = text;
+    group.rev ??= el.companionRev;
+  }
+
+  const toCommit = [];
+  for (const [slug, kinds] of projects) {
+    const pairs = new Map();
+    for (const group of [kinds.worktree, kinds.stage]) {
+      if (group.hot === undefined && group['session-state'] === undefined) continue;
+      const side = (name) =>
+        group[name] ??
+        (group.rev ? gitShowText(hypoDir, group.rev, `projects/${slug}/${name}.md`) : null) ??
+        '';
+      const pair = { hotText: side('hot'), stateText: side('session-state') };
+      pairs.set(JSON.stringify(pair), pair);
+    }
+    const indexText = readTextOrNull(join(hypoDir, 'projects', slug, 'index.md')) ?? '';
+    let existing = null;
+    for (const { hotText, stateText } of pairs.values()) {
+      const built = buildBaselineEntry({
+        hotText,
+        stateText,
+        date: legacyBaselineDate(hypoDir, slug, [hotText, stateText]),
+        visibilityScope: narrowestVisibilityScope([
+          readVisibilityScope(indexText),
+          readVisibilityScope(hotText),
+          readVisibilityScope(stateText),
+        ]).scope,
+        project: slug,
+        legacyDone: false,
+      });
+      const mine = parseSessionEntry(built.text).entry;
+      existing ??= committedBaselines(hypoDir, slug);
+      const rel = `projects/${slug}/sessions/${built.fileName}`;
+      if (
+        existing.some(
+          (e) => e.summary === mine.summary && e.legacy === mine.bodies[LEGACY_TRACK_ID],
+        )
+      ) {
+        skipped.push(rel);
+        continue;
+      }
+      if (publishNoClobber(join(hypoDir, rel), built.text) === 'conflict') {
+        skipped.push(rel);
+        notices.push(`${rel}에 다른 내용의 파일이 이미 있어 추가 기준선을 쓰지 않았습니다.`);
+        continue;
+      }
+      toCommit.push(rel);
+      notices.push(
+        `이 기계에만 있던 옛 세션 현황을 추가 기준선 ${rel}로 기록했습니다. legacy 트랙에 머리가 여럿 보일 수 있습니다.`,
+      );
+    }
+  }
+  if (toCommit.length) {
+    const result = commitWikiChanges(hypoDir, toCommit);
+    if (!result.committed) {
+      notices.push(`추가 기준선을 커밋하지 못했습니다: ${result.reason ?? '이유 미상'}`);
+    }
+    created.push(...toCommit);
+  }
+  return { created, skipped, notices };
+}
+
+/**
+ * Finish what a catch-up merge left behind: a record whose `stage` is `merged`, or whose
+ * `targetSha` is already an ancestor of HEAD (the merge landed, the rest did not run). Puts the
+ * archived `.gitignore` lines back, shares the archived bytes, and deletes the record once every
+ * baseline it made is in HEAD. A record that is still `archived` with a target HEAD does not contain
+ * is the next catch-up's to recover and is left alone. Independent of the migration state. Returns
+ * `{resumed, created, notices}`.
+ */
+export function resumePullArchive(hypoDir) {
+  const rec = readPullArchive(hypoDir);
+  if (!rec || (rec.stage !== 'merged' && !isAncestorOfHead(hypoDir, rec.targetSha))) {
+    return { resumed: false, created: [], notices: [] };
+  }
+  restoreGitignoreLines(hypoDir, rec.gitignoreLines);
+  const shared = shareLegacyBytes(hypoDir, rec.views);
+  const notices = [...shared.notices];
+  if (shared.created.every((rel) => pathInHead(hypoDir, rel))) {
+    rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
+  } else {
+    notices.push(
+      '추가 기준선이 아직 커밋되지 않아 보관 기록을 남겼습니다. 다음 실행이 이어서 처리합니다.',
+    );
+  }
+  return { resumed: true, created: shared.created, notices };
 }
 
 /**
