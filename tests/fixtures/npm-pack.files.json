@@ -260,6 +260,10 @@
     "exec": false
   },
   {
+    "path": "hooks/session-entries.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/shared.json",
     "exec": false
   },

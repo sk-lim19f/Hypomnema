@@ -11,5 +11,6 @@
   "hypo-session-record.mjs",
   "hypo-auto-commit.mjs",
   "hypo-auto-minimal-crystallize.mjs",
-  "close-receipt.mjs"
+  "close-receipt.mjs",
+  "session-entries.mjs"
 ]
