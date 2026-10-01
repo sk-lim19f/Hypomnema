@@ -240,7 +240,7 @@ async function main() {
         encoding: 'utf-8',
         env: cleanEnv,
         cwd: expectedRoot,
-      }).trim();
+      }).replace(/\r?\n$/, '');
     try {
       const list = run(['rev-parse', '--local-env-vars']).split(/\r?\n/).filter(Boolean);
       cleanEnv = buildScrubbedEnv(list);
@@ -249,7 +249,7 @@ async function main() {
           encoding: 'utf-8',
           env: cleanEnv,
           cwd: expectedRoot,
-        }).trim();
+        }).replace(/\r?\n$/, '');
     } catch {
       // Old git without --local-env-vars; keep static-list cleanEnv.
     }

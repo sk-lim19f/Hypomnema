@@ -719,7 +719,7 @@ export function resolveGitHooksDir(repoRoot, { timeoutMs = 5000 } = {}) {
       timeout: timeoutMs,
       stdio: ['ignore', 'pipe', 'ignore'],
       maxBuffer: 1024 * 1024,
-    }).trim();
+    }).replace(/\r?\n$/, '');
 
   try {
     // Enrich the scrub list from git's own truth when this git supports it.

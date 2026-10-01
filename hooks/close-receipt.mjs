@@ -275,6 +275,11 @@ export function readReceiptStrict(hypoDir, sessionId) {
   if (toplevelRes.error || toplevelRes.status !== 0) {
     return { status: 'invalid', reason: 'not-a-git-repository' };
   }
+  // trim() on purpose, unlike the path outputs elsewhere: this value is only ever compared with
+  // the toplevel the receipt was issued with, which repoIdentity trims the same way, so both
+  // sides agree. Changing one side alone would void receipts issued by the other (an npm
+  // install can run a newer issuer against an older deployed copy of this file). If something
+  // ever uses this as a path, change both sides together.
   const actualToplevel = (toplevelRes.stdout || '').trim();
   if (actualToplevel !== receipt.repo.toplevel) {
     return { status: 'invalid', reason: 'repo-mismatch' };

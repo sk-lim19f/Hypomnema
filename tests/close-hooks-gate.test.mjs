@@ -965,6 +965,31 @@ test('hypoIsClean(dir, {deadline: {end: Number.MAX_VALUE}}) folds to the deadlin
   });
 });
 
+// ── gitDirtyFiles: a vault nested in a host repo under a directory whose NAME
+//    starts or ends with a space. The repo root is one level above that
+//    directory, so `git rev-parse --show-prefix` returns `<dir name>/vault/\n`
+//    and the space is inside the prefix. Only the newline is framing. A leading
+//    space is what trim() actually strips (the prefix always ends in `/`), so
+//    the " parent" case is the one that pins the fix; "parent " guards the
+//    other edge. ───────────────────────────────────────────────────────────────
+suite('gitDirtyFiles: nested vault under a parent dir with edge whitespace');
+
+for (const parentName of ['parent ', ' parent']) {
+  test(`gitDirtyFiles returns the vault's dirty files when the parent dir is ${JSON.stringify(parentName)}`, () => {
+    if (process.platform === 'win32') return; // Windows rejects trailing-space directory names
+    withTmpDir((tmp) => {
+      const top = tmp; // host repo root; the whitespace name sits inside the prefix
+      const vault = join(top, parentName, 'vault');
+      mkdirSync(vault, { recursive: true });
+      const opts = { cwd: top, encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } };
+      assert.equal(spawnSync('git', ['init', '-q'], opts).status, 0);
+      writeFileSync(join(vault, 'note.md'), 'x\n');
+      writeFileSync(join(top, 'outside.md'), 'x\n'); // in the host repo, not in the vault
+      assert.deepEqual(gitDirtyFiles(vault), ['note.md']);
+    });
+  });
+}
+
 suite('hypo-personal-check.mjs — close-intent enrichment (#20)');
 
 test('close intent in transcript → systemMessage includes close-intent note, never blocks', () => {
