@@ -292,7 +292,10 @@ export function splitLegacyFrontmatter(text) {
 
 /**
  * The entry that stands in for a project's old `hot.md` and `session-state.md`. Both texts go in
- * whole, frontmatter included (`tags`, `related`, `machine_note` survive). Returns
+ * whole, frontmatter included (`tags`, `related`, `machine_note` survive), with line endings
+ * normalized to LF. A CRLF source would otherwise leave `\r` in a blob that `.gitattributes`
+ * (`eol=lf`) rewrites on checkout, so the path would read as modified forever, and a CRLF machine
+ * and an LF machine would hash the same content to different paths. Returns
  * `{closeId, fileName, text}`. The id hashes the two texts, `legacyDone` and `visibilityScope`, so
  * two machines with the same inputs write the same path and bytes, and inputs that differ in any
  * of those land on different paths instead of colliding.
@@ -305,8 +308,8 @@ export function buildBaselineEntry({
   project,
   legacyDone,
 }) {
-  const hot = hotText ?? '';
-  const state = stateText ?? '';
+  const hot = (hotText ?? '').replace(/\r\n/g, '\n');
+  const state = (stateText ?? '').replace(/\r\n/g, '\n');
   const done = Boolean(legacyDone);
   const scope = visibilityScope || null;
   const h16 = createHash('sha256')

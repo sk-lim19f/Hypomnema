@@ -16,6 +16,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
@@ -55,12 +56,14 @@ import {
   clearGeneratedPathsBlockingPull,
   consumeRootHotHealthNotice,
   formatRootHotProjection,
+  frontmatterScalar,
   isIgnored as isIgnoredHooks,
   legacyBaselineDate,
   localChangesOn,
   markPullArchiveMerged,
   pathInHead,
   readGeneratedViewsRecord,
+  readVisibilityScope,
   resolveActiveProject,
   restoreGitignoreLines,
   resumePullArchive,
@@ -400,6 +403,17 @@ test('a baseline keeps both old files whole, frontmatter included', () => {
   assert.equal(b.fileName, `2026-09-30-${b.closeId}.md`);
   assert.equal(parsed.entry.sessionId, null);
   assert.deepEqual(parsed.entry.tracks, [{ id: 'legacy', title: '이행 전 기록', new: true }]);
+});
+
+test('a baseline from CRLF files is the baseline from the same LF files, with no CR in it', () => {
+  const crlf = (t) => t.replace(/\n/g, '\r\n');
+  assert.equal(OLD_HOT.includes('\r') || OLD_STATE.includes('\r'), false);
+  const fromLf = baseline();
+  const fromCrlf = baseline({ hotText: crlf(OLD_HOT), stateText: crlf(OLD_STATE) });
+  assert.equal(fromCrlf.closeId, fromLf.closeId);
+  assert.equal(fromCrlf.fileName, fromLf.fileName);
+  assert.equal(fromCrlf.text, fromLf.text);
+  assert.equal(fromCrlf.text.includes('\r'), false);
 });
 
 test('--- lines and frontmatter-shaped text inside a section do not leak into the entry frontmatter', () => {
@@ -1406,6 +1420,37 @@ test('projectEntryScope: the narrowest of index.md and the baselines, or the ent
   });
 });
 
+test('visibility_scope and entry_scope are read by one parser: quotes, comments, first-wins, CRLF and nesting alike', () => {
+  const doc = (lines, eol = '\n') => `---${eol}${lines.join(eol)}${eol}---${eol}body${eol}`;
+  const cases = [
+    ['plain', (k) => [`${k}: machine:devA`], true, '\n'],
+    ['double quotes', (k) => [`${k}: "machine:devA"`], true, '\n'],
+    ['single quotes', (k) => [`${k}: 'machine:devA'`], true, '\n'],
+    ['trailing comment', (k) => [`${k}: machine:devA # note`], true, '\n'],
+    ['first wins', (k) => [`${k}: machine:devA`, `${k}: machine:devB`], true, '\n'],
+    ['CRLF', (k) => [`${k}: machine:devA`], true, '\r\n'],
+    ['nested key', (k) => ['meta:', `  ${k}: machine:devA`], false, '\n'],
+    ['list item', (k) => ['tags:', `- ${k}: machine:devA`], false, '\n'],
+  ];
+  withTmpDir((dir) => {
+    for (const [name, lines, read, eol] of cases) {
+      const viaVisibility = readVisibilityScope(doc(lines('visibility_scope'), eol));
+      assert.equal(viaVisibility, read ? 'machine:devA' : '', `visibility_scope: ${name}`);
+      put(dir, 'projects/p/index.md', doc(lines('entry_scope'), eol));
+      const viaEntry = projectEntryScope(dir, 'p');
+      assert.equal(viaEntry === 'machine:devA', read, `entry_scope: ${name} (${viaEntry})`);
+      for (const key of ['visibility_scope', 'entry_scope']) {
+        assert.equal(
+          frontmatterScalar(doc(lines(key), eol), key),
+          read ? 'machine:devA' : null,
+          `${key}: ${name}`,
+        );
+      }
+    }
+    assert.equal(frontmatterScalar('no frontmatter', 'entry_scope'), null);
+  });
+});
+
 // ── git state ────────────────────────────────────────────────────────────────
 
 suite('session views: tracked views and migration state');
@@ -1671,6 +1716,27 @@ test('git that cannot answer is not a vault that tracks nothing: a tracked view 
     });
     assert.equal(readRel(dir, VIEW), OLD_HOT_FILE);
     assert.equal(git(dir, ['status', '--porcelain']).stdout, statusBefore);
+  });
+});
+
+test('a vault reached through a symlink to a subdirectory of a repository has its .git above the real path', () => {
+  withTmpDir((tmp) => {
+    mkdirSync(join(tmp, 'repo/vault'), { recursive: true });
+    mkdirSync(join(tmp, 'repo/.git'));
+    symlinkSync(join(tmp, 'repo/vault'), join(tmp, 'x'));
+    const body = `console.log(JSON.stringify(V.migrationState(${JSON.stringify(join(tmp, 'x'))})))`;
+    const r = runChild(body, { PATH: '/nonexistent' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(
+      JSON.parse(r.stdout),
+      'not-migrated',
+      'git cannot answer, the real path has a .git',
+    );
+    // a link into a place with no .git anywhere is still a vault that tracks nothing
+    mkdirSync(join(tmp, 'plain/vault'), { recursive: true });
+    symlinkSync(join(tmp, 'plain/vault'), join(tmp, 'y'));
+    const plain = runChild(body.replace(join(tmp, 'x'), join(tmp, 'y')), { PATH: '/nonexistent' });
+    assert.equal(JSON.parse(plain.stdout), 'migrated');
   });
 });
 
@@ -3314,6 +3380,106 @@ test('undoClearedPaths puts a staged path back with the vault prefix, in a vault
   });
 });
 
+test('undoClearedPaths puts bytes back in a core.autocrlf=true clone, where the checkout of HEAD has CRLF', () => {
+  withCatchUp(({ b }) => {
+    cgitOk(b, ['config', 'core.autocrlf', 'true']);
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.ok(readRel(b, 'projects/p/hot.md').includes('\r\n'), 'the restore left CRLF behind');
+    const undone = undoClearedPaths(b, r);
+    assert.deepEqual(undone, { ok: true, notices: [] });
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+    assert.equal(existsSync(r.backups[0]), false);
+  });
+});
+
+test('a clean CRLF root hot.md that the generator vouches for gets no backup in a core.autocrlf=true clone', () => {
+  withCatchUp(({ b }) => {
+    cgitOk(b, ['config', 'core.autocrlf', 'true']);
+    unlinkSync(join(b, 'hot.md'));
+    cgitOk(b, ['checkout', '--', 'hot.md']); // what git itself writes under autocrlf
+    assert.equal(readRel(b, 'hot.md'), 'root hot\r\n');
+    assert.equal(cgitOk(b, ['status', '--porcelain', '--', 'hot.md']), '', 'git sees it clean');
+    put(
+      b,
+      '.cache/generated-views.json',
+      JSON.stringify({ views: { 'hot.md': sha('root hot\n') } }),
+    );
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.deepEqual(r.unowned, []);
+    assert.deepEqual(backupsIn(b, 'hot.md'), []);
+    // bytes nobody vouches for still get their copy, whatever the line ending
+    put(b, '.cache/generated-views.json', JSON.stringify({ views: {} }));
+    const other = clear(b);
+    assert.equal(other.unowned.length, 1);
+    assert.equal(readFileSync(other.unowned[0].backupPath, 'utf-8'), 'root hot\r\n');
+  });
+});
+
+test('a stop that comes after the backups reports everything it moved, and the move is undone', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    // `.cache` as a dangling link: the archive record cannot be written
+    symlinkSync(join(b, 'nowhere'), join(b, '.cache'));
+    const r = fastForwardTo(b, '@{u}');
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'archive-write-failed');
+    assert.equal(r.pre.archived.length, 1);
+    assert.equal(r.pre.backups.length, 1);
+    assert.equal(r.pre.unowned.length, 1, 'the root hot.md copy is reported too');
+    assert.equal(existsSync(r.pre.backups[0]), false, 'the backup is taken back');
+    assert.equal(existsSync(r.pre.unowned[0].backupPath), false);
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+    assert.equal(readRel(b, 'hot.md'), 'root hot\n');
+  });
+});
+
+test('a path the target adds as tracked and the clearing step removed comes back when the merge fails', () => {
+  withCatchUp(({ a, b }) => {
+    cgitOk(a, ['pull', '-q']);
+    put(a, 'projects/p/hot.md', 'rolled back hot\n');
+    cgitOk(a, ['add', '-f', 'projects/p/hot.md']);
+    cgitOk(a, ['commit', '-q', '-m', 'rollback']);
+    cgitOk(a, ['push', '-q']);
+    cgitOk(b, ['pull', '-q', '--ff-only']);
+    cgitOk(b, ['rm', '-q', '--cached', '-f', 'projects/p/hot.md']);
+    cgitOk(b, ['reset', '-q', '--hard', 'HEAD~1']);
+    put(b, 'projects/p/hot.md', 'local generated hot\n');
+    const r = fastForwardTo(b, 'origin/main', {
+      // a held index lock makes the merge fail after the clearing step is done
+      testHooks: { afterArchive: () => put(b, '.git/index.lock', '') },
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /^fast-forward-failed/);
+    assert.equal(r.pre.cleared.length, 1);
+    assert.equal(r.pre.cleared[0].relPath, 'projects/p/hot.md');
+    assert.equal(r.pre.archived.length, 0, 'a cleared file is never a baseline candidate');
+    assert.equal(readRel(b, 'projects/p/hot.md'), 'local generated hot\n');
+    assert.equal(existsSync(r.pre.cleared[0].backupPath), false);
+  });
+});
+
+test('a stop puts the set-aside .gitignore lines back before it reports', () => {
+  withCatchUp(({ b }) => {
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const r = fastForwardTo(b, '@{u}', {
+      testHooks: {
+        // something reset .gitignore, and the index is held so the checkout stops the run
+        afterArchive: () => {
+          put(b, '.gitignore', '.cache/\n');
+          put(b, '.git/index.lock', '');
+        },
+      },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'checkout-failed');
+    assert.deepEqual(r.pre.gitignoreLines, ['local-only/']);
+    assert.equal(readRel(b, '.gitignore'), '.cache/\nlocal-only/\n');
+  });
+});
+
 test('a user .gitignore rule that hides projects/*/sessions/ defers the move and touches nothing', () => {
   withOldGit(
     (dir) => {
@@ -3333,6 +3499,34 @@ test('a user .gitignore rule that hides projects/*/sessions/ defers the move and
       assert.equal(migrate(dir).migrated, true);
     },
     { '.gitignore': '.cache/\nsessions/\n' },
+  );
+});
+
+test('a rule hiding the sessions/ of any visible project defers the move, and the notice names each one', () => {
+  const extra = {
+    'projects/q/index.md': '---\ntitle: q\n---\n',
+    'projects/q/hot.md': OLD_HOT_FILE,
+    'projects/q/session-state.md': OLD_STATE_FILE,
+    'projects/r/index.md': '---\ntitle: r\n---\n',
+    'projects/r/hot.md': OLD_HOT_FILE,
+    'projects/r/session-state.md': OLD_STATE_FILE,
+  };
+  withOldGit(
+    (dir) => {
+      const head = headOf(dir);
+      const r = migrate(dir);
+      assert.equal(r.migrated, false);
+      assert.equal(r.deferred, 'sessions-ignored');
+      assert.match(r.notices[0], /projects\/q\/sessions\//);
+      assert.match(r.notices[0], /projects\/r\/sessions\//);
+      assert.doesNotMatch(r.notices[0], /projects\/p\/sessions\//, 'p is not covered');
+      assert.equal(headOf(dir), head);
+      assert.equal(migrationState(dir), 'not-migrated');
+      // a covered project that .hypoignore hides gets no entries, so its rule does not matter
+      put(dir, '.hypoignore', 'projects/q/hot.md\nprojects/r/hot.md\n');
+      assert.equal(migrate(dir).migrated, true);
+    },
+    { ...extra, '.gitignore': '.cache/\nprojects/q/sessions/\nprojects/r/sessions/\n' },
   );
 });
 
