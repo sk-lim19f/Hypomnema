@@ -32,7 +32,8 @@ try {
   const path = await import('node:path');
   const { pathToFileURL, fileURLToPath } = await import('node:url');
 
-  const probe = (args, env) => execFileSync('git', args, { encoding: 'utf8', env }).trim();
+  const probe = (args, env) =>
+    execFileSync('git', args, { encoding: 'utf8', env }).replace(/\r?\n$/, '');
 
   // (0) Derive expectedRoot from THIS script's filesystem location. The shell
   //     shim already verifies HYPOMNEMA_ROOT/HYPOMNEMA_GIT_DIR before exec'ing

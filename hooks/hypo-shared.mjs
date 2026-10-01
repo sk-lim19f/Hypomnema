@@ -584,7 +584,11 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
     t1 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t1 },
   );
   if (prefixRes.error || prefixRes.status !== 0) return []; // can't resolve the repo → cannot attribute
-  const prefix = (prefixRes.stdout || '').trim();
+  // Only the line ending is git's framing (LF, or CRLF where git writes one). The
+  // prefix is a real path segment, so a leading or trailing space in a parent
+  // directory name belongs to it; trim() would make every path under that vault
+  // read as foreign.
+  const prefix = (prefixRes.stdout || '').replace(/\r?\n$/, '');
 
   const t2 = remainingSpawnTimeoutMs(deadline);
   if (t2 === 0) return [];
@@ -4280,7 +4284,7 @@ export function commitWikiChanges(hypoDir, paths) {
   const prefixRes = git('rev-parse', '--show-prefix');
   if (prefixRes.status !== 0)
     return { committed: false, reason: `git rev-parse --show-prefix failed in ${hypoDir}` };
-  const prefix = (prefixRes.stdout || '').replace(/\n$/, '');
+  const prefix = (prefixRes.stdout || '').replace(/\r?\n$/, '');
   const toVaultRelative = (f) => {
     if (!f || !prefix) return f || null;
     return f.startsWith(prefix) ? f.slice(prefix.length) : null;

@@ -2361,6 +2361,43 @@ test('--mark-session-closed in a vault nested inside a larger repository: the re
   });
 });
 
+// The vault repository's top-level directory NAME ends in a space. The issuer
+// (repoIdentity in crystallize-close-apply.mjs) and the verifier
+// (readReceiptStrict) both trim() `rev-parse --show-toplevel`, so they agree.
+// Changing only one of them to strip just the newline makes every receipt from
+// such a vault read as repo-mismatch while no other test goes red.
+test('--mark-session-closed in a vault whose directory name ends in a space: the issued receipt reads as valid, not repo-mismatch', () => {
+  if (process.platform === 'win32') return; // Windows rejects trailing-space directory names
+  withTmpDir((outer) => {
+    const vault = join(outer, 'wiki ');
+    mkdirSync(vault, { recursive: true });
+    buildCleanWikiTree(vault, todayLocal());
+    const g = (args) => spawnSync('git', ['-C', vault, ...args], { encoding: 'utf-8' });
+    g(['init', '-q']);
+    g(['config', 'user.email', 'test@test.com']);
+    g(['config', 'user.name', 'Test']);
+    g(['add', '-A']);
+    assert.equal(g(['commit', '-q', '-m', 'init']).status, 0);
+    assert.ok(
+      g(['rev-parse', '--show-toplevel']).stdout.endsWith(' \n'),
+      'fixture: the toplevel must end in a space',
+    );
+
+    const cleanup = seedCloseTranscript('s-space-top');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${vault}`,
+      '--mark-session-closed',
+      '--session-id=s-space-top',
+      '--project=test-project',
+      '--json',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+    const read = readReceiptStrict(vault, 's-space-top');
+    assert.equal(read.status, 'valid', JSON.stringify(read));
+  });
+});
+
 // design.md v5 §1 / v2 §F, on the OTHER writer entry point: a session that
 // already carries a valid receipt and compat marker (from an earlier
 // successful --mark) sends a fresh --mark-session-closed, and the gate then

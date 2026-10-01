@@ -3241,6 +3241,9 @@ function repoIdentity(hypoDir) {
     encoding: 'utf-8',
   });
   if (top.error || top.status !== 0) return null;
+  // trim() on purpose: readReceiptStrict (hooks/close-receipt.mjs) compares this toplevel with its
+  // own trimmed rev-parse output, and nothing reads it as a path. See the note there before
+  // changing either side.
   const toplevel = (top.stdout || '').trim();
   if (!toplevel) return null;
   const pfx = spawnSync('git', ['-C', hypoDir, 'rev-parse', '--show-prefix'], {
