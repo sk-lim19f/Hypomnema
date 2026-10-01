@@ -11,7 +11,7 @@
 // besides those. Listed in `hooks/shared.json`.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -38,6 +38,7 @@ import {
   backUpGeneratedPath,
   clearGeneratedPathsBlockingPull,
   currentDevice,
+  frontmatterScalar,
   legacyBaselineDate,
   loadHypoIgnore,
   markPullArchiveMerged,
@@ -108,24 +109,6 @@ const isFile = (path) => {
 };
 
 const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-
-// A top-level frontmatter value: first wins, a trailing ` # comment` and surrounding quotes
-// stripped (the same reading as readVisibilityScope, for another key). `null` when absent.
-function frontmatterValue(text, key) {
-  const m = String(text ?? '').match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (!m) return null;
-  for (const line of m[1].split(/\r?\n/)) {
-    if (/^\s/.test(line) || /^-(\s|$)/.test(line)) continue;
-    const idx = line.indexOf(':');
-    if (idx < 0 || line.slice(0, idx).trim() !== key) continue;
-    return line
-      .slice(idx + 1)
-      .trim()
-      .replace(/\s+#.*$/, '')
-      .replace(/^["']|["']$/g, '');
-  }
-  return null;
-}
 
 // ── projects and entries ─────────────────────────────────────────────────────
 
@@ -208,12 +191,23 @@ export function listTrackedGeneratedViews(hypoDir, { source = 'index' } = {}) {
   return r.stdout.split('\0').filter((p) => isGeneratedViewPath(p));
 }
 
-// A `.git` in `dir` or a parent, a directory or the file a linked worktree or submodule has.
+// A `.git` in `dir` or a parent, a directory or the file a linked worktree or submodule has. Both
+// the path as given and its real path are walked: a vault reached through a symlink to a
+// subdirectory of a repository has its `.git` above the real path, not above the link.
 function hasGitEntry(dir) {
-  for (let d = resolve(dir); ; d = dirname(d)) {
-    if (existsSync(join(d, '.git'))) return true;
-    if (dirname(d) === d) return false;
+  const starts = [resolve(dir)];
+  try {
+    starts.push(realpathSync(dir));
+  } catch {
+    // unresolvable: the path as given is all there is
   }
+  for (const start of starts) {
+    for (let d = start; ; d = dirname(d)) {
+      if (existsSync(join(d, '.git'))) return true;
+      if (dirname(d) === d) break;
+    }
+  }
+  return false;
 }
 
 /**
@@ -247,7 +241,7 @@ export function migrationState(hypoDir) {
 // ── model ────────────────────────────────────────────────────────────────────
 
 function entryScopeOf(indexText) {
-  const raw = frontmatterValue(indexText, 'entry_scope');
+  const raw = frontmatterScalar(indexText, 'entry_scope');
   if (raw === null) return null;
   return ENTRY_SCOPE_RE.test(raw) ? raw : 'machine:';
 }
@@ -650,7 +644,9 @@ export function buildCommitInTempIndex(hypoDir, edits, { testHooks } = {}) {
  * motion. First `clearGeneratedPathsBlockingPull` sets aside what would block the merge, then
  * `git merge --ff-only`. When the merge fails, or the first step stops half way, what it moved is
  * taken back (`undoClearedPaths`: working-tree and staged bytes, backups, archive record) and the
- * `.gitignore` lines it set aside are put back, so a failed move leaves the vault as it was.
+ * `.gitignore` lines it set aside are put back, so a failed move leaves the vault as it was. That
+ * covers bytes only: a deletion the user had made of a view path before the move is not made
+ * again, because the clearing step brought the file back from HEAD with no bytes to keep.
  * Returns `{ok, pre, deferred?, reason?, notice?}` where `pre` is the clearing step's result (its
  * `archived[]`, `localOnly[]` and `unowned[]` are for the caller, after a successful merge).
  * `notice` carries git's whole stderr after a failed merge, which names the files in the way, and
@@ -658,8 +654,10 @@ export function buildCommitInTempIndex(hypoDir, edits, { testHooks } = {}) {
  */
 export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
   const pre = clearGeneratedPathsBlockingPull(hypoDir, sha, { testHooks });
-  const moved = pre.archived.length + pre.localOnly.length + pre.unowned.length > 0;
+  const moved =
+    pre.archived.length + pre.localOnly.length + pre.unowned.length + pre.cleared.length > 0;
   if (!pre.ok) {
+    restoreGitignoreLines(hypoDir, pre.gitignoreLines);
     const undone = moved ? undoClearedPaths(hypoDir, pre).notices : [];
     const notice = [pre.notice, ...undone].filter(Boolean).join('\n') || undefined;
     return { ok: false, pre, deferred: pre.deferred, reason: pre.reason, notice };
@@ -730,22 +728,27 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
   const slugs = [...new Set(tracked.map((rel) => generatedViewSlug(rel)))]
     .filter(Boolean)
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  // A rule of the user's own `.gitignore` (or an exclude file) that covers the entry directory would
+  // A rule of the user's own `.gitignore` (or an exclude file) that covers an entry directory would
   // keep every close out of git once the views stop being tracked: the move waits for that rule.
-  const probeProject = slugs[0] ?? listSessionProjects(hypoDir)[0];
-  if (
-    probeProject &&
-    git(hypoDir, [
-      'check-ignore',
-      '-q',
-      '--',
-      `projects/${probeProject}/sessions/0000-00-00-probe.md`,
-    ]).status === 0
-  ) {
-    return deferredMigration(
-      'sessions-ignored',
-      `무시 규칙이 projects/${probeProject}/sessions/의 세션 원본을 가립니다. 그대로 옮기면 세션 기록이 커밋되지 않으니, 그 규칙을 고친 뒤 다시 시도합니다`,
-    );
+  // Every project that is not hidden by `.hypoignore` is probed in one call, so the answer does not
+  // depend on which project sorts first, and the notice names all of them.
+  const probed = [...new Set([...slugs, ...listSessionProjects(hypoDir)])]
+    .filter((slug) => !projectHiddenByHypoignore(hypoDir, slug, patterns))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  if (probed.length) {
+    const probePath = (slug) => `projects/${slug}/sessions/0000-00-00-probe.md`;
+    const checked = gitRun(hypoDir, ['check-ignore', '--stdin', '-z'], {
+      input: probed.map((slug) => `${probePath(slug)}\0`).join(''),
+    });
+    const hits = checked.status === 0 ? new Set(checked.stdout.split('\0')) : new Set();
+    const covered = probed.filter((slug) => hits.has(probePath(slug)));
+    if (covered.length) {
+      const dirs = covered.map((slug) => `projects/${slug}/sessions/`).join(', ');
+      return deferredMigration(
+        'sessions-ignored',
+        `무시 규칙이 ${dirs}의 세션 원본을 가립니다. 그대로 옮기면 세션 기록이 커밋되지 않으니, 그 규칙을 고친 뒤 다시 시도합니다`,
+      );
+    }
   }
   for (const slug of slugs) {
     // A hidden project's entries are never committed, so it gets no baseline. The catch-up step

@@ -1982,6 +1982,10 @@ function readPullArchive(hypoDir) {
 const writePullArchive = (hypoDir, rec) =>
   atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), `${JSON.stringify(rec, null, 2)}\n`);
 
+// Line endings as git stores them: `core.autocrlf=true` checks a file out with CRLF, so a working
+// tree text and the HEAD blob of the same file only match once both are read this way.
+const lfText = (t) => (typeof t === 'string' ? t.replace(/\r\n/g, '\n') : t);
+
 const viewKey = (v) => `${v.relPath}\0${v.kind}\0${v.sha256}`;
 
 function mergeViews(...lists) {
@@ -2016,7 +2020,9 @@ export function markPullArchiveMerged(hypoDir) {
 /**
  * The step before `merge --ff-only <targetRev>` or `pull --no-rebase` takes in a migration (or
  * rollback) commit: clear what would block it, without ever migrating this machine. Returns
- * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], unowned[], gitignoreLines[]}`.
+ * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], unowned[], cleared[], gitignoreLines[]}`.
+ * A stopped run (`ok: false`) reports everything it had moved up to that point in the same lists,
+ * so the caller can take it back.
  *
  * The paths looked at are the ones `targetRev` changes since its merge-base with HEAD (so a
  * diverged history counts only what is coming in). A local change on any of them that is not a
@@ -2029,26 +2035,40 @@ export function markPullArchiveMerged(hypoDir) {
  * staged target paths are unstaged; the blocked paths are restored to HEAD (or removed when HEAD
  * lacks them); and a path `targetRev` adds as tracked that exists here untracked is cleared
  * (backed up unless its bytes are what this machine's generator last wrote), because git
- * overwrites such a file silently. `gitignoreLines` are the uncommitted `.gitignore` additions the
+ * overwrites such a file silently. A cleared path with a backup is listed in `cleared[]`
+ * (`{relPath, backupPath}`), not in `archived[]`: it is not a view this machine meant to keep, so
+ * it is never shared as a baseline, and `undoClearedPaths` still puts it back. `gitignoreLines` are the uncommitted `.gitignore` additions the
  * caller appends back after the merge (`restoreGitignoreLines`).
  *
  * The root `hot.md` that `targetRev` deletes while it is clean is the one path nobody else
  * touches: its bytes are copied to `unowned[]` (`{relPath, kind, backupPath}`, not part of
  * `backups[]`) unless the generator record or the old root projection state says this machine
- * wrote them.
+ * wrote them. Hashes and comparisons against HEAD ignore the line-ending difference
+ * (`\r\n` is read as `\n`), because `core.autocrlf=true` checks the file out with CRLF.
+ *
+ * Only bytes are moved, never a deletion. A blocked view path the user had deleted (in the working
+ * tree or the index) has no bytes to back up, and the clearing step brings it back from HEAD.
  *
  * `testHooks.afterArchive` runs after the archive record is written and the stage is released,
  * before any working-tree path is restored. `testHooks.beforeBackupWrite` goes to the backups.
  */
 export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   const { testHooks } = opts;
+  // What has been moved so far. Every stop reports all of it, so the caller can undo it.
+  const backups = [];
+  const localOnly = [];
+  const unowned = [];
+  const cleared = [];
+  let archived = [];
+  let gitignoreLines = [];
   const stop = (extra) => ({
     ok: false,
-    backups: [],
-    archived: [],
-    localOnly: [],
-    unowned: [],
-    gitignoreLines: [],
+    backups,
+    archived,
+    localOnly,
+    unowned,
+    cleared,
+    gitignoreLines,
     ...extra,
   });
 
@@ -2099,7 +2119,6 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   }
 
   // 4. `.gitignore`: only a pure addition (stage and working tree alike) can be set aside.
-  let gitignoreLines = [];
   if (blocked.includes('.gitignore')) {
     const headText = gitShowText(hypoDir, 'HEAD', '.gitignore') ?? '';
     const targetText = gitShowText(hypoDir, target, '.gitignore') ?? '';
@@ -2127,8 +2146,6 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
     const slug = generatedViewSlug(relPath);
     return slug !== null && projectHiddenByHypoignore(hypoDir, slug, patterns);
   };
-  const backups = [];
-  const localOnly = [];
   const fresh = [];
   const backUp = (relPath, kind, text) => {
     const backupPath = backUpGeneratedPath(join(hypoDir, relPath), text, testHooks);
@@ -2147,11 +2164,10 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   // 5b. The root `hot.md` is a generated path too, and a clean one that `target` deletes goes with
   // the merge. Bytes that neither the generator record nor the old root projection state vouches
   // for are someone's own writing: keep a copy and say so (`unowned[]`).
-  const unowned = [];
   if (incoming.some((c) => c.status === 'D' && c.path === 'hot.md') && !dirty.has('hot.md')) {
     const text = readTextOrNull(join(hypoDir, 'hot.md'));
     if (text !== null) {
-      const sha = sha256Hex(text);
+      const sha = sha256Hex(lfText(text));
       const vouched = [
         readGeneratedViewsRecord(hypoDir).views['hot.md'],
         readRootHotProjectionOwnership(hypoDir).lastHash,
@@ -2176,18 +2192,18 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
       else fresh.push({ ...where, sha256: sha256Hex(text), companionRev: head });
     }
   }
-  const archivedViews = mergeViews(recovered?.views ?? [], fresh);
-  if (prior || archivedViews.length || gitignoreLines.length) {
+  archived = mergeViews(recovered?.views ?? [], fresh);
+  if (prior || archived.length || gitignoreLines.length) {
     try {
       writePullArchive(hypoDir, {
         v: 2,
         stage: 'archived',
         targetSha: target,
         gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
-        views: mergeViews(prior?.views ?? [], archivedViews),
+        views: mergeViews(prior?.views ?? [], archived),
       });
     } catch {
-      return stop({ reason: 'archive-write-failed', backups });
+      return stop({ reason: 'archive-write-failed' });
     }
   }
   const unstage = blocked.filter((p) => staged.has(p));
@@ -2195,7 +2211,7 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
     unstage.length &&
     vaultGit(hypoDir, ['reset', '-q', '--', ...literalSpecs(unstage)]).status !== 0
   ) {
-    return stop({ reason: 'unstage-failed', backups, localOnly, unowned, archived: archivedViews });
+    return stop({ reason: 'unstage-failed' });
   }
   testHooks?.afterArchive?.();
 
@@ -2212,41 +2228,48 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
     if (pathInHead(hypoDir, path)) continue;
     const text = readTextOrNull(join(hypoDir, path));
     if (text === null) continue;
-    if (owned[path] !== sha256Hex(text)) backUp(path, 'worktree', text);
+    if (owned[path] !== sha256Hex(text)) {
+      const { backupPath } = backUp(path, 'worktree', text);
+      cleared.push({ relPath: path, backupPath });
+    }
     rmSync(join(hypoDir, path), { force: true });
   }
   if (restore.length) {
     const r = vaultGit(hypoDir, ['checkout', 'HEAD', '--', ...literalSpecs(restore)]);
     if (r.status !== 0) {
-      return stop({
-        reason: 'checkout-failed',
-        backups,
-        localOnly,
-        unowned,
-        archived: archivedViews,
-      });
+      return stop({ reason: 'checkout-failed' });
     }
   }
-  return { ok: true, backups, archived: archivedViews, localOnly, unowned, gitignoreLines };
+  return { ok: true, backups, archived, localOnly, unowned, cleared, gitignoreLines };
 }
 
 /**
  * Take back what `clearGeneratedPathsBlockingPull` moved when the merge it was clearing for did not
- * happen. `cleared` is its result. Each archived or local-only path gets its bytes back: a
+ * happen. `moved` is its result. Each archived, local-only or cleared path gets its bytes back: a
  * working-tree path is rewritten only when it is absent or still holds what HEAD holds (bytes that
- * landed since are not overwritten), a staged one is put back in the index only when the index
- * entry still equals HEAD's (`hash-object -w`, then `update-index --cacheinfo`, with the vault's
- * prefix in front). When every path is back, the backup files made for them (and for `unowned[]`)
- * and `.cache/pull-archive.json` (when any path was archived) are deleted; otherwise those stay for
- * the next catch-up to carry.
+ * landed since are not overwritten; a CRLF checkout of HEAD's bytes counts as holding them), a
+ * staged one is put back in the index only when the index entry still equals HEAD's
+ * (`hash-object -w`, then `update-index --cacheinfo`, with the vault's prefix in front). The
+ * backup bytes are written as they are. When every path is back, the backup files made for them
+ * (and for `unowned[]`) and `.cache/pull-archive.json` (when any path was archived or local-only)
+ * are deleted; otherwise those stay for the next catch-up to carry.
+ *
+ * Only bytes come back, never a deletion: a view path the user had deleted before the clearing step
+ * had no bytes to back up, the clearing step restored it from HEAD, and nothing here deletes it
+ * again. The generated views are rebuilt from the entries, so the file returns either way.
  * Returns `{ok, notices[]}`; a path that could not be put back has a notice naming its backup.
  */
-export function undoClearedPaths(hypoDir, cleared) {
+export function undoClearedPaths(hypoDir, moved) {
   const seen = new Set();
-  const items = [...(cleared.archived ?? []), ...(cleared.localOnly ?? [])].filter((v) => {
+  const dedupe = (v) => {
     const key = `${v.relPath}\0${v.kind}\0${v.backupPath}`;
     return !seen.has(key) && seen.add(key);
-  });
+  };
+  const items = [...(moved.archived ?? []), ...(moved.localOnly ?? [])].filter(dedupe);
+  const all = [
+    ...items,
+    ...(moved.cleared ?? []).map((c) => ({ ...c, kind: 'worktree' })).filter(dedupe),
+  ];
   const prefix = vaultGitPrefix(hypoDir);
   const notices = [];
   const lenient = (path) => {
@@ -2286,12 +2309,12 @@ export function undoClearedPaths(hypoDir, cleared) {
     const abs = join(hypoDir, relPath);
     const now = lenient(abs);
     if (now === bytes) return true;
-    if (now !== null && now !== gitShowText(hypoDir, 'HEAD', relPath)) return false;
+    if (now !== null && lfText(now) !== lfText(gitShowText(hypoDir, 'HEAD', relPath))) return false;
     atomicWrite(abs, bytes);
     return true;
   };
   let allBack = true;
-  for (const item of items) {
+  for (const item of all) {
     const bytes = lenient(item.backupPath);
     let back = false;
     if (typeof bytes === 'string') {
@@ -2309,7 +2332,7 @@ export function undoClearedPaths(hypoDir, cleared) {
     }
   }
   if (allBack) {
-    for (const { backupPath } of [...items, ...(cleared.unowned ?? [])]) {
+    for (const { backupPath } of [...all, ...(moved.unowned ?? [])]) {
       rmSync(backupPath, { force: true });
     }
     if (items.length) rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
@@ -8690,28 +8713,33 @@ export function currentDevice() {
   return host || 'unknown';
 }
 
-// Extract the top-level `visibility_scope` from a page's raw content. Mirrors
-// scripts/lib/frontmatter.mjs normalization (top-level only, first-wins, strip a
-// whitespace-led trailing YAML comment, strip surrounding quotes) rather than
-// importing it: hooks deploy to ~/.claude/hooks/ with no external imports. The
-// five consumers must call this instead of a local last-wins/no-comment parser,
-// else a `machine:devA # note` value fails to match on its own machine. Returns
-// '' when absent (which scopeVisible treats as shared).
-export function readVisibilityScope(raw) {
+// A top-level frontmatter scalar from a page's raw content: top-level only, first-wins, a
+// whitespace-led trailing YAML comment and surrounding quotes stripped. Mirrors
+// scripts/lib/frontmatter.mjs normalization rather than importing it: hooks deploy to
+// ~/.claude/hooks/ with no external imports. `null` when the key is absent. Every key read this
+// way (`visibility_scope`, `entry_scope`) goes through here, so they cannot drift apart.
+export function frontmatterScalar(raw, key) {
   const m = String(raw || '').match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (!m) return '';
+  if (!m) return null;
   for (const line of m[1].split(/\r?\n/)) {
     if (/^\s/.test(line) || /^-(\s|$)/.test(line)) continue; // nested / list item
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    if (line.slice(0, idx).trim() !== 'visibility_scope') continue;
+    if (line.slice(0, idx).trim() !== key) continue;
     return line
       .slice(idx + 1)
       .trim()
       .replace(/\s+#.*$/, '')
       .replace(/^["']|["']$/g, '');
   }
-  return '';
+  return null;
+}
+
+// Extract the top-level `visibility_scope` from a page's raw content. The five consumers must
+// call this instead of a local last-wins/no-comment parser, else a `machine:devA # note` value
+// fails to match on its own machine. Returns '' when absent (which scopeVisible treats as shared).
+export function readVisibilityScope(raw) {
+  return frontmatterScalar(raw, 'visibility_scope') ?? '';
 }
 
 // The single visibility decision, shared by lookup / query / file-watch /
