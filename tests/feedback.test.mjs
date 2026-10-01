@@ -19,6 +19,7 @@ import {
   chmodSync,
   cpSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 // static import (no top-level await) — feedback-sync.mjs guards main() behind an
@@ -364,6 +365,92 @@ test('feedback-sync-write-idempotent: second --write is byte-identical + post-ch
       );
       assert.equal(runFb(['--check']).status, 0, 'post-write check must be clean');
     },
+  );
+});
+
+// The separators feedback-sync writes carry no em dash: a model that reads the
+// projected lines copies their shape by hand, and a dash separator collides with
+// dashes inside a summary.
+// A summary that itself holds one still carries it; that is wiki content, not format.
+const FB_EM = '—';
+const fbBlock = (slug, line) => {
+  const hash = createHash('sha256').update(line, 'utf-8').digest('hex');
+  return (
+    `<!-- HYPO:FEEDBACK-SYNC:START source=${slug} sha256=${hash} -->\n${line}\n` +
+    '<!-- HYPO:FEEDBACK-SYNC:END -->\n'
+  );
+};
+
+test('feedback-sync-projected-lines-have-no-em-dash: colon index line, period before 근거', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const claude = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+    const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+    assert.ok(mem.split('\n').includes('- [Rule A](feedback_rule-a.md): do A'), mem);
+    assert.ok(claude.split('\n').includes('- [2026-05-20] always do A. 근거: [[rule-a]]'), claude);
+    assert.ok(!mem.includes(FB_EM) && !claude.includes(FB_EM), 'no em dash in either projection');
+  });
+});
+
+test('feedback-sync-projected-lines-edge: no doubled period, no dangling separator', () => {
+  const page = { ...FB_GLOBAL_L1, global_summary: 'always do A.', memory_summary: '' };
+  withFeedbackEnv({ 'rule-a': page }, ({ claudeHome, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const claude = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+    const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+    assert.ok(claude.split('\n').includes('- [2026-05-20] always do A. 근거: [[rule-a]]'), claude);
+    assert.ok(mem.split('\n').includes('- [Rule A](feedback_rule-a.md)'), mem);
+  });
+});
+
+test('feedback-sync-legacy-dash-blocks-migrate: old-format managed blocks rewrite, never exit 3', () => {
+  // Blocks projected before the separator change match their own sha256, so they
+  // are an ordinary stale projection, not a manual edit.
+  const claudeMd =
+    '# Global\n<learned_behaviors>\n- manual entry\n' +
+    fbBlock('rule-a', `- [2026-05-20] always do A ${FB_EM} 근거: [[rule-a]]`) +
+    '</learned_behaviors>\n';
+  const memoryMd =
+    '# Memory Index\n' + fbBlock('rule-a', `- [Rule A](feedback_rule-a.md) ${FB_EM} do A`);
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, memDir, runFb }) => {
+      const check = runFb(['--check', '--json']);
+      assert.equal(check.status, 1, `legacy blocks are drift, not conflict: ${check.stderr}`);
+      const rep = JSON.parse(check.stdout);
+      assert.deepEqual(rep.targets.claude.conflicts, []);
+      assert.deepEqual(rep.targets.memory.conflicts, []);
+      const w = runFb(['--write']);
+      assert.equal(w.status, 0, `--write must rewrite, got ${w.status}: ${w.stderr}`);
+      const claude = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      assert.ok(claude.includes('- [2026-05-20] always do A. 근거: [[rule-a]]'), claude);
+      assert.ok(claude.includes('- manual entry'), 'manual entry must survive the rewrite');
+      assert.ok(mem.includes('- [Rule A](feedback_rule-a.md): do A'), mem);
+      assert.ok(!mem.includes(FB_EM) && !claude.includes(FB_EM), 'legacy dash fully replaced');
+      assert.equal(runFb(['--check']).status, 0, 'post-migration check must be clean');
+    },
+    { claudeMd, memoryMd },
+  );
+});
+
+test('feedback-sync-bootstrap-reads-both-index-forms: colon and legacy dash lines both draft', () => {
+  const memoryMd =
+    '# Memory Index\n' +
+    '- [New form](feedback_new_form.md): colon summary\n' +
+    `- [Old form](feedback_old_form.md) ${FB_EM} dash summary\n` +
+    '- [Bare](feedback_bare.md)\n';
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+      const read = (f) => readFileSync(join(draftsDir, f), 'utf-8');
+      assert.ok(read('new-form.md').includes('memory_summary: colon summary'));
+      assert.ok(read('old-form.md').includes('memory_summary: dash summary'));
+      assert.ok(existsSync(join(draftsDir, 'bare.md')), 'summary-less line still drafts');
+    },
+    { memoryMd },
   );
 });
 
@@ -1354,18 +1441,18 @@ STDERR
 # Global
 <learned_behaviors>
 - manual entry
-<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=829952d557370646323ab1630c165ce8d6edcd45d5a1a5836f79bb631a944032 -->
-- [2026-05-20] always do A — 근거: [[rule-a]]
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=385307561ac01ec70b7890b5292503dd34db25b65800a955138c86b9a5de4524 -->
+- [2026-05-20] always do A. 근거: [[rule-a]]
 <!-- HYPO:FEEDBACK-SYNC:END -->
 </learned_behaviors>
 
 ### FILE MEMORY.md
 # Memory Index
-<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=1b742d57d519e1715e7d3e36ccac73617147022a5ab69cbaf2f09f525ca379aa -->
-- [Rule A](feedback_rule-a.md) — do A
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=be7aad44b99be849ab8fe781b4586559f04c42546f927eec592a70203aebc6de -->
+- [Rule A](feedback_rule-a.md): do A
 <!-- HYPO:FEEDBACK-SYNC:END -->
-<!-- HYPO:FEEDBACK-SYNC:START source=rule-b sha256=7a8c12be4e66e219b61ebb46543f84cf8935386fe2b8dcb1d351c37fd55e59e1 -->
-- [Rule B](feedback_rule-b.md) — do B
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-b sha256=fc9139eb4306741e179b9cea6e503f5945fc21614bc5ffeee1a894a74c7dd61c -->
+- [Rule B](feedback_rule-b.md): do B
 <!-- HYPO:FEEDBACK-SYNC:END -->
 
 ### FILE feedback_rule-a.md
@@ -1533,15 +1620,15 @@ STDERR
 # Global
 <learned_behaviors>
 - manual entry
-<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=829952d557370646323ab1630c165ce8d6edcd45d5a1a5836f79bb631a944032 -->
-- [2026-05-20] HAND EDITED — 근거: [[rule-a]]
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=385307561ac01ec70b7890b5292503dd34db25b65800a955138c86b9a5de4524 -->
+- [2026-05-20] HAND EDITED. 근거: [[rule-a]]
 <!-- HYPO:FEEDBACK-SYNC:END -->
 </learned_behaviors>
 
 ### FILE MEMORY.md
 # Memory Index
-<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=1b742d57d519e1715e7d3e36ccac73617147022a5ab69cbaf2f09f525ca379aa -->
-- [Rule A](feedback_rule-a.md) — do A
+<!-- HYPO:FEEDBACK-SYNC:START source=rule-a sha256=be7aad44b99be849ab8fe781b4586559f04c42546f927eec592a70203aebc6de -->
+- [Rule A](feedback_rule-a.md): do A
 <!-- HYPO:FEEDBACK-SYNC:END -->
 
 ### FILE feedback_rule-a.md
@@ -1577,8 +1664,8 @@ tier: TODO
 targets: [project-memory]
 sensitivity: public
 priority: 3
-memory_summary: - [2026-05-20] HAND EDITED — 근거: [[rule-a]]
-global_summary: - [2026-05-20] HAND EDITED — 근거: [[rule-a]]
+memory_summary: - [2026-05-20] HAND EDITED. 근거: [[rule-a]]
+global_summary: - [2026-05-20] HAND EDITED. 근거: [[rule-a]]
 promote_to_global: false
 reason: imported from claude <learned_behaviors>/MEMORY managed block (hand-edited)
 source: TODO
@@ -1590,7 +1677,7 @@ imported_from: claude
 > The managed block below was edited outside the wiki. Reconcile it into
 > pages/feedback/rule-a.md (the SoT), then re-run feedback-sync --write.
 
-- [2026-05-20] HAND EDITED — 근거: [[rule-a]]
+- [2026-05-20] HAND EDITED. 근거: [[rule-a]]
 `;
 
 // ── CONCERN 6: --ensure-container — the provisioning path a blocker can
