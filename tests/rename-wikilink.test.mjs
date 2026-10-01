@@ -29,7 +29,7 @@ import {
   extractWikilinks,
 } from '../scripts/lib/wikilink.mjs';
 import { test, suite } from './harness.mjs';
-import { run, withTmpDir, SCRIPTS, SESSION_TMP_HOME } from './helpers.mjs';
+import { run, withTmpDir, SCRIPTS, HOOKS, SESSION_TMP_HOME } from './helpers.mjs';
 
 // ── rename.mjs (inbound wikilink rewrite) ─────────────────────────────────────
 
@@ -369,6 +369,8 @@ process.on('exit', () => {
 const KILL_SCRIPTS = join(KILL_COPY_ROOT, 'scripts');
 const KILL_RENAME = join(KILL_SCRIPTS, 'rename.mjs');
 cpSync(SCRIPTS, KILL_SCRIPTS, { recursive: true });
+// scripts/ imports hooks/ (the shipped layout has both side by side), so the copy needs it too.
+cpSync(HOOKS, join(KILL_COPY_ROOT, 'hooks'), { recursive: true });
 {
   let src = readFileSync(KILL_RENAME, 'utf-8');
   const pageAnchor = 'renameSync(fromPage.path, toPath);';

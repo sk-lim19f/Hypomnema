@@ -32,6 +32,8 @@ import {
 import {
   backUpGeneratedPath,
   currentDevice,
+  isIgnored,
+  loadHypoIgnore,
   pathInHead,
   readVisibilityScope,
   revPathArg,
@@ -423,14 +425,24 @@ const emptyResult = (over) => ({
  * reentrant). `opts`: `projects` (slugs, default every session project), `root` (write the root
  * `hot.md`, default true), `device` (default `currentDevice()`), `testHooks`. Returns
  * `{notMigrated, lockTimeout, written[], unchanged[], backedUp[{relPath, backupPath}]}`; when the
- * vault is not `migrated` nothing is written and `notMigrated` is true. Any backup leaves a health
- * notice for the next SessionStart.
+ * vault is not `migrated` nothing is written and `notMigrated` is true. A project that
+ * `.hypoignore` ignores (see `isIgnored`) is neither read nor written and has no root row. Any
+ * backup leaves a health notice for the next SessionStart.
  */
 export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   const { root = true, device = currentDevice(), testHooks } = opts;
   const state = migrationState(hypoDir);
   if (state !== 'migrated') return emptyResult({ notMigrated: true, state });
-  const all = listSessionProjects(hypoDir);
+  // A project the `.hypoignore` hides gets no views and no row in the root table: its entries are
+  // never committed, so a table row would publish a project the owner chose to keep local. A
+  // project is hidden exactly when one of its two view paths is, which is the same test
+  // `isIgnored` applies to each of its entries.
+  const patterns = loadHypoIgnore(hypoDir);
+  const hidden = (p) =>
+    ['hot.md', 'session-state.md'].some((f) =>
+      isIgnored(join(hypoDir, 'projects', p, f), hypoDir, patterns),
+    );
+  const all = listSessionProjects(hypoDir).filter((p) => !hidden(p));
   const only = opts.projects ? all.filter((p) => opts.projects.includes(p)) : all;
   const models = all.map((p) => loadSessionModel(hypoDir, p, { state, testHooks }));
   const views = renderViews(models, { device, only });
