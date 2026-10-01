@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   statSync,
   unlinkSync,
   utimesSync,
@@ -49,14 +50,20 @@ import {
   trackHeads,
 } from '../hooks/session-entries.mjs';
 import {
+  clearGeneratedPathsBlockingPull,
   consumeRootHotHealthNotice,
   formatRootHotProjection,
   isIgnored as isIgnoredHooks,
   localChangesOn,
+  markPullArchiveMerged,
   pathInHead,
   resolveActiveProject,
+  restoreGitignoreLines,
+  resumePullArchive,
   revPathArg,
   scopeVisible as sharedScopeVisible,
+  shareLegacyBytes,
+  upstreamIsMigrated,
   vaultCommitLockTarget,
   vaultGitPrefix,
   withFileLock,
@@ -1744,3 +1751,651 @@ for (const [name, isIgnored] of [
     assert.equal(ignoredIn(isIgnored, 'projects/secret/sessions/x.md', []), false);
   });
 }
+
+// ── catching up with a migration commit ──────────────────────────────────────
+
+suite('catch-up: clearGeneratedPathsBlockingPull clears what blocks the merge');
+
+// Two real clones of one bare origin. `a` is the machine that migrates, `b` is the machine that
+// has to catch up. Every git child gets HOME in the session temp dir and a throwaway global
+// config; the production functions under test run in this process, so the same two variables are
+// set around the body and restored in a finally.
+const CATCH_UP_CONFIG = () => {
+  const path = join(SESSION_TMP_HOME, 'gitconfig-catch-up');
+  writeFileSync(
+    path,
+    '[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n',
+  );
+  return path;
+};
+
+function cgit(dir, args) {
+  return spawnSync('git', args, {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      GIT_CONFIG_GLOBAL: CATCH_UP_CONFIG(),
+      GIT_CONFIG_NOSYSTEM: '1',
+    },
+  });
+}
+
+const cgitOk = (dir, args) => {
+  const r = cgit(dir, args);
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout;
+};
+
+function inCatchUpEnv(fn) {
+  const saved = {
+    GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+    GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM,
+  };
+  process.env.GIT_CONFIG_GLOBAL = CATCH_UP_CONFIG();
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+const commitIn = (dir) => {
+  cgitOk(dir, ['add', '-A']);
+  cgitOk(dir, ['commit', '-q', '-m', 'x']);
+};
+const headOf = (dir) => cgitOk(dir, ['rev-parse', 'HEAD']).trim();
+const commitCount = (dir) => Number(cgitOk(dir, ['rev-list', '--count', 'HEAD']).trim());
+const sessionsDir = (dir, project = 'p') => join(dir, 'projects', project, 'sessions');
+const listDir = (dir) => {
+  try {
+    return readdirSync(dir).sort();
+  } catch {
+    return [];
+  }
+};
+const backupsIn = (dir, rel) =>
+  listDir(join(dir, dirname(rel))).filter((n) => n.startsWith(`${rel.split('/').at(-1)}.pre-`));
+
+const SEED = {
+  '.gitignore': '.cache/\n',
+  'hot.md': 'root hot\n',
+  'projects/p/index.md': '---\ntitle: p\n---\n',
+  'projects/p/hot.md': OLD_HOT_FILE,
+  'projects/p/session-state.md': OLD_STATE_FILE,
+  'pages/x.md': 'x\n',
+  'pages/y.md': 'y\n',
+};
+
+// `a` seeds the origin, `b` clones it, then `a` pushes a migration commit that untracks the old
+// views and adds the block and a remote baseline. `b` has fetched it: HEAD is the old state,
+// `@{u}` the migrated one. `opts.seed` adds seed files, `opts.migrate.touch` more files the
+// migration commit changes, `opts.migrate.legacyDone` builds the remote baseline folded.
+function withCatchUp(fn, opts = {}) {
+  inCatchUpEnv(() =>
+    withTmpDir((root) => {
+      const origin = join(root, 'origin.git');
+      const a = join(root, 'a');
+      const b = join(root, 'b');
+      cgitOk(root, ['init', '-q', '--bare', origin]);
+      cgitOk(root, ['clone', '-q', origin, a]);
+      for (const [rel, text] of Object.entries({ ...SEED, ...opts.seed })) put(a, rel, text);
+      commitIn(a);
+      cgitOk(a, ['push', '-q', '-u', 'origin', 'main']);
+      cgitOk(root, ['clone', '-q', origin, b]);
+      const gone = [
+        'hot.md',
+        'projects/p/hot.md',
+        'projects/p/session-state.md',
+        ...(opts.gone ?? []),
+      ];
+      cgitOk(a, ['rm', '-q', ...gone]);
+      put(a, '.gitignore', `.cache/\n${GITIGNORE_BLOCK}`);
+      const remote = buildBaselineEntry({
+        hotText: OLD_HOT_FILE,
+        stateText: OLD_STATE_FILE,
+        date: '2026-09-25',
+        visibilityScope: 'machine:devA',
+        project: 'p',
+        legacyDone: opts.migrate?.legacyDone === true,
+      });
+      put(a, `projects/p/sessions/${remote.fileName}`, remote.text);
+      for (const [rel, text] of Object.entries(opts.migrate?.touch ?? {})) {
+        put(a, rel, text);
+        cgitOk(a, ['add', '-f', rel]); // the block ignores generated view paths
+      }
+      commitIn(a);
+      cgitOk(a, ['push', '-q']);
+      cgitOk(b, ['fetch', '-q']);
+      fn({ a, b, root, remote });
+    }),
+  );
+}
+
+const W1 = OLD_HOT_FILE.replace('old hot body', 'local edit one');
+const W2 = OLD_HOT_FILE.replace('old hot body', 'local edit two');
+const clear = (dir, rev = '@{u}', opts) => clearGeneratedPathsBlockingPull(dir, rev, opts);
+const ffTo = (dir, rev = '@{u}') => cgit(dir, ['merge', '--ff-only', rev]).status;
+const unmerged = (dir) => cgitOk(dir, ['ls-files', '-u']).trim();
+
+test('upstreamIsMigrated reads @{u}: true once the migrated commit is fetched, false before it and with no upstream', () => {
+  withCatchUp(({ b, root }) => {
+    assert.equal(upstreamIsMigrated(b), true);
+    // Point the remote-tracking ref back at the old state, as before the fetch.
+    cgitOk(b, ['update-ref', 'refs/remotes/origin/main', headOf(b)]);
+    assert.equal(upstreamIsMigrated(b), false);
+    cgitOk(b, ['fetch', '-q']);
+    assert.equal(upstreamIsMigrated(b), true);
+    const lone = join(root, 'lone');
+    cgitOk(root, ['init', '-q', lone]);
+    assert.equal(upstreamIsMigrated(lone), false, 'no upstream');
+  });
+});
+
+test('(a) an uncommitted edit of a view blocks the ff; it is backed up and restored, then the ff succeeds', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    assert.notEqual(ffTo(b), 0, 'the block is real before the call');
+    assert.equal(unmerged(b), '');
+    const r = clear(b);
+    assert.equal(r.ok, true);
+    assert.equal(r.backups.length, 1);
+    assert.equal(readFileSync(r.backups[0], 'utf-8'), W1);
+    assert.equal(readRel(b, 'projects/p/hot.md'), OLD_HOT_FILE, 'the working tree is HEAD again');
+    assert.deepEqual(
+      r.archived.map((v) => [v.relPath, v.kind, v.backupPath, v.sha256]),
+      [['projects/p/hot.md', 'worktree', r.backups[0], sha(W1)]],
+    );
+    assert.equal(ffTo(b), 0);
+  });
+});
+
+test('(b) diverged history: the same edit is cleared and pull --no-rebase then succeeds with nothing unmerged', () => {
+  withCatchUp(({ b }) => {
+    putEntry(b, 'p', 'local-close-1');
+    commitIn(b);
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true);
+    assert.equal(cgit(b, ['pull', '--no-rebase', '--no-edit', '-q']).status, 0);
+    assert.equal(unmerged(b), '');
+    assert.equal(readFileSync(r.backups[0], 'utf-8'), W1);
+  });
+});
+
+test('(b2) diverged history: a file only the local commit changed, edited again, is not a block', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'pages/y.md', 'y local commit\n');
+    commitIn(b);
+    put(b, 'pages/y.md', 'y local commit\nplus uncommitted\n');
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(cgit(b, ['pull', '--no-rebase', '--no-edit', '-q']).status, 0);
+    assert.equal(readRel(b, 'pages/y.md'), 'y local commit\nplus uncommitted\n');
+  });
+});
+
+test('(c) staged bytes S and later working-tree bytes W are both backed up and archived, the stage is released', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    cgitOk(b, ['add', 'projects/p/hot.md']);
+    put(b, 'projects/p/hot.md', W2);
+    const r = clear(b);
+    assert.equal(r.ok, true);
+    const byKind = Object.fromEntries(r.archived.map((v) => [v.kind, v]));
+    assert.equal(readFileSync(byKind.stage.backupPath, 'utf-8'), W1);
+    assert.equal(readFileSync(byKind.worktree.backupPath, 'utf-8'), W2);
+    assert.equal(byKind.stage.relPath, 'projects/p/hot.md');
+    assert.equal(byKind.worktree.relPath, 'projects/p/hot.md');
+    assert.equal(cgitOk(b, ['diff', '--cached', '--name-only']).trim(), '');
+    assert.equal(ffTo(b), 0);
+    // Both versions differ from the remote baseline: two additional baselines.
+    const shared = shareLegacyBytes(b, r.archived);
+    assert.equal(shared.created.length, 2);
+  });
+});
+
+test('(c) the same bytes staged and in the working tree make one backup and one additional baseline', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    cgitOk(b, ['add', 'projects/p/hot.md']);
+    const r = clear(b);
+    assert.equal(r.ok, true);
+    assert.equal(new Set(r.backups).size, 1);
+    assert.equal(backupsIn(b, 'projects/p/hot.md').length, 1);
+    assert.equal(ffTo(b), 0);
+    assert.equal(shareLegacyBytes(b, r.archived).created.length, 1);
+  });
+});
+
+test('(c2) a staged .gitignore that is not a pure addition defers and leaves HEAD, index and tree alone', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\n!keep.md\n');
+    cgitOk(b, ['add', '.gitignore']);
+    const head = headOf(b);
+    const stagedBytes = cgitOk(b, ['show', ':.gitignore']);
+    const r = clear(b);
+    assert.equal(r.ok, false);
+    assert.equal(r.deferred, 'gitignore');
+    assert.ok(r.notice.includes('.gitignore'));
+    assert.equal(headOf(b), head);
+    assert.equal(cgitOk(b, ['show', ':.gitignore']), stagedBytes);
+    assert.equal(readRel(b, '.gitignore'), '.cache/\n!keep.md\n');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'nothing is archived before the verdict');
+    assert.equal(backupsIn(b, 'projects/p/hot.md').length, 0);
+  });
+});
+
+test('(d) a working-tree .gitignore with a negation line defers and touches nothing', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\n!keep.md\n');
+    const r = clear(b);
+    assert.equal(r.ok, false);
+    assert.equal(r.deferred, 'gitignore');
+    assert.equal(readRel(b, '.gitignore'), '.cache/\n!keep.md\n');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+    assert.equal(backupsIn(b, 'projects/p/hot.md').length, 0);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+  });
+});
+
+test('(e) a local edit of another incoming path is other-dirty and nothing is touched', () => {
+  withCatchUp(
+    ({ b }) => {
+      put(b, 'pages/x.md', 'local x\n');
+      put(b, 'projects/p/hot.md', W1);
+      const r = clear(b);
+      assert.equal(r.ok, false);
+      assert.equal(r.reason, 'other-dirty');
+      assert.equal(readRel(b, 'pages/x.md'), 'local x\n');
+      assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+      assert.equal(backupsIn(b, 'projects/p/hot.md').length, 0);
+    },
+    { migrate: { touch: { 'pages/x.md': 'remote x\n' } } },
+  );
+});
+
+test('uncommitted .gitignore additions are kept, the file is restored, and they come back after the ff once', () => {
+  withCatchUp(({ b }) => {
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const r = clear(b);
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.gitignoreLines, ['local-only/']);
+    assert.equal(readRel(b, '.gitignore'), '.cache/\n');
+    assert.equal(ffTo(b), 0);
+    assert.deepEqual(restoreGitignoreLines(b, r.gitignoreLines), ['local-only/']);
+    assert.deepEqual(
+      restoreGitignoreLines(b, r.gitignoreLines),
+      [],
+      'a second restore adds nothing',
+    );
+    const text = readRel(b, '.gitignore');
+    assert.equal(text.split('\n').filter((l) => l === 'local-only/').length, 1);
+    assert.ok(text.includes(GITIGNORE_BLOCK));
+    assert.equal(cgitOk(b, ['diff', '--name-only']).trim(), '.gitignore', 'still uncommitted');
+  });
+});
+
+test('(f) a run that stopped after archiving is recovered: the lines and the archived bytes come back, each once', () => {
+  const stopAfterArchive = {
+    testHooks: {
+      afterArchive: () => {
+        throw new Error('stopped');
+      },
+    },
+  };
+  const countLine = (dir) =>
+    readRel(dir, '.gitignore')
+      .split('\n')
+      .filter((l) => l === 'local-only/').length;
+  // Stopped before anything was restored: the second run finds the same dirt and the same record.
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    assert.throws(() => clear(b, '@{u}', stopAfterArchive), /stopped/);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.deepEqual(r.gitignoreLines, ['local-only/']);
+    assert.equal(r.archived.length, 1);
+    assert.equal(
+      backupsIn(b, 'projects/p/hot.md').length,
+      1,
+      'the backup is reused, not copied again',
+    );
+    assert.equal(ffTo(b), 0);
+    restoreGitignoreLines(b, r.gitignoreLines);
+    assert.equal(countLine(b), 1);
+  });
+  // Stopped further on: the working tree is already back at HEAD, so only the record remembers.
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    assert.throws(() => clear(b, '@{u}', stopAfterArchive), /stopped/);
+    cgitOk(b, ['checkout', 'HEAD', '--', 'projects/p/hot.md', '.gitignore']);
+    assert.equal(countLine(b), 0);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.deepEqual(r.gitignoreLines, ['local-only/']);
+    assert.deepEqual(
+      r.archived.map((v) => [v.relPath, v.sha256]),
+      [['projects/p/hot.md', sha(W1)]],
+    );
+    const record = JSON.parse(readRel(b, '.cache/pull-archive.json'));
+    assert.equal(record.stage, 'archived');
+    assert.equal(record.views.length, 1);
+    assert.deepEqual(record.gitignoreLines, ['local-only/']);
+    assert.equal(ffTo(b), 0);
+    restoreGitignoreLines(b, r.gitignoreLines);
+    assert.equal(countLine(b), 1);
+  });
+});
+
+test('a path the target adds as tracked, held here untracked, is cleared: backed up unless the generator wrote it', () => {
+  withCatchUp(({ b }) => {
+    // a rollback-shaped target: the next commit re-adds two views as tracked files
+    const [a2] = [join(dirname(b), 'a')];
+    cgitOk(a2, ['pull', '-q']);
+    put(a2, 'projects/p/hot.md', 'rolled back hot\n');
+    put(a2, 'projects/p/session-state.md', 'rolled back state\n');
+    cgitOk(a2, ['add', '-f', 'projects/p/hot.md', 'projects/p/session-state.md']);
+    cgitOk(a2, ['commit', '-q', '-m', 'rollback']);
+    cgitOk(a2, ['push', '-q']);
+    cgitOk(b, ['pull', '-q', '--ff-only']);
+    cgitOk(b, ['rm', '-q', '--cached', '-f', 'projects/p/hot.md', 'projects/p/session-state.md']);
+    cgitOk(b, ['reset', '-q', '--hard', 'HEAD~1']);
+    put(b, 'projects/p/hot.md', 'local generated hot\n');
+    put(b, 'projects/p/session-state.md', 'owned generated state\n');
+    put(
+      b,
+      '.cache/generated-views.json',
+      JSON.stringify({ views: { 'projects/p/session-state.md': sha('owned generated state\n') } }),
+    );
+    const r = clear(b, 'origin/main');
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(existsSync(join(b, 'projects/p/hot.md')), false);
+    assert.equal(existsSync(join(b, 'projects/p/session-state.md')), false);
+    assert.equal(r.backups.length, 1, 'only the file this machine did not generate is backed up');
+    assert.equal(readFileSync(r.backups[0], 'utf-8'), 'local generated hot\n');
+    assert.equal(ffTo(b, 'origin/main'), 0);
+    assert.equal(readRel(b, 'projects/p/hot.md'), 'rolled back hot\n');
+  });
+});
+
+test('a view staged as new while the target adds the same path is released from the index and removed, with its bytes kept', () => {
+  withCatchUp(
+    ({ b }) => {
+      put(b, 'projects/q/hot.md', 'local q\n');
+      cgitOk(b, ['add', 'projects/q/hot.md']);
+      const r = clear(b);
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.deepEqual(r.archived.map((v) => v.kind).sort(), ['stage', 'worktree']);
+      assert.equal(readFileSync(r.backups[0], 'utf-8'), 'local q\n');
+      assert.equal(cgitOk(b, ['diff', '--cached', '--name-only']).trim(), '');
+      assert.equal(existsSync(join(b, 'projects/q/hot.md')), false);
+      assert.equal(ffTo(b), 0);
+      assert.equal(readRel(b, 'projects/q/hot.md'), 'q from remote\n');
+    },
+    { migrate: { touch: { 'projects/q/hot.md': 'q from remote\n' } } },
+  );
+});
+
+test('(h) an ignored project: even clean old views are backed up and kept local, and never shared', () => {
+  withCatchUp(
+    ({ b }) => {
+      put(b, '.hypoignore', 'projects/secret/hot.md\n');
+      const r = clear(b);
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.deepEqual(r.localOnly.map((v) => v.relPath).sort(), [
+        'projects/secret/hot.md',
+        'projects/secret/session-state.md',
+      ]);
+      const bytes = Object.fromEntries(
+        r.localOnly.map((v) => [v.relPath, readFileSync(v.backupPath, 'utf-8')]),
+      );
+      assert.equal(bytes['projects/secret/hot.md'], 'secret hot\n');
+      assert.equal(bytes['projects/secret/session-state.md'], 'secret state\n');
+      assert.equal(r.archived.length, 0);
+      assert.equal(
+        backupsIn(b, 'projects/p/hot.md').length,
+        0,
+        'a project that is not ignored: no backup',
+      );
+      assert.equal(ffTo(b), 0);
+      assert.equal(existsSync(join(b, 'projects/secret/hot.md')), false);
+      assert.equal(existsSync(r.localOnly[0].backupPath), true);
+      assert.deepEqual(shareLegacyBytes(b, r.archived).created, []);
+      // The same view held in an old record is skipped by the share itself.
+      const held = r.localOnly.find((v) => v.relPath === 'projects/secret/hot.md');
+      const shared = shareLegacyBytes(b, [
+        { ...held, kind: 'worktree', sha256: sha('secret hot\n'), companionRev: 'HEAD' },
+      ]);
+      assert.deepEqual(shared.created, []);
+      assert.deepEqual(listDir(sessionsDir(b, 'secret')), []);
+    },
+    {
+      seed: {
+        'projects/secret/index.md': '---\ntitle: secret\n---\n',
+        'projects/secret/hot.md': 'secret hot\n',
+        'projects/secret/session-state.md': 'secret state\n',
+      },
+      gone: ['projects/secret/hot.md', 'projects/secret/session-state.md'],
+    },
+  );
+});
+
+test('(h2) an ignored project whose view has local edits: the edit is backed up and stays local, not archived', () => {
+  withCatchUp(
+    ({ b }) => {
+      put(b, '.hypoignore', 'projects/secret/\n');
+      put(b, 'projects/secret/session-state.md', 'secret state edited\n');
+      cgitOk(b, ['add', 'projects/secret/session-state.md']);
+      const r = clear(b);
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.equal(r.archived.length, 0);
+      const edited = r.localOnly.filter((v) => v.relPath === 'projects/secret/session-state.md');
+      assert.deepEqual(
+        [...new Set(edited.map((v) => readFileSync(v.backupPath, 'utf-8')))],
+        ['secret state edited\n'],
+      );
+      assert.equal(ffTo(b), 0);
+    },
+    {
+      seed: {
+        'projects/secret/index.md': '---\ntitle: secret\n---\n',
+        'projects/secret/hot.md': 'secret hot\n',
+        'projects/secret/session-state.md': 'secret state\n',
+      },
+      gone: ['projects/secret/hot.md', 'projects/secret/session-state.md'],
+    },
+  );
+});
+
+// ── additional baselines and the leftover archive ────────────────────────────
+
+suite('catch-up: shareLegacyBytes and resumePullArchive share the bytes that were set aside');
+
+const catchUpAndMerge = (b, hooks) => {
+  const pre = clear(b, '@{u}', hooks);
+  assert.equal(pre.ok, true, JSON.stringify(pre));
+  assert.equal(ffTo(b), 0);
+  return pre;
+};
+const baselinesOf = (dir) =>
+  listDir(sessionsDir(dir)).filter((n) => /-baseline-[0-9a-f]{16}\.md$/.test(n));
+const legacyHeads = (dir, state = 'migrated') => {
+  const model = loadSessionModel(dir, 'p', { state });
+  return trackHeads(model.entries).find((t) => t.trackId === LEGACY_TRACK_ID)?.heads ?? [];
+};
+
+test('(g) bytes that differ from the remote baseline become a new committed baseline and a second legacy head', () => {
+  withCatchUp(({ b, remote }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const pre = catchUpAndMerge(b);
+    assert.deepEqual(baselinesOf(b), [remote.fileName]);
+    const before = commitCount(b);
+    const shared = shareLegacyBytes(b, pre.archived);
+    assert.equal(shared.created.length, 1);
+    assert.match(
+      shared.created[0],
+      /^projects\/p\/sessions\/2026-09-25-baseline-[0-9a-f]{16}\.md$/,
+    );
+    assert.equal(baselinesOf(b).length, 2);
+    assert.equal(commitCount(b), before + 1, 'one commit');
+    assert.equal(pathInHead(b, shared.created[0]), true);
+    assert.equal(legacyHeads(b).length, 2);
+    assert.ok(shared.notices.some((n) => n.includes(shared.created[0])));
+  });
+});
+
+test('(g) the same bytes as the remote baseline make no new file, even when the remote baseline was folded', () => {
+  for (const legacyDone of [false, true]) {
+    withCatchUp(
+      ({ b }) => {
+        const pre = catchUpAndMerge(b);
+        const backup = join(b, 'held-hot.txt');
+        writeFileSync(backup, OLD_HOT_FILE);
+        const held = [
+          {
+            relPath: 'projects/p/hot.md',
+            kind: 'worktree',
+            backupPath: backup,
+            sha256: sha(OLD_HOT_FILE),
+            companionRev: 'ORIG_HEAD',
+          },
+        ];
+        void pre;
+        const before = commitCount(b);
+        const shared = shareLegacyBytes(b, held);
+        assert.deepEqual(shared.created, [], `legacyDone ${legacyDone}`);
+        assert.equal(commitCount(b), before);
+        assert.equal(baselinesOf(b).length, 1);
+      },
+      { migrate: { legacyDone } },
+    );
+  }
+});
+
+test('(g) the root hot.md is never turned into a baseline', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'hot.md', 'root edited\n');
+    const pre = catchUpAndMerge(b);
+    assert.equal(pre.archived.length, 1);
+    const before = baselinesOf(b);
+    assert.deepEqual(shareLegacyBytes(b, pre.archived).created, []);
+    assert.deepEqual(baselinesOf(b), before);
+  });
+});
+
+test('(g) a baseline this machine had already folded with done is created but is not a legacy head', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const virtual = loadSessionModel(b, 'p', { state: 'not-migrated' }).entries.find((e) =>
+      isBaselineId(e.closeId),
+    );
+    putEntry(b, 'p', 'earlier-close-1', {
+      tracks: [{ id: LEGACY_TRACK_ID, done: true, supersedes: [virtual.closeId] }],
+      bodies: { [LEGACY_TRACK_ID]: 'folded\n' },
+    });
+    const pre = catchUpAndMerge(b);
+    const shared = shareLegacyBytes(b, pre.archived);
+    assert.equal(shared.created.length, 1);
+    const ids = legacyHeads(b).map((h) => h.closeId);
+    assert.equal(ids.includes(virtual.closeId), false, 'the folded id stays folded');
+    assert.ok(baselinesOf(b).some((n) => n.includes(virtual.closeId.slice('baseline-'.length))));
+  });
+});
+
+test('(g2) a frontmatter-only difference is a different memory and gets its own baseline', () => {
+  withCatchUp(({ b }) => {
+    put(
+      b,
+      'projects/p/hot.md',
+      OLD_HOT_FILE.replace('visibility_scope:', 'machine_note: changed\nvisibility_scope:'),
+    );
+    const pre = catchUpAndMerge(b);
+    assert.equal(shareLegacyBytes(b, pre.archived).created.length, 1);
+  });
+});
+
+test('shareLegacyBytes skips an element whose backup is gone or changed, and says so', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const pre = catchUpAndMerge(b);
+    const [view] = pre.archived;
+    writeFileSync(view.backupPath, 'changed by hand\n');
+    const before = commitCount(b);
+    const shared = shareLegacyBytes(b, pre.archived);
+    assert.deepEqual(shared.created, []);
+    assert.deepEqual(shared.skipped, ['projects/p/hot.md']);
+    assert.equal(shared.notices.length, 1);
+    assert.equal(commitCount(b), before);
+  });
+});
+
+test('(i) a stop between the ff and the share is finished by resumePullArchive, once', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    // the caller, up to the point where it stops
+    assert.throws(() => {
+      catchUpAndMerge(b);
+      throw new Error('stopped after the merge');
+    }, /stopped after the merge/);
+    assert.equal(migrationState(b), 'migrated');
+    const record = JSON.parse(readRel(b, '.cache/pull-archive.json'));
+    assert.equal(record.stage, 'archived');
+    const before = commitCount(b);
+    const first = resumePullArchive(b);
+    assert.equal(first.resumed, true);
+    assert.equal(first.created.length, 1);
+    assert.equal(commitCount(b), before + 1);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+    assert.equal(
+      readRel(b, '.gitignore')
+        .split('\n')
+        .filter((l) => l === 'local-only/').length,
+      1,
+    );
+    const head = headOf(b);
+    assert.equal(resumePullArchive(b).resumed, false);
+    assert.equal(headOf(b), head, 'a second resume makes no commit');
+  });
+});
+
+test('(i) the commit was made but the record was not deleted: resume deletes it and makes no commit', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const pre = catchUpAndMerge(b);
+    markPullArchiveMerged(b);
+    const saved = readRel(b, '.cache/pull-archive.json');
+    assert.equal(JSON.parse(saved).stage, 'merged');
+    assert.equal(shareLegacyBytes(b, pre.archived).created.length, 1);
+    const head = headOf(b);
+    writeFileSync(join(b, '.cache', 'pull-archive.json'), saved);
+    const r = resumePullArchive(b);
+    assert.equal(r.resumed, true);
+    assert.deepEqual(r.created, [], 'the baseline is already there, so nothing is created');
+    assert.equal(headOf(b), head);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+  });
+});
+
+test('(i) an archived record whose target is not in HEAD yet is left alone', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const pre = clear(b);
+    assert.equal(pre.ok, true);
+    const bytes = readRel(b, '.cache/pull-archive.json');
+    const r = resumePullArchive(b);
+    assert.equal(r.resumed, false);
+    assert.equal(readRel(b, '.cache/pull-archive.json'), bytes);
+    assert.deepEqual(baselinesOf(b), [], 'nothing was shared');
+  });
+});
