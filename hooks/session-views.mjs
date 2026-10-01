@@ -10,14 +10,17 @@
 // pure helpers (hypo-shared imports `scopeVisible` from session-entries). Node built-ins only
 // besides those. Listed in `hooks/shared.json`.
 
-import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { atomicWrite } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
 import {
+  GITATTRIBUTES_BLOCK,
   GITIGNORE_BLOCK,
+  LEGACY_TRACK_ID,
   TRACK_ID_RE,
   buildBaselineEntry,
   isBaselineId,
@@ -28,16 +31,24 @@ import {
   parseSessionEntry,
   renderViews,
   splitLegacyFrontmatter,
+  trackHeads,
 } from './session-entries.mjs';
 import {
   backUpGeneratedPath,
+  clearGeneratedPathsBlockingPull,
   currentDevice,
-  isIgnored,
+  legacyBaselineDate,
   loadHypoIgnore,
+  markPullArchiveMerged,
   pathInHead,
+  projectHiddenByHypoignore,
+  readGeneratedViewsRecord,
   readVisibilityScope,
+  restoreGitignoreLines,
+  resumePullArchive,
   revPathArg,
   vaultCommitLockTarget,
+  vaultGitPrefix,
   withFileLock,
   writeRootHotHealthNotice,
 } from './hypo-shared.mjs';
@@ -47,7 +58,6 @@ export const SESSION_ENTRIES_OFF_MARKER = '.hypo-session-entries-off';
 
 const OWNERSHIP_REL = join('.cache', 'generated-views.json');
 const LEGACY_ROOT_STATE_REL = join('.cache', 'root-hot-projection-state.json');
-const DATE_PREFIX_RE = /^\d{4}-\d{2}-\d{2}/;
 // `entry_scope` has the grammar of `visibility_scope`; anything else closes the project.
 const ENTRY_SCOPE_RE = /^(shared|machine:\S*|agent:\S+)$/;
 
@@ -227,30 +237,6 @@ function entryScopeOf(indexText) {
   return ENTRY_SCOPE_RE.test(raw) ? raw : 'machine:';
 }
 
-function localDate(date) {
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-}
-
-// The baseline date: the larger `updated:` of the two old files, else the day git last changed
-// them, else the file's mtime day.
-function legacyDate(hypoDir, rels, texts) {
-  const updated = texts
-    .map((t) => DATE_PREFIX_RE.exec(frontmatterValue(t, 'updated') ?? '')?.[0])
-    .filter(Boolean)
-    .sort();
-  if (updated.length) return updated.at(-1);
-  const committed = rels
-    .map((rel) => {
-      const r = git(hypoDir, ['log', '-1', '--format=%cs', '--', `:(literal)${rel}`]);
-      return r.status === 0 ? DATE_PREFIX_RE.exec(r.stdout.trim())?.[0] : null;
-    })
-    .filter(Boolean)
-    .sort();
-  if (committed.length) return committed.at(-1);
-  return localDate(statSync(join(hypoDir, rels[0])).mtime);
-}
-
 // The in-memory entry that stands for a not-yet-migrated project's old `hot.md` and
 // `session-state.md` (whichever of them git tracks). `null` when neither is.
 function virtualBaseline(hypoDir, project, tracked, indexText) {
@@ -258,8 +244,7 @@ function virtualBaseline(hypoDir, project, tracked, indexText) {
   const [hotText, stateText] = rels.map((rel) =>
     tracked.has(rel) ? readOrNull(join(hypoDir, rel)) : null,
   );
-  const present = rels.filter((_, i) => [hotText, stateText][i] !== null);
-  if (!present.length) return null;
+  if (hotText === null && stateText === null) return null;
   const { scope } = narrowestVisibilityScope([
     readVisibilityScope(indexText ?? ''),
     readVisibilityScope(hotText ?? ''),
@@ -268,7 +253,7 @@ function virtualBaseline(hypoDir, project, tracked, indexText) {
   const built = buildBaselineEntry({
     hotText,
     stateText,
-    date: legacyDate(hypoDir, present, [hotText ?? '', stateText ?? '']),
+    date: legacyBaselineDate(hypoDir, project, [hotText ?? '', stateText ?? '']),
     visibilityScope: scope,
     project,
     legacyDone: false,
@@ -334,52 +319,31 @@ export function projectEntryScope(hypoDir, project, model) {
 
 // ── writing the views ────────────────────────────────────────────────────────
 
-// `.cache/generated-views.json` = {views: {relPath: sha}, absorbed: {relPath: sha}}. A file that
-// cannot be read makes every path unowned (backed up before it is overwritten). A missing file
-// starts from the old root projection's hash for `hot.md`. `absorbed` that is not an object is
-// dropped. `dirty` says the record on disk needs rewriting.
+// `.cache/generated-views.json` = {views: {relPath: sha}}, read by hypo-shared's one reader. A file
+// that cannot be read makes every path unowned (backed up before it is overwritten). A missing
+// file starts from the old root projection's hash for `hot.md`. `dirty` says the record on disk
+// needs rewriting.
 function readOwnership(hypoDir) {
-  const strings = (src) =>
-    Object.fromEntries(Object.entries(src).filter(([, v]) => typeof v === 'string'));
-  let raw;
-  try {
-    raw = readFileSync(join(hypoDir, OWNERSHIP_REL), 'utf-8');
-  } catch (err) {
-    const views = {};
-    if (err?.code === 'ENOENT') {
-      try {
-        const legacy = JSON.parse(readFileSync(join(hypoDir, LEGACY_ROOT_STATE_REL), 'utf-8'));
-        if (typeof legacy?.lastHash === 'string') views['hot.md'] = legacy.lastHash;
-      } catch {
-        // no old state either: nothing to inherit
-      }
+  const { views, state } = readGeneratedViewsRecord(hypoDir);
+  if (state === 'missing') {
+    try {
+      const legacy = JSON.parse(readFileSync(join(hypoDir, LEGACY_ROOT_STATE_REL), 'utf-8'));
+      if (typeof legacy?.lastHash === 'string') views['hot.md'] = legacy.lastHash;
+    } catch {
+      // no old state either: nothing to inherit
     }
-    return { views, absorbed: {}, dirty: true };
   }
-  try {
-    const parsed = JSON.parse(raw);
-    if (!isPlain(parsed) || !isPlain(parsed.views)) throw new Error('shape');
-    return {
-      views: strings(parsed.views),
-      absorbed: isPlain(parsed.absorbed) ? strings(parsed.absorbed) : {},
-      dirty: !isPlain(parsed.absorbed),
-    };
-  } catch {
-    return { views: {}, absorbed: {}, dirty: true };
-  }
+  return { views, dirty: state !== 'ok' };
 }
 
-// Write one view if its bytes differ. Bytes that neither this writer last wrote (`views`) nor the
-// migration absorbed for this very path (`absorbed`) are backed up first, and the file is read
-// again right before the replacing write so a save landing in between is backed up as well.
+// Write one view if its bytes differ. Bytes this writer did not last write at this very path are
+// backed up first, and the file is read again right before the replacing write so a save landing
+// in between is backed up as well.
 function writeOneView(hypoDir, relPath, content, own, testHooks, result) {
   const abs = join(hypoDir, relPath);
   const sha = sha256(content);
   const read = () => readOrNull(abs);
-  const ours = (text) => {
-    const h = sha256(text);
-    return h === own.views[relPath] || h === own.absorbed[relPath];
-  };
+  const ours = (text) => sha256(text) === own.views[relPath];
   const claim = () => {
     if (own.views[relPath] !== sha) {
       own.views[relPath] = sha;
@@ -426,22 +390,17 @@ const emptyResult = (over) => ({
  * `hot.md`, default true), `device` (default `currentDevice()`), `testHooks`. Returns
  * `{notMigrated, lockTimeout, written[], unchanged[], backedUp[{relPath, backupPath}]}`; when the
  * vault is not `migrated` nothing is written and `notMigrated` is true. A project that
- * `.hypoignore` ignores (see `isIgnored`) is neither read nor written and has no root row. Any
- * backup leaves a health notice for the next SessionStart.
+ * `.hypoignore` hides (see `projectHiddenByHypoignore`) is neither read nor written and has no
+ * root row. Any backup leaves a health notice for the next SessionStart.
  */
 export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   const { root = true, device = currentDevice(), testHooks } = opts;
   const state = migrationState(hypoDir);
   if (state !== 'migrated') return emptyResult({ notMigrated: true, state });
   // A project the `.hypoignore` hides gets no views and no row in the root table: its entries are
-  // never committed, so a table row would publish a project the owner chose to keep local. A
-  // project is hidden exactly when one of its two view paths is, which is the same test
-  // `isIgnored` applies to each of its entries.
+  // never committed, so a table row would publish a project the owner chose to keep local.
   const patterns = loadHypoIgnore(hypoDir);
-  const hidden = (p) =>
-    ['hot.md', 'session-state.md'].some((f) =>
-      isIgnored(join(hypoDir, 'projects', p, f), hypoDir, patterns),
-    );
+  const hidden = (p) => projectHiddenByHypoignore(hypoDir, p, patterns);
   const all = listSessionProjects(hypoDir).filter((p) => !hidden(p));
   const only = opts.projects ? all.filter((p) => opts.projects.includes(p)) : all;
   const models = all.map((p) => loadSessionModel(hypoDir, p, { state, testHooks }));
@@ -464,10 +423,7 @@ export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   }
   if (own.dirty) {
     try {
-      atomicWrite(
-        join(hypoDir, OWNERSHIP_REL),
-        JSON.stringify({ views: own.views, absorbed: own.absorbed }),
-      );
+      atomicWrite(join(hypoDir, OWNERSHIP_REL), JSON.stringify({ views: own.views }));
     } catch (err) {
       failure ??= err;
     }
@@ -593,4 +549,254 @@ export function recordObservedHeads(hypoDir, sessionId, project, { level, heads 
 export function readObservedHeads(hypoDir, sessionId, project) {
   if (!isValidSessionId(sessionId) || typeof project !== 'string') return { full: {}, pointer: {} };
   return levelsOf(readObservedFile(observedPath(hypoDir, sessionId)), project);
+}
+
+// ── moving a vault to the scheme ─────────────────────────────────────────────
+
+const PROJECT_VIEW_RE = /^projects\/([^/]+)\/(hot|session-state)\.md$/;
+
+const gitRun = (cwd, args, extra = {}) =>
+  spawnSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf-8',
+    timeout: 30000,
+    maxBuffer: 64 * 1024 * 1024,
+    ...extra,
+  });
+
+/** `git show <rev>:./<relPath>` as text, `null` when HEAD has no such path. */
+function showText(hypoDir, rev, relPath) {
+  const r = gitRun(hypoDir, ['show', revPathArg(rev, relPath)]);
+  return r.status === 0 ? r.stdout : null;
+}
+
+// `base` with `block` after it, unless the block's first line is already there (then `base` as it is).
+function withBlock(base, block) {
+  const first = block.split('\n')[0];
+  if (base.split('\n').some((l) => l.trim() === first)) return base;
+  return `${base}${base === '' || base.endsWith('\n') ? '' : '\n'}${block}`;
+}
+
+/**
+ * Make a commit on top of HEAD without touching HEAD, the real index or the working tree, and
+ * return its sha: `{ok: true, sha}` or `{ok: false, reason}`. `edits` is `{message, writes:
+ * [{relPath, text}], deletes: [relPath]}` (vault-relative paths): the tree of HEAD with every
+ * `writes` blob stored and every `deletes` path removed. It runs in a temporary index file under
+ * `os.tmpdir()` (removed in a `finally`), so another session's staged files and the uncommitted
+ * lines of the working tree `.gitignore` never reach the commit, and no temporary worktree is
+ * needed.
+ *
+ * Every git call here runs from the repository top level on paths with the vault's prefix:
+ * `update-index --cacheinfo` takes a top level path, but `--force-remove` takes one relative to the
+ * current directory, so from inside a vault below the top level a prefixed `--force-remove` would
+ * exit 0 and remove nothing. `testHooks.afterBuildCommit(sha)` runs once the commit object exists,
+ * `testHooks.now` (a Date) fixes the author and committer date.
+ */
+export function buildCommitInTempIndex(hypoDir, edits, { testHooks } = {}) {
+  const { message, writes = [], deletes = [] } = edits;
+  const top = gitRun(hypoDir, ['rev-parse', '--show-toplevel']).stdout?.trim();
+  const head = gitRun(hypoDir, [
+    'rev-parse',
+    '--verify',
+    '--quiet',
+    'HEAD^{commit}',
+  ]).stdout?.trim();
+  if (!top || !head) return { ok: false, reason: 'no-head' };
+  const prefix = vaultGitPrefix(hypoDir);
+  const index = join(tmpdir(), `hypo-index-${process.pid}-${randomBytes(4).toString('hex')}`);
+  const env = { ...process.env, GIT_INDEX_FILE: index };
+  if (testHooks?.now) {
+    env.GIT_AUTHOR_DATE = env.GIT_COMMITTER_DATE = testHooks.now.toISOString();
+  }
+  const step = (args, input) => {
+    const r = gitRun(top, args, { env, input });
+    if (r.status !== 0) throw new Error(`git ${args[0]}: ${String(r.stderr).trim()}`);
+    return r.stdout.trim();
+  };
+  try {
+    step(['read-tree', 'HEAD']);
+    for (const { relPath, text } of writes) {
+      const blob = step(['hash-object', '-w', '--stdin'], text);
+      step(['update-index', '--add', '--cacheinfo', `100644,${blob},${prefix}${relPath}`]);
+    }
+    for (const relPath of deletes) step(['update-index', '--force-remove', '--', prefix + relPath]);
+    const sha = step(['commit-tree', step(['write-tree']), '-p', head, '-m', message]);
+    testHooks?.afterBuildCommit?.(sha);
+    return { ok: true, sha };
+  } catch (err) {
+    if (err?.message?.startsWith('git ')) return { ok: false, reason: err.message };
+    throw err;
+  } finally {
+    rmSync(index, { force: true });
+    rmSync(`${index}.lock`, { force: true });
+  }
+}
+
+/**
+ * Bring HEAD, the real index and the working tree to `sha` (a descendant of HEAD) in one git
+ * motion. First `clearGeneratedPathsBlockingPull` sets aside what would block the merge, then
+ * `git merge --ff-only`; when the merge fails the `.gitignore` lines the first step set aside are
+ * put back. Returns `{ok, pre, deferred?, reason?, notice?}` where `pre` is the clearing step's
+ * result (its `archived[]` and `localOnly[]` are for the caller, after a successful merge).
+ */
+export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
+  const pre = clearGeneratedPathsBlockingPull(hypoDir, sha, { testHooks });
+  if (!pre.ok) {
+    return { ok: false, pre, deferred: pre.deferred, reason: pre.reason, notice: pre.notice };
+  }
+  const merged = gitRun(hypoDir, ['merge', '--ff-only', sha]);
+  if (merged.status !== 0) {
+    restoreGitignoreLines(hypoDir, pre.gitignoreLines);
+    const detail = String(merged.stderr).trim().split('\n')[0];
+    return { ok: false, pre, reason: `fast-forward-failed: ${detail}` };
+  }
+  return { ok: true, pre };
+}
+
+const migrationResult = (over) => ({
+  migrated: false,
+  commit: null,
+  baselines: [],
+  shared: [],
+  skipped: null,
+  notices: [],
+  ...over,
+});
+
+const deferredMigration = (reason, detail) =>
+  migrationResult({
+    deferred: reason,
+    notices: [`이행을 다음 세션으로 미뤘습니다: ${detail ?? reason}`],
+  });
+
+/**
+ * Move a vault from tracked `hot.md`/`session-state.md` files to session entries: one commit with a
+ * baseline entry per project (the old two files whole, as HEAD has them), the `.gitignore` and
+ * `.gitattributes` blocks, and the generated views untracked, applied with `fastForwardTo`.
+ * `index.md` is not changed (the baseline carries the old files' `visibility_scope`), and
+ * `projects/_template` is not touched (it is not a generated path). For a caller that already
+ * holds the vault commit lock; `migrateVaultToSessionEntries` takes it. `opts`: `reenable` (also
+ * move a vault rolled back on purpose, removing the off marker in the same commit), `testHooks`
+ * (`afterBuildCommit`, `now`, and whatever `fastForwardTo` takes).
+ *
+ * Returns `{migrated, deferred?, commit, baselines[], shared[], skipped, notices[]}`. `skipped` is
+ * `'already-migrated'` or `'opted-out'` when nothing was done for that reason, else `null`.
+ * `baselines` are the entry paths the migration commit added, `shared` the additional baselines
+ * made from this machine's uncommitted old files (separate commit, see `shareLegacyBytes`).
+ * A failure to apply leaves the vault as it was and returns `migrated: false` with `deferred`.
+ */
+export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
+  const { reenable = false, testHooks } = opts;
+  const state = migrationState(hypoDir);
+  if (state === 'migrated') return migrationResult({ migrated: true, skipped: 'already-migrated' });
+  if (state === 'opted-out' && !reenable) return migrationResult({ skipped: 'opted-out' });
+
+  let tracked;
+  try {
+    tracked = listTrackedGeneratedViews(hypoDir, { source: 'head' });
+  } catch (err) {
+    return deferredMigration('head-unreadable', err?.message);
+  }
+  const notices = [];
+  const patterns = loadHypoIgnore(hypoDir);
+  const writes = [];
+  const baselines = [];
+  const slugs = [...new Set(tracked.map((rel) => PROJECT_VIEW_RE.exec(rel)?.[1]))]
+    .filter(Boolean)
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  for (const slug of slugs) {
+    // A hidden project's entries are never committed, so it gets no baseline. The catch-up step
+    // keeps a local copy of its old files before the merge removes them.
+    if (projectHiddenByHypoignore(hypoDir, slug, patterns)) continue;
+    const hotText = showText(hypoDir, 'HEAD', `projects/${slug}/hot.md`);
+    const stateText = showText(hypoDir, 'HEAD', `projects/${slug}/session-state.md`);
+    const indexScope = readVisibilityScope(showText(hypoDir, 'HEAD', `projects/${slug}/index.md`));
+    const { scope, conflict } = narrowestVisibilityScope([
+      indexScope,
+      readVisibilityScope(hotText ?? ''),
+      readVisibilityScope(stateText ?? ''),
+    ]);
+    if (conflict) {
+      notices.push(
+        `프로젝트 ${slug}: 옛 파일들의 범위가 서로 다른 기계를 가리켜 기준선을 machine:으로 닫았습니다. 어느 기계에서도 보이지 않습니다.`,
+      );
+    } else if (scope !== null && scope !== indexScope) {
+      notices.push(
+        `이행 뒤 프로젝트 ${slug}의 원본은 옛 파일의 범위를 이어받습니다: ${indexScope || '(없음)'} → ${scope}`,
+      );
+    }
+    // An update the old scheme already sent to `legacy` with `done` replaced the virtual baseline,
+    // whose id covers the bytes of this moment. The real baseline gets another id when the files
+    // changed since, so it is built folded to keep that `done` effective.
+    const legacy = trackHeads(listSessionEntries(hypoDir, slug).entries).find(
+      (t) => t.trackId === LEGACY_TRACK_ID,
+    );
+    const built = buildBaselineEntry({
+      hotText,
+      stateText,
+      date: legacyBaselineDate(hypoDir, slug, [hotText ?? '', stateText ?? '']),
+      visibilityScope: scope,
+      project: slug,
+      legacyDone: legacy?.done === true,
+    });
+    const relPath = `projects/${slug}/sessions/${built.fileName}`;
+    if (pathInHead(hypoDir, relPath)) continue; // the same content is already there
+    writes.push({ relPath, text: built.text });
+    baselines.push(relPath);
+  }
+
+  const headText = (rel) => showText(hypoDir, 'HEAD', rel) ?? '';
+  writes.push(
+    { relPath: '.gitignore', text: withBlock(headText('.gitignore'), GITIGNORE_BLOCK) },
+    { relPath: '.gitattributes', text: withBlock(headText('.gitattributes'), GITATTRIBUTES_BLOCK) },
+  );
+  const deletes = [...tracked];
+  if (reenable && pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) {
+    deletes.push(SESSION_ENTRIES_OFF_MARKER);
+  }
+  const commit = buildCommitInTempIndex(
+    hypoDir,
+    { message: 'hypomnema: move session state into projects/*/sessions entries', writes, deletes },
+    { testHooks },
+  );
+  if (!commit.ok) return deferredMigration('commit-failed', commit.reason);
+
+  const applied = fastForwardTo(hypoDir, commit.sha, { testHooks });
+  if (!applied.ok) {
+    const reason = applied.deferred ?? applied.reason ?? 'ff-failed';
+    return deferredMigration(reason, applied.notice ?? reason);
+  }
+  for (const { relPath, backupPath } of applied.pre.localOnly) {
+    const proj = PROJECT_VIEW_RE.exec(relPath)?.[1] ?? relPath;
+    notices.push(
+      `무시 프로젝트 ${proj}의 옛 세션 현황을 ${relative(hypoDir, backupPath)}에 보관했습니다. 이 기억은 공유되지 않습니다.`,
+    );
+  }
+  // What this machine held only in its working tree or index (the old files differ from HEAD) goes
+  // out as additional baselines; the record is dropped once those are committed.
+  markPullArchiveMerged(hypoDir);
+  const resumed = resumePullArchive(hypoDir);
+  return migrationResult({
+    migrated: true,
+    commit: commit.sha,
+    baselines,
+    shared: resumed.created,
+    notices: [...notices, ...resumed.notices],
+  });
+}
+
+/**
+ * `migrateVaultToSessionEntriesUnlocked` under the vault commit lock. A busy lock defers the move
+ * (`deferred: 'lock-timeout'`) instead of throwing.
+ */
+export function migrateVaultToSessionEntries(hypoDir, opts = {}) {
+  try {
+    return withFileLock(
+      vaultCommitLockTarget(hypoDir),
+      () => migrateVaultToSessionEntriesUnlocked(hypoDir, opts),
+      { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
+    );
+  } catch (err) {
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    return deferredMigration('lock-timeout', '다른 세션이 저장소 잠금을 쥐고 있습니다');
+  }
 }
