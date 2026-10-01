@@ -11,9 +11,9 @@
 // besides those. Listed in `hooks/shared.json`.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { atomicWrite } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
@@ -23,6 +23,7 @@ import {
   LEGACY_TRACK_ID,
   TRACK_ID_RE,
   buildBaselineEntry,
+  generatedViewSlug,
   isBaselineId,
   isGeneratedViewPath,
   isSessionEntryPath,
@@ -43,21 +44,23 @@ import {
   pathInHead,
   projectHiddenByHypoignore,
   readGeneratedViewsRecord,
+  readRootHotProjectionOwnership,
   readVisibilityScope,
   restoreGitignoreLines,
   resumePullArchive,
   revPathArg,
+  rootHotBackupRecoveryNotice,
+  undoClearedPaths,
   vaultCommitLockTarget,
   vaultGitPrefix,
   withFileLock,
+  writeGeneratedViewsRecord,
   writeRootHotHealthNotice,
 } from './hypo-shared.mjs';
 
 /** Present in HEAD's tree when the vault was rolled back to the old flat files on purpose. */
 export const SESSION_ENTRIES_OFF_MARKER = '.hypo-session-entries-off';
 
-const OWNERSHIP_REL = join('.cache', 'generated-views.json');
-const LEGACY_ROOT_STATE_REL = join('.cache', 'root-hot-projection-state.json');
 // `entry_scope` has the grammar of `visibility_scope`; anything else closes the project.
 const ENTRY_SCOPE_RE = /^(shared|machine:\S*|agent:\S+)$/;
 
@@ -205,15 +208,27 @@ export function listTrackedGeneratedViews(hypoDir, { source = 'index' } = {}) {
   return r.stdout.split('\0').filter((p) => isGeneratedViewPath(p));
 }
 
+// A `.git` in `dir` or a parent, a directory or the file a linked worktree or submodule has.
+function hasGitEntry(dir) {
+  for (let d = resolve(dir); ; d = dirname(d)) {
+    if (existsSync(join(d, '.git'))) return true;
+    if (dirname(d) === d) return false;
+  }
+}
+
 /**
  * `'migrated' | 'not-migrated' | 'opted-out'`, read from HEAD's tree only (the real index is not
  * consulted: a migration commit moves HEAD and the index together). The off marker in HEAD is
  * `opted-out`; the `.gitignore` block in HEAD plus no tracked generated view in HEAD is
- * `migrated`; anything else, including git failing to answer, is `not-migrated`. A vault that is
- * not a git repository tracks nothing, so it counts as `migrated`.
+ * `migrated`; anything else, including git failing to answer, is `not-migrated`. Only a vault with
+ * no `.git` entry in it or any parent (`hasGitEntry`) tracks nothing and counts as `migrated`: when
+ * git cannot say whether the directory is a work tree (not installed, dubious ownership, a timeout,
+ * a broken config) but the entry is there, the vault may well track views, so it is `not-migrated`.
  */
 export function migrationState(hypoDir) {
-  if (git(hypoDir, ['rev-parse', '--is-inside-work-tree']).status !== 0) return 'migrated';
+  if (git(hypoDir, ['rev-parse', '--is-inside-work-tree']).status !== 0) {
+    return hasGitEntry(hypoDir) ? 'not-migrated' : 'migrated';
+  }
   if (pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) return 'opted-out';
   const shown = git(hypoDir, ['show', revPathArg('HEAD', '.gitignore')]);
   const first = GITIGNORE_BLOCK.split('\n')[0];
@@ -319,26 +334,24 @@ export function projectEntryScope(hypoDir, project, model) {
 
 // ── writing the views ────────────────────────────────────────────────────────
 
-// `.cache/generated-views.json` = {views: {relPath: sha}}, read by hypo-shared's one reader. A file
-// that cannot be read makes every path unowned (backed up before it is overwritten). A missing
-// file starts from the old root projection's hash for `hot.md`. `dirty` says the record on disk
-// needs rewriting.
+// `.cache/generated-views.json` = {views: {relPath: sha}}, read and written by hypo-shared's one
+// reader and writer. A file that cannot be read makes every path unowned (backed up before it is
+// overwritten). A missing file starts from the old root projection's hash for `hot.md`. `dirty`
+// says the record on disk needs rewriting.
 function readOwnership(hypoDir) {
   const { views, state } = readGeneratedViewsRecord(hypoDir);
   if (state === 'missing') {
-    try {
-      const legacy = JSON.parse(readFileSync(join(hypoDir, LEGACY_ROOT_STATE_REL), 'utf-8'));
-      if (typeof legacy?.lastHash === 'string') views['hot.md'] = legacy.lastHash;
-    } catch {
-      // no old state either: nothing to inherit
-    }
+    const { lastHash } = readRootHotProjectionOwnership(hypoDir);
+    if (lastHash) views['hot.md'] = lastHash;
   }
   return { views, dirty: state !== 'ok' };
 }
 
 // Write one view if its bytes differ. Bytes this writer did not last write at this very path are
 // backed up first, and the file is read again right before the replacing write so a save landing
-// in between is backed up as well.
+// in between is backed up as well. The ownership record takes the new hash before the replacing
+// write, so a process that dies after the write finds its own bytes vouched for (the other order
+// would back them up as foreign on the next run).
 function writeOneView(hypoDir, relPath, content, own, testHooks, result) {
   const abs = join(hypoDir, relPath);
   const sha = sha256(content);
@@ -368,8 +381,11 @@ function writeOneView(hypoDir, relPath, content, own, testHooks, result) {
     if (latest !== current && latest !== null && !ours(latest)) {
       backups.push(backUpGeneratedPath(abs, latest, testHooks));
     }
+    if (own.views[relPath] !== sha) {
+      own.views[relPath] = sha;
+      writeGeneratedViewsRecord(hypoDir, own.views);
+    }
     atomicWrite(abs, content);
-    claim();
     result.written.push(relPath);
   }
   for (const backupPath of backups) result.backedUp.push({ relPath, backupPath });
@@ -423,7 +439,7 @@ export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   }
   if (own.dirty) {
     try {
-      atomicWrite(join(hypoDir, OWNERSHIP_REL), JSON.stringify({ views: own.views }));
+      writeGeneratedViewsRecord(hypoDir, own.views);
     } catch (err) {
       failure ??= err;
     }
@@ -553,8 +569,6 @@ export function readObservedHeads(hypoDir, sessionId, project) {
 
 // ── moving a vault to the scheme ─────────────────────────────────────────────
 
-const PROJECT_VIEW_RE = /^projects\/([^/]+)\/(hot|session-state)\.md$/;
-
 const gitRun = (cwd, args, extra = {}) =>
   spawnSync('git', ['-C', cwd, ...args], {
     encoding: 'utf-8',
@@ -634,20 +648,33 @@ export function buildCommitInTempIndex(hypoDir, edits, { testHooks } = {}) {
 /**
  * Bring HEAD, the real index and the working tree to `sha` (a descendant of HEAD) in one git
  * motion. First `clearGeneratedPathsBlockingPull` sets aside what would block the merge, then
- * `git merge --ff-only`; when the merge fails the `.gitignore` lines the first step set aside are
- * put back. Returns `{ok, pre, deferred?, reason?, notice?}` where `pre` is the clearing step's
- * result (its `archived[]` and `localOnly[]` are for the caller, after a successful merge).
+ * `git merge --ff-only`. When the merge fails, or the first step stops half way, what it moved is
+ * taken back (`undoClearedPaths`: working-tree and staged bytes, backups, archive record) and the
+ * `.gitignore` lines it set aside are put back, so a failed move leaves the vault as it was.
+ * Returns `{ok, pre, deferred?, reason?, notice?}` where `pre` is the clearing step's result (its
+ * `archived[]`, `localOnly[]` and `unowned[]` are for the caller, after a successful merge).
+ * `notice` carries git's whole stderr after a failed merge, which names the files in the way, and
+ * any path that could not be put back.
  */
 export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
   const pre = clearGeneratedPathsBlockingPull(hypoDir, sha, { testHooks });
+  const moved = pre.archived.length + pre.localOnly.length + pre.unowned.length > 0;
   if (!pre.ok) {
-    return { ok: false, pre, deferred: pre.deferred, reason: pre.reason, notice: pre.notice };
+    const undone = moved ? undoClearedPaths(hypoDir, pre).notices : [];
+    const notice = [pre.notice, ...undone].filter(Boolean).join('\n') || undefined;
+    return { ok: false, pre, deferred: pre.deferred, reason: pre.reason, notice };
   }
   const merged = gitRun(hypoDir, ['merge', '--ff-only', sha]);
   if (merged.status !== 0) {
     restoreGitignoreLines(hypoDir, pre.gitignoreLines);
-    const detail = String(merged.stderr).trim().split('\n')[0];
-    return { ok: false, pre, reason: `fast-forward-failed: ${detail}` };
+    const stderr = String(merged.stderr).trim();
+    const undone = moved ? undoClearedPaths(hypoDir, pre).notices : [];
+    return {
+      ok: false,
+      pre,
+      reason: `fast-forward-failed: ${stderr.split('\n')[0]}`,
+      notice: [`git merge --ff-only 실패: ${stderr}`, ...undone].join('\n'),
+    };
   }
   return { ok: true, pre };
 }
@@ -700,9 +727,26 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
   const patterns = loadHypoIgnore(hypoDir);
   const writes = [];
   const baselines = [];
-  const slugs = [...new Set(tracked.map((rel) => PROJECT_VIEW_RE.exec(rel)?.[1]))]
+  const slugs = [...new Set(tracked.map((rel) => generatedViewSlug(rel)))]
     .filter(Boolean)
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  // A rule of the user's own `.gitignore` (or an exclude file) that covers the entry directory would
+  // keep every close out of git once the views stop being tracked: the move waits for that rule.
+  const probeProject = slugs[0] ?? listSessionProjects(hypoDir)[0];
+  if (
+    probeProject &&
+    git(hypoDir, [
+      'check-ignore',
+      '-q',
+      '--',
+      `projects/${probeProject}/sessions/0000-00-00-probe.md`,
+    ]).status === 0
+  ) {
+    return deferredMigration(
+      'sessions-ignored',
+      `무시 규칙이 projects/${probeProject}/sessions/의 세션 원본을 가립니다. 그대로 옮기면 세션 기록이 커밋되지 않으니, 그 규칙을 고친 뒤 다시 시도합니다`,
+    );
+  }
   for (const slug of slugs) {
     // A hidden project's entries are never committed, so it gets no baseline. The catch-up step
     // keeps a local copy of its old files before the merge removes them.
@@ -766,10 +810,13 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
     return deferredMigration(reason, applied.notice ?? reason);
   }
   for (const { relPath, backupPath } of applied.pre.localOnly) {
-    const proj = PROJECT_VIEW_RE.exec(relPath)?.[1] ?? relPath;
+    const proj = generatedViewSlug(relPath) ?? relPath;
     notices.push(
       `무시 프로젝트 ${proj}의 옛 세션 현황을 ${relative(hypoDir, backupPath)}에 보관했습니다. 이 기억은 공유되지 않습니다.`,
     );
+  }
+  for (const { backupPath } of applied.pre.unowned) {
+    notices.push(rootHotBackupRecoveryNotice(backupPath));
   }
   // What this machine held only in its working tree or index (the old files differ from HEAD) goes
   // out as additional baselines; the record is dropped once those are committed.
