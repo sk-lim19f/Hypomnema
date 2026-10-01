@@ -428,3 +428,406 @@ export function mergeAdditiveGitignore(base, ours, theirs) {
   const lead = theirs === '' || theirs.endsWith('\n') ? '' : '\n';
   return { ok: true, merged: `${theirs}${lead}${extra.join('\n')}\n` };
 }
+
+// ── project directories and root rows ────────────────────────────────────────
+
+/** A `projects/` child that is a session project: has `index.md` or `sessions/`, not `_template`. */
+export function isSessionProjectDir({ slug, hasIndex, hasSessions }) {
+  return (
+    typeof slug === 'string' && slug !== '' && slug !== '_template' && !!(hasIndex || hasSessions)
+  );
+}
+
+// Code-unit comparison on purpose: `localeCompare` orders by locale, so two machines could
+// disagree on the bytes of one generated file.
+const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Root table rows `{slug, date}`: date descending (blank last), then slug ascending. A new array. */
+export function sortRootRows(rows) {
+  return [...rows].sort((a, b) => {
+    if (a.date !== b.date) {
+      if (!a.date) return 1;
+      if (!b.date) return -1;
+      return cmp(b.date, a.date);
+    }
+    return cmp(a.slug, b.slug);
+  });
+}
+
+// ── order and heads ──────────────────────────────────────────────────────────
+
+const isBaselineId = (closeId) => closeId.startsWith('baseline-');
+
+const supersededIdsOf = (entry) => entry.tracks.flatMap((t) => t.supersedes ?? []);
+
+/**
+ * Entries newest first: `date` descending, then supersede depth descending (1 + the deepest entry
+ * it replaces, so a same-day replacement sorts before what it replaced), then close id ascending.
+ * A new array; never reads the clock.
+ */
+export function sortEntries(entries) {
+  const byId = new Map(entries.map((e) => [e.closeId, e]));
+  const depths = new Map();
+  const depthOf = (entry, active = new Set()) => {
+    if (depths.has(entry.closeId)) return depths.get(entry.closeId);
+    if (active.has(entry.closeId)) return 0; // a cycle cannot arise from real ids; just do not loop
+    active.add(entry.closeId);
+    let deepest = 0;
+    for (const id of supersededIdsOf(entry)) {
+      const target = byId.get(id);
+      if (target && target !== entry) deepest = Math.max(deepest, depthOf(target, active));
+    }
+    active.delete(entry.closeId);
+    depths.set(entry.closeId, deepest + 1);
+    return deepest + 1;
+  };
+  return [...entries].sort(
+    (a, b) => cmp(b.date, a.date) || depthOf(b) - depthOf(a) || cmp(a.closeId, b.closeId),
+  );
+}
+
+/**
+ * The heads of every track in `entries`: `[{trackId, title, done, heads}]`, tracks in the order of
+ * their first head, heads in entry order. An update is a head unless another update of the same
+ * track lists its close id in `supersedes` (an id that names nothing is ignored). `done` is true
+ * when every head is done. `title` is the newest title any update of the track carries.
+ */
+export function trackHeads(entries) {
+  const sorted = sortEntries(entries);
+  const updates = new Map(); // trackId -> [{entry, track}] in entry order
+  for (const entry of sorted) {
+    for (const track of entry.tracks) {
+      if (!updates.has(track.id)) updates.set(track.id, []);
+      updates.get(track.id).push({ entry, track });
+    }
+  }
+  const byFirstHead = [];
+  for (const [trackId, list] of updates) {
+    const replaced = new Set();
+    for (const { entry, track } of list) {
+      for (const id of track.supersedes ?? []) if (id !== entry.closeId) replaced.add(id);
+    }
+    const heads = list
+      .filter(({ entry }) => !replaced.has(entry.closeId))
+      .map(({ entry, track }) => ({
+        trackId,
+        closeId: entry.closeId,
+        date: entry.date,
+        done: track.done === true,
+        entry,
+      }));
+    if (!heads.length) continue;
+    const title = list.find(({ track }) => typeof track.title === 'string' && track.title)?.track
+      .title;
+    byFirstHead.push({
+      trackId,
+      title: title ?? trackId,
+      done: heads.every((h) => h.done),
+      heads,
+      first: sorted.indexOf(heads[0].entry),
+    });
+  }
+  return byFirstHead
+    .sort((a, b) => a.first - b.first || cmp(a.trackId, b.trackId))
+    .map(({ first, ...track }) => track);
+}
+
+// Mirrors scopeVisible in hooks/hypo-shared.mjs: this module cannot import it (hypo-shared will
+// import this one). A test pins the two to the same answers. No `device` hides every `machine:`.
+function scopeVisibleTo(scope, device) {
+  const v = String(scope || '').trim();
+  return v.startsWith('machine:') ? v.slice('machine:'.length) === device : true;
+}
+
+// Everything the renderers and the injection share: the entries this machine may see (a hidden
+// entry is treated as absent, so it cannot replace a visible one), newest first, and the active
+// and finished tracks. `model.entryScope`, when a string, replaces every entry's own scope.
+function projectView(model, device) {
+  const forced = typeof model.entryScope === 'string' ? model.entryScope : null;
+  const entries = sortEntries(
+    model.entries.filter((e) => scopeVisibleTo(forced ?? e.visibilityScope, device)),
+  );
+  const tracks = trackHeads(entries);
+  const live = new Set();
+  for (const t of tracks) {
+    if (t.done) continue;
+    for (const h of t.heads) if (!h.done) live.add(`${t.trackId} ${h.closeId}`);
+  }
+  const titles = new Map(tracks.map((t) => [t.trackId, t.title]));
+  const slug = model.project;
+  const items = [];
+  for (const entry of entries) {
+    for (const track of entry.tracks) {
+      if (!live.has(`${track.id} ${entry.closeId}`)) continue;
+      const baseline = isBaselineId(entry.closeId);
+      const { frontmatter, body } = baseline
+        ? splitLegacyFrontmatter(entry.bodies[track.id] ?? '')
+        : { frontmatter: null, body: entry.bodies[track.id] ?? '' };
+      items.push({
+        trackId: track.id,
+        title: titles.get(track.id),
+        date: entry.date,
+        closeId: entry.closeId,
+        body,
+        legacyFrontmatter: frontmatter,
+        sourcePath:
+          model.migrated || baseline
+            ? `projects/${slug}/session-state.md`
+            : `projects/${slug}/sessions/${entryFileName(entry.date, entry.closeId)}`,
+      });
+    }
+  }
+  return { entries, finished: tracks.filter((t) => t.done), items };
+}
+
+/**
+ * The active heads in entry order, for `## Next Up`, the terminal summary and resume:
+ * `[{trackId, title, date, closeId, body, legacyFrontmatter, sourcePath}]`. `body` is the head's
+ * section without a baseline's old frontmatter (that goes in `legacyFrontmatter`, else `null`).
+ * `sourcePath` is where to read the head: `session-state.md` once the vault is migrated or for a
+ * baseline, else the entry file. `model`: `{project, migrated, entries, ...}`; `device` filters
+ * entries by `visibility_scope`.
+ */
+export function nextUpItems(model, { device } = {}) {
+  return projectView(model, device).items;
+}
+
+// ── rendering ────────────────────────────────────────────────────────────────
+
+const RECENT_SUMMARIES = 5;
+const OLDER_LINKS = 20;
+const FINISHED_TRACKS = 5;
+const POINTER_LINES = 20;
+
+const labelOf = (i) => `${i.title} (${i.trackId}) · ${i.date} · ${i.closeId}`;
+
+function yamlFence(text) {
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = '`'.repeat(Math.max(3, longest + 1));
+  return `${fence}yaml\n${text.endsWith('\n') ? text : `${text}\n`}${fence}`;
+}
+
+const foldedFrontmatter = (fm) =>
+  `<details><summary>이행 전 파일의 frontmatter</summary>\n\n${yamlFence(fm)}\n\n</details>`;
+
+const GENERATED_NOTE = (slug) =>
+  `> Generated from projects/${slug}/sessions/. Do not edit: the next session start or stop overwrites this file and keeps a backup of anything it did not write. To change it, close a session with a track update.`;
+
+const joinBlocks = (blocks) => blocks.filter((b) => b !== null && b !== '').join('\n\n');
+
+// A summary section; a baseline's is the old hot.md whole, so its frontmatter is split off.
+function summaryParts(entry) {
+  return isBaselineId(entry.closeId)
+    ? splitLegacyFrontmatter(entry.summary)
+    : { frontmatter: null, body: entry.summary };
+}
+
+function renderSessionState(model, view) {
+  const { items, finished } = view;
+  const shownFinished = finished.slice(0, FINISHED_TRACKS);
+  const updated = [...items.map((i) => i.date), ...shownFinished.map((t) => t.heads[0].date)]
+    .sort()
+    .at(-1);
+  const blocks = [
+    `---\ntype: session-state\ntitle: "session state: ${model.project}"\nupdated: ${updated ?? ''}\ngenerated: sessions\n---`,
+    GENERATED_NOTE(model.project),
+    '## Next Up',
+  ];
+  if (!items.length) blocks.push('No active tracks.');
+  for (const i of items) {
+    blocks.push(
+      `### ${labelOf(i)}`,
+      i.legacyFrontmatter === null ? null : foldedFrontmatter(i.legacyFrontmatter),
+      i.body,
+    );
+  }
+  if (shownFinished.length) {
+    blocks.push(
+      '## Finished tracks',
+      shownFinished.map((t) => `- ${t.title} (${t.trackId}) · ${t.heads[0].date}`).join('\n'),
+    );
+  }
+  const unreadable = [...(model.unreadable ?? [])].sort((a, b) => cmp(a.fileName, b.fileName));
+  if (unreadable.length) {
+    blocks.push(
+      '## Unreadable entries',
+      unreadable.map((u) => `- \`${u.fileName}\`: ${u.reason}`).join('\n'),
+    );
+  }
+  return `${joinBlocks(blocks)}\n`;
+}
+
+function renderHot(model, view) {
+  const { entries } = view;
+  const recent = entries.slice(0, RECENT_SUMMARIES);
+  const older = entries.slice(RECENT_SUMMARIES, RECENT_SUMMARIES + OLDER_LINKS);
+  const rest = entries.length - recent.length - older.length;
+  const slug = model.project;
+  const blocks = [
+    `---\ntype: reference\ntitle: "hot: ${slug}"\nupdated: ${entries[0]?.date ?? ''}\ngenerated: sessions\n---`,
+    GENERATED_NOTE(slug),
+    '## Recent sessions',
+  ];
+  if (!recent.length) blocks.push('No session entries yet.');
+  for (const e of recent) {
+    const { frontmatter, body } = summaryParts(e);
+    blocks.push(
+      `### ${e.date} · ${e.closeId}`,
+      frontmatter === null ? null : foldedFrontmatter(frontmatter),
+      body,
+    );
+  }
+  if (older.length || rest > 0) {
+    blocks.push('## Older sessions');
+    if (older.length) {
+      blocks.push(
+        older
+          .map(
+            (e) =>
+              `- ${e.date} · [[projects/${slug}/sessions/${entryFileName(e.date, e.closeId).slice(0, -3)}]]`,
+          )
+          .join('\n'),
+      );
+    }
+    if (rest > 0) blocks.push(`그 밖 ${rest}개는 \`projects/${slug}/sessions/\`에 있습니다.`);
+  }
+  blocks.push('## Project notes', `- [[projects/${slug}/notes]]`);
+  return `${joinBlocks(blocks)}\n`;
+}
+
+function renderRoot(rows) {
+  const table = rows
+    .map((r) => `| ${r.slug} | ${r.date} | [[projects/${r.slug}/hot]] |`)
+    .join('\n');
+  const updated = rows.reduce((max, r) => (r.date && r.date > max ? r.date : max), '');
+  return `---
+title: "Hot Cache: Pointer"
+type: reference
+updated: ${updated}
+tags: [wiki, operations]
+---
+
+# Hot Cache
+
+> Read at session start → navigate to the relevant project session-state.md and hot.md.
+> This "Active Projects" table is generated from \`projects/*/sessions/\`, rebuilt at every session start and stop. To change it, close a session in the relevant project: a hand edit to this table is overwritten by the next session.
+
+## Active Projects
+
+| Project | Last Session | Hot Cache |
+|---|---|---|
+${table}
+
+## Session Start Checklist
+
+1. Check this file for the relevant project link
+2. Read \`projects/<name>/session-state.md\` for next tasks if it exists
+3. Read \`projects/<name>/hot.md\` for project background
+`;
+}
+
+/**
+ * The generated files, as strings, from project models (see nextUpItems). `models` is every
+ * project's model, because the root table has a row per project. Returns
+ * `{projects: {slug: {hot, sessionState}}, root}`; `only` (slugs) limits the per-project files,
+ * the root is always whole. A function of its arguments: the same models give the same bytes on
+ * any machine and any day.
+ */
+export function renderViews(models, { device, only } = {}) {
+  const projects = {};
+  const rows = [];
+  for (const model of models) {
+    const view = projectView(model, device);
+    rows.push({ slug: model.project, date: view.entries[0]?.date ?? '' });
+    if (only && !only.includes(model.project)) continue;
+    projects[model.project] = {
+      hot: renderHot(model, view),
+      sessionState: renderSessionState(model, view),
+    };
+  }
+  return { projects, root: renderRoot(sortRootRows(rows)) };
+}
+
+// ── injection ────────────────────────────────────────────────────────────────
+
+/**
+ * What SessionStart tells the model, within `budget` characters: `{text, observed}`. Every active
+ * head gets a pointer line first (up to 20, then "외 N개"; this reservation is never cut back).
+ * With what is left, whole items replace pointer lines or join the text in priority order: heads
+ * in entry order, the newest summary, `model.notes`, the other recent summaries. An item goes in
+ * whole or not at all, except that the first head alone may be cut to the remaining budget. A
+ * head whose body went in whole is in `observed.heads`; one shown as a pointer or cut is in
+ * `observed.pointer`; one folded into "외 N개" is in neither (the session was never told of it).
+ */
+export function buildInjection(model, budget, { device } = {}) {
+  const view = projectView(model, device);
+  const slots = view.items
+    .slice(0, POINTER_LINES)
+    .map((item) => ({ item, text: null, cut: false }));
+  const overflow = view.items.length - slots.length;
+  const pointer = (item) =>
+    `- ${labelOf(item)}: 이 트랙을 이어 작업하면 먼저 ${item.sourcePath}에서 이 머리를 읽으세요. 닫을 때 이 머리를 대체합니다.`;
+  const sums = view.entries.slice(0, RECENT_SUMMARIES).map((entry) => {
+    const { frontmatter, body } = summaryParts(entry);
+    const text = joinBlocks([
+      `### ${entry.date} · ${entry.closeId}`,
+      frontmatter === null ? null : yamlFence(frontmatter),
+      body,
+    ]);
+    return { text, on: false };
+  });
+  const notes = { text: model.notes ? `## Project notes\n\n${model.notes}` : null, on: false };
+
+  const render = () => {
+    const sections = [];
+    const active = slots.map((s) => s.text ?? pointer(s.item));
+    if (overflow > 0) active.push(`- 외 ${overflow}개`);
+    if (active.length) sections.push(`## Active tracks\n\n${active.join('\n\n')}`);
+    if (sums[0]?.on) sections.push(`## Latest session\n\n${sums[0].text}`);
+    if (notes.on) sections.push(notes.text);
+    const earlier = sums.slice(1).filter((s) => s.on);
+    if (earlier.length)
+      sections.push(`## Earlier sessions\n\n${earlier.map((s) => s.text).join('\n\n')}`);
+    return sections.join('\n\n');
+  };
+  const unitOf = (item, body, note) =>
+    joinBlocks([
+      `#### ${labelOf(item)}`,
+      item.legacyFrontmatter === null ? null : yamlFence(item.legacyFrontmatter),
+      body,
+      note,
+    ]);
+  const fits = () => render().length <= budget;
+
+  slots.forEach((slot, index) => {
+    slot.text = unitOf(slot.item, slot.item.body, null);
+    if (fits()) return;
+    slot.text = null;
+    if (index !== 0) return;
+    // The first head may be cut to what is left; the pointer lines of the others stay reserved.
+    const note = `(잘림: 전문은 ${slot.item.sourcePath})`;
+    slot.text = unitOf(slot.item, '', note);
+    const room = budget - render().length - 2;
+    if (room <= 0) {
+      slot.text = null;
+      return;
+    }
+    let cut = slot.item.body.slice(0, room);
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+    slot.text = unitOf(slot.item, cut, note);
+    slot.cut = true;
+  });
+  for (const part of [sums[0], notes, ...sums.slice(1)]) {
+    if (!part || part.text === null) continue;
+    part.on = true;
+    if (!fits()) part.on = false;
+  }
+
+  const heads = {};
+  const pointers = {};
+  for (const { item, text, cut } of slots) {
+    const into = text !== null && !cut ? heads : pointers;
+    (into[item.trackId] ??= []).push(item.closeId);
+  }
+  return { text: render(), observed: { project: model.project, heads, pointer: pointers } };
+}

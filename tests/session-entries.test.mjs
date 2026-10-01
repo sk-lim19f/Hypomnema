@@ -20,16 +20,28 @@ import {
   closeIdFor,
   entryFileName,
   entryMarker,
+  buildInjection,
   formatSessionEntry,
   isGeneratedViewPath,
   isSessionEntryPath,
+  isSessionProjectDir,
   mergeAdditiveGitignore,
   narrowestVisibilityScope,
+  nextUpItems,
   parseSessionEntry,
+  renderViews,
   resolveSupersedesPrefix,
   sessionViewPathsOf,
+  sortEntries,
+  sortRootRows,
   splitLegacyFrontmatter,
+  trackHeads,
 } from '../hooks/session-entries.mjs';
+import {
+  formatRootHotProjection,
+  resolveActiveProject,
+  scopeVisible,
+} from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import { SESSION_TMP_HOME, withTmpDir } from './helpers.mjs';
 
@@ -543,4 +555,463 @@ test('the same input shape with plain patterns on both sides merges (the refusal
   assert.deepEqual(r, { ok: true, merged: `${BASE}*.md\nkeep.md\n` });
   // A line that merely contains ! is not a negation.
   assert.equal(mergeAdditiveGitignore(BASE, `${BASE}a!b\n`, `${BASE}\\!c\n`).ok, true);
+});
+
+// ── heads, order, projection ─────────────────────────────────────────────────
+
+// A parsed entry (what parseSessionEntry returns) without the file round trip.
+function E(closeId, over = {}) {
+  const date = over.date ?? '2026-10-01';
+  return {
+    project: 'p',
+    closeId,
+    sessionId: null,
+    date,
+    updated: date,
+    visibilityScope: null,
+    tracks: [{ id: 'masking', title: 'Masking' }],
+    summary: `summary of ${closeId}`,
+    bodies: { masking: `body of ${closeId}` },
+    ...over,
+  };
+}
+
+function M(entries, over = {}) {
+  return {
+    project: 'p',
+    migrated: true,
+    entries,
+    unreadable: [],
+    notes: null,
+    entryScope: null,
+    ...over,
+  };
+}
+
+const ids = (list) => list.map((e) => e.closeId);
+const reversed = (list) => [...list].reverse();
+const rotated = (list) => [...list.slice(2), ...list.slice(0, 2)];
+
+suite('session entries: order and track heads');
+
+test('sortEntries is newest first; a same-day replacement goes before what it replaced', () => {
+  // a1 < b1 by close id, so only the supersede depth can put b1 first.
+  const a1 = E('a1');
+  const b1 = E('b1', { tracks: [{ id: 'masking', supersedes: ['a1'] }] });
+  const old = E('z0', { date: '2026-09-30' });
+  assert.deepEqual(ids(sortEntries([a1, old, b1])), ['b1', 'a1', 'z0']);
+});
+
+test('same day and same depth are ordered by close id, whatever the input order', () => {
+  const list = [E('c1'), E('b2'), E('a3'), E('d4')];
+  const want = ['a3', 'b2', 'c1', 'd4'];
+  for (const input of [list, reversed(list), rotated(list)]) {
+    assert.deepEqual(ids(sortEntries(input)), want);
+  }
+});
+
+test('close ids are compared by code unit, not by locale', () => {
+  assert.deepEqual(ids(sortEntries([E('a'), E('B'), E('_x')])), ['B', '_x', 'a']);
+});
+
+test('a superseded update is not a head; one nobody supersedes is', () => {
+  const first = E('c1');
+  const second = E('c2', { tracks: [{ id: 'masking', supersedes: ['c1'] }] });
+  const [track] = trackHeads([first, second]);
+  assert.deepEqual(
+    track.heads.map((h) => h.closeId),
+    ['c2'],
+  );
+});
+
+test('two unrelated updates of one track are both heads and both rendered', () => {
+  const model = M([E('c1'), E('c2')]);
+  const [track] = trackHeads(model.entries);
+  assert.deepEqual(
+    track.heads.map((h) => h.closeId),
+    ['c1', 'c2'],
+  );
+  const state = renderViews([model]).projects.p.sessionState;
+  assert.ok(state.includes('body of c1') && state.includes('body of c2'));
+});
+
+test('a supersedes naming an id no entry has is ignored', () => {
+  const only = E('c1', { tracks: [{ id: 'masking', supersedes: ['gone-9'] }] });
+  assert.deepEqual(
+    trackHeads([only])[0].heads.map((h) => h.closeId),
+    ['c1'],
+  );
+  // Naming an entry that has no update of THIS track does not replace anything either.
+  const other = E('c0', { tracks: [{ id: 'flow' }], bodies: {} });
+  const naming = E('c2', { tracks: [{ id: 'masking', supersedes: ['c0'] }] });
+  assert.equal(trackHeads([other, naming]).length, 2);
+});
+
+test('a track whose heads are all done is finished: one line, no Next Up item', () => {
+  const open = E('c1');
+  const closing = E('c2', {
+    tracks: [{ id: 'masking', done: true, supersedes: ['c1'] }],
+    bodies: {},
+  });
+  const model = M([open, closing]);
+  assert.equal(trackHeads(model.entries)[0].done, true);
+  assert.deepEqual(nextUpItems(model), []);
+  const state = renderViews([model]).projects.p.sessionState;
+  assert.match(state, /## Finished tracks\n\n- Masking \(masking\) · 2026-10-01\n/);
+  assert.ok(!state.includes('body of c1'));
+});
+
+test('a done update does not finish a track that still has another head', () => {
+  const closing = E('c2', { tracks: [{ id: 'masking', done: true }], bodies: {} });
+  const model = M([E('c1'), closing]);
+  assert.equal(trackHeads(model.entries)[0].done, false);
+  assert.deepEqual(ids(nextUpItems(model)), ['c1']);
+});
+
+test('the track title is the newest title any update carries', () => {
+  const a = E('c1', { date: '2026-09-01', tracks: [{ id: 'masking', title: 'Old name' }] });
+  const b = E('c2', { tracks: [{ id: 'masking', supersedes: ['c1'] }] });
+  assert.equal(trackHeads([a, b])[0].title, 'Old name');
+  const c = E('c3', {
+    date: '2026-10-02',
+    tracks: [{ id: 'masking', title: 'New name', supersedes: ['c2'] }],
+  });
+  assert.equal(trackHeads([a, b, c])[0].title, 'New name');
+});
+
+test('an entry the machine cannot see is absent: it cannot replace a visible head', () => {
+  const visible = E('c1');
+  const hidden = E('c2', {
+    visibilityScope: 'machine:devB',
+    tracks: [{ id: 'masking', supersedes: ['c1'] }],
+  });
+  const model = M([visible, hidden]);
+  assert.deepEqual(ids(nextUpItems(model, { device: 'devA' })), ['c1']);
+  assert.deepEqual(ids(nextUpItems(model, { device: 'devB' })), ['c2']);
+});
+
+test('the machine filter answers like scopeVisible for every scope shape', () => {
+  for (const scope of [
+    null,
+    '',
+    'shared',
+    'machine:devA',
+    'machine:devB',
+    'machine:',
+    'agent:x',
+    'odd',
+  ]) {
+    for (const device of ['devA', 'devB', 'devC']) {
+      const items = nextUpItems(M([E('c1', { visibilityScope: scope })]), { device });
+      assert.equal(items.length === 1, scopeVisible(scope, device), `${scope} on ${device}`);
+    }
+  }
+});
+
+test('entryScope, when set, replaces every entry scope', () => {
+  const entries = [E('c1', { visibilityScope: 'machine:devB' }), E('c2')];
+  const open = M(entries, { entryScope: 'shared' });
+  assert.deepEqual(ids(nextUpItems(open, { device: 'devA' })), ['c1', 'c2']);
+  const closed = M(entries, { entryScope: 'machine:devB' });
+  assert.deepEqual(nextUpItems(closed, { device: 'devA' }), []);
+});
+
+test('isSessionProjectDir wants index.md or sessions/ and refuses _template', () => {
+  assert.equal(isSessionProjectDir({ slug: 'p', hasIndex: true, hasSessions: false }), true);
+  assert.equal(isSessionProjectDir({ slug: 'p', hasIndex: false, hasSessions: true }), true);
+  assert.equal(isSessionProjectDir({ slug: 'p', hasIndex: false, hasSessions: false }), false);
+  assert.equal(
+    isSessionProjectDir({ slug: '_template', hasIndex: true, hasSessions: true }),
+    false,
+  );
+});
+
+test('sortRootRows: date descending, blank last, slugs by code unit', () => {
+  const rows = [
+    { slug: 'a', date: '2026-10-01' },
+    { slug: 'B', date: '2026-10-01' },
+    { slug: '_x', date: '2026-10-01' },
+    { slug: 'z', date: '' },
+    { slug: 'm', date: '2026-10-02' },
+  ];
+  const want = ['m', 'B', '_x', 'a', 'z'];
+  assert.deepEqual(
+    sortRootRows(rows).map((r) => r.slug),
+    want,
+  );
+  assert.deepEqual(
+    sortRootRows(reversed(rows)).map((r) => r.slug),
+    want,
+  );
+});
+
+suite('session entries: generated views');
+
+test('the views are the same bytes for any input order', () => {
+  const list = [
+    E('c1'),
+    E('b2'),
+    E('a3', { tracks: [{ id: 'flow', title: 'Flow' }], bodies: { flow: 'flow body' } }),
+    E('d4', { date: '2026-09-29' }),
+    E('e5', { tracks: [{ id: 'masking', supersedes: ['d4'] }] }),
+  ];
+  const want = renderViews([M(list)]);
+  for (const input of [reversed(list), rotated(list)]) {
+    assert.deepEqual(renderViews([M(input)]), want);
+  }
+});
+
+test('unreadable entries render by file name whatever the input order, and are never dropped', () => {
+  const a = { fileName: 'a.md', reason: 'bad-tracks' };
+  const b = { fileName: 'b.md', reason: 'missing-summary' };
+  const one = renderViews([M([E('c1')], { unreadable: [b, a] })]).projects.p.sessionState;
+  const two = renderViews([M([E('c1')], { unreadable: [a, b] })]).projects.p.sessionState;
+  assert.equal(one, two);
+  assert.match(one, /## Unreadable entries\n\n- `a\.md`: bad-tracks\n- `b\.md`: missing-summary\n/);
+});
+
+test('hot.md spreads the newest 5 summaries, links the next 20, and renders nothing older', () => {
+  const entries = [];
+  for (let n = 1; n <= 30; n++) {
+    const nn = String(n).padStart(2, '0');
+    entries.push(E(`c${nn}`, { date: `2026-09-${nn}`, summary: `SUM-${nn}` }));
+  }
+  const hot = renderViews([M(entries)]).projects.p.hot;
+  for (let n = 26; n <= 30; n++) assert.ok(hot.includes(`SUM-${n}`), `summary ${n}`);
+  for (let n = 1; n <= 25; n++) assert.ok(!hot.includes(`SUM-${String(n).padStart(2, '0')}`));
+  for (let n = 6; n <= 25; n++) {
+    const nn = String(n).padStart(2, '0');
+    assert.ok(hot.includes(`[[projects/p/sessions/2026-09-${nn}-c${nn}]]`), `link ${n}`);
+  }
+  for (let n = 1; n <= 5; n++) {
+    const nn = String(n).padStart(2, '0');
+    assert.ok(!hot.includes(`c${nn}`), `entry ${n} is not rendered`);
+  }
+  assert.match(hot, /그 밖 5개는 `projects\/p\/sessions\/`/);
+  assert.match(
+    hot,
+    /^---\ntype: reference\ntitle: "hot: p"\nupdated: 2026-09-30\ngenerated: sessions\n---\n/,
+  );
+  assert.ok(hot.includes('[[projects/p/notes]]'));
+});
+
+test('the generator never reads the date: two mocked days give the same bytes, updated is the newest entry', () => {
+  const RealDate = globalThis.Date;
+  const render = (iso) => {
+    const fixed = new RealDate(iso).getTime();
+    globalThis.Date = class extends RealDate {
+      constructor(...args) {
+        super(...(args.length ? args : [fixed]));
+      }
+      static now() {
+        return fixed;
+      }
+    };
+    try {
+      return renderViews([M([E('c1', { date: '2026-10-01' }), E('c2', { date: '2026-09-20' })])]);
+    } finally {
+      globalThis.Date = RealDate;
+    }
+  };
+  const first = render('2030-01-01T00:00:00Z');
+  const second = render('2041-06-15T00:00:00Z');
+  assert.deepEqual(first, second);
+  assert.match(first.projects.p.hot, /\nupdated: 2026-10-01\n/);
+  assert.match(first.projects.p.sessionState, /\nupdated: 2026-10-01\n/);
+  assert.match(first.root, /\nupdated: 2026-10-01\n/);
+});
+
+test('the root table is what formatRootHotProjection writes for the rows, and resolveActiveProject reads it', () => {
+  const models = [
+    M([E('c1', { date: '2026-10-01' })], { project: 'p' }),
+    M([E('c2', { date: '2026-10-03' })], { project: 'q' }),
+    M([], { project: 'r' }),
+  ];
+  const { root } = renderViews(models);
+  const rows = sortRootRows([
+    { slug: 'p', date: '2026-10-01' },
+    { slug: 'q', date: '2026-10-03' },
+    { slug: 'r', date: '' },
+  ]);
+  const tableOf = (text) =>
+    text
+      .split('\n')
+      .filter((l) => l.startsWith('| '))
+      .join('\n');
+  assert.equal(tableOf(root), tableOf(formatRootHotProjection(rows)));
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hot.md'), root);
+    assert.equal(resolveActiveProject(dir), 'q');
+  });
+});
+
+test('only limits the per-project files; the root still has a row for every project', () => {
+  const models = [M([E('c1')], { project: 'p' }), M([E('c2')], { project: 'q' })];
+  const out = renderViews(models, { only: ['p'] });
+  assert.deepEqual(Object.keys(out.projects), ['p']);
+  assert.ok(out.root.includes('[[projects/q/hot]]'));
+});
+
+test('a baseline head: nextUpItems keeps the whole body and splits the old frontmatter off', () => {
+  const state = `${OLD_STATE}\n## Notes\n\nlast line of the old file\n`;
+  const b = baseline({ stateText: state });
+  const model = M([parseSessionEntry(b.text).entry]);
+  const [item] = nextUpItems(model);
+  const split = splitLegacyFrontmatter(state);
+  assert.equal(item.body, split.body);
+  assert.ok(item.body.includes('## Notes') && item.body.includes('last line of the old file'));
+  assert.equal(item.legacyFrontmatter, split.frontmatter);
+  assert.ok(item.legacyFrontmatter.includes('machine_note: next, finish the masking pipeline'));
+});
+
+test('a baseline head folds the old frontmatter into <details> and the body starts without it', () => {
+  const model = M([parseSessionEntry(baseline().text).entry]);
+  const { sessionState, hot } = renderViews([model]).projects.p;
+  assert.match(sessionState, /<details><summary>[^<]+<\/summary>\n\n```yaml\n---\n/);
+  assert.ok(sessionState.includes('machine_note: next, finish the masking pipeline'));
+  const afterFold = sessionState.split('</details>\n\n')[1];
+  assert.ok(!afterFold.startsWith('---') && !afterFold.includes('machine_note'));
+  // The baseline summary is the old hot.md whole: its tags and related fold the same way.
+  assert.match(hot, /<details>[\s\S]*tags: \[a, b\][\s\S]*<\/details>/);
+});
+
+test('a track and a summary with a fence in their text still render the old frontmatter safely', () => {
+  const state = '---\nnote: |\n  ```\n---\nbody\n';
+  const b = baseline({ stateText: state });
+  const out = renderViews([M([parseSessionEntry(b.text).entry])]).projects.p.sessionState;
+  assert.ok(out.includes('````yaml'), 'the fence is longer than any backtick run inside');
+});
+
+test('generated text holds no em dash or en dash', () => {
+  const model = M([
+    E('c1'),
+    E('c2', { tracks: [{ id: 'flow', title: 'Flow', done: true }], bodies: {} }),
+    parseSessionEntry(baseline().text).entry,
+  ]);
+  const out = renderViews([model]);
+  const injected = buildInjection(model, 4000).text;
+  for (const text of [out.root, out.projects.p.hot, out.projects.p.sessionState, injected]) {
+    assert.ok(!/[\u2013\u2014]/.test(text));
+  }
+});
+
+// ── injection ────────────────────────────────────────────────────────────────
+
+suite('session entries: injection budget');
+
+const pointerLines = (text) =>
+  text.split('\n').filter((l) => l.startsWith('- ') && l.includes('이 머리를 읽으세요'));
+const lineWith = (text, closeId) => text.split('\n').find((l) => l.includes(closeId));
+
+test('a head that fits goes in whole and is in observed.heads only', () => {
+  const model = M([E('c1')]);
+  const { text, observed } = buildInjection(model, 4000);
+  assert.ok(text.includes('body of c1'));
+  assert.deepEqual(observed, { project: 'p', heads: { masking: ['c1'] }, pointer: {} });
+});
+
+test('a head over budget is a pointer line with the whole close id and the replace notice', () => {
+  const big = E('c1', { bodies: { masking: 'X'.repeat(9000) } });
+  const second = E('c2', {
+    tracks: [{ id: 'flow', title: 'Flow' }],
+    bodies: { flow: 'F'.repeat(9000) },
+  });
+  const { text, observed } = buildInjection(M([big, second]), 4000);
+  const line = lineWith(text, 'c2');
+  assert.ok(line.includes('닫을 때 이 머리를 대체합니다') && line.includes('c2'));
+  assert.ok(!text.includes('F'.repeat(40)), 'the second head is not cut, it is a pointer');
+  assert.deepEqual(observed.pointer.flow, ['c2']);
+  assert.equal(observed.heads.flow, undefined);
+});
+
+test('an item goes in whole or not at all: a summary that does not fit leaves no trace', () => {
+  const entries = [
+    E('c1', { bodies: { masking: 'small' }, summary: 'S'.repeat(5000) }),
+    E('c2', { date: '2026-09-01', bodies: { masking: 'x' }, summary: 'shorter summary' }),
+  ];
+  const { text } = buildInjection(M(entries), 4000);
+  assert.ok(!text.includes('SSSS'));
+  assert.ok(text.includes('body of c2') || text.includes('shorter summary'));
+  const roomy = buildInjection(M(entries), 20000).text;
+  assert.ok(roomy.includes('S'.repeat(5000)));
+});
+
+test('the priority is heads, newest summary, notes, then the other summaries', () => {
+  const entries = [
+    E('c1', { summary: 'NEWEST-SUMMARY' }),
+    E('c2', { date: '2026-09-01', summary: 'OLDER-SUMMARY' }),
+  ];
+  const model = M(entries, { notes: 'THE-NOTES' });
+  const full = buildInjection(model, 4000).text;
+  assert.ok(full.indexOf('NEWEST-SUMMARY') < full.indexOf('THE-NOTES'));
+  assert.ok(full.indexOf('THE-NOTES') < full.indexOf('OLDER-SUMMARY'));
+  // Squeezed so that only the heads, the newest summary and the notes fit: the older one drops first.
+  const tight = buildInjection(model, full.length - 10).text;
+  assert.ok(tight.includes('THE-NOTES') && tight.includes('NEWEST-SUMMARY'));
+  assert.ok(!tight.includes('OLDER-SUMMARY'));
+});
+
+test('the first head over budget is cut to the rest and still tells every other head', () => {
+  const first = E('c1', { bodies: { masking: 'A'.repeat(6000) } });
+  // Longer than its own pointer line, so it cannot squeeze in if the pointer line were not reserved.
+  const second = E('c2', {
+    tracks: [{ id: 'flow', title: 'Flow' }],
+    bodies: { flow: 'F'.repeat(400) },
+  });
+  const { text, observed } = buildInjection(M([first, second]), 4000);
+  assert.ok(text.includes('c1') && text.includes('c2'));
+  assert.match(text, /\(잘림: 전문은 projects\/p\/session-state\.md\)/);
+  assert.ok(text.length <= 4000);
+  assert.deepEqual(observed.pointer.masking, ['c1']);
+  assert.equal(observed.heads.masking, undefined);
+  assert.deepEqual(observed.pointer.flow, ['c2']);
+  assert.equal(observed.heads.flow, undefined);
+});
+
+test('21 active heads: 20 pointer lines and "외 1개" even with no room, the 21st in neither key', () => {
+  const tracks = [];
+  for (let n = 1; n <= 21; n++)
+    tracks.push({ id: `t${String(n).padStart(2, '0')}`, title: `T${n}` });
+  const { text, observed } = buildInjection(M([E('c1', { tracks, bodies: {} })]), 1);
+  assert.equal(pointerLines(text).length, 20);
+  assert.ok(text.includes('- 외 1개'));
+  assert.equal(Object.keys(observed.pointer).length, 20);
+  assert.deepEqual(observed.heads, {});
+  assert.equal(observed.pointer.t21, undefined);
+  assert.equal(observed.pointer.t20.length, 1);
+});
+
+test('the pointer target follows migration: entry file before, session-state.md after, baseline always session-state.md', () => {
+  const real = E('c1', { date: '2026-10-02', bodies: { masking: 'R'.repeat(9000) } });
+  const base = parseSessionEntry(baseline().text).entry;
+  const target = (migrated) => {
+    const { text } = buildInjection(M([real, base], { migrated }), 800);
+    return { real: lineWith(text, 'c1'), base: lineWith(text, base.closeId), text };
+  };
+  const before = target(false);
+  assert.ok(before.base.includes('projects/p/session-state.md'));
+  assert.ok(before.text.includes(`(잘림: 전문은 projects/p/sessions/2026-10-02-c1.md)`));
+  const after = target(true);
+  assert.ok(after.base.includes('projects/p/session-state.md'));
+  assert.ok(after.text.includes('(잘림: 전문은 projects/p/session-state.md)'));
+  // Before migration a head that is only a pointer names its entry file too.
+  const pointerOnly = buildInjection(M([real], { migrated: false }), 1).text;
+  assert.ok(lineWith(pointerOnly, 'c1').includes('projects/p/sessions/2026-10-02-c1.md'));
+  const migratedPointer = buildInjection(M([real], { migrated: true }), 1).text;
+  assert.ok(lineWith(migratedPointer, 'c1').includes('projects/p/session-state.md'));
+});
+
+test('a baseline head carries its old frontmatter into the injection, and the nextUp body does not', () => {
+  const model = M([parseSessionEntry(baseline().text).entry]);
+  const { text } = buildInjection(model, 4000);
+  assert.ok(text.includes('machine_note: next, finish the masking pipeline'));
+  assert.match(text, /```yaml\n---\n/);
+  assert.ok(!nextUpItems(model)[0].body.includes('machine_note'));
+});
+
+test('no active head and no summary: empty text and empty observed', () => {
+  assert.deepEqual(buildInjection(M([]), 4000), {
+    text: '',
+    observed: { project: 'p', heads: {}, pointer: {} },
+  });
 });
