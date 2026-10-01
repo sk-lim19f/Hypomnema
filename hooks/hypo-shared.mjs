@@ -1890,13 +1890,41 @@ function readTextOrNull(path) {
 const literalSpecs = (paths) => paths.map((p) => `:(literal)${p}`);
 
 // A project is hidden by `.hypoignore` when its session entries are (isIgnored's second look
-// covers a pattern on either view path or on the project directory).
-const projectHiddenByHypoignore = (hypoDir, slug, patterns) =>
+// covers a pattern on either view path or on the project directory). The generator, the migration
+// and the catch-up all ask this one question.
+export const projectHiddenByHypoignore = (hypoDir, slug, patterns) =>
   patterns.length > 0 &&
   isIgnored(join(hypoDir, 'projects', slug, 'sessions', 'x.md'), hypoDir, patterns);
 
 const isAncestorOfHead = (hypoDir, sha) =>
   vaultGit(hypoDir, ['merge-base', '--is-ancestor', sha, 'HEAD']).status === 0;
+
+/**
+ * `.cache/generated-views.json` = {views: {relPath: sha256}}: the bytes the generator last wrote at
+ * each generated path. Returns `{views, state}` with `state` `'ok'`, `'missing'` (no file) or
+ * `'invalid'` (unreadable, not JSON, or `views` not an object); `views` is `{}` unless `'ok'`.
+ * Entries whose value is not a string are dropped. The generator and the catch-up share this one
+ * reader, so "did we write these bytes" has one answer.
+ */
+export function readGeneratedViewsRecord(hypoDir) {
+  let raw;
+  try {
+    raw = readFileSync(join(hypoDir, GENERATED_VIEWS_RECORD_REL), 'utf-8');
+  } catch (err) {
+    return { views: {}, state: err?.code === 'ENOENT' ? 'missing' : 'invalid' };
+  }
+  try {
+    const views = JSON.parse(raw)?.views;
+    if (views === null || typeof views !== 'object' || Array.isArray(views))
+      throw new Error('shape');
+    return {
+      views: Object.fromEntries(Object.entries(views).filter(([, v]) => typeof v === 'string')),
+      state: 'ok',
+    };
+  } catch {
+    return { views: {}, state: 'invalid' };
+  }
+}
 
 /**
  * Whether the branch's upstream already carries the session-entries `.gitignore` block, read from
@@ -2138,15 +2166,7 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
     rmSync(join(hypoDir, p), { force: true });
   // A path `target` adds as tracked, held here as an untracked file: git overwrites it without a
   // word (rollback commits do this to every view), so move it out first.
-  const owned = (() => {
-    try {
-      return (
-        JSON.parse(readFileSync(join(hypoDir, GENERATED_VIEWS_RECORD_REL), 'utf-8')).views ?? {}
-      );
-    } catch {
-      return {};
-    }
-  })();
+  const owned = readGeneratedViewsRecord(hypoDir).views;
   for (const { status, path } of incoming) {
     if (status !== 'A' || !isGeneratedViewPath(path) || blocked.includes(path)) continue;
     if (pathInHead(hypoDir, path)) continue;
@@ -2164,15 +2184,24 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   return { ok: true, backups, archived: archivedViews, localOnly, gitignoreLines };
 }
 
-// The date of an additional baseline: the larger `updated:` of the two old files, else the day git
-// last changed either one, else today (local). Same order as the baseline the generator builds.
-function legacyBaselineDate(hypoDir, slug, texts) {
+/**
+ * The date of a baseline built from a project's old `hot.md` and `session-state.md` (`texts`, the
+ * bytes the baseline holds): the larger `updated:` of the two, else the day git last changed either
+ * file, else the local day of `hot.md`'s mtime (`session-state.md`'s when `hot.md` is not on
+ * disk), else today. Every step after the first reads the vault, not the bytes, so one pair of
+ * bytes gets a different date on two machines only when neither has `updated:` and git has never
+ * seen the files. mtime comes before today because today would turn the same bytes into a
+ * different baseline on a different day.
+ * The generator's virtual baseline, the migration and the catch-up all date a baseline here.
+ */
+export function legacyBaselineDate(hypoDir, slug, texts) {
   const updated = texts
     .map((t) => ISO_DAY_RE.exec(frontmatterUpdated(t) ?? '')?.[0])
     .filter(Boolean)
     .sort();
   if (updated.length) return updated.at(-1);
-  const committed = ['hot', 'session-state']
+  const names = ['hot', 'session-state'];
+  const committed = names
     .map((name) => {
       const out = gitOut(hypoDir, [
         'log',
@@ -2186,9 +2215,16 @@ function legacyBaselineDate(hypoDir, slug, texts) {
     .filter(Boolean)
     .sort();
   if (committed.length) return committed.at(-1);
-  const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const day = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  for (const name of names) {
+    try {
+      return day(statSync(join(hypoDir, 'projects', slug, `${name}.md`)).mtime);
+    } catch {
+      // not on disk: try the other file
+    }
+  }
+  return day(new Date());
 }
 
 // Write `text` at `abs` unless something is already there (a link fails on an existing name, so

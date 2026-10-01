@@ -12,6 +12,7 @@ import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   statSync,
@@ -54,9 +55,11 @@ import {
   consumeRootHotHealthNotice,
   formatRootHotProjection,
   isIgnored as isIgnoredHooks,
+  legacyBaselineDate,
   localChangesOn,
   markPullArchiveMerged,
   pathInHead,
+  readGeneratedViewsRecord,
   resolveActiveProject,
   restoreGitignoreLines,
   resumePullArchive,
@@ -70,10 +73,13 @@ import {
 } from '../hooks/hypo-shared.mjs';
 import {
   SESSION_ENTRIES_OFF_MARKER,
+  buildCommitInTempIndex,
+  fastForwardTo,
   listSessionEntries,
   listSessionProjects,
   listTrackedGeneratedViews,
   loadSessionModel,
+  migrateVaultToSessionEntries,
   migrationState,
   projectEntryScope,
   readObservedHeads,
@@ -1432,31 +1438,33 @@ test('an unreadable ownership record makes every file unowned, and the record is
   });
 });
 
-test('absorbed bytes are replaced without a backup, but only at the path they were absorbed from', () => {
+test('ownership is per path and only `views` counts: the same bytes at another path, or under a stale absorbed key, are backed up', () => {
   withTmpDir((dir) => {
     seedProjects(dir, ['p', 'q']);
-    const absorbed = 'the old hot.md the migration absorbed\n';
+    const bytes = 'bytes the writer recorded for q only\n';
+    // p is written before q, so a lookup that ignored the path would still find q's record
     put(
       dir,
       '.cache/generated-views.json',
-      JSON.stringify({ views: {}, absorbed: { [VIEW]: sha(absorbed) } }),
+      JSON.stringify({
+        views: { 'projects/q/hot.md': sha(bytes) },
+        absorbed: { [VIEW]: sha(bytes) },
+      }),
     );
-    put(dir, VIEW, absorbed);
-    put(dir, 'projects/q/hot.md', absorbed);
+    put(dir, VIEW, bytes);
+    put(dir, 'projects/q/hot.md', bytes);
     const r = writeGeneratedViews(dir, WRITE);
     assert.deepEqual(
       r.backedUp.map((b) => b.relPath),
-      ['projects/q/hot.md'],
-      'q holds the same bytes but they were never absorbed from q',
+      [VIEW],
+      'p holds the same bytes, but only a views record at p, not a record at q or an absorbed key, protects them',
     );
-    assert.equal(existsSync(join(dir, `${VIEW}.pre-projection-backup.md`)), false);
-    assert.equal(readRel(dir, 'projects/q/hot.md.pre-projection-backup.md'), absorbed);
-    const record = JSON.parse(readRel(dir, '.cache/generated-views.json'));
-    assert.deepEqual(record.absorbed, { [VIEW]: sha(absorbed) }, 'absorbed is kept as it was');
+    assert.equal(readRel(dir, `${VIEW}.pre-projection-backup.md`), bytes);
+    assert.equal(existsSync(join(dir, 'projects/q/hot.md.pre-projection-backup.md')), false);
   });
 });
 
-test('absorbed that is not an object is dropped and the views record is still honoured', () => {
+test('a record that still carries an absorbed key keeps its views honoured and is rewritten without the key', () => {
   withTmpDir((dir) => {
     seedProjects(dir);
     writeGeneratedViews(dir, WRITE);
@@ -1465,7 +1473,9 @@ test('absorbed that is not an object is dropped and the views record is still ho
     putEntry(dir, 'p', 'c-new', { date: '2026-10-02' });
     const r = writeGeneratedViews(dir, WRITE);
     assert.deepEqual(r.backedUp, []);
-    assert.deepEqual(JSON.parse(readRel(dir, '.cache/generated-views.json')).absorbed, {});
+    assert.deepEqual(Object.keys(JSON.parse(readRel(dir, '.cache/generated-views.json'))), [
+      'views',
+    ]);
   });
 });
 
@@ -2397,5 +2407,732 @@ test('(i) an archived record whose target is not in HEAD yet is left alone', () 
     assert.equal(r.resumed, false);
     assert.equal(readRel(b, '.cache/pull-archive.json'), bytes);
     assert.deepEqual(baselinesOf(b), [], 'nothing was shared');
+  });
+});
+
+// ── moving a vault to the scheme ─────────────────────────────────────────────
+
+suite('session views: migrateVaultToSessionEntries');
+
+const RICH_HOT = `---
+title: "hot: p"
+type: reference
+updated: 2026-09-20
+tags: [a, b]
+---
+## Summary
+the old summary
+
+\`\`\`md
+## Track: x
+\`\`\`
+`;
+const OLD_SCOPED_STATE = OLD_STATE_FILE.replace(
+  'machine_note: keep me',
+  'machine_note: keep me\nvisibility_scope: machine:devA',
+);
+const OLD_PROJECT_FILES = {
+  '.gitignore': '.cache/\n',
+  'hot.md': 'root hot\n',
+  'projects/p/index.md': '---\ntitle: p\n---\n',
+  'projects/p/hot.md': RICH_HOT,
+  'projects/p/session-state.md': OLD_STATE_FILE,
+  'projects/p/platform/hot.md': 'platform hot\n',
+  'projects/p/platform/session-state.md': 'platform state\n',
+  'projects/_template/hot.md': 'template hot\n',
+  'projects/_template/session-state.md': 'template state\n',
+  'pages/x.md': 'x\n',
+};
+
+// One vault with the old tracked files, in a git environment with an identity (the code under test
+// makes commits itself).
+function withOldGit(fn, extra = {}) {
+  inCatchUpEnv(() =>
+    withTmpDir((dir) => {
+      cgitOk(dir, ['init', '-q']);
+      for (const [rel, text] of Object.entries({ ...OLD_PROJECT_FILES, ...extra })) {
+        if (text !== null) put(dir, rel, text);
+      }
+      commitIn(dir);
+      fn(dir);
+    }),
+  );
+}
+
+// Two clones `a` and `b` of one origin, both at the old state.
+function withOldClones(fn, extra = {}) {
+  inCatchUpEnv(() =>
+    withTmpDir((root) => {
+      const origin = join(root, 'origin.git');
+      const a = join(root, 'a');
+      const b = join(root, 'b');
+      cgitOk(root, ['init', '-q', '--bare', origin]);
+      cgitOk(root, ['clone', '-q', origin, a]);
+      for (const [rel, text] of Object.entries({ ...OLD_PROJECT_FILES, ...extra }))
+        put(a, rel, text);
+      commitIn(a);
+      cgitOk(a, ['push', '-q', '-u', 'origin', 'main']);
+      cgitOk(root, ['clone', '-q', origin, b]);
+      fn({ a, b, root });
+    }),
+  );
+}
+
+const treeNames = (dir, rev = 'HEAD') =>
+  cgitOk(dir, ['ls-tree', '-r', '--name-only', rev]).split('\n').filter(Boolean);
+const showHead = (dir, rel) => cgitOk(dir, ['show', `HEAD:${rel}`]);
+const changedBy = (dir, rev = 'HEAD') =>
+  cgitOk(dir, ['diff-tree', '--no-commit-id', '--name-status', '-r', rev])
+    .trim()
+    .split('\n')
+    .sort();
+const entryOf = (dir, rel) => parseSessionEntry(readRel(dir, rel)).entry;
+const countOf = (text, needle) => text.split(needle).length - 1;
+const migrate = (dir, opts = {}) => migrateVaultToSessionEntries(dir, opts);
+
+test('the move untracks the generated views, adds one baseline and both blocks, and keeps the rest as it was', () => {
+  withOldGit((dir) => {
+    const before = commitCount(dir);
+    const r = migrate(dir);
+    assert.equal(r.migrated, true);
+    assert.equal(r.skipped, null);
+    assert.equal(r.commit, headOf(dir));
+    assert.equal(commitCount(dir), before + 1);
+    assert.equal(migrationState(dir), 'migrated');
+    assert.deepEqual(listTrackedGeneratedViews(dir, { source: 'head' }), []);
+    assert.deepEqual(listTrackedGeneratedViews(dir), []);
+    assert.equal(r.baselines.length, 1, 'one project, one baseline');
+    assert.match(r.baselines[0], /^projects\/p\/sessions\/2026-09-25-baseline-[0-9a-f]{16}\.md$/);
+    assert.deepEqual(
+      changedBy(dir),
+      [
+        'A\t.gitattributes',
+        `A\t${r.baselines[0]}`,
+        'D\thot.md',
+        'D\tprojects/p/hot.md',
+        'D\tprojects/p/session-state.md',
+        'M\t.gitignore',
+      ].sort(),
+    );
+    // the nested track pages are not generated paths: still tracked, same bytes
+    assert.equal(showHead(dir, 'projects/p/platform/hot.md'), 'platform hot\n');
+    assert.equal(showHead(dir, 'projects/p/platform/session-state.md'), 'platform state\n');
+    assert.equal(showHead(dir, '.gitignore'), `.cache/\n${GITIGNORE_BLOCK}`);
+    assert.equal(showHead(dir, '.gitattributes'), GITATTRIBUTES_BLOCK);
+    for (const gone of ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md']) {
+      assert.equal(existsSync(join(dir, gone)), false, `${gone} left the working tree`);
+    }
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+  });
+});
+
+test('the baseline holds both old files whole: a fenced track heading, machine_note and tags survive', () => {
+  withOldGit((dir) => {
+    const [rel] = migrate(dir).baselines;
+    const entry = entryOf(dir, rel);
+    assert.equal(entry.summary, RICH_HOT);
+    assert.equal(entry.bodies[LEGACY_TRACK_ID], OLD_STATE_FILE);
+    assert.match(entry.bodies[LEGACY_TRACK_ID], /machine_note: keep me/);
+    assert.equal(entry.tracks[0].id, LEGACY_TRACK_ID);
+  });
+});
+
+test('projects/_template is not part of the move: both files stay tracked, unchanged on disk and out of the commit', () => {
+  withOldGit((dir) => {
+    migrate(dir);
+    for (const f of ['hot.md', 'session-state.md']) {
+      assert.ok(treeNames(dir).includes(`projects/_template/${f}`));
+      assert.equal(
+        readRel(dir, `projects/_template/${f}`),
+        f === 'hot.md' ? 'template hot\n' : 'template state\n',
+      );
+    }
+    assert.equal(
+      changedBy(dir).filter((l) => l.includes('_template')).length,
+      0,
+      'the move commit does not touch _template',
+    );
+    assert.equal(existsSync(join(dir, 'projects/_template/sessions')), false, 'no baseline for it');
+  });
+});
+
+test('a machine with a local edit of _template/hot.md is not blocked from taking the move (not other-dirty)', () => {
+  withOldClones(({ a, b }) => {
+    migrate(a);
+    cgitOk(a, ['push', '-q']);
+    cgitOk(b, ['fetch', '-q']);
+    put(b, 'projects/_template/hot.md', 'my template edit\n');
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(ffTo(b), 0);
+    assert.equal(readRel(b, 'projects/_template/hot.md'), 'my template edit\n');
+  });
+});
+
+test('.gitattributes: only the block when HEAD had none, never twice, and a hand-written line stays', () => {
+  withOldGit((dir) => {
+    migrate(dir);
+    assert.equal(showHead(dir, '.gitattributes'), GITATTRIBUTES_BLOCK);
+  });
+  withOldGit(
+    (dir) => {
+      migrate(dir);
+      assert.equal(
+        showHead(dir, '.gitattributes'),
+        GITATTRIBUTES_BLOCK,
+        'already there: untouched',
+      );
+    },
+    { '.gitattributes': GITATTRIBUTES_BLOCK },
+  );
+  withOldGit(
+    (dir) => {
+      migrate(dir);
+      assert.equal(showHead(dir, '.gitattributes'), `log.md merge=union\n${GITATTRIBUTES_BLOCK}`);
+    },
+    { '.gitattributes': 'log.md merge=union\n' },
+  );
+});
+
+test('.gitignore: the block goes in once, and not again when HEAD already has it', () => {
+  withOldGit((dir) => {
+    migrate(dir);
+    assert.equal(countOf(showHead(dir, '.gitignore'), GITIGNORE_BLOCK.split('\n')[0]), 1);
+  });
+  withOldGit(
+    (dir) => {
+      migrate(dir);
+      assert.equal(showHead(dir, '.gitignore'), `.cache/\n${GITIGNORE_BLOCK}`);
+    },
+    { '.gitignore': `.cache/\n${GITIGNORE_BLOCK}` },
+  );
+});
+
+test('a second run makes no commit and leaves HEAD alone, which is also the state after a failed push', () => {
+  withOldGit((dir) => {
+    migrate(dir);
+    const head = headOf(dir);
+    const count = commitCount(dir);
+    const again = migrate(dir);
+    assert.equal(again.migrated, true);
+    assert.equal(again.skipped, 'already-migrated');
+    assert.equal(again.commit, null);
+    assert.equal(headOf(dir), head);
+    assert.equal(commitCount(dir), count);
+  });
+});
+
+test('a file another session staged and a .gitignore line not yet committed stay out of the commit, and stay', () => {
+  withOldGit((dir) => {
+    put(dir, 'pages/new.md', 'new\n');
+    cgitOk(dir, ['add', 'pages/new.md']);
+    put(dir, '.gitignore', '.cache/\nlocal-only/\n');
+    const r = migrate(dir);
+    assert.equal(r.migrated, true, JSON.stringify(r));
+    assert.equal(
+      treeNames(dir).includes('pages/new.md'),
+      false,
+      'the staged file is not in the commit',
+    );
+    assert.equal(cgitOk(dir, ['diff', '--cached', '--name-only']).trim(), 'pages/new.md');
+    assert.equal(showHead(dir, '.gitignore').includes('local-only/'), false);
+    assert.equal(readRel(dir, '.gitignore'), `.cache/\n${GITIGNORE_BLOCK}local-only/\n`);
+    assert.equal(
+      existsSync(join(dir, '.cache/pull-archive.json')),
+      false,
+      'the archive record is gone',
+    );
+  });
+});
+
+test('the old hot.md scope goes into the baseline and index.md is not changed', () => {
+  withOldGit(
+    (dir) => {
+      const before = showHead(dir, 'projects/p/index.md');
+      const r = migrate(dir);
+      assert.equal(entryOf(dir, r.baselines[0]).visibilityScope, 'machine:devA');
+      assert.equal(showHead(dir, 'projects/p/index.md'), before);
+      assert.equal(
+        changedBy(dir).some((l) => l.endsWith('index.md')),
+        false,
+      );
+    },
+    { 'projects/p/hot.md': OLD_HOT_FILE },
+  );
+});
+
+test('scope: index.md machine:devA beats a shared hot.md quietly; a scope only the old state file has is carried with a notice; two machines close it', () => {
+  withOldGit(
+    (dir) => {
+      const r = migrate(dir);
+      assert.equal(entryOf(dir, r.baselines[0]).visibilityScope, 'machine:devA');
+      assert.equal(
+        r.notices.some((n) => n.includes('범위를 이어받습니다')),
+        false,
+      );
+    },
+    { 'projects/p/index.md': '---\ntitle: p\nvisibility_scope: machine:devA\n---\n' },
+  );
+  withOldGit(
+    (dir) => {
+      const index = showHead(dir, 'projects/p/index.md');
+      const r = migrate(dir);
+      assert.equal(entryOf(dir, r.baselines[0]).visibilityScope, 'machine:devA');
+      assert.equal(showHead(dir, 'projects/p/index.md'), index, 'index.md bytes are untouched');
+      assert.ok(
+        r.notices.some(
+          (n) => n.includes('옛 파일의 범위를 이어받습니다') && n.includes('machine:devA'),
+        ),
+      );
+      // a close of this project now takes the carried scope (the T7 path asks projectEntryScope)
+      assert.equal(projectEntryScope(dir, 'p'), 'machine:devA');
+    },
+    {
+      'projects/p/index.md': '---\ntitle: p\nvisibility_scope: shared\n---\n',
+      'projects/p/session-state.md': OLD_SCOPED_STATE,
+    },
+  );
+  withOldGit(
+    (dir) => {
+      const r = migrate(dir);
+      assert.equal(entryOf(dir, r.baselines[0]).visibilityScope, 'machine:');
+      assert.ok(r.notices.some((n) => n.includes('machine:')));
+    },
+    {
+      'projects/p/index.md': '---\ntitle: p\nvisibility_scope: machine:devB\n---\n',
+      'projects/p/hot.md': OLD_HOT_FILE,
+    },
+  );
+});
+
+test('two clones that move on their own clocks and then pull each other agree: no conflict, one baseline', () => {
+  withOldClones(({ a, b }) => {
+    migrate(a, { testHooks: { now: new Date('2026-10-01T09:00:00Z') } });
+    migrate(b, { testHooks: { now: new Date('2026-10-01T09:01:00Z') } });
+    assert.notEqual(headOf(a), headOf(b), 'two distinct move commits');
+    cgitOk(a, ['push', '-q']);
+    const pulled = cgit(b, ['pull', '--no-rebase', '--no-edit']);
+    assert.equal(pulled.status, 0, pulled.stderr);
+    assert.equal(unmerged(b), '');
+    assert.equal(baselinesOf(b).length, 1);
+    cgitOk(b, ['push', '-q']);
+    const back = cgit(a, ['pull', '--no-rebase', '--no-edit']);
+    assert.equal(back.status, 0, back.stderr);
+    assert.equal(unmerged(a), '');
+    assert.equal(baselinesOf(a).length, 1);
+  });
+});
+
+test('two clones that read different scopes make two baselines and no index.md conflict', () => {
+  withOldClones(
+    ({ a, b }) => {
+      put(b, 'projects/p/hot.md', OLD_HOT_FILE.replace('machine:devA', 'machine:devB'));
+      commitIn(b);
+      const ra = migrate(a);
+      const rb = migrate(b);
+      for (const r of [ra, rb]) assert.equal(r.migrated, true, JSON.stringify(r));
+      for (const [dir, head] of [
+        [a, 'a'],
+        [b, 'b'],
+      ]) {
+        assert.equal(
+          changedBy(dir).some((l) => l.endsWith('index.md')),
+          false,
+          `the move commit of ${head} leaves index.md alone`,
+        );
+      }
+      cgitOk(a, ['push', '-q']);
+      const pulled = cgit(b, ['pull', '--no-rebase', '--no-edit']);
+      assert.equal(pulled.status, 0, pulled.stderr);
+      assert.equal(unmerged(b), '');
+      cgitOk(b, ['push', '-q']);
+      const back = cgit(a, ['pull', '--no-rebase', '--no-edit']);
+      assert.equal(back.status, 0, back.stderr);
+      assert.equal(unmerged(a), '');
+      const scopes = baselinesOf(a).map(
+        (n) => entryOf(a, `projects/p/sessions/${n}`).visibilityScope,
+      );
+      assert.deepEqual(scopes.sort(), ['machine:', 'machine:devA']);
+      assert.equal(
+        showHead(a, 'projects/p/index.md'),
+        '---\ntitle: p\nvisibility_scope: shared\n---\n',
+      );
+    },
+    {
+      'projects/p/index.md': '---\ntitle: p\nvisibility_scope: shared\n---\n',
+      'projects/p/hot.md': RICH_HOT,
+      'projects/p/session-state.md': OLD_SCOPED_STATE,
+    },
+  );
+});
+
+test('a project .hypoignore hides gets no baseline; its old files are kept locally and the notice names them', () => {
+  withOldGit(
+    (dir) => {
+      const r = migrate(dir);
+      assert.equal(r.migrated, true, JSON.stringify(r));
+      assert.deepEqual(
+        r.baselines.map((b) => b.split('/')[1]),
+        ['p'],
+      );
+      assert.equal(existsSync(join(dir, 'projects/secret/sessions')), false);
+      for (const f of ['hot.md', 'session-state.md']) {
+        assert.equal(existsSync(join(dir, `projects/secret/${f}`)), false, 'the move removed it');
+        const kept = backupsIn(dir, `projects/secret/${f}`);
+        assert.equal(kept.length, 1, `${f} has a local backup`);
+        assert.equal(
+          readRel(dir, `projects/secret/${kept[0]}`),
+          f === 'hot.md' ? 'secret hot\n' : 'secret state\n',
+        );
+        assert.ok(r.notices.some((n) => n.includes(`projects/secret/${kept[0]}`)));
+      }
+      assert.equal(
+        backupsIn(dir, 'projects/p/hot.md').length,
+        0,
+        'a project that is not hidden needs none',
+      );
+    },
+    {
+      '.hypoignore': 'projects/secret/hot.md\n',
+      'projects/secret/index.md': '---\ntitle: secret\n---\n',
+      'projects/secret/hot.md': 'secret hot\n',
+      'projects/secret/session-state.md': 'secret state\n',
+    },
+  );
+});
+
+test('an off marker in HEAD stops every automatic move; reenable removes the marker in the one move commit', () => {
+  withOldGit(
+    (dir) => {
+      const head = headOf(dir);
+      assert.equal(migrationState(dir), 'opted-out');
+      const off = migrate(dir);
+      assert.equal(off.migrated, false);
+      assert.equal(off.skipped, 'opted-out');
+      assert.equal(headOf(dir), head);
+      const count = commitCount(dir);
+      const on = migrate(dir, { reenable: true });
+      assert.equal(on.migrated, true, JSON.stringify(on));
+      assert.equal(commitCount(dir), count + 1);
+      assert.equal(treeNames(dir).includes(SESSION_ENTRIES_OFF_MARKER), false);
+      assert.equal(migrationState(dir), 'migrated');
+    },
+    { [SESSION_ENTRIES_OFF_MARKER]: '' },
+  );
+});
+
+test('a view staged as S and edited to W: both go to backups and out as additional baselines, the index ends clean', () => {
+  withOldGit((dir) => {
+    const S = RICH_HOT.replace('the old summary', 'staged S');
+    const W = RICH_HOT.replace('the old summary', 'worktree W');
+    put(dir, 'projects/p/hot.md', S);
+    cgitOk(dir, ['add', 'projects/p/hot.md']);
+    put(dir, 'projects/p/hot.md', W);
+    const before = commitCount(dir);
+    const r = migrate(dir);
+    assert.equal(r.migrated, true, JSON.stringify(r));
+    assert.equal(commitCount(dir), before + 2, 'the move, then the additional baselines');
+    assert.deepEqual(
+      backupsIn(dir, 'projects/p/hot.md')
+        .map((n) => readRel(dir, `projects/p/${n}`))
+        .sort(),
+      [S, W].sort(),
+    );
+    assert.equal(r.shared.length, 2);
+    assert.deepEqual(r.shared.map((rel) => entryOf(dir, rel).summary).sort(), [S, W].sort());
+    assert.equal(baselinesOf(dir).length, 3);
+    assert.equal(cgitOk(dir, ['diff', '--cached', '--name-only']).trim(), '');
+  });
+});
+
+test('a local edit of the old hot.md: the move baseline has the HEAD bytes, the edit is a second baseline and a backup', () => {
+  withOldGit((dir) => {
+    const W = RICH_HOT.replace('the old summary', 'uncommitted edit');
+    put(dir, 'projects/p/hot.md', W);
+    const r = migrate(dir);
+    assert.equal(r.migrated, true, JSON.stringify(r));
+    assert.equal(entryOf(dir, r.baselines[0]).summary, RICH_HOT);
+    assert.equal(r.shared.length, 1);
+    assert.equal(entryOf(dir, r.shared[0]).summary, W);
+    assert.deepEqual(
+      backupsIn(dir, 'projects/p/hot.md').map((n) => readRel(dir, `projects/p/${n}`)),
+      [W],
+    );
+  });
+});
+
+test('a legacy update the old scheme already marked done keeps legacy folded after the old file changed', () => {
+  const doneEntry = {
+    closeId: 'c-done',
+    date: '2026-09-30',
+    tracks: [{ id: LEGACY_TRACK_ID, done: true }],
+    bodies: { [LEGACY_TRACK_ID]: 'wrapped up\n' },
+  };
+  withOldGit(
+    (dir) => {
+      const r = migrate(dir);
+      assert.equal(r.migrated, true, JSON.stringify(r));
+      const legacy = trackHeads(loadSessionModel(dir, 'p').entries).find(
+        (t) => t.trackId === LEGACY_TRACK_ID,
+      );
+      assert.equal(legacy.done, true, 'finished: a one-line track, not an active head');
+    },
+    {
+      [`projects/p/sessions/${entryFileName('2026-09-30', 'c-done')}`]: entryFile(
+        'c-done',
+        doneEntry,
+      ),
+    },
+  );
+  withOldGit((dir) => {
+    migrate(dir);
+    const legacy = trackHeads(loadSessionModel(dir, 'p').entries).find(
+      (t) => t.trackId === LEGACY_TRACK_ID,
+    );
+    assert.equal(legacy.done, false, 'without a done update it is an active head');
+  });
+});
+
+test('a vault below the repository root moves under its own prefix and the root stays as it was', () => {
+  inCatchUpEnv(() =>
+    withTmpDir((root) => {
+      cgitOk(root, ['init', '-q']);
+      put(root, '.gitignore', 'ROOT\n');
+      put(root, 'README.md', 'r\n');
+      const vault = join(root, 'wiki');
+      for (const [rel, text] of Object.entries(OLD_PROJECT_FILES)) put(vault, rel, text);
+      commitIn(root);
+      const r = migrate(vault);
+      assert.equal(r.migrated, true, JSON.stringify(r));
+      const names = treeNames(root);
+      assert.ok(names.includes(`wiki/${r.baselines[0]}`), 'the baseline is under wiki/');
+      for (const gone of [
+        'wiki/hot.md',
+        'wiki/projects/p/hot.md',
+        'wiki/projects/p/session-state.md',
+      ]) {
+        assert.equal(names.includes(gone), false, `${gone} is untracked`);
+      }
+      assert.equal(showHead(root, 'wiki/.gitignore'), `.cache/\n${GITIGNORE_BLOCK}`);
+      assert.equal(showHead(root, 'wiki/.gitattributes'), GITATTRIBUTES_BLOCK);
+      assert.equal(
+        showHead(root, '.gitignore'),
+        'ROOT\n',
+        'the root .gitignore is not the vault one',
+      );
+      assert.deepEqual(
+        cgitOk(root, ['ls-tree', '--name-only', 'HEAD']).trim().split('\n'),
+        ['.gitignore', 'README.md', 'wiki'],
+        'nothing new at the repository root',
+      );
+      const count = commitCount(root);
+      assert.equal(migrate(vault).skipped, 'already-migrated');
+      assert.equal(commitCount(root), count);
+    }),
+  );
+});
+
+test('stopping once the commit object exists changes nothing, leaves no temporary index, and the next run makes one commit', () => {
+  withOldGit((dir) => {
+    const snapshot = () => ({
+      head: headOf(dir),
+      index: cgitOk(dir, ['ls-files', '-s']),
+      status: cgitOk(dir, ['status', '--porcelain']),
+      hot: readRel(dir, 'projects/p/hot.md'),
+    });
+    const before = snapshot();
+    const count = commitCount(dir);
+    const tmp = mkdtempSync(join(SESSION_TMP_HOME, 'tmpdir-'));
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = tmp;
+    let made = null;
+    try {
+      assert.throws(
+        () =>
+          migrate(dir, {
+            testHooks: {
+              afterBuildCommit: (sha) => {
+                made = sha;
+                assert.equal(
+                  readdirSync(tmp).length,
+                  1,
+                  'the temporary index exists at this point',
+                );
+                throw new Error('stop here');
+              },
+            },
+          }),
+        /stop here/,
+      );
+    } finally {
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+    }
+    assert.equal(
+      cgitOk(dir, ['cat-file', '-t', made]).trim(),
+      'commit',
+      'the commit object was made',
+    );
+    assert.deepEqual(readdirSync(tmp), [], 'no temporary index left');
+    assert.deepEqual(snapshot(), before);
+    assert.equal(migrationState(dir), 'not-migrated');
+    assert.equal(cgitOk(dir, ['worktree', 'list']).trim().split('\n').length, 1);
+    const r = migrate(dir);
+    assert.equal(r.migrated, true);
+    assert.equal(commitCount(dir), count + 1);
+  });
+});
+
+test('fastForwardTo applies nothing when HEAD moved after the commit was built', () => {
+  withOldGit((dir) => {
+    const built = buildCommitInTempIndex(dir, {
+      message: 'm',
+      writes: [{ relPath: '.gitignore', text: `.cache/\n${GITIGNORE_BLOCK}` }],
+      deletes: ['hot.md'],
+    });
+    assert.equal(built.ok, true, JSON.stringify(built));
+    put(dir, 'pages/y.md', 'y\n');
+    commitIn(dir);
+    const head = headOf(dir);
+    const r = fastForwardTo(dir, built.sha);
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /^fast-forward-failed/);
+    assert.equal(headOf(dir), head);
+    assert.equal(readRel(dir, 'hot.md'), 'root hot\n');
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+  });
+});
+
+test('a local edit of .gitattributes, which the move changes, defers the move and touches nothing', () => {
+  withOldGit(
+    (dir) => {
+      put(dir, '.gitattributes', 'log.md merge=union\n# mine\n');
+      const head = headOf(dir);
+      const r = migrate(dir);
+      assert.equal(r.migrated, false);
+      assert.equal(r.deferred, 'other-dirty');
+      assert.ok(r.notices[0].startsWith('이행을 다음 세션으로 미뤘습니다'));
+      assert.equal(headOf(dir), head);
+      assert.equal(migrationState(dir), 'not-migrated');
+      assert.equal(readRel(dir, '.gitattributes'), 'log.md merge=union\n# mine\n');
+      assert.equal(readRel(dir, 'projects/p/hot.md'), RICH_HOT);
+    },
+    { '.gitattributes': 'log.md merge=union\n' },
+  );
+});
+
+test('the first generation after the move writes no backup, and an add-all commit does not take the views back', () => {
+  withOldGit((dir) => {
+    migrate(dir);
+    const r = writeGeneratedViews(dir, { device: 'devA' });
+    assert.ok(r.written.includes('projects/p/hot.md'));
+    assert.deepEqual(r.backedUp, []);
+    assert.deepEqual(
+      listDir(join(dir, 'projects/p')).filter((n) => n.includes('.pre-projection-backup')),
+      [],
+    );
+    put(dir, 'pages/new.md', 'new\n');
+    commitIn(dir); // what Obsidian Git does: add -A, commit
+    assert.deepEqual(treeNames(dir).filter(isGeneratedViewPath), []);
+  });
+});
+
+// ── one baseline date, one ownership reader ──────────────────────────────────
+
+suite('session views: the baseline date and the ownership record each have one definition');
+
+const BARE_HOT = '---\ntitle: p\n---\nno updated line\n';
+const BARE_STATE = 'no frontmatter at all\n';
+const commitAt = (dir, iso) => {
+  cgitOk(dir, ['add', '-A']);
+  const r = spawnSync('git', ['commit', '-q', '-m', 'x'], {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      GIT_CONFIG_GLOBAL: CATCH_UP_CONFIG(),
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_COMMITTER_DATE: iso,
+      GIT_AUTHOR_DATE: iso,
+    },
+  });
+  assert.equal(r.status, 0, r.stderr);
+};
+
+test('legacyBaselineDate: updated first, then the day git last changed the files, then the mtime day', () => {
+  inCatchUpEnv(() =>
+    withTmpDir((dir) => {
+      cgitOk(dir, ['init', '-q']);
+      put(dir, 'projects/p/hot.md', BARE_HOT);
+      put(dir, 'projects/p/session-state.md', BARE_STATE);
+      // never committed: the mtime day, whatever today is
+      utimesSync(
+        join(dir, 'projects/p/hot.md'),
+        new Date(2026, 2, 4, 12),
+        new Date(2026, 2, 4, 12),
+      );
+      assert.equal(legacyBaselineDate(dir, 'p', [BARE_HOT, BARE_STATE]), '2026-03-04');
+      utimesSync(
+        join(dir, 'projects/p/hot.md'),
+        new Date(2026, 2, 5, 12),
+        new Date(2026, 2, 5, 12),
+      );
+      assert.equal(
+        legacyBaselineDate(dir, 'p', [BARE_HOT, BARE_STATE]),
+        '2026-03-05',
+        'follows the file',
+      );
+      commitAt(dir, '2026-02-03T12:00:00Z');
+      assert.equal(
+        legacyBaselineDate(dir, 'p', [BARE_HOT, BARE_STATE]),
+        '2026-02-03',
+        'git beats mtime',
+      );
+      assert.equal(
+        legacyBaselineDate(dir, 'p', ['---\nupdated: 2026-05-06\n---\n', BARE_STATE]),
+        '2026-05-06',
+        'updated beats git',
+      );
+    }),
+  );
+});
+
+test('the virtual baseline and the move date the same bytes alike (the day git last changed them)', () => {
+  inCatchUpEnv(() =>
+    withTmpDir((dir) => {
+      cgitOk(dir, ['init', '-q']);
+      put(dir, '.gitignore', '.cache/\n');
+      put(dir, 'projects/p/index.md', '---\ntitle: p\n---\n');
+      put(dir, 'projects/p/hot.md', BARE_HOT);
+      put(dir, 'projects/p/session-state.md', BARE_STATE);
+      commitAt(dir, '2026-02-03T12:00:00Z');
+      const virtual = loadSessionModel(dir, 'p').entries.find((e) => isBaselineId(e.closeId));
+      assert.equal(virtual.date, '2026-02-03');
+      const r = migrate(dir);
+      assert.equal(r.migrated, true, JSON.stringify(r));
+      assert.match(r.baselines[0], /\/2026-02-03-baseline-/);
+      assert.equal(
+        r.baselines[0].split('/').at(-1),
+        entryFileName(virtual.date, virtual.closeId),
+        'the file name is the virtual baseline id and date: the same bytes, the same entry',
+      );
+    }),
+  );
+});
+
+test('readGeneratedViewsRecord: ok with string values only, missing, or invalid', () => {
+  withTmpDir((dir) => {
+    assert.deepEqual(readGeneratedViewsRecord(dir), { views: {}, state: 'missing' });
+    put(dir, '.cache/generated-views.json', '{not json');
+    assert.deepEqual(readGeneratedViewsRecord(dir), { views: {}, state: 'invalid' });
+    put(dir, '.cache/generated-views.json', JSON.stringify({ views: ['x'] }));
+    assert.equal(readGeneratedViewsRecord(dir).state, 'invalid');
+    put(
+      dir,
+      '.cache/generated-views.json',
+      JSON.stringify({ views: { a: 'h', b: 1 }, absorbed: { c: 'h' } }),
+    );
+    assert.deepEqual(readGeneratedViewsRecord(dir), { views: { a: 'h' }, state: 'ok' });
   });
 });
