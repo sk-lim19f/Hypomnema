@@ -8,8 +8,17 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
 import {
   GITATTRIBUTES_BLOCK,
   GITIGNORE_BLOCK,
@@ -22,6 +31,7 @@ import {
   entryMarker,
   buildInjection,
   formatSessionEntry,
+  isBaselineId,
   isGeneratedViewPath,
   isSessionEntryPath,
   isSessionProjectDir,
@@ -31,6 +41,7 @@ import {
   parseSessionEntry,
   renderViews,
   resolveSupersedesPrefix,
+  scopeVisible,
   sessionViewPathsOf,
   sortEntries,
   sortRootRows,
@@ -38,10 +49,30 @@ import {
   trackHeads,
 } from '../hooks/session-entries.mjs';
 import {
+  consumeRootHotHealthNotice,
   formatRootHotProjection,
+  localChangesOn,
+  pathInHead,
   resolveActiveProject,
-  scopeVisible,
+  revPathArg,
+  scopeVisible as sharedScopeVisible,
+  vaultCommitLockTarget,
+  vaultGitPrefix,
+  withFileLock,
 } from '../hooks/hypo-shared.mjs';
+import {
+  SESSION_ENTRIES_OFF_MARKER,
+  listSessionEntries,
+  listSessionProjects,
+  listTrackedGeneratedViews,
+  loadSessionModel,
+  migrationState,
+  projectEntryScope,
+  readObservedHeads,
+  recordObservedHeads,
+  writeGeneratedViews,
+  writeGeneratedViewsUnlocked,
+} from '../hooks/session-views.mjs';
 import { test, suite } from './harness.mjs';
 import { SESSION_TMP_HOME, withTmpDir } from './helpers.mjs';
 
@@ -690,20 +721,27 @@ test('an entry the machine cannot see is absent: it cannot replace a visible hea
   assert.deepEqual(ids(nextUpItems(model, { device: 'devB' })), ['c2']);
 });
 
-test('the machine filter answers like scopeVisible for every scope shape', () => {
-  for (const scope of [
-    null,
-    '',
-    'shared',
-    'machine:devA',
-    'machine:devB',
-    'machine:',
-    'agent:x',
-    'odd',
-  ]) {
-    for (const device of ['devA', 'devB', 'devC']) {
+// The expected answers are written out: a scope on a device is visible unless it is a
+// `machine:` value naming another device (or nobody).
+const SCOPE_EXPECTED = {
+  null: { devA: true, devB: true, devC: true },
+  '': { devA: true, devB: true, devC: true },
+  shared: { devA: true, devB: true, devC: true },
+  'machine:devA': { devA: true, devB: false, devC: false },
+  'machine:devB': { devA: false, devB: true, devC: false },
+  'machine:': { devA: false, devB: false, devC: false },
+  'agent:x': { devA: true, devB: true, devC: true },
+  odd: { devA: true, devB: true, devC: true },
+};
+
+test('hypo-shared re-exports the one scopeVisible, and the machine filter answers like it', () => {
+  assert.equal(sharedScopeVisible, scopeVisible, 'one definition, not a copy');
+  for (const [key, byDevice] of Object.entries(SCOPE_EXPECTED)) {
+    const scope = key === 'null' ? null : key;
+    for (const [device, visible] of Object.entries(byDevice)) {
+      assert.equal(scopeVisible(scope, device), visible, `${key} on ${device}`);
       const items = nextUpItems(M([E('c1', { visibilityScope: scope })]), { device });
-      assert.equal(items.length === 1, scopeVisible(scope, device), `${scope} on ${device}`);
+      assert.equal(items.length === 1, visible, `filter: ${key} on ${device}`);
     }
   }
 });
@@ -1013,5 +1051,635 @@ test('no active head and no summary: empty text and empty observed', () => {
   assert.deepEqual(buildInjection(M([]), 4000), {
     text: '',
     observed: { project: 'p', heads: {}, pointer: {} },
+  });
+});
+
+// ── session-views: IO fixtures ───────────────────────────────────────────────
+
+const sha = (text) => createHash('sha256').update(text, 'utf-8').digest('hex');
+
+function put(dir, rel, text) {
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+}
+
+const readRel = (dir, rel) => readFileSync(join(dir, rel), 'utf-8');
+
+function commitAll(dir) {
+  assert.equal(git(dir, ['add', '-A']).status, 0);
+  const r = git(dir, [
+    '-c',
+    'user.email=t@example.com',
+    '-c',
+    'user.name=t',
+    'commit',
+    '-q',
+    '-m',
+    'x',
+  ]);
+  assert.equal(r.status, 0, r.stderr);
+}
+
+// A plain entry file: one track, no supersedes, no scope.
+function entryFile(closeId, over = {}) {
+  return formatSessionEntry(
+    sample({
+      closeId,
+      sessionId: null,
+      visibilityScope: null,
+      tracks: [{ id: 'masking', title: 'Masking' }],
+      bodies: { masking: `next for ${closeId}\n` },
+      summary: `summary ${closeId}\n`,
+      ...over,
+    }),
+  );
+}
+
+const putEntry = (dir, project, closeId, over = {}) =>
+  put(
+    dir,
+    `projects/${project}/sessions/${entryFileName(over.date ?? '2026-10-01', closeId)}`,
+    entryFile(closeId, { project, ...over }),
+  );
+
+const OLD_HOT_FILE = `---
+title: "hot: p"
+type: reference
+updated: 2026-09-20
+visibility_scope: machine:devA
+---
+old hot body
+`;
+const OLD_STATE_FILE = `---
+type: session-state
+updated: 2026-09-25
+machine_note: keep me
+---
+## Next Up
+old state body
+`;
+
+// A git vault that has not moved to the scheme: the old two files are tracked, no block.
+function withOldVault(fn, files = {}) {
+  withVault({}, (dir) => {
+    put(dir, 'projects/p/index.md', '---\ntitle: p\n---\n');
+    put(dir, 'projects/p/hot.md', OLD_HOT_FILE);
+    put(dir, 'projects/p/session-state.md', OLD_STATE_FILE);
+    for (const [rel, text] of Object.entries(files)) put(dir, rel, text);
+    commitAll(dir);
+    fn(dir);
+  });
+}
+
+// A git vault that has moved: the block is in HEAD and no view is tracked.
+function withMigratedVault(fn, files = {}) {
+  withVault({}, (dir) => {
+    put(dir, '.gitignore', GITIGNORE_BLOCK);
+    put(dir, 'projects/p/index.md', '---\ntitle: p\n---\n');
+    for (const [rel, text] of Object.entries(files)) put(dir, rel, text);
+    commitAll(dir);
+    fn(dir);
+  });
+}
+
+// ── project list, entry list, model ──────────────────────────────────────────
+
+suite('session views: projects, entries and the model');
+
+test('listSessionProjects leaves out _template and empty directories and keeps sessions-only projects', () => {
+  withTmpDir((dir) => {
+    put(dir, 'projects/_template/index.md', 'x');
+    put(dir, 'projects/idx/index.md', 'x');
+    mkdirSync(join(dir, 'projects/only-sessions/sessions'), { recursive: true });
+    mkdirSync(join(dir, 'projects/empty'), { recursive: true });
+    put(dir, 'projects/stray.md', 'x');
+    assert.deepEqual(listSessionProjects(dir), ['idx', 'only-sessions']);
+    assert.deepEqual(listSessionProjects(join(dir, 'nowhere')), []);
+  });
+});
+
+test('listSessionEntries skips a file deleted between the listing and the read, and reports the rest', () => {
+  withTmpDir((dir) => {
+    putEntry(dir, 'p', 'keep');
+    putEntry(dir, 'p', 'gone');
+    put(dir, 'projects/p/sessions/2026-10-01-broken.md', 'no frontmatter at all\n');
+    mkdirSync(join(dir, 'projects/p/sessions/2026-10-01-dir.md'));
+    put(dir, 'projects/p/sessions/2026-10-01-temp.md.123.tmp', 'partial');
+    const { entries, unreadable } = listSessionEntries(dir, 'p', {
+      testHooks: {
+        betweenListAndRead: () =>
+          unlinkSync(join(dir, 'projects/p/sessions', entryFileName('2026-10-01', 'gone'))),
+      },
+    });
+    assert.deepEqual(
+      entries.map((e) => e.closeId),
+      ['keep'],
+    );
+    assert.deepEqual(
+      unreadable.map((u) => u.fileName),
+      ['2026-10-01-broken.md', '2026-10-01-dir.md'],
+    );
+    assert.match(unreadable[1].reason, /^read-error: EISDIR$/);
+  });
+});
+
+test('loadSessionModel on a vault without git reads entries, notes body and entry_scope', () => {
+  withTmpDir((dir) => {
+    putEntry(dir, 'p', 'c1');
+    put(dir, 'projects/p/index.md', '---\ntitle: p\nentry_scope: shared # widened\n---\n');
+    put(dir, 'projects/p/notes.md', '---\ntitle: notes\n---\n\nthe notes\n');
+    const model = loadSessionModel(dir, 'p');
+    assert.equal(model.migrated, true);
+    assert.equal(model.project, 'p');
+    assert.deepEqual(
+      model.entries.map((e) => e.closeId),
+      ['c1'],
+    );
+    assert.deepEqual(model.unreadable, []);
+    assert.equal(model.notes, 'the notes');
+    assert.equal(model.entryScope, 'shared');
+    const bare = loadSessionModel(dir, 'nobody');
+    assert.deepEqual([bare.entries, bare.notes, bare.entryScope], [[], null, null]);
+  });
+});
+
+test('an entry_scope that is not a scope closes the project instead of being ignored', () => {
+  withTmpDir((dir) => {
+    for (const [raw, expected] of [
+      ['machine:devA', 'machine:devA'],
+      ['agent:x', 'agent:x'],
+      ['everyone', 'machine:'],
+      ['', 'machine:'],
+      ['machine:dev A', 'machine:'],
+    ]) {
+      put(dir, 'projects/p/index.md', `---\nentry_scope: ${raw}\n---\n`);
+      assert.equal(loadSessionModel(dir, 'p').entryScope, expected, `[${raw}]`);
+    }
+  });
+});
+
+test('before the move the model holds a virtual baseline of the old files and nothing on disk changes', () => {
+  withOldVault((dir) => {
+    putEntry(dir, 'p', 'c1');
+    const model = loadSessionModel(dir, 'p');
+    assert.equal(model.migrated, false);
+    const base = model.entries.find((e) => isBaselineId(e.closeId));
+    assert.ok(base, 'a virtual baseline entry');
+    assert.equal(base.summary, OLD_HOT_FILE);
+    assert.equal(base.bodies[LEGACY_TRACK_ID], OLD_STATE_FILE);
+    assert.equal(base.date, '2026-09-25');
+    assert.equal(base.visibilityScope, 'machine:devA');
+    assert.deepEqual(
+      model.entries.map((e) => e.closeId).filter((id) => !isBaselineId(id)),
+      ['c1'],
+    );
+    assert.equal(readRel(dir, 'projects/p/hot.md'), OLD_HOT_FILE);
+    assert.equal(readRel(dir, 'projects/p/session-state.md'), OLD_STATE_FILE);
+    assert.equal(git(dir, ['status', '--porcelain', '--untracked-files=no']).stdout, '');
+  });
+});
+
+test('a migrated vault has no virtual baseline even when old view files linger on disk', () => {
+  withMigratedVault(
+    (dir) => {
+      put(dir, 'projects/p/hot.md', OLD_HOT_FILE);
+      const model = loadSessionModel(dir, 'p');
+      assert.equal(model.migrated, true);
+      assert.deepEqual(
+        model.entries.map((e) => e.closeId),
+        ['c1'],
+      );
+    },
+    { [`projects/p/sessions/${entryFileName('2026-10-01', 'c1')}`]: entryFile('c1') },
+  );
+});
+
+test('projectEntryScope: the narrowest of index.md and the baselines, or the entry_scope as written', () => {
+  withOldVault((dir) => {
+    put(dir, 'projects/p/index.md', '---\nvisibility_scope: shared\n---\n');
+    assert.equal(projectEntryScope(dir, 'p', loadSessionModel(dir, 'p')), 'machine:devA');
+    assert.equal(projectEntryScope(dir, 'p'), 'machine:devA', 'model is optional');
+    put(dir, 'projects/p/index.md', '---\nvisibility_scope: shared\nentry_scope: shared\n---\n');
+    assert.equal(projectEntryScope(dir, 'p'), 'shared', 'entry_scope skips the calculation');
+  });
+  withTmpDir((dir) => {
+    put(dir, 'projects/p/index.md', '---\nvisibility_scope: shared\n---\n');
+    putEntry(dir, 'p', 'c1', { visibilityScope: 'machine:devB' });
+    assert.equal(
+      projectEntryScope(dir, 'p'),
+      'shared',
+      'no baseline: a non-baseline entry scope does not narrow',
+    );
+    put(dir, 'projects/q/index.md', '---\ntitle: q\n---\n');
+    assert.equal(projectEntryScope(dir, 'q'), null);
+  });
+});
+
+// ── git state ────────────────────────────────────────────────────────────────
+
+suite('session views: tracked views and migration state');
+
+test('listTrackedGeneratedViews holds the root and depth-1 views only, never by pathspec', () => {
+  withVault({}, (dir) => {
+    for (const rel of [
+      'hot.md',
+      'projects/p/hot.md',
+      'projects/p/session-state.md',
+      'projects/p/platform/session-state.md',
+      'projects/p/platform/hot.md',
+      'projects/_template/hot.md',
+      'projects/p/notes.md',
+    ]) {
+      put(dir, rel, 'x\n');
+    }
+    commitAll(dir);
+    const expected = ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'];
+    assert.deepEqual(listTrackedGeneratedViews(dir, { source: 'head' }), expected);
+    assert.deepEqual(listTrackedGeneratedViews(dir), expected);
+    assert.throws(() => listTrackedGeneratedViews(dir, { source: 'worktree' }));
+  });
+});
+
+test('migrationState reads HEAD alone: block plus no tracked view is migrated', () => {
+  withTmpDir((dir) => assert.equal(migrationState(dir), 'migrated', 'not a git repository'));
+  withVault({}, (dir) => {
+    assert.equal(migrationState(dir), 'not-migrated', 'a repository with no commit');
+  });
+  withOldVault((dir) => {
+    assert.equal(migrationState(dir), 'not-migrated');
+    // The block in the working tree alone does not count.
+    put(dir, '.gitignore', GITIGNORE_BLOCK);
+    assert.equal(migrationState(dir), 'not-migrated');
+    commitAll(dir);
+    assert.equal(
+      migrationState(dir),
+      'not-migrated',
+      'block committed but the views still tracked',
+    );
+    assert.equal(
+      git(dir, ['rm', '-q', '--cached', 'projects/p/hot.md', 'projects/p/session-state.md']).status,
+      0,
+    );
+    // The untracking is only staged: HEAD still tracks the views.
+    assert.equal(migrationState(dir), 'not-migrated');
+    commitAll(dir);
+    assert.equal(migrationState(dir), 'migrated');
+  });
+});
+
+test('HEAD migrated while the real index still holds a view: migrated', () => {
+  withOldVault((dir) => {
+    put(dir, '.gitignore', GITIGNORE_BLOCK);
+    assert.equal(
+      git(dir, ['rm', '-q', '--cached', 'projects/p/hot.md', 'projects/p/session-state.md']).status,
+      0,
+    );
+    commitAll(dir);
+    assert.equal(git(dir, ['add', '-f', 'projects/p/hot.md']).status, 0);
+    assert.deepEqual(listTrackedGeneratedViews(dir), ['projects/p/hot.md']);
+    assert.deepEqual(listTrackedGeneratedViews(dir, { source: 'head' }), []);
+    assert.equal(migrationState(dir), 'migrated');
+  });
+});
+
+test('an off marker in HEAD is opted-out, and only HEAD counts', () => {
+  withMigratedVault((dir) => {
+    put(dir, SESSION_ENTRIES_OFF_MARKER, '');
+    assert.equal(migrationState(dir), 'migrated', 'untracked marker is not HEAD');
+    commitAll(dir);
+    assert.equal(migrationState(dir), 'opted-out');
+  });
+});
+
+// ── writing the views ────────────────────────────────────────────────────────
+
+suite('session views: the writer');
+
+const VIEW = 'projects/p/hot.md';
+const WRITE = { device: 'devA' };
+
+function seedProjects(dir, slugs = ['p']) {
+  for (const slug of slugs) {
+    put(dir, `projects/${slug}/index.md`, '---\ntitle: x\n---\n');
+    putEntry(dir, slug, `c-${slug}`);
+  }
+}
+
+test('the first write creates the project views and the root, the second changes nothing and keeps mtimes', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    const first = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(first.written.sort(), ['hot.md', VIEW, 'projects/p/session-state.md'].sort());
+    assert.deepEqual(first.backedUp, []);
+    assert.match(readRel(dir, VIEW), /^---\ntype: reference\ntitle: "hot: p"/);
+    assert.match(readRel(dir, 'projects/p/session-state.md'), /next for c-p/);
+    for (const rel of first.written) utimesSync(join(dir, rel), 1000, 1000);
+    const second = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(second.written, []);
+    assert.equal(second.unchanged.length, 3);
+    for (const rel of first.written) assert.equal(statSync(join(dir, rel)).mtimeMs, 1000000, rel);
+  });
+});
+
+test('bytes the writer did not write are backed up before they are replaced, and a notice is left', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    put(dir, VIEW, 'hand written\n');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(r.backedUp.length, 1);
+    assert.equal(r.backedUp[0].relPath, VIEW);
+    assert.equal(readRel(dir, `${VIEW}.pre-projection-backup.md`), 'hand written\n');
+    assert.match(readRel(dir, VIEW), /generated: sessions/);
+    const notice = consumeRootHotHealthNotice(dir);
+    assert.ok(notice?.includes(VIEW) && notice.includes('pre-projection-backup'), notice);
+  });
+});
+
+test('an owned file is replaced without a backup when its entries change', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    writeGeneratedViews(dir, WRITE);
+    putEntry(dir, 'p', 'c-new', { date: '2026-10-02' });
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(r.backedUp, []);
+    assert.ok(r.written.includes(VIEW));
+    assert.equal(existsSync(join(dir, `${VIEW}.pre-projection-backup.md`)), false);
+  });
+});
+
+test('an unreadable ownership record makes every file unowned, and the record is rewritten', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    writeGeneratedViews(dir, WRITE);
+    putEntry(dir, 'p', 'c-new', { date: '2026-10-02' });
+    put(dir, '.cache/generated-views.json', '{not json');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.ok(
+      r.backedUp.some((b) => b.relPath === VIEW),
+      JSON.stringify(r.backedUp),
+    );
+    const record = JSON.parse(readRel(dir, '.cache/generated-views.json'));
+    assert.equal(record.views[VIEW], sha(readRel(dir, VIEW)));
+  });
+});
+
+test('absorbed bytes are replaced without a backup, but only at the path they were absorbed from', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir, ['p', 'q']);
+    const absorbed = 'the old hot.md the migration absorbed\n';
+    put(
+      dir,
+      '.cache/generated-views.json',
+      JSON.stringify({ views: {}, absorbed: { [VIEW]: sha(absorbed) } }),
+    );
+    put(dir, VIEW, absorbed);
+    put(dir, 'projects/q/hot.md', absorbed);
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(
+      r.backedUp.map((b) => b.relPath),
+      ['projects/q/hot.md'],
+      'q holds the same bytes but they were never absorbed from q',
+    );
+    assert.equal(existsSync(join(dir, `${VIEW}.pre-projection-backup.md`)), false);
+    assert.equal(readRel(dir, 'projects/q/hot.md.pre-projection-backup.md'), absorbed);
+    const record = JSON.parse(readRel(dir, '.cache/generated-views.json'));
+    assert.deepEqual(record.absorbed, { [VIEW]: sha(absorbed) }, 'absorbed is kept as it was');
+  });
+});
+
+test('absorbed that is not an object is dropped and the views record is still honoured', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    writeGeneratedViews(dir, WRITE);
+    const record = JSON.parse(readRel(dir, '.cache/generated-views.json'));
+    put(dir, '.cache/generated-views.json', JSON.stringify({ ...record, absorbed: [sha('x')] }));
+    putEntry(dir, 'p', 'c-new', { date: '2026-10-02' });
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(r.backedUp, []);
+    assert.deepEqual(JSON.parse(readRel(dir, '.cache/generated-views.json')).absorbed, {});
+  });
+});
+
+test('the old root projection hash seeds ownership of the root hot.md once', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    const rootBytes = 'what the old root projection wrote\n';
+    put(dir, 'hot.md', rootBytes);
+    put(dir, '.cache/root-hot-projection-state.json', JSON.stringify({ lastHash: sha(rootBytes) }));
+    assert.deepEqual(writeGeneratedViews(dir, WRITE).backedUp, [], 'inherited hash: no backup');
+  });
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    put(dir, 'hot.md', 'hand written root\n');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(
+      r.backedUp.map((b) => b.relPath),
+      ['hot.md'],
+    );
+  });
+});
+
+test('bytes that land between the first read and the write are backed up too', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    writeGeneratedViews(dir, WRITE);
+    putEntry(dir, 'p', 'c-new', { date: '2026-10-02' });
+    const r = writeGeneratedViews(dir, {
+      ...WRITE,
+      testHooks: {
+        beforeFinalWrite: (abs) => abs.endsWith(VIEW) && writeFileSync(abs, 'saved in the gap\n'),
+      },
+    });
+    assert.deepEqual(
+      r.backedUp.map((b) => b.relPath),
+      [VIEW],
+    );
+    assert.equal(readRel(dir, `${VIEW}.pre-projection-backup.md`), 'saved in the gap\n');
+  });
+});
+
+test('a vault that has not moved is left alone: notMigrated, no file written, tracked bytes intact', () => {
+  withOldVault((dir) => {
+    putEntry(dir, 'p', 'c1');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(r.notMigrated, true);
+    assert.deepEqual([r.written, r.backedUp], [[], []]);
+    assert.equal(readRel(dir, VIEW), OLD_HOT_FILE);
+    assert.equal(existsSync(join(dir, 'hot.md')), false);
+    assert.equal(git(dir, ['status', '--porcelain']).stdout.trim(), '?? projects/p/sessions/');
+  });
+});
+
+test('projects and root choose what is written', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir, ['p', 'q']);
+    const r = writeGeneratedViews(dir, { ...WRITE, projects: ['q', 'not-a-project'], root: false });
+    assert.deepEqual(r.written.sort(), ['projects/q/hot.md', 'projects/q/session-state.md']);
+    assert.equal(existsSync(join(dir, 'hot.md')), false);
+    assert.match(readRel(dir, 'projects/q/hot.md'), /c-q/);
+  });
+});
+
+test('the machine filter applies per device on write', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    putEntry(dir, 'p', 'c-secret', { date: '2026-10-02', visibilityScope: 'machine:devB' });
+    writeGeneratedViews(dir, { device: 'devA' });
+    assert.ok(!readRel(dir, 'projects/p/session-state.md').includes('c-secret'));
+    writeGeneratedViews(dir, { device: 'devB' });
+    assert.ok(readRel(dir, 'projects/p/session-state.md').includes('c-secret'));
+  });
+});
+
+test('a busy vault lock is a lockTimeout result, not a throw, and the unlocked form runs inside the lock', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    const saved = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+    process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '100';
+    try {
+      withFileLock(vaultCommitLockTarget(dir), () => {
+        const busy = writeGeneratedViews(dir, WRITE);
+        assert.equal(busy.lockTimeout, true);
+        assert.deepEqual(busy.written, []);
+        assert.equal(existsSync(join(dir, VIEW)), false);
+        assert.equal(writeGeneratedViewsUnlocked(dir, WRITE).written.length, 3);
+      });
+    } finally {
+      if (saved === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+      else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = saved;
+    }
+    assert.match(consumeRootHotHealthNotice(dir) ?? '', /잠금/);
+  });
+});
+
+// ── observed heads ───────────────────────────────────────────────────────────
+
+suite('session views: observed heads');
+
+const SID = '2b1c4d5e-aaaa-bbbb-cccc-0123456789ab';
+
+test('heads accumulate as a union per level, and a full id never shows up under pointer', () => {
+  withTmpDir((dir) => {
+    recordObservedHeads(dir, SID, 'p', { level: 'full', heads: { masking: ['c1'] } });
+    recordObservedHeads(dir, SID, 'p', {
+      level: 'full',
+      heads: { masking: ['c1', 'c2'], flow: ['c3'] },
+    });
+    recordObservedHeads(dir, SID, 'p', { level: 'pointer', heads: { masking: ['c9'] } });
+    assert.deepEqual(readObservedHeads(dir, SID, 'p'), {
+      full: { masking: ['c1', 'c2'], flow: ['c3'] },
+      pointer: { masking: ['c9'] },
+    });
+    assert.deepEqual(readObservedHeads(dir, SID, 'other'), { full: {}, pointer: {} });
+    assert.deepEqual(readObservedHeads(dir, 'someone-else', 'p'), { full: {}, pointer: {} });
+  });
+});
+
+test('a record without a valid level throws and writes nothing', () => {
+  withTmpDir((dir) => {
+    for (const level of [undefined, 'both', 'FULL']) {
+      assert.throws(
+        () => recordObservedHeads(dir, SID, 'p', { level, heads: { a: ['c1'] } }),
+        /level/,
+      );
+    }
+    assert.throws(() => recordObservedHeads(dir, SID, 'p', undefined), /level/);
+    assert.equal(existsSync(join(dir, '.cache')), false);
+  });
+});
+
+test('a session id that is not a plain id never creates a file', () => {
+  withTmpDir((dir) => {
+    for (const bad of ['../x', 'a/b', '', 'a b', '.', null]) {
+      const r = recordObservedHeads(dir, bad, 'p', { level: 'full', heads: { a: ['c1'] } });
+      assert.equal(r.recorded, false, String(bad));
+      assert.deepEqual(readObservedHeads(dir, bad, 'p'), { full: {}, pointer: {} });
+    }
+    assert.equal(existsSync(join(dir, '.cache')), false);
+    assert.equal(existsSync(join(dir, 'x')), false);
+  });
+});
+
+test('a corrupt record reads as empty and the next record starts over', () => {
+  withTmpDir((dir) => {
+    put(dir, `.cache/sessions/${SID}/observed-heads.json`, '{broken');
+    assert.deepEqual(readObservedHeads(dir, SID, 'p'), { full: {}, pointer: {} });
+    recordObservedHeads(dir, SID, 'p', { level: 'full', heads: { a: ['c1'] } });
+    assert.deepEqual(readObservedHeads(dir, SID, 'p').full, { a: ['c1'] });
+  });
+});
+
+// ── vault git helpers (hypo-shared) ──────────────────────────────────────────
+
+suite('vault git helpers: HEAD paths and local changes');
+
+test('revPathArg puts ./ in front so the path resolves from the vault', () => {
+  assert.equal(revPathArg('HEAD', 'projects/p/hot.md'), 'HEAD:./projects/p/hot.md');
+  assert.equal(revPathArg('@{u}', '.gitignore'), '@{u}:./.gitignore');
+});
+
+test('pathInHead is true for a committed path and false for one that exists only on disk', () => {
+  withVault({}, (dir) => {
+    assert.equal(pathInHead(dir, 'a.md'), false, 'no commit yet');
+    put(dir, 'a.md', 'a\n');
+    put(dir, 'sub/b.md', 'b\n');
+    commitAll(dir);
+    put(dir, 'disk-only.md', 'c\n');
+    assert.equal(pathInHead(dir, 'a.md'), true);
+    assert.equal(pathInHead(dir, 'sub/b.md'), true);
+    assert.equal(pathInHead(dir, 'disk-only.md'), false);
+    assert.equal(pathInHead(dir, 'missing.md'), false);
+  });
+  withTmpDir((dir) => assert.equal(pathInHead(dir, 'a.md'), false, 'not a repository'));
+});
+
+test('in a vault below the repository root, paths resolve from the vault and the prefix is reported', () => {
+  withVault({}, (repo) => {
+    put(repo, 'vault/projects/p/hot.md', 'x\n');
+    put(repo, 'top.md', 'x\n');
+    commitAll(repo);
+    const vault = join(repo, 'vault');
+    assert.equal(vaultGitPrefix(vault), 'vault/');
+    assert.equal(vaultGitPrefix(repo), '');
+    assert.equal(pathInHead(vault, 'projects/p/hot.md'), true);
+    assert.equal(pathInHead(vault, 'vault/projects/p/hot.md'), false);
+    assert.equal(pathInHead(vault, 'top.md'), false, 'a repository-root path is not a vault path');
+  });
+  withTmpDir((dir) => assert.equal(vaultGitPrefix(dir), '', 'not a repository'));
+});
+
+test('localChangesOn splits staged from unstaged, and a path staged then edited again is in both', () => {
+  withVault({}, (dir) => {
+    for (const rel of ['both.md', 'work.md', 'clean.md']) put(dir, rel, 'base\n');
+    commitAll(dir);
+    put(dir, 'both.md', 'staged\n');
+    assert.equal(git(dir, ['add', 'both.md']).status, 0);
+    put(dir, 'both.md', 'edited again\n');
+    put(dir, 'work.md', 'edited\n');
+    put(dir, 'untracked.md', 'new\n');
+    const changes = localChangesOn(dir, ['both.md', 'work.md', 'clean.md', 'untracked.md']);
+    assert.deepEqual(changes.staged, ['both.md']);
+    assert.deepEqual(changes.unstaged.sort(), ['both.md', 'work.md']);
+    assert.deepEqual(localChangesOn(dir, []), { staged: [], unstaged: [] });
+  });
+});
+
+test('localChangesOn takes each path literally, so a glob character in a name matches only that file', () => {
+  withVault({}, (dir) => {
+    put(dir, 's1.md', 'base\n');
+    put(dir, 's*.md', 'base\n');
+    commitAll(dir);
+    put(dir, 's1.md', 'edited\n');
+    assert.deepEqual(localChangesOn(dir, ['s*.md']), { staged: [], unstaged: [] });
+    assert.deepEqual(localChangesOn(dir, ['s1.md']).unstaged, ['s1.md']);
+  });
+});
+
+test('when git cannot answer, localChangesOn reports every path changed so the caller stops', () => {
+  withTmpDir((dir) => {
+    assert.deepEqual(localChangesOn(dir, ['a.md', 'b.md']), {
+      staged: ['a.md', 'b.md'],
+      unstaged: ['a.md', 'b.md'],
+    });
   });
 });

@@ -456,7 +456,8 @@ export function sortRootRows(rows) {
 
 // ── order and heads ──────────────────────────────────────────────────────────
 
-const isBaselineId = (closeId) => closeId.startsWith('baseline-');
+/** A baseline entry (real or virtual) stands for the old `hot.md` and `session-state.md`. */
+export const isBaselineId = (closeId) => closeId.startsWith('baseline-');
 
 const supersededIdsOf = (entry) => entry.tracks.flatMap((t) => t.supersedes ?? []);
 
@@ -532,11 +533,24 @@ export function trackHeads(entries) {
     .map(({ first, ...track }) => track);
 }
 
-// Mirrors scopeVisible in hooks/hypo-shared.mjs: this module cannot import it (hypo-shared will
-// import this one). A test pins the two to the same answers. No `device` hides every `machine:`.
-function scopeVisibleTo(scope, device) {
-  const v = String(scope || '').trim();
-  return v.startsWith('machine:') ? v.slice('machine:'.length) === device : true;
+/**
+ * The single visibility decision, shared by lookup / query / file-watch / page-usage /
+ * crystallize (through hypo-shared, which re-exports it) and by the generated views.
+ * `scopeValue` is a readVisibilityScope() output, `device` a currentDevice() output. Prefix
+ * dispatch, fail-open on anything unrecognized so the field is purely additive:
+ *   ''/'shared'       visible (the implicit default of every pre-existing page)
+ *   'machine:<owner>' visible only on the owning machine. An empty owner (`machine:`) hides
+ *                     everywhere: '' can never equal currentDevice()'s non-empty fallback.
+ *   'agent:<id>'      visible; value space reserved, no writer yet (forward-compat)
+ *   anything else     visible (fail-open)
+ * No `device` hides every `machine:` value.
+ */
+export function scopeVisible(scopeValue, device) {
+  const v = String(scopeValue || '').trim();
+  if (v === '' || v === 'shared') return true;
+  if (v.startsWith('machine:')) return v.slice('machine:'.length) === device;
+  if (v.startsWith('agent:')) return true;
+  return true;
 }
 
 // Everything the renderers and the injection share: the entries this machine may see (a hidden
@@ -545,7 +559,7 @@ function scopeVisibleTo(scope, device) {
 function projectView(model, device) {
   const forced = typeof model.entryScope === 'string' ? model.entryScope : null;
   const entries = sortEntries(
-    model.entries.filter((e) => scopeVisibleTo(forced ?? e.visibilityScope, device)),
+    model.entries.filter((e) => scopeVisible(forced ?? e.visibilityScope, device)),
   );
   const tracks = trackHeads(entries);
   const live = new Set();

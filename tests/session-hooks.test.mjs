@@ -40,6 +40,7 @@ import {
   renderRootHotProjection,
   formatRootHotProjection,
   writeRootHotProjection,
+  backUpGeneratedPath,
   scanRootHotProjectionSources,
   sortRootHotRows,
   writeRootHotHealthNotice,
@@ -6562,11 +6563,11 @@ test('BLOCKER: once a hot.md carries the projection marker, further writes never
 
 // Final cross-review finding: this used to make the whole directory 0500, so
 // the backup and the projection write failed together in the same parent.
-// Deleting the backUpOnce call outright still threw, still kept the original,
+// Deleting the backUpGeneratedPath call outright still threw, still kept the original,
 // and still left no backup, so the test passed without the defense. The
 // failure is now injected into the backup write alone; the projection write
 // after it would succeed, which the retry at the end proves.
-// Disabling the check: delete `backupPath = backUpOnce(hotPath, current,
+// Disabling the check: delete `backupPath = backUpGeneratedPath(hotPath, current,
 // testHooks)` in writeRootHotProjectionUnlocked. The projection then replaces
 // the hand-authored file and the first assertion fails.
 test('BLOCKER: a failed backup write aborts the transition, the pre-migration file survives untouched', () => {
@@ -7476,6 +7477,37 @@ test('minor: a repeated backup of the SAME manual content reuses the first backu
     const third = writeRootHotProjection(dir);
     assert.equal(third.backedUp, true);
     assert.notEqual(third.backupPath, first.backupPath);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('backUpGeneratedPath backs up any generated view path, reuses a backup that holds the same bytes and numbers a different one', () => {
+  const dir = projectionWikiDir();
+  try {
+    for (const rel of ['projects/alpha/hot.md', 'hot.md']) {
+      const abs = join(dir, rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      const first = backUpGeneratedPath(abs, 'one\n');
+      assert.equal(first, `${abs}${ROOT_HOT_BACKUP_SUFFIX}`);
+      assert.equal(readFileSync(first, 'utf-8'), 'one\n');
+      assert.equal(backUpGeneratedPath(abs, 'one\n'), first, 'same bytes: the backup that exists');
+      assert.equal(existsSync(`${abs}.pre-projection-backup-2.md`), false);
+      const second = backUpGeneratedPath(abs, 'two\n');
+      assert.equal(second, `${abs}.pre-projection-backup-2.md`);
+      assert.equal(backUpGeneratedPath(abs, 'two\n'), second);
+      assert.equal(backUpGeneratedPath(abs, 'one\n'), first, 'an older backup is still found');
+    }
+    const injected = new Error('injected');
+    assert.throws(
+      () =>
+        backUpGeneratedPath(join(dir, 'projects/alpha/hot.md'), 'three\n', {
+          beforeBackupWrite: () => {
+            throw injected;
+          },
+        }),
+      injected,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
