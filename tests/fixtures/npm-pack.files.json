@@ -264,6 +264,10 @@
     "exec": false
   },
   {
+    "path": "hooks/session-views.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/shared.json",
     "exec": false
   },

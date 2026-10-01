@@ -27,6 +27,7 @@ import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { atomicWrite } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
+import { scopeVisible } from './session-entries.mjs';
 
 const HOME = homedir();
 
@@ -1504,13 +1505,13 @@ const ROOT_HOT_PROJECTION_MARKER = 'generated projection of `projects/*/hot.md`'
 // writeRootHotProjection sees content it does not own (readRootHotProjectionOwnership's
 // hash comparison, not a one-shot marker check), and there is no cap: each
 // unowned write that finds the plain suffix already taken gets its own
-// numbered path from nextRootHotBackupPath, without limit.
+// numbered path from nextGeneratedBackupPath, without limit.
 export const ROOT_HOT_BACKUP_SUFFIX = '.pre-projection-backup.md';
 
 // Root-anchored (leading `/`) so this only ever matches the backup sitting
 // next to hot.md itself, never an unrelated file elsewhere in the vault that
 // happens to share the tail of the name. The trailing `*` covers every
-// variant nextRootHotBackupPath can produce: the plain suffix, a `-2`/`-3`/...
+// variant nextGeneratedBackupPath can produce: the plain suffix, a `-2`/`-3`/...
 // counter, and the timestamp fallback.
 const ROOT_HOT_BACKUP_GITIGNORE_PATTERN = '/hot.md.pre-projection-backup*.md';
 
@@ -1522,7 +1523,7 @@ const ROOT_HOT_BACKUP_GITIGNORE_PATTERN = '/hot.md.pre-projection-backup*.md';
 // on the next start, and nothing reads or removes it, so `git add -A`
 // exposes it. The glob's `*` matches the `.md` in the middle too (gitignore
 // globs don't stop at `.`, only at `/`), so this one pattern covers the temp
-// name for every backupPath variant nextRootHotBackupPath can produce.
+// name for every backupPath variant nextGeneratedBackupPath can produce.
 const ROOT_HOT_BACKUP_TMP_GITIGNORE_PATTERN = '/hot.md.pre-projection-backup*.tmp';
 
 /**
@@ -1720,7 +1721,7 @@ export function rootHotProjectionIsCurrent(hypoDir, sessionId) {
  * the backup step entirely, and overwrote hot.md anyway. Every later
  * non-owned overwrite now gets its own place to land instead.
  */
-function nextRootHotBackupPath(hotPath) {
+function nextGeneratedBackupPath(hotPath) {
   const plain = `${hotPath}${ROOT_HOT_BACKUP_SUFFIX}`;
   if (!existsSync(plain)) return plain;
   const stem = ROOT_HOT_BACKUP_SUFFIX.slice(0, -'.md'.length); // '.pre-projection-backup'
@@ -1735,8 +1736,9 @@ function nextRootHotBackupPath(hotPath) {
 }
 
 /**
- * Back `content` up next to `hotPath`, unless a backup already holds exactly
- * these bytes.
+ * Back `content` up next to `hotPath` (any generated view's absolute path, not
+ * only the root hot.md: the session view writer and the pull resolution use
+ * the same function), unless a backup already holds exactly these bytes.
  *
  * minor fix: the backup and the `.gitignore` update run BEFORE the write that
  * replaces hot.md, so a write that fails afterwards (disk full, a rename
@@ -1747,7 +1749,7 @@ function nextRootHotBackupPath(hotPath) {
  * makes the retry converge instead: one backup per distinct content, however
  * many times the write after it fails.
  *
- * Reuses nextRootHotBackupPath's candidate order, so the paths checked here
+ * Reuses nextGeneratedBackupPath's candidate order, so the paths checked here
  * are exactly the ones a fresh backup could occupy, and an unreadable
  * candidate counts as "not a match" (the safe direction: one extra copy, not
  * a skipped one).
@@ -1758,7 +1760,7 @@ function nextRootHotBackupPath(hotPath) {
  * the projection write fails there too.
  * @returns {string} the backup path now holding `content`, fresh or reused
  */
-function backUpOnce(hotPath, content, testHooks) {
+export function backUpGeneratedPath(hotPath, content, testHooks) {
   const stem = ROOT_HOT_BACKUP_SUFFIX.slice(0, -'.md'.length);
   const holdsContent = (candidate) => {
     try {
@@ -1778,10 +1780,63 @@ function backUpOnce(hotPath, content, testHooks) {
       if (holdsContent(candidate)) return candidate;
     }
   }
-  const fresh = nextRootHotBackupPath(hotPath);
+  const fresh = nextGeneratedBackupPath(hotPath);
   testHooks?.beforeBackupWrite?.(fresh);
   atomicWrite(fresh, content);
   return fresh;
+}
+
+// ── vault git path helpers ───────────────────────────────────────────────────
+// The vault may be a subdirectory of a larger repository. `<rev>:./<path>` makes
+// git resolve the path from the vault; `update-index --cacheinfo` and other
+// repository-root paths take `vaultGitPrefix` in front instead.
+
+const vaultGit = (hypoDir, args) =>
+  spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
+
+/** `<rev>:./<relPath>`: a `git show` / `cat-file` argument resolved from the vault. */
+export function revPathArg(rev, relPath) {
+  return `${rev}:./${relPath}`;
+}
+
+/** Whether HEAD's tree has `relPath` (a blob or a tree). False with no HEAD or no repository. */
+export function pathInHead(hypoDir, relPath) {
+  return vaultGit(hypoDir, ['cat-file', '-e', revPathArg('HEAD', relPath)]).status === 0;
+}
+
+/** The vault's path inside its repository (`vault/`, or `''` at the top or outside a repository). */
+export function vaultGitPrefix(hypoDir) {
+  const r = vaultGit(hypoDir, ['rev-parse', '--show-prefix']);
+  return r.status === 0 ? r.stdout.replace(/\r?\n$/, '') : '';
+}
+
+/**
+ * Which of `relPaths` carry uncommitted changes: `{staged, unstaged}`. `staged` is where the index
+ * differs from HEAD, `unstaged` where the working tree differs from the index (so a path staged and
+ * then edited again is in both). Each path is a literal pathspec of its own, so `*` and `:` in a
+ * name mean themselves. Untracked files are not changes here. When git cannot answer (no HEAD, not
+ * a repository) every path is reported in both lists: this decides whether it is safe to start, so
+ * the failure must land on the side that stops.
+ */
+export function localChangesOn(hypoDir, relPaths) {
+  if (!relPaths.length) return { staged: [], unstaged: [] };
+  const specs = relPaths.map((p) => `:(literal)${p}`);
+  const names = (args) => {
+    const r = vaultGit(hypoDir, args);
+    return r.status === 0 ? r.stdout.split('\0').filter(Boolean) : null;
+  };
+  const staged = names([
+    'diff',
+    '--cached',
+    '--name-only',
+    '-z',
+    '--relative',
+    'HEAD',
+    '--',
+    ...specs,
+  ]);
+  const unstaged = names(['diff', '--name-only', '-z', '--relative', '--', ...specs]);
+  return { staged: staged ?? [...relPaths], unstaged: unstaged ?? [...relPaths] };
 }
 
 /**
@@ -2025,7 +2080,7 @@ export function renderRootHotProjection(hypoDir) {
  * function itself last wrote (a hand-authored hot.md, one written before
  * this projection existed, or ANY later external overwrite, per
  * ownershipMatches), the existing bytes are backed up next to it
- * (nextRootHotBackupPath: the plain `hot.md` + ROOT_HOT_BACKUP_SUFFIX name if
+ * (nextGeneratedBackupPath: the plain `hot.md` + ROOT_HOT_BACKUP_SUFFIX name if
  * free, else a numbered variant, so a second external overwrite after the
  * first migration backup still lands somewhere instead of being silently
  * destroyed) before the projection is written. Immediately before that FIRST
@@ -2056,7 +2111,7 @@ export function renderRootHotProjection(hypoDir) {
  * major finding in r5-w1.md for why that is not pursued here).
  * @param {string} hypoDir
  * @param {{ beforeFinalWrite?: (hotPath: string) => void, beforeBackupWrite?: (backupPath: string) => void }} [testHooks]
- *   `beforeBackupWrite` is test-only too: see backUpOnce.
+ *   `beforeBackupWrite` is test-only too: see backUpGeneratedPath.
  *   `beforeFinalWrite` is test-only: called with `hotPath` right after the
  *   second read below and before the final `atomicWrite`, so a test can
  *   write NEW bytes to `hotPath` at exactly the point a real concurrent
@@ -2147,7 +2202,7 @@ function writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId) {
   };
   if (current !== null && !ownershipMatches(hypoDir, current)) {
     gitignoreUpdated = ensureBackupIgnored();
-    backupPath = backUpOnce(hotPath, current, testHooks);
+    backupPath = backUpGeneratedPath(hotPath, current, testHooks);
     backedUp = true;
   }
   // major fix (TOCTOU narrowing): re-read right before the write that
@@ -2183,7 +2238,7 @@ function writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId) {
   }
   if (latest !== current && latest !== null && !ownershipMatches(hypoDir, latest)) {
     if (!gitignoreUpdated) gitignoreUpdated = ensureBackupIgnored();
-    backupPath = backUpOnce(hotPath, latest, testHooks);
+    backupPath = backUpGeneratedPath(hotPath, latest, testHooks);
     backedUp = true;
   }
   // atomicWrite, not writeFileSync: this write now happens at BOTH
@@ -7906,19 +7961,7 @@ export function readVisibilityScope(raw) {
 }
 
 // The single visibility decision, shared by lookup / query / file-watch /
-// page-usage / crystallize. `scopeValue` is a readVisibilityScope() output,
-// `device` a currentDevice() output. Prefix dispatch, fail-open on anything
-// unrecognized so the field is purely additive:
-//   ''/'shared'       → visible (the implicit default of every pre-existing page)
-//   'machine:<owner>' → visible only on the owning machine. Empty owner
-//                       (`machine:`) hides everywhere: '' can never equal
-//                       currentDevice()'s non-empty fallback.
-//   'agent:<id>'      → visible; value space reserved, no writer yet (forward-compat)
-//   anything else     → visible (fail-open)
-export function scopeVisible(scopeValue, device) {
-  const v = String(scopeValue || '').trim();
-  if (v === '' || v === 'shared') return true;
-  if (v.startsWith('machine:')) return v.slice('machine:'.length) === device;
-  if (v.startsWith('agent:')) return true;
-  return true;
-}
+// page-usage / crystallize. Its definition lives in session-entries.mjs, which
+// the generated views need and which cannot import this file; re-exported here
+// so every existing caller keeps its import.
+export { scopeVisible };
