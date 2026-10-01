@@ -41,6 +41,8 @@ export const GITIGNORE_BLOCK = `# Hypomnema: session views generated from projec
 
 export const GITATTRIBUTES_BLOCK = `# Hypomnema: session-log shards are append-only, keep both sides on a merge
 projects/*/session-log/*.md merge=union
+# Session entries are parsed byte-exact: keep LF in the working tree even where autocrlf is on
+projects/*/sessions/*.md text eol=lf
 `;
 
 function fail(code, message) {
@@ -139,7 +141,13 @@ export function formatSessionEntry(obj) {
   const date = scalar('date', obj.date, DATE_RE);
   const tracks = obj.tracks;
   const trackProblem = validateTracks(tracks);
-  if (trackProblem) throw fail(trackProblem, `invalid tracks: ${trackProblem}`);
+  if (trackProblem) {
+    // The plan names three codes; the finer reason stays in the message.
+    throw fail(
+      trackProblem === 'duplicate-track-id' ? trackProblem : 'invalid-entry',
+      `invalid tracks: ${trackProblem}`,
+    );
+  }
   const bodies = obj.bodies ?? {};
   for (const id of Object.keys(bodies)) {
     if (!tracks.some((t) => t.id === id)) {
@@ -193,6 +201,7 @@ function frontmatterEnd(text) {
 export function parseSessionEntry(text) {
   const bad = (reason) => ({ ok: false, reason });
   if (typeof text !== 'string') return bad('not-text');
+  text = text.replaceAll('\r\n', '\n'); // a CRLF checkout (autocrlf) parses as the LF original
   const fmEnd = frontmatterEnd(text);
   if (fmEnd === -1) return bad('no-frontmatter');
   const fm = {};
@@ -348,11 +357,18 @@ export function closeIdFor(sessionId, openedAtIndex) {
 
 // ── path predicates ──────────────────────────────────────────────────────────
 
+/**
+ * The project slug of `projects/<slug>/hot.md` or `projects/<slug>/session-state.md` (depth 1, not
+ * `_template`); `null` for the root `hot.md` and for any other path.
+ */
+export function generatedViewSlug(relPath) {
+  const m = /^projects\/([^/]+)\/(?:hot|session-state)\.md$/.exec(relPath);
+  return m !== null && m[1] !== '_template' ? m[1] : null;
+}
+
 /** `hot.md`, `projects/<slug>/hot.md`, `projects/<slug>/session-state.md` (depth 1, not `_template`). */
 export function isGeneratedViewPath(relPath) {
-  if (relPath === 'hot.md') return true;
-  const m = /^projects\/([^/]+)\/(?:hot|session-state)\.md$/.exec(relPath);
-  return m !== null && m[1] !== '_template';
+  return relPath === 'hot.md' || generatedViewSlug(relPath) !== null;
 }
 
 /** `projects/<slug>/sessions/<file>.md`, depth fixed. */
@@ -384,7 +400,7 @@ export function narrowestVisibilityScope(values) {
 }
 
 function splitLines(text) {
-  const lines = text.split('\n');
+  const lines = text.split('\n').map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
   if (lines.at(-1) === '') lines.pop();
   return lines;
 }
