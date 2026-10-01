@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'fs';
 import { join, relative, basename, resolve } from 'path';
+import { sessionViewPathsOf } from '../../hooks/session-entries.mjs';
 
 export function loadHypoIgnore(hypoDir) {
   const ignorePath = join(hypoDir, '.hypoignore');
@@ -95,7 +96,19 @@ export function isScanIgnored(filePath, hypoDir, patterns) {
   );
 }
 
+// A session entry is ignored when the patterns ignore it or either generated view of its project
+// (the entry is the source of those views). hooks/hypo-shared.mjs has the same second look in its
+// own isIgnored; keep the two in step.
 export function isIgnored(filePath, hypoDir, patterns) {
+  if (matchesIgnorePatterns(filePath, hypoDir, patterns)) return true;
+  const views = sessionViewPathsOf(relative(hypoDir, filePath).replace(/\\/g, '/'));
+  return (
+    views !== null &&
+    views.some((view) => matchesIgnorePatterns(join(hypoDir, view), hypoDir, patterns))
+  );
+}
+
+function matchesIgnorePatterns(filePath, hypoDir, patterns) {
   const rel = relative(hypoDir, filePath).replace(/\\/g, '/');
   const base = basename(filePath);
 

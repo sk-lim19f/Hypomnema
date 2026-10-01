@@ -27,7 +27,7 @@ import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { atomicWrite } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
-import { scopeVisible } from './session-entries.mjs';
+import { scopeVisible, sessionViewPathsOf } from './session-entries.mjs';
 
 const HOME = homedir();
 
@@ -7887,7 +7887,20 @@ export function loadHypoIgnore(hypoDir) {
     .filter((l) => l && !l.startsWith('#'));
 }
 
+// A session entry (`projects/<p>/sessions/<file>.md`) is ignored when the pattern list ignores the
+// entry itself or either generated view of its project: the entry is the source of those views,
+// so a project hidden from git by its view paths must not leak through its source files.
+// scripts/lib/hypo-ignore.mjs carries the same second look; keep the two in step.
 export function isIgnored(filePath, hypoDir, patterns) {
+  if (matchesIgnorePatterns(filePath, hypoDir, patterns)) return true;
+  const views = sessionViewPathsOf(relative(hypoDir, filePath).replace(/\\/g, '/'));
+  return (
+    views !== null &&
+    views.some((view) => matchesIgnorePatterns(join(hypoDir, view), hypoDir, patterns))
+  );
+}
+
+function matchesIgnorePatterns(filePath, hypoDir, patterns) {
   const rel = relative(hypoDir, filePath).replace(/\\/g, '/');
   const base = basename(filePath);
   for (const pattern of patterns) {

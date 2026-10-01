@@ -51,6 +51,7 @@ import {
 import {
   consumeRootHotHealthNotice,
   formatRootHotProjection,
+  isIgnored as isIgnoredHooks,
   localChangesOn,
   pathInHead,
   resolveActiveProject,
@@ -73,6 +74,7 @@ import {
   writeGeneratedViews,
   writeGeneratedViewsUnlocked,
 } from '../hooks/session-views.mjs';
+import { isIgnored as isIgnoredScripts } from '../scripts/lib/hypo-ignore.mjs';
 import { test, suite } from './harness.mjs';
 import { SESSION_TMP_HOME, withTmpDir } from './helpers.mjs';
 
@@ -1520,6 +1522,34 @@ test('projects and root choose what is written', () => {
   });
 });
 
+test('a project .hypoignore hides gets no views and no root row, the others are unaffected', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir, ['p', 'secret']);
+    put(dir, '.hypoignore', 'projects/secret/hot.md\n');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(r.written.sort(), ['hot.md', VIEW, 'projects/p/session-state.md'].sort());
+    assert.equal(existsSync(join(dir, 'projects/secret/hot.md')), false);
+    assert.equal(existsSync(join(dir, 'projects/secret/session-state.md')), false);
+    assert.ok(!readRel(dir, 'hot.md').includes('secret'), 'the root table has no secret row');
+    assert.match(readRel(dir, 'hot.md'), /\bp\b/);
+  });
+});
+
+test('naming a project in `projects` does not write it while .hypoignore hides it, and without the pattern it is written', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir, ['p', 'secret']);
+    put(dir, '.hypoignore', 'projects/secret/session-state.md\n');
+    const hidden = writeGeneratedViews(dir, { ...WRITE, projects: ['secret'], root: false });
+    assert.deepEqual(hidden.written, []);
+    unlinkSync(join(dir, '.hypoignore'));
+    const shown = writeGeneratedViews(dir, { ...WRITE, projects: ['secret'], root: false });
+    assert.deepEqual(shown.written.sort(), [
+      'projects/secret/hot.md',
+      'projects/secret/session-state.md',
+    ]);
+  });
+});
+
 test('the machine filter applies per device on write', () => {
   withTmpDir((dir) => {
     seedProjects(dir);
@@ -1683,3 +1713,34 @@ test('when git cannot answer, localChangesOn reports every path changed so the c
     });
   });
 });
+
+// ── .hypoignore covers a project's session entries ───────────────────────────
+
+suite('.hypoignore: a project hidden by its view paths hides its entries too');
+
+const IGNORE_DIR = '/tmp/ignore-vault';
+const ignoredIn = (isIgnored, rel, patterns) =>
+  isIgnored(join(IGNORE_DIR, rel), IGNORE_DIR, patterns);
+
+// The two `isIgnored` copies are separate code (hooks cannot import scripts/), so every case runs
+// against both and a divergence between them shows up as a failure of one name.
+for (const [name, isIgnored] of [
+  ['hooks/hypo-shared isIgnored', isIgnoredHooks],
+  ['scripts/lib/hypo-ignore isIgnored', isIgnoredScripts],
+]) {
+  test(`${name}: a view pattern covers that project's entries and no other project's`, () => {
+    for (const pattern of ['projects/secret/hot.md', 'projects/secret/session-state.md']) {
+      assert.equal(ignoredIn(isIgnored, 'projects/secret/sessions/x.md', [pattern]), true, pattern);
+      assert.equal(ignoredIn(isIgnored, 'projects/other/sessions/x.md', [pattern]), false, pattern);
+    }
+  });
+
+  test(`${name}: only an entry path gets the second look, and a directory pattern still matches`, () => {
+    const pattern = ['projects/secret/hot.md'];
+    assert.equal(ignoredIn(isIgnored, 'projects/secret/notes.md', pattern), false);
+    assert.equal(ignoredIn(isIgnored, 'projects/secret/sessions/sub/x.md', pattern), false);
+    assert.equal(ignoredIn(isIgnored, 'projects/secret/hot.md', pattern), true);
+    assert.equal(ignoredIn(isIgnored, 'projects/secret/sessions/x.md', ['projects/secret/']), true);
+    assert.equal(ignoredIn(isIgnored, 'projects/secret/sessions/x.md', []), false);
+  });
+}
