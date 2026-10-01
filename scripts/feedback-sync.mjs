@@ -314,8 +314,13 @@ function memoryTarget(args, projectId) {
       (p.fm.scope === 'global' || p.fm.scope === `project:${projectId}`) &&
       p.targets.includes('project-memory') &&
       PUBLIC_SENSITIVITY.has(p.fm.sensitivity),
-    render: (p) =>
-      `- [${p.fm.title || p.slug}](feedback_${p.slug}.md) — ${p.fm.memory_summary || ''}`.trim(),
+    // Colon separator, not a dash: a model that reads this index copies the line's
+    // shape when it adds an entry by hand, and a dash separator also collides with
+    // dashes inside a summary. parseMemoryIndex still reads the legacy dash form.
+    render: (p) => {
+      const summary = p.fm.memory_summary || '';
+      return `- [${p.fm.title || p.slug}](feedback_${p.slug}.md)${summary ? `: ${summary}` : ''}`;
+    },
     // full-copy individual files owned entirely by sync (contract §7); the
     // provenance header marks them as tool-generated for safe staleness removal
     sideFiles: (p) => [
@@ -344,7 +349,11 @@ function claudeTarget(args) {
     render: (p) => {
       const date = (p.fm.updated || p.fm.date || '').slice(0, 10);
       const datePart = date ? `[${date}] ` : '';
-      return `- ${datePart}${p.fm.global_summary || ''} — 근거: [[${p.slug}]]`;
+      // Period before 근거 instead of the legacy dash; no doubled period when the
+      // summary already ends in terminal punctuation.
+      const summary = (p.fm.global_summary || '').trim();
+      const sep = !summary ? '' : /[.!?]$/.test(summary) ? ' ' : '. ';
+      return `- ${datePart}${summary}${sep}근거: [[${p.slug}]]`;
     },
     sideFiles: () => [],
   };
@@ -913,7 +922,9 @@ function parseLearnedBehaviors(content) {
 }
 
 // Parse MEMORY.md index for sync-shaped feedback entries:
-//   `- [Title](feedback_<name>.md) — summary`
+//   `- [Title](feedback_<name>.md): summary`
+// A legacy dash separator before the summary is read too (older projections and
+// hand-written lines).
 // Non-`feedback_*` index lines are out of scope (not feedback projections).
 function parseMemoryIndex(content) {
   const out = [];
@@ -921,7 +932,7 @@ function parseMemoryIndex(content) {
   // index lines inside a HYPO:FEEDBACK-SYNC block already have a wiki SoT and must
   // not be re-drafted as legacy entries.
   const scrubbed = content.replace(BLOCK_RE, '');
-  const re = /^- \[([^\]]*)\]\(feedback_([^)]+?)\.md\)\s*(?:—\s*(.*\S))?\s*$/gm;
+  const re = /^- \[([^\]]*)\]\(feedback_([^)]+?)\.md\)\s*(?:(?::|—)\s*(.*\S))?\s*$/gm;
   let m;
   while ((m = re.exec(scrubbed)) !== null) {
     out.push({ title: m[1].trim(), name: m[2].trim(), summary: (m[3] || '').trim() });
@@ -1215,7 +1226,7 @@ function runEnsureContainer(args) {
     `${sep}\n` +
     '<!-- Added by `hypomnema feedback-sync --ensure-container`: this pair is the managed\n' +
     'region feedback-sync projects wiki-sourced learned behaviors into. Do not hand-edit its\n' +
-    'contents — a hand-edit becomes a sync conflict. -->\n' +
+    'contents: a hand-edit becomes a sync conflict. -->\n' +
     '<learned_behaviors>\n</learned_behaviors>\n';
   try {
     atomicWrite(file, content + addition);
