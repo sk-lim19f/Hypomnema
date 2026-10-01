@@ -1944,10 +1944,10 @@ test('w8-edge: design-history body has no date heading → stale, diffDays=null'
   });
 });
 
-test('w8-edge: invalid date headings (## [2026-13-01]) are filtered, no Invalid Date crash', () => {
-  // codex 2-worker pre-commit review CONCERN: `new Date('2026-13-01')` is an
-  // Invalid Date and `toISOString()` on it throws RangeError. Guarantee the
-  // parser silently drops malformed dates instead of crashing all of lint.
+test('w8-edge: invalid date headings (## [2026-13-01]) are reported as calendarOverflow, no Invalid Date crash', () => {
+  // `new Date('2026-13-01')` is an Invalid Date and `toISOString()` on it
+  // throws RangeError. The parser must not crash all of lint on it, and must
+  // not drop it silently either: it comes back as a calendarOverflow literal.
   withTmpDir((root) => {
     setupDhProject(root, 'p8', {
       dh: '## 2026-05-10\nfoo\n',
@@ -1956,6 +1956,9 @@ test('w8-edge: invalid date headings (## [2026-13-01]) are filtered, no Invalid 
     const stale = findDesignHistoryStale(root);
     assert.equal(stale.length, 1);
     assert.equal(stale[0].lastSession, '2026-05-20');
+    assert.deepEqual(stale[0].calendarOverflow, [
+      { literal: '2026-13-01', file: 'projects/p8/session-log.md' },
+    ]);
   });
 });
 
@@ -1992,24 +1995,116 @@ test('w8-edge: calendar-overflow heading (## 2026-02-30) is filtered, not normal
   });
 });
 
-test('w8-edge: calendar-overflow session-log heading (## [2026-02-30]) still counts, no lost finding', () => {
-  // Tightening the session-log side to the same strict parser as the
-  // design-history side emptied sessionDates for a project whose only entry
-  // carried a calendar-overflow date, and both the W8 stale verdict and the
-  // W14 missing verdict silently disappeared with it. The session-log side
-  // stays lenient on purpose: `new Date('2026-02-30')` normalizes to March 2
-  // instead of failing, and that later date is exactly what should trip this
-  // stale comparison against `## 2026-02-20` in design-history.
+test('w8-edge: calendar-overflow session-log heading (## [2026-02-30]) is reported, not normalized into 03-02', () => {
+  // The heading must neither be dropped (sessionDates would empty and both W8
+  // and W14 would vanish) nor read as March 2 (that invents a 2-day gap).
   withTmpDir((root) => {
     setupDhProject(root, 'p11', {
-      dh: '## 2026-02-20\nfoo\n',
+      dh: '## 2026-02-28\nfoo\n',
       sessionLogMd: '## [2026-02-30] s\n',
     });
     const stale = findDesignHistoryStale(root);
     assert.equal(stale.length, 1);
     assert.equal(stale[0].kind, 'stale');
-    assert.equal(stale[0].lastSession, '2026-03-02');
-    assert.equal(stale[0].lastDesignHistory, '2026-02-20');
+    assert.deepEqual(stale[0].calendarOverflow, [
+      { literal: '2026-02-30', file: `projects/${stale[0].project}/session-log.md` },
+    ]);
+    assert.equal(stale[0].diffDays, null); // not the invented 2
+    assert.equal(stale[0].lastSession, null); // not '2026-03-02'
+    assert.equal(stale[0].lastDesignHistory, '2026-02-28');
+  });
+});
+
+test('w8-edge: overflow heading is not silent when design-history equals the normalized date', () => {
+  // new Date('2026-02-30') is March 2, not later than a design-history of
+  // 2026-03-02, so the normalizing read raised nothing at all.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p11b', {
+      dh: '## 2026-03-02\nfoo\n',
+      sessionLogMd: '## [2026-02-30] s\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.deepEqual(stale[0].calendarOverflow, [
+      { literal: '2026-02-30', file: `projects/${stale[0].project}/session-log.md` },
+    ]);
+    assert.equal(stale[0].diffDays, null);
+  });
+});
+
+test('w8-edge: calendar boundaries (leap day, April 31, year 0000) sort into real dates or overflow', () => {
+  // 2024-02-29 is a real leap day and 0000-01-01 is a real proleptic date, so both count as
+  // dates; 2026-02-29 and 2026-04-31 do not exist and land in calendarOverflow, unnormalised.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p11f', {
+      dh: '## 2023-01-01\nfoo\n',
+      sessionLogMd:
+        '## [2024-02-29] a\n\n## [2026-02-29] b\n\n## [2026-04-31] c\n\n## [0000-01-01] d\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2024-02-29');
+    assert.equal(stale[0].realLater, true);
+    assert.deepEqual(
+      stale[0].calendarOverflow.map((o) => o.literal),
+      ['2026-02-29', '2026-04-31'],
+    );
+  });
+  // 0000-01-01 alone, no design-history: read as a date it makes a missing finding with that
+  // lastSession; dropped, it would make no finding at all.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p11g', { sessionLogMd: '## [0000-01-01] d\n' });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].kind, 'missing');
+    assert.equal(stale[0].lastSession, '0000-01-01');
+    assert.deepEqual(stale[0].calendarOverflow, []);
+  });
+});
+
+test('w8-edge: overflow heading is not hidden by an older real date that design-history covers', () => {
+  // The real date (02-20) is not later than design-history (02-28), so only the
+  // overflow literal itself can raise the finding; lastSession is not null here.
+  withTmpDir((root) => {
+    setupDhProject(root, 'p11e', {
+      dh: '## 2026-02-28\nfoo\n',
+      sessionLogMd: '## [2026-02-30] a\n\n## [2026-02-20] b\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-02-20');
+    assert.equal(stale[0].diffDays, null);
+    assert.deepEqual(stale[0].calendarOverflow, [
+      { literal: '2026-02-30', file: `projects/${stale[0].project}/session-log.md` },
+    ]);
+  });
+});
+
+test('w8-edge: overflow heading beside a real later date keeps the real diffDays', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p11c', {
+      dh: '## 2026-02-20\nfoo\n',
+      sessionLogMd: '## [2026-02-30] a\n\n## [2026-02-25] b\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].lastSession, '2026-02-25');
+    assert.equal(stale[0].diffDays, 5);
+    assert.deepEqual(stale[0].calendarOverflow, [
+      { literal: '2026-02-30', file: `projects/${stale[0].project}/session-log.md` },
+    ]);
+  });
+});
+
+test('w8-edge: only real dates → calendarOverflow is empty and diffDays unchanged', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p11d', {
+      dh: '## 2026-02-20\nfoo\n',
+      sessionLogMd: '## [2026-02-25] s\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.deepEqual(stale[0].calendarOverflow, []);
+    assert.equal(stale[0].diffDays, 5);
   });
 });
 
@@ -2192,6 +2287,113 @@ test('w8-lint-emits-id-and-posix-file-in-json', () => {
     assert.equal(w8[0].file, 'projects/demo/design-history.md');
     assert.ok(w8[0].message.includes('design-history stale'));
     assert.equal(w8[0].id, 'W8');
+  });
+});
+
+function lintWarnsFor(root, id, extraArgs = []) {
+  mkdirSync(join(root, 'pages'), { recursive: true });
+  const r = spawnSync(
+    process.execPath,
+    [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${root}`, '--json', ...extraArgs],
+    {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    },
+  );
+  // default (non-strict) --json exposes ids for W8 only, so match W14 by message
+  return (JSON.parse(r.stdout).warns || []).filter((w) =>
+    id === 'W14' ? w.message.includes('design-history missing') : w.id === id,
+  );
+}
+
+test('w19-lint-overflow-only: W19 not W8, no ">" comparison, names file and literal, leads with fixing the heading', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-03-02\nfoo\n',
+      sessionLogMd: '## [2026-02-30] s\n',
+    });
+    // W8 is the close-gate blocker; a heading typo must not be one.
+    assert.equal(lintWarnsFor(root, 'W8').length, 0, 'overflow alone is never W8');
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1);
+    const m = w19[0].message;
+    assert.ok(!m.includes('>'), `no false ordering claim: ${m}`);
+    assert.ok(m.includes('projects/demo/session-log.md: 2026-02-30'));
+    assert.ok(m.includes('실제 날짜로 고치세요'));
+    assert.ok(!/\d+일 차이/.test(m), 'no invented day gap');
+    assert.ok(
+      m.indexOf('실제 날짜로 고치세요') < m.indexOf('append'),
+      'fix-the-heading comes first',
+    );
+  });
+});
+
+test('w19-lint-strict: W19 is not promoted, exit 0 and still a warn', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '---\ntitle: dh\ntype: reference\nupdated: 2026-03-02\n---\n\n## 2026-03-02\nfoo\n',
+      sessionLogMd:
+        '---\ntitle: sl\ntype: session-log\nupdated: 2026-03-02\n---\n\n## [2026-02-30] s\n',
+    });
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    const r = runLintE(root, ['--strict']);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(r.status, 0, 'W19 is outside STRICT_PROMOTE_IDS');
+    assert.equal(parsed.ok, true);
+    assert.equal((parsed.warns || []).filter((w) => w.id === 'W19').length, 1);
+  });
+});
+
+test('w8-lint-real-later-with-overflow: a real later date keeps id W8 and its overflow tail', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-02-20\nfoo\n',
+      sessionLogMd: '## [2026-02-30] a\n\n## [2026-02-25] b\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W19', ['--strict']).length, 0);
+    const w8 = lintWarnsFor(root, 'W8');
+    assert.equal(w8.length, 1);
+    assert.ok(w8[0].message.includes('2026-02-30'));
+  });
+});
+
+test('w8-lint-overflow-beside-real-later-date: keeps the ">" message and the real gap, plus the overflow tail', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-02-20\nfoo\n',
+      sessionLogMd: '## [2026-02-30] a\n\n## [2026-02-25] b\n',
+    });
+    const m = lintWarnsFor(root, 'W8')[0].message;
+    assert.ok(m.includes('최신=2026-02-25 > design-history 최신=2026-02-20 (5일 차이)'));
+    assert.ok(m.includes('projects/demo/session-log.md: 2026-02-30'));
+    // Clearing W8 by appending to design-history would leave the bad heading in place, so the
+    // message must also say to fix it.
+    assert.ok(m.includes('이 헤딩 날짜도 실제 날짜로 고치세요'), m);
+  });
+});
+
+test('w14-lint-overflow-beside-real-date: missing design-history with a real date still says to fix the bad heading', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      sessionLogMd: '## [2026-02-30] a\n\n## [2026-02-25] b\n',
+    });
+    const all = lintWarnsFor(root, 'W14', ['--strict']);
+    assert.equal(all.length, 1);
+    const m = all[0].message;
+    assert.ok(m.includes('최신=2026-02-25'), m);
+    assert.ok(m.includes('projects/demo/session-log.md: 2026-02-30'), m);
+    assert.ok(m.includes('위 session-log 헤딩 날짜도 실제 날짜로 고치세요'), m);
+  });
+});
+
+test('w14-lint-overflow-only: missing design-history with no real date also says to fix the heading', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', { sessionLogMd: '## [2026-09-31] s\n' });
+    const w14 = lintWarnsFor(root, 'W14');
+    assert.equal(w14.length, 1);
+    assert.ok(w14[0].message.includes('(유효한 날짜 없음)'));
+    assert.ok(w14[0].message.includes('projects/demo/session-log.md: 2026-09-31'));
+    assert.ok(w14[0].message.includes('실제 날짜로 고치세요'));
   });
 });
 

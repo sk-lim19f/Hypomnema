@@ -24,39 +24,22 @@ const DESIGN_HISTORY_DATE_RE = /^## (\d{4}-\d{2}-\d{2})/gm;
 const NO_ADR_MARKER_RE = /ADR\s*없음/;
 const ADR_REF_RE = /ADR\s+\d{4}|decisions\/\d{4}/;
 
-// Two separate date validators, one per side of the comparison, because a
-// filter that is too eager to REJECT does opposite things to the two sides:
-// dropping a design-history heading only removes a candidate for lastDH
-// (pushes the verdict toward MORE staleness, safe), but dropping a
-// session-log heading can empty sessionDates entirely and erase the finding
-// altogether (an actually-stale or actually-missing project reads as clean).
-// Both filters stay conservative in the direction that never hides a real
-// gap: reject on the design-history side, accept on the session-log side.
-
-// design-history heading dates: strict. `new Date('2026-13-01')` is an
-// Invalid Date (would crash `toISOString()` with RangeError and poison `>`
-// comparisons inside maxDate), but `new Date('2026-02-30')` silently
-// normalizes to March 2 instead of failing, so a plain Invalid-Date check let
-// a calendar-overflow heading through looking like a real, later date and
-// made a stale design-history read as caught up. parseStrictDate (lib/time.mjs)
-// rejects both classes by round-tripping year/month/day through a UTC Date and
-// checking they come back unchanged.
+// design-history heading dates: a calendar-overflow literal (`2026-02-30`,
+// month 13) is dropped. `new Date('2026-02-30')` silently normalizes to March
+// 2 instead of failing, so a plain Invalid-Date check let it through looking
+// like a real, later date and made a stale design-history read as caught up.
+// Dropping only removes a candidate for lastDH (pushes the verdict toward MORE
+// staleness, safe). parseStrictDate (lib/time.mjs) round-trips year/month/day
+// through a UTC Date to catch both classes.
+//
+// The session-log side must NOT drop such a literal: a project whose only
+// design-relevant entry carries one would then have an empty sessionDates, and
+// BOTH the W8 stale verdict and the W14 missing verdict would vanish. It must
+// not normalize it either, which would invent a day difference. So
+// parseSessionDates keeps it apart, as a literal, in `overflow`: the verdict
+// is still reported, and no diffDays is derived from it.
 function isValidDesignHistoryDate(literal) {
   return parseStrictDate(literal) != null;
-}
-
-// session-log heading dates: the pre-strict-parser check, kept on purpose.
-// Tightening this side to parseStrictDate looked like the same fix, but a
-// project whose only design-relevant entry carries a calendar-overflow
-// heading (`## [2026-02-30]`) would then filter out of sessionDates
-// entirely, and with it BOTH the W8 stale verdict and the W14 missing
-// verdict that depend on sessionDates being non-empty (reviewer repro: a
-// project stale at base with lastSession 2026-03-02 > design-history
-// 2026-02-20 produced no finding at all once this side went strict). This
-// side accepts anything `new Date` can parse at all, so it still errs toward
-// reporting rather than toward silence.
-function isValidSessionLogDate(literal) {
-  return !Number.isNaN(new Date(literal).getTime());
 }
 
 function parseDates(text, pattern) {
@@ -73,6 +56,8 @@ function parseDates(text, pattern) {
 // Entries are sliced by heading start-index (not a single `$`-anchored block
 // regex — multiline `$` terminates at line ends, not true EOF, so the last
 // entry would be truncated). The last entry runs to EOF.
+// Returns { dates, overflow }: real dates as Date, calendar-overflow literals
+// as the original strings.
 function parseSessionDates(text) {
   const headings = [];
   SESSION_LOG_HEADING_RE.lastIndex = 0;
@@ -81,14 +66,21 @@ function parseSessionDates(text) {
     headings.push({ literal: m[1] ?? m[2], start: m.index });
   }
   const dates = [];
+  const overflow = [];
   for (let i = 0; i < headings.length; i++) {
     const body = text.slice(headings[i].start, headings[i + 1]?.start ?? text.length);
     // Exclude only an explicit no-design-change entry. An entry carrying both
     // the marker and an ADR reference is treated as a design entry (included).
     if (NO_ADR_MARKER_RE.test(body) && !ADR_REF_RE.test(body)) continue;
-    if (isValidSessionLogDate(headings[i].literal)) dates.push(new Date(headings[i].literal));
+    const { literal } = headings[i];
+    if (parseStrictDate(literal) != null) dates.push(new Date(literal));
+    else overflow.push(literal);
   }
-  return dates;
+  return { dates, overflow };
+}
+
+function isoDay(date) {
+  return date ? date.toISOString().slice(0, 10) : null;
 }
 
 function maxDate(dates) {
@@ -96,7 +88,17 @@ function maxDate(dates) {
   return dates.reduce((a, b) => (a > b ? a : b));
 }
 
-// Returns findings: { project, kind, lastSession, lastDesignHistory, diffDays }.
+// Returns findings:
+// { project, kind, lastSession, lastDesignHistory, diffDays, calendarOverflow,
+//   realLater }. `realLater` (kind 'stale' only) is true when a REAL date, not
+// an overflow literal, makes the project stale; false means the overflow
+// literals alone raised the finding.
+// `calendarOverflow` lists session-log headings, as { literal, file } with file
+// vault-relative, whose literal names a day that
+// does not exist. Any such literal makes a finding (it cannot be compared, so
+// it is never read as caught up). `lastSession` is the latest REAL date, null
+// when every heading overflowed, and `diffDays` is null unless that real date
+// is itself later than design-history.
 // `kind` is 'stale' (the file exists but session-log has moved past it) or
 // 'missing' (the file does not exist at all, yet session-log carries at least
 // one design-relevant entry). Date source is body section headings
@@ -123,19 +125,27 @@ export function findDesignHistoryStale(hypoDir) {
     // existsSync(dhPath) branch below, since a project with zero design-history
     // file still needs this to decide whether it has a design-relevant entry.
     const sessionDates = [];
+    const calendarOverflow = [];
+    const addSession = (text, file) => {
+      const r = parseSessionDates(text);
+      sessionDates.push(...r.dates);
+      calendarOverflow.push(...r.overflow.map((literal) => ({ literal, file })));
+    };
     const flatSlPath = join(projectDir, 'session-log.md');
     if (existsSync(flatSlPath)) {
-      sessionDates.push(...parseSessionDates(readFileSync(flatSlPath, 'utf-8')));
+      addSession(readFileSync(flatSlPath, 'utf-8'), `projects/${name}/session-log.md`);
     }
     const dirSlPath = join(projectDir, 'session-log');
     if (existsSync(dirSlPath) && statSync(dirSlPath).isDirectory()) {
       for (const entry of readdirSync(dirSlPath)) {
         if (!entry.endsWith('.md')) continue;
-        const text = readFileSync(join(dirSlPath, entry), 'utf-8');
-        sessionDates.push(...parseSessionDates(text));
+        addSession(
+          readFileSync(join(dirSlPath, entry), 'utf-8'),
+          `projects/${name}/session-log/${entry}`,
+        );
       }
     }
-    if (sessionDates.length === 0) continue;
+    if (sessionDates.length === 0 && calendarOverflow.length === 0) continue;
 
     if (!existsSync(dhPath)) {
       // The file was never created, so there is nothing to compare dates
@@ -147,9 +157,10 @@ export function findDesignHistoryStale(hypoDir) {
       stale.push({
         project: name,
         kind: 'missing',
-        lastSession: maxDate(sessionDates).toISOString().slice(0, 10),
+        lastSession: isoDay(maxDate(sessionDates)),
         lastDesignHistory: null,
         diffDays: null,
+        calendarOverflow,
       });
       continue;
     }
@@ -158,14 +169,16 @@ export function findDesignHistoryStale(hypoDir) {
     const lastSession = maxDate(sessionDates);
     const lastDH = maxDate(parseDates(dhText, DESIGN_HISTORY_DATE_RE));
 
-    if (!lastDH || lastSession > lastDH) {
-      const diffDays = lastDH ? Math.round((lastSession - lastDH) / DAY_MS) : null;
+    const pastDH = lastSession != null && lastDH != null && lastSession > lastDH;
+    if (!lastDH || lastSession == null || pastDH || calendarOverflow.length > 0) {
       stale.push({
         project: name,
         kind: 'stale',
-        lastSession: lastSession.toISOString().slice(0, 10),
+        lastSession: isoDay(lastSession),
         lastDesignHistory: lastDH ? lastDH.toISOString().slice(0, 10) : '(없음)',
-        diffDays,
+        diffDays: pastDH ? Math.round((lastSession - lastDH) / DAY_MS) : null,
+        calendarOverflow,
+        realLater: pastDH || (!lastDH && lastSession != null),
       });
     }
   }

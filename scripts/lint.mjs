@@ -15,7 +15,7 @@
  *                       so they exit 1. Opt-in gate for release-checklist /
  *                       pre-commit. Adding the flag did not change what default
  *                       mode emits; a new warning class still adds warnings
- *                       there, as every W9..W16 addition has.
+ *                       there, as every new warning class has.
  */
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
@@ -359,6 +359,11 @@ const synthesisPages = [];
 //                             PreCompact hook no longer blocks /compact, so
 //                             that set is what --check-session-close and
 //                             --mark-session-closed read, not a compact stop.
+//   W19 session-log-date-overflow → excluded, and its own id like W14: a
+//                             calendar-overflow heading with no real later
+//                             date is a typo, not staleness, and the gate's
+//                             "append to design-history" advice cannot clear
+//                             it, so it must stay out of the W8 blocker filter.
 //   W15 synthesis-stale     → excluded, same reason as W8/W14 (a freshness
 //                             signal to triage, not a content defect), and
 //                             its own id for the same reason W14 has one: the
@@ -757,22 +762,56 @@ for (const rel of closeRootTargets) {
 // --mark-session-closed refuses on; the PreCompact hook itself no longer stops
 // /compact. W14 stays a plain warn: never added to STRICT_PROMOTE_IDS, never
 // matched by that W8-only filter.
+//
+// W19: the only thing wrong is a calendar-overflow session-log heading and no
+// real date is later than design-history. That is a typo in a heading, not
+// staleness: appending to design-history or writing "ADR 없음" does not clear
+// it, so as a W8 it would be a close-gate blocker the gate's own advice cannot
+// resolve. Own id for the same reason as W14, and also a plain warn.
 for (const s of findDesignHistoryStale(args.hypoDir)) {
+  // A calendar-overflow heading (## [2026-02-30]) is reported as written, never
+  // normalized into a neighbouring real date, so no day gap is derived from it.
+  // It makes a W8 finding whatever design-history says, so when the real dates
+  // are not later than design-history the ">" comparison would be false and
+  // "append to design-history" would not clear the warning. Only fixing the
+  // heading does, and that is what the message leads with.
+  const overflowList = s.calendarOverflow.map((o) => `${o.file}: ${o.literal}`).join(', ');
+  const lastSession = s.lastSession ?? '(유효한 날짜 없음)';
   if (s.kind === 'missing') {
+    const tail = overflowList ? ` [달력에 없는 session-log 헤딩: ${overflowList}]` : '';
+    const fix =
+      s.lastSession == null
+        ? ' 먼저 session-log 헤딩 날짜를 실제 날짜로 고치세요.'
+        : overflowList
+          ? ' 위 session-log 헤딩 날짜도 실제 날짜로 고치세요.'
+          : '';
     issue(
       'warn',
       `projects/${s.project}/design-history.md`,
-      `design-history missing: session-log 설계-관련 최신=${s.lastSession}인데 projects/${s.project}/design-history.md가 없습니다 — 파일을 새로 만들어 설계 변경 사항을 append 하는 것을 권고합니다`,
+      `design-history missing: session-log 설계-관련 최신=${lastSession}${tail}인데 projects/${s.project}/design-history.md가 없습니다 — 파일을 새로 만들어 설계 변경 사항을 append 하는 것을 권고합니다.${fix}`,
       null,
       'W14',
     );
     continue;
   }
+  if (!s.realLater) {
+    issue(
+      'warn',
+      `projects/${s.project}/design-history.md`,
+      `session-log heading date not on the calendar: session-log 헤딩 날짜가 달력에 없어 design-history와 날짜를 비교할 수 없습니다 (${overflowList}). 헤딩 날짜를 실제 날짜로 고치세요. 고친 뒤에도 session-log가 더 늦으면 projects/${s.project}/design-history.md에 설계 변경 사항을 append 하거나, 무-설계 세션이면 session-log 엔트리에 "ADR 없음" 마커를 명시하세요`,
+      null,
+      'W19',
+    );
+    continue;
+  }
   const gap = s.diffDays != null ? ` (${s.diffDays}일 차이)` : '';
+  const tail = overflowList
+    ? ` [달력에 없는 session-log 헤딩: ${overflowList}, 일 차이는 이 날짜로 계산하지 않음. 이 헤딩 날짜도 실제 날짜로 고치세요]`
+    : '';
   issue(
     'warn',
     `projects/${s.project}/design-history.md`,
-    `design-history stale: session-log 설계-관련 최신=${s.lastSession} > design-history 최신=${s.lastDesignHistory}${gap} — projects/${s.project}/design-history.md에 설계 변경 사항을 append 하거나, 무-설계 세션이면 session-log 엔트리에 "ADR 없음" 마커를 명시하세요`,
+    `design-history stale: session-log 설계-관련 최신=${lastSession} > design-history 최신=${s.lastDesignHistory}${gap}${tail} — projects/${s.project}/design-history.md에 설계 변경 사항을 append 하거나, 무-설계 세션이면 session-log 엔트리에 "ADR 없음" 마커를 명시하세요`,
     null,
     'W8',
   );
@@ -965,7 +1004,8 @@ if (args.json) {
   // it). Every other id stays internal unless `--strict` is set, where the full
   // set is exposed so promoted findings are traceable to their warning class.
   // A new rule does add warnings to default output; that is what a new rule is
-  // for, and W9 through W16 all did it.
+  // for, and every new warning class has done it (W19 included: it is a warn
+  // with no id in this mode, so the close gate never sees it).
   const toOut = ({ severity, file, message, id }) =>
     id && (id === 'W8' || args.strict)
       ? { severity, file, message, id }
