@@ -23,8 +23,10 @@ const ENTRY_SCHEMA = 1;
 // a close id never holds a space or a dot. The markers rely on that to be unambiguous.
 const CLOSE_ID_RE = /^[A-Za-z0-9_-]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-// Written into `title:` inside double quotes and into the project directory name.
-const PROJECT_RE = /^[^\r\n"\\/]+$/;
+// The vault project slug rule (hypo-shared `isProjectSlugDirectory`, scripts/lib/project-create.mjs):
+// `[A-Za-z0-9._-]`, not all dots, at least one alphanumeric. It is written unquoted into
+// `project:`, so a space or `#` would read differently in a generic frontmatter reader.
+const PROJECT_RE = /^(?!\.+$)(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$/;
 const BASELINE_TITLE = '이행 전 기록';
 
 // Byte-fixed blocks. Two machines that append them independently must produce the same change.
@@ -44,6 +46,23 @@ projects/*/session-log/*.md merge=union
 # Session entries are parsed byte-exact: keep LF in the working tree even where autocrlf is on
 projects/*/sessions/*.md text eol=lf
 `;
+
+/**
+ * How much of `block` (`GITIGNORE_BLOCK` or `GITATTRIBUTES_BLOCK`) `text` holds: `null` when the
+ * block's first line is not a line of `text`, else the block's pattern lines (every line after the
+ * first that is not a comment) that `text` lacks, in block order. `[]` means complete. Lines are
+ * compared trimmed and whole; order and neighbouring lines are not looked at, and nothing here
+ * rewrites `text`.
+ */
+export function missingBlockLines(text, block) {
+  const have = new Set(text.split('\n').map((l) => l.trim()));
+  const lines = block
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!have.has(lines[0])) return null;
+  return lines.slice(1).filter((l) => !l.startsWith('#') && !have.has(l));
+}
 
 function fail(code, message) {
   const err = new Error(message ?? code);
@@ -87,9 +106,16 @@ function markerOf(line, closeId) {
   return null;
 }
 
+// Section text as it is stored: every line ending is LF. The parser folds CRLF to LF before it
+// looks for markers, so a marker line ending in CRLF must be judged as the marker it becomes. A
+// lone CR is a line break here too (old Mac endings): left in, it could end up next to the `\n`
+// the writer appends and fold into a CRLF the check never saw. After this no CR remains, so the
+// parser's fold is a no-op on what the writer emits.
+const toLf = (text) => String(text).replace(/\r\n?/g, '\n');
+
 /** Throws (code `payload-reserved-marker`) if a line of `text` is a marker of this close id. */
 export function assertNoEntryMarkers(text, closeId) {
-  for (const line of String(text).split('\n')) {
+  for (const line of toLf(text).split('\n')) {
     if (markerOf(line, closeId)) {
       throw fail(
         'payload-reserved-marker',
@@ -165,13 +191,14 @@ export function formatSessionEntry(obj) {
   }
   head.push(`tracks: ${JSON.stringify(tracks)}`, '---');
 
-  const sections = [{ marker: entryMarker('summary', closeId), text: obj.summary }];
+  const sections = [{ marker: entryMarker('summary', closeId), text: toLf(obj.summary) }];
   for (const t of tracks) {
     if (!Object.hasOwn(bodies, t.id)) continue;
     if (typeof bodies[t.id] !== 'string')
       throw fail('invalid-entry', `body of ${t.id} not a string`);
-    sections.push({ marker: entryMarker('track', closeId, t.id), text: bodies[t.id] });
+    sections.push({ marker: entryMarker('track', closeId, t.id), text: toLf(bodies[t.id]) });
   }
+  // Checked and written as the same LF text.
   for (const s of sections) assertNoEntryMarkers(s.text, closeId);
 
   // `marker`, blank line, text, newline; a blank line joins sections. parse strips exactly this.
@@ -408,23 +435,20 @@ function splitLines(text) {
   return lines;
 }
 
-// The lines of `lines` that are not base lines, or null when a base line is missing or out of
-// order (leftmost greedy match, so a duplicated base line is matched to its first copy).
+// The lines `lines` appends after `base`, or null unless `lines` starts with every base line, in
+// order, unchanged. Only a tail addition counts: a line inserted in the middle would move the lines
+// after it, and `.gitignore` order decides how `!` rules read.
 function addedLines(base, lines) {
-  const added = [];
-  let b = 0;
-  for (const line of lines) {
-    if (b < base.length && line === base[b]) b++;
-    else added.push(line);
-  }
-  return b === base.length ? added : null;
+  if (lines.length < base.length || base.some((line, i) => lines[i] !== line)) return null;
+  return lines.slice(base.length);
 }
 
 /**
- * Merge two `.gitignore` edits of one base when both only added lines. `{ok: true, merged}`
+ * Merge two `.gitignore` edits of one base when both only appended lines. `{ok: true, merged}`
  * (theirs' bytes, then the lines only `ours` added, each once) or `{ok: false, reason}`. It
- * refuses a removed or reordered base line on either side, and a `!` line added on EITHER side:
- * a negation depends on where it sits among the other patterns, and appending reorders them.
+ * refuses a removed, reordered or middle-inserted base line on either side, and a `!` line added
+ * on EITHER side: a negation depends on where it sits among the other patterns, and appending
+ * reorders them.
  */
 export function mergeAdditiveGitignore(base, ours, theirs) {
   const baseLines = splitLines(base);

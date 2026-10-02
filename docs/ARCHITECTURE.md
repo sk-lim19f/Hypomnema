@@ -324,8 +324,9 @@ date the projection itself was last rewritten. A vault whose newest project row 
 keeps that same week-old date across every SessionStart and Stop until a project's own `hot.md`
 moves forward, even though the root file's bytes get recomputed and checked far more often.
 
-Before overwriting content it does not recognize as its own, the projection backs it up next to
-`hot.md` as `hot.md.pre-projection-backup.md` (or a numbered variant, `-2.md`, `-3.md`, ...). These
+Before overwriting content it does not recognize as its own, the projection backs it up under
+`.cache/backups/<relPath>` (for the root file, `.cache/backups/hot.md.pre-projection-backup.md`, or
+a numbered variant, `-2.md`, `-3.md`, ...). These
 backups are never cleaned up automatically. Delete the ones you no longer need by hand.
 
 The write itself goes through `writeRootHotProjection` in `hooks/hypo-shared.mjs`, which holds
