@@ -6483,7 +6483,7 @@ test('BLOCKER: a hand-authored hot.md is backed up, byte for byte, on the first 
       true,
       'the first overwrite of a non-projection file must back it up',
     );
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    const backupPath = join(dir, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
     assert.equal(result.backupPath, backupPath);
     assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
     assert.equal(
@@ -6508,7 +6508,7 @@ test('BLOCKER: the FIRST migration backup is never replaced, and a SECOND extern
     writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
     writeFileSync(join(dir, 'hot.md'), '# first manual content\n');
     writeRootHotProjection(dir); // migrates: backs up "# first manual content\n"
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    const backupPath = join(dir, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
     const firstBackupBytes = readFileSync(backupPath, 'utf-8');
     assert.equal(firstBackupBytes, '# first manual content\n');
 
@@ -6547,7 +6547,7 @@ test('BLOCKER: once a hot.md carries the projection marker, further writes never
   try {
     writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
     writeRootHotProjection(dir); // already projection-owned from the start, no prior manual content
-    assert.ok(!existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)));
+    assert.ok(!existsSync(join(dir, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)));
     writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' }); // force a real second write
     const result = writeRootHotProjection(dir);
     assert.equal(result.written, true);
@@ -6597,7 +6597,7 @@ test('BLOCKER: a failed backup write aborts the transition, the pre-migration fi
     assert.equal(thrown, injected, 'the backup failure must propagate, not be swallowed');
     assert.equal(backupAttempts, 1);
     assert.ok(
-      !existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)),
+      !existsSync(join(dir, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)),
       'a failed migration must not leave a half-written backup file behind either',
     );
     // Control: the same directory takes the projection once the backup can be
@@ -7196,7 +7196,7 @@ test('MAJOR: a hand-authored root hot.md backed up during SessionStart itself is
     const r = runStart(dir);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout);
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    const backupPath = join(dir, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
     assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
     assert.ok(
       out.systemMessage && out.systemMessage.includes(basename(backupPath)),
@@ -7228,7 +7228,7 @@ test('MAJOR: a hand-authored root hot.md backed up by the Stop-hook rebuild is n
     writeFileSync(join(dir, 'hot.md'), manual);
     const stop = runStop('hypo-hot-rebuild.mjs', dir);
     assert.equal(stop.status, 0, `stderr: ${stop.stderr}`);
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    const backupPath = join(dir, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
     assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
     // Stop's own rebuild already regenerated hot.md into the canonical
     // projection, so this SessionStart's own write is a no-op: the
@@ -7279,7 +7279,7 @@ test('MAJOR: a hand-authored root hot.md backed up by createProject reaches the 
 
     const result = createProject({ hypoDir: dir, name: 'beta', workingDir: '/tmp/beta' });
 
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    const backupPath = join(dir, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
     assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
     // Naming the file alone is not a recovery path (see the two Stop/
     // SessionStart tests above for why); both assertions below must hold,
@@ -7412,7 +7412,7 @@ test('BLOCKER: a held vault lock makes the projection decline to write, and say 
       'the writer must not replace bytes it could not take the lock for',
     );
     assert.equal(
-      existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)),
+      existsSync(join(dir, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)),
       false,
       'no backup either: the writer never ran, so it had nothing to back up',
     );
@@ -7467,7 +7467,7 @@ test('minor: a repeated backup of the SAME manual content reuses the first backu
       'identical content must land in the backup that already holds it, not a numbered copy',
     );
     assert.equal(
-      existsSync(join(dir, 'hot.md.pre-projection-backup-2.md')),
+      existsSync(join(dir, '.cache/backups', 'hot.md.pre-projection-backup-2.md')),
       false,
       'no second copy of bytes already backed up',
     );
@@ -7487,21 +7487,38 @@ test('backUpGeneratedPath backs up any generated view path, reuses a backup that
   try {
     for (const rel of ['projects/alpha/hot.md', 'hot.md']) {
       const abs = join(dir, rel);
-      mkdirSync(dirname(abs), { recursive: true });
-      const first = backUpGeneratedPath(abs, 'one\n');
-      assert.equal(first, `${abs}${ROOT_HOT_BACKUP_SUFFIX}`);
+      const base = join(dir, '.cache/backups', rel);
+      const first = backUpGeneratedPath(dir, abs, 'one\n');
+      assert.equal(
+        first,
+        `${base}${ROOT_HOT_BACKUP_SUFFIX}`,
+        'under .cache/backups, not beside the view',
+      );
+      assert.equal(
+        existsSync(`${abs}${ROOT_HOT_BACKUP_SUFFIX}`),
+        false,
+        'nothing next to the view',
+      );
       assert.equal(readFileSync(first, 'utf-8'), 'one\n');
-      assert.equal(backUpGeneratedPath(abs, 'one\n'), first, 'same bytes: the backup that exists');
-      assert.equal(existsSync(`${abs}.pre-projection-backup-2.md`), false);
-      const second = backUpGeneratedPath(abs, 'two\n');
-      assert.equal(second, `${abs}.pre-projection-backup-2.md`);
-      assert.equal(backUpGeneratedPath(abs, 'two\n'), second);
-      assert.equal(backUpGeneratedPath(abs, 'one\n'), first, 'an older backup is still found');
+      assert.equal(
+        backUpGeneratedPath(dir, abs, 'one\n'),
+        first,
+        'same bytes: the backup that exists',
+      );
+      assert.equal(existsSync(`${base}.pre-projection-backup-2.md`), false);
+      const second = backUpGeneratedPath(dir, abs, 'two\n');
+      assert.equal(second, `${base}.pre-projection-backup-2.md`);
+      assert.equal(backUpGeneratedPath(dir, abs, 'two\n'), second);
+      assert.equal(backUpGeneratedPath(dir, abs, 'one\n'), first, 'an older backup is still found');
     }
+    assert.throws(
+      () => backUpGeneratedPath(dir, join(dir, '..', 'outside.md'), 'x\n'),
+      /outside the vault/,
+    );
     const injected = new Error('injected');
     assert.throws(
       () =>
-        backUpGeneratedPath(join(dir, 'projects/alpha/hot.md'), 'three\n', {
+        backUpGeneratedPath(dir, join(dir, 'projects/alpha/hot.md'), 'three\n', {
           beforeBackupWrite: () => {
             throw injected;
           },

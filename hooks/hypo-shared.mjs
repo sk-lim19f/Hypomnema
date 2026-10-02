@@ -20,7 +20,7 @@ import {
   unlinkSync,
   linkSync,
 } from 'fs';
-import { join, relative, basename, dirname, isAbsolute } from 'path';
+import { join, relative, basename, dirname, isAbsolute, sep } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { randomBytes, createHash } from 'crypto';
@@ -1511,16 +1511,17 @@ const ROOT_HOT_PROJECTS_TEMPLATE_SLUG = '_template';
 // existed. See writeRootHotProjection's migration-backup step below.
 const ROOT_HOT_PROJECTION_MARKER = 'generated projection of `projects/*/hot.md`';
 
-// Sits next to hot.md itself so a person who opens the vault root finds it
-// without hunting: `hot.md.pre-projection-backup.md`. Written every time
+// File-name suffix of a view backup, now kept under `.cache/backups/` (see
+// VIEW_BACKUP_DIR_REL): `.cache/backups/hot.md.pre-projection-backup.md`. Earlier versions
+// wrote it next to hot.md, which is why the ignore patterns below stay. Written every time
 // writeRootHotProjection sees content it does not own (readRootHotProjectionOwnership's
 // hash comparison, not a one-shot marker check), and there is no cap: each
 // unowned write that finds the plain suffix already taken gets its own
 // numbered path from nextGeneratedBackupPath, without limit.
 export const ROOT_HOT_BACKUP_SUFFIX = '.pre-projection-backup.md';
 
-// Root-anchored (leading `/`) so this only ever matches the backup sitting
-// next to hot.md itself, never an unrelated file elsewhere in the vault that
+// Root-anchored (leading `/`) so this only ever matches a backup sitting
+// next to hot.md itself (one an earlier version wrote), never an unrelated file elsewhere in the vault that
 // happens to share the tail of the name. The trailing `*` covers every
 // variant nextGeneratedBackupPath can produce: the plain suffix, a `-2`/`-3`/...
 // counter, and the timestamp fallback.
@@ -1558,7 +1559,7 @@ const ROOT_HOT_BACKUP_TMP_GITIGNORE_PATTERN = '/hot.md.pre-projection-backup*.tm
  */
 export function rootHotBackupRecoveryNotice(backupPath) {
   return (
-    `루트 hot.md 의 이전 내용을 ${basename(backupPath)} 로 백업했습니다 (손으로 편집한 내용이 있었습니다). ` +
+    `루트 hot.md 의 이전 내용을 ${backupPathForNotice(backupPath)} 로 백업했습니다 (손으로 편집한 내용이 있었습니다). ` +
     `루트로 되돌리지 마세요. 다음 훅 실행이 다시 덮어씁니다. 열어 본 뒤 남길 내용을 projects/<slug>/hot.md 나 별도 페이지로 옮기고 백업은 지우세요.`
   );
 }
@@ -1746,10 +1747,27 @@ function nextGeneratedBackupPath(hotPath) {
   return `${hotPath}${stem}-${Date.now()}.md`;
 }
 
+// Where view backups live, relative to the vault: `.cache/backups/<view relPath>.pre-projection-backup*.md`.
+// Never next to the view: before the migration ignore block lands, and after a rollback, no pattern
+// ignores that name, so a blanket `git add -A` would stage a backup holding a person's notes.
+// `.cache/` is ignored by every vault `.gitignore` this plugin writes.
+export const VIEW_BACKUP_DIR_REL = join('.cache', 'backups');
+
 /**
- * Back `content` up next to `hotPath` (any generated view's absolute path, not
- * only the root hot.md: the session view writer and the pull resolution use
- * the same function), unless a backup already holds exactly these bytes.
+ * The part of a backup path that a notice shows: from `.cache/backups/` on, so the reader can open
+ * it from the vault root. A path from before the move (next to the view) shows its file name.
+ */
+export function backupPathForNotice(backupPath) {
+  const marker = `${VIEW_BACKUP_DIR_REL}${sep}`;
+  const at = backupPath.lastIndexOf(marker);
+  return at === -1 ? basename(backupPath) : backupPath.slice(at).split(sep).join('/');
+}
+
+/**
+ * Back `content` up under `.cache/backups/` (see `VIEW_BACKUP_DIR_REL`) for `viewPath` (any
+ * generated view's absolute path inside `hypoDir`, not only the root hot.md: the session view
+ * writer and the pull resolution use the same function), unless a backup already holds exactly
+ * these bytes.
  *
  * minor fix: the backup and the `.gitignore` update run BEFORE the write that
  * replaces hot.md, so a write that fails afterwards (disk full, a rename
@@ -1771,7 +1789,12 @@ function nextGeneratedBackupPath(hotPath) {
  * the projection write fails there too.
  * @returns {string} the backup path now holding `content`, fresh or reused
  */
-export function backUpGeneratedPath(hotPath, content, testHooks) {
+export function backUpGeneratedPath(hypoDir, viewPath, content, testHooks) {
+  const rel = relative(hypoDir, viewPath);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(`backup target is outside the vault: ${viewPath}`);
+  }
+  const hotPath = join(hypoDir, VIEW_BACKUP_DIR_REL, rel);
   const stem = ROOT_HOT_BACKUP_SUFFIX.slice(0, -'.md'.length);
   const holdsContent = (candidate) => {
     try {
@@ -1941,7 +1964,9 @@ export function writeGeneratedViewsRecord(hypoDir, views) {
 
 /**
  * Whether the branch's upstream already carries the session-entries `.gitignore` block, read from
- * `@{u}`'s tree (a failed `pull --ff-only` has still fetched it). False without an upstream.
+ * `@{u}`'s tree (a failed `pull --ff-only` has still fetched it). False without an upstream. It
+ * answers "is the remote migrated", not "does the incoming range need the clearing step": a rollback
+ * commit leaves it false. The entry decision for a catch-up is `incomingChangesViewTracking`.
  */
 export function upstreamIsMigrated(hypoDir) {
   const shown = gitShowText(hypoDir, '@{u}', '.gitignore');
@@ -1949,9 +1974,44 @@ export function upstreamIsMigrated(hypoDir) {
   return shown !== null && shown.split('\n').some((l) => l.trim() === first);
 }
 
+/**
+ * Whether taking in `targetRev` adds or removes tracking of any generated view path (`hot.md`,
+ * `projects/<p>/hot.md`, `projects/<p>/session-state.md`), read from git: the paths `targetRev`
+ * changes since its merge-base with HEAD, status `A` or `D`. This is what decides whether a
+ * catch-up needs `clearGeneratedPathsBlockingPull` first. A migration commit removes tracking and a
+ * rollback commit adds it back (git then overwrites an ignored local file without a word), so both
+ * directions count; `upstreamIsMigrated` sees only the first. A revision git cannot read or diff
+ * counts as touching, because the clearing step then reports the failure itself.
+ */
+export function incomingChangesViewTracking(hypoDir, targetRev) {
+  const base = gitOut(hypoDir, ['merge-base', 'HEAD', targetRev])?.trim();
+  if (!base) return true;
+  const diff = gitOut(hypoDir, [
+    'diff',
+    '--no-renames',
+    '--name-status',
+    '-z',
+    '--relative',
+    base,
+    targetRev,
+  ]);
+  if (diff === null) return true;
+  const tokens = diff.split('\0').filter(Boolean);
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    if ('AD'.includes(tokens[i][0]) && isGeneratedViewPath(tokens[i + 1])) return true;
+  }
+  return false;
+}
+
 // `.cache/pull-archive.json`: {v: 2, stage: 'archived'|'merged', targetSha, gitignoreLines,
-// views: [{relPath, kind: 'stage'|'worktree', backupPath, sha256, companionRev}]}. A record of any
-// other shape counts as no record.
+// views: [{relPath, kind: 'stage'|'worktree', backupPath, sha256, companionRev, run}],
+// localOnly: [{relPath, kind, backupPath}], unowned: [{relPath, kind, backupPath}],
+// cleared: [{relPath, backupPath}], gitignoreSaved: [{relPath: '.gitignore', kind, backupPath}]}.
+// `run` numbers the clearing runs that fed the record: the views of one run (and kind) are one
+// state of the machine and pair up in a baseline. The four lists after `views` are what the
+// clearing step set aside besides the views, written before it removes anything. A record from
+// before they existed lacks them (read as empty, and a view without `run` as run 0). A record of
+// any other shape counts as no record.
 function readPullArchive(hypoDir) {
   let rec;
   try {
@@ -1961,6 +2021,8 @@ function readPullArchive(hypoDir) {
   }
   const okView = (v) =>
     v && ['relPath', 'backupPath', 'sha256'].every((k) => typeof v[k] === 'string');
+  const okItem = (v) => v && ['relPath', 'backupPath'].every((k) => typeof v[k] === 'string');
+  const items = (key) => (Array.isArray(rec[key]) ? rec[key].filter(okItem) : []);
   if (
     rec?.v !== 2 ||
     !['archived', 'merged'].includes(rec.stage) ||
@@ -1976,6 +2038,10 @@ function readPullArchive(hypoDir) {
     targetSha: rec.targetSha,
     gitignoreLines: rec.gitignoreLines.filter((l) => typeof l === 'string'),
     views: rec.views.filter(okView),
+    localOnly: items('localOnly'),
+    unowned: items('unowned'),
+    cleared: items('cleared'),
+    gitignoreSaved: items('gitignoreSaved'),
   };
 }
 
@@ -1992,6 +2058,49 @@ function mergeViews(...lists) {
   const seen = new Map();
   for (const v of lists.flat()) if (!seen.has(viewKey(v))) seen.set(viewKey(v), v);
   return [...seen.values()];
+}
+
+// The same merge for the set-aside lists (`localOnly`, `unowned`, `cleared`, `gitignoreSaved`),
+// keyed by the backup, so a retry that finds an entry again does not list it twice and one that
+// does not find it any more (the file is already gone) does not lose it.
+function mergeItems(...lists) {
+  const seen = new Map();
+  for (const v of lists.flat()) {
+    const key = `${v.relPath}\0${v.kind ?? 'worktree'}\0${v.backupPath}`;
+    if (!seen.has(key)) seen.set(key, v);
+  }
+  return [...seen.values()];
+}
+
+/**
+ * The notices for what the clearing step set aside besides the views: an ignored project's old
+ * files (`localOnly`), a root `hot.md` nobody vouched for (`unowned`), an untracked file in a path
+ * the merge adds as tracked (`cleared`). Each names its backup. Entries whose `backupPath` is in
+ * `announced` are skipped: a caller that already told the user about this run's entries passes
+ * them, so the resume of the same record does not say it twice.
+ */
+export function setAsideNotices(
+  hypoDir,
+  { localOnly = [], unowned = [], cleared = [] },
+  announced = [],
+) {
+  const done = new Set(announced);
+  const fresh = (list) => list.filter((v) => !done.has(v.backupPath));
+  const notices = [];
+  for (const { relPath, backupPath } of fresh(localOnly)) {
+    const proj = generatedViewSlug(relPath) ?? relPath;
+    notices.push(
+      `무시 프로젝트 ${proj}의 옛 세션 현황을 ${relative(hypoDir, backupPath)}에 보관했습니다. 이 기억은 공유되지 않습니다.`,
+    );
+  }
+  for (const { backupPath } of fresh(unowned))
+    notices.push(rootHotBackupRecoveryNotice(backupPath));
+  for (const { relPath, backupPath } of fresh(cleared)) {
+    notices.push(
+      `${relPath}는 이행 커밋이 추적 파일로 더하는 경로라 치웠습니다. 원래 내용은 ${relative(hypoDir, backupPath)}에 있습니다.`,
+    );
+  }
+  return notices;
 }
 
 /**
@@ -2020,7 +2129,7 @@ export function markPullArchiveMerged(hypoDir) {
 /**
  * The step before `merge --ff-only <targetRev>` or `pull --no-rebase` takes in a migration (or
  * rollback) commit: clear what would block it, without ever migrating this machine. Returns
- * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], unowned[], cleared[], gitignoreLines[]}`.
+ * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], unowned[], cleared[], gitignoreLines[], gitignoreSaved[]}`.
  * A stopped run (`ok: false`) reports everything it had moved up to that point in the same lists,
  * so the caller can take it back.
  *
@@ -2031,14 +2140,21 @@ export function markPullArchiveMerged(hypoDir) {
  * untouched. Otherwise: an ignored project's generated paths that `targetRev` deletes are backed
  * up even when clean (the merge deletes them from the working tree), and go to `localOnly[]`
  * only; every blocked generated path gets its working-tree bytes, and its staged bytes when
- * staged, backed up and listed in `archived[]` (and in `.cache/pull-archive.json`, written first);
+ * staged, backed up and listed in `archived[]`;
  * staged target paths are unstaged; the blocked paths are restored to HEAD (or removed when HEAD
  * lacks them); and a path `targetRev` adds as tracked that exists here untracked is cleared
  * (backed up unless its bytes are what this machine's generator last wrote), because git
  * overwrites such a file silently. A cleared path with a backup is listed in `cleared[]`
  * (`{relPath, backupPath}`), not in `archived[]`: it is not a view this machine meant to keep, so
  * it is never shared as a baseline, and `undoClearedPaths` still puts it back. `gitignoreLines` are the uncommitted `.gitignore` additions the
- * caller appends back after the merge (`restoreGitignoreLines`).
+ * caller appends back after the merge (`restoreGitignoreLines`). `gitignoreSaved[]` holds the exact
+ * working-tree and staged bytes of a blocked `.gitignore` (`{relPath, kind, backupPath}`, backed up
+ * like a view), which `undoClearedPaths` puts back when the merge does not happen.
+ *
+ * Before anything is removed or unstaged, everything set aside (`archived`, `localOnly`, `unowned`,
+ * `cleared`, `gitignoreSaved`, the lines) is written to `.cache/pull-archive.json`, so a crash at
+ * any later point leaves a record that names every backup. The lists also carry what an earlier
+ * run that stopped had recorded, merged by backup path.
  *
  * The root `hot.md` that `targetRev` deletes while it is clean is the one path nobody else
  * touches: its bytes are copied to `unowned[]` (`{relPath, kind, backupPath}`, not part of
@@ -2049,18 +2165,25 @@ export function markPullArchiveMerged(hypoDir) {
  * Only bytes are moved, never a deletion. A blocked view path the user had deleted (in the working
  * tree or the index) has no bytes to back up, and the clearing step brings it back from HEAD.
  *
- * `testHooks.afterArchive` runs after the archive record is written and the stage is released,
- * before any working-tree path is restored. `testHooks.beforeBackupWrite` goes to the backups.
+ * Just before the unstage, and again before the restore, every blocked path's working-tree bytes
+ * and index blob are read again and compared with what the backup took (and a cleared untracked
+ * file with the bytes just backed up). A difference means another process wrote meanwhile: nothing
+ * more is changed and `{ok: false, deferred: 'concurrent-change'}` comes back.
+ *
+ * `testHooks.beforeUnstage` runs before the first of those comparisons, `testHooks.afterArchive`
+ * after the archive record is written and the stage is released, before the second (and before any
+ * working-tree path is restored). `testHooks.beforeBackupWrite` goes to the backups.
  */
 export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   const { testHooks } = opts;
   // What has been moved so far. Every stop reports all of it, so the caller can undo it.
   const backups = [];
-  const localOnly = [];
-  const unowned = [];
-  const cleared = [];
+  let localOnly = [];
+  let unowned = [];
+  let cleared = [];
   let archived = [];
   let gitignoreLines = [];
+  let gitignoreSaved = [];
   const stop = (extra) => ({
     ok: false,
     backups,
@@ -2069,6 +2192,7 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
     unowned,
     cleared,
     gitignoreLines,
+    gitignoreSaved,
     ...extra,
   });
 
@@ -2080,7 +2204,22 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
     prior && prior.stage === 'archived' && !isAncestorOfHead(hypoDir, prior.targetSha)
       ? prior
       : null;
-  if (recovered) restoreGitignoreLines(hypoDir, recovered.gitignoreLines);
+  // The exact `.gitignore` bytes of that run come back first (guarded like any undo). The lines are
+  // the fallback for a record that has none or whose bytes could not be put back (that entry is
+  // carried on); appended after an exact restore they would put a staged-only line in the working tree.
+  let carriedGitignore = [];
+  if (recovered) {
+    let exactBack = false;
+    if (recovered.gitignoreSaved.length) {
+      exactBack = undoClearedPaths(
+        hypoDir,
+        { gitignoreSaved: recovered.gitignoreSaved },
+        { keepRecord: true },
+      ).ok;
+      if (!exactBack) carriedGitignore = recovered.gitignoreSaved;
+    }
+    if (!exactBack) restoreGitignoreLines(hypoDir, recovered.gitignoreLines);
+  }
 
   const targetSha = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', `${targetRev}^{commit}`]);
   const headSha = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
@@ -2147,8 +2286,10 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
     return slug !== null && projectHiddenByHypoignore(hypoDir, slug, patterns);
   };
   const fresh = [];
+  // The number of this run among those that fed the record; see the record's comment.
+  const run = Math.max(0, ...(prior?.views ?? []).map((v) => v.run ?? 0)) + 1;
   const backUp = (relPath, kind, text) => {
-    const backupPath = backUpGeneratedPath(join(hypoDir, relPath), text, testHooks);
+    const backupPath = backUpGeneratedPath(hypoDir, join(hypoDir, relPath), text, testHooks);
     backups.push(backupPath);
     return { relPath, kind, backupPath };
   };
@@ -2173,56 +2314,47 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
         readRootHotProjectionOwnership(hypoDir).lastHash,
       ];
       if (!vouched.includes(sha)) {
-        const backupPath = backUpGeneratedPath(join(hypoDir, 'hot.md'), text, testHooks);
+        const backupPath = backUpGeneratedPath(hypoDir, join(hypoDir, 'hot.md'), text, testHooks);
         unowned.push({ relPath: 'hot.md', kind: 'worktree', backupPath });
       }
     }
   }
 
   // 6. Blocked generated paths: the working-tree bytes, and the staged bytes of a staged path.
+  // `snapshot` is what every blocked path (`.gitignore` too) held when its backup was taken: the
+  // unstage and the restore below run only while the bytes still match it (`drifted`).
+  const snapshot = new Map(
+    blocked.map((p) => [
+      p,
+      { work: readTextOrNull(join(hypoDir, p)), index: gitShowText(hypoDir, ':0', p) },
+    ]),
+  );
   for (const path of blocked.filter(isGeneratedViewPath)) {
     const versions = [];
-    const work = readTextOrNull(join(hypoDir, path));
+    const { work, index } = snapshot.get(path);
     if (work !== null) versions.push(['worktree', work]);
-    const stagedText = staged.has(path) ? gitShowText(hypoDir, ':0', path) : null;
+    const stagedText = staged.has(path) ? index : null;
     if (stagedText !== null) versions.push(['stage', stagedText]);
     for (const [kind, text] of versions) {
       const where = backUp(path, kind, text);
       if (hidden(path)) localOnly.push(where);
-      else fresh.push({ ...where, sha256: sha256Hex(text), companionRev: head });
+      else fresh.push({ ...where, sha256: sha256Hex(text), companionRev: head, run });
     }
   }
-  archived = mergeViews(recovered?.views ?? [], fresh);
-  if (prior || archived.length || gitignoreLines.length) {
-    try {
-      writePullArchive(hypoDir, {
-        v: 2,
-        stage: 'archived',
-        targetSha: target,
-        gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
-        views: mergeViews(prior?.views ?? [], archived),
-      });
-    } catch {
-      return stop({ reason: 'archive-write-failed' });
+  // The `.gitignore` of a blocked run: its exact working-tree and staged bytes, so a failed move can
+  // put them back as they were (the lines in `gitignoreLines` are all the merge's success keeps).
+  if (blocked.includes('.gitignore')) {
+    const { work, index } = snapshot.get('.gitignore');
+    if (work !== null) gitignoreSaved.push(backUp('.gitignore', 'worktree', work));
+    if (staged.has('.gitignore') && index !== null) {
+      gitignoreSaved.push(backUp('.gitignore', 'stage', index));
     }
   }
-  const unstage = blocked.filter((p) => staged.has(p));
-  if (
-    unstage.length &&
-    vaultGit(hypoDir, ['reset', '-q', '--', ...literalSpecs(unstage)]).status !== 0
-  ) {
-    return stop({ reason: 'unstage-failed' });
-  }
-  testHooks?.afterArchive?.();
-
-  // 7. Put the working tree where `target` can land. Bytes of a blocked path are already backed
-  // up. A path HEAD lacks is removed instead of restored.
-  const restore = blocked.filter((p) => pathInHead(hypoDir, p));
-  for (const p of blocked.filter((q) => !restore.includes(q)))
-    rmSync(join(hypoDir, p), { force: true });
-  // A path `target` adds as tracked, held here as an untracked file: git overwrites it without a
-  // word (rollback commits do this to every view), so move it out first.
+  // 6b. A path `target` adds as tracked, held here as an untracked file: git overwrites it without a
+  // word (rollback commits do this to every view), so it is moved out below. Its bytes are backed up
+  // now, with everything else, so the record written next knows them before anything is removed.
   const owned = readGeneratedViewsRecord(hypoDir).views;
+  const untracked = [];
   for (const { status, path } of incoming) {
     if (status !== 'A' || !isGeneratedViewPath(path) || blocked.includes(path)) continue;
     if (pathInHead(hypoDir, path)) continue;
@@ -2232,6 +2364,77 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
       const { backupPath } = backUp(path, 'worktree', text);
       cleared.push({ relPath: path, backupPath });
     }
+    untracked.push({ path, text });
+  }
+  archived = mergeViews(recovered?.views ?? [], fresh);
+  localOnly = mergeItems(recovered?.localOnly ?? [], localOnly);
+  unowned = mergeItems(recovered?.unowned ?? [], unowned);
+  cleared = mergeItems(recovered?.cleared ?? [], cleared);
+  gitignoreSaved = mergeItems(carriedGitignore, gitignoreSaved);
+  const anySetAside = [archived, localOnly, unowned, cleared, gitignoreSaved, gitignoreLines].some(
+    (list) => list.length,
+  );
+  if (prior || anySetAside) {
+    try {
+      writePullArchive(hypoDir, {
+        v: 2,
+        stage: 'archived',
+        targetSha: target,
+        gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
+        views: mergeViews(prior?.views ?? [], archived),
+        localOnly: mergeItems(prior?.localOnly ?? [], localOnly),
+        unowned: mergeItems(prior?.unowned ?? [], unowned),
+        cleared: mergeItems(prior?.cleared ?? [], cleared),
+        gitignoreSaved,
+      });
+    } catch {
+      return stop({ reason: 'archive-write-failed' });
+    }
+  }
+  // The vault's own writers are shut out by the vault commit lock the caller holds, so a change
+  // since the snapshot came from another Hypomnema process that does not take it, or a person.
+  // Either way this run changes nothing more and the bytes stay where they are. ponytail: an
+  // external editor can still save between this re-read and the git command right after it; that
+  // window (milliseconds) is accepted, a compare-and-swap does not exist for a working tree.
+  const changedSince = () => ({
+    deferred: 'concurrent-change',
+    reason: 'changed-during-clear',
+    notice:
+      '이행 커밋을 받는 도중 생성 파일이나 인덱스가 바뀌어 아무것도 더 바꾸지 않고 미뤘습니다. 다음 동기화에서 다시 시도합니다',
+  });
+  const read = (p) => {
+    try {
+      return readTextOrNull(join(hypoDir, p));
+    } catch {
+      return undefined; // unreadable counts as changed
+    }
+  };
+  const drifted = (afterUnstage) =>
+    blocked.some((p) => {
+      const was = snapshot.get(p);
+      const index = afterUnstage && staged.has(p) ? gitShowText(hypoDir, 'HEAD', p) : was.index;
+      return read(p) !== was.work || gitShowText(hypoDir, ':0', p) !== index;
+    });
+  testHooks?.beforeUnstage?.();
+  if (drifted(false)) return stop(changedSince());
+  const unstage = blocked.filter((p) => staged.has(p));
+  if (
+    unstage.length &&
+    vaultGit(hypoDir, ['reset', '-q', '--', ...literalSpecs(unstage)]).status !== 0
+  ) {
+    return stop({ reason: 'unstage-failed' });
+  }
+  testHooks?.afterArchive?.();
+  if (drifted(true)) return stop(changedSince());
+
+  // 7. Put the working tree where `target` can land. Bytes of a blocked path are already backed
+  // up. A path HEAD lacks is removed instead of restored.
+  const restore = blocked.filter((p) => pathInHead(hypoDir, p));
+  for (const p of blocked.filter((q) => !restore.includes(q)))
+    rmSync(join(hypoDir, p), { force: true });
+  // The untracked files of 6b go now, each only while it still holds the bytes that were backed up.
+  for (const { path, text } of untracked) {
+    if (read(path) !== text) return stop(changedSince());
     rmSync(join(hypoDir, path), { force: true });
   }
   if (restore.length) {
@@ -2240,7 +2443,16 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
       return stop({ reason: 'checkout-failed' });
     }
   }
-  return { ok: true, backups, archived, localOnly, unowned, cleared, gitignoreLines };
+  return {
+    ok: true,
+    backups,
+    archived,
+    localOnly,
+    unowned,
+    cleared,
+    gitignoreLines,
+    gitignoreSaved,
+  };
 }
 
 /**
@@ -2251,15 +2463,19 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
  * staged one is put back in the index only when the index entry still equals HEAD's
  * (`hash-object -w`, then `update-index --cacheinfo`, with the vault's prefix in front). The
  * backup bytes are written as they are. When every path is back, the backup files made for them
- * (and for `unowned[]`) and `.cache/pull-archive.json` (when any path was archived or local-only)
- * are deleted; otherwise those stay for the next catch-up to carry.
+ * (and for `unowned[]`) and `.cache/pull-archive.json` (when anything was set aside) are deleted;
+ * otherwise those stay for the next catch-up to carry. `keepRecord` leaves the record in place (the
+ * clearing step uses it to take back a stopped run's `.gitignore` bytes while that record lives on).
+ * `moved.gitignoreSaved[]` is the exact `.gitignore` bytes, put back with the same guards as a
+ * view: a working tree that is absent or at HEAD, an index entry that is at HEAD. A `.gitignore`
+ * written since is left alone, with a notice naming the backup.
  *
  * Only bytes come back, never a deletion: a view path the user had deleted before the clearing step
  * had no bytes to back up, the clearing step restored it from HEAD, and nothing here deletes it
  * again. The generated views are rebuilt from the entries, so the file returns either way.
  * Returns `{ok, notices[]}`; a path that could not be put back has a notice naming its backup.
  */
-export function undoClearedPaths(hypoDir, moved) {
+export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
   const seen = new Set();
   const dedupe = (v) => {
     const key = `${v.relPath}\0${v.kind}\0${v.backupPath}`;
@@ -2269,6 +2485,7 @@ export function undoClearedPaths(hypoDir, moved) {
   const all = [
     ...items,
     ...(moved.cleared ?? []).map((c) => ({ ...c, kind: 'worktree' })).filter(dedupe),
+    ...(moved.gitignoreSaved ?? []).filter(dedupe),
   ];
   const prefix = vaultGitPrefix(hypoDir);
   const notices = [];
@@ -2335,7 +2552,9 @@ export function undoClearedPaths(hypoDir, moved) {
     for (const { backupPath } of [...all, ...(moved.unowned ?? [])]) {
       rmSync(backupPath, { force: true });
     }
-    if (items.length) rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
+    if (!keepRecord && all.length + (moved.unowned ?? []).length > 0) {
+      rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
+    }
   }
   return { ok: allBack, notices };
 }
@@ -2421,8 +2640,10 @@ function committedBaselines(hypoDir, slug) {
  * machine held reaches the others. `archived` is `[{relPath, kind, backupPath, sha256,
  * companionRev}]`; the bytes come from `backupPath` (a missing or changed backup is skipped with a
  * notice). The root `hot.md` and `.hypoignore`d projects are skipped. Per project, one pair
- * (`hot.md` text, `session-state.md` text) is built per kind; the side that was not archived comes
- * from `companionRev`'s tree. A pair is not made when HEAD already has a baseline whose summary
+ * (`hot.md` text, `session-state.md` text) is built per run and kind (`run` is 0 when absent), and
+ * once for every distinct version of a path within one, so a path archived in two runs with
+ * different bytes yields a baseline for each; the side that was not archived comes from
+ * `companionRev`'s tree. A pair is not made when HEAD already has a baseline whose summary
  * and `legacy` sections are byte-equal to it (frontmatter included, so a changed `machine_note` is
  * a different memory). A path whose file is already there with the same bytes (published, not yet
  * committed) is committed without being written again. Returns `{created: [relPath], skipped:
@@ -2459,24 +2680,43 @@ export function shareLegacyBytes(hypoDir, archived) {
       );
       continue;
     }
-    const kinds = projects.get(slug) ?? { worktree: {}, stage: {} };
-    projects.set(slug, kinds);
-    const group = el.kind === 'stage' ? kinds.stage : kinds.worktree;
-    group[el.relPath.endsWith('/hot.md') ? 'hot' : 'session-state'] = text;
+    // One group per run and kind: the versions of both files that one clearing run set aside.
+    // Another run's version of the same path is a version of its own and gets its own baseline.
+    const groups = projects.get(slug) ?? new Map();
+    projects.set(slug, groups);
+    const run = Number.isInteger(el.run) ? el.run : 0;
+    const kind = el.kind === 'stage' ? 'stage' : 'worktree';
+    const groupKey = `${run}\0${kind === 'stage' ? 1 : 0}`;
+    const group = groups.get(groupKey) ?? {
+      sort: [run, kind === 'stage' ? 1 : 0],
+      hot: [],
+      state: [],
+    };
+    groups.set(groupKey, group);
+    const list = el.relPath.endsWith('/hot.md') ? group.hot : group.state;
+    if (!list.includes(text)) list.push(text);
     group.rev ??= el.companionRev;
   }
 
   const toCommit = [];
-  for (const [slug, kinds] of projects) {
+  for (const [slug, groups] of projects) {
     const pairs = new Map();
-    for (const group of [kinds.worktree, kinds.stage]) {
-      if (group.hot === undefined && group['session-state'] === undefined) continue;
-      const side = (name) =>
-        group[name] ??
+    const ordered = [...groups.values()].sort(
+      (a, b) => a.sort[0] - b.sort[0] || a.sort[1] - b.sort[1],
+    );
+    for (const group of ordered) {
+      // A side with no version in this group comes from `companionRev`'s tree, else it is empty.
+      const side = (name, list, i) =>
+        list[i] ??
         (group.rev ? gitShowText(hypoDir, group.rev, `projects/${slug}/${name}.md`) : null) ??
         '';
-      const pair = { hotText: side('hot'), stateText: side('session-state') };
-      pairs.set(JSON.stringify(pair), pair);
+      for (let i = 0; i < Math.max(group.hot.length, group.state.length); i++) {
+        const pair = {
+          hotText: side('hot', group.hot, i),
+          stateText: side('session-state', group.state, i),
+        };
+        pairs.set(JSON.stringify(pair), pair);
+      }
     }
     const indexText = readTextOrNull(join(hypoDir, 'projects', slug, 'index.md')) ?? '';
     let existing = null;
@@ -2529,18 +2769,21 @@ export function shareLegacyBytes(hypoDir, archived) {
  * Finish what a catch-up merge left behind: a record whose `stage` is `merged`, or whose
  * `targetSha` is already an ancestor of HEAD (the merge landed, the rest did not run). Puts the
  * archived `.gitignore` lines back, shares the archived bytes, and deletes the record once every
- * baseline it made is in HEAD. A record that is still `archived` with a target HEAD does not contain
- * is the next catch-up's to recover and is left alone. Independent of the migration state. Returns
- * `{resumed, created, notices}`.
+ * baseline it made is in HEAD. It names the backup of every local-only, unowned and cleared entry
+ * the record holds, except those whose backup path is in `announced`. A record that is still
+ * `archived` with a target HEAD does not contain is the next catch-up's to recover and is left
+ * alone. Independent of the migration state. Returns `{resumed, created, notices}`.
  */
-export function resumePullArchive(hypoDir) {
+export function resumePullArchive(hypoDir, { announced = [] } = {}) {
   const rec = readPullArchive(hypoDir);
   if (!rec || (rec.stage !== 'merged' && !isAncestorOfHead(hypoDir, rec.targetSha))) {
     return { resumed: false, created: [], notices: [] };
   }
   restoreGitignoreLines(hypoDir, rec.gitignoreLines);
+  // The merge landed, so the lines above are all of the `.gitignore` that carries over.
+  for (const { backupPath } of rec.gitignoreSaved) rmSync(backupPath, { force: true });
   const shared = shareLegacyBytes(hypoDir, rec.views);
-  const notices = [...shared.notices];
+  const notices = [...shared.notices, ...setAsideNotices(hypoDir, rec, announced)];
   if (shared.created.every((rel) => pathInHead(hypoDir, rel))) {
     rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
   } else {
@@ -2914,7 +3157,7 @@ function writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId) {
   };
   if (current !== null && !ownershipMatches(hypoDir, current)) {
     gitignoreUpdated = ensureBackupIgnored();
-    backupPath = backUpGeneratedPath(hotPath, current, testHooks);
+    backupPath = backUpGeneratedPath(hypoDir, hotPath, current, testHooks);
     backedUp = true;
   }
   // major fix (TOCTOU narrowing): re-read right before the write that
@@ -2950,7 +3193,7 @@ function writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId) {
   }
   if (latest !== current && latest !== null && !ownershipMatches(hypoDir, latest)) {
     if (!gitignoreUpdated) gitignoreUpdated = ensureBackupIgnored();
-    backupPath = backUpGeneratedPath(hotPath, latest, testHooks);
+    backupPath = backUpGeneratedPath(hypoDir, hotPath, latest, testHooks);
     backedUp = true;
   }
   // atomicWrite, not writeFileSync: this write now happens at BOTH

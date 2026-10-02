@@ -28,6 +28,7 @@ import {
   isGeneratedViewPath,
   isSessionEntryPath,
   isSessionProjectDir,
+  missingBlockLines,
   narrowestVisibilityScope,
   parseSessionEntry,
   renderViews,
@@ -47,10 +48,9 @@ import {
   readGeneratedViewsRecord,
   readRootHotProjectionOwnership,
   readVisibilityScope,
-  restoreGitignoreLines,
   resumePullArchive,
+  setAsideNotices,
   revPathArg,
-  rootHotBackupRecoveryNotice,
   undoClearedPaths,
   vaultCommitLockTarget,
   vaultGitPrefix,
@@ -137,7 +137,8 @@ export function listSessionProjects(hypoDir) {
 
 /**
  * The parsed entries of one project plus the files that could not be read: `{entries, unreadable}`.
- * A file that disappears between the directory listing and its read (a pull in flight) is skipped.
+ * When several files hold the same close id, the one with the smallest file name is the entry and
+ * the others are dropped. A file that disappears between the directory listing and its read (a pull in flight) is skipped.
  * Any other read error and a parse failure go to `unreadable[]` as `{fileName, reason}`, so a bad
  * entry shows up in the view instead of vanishing. `testHooks.betweenListAndRead` runs after the
  * listing, so a test can delete a file at exactly that point.
@@ -167,8 +168,10 @@ export function listSessionEntries(hypoDir, project, { testHooks } = {}) {
     }
     if (text === null) continue;
     const parsed = parseSessionEntry(text);
-    if (parsed.ok) entries.push(parsed.entry);
-    else unreadable.push({ fileName, reason: parsed.reason });
+    if (!parsed.ok) unreadable.push({ fileName, reason: parsed.reason });
+    // One entry per close id: two clones that migrated on their own date one baseline differently
+    // and so name two files for one id. `names` is sorted, so the smallest file name stays.
+    else if (!entries.some((e) => e.closeId === parsed.entry.closeId)) entries.push(parsed.entry);
   }
   return { entries, unreadable };
 }
@@ -211,10 +214,13 @@ function hasGitEntry(dir) {
 }
 
 /**
- * `'migrated' | 'not-migrated' | 'opted-out'`, read from HEAD's tree only (the real index is not
+ * `'migrated' | 'not-migrated' | 'opted-out' | 'incomplete-block'`, read from HEAD's tree only (the real index is not
  * consulted: a migration commit moves HEAD and the index together). The off marker in HEAD is
  * `opted-out`; the `.gitignore` block in HEAD plus no tracked generated view in HEAD is
- * `migrated`; anything else, including git failing to answer, is `not-migrated`. Only a vault with
+ * `migrated`; a `.gitignore` in HEAD that has the block's first line but lacks one of its pattern
+ * lines is `incomplete-block` (a hand edit or a bad merge: nothing treats it as `migrated`, and
+ * migration waits for the user to restore it); anything else, including git failing to answer, is
+ * `not-migrated`. Only a vault with
  * no `.git` entry in it or any parent (`hasGitEntry`) tracks nothing and counts as `migrated`: when
  * git cannot say whether the directory is a work tree (not installed, dubious ownership, a timeout,
  * a broken config) but the entry is there, the vault may well track views, so it is `not-migrated`.
@@ -225,10 +231,9 @@ export function migrationState(hypoDir) {
   }
   if (pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) return 'opted-out';
   const shown = git(hypoDir, ['show', revPathArg('HEAD', '.gitignore')]);
-  const first = GITIGNORE_BLOCK.split('\n')[0];
-  if (shown.status !== 0 || !shown.stdout.split('\n').some((l) => l.trim() === first)) {
-    return 'not-migrated';
-  }
+  const missing = shown.status === 0 ? missingBlockLines(shown.stdout, GITIGNORE_BLOCK) : null;
+  if (missing === null) return 'not-migrated';
+  if (missing.length) return 'incomplete-block';
   try {
     return listTrackedGeneratedViews(hypoDir, { source: 'head' }).length === 0
       ? 'migrated'
@@ -247,11 +252,13 @@ function entryScopeOf(indexText) {
 }
 
 // The in-memory entry that stands for a not-yet-migrated project's old `hot.md` and
-// `session-state.md` (whichever of them git tracks). `null` when neither is.
+// `session-state.md` (whichever of them HEAD tracks), built from HEAD's committed bytes: the same
+// bytes, so the same id, as the baseline the migration commit makes. `null` when neither is.
 function virtualBaseline(hypoDir, project, tracked, indexText) {
   const rels = [`projects/${project}/hot.md`, `projects/${project}/session-state.md`];
+  // HEAD's bytes, as the migration commit reads them, not the index or the working tree.
   const [hotText, stateText] = rels.map((rel) =>
-    tracked.has(rel) ? readOrNull(join(hypoDir, rel)) : null,
+    tracked.has(rel) ? showText(hypoDir, 'HEAD', rel) : null,
   );
   if (hotText === null && stateText === null) return null;
   const { scope } = narrowestVisibilityScope([
@@ -291,12 +298,13 @@ export function loadSessionModel(hypoDir, project, opts = {}) {
     try {
       let tracked = new Set();
       try {
-        tracked = new Set(listTrackedGeneratedViews(hypoDir));
+        tracked = new Set(listTrackedGeneratedViews(hypoDir, { source: 'head' }));
       } catch {
         // git cannot say what is tracked: no baseline rather than a guessed one
       }
       const baseline = virtualBaseline(hypoDir, project, tracked, indexText);
-      if (baseline) entries.push(baseline);
+      // A real baseline file with this id (an interrupted move) stands for it already.
+      if (baseline && !entries.some((e) => e.closeId === baseline.closeId)) entries.push(baseline);
     } catch (err) {
       unreadable.push({ fileName: 'session-state.md', reason: `baseline: ${err?.message ?? err}` });
     }
@@ -365,7 +373,7 @@ function writeOneView(hypoDir, relPath, content, own, testHooks, result) {
   }
   const backups = [];
   if (current !== null && !ours(current))
-    backups.push(backUpGeneratedPath(abs, current, testHooks));
+    backups.push(backUpGeneratedPath(hypoDir, abs, current, testHooks));
   testHooks?.beforeFinalWrite?.(abs);
   const latest = read();
   if (latest === content) {
@@ -373,7 +381,7 @@ function writeOneView(hypoDir, relPath, content, own, testHooks, result) {
     result.unchanged.push(relPath);
   } else {
     if (latest !== current && latest !== null && !ours(latest)) {
-      backups.push(backUpGeneratedPath(abs, latest, testHooks));
+      backups.push(backUpGeneratedPath(hypoDir, abs, latest, testHooks));
     }
     if (own.views[relPath] !== sha) {
       own.views[relPath] = sha;
@@ -394,18 +402,36 @@ const emptyResult = (over) => ({
   ...over,
 });
 
+// A migrated vault whose `.gitignore` block lost a line is not rendered into: the views would sit
+// outside the ignore patterns and a `git add -A` tool would stage them. Stopping silently is not
+// acceptable, so the next SessionStart gets a notice naming the lines. A plain not-migrated vault
+// stays silent. The notice file holds one message, so repeated renders do not pile notices up.
+function skipIncompleteBlock(hypoDir, state) {
+  const missing =
+    missingBlockLines(showText(hypoDir, 'HEAD', '.gitignore') ?? '', GITIGNORE_BLOCK) ?? [];
+  writeRootHotHealthNotice(
+    hypoDir,
+    '세션 현황 파일: .gitignore의 Hypomnema 블록이 불완전해 이번에는 갱신하지 않았습니다 ' +
+      '(생성 파일이 ignore 밖에서 저장소에 올라가는 일을 막기 위해서입니다). ' +
+      `빠진 줄: ${missing.join(', ')}. 블록 전체를 되살리거나 블록을 지우면 다음 세션이 다시 추가합니다.`,
+  );
+  return emptyResult({ notMigrated: true, state, missingBlockLines: missing });
+}
+
 /**
  * `writeGeneratedViews` for a caller that already holds the vault commit lock (the lock is not
  * reentrant). `opts`: `projects` (slugs, default every session project), `root` (write the root
  * `hot.md`, default true), `device` (default `currentDevice()`), `testHooks`. Returns
  * `{notMigrated, lockTimeout, written[], unchanged[], backedUp[{relPath, backupPath}]}`; when the
- * vault is not `migrated` nothing is written and `notMigrated` is true. A project that
+ * vault is not `migrated` nothing is written and `notMigrated` is true (`incomplete-block` also adds
+ * `missingBlockLines[]` and leaves a health notice). A project that
  * `.hypoignore` hides (see `projectHiddenByHypoignore`) is neither read nor written and has no
  * root row. Any backup leaves a health notice for the next SessionStart.
  */
 export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   const { root = true, device = currentDevice(), testHooks } = opts;
   const state = migrationState(hypoDir);
+  if (state === 'incomplete-block') return skipIncompleteBlock(hypoDir, state);
   if (state !== 'migrated') return emptyResult({ notMigrated: true, state });
   // A project the `.hypoignore` hides gets no views and no row in the root table: its entries are
   // never committed, so a table row would publish a project the owner chose to keep local.
@@ -643,28 +669,33 @@ export function buildCommitInTempIndex(hypoDir, edits, { testHooks } = {}) {
  * Bring HEAD, the real index and the working tree to `sha` (a descendant of HEAD) in one git
  * motion. First `clearGeneratedPathsBlockingPull` sets aside what would block the merge, then
  * `git merge --ff-only`. When the merge fails, or the first step stops half way, what it moved is
- * taken back (`undoClearedPaths`: working-tree and staged bytes, backups, archive record) and the
- * `.gitignore` lines it set aside are put back, so a failed move leaves the vault as it was. That
+ * taken back (`undoClearedPaths`: working-tree and staged bytes, the `.gitignore`, backups, archive
+ * record), so a failed move leaves the vault as it was. That
  * covers bytes only: a deletion the user had made of a view path before the move is not made
  * again, because the clearing step brought the file back from HEAD with no bytes to keep.
  * Returns `{ok, pre, deferred?, reason?, notice?}` where `pre` is the clearing step's result (its
- * `archived[]`, `localOnly[]` and `unowned[]` are for the caller, after a successful merge).
+ * `archived[]`, `localOnly[]`, `unowned[]` and `cleared[]` are for the caller, after a successful
+ * merge). The `.gitignore` goes back as the exact bytes it held (`undoClearedPaths`), unstaged
+ * lines and staged ones apart, not as lines appended.
  * `notice` carries git's whole stderr after a failed merge, which names the files in the way, and
  * any path that could not be put back.
  */
 export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
   const pre = clearGeneratedPathsBlockingPull(hypoDir, sha, { testHooks });
   const moved =
-    pre.archived.length + pre.localOnly.length + pre.unowned.length + pre.cleared.length > 0;
+    pre.archived.length +
+      pre.localOnly.length +
+      pre.unowned.length +
+      pre.cleared.length +
+      pre.gitignoreSaved.length >
+    0;
   if (!pre.ok) {
-    restoreGitignoreLines(hypoDir, pre.gitignoreLines);
     const undone = moved ? undoClearedPaths(hypoDir, pre).notices : [];
     const notice = [pre.notice, ...undone].filter(Boolean).join('\n') || undefined;
     return { ok: false, pre, deferred: pre.deferred, reason: pre.reason, notice };
   }
   const merged = gitRun(hypoDir, ['merge', '--ff-only', sha]);
   if (merged.status !== 0) {
-    restoreGitignoreLines(hypoDir, pre.gitignoreLines);
     const stderr = String(merged.stderr).trim();
     const undone = moved ? undoClearedPaths(hypoDir, pre).notices : [];
     return {
@@ -715,6 +746,22 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
   if (state === 'migrated') return migrationResult({ migrated: true, skipped: 'already-migrated' });
   if (state === 'opted-out' && !reenable) return migrationResult({ skipped: 'opted-out' });
 
+  // A block with its first line but not every pattern line is not repaired here: user lines keep
+  // their order (a later negation changes what an earlier pattern means). The user restores it, or
+  // removes it so the move adds it whole.
+  const incomplete = [
+    ['.gitignore', GITIGNORE_BLOCK],
+    ['.gitattributes', GITATTRIBUTES_BLOCK],
+  ]
+    .map(([rel, block]) => [rel, missingBlockLines(showText(hypoDir, 'HEAD', rel) ?? '', block)])
+    .filter(([, missing]) => missing?.length);
+  if (incomplete.length) {
+    const what = incomplete.map(([rel, missing]) => `${rel}에 ${missing.join(' , ')}`).join('; ');
+    return deferredMigration(
+      'block-incomplete',
+      `Hypomnema 블록의 첫 줄은 있지만 필요한 줄이 빠져 있습니다 (${what}). 블록을 통째로 복원하거나, 블록을 지우면 이행 때 도구가 전체를 다시 추가합니다`,
+    );
+  }
   let tracked;
   try {
     tracked = listTrackedGeneratedViews(hypoDir, { source: 'head' });
@@ -812,19 +859,14 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
     const reason = applied.deferred ?? applied.reason ?? 'ff-failed';
     return deferredMigration(reason, applied.notice ?? reason);
   }
-  for (const { relPath, backupPath } of applied.pre.localOnly) {
-    const proj = generatedViewSlug(relPath) ?? relPath;
-    notices.push(
-      `무시 프로젝트 ${proj}의 옛 세션 현황을 ${relative(hypoDir, backupPath)}에 보관했습니다. 이 기억은 공유되지 않습니다.`,
-    );
-  }
-  for (const { backupPath } of applied.pre.unowned) {
-    notices.push(rootHotBackupRecoveryNotice(backupPath));
-  }
+  notices.push(...setAsideNotices(hypoDir, applied.pre));
   // What this machine held only in its working tree or index (the old files differ from HEAD) goes
   // out as additional baselines; the record is dropped once those are committed.
   markPullArchiveMerged(hypoDir);
-  const resumed = resumePullArchive(hypoDir);
+  const { localOnly, unowned, cleared } = applied.pre;
+  const resumed = resumePullArchive(hypoDir, {
+    announced: [...localOnly, ...unowned, ...cleared].map((v) => v.backupPath),
+  });
   return migrationResult({
     migrated: true,
     commit: commit.sha,

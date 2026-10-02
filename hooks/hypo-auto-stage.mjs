@@ -7,7 +7,14 @@
 
 import { spawnSync } from 'child_process';
 import { relative } from 'path';
-import { HYPO_DIR, loadHypoIgnore, isIgnored, recordTouchedPaths } from './hypo-shared.mjs';
+import {
+  HYPO_DIR,
+  loadHypoIgnore,
+  isIgnored,
+  recordTouchedPaths,
+  vaultCommitLockTarget,
+  withFileLock,
+} from './hypo-shared.mjs';
 import { advanceBaseForWrite, hashContent } from './base-store.mjs';
 
 // Tools that REPLACE file bytes. The base advance below must fire only for these:
@@ -37,7 +44,22 @@ const filePath = input.tool_input?.file_path ?? '';
 if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
   const patterns = loadHypoIgnore(HYPO_DIR);
   if (patterns.length === 0 || !isIgnored(filePath, HYPO_DIR, patterns)) {
-    spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' });
+    // Under the vault commit lock, like every other writer of the index: the catch-up pre-step
+    // (clearGeneratedPathsBlockingPull) reads and releases the index while it holds that lock, and
+    // an add landing in between would stage bytes it is about to set aside. A lock that cannot be
+    // taken skips the add: the session's scoped auto-commit stages its own paths, so nothing is
+    // lost.
+    try {
+      withFileLock(
+        vaultCommitLockTarget(HYPO_DIR),
+        () => spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' }),
+        { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
+      );
+    } catch (err) {
+      process.stderr.write(
+        `[hypo-auto-stage] 볼트 잠금을 못 잡아 ${filePath} 의 git add 를 건너뛰었습니다 (${err?.code ?? err?.message})\n`,
+      );
+    }
   }
 
   if (WRITE_TOOLS.has(input.tool_name)) {
