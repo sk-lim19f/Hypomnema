@@ -2184,7 +2184,13 @@ function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
             : 'managed block outside its container';
     fail(
       'Feedback projection integrity',
-      `${name}: ${reason} — run \`hypomnema feedback-sync --import-target-change\` to reconcile`,
+      // feedback-sync decides the remedy by shape (import and accept for a
+      // conflicting block, move the lines for an intruder, repair for unpaired
+      // markers). An older installed script that does not send one gets the import
+      // command alone, which is only right when a block is in conflict.
+      `${name}: ${reason}. ` +
+        (t.conflictRemedy ||
+          `Run \`hypomnema feedback-sync --import-target-change --from=${name}\` to keep a copy of the hand edit as a draft.`),
     );
   } else {
     // 2) build error. Split by kind:

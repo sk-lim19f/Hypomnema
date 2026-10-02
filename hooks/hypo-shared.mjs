@@ -6197,9 +6197,27 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             reason: `feedback projection cannot be built — ${details} — no rules are loaded from it. ${remedies}`,
           });
         } else if (conflictedT.length) {
+          // The remedy text comes from the report (feedback-sync names the real
+          // slugs and leaves out --accept-wiki for an unpaired file). A report from
+          // an older installed script has none: fall back to the import command.
+          const remedies = [
+            ...new Set(
+              entries
+                .filter(([n]) => conflictedT.includes(n))
+                .map(([, t]) => t.conflictRemedy)
+                .filter((x) => typeof x === 'string' && x),
+            ),
+          ].join(' ');
           blockers.push({
             type: 'feedback',
-            reason: `feedback projection conflict (manual edit of ${conflictedT.join(', ')}) — run \`hypomnema feedback-sync --import-target-change --from=<memory|claude>\``,
+            // reasons are rendered with an appended period and joined with ', ', so
+            // the full-sentence remedy loses its own final period here (CLI and doctor keep it)
+            reason:
+              `feedback projection conflict (manual edit of ${conflictedT.join(', ')}): ` +
+              (
+                remedies ||
+                'run `hypomnema feedback-sync --import-target-change --from=<memory|claude>`'
+              ).replace(/\.$/, ''),
           });
         } else if (overCapT.length) {
           blockers.push({
@@ -6213,14 +6231,26 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             reason: `feedback projection drift (${driftedT.join(', ')}) — will self-heal at /compact`,
           });
         }
-        // Additive, and deliberately outside the chain above: a side-file I/O
-        // problem is orthogonal to the primary target's health, so it is a notice
-        // whatever else is (or is not) going on. It names the path and the
-        // permission fix, because that — not a command — is the way out.
+        // Additive, and deliberately outside the chain above: a side-file problem
+        // is orthogonal to the primary target's health, so it is a notice whatever
+        // else is (or is not) going on. Two kinds reach here. "cannot read side
+        // file" is an I/O error whose only way out is a permission bit on that
+        // path (`--ensure-container` cannot touch it), so only that kind carries
+        // the permissions advice. "not overwriting ..." is feedback-sync declining
+        // to replace a hand-written file that lacks its provenance header; the
+        // warning text already says to rename or delete it, and calling it
+        // unreadable or pointing at permissions would be wrong. The reason has no
+        // trailing period: the hook that renders it appends one.
         for (const [n, t] of sideWarnT) {
+          const unreadable = t.sideWarnings.some((w) => w.startsWith('cannot read side file'));
           notices.push({
             type: 'feedback',
-            reason: `feedback projection side file unreadable (${n}): ${t.sideWarnings.join('; ')} — fix the permissions on that path; the primary projection still loads every rule (\`--ensure-container\` does not fix this)`,
+            reason:
+              `feedback projection side file warning (${n}): ${t.sideWarnings.join('; ')}. ` +
+              'The primary projection still loads every rule' +
+              (unreadable
+                ? '. Fix the permissions on that path; --ensure-container does not fix this'
+                : ''),
           });
         }
       }

@@ -78,6 +78,8 @@ When `--targets` includes `claude-learned`, `--global-summary` and `--promote-to
 
 On a real (non-dry-run) write, the script automatically runs `feedback-sync --write` to refresh MEMORY.md / CLAUDE.md. If that post-step reports drift it prints a one-line warning — the page is still saved; reconcile with `hypomnema feedback-sync --check`.
 
+A projection block you edited by hand is a conflict, except when the edit already matches what the wiki would write: the next `--write` takes it over. To keep the wiki version of a conflicted block, run `hypomnema feedback-sync --import-target-change --from=<target>` first to save a copy of the edit as a draft, then `hypomnema feedback-sync --accept-wiki=<slug>`.
+
 ---
 
 ## Step 4 — Confirm
