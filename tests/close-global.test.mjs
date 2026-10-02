@@ -6040,3 +6040,55 @@ test('an ordinary create (no lock contention) still reports the plain "hot.md ro
     );
   });
 });
+
+// W19 fixture: design-history is as new as today and a session-log heading
+// carries a date that is not on the calendar, so lint reports W19 (never W8).
+// Local to this area; the same shape lives in the other close areas' tests.
+function addW19Overflow(dir, today) {
+  const proj = join(dir, 'projects', 'test-project');
+  writeFileSync(
+    join(proj, 'design-history.md'),
+    `---\ntitle: dh\ntype: reference\nupdated: ${today}\n---\n\n## ${today}\nfoo\n`,
+  );
+  const shard = join(proj, 'session-log', `${today.slice(0, 7)}.md`);
+  writeFileSync(shard, readFileSync(shard, 'utf-8') + '\n## [2026-02-30] heading typo\n');
+}
+
+suite('W19 never enters the close gate blocker set');
+
+test('precompactGateStatus: a W19-only vault has no lint or design-history blocker or notice', () => {
+  withWiki(addW19Overflow, (dir) => {
+    // Baseline: lint really reports W19 here, or the absence below proves nothing.
+    const lint = spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'lint.mjs'), `--hypo-dir=${dir}`, '--json'],
+      {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: '' },
+      },
+    );
+    const parsed = JSON.parse(lint.stdout);
+    assert.equal(
+      parsed.warns.filter((w) => w.id === 'W19').length,
+      1,
+      `fixture must produce W19: ${lint.stdout}`,
+    );
+    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+    assert.equal(gate.skipped.lint, false, 'the gate must actually have run its lint step');
+    assert.deepEqual(
+      gate.blockers.filter((b) => b.type === 'lint' || b.type === 'design-history'),
+      [],
+      `W19 must not block: ${JSON.stringify(gate.blockers)}`,
+    );
+    assert.equal(
+      gate.blockers.some((b) => /W19/.test(b.reason || '')),
+      false,
+      'no blocker reason names W19',
+    );
+    assert.deepEqual(
+      gate.notices.filter((n) => n.type === 'lint' || n.type === 'design-history'),
+      [],
+      `W19 must not surface as a gate notice either: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});

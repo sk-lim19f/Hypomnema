@@ -308,6 +308,10 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/code-fence.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/core-hooks.mjs",
     "exec": false
   },

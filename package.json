@@ -27,6 +27,7 @@
     "scripts/upgrade.mjs",
     "scripts/verify.mjs",
     "scripts/weekly-report.mjs",
+    "scripts/lib/code-fence.mjs",
     "scripts/lib/core-hooks.mjs",
     "scripts/lib/crystallize-args.mjs",
     "scripts/lib/crystallize-close-apply.mjs",

@@ -1163,7 +1163,7 @@ test('session-log missing a today-dated heading → advisory systemMessage', () 
 
 test('lint blockers without id field → systemMessage names files, no empty placeholders', () => {
   // Regression: line 244 used `b.id` directly, but error-severity lint issues
-  // never carry an id (only W8 warns do). The result was a reason like
+  // never carry an id (only W8 and W19 warns do). The result was a reason like
   // `lint blockers: , , , , , , ,` — blocks correctly but tells the user
   // nothing actionable. Fix: fall back to file path + dedupe.
   //

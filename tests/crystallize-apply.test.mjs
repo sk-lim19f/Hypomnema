@@ -10,6 +10,7 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  appendFileSync,
   writeFileSync,
   readFileSync,
   existsSync,
@@ -1231,8 +1232,8 @@ test('apply on a project with no index.md creates one from the template, tokens 
     // CONCERN 1 (2nd round): a missing anchor is expected to surface as a
     // visible W13 WARNING (not silence, not an error) so it doesn't sit
     // invisible until a manual `doctor` run. Matched by message (not `id`):
-    // non-W8/non-strict --json deliberately omits the `id` field on every
-    // other warning class (lint.mjs's byte-identical-default guarantee).
+    // non-strict --json deliberately omits the `id` field on every
+    // warning class except W8 and W19 (lint.mjs's byte-identical-default guarantee).
     assert.ok(
       (lintOut.warns || []).some(
         (w) =>
@@ -3206,4 +3207,311 @@ test('commands/crystallize.md documents every failure stage the receipt path can
     assert.ok(row, `the stage table needs a row for ${stage}`);
   }
   assert.ok(md.includes('mismatches[]'), 'the doc must explain mismatches[]');
+});
+
+// W19 fixture: design-history is as new as today and a session-log heading
+// carries a date that is not on the calendar, so lint reports W19 (never W8).
+// Local to this area; the same shape lives in the other close areas' tests.
+function addW19Overflow(dir, today) {
+  const proj = join(dir, 'projects', 'test-project');
+  writeFileSync(
+    join(proj, 'design-history.md'),
+    `---\ntitle: dh\ntype: reference\nupdated: ${today}\n---\n\n## ${today}\nfoo\n`,
+  );
+  const shard = join(proj, 'session-log', `${today.slice(0, 7)}.md`);
+  writeFileSync(shard, readFileSync(shard, 'utf-8') + '\n## [2026-02-30] heading typo\n');
+}
+
+suite('close surfaces W19 as a non-blocking notice, not as "lint clean"');
+
+test('close with only a W19 finding succeeds, prints the notice, and does not claim "lint clean"', () => {
+  withWiki(addW19Overflow, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const sessionId = `w19-console-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const r = runApplyConsole(dir, payload, sessionId);
+      assert.equal(r.status, 0, `W19 alone must not fail the close: ${r.stdout}\n${r.stderr}`);
+      assert.match(r.stdout, /session-close verified/, `close must succeed: ${r.stdout}`);
+      assert.match(
+        r.stdout,
+        /not on the calendar[^\n]*2026-02-30[^\n]*\(not blocking\)/,
+        `the W19 finding must be printed as a notice: ${r.stdout}`,
+      );
+      assert.ok(
+        !r.stdout.includes('lint clean'),
+        `"lint clean" must not be claimed over a shown W19 notice: ${r.stdout}`,
+      );
+      assert.match(r.stdout, /no lint blockers/, `success line says nothing blocks: ${r.stdout}`);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('--json close with only a W19 finding: ok, lintNotices lists it, and no blocker names it', () => {
+  withWiki(addW19Overflow, (dir, today) => {
+    const r = runApply(dir, payloadForCleanWiki(dir, today));
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, `W19 alone must not fail the close: ${r.stdout}`);
+    assert.equal(r.status, 0);
+    assert.equal(out.lintNotices.length, 1, `one W19 notice: ${JSON.stringify(out.lintNotices)}`);
+    assert.equal(out.lintNotices[0].id, 'W19');
+    assert.equal(out.lintNotices[0].file, 'projects/test-project/design-history.md');
+    assert.deepEqual(out.gateBlockers, [], 'W19 is never a gate blocker');
+  });
+});
+
+// Same overflow heading, but in a project the close is not targeting.
+function addW19OverflowElsewhere(dir, today) {
+  const proj = join(dir, 'projects', 'other-project');
+  mkdirSync(join(proj, 'session-log'), { recursive: true });
+  writeFileSync(
+    join(proj, 'design-history.md'),
+    `---\ntitle: dh\ntype: reference\nupdated: ${today}\n---\n\n## ${today}\nfoo\n`,
+  );
+  writeFileSync(
+    join(proj, 'session-log', `${today.slice(0, 7)}.md`),
+    `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [2026-02-30] heading typo\n`,
+  );
+}
+
+test('W19 in the closing project is printed per finding and not folded into a count', () => {
+  withWiki(addW19Overflow, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const sessionId = `w19-scope-in-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const j = JSON.parse(runApply(dir, payload).stdout);
+      assert.deepEqual(
+        j.lintNotices.map((w) => w.file),
+        ['projects/test-project/design-history.md'],
+        'fixture must put the W19 in the closing project',
+      );
+      const r = runApplyConsole(dir, payload, sessionId);
+      assert.match(
+        r.stdout,
+        /⚠ projects\/test-project\/design-history\.md: [^\n]*2026-02-30[^\n]*\(not blocking\)/,
+        `in-scope W19 is listed: ${r.stdout}`,
+      );
+      assert.ok(
+        !r.stdout.includes('project(s) with calendar-overflow session-log headings'),
+        `nothing is folded when the finding is in scope: ${r.stdout}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('W19 only in another project folds to one count line, keeps "no lint blockers", stays in lintNotices', () => {
+  withWiki(addW19OverflowElsewhere, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const sessionId = `w19-scope-out-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const j = JSON.parse(runApply(dir, payload).stdout);
+      const w19 = j.lintNotices.filter((w) => w.id === 'W19');
+      assert.equal(w19.length, 1, `one W19 in lintNotices: ${JSON.stringify(j.lintNotices)}`);
+      assert.ok(
+        w19[0].file.startsWith('projects/other-project/'),
+        `fixture must put the W19 in the other project: ${w19[0].file}`,
+      );
+      const r = runApplyConsole(dir, payload, sessionId);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.ok(
+        !r.stdout.includes('⚠ projects/other-project'),
+        `no per-finding line for another project: ${r.stdout}`,
+      );
+      assert.match(
+        r.stdout,
+        /\+1 project\(s\) with calendar-overflow session-log headings \(not blocking\)/,
+        `folded count line: ${r.stdout}`,
+      );
+      assert.match(r.stdout, /no lint blockers/, `success line: ${r.stdout}`);
+      assert.ok(!r.stdout.includes('lint clean'), `not clean while a W19 exists: ${r.stdout}`);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('two overflow headings in one other project fold to "+1 project(s)", not a heading count', () => {
+  withWiki(
+    (dir, today) => {
+      addW19OverflowElsewhere(dir, today);
+      appendFileSync(
+        join(dir, 'projects', 'other-project', 'session-log', `${today.slice(0, 7)}.md`),
+        '\n## [2026-02-31] second typo\n',
+      );
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      const sessionId = `w19-two-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+      const cleanup = seedCloseTranscript(sessionId);
+      try {
+        const j = JSON.parse(runApply(dir, payload).stdout);
+        const w19 = j.lintNotices.filter((w) => w.id === 'W19');
+        assert.equal(w19.length, 1, `one finding per project: ${JSON.stringify(w19)}`);
+        assert.ok(
+          w19[0].message.includes('2026-02-30') && w19[0].message.includes('2026-02-31'),
+          `the message lists both headings: ${w19[0].message}`,
+        );
+        const r = runApplyConsole(dir, payload, sessionId);
+        assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+        assert.match(
+          r.stdout,
+          /\+1 project\(s\) with calendar-overflow session-log headings \(not blocking\)/,
+          `fold line counts projects: ${r.stdout}`,
+        );
+        assert.ok(!r.stdout.includes('+2 '), `not counted per heading: ${r.stdout}`);
+      } finally {
+        cleanup();
+      }
+    },
+  );
+});
+
+test('a close with no W19 finding keeps "lint clean" and an empty lintNotices', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = `w19-none-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const payload = payloadForCleanWiki(dir, today);
+      const r = runApplyConsole(dir, payload, sessionId);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.match(r.stdout, /lint clean/, `no notice, so the clean claim stands: ${r.stdout}`);
+      const j = JSON.parse(runApply(dir, payload).stdout);
+      assert.deepEqual(j.lintNotices, []);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in crystallize-close-apply.mjs printCloseReport, make
+// lintWord depend on w19Notice.length only (drop the closeScopeNotice and
+// otherDebtCount terms).
+test('a close that prints pre-existing lint debt below does not claim "lint clean"', () => {
+  const cases = [
+    ['elsewhere in the vault', 'other-proj'],
+    ['in untouched files of the closing project', 'test-project'],
+  ];
+  for (const [label, proj] of cases) {
+    withWiki(
+      (dir) => {
+        mkdirSync(join(dir, 'projects', proj), { recursive: true });
+        writeFileSync(
+          join(dir, 'projects', proj, 'broken.md'),
+          '---\ntitle: broken\ntype: concept\n\nbody (frontmatter never closes)\n',
+        );
+      },
+      (dir, today) => {
+        const sessionId = `lint-debt-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+        const cleanup = seedCloseTranscript(sessionId);
+        try {
+          const r = runApplyConsole(dir, payloadForCleanWiki(dir, today), sessionId);
+          assert.equal(r.status, 0, `${label}: ${r.stdout}\n${r.stderr}`);
+          assert.match(
+            r.stdout,
+            /pre-existing lint issue\(s\)/,
+            `${label}: debt line shown: ${r.stdout}`,
+          );
+          assert.match(r.stdout, /no lint blockers/, `${label}: ${r.stdout}`);
+          assert.ok(!r.stdout.includes('lint clean'), `${label}: not clean: ${r.stdout}`);
+        } finally {
+          cleanup();
+        }
+      },
+    );
+  }
+});
+
+// Disabling the check: put `node scripts/lint.mjs` back in the W19 fold line and
+// the otherDebtCount line of printCloseReport.
+test('the lint-debt fold lines point at /hypo:lint, not at a script path a vault does not have', () => {
+  withWiki(
+    (dir, today) => {
+      addW19OverflowElsewhere(dir, today);
+      mkdirSync(join(dir, 'projects', 'debt-proj'), { recursive: true });
+      writeFileSync(
+        join(dir, 'projects', 'debt-proj', 'broken.md'),
+        '---\ntitle: broken\ntype: concept\n\nbody (frontmatter never closes)\n',
+      );
+    },
+    (dir, today) => {
+      const sessionId = `lint-hint-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+      const cleanup = seedCloseTranscript(sessionId);
+      try {
+        const r = runApplyConsole(dir, payloadForCleanWiki(dir, today), sessionId);
+        assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+        const lines = r.stdout
+          .split('\n')
+          .filter((l) => /project\(s\) with calendar-overflow|elsewhere in the vault/.test(l));
+        assert.equal(lines.length, 2, `both fold lines print: ${r.stdout}`);
+        for (const l of lines) {
+          assert.ok(l.includes('`/hypo:lint`'), `names /hypo:lint: ${l}`);
+          assert.ok(!l.includes('scripts/lint.mjs'), `no script path: ${l}`);
+        }
+      } finally {
+        cleanup();
+      }
+    },
+  );
+});
+
+// Disabling the check: revert the lintNotices bullet and the post-apply lint
+// line in commands/crystallize.md to the old unconditional "post-apply lint clean".
+test('commands/crystallize.md documents lintNotices and does not instruct an unconditional "lint clean"', () => {
+  const md = readFileSync(join(REPO, 'commands', 'crystallize.md'), 'utf-8');
+  const bullet = md.split('\n').find((l) => l.startsWith('- **`lintNotices[]`**'));
+  assert.ok(bullet, 'precondition: the lintNotices[] bullet must exist');
+  assert.ok(
+    bullet.includes('not blocking') || bullet.includes('never block'),
+    `non-blocking: ${bullet}`,
+  );
+  assert.ok(bullet.includes('verbatim'), `report verbatim: ${bullet}`);
+  assert.ok(!md.includes('✓ post-apply lint clean'), 'no unconditional "post-apply lint clean"');
+  const line = md.split('\n').find((l) => l.startsWith('- ✓ post-apply lint'));
+  assert.ok(line, 'precondition: the post-apply lint checklist line must exist');
+  assert.ok(
+    line.includes('no blockers') && line.includes('lintNotices'),
+    `the line ties "lint clean" to an empty lintNotices: ${line}`,
+  );
+});
+
+// A project with no design-history.md and a calendar-overflow heading: W14 has no
+// default --json id, so close only sees it through the W19 that lint also emits.
+function addOverflowWithoutDesignHistory(dir, today) {
+  const proj = join(dir, 'projects', 'test-project');
+  rmSync(join(proj, 'design-history.md'), { force: true });
+  const shard = join(proj, 'session-log', `${today.slice(0, 7)}.md`);
+  writeFileSync(shard, readFileSync(shard, 'utf-8') + '\n## [2026-02-30] heading typo\n');
+}
+
+// Disabling the check: remove the W19 issue() emitted in the `s.kind === 'missing'`
+// branch of the design-history loop in scripts/lint.mjs.
+test('overflow heading in a project without design-history.md: close lists it as a W19 notice', () => {
+  withWiki(addOverflowWithoutDesignHistory, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const sessionId = `w19-missing-dh-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const j = JSON.parse(runApply(dir, payload).stdout);
+      assert.equal(j.ok, true, `W19 alone must not fail the close: ${JSON.stringify(j)}`);
+      assert.equal(j.lintNotices.length, 1, JSON.stringify(j.lintNotices));
+      assert.equal(j.lintNotices[0].id, 'W19');
+      assert.ok(j.lintNotices[0].message.includes('2026-02-30'), j.lintNotices[0].message);
+      assert.ok(
+        !j.lintNotices[0].message.includes('design-history와 날짜를 비교'),
+        'the missing-file variant does not talk about comparing with design-history',
+      );
+      const r = runApplyConsole(dir, payload, sessionId);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.match(r.stdout, /⚠ [^\n]*2026-02-30[^\n]*\(not blocking\)/, r.stdout);
+      assert.ok(!r.stdout.includes('lint clean'), r.stdout);
+    } finally {
+      cleanup();
+    }
+  });
 });
