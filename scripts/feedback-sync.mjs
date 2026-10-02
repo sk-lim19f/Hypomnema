@@ -18,18 +18,37 @@
  * something it can bootstrap into existence (that would mean guessing WHERE in
  * an arbitrary, possibly hand-authored CLAUDE.md to insert it).
  *
+ * A hand-edited block (hash mismatch) normally exits 3. Two ways out:
+ *   - automatic: when the block's content equals what the wiki renders now (the
+ *     page was edited to match), --write accepts it and rewrites the stored hash.
+ *     The comparison is byte for byte, so for the claude target it includes the
+ *     `[YYYY-MM-DD]` prefix, which comes from the page's `updated`. A page edited
+ *     through /hypo:feedback (append mode) gets `updated` bumped to today, so its
+ *     rendering no longer equals an older hand edit and the block stays a conflict
+ *     until --accept-wiki=<slug> resolves it. The comparison is not loosened to
+ *     ignore the date.
+ *   - explicit: `--accept-wiki=<slug>` overwrites that one conflicted block with
+ *     the wiki's current rendering, discarding the hand edit, or removes the block
+ *     when the wiki projects nothing for that source in that target any more.
+ *     Run --import-target-change first to keep a copy of the edit as a draft.
+ *     It refuses a block that is not in conflict, and refuses a file whose
+ *     markers are malformed or unpaired (block extents are then unreliable).
+ *     Otherwise it splices only that block's bytes: no other block, hand line,
+ *     side-file or file is touched. `--dry-run` reports the plan and writes nothing.
+ *
  * Contract: projects/hypomnema/fix-37-contract.md (per-slug managed block model,
  * sha256 over normalized inner content, sort key, exit matrix, project-id rule).
  *
  * Usage:
- *   node scripts/feedback-sync.mjs [--check|--write|--bootstrap|--import-target-change --from=<memory|claude>|--ensure-container]
+ *   node scripts/feedback-sync.mjs [--check|--write|--bootstrap|--import-target-change --from=<memory|claude>|--accept-wiki=<slug>|--ensure-container]
  *     --hypo-dir=<path>      Hypomnema root (default: HYPO_DIR / hypo-config.md / ~/hypomnema)
  *     --claude-home=<path>   Claude Code home (default: ~/.claude)
  *     --project-id=<id>      Override derived project-id (§5; always wins, no prompt)
  *     --no-input             Never prompt; treat unresolved project-id non-interactively
  *     --strict               Promote warnings to failures (PreCompact gate)
  *     --json                 Machine-readable output
- *     --dry-run              (bootstrap/import) report planned drafts, write nothing
+ *     --accept-wiki=<slug>   keep the wiki version of one conflicted block (see above)
+ *     --dry-run              (bootstrap/import/accept) report the plan, write nothing
  *
  * --ensure-container: the remedy for a 'build-failed' target (its
  * `<learned_behaviors>` container is gone, so NOT ONE L1 rule loads and every
@@ -88,8 +107,9 @@ const HOME = homedir();
 
 function parseArgs(argv) {
   const args = {
-    mode: 'check', // check | write | bootstrap | import | ensure-container
+    mode: 'check', // check | write | bootstrap | import | accept | ensure-container
     from: null,
+    acceptSlug: null,
     hypoDir: null,
     claudeHome: null,
     projectId: null,
@@ -105,7 +125,13 @@ function parseArgs(argv) {
     else if (arg === '--write') args.mode = 'write';
     else if (arg === '--bootstrap') args.mode = 'bootstrap';
     else if (arg === '--import-target-change') args.mode = 'import';
-    else if (arg === '--ensure-container') args.mode = 'ensure-container';
+    else if (arg.startsWith('--accept-wiki=')) {
+      args.mode = 'accept';
+      args.acceptSlug = arg.slice(14);
+    } else if (arg === '--accept-wiki') {
+      // bare form: run() rejects it. Leaving it unparsed would read as --check.
+      args.mode = 'accept';
+    } else if (arg === '--ensure-container') args.mode = 'ensure-container';
     else if (arg.startsWith('--from=')) args.from = arg.slice(7);
     else if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--claude-home=')) args.claudeHome = expandHome(arg.slice(14));
@@ -264,6 +290,15 @@ function hashInner(text) {
 function renderBlock(slug, inner) {
   const norm = normalizeInner(inner);
   return `${MARK_START(slug, hashInner(norm))}\n${norm}\n${MARK_END}`;
+}
+
+// A block is in conflict when its content no longer matches its stored hash AND
+// differs from what the wiki renders now. A block that was hand-edited and then
+// matched by a wiki edit has a stale marker only: nothing is lost by rewriting it.
+function isBlockConflict(b, desired) {
+  if (b.actualHash === b.declaredHash) return false;
+  const d = desired.find((x) => x.slug === b.slug);
+  return !d || d.hash !== b.actualHash;
 }
 
 // Find existing managed blocks with their positions. Returns
@@ -489,6 +524,10 @@ function classifyContainer(content) {
 // remedy is decided ONCE, here, next to the branch that detects the cause, and
 // rides along in the JSON report (`buildErrorRemedy`) so doctor and the PreCompact
 // gate print the same way out instead of each guessing one.
+// A slug safe to paste unquoted into a suggested shell command: the same class
+// safeDraftSlug keeps, tested whole instead of cleaned.
+const SAFE_SLUG_RE = /^[\p{L}\p{N}._-]+$/u;
+
 const REMEDY = {
   containerMissing: (file) =>
     'Run `hypomnema feedback-sync --ensure-container` to add the missing ' +
@@ -504,7 +543,51 @@ const REMEDY = {
   danglingSymlink: (file) =>
     `${file} is a symlink whose target does not exist (\`ls -l\` it). Repoint or remove the link, ` +
     'then re-run `hypomnema feedback-sync --write`.',
+  // One text for every consumer of a conflicted target (CLI, doctor, PreCompact
+  // gate), chosen by the SHAPE of the problem, because the import-then-accept way
+  // out only exists when a block is in conflict: for a target whose only trouble
+  // is hand-written lines in the managed region, or a block outside the container,
+  // import finds nothing ('nothing to import', exit 0) and accept refuses.
+  //   conflicting block(s)  import to keep a copy, then accept per block. The accept
+  //                         part is left out for an unpaired file (it refuses until
+  //                         the markers are repaired) and for a slug that is not a
+  //                         plain name (it would be pasted into a shell unquoted).
+  //   unpaired markers      repair by hand.
+  //   block outside container / intruder lines   move them, then --write.
+  conflict: (name, { conflicts, unpaired, outOfContainer }) => {
+    if (!conflicts.length) {
+      if (unpaired)
+        return 'Repair the malformed HYPO:FEEDBACK-SYNC markers by hand (every block needs one START and one END marker), then run `hypomnema feedback-sync --write`.';
+      return (
+        (outOfContainer
+          ? 'Move the HYPO:FEEDBACK-SYNC block(s) back inside <learned_behaviors>, or delete them and let `--write` project them again, then run `hypomnema feedback-sync --write`.'
+          : 'Move the hand-written lines outside the HYPO blocks (before the first block or after the last; in CLAUDE.md keep them inside <learned_behaviors>), then run `hypomnema feedback-sync --write`.') +
+        ' `--import-target-change` has nothing to import here.'
+      );
+    }
+    const accepts = unpaired ? [] : conflicts.filter((c) => SAFE_SLUG_RE.test(c));
+    return (
+      `Run \`hypomnema feedback-sync --import-target-change --from=${name}\` to keep a copy of the hand edit as a draft.` +
+      (unpaired
+        ? ' To keep the wiki version instead, repair the malformed markers by hand first, then re-run the check.'
+        : '') +
+      (accepts.length
+        ? ' To discard the edit and keep the wiki version instead, run that import first, then ' +
+          accepts.map((c) => `\`hypomnema feedback-sync --accept-wiki=${c}\``).join(', ') +
+          ' (one command per conflicted block).'
+        : '')
+    );
+  },
 };
+
+// Sentence for a hand line --write left in place.
+function handKeptNotice(r) {
+  return (
+    `kept the hand-written line in ${r.file} that bootstrap drafted "${r.slug}" from: ` +
+    'it was changed, moved or duplicated, or links a different memory file than the managed entry, so it was not removed. ' +
+    `Delete it by hand if it now duplicates the managed entry. The line as bootstrap saw it: ${r.line}`
+  );
+}
 
 // Compute the next file content for a target. Returns { content } on success or
 // { error, remedy } when the region cannot be placed (missing / corrupt
@@ -585,9 +668,96 @@ function staleSideFiles(target, desired) {
     });
 }
 
+// ── hand lines that --bootstrap drafted from ────────────────────────────────
+//
+// --bootstrap leaves the original hand-written index line where it is. Once the
+// draft is promoted, --write adds a managed entry for the same slug and the hand
+// line would sit beside it as a duplicate (or, between two managed blocks, as an
+// intruder that blocks every write). So bootstrap records the exact bytes of each
+// line it drafted from, and the --write that adds that slug's managed entry
+// removes exactly that line in the same atomic write.
+//
+// The record lives in the vault under .cache/ (gitignored by the vault template),
+// not under ~/.claude. A line is removed only when it is still there byte for
+// byte, outside every managed block, exactly once. Anything else (edited, moved,
+// duplicated) is left alone and reported. Lines bootstrap never recorded are never
+// touched.
+//
+// The "kept" notice is delivered once and best-effort: the --write that kept a line
+// reports it (stderr, the JSON report, the PreCompact heal notice) and drops the
+// record in the same run, so a missed notice is never repeated. The failure
+// direction is a visible duplicate line beside the managed entry, never a deletion.
+//
+// Two more conditions keep a deletion from orphaning or hitting the wrong thing:
+//   - memory lines: the line's link must name the file the managed entry links,
+//     feedback_<slug>.md. Bootstrap turns '_' into '-' when it makes the slug, so a
+//     hand line for feedback_no_mocks.md becomes slug no-mocks and its managed entry
+//     links feedback_no-mocks.md, a different file. Deleting that hand line would
+//     drop the only index pointer to the user's own feedback_no_mocks.md.
+//   - a record is consumed only when the projected page carries bootstrap_origin,
+//     the key a promoted bootstrap draft keeps. A rejected draft's leftover record
+//     must not delete a hand line when an unrelated page later reuses its slug.
+const HAND_LINES_FILE = (hypoDir) => join(hypoDir, '.cache', 'feedback-bootstrap-lines.json');
+
+// Entries are { slug, target: 'memory' | 'claude', file, line }. A missing or
+// unreadable record means "nothing recorded": the safe direction (no deletion).
+function loadHandLines(hypoDir) {
+  try {
+    const j = JSON.parse(readFileSync(HAND_LINES_FILE(hypoDir), 'utf-8'));
+    return (Array.isArray(j.lines) ? j.lines : []).filter(
+      (r) => r && ['slug', 'target', 'file', 'line'].every((k) => typeof r[k] === 'string' && r[k]),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function saveHandLines(hypoDir, lines) {
+  const file = HAND_LINES_FILE(hypoDir);
+  if (!lines.length) rmSync(file, { force: true });
+  else atomicWrite(file, JSON.stringify({ version: 1, lines }, null, 2) + '\n');
+}
+
+// Split `recs` (records for one target file whose slug the wiki now projects)
+// into removed / kept / stale and return the content without the removed lines.
+//   stale   the slug already has a managed block in the file: an earlier write
+//           placed it, only the record cleanup was lost. Nothing to remove.
+//   kept    the line is not there exactly once outside the managed blocks, or (memory
+//           lines) it links a different file than the managed entry will.
+function stripHandLines(content, recs) {
+  const { blocks } = findBlocks(content);
+  const have = new Set(blocks.map((b) => b.slug));
+  const lines = content.split('\n');
+  const outside = [];
+  let off = 0;
+  lines.forEach((text, i) => {
+    if (!blocks.some((b) => off >= b.start && off < b.end)) outside.push(i);
+    off += text.length + 1;
+  });
+  const drop = new Set();
+  const out = { removed: [], kept: [], stale: [] };
+  for (const r of recs) {
+    if (have.has(r.slug)) {
+      out.stale.push(r);
+      continue;
+    }
+    const link = /\]\((feedback_[^)]*\.md)\)/.exec(r.line);
+    if (r.target === 'memory' && (!link || link[1] !== `feedback_${r.slug}.md`)) {
+      out.kept.push(r);
+      continue;
+    }
+    const hits = outside.filter((i) => lines[i] === r.line);
+    if (hits.length === 1) {
+      drop.add(hits[0]);
+      out.removed.push(r);
+    } else out.kept.push(r);
+  }
+  return { ...out, content: lines.filter((_, i) => !drop.has(i)).join('\n') };
+}
+
 // ── per-target evaluation (preflight: validates + computes the write plan) ─────
 
-function evaluateTarget(pages, target) {
+function evaluateTarget(pages, target, handRecs = []) {
   const desired = computeDesired(pages, target);
   const fileExists = existsSync(target.file);
   const dangling = isDanglingSymlink(target.file);
@@ -599,20 +769,36 @@ function evaluateTarget(pages, target) {
   // fails OPEN — reproducing, via an ordinary filesystem error, the exact
   // failure mode ("rules not loaded, gate stays green") this whole projection
   // system exists to prevent. Caught and classified as 'build-failed' instead.
-  let content = '';
+  let original = '';
   let ioError = null;
   if (fileExists) {
     try {
-      content = readFileSync(target.file, 'utf-8');
+      original = readFileSync(target.file, 'utf-8');
     } catch (err) {
       ioError = `cannot read target file ${target.file}: ${err.message}`;
     }
   }
+  // Hand lines bootstrap drafted from, for slugs the wiki now projects here, are
+  // judged on the content WITHOUT them: a recorded line between two blocks is no
+  // intruder once this write removes it. `original` stays the on-disk bytes
+  // (dirty check, applyTarget, runAccept); `content` is the plan's input.
+  const mine = ioError
+    ? []
+    : handRecs.filter(
+        (r) =>
+          r.target === target.name &&
+          r.file === target.file &&
+          desired.some((d) => d.slug === r.slug && d.page.fm.bootstrap_origin),
+      );
+  const hand = stripHandLines(original, mine);
+  const content = hand.content;
   const { blocks } = findBlocks(content);
   const { starts, ends } = countMarkers(content);
 
-  // conflict: on-disk block whose inner content no longer matches its marker
-  const conflicts = blocks.filter((b) => b.actualHash !== b.declaredHash).map((b) => b.slug);
+  // conflict: on-disk block whose inner content no longer matches its marker and
+  // differs from the wiki rendering (equal-to-wiki is accepted: the region rebuild
+  // below rewrites its marker hash, which --check reports as drift, --write fixes)
+  const conflicts = blocks.filter((b) => isBlockConflict(b, desired)).map((b) => b.slug);
   // unpaired: a raw START/END marker that BLOCK_RE could not pair (malformed/tampered)
   const unpaired = starts !== blocks.length || ends !== blocks.length;
   // intruder: hand-added lines inside the managed span (would be dropped on rewrite)
@@ -707,7 +893,27 @@ function evaluateTarget(pages, target) {
   const sideWarnings = [];
   const sideWrites = [];
   for (const d of desired) {
-    for (const sf of target.sideFiles(d.page)) sideWrites.push(sf);
+    for (const sf of target.sideFiles(d.page)) {
+      // Same provenance rule as staleSideFiles, on the overwrite side: a
+      // feedback_<slug>.md without the header is the user's own file (a promoted
+      // bootstrap draft points at it, and the wiki copy only holds the index
+      // summary). Unreadable counts as "not ours": never overwrite what cannot
+      // be checked.
+      if (existsSync(sf.path)) {
+        let skip = null;
+        try {
+          if (!readFileSync(sf.path, 'utf-8').startsWith(SIDE_MARKER_PREFIX))
+            skip = `not overwriting ${sf.path}: it has no feedback-sync provenance header, so it is a hand-written file. Rename or delete it by hand if the wiki page should own that name`;
+        } catch (err) {
+          skip = `cannot read side file ${sf.path}: ${err.message}`;
+        }
+        if (skip) {
+          sideWarnings.push(skip);
+          continue;
+        }
+      }
+      sideWrites.push(sf);
+    }
   }
   let sideDeletes = [];
   if (!buildError) {
@@ -719,7 +925,7 @@ function evaluateTarget(pages, target) {
   }
 
   // dirty: main content would change OR any side-file would change/be removed
-  let dirty = nextContent !== null && nextContent !== (fileExists ? content : '');
+  let dirty = nextContent !== null && nextContent !== (fileExists ? original : '');
   if (sideDeletes.length) dirty = true;
   for (const sf of sideWrites) {
     let cur = null;
@@ -742,7 +948,8 @@ function evaluateTarget(pages, target) {
     outOfContainer,
     overCap,
     dirty,
-    content,
+    content: original,
+    hand,
     fileExists,
     nextContent,
     buildError,
@@ -916,7 +1123,7 @@ function parseLearnedBehaviors(content) {
   const out = [];
   for (const line of scrubbed.split('\n')) {
     const m = line.match(/^- \[(\d{4}-\d{2}-\d{2})\]\s+(.*\S)\s*$/);
-    if (m) out.push({ date: m[1], rule: m[2].trim() });
+    if (m) out.push({ date: m[1], rule: m[2].trim(), line });
   }
   return out;
 }
@@ -935,7 +1142,10 @@ function parseMemoryIndex(content) {
   const re = /^- \[([^\]]*)\]\(feedback_([^)]+?)\.md\)\s*(?:(?::|—)\s*(.*\S))?\s*$/gm;
   let m;
   while ((m = re.exec(scrubbed)) !== null) {
-    out.push({ title: m[1].trim(), name: m[2].trim(), summary: (m[3] || '').trim() });
+    // The trailing \s* can swallow newlines, so the first segment is the physical
+    // line (bytes as on disk, a CRLF's \r included): what --bootstrap records.
+    const line = m[0].split('\n')[0];
+    out.push({ title: m[1].trim(), name: m[2].trim(), summary: (m[3] || '').trim(), line });
   }
   return out;
 }
@@ -961,7 +1171,17 @@ function bootstrapDraftContent({ title, summary, body, date, origin }) {
     `source: ${date ? `session:${date}` : 'TODO'}`,
   ];
   if (date) lines.push(`created: ${date}`, `updated: ${date}`);
-  lines.push(`bootstrap_origin: ${origin}`, '---', '', `# ${title}`, '', body, '');
+  // the comment has no colon, so parseFrontmatter skips it (a key-less line)
+  lines.push(
+    '# keep the bootstrap_origin line below, it lets --write remove the hand line this draft came from',
+    `bootstrap_origin: ${origin}`,
+    '---',
+    '',
+    `# ${title}`,
+    '',
+    body,
+    '',
+  );
   return lines.join('\n');
 }
 
@@ -1032,6 +1252,9 @@ function loadBootstrapSources(args) {
         summary: oneLineSummary(lb.rule),
         body: lb.rule,
         date: lb.date,
+        target: 'claude',
+        file: claudeFile,
+        line: lb.line,
       });
     }
   } else {
@@ -1054,6 +1277,9 @@ function loadBootstrapSources(args) {
         summary: e.summary,
         body: e.summary || e.title || slug,
         date: '',
+        target: 'memory',
+        file: memFile,
+        line: e.line,
       });
     }
   } else {
@@ -1074,6 +1300,7 @@ function runBootstrap(args) {
   const report = { mode: 'bootstrap', dryRun: args.dryRun, created: [], skipped: [...skipped] };
 
   const seen = new Set();
+  const recorded = [];
   for (const c of candidates) {
     if (seen.has(c.slug)) {
       report.skipped.push({ slug: c.slug, reason: 'duplicate-in-batch' });
@@ -1094,6 +1321,19 @@ function runBootstrap(args) {
     if (!args.dryRun) {
       mkdirSync(draftsDir, { recursive: true });
       writeFileSync(draftPath, bootstrapDraftContent(c));
+      recorded.push({ slug: c.slug, target: c.target, file: c.file, line: c.line });
+    }
+  }
+  if (recorded.length) {
+    const kept = loadHandLines(args.hypoDir).filter(
+      (r) => !recorded.some((n) => n.slug === r.slug && n.target === r.target),
+    );
+    try {
+      saveHandLines(args.hypoDir, [...kept, ...recorded]);
+    } catch (err) {
+      warnings.push(
+        `could not record hand lines; they will not be removed on promotion: ${err.message}`,
+      );
     }
   }
   return { code: 0, report, warnings };
@@ -1101,9 +1341,8 @@ function runBootstrap(args) {
 
 // Source loader for --import-target-change (input side): select the target
 // projection file (CLAUDE.md or the project MEMORY.md), read it, and return the
-// managed blocks whose inner content no longer matches their marker hash
-// (hand-edited = conflict). This IS the import contract — findBlocks + hash-
-// mismatch filter, NOT projection evaluation. Returns { file, conflicts } or
+// managed blocks in conflict: inner content no longer matches the marker hash
+// AND differs from what the wiki renders now (isBlockConflict). Returns { file, conflicts } or
 // { error } for an invalid --from / missing target file.
 function loadImportConflicts(args) {
   if (args.from !== 'memory' && args.from !== 'claude') {
@@ -1115,8 +1354,13 @@ function loadImportConflicts(args) {
       : join(args.claudeHome, 'projects', deriveProjectId(args).id, 'memory', 'MEMORY.md');
   if (!existsSync(file)) return { error: `target file not found: ${file}` };
 
+  // the same definition of conflict as --check/--write/--accept-wiki: a block that
+  // was auto-accepted (its content equals the wiki's rendering) is not imported
+  const target =
+    args.from === 'claude' ? claudeTarget(args) : memoryTarget(args, deriveProjectId(args).id);
+  const desired = computeDesired(loadFeedbackPages(args.hypoDir), target);
   const { blocks } = findBlocks(readFileSync(file, 'utf-8'));
-  const conflicts = blocks.filter((b) => b.actualHash !== b.declaredHash);
+  const conflicts = blocks.filter((b) => isBlockConflict(b, desired));
   return { file, conflicts };
 }
 
@@ -1158,6 +1402,78 @@ function runImport(args) {
     }
   }
   return { code: 0, report, warnings };
+}
+
+// --accept-wiki=<slug>: for every target that holds that source's block in
+// conflict, replace the block with the wiki's current rendering (or remove it when
+// the wiki projects nothing for that source there any more: the wiki's rendering is
+// empty). Only that block's bytes change, rewritten with a fresh marker hash. No
+// other block, hand line, side-file or target file is touched.
+//
+// Refused per target when the file's markers are malformed or unpaired: BLOCK_RE
+// pairs lazily, so a START whose END was deleted by hand swallows everything up to
+// the NEXT block's END, and splicing that span would delete the neighbor block and
+// any hand-written lines in between. --dry-run reports the plan and writes nothing.
+function runAccept(args, evals) {
+  const slug = args.acceptSlug;
+  const report = { mode: 'accept', slug, dryRun: args.dryRun, accepted: [], refused: [] };
+  if (args.dryRun) report.planned = [];
+  const plans = [];
+  for (const { target, res } of evals) {
+    const { blocks } = findBlocks(res.content);
+    const b = blocks.find((x) => x.slug === slug);
+    const d = res.desired.find((x) => x.slug === slug);
+    const { starts, ends } = countMarkers(res.content);
+    let reason = null;
+    if (!b) reason = 'no managed block for this source';
+    else if (starts !== blocks.length || ends !== blocks.length)
+      reason = `malformed or unpaired managed marker in ${target.file}: repair the markers by hand first`;
+    else if (!isBlockConflict(b, res.desired)) reason = 'block is not in conflict';
+    if (reason) report.refused.push({ target: target.name, reason });
+    else plans.push({ target, b, d, content: res.content, discarded: b.inner });
+  }
+  if (!plans.length) {
+    const why = report.refused.map((r) => `${r.target}: ${r.reason}`).join('; ');
+    return { code: 1, error: `--accept-wiki=${slug}: nothing to accept (${why})`, report };
+  }
+  for (const { target, b, d, content, discarded } of plans) {
+    const action = d ? 'replace' : 'remove';
+    // Marker counts cannot tell a block from two blocks fused by deleting one END
+    // and the next START, so the exact inner text that is about to go is reported:
+    // it is the only way to see a swallowed span before (or after) it is gone.
+    if (args.dryRun) {
+      report.planned.push({ target: target.name, file: target.file, action, discarded });
+      continue;
+    }
+    const next = d
+      ? content.slice(0, b.start) + renderBlock(slug, d.inner) + content.slice(b.end)
+      : removeBlock(content, b);
+    try {
+      atomicWrite(target.file, next);
+    } catch (err) {
+      const done = report.accepted.map((a) => a.target).join(', ');
+      return {
+        code: 1,
+        error:
+          `cannot write ${target.file}: ${err.message}. ${REMEDY.io(target.file)}` +
+          (done ? ` Already accepted before this failure: ${done}.` : ''),
+        report,
+      };
+    }
+    report.accepted.push({ target: target.name, file: target.file, action, discarded });
+  }
+  return { code: 0, report, warnings: [] };
+}
+
+// Cut one managed block out of `content` together with its line ending, so no blank
+// line is left behind. A block that ends the file without a trailing newline takes
+// the newline before it instead.
+function removeBlock(content, b) {
+  let { start, end } = b;
+  if (content.startsWith('\r\n', end)) end += 2;
+  else if (content[end] === '\n') end += 1;
+  else if (start > 0 && content[start - 1] === '\n') start -= 1;
+  return content.slice(0, start) + content.slice(end);
 }
 
 // The provisioning step --write can never do on its own: --write only ever
@@ -1245,6 +1561,14 @@ function run(args, resolvedPid = null) {
   if (args.mode === 'ensure-container') return runEnsureContainer(args);
   if (args.mode === 'bootstrap') return runBootstrap(args);
   if (args.mode === 'import') return runImport(args);
+  if (args.mode === 'accept' && !args.acceptSlug) {
+    return {
+      code: 1,
+      error:
+        '--accept-wiki requires a source slug in the `=` form, e.g. --accept-wiki=rule-a ' +
+        '(a space-separated slug is not read)',
+    };
+  }
 
   const pages = loadFeedbackPages(args.hypoDir);
   // pid may be pre-resolved by the interactive layer in main(); fall back to the
@@ -1302,7 +1626,11 @@ function run(args, resolvedPid = null) {
   // over-cap / build error in ANY target blocks writes to ALL (atomicity:
   // "no auto-merge"; avoids a partial write where one target
   // lands and another refuses).
-  const evals = targets.map((target) => ({ target, res: evaluateTarget(pages, target) }));
+  const handRecs = loadHandLines(args.hypoDir);
+  const evals = targets.map((target) => ({
+    target,
+    res: evaluateTarget(pages, target, handRecs),
+  }));
   for (const { target, res } of evals) {
     report.targets[target.name] = {
       candidates: res.desired.length,
@@ -1329,6 +1657,10 @@ function run(args, resolvedPid = null) {
       // Non-fatal: a side-file I/O problem degrades the projection, it does not
       // break it. Reported (never swallowed), but it must not block /compact.
       ...(res.sideWarnings.length ? { sideWarnings: res.sideWarnings } : {}),
+      // The way out of a conflicted target, decided once here (see REMEDY.conflict).
+      ...(res.conflicts.length || res.intruder || res.unpaired || res.outOfContainer
+        ? { conflictRemedy: REMEDY.conflict(target.name, res) }
+        : {}),
     };
     for (const w of res.sideWarnings) warnings.push(`${target.name}: ${w}`);
     if (res.conflicts.length || res.intruder || res.unpaired || res.outOfContainer)
@@ -1338,6 +1670,8 @@ function run(args, resolvedPid = null) {
     else if (res.dirty && args.mode === 'check') code = Math.max(code, 1);
   }
 
+  if (args.mode === 'accept') return runAccept(args, evals);
+
   // strict promotes warnings to a failure; compute it BEFORE the write gate so a
   // --write --strict refuses rather than writing then exiting non-zero.
   const strictFail = args.strict && strictWarnings.length > 0;
@@ -1346,10 +1680,12 @@ function run(args, resolvedPid = null) {
   // build error, or check-mode drift) and no strict failure. Skip clean targets
   // so writes stay byte-idempotent.
   if (args.mode === 'write' && code === 0 && !strictFail) {
+    const spent = [];
     for (const { target, res } of evals) {
-      if (!res.dirty) continue;
       try {
-        warnings.push(...applyTarget(target, res).map((w) => `${target.name}: ${w}`));
+        if (res.dirty) {
+          warnings.push(...applyTarget(target, res).map((w) => `${target.name}: ${w}`));
+        }
       } catch (err) {
         // A PRIMARY-target write failure (ENOSPC, EACCES, a read-only mount).
         // Reported, not thrown: an uncaught throw prints no JSON, and every
@@ -1366,6 +1702,31 @@ function run(args, resolvedPid = null) {
           report,
           warnings,
         };
+      }
+      // The record entry is dropped below, so this run is the only one that can say
+      // so: put it in the JSON report as well as on stderr (--json prints no warnings).
+      const pick = (r) => ({ slug: r.slug, file: r.file, line: r.line });
+      if (res.hand.kept.length) report.targets[target.name].handKept = res.hand.kept.map(pick);
+      if (res.hand.removed.length)
+        report.targets[target.name].handRemoved = res.hand.removed.map(pick);
+      for (const r of res.hand.kept) warnings.push(`${target.name}: ${handKeptNotice(r)}`);
+      spent.push(...res.hand.removed, ...res.hand.kept, ...res.hand.stale);
+    }
+    // a record whose draft and page are both gone can never be consumed: drop it
+    // so it cannot meet an unrelated page that reuses the slug later
+    const draftsDir = join(args.hypoDir, 'pages', 'feedback', '_drafts');
+    for (const r of handRecs) {
+      if (!pages.some((p) => p.slug === r.slug) && !existsSync(join(draftsDir, `${r.slug}.md`)))
+        spent.push(r);
+    }
+    if (spent.length) {
+      try {
+        saveHandLines(
+          args.hypoDir,
+          handRecs.filter((r) => !spent.includes(r)),
+        );
+      } catch (err) {
+        warnings.push(`cannot update the bootstrap line record: ${err.message}`);
       }
     }
   }
@@ -1393,7 +1754,12 @@ async function main() {
   const out = run(args, resolvedPid);
 
   if (args.json) {
-    console.log(JSON.stringify(out.error ? { error: out.error } : out.report, null, 2));
+    // a failed --accept-wiki still says which targets were already rewritten
+    const errBody =
+      out.report && out.report.mode === 'accept'
+        ? { error: out.error, accepted: out.report.accepted, refused: out.report.refused }
+        : { error: out.error };
+    console.log(JSON.stringify(out.error ? errBody : out.report, null, 2));
   } else if (out.error) {
     console.error(`[feedback-sync] ${out.error}`);
   } else if (out.report.mode === 'ensure-container') {
@@ -1426,6 +1792,27 @@ async function main() {
       `[feedback-sync] bootstrap: ${out.report.created.length} ${verb}, ${out.report.skipped.length} skipped. ` +
         `Fill scope/tier/targets/promote_to_global and move into pages/feedback/.`,
     );
+  } else if (out.report.mode === 'accept') {
+    const what = (a) =>
+      a.action === 'remove' ? 'removed the block' : 'accepted the wiki rendering';
+    const showDiscarded = (a) =>
+      console.error(
+        `[feedback-sync] ${out.report.dryRun ? 'would discard' : 'discarded'} hand edit in ${a.file} for ${out.report.slug}:\n${a.discarded}`,
+      );
+    for (const a of out.report.planned || []) {
+      console.error(
+        `[feedback-sync] would ${a.action} the block for ${out.report.slug} in ${a.target} (${a.file}). Nothing written (--dry-run).`,
+      );
+      showDiscarded(a);
+    }
+    for (const a of out.report.accepted) {
+      console.error(
+        `[feedback-sync] ${what(a)} for ${out.report.slug} in ${a.target} (${a.file}).`,
+      );
+      showDiscarded(a);
+    }
+    if (!out.report.dryRun)
+      console.error('[feedback-sync] Run `hypomnema feedback-sync --check` to confirm.');
   } else if (out.report.mode === 'import') {
     for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
     const verb = out.report.dryRun ? 'would import' : 'imported';
@@ -1446,10 +1833,7 @@ async function main() {
             : t.outOfContainer
               ? 'managed block sits outside <learned_behaviors>'
               : 'managed region has unrecognized lines (move them outside the HYPO blocks)';
-        console.error(
-          `[feedback-sync] CONFLICT: ${name} ${why}\n` +
-            `  Run \`hypomnema feedback-sync --import-target-change --from=${name}\` to import.`,
-        );
+        console.error(`[feedback-sync] CONFLICT: ${name} ${why}\n` + `  ${t.conflictRemedy}`);
       } else if (t.buildError) console.error(`[feedback-sync] ERROR: ${name} ${t.buildError}`);
       else if (t.overCap)
         console.error(

@@ -127,6 +127,9 @@ test('feedback projection conflict (hand-edited block) → named in the notice, 
           /conflict/.test(out.systemMessage || ''),
           `notice must name the conflict: ${r.stdout}`,
         );
+        // the remedy is the report's text: --from for the copy, the real slug for accept
+        assert.match(out.systemMessage, /--import-target-change --from=claude/, r.stdout);
+        assert.match(out.systemMessage, /--accept-wiki=rule-a/, r.stdout);
         // Never auto-merged over the hand edit.
         assert.ok(
           readFileSync(claudePath, 'utf-8').includes('HAND EDITED'),
@@ -1199,6 +1202,449 @@ test('feedback-sync-import-target-change: hand-edited block → draft, SoT page 
   });
 });
 
+// ── hand-edited block: auto-accept when the wiki matches, explicit --accept-wiki otherwise ──
+
+// stored vs recomputed hash of one managed block in a projected file
+function fbBlockHashes(text, slug) {
+  const m = text.match(
+    new RegExp(
+      `<!-- HYPO:FEEDBACK-SYNC:START source=${slug} sha256=([0-9a-f]{64}) -->\n([\\s\\S]*?)\n<!-- HYPO:FEEDBACK-SYNC:END -->`,
+    ),
+  );
+  assert.ok(m, `managed block for ${slug} present`);
+  return { declared: m[1], actual: createHash('sha256').update(m[2], 'utf-8').digest('hex') };
+}
+
+const FB_GLOBAL_C = {
+  ...FB_GLOBAL_L1,
+  title: 'Rule C',
+  priority: 4,
+  memory_summary: 'do C',
+  global_summary: 'always do C',
+};
+
+test('feedback-sync-conflict-auto-accept: hand edit matched by the wiki page → --write rewrites the hash, check clean', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED'));
+    const before = fbBlockHashes(readFileSync(p, 'utf-8'), 'rule-a');
+    assert.notEqual(before.declared, before.actual, 'precondition: stored hash is stale');
+    assert.equal(runFb(['--check']).status, 3, 'precondition: wiki still differs, conflict');
+    // the wiki side now says the same thing, byte for byte
+    const page = join(wiki, 'pages', 'feedback', 'rule-a.md');
+    writeFileSync(page, readFileSync(page, 'utf-8').replace('always do A', 'HAND EDITED'));
+    assert.equal(
+      runFb(['--check']).status,
+      1,
+      'matched block is drift (hash to rewrite), not conflict',
+    );
+    assert.equal(runFb(['--write']).status, 0, 'matched block must not block --write');
+    const after = fbBlockHashes(readFileSync(p, 'utf-8'), 'rule-a');
+    assert.equal(after.declared, after.actual, 'marker hash rewritten to match the content');
+    assert.notEqual(after.declared, before.declared);
+    assert.ok(readFileSync(p, 'utf-8').includes('HAND EDITED'), 'content kept');
+    assert.equal(runFb(['--check']).status, 0, 'following --check is clean');
+  });
+});
+
+test('feedback-sync-conflict-differs-from-wiki-still-exit-3: auto-accept does not swallow a differing hand edit', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED'));
+    // wiki edited to something else, so the two sides differ
+    const page = join(wiki, 'pages', 'feedback', 'rule-a.md');
+    writeFileSync(page, readFileSync(page, 'utf-8').replace('always do A', 'WIKI EDITED'));
+    const h = fbBlockHashes(readFileSync(p, 'utf-8'), 'rule-a');
+    assert.notEqual(h.declared, h.actual, 'precondition: stored hash is stale');
+    for (const mode of ['--check', '--write']) {
+      const r = runFb([mode, '--json']);
+      assert.equal(r.status, 3, `${mode} must stay a conflict: ${r.stderr}`);
+      assert.deepEqual(JSON.parse(r.stdout).targets.claude.conflicts, ['rule-a']);
+    }
+    assert.ok(readFileSync(p, 'utf-8').includes('HAND EDITED'), 'hand edit not overwritten');
+  });
+});
+
+test('feedback-sync-accept-wiki: resolves only the named conflicted block, refuses non-conflicted sources', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C },
+    ({ claudeHome, memDir, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const p = join(claudeHome, 'CLAUDE.md');
+      writeFileSync(
+        p,
+        readFileSync(p, 'utf-8')
+          .replace('always do A', 'HAND EDITED A')
+          .replace('always do C', 'HAND EDITED C'),
+      );
+      const mem = join(memDir, 'MEMORY.md');
+      const memBefore = readFileSync(mem, 'utf-8');
+      for (const slug of ['rule-a', 'rule-c']) {
+        const h = fbBlockHashes(readFileSync(p, 'utf-8'), slug);
+        assert.notEqual(h.declared, h.actual, `precondition: ${slug} hash is stale`);
+      }
+      assert.equal(runFb(['--check']).status, 3, 'precondition: conflict');
+
+      const r = runFb(['--accept-wiki=rule-a', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(
+        JSON.parse(r.stdout).accepted.map((a) => a.target),
+        ['claude'],
+      );
+      const text = readFileSync(p, 'utf-8');
+      assert.ok(text.includes('always do A'), 'wiki rendering restored for rule-a');
+      assert.ok(!text.includes('HAND EDITED A'), 'hand edit for rule-a discarded');
+      const a = fbBlockHashes(text, 'rule-a');
+      assert.equal(a.declared, a.actual, 'rule-a hash rewritten');
+      assert.ok(text.includes('HAND EDITED C'), 'rule-c hand edit untouched');
+      const c = fbBlockHashes(text, 'rule-c');
+      assert.notEqual(c.declared, c.actual, 'rule-c still conflicted on disk');
+      assert.equal(readFileSync(mem, 'utf-8'), memBefore, 'other target untouched');
+      const chk = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.deepEqual(chk.targets.claude.conflicts, ['rule-c'], 'only rule-c remains in conflict');
+
+      // refusals: already resolved, unknown source, empty slug; the file stays as is
+      for (const flag of ['--accept-wiki=rule-a', '--accept-wiki=nope', '--accept-wiki=']) {
+        const bad = runFb([flag]);
+        assert.equal(bad.status, 1, `${flag} must be refused`);
+        assert.equal(readFileSync(p, 'utf-8'), text, `${flag} must not write`);
+      }
+      assert.match(runFb(['--accept-wiki=rule-a']).stderr, /not in conflict/);
+    },
+  );
+});
+
+// A START whose END was deleted by hand: BLOCK_RE pairs it with the NEXT block's END,
+// so the "block" spans the neighbor and the note between them. Accept would splice
+// that whole span. It must refuse, leave every byte alone, and not advertise itself.
+test('feedback-sync-accept-wiki-refuses-unpaired-file: a deleted END marker cannot make accept eat the neighbor block and a hand note', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C }, ({ claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    const END = '<!-- HYPO:FEEDBACK-SYNC:END -->';
+    // rule-a sorts first (priority 5 over 4): its END is the first one in the file
+    const damaged = readFileSync(p, 'utf-8')
+      .replace('always do A', 'HAND EDITED A')
+      .replace(END, '- my personal note I want to keep');
+    writeFileSync(p, damaged);
+
+    const chk = runFb(['--check', '--json']);
+    assert.equal(chk.status, 3, 'precondition: conflict exit');
+    const rep = JSON.parse(chk.stdout).targets.claude;
+    assert.deepEqual(rep.conflicts, ['rule-a'], 'precondition: rule-a reads as conflicted');
+    assert.equal(rep.unpaired, true, 'precondition: the file is unpaired');
+    assert.ok(
+      !runFb(['--check']).stderr.includes('--accept-wiki'),
+      'the accept hint must not be offered for an unpaired file',
+    );
+
+    const r = runFb(['--accept-wiki=rule-a']);
+    assert.equal(r.status, 1, `accept must refuse: ${r.stderr}`);
+    assert.match(r.stderr, /malformed or unpaired managed marker/);
+    assert.ok(r.stderr.includes(p), 'the refusal names the file');
+    assert.equal(readFileSync(p, 'utf-8'), damaged, 'file is byte-identical after the refusal');
+    assert.ok(damaged.includes('- my personal note I want to keep') && damaged.includes('rule-c'));
+  });
+});
+
+test('feedback-sync-accept-wiki-removes-block-of-archived-page: no wiki rendering left, the block goes, nothing else does', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C },
+    ({ wiki, claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const p = join(claudeHome, 'CLAUDE.md');
+      writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED A'));
+      // the page is archived after the hand edit: the wiki projects nothing for rule-a now
+      writeFileSync(
+        join(wiki, 'pages', 'feedback', 'rule-a.md'),
+        fbPage({ ...FB_GLOBAL_L1, status: 'archived' }),
+      );
+      assert.equal(runFb(['--check']).status, 3, 'precondition: stuck in conflict');
+
+      const r = runFb(['--accept-wiki=rule-a', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      const rep = JSON.parse(r.stdout);
+      assert.deepEqual(
+        rep.accepted.map((a) => [a.target, a.action]),
+        [['claude', 'remove']],
+      );
+      const text = readFileSync(p, 'utf-8');
+      assert.ok(!text.includes('source=rule-a') && !text.includes('HAND EDITED A'), 'block gone');
+      assert.ok(text.includes('source=rule-c'), 'neighbor block intact');
+      assert.ok(text.includes('- manual entry'), 'hand line intact');
+      assert.ok(!text.includes('\n\n'), 'no blank line left behind');
+      // the claude side is clean; the MEMORY projection of the archived page is ordinary drift
+      const chk = JSON.parse(runFb(['--check', '--json']).stdout);
+      assert.deepEqual(chk.targets.claude.conflicts, []);
+      assert.equal(chk.targets.claude.dirty, false);
+      assert.equal(runFb(['--write']).status, 0);
+      assert.equal(runFb(['--check']).status, 0, 'fully clean after the next write');
+    },
+  );
+});
+
+test('feedback-sync-accept-wiki-dry-run-and-usage: --dry-run writes nothing, a space-separated slug is a usage error', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED A'));
+    const before = readFileSync(p, 'utf-8');
+    const hint = runFb(['--check']).stderr;
+    assert.match(hint, /--import-target-change --from=claude/);
+    assert.match(
+      hint,
+      /run that import first, then `hypomnema feedback-sync --accept-wiki=rule-a`/,
+    );
+
+    const r = runFb(['--accept-wiki=rule-a', '--dry-run', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    const rep = JSON.parse(r.stdout);
+    assert.deepEqual(
+      rep.planned.map((a) => [a.target, a.action]),
+      [['claude', 'replace']],
+    );
+    assert.deepEqual(rep.accepted, [], 'nothing reported as written');
+    assert.equal(readFileSync(p, 'utf-8'), before, 'dry run leaves the file byte-identical');
+
+    // the space form used to be read as --check
+    const sp = runFb(['--accept-wiki', 'rule-a']);
+    assert.equal(sp.status, 1, 'bare --accept-wiki is a usage error');
+    assert.match(sp.stderr, /--accept-wiki=rule-a/, 'the message shows the = form');
+    assert.equal(readFileSync(p, 'utf-8'), before, 'and writes nothing');
+  });
+});
+
+test('feedback-sync-conflict-remedy: the report carries one remedy text naming --from and the real slugs; an unpaired file gets no accept part', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C }, ({ claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    const clean = readFileSync(p, 'utf-8');
+    assert.equal(
+      JSON.parse(runFb(['--check', '--json']).stdout).targets.claude.conflictRemedy,
+      undefined,
+      'a clean target carries no remedy',
+    );
+    writeFileSync(
+      p,
+      clean.replace('always do A', 'HAND EDITED A').replace('always do C', 'HAND EDITED C'),
+    );
+    const t = JSON.parse(runFb(['--check', '--json']).stdout).targets.claude;
+    assert.match(t.conflictRemedy, /--import-target-change --from=claude/);
+    assert.match(t.conflictRemedy, /--accept-wiki=rule-a/);
+    assert.match(t.conflictRemedy, /--accept-wiki=rule-c/);
+    assert.ok(!/[\u2014\u2013]| -- /.test(t.conflictRemedy), 'no dash in the text');
+    assert.ok(
+      runFb(['--check']).stderr.includes(t.conflictRemedy),
+      'the CLI prints the report text, not its own',
+    );
+
+    // unpaired: rule-a's END deleted, so --accept-wiki would refuse; the remedy must not offer it
+    writeFileSync(
+      p,
+      clean
+        .replace('always do A', 'HAND EDITED A')
+        .replace('<!-- HYPO:FEEDBACK-SYNC:END -->', '- note'),
+    );
+    const u = JSON.parse(runFb(['--check', '--json']).stdout).targets.claude;
+    assert.equal(u.unpaired, true, 'precondition');
+    assert.match(u.conflictRemedy, /--import-target-change --from=claude/);
+    assert.ok(!u.conflictRemedy.includes('--accept-wiki'), `unpaired: ${u.conflictRemedy}`);
+  });
+});
+
+test('feedback-sync-conflict-remedy-by-shape: an intruder-only target is told to move the lines, not to import', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C }, ({ claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(
+      p,
+      readFileSync(p, 'utf-8').replace(
+        '<!-- HYPO:FEEDBACK-SYNC:END -->\n<!-- HYPO:FEEDBACK-SYNC:START',
+        '<!-- HYPO:FEEDBACK-SYNC:END -->\n- intruder line\n<!-- HYPO:FEEDBACK-SYNC:START',
+      ),
+    );
+    const t = JSON.parse(runFb(['--check', '--json']).stdout).targets.claude;
+    assert.equal(t.intruder, true, 'precondition: intruder only');
+    assert.equal(t.conflicts.length, 0, 'precondition: no conflicting block');
+    assert.ok(!t.conflictRemedy.includes('--accept-wiki'), t.conflictRemedy);
+    assert.match(t.conflictRemedy, /Move the hand-written lines outside the HYPO blocks/);
+    assert.match(t.conflictRemedy, /--write/);
+    // import has nothing to offer here: the text may say so, but must not tell the reader to run it
+    assert.ok(!/Run `[^`]*--import-target-change/.test(t.conflictRemedy), t.conflictRemedy);
+    assert.ok(!/[\u2014\u2013]| -- /.test(t.conflictRemedy), 'no dash in the text');
+  });
+});
+
+test('feedback-sync-conflict-remedy-quotes-nothing-unsafe: a marker slug with shell syntax gets no accept command', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C }, ({ claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(
+      p,
+      readFileSync(p, 'utf-8')
+        .replace('always do A', 'HAND EDITED A')
+        .replace('START source=rule-a', 'START source=x$(id)')
+        .replace('always do C', 'HAND EDITED C'),
+    );
+    const t = JSON.parse(runFb(['--check', '--json']).stdout).targets.claude;
+    assert.ok(
+      t.conflicts.includes('x$(id)'),
+      `precondition: the odd slug conflicts: ${t.conflicts}`,
+    );
+    assert.ok(!t.conflictRemedy.includes('x$(id)'), `no shell syntax pasted: ${t.conflictRemedy}`);
+    assert.match(t.conflictRemedy, /--import-target-change --from=claude/);
+    assert.match(t.conflictRemedy, /--accept-wiki=rule-c/, 'a plain slug still gets its command');
+  });
+});
+
+test('doctor-conflict-remedy: doctor prints the report text; an unpaired target gets no accept part', () => {
+  withDoctorFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C },
+    ({ runFb, claudeHome, runDoctor }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const p = join(claudeHome, 'CLAUDE.md');
+      const clean = readFileSync(p, 'utf-8');
+      writeFileSync(p, clean.replace('always do A', 'HAND EDITED A'));
+      const remedy = JSON.parse(runFb(['--check', '--json']).stdout).targets.claude.conflictRemedy;
+      const hit = runDoctor().fb.find((c) => c.label === 'Feedback projection integrity');
+      assert.ok(hit && hit.status === 'fail', 'precondition: doctor fails the conflict');
+      assert.ok(hit.detail.includes(remedy), `doctor must print the report's text: ${hit.detail}`);
+      assert.ok(
+        hit.detail.includes('--from=claude') && hit.detail.includes('--accept-wiki=rule-a'),
+      );
+      assert.ok(!/[\u2014\u2013]/.test(hit.detail), 'no dash in the doctor line');
+
+      writeFileSync(
+        p,
+        clean
+          .replace('always do A', 'HAND EDITED A')
+          .replace('<!-- HYPO:FEEDBACK-SYNC:END -->', '- note'),
+      );
+      const un = runDoctor().fb.find((c) => c.label === 'Feedback projection integrity');
+      assert.ok(un && un.status === 'fail', 'precondition: doctor still fails');
+      assert.ok(un.detail.includes('--from=claude'), un.detail);
+      assert.ok(!un.detail.includes('--accept-wiki'), `unpaired: no accept offered: ${un.detail}`);
+    },
+  );
+});
+
+test('feedback-sync-accept-discarded: accept reports the exact inner text it replaces (json and stderr), dry-run included', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C }, ({ claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    const innerOf = (text, slug) =>
+      new RegExp(
+        `<!-- HYPO:FEEDBACK-SYNC:START source=${slug} [^\\n]*-->\\n([\\s\\S]*?)\\n<!-- HYPO:FEEDBACK-SYNC:END -->`,
+      ).exec(text)[1];
+    const clean = readFileSync(p, 'utf-8');
+    const edited = clean.replace('always do A', 'HAND EDITED A');
+    writeFileSync(p, edited);
+    const expected = innerOf(edited, 'rule-a');
+    assert.ok(expected.includes('HAND EDITED A'), 'precondition');
+
+    const dry = JSON.parse(runFb(['--accept-wiki=rule-a', '--dry-run', '--json']).stdout);
+    assert.equal(dry.planned[0].discarded, expected, 'dry-run shows what would go');
+    const dryErr = runFb(['--accept-wiki=rule-a', '--dry-run']).stderr;
+    assert.ok(dryErr.includes(`would discard hand edit in ${p} for rule-a:\n${expected}`), dryErr);
+    assert.equal(readFileSync(p, 'utf-8'), edited, 'dry-run wrote nothing');
+
+    const r = runFb(['--accept-wiki=rule-a']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stderr.includes(`discarded hand edit in ${p} for rule-a:\n${expected}`), r.stderr);
+    assert.equal(readFileSync(p, 'utf-8'), clean, 'the wiki rendering is back');
+
+    // rule-a's END and rule-c's START both deleted: the marker counts still pair, the
+    // two blocks read as one, and accept overwrites the fused span. The report is
+    // the only place that span stays visible.
+    const fused = clean
+      .replace('always do A', 'HAND EDITED A')
+      .replace('<!-- HYPO:FEEDBACK-SYNC:END -->\n', '')
+      .replace(/<!-- HYPO:FEEDBACK-SYNC:START source=rule-c [^\n]*-->\n/, '');
+    writeFileSync(p, fused);
+    const rep = JSON.parse(runFb(['--accept-wiki=rule-a', '--json']).stdout);
+    const got = rep.accepted[0].discarded;
+    assert.ok(got.includes('HAND EDITED A') && got.includes('always do C'), got);
+  });
+});
+
+test('feedback-sync-accept-wiki-partial-failure: the error names the targets already accepted', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const edit = (f) =>
+      writeFileSync(f, readFileSync(f, 'utf-8').replace(/do A|always do A/, 'HAND EDITED A'));
+    const mem = join(memDir, 'MEMORY.md');
+    const cl = join(claudeHome, 'CLAUDE.md');
+    edit(mem);
+    edit(cl);
+    chmodSync(claudeHome, 0o500); // memory (written first) succeeds, claude's tmp file cannot be created
+    try {
+      const r = runFb(['--accept-wiki=rule-a', '--json']);
+      assert.equal(r.status, 1);
+      const out = JSON.parse(r.stdout);
+      assert.match(out.error, /Already accepted before this failure: memory/);
+      assert.deepEqual(
+        out.accepted.map((a) => a.target),
+        ['memory'],
+      );
+    } finally {
+      chmodSync(claudeHome, 0o700);
+    }
+    assert.ok(!readFileSync(mem, 'utf-8').includes('HAND EDITED A'), 'memory was rewritten');
+    assert.ok(readFileSync(cl, 'utf-8').includes('HAND EDITED A'), 'claude was not');
+  });
+});
+
+test('feedback-sync-claude-auto-accept-compares-the-date: an /hypo:feedback append bumps updated, so the block stays a conflict until --accept-wiki', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED'));
+    const page = join(wiki, 'pages', 'feedback', 'rule-a.md');
+    writeFileSync(page, readFileSync(page, 'utf-8').replace('always do A', 'HAND EDITED'));
+    assert.equal(runFb(['--check']).status, 1, 'control: raw page edit matches byte for byte');
+
+    // the supported reconcile path: append mode bumps `updated` to today
+    const w = run('feedback.mjs', [
+      '--topic=rule-a',
+      '--entry=reconciled with the hand edit.',
+      '--no-sync',
+      `--hypo-dir=${wiki}`,
+    ]);
+    assert.equal(w.status, 0, w.stderr);
+    assert.ok(!readFileSync(page, 'utf-8').includes('updated: 2026-05-20'), 'updated was bumped');
+
+    const chk = runFb(['--check', '--json']);
+    assert.equal(chk.status, 3, 'the date prefix now differs: still a conflict');
+    assert.deepEqual(JSON.parse(chk.stdout).targets.claude.conflicts, ['rule-a']);
+    assert.equal(runFb(['--accept-wiki=rule-a']).status, 0, 'accept resolves it');
+    assert.equal(runFb(['--write']).status, 0);
+    assert.equal(runFb(['--check']).status, 0);
+    assert.ok(readFileSync(p, 'utf-8').includes('HAND EDITED. 근거: [[rule-a]]'));
+  });
+});
+
+test('feedback-sync-import-skips-auto-accepted-block: a hand edit the page already matches is not imported as a conflict', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED'));
+    const ctl = JSON.parse(
+      runFb(['--import-target-change', '--from=claude', '--dry-run', '--json']).stdout,
+    );
+    assert.equal(ctl.imported.length, 1, 'control: a differing hand edit is imported');
+
+    const page = join(wiki, 'pages', 'feedback', 'rule-a.md');
+    writeFileSync(page, readFileSync(page, 'utf-8').replace('always do A', 'HAND EDITED'));
+    const r = runFb(['--import-target-change', '--from=claude', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).imported.length, 0, 'matched block: no draft');
+    assert.ok(!existsSync(join(wiki, 'pages', 'feedback', '_drafts')), 'no drafts dir created');
+  });
+});
+
 test('feedback-sync-import-no-conflict-noop: clean target imports nothing, exit 0', () => {
   withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb }) => {
     runFb(['--write']);
@@ -1270,6 +1716,388 @@ test('feedback-sync-bootstrap-skips-managed-memory-block: projected MEMORY entri
       const drafts = existsSync(draftsDir) ? readdirSync(draftsDir) : [];
       assert.ok(drafts.includes('loose-y.md'), 'loose legacy MEMORY entry is drafted');
       assert.ok(!drafts.includes('managed-x.md'), 'managed-block entry must NOT be re-drafted');
+    },
+    { memoryMd },
+  );
+});
+
+// ── bootstrap records the hand lines it drafted from; promotion + --write removes them ──
+
+// The hand line links feedback_rule-b.md, the file the managed entry links too.
+// (A hand line that links a different file, e.g. feedback_rule_b.md, is kept: see
+// the underscore test below.) Its text differs from the managed line so the two
+// can be told apart.
+const FB_HAND_COLON = '- [Rule B](feedback_rule-b.md): written by hand';
+const FB_HAND_DASH = `- [Rule B](feedback_rule-b.md) ${FB_EM} written by hand`;
+const FB_MANAGED_B = '- [Rule B](feedback_rule-b.md): do B';
+const fbHandRecord = (wiki) => join(wiki, '.cache', 'feedback-bootstrap-lines.json');
+// every index line that names rule b, hand-written or managed
+const fbBLines = (memDir) =>
+  readFileSync(join(memDir, 'MEMORY.md'), 'utf-8')
+    .split('\n')
+    .filter((l) => /^- \[.*\]\(feedback_rule[_-]b\.md\)/.test(l));
+// a promoted bootstrap draft keeps its bootstrap_origin key; the hand-line removal needs it
+const fbPromoteB = (wiki) =>
+  writeFileSync(
+    join(wiki, 'pages', 'feedback', 'rule-b.md'),
+    fbPage({ ...FB_PROJECT_L2, bootstrap_origin: 'memory-index' }),
+  );
+
+for (const [form, handLine] of [
+  ['colon', FB_HAND_COLON],
+  ['dash', FB_HAND_DASH],
+]) {
+  test(`feedback-sync-bootstrap-hand-line-removed-on-promotion (${form} form): one managed entry remains, check clean`, () => {
+    const memoryMd = `# Memory Index\n${handLine}\n- unrelated manual note\n`;
+    withFeedbackEnv(
+      {},
+      ({ wiki, memDir, runFb }) => {
+        assert.equal(runFb(['--bootstrap']).status, 0);
+        assert.ok(existsSync(join(wiki, 'pages', 'feedback', '_drafts', 'rule-b.md')), 'drafted');
+        assert.ok(existsSync(fbHandRecord(wiki)), 'bootstrap recorded the line in the vault');
+        fbPromoteB(wiki);
+        assert.deepEqual(fbBLines(memDir), [handLine], 'precondition: only the hand line yet');
+        assert.equal(runFb(['--check']).status, 1, 'precondition: managed entry not written yet');
+
+        const r = runFb(['--write']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.deepEqual(fbBLines(memDir), [FB_MANAGED_B], 'hand line gone, managed entry alone');
+        const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+        assert.ok(mem.includes('- unrelated manual note'), 'unrelated line untouched');
+        assert.equal(runFb(['--check']).status, 0, 'check clean');
+        assert.ok(!existsSync(fbHandRecord(wiki)), 'record entry cleared after the removal');
+      },
+      { memoryMd },
+    );
+  });
+}
+
+test('feedback-sync-bootstrap-record-failure-is-a-warning: an unwritable line record does not abort bootstrap', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      // a regular file where the record's directory should be makes the write throw
+      rmSync(join(wiki, '.cache'), { recursive: true, force: true });
+      writeFileSync(join(wiki, '.cache'), 'not a directory');
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(existsSync(join(wiki, 'pages', 'feedback', '_drafts', 'rule-b.md')), 'drafted');
+      assert.match(r.stderr, /could not record hand lines; they will not be removed on promotion/);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-bootstrap-hand-line-edited-is-kept: changed line survives, notice printed, managed entry added', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const p = join(memDir, 'MEMORY.md');
+      writeFileSync(p, readFileSync(p, 'utf-8').replace('written by hand', 'reworded by hand'));
+      fbPromoteB(wiki);
+      assert.equal(fbBLines(memDir).length, 1, 'precondition: edited hand line present');
+
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /kept the hand-written line in .*MEMORY\.md.*"rule-b"/);
+      assert.ok(r.stderr.includes(FB_HAND_COLON), 'notice names the line as bootstrap saw it');
+      assert.deepEqual(
+        fbBLines(memDir),
+        ['- [Rule B](feedback_rule-b.md): reworded by hand', FB_MANAGED_B],
+        'edited line kept, managed entry added',
+      );
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'noticed once, then the record is dropped');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-hand-line-kept-and-removed-reach-the-json-report: --write --json carries handKept / handRemoved per target', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const p = join(memDir, 'MEMORY.md');
+      writeFileSync(p, readFileSync(p, 'utf-8').replace('written by hand', 'reworded by hand'));
+      fbPromoteB(wiki);
+      const kept = JSON.parse(runFb(['--write', '--json']).stdout).targets.memory;
+      assert.deepEqual(kept.handKept, [{ slug: 'rule-b', file: p, line: FB_HAND_COLON }]);
+      assert.equal(kept.handRemoved, undefined);
+    },
+    { memoryMd },
+  );
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbPromoteB(wiki);
+      const t = JSON.parse(runFb(['--write', '--json']).stdout).targets.memory;
+      assert.deepEqual(t.handRemoved, [
+        { slug: 'rule-b', file: join(memDir, 'MEMORY.md'), line: FB_HAND_COLON },
+      ]);
+      assert.equal(t.handKept, undefined);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback.mjs post-step prints the kept hand line even though feedback-sync exits 0', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, claudeHome, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const p = join(memDir, 'MEMORY.md');
+      writeFileSync(p, readFileSync(p, 'utf-8').replace('written by hand', 'reworded by hand'));
+      fbPromoteB(wiki);
+      const w = run('feedback.mjs', [
+        '--topic=rule-b',
+        '--entry=still true.',
+        `--hypo-dir=${wiki}`,
+        `--claude-home=${claudeHome}`,
+        '--project-id=proj',
+      ]);
+      assert.equal(w.status, 0, w.stderr);
+      assert.match(w.stdout, /Projection refreshed/);
+      assert.match(w.stderr, /kept the hand-written line in .*MEMORY\.md.*"rule-b"/);
+    },
+    { memoryMd },
+  );
+});
+
+test('PreCompact self-heal surfaces the hand line the --write kept', () => {
+  const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-kept-'));
+  try {
+    const id = process.cwd().replace(/[/.]/g, '-');
+    const claudeHome = join(home, '.claude');
+    const memDir = join(claudeHome, 'projects', id, 'memory');
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(claudeHome, 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+    writeFileSync(
+      join(claudeHome, 'CLAUDE.md'),
+      '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+    );
+    const edited = '- [Rule B](feedback_rule-b.md): reworded by hand';
+    writeFileSync(join(memDir, 'MEMORY.md'), `# Memory Index\n${edited}\n`);
+    withWiki(
+      (dir) => {
+        // committed with the wiki, so the gate sees a clean tree and reaches the self-heal
+        mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+        writeFileSync(
+          join(dir, 'pages', 'feedback', 'rule-b.md'),
+          fbPage({ ...FB_PROJECT_L2, scope: `project:${id}`, bootstrap_origin: 'memory-index' }),
+        );
+        mkdirSync(join(dir, '.cache'), { recursive: true });
+        writeFileSync(
+          fbHandRecord(dir),
+          JSON.stringify({
+            version: 1,
+            lines: [
+              {
+                slug: 'rule-b',
+                target: 'memory',
+                file: join(memDir, 'MEMORY.md'),
+                line: FB_HAND_COLON,
+              },
+            ],
+          }),
+        );
+      },
+      (dir) => {
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const out = JSON.parse(r.stdout);
+        assert.match(
+          out.systemMessage || '',
+          /re-synced/,
+          `precondition: self-healed: ${r.stdout}`,
+        );
+        assert.match(
+          out.systemMessage,
+          /kept the hand-written line in .*MEMORY\.md.*"rule-b"/,
+          `the notice must reach the user: ${r.stdout}`,
+        );
+        assert.ok(
+          out.systemMessage.includes(FB_HAND_COLON),
+          'it names the line as bootstrap saw it',
+        );
+        assert.ok(
+          !existsSync(fbHandRecord(dir)),
+          'the record entry is gone: this was the only chance',
+        );
+      },
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('feedback-sync-side-file-without-provenance-is-not-overwritten: a hand-written feedback_<slug>.md survives, marked copies still refresh', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ memDir, runFb }) => {
+    const side = join(memDir, 'feedback_rule-b.md');
+    const mine = '# My own rule B\n\nA full body the wiki page does not have.\n';
+    writeFileSync(side, mine);
+    const r = runFb(['--write', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(readFileSync(side, 'utf-8'), mine, 'byte-identical after --write');
+    const t = JSON.parse(r.stdout).targets.memory;
+    assert.ok(
+      (t.sideWarnings || []).some((w) => w.includes(side) && /not overwriting/.test(w)),
+      `reported with the file named: ${r.stdout}`,
+    );
+    assert.ok(readFileSync(join(memDir, 'MEMORY.md'), 'utf-8').includes('feedback_rule-b.md'));
+
+    writeFileSync(side, '<!-- HYPO:FEEDBACK-SYNC source=rule-b -->\nstale copy\n');
+    const r2 = runFb(['--write', '--json']);
+    assert.equal(r2.status, 0, r2.stderr);
+    assert.ok(!readFileSync(side, 'utf-8').includes('stale copy'), 'a marked copy is refreshed');
+    assert.equal(JSON.parse(r2.stdout).targets.memory.sideWarnings, undefined);
+  });
+});
+
+test('feedback-sync-bootstrap-hand-line-ambiguous-is-kept: two identical hand lines, neither is deleted', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.deepEqual(
+        fbBLines(memDir),
+        [FB_HAND_COLON, FB_HAND_COLON],
+        'precondition: two copies',
+      );
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const rec = JSON.parse(readFileSync(fbHandRecord(wiki), 'utf-8'));
+      assert.equal(rec.lines.length, 1, 'precondition: the second copy is a duplicate-in-batch');
+      assert.equal(rec.lines[0].line, FB_HAND_COLON);
+      fbPromoteB(wiki);
+
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /kept the hand-written line in .*MEMORY\.md.*"rule-b"/);
+      assert.deepEqual(
+        fbBLines(memDir),
+        [FB_HAND_COLON, FB_HAND_COLON, FB_MANAGED_B],
+        'both hand lines kept, managed entry added',
+      );
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-bootstrap-unrecorded-line-untouched: only the recorded line is ever deleted', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  // (a) a line added after bootstrap has no record
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const p = join(memDir, 'MEMORY.md');
+      const other = '- [Other](feedback_other.md): keep me';
+      writeFileSync(p, readFileSync(p, 'utf-8') + `${other}\n`);
+      fbPromoteB(wiki);
+      assert.equal(runFb(['--write']).status, 0);
+      const mem = readFileSync(p, 'utf-8');
+      assert.ok(mem.includes(other), 'unrecorded line survives');
+      assert.deepEqual(fbBLines(memDir), [FB_MANAGED_B], 'recorded line is the one removed');
+    },
+    { memoryMd },
+  );
+  // (b) no bootstrap at all: the same promotion leaves the hand line (duplicate stays)
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      fbPromoteB(wiki);
+      assert.equal(runFb(['--write']).status, 0);
+      assert.deepEqual(fbBLines(memDir), [FB_HAND_COLON, FB_MANAGED_B], 'no record, no deletion');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-bootstrap-hand-line-between-blocks: dead end before promotion, removed and clean after', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C }, ({ wiki, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(memDir, 'MEMORY.md');
+    const endMark = '<!-- HYPO:FEEDBACK-SYNC:END -->\n';
+    const text = readFileSync(p, 'utf-8');
+    const at = text.indexOf(endMark) + endMark.length;
+    writeFileSync(p, `${text.slice(0, at)}${FB_HAND_COLON}\n${text.slice(at)}`);
+    assert.equal(runFb(['--check']).status, 3, 'precondition: intruder between blocks');
+
+    assert.equal(runFb(['--bootstrap']).status, 0);
+    assert.ok(existsSync(fbHandRecord(wiki)), 'precondition: line recorded');
+    // not promoted yet: today's behavior is kept, the line is still an intruder
+    assert.equal(runFb(['--check']).status, 3, 'unpromoted recorded line stays an intruder');
+    assert.equal(runFb(['--write']).status, 3, 'and write still refuses');
+    assert.deepEqual(fbBLines(memDir), [FB_HAND_COLON], 'nothing was removed');
+
+    fbPromoteB(wiki);
+    assert.equal(runFb(['--check']).status, 1, 'promoted: pending drift, no longer an intruder');
+    const r = runFb(['--write']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(fbBLines(memDir), [FB_MANAGED_B], 'hand line removed, managed entry added');
+    assert.equal(runFb(['--check']).status, 0, 'the former dead end is clean');
+    const after = readFileSync(p, 'utf-8');
+    assert.ok(after.includes('(feedback_rule-a.md)') && after.includes('(feedback_rule-c.md)'));
+  });
+});
+
+test('feedback-sync-bootstrap-hand-line-underscore-link-is-kept: a user memory file keeps its index line', () => {
+  // slug no-mocks => managed entry links feedback_no-mocks.md, a different file than
+  // the hand line's feedback_no_mocks.md. Removing the hand line would orphan it.
+  const hand = '- [No mocks](feedback_no_mocks.md): never mock the database';
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      const own = join(memDir, 'feedback_no_mocks.md');
+      writeFileSync(own, '---\nname: no mocks\n---\nnever mock the database\n');
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      assert.ok(existsSync(join(wiki, 'pages', 'feedback', '_drafts', 'no-mocks.md')), 'drafted');
+      writeFileSync(
+        join(wiki, 'pages', 'feedback', 'no-mocks.md'),
+        fbPage({ ...FB_PROJECT_L2, title: 'No mocks', bootstrap_origin: 'memory-index' }),
+      );
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /kept the hand-written line in .*MEMORY\.md.*"no-mocks"/);
+      const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      assert.ok(mem.split('\n').includes(hand), 'the hand line still points at the original file');
+      assert.ok(mem.includes('(feedback_no-mocks.md)'), 'managed entry added beside it');
+      assert.equal(
+        readFileSync(own, 'utf-8'),
+        '---\nname: no mocks\n---\nnever mock the database\n',
+        'the user memory file is untouched',
+      );
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'noticed once, then the record is dropped');
+    },
+    { memoryMd: `# Memory Index\n${hand}\n` },
+  );
+});
+
+test('feedback-sync-bootstrap-hand-line-needs-bootstrap-origin: a lingering record never deletes a line for an unrelated page', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      assert.ok(existsSync(fbHandRecord(wiki)), 'precondition: recorded');
+      // the draft was rejected, but its record lingers; later an unrelated page takes the slug
+      rmSync(join(wiki, 'pages', 'feedback', '_drafts', 'rule-b.md'));
+      const page = join(wiki, 'pages', 'feedback', 'rule-b.md');
+      writeFileSync(page, fbPage(FB_PROJECT_L2));
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(fbBLines(memDir), [FB_HAND_COLON, FB_MANAGED_B], 'hand line survives');
+      assert.ok(!r.stderr.includes('kept the hand-written line'), 'and it is not a kept notice');
+
+      // once neither a draft nor a page is left, the record is pruned on the next write
+      rmSync(page);
+      assert.equal(runFb(['--write']).status, 0);
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'orphan record pruned');
+      assert.deepEqual(fbBLines(memDir), [FB_HAND_COLON], 'hand line still there');
     },
     { memoryMd },
   );
@@ -1559,6 +2387,7 @@ reason: TODO
 source: session:2026-05-01
 created: 2026-05-01
 updated: 2026-05-01
+# keep the bootstrap_origin line below, it lets --write remove the hand line this draft came from
 bootstrap_origin: claude-learned
 ---
 
@@ -1582,6 +2411,7 @@ global_summary: legacy hand entry
 promote_to_global: false # set true to project into <learned_behaviors>
 reason: TODO
 source: TODO
+# keep the bootstrap_origin line below, it lets --write remove the hand line this draft came from
 bootstrap_origin: memory-index
 ---
 
@@ -2181,6 +3011,11 @@ test('an unreadable side file does NOT block /compact (the hook reports a notice
             'block',
             `a side-file permission error must not block /compact: ${r.stdout}`,
           );
+          assert.match(
+            out.systemMessage || '',
+            /side file warning \(memory\): cannot read side file .*feedback_rule-a\.md.*Fix the permissions on that path; --ensure-container does not fix this/,
+            `the unreadable kind keeps the permissions advice: ${r.stdout}`,
+          );
           // Non-vacuity: prove the MEMORY target really was evaluated here (a
           // skipped target would make the assertion above pass for free). The
           // unreadable side file reads as drift, so the gate's self-heal --write
@@ -2194,6 +3029,56 @@ test('an unreadable side file does NOT block /compact (the hook reports a notice
         } finally {
           chmodSync(side, 0o644);
         }
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('a hand-written side file notice names the warning and gives no permissions advice', () => {
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-handside-'));
+      const projectId = process.cwd().replace(/[/.]/g, '-');
+      const memDir = join(home, '.claude', 'projects', projectId, 'memory');
+      try {
+        mkdirSync(memDir, { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        writeFileSync(
+          join(home, '.claude', 'CLAUDE.md'),
+          '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+        );
+        writeFileSync(join(memDir, 'MEMORY.md'), '# Memory Index\n');
+        // a hand-written file under the name the wiki page would own: no provenance header
+        const side = join(memDir, 'feedback_rule-a.md');
+        const mine = '# My own rule A\n\nA body the wiki page does not have.\n';
+        writeFileSync(side, mine);
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const out = JSON.parse(r.stdout);
+        const msg = out.systemMessage || '';
+        assert.notEqual(
+          out.decision,
+          'block',
+          `a hand-written side file must not block: ${r.stdout}`,
+        );
+        assert.match(
+          msg,
+          /feedback projection side file warning \(memory\): not overwriting .*feedback_rule-a\.md/,
+          `the notice names the warning: ${r.stdout}`,
+        );
+        assert.match(msg, /The primary projection still loads every rule/);
+        // the self-heal --write reports the same warning in its JSON: it must not be repeated
+        assert.equal(msg.split('not overwriting').length - 1, 1, `shown once: ${msg}`);
+        assert.ok(
+          !/permissions|unreadable/i.test(msg),
+          `a hand-written file is not a permission problem: ${r.stdout}`,
+        );
+        assert.equal(readFileSync(side, 'utf-8'), mine, 'the hand-written file is left alone');
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
@@ -2539,6 +3424,41 @@ test('feedback.mjs create: full classification → page written + lint-clean', (
     const lint = run('lint.mjs', ['--json', `--hypo-dir=${dir}`]);
     const report = JSON.parse(lint.stdout);
     assert.equal(report.errors.length, 0, `lint errors on generated page: ${lint.stdout}`);
+  });
+});
+
+test('feedback.mjs create: log.md line uses a colon separator, never an em dash', () => {
+  withFeedbackWriterWiki((dir) => {
+    writeFileSync(
+      join(dir, 'log.md'),
+      '# Log\n\n- 2026-01-01 feedback: [[pages/feedback/old]] \u2014 old line\n',
+    );
+    const r = run('feedback.mjs', [
+      '--topic=log-sep',
+      '--entry=항상 X를 한다.',
+      '--scope=global',
+      '--tier=L1',
+      '--targets=project-memory,claude-learned',
+      '--priority=4',
+      '--memory-summary=X를 항상 수행',
+      '--global-summary=항상 X 수행',
+      '--promote-to-global',
+      '--reason=Y 실수 방지',
+      '--no-sync',
+      `--hypo-dir=${dir}`,
+    ]);
+    assert.equal(r.status, 0, `feedback create failed: ${r.stderr}`);
+    const lines = readFileSync(join(dir, 'log.md'), 'utf-8').trimEnd().split('\n');
+    const line = lines[lines.length - 1];
+    assert.ok(
+      line.includes('feedback: [[pages/feedback/log-sep]]: 항상 X를 한다.'),
+      `got: ${line}`,
+    );
+    assert.ok(!line.includes('\u2014'), `em dash in appended log line: ${line}`);
+    assert.ok(
+      lines.some((l) => l.includes('old line')),
+      'pre-existing line must be left untouched',
+    );
   });
 });
 
