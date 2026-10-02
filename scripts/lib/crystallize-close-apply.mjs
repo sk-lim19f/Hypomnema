@@ -15,6 +15,7 @@ import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { expandHome } from './hypo-root.mjs';
 import { parseStrictDate } from './time.mjs';
+import { fencedLineMask } from './code-fence.mjs';
 import { isValidProjectName, substituteTokens, TEMPLATE_DIR } from './project-create.mjs';
 import { appendPendingTags, checkForbidden } from './schema-vocab.mjs';
 import { atomicWrite } from '../../hooks/atomic-write.mjs';
@@ -1671,7 +1672,7 @@ function runPreflight(args, payload, project, date) {
   // pages/feedback/) is untouched by this filter and stays a plain warn.
   //
   // W9 carries no `id` in the default (non-strict) --json warns lint.mjs
-  // returns, only W8 does (see lint.mjs's `toOut`), so it is matched by its
+  // returns, only W8 and W19 do (see lint.mjs's `toOut`), so it is matched by its
   // fixed message prefix instead, the same technique registerPendingTags
   // above already uses for W10.
   const blockingW9 = (preflightLint.warns || []).filter(
@@ -1693,7 +1694,7 @@ function runPreflight(args, payload, project, date) {
     } else {
       console.log('✗ lint preflight failed — apply aborted (no payload bytes written):');
       for (const e of allPreflightBlocking) console.log(`  ✗ ${e.file}: ${e.message}`);
-      console.log('  Fix the wiki (run `node scripts/lint.mjs`) and retry.');
+      console.log('  Fix the wiki (run `/hypo:lint`) and retry.');
     }
     process.exit(1);
   }
@@ -1752,76 +1753,6 @@ function runPreflight(args, payload, project, date) {
 const SECTION_LOSS_MIN_COUNT = 2; // an ordinary single-section edit (finishing one track,
 // retiring one open question) stays under this and must not park; 2 or more is
 // the incident's own shape and always trips, at any file size.
-
-// A fence marker line: 0-3 leading spaces (CommonMark still calls that "unindented"),
-// then a run of 3+ backticks or 3+ tildes, then the rest of the line. `m[1]` is the
-// marker run itself (so its first char and length identify what closes it); `m[2]` is
-// whatever follows, an info string on the opening line, and required to be blank
-// (after trim) on a line being checked as a close.
-const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-
-/**
- * Which line indices are inside a fenced code block, for one file's lines.
- *
- * A fence opens on any line FENCE_RE matches while not already inside one, and
- * closes only on a later line whose marker is the SAME character and AT LEAST as
- * long (a 4-backtick open is not closed by 3 backticks, a CommonMark rule, and the
- * one this guard's predecessor ignored: the section-loss bypass this closes moved
- * two `##` headings into a properly-closed ```md fence and the old line-scan still
- * counted them as real headings because it never looked for a fence at all).
- *
- * An opening fence that never finds a matching close before EOF is treated as
- * NEVER HAVING OPENED (every line from that marker to EOF is unhidden here). That
- * is the safe direction for a guard whose entire job is "did content silently
- * disappear": the same function extracts headings from both disk and payload, so
- * treating an unclosed run as fenced would let it swallow real headings on
- * whichever side has the malformed markdown: undercounting disk (hiding sections
- * the guard should have protected) or undercounting payload (reporting a section
- * as lost when the payload never actually removed it). Treating it as prose
- * instead only risks the opposite: an occasional false park on a document with a
- * genuinely broken fence, which is recoverable through the same
- * `restructure: true` / proposal-resolve door every other park in this guard
- * already uses, not a silent loss.
- *
- * Declined on purpose, not CommonMark-complete: an opening line's info string is
- * never checked for a stray backtick (CommonMark forbids one in a backtick fence's
- * info string; this scan does not care), and a fence inside a blockquote or list
- * item is scanned exactly like a top-level one. Both would need block-context
- * tracking this guard's own doc comment (above, the base-conflict guard section)
- * already argues against building here. Getting the two reproduced bypasses closed
- * cheaply matters more than a complete parser.
- *
- * @returns {boolean[]} same length as `lines`, true where the line is fenced
- */
-function fencedLineMask(lines) {
-  const hidden = new Array(lines.length).fill(false);
-  let openIdx = -1;
-  let fenceChar = null;
-  let fenceLen = 0;
-  for (let i = 0; i < lines.length; i++) {
-    if (openIdx === -1) {
-      const m = lines[i].match(FENCE_RE);
-      if (m) {
-        openIdx = i;
-        fenceChar = m[1][0];
-        fenceLen = m[1].length;
-        hidden[i] = true; // tentative, unhidden below if this never closes
-      }
-      continue;
-    }
-    hidden[i] = true; // tentative, unhidden below if this never closes
-    const m = lines[i].match(FENCE_RE);
-    if (m && m[1][0] === fenceChar && m[1].length >= fenceLen && m[2].trim() === '') {
-      openIdx = -1;
-      fenceChar = null;
-      fenceLen = 0;
-    }
-  }
-  if (openIdx !== -1) {
-    for (let i = openIdx; i < lines.length; i++) hidden[i] = false;
-  }
-  return hidden;
-}
 
 /**
  * Extract this file's `##` section headings, in order, as a MULTISET (every
@@ -3005,7 +2936,7 @@ const unknownTagRe = /^Unknown tag: "(.+)" \(not in SCHEMA\.md Tag Vocabulary\)/
 
 // W9 (invalid-YAML frontmatter) is warn-severity in lint.mjs's default,
 // non-strict classification, and its `id` is stripped from the --json warns
-// this apply reads (only W8 survives toOut without --strict, see lint.mjs).
+// this apply reads (only W8 and W19 survive toOut without --strict, see lint.mjs).
 // Matched by its fixed message prefix instead, same technique as
 // unknownTagRe above. Shared by runPreflight's append-target legacy-debt
 // check and runPostApplyLint's payload-scope promotion below.
@@ -3165,7 +3096,12 @@ function runPostApplyLint(args, payloadScope) {
     postNotice = errNotice;
   }
   const postLintOk = !postApplyCrashed && postBlocking.length === 0;
-  return { postApplyLint, postBlocking, postNotice, postLintOk };
+  // W19 (a session-log heading date that is not on the calendar) is a typo the
+  // close cannot repair, so it is a notice and never joins postBlocking. It is
+  // vault-wide on purpose: the gate that blocks on it would be the wrong answer,
+  // but a close that printed "lint clean" over it would hide it.
+  const w19Notice = (postApplyLint.warns || []).filter((w) => w.id === 'W19');
+  return { postApplyLint, postBlocking, postNotice, postLintOk, w19Notice };
 }
 
 // Amendment 2026-05-19: auto-write the per-session
@@ -3619,6 +3555,7 @@ function buildCloseResult({
   postApplyLint,
   closeScopeNotice,
   otherDebtCount,
+  w19Notice,
   gateNotices,
   gateBlockers,
   restructureWaivers,
@@ -3729,6 +3666,14 @@ function buildCloseResult({
     // reader that expected only filenames still gets a string it can print.
     notices: [...(obsoleteNotices || []), ...new Set(closeScopeNotice.map((e) => e.file))],
     otherDebtCount,
+    // W19 findings (id, file, message), one per project with calendar-overflow
+    // session-log headings (the message lists every overflowing heading and its
+    // session-log file), full list, always present in this
+    // buildCloseResult result (the preflight and authority-refusal outputs never
+    // reach lint and do not carry it). Non-blocking:
+    // never in `gateBlockers`, never flips `ok`. A caller that reads `lint`
+    // above sees them too, but only in the capped warn sample.
+    lintNotices: w19Notice,
     // Separate from `notices` above, which is lint debt. These are the close
     // GATE's demotions: what it declined to block on. `--mark-session-closed`
     // has always reported them and this path did not, so a demotion on the
@@ -3792,6 +3737,7 @@ function printCloseReport({
   postBlocking,
   closeScopeNotice,
   otherDebtCount,
+  w19Notice,
   restructureWaivers,
   obsoleteNotices,
   hostTagWarning,
@@ -3877,13 +3823,20 @@ function printCloseReport({
     // When the marker was withheld, qualify the success line so a reader scanning
     // stdout alone cannot mistake "verified" for "fully closed". markerSkipReason
     // is non-null exactly when args.sessionId is set and the marker did not land.
+    // "lint clean" is claimed only when this report shows no lint notice below
+    // (W19, pre-existing debt in untouched files, or debt elsewhere in the vault);
+    // otherwise the line says what is true: nothing blocks.
+    const lintWord =
+      w19Notice.length > 0 || closeScopeNotice.length > 0 || otherDebtCount > 0
+        ? 'no lint blockers'
+        : 'lint clean';
     if (markerSkipReason) {
       console.log(
-        '\n✓ session-close files verified (all 4 mandatory files fresh, lint clean).' +
+        `\n✓ session-close files verified (all 4 mandatory files fresh, ${lintWord}).` +
           '\n  session NOT fully closed: the Stop-chain marker was not written (see warning below).',
       );
     } else {
-      console.log('\n✓ session-close verified (all 4 mandatory files fresh, lint clean).');
+      console.log(`\n✓ session-close verified (all 4 mandatory files fresh, ${lintWord}).`);
     }
   }
   // Warn once per run, not on every gate read, which is exactly the
@@ -3989,6 +3942,18 @@ function printCloseReport({
       console.log('  Payload introduced a lint blocker — fix the payload content and retry.');
     }
   }
+  // Same folding as closeScopeNotice / otherDebtCount: W19 under the closing
+  // project's dirs is listed, the rest folds to one count. Lint emits one W19
+  // finding per project (all its overflowing headings in the message), so the
+  // count is projects, not headings. --json keeps the full list in `lintNotices`.
+  const w19InScope = w19Notice.filter((w) => isUnderProjectDirs(w.file, [project]));
+  for (const w of w19InScope) console.log(`\n⚠ ${w.file}: ${w.message} (not blocking)`);
+  const w19Elsewhere = w19Notice.length - w19InScope.length;
+  if (w19Elsewhere > 0) {
+    console.log(
+      `\n· +${w19Elsewhere} project(s) with calendar-overflow session-log headings (not blocking), run \`/hypo:lint\` for the list.`,
+    );
+  }
   if (closeScopeNotice.length > 0) {
     console.log(
       `\n· ${closeScopeNotice.length} pre-existing lint issue(s) in untouched files (not blocking): ${[
@@ -4000,7 +3965,7 @@ function printCloseReport({
   }
   if (otherDebtCount > 0) {
     console.log(
-      `\n· +${otherDebtCount} pre-existing lint issue(s) elsewhere in the vault (other projects / shared pages, not blocking) — run \`node scripts/lint.mjs\` for the full list.`,
+      `\n· +${otherDebtCount} pre-existing lint issue(s) elsewhere in the vault (other projects / shared pages, not blocking), run \`/hypo:lint\` for the full list.`,
     );
   }
 }
@@ -4183,7 +4148,7 @@ export function applySessionClose(args) {
   // a completed close (the 2026-06-09 security-ops-kb incident).
   const verification = sessionCloseFileStatus(args.hypoDir, { projectOverride: project });
 
-  const { postApplyLint, postBlocking, postNotice, postLintOk } = runPostApplyLint(
+  const { postApplyLint, postBlocking, postNotice, postLintOk, w19Notice } = runPostApplyLint(
     args,
     payloadScope,
   );
@@ -4300,6 +4265,7 @@ export function applySessionClose(args) {
     postApplyLint,
     closeScopeNotice,
     otherDebtCount,
+    w19Notice,
     gateNotices,
     gateBlockers,
     restructureWaivers,
@@ -4329,6 +4295,7 @@ export function applySessionClose(args) {
       postBlocking,
       closeScopeNotice,
       otherDebtCount,
+      w19Notice,
       restructureWaivers,
       obsoleteNotices,
       hostTagWarning: hostTagNotice,

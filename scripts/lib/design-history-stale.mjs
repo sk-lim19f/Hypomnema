@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { DAY_MS, parseStrictDate } from './time.mjs';
+import { maskNonProse } from './code-fence.mjs';
 
 // session-log headings appear in two shapes in the wild: bracketed
 // `## [YYYY-MM-DD]` (spec convention) and bare `## YYYY-MM-DD` (some entries,
@@ -44,9 +45,12 @@ function isValidDesignHistoryDate(literal) {
 
 function parseDates(text, pattern) {
   const dates = [];
+  // A fenced or commented `## 2026-12-31` is example text, not a design-history
+  // entry; counting it would push lastDH forward and silence W8.
+  const live = maskNonProse(text);
   pattern.lastIndex = 0;
   let m;
-  while ((m = pattern.exec(text)) !== null) {
+  while ((m = pattern.exec(live)) !== null) {
     if (isValidDesignHistoryDate(m[1])) dates.push(new Date(m[1]));
   }
   return dates;
@@ -60,18 +64,29 @@ function parseDates(text, pattern) {
 // as the original strings.
 function parseSessionDates(text) {
   const headings = [];
+  // Length-preserving copy with fenced code and HTML comments blanked. A heading
+  // in it is a real entry start; a heading in a fence is example text. The
+  // marker test below reads this copy too, so a fenced example's `ADR 없음`
+  // cannot exclude the real entry around it. Blocking W8 depends on that.
+  const live = maskNonProse(text);
   SESSION_LOG_HEADING_RE.lastIndex = 0;
   let m;
-  while ((m = SESSION_LOG_HEADING_RE.exec(text)) !== null) {
+  while ((m = SESSION_LOG_HEADING_RE.exec(live)) !== null) {
     headings.push({ literal: m[1] ?? m[2], start: m.index });
   }
   const dates = [];
   const overflow = [];
   for (let i = 0; i < headings.length; i++) {
-    const body = text.slice(headings[i].start, headings[i + 1]?.start ?? text.length);
+    const end = headings[i + 1]?.start ?? text.length;
     // Exclude only an explicit no-design-change entry. An entry carrying both
     // the marker and an ADR reference is treated as a design entry (included).
-    if (NO_ADR_MARKER_RE.test(body) && !ADR_REF_RE.test(body)) continue;
+    // The marker is read from the live copy, the ADR reference from the raw
+    // text: a fenced ADR reference keeps the entry included (the safe side).
+    if (
+      NO_ADR_MARKER_RE.test(live.slice(headings[i].start, end)) &&
+      !ADR_REF_RE.test(text.slice(headings[i].start, end))
+    )
+      continue;
     const { literal } = headings[i];
     if (parseStrictDate(literal) != null) dates.push(new Date(literal));
     else overflow.push(literal);

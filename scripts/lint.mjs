@@ -364,6 +364,9 @@ const synthesisPages = [];
 //                             date is a typo, not staleness, and the gate's
 //                             "append to design-history" advice cannot clear
 //                             it, so it must stay out of the W8 blocker filter.
+//                             It does carry its id in the default --json (see
+//                             toOut) so close can show it as a notice; no gate
+//                             filters on it, so it still never blocks.
 //   W15 synthesis-stale     → excluded, same reason as W8/W14 (a freshness
 //                             signal to triage, not a content defect), and
 //                             its own id for the same reason W14 has one: the
@@ -378,6 +381,8 @@ const synthesisPages = [];
 // pre-commit hook (scripts/init.mjs, pinned by tests/init.test.mjs), so a
 // vault that opts in does gate a commit on these IDs today.
 const STRICT_PROMOTE_IDS = new Set(['W1', 'W2', 'W4', 'W9']);
+// Ids that appear in the default (non-strict) --json output. See toOut.
+const DEFAULT_JSON_IDS = new Set(['W8', 'W19']);
 
 function issue(severity, rel, msg, fullPath = null, id = null) {
   issues.push({ severity, file: rel, message: msg, path: fullPath, id });
@@ -792,6 +797,18 @@ for (const s of findDesignHistoryStale(args.hypoDir)) {
       null,
       'W14',
     );
+    // W14 has no default --json id, so on its own a calendar-overflow heading in
+    // a project without design-history.md would never reach close. Emit W19 too
+    // (same file, same id as the exists-case) so close shows it as a notice.
+    if (overflowList) {
+      issue(
+        'warn',
+        `projects/${s.project}/design-history.md`,
+        `session-log heading date not on the calendar: 달력에 없는 session-log 헤딩이 있습니다 (${overflowList}). 헤딩 날짜를 실제 날짜로 고치세요`,
+        null,
+        'W19',
+      );
+    }
     continue;
   }
   if (!s.realLater) {
@@ -1000,14 +1017,14 @@ const warns = issues.filter((i) => i.severity === 'warn');
 
 if (args.json) {
   // The `id` field, not the warning list, is what default mode holds stable:
-  // only W8 carries one (the close gate in hooks/hypo-shared.mjs filters on
-  // it). Every other id stays internal unless `--strict` is set, where the full
-  // set is exposed so promoted findings are traceable to their warning class.
-  // A new rule does add warnings to default output; that is what a new rule is
-  // for, and every new warning class has done it (W19 included: it is a warn
-  // with no id in this mode, so the close gate never sees it).
+  // only W8 and W19 carry one. W8 is what the close gate in hooks/hypo-shared.mjs
+  // filters on to block; W19 is exposed so close can show it as a non-blocking
+  // notice (no gate reads it, and it is a warn, so it never fails `ok`). Every
+  // other id stays internal unless `--strict` is set, where the full set is
+  // exposed so promoted findings are traceable to their warning class. A new
+  // rule does add warnings to default output; that is what a new rule is for.
   const toOut = ({ severity, file, message, id }) =>
-    id && (id === 'W8' || args.strict)
+    id && (DEFAULT_JSON_IDS.has(id) || args.strict)
       ? { severity, file, message, id }
       : { severity, file, message };
   console.log(
