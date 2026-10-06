@@ -4877,6 +4877,86 @@ test('a retry that crosses midnight with no close pin left still finds the entry
   });
 });
 
+test('twelve closes over forty days, three of them superseding an earlier entry and one marking the track done: every close commit only adds one entry and never deletes (never deletes)', () => {
+  withWiki(null, (dir, today) => {
+    const [y, m, d] = today.split('-').map(Number);
+    const daysAgo = (n) => {
+      const t = new Date(y, m - 1, d - n);
+      return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+    };
+    const offsets = [40, 37, 34, 30, 27, 24, 20, 17, 13, 9, 4, 0];
+    const sessionsRel = join('projects', 'test-project', 'sessions');
+    const git = (...args) => spawnSync('git', args, { cwd: dir, encoding: 'utf-8' });
+    const supersedingAt = new Set([3, 7, 9]);
+    const doneAt = 10;
+
+    const written = [];
+    offsets.forEach((offset, i) => {
+      const date = daysAgo(offset);
+      const track = { id: 'main', next: `- step ${i}` };
+      if (i === 0) track.new = true;
+      if (supersedingAt.has(i)) track.supersedes = [entryAt(dir, written[i - 1]).closeId];
+      if (i === doneAt) track.done = true;
+      const before = commitCountOf(dir);
+      const { out } = applyJson(
+        dir,
+        v2Payload(date, { tracks: [track], tag: `close ${i}`, summary: `summary ${i}` }),
+        newPinSession(`never-deletes-${i}`),
+      );
+      assert.equal(out.ok, true, `close ${i} (${date}): ${JSON.stringify(out)}`);
+      assert.equal(out.committed, true, `close ${i} (${date}) must commit`);
+      assert.equal(commitCountOf(dir), before + 1, `close ${i} made exactly one commit`);
+
+      const files = sessionFilesOf(dir);
+      const fresh = files.filter((f) => !written.includes(f));
+      assert.equal(fresh.length, 1, `close ${i} added exactly one entry file: ${files}`);
+      assert.ok(fresh[0].startsWith(`${date}-`), `close ${i} entry is dated ${date}: ${fresh[0]}`);
+      written.push(fresh[0]);
+
+      const diff = git(
+        'diff-tree',
+        '--no-commit-id',
+        '--name-status',
+        '-r',
+        'HEAD',
+        '--',
+        sessionsRel,
+      );
+      assert.equal(diff.status, 0, diff.stderr);
+      assert.deepEqual(
+        diff.stdout.split('\n').filter(Boolean),
+        [`A\t${join(sessionsRel, fresh[0])}`],
+        `close ${i}'s commit changes sessions/ by one added entry and nothing else`,
+      );
+
+      // Every earlier entry is still on disk and in HEAD, however it was superseded.
+      const inHead = git('ls-tree', '--name-only', 'HEAD', `${sessionsRel}/`)
+        .stdout.split('\n')
+        .filter(Boolean)
+        .map((p) => p.slice(sessionsRel.length + 1))
+        .sort();
+      assert.deepEqual(inHead, files, `after close ${i} HEAD holds every entry written so far`);
+      assert.deepEqual(files, [...written].sort());
+    });
+
+    assert.equal(written.length, 12);
+    const dayNumber = (f) => Date.parse(`${f.slice(0, 10)}T00:00:00Z`) / 86400000;
+    assert.equal(dayNumber(written[11]) - dayNumber(written[0]), 40, 'the closes span forty days');
+
+    // The supersedes really point at the entry before them, and that entry stays a file.
+    const closeIds = written.map((f) => entryAt(dir, f).closeId);
+    for (const i of supersedingAt) {
+      assert.deepEqual(entryAt(dir, written[i]).tracks[0].supersedes, [closeIds[i - 1]]);
+      assert.ok(
+        existsSync(join(sessionsDirOf(dir), written[i - 1])),
+        `entry ${i - 1} stays on disk`,
+      );
+      assert.ok(!headsOf(dir).main.includes(closeIds[i - 1]), `entry ${i - 1} is no longer a head`);
+    }
+    assert.equal(entryAt(dir, written[doneAt]).tracks[0].done, true);
+  });
+});
+
 suite('close entries: a project that .hypoignore keeps out of git');
 
 test('an ignored project: the entry is never committed, the local proof outlives the commit step, and a fixed retry keeps the bytes (X2)', () => {
