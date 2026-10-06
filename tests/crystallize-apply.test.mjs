@@ -4485,6 +4485,109 @@ test('legacy payload: the old two fields become the summary and a legacy track b
   });
 });
 
+// An old-format payload with bodies that make byte loss visible: Korean text, trailing
+// spaces, an inner blank line, and frontmatter fields that must not reach the entry.
+const LEGACY_HOT_BODY = '# 옛 hot\n\n- legacy-hot-line  \n\n- 두 번째 줄 legacy-hot-end';
+const LEGACY_STATE_BODY = '## 다음 작업\n\n- legacy-state-line  \n\n- 두 번째 legacy-state-end';
+
+// `legacy` is registered only through the baseline that HEAD's tracked old files make. Untrack
+// both (they stay on disk, which the post-apply verification needs) and no baseline exists.
+function untrackOldStateFiles(dir) {
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  const files = ['hot.md', 'session-state.md'].map((f) => join('projects', 'test-project', f));
+  spawnSync('git', ['rm', '--cached', ...files], { cwd: dir, env });
+  spawnSync('git', ['commit', '-m', 'untrack old files'], { cwd: dir, env });
+  appendFileSync(join(dir, '.git', 'info', 'exclude'), `${files.join('\n')}\n`);
+}
+
+function legacyFormatPayload(today, tag) {
+  return {
+    project: 'test-project',
+    date: today,
+    sessionState: {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${LEGACY_STATE_BODY}\n`,
+    },
+    projectHot: {
+      content: `---\ntitle: hot\ntype: hot\nupdated: ${today}\nlegacy-fm-marker: x\n---\n\n${LEGACY_HOT_BODY}\n`,
+    },
+    sessionLog: { entry: `## [${today}] ${tag}\n` },
+  };
+}
+
+test('legacy payload: both old field bodies sit in the original entry byte for byte, frontmatter stripped, and exactly one notice says it was absorbed', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const sid = newPinSession('legacy-bytes');
+    const { out } = applyJson(dir, legacyFormatPayload(today, 'legacy bytes'), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const file = sessionFilesOf(dir).find((f) => f.includes(sid));
+    const text = readFileSync(join(sessionsDirOf(dir), file), 'utf-8');
+    assert.ok(text.includes(LEGACY_HOT_BODY), 'the projectHot body is in the file as sent');
+    assert.ok(text.includes(LEGACY_STATE_BODY), 'the sessionState body is in the file as sent');
+    assert.ok(!text.includes('legacy-fm-marker'), 'the old frontmatter did not come along');
+    const entry = entryAt(dir, file);
+    assert.ok(entry.summary.includes(LEGACY_HOT_BODY), entry.summary);
+    assert.ok(entry.bodies.legacy.includes(LEGACY_STATE_BODY), entry.bodies.legacy);
+    assert.equal(entry.tracks.length, 1);
+    assert.equal(entry.tracks[0].id, 'legacy');
+    assert.equal(entry.tracks[0].new, true, 'legacy is registered by this close');
+    const absorbed = (out.notices ?? []).filter((n) => /구버전 형식 payload/.test(n));
+    assert.equal(absorbed.length, 1, JSON.stringify(out.notices));
+  });
+});
+
+test('legacy payload: the same session closing in the old format twice leaves one legacy head, and the first entry is not it', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const sid = newPinSession('legacy-twice');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const first = applyJson(dir, legacyFormatPayload(today, 'legacy twice first'), sid);
+      assert.equal(first.out.ok, true, JSON.stringify(first.out));
+      typeCloseAgain(sid);
+      const second = applyJson(dir, legacyFormatPayload(today, 'legacy twice second'), sid);
+      assert.equal(second.out.ok, true, JSON.stringify(second.out));
+      assert.equal(sessionFilesOf(dir).length, 2, 'both closes wrote an entry');
+      const heads = headsOf(dir);
+      assert.equal(heads.legacy.length, 1, JSON.stringify(heads));
+      assert.notEqual(heads.legacy[0], closeIdFor(sid, 0), 'the first entry is no longer a head');
+      const secondEntry = entryAt(
+        dir,
+        sessionFilesOf(dir).find((f) => f.includes(heads.legacy[0])),
+      );
+      assert.deepEqual(secondEntry.tracks[0].supersedes, [closeIdFor(sid, 0)]);
+      assert.ok(!secondEntry.tracks[0].new, 'legacy was already registered');
+      assert.equal(readObservedHeads(dir, sid, 'test-project').full.legacy.length, 2);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('legacy payload: a payload mixing either old field with summary or tracks fails and writes nothing', () => {
+  const mixes = [
+    { summary: 'x' },
+    { tracks: [{ id: 'main', new: true }] },
+    { summary: 'x', tracks: [{ id: 'main', new: true }] },
+  ];
+  withWiki(null, (dir, today) => {
+    const head = gitHead(dir);
+    for (const [i, extra] of mixes.entries()) {
+      for (const drop of ['projectHot', 'sessionState']) {
+        const payload = { ...legacyFormatPayload(today, `legacy mixed ${i}`), ...extra };
+        delete payload[drop];
+        const { out } = applyJson(dir, payload, newPinSession(`legacy-mixed-${i}`));
+        assert.equal(out.ok, false, JSON.stringify(out));
+        assert.match(JSON.stringify(out.details), /both the old fields/);
+      }
+    }
+    assert.equal(sessionFilesOf(dir).length, 0, 'no entry was written');
+    assert.equal(gitHead(dir), head, 'no commit was made');
+    const status = spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf-8' });
+    assert.equal(status.stdout, '', 'the vault is untouched');
+  });
+});
+
 suite('close entries: publishing and retrying one close');
 
 // Occupy the receipt directory with a file: the commit lands, the receipt cannot.
