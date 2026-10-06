@@ -817,11 +817,11 @@ export function sessionLogScopePath(hypoDir, project, date) {
  * the project slug from anything that follows by whitespace, a colon, or
  * end-of-line, so the lookahead correctly rejects "session | foo-bar" when
  * looking for "foo". Both delimiters are canonical: the derive path
- * (rootLogEntry) emits `<project> — <title>` (space), while the dominant
- * hand-written convention is `<project>: <title>` (colon, since the tone rule
- * banned the em dash). The colon must be accepted: without it, a close whose
- * only log.md evidence used the colon form was misread as "stale" and blocked
- * non-deterministically. (Was a pre-existing boundary bug in
+ * (rootLogEntry) now emits `<project>: <title>` (colon, since the tone rule
+ * banned the em dash), and log.md files written by earlier versions carry
+ * `<project>` + space + em dash + `<title>`, which must keep matching. The colon must be
+ * accepted: without it, a close whose only log.md evidence used the colon form
+ * was misread as "stale" and blocked non-deterministically. (Was a pre-existing boundary bug in
  * sessionCloseFileStatus that the helper extraction inherited.)
  */
 export function hasLogEntry(content, date, project) {
@@ -2912,8 +2912,19 @@ function deriveLogTitle(tail) {
  */
 export function rootLogEntry(slug, date, headingTail) {
   const title = deriveLogTitle(headingTail);
-  const heading = `## [${date}] session | ${slug}` + (title ? ` — ${title}` : '');
+  const heading = `## [${date}] session | ${slug}` + (title ? `: ${title}` : '');
   return { heading, block: `${heading}\n→ [[projects/${slug}/hot]]` };
+}
+
+/**
+ * The form of a log.md line that rootLogEntry's exact-line dedup compares. Earlier
+ * versions wrote an em dash after the slug; this one writes `## [d] session | slug: title`. A
+ * log.md that already carries the old heading must count as having the entry, or
+ * the next derive appends the same session a second time. Only the separator right
+ * after the slug is rewritten, so every other line is returned as it came.
+ */
+export function rootLogHeadingKey(line) {
+  return String(line).replace(/^(## \[[^\]]*\] session \| [^\s:]+) — /, '$1: ');
 }
 
 /**
@@ -3198,9 +3209,10 @@ export function deriveRootLogEntries(hypoDir) {
   }
 
   // Exact-LINE dedup: a titleless heading (`## [d] session | a`) is a substring/
-  // prefix of a titled one (`## [d] session | a — first`), so substring checks
-  // would wrongly drop a distinct same-day session. Track whole heading lines.
-  const seenHeadings = new Set((logContent || '').split(/\r?\n/));
+  // prefix of a titled one (`## [d] session | a: first`), so substring checks
+  // would wrongly drop a distinct same-day session. Track whole heading lines,
+  // with an old em dash heading read as its colon form.
+  const seenHeadings = new Set((logContent || '').split(/\r?\n/).map(rootLogHeadingKey));
   const additions = [];
   for (const slug of todayActive) {
     // Guard: only the log.md entry may be the gap; an otherwise-incomplete close
@@ -3260,7 +3272,7 @@ export function deriveRootLogEntries(hypoDir) {
       } catch {
         return 0;
       }
-      const seen = new Set((current || '').split(/\r?\n/));
+      const seen = new Set((current || '').split(/\r?\n/).map(rootLogHeadingKey));
       const fresh = additions.filter(({ heading }) => {
         if (seen.has(heading)) return false;
         seen.add(heading);
@@ -6129,9 +6141,11 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       );
       if (r.error || r.status === null) {
         skipped.feedback = true; // spawn failure → fail-open
-      } else if (r.status !== 0) {
-        // Only a non-zero exit carries an actionable issue. A clean check exits 0
-        // (the implicit else below) — that is NOT skipped, just nothing to do.
+      } else {
+        // A non-zero exit carries an actionable issue. A clean check exits 0 and is NOT
+        // skipped, just nothing to do, except that its report can still carry
+        // sideWarnings (a hand-written feedback_<slug>.md in the way): those exit 0, so
+        // the report is read for them too.
         let report = null;
         try {
           report = JSON.parse(r.stdout || '');
@@ -6142,7 +6156,11 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         const conflictedT = entries
           .filter(
             ([, t]) =>
-              t.intruder || t.unpaired || t.outOfContainer || (t.conflicts && t.conflicts.length),
+              t.intruder ||
+              t.unpaired ||
+              t.outOfContainer ||
+              (t.conflicts && t.conflicts.length) ||
+              (t.sideEdited && t.sideEdited.length),
           )
           .map(([n]) => n);
         const overCapT = entries.filter(([, t]) => t.overCap).map(([n]) => n);
@@ -6169,14 +6187,15 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         // gets bypassed.
         const sideWarnT = entries.filter(([, t]) => (t.sideWarnings || []).length);
         if (
-          !report ||
-          !(
-            conflictedT.length ||
-            overCapT.length ||
-            driftedT.length ||
-            buildErrT.length ||
-            sideWarnT.length
-          )
+          r.status !== 0 &&
+          (!report ||
+            !(
+              conflictedT.length ||
+              overCapT.length ||
+              driftedT.length ||
+              buildErrT.length ||
+              sideWarnT.length
+            ))
         ) {
           skipped.feedback = true; // unparseable / non-actionable → fail-open
         } else if (buildErrT.length) {
@@ -6197,9 +6216,30 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             reason: `feedback projection cannot be built — ${details} — no rules are loaded from it. ${remedies}`,
           });
         } else if (conflictedT.length) {
+          // The remedy text comes from the report (feedback-sync names the real
+          // slugs and leaves out --accept-wiki for an unpaired file). A report from an
+          // older installed script has none, and this hook cannot tell from the report
+          // which of its shapes is the right way out (the import command it used to
+          // fall back to does nothing for an intruder-only target), so that target gets
+          // a generic pointer and no state-specific command.
+          const remedies = [
+            ...new Set(
+              entries
+                .filter(([n]) => conflictedT.includes(n))
+                .map(([, t]) =>
+                  typeof t.conflictRemedy === 'string' && t.conflictRemedy
+                    ? t.conflictRemedy
+                    : 'the installed feedback-sync sent no remedy for this target (its version differs from this hook): run `hypomnema feedback-sync --check` for the details, and update Hypomnema so the hook and the script match.',
+                ),
+            ),
+          ].join(' ');
           blockers.push({
             type: 'feedback',
-            reason: `feedback projection conflict (manual edit of ${conflictedT.join(', ')}) — run \`hypomnema feedback-sync --import-target-change --from=<memory|claude>\``,
+            // reasons are rendered with an appended period and joined with ', ', so
+            // the full-sentence remedy loses its own final period here (CLI and doctor keep it)
+            reason:
+              `feedback projection conflict (manual edit of ${conflictedT.join(', ')}): ` +
+              remedies.replace(/\.$/, ''),
           });
         } else if (overCapT.length) {
           blockers.push({
@@ -6213,14 +6253,26 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             reason: `feedback projection drift (${driftedT.join(', ')}) — will self-heal at /compact`,
           });
         }
-        // Additive, and deliberately outside the chain above: a side-file I/O
-        // problem is orthogonal to the primary target's health, so it is a notice
-        // whatever else is (or is not) going on. It names the path and the
-        // permission fix, because that — not a command — is the way out.
+        // Additive, and deliberately outside the chain above: a side-file problem
+        // is orthogonal to the primary target's health, so it is a notice whatever
+        // else is (or is not) going on. Two kinds reach here. "cannot read side
+        // file" is an I/O error whose only way out is a permission bit on that
+        // path (`--ensure-container` cannot touch it), so only that kind carries
+        // the permissions advice. "not overwriting ..." is feedback-sync declining
+        // to replace a hand-written file that lacks its provenance header; the
+        // warning text already says to rename or delete it, and calling it
+        // unreadable or pointing at permissions would be wrong. The reason has no
+        // trailing period: the hook that renders it appends one.
         for (const [n, t] of sideWarnT) {
+          const unreadable = t.sideWarnings.some((w) => w.startsWith('cannot read side file'));
           notices.push({
             type: 'feedback',
-            reason: `feedback projection side file unreadable (${n}): ${t.sideWarnings.join('; ')} — fix the permissions on that path; the primary projection still loads every rule (\`--ensure-container\` does not fix this)`,
+            reason:
+              `feedback projection side file warning (${n}): ${t.sideWarnings.join('; ')}. ` +
+              'The primary projection still loads every rule' +
+              (unreadable
+                ? '. Fix the permissions on that path; --ensure-container does not fix this'
+                : ''),
           });
         }
       }

@@ -152,6 +152,11 @@ process.stdin.on('end', () => {
   // file can land before another fails), which the preflight narrows to genuine
   // fs errors and no further.
   let feedbackHealed = '';
+  // Notices the --write itself reports: a hand line it kept, and its write-time
+  // warnings. Its JSON report is the only place those exist (the record entry behind a
+  // kept line is dropped by that same write), so they are turned into notice lines
+  // below. A report that is missing or malformed yields none.
+  const healNotices = [];
   if (gate.ok && gate.driftTargets.length > 0) {
     const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
     const w = feedbackPath
@@ -161,6 +166,7 @@ process.stdin.on('end', () => {
             feedbackPath,
             '--write',
             '--no-input',
+            '--json',
             `--hypo-dir=${HYPO_DIR}`,
             `--claude-home=${join(homedir(), '.claude')}`,
           ],
@@ -174,6 +180,31 @@ process.stdin.on('end', () => {
         reason: `feedback projection drift (${gate.driftTargets.join(', ')}) — auto-sync failed; run \`hypomnema feedback-sync --write\` manually`,
       });
     } else {
+      try {
+        const report = JSON.parse(w.stdout || '');
+        for (const [name, t] of Object.entries(report.targets || {})) {
+          for (const k of Array.isArray(t.handKept) ? t.handKept : []) {
+            healNotices.push(
+              `[WIKI CHECK] feedback-sync kept the hand-written line in ${k.file} that bootstrap drafted "${k.slug}" from (${name}); it was changed, moved or duplicated, or links another file, so it was not removed. Delete it by hand if it now duplicates the managed entry: ${k.line}`,
+            );
+          }
+          // sideWarnings are not repeated here: the gate's own side-file notice
+          // already carries them, and a second line would show the same warning twice.
+        }
+        // Warnings raised while writing (a before-write copy skipped, a side file left
+        // alone, a record that could not be saved) exist only in this report, so they
+        // are shown too, except a sentence the gate's own notices already carry.
+        const shown = new Set();
+        for (const m of Array.isArray(report.warnings) ? report.warnings : []) {
+          if (typeof m !== 'string' || shown.has(m)) continue;
+          if (gate.notices.some((n) => typeof n.reason === 'string' && n.reason.includes(m)))
+            continue;
+          shown.add(m);
+          healNotices.push(`[WIKI CHECK] feedback-sync warning while re-syncing: ${m}`);
+        }
+      } catch {
+        /* fail open: no report, no extra notices */
+      }
       feedbackHealed = `[WIKI CHECK] feedback projection re-synced (${gate.driftTargets.join(', ')}); MEMORY.md body may be unchanged — drift was in the managed block / side-files.`;
     }
   }
@@ -271,6 +302,7 @@ process.stdin.on('end', () => {
     noticeLines.push(`[WIKI CHECK] ${n.reason}.`);
   }
 
+  noticeLines.push(...healNotices);
   let noticeText = noticeLines.join('\n');
   // Surface the self-heal so a re-synced projection is not a silent mutation of
   // the user's MEMORY.md / CLAUDE.md (transparency).

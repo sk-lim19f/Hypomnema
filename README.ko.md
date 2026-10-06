@@ -436,7 +436,7 @@ Claude(또는 다른 코딩 에이전트)로서 Hypomnema 위키를 운영한다
 
 위키가 단일 원천입니다. 사용자가 기억해 달라고 한 것은 전부 위키 루트 아래 마크다운으로 있고, 기억에 의존해 답하기 전에 그것부터 읽습니다. 한 프로젝트의 배경은 `projects/<name>/hot.md`에, 다음에 할 일은 `projects/<name>/session-state.md`에 있으며 `/hypo:resume`이 둘 다 불러옵니다. 위키 루트의 `hot.md`는 다른 파일입니다. 어떤 프로젝트가 활성인지 가리키는 포인터 테이블입니다.
 
-그 상태를 위키 밖에 또 두지 마세요. `MEMORY.md`와 `~/.claude/CLAUDE.md`의 `<learned_behaviors>` 블록은 스스로의 메모리처럼 보이지만, Hypomnema가 `pages/feedback/`에서 뽑아내는 단방향 projection입니다. 교정은 `/hypo:feedback`으로 적고 동기화가 다시 만들게 두면 됩니다. projection을 손으로 고치면 다음 동기화가 그것을 병합하지 않고 conflict로 멈춥니다. 어느 쪽이 진실인지 판단할 근거가 없기 때문이고, 그때부터 feedback 페이지로 되돌려 정리하는 일이 남습니다. 위키에 있어야 할 내용을 혼자만 보는 곳에 따로 챙겨 두면, 사용자의 다른 기기에는 끝내 닿지 않습니다.
+그 상태를 위키 밖에 또 두지 마세요. `MEMORY.md`와 `~/.claude/CLAUDE.md`의 `<learned_behaviors>` 블록은 스스로의 메모리처럼 보이지만, Hypomnema가 `pages/feedback/`에서 뽑아내는 단방향 projection입니다. 교정은 `/hypo:feedback`으로 적고 동기화가 다시 만들게 두면 됩니다. projection을 손으로 고치면 다음 동기화가 그것을 병합하지 않고 conflict로 멈춥니다. 어느 쪽이 진실인지 판단할 근거가 없기 때문이고, 그때부터 feedback 페이지로 되돌려 정리하는 일이 남습니다. 손으로 고친 내용이 위키가 쓸 내용과 이미 같다면 예외로, 다음 `--write`가 그대로 받아들입니다. 충돌한 블록을 위키 버전으로 되돌리려면 먼저 `hypomnema feedback-sync --import-target-change --from=<target>`으로 고친 내용을 초안으로 남겨 두고, 이어서 `hypomnema feedback-sync --accept-wiki=<slug>`를 실행하세요. 위키에 있어야 할 내용을 혼자만 보는 곳에 따로 챙겨 두면, 사용자의 다른 기기에는 끝내 닿지 않습니다.
 
 `sources/`는 불변입니다. 그 아래는 무엇도 고치지 않습니다. 대신 `pages/`로 합성하고 출처를 링크로 되짚습니다.
 

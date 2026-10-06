@@ -336,7 +336,7 @@ function writeFeedback(args, today) {
 
   // append to log.md
   const logPath = join(args.hypoDir, 'log.md');
-  const logEntry = `\n- ${today} feedback: [[pages/feedback/${args.topic}]] — ${args.entry
+  const logEntry = `\n- ${today} feedback: [[pages/feedback/${args.topic}]]: ${args.entry
     .split('\n')[0]
     .slice(0, 80)}\n`;
   if (existsSync(logPath)) {
@@ -366,6 +366,13 @@ function runProjection(args) {
   const r = spawnSync(process.execPath, cliArgs, { encoding: 'utf-8' });
   if (r.status === 0) {
     console.log('↪ Projection refreshed (MEMORY.md / CLAUDE.md learned-behaviors)');
+    // A clean exit can still carry a notice the user has to act on: feedback-sync
+    // prints it once, on the --write that meets it. Other warnings (a skipped MEMORY
+    // projection, an excluded page) are ordinary and stay quiet here.
+    for (const line of (r.stderr || '').split('\n')) {
+      if (/^\[feedback-sync\] warn: .*(kept the hand-written line|not overwriting)/.test(line))
+        console.error(`⚠ ${line.replace('[feedback-sync] warn: ', '')}`);
+    }
     return;
   }
   const detail = (r.stderr || '').trim().split('\n').slice(-1)[0] || `exit ${r.status}`;
