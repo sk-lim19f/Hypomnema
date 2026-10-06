@@ -2,7 +2,7 @@
 title: Wiki Operations Guide
 type: reference
 updated: YYYY-MM-DD
-version: 2
+version: 3
 tags: [wiki, guide, operations]
 ---
 
@@ -90,8 +90,8 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
 6. Check with `/hypo:crystallize` in its `--check-session-close` mode: a dry-run of the
    **full** set of checks the PreCompact hook itself runs (close files + lint + design-history + feedback
    projection), sharing one function (`precompactGateStatus`) with that hook. Its
-   **"Compact-ready"** line is a diagnostic of the whole vault, not the bar for calling a
-   session closed. It goes red for anything in the vault, including an uncommitted file
+   **"Close check"** line is a diagnostic of the whole vault, not the bar for calling a
+   session closed. It goes red for a gate blocker anywhere in the vault, including an uncommitted file
    another session wrote, so on a shared vault a normal close can finish while it is still
    red. A "close files updated" check alone is not enough to turn it green: a lint error in
    a close file or a feedback projection over-cap keeps it red on its own.
@@ -102,8 +102,10 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    Pass `--session-id=<id>` to also see `marker_present` and `close_state` (step 7).
    `--project=<slug>` narrows the check to one project (a scoped
    diagnostic, JSON `scope: "project"`): green there means only that slug is
-   close-complete, **not** that every project in the vault is. Use the plain
-   check when you want to know whether the whole vault is clean.
+   close-complete, **not** that every project in the vault is. The plain check
+   lists the blocking items across the vault; another session's unfinished project
+   can show there as a non-blocking notice rather than a blocker. With `--session-id` for a
+   session whose close was log-only (no project), the project-close checks are skipped.
 7. Record the close checkpoint. The Stop hook blocks until this session's close
    checkpoint receipt (`.cache/sessions/<id>/close-receipt.json`) is valid, and a hand-edit
    close (writing the files directly + committing) never writes one; the receipt
@@ -118,8 +120,8 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    (`--apply-session-close --session-id=<id> --transcript-path=<path>`), which files the
    checkpoint once the gate is green. Hand-edit recovery: after committing the
    files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
-   Both writers gate the checkpoint on `precompactGateStatus`, the gate `/compact`
-   uses, with one difference: the git check is narrower. An uncommitted file
+   Both writers gate the checkpoint on `precompactGateStatus`, the gate the PreCompact
+   notice reads, with one difference: the git check is narrower. An uncommitted file
    inside the project folder being closed (`projects/<project>/`) blocks whether
    or not this session has a record of writing it. An uncommitted file at the
    root or in another project's folder blocks only when this session wrote it
@@ -130,11 +132,13 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    determine ownership. So it can land while step 6 still shows a git blocker
    for someone else's dirty file.
    Every other check (close files, hot.md, lint, feedback) is the same as step 6.
-   **The session is closed once the checkpoint receipt is issued**: the writer's result
+   **This session's close is recorded once the checkpoint receipt is issued**: the writer's result
    reports `markerWritten: true` (apply) or `ok: true` (`--mark`), and
-   `--check-session-close --session-id=<id>` then reports `close_state: closed`. Declare the
-   close on that, not on "Compact-ready". If the writer reports the marker as not written, or
-   `close_state` is anything other than `closed`, the session is still open whatever step 6 says.
+   `--check-session-close --session-id=<id>` then reports `close_state: closed`. (`legacy-closed` is an
+   older marker written before receipts existed; it is still accepted, without a receipt.) Report the
+   close on that, not on the step 6 "Close check" line. The Stop hook still checks this session's own
+   project folder and has the final say. If the writer reports the marker as not written, or
+   `close_state` is anything other than `closed` or `legacy-closed`, the close is not recorded whatever step 6 says.
    If `close_state` is `broken` because the commit an earlier close proved was dropped from
    history (a reset or rebase), `--mark-session-closed` refuses with
    `prior-checkpoint-rewritten` and leaves the old receipt alone: restore that commit, or ask

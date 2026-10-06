@@ -71,6 +71,7 @@ import {
   precompactGateStatus,
   resolveGateProjectOverride,
   run,
+  runHook,
   runStop,
   runWithHome,
   seedCloseTranscript,
@@ -3859,7 +3860,7 @@ test('check-session-close surfaces a feedback over-cap as a gate blocker (not ju
       [join(SCRIPTS, 'crystallize.mjs'), '--check-session-close', `--hypo-dir=${wiki}`, '--json'],
       { encoding: 'utf-8', env: { ...process.env, HOME: home, HYPO_DIR: '' } },
     );
-    assert.equal(r.status, 1, `over-cap must make the check not compact-ready: ${r.stdout}`);
+    assert.equal(r.status, 1, `over-cap must make the check not gate-green: ${r.stdout}`);
     const report = JSON.parse(r.stdout);
     assert.equal(report.ok, false, 'ok must reflect the full gate, not just close files');
     assert.ok(
@@ -4465,14 +4466,10 @@ test('--check-session-close --session-id reports marker presence without alterin
     const o1 = JSON.parse(r1.stdout);
     assert.equal(o1.session_id, 's-mp');
     assert.equal(o1.marker_present, false, `marker absent must report false: ${r1.stdout}`);
-    // `ok` is the compact-ready verdict and must NOT require the marker: a clean
-    // close is compact-ready even before the marker exists (that IS the hand-edit
+    // `ok` is the global gate verdict and must NOT require the marker: a clean
+    // close is gate-green even before the marker exists (that IS the hand-edit
     // state). Prove independence directly rather than across two runs.
-    assert.equal(
-      o1.ok,
-      true,
-      `a clean close must be compact-ready without the marker: ${r1.stdout}`,
-    );
+    assert.equal(o1.ok, true, `a clean close must be gate-green without the marker: ${r1.stdout}`);
     writeSessionClosedMarkerFile(dir, 's-mp');
     // Commit the marker file so the second run's git tree stays clean (otherwise
     // the new .cache/ file would dirty git and flip ok via the git blocker —
@@ -4487,7 +4484,7 @@ test('--check-session-close --session-id reports marker presence without alterin
     ]);
     const o2 = JSON.parse(r2.stdout);
     assert.equal(o2.marker_present, true, `marker present must report true: ${r2.stdout}`);
-    assert.equal(o1.ok, o2.ok, 'marker_present must not change the compact-ready ok verdict');
+    assert.equal(o1.ok, o2.ok, 'marker_present must not change the global-gate ok verdict');
   });
 });
 
@@ -4820,7 +4817,7 @@ test('--check-session-close --session-id: log-only marker → ok:true, marker_pr
       assert.equal(
         out.ok,
         true,
-        `log-only check must be compact-ready despite the stale project: ${r.stdout}`,
+        `log-only check must be gate-green despite the stale project: ${r.stdout}`,
       );
     },
   );
@@ -5742,8 +5739,8 @@ test('IMPR-34: the no-activity fallback still blocks unconditionally', () => {
   });
 });
 
-// marker == compact-ready: the marker must be attributed to a project the gate
-// actually cleared, or PreCompact re-derives a scope the marker never covered.
+// The marker gate is the global gate with the git axis narrowed (checkpointMode).
+// The marker must be attributed to a project the gate actually cleared, or PreCompact re-derives a scope the marker never covered.
 test('IMPR-34: marker attribution comes from the close scope, not the global primary', () => {
   const today = todayLocal();
   withClosePartitionWiki(
@@ -6037,6 +6034,147 @@ test('an ordinary create (no lock contention) still reports the plain "hot.md ro
       !result.skipped.includes('hot.md row (lock timeout)') &&
         !result.created.includes('hot.md row (lock timeout)'),
       `an uncontended create must never report a lock timeout: ${JSON.stringify(result)}`,
+    );
+  });
+});
+
+// ── --check-session-close wording vs the real PreCompact behavior ─────────────
+suite('--check-session-close wording matches what PreCompact does');
+
+test('a red check never says /compact blocks or waits, while PreCompact on the same vault carries no decision', () => {
+  // The check's wording used to say "/compact would block on these" long after
+  // the PreCompact hook became a notice. Pin the wording to the behavior: build a
+  // vault the check judges red, run the real hook on it, and require that the hook
+  // does not block and the check does not claim it does.
+  const blockClaim =
+    /\/compact\b[^.\n]*\b(would|will|still)\b[^.\n]*\b(block|wait)|would block on these|^\s*[✓✗] (not )?compact-ready/im;
+  // Self-check: the pattern must still catch the old red line, and must leave the
+  // true sentence about the Stop hook alone.
+  assert.ok(
+    blockClaim.test(
+      '✗ Not compact-ready — resolve the ✗ items above, then retry. /compact would block on these.',
+    ),
+    'blockClaim must match the old red line',
+  );
+  assert.ok(
+    !blockClaim.test('the Stop hook will block until it is written.'),
+    'blockClaim must not match a true statement about the Stop hook',
+  );
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'hot.md'),
+        '---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n',
+      );
+    },
+    (dir) => {
+      const hook = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir });
+      const hookOut = JSON.parse(hook.stdout);
+      assert.equal(hookOut.continue, true, `PreCompact must not stop the run: ${hook.stdout}`);
+      assert.ok(
+        !('decision' in hookOut),
+        `PreCompact must carry no block decision: ${hook.stdout}`,
+      );
+      assert.ok(
+        hookOut.systemMessage.includes('projects/test-project/hot.md'),
+        `precondition: the hook must see the same red state: ${hook.stdout}`,
+      );
+      // The hook's checklist tells the model what line to wait for. It must name
+      // what the close writer reports, not a check label the CLI no longer prints.
+      assert.ok(
+        hookOut.systemMessage.includes('close_state: closed'),
+        `the checklist must point at close_state: ${hook.stdout}`,
+      );
+      assert.ok(
+        !/compact-ready/i.test(hookOut.systemMessage),
+        `the checklist must not wait for a "Compact-ready" line: ${hook.stdout}`,
+      );
+
+      const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close']);
+      assert.equal(r.status, 1, `precondition: the check must be red here: ${r.stdout}`);
+      assert.ok(
+        r.stdout.includes('projects/test-project/hot.md'),
+        `the red check must name the stale file: ${r.stdout}`,
+      );
+      assert.ok(
+        !blockClaim.test(r.stdout),
+        `a red check must not claim /compact is blocked or waiting: ${r.stdout}`,
+      );
+      assert.ok(
+        r.stdout.includes('does not stop /compact'),
+        `a red check must say outright that it does not stop /compact: ${r.stdout}`,
+      );
+      // An older installed hook waits for the old label. The verdict line is the one
+      // thing such a model still sees from this CLI, so it must name the old label
+      // and point at close_state.
+      assert.ok(
+        r.stdout.includes('Older hooks call this line "Not compact-ready"') &&
+          r.stdout.includes('read the close_state line'),
+        `a red check must tell an older hook's reader where to look: ${r.stdout}`,
+      );
+    },
+  );
+  withWiki(null, (dir) => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close']);
+    assert.equal(r.status, 0, `precondition: the check must be green here: ${r.stdout}`);
+    assert.ok(!blockClaim.test(r.stdout), `a green check must not say compact-ready: ${r.stdout}`);
+    assert.ok(
+      r.stdout.includes('Older hooks call this line "Compact-ready"') &&
+        r.stdout.includes('read the close_state line'),
+      `a green check must tell an older hook's reader where to look: ${r.stdout}`,
+    );
+  });
+});
+
+test('--session-id: the CLI text prints close_state by name, the same token the hook checklist waits for', () => {
+  const sid = 's-wording-closed';
+  const hookOut = (dir) =>
+    JSON.parse(
+      runHook('hypo-personal-check.mjs', JSON.stringify({ session_id: sid }), { HYPO_DIR: dir })
+        .stdout,
+    );
+  const cliText = (dir, id) =>
+    run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close', `--session-id=${id}`])
+      .stdout;
+  const blockClaim =
+    /\/compact\b[^.\n]*\b(would|will|still)\b[^.\n]*\b(block|wait)|would block on these|^\s*[✓✗] (not )?compact-ready/im;
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'hot.md'),
+        '---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n',
+      );
+    },
+    (dir) => {
+      const msg = hookOut(dir).systemMessage;
+      assert.ok(msg.includes('close_state: closed'), `the checklist names the token: ${msg}`);
+      assert.ok(
+        msg.includes(`--session-id=${sid}`),
+        `the checklist fills in this session's id: ${msg}`,
+      );
+      // An open session: the CLI names the state too, by key.
+      assert.ok(
+        cliText(dir, sid).includes('close_state: open'),
+        'an absent marker must print close_state: open',
+      );
+    },
+  );
+  withWiki(null, (dir) => {
+    writeValidReceipt(dir, sid);
+    const text = cliText(dir, sid);
+    // (c) the token the hook asks for is the token the CLI prints.
+    assert.ok(text.includes('close_state: closed'), `CLI text must print close_state: ${text}`);
+    // (b) a recorded close carries no /compact blocking claim.
+    assert.ok(
+      !blockClaim.test(text),
+      `a recorded close must not claim /compact is blocked: ${text}`,
+    );
+  });
+  withWiki(null, (dir) => {
+    writeMarkerWithReceiptGeneration(dir, sid, 'gen-missing');
+    assert.ok(
+      cliText(dir, sid).includes('close_state: broken'),
+      'a broken checkpoint must print close_state: broken',
     );
   });
 });

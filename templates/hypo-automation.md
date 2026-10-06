@@ -104,7 +104,7 @@ Edit `.hypoignore` in your wiki root to exclude additional files or directories 
 `hypo-personal-check.mjs` runs `lint.mjs` before a compact.
 Blocker errors are reported in its `systemMessage`; the PreCompact hook does not
 stop `/compact` on them. The two places that still refuse on a red gate are
-`crystallize --check-session-close` (it reports the session as not close-complete)
+`crystallize --check-session-close` (it reports the gate blockers; whether this session's close is recorded is its separate `close_state` line)
 and the marker writer (`--mark-session-closed` will not stamp a marker).
 
 Run `/hypo:lint` to check and fix issues.

@@ -18,14 +18,15 @@ import { closeCheckpointState, isCloseComplete } from '../../hooks/close-receipt
 const SELF_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'crystallize.mjs');
 
 // ── session-close check (spec §5.2.7 / §8.3) ────────────────────────
-// Mirrors the hard gate in hypo-personal-check.mjs so the /hypo:crystallize
-// flow can self-verify before /compact triggers PreCompact.
+// Runs the same gate decision hypo-personal-check.mjs uses for its PreCompact
+// notice, so the /hypo:crystallize flow can self-verify the close. /compact is
+// never blocked by this verdict: PreCompact only shows a notice.
 
 export function runSessionCloseCheck(args) {
   // The check mirrors the FULL PreCompact gate via the shared
   // precompactGateStatus (close files + lint + design-history + feedback
-  // projection), not just the close files — so a green check means /compact
-  // won't block on a human-fixable issue. Pass --transcript-path to widen the
+  // projection), not just the close files, so a green check means no
+  // human-fixable close item is left in the vault. Pass --transcript-path to widen the
   // lint scope to the session's edited files exactly as the interactive hook
   // does (without it, the scope is the mandatory close files only).
   // Pass --session-id so a log-only marker activates log-only gate
@@ -35,9 +36,9 @@ export function runSessionCloseCheck(args) {
   // (codex design Finding 2).
   //
   // --project=<slug> narrows BOTH the close status and the lint scope to that one
-  // project: a project-scoped DIAGNOSTIC, NOT the global compact-ready verdict.
-  // It is check-only: the marker writers stay global so
-  // the marker == compact-ready invariant holds. When narrowed, the
+  // project: a project-scoped DIAGNOSTIC, NOT the global close verdict.
+  // It is check-only: the marker writers stay global (the marker gate is the
+  // global gate with only the git axis narrowed by checkpointMode). When narrowed, the
   // transcript widening is suppressed: a transcript touch in some OTHER project
   // would re-add that project's files to the lint scope and re-block the scoped
   // check, defeating the point. The global (no --project) check keeps widening.
@@ -46,8 +47,8 @@ export function runSessionCloseCheck(args) {
   // exactly as --mark and the apply auto-marker already do. The transcript is what
   // attributes the close as well as widening the lint scope, and PreCompact
   // always has one from its hook payload. A check without it would compute an EMPTY
-  // close scope, fall back to the global block, and report RED for debt that /compact
-  // demotes. Checklist step 14 tells the model to trust this command, so an over-red
+  // close scope, fall back to the global block, and report RED for debt that the
+  // PreCompact notice demotes. Checklist step 14 tells the model to trust this command, so an over-red
   // check is as harmful as an over-green one.
   const checkTranscript =
     args.transcriptPath ||
@@ -104,7 +105,7 @@ export function runSessionCloseCheck(args) {
   const scopedProject = args.project || inferredProject;
 
   // When a --session-id is supplied, report THIS session's close verdict. Two
-  // separate fields, neither folded into `ok` (`ok` stays the compact-readiness
+  // separate fields, neither folded into `ok` (`ok` stays the global gate
   // verdict):
   //   close_state     closeCheckpointState's state, the one Stop blocks on.
   //                   Only 'closed' and 'legacy-closed' are a finished close;
@@ -115,14 +116,14 @@ export function runSessionCloseCheck(args) {
   //                   whose receipt is gone still counts here); read close_state
   //                   for that.
   // A green gate with an unfinished close_state is the hand-edit close state:
-  // compact-ready, but the Stop hook still blocks until the close is recorded.
+  // gate green, but the Stop hook still blocks until the close is recorded.
   const markerObj = checkpoint ? checkpoint.marker : null;
   const markerPresent = args.sessionId ? markerObj !== null : null;
 
   // Scope of this check (codex design review finding 2 — the scope must be
   // explicit in JSON + prose, not implied). `global` = the full PreCompact mirror
-  // (green ⇒ compact-ready). `project` = narrowed to --project=<slug> (green ⇒
-  // only THAT project is close-complete, NOT global compact-readiness). When a
+  // (green ⇒ no close item left). `project` = narrowed to --project=<slug> (green ⇒
+  // only THAT project is close-complete, NOT the global verdict). When a
   // log-only marker governs the session, the gate runs in log-only mode and the
   // --project override is IGNORED — surface that rather than implying X was
   // checked (it was not).
@@ -190,13 +191,13 @@ export function runSessionCloseCheck(args) {
     );
   } else if (scope === 'project') {
     console.log(
-      `Note: ${scopedProjectLabel} — this is a PROJECT-SCOPED diagnostic, not the global /compact gate. A green result means only ${scopedProject} is close-complete; another project can still block /compact.\n`,
+      `Note: ${scopedProjectLabel}: this is a PROJECT-SCOPED diagnostic, not the global close verdict. A green result means only ${scopedProject} is close-complete; another project can still have a close item left. /compact is never blocked either way.\n`,
     );
   }
 
   const proj = close.project || '(unresolved)';
   console.log(
-    `Compact-ready check (${scope === 'global' ? `project: ${proj}` : `scope: ${scope}, project: ${proj}`}, date: ${close.dates.join(' / ')}):\n`,
+    `Close check (${scope === 'global' ? `project: ${proj}` : `scope: ${scope}, project: ${proj}`}, date: ${close.dates.join(' / ')}):\n`,
   );
 
   const required = close.project
@@ -217,7 +218,7 @@ export function runSessionCloseCheck(args) {
   }
   // Beyond the close files: the rest of the PreCompact gate (lint, design-history,
   // feedback over-cap/conflict). These are what made a "close-complete" check
-  // disagree with the real /compact gate before this check was added.
+  // disagree with the real PreCompact gate before this check was added.
   for (const b of status.blockers) {
     if (b.type !== 'close') console.log(`  ✗ ${b.reason}`);
   }
@@ -225,33 +226,33 @@ export function runSessionCloseCheck(args) {
     console.log('');
     for (const n of status.notices) console.log(`  · ${n.reason}`);
   }
-  // Surface the per-session close verdict (separate from compact-
-  // readiness) so a green-but-unrecorded close is visible at verify time.
+  // Surface the per-session close verdict (separate from the gate
+  // verdict) so a green-but-unrecorded close is visible at verify time.
   if (args.sessionId) {
     const markCmd = `node "${SELF_SCRIPT}" --mark-session-closed --session-id=${args.sessionId}${args.transcriptPath ? ` --transcript-path="${args.transcriptPath}"` : ''}`;
     console.log('');
     console.log(
       closeComplete
-        ? `  ✓ session close recorded (${checkpoint.state}, session_id: ${args.sessionId}).`
+        ? `  ✓ session close recorded (close_state: ${checkpoint.state}, session_id: ${args.sessionId}).`
         : checkpoint.state === 'broken'
-          ? `  · session close checkpoint broken (session_id: ${args.sessionId}): ${checkpoint.reason}. The Stop hook will block until the close is recorded again. Run \`${markCmd}\`.`
-          : `  · session-closed marker absent (session_id: ${args.sessionId}): the Stop hook will block until it is written. Run \`${markCmd}\`.`,
+          ? `  · session close checkpoint broken (close_state: ${checkpoint.state}, session_id: ${args.sessionId}): ${checkpoint.reason}. The Stop hook can hold a close open until it is recorded again. Run \`${markCmd}\`.`
+          : `  · session-closed marker absent (close_state: ${checkpoint.state}, session_id: ${args.sessionId}): the Stop hook can hold a close open until it is written. Run \`${markCmd}\`.`,
     );
   }
   console.log('');
   if (scope === 'project') {
     // Project-scoped diagnostic: green means ONLY this project is close-complete.
-    // Do NOT claim global compact-readiness (the whole point of the narrow).
+    // Do NOT claim the global verdict (the whole point of the narrow).
     console.log(
       status.ok
-        ? `✓ ${scopedProject} is close-complete (project-scoped). This is NOT a global /compact guarantee — run \`--check-session-close\` without --project for that.`
+        ? `✓ ${scopedProject} is close-complete (project-scoped). This is NOT a global verdict, run \`--check-session-close\` without --project for that.`
         : `✗ ${scopedProject} is not close-complete — resolve the ✗ items above.`,
     );
   } else {
     console.log(
       status.ok
-        ? '✓ Compact-ready — no PreCompact gate blocker needs a human fix. (open-questions.md: conditional, not checked. The live /compact can still differ on a context-≥70% prompt, HYPO_SKIP_GATE, or a transcript-scoped lint error this check did not see — pass --transcript-path to include the latter.)'
-        : '✗ Not compact-ready — resolve the ✗ items above, then retry. /compact would block on these.',
+        ? '✓ Close check clean: no blocking items in this check\'s scope; the notices listed above, if any, do not block it. Older hooks call this line "Compact-ready"; for this session, read the close_state line, shown with --session-id. (open-questions.md: conditional, not checked. The live PreCompact notice can still differ on a context-≥70% prompt, HYPO_SKIP_GATE, or a transcript-scoped lint error this check did not see. Pass --transcript-path to include the latter.)'
+        : '✗ Close check found items a human still needs to fix: resolve the ✗ items above, then retry. This does not stop /compact; PreCompact only shows a notice. Older hooks call this line "Not compact-ready"; for this session, read the close_state line, shown with --session-id.',
     );
   }
   process.exit(status.ok ? 0 : 1);

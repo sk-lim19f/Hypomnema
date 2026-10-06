@@ -50,11 +50,11 @@ process.stdin.on('end', () => {
     const input = JSON.parse(raw || '{}');
     transcriptPath = input.transcript_path ?? null;
     // A log-only marker for this session activates log-only gate
-    // semantics (no project attribution) so /compact does not block a closed
+    // semantics (no project attribution) so the notice does not flag a closed
     // non-project session on the active/phantom project's files.
     sessionId = input.session_id ?? input.sessionId ?? null;
     // Authoritative session cwd for the session-cwd close check. This is the one
-    // verified cwd source (mirrors hypo-session-record); it lets /compact block a
+    // verified cwd source (mirrors hypo-session-record); it lets the notice name a
     // session whose own project close was never started, which the recency-based
     // global status cannot see.
     sessionCwd = input.cwd ?? null;
@@ -101,7 +101,7 @@ process.stdin.on('end', () => {
 
   // The full PreCompact gate decision, single-sourced. The SAME
   // function backs `crystallize --check-session-close`, so a green self-check
-  // there means this hook will not block. precompactGateStatus runs git-clean +
+  // there means this hook will raise no close notice. precompactGateStatus runs git-clean +
   // hot.md structure + session-close files (global invariant) + scoped
   // lint + W8 design-history + feedback projection. The transcript widens the
   // lint scope to this session's edited files; without one the scope
@@ -335,8 +335,9 @@ process.stdin.on('end', () => {
       `  [ ] 12. lint — run /hypo:lint; fix errors in files YOU touched`,
       `           (other projects' / shared-page debt is reported as non-blocking notice)`,
       `  [ ] 13. git commit & push`,
-      `  [ ] 14. verify — run /hypo:crystallize (--check-session-close mode); only declare`,
-      `           the session closed once it prints "Compact-ready" (= this gate passes).`,
+      `  [ ] 14. verify: run /hypo:crystallize (--check-session-close --session-id=${sessionId ?? '<id>'});`,
+      `           the close is recorded once it reports close_state: closed (or legacy-closed).`,
+      `           The Stop hook still checks this session's own project folder and has the final say.`,
     ].join('\n');
 
   const closeIntentNote = hasCloseIntent
