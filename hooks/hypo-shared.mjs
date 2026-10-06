@@ -732,8 +732,9 @@ export function hotMdIsClean(dir = HYPO_DIR) {
 // ── strict session-close verification ────────────────────────────
 // spec §5.2.7 / §8.3 (updated 2026-05-15): session-close = steps 1~6 of the
 // 11-step crystallize checklist (synthesis is steps 7~11). The hard gate
-// (sessionCloseFileStatus) confirms the 4 mandatory files: session-state.md,
-// project hot.md, session-log/YYYY-MM-DD.md, and log.md. Root hot.md is NOT
+// (sessionCloseFileStatus) confirms the close files: this close's own session
+// entry (projects/<p>/sessions/<date>-<close id>.md), session-log/YYYY-MM-DD.md, and
+// log.md. The generated session-state.md and project hot.md are not close files. Root hot.md is NOT
 // one of them: it became a hook-generated projection, so the close no longer
 // writes it and the gate no longer checks it (see the note at the
 // checkUpdated calls in sessionCloseFileStatus for why its `updated:` field
@@ -6360,9 +6361,8 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
   try {
     const cacheDir = join(hypoDir, '.cache');
     if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
-    // scope distinguishes a project close (the 4 mandatory files were verified
-    // fresh) from a log-only close (a non-project session, no project
-    // attribution). Readers (precompactGateStatus / --check-session-close) key
+    // scope distinguishes a project close (its close files were verified) from a
+    // log-only close (a non-project session, no project attribution). Readers (precompactGateStatus / --check-session-close) key
     // the gate semantics on this field, so it must be recorded.
     const scope = info.scope === 'log-only' ? 'log-only' : 'project';
     // v4 attribution discriminator (session-close attribution). `projects` is the evidence-based

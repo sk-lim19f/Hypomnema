@@ -37,31 +37,37 @@
  * Payload schema:
  *   {
  *     "project":      "<slug>",                       // REQUIRED — single segment [A-Za-z0-9._-]+ (≥1 alnum, not dot-only), projects/<slug>/ dir must exist (B-3: no recency fallback for apply)
+ *     "sessionId":    "<session id>",                 // recommended: must equal --session-id when present (null or absent skips the check)
  *     "date":         "YYYY-MM-DD",                   // optional — defaults to today (local)
- *     "sessionState": { "content": "<full file>" },   // overwrite (idempotent: identical bytes → skip)
- *     "projectHot":   { "content": "<full file>" },   // overwrite
- *     "sessionLog":   { "entry":   "## [date] ..." }, // append, skip if heading already present
+ *     "summary":      "<markdown>",                   // REQUIRED: string; becomes the summary of this close's session entry
+ *     "tracks":       [{ "id": "<track-id>", "title": "...", "next": "<markdown>",
+ *                        "new": true, "done": true, "supersedes": ["<close id or prefix>"] }], // optional array, may be empty; title/next/new/done/supersedes optional per element, one element per track id
+ *     "sessionLog":   { "entry":   "## [date] ..." }, // REQUIRED: append, skip if heading already present
  *     "log":          { "entry":   "## [date] session | <project> ..." }, // OPTIONAL (B-1): omit it and apply derives the root log.md entry from this close's sessionLog heading; supply it only for a deliberately custom log line
- *     "openQuestions":{ "content": "<full file>" }    // optional overwrite
+ *     "openQuestions":{ "content": "<full file>" }    // optional overwrite (the only overwrite left in a close)
  *   }
  *
- * The helper does NOT auto-fix `updated:` frontmatter. If a payload field carries a
- * stale date, the final sessionCloseFileStatus check fails with a clear error so the
- * caller fixes the payload and retries. Silent rewrites would mask payload bugs.
+ * A close creates ONE immutable file, projects/<slug>/sessions/<date>-<close id>.md, and
+ * appends to the session-log shard and log.md. It never rewrites a project's
+ * session-state.md or hot.md: those are generated views of the entries.
+ * The old form (`sessionState` + `projectHot` instead of `summary` + `tracks`) is still
+ * accepted and recorded as a `legacy` track; sending both forms is refused.
  *
  * Lint gates:
- *   • Preflight — runs `lint.mjs --json` BEFORE any payload byte is written.
- *     Errors in files this payload will OVERWRITE (sessionState/projectHot/
- *     openQuestions) are filtered out: they're about to be replaced,
- *     and not filtering them dead-locks the documented "fix payload and retry"
- *     recovery after a post-apply-lint failure (codex P2). Errors in any other
- *     file → exit 1 with stage='preflight-lint', no apply occurs. PreCompact's
- *     hypo-personal-check is still the final enforcement.
- *   • Post-apply — runs after the writes. Surfaces as stage='post-apply-lint'
- *     (or 'post-apply-verification+lint' if freshness also fails). Catches
- *     payloads that introduce a malformed body / bad frontmatter (error-level);
- *     broken wikilinks are lint W4 warnings and are not gated. A lint crash
- *     hard-fails regardless of scope.
+ *   • Preflight: runs `lint.mjs --json` BEFORE any payload byte is written.
+ *     Errors in files this close is about to write itself (its own session entry,
+ *     openQuestions) are filtered out: a retry may replace them, and not filtering
+ *     them dead-locks the documented "fix payload and retry" recovery after a
+ *     post-apply-lint failure (codex P2). Errors in the other payload files
+ *     (session-log shard, log.md) → exit 1 with stage='preflight-lint', no apply
+ *     occurs. The generated session-state.md / hot.md and the root hot.md are not
+ *     payload files. PreCompact's hypo-personal-check is still the final enforcement.
+ *   • Post-apply: runs after the writes and BEFORE the commit. Surfaces as
+ *     stage='post-apply-lint'. Catches payloads that introduce a malformed body /
+ *     bad frontmatter (error-level); broken wikilinks are lint W4 warnings and are not
+ *     gated. A lint crash hard-fails regardless of scope. The verification that this
+ *     close's entry, session-log heading and log.md line read back (stage
+ *     'post-apply-verification') runs after the commit, so it never joins a lint failure.
  */
 
 import { readFileSync, realpathSync } from 'fs';

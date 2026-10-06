@@ -4444,11 +4444,13 @@ function printCloseReport({
         : 'lint clean';
     if (markerSkipReason) {
       console.log(
-        `\n✓ session-close files verified (all 4 mandatory files fresh, ${lintWord}).` +
+        `\n✓ session-close files verified (this close's entry, session-log and log.md, ${lintWord}).` +
           '\n  session NOT fully closed: the Stop-chain marker was not written (see warning below).',
       );
     } else {
-      console.log(`\n✓ session-close verified (all 4 mandatory files fresh, ${lintWord}).`);
+      console.log(
+        `\n✓ session-close verified (this close's entry, session-log and log.md, ${lintWord}).`,
+      );
     }
   }
   // Warn once per run, not on every gate read, which is exactly the
@@ -4486,13 +4488,13 @@ function printCloseReport({
     // and neither is the gate refusal (compact-gate-not-ok), which stays ok:true.
     const receiptFailure =
       markerSkipReason === 'receipt-proof-mismatch'
-        ? `    The 4 mandatory files were applied, but the close checkpoint receipt\n` +
+        ? `    The close files were applied, but the close checkpoint receipt\n` +
           `    could not prove them against the commit (see mismatches[] in --json\n` +
           `    output). This run reports ok:false and exits 1. The session is NOT closed.\n` +
           `    To fix: check the listed paths with git status, commit the ones you\n` +
           `    have reviewed, then re-run the same close. No fresh close phrase is needed.\n`
         : markerSkipReason === 'receipt-write-failed'
-          ? `    The 4 mandatory files were applied and committed, but writing the close\n` +
+          ? `    The close files were applied and committed, but writing the close\n` +
             `    checkpoint receipt under .cache/sessions/<session-id>/ failed. This run\n` +
             `    reports ok:false and exits 1. The session is NOT closed.\n` +
             `    To fix: clear whatever blocks that directory (permissions, disk space),\n` +
@@ -4501,7 +4503,7 @@ function printCloseReport({
             // by a compact-gate blocker. It is not a session-id problem and not a receipt
             // problem, so it gets its own words.
             markerSkipReason === 'compact-gate-not-ok'
-            ? `    The 4 mandatory files were applied and verified, but the close gate\n` +
+            ? `    The close files were applied and verified, but the close gate\n` +
               `    refused the per-session Stop-chain marker because a gate blocker\n` +
               `    remains. The session is NOT fully closed: the Stop hook will re-prompt\n` +
               `    until the marker is present. This is not a --session-id problem.\n` +
@@ -4522,7 +4524,7 @@ function printCloseReport({
         (markerGateReason ? `    Gate detail: ${markerGateReason}\n` : '') +
         (receiptFailure ??
           (diskFailure
-            ? `    The 4 mandatory files were applied and committed, but writing the\n` +
+            ? `    The close files were applied and committed, but writing the\n` +
               `    per-session Stop-chain marker itself failed. This run reports\n` +
               `    ok:false and exits 1. The session is NOT closed: the Stop hook\n` +
               `    will re-prompt until the marker is present.\n` +
@@ -4530,7 +4532,7 @@ function printCloseReport({
               `    (permissions, a directory sitting where the marker file goes,\n` +
               `    disk space), then re-run the same close. No fresh close phrase\n` +
               `    is needed: a close signal is spent only once the marker lands.\n`
-            : `    The 4 mandatory files were applied and verified (ok:true), but the\n` +
+            : `    The close files were applied and verified (ok:true), but the\n` +
               `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
               `    closed: the Stop hook will re-prompt until the marker is present.\n` +
               `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +

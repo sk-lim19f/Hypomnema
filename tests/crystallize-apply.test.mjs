@@ -4521,6 +4521,68 @@ test('legacy payload: the old two fields become the summary and a legacy track b
   });
 });
 
+// The Step 2 json block of commands/crystallize.md is what a model copies. It has to survive a
+// real apply, not only the shape check: a duplicate track id or an unregistered track passes the
+// shape check and is refused later, which is how the first version of the example got through.
+// Disabling the check: put a `done` element for the same <track-id> back into that block (the
+// real apply refuses it as track-duplicate), or add an `openQuestions` key to the block.
+test('commands/crystallize.md Step 2 payload example applies for real against a registered track', () => {
+  const md = readFileSync(join(REPO, 'commands', 'crystallize.md'), 'utf-8');
+  const step2 = md.slice(md.indexOf('## Step 2'), md.indexOf('## Step 3'));
+  const blocks = [...step2.matchAll(/```json\n([\s\S]*?)```/g)];
+  assert.equal(blocks.length, 1, 'Step 2 must hold exactly one json example');
+  const template = JSON.parse(blocks[0][1]);
+  assert.ok(!('openQuestions' in template), 'the example must not carry openQuestions by default');
+
+  const strings = (v) =>
+    typeof v === 'string'
+      ? [v]
+      : Array.isArray(v)
+        ? v.flatMap(strings)
+        : v && typeof v === 'object'
+          ? Object.values(v).flatMap(strings)
+          : [];
+
+  withWiki(null, (dir, today) => {
+    // Register track `main` the way a real earlier close does.
+    const seed = applyJson(dir, v2Payload(today, { tag: 'seed close' }), newPinSession('doc-seed'));
+    assert.equal(seed.out.ok, true, JSON.stringify(seed.out));
+    const filesBefore = sessionFilesOf(dir).length;
+
+    const sessionId = newPinSession('doc-example');
+    const values = {
+      '<slug>': 'test-project',
+      '<current session id>': sessionId,
+      '<what this session did and decided, markdown>': 'summary written from the doc example',
+      '<track-id>': 'main',
+      '<display title>': 'Main track',
+      '<next steps and state, markdown>': '- next step written from the doc example',
+      '<entry to append to projects/<slug>/session-log/YYYY-MM-DD.md>': `## [${today}] crystallize.md example\n`,
+    };
+    const fill = (v) =>
+      typeof v === 'string'
+        ? Object.hasOwn(values, v)
+          ? values[v]
+          : v
+        : Array.isArray(v)
+          ? v.map(fill)
+          : v && typeof v === 'object'
+            ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fill(x)]))
+            : v;
+    const payload = fill(template);
+    assert.deepEqual(
+      strings(payload).filter((s) => s.startsWith('<')),
+      [],
+      'every placeholder in the example must have a value in this test',
+    );
+
+    const { out } = applyJson(dir, payload, sessionId);
+    assert.equal(out.ok, true, `the doc example must apply: ${JSON.stringify(out)}`);
+    assert.equal(out.committed, true, 'the doc example must commit its entry');
+    assert.equal(sessionFilesOf(dir).length, filesBefore + 1, 'exactly one entry was created');
+  });
+});
+
 // An old-format payload with bodies that make byte loss visible: Korean text, trailing
 // spaces, an inner blank line, and frontmatter fields that must not reach the entry.
 const LEGACY_HOT_BODY = '# 옛 hot\n\n- legacy-hot-line  \n\n- 두 번째 줄 legacy-hot-end';
