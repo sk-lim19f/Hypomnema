@@ -773,6 +773,9 @@ for (const rel of closeRootTargets) {
 // staleness: appending to design-history or writing "ADR 없음" does not clear
 // it, so as a W8 it would be a close-gate blocker the gate's own advice cannot
 // resolve. Own id for the same reason as W14, and also a plain warn.
+// W19 is emitted whenever a project has a calendar-overflow heading, independent
+// of the W8/W14 verdict: beside a W8 or W14 (their message repeats the literal),
+// and alone when only `ADR 없음` entries carry it.
 for (const s of findDesignHistoryStale(args.hypoDir)) {
   // A calendar-overflow heading (## [2026-02-30]) is reported as written, never
   // normalized into a neighbouring real date, so no day gap is derived from it.
@@ -782,6 +785,18 @@ for (const s of findDesignHistoryStale(args.hypoDir)) {
   // heading does, and that is what the message leads with.
   const overflowList = s.calendarOverflow.map((o) => `${o.file}: ${o.literal}`).join(', ');
   const lastSession = s.lastSession ?? '(유효한 날짜 없음)';
+  const issueShortW19 = () =>
+    issue(
+      'warn',
+      `projects/${s.project}/design-history.md`,
+      `session-log heading date not on the calendar: 달력에 없는 session-log 헤딩이 있습니다 (${overflowList}). 헤딩 날짜를 실제 날짜로 고치세요`,
+      null,
+      'W19',
+    );
+  if (s.kind === 'overflow') {
+    issueShortW19();
+    continue;
+  }
   if (s.kind === 'missing') {
     const tail = overflowList ? ` [달력에 없는 session-log 헤딩: ${overflowList}]` : '';
     const fix =
@@ -800,15 +815,7 @@ for (const s of findDesignHistoryStale(args.hypoDir)) {
     // W14 has no default --json id, so on its own a calendar-overflow heading in
     // a project without design-history.md would never reach close. Emit W19 too
     // (same file, same id as the exists-case) so close shows it as a notice.
-    if (overflowList) {
-      issue(
-        'warn',
-        `projects/${s.project}/design-history.md`,
-        `session-log heading date not on the calendar: 달력에 없는 session-log 헤딩이 있습니다 (${overflowList}). 헤딩 날짜를 실제 날짜로 고치세요`,
-        null,
-        'W19',
-      );
-    }
+    if (overflowList) issueShortW19();
     continue;
   }
   if (!s.realLater) {
@@ -832,6 +839,8 @@ for (const s of findDesignHistoryStale(args.hypoDir)) {
     null,
     'W8',
   );
+  // The W8 tail names the overflow literal, but close lists only W19 as a notice.
+  if (overflowList) issueShortW19();
 }
 
 // W15: synthesis page stale relative to its own sources_consulted. A

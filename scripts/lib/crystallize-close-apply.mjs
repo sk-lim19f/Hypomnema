@@ -15,7 +15,7 @@ import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { expandHome } from './hypo-root.mjs';
 import { parseStrictDate } from './time.mjs';
-import { fencedLineMask } from './code-fence.mjs';
+import { maskNonProse } from './code-fence.mjs';
 import { isValidProjectName, substituteTokens, TEMPLATE_DIR } from './project-create.mjs';
 import { appendPendingTags, checkForbidden } from './schema-vocab.mjs';
 import { atomicWrite } from '../../hooks/atomic-write.mjs';
@@ -1756,7 +1756,7 @@ const SECTION_LOSS_MIN_COUNT = 2; // an ordinary single-section edit (finishing 
 
 /**
  * Extract this file's `##` section headings, in order, as a MULTISET (every
- * occurrence kept, none deduped) with fenced-code lines excluded. Only `##`
+ * occurrence kept, none deduped) with fenced code, HTML comments and frontmatter excluded. Only `##`
  * (not `#`/`###`), the granularity the section-loss incident was measured at.
  *
  * Multiset, not a `Set`, because a dedup here silently halves the denominator
@@ -1765,7 +1765,7 @@ const SECTION_LOSS_MIN_COUNT = 2; // an ordinary single-section edit (finishing 
  * payload that kept only one copy compared as "the heading is still present"
  * with nothing lost at all: the second bypass this pass closes.
  *
- * Known limit, left as-is (see fencedLineMask's own doc comment for the fuller
+ * Known limit, left as-is (see code-fence.mjs's scan doc comment for the fuller
  * case against building a real parser here): this still reads every non-fenced
  * line as prose, so a `## ` line inside an indented (non-fenced) code block, a
  * blockquote, or a list item is still counted as a real heading. That is a
@@ -1774,11 +1774,15 @@ const SECTION_LOSS_MIN_COUNT = 2; // an ordinary single-section edit (finishing 
  * @returns {string[]}
  */
 function h2Headings(content) {
-  const lines = (content || '').split(/\r?\n/);
-  const hidden = fencedLineMask(lines);
+  const text = content || '';
+  // The masked copy decides what is prose (fences, HTML comments and a leading
+  // frontmatter block are handled in code-fence.mjs, the same answer lint gets);
+  // the heading text itself is read from the original line.
+  const lines = text.split(/\r?\n/);
+  const live = maskNonProse(text).split(/\r?\n/);
   const out = [];
   for (let i = 0; i < lines.length; i++) {
-    if (!hidden[i] && /^##\s+\S/.test(lines[i])) out.push(lines[i]);
+    if (/^##\s+\S/.test(live[i])) out.push(lines[i]);
   }
   return out;
 }

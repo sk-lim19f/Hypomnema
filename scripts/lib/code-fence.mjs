@@ -1,6 +1,12 @@
-// Fenced-code detection shared by the close apply's section-loss guard
+// Fenced-code and HTML-comment detection, the one place in this repo that decides
+// which text is prose. Callers: the close apply's section-loss guard
 // (crystallize-close-apply.mjs) and the design-history lint (design-history-stale.mjs).
 // Pure, node built-ins only: hooks may copy it, and scripts/ imports it.
+//
+// Public API, both take the whole file text:
+//   fencedLineMask(text)  boolean[] per `\n`-split line, true on a fence line
+//                         (opener, body, closer)
+//   maskNonProse(text)    copy of `text` with fences and HTML comments blanked
 
 // A fence marker line: 0-3 leading spaces (CommonMark still calls that "unindented"),
 // then a run of 3+ backticks or 3+ tildes, then the rest of the line. `m[1]` is the
@@ -9,108 +15,133 @@
 // (after trim) on a line being checked as a close.
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 
-/**
- * Which line indices are inside a fenced code block, for one file's lines.
- *
- * A fence opens on any line FENCE_RE matches while not already inside one, and
- * closes only on a later line whose marker is the SAME character and AT LEAST as
- * long (a 4-backtick open is not closed by 3 backticks, a CommonMark rule, and the
- * one this guard's predecessor ignored: the section-loss bypass this closes moved
- * two `##` headings into a properly-closed ```md fence and the old line-scan still
- * counted them as real headings because it never looked for a fence at all).
- *
- * An opening fence that never finds a matching close before EOF is treated as
- * NEVER HAVING OPENED (every line from that marker to EOF is unhidden here). That
- * is the safe direction for a guard whose entire job is "did content silently
- * disappear": the same function extracts headings from both disk and payload, so
- * treating an unclosed run as fenced would let it swallow real headings on
- * whichever side has the malformed markdown: undercounting disk (hiding sections
- * the guard should have protected) or undercounting payload (reporting a section
- * as lost when the payload never actually removed it). Treating it as prose
- * instead only risks the opposite: an occasional false park on a document with a
- * genuinely broken fence, which is recoverable through the same
- * `restructure: true` / proposal-resolve door every other park in this guard
- * already uses, not a silent loss. The design-history lint reads the same
- * direction for its own reason: a heading it wrongly hid would drop a W8 that
- * blocks the close, while a fence example it wrongly reads as live only adds a
- * warning the author can see and fix.
- *
- * Declined on purpose, not CommonMark-complete: an opening line's info string is
- * never checked for a stray backtick (CommonMark forbids one in a backtick fence's
- * info string; this scan does not care), and a fence inside a blockquote or list
- * item is scanned exactly like a top-level one. Both would need block-context
- * tracking that a complete parser needs and a loss guard does not. Getting the two
- * reproduced bypasses closed cheaply matters more than a complete parser.
- *
- * @returns {boolean[]} same length as `lines`, true where the line is fenced
- */
-export function fencedLineMask(lines) {
-  const hidden = new Array(lines.length).fill(false);
-  let openIdx = -1;
-  let fenceChar = null;
-  let fenceLen = 0;
-  for (let i = 0; i < lines.length; i++) {
-    if (openIdx === -1) {
-      const m = lines[i].match(FENCE_RE);
-      if (m) {
-        openIdx = i;
-        fenceChar = m[1][0];
-        fenceLen = m[1].length;
-        hidden[i] = true; // tentative, unhidden below if this never closes
-      }
+// One pass over the lines, fences and comments tracked together so neither can be
+// read out of the other: a marker inside a comment is not a fence, and a comment
+// opener inside a fence is not a comment. `skip` holds openers that turned out to
+// never close; they are read as plain text on the rescan (see scan).
+function scanOnce(text, skip) {
+  const lines = text.split('\n').map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+  // A leading frontmatter block is not scanned, so a ``` inside a YAML block scalar
+  // cannot open a fence that swallows the body. A BOM does not hide the opener.
+  let from = 0;
+  if (lines[0].replace(/^﻿/, '') === '---') {
+    const close = lines.indexOf('---', 1);
+    if (close > 0) from = close + 1;
+  }
+  const fenced = new Array(lines.length).fill(false);
+  const spans = lines.map(() => []); // comment [start, end) columns per line
+  let fence = null; // { ch, len, key }
+  let comment = null; // { key }
+  for (let i = from; i < lines.length; i++) {
+    const line = lines[i];
+    if (fence) {
+      fenced[i] = true;
+      const m = line.match(FENCE_RE);
+      if (m && m[1][0] === fence.ch && m[1].length >= fence.len && m[2].trim() === '') fence = null;
       continue;
     }
-    hidden[i] = true; // tentative, unhidden below if this never closes
-    const m = lines[i].match(FENCE_RE);
-    if (m && m[1][0] === fenceChar && m[1].length >= fenceLen && m[2].trim() === '') {
-      openIdx = -1;
-      fenceChar = null;
-      fenceLen = 0;
+    // Only a line that starts outside a comment can open a fence. CommonMark also
+    // refuses a backtick fence whose info string holds a backtick (that line is
+    // inline code), so ```js`x` is plain text, not an opener.
+    const key = `f${i}`;
+    const m = comment || skip.has(key) ? null : line.match(FENCE_RE);
+    if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
+      fence = { ch: m[1][0], len: m[1].length, key };
+      fenced[i] = true;
+      continue;
+    }
+    let col = 0;
+    for (;;) {
+      let start = col;
+      if (!comment) {
+        let s = line.indexOf('<!--', col);
+        while (s >= 0 && skip.has(`c${i}:${s}`)) s = line.indexOf('<!--', s + 4);
+        if (s < 0) break;
+        comment = { key: `c${i}:${s}` };
+        start = s;
+        col = s + 4;
+      }
+      const e = line.indexOf('-->', col);
+      if (e < 0) {
+        spans[i].push([start, line.length]);
+        break;
+      }
+      spans[i].push([start, e + 3]);
+      comment = null;
+      col = e + 3;
     }
   }
-  if (openIdx !== -1) {
-    for (let i = openIdx; i < lines.length; i++) hidden[i] = false;
-  }
-  return hidden;
+  return { lines, fenced, spans, unclosed: (fence || comment)?.key ?? null };
 }
 
-const HTML_COMMENT_RE = /<!--[\s\S]*?-->/g;
+/**
+ * Scan `text`. A fence closes only on a later line whose marker is the SAME
+ * character and AT LEAST as long (a 4-backtick open is not closed by 3 backticks),
+ * with nothing after it. An HTML comment runs from `<!--` to the next `-->`, across
+ * lines.
+ *
+ * An opener that never finds its close before EOF is treated as NEVER HAVING
+ * OPENED: the scan reruns with that opener read as plain text, so every line from
+ * it to EOF is visible again. That is the safe direction for both callers. The
+ * section-loss guard extracts headings from disk and payload with the same
+ * function, so an unclosed run swallowing real headings would undercount one side
+ * and either hide a loss or report one that never happened; reading it as prose
+ * costs at most a false park, recoverable through `restructure: true`. The
+ * design-history lint reads the same direction: a heading it wrongly hid would
+ * drop a W8 that blocks the close, while an example it wrongly reads as live only
+ * adds a warning the author can see and fix.
+ *
+ * Not CommonMark-complete: a fence inside a blockquote or list item is scanned
+ * like a top-level one, and an indented code block is not recognised. Both would
+ * need block-context tracking that a complete parser needs and these callers do
+ * not.
+ */
+function scan(text) {
+  const skip = new Set();
+  for (;;) {
+    const r = scanOnce(text, skip);
+    if (r.unclosed === null) return r;
+    skip.add(r.unclosed); // each rescan retires one opener, so this terminates
+  }
+}
+
+/**
+ * Which lines are fence lines (opener, body, closer). Lines are the `\n` split of
+ * `text`, so index i is line i of the file. Frontmatter lines are never fenced.
+ * A fence marker inside an HTML comment does not count, and a comment inside a
+ * fence is just fence content, which makes this the right mask for ignoring
+ * markers that are themselves comments (`<!-- ... -->`) when they sit in a fence.
+ *
+ * @param {string} text
+ * @returns {boolean[]}
+ */
+export function fencedLineMask(text) {
+  return scan(text).fenced;
+}
+
 const blank = (s) => s.replace(/[^\n]/g, ' ');
 
 /**
  * A copy of `text` with fenced code and HTML comments blanked to spaces, same
  * length and same newline positions, so a match index in the copy is the same
- * index in `text`.
+ * index in `text`. Frontmatter text is left as written. A comment is blanked from
+ * its `<!--` to its `-->` only, so the rest of a line stays readable.
  *
- * Fences follow fencedLineMask exactly (an unclosed fence never opened). Scanning
- * starts after the closing `---` of a leading frontmatter block, so a ``` inside a
- * YAML block scalar cannot open a fence that swallows the body; frontmatter text
- * itself is left as written. A `<!-- ... -->` region is blanked after the fences
- * (so a comment opener inside a fence is not read), and an unclosed `<!--` is left
- * alone, the same never-opened direction. Like fencedLineMask this follows fence
- * rules only and does not track list or blockquote containers.
+ * A CRLF line is matched without its `\r`; the `\r` stays in the copy, except on a
+ * fence line, where the whole line (its `\r` too) becomes spaces.
  *
- * A fence marker inside an HTML comment is still read as a fence (fences are
- * masked before comments); that is out of scope here. A leading UTF-8 BOM does
- * not hide the frontmatter opener (it is compared stripped, the text is untouched).
- *
- * A CRLF line is matched without its `\r`, which stays in the copy (or becomes a
- * space when the line is blanked).
+ * @param {string} text
+ * @returns {string}
  */
 export function maskNonProse(text) {
-  const lines = text.split('\n');
-  const bare = lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
-  let from = 0;
-  if (bare[0].replace(/^\uFEFF/, '') === '---') {
-    const close = bare.indexOf('---', 1);
-    if (close > 0) from = close + 1;
-  }
-  const offset = from ? lines.slice(0, from).join('\n').length + 1 : 0;
-  const tailLines = text.slice(offset).split('\n');
-  const mask = fencedLineMask(bare.slice(from));
-  const tail = tailLines
-    .map((l, i) => (mask[i] ? blank(l) : l))
-    .join('\n')
-    .replace(HTML_COMMENT_RE, blank);
-  return text.slice(0, offset) + tail;
+  const { lines, fenced, spans } = scan(text);
+  const raw = text.split('\n');
+  return raw
+    .map((l, i) => {
+      if (fenced[i]) return blank(l);
+      let out = lines[i];
+      for (const [s, e] of spans[i]) out = out.slice(0, s) + blank(out.slice(s, e)) + out.slice(e);
+      return out + l.slice(lines[i].length);
+    })
+    .join('\n');
 }

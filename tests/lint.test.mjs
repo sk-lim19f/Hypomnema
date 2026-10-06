@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'nod
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
+import { fencedLineMask, maskNonProse } from '../scripts/lib/code-fence.mjs';
 import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
 import { test, suite } from './harness.mjs';
 import {
@@ -2521,13 +2522,85 @@ test('w19-lint-unfenced-still-flagged: an overflow heading after a closed fence 
   });
 });
 
+// Disabling the check: in scripts/lib/code-fence.mjs scanOnce, change `comment || skip.has(key)`
+// to `skip.has(key)` so a fence marker is read even on a line inside a comment.
+test('w8-lint-fence-markers-in-comments-do-not-pair: markers inside two comments do not hide the real heading between them', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '---\ntitle: sl\ntype: session-log\nupdated: 2026-10-02\n---\n\n<!--\n```\n-->\n\n## [2026-10-02] session | demo\ndesigned X\n\n<!--\n```\n-->\n',
+    });
+    assert.equal(
+      lintWarnsFor(root, 'W8').length,
+      1,
+      'real heading between the comments stays live',
+    );
+  });
+});
+
+// Disabling the check: in scripts/lib/code-fence.mjs scanOnce, drop the
+// `!(m[1][0] === '`' && m[2].includes('`'))` clause so a backtick in the info string still opens.
+test('w8-lint-backtick-info-string-is-not-a-fence: ```js`x` opens nothing, so the heading after it stays live', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-09-01] a\n\n```js`x`\n## [2026-10-02] session | demo\ndesigned X\n```\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1);
+  });
+});
+
+// Disabling the check: in scripts/lib/design-history-stale.mjs parseSessionDates, push the
+// overflow literal only when `!excluded`.
+test('w19-lint-adr-none-overflow: an overflow heading inside an `ADR 없음` entry is W19, and never W8', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '---\ntitle: sl\ntype: session-log\nupdated: 2026-09-01\n---\n\n## [2026-02-30] session | demo\nADR 없음\n',
+    });
+    const w19 = lintWarnsFor(root, 'W19');
+    assert.equal(w19.length, 1, JSON.stringify(w19));
+    assert.ok(w19[0].message.includes('projects/demo/session-log.md: 2026-02-30'), w19[0].message);
+    assert.equal(lintWarnsFor(root, 'W8').length, 0, 'a no-design entry never makes W8');
+  });
+});
+
+test('w19-lint-adr-none-overflow-no-dh: an `ADR 없음` overflow heading with no design-history.md is W19 only, no W14', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', { sessionLogMd: '## [2026-02-30] session | demo\nADR 없음\n' });
+    assert.equal(lintWarnsFor(root, 'W19').length, 1);
+    assert.equal(lintWarnsFor(root, 'W14').length, 0);
+  });
+});
+
+test('w19-findDesignHistoryStale-kind-overflow: only a no-design overflow heading gives kind overflow with the literal and file', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd: '## [2026-08-01] a\nADR 없음\n\n## [2026-02-30] b\nADR 없음\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].kind, 'overflow');
+    assert.deepEqual(stale[0].calendarOverflow, [
+      { literal: '2026-02-30', file: 'projects/p/session-log.md' },
+    ]);
+  });
+});
+
 test('w8-lint-real-later-with-overflow: a real later date keeps id W8 and its overflow tail', () => {
   withTmpDir((root) => {
     setupDhProject(root, 'demo', {
       dh: '## 2026-02-20\nfoo\n',
       sessionLogMd: '## [2026-02-30] a\n\n## [2026-02-25] b\n',
     });
-    assert.equal(lintWarnsFor(root, 'W19', ['--strict']).length, 0);
+    // The overflow heading is also its own W19 now (close lists only W19 as a notice).
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1, JSON.stringify(w19));
+    assert.ok(w19[0].message.includes('2026-02-30'), w19[0].message);
     const w8 = lintWarnsFor(root, 'W8');
     assert.equal(w8.length, 1);
     assert.ok(w8[0].message.includes('2026-02-30'));
@@ -3486,4 +3559,51 @@ test('strict: the closeRootTargets W1 exemption does not leak to pages/ (ISSUE-9
       `log.md's W1 must stay a warn: ${JSON.stringify(parsed.warns)}`,
     );
   });
+});
+
+suite('code-fence.mjs: one place for fence and comment decisions');
+
+test('fencedLineMask: a fence marker inside an HTML comment is not a fence, so two of them never pair', () => {
+  const text = '<!--\n```\n-->\n## real\n<!--\n```\n-->\n';
+  assert.deepEqual(fencedLineMask(text), new Array(8).fill(false));
+  assert.ok(maskNonProse(text).includes('## real'));
+});
+
+test('fencedLineMask: a comment opener inside a fence is fence content, not a comment', () => {
+  const text = '```\n<!--\n```\n## real\n-->\n';
+  assert.deepEqual(fencedLineMask(text), [true, true, true, false, false, false]);
+  assert.ok(maskNonProse(text).includes('## real'), 'the unclosed `<!--` was never opened');
+});
+
+test('fencedLineMask: a backtick fence whose info string has a backtick is not an opener; a tilde one is', () => {
+  assert.deepEqual(fencedLineMask('```js`x`\na\n```\n'), [false, false, false, false]);
+  assert.deepEqual(fencedLineMask('~~~js`x`\na\n~~~\n'), [true, true, true, false]);
+  assert.deepEqual(fencedLineMask('```js\na\n```\n'), [true, true, true, false]);
+});
+
+test('fencedLineMask: frontmatter lines are never fenced, so a scalar ``` cannot swallow the body', () => {
+  const text = '---\nnote: |\n  ```\n---\n## h\n```\nx\n```\n';
+  assert.deepEqual(fencedLineMask(text), [
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    false,
+  ]);
+});
+
+test('fencedLineMask: an unclosed fence and an unclosed comment never opened', () => {
+  assert.deepEqual(fencedLineMask('a\n```\nb\n'), [false, false, false, false]);
+  assert.equal(maskNonProse('a <!-- b\n## h\n'), 'a <!-- b\n## h\n');
+});
+
+test('maskNonProse: keeps length and newlines, blanks only the comment span and whole fence lines', () => {
+  const text = 'x <!-- c --> y\n```\nf\n```\nz\n';
+  const out = maskNonProse(text);
+  assert.equal(out.length, text.length);
+  assert.equal(out, `x${' '.repeat(12)}y\n   \n \n   \nz\n`);
 });
