@@ -12,6 +12,7 @@ import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -22,7 +23,8 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { basename, dirname, join } from 'node:path';
 import {
   GITATTRIBUTES_BLOCK,
   GITIGNORE_BLOCK,
@@ -97,6 +99,7 @@ import {
   writeGeneratedViewsUnlocked,
 } from '../hooks/session-views.mjs';
 import { isIgnored as isIgnoredScripts } from '../scripts/lib/hypo-ignore.mjs';
+import { isValidProjectName } from '../scripts/lib/project-create.mjs';
 import { test, suite } from './harness.mjs';
 import { SESSION_TMP_HOME, withTmpDir } from './helpers.mjs';
 
@@ -609,6 +612,35 @@ test('isGeneratedViewPath matches git check-ignore on the block, except _templat
   });
 });
 
+test('the block ignores the temp file a killed view write leaves beside the view, and hides no file a person would name', () => {
+  // The name atomicWrite gives its temp: `<path>.<pid>.<random>.tmp`.
+  const tmpOf = (rel) => `${rel}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  const views = ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'];
+  const leaked = views.map(tmpOf);
+  const mine = ['hot.md.draft.tmp', 'projects/p/hot.md.old', 'projects/p/notes.md.1.tmp'];
+  // a vault with its own .gitignore around the block, as an existing vault has
+  withVault({ '.gitignore': `node_modules/\n${GITIGNORE_BLOCK}local-only/\n` }, (dir) => {
+    for (const rel of [...leaked, ...mine]) put(dir, rel, 'x\n');
+    assert.equal(git(dir, ['add', '-A']).status, 0);
+    const staged = git(dir, ['ls-files']).stdout.split('\n').filter(Boolean);
+    for (const rel of leaked) assert.equal(staged.includes(rel), false, `${rel} is not staged`);
+    for (const rel of mine) assert.equal(staged.includes(rel), true, `${rel} is a person's file`);
+  });
+});
+
+test('the block ignores everything under .cache/, where backups and the records live', () => {
+  withVault({ '.gitignore': `node_modules/\n${GITIGNORE_BLOCK}` }, (dir) => {
+    const files = [
+      '.cache/backups/projects/p/hot.md.pre-projection-backup.md',
+      '.cache/pull-archive.json',
+      '.cache/generated-views.json',
+    ];
+    for (const rel of files) put(dir, rel, 'private notes\n');
+    assert.equal(git(dir, ['add', '-A']).status, 0);
+    assert.deepEqual(git(dir, ['ls-files']).stdout.split('\n').filter(Boolean), ['.gitignore']);
+  });
+});
+
 test('the generated paths are exactly the root hot and the two depth-1 project views', () => {
   assert.equal(isGeneratedViewPath('hot.md'), true);
   assert.equal(isGeneratedViewPath('projects/p/hot.md'), true);
@@ -975,6 +1007,44 @@ test('isSessionProjectDir wants index.md or sessions/ and refuses _template', ()
     isSessionProjectDir({ slug: '_template', hasIndex: true, hasSessions: true }),
     false,
   );
+});
+
+test('isSessionProjectDir takes the slugs the other project rules take: no space, #, slash or all-dot name', () => {
+  const names = [
+    'p',
+    'my-proj.v2',
+    'A_b-1',
+    '.hidden',
+    'a..b',
+    'foo #bar',
+    'a b',
+    '#x',
+    '..',
+    '.',
+    '-',
+    '한글',
+    '',
+  ];
+  for (const slug of names) {
+    const asDir = isSessionProjectDir({ slug, hasIndex: true, hasSessions: true });
+    assert.equal(asDir, isValidProjectName(slug), `scripts validator: ${JSON.stringify(slug)}`);
+    const forged = formatSessionEntry(sample()).replace('\nproject: p\n', `\nproject: ${slug}\n`);
+    assert.equal(
+      asDir,
+      parseSessionEntry(forged).ok === true,
+      `entry parser: ${JSON.stringify(slug)}`,
+    );
+  }
+  assert.equal(isSessionProjectDir({ slug: undefined, hasIndex: true, hasSessions: true }), false);
+});
+
+test('listSessionProjects skips a projects/ child whose name is not a slug, even with an index.md', () => {
+  withTmpDir((dir) => {
+    for (const name of ['p', 'foo #bar', 'a b', '..hidden ', '_template']) {
+      put(dir, `projects/${name}/index.md`, '---\ntitle: x\n---\n');
+    }
+    assert.deepEqual(listSessionProjects(dir), ['p']);
+  });
 });
 
 test('sortRootRows: date descending, blank last, slugs by code unit', () => {
@@ -2613,6 +2683,35 @@ test('(a) a view backup is made under .cache/backups, never beside the view, and
   });
 });
 
+test('a vault whose own .gitignore leaves .cache/ out gets no backup or archive: the catch-up defers with a notice, and goes on once .cache/ is ignored', () => {
+  withCatchUp(
+    ({ b }) => {
+      put(b, 'projects/p/hot.md', W1);
+      const r = clear(b);
+      assert.equal(r.ok, false);
+      assert.equal(r.deferred, 'cache-not-ignored');
+      assert.match(r.notice, /\/\.cache\//);
+      assert.equal(existsSync(join(b, '.cache')), false, 'nothing was written under .cache/');
+      assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the local bytes were not moved');
+      cgitOk(b, ['add', '-A']);
+      assert.equal(
+        cgitOk(b, ['ls-files'])
+          .split('\n')
+          .some((n) => n.startsWith('.cache/')),
+        false,
+        'an add-all stages nothing from .cache/',
+      );
+      // the person fixes the rule (the exclude file does not dirty the tree)
+      writeFileSync(join(b, '.git', 'info', 'exclude'), '.cache/\n');
+      cgitOk(b, ['reset', '-q']);
+      const again = clear(b);
+      assert.equal(again.ok, true, JSON.stringify(again));
+      assert.equal(readFileSync(again.archived[0].backupPath, 'utf-8'), W1);
+    },
+    { seed: { '.gitignore': 'node_modules/\n' } },
+  );
+});
+
 test('(a) the notices of the generator and of the root hot.md name the backup under .cache/backups', () => {
   withTmpDir((dir) => {
     assert.match(
@@ -3584,6 +3683,85 @@ test('a merge that fails puts back what the clearing step moved: working-tree an
   });
 });
 
+test('a vault lock held elsewhere defers the move: lock-timeout, and HEAD, the index and the files are as they were', () => {
+  withOldGit((dir) => {
+    const S = RICH_HOT.replace('the old summary', 'staged S');
+    const W = RICH_HOT.replace('the old summary', 'worktree W');
+    put(dir, 'projects/p/hot.md', S);
+    cgitOk(dir, ['add', 'projects/p/hot.md']);
+    put(dir, 'projects/p/hot.md', W);
+    put(dir, 'projects/p/session-state.md', `${OLD_STATE_FILE}edited\n`);
+    const rels = ['projects/p/hot.md', 'projects/p/session-state.md', 'hot.md', '.gitignore'];
+    const state = () => ({
+      ...vaultSnapshot(dir, rels),
+      head: headOf(dir),
+      index: cgitOk(dir, ['ls-files', '-s']),
+    });
+    const before = state();
+    const saved = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+    process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '100';
+    let r;
+    try {
+      withFileLock(vaultCommitLockTarget(dir), () => {
+        r = migrate(dir);
+      });
+    } finally {
+      if (saved === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+      else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = saved;
+    }
+    assert.equal(r.migrated, false, JSON.stringify(r));
+    assert.equal(r.deferred, 'lock-timeout');
+    assert.deepEqual(state(), before);
+    assert.deepEqual(backupsIn(dir, 'projects/p/hot.md'), []);
+    // the lock released, the same vault moves
+    assert.equal(migrate(dir).migrated, true);
+  });
+});
+
+test('a vault below the repository root: a staged view edit is backed up by the clearing step and comes back exactly when the merge fails', () => {
+  inCatchUpEnv(() =>
+    withTmpDir((root) => {
+      cgitOk(root, ['init', '-q']);
+      put(root, 'README.md', 'r\n');
+      const vault = join(root, 'wiki');
+      for (const [rel, text] of Object.entries(OLD_PROJECT_FILES)) put(vault, rel, text);
+      commitIn(root);
+      const S = RICH_HOT.replace('the old summary', 'staged S');
+      const W = RICH_HOT.replace('the old summary', 'worktree W');
+      put(vault, 'projects/p/hot.md', S);
+      cgitOk(root, ['add', 'wiki/projects/p/hot.md']);
+      put(vault, 'projects/p/hot.md', W);
+      // The move adds .gitattributes; an untracked one in the way makes the fast-forward fail.
+      put(vault, '.gitattributes', 'mine\n');
+      const staged = () => cgitOk(root, ['show', ':wiki/projects/p/hot.md']);
+      const state = () => ({
+        index: cgitOk(root, ['ls-files', '-s']),
+        work: readRel(vault, 'projects/p/hot.md'),
+        status: cgitOk(root, ['status', '--porcelain']),
+        head: headOf(root),
+      });
+      assert.equal(staged(), S, 'precondition: the index holds S');
+      const before = state();
+      const r = migrate(vault);
+      assert.match(r.deferred ?? '', /^fast-forward-failed/, JSON.stringify(r));
+      assert.deepEqual(state(), before);
+      assert.equal(staged(), S);
+      assert.deepEqual(backupsIn(vault, 'projects/p/hot.md'), [], 'the undo took its backups away');
+      // with the file out of the way the same vault moves: both versions were captured
+      unlinkSync(join(vault, '.gitattributes'));
+      const again = migrate(vault);
+      assert.equal(again.migrated, true, JSON.stringify(again));
+      assert.deepEqual(
+        backupsIn(vault, 'projects/p/hot.md')
+          .map((n) => readRel(vault, n))
+          .sort(),
+        [S, W].sort(),
+      );
+      assert.equal(again.shared.length, 2);
+    }),
+  );
+});
+
 test('undoClearedPaths does not overwrite a path written since, keeps its backup and the record, and says so', () => {
   withCatchUp(({ b }) => {
     put(b, 'projects/p/hot.md', W1);
@@ -3998,6 +4176,102 @@ function rollbackTarget(a, b) {
 }
 const underVault = (dir, abs) => abs.slice(dir.length + 1);
 
+// Spies on the fs calls that decide durability and cleanup order, as the hooks see them:
+// syncBuiltinESMExports carries the patched properties to their named imports. Returns the
+// events seen, in order.
+function recordDurability(fn) {
+  const nodeFs = createRequire(import.meta.url)('node:fs');
+  const { fsyncSync, renameSync, rmSync } = nodeFs;
+  const events = [];
+  nodeFs.fsyncSync = (fd) => {
+    events.push(fstatSync(fd).isDirectory() ? 'fsync-dir' : 'fsync-file');
+    return fsyncSync(fd);
+  };
+  nodeFs.renameSync = (from, to) => {
+    events.push(`rename ${basename(to)}`);
+    return renameSync(from, to);
+  };
+  nodeFs.rmSync = (path, ...rest) => {
+    events.push(`rm ${basename(String(path))}`);
+    return rmSync(path, ...rest);
+  };
+  syncBuiltinESMExports();
+  try {
+    fn();
+  } finally {
+    nodeFs.fsyncSync = fsyncSync;
+    nodeFs.renameSync = renameSync;
+    nodeFs.rmSync = rmSync;
+    syncBuiltinESMExports();
+  }
+  return events;
+}
+
+test('the clearing step syncs each backup, then the archive record, before it removes anything: file, rename, directory', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    let r;
+    const events = recordDurability(() => {
+      r = clear(b);
+    });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const at = (name) => events.indexOf(`rename ${name}`);
+    const backup = at(basename(r.backups[0]));
+    const record = at('pull-archive.json');
+    assert.ok(backup >= 0 && record > backup, `backup, then record: ${events.join(' | ')}`);
+    for (const i of [backup, record]) {
+      assert.equal(
+        events[i - 1],
+        'fsync-file',
+        `the file is synced before its rename: ${events[i]}`,
+      );
+      assert.equal(events[i + 1], 'fsync-dir', `the directory is synced after it: ${events[i]}`);
+    }
+  });
+});
+
+test('an undo drops the archive record before the backups it names, so a stop between never leaves a record naming a missing backup', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    let undone;
+    const events = recordDurability(() => {
+      undone = undoClearedPaths(b, r);
+    });
+    assert.equal(undone.ok, true, JSON.stringify(undone));
+    const record = events.indexOf('rm pull-archive.json');
+    const backup = events.indexOf(`rm ${basename(r.backups[0])}`);
+    assert.ok(record >= 0 && backup > record, events.join(' | '));
+  });
+});
+
+test('a resume that finds the record naming a backup that is gone keeps the record and says which', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(ffTo(b), 0);
+    const [backupPath] = r.backups;
+    unlinkSync(backupPath);
+    const lost = resumePullArchive(b);
+    assert.equal(lost.resumed, true);
+    assert.equal(lost.created.length, 0, 'nothing could be shared without the bytes');
+    assert.equal(existsSync(join(b, '.cache/pull-archive.json')), true, 'the record stays');
+    assert.ok(
+      lost.notices.some(
+        (n) => n.includes('projects/p/hot.md') && n.includes(underVault(b, backupPath)),
+      ),
+      lost.notices.join('\n'),
+    );
+    // the bytes back on disk: the next run shares them and drops the record
+    put(b, underVault(b, backupPath), W1);
+    const found = resumePullArchive(b);
+    assert.equal(found.created.length, 1, found.notices.join('\n'));
+    assert.equal(existsSync(join(b, '.cache/pull-archive.json')), false);
+  });
+});
+
 test('the archive record names a cleared file backup before the file is removed, and a resume after a crash announces it', () => {
   withCatchUp(({ a, b }) => {
     rollbackTarget(a, b);
@@ -4290,10 +4564,65 @@ test('a .gitignore with the block first line but not its view patterns defers th
       for (const line of ['/projects/*/hot.md', '/projects/*/session-state.md']) {
         assert.ok(notice.includes(line), `the notice names ${line}: ${notice}`);
       }
+      assert.match(notice, /커밋/, 'the notice says the repair is read from a commit');
       assert.equal(notice.includes('/hot.md.pre'), true, 'the backup patterns are named too');
     },
     { '.gitignore': `.cache/\n${GITIGNORE_FIRST_LINE}\n/hot.md\n` },
   );
+});
+
+test('a vault whose own .gitignore leaves .cache/ out is not moved: the backup of a local edit would be staged by an add-all', () => {
+  withOldGit(
+    (dir) => {
+      put(dir, 'projects/p/hot.md', `${RICH_HOT}local edit\n`);
+      const before = commitCount(dir);
+      const r = migrate(dir);
+      assert.equal(r.migrated, false);
+      assert.equal(r.deferred, 'cache-not-ignored');
+      assert.equal(commitCount(dir), before, 'no commit was created');
+      assert.match(r.notices.join('\n'), /\/\.cache\//);
+      for (const rel of [
+        '.cache/backups',
+        '.cache/pull-archive.json',
+        '.cache/generated-views.json',
+      ]) {
+        assert.equal(existsSync(join(dir, rel)), false, `${rel} was not written`);
+      }
+      assert.equal(readRel(dir, 'projects/p/hot.md'), `${RICH_HOT}local edit\n`);
+      cgitOk(dir, ['add', '-A']);
+      assert.equal(
+        cgitOk(dir, ['ls-files'])
+          .split('\n')
+          .some((n) => n.startsWith('.cache/')),
+        false,
+      );
+    },
+    { '.gitignore': 'node_modules/\n' },
+  );
+});
+
+test('the writer leaves .cache/ alone while a later rule un-ignores it, and says so', () => {
+  withOldGit((dir) => {
+    assert.equal(migrate(dir).migrated, true, 'precondition: the vault is migrated');
+    put(dir, '.gitignore', `${showHead(dir, '.gitignore')}!/.cache/\n`);
+    commitIn(dir);
+    assert.equal(migrationState(dir), 'migrated', 'precondition: the block itself is whole');
+    assert.equal(consumeRootHotHealthNotice(dir), null);
+    putEntry(dir, 'p', 'c-late', { date: '2026-10-02' });
+    put(dir, 'projects/p/hot.md', 'hand written\n'); // foreign bytes: the writer would back them up
+    const cacheNow = () => [
+      listDir(join(dir, '.cache/backups')),
+      existsSync(join(dir, '.cache/generated-views.json')),
+    ];
+    const cacheBefore = cacheNow();
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(r.notMigrated, true);
+    assert.deepEqual(r.written, []);
+    assert.deepEqual(cacheNow(), cacheBefore, 'no backup or ownership record was added');
+    assert.ok(r.unignoredCache.includes('.cache/backups/probe.md'), JSON.stringify(r));
+    assert.equal(readRel(dir, 'projects/p/hot.md'), 'hand written\n');
+    assert.match(consumeRootHotHealthNotice(dir) ?? '', /\/\.cache\//);
+  });
 });
 
 test('a .gitattributes with the block first line but not its patterns defers the move', () => {
@@ -4407,6 +4736,7 @@ test('a migrated vault whose HEAD .gitignore later loses a view pattern renders 
     assert.equal(healthy.missingBlockLines, undefined);
     assert.equal(consumeRootHotHealthNotice(dir), null, 'a healthy vault leaves no notice');
 
+    const healthyIgnore = showHead(dir, '.gitignore');
     const lost = ['/projects/*/hot.md', '/projects/*/session-state.md'];
     const damaged = showHead(dir, '.gitignore')
       .split('\n')
@@ -4428,7 +4758,17 @@ test('a migrated vault whose HEAD .gitignore later loses a view pattern renders 
     for (const line of lost)
       assert.ok(notice.includes(line), `the notice names ${line}: ${notice}`);
     assert.match(notice, /불완전/);
+    assert.match(notice, /커밋/, 'the notice says to commit the restored block');
     assert.equal(consumeRootHotHealthNotice(dir), null, 'the notice is delivered once');
+    // the state is read from HEAD: a restored working tree alone does not start the renders again
+    put(dir, '.gitignore', healthyIgnore);
+    assert.equal(migrationState(dir), 'incomplete-block', 'an uncommitted restore changes nothing');
+    assert.equal(writeGeneratedViews(dir, WRITE).notMigrated, true);
+    // the damaged commit also took the views in (nothing ignored the project ones): untrack them again
+    cgitOk(dir, ['rm', '-q', '--cached', VIEW, 'projects/p/session-state.md']);
+    commitIn(dir);
+    assert.equal(migrationState(dir), 'migrated', 'the committed block starts them again');
+    assert.ok(writeGeneratedViews(dir, WRITE).written.length > 0);
   });
 });
 

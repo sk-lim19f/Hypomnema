@@ -30,10 +30,17 @@ const PROJECT_RE = /^(?!\.+$)(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$/;
 const BASELINE_TITLE = '이행 전 기록';
 
 // Byte-fixed blocks. Two machines that append them independently must produce the same change.
+// `atomicWrite` leaves a killed write as `<view>.<pid>.<random>.tmp` beside the view (the pid is
+// all digits), so the `.[0-9]*.tmp` patterns cover that name and nothing a person would pick.
+// `/.cache/` holds the view backups, the ownership record and the pull archive.
 export const GITIGNORE_BLOCK = `# Hypomnema: session views generated from projects/*/sessions/ (not committed)
 /hot.md
 /projects/*/hot.md
 /projects/*/session-state.md
+/hot.md.[0-9]*.tmp
+/projects/*/hot.md.[0-9]*.tmp
+/projects/*/session-state.md.[0-9]*.tmp
+/.cache/
 /hot.md.pre-projection-backup*.md
 /hot.md.pre-projection-backup*.tmp
 /projects/*/*.pre-projection-backup*.md
@@ -474,10 +481,16 @@ export function mergeAdditiveGitignore(base, ours, theirs) {
 
 // ── project directories and root rows ────────────────────────────────────────
 
-/** A `projects/` child that is a session project: has `index.md` or `sessions/`, not `_template`. */
+/**
+ * A `projects/` child that is a session project: a vault slug (`PROJECT_RE`, the rule an entry's
+ * `project:` uses), has `index.md` or `sessions/`, not `_template`.
+ */
 export function isSessionProjectDir({ slug, hasIndex, hasSessions }) {
   return (
-    typeof slug === 'string' && slug !== '' && slug !== '_template' && !!(hasIndex || hasSessions)
+    typeof slug === 'string' &&
+    PROJECT_RE.test(slug) &&
+    slug !== '_template' &&
+    !!(hasIndex || hasSessions)
   );
 }
 

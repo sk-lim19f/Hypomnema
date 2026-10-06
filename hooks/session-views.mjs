@@ -37,6 +37,7 @@ import {
 } from './session-entries.mjs';
 import {
   backUpGeneratedPath,
+  cacheNotIgnoredNotice,
   clearGeneratedPathsBlockingPull,
   currentDevice,
   frontmatterScalar,
@@ -52,6 +53,7 @@ import {
   setAsideNotices,
   revPathArg,
   undoClearedPaths,
+  unignoredCachePaths,
   vaultCommitLockTarget,
   vaultGitPrefix,
   withFileLock,
@@ -413,9 +415,17 @@ function skipIncompleteBlock(hypoDir, state) {
     hypoDir,
     '세션 현황 파일: .gitignore의 Hypomnema 블록이 불완전해 이번에는 갱신하지 않았습니다 ' +
       '(생성 파일이 ignore 밖에서 저장소에 올라가는 일을 막기 위해서입니다). ' +
-      `빠진 줄: ${missing.join(', ')}. 블록 전체를 되살리거나 블록을 지우면 다음 세션이 다시 추가합니다.`,
+      `빠진 줄: ${missing.join(', ')}. 블록 전체를 되살려 커밋하세요. 판정은 커밋된 .gitignore(HEAD)를 읽으므로, 작업 트리만 고쳐서는 갱신이 다시 시작되지 않습니다.`,
   );
   return emptyResult({ notMigrated: true, state, missingBlockLines: missing });
+}
+
+// The backups and the ownership record the writer keeps under `.cache/` must not be stageable by a
+// `git add -A`. A vault whose own `.gitignore` leaves `.cache/` out gets the same stop as a damaged
+// block: nothing is written, and the next SessionStart says why.
+function skipUnignoredCache(hypoDir, state, unignored) {
+  writeRootHotHealthNotice(hypoDir, `세션 현황 파일: ${cacheNotIgnoredNotice(unignored)}`);
+  return emptyResult({ notMigrated: true, state, unignoredCache: unignored });
 }
 
 /**
@@ -424,7 +434,8 @@ function skipIncompleteBlock(hypoDir, state) {
  * `hot.md`, default true), `device` (default `currentDevice()`), `testHooks`. Returns
  * `{notMigrated, lockTimeout, written[], unchanged[], backedUp[{relPath, backupPath}]}`; when the
  * vault is not `migrated` nothing is written and `notMigrated` is true (`incomplete-block` also adds
- * `missingBlockLines[]` and leaves a health notice). A project that
+ * `missingBlockLines[]` and leaves a health notice; a `.cache/` that git would not ignore adds
+ * `unignoredCache[]` and leaves one too). A project that
  * `.hypoignore` hides (see `projectHiddenByHypoignore`) is neither read nor written and has no
  * root row. Any backup leaves a health notice for the next SessionStart.
  */
@@ -433,6 +444,8 @@ export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   const state = migrationState(hypoDir);
   if (state === 'incomplete-block') return skipIncompleteBlock(hypoDir, state);
   if (state !== 'migrated') return emptyResult({ notMigrated: true, state });
+  const unignored = unignoredCachePaths(hypoDir);
+  if (unignored.length) return skipUnignoredCache(hypoDir, state, unignored);
   // A project the `.hypoignore` hides gets no views and no row in the root table: its entries are
   // never committed, so a table row would publish a project the owner chose to keep local.
   const patterns = loadHypoIgnore(hypoDir);
@@ -759,7 +772,7 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
     const what = incomplete.map(([rel, missing]) => `${rel}에 ${missing.join(' , ')}`).join('; ');
     return deferredMigration(
       'block-incomplete',
-      `Hypomnema 블록의 첫 줄은 있지만 필요한 줄이 빠져 있습니다 (${what}). 블록을 통째로 복원하거나, 블록을 지우면 이행 때 도구가 전체를 다시 추가합니다`,
+      `Hypomnema 블록의 첫 줄은 있지만 필요한 줄이 빠져 있습니다 (${what}). 블록을 통째로 복원해 커밋하거나, 블록을 지워 커밋하면 이행 때 도구가 전체를 다시 추가합니다 (판정은 커밋된 파일을 읽습니다)`,
     );
   }
   let tracked;

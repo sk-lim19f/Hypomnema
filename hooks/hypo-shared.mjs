@@ -1816,7 +1816,9 @@ export function backUpGeneratedPath(hypoDir, viewPath, content, testHooks) {
   }
   const fresh = nextGeneratedBackupPath(hotPath);
   testHooks?.beforeBackupWrite?.(fresh);
-  atomicWrite(fresh, content);
+  // Durable: the archive record that names this backup is written next, and the clearing step
+  // removes the original after that. A power loss must not keep the record and lose the backup.
+  atomicWrite(fresh, content, { durable: true });
   return fresh;
 }
 
@@ -1897,6 +1899,37 @@ const BASELINE_FILE_RE = /-baseline-[0-9a-f]{16}\.md$/;
 function gitOut(hypoDir, args) {
   const r = vaultGit(hypoDir, args);
   return r.status === 0 ? r.stdout : null;
+}
+
+/**
+ * The files Hypomnema keeps under `.cache/` (a view backup, the ownership record, the pull archive)
+ * that a `git add -A` would stage because no ignore rule covers them, as paths relative to the vault.
+ * `[]` means every one is ignored, or git cannot answer (no repository: nothing to stage). The
+ * block this plugin writes ignores `/.cache/`, but a vault with its own `.gitignore` may not, and
+ * the backups hold a person's own notes. Callers write nothing under `.cache/` while this is not
+ * empty. A tracked path counts as not ignored, which is the safe side.
+ */
+export function unignoredCachePaths(hypoDir) {
+  const probes = [
+    '.cache/backups/probe.md',
+    '.cache/pull-archive.json',
+    '.cache/generated-views.json',
+  ];
+  const r = vaultGit(hypoDir, ['check-ignore', '--stdin', '-z'], {
+    input: probes.map((p) => `${p}\0`).join(''),
+  });
+  if (r.status !== 0 && r.status !== 1) return [];
+  const ignored = new Set(String(r.stdout).split('\0'));
+  return probes.filter((p) => !ignored.has(p));
+}
+
+/** The notice that goes with a deferral because `unignoredCachePaths` was not empty. */
+export function cacheNotIgnoredNotice(paths) {
+  return (
+    `.gitignore가 ${paths.join(', ')}를 무시하지 않아 백업과 기록을 쓰지 않고 미뤘습니다 ` +
+    '(그대로 쓰면 git add -A가 개인 메모가 든 백업을 스테이징합니다). ' +
+    '.gitignore가 `/.cache/`를 무시하도록 고치면(줄을 추가하거나 뒤의 `!` 규칙을 지웁니다) 다음 시도에서 진행됩니다.'
+  );
 }
 
 // `git show <rev>:./<path>` as text, `null` when git cannot produce it (no such path or revision).
@@ -2045,8 +2078,12 @@ function readPullArchive(hypoDir) {
   };
 }
 
+// Durable, and only ever called after every backup it names was written durably: nothing is
+// removed from the index or the working tree until this record is on disk.
 const writePullArchive = (hypoDir, rec) =>
-  atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), `${JSON.stringify(rec, null, 2)}\n`);
+  atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), `${JSON.stringify(rec, null, 2)}\n`, {
+    durable: true,
+  });
 
 // Line endings as git stores them: `core.autocrlf=true` checks a file out with CRLF, so a working
 // tree text and the HEAD blob of the same file only match once both are read this way.
@@ -2226,6 +2263,17 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   if (!targetSha || !headSha) return stop({ reason: 'revision-unreadable' });
   const target = targetSha.trim();
   const head = headSha.trim();
+
+  // 1b. Backups and the archive go under `.cache/`: no byte is moved while a `git add -A` would
+  // stage them. Nothing was written yet except the restore of step 1.
+  const unignored = unignoredCachePaths(hypoDir);
+  if (unignored.length) {
+    return stop({
+      deferred: 'cache-not-ignored',
+      reason: 'cache-not-ignored',
+      notice: cacheNotIgnoredNotice(unignored),
+    });
+  }
 
   // 2. What `target` brings in.
   const base = gitOut(hypoDir, ['merge-base', 'HEAD', target])?.trim();
@@ -2549,11 +2597,13 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
     }
   }
   if (allBack) {
-    for (const { backupPath } of [...all, ...(moved.unowned ?? [])]) {
-      rmSync(backupPath, { force: true });
-    }
+    // The record goes first: a stop in between leaves a backup nobody names, not a record that
+    // names a backup that is gone.
     if (!keepRecord && all.length + (moved.unowned ?? []).length > 0) {
       rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
+    }
+    for (const { backupPath } of [...all, ...(moved.unowned ?? [])]) {
+      rmSync(backupPath, { force: true });
     }
   }
   return { ok: allBack, notices };
@@ -2784,7 +2834,16 @@ export function resumePullArchive(hypoDir, { announced = [] } = {}) {
   for (const { backupPath } of rec.gitignoreSaved) rmSync(backupPath, { force: true });
   const shared = shareLegacyBytes(hypoDir, rec.views);
   const notices = [...shared.notices, ...setAsideNotices(hypoDir, rec, announced)];
-  if (shared.created.every((rel) => pathInHead(hypoDir, rel))) {
+  // A backup the record names that is not on disk (a crash lost it) means nothing was shared for
+  // that entry, so "no baseline was created" must not read as "nothing left to do".
+  const lost = [...rec.views, ...rec.localOnly, ...rec.unowned, ...rec.cleared].filter(
+    (v) => !existsSync(v.backupPath),
+  );
+  if (lost.length) {
+    notices.push(
+      `보관 기록이 가리키는 백업 파일이 없어 기록을 지우지 않고 남겼습니다: ${lost.map((v) => `${v.relPath} (${v.backupPath})`).join(', ')}. 내용을 확인한 뒤 ${PULL_ARCHIVE_REL}를 직접 지우세요.`,
+    );
+  } else if (shared.created.every((rel) => pathInHead(hypoDir, rel))) {
     rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
   } else {
     notices.push(
