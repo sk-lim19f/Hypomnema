@@ -2813,15 +2813,15 @@ test('(b) an index entry changed after the backup defers too', () => {
   });
 });
 
-test('(b) hypo-auto-stage takes the vault commit lock: with it held the add is skipped, without it the file is staged', () => {
+test('(b) hypo-auto-stage takes the vault commit lock: with it held the add is skipped, without it the file is staged; a Read never stages', () => {
   withTmpDir((dir) => {
     cgitOk(dir, ['init', '-q']);
     put(dir, 'pages/n.md', 'n\n');
     const hook = new URL('../hooks/hypo-auto-stage.mjs', import.meta.url).pathname;
-    const run = () =>
+    const run = (tool = 'Write') =>
       spawnSync(process.execPath, [hook], {
         input: JSON.stringify({
-          tool_name: 'Read',
+          tool_name: tool,
           tool_input: { file_path: join(dir, 'pages/n.md') },
         }),
         encoding: 'utf-8',
@@ -2833,6 +2833,9 @@ test('(b) hypo-auto-stage takes the vault commit lock: with it held the add is s
         },
       });
     const staged = () => cgitOk(dir, ['diff', '--cached', '--name-only']).trim();
+    const read = run('Read');
+    assert.equal(read.status, 0, read.stderr);
+    assert.equal(staged(), '', 'a Read left the index alone');
     const held = withFileLock(vaultCommitLockTarget(dir), () => run());
     assert.equal(held.status, 0, held.stderr);
     assert.equal(staged(), '', 'the add waited for the lock, timed out and skipped');

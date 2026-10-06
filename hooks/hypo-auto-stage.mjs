@@ -17,7 +17,7 @@ import {
 } from './hypo-shared.mjs';
 import { advanceBaseForWrite, hashContent } from './base-store.mjs';
 
-// Tools that REPLACE file bytes. The base advance below must fire only for these:
+// Tools that REPLACE file bytes. The add and the base advance below fire only for these:
 // this hook has no matcher in hooks.json (it runs on every PostToolUse), and a
 // read-only tool like Read also carries `tool_input.file_path`. Without this
 // allowlist, merely Reading a target another session had drifted would advance
@@ -43,7 +43,11 @@ const filePath = input.tool_input?.file_path ?? '';
 
 if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
   const patterns = loadHypoIgnore(HYPO_DIR);
-  if (patterns.length === 0 || !isIgnored(filePath, HYPO_DIR, patterns)) {
+  // Only a write stages: a Read of a vault file must not change the index.
+  if (
+    WRITE_TOOLS.has(input.tool_name) &&
+    (patterns.length === 0 || !isIgnored(filePath, HYPO_DIR, patterns))
+  ) {
     // Under the vault commit lock, like every other writer of the index: the catch-up pre-step
     // (clearGeneratedPathsBlockingPull) reads and releases the index while it holds that lock, and
     // an add landing in between would stage bytes it is about to set aside. A lock that cannot be
