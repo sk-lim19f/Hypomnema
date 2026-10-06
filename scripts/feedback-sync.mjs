@@ -101,6 +101,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { parseFrontmatter } from './lib/frontmatter.mjs';
+import { fencedLineMask } from './lib/code-fence.mjs';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 // scripts/ may import hooks/ (never the reverse): the same lock the vault's other
 // append-only writers take, so two feedback-sync runs cannot interleave.
@@ -265,17 +266,55 @@ const MARK_ANCHOR = '<!-- HYPO:FEEDBACK-SYNC:ANCHOR -->';
 const SIDE_MARKER = (slug) => `<!-- HYPO:FEEDBACK-SYNC source=${slug} -->`;
 const SIDE_MARKER_PREFIX = '<!-- HYPO:FEEDBACK-SYNC source=';
 const BLOCK_RE =
-  /<!-- HYPO:FEEDBACK-SYNC:START source=(\S+) sha256=([0-9a-f]{64}) -->\r?\n([\s\S]*?)\r?\n<!-- HYPO:FEEDBACK-SYNC:END -->/g;
+  /<!-- HYPO:FEEDBACK-SYNC:START source=(\S+) sha256=([0-9a-f]{64}) -->\r?\n([\s\S]*?)\r?\n<!-- HYPO:FEEDBACK-SYNC:END -->/dg;
 // line-anchored so marker-looking text inside prose/code does not false-count
 const START_RE = /^[ \t]*<!-- HYPO:FEEDBACK-SYNC:START\b/gm;
 const END_RE = /^[ \t]*<!-- HYPO:FEEDBACK-SYNC:END -->[ \t]*$/gm;
 
+// The writer always puts a marker on a line of its own, so a marker only counts when
+// its line is not in a code fence and nothing but indentation precedes it. A pair
+// quoted in a fence, in inline code or mid-sentence is documentation, not a block:
+// reading it as one made --write delete the text between the quoted markers.
+// Returns `content` with every other marker's opener spelled out of shape (same
+// length, so an index found in the view is the same index in `content`). EVERY site
+// that looks for a marker reads this view: findBlocks, countMarkers, the intruder
+// check, the scrubs in the bootstrap parsers and the anchor lookup.
+// ponytail: an inline code span that opens on an earlier line is not seen, and
+// neither is an indented (4 space) code block. Both need block context a line
+// scan does not have.
+const MARKER_OPEN_RE = /<!-- HYPO:FEEDBACK-SYNC/g;
+function liveMarkerView(content) {
+  if (!content.includes('HYPO:FEEDBACK-SYNC')) return content;
+  const fenced = fencedLineMask(content);
+  return content
+    .split('\n')
+    .map((line, i) =>
+      line.replace(MARKER_OPEN_RE, (m, at) =>
+        !fenced[i] && /^[ \t]*$/.test(line.slice(0, at)) ? m : '<!-- HYPO:FEEDBACK_SYNC',
+      ),
+    )
+    .join('\n');
+}
+
+// `content[from, to)` with every live managed block cut out.
+function stripBlocks(content, from = 0, to = content.length) {
+  let out = '';
+  let last = from;
+  for (const m of liveMarkerView(content).matchAll(BLOCK_RE)) {
+    if (m.index < from || m.index + m[0].length > to) continue;
+    out += content.slice(last, m.index);
+    last = m.index + m[0].length;
+  }
+  return out + content.slice(last, to);
+}
+
 // Count raw START/END markers; if they outnumber fully-matched blocks, a marker
 // is malformed/unpaired (truncated, tampered hash, stray) → refuse (conflict).
 function countMarkers(content) {
+  const view = liveMarkerView(content);
   return {
-    starts: (content.match(START_RE) || []).length,
-    ends: (content.match(END_RE) || []).length,
+    starts: (view.match(START_RE) || []).length,
+    ends: (view.match(END_RE) || []).length,
   };
 }
 
@@ -312,12 +351,16 @@ function findBlocks(content) {
   const blocks = [];
   let m;
   BLOCK_RE.lastIndex = 0;
-  while ((m = BLOCK_RE.exec(content)) !== null) {
+  const view = liveMarkerView(content);
+  while ((m = BLOCK_RE.exec(view)) !== null) {
+    // the inner text comes from `content`, not the view: a quoted marker inside a
+    // real block must hash and rewrite as the bytes on disk
+    const inner = content.slice(...m.indices[3]);
     blocks.push({
       slug: m[1],
       declaredHash: m[2],
-      inner: m[3],
-      actualHash: hashInner(m[3]),
+      inner,
+      actualHash: hashInner(inner),
       start: m.index,
       end: m.index + m[0].length,
     });
@@ -333,7 +376,7 @@ function findBlocks(content) {
 function regionHasIntruders(content) {
   const { blocks, firstStart, lastEnd } = findBlocks(content);
   if (blocks.length < 1) return false;
-  const span = content.slice(firstStart, lastEnd).replace(BLOCK_RE, '');
+  const span = liveMarkerView(content).slice(firstStart, lastEnd).replace(BLOCK_RE, '');
   return span.trim().length > 0;
 }
 
@@ -644,7 +687,7 @@ function buildNextContent(content, region, target) {
       };
     }
     // an anchor is honored ONLY when it sits inside the container span
-    const anchorIdx = content.indexOf(MARK_ANCHOR);
+    const anchorIdx = liveMarkerView(content).indexOf(MARK_ANCHOR);
     if (anchorIdx > c.open && anchorIdx < c.close) {
       return {
         content:
@@ -656,7 +699,7 @@ function buildNextContent(content, region, target) {
   if (firstStart >= 0) return replaceSpan();
   if (region === '') return { content };
   // memory index: anchor (anywhere) or append
-  const anchorIdx = content.indexOf(MARK_ANCHOR);
+  const anchorIdx = liveMarkerView(content).indexOf(MARK_ANCHOR);
   if (anchorIdx >= 0) {
     return {
       content: content.slice(0, anchorIdx) + region + content.slice(anchorIdx + MARK_ANCHOR.length),
@@ -1353,8 +1396,7 @@ function parseLearnedBehaviors(content) {
   // legacy rules out of, and a corrupt one has no unambiguous inner span at all.
   const c = classifyContainer(content);
   if (c.state !== 'present') return [];
-  const inner = content.slice(c.open + LB_OPEN.length, c.close);
-  const scrubbed = inner.replace(BLOCK_RE, ''); // blank out already-projected blocks
+  const scrubbed = stripBlocks(content, c.open + LB_OPEN.length, c.close); // blank out already-projected blocks
   const out = [];
   let section = sectionAt(content.slice(0, c.open + LB_OPEN.length));
   for (const line of scrubbed.split('\n')) {
@@ -1375,7 +1417,7 @@ function parseMemoryIndex(content) {
   // scrub already-projected managed blocks first (parity with parseLearnedBehaviors):
   // index lines inside a HYPO:FEEDBACK-SYNC block already have a wiki SoT and must
   // not be re-drafted as legacy entries.
-  const scrubbed = content.replace(BLOCK_RE, '');
+  const scrubbed = stripBlocks(content);
   const re = /^- \[([^\]]*)\]\(feedback_([^)]+?)\.md\)\s*(?:(?::|—)\s*(.*\S))?\s*$/gm;
   let m;
   while ((m = re.exec(scrubbed)) !== null) {

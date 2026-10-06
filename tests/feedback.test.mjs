@@ -856,6 +856,100 @@ test('feedback-sync-marker-in-prose-not-counted: mid-line marker text does not t
   );
 });
 
+// ── managed-block markers quoted as documentation ───────────────────────────────
+// A marker pair shown in a code fence or in inline code is an example, not a block.
+// Before this, --write read it as a block and replaced the text between the quoted
+// markers with the projection.
+
+const FB_EXAMPLE_LINE = '- [2026-01-01] quoted example rule';
+const FB_FENCED_EXAMPLE = '```md\n' + fbBlock('quoted', FB_EXAMPLE_LINE) + '```\n';
+const fbContainer = (body) =>
+  `# Global\n<learned_behaviors>\n- manual entry\n${body}</learned_behaviors>\n`;
+
+test('feedback-sync-fenced-marker-example-untouched: --write leaves a quoted START/END pair and the text between byte for byte', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const c = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      assert.ok(c.includes(FB_FENCED_EXAMPLE), `fenced example must survive verbatim:\n${c}`);
+      assert.ok(c.includes('- manual entry'), c);
+      assert.ok(c.includes('source=rule-a'), 'the real block is still projected');
+    },
+    { claudeMd: fbContainer(FB_FENCED_EXAMPLE) },
+  );
+});
+
+test('feedback-sync-inline-marker-example-untouched: a START quoted mid-line in inline code is not a block', () => {
+  const hash = createHash('sha256').update(FB_EXAMPLE_LINE, 'utf-8').digest('hex');
+  // the inline code span opens before the START marker and closes after the END line
+  const example =
+    `Write \`<!-- HYPO:FEEDBACK-SYNC:START source=quoted sha256=${hash} -->\n` +
+    `${FB_EXAMPLE_LINE}\n<!-- HYPO:FEEDBACK-SYNC:END -->\` to pin a rule.\n`;
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const c = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      assert.ok(c.includes(example), `inline example must survive verbatim:\n${c}`);
+      assert.ok(c.includes('source=rule-a'), 'the real block is still projected');
+    },
+    { claudeMd: fbContainer(example) },
+  );
+});
+
+test('feedback-sync-real-block-beside-fenced-example: only the real block is rewritten', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const c = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      assert.ok(c.includes(FB_FENCED_EXAMPLE), `fenced example must survive verbatim:\n${c}`);
+      assert.ok(c.includes('- [2026-05-20] always do A. 근거: [[rule-a]]'), c);
+      assert.ok(!c.includes('stale projected text'), 'the real block was rewritten in place');
+      assert.equal((c.match(/source=rule-a/g) || []).length, 1, 'one real block, not a copy');
+    },
+    {
+      claudeMd: fbContainer(
+        FB_FENCED_EXAMPLE + fbBlock('rule-a', '- [2026-05-20] stale projected text'),
+      ),
+    },
+  );
+});
+
+test('feedback-sync-check-ignores-fenced-marker-example: --check reports no conflict or intruder for a quoted pair', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ runFb }) => {
+      assert.notEqual(runFb(['--check']).status, 3, 'a quoted pair is not a conflict');
+      assert.equal(runFb(['--write']).status, 0);
+      assert.equal(runFb(['--check']).status, 0, 'in sync, with the example still in the file');
+    },
+    {
+      // a hand-edited hash inside the fence would be a conflict if it were read as a block
+      claudeMd: fbContainer(FB_FENCED_EXAMPLE.replace(FB_EXAMPLE_LINE, '- [2026-01-01] edited')),
+    },
+  );
+});
+
+test('feedback-sync-unclosed-fence-does-not-hide-real-block: a fence that never closes is read as text', () => {
+  const unclosed = '# Memory Index\n```\nexample that never closes\n';
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ memDir, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const m = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      assert.ok(m.startsWith(unclosed), m);
+      assert.ok(m.includes('- [Rule A](feedback_rule-a.md): do A'), m);
+      assert.ok(!m.includes('stale'), 'the real block below the unclosed fence was rewritten');
+      assert.equal((m.match(/source=rule-a/g) || []).length, 1, 'rewritten in place, not appended');
+    },
+    {
+      memoryMd: unclosed + fbBlock('rule-a', '- [Rule A](feedback_rule-a.md): stale'),
+    },
+  );
+});
+
 test('feedback-sync-write-strict-refuses-before-write: strict warning blocks the write', () => {
   withFeedbackEnv(
     { 'rule-a': FB_GLOBAL_L1, priv: { ...FB_PROJECT_L2, sensitivity: 'private' } },
