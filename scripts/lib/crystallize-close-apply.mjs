@@ -52,6 +52,7 @@ import {
   headPathState,
   revPathArg,
   recordTouchedPaths,
+  recordShardAppend,
   loadHypoIgnore,
   isIgnored,
 } from '../../hooks/hypo-shared.mjs';
@@ -369,9 +370,10 @@ export function overwriteConflictReason(
  * Append `entry` to `path` only if `alreadyPresent(content)` is false.
  * Atomic: rebuilds the full file content and writes via atomicWrite — a crash
  * mid-append cannot leave log.md or session-log/YYYY-MM-DD.md half-written, which
- * matters for these append-only history files.
+ * matters for these append-only history files. `beforeWrite(content, added)`, when
+ * given, runs right before the write with the current text and the text appended.
  */
-function appendIfAbsent(path, entry, alreadyPresent) {
+function appendIfAbsent(path, entry, alreadyPresent, beforeWrite) {
   let content = '';
   if (existsSync(path)) {
     try {
@@ -393,6 +395,7 @@ function appendIfAbsent(path, entry, alreadyPresent) {
   const sep =
     content === '' ? '' : content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
   const next = entry.endsWith('\n') ? entry : entry + '\n';
+  beforeWrite?.(content, sep + next);
   atomicWrite(path, content + sep + next);
   return true;
 }
@@ -3172,7 +3175,7 @@ const entryAlreadyPresent = (entry) => (content) =>
 
 // Append this close's entry to the project's daily session-log shard, pushing the
 // outcome into the shared `acc` bag.
-function appendSessionLogEntry(args, payload, project, date, acc) {
+function appendSessionLogEntry(args, payload, project, date, acc, closeId) {
   const { applied, skipped, appliedPaths, conflicts, proofEntries } = acc;
   const rel = join('projects', project, 'session-log', `${date}.md`);
   const full = join(args.hypoDir, rel);
@@ -3237,7 +3240,18 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
           atomicWrite(full, `${header}\n${body}`);
           return 'created';
         }
-        return appendIfAbsent(full, payload.sessionLog.entry, isPresent) ? 'appended' : 'skipped';
+        // Another session's marker gate tells this append from a hand edit only by
+        // this record (isForeignAppendOnlyShard). Not recorded, the append still
+        // lands and those gates block on the shard until it is committed.
+        const recordAppend = (before, added) => {
+          if (!recordShardAppend(args.hypoDir, args.sessionId, rel, before, added, closeId))
+            process.stderr.write(
+              `[crystallize] warning: could not record this close's append to ${rel}; another session's close gate blocks on it until it is committed\n`,
+            );
+        };
+        return appendIfAbsent(full, payload.sessionLog.entry, isPresent, recordAppend)
+          ? 'appended'
+          : 'skipped';
       },
       { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
     );
@@ -3912,6 +3926,8 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
       });
       commitOutcome = locked.outcome;
       headAfterCommit = locked.head;
+      if (commitOutcome.indexWarning)
+        process.stderr.write(`[crystallize] warning: ${commitOutcome.indexWarning}\n`);
     } catch (err) {
       commitOutcome = { committed: false, reason: `vault-commit-lock: ${err?.message || err}` };
     }
@@ -4860,7 +4876,7 @@ export function applySessionClose(args, testHooks = null) {
     intentResult.attemptId,
   );
   markCloseIntentApplied(args.hypoDir, args.sessionId, intentResult.attemptId);
-  appendSessionLogEntry(args, payload, project, date, acc);
+  appendSessionLogEntry(args, payload, project, date, acc, closeId);
   appendRootLogEntry(args, payload, project, date, acc);
 
   // A migrated vault shows the new entry in its generated views right away. A vault

@@ -43,6 +43,7 @@ import {
 import {
   closePinPath,
   findBackfillCandidate,
+  precompactGateStatus,
   readClosePin,
   readTouchedPathsStrict,
   writeClosePin,
@@ -4156,6 +4157,57 @@ await testAsync(
   'two closes of one project started 400ms apart both commit and both write their marker',
   () => closeTwiceInParallel(400),
 );
+
+// X3 (wave B, third review): another session's gate tells a close's append from a hand
+// edit only by the record apply leaves before it writes. The fixture holds the moment
+// without timing: close A committed the day's shard, close B appended to it and its
+// commit was refused (B keeps its heading uncommitted on top of A's commit). Disabling
+// the check (X3, apply record): in appendSessionLogEntry pass no `recordAppend` to
+// appendIfAbsent. A's gate then blocks on the shard: red.
+test("a close whose commit was refused leaves its shard append recorded, so another session's gate reads it as that close's append", () => {
+  withWiki(null, (dir, today) => {
+    const a = newPinSession('rec-a');
+    const first = applyJson(dir, v2Payload(today, { tag: 'close a' }), a).out;
+    assert.equal(first.committed, true, JSON.stringify(first));
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const hooks = join(dir, '.git', 'x-test-hooks');
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, 'pre-commit'), '#!/bin/sh\nexit 1\n');
+    chmodSync(join(hooks, 'pre-commit'), 0o755);
+    spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+    const b = newPinSession('rec-b');
+    const second = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close b', tracks: [{ id: 'b', new: true, next: '- b' }] }),
+      b,
+    ).out;
+    spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+    assert.notEqual(second.committed, true, JSON.stringify(second));
+    assert.match(readFileSync(join(dir, shard), 'utf-8'), /close b/);
+    const gateOf = (sessionId) =>
+      precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        checkpointMode: true,
+        sessionId,
+        attributionScope: 'test-project',
+      });
+    const mine = gateOf(a);
+    assert.ok(
+      !mine.blockers.some((x) => x.file === shard),
+      `A must not block on B's append: ${JSON.stringify(mine.blockers)}`,
+    );
+    assert.ok(
+      mine.notices.some((n) => n.type === 'foreign-append' && n.file === shard),
+      JSON.stringify(mine.notices),
+    );
+    // Pair: the close that appended still owns it.
+    const theirs = gateOf(b);
+    assert.ok(
+      theirs.blockers.some((x) => x.file === shard),
+      JSON.stringify(theirs.blockers),
+    );
+  });
+});
 
 test('the 2026-10-01 shape: session 229 on track a, another project closes in between, session 230 on track b: no approval asked', () => {
   withWiki(

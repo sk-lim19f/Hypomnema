@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { recordGateClosed, resolutionStamp } from '../hooks/close-gate-store.mjs';
-import { gitDirtyFiles, hypoIsClean } from '../hooks/hypo-shared.mjs';
+import { gitDirtyFiles, hypoIsClean, recordShardAppend } from '../hooks/hypo-shared.mjs';
 import { closeIdFor, formatSessionEntry } from '../hooks/session-entries.mjs';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 import {
@@ -466,7 +466,16 @@ test("/compact with only another session's new entry and shard append dirty → 
     const shards = readdirSync(logDir);
     assert.equal(shards.length, 1, 'precondition: the fixture commits one session-log shard');
     const shard = join(logDir, shards[0]);
-    appendFileSync(shard, `\n## [${today}] other close\n`);
+    // What another close leaves: its append, recorded before it was written.
+    const added = `\n## [${today}] other close\n`;
+    recordShardAppend(
+      dir,
+      's-cg-other',
+      `projects/test-project/session-log/${shards[0]}`,
+      readFileSync(shard, 'utf-8'),
+      added,
+    );
+    appendFileSync(shard, added);
     const run = (session_id) =>
       JSON.parse(
         runHook('hypo-compact-guard.mjs', { prompt: '/compact', session_id }, { HYPO_DIR: dir })

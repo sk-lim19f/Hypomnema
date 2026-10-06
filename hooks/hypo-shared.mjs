@@ -496,7 +496,7 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
     }
     const porcelain = spawnSync(
       'git',
-      ['-C', dir, 'status', '--porcelain'],
+      ['--no-optional-locks', '-C', dir, 'status', '--porcelain'],
       t1 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t1 },
     );
     if (porcelain.error || porcelain.status !== 0)
@@ -519,7 +519,7 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
     }
     const aheadRes = spawnSync(
       'git',
-      ['-C', dir, 'status', '--branch', '--porcelain'],
+      ['--no-optional-locks', '-C', dir, 'status', '--branch', '--porcelain'],
       t2 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t2 },
     );
     // Only enforced when a deadline is in play. Without one this spawn cannot
@@ -589,6 +589,9 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
  * together run twice as long as intended). Omitted, both spawns run exactly
  * as before — precompactGateStatus's own call (`:3874`) does not pass one.
  */
+// Read-only status calls here pass --no-optional-locks: a plain `git status` may take
+// .git/index.lock to refresh the index, and outside the vault commit lock that collides
+// with another close's `git add` ("index.lock: File exists").
 export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
   const { deadline } = opts;
   const t1 = remainingSpawnTimeoutMs(deadline);
@@ -609,7 +612,7 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
   if (t2 === 0) return [];
   const porcelain = spawnSync(
     'git',
-    ['-C', dir, 'status', '--porcelain', '-uall', '-z'],
+    ['--no-optional-locks', '-C', dir, 'status', '--porcelain', '-uall', '-z'],
     t2 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t2 },
   );
   if (porcelain.error || porcelain.status !== 0) return [];
@@ -3735,12 +3738,14 @@ const sessionIdOfClose = (closeId) => closeId.replace(/-\d+$/, '');
 // commit or revert it (it is the only copy of that session's summary). An entry
 // already in HEAD and since modified is not new, and git failing to answer is not
 // "absent": both stay blocking. A name is easy to type by hand, so the file must
-// also parse as the entry of the close its name carries.
+// also parse as the entry its path names: that close id, that project folder, that
+// date, and (when it carries one) the session the close id belongs to.
 export function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
   if (!isValidSessionId(sessionId) || !isSessionEntryPath(relPath)) return false;
-  const m = /^\d{4}-\d{2}-\d{2}-(.+-\d+)\.md$/.exec(relPath.split('/').pop());
+  const m = /^projects\/([^/]+)\/sessions\/(\d{4}-\d{2}-\d{2})-(.+-\d+)\.md$/.exec(relPath);
   if (!m) return false;
-  const owner = sessionIdOfClose(m[1]);
+  const [, project, date, closeId] = m;
+  const owner = sessionIdOfClose(closeId);
   if (owner === sessionId || !isValidSessionId(owner)) return false;
   let parsed;
   try {
@@ -3748,7 +3753,10 @@ export function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
   } catch {
     return false;
   }
-  if (!parsed.ok || parsed.entry.closeId !== m[1]) return false;
+  if (!parsed.ok) return false;
+  const e = parsed.entry;
+  if (e.closeId !== closeId || e.project !== project || e.date !== date) return false;
+  if (e.sessionId !== null && e.sessionId !== owner) return false;
   return headPathState(hypoDir, relPath) === 'absent';
 }
 
@@ -3757,14 +3765,87 @@ const FOREIGN_ENTRY_NOTICE = (f) =>
   `commits it, so do not commit or revert it here (다른 세션 close 의 원본이다. 그 세션의 ` +
   `커밋이 실패해 남은 것이면 그 세션이 close 를 다시 실행해야 동기화된다)`;
 
-// A session-log shard another writer is appending to: in HEAD, and the bytes on disk
-// are HEAD's bytes with more after them. Two closes of one project share the day's
-// shard, so the later close's heading sits uncommitted while the earlier close's
-// marker gate still runs. A shard this session recorded counts only when the bytes
-// it recorded are the ones HEAD holds (its own write committed, the tail written by
-// someone else), the same retirement commitTouchedPaths applies. A changed prefix, a
-// deleted shard, a tail with no dated heading, a HEAD git cannot read and this
-// session's own uncommitted append all stay blocking.
+// Where a session keeps the session-log appends its closes made, one record each:
+// `{path, beforeLen, beforeSha256, addedLen, addedSha256, closeId}`.
+function shardAppendsPath(hypoDir, sessionId) {
+  return join(sessionCacheDir(hypoDir, sessionId), 'shard-appends.json');
+}
+
+function readShardAppends(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Record that this session's close appends the text `added` to the session-log shard
+ * `relPath`, whose text is `before`. The caller holds the shard lock and calls this
+ * before writing: an append nobody recorded blocks every other session's gate, while
+ * a record whose write then failed matches no bytes. Never throws.
+ *
+ * @returns {boolean} false when the record could not be written
+ */
+export function recordShardAppend(hypoDir, sessionId, relPath, before, added, closeId = null) {
+  if (!isValidSessionId(sessionId)) return false;
+  const b = Buffer.from(before, 'utf-8');
+  const a = Buffer.from(added, 'utf-8');
+  const path = shardAppendsPath(hypoDir, sessionId);
+  try {
+    withFileLock(path, () => {
+      const list = readShardAppends(path);
+      list.push({
+        path: posixPath(relPath),
+        beforeLen: b.length,
+        beforeSha256: sha256Hex(b),
+        addedLen: a.length,
+        addedSha256: sha256Hex(a),
+        closeId,
+      });
+      atomicWrite(path, JSON.stringify(list));
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Every other session's recorded appends to `relPath`.
+// ponytail: one small file read per session directory; index the records by shard if
+// a vault ever keeps thousands of session directories.
+function foreignShardAppends(hypoDir, relPath, sessionId) {
+  const own = sessionCacheDir(hypoDir, sessionId);
+  const root = dirname(own);
+  let dirs = [];
+  try {
+    dirs = readdirSync(root);
+  } catch {
+    return [];
+  }
+  return dirs
+    .filter((d) => join(root, d) !== own)
+    .flatMap((d) => readShardAppends(join(root, d, 'shard-appends.json')))
+    .filter(
+      (r) =>
+        r?.path === relPath &&
+        Number.isInteger(r.beforeLen) &&
+        Number.isInteger(r.addedLen) &&
+        r.addedLen > 0,
+    );
+}
+
+// A session-log shard other sessions are appending to: in HEAD, and the bytes on disk
+// are HEAD's bytes followed by appends other sessions' closes recorded
+// (recordShardAppend), one after another, byte for byte. Two closes of one project
+// share the day's shard, so the later close's heading sits uncommitted while the
+// earlier close's marker gate still runs. A byte no other session recorded (a hand
+// edit, this session's own append, a close that died before recording) keeps the
+// shard blocking, and so does an index entry that is neither HEAD nor HEAD plus some
+// of those appends (a staged edit or deletion). A shard this session recorded counts
+// only when the bytes it recorded are the ones HEAD holds (its own write committed),
+// the same retirement commitTouchedPaths applies.
 export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId) {
   if (!isValidSessionId(sessionId) || !CLOSE_FILE_RE.test(relPath)) return false;
   const head = headBlob(hypoDir, relPath);
@@ -3775,26 +3856,46 @@ export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId) {
   } catch {
     return false;
   }
-  // Equal bytes count too: a pathspec commit (`--only`) reads each path from the work
-  // tree twice (once for the real index, once for the commit), so an append landing
-  // between the two reads is committed while the real index keeps the shorter version.
   if (disk.length < head.length || !disk.subarray(0, head.length).equals(head)) return false;
-  // What a close appends carries a dated heading (apply refuses a payload without one
-  // before any write), so a tail with none is not another close's.
-  const tail = disk.subarray(head.length).toString('utf-8');
-  if (tail && !/^#{1,6} \[\d{4}-\d{2}-\d{2}\]/m.test(tail)) return false;
+  const records = foreignShardAppends(hypoDir, relPath, sessionId);
+  const ends = [head.length]; // HEAD, then HEAD plus each whole recorded append
+  for (let pos = head.length; pos < disk.length; ) {
+    const before = sha256Hex(disk.subarray(0, pos));
+    const r = records.find(
+      (x) =>
+        x.beforeLen === pos &&
+        x.beforeSha256 === before &&
+        pos + x.addedLen <= disk.length &&
+        sha256Hex(disk.subarray(pos, pos + x.addedLen)) === x.addedSha256,
+    );
+    if (!r) return false;
+    pos += r.addedLen;
+    ends.push(pos);
+  }
   const touched = readTouchedPathsStrict(hypoDir, sessionId);
   if (touched.state === 'locked' || touched.state === 'unreadable') return false;
-  if (!touched.paths.map(posixPath).includes(relPath)) return true;
-  // The bytes this session recorded must be HEAD's, or HEAD's up to a line end (the
-  // same race: the other close's append was committed along with this one's).
-  const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
-  if (!Object.hasOwn(hashes, relPath)) return false;
-  // One hash per line end: a day's shard is a few hundred lines at most.
-  for (let end = head.indexOf(10); end !== -1; end = head.indexOf(10, end + 1)) {
-    if (sha256Hex(head.subarray(0, end + 1)) === hashes[relPath]) return true;
+  // The bytes this session recorded writing, when it wrote this shard. They must be
+  // HEAD's, or HEAD's up to a line end: a pathspec commit (`--only`) reads each path
+  // from the work tree twice, so another close's append landing between the two
+  // reads is committed along with this one's.
+  let own = null;
+  if (touched.paths.map(posixPath).includes(relPath)) {
+    const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+    if (!Object.hasOwn(hashes, relPath)) return false;
+    own = hashes[relPath];
+    let committed = sha256Hex(head) === own;
+    // One hash per line end: a day's shard is a few hundred lines at most.
+    for (let end = head.indexOf(10); !committed && end !== -1; end = head.indexOf(10, end + 1)) {
+      committed = sha256Hex(head.subarray(0, end + 1)) === own;
+    }
+    if (!committed) return false;
   }
-  return sha256Hex(head) === hashes[relPath];
+  // The index: HEAD, HEAD plus recorded appends another close is staging right now,
+  // or (the same race) the shorter bytes this session's committed write left there.
+  const index = headBlob(hypoDir, relPath, { index: true });
+  if (!index) return false;
+  if (ends.some((e) => e === index.length && disk.subarray(0, e).equals(index))) return true;
+  return own !== null && sha256Hex(index) === own;
 }
 
 const FOREIGN_APPEND_NOTICE = (f) =>
@@ -5145,9 +5246,11 @@ function headFileHash(hypoDir, relPath) {
   return blob ? sha256Hex(blob) : null;
 }
 
-/** A vault path's blob in HEAD as a Buffer, `null` when git cannot give it. */
-function headBlob(hypoDir, relPath) {
-  const r = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', `HEAD:./${relPath}`], {
+/** A vault path's blob in HEAD (or, with `index`, in the index at stage 0) as a
+ * Buffer, `null` when git cannot give it. */
+function headBlob(hypoDir, relPath, { index = false } = {}) {
+  const spec = `${index ? ':0' : 'HEAD'}:./${relPath}`;
+  const r = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', spec], {
     timeout: 30000,
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -5633,7 +5736,7 @@ function projectOfPath(relPath) {
  *
  * @param {string} hypoDir
  * @param {string[]} [paths] vault-relative paths this caller wrote/owns this close
- * @returns {{committed: boolean, scoped?: number, sha?: string|null, committedPaths?: string[], ignoredPaths?: string[], reason?: string}}
+ * @returns {{committed: boolean, scoped?: number, sha?: string|null, committedPaths?: string[], ignoredPaths?: string[], reason?: string, indexWarning?: string}}
  *   committed:true when a commit was created OR nothing needed committing
  *   (scoped:0 in the latter case); committed:false (with reason) on a real
  *   failure: not a git repo, or git status/add/commit erroring. `sha` is the
@@ -5649,7 +5752,11 @@ function projectOfPath(relPath) {
  *   because `.hypoignore` matches them, so a caller clearing a per-session
  *   pending-write set (Stop's `commitTouchedPaths`) can keep exactly those as
  *   unresolved. A stale or already-clean supplied path is never listed:
- *   nothing about it is left unresolved.
+ *   nothing about it is left unresolved. On a failed add or commit the
+ *   index entries of this call's paths are put back as they were (the
+ *   `reason` says so when that fails too). `indexWarning` is present only
+ *   when a commit landed but its paths' index entries could not be brought
+ *   to HEAD afterwards.
  */
 export function commitWikiChanges(hypoDir, paths) {
   const git = (...args) =>
@@ -5728,13 +5835,39 @@ export function commitWikiChanges(hypoDir, paths) {
   if (scoped.length === 0 && commitScope.length === 0)
     return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
 
+  // The real index entries of this call's paths before it stages anything, so a
+  // failed add or commit can put them back. Left staged, they would ride along
+  // with the next plain `git commit` anyone runs in this tree (a new session
+  // entry included). `--full-name` because `--index-info` reads repository-root
+  // paths. A crash between the add and the restore still leaves them staged.
+  const before = git('ls-files', '-s', '-z', '--full-name', '--', ...commitScope);
+  const failed = (reason) => {
+    if (before.status !== 0)
+      return {
+        committed: false,
+        reason: `${reason}; the index was not restored (ls-files failed)`,
+      };
+    const removed = git('update-index', '--force-remove', '--', ...commitScope);
+    const restored =
+      removed.status === 0 && before.stdout
+        ? spawnSync('git', ['-C', hypoDir, 'update-index', '-z', '--index-info'], {
+            input: before.stdout,
+            encoding: 'utf-8',
+            timeout: 30000,
+          })
+        : removed;
+    if (restored.status !== 0)
+      return {
+        committed: false,
+        reason: `${reason}; the index was not restored: ${(restored.stderr || '').trim() || 'unknown'}`,
+      };
+    return { committed: false, reason };
+  };
+
   if (scoped.length > 0) {
     const add = git('add', '-A', '--', ...scoped);
     if (add.status !== 0)
-      return {
-        committed: false,
-        reason: `git add failed: ${(add.stderr || '').trim() || 'unknown'}`,
-      };
+      return failed(`git add failed: ${(add.stderr || '').trim() || 'unknown'}`);
   }
 
   // Re-derive from what actually landed in the index, bounded by the SAME
@@ -5767,10 +5900,17 @@ export function commitWikiChanges(hypoDir, paths) {
   // logical changes", where a rename is rightly one.
   const commit = git('commit', '--only', '-m', msg, '--', ...commitScope);
   if (commit.status !== 0)
-    return {
-      committed: false,
-      reason: `git commit failed: ${(commit.stderr || '').trim() || 'unknown'}`,
-    };
+    return failed(`git commit failed: ${(commit.stderr || '').trim() || 'unknown'}`);
+  // `--only` reads each path from the work tree twice, once into the real index
+  // and once into the commit. Another close appending in between leaves HEAD with
+  // the append and the real index without it, and the next plain `git commit`
+  // anyone runs would then take the append back out of HEAD. Bring these paths'
+  // index entries to HEAD while the caller still holds the vault lock.
+  const sync = git('reset', '-q', 'HEAD', '--', ...commitScope);
+  const indexWarning =
+    sync.status === 0
+      ? undefined
+      : `the index of the committed paths was not brought to HEAD (${(sync.stderr || '').trim() || 'unknown'}); run \`git reset -q HEAD -- ${commitScope.join(' ')}\` before any plain git commit`;
   // MAJOR fix: name the commit this call just created. A caller that has to
   // tell a user how to take it back (close-gate-store.mjs's
   // hostTagWarningWithUndo) cannot derive it afterwards: on a shared vault
@@ -5787,6 +5927,7 @@ export function commitWikiChanges(hypoDir, paths) {
     sha,
     committedPaths: stagedFiles,
     ignoredPaths,
+    ...(indexWarning ? { indexWarning } : {}),
   };
 }
 
@@ -9480,10 +9621,14 @@ export function computeSessionGrowth(hypoDir) {
     // newline/quote-strip parser left octal escapes in place, so Korean page
     // names silently failed the `pages/`·`projects/` scope match and dropped
     // out of the growth count.
-    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall', '-z'], {
-      encoding: 'utf-8',
-      timeout: 5000,
-    });
+    const porcelain = spawnSync(
+      'git',
+      ['--no-optional-locks', '-C', hypoDir, 'status', '--porcelain', '-uall', '-z'],
+      {
+        encoding: 'utf-8',
+        timeout: 5000,
+      },
+    );
     if (porcelain.status !== 0) return empty;
     let addedPages = 0,
       updatedPages = 0;

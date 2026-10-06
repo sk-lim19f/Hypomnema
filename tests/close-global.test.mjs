@@ -36,6 +36,7 @@ import { recordJournalEntry } from '../hooks/close-journal.mjs';
 // strictly outside it instead of guessing with local-yesterday.
 import {
   freshDates,
+  recordShardAppend,
   recordTouchedPaths,
   rootLogHeadingKey,
   sessionClosedMarkerPath,
@@ -7134,6 +7135,57 @@ test("a file named like another session's entry but not that entry still blocks 
   });
 });
 
+// X4 (wave B, third review): the entry must also be the one its path names by project,
+// by date, and by the session its close id belongs to. Disabling the check (X4,
+// project and date): in isForeignUncommittedEntry drop `|| e.project !== project ||
+// e.date !== date`. (X4, session): drop the `e.sessionId` line. Either goes red.
+test("a file named like another session's entry whose project, date or session differ from its path still blocks on the scoped partition (X4)", () => {
+  withWiki(anchorTestProject, (dir, today) => {
+    const sid = 's-t10-x4-mine';
+    const otherId = closeIdFor('s-t10-x4-other', 0);
+    const rel = `projects/test-project/sessions/${today}-${otherId}.md`;
+    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
+    const entryOf = (over) =>
+      formatSessionEntry({
+        project: 'test-project',
+        closeId: otherId,
+        date: today,
+        tracks: [],
+        summary: 'x4',
+        bodies: {},
+        ...over,
+      });
+    const gate = () =>
+      precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        attributionScope: 'test-project',
+        sessionId: sid,
+      });
+    // Pair: the entry its path names is a notice.
+    writeFileSync(join(dir, rel), entryOf({ sessionId: 's-t10-x4-other' }));
+    assert.ok(
+      gate().notices.some((n) => n.type === 'foreign-entry' && n.file === rel),
+      'precondition: the matching entry is foreign',
+    );
+    for (const over of [
+      { project: 'another-project' },
+      { date: '2001-01-01' },
+      { sessionId: 's-t10-x4-third' },
+    ]) {
+      writeFileSync(join(dir, rel), entryOf(over));
+      const g = gate();
+      assert.ok(
+        g.blockers.some((b) => b.type === 'git' && b.reason.includes(rel)),
+        `${JSON.stringify(over)}: ${JSON.stringify(g.blockers)}`,
+      );
+      assert.ok(
+        !g.notices.some((n) => n.type === 'foreign-entry'),
+        `${JSON.stringify(over)}: ${JSON.stringify(g.notices)}`,
+      );
+    }
+  });
+});
+
 // S1: the day's session-log shard is shared by every close of the project. A later
 // close appends its heading and commits it after the earlier close's marker gate has
 // already read the tree. The fixture is that moment, built without any timing: the
@@ -7159,6 +7211,14 @@ function withCommittedShard(fn) {
   });
 }
 const OTHER_HEADING = (today) => `\n## [${today}] other session's close\n`;
+// Another session's close appending to the shard: it records the append (what the
+// gate matches the tail against), then writes it.
+const S1_OTHER = 's-t10-s1-other';
+function appendAsOther(dir, rel, text, sid = S1_OTHER) {
+  const before = readFileSync(join(dir, rel), 'utf-8');
+  assert.ok(recordShardAppend(dir, sid, rel, before, text), 'precondition: the append is recorded');
+  appendFileSync(join(dir, rel), text);
+}
 const checkpointGate = (dir, sessionId) =>
   precompactGateStatus(dir, {
     claudeHome: join(dir, '.claude-none'),
@@ -7176,7 +7236,7 @@ const appendNotice = (gate, rel) =>
 // session's own write (it is in the touched set): both checkpoint assertions go red.
 test("another session's heading appended to a shard this session's close committed is a foreign-append notice at the marker gate (S1)", () => {
   withCommittedShard((dir, today, { rel }) => {
-    appendFileSync(join(dir, rel), OTHER_HEADING(today));
+    appendAsOther(dir, rel, OTHER_HEADING(today));
     const gate = checkpointGate(dir, S1_SID);
     assert.deepEqual(blockersOn(gate, rel), [], JSON.stringify(gate.blockers));
     assert.ok(appendNotice(gate, rel), JSON.stringify(gate.notices));
@@ -7196,7 +7256,7 @@ test("another session's heading appended to a shard this session's close committ
 // `return sha256Hex(head) === hashes[relPath];`. Red here only.
 test('a shard committed with the other close heading while the real index kept only this session heading is a foreign-append notice (S1)', () => {
   withCommittedShard((dir, today, { rel, own, git }) => {
-    appendFileSync(join(dir, rel), OTHER_HEADING(today));
+    appendAsOther(dir, rel, OTHER_HEADING(today));
     git('add', '--', rel);
     git('commit', '-q', '-m', 'other close', '--', rel);
     const blob = spawnSync('git', ['-C', dir, 'hash-object', '-w', '--stdin'], {
@@ -7217,9 +7277,10 @@ test('a shard committed with the other close heading while the real index kept o
 
 // The pairs: what is not a pure append by someone else keeps blocking. Disabling the
 // check (S1, prefix): drop the `!disk.subarray(0, head.length).equals(head)` test.
-// The edited-prefix assertions go red. (S1, dated tail): drop the dated heading test
-// on the tail. The undated assertions go red. (S1, own write): make the touched
-// branch `return true`. The own-append assertion goes red.
+// The edited-prefix assertions go red. (S1, recorded tail): make the tail walk accept
+// a missing record. The undated assertions go red. (S1, own write): in
+// isForeignAppendOnlyShard replace `if (!committed) return false;` with
+// `if (!committed) own = null;`. The reverted-write assertion goes red.
 test('a shard whose committed part changed, an undated append, a deleted shard, and this session own uncommitted append still block the marker gate (S1 pair)', () => {
   withCommittedShard((dir, today, { rel, own }) => {
     writeFileSync(join(dir, rel), own.replace('own close', 'rewritten') + OTHER_HEADING(today));
@@ -7259,6 +7320,86 @@ test('a shard whose committed part changed, an undated append, a deleted shard, 
       JSON.stringify(ownAppend.blockers),
     );
     assert.ok(!appendNotice(ownAppend, rel), JSON.stringify(ownAppend.notices));
+
+    // This session's recorded write never reached HEAD and is gone from disk (put
+    // back by hand), and another close appended since: still this session's
+    // unresolved write, not a clean foreign append.
+    writeFileSync(join(dir, rel), own);
+    appendAsOther(dir, rel, OTHER_HEADING(today));
+    const reverted = checkpointGate(dir, S1_SID);
+    assert.ok(
+      blockersOn(reverted, rel).some((b) => b.type === 'known-session-write'),
+      JSON.stringify(reverted.blockers),
+    );
+    assert.ok(!appendNotice(reverted, rel), JSON.stringify(reverted.notices));
+  });
+});
+
+// X3 (wave B, third review): only bytes another close recorded count as its append.
+// (a) A dated heading typed by hand, with no record anywhere, is not another close's.
+// (c) A hand note sitting in front of a recorded append makes the whole tail unowned.
+// Disabling the check (X3, tail walk): in isForeignAppendOnlyShard replace
+// `if (!r) return false;` with `if (!r) break;`. Both gates go red.
+test('a hand-typed dated heading, and a hand note ahead of another close recorded append, still block the marker gate (X3 a, c)', () => {
+  withCommittedShard((dir, today, { rel, own }) => {
+    appendFileSync(join(dir, rel), `\n## [${today}] typed by hand\n`);
+    const typed = checkpointGate(dir, 's-t10-s1-fresh');
+    assert.ok(
+      blockersOn(typed, rel).some((b) => b.type === 'git'),
+      JSON.stringify(typed.blockers),
+    );
+    assert.ok(!appendNotice(typed, rel), JSON.stringify(typed.notices));
+
+    writeFileSync(join(dir, rel), own + '\na note by hand\n');
+    appendAsOther(dir, rel, OTHER_HEADING(today));
+    const noted = checkpointGate(dir, 's-t10-s1-fresh');
+    assert.ok(
+      blockersOn(noted, rel).some((b) => b.type === 'git'),
+      JSON.stringify(noted.blockers),
+    );
+    assert.ok(!appendNotice(noted, rel), JSON.stringify(noted.notices));
+  });
+});
+
+// X3 (b): a work tree equal to HEAD says nothing about the index. A staged edit or a
+// staged deletion is still a change a plain commit would take. Pair: another close
+// staging its recorded append (its commit in flight) is a notice. Disabling the check
+// (X3, index): in isForeignAppendOnlyShard replace `if (!index) return false;` with
+// `if (!index || index) return true;`. The edit and deletion gates go red.
+test('a staged edit or staged deletion of a shard whose work tree is HEAD still blocks, another close staging its recorded append does not (X3 b)', () => {
+  withCommittedShard((dir, today, { rel, own, git }) => {
+    const blob = spawnSync('git', ['-C', dir, 'hash-object', '-w', '--stdin'], {
+      input: own.replace('own close', 'staged edit'),
+      encoding: 'utf-8',
+    }).stdout.trim();
+    git('update-index', '--cacheinfo', `100644,${blob},${rel}`);
+    // The work tree is HEAD; only the index moved (the second column compares the
+    // work tree to that index).
+    assert.equal(git('status', '--porcelain', '--', rel).stdout.slice(0, 2), 'MM');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), own);
+    const staged = checkpointGate(dir, 's-t10-s1-fresh');
+    assert.ok(
+      blockersOn(staged, rel).some((b) => b.type === 'git'),
+      JSON.stringify(staged.blockers),
+    );
+    assert.ok(!appendNotice(staged, rel), JSON.stringify(staged.notices));
+
+    git('reset', '-q', 'HEAD', '--', rel);
+    git('rm', '-q', '--cached', '--', rel);
+    assert.equal(git('status', '--porcelain', '--', rel).stdout.slice(0, 2), 'D ');
+    const removed = checkpointGate(dir, 's-t10-s1-fresh');
+    assert.ok(
+      blockersOn(removed, rel).some((b) => b.type === 'git'),
+      JSON.stringify(removed.blockers),
+    );
+    assert.ok(!appendNotice(removed, rel), JSON.stringify(removed.notices));
+
+    git('reset', '-q', 'HEAD', '--', rel);
+    appendAsOther(dir, rel, OTHER_HEADING(today));
+    git('add', '--', rel);
+    const inFlight = checkpointGate(dir, 's-t10-s1-fresh');
+    assert.deepEqual(blockersOn(inFlight, rel), [], JSON.stringify(inFlight.blockers));
+    assert.ok(appendNotice(inFlight, rel), JSON.stringify(inFlight.notices));
   });
 });
 
@@ -7267,7 +7408,7 @@ test('a shard whose committed part changed, an undated append, a deleted shard, 
 // trusted unscoped branch. The second gate goes red.
 test("another session's append to the committed shard is a foreign-append notice on the scoped and the trusted unscoped git partitions (S1)", () => {
   withCommittedShard((dir, today, { rel }) => {
-    appendFileSync(join(dir, rel), OTHER_HEADING(today));
+    appendAsOther(dir, rel, OTHER_HEADING(today));
     const cleanup = seedCloseTranscript(S1_SID);
     try {
       const scoped = precompactGateStatus(dir, {
@@ -7301,7 +7442,7 @@ test("Stop's unresolved-changes notice leaves out another session's new entry an
     const theirs = writeDatedEntry(dir, 'test-project', today, closeIdFor('s-t10-s4-other', 0));
     const shard = `projects/test-project/session-log/${today}.md`;
     assert.ok(existsSync(join(dir, shard)), 'precondition: the close committed the shard');
-    appendFileSync(join(dir, shard), `\n## [${today}] other session's close\n`);
+    appendAsOther(dir, shard, `\n## [${today}] other session's close\n`, 's-t10-s4-other');
     writeFileSync(join(dir, 'projects', 'test-project', 'scratch.md'), '# left over\n');
     const r = runStop('hypo-auto-minimal-crystallize.mjs', dir, {
       session_id: sid,

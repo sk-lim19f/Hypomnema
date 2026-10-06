@@ -4736,6 +4736,94 @@ test('commitWikiChanges: a vault nested inside a larger repository commits its v
   });
 });
 
+// A pre-commit hook installed through a repository-local hooksPath, so a global
+// core.hooksPath on the developer's machine can neither replace nor add to it.
+function withPreCommitHook(dir, script, fn) {
+  const hooks = join(dir, '.git', 'x-test-hooks');
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, 'pre-commit'), `#!/bin/sh\n${script}\n`);
+  chmodSync(join(hooks, 'pre-commit'), 0o755);
+  spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+  try {
+    fn();
+  } finally {
+    spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+  }
+}
+const cachedNames = (dir) =>
+  spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], { encoding: 'utf-8' }).stdout;
+const headText = (dir, rel) =>
+  spawnSync('git', ['-C', dir, 'show', `HEAD:${rel}`], { encoding: 'utf-8' }).stdout;
+
+// X1 (wave B, third review): `--only` reads the path into the real index and again into
+// the commit. Another close appending between the two reads (here the pre-commit hook,
+// which git runs after both) leaves HEAD with the append and the real index without
+// it, and the next plain commit takes the append back out of HEAD. Disabling the check
+// (X1): in commitWikiChanges replace `git('reset', '-q', 'HEAD', '--', ...commitScope)`
+// with `{ status: 0 }`. The index assertion and the plain-commit assertion go red.
+test('commitWikiChanges: an append landing inside its pathspec commit leaves the index at HEAD, so a plain commit keeps it', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'shard.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    withPreCommitHook(dir, `printf 'other close\\n' >> ${rel}\ngit add -- ${rel}`, () => {
+      const res = commitWikiChanges(dir, [rel]);
+      assert.equal(res.committed, true, JSON.stringify(res));
+      assert.equal(res.indexWarning, undefined, JSON.stringify(res));
+    });
+    assert.equal(
+      headText(dir, rel),
+      'committed\nthis close\nother close\n',
+      'precondition: the other append landed in the commit',
+    );
+    assert.equal(cachedNames(dir), '', 'the index of the committed path is HEAD');
+    spawnSync('git', ['-C', dir, 'commit', '-q', '--allow-empty', '-m', 'plain']);
+    assert.equal(headText(dir, rel), 'committed\nthis close\nother close\n');
+  });
+});
+
+// X2 (wave B, third review): a commit the pre-commit hook refuses used to leave every
+// path the call staged in the index (a new session entry included), for the next plain
+// commit anyone runs to take along. Disabling the check (X2): in commitWikiChanges make
+// `failed` return `{ committed: false, reason }` before it touches the index. The
+// staged-names and the plain-commit assertions go red.
+test('commitWikiChanges: a refused commit puts the index of its paths back, so a plain commit takes none of them', () => {
+  withSyncedWiki((dir) => {
+    const entry = 'projects/p/sessions/2026-10-06-s-x2-0.md';
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'staged.md'), 'v1\n');
+    assert.equal(commitWikiChanges(dir, ['staged.md']).committed, true);
+    // A path that already had something staged gets exactly that back.
+    writeFileSync(join(dir, 'staged.md'), 'v2 staged\n');
+    spawnSync('git', ['-C', dir, 'add', '--', 'staged.md']);
+    writeFileSync(join(dir, 'staged.md'), 'v3 on disk\n');
+    writeFileSync(join(dir, entry), 'new entry\n');
+    const lsBefore = spawnSync('git', ['-C', dir, 'ls-files', '-s'], { encoding: 'utf-8' }).stdout;
+    withPreCommitHook(dir, 'exit 1', () => {
+      const res = commitWikiChanges(dir, [entry, 'staged.md']);
+      assert.equal(res.committed, false, JSON.stringify(res));
+      assert.match(res.reason, /^git commit failed/);
+      assert.doesNotMatch(res.reason, /not restored/);
+    });
+    assert.equal(
+      spawnSync('git', ['-C', dir, 'ls-files', '-s'], { encoding: 'utf-8' }).stdout,
+      lsBefore,
+      'the index is what it was before the call',
+    );
+    assert.equal(cachedNames(dir), 'staged.md\n');
+    assert.equal(readFileSync(join(dir, entry), 'utf-8'), 'new entry\n', 'the work tree is kept');
+    writeFileSync(join(dir, 'other.md'), 'other\n');
+    spawnSync('git', ['-C', dir, 'add', '--', 'other.md']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'plain']);
+    const names = spawnSync('git', ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(!names.includes(entry), names);
+    assert.ok(names.includes('other.md'), names);
+  });
+});
+
 // ── session-close-scope-boundary spec §2b: structural git demotion under
 //    projectOverride / attributionScope ──────────────────────────────────
 //
