@@ -2462,7 +2462,7 @@ STDOUT
 STDERR
 [feedback-sync] created draft: .cache/feedback-drafts/legacy-claude-20260501-legacy-rule-one.md (claude-learned)
 [feedback-sync] created draft: .cache/feedback-drafts/loose-y.md (memory-index)
-[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/targets/promote_to_global and move into pages/feedback/. The drafts are in .cache/feedback-drafts/ (git ignores them and they are not synced to other machines).
+[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git when the vault is a git work tree (feedback-sync checked that git ignores that path).
 
 ### FILE CLAUDE.md
 # Global
@@ -4497,7 +4497,9 @@ test('feedback-sync-drafts-are-invisible-to-git: bootstrap and import drafts lan
       for (const path of made) {
         assert.equal(join(path, '..'), fbDraftsDir(wiki), `${path} is in the drafts dir`);
         assert.ok(existsSync(path));
-        const ignored = spawnSync('git', ['-C', wiki, 'check-ignore', '-q', path]);
+        const ignored = spawnSync('git', ['-C', wiki, 'check-ignore', '-q', path], {
+          env: { ...process.env, HOME: SESSION_TMP_HOME },
+        });
         assert.equal(ignored.status, 0, `git ignores ${path}`);
       }
       assert.ok(
@@ -4641,7 +4643,10 @@ test('feedback-sync-legacy-drafts-are-still-read: a draft in the old pages/feedb
       // bootstrap sees it and drafts nothing
       const r = JSON.parse(runFb(['--bootstrap', '--json']).stdout);
       assert.deepEqual(r.created, []);
-      assert.deepEqual(r.skipped, [{ slug: 'rule-b', reason: 'draft-exists' }]);
+      assert.deepEqual(r.skipped, [
+        { slug: 'rule-b', reason: 'draft-exists-legacy', path: legacy },
+      ]);
+      assert.equal(r.warnings, undefined, 'a vault that is not a git tree has nothing to warn of');
       assert.ok(!existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'no second copy');
       // a write with neither page nor new-place draft keeps the record while the old draft is there
       assert.equal(runFb(['--write']).status, 0);
@@ -4692,17 +4697,178 @@ test('feedback-sync-ensure-container-reads-again-and-keeps-a-copy: a CLAUDE.md s
   // a vault whose git would stage .cache/ gets no copy: the append goes on, with a warning
   withFeedbackEnv(
     {},
-    (ctx) => {
-      const { wiki, claudeHome } = ctx;
+    ({ wiki, claudeHome, runFb }) => {
+      // a child process, so the vault's git sees the pinned HOME and not the runner's
+      // global excludes
       fbGitInit(wiki, 'node_modules/\n');
-      const out = fbInProcess(ctx, ['--ensure-container']);
-      assert.equal(out.code, 0, out.error);
-      assert.match(out.warnings[0], /no copy of .*CLAUDE\.md was kept.*not ignored/);
-      assert.deepEqual(out.report.warnings, out.warnings, 'the --json report carries it too');
-      assert.ok(
-        readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8').includes('<learned_behaviors>'),
-      );
+      const p = join(claudeHome, 'CLAUDE.md');
+      const warned = /no copy of .*CLAUDE\.md was kept.*not ignored/;
+      const j = runFb(['--ensure-container', '--json']);
+      assert.equal(j.status, 0, j.stderr);
+      assert.match(JSON.parse(j.stdout).warnings[0], warned, 'the --json report carries it');
+      assert.ok(readFileSync(p, 'utf-8').includes('<learned_behaviors>'), 'the append went on');
       assert.ok(!existsSync(fbKeptDir(wiki)), 'nothing went under .cache/');
+      // the text mode prints it
+      writeFileSync(p, original);
+      const t = runFb(['--ensure-container']);
+      assert.equal(t.status, 0, t.stderr);
+      assert.match(t.stderr, /warn: no copy of .*CLAUDE\.md was kept.*not ignored/);
+    },
+    { claudeMd: original },
+  );
+});
+
+test('feedback-sync-legacy-drafts-visible-to-git-are-warned-about: an old _drafts file git could stage is named with the way out, and the pointer to the new place is not printed when nothing was drafted', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  const legacyBody = '<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=memory-index -->\nsensitivity: public\n';
+  const seed = (wiki) => {
+    const dir = join(wiki, 'pages', 'feedback', '_drafts');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'rule-b.md'), legacyBody);
+    return join(dir, 'rule-b.md');
+  };
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, claudeHome, runFb }) => {
+      fbGitInit(wiki, '.cache/\n');
+      const legacy = seed(wiki);
+      assert.ok(
+        fbGitStaged(wiki).some((l) => l.endsWith('pages/feedback/_drafts/rule-b.md')),
+        'precondition: git sees the old draft',
+      );
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(
+        r.stderr,
+        /warn: pages\/feedback\/_drafts\/rule-b\.md was written by an earlier version.*git add -A.*Move it to \.cache\/feedback-drafts\/ or delete it/,
+      );
+      assert.match(r.stderr, /skipped rule-b: draft-exists-legacy \(.*_drafts\/rule-b\.md\)/);
+      assert.ok(!/The drafts are in/.test(r.stderr), 'no pointer when this run drafted nothing');
+      assert.equal(readFileSync(legacy, 'utf-8'), legacyBody, 'the old draft is not touched');
+      const rep = JSON.parse(runFb(['--bootstrap', '--json']).stdout);
+      assert.deepEqual(rep.skipped, [
+        { slug: 'rule-b', reason: 'draft-exists-legacy', path: legacy },
+      ]);
+      assert.equal(rep.warnings.length, 1, 'the --json report carries the warning');
+      // --import-target-change says it too
+      fbHandEditClaude(claudeHome, runFb);
+      const i = runFb(['--import-target-change', '--from=claude']);
+      assert.equal(i.status, 0, i.stderr);
+      assert.match(
+        i.stderr,
+        /warn: pages\/feedback\/_drafts\/rule-b\.md was written by an earlier version/,
+      );
+      // moved to the new place, git no longer sees it, and the warning goes
+      mkdirSync(fbDraftsDir(wiki), { recursive: true });
+      writeFileSync(join(fbDraftsDir(wiki), 'rule-b.md'), legacyBody);
+      rmSync(legacy);
+      const moved = runFb(['--bootstrap']);
+      assert.equal(moved.status, 0, moved.stderr);
+      assert.ok(!/earlier version/.test(moved.stderr), 'no warning once it is moved');
+      assert.match(
+        moved.stderr,
+        /skipped rule-b: draft-exists\b(?!-)/,
+        'and the new place is recognised',
+      );
+    },
+    { memoryMd, claudeMd: '# Global\n<learned_behaviors>\n- manual entry\n</learned_behaviors>\n' },
+  );
+  // the same file where git ignores it: nothing to warn of
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      fbGitInit(wiki, '.cache/\npages/feedback/_drafts/\n');
+      seed(wiki);
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(!/earlier version/.test(r.stderr), r.stderr);
+      assert.match(r.stderr, /draft-exists-legacy/);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-draft-tmp-name-collision-is-an-error-not-a-taken-name: a stray tmp file with the picked name makes the run fail instead of skipping the draft', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki } = ctx;
+      const real = Math.random;
+      Math.random = () => 0.5;
+      try {
+        mkdirSync(fbDraftsDir(wiki), { recursive: true });
+        const tmp = `.rule-b.md.${process.pid}.${(0.5).toString(36).slice(2, 10)}.tmp`;
+        writeFileSync(join(fbDraftsDir(wiki), tmp), 'stray');
+        const out = fbInProcess(ctx, ['--bootstrap']);
+        assert.equal(out.code, 1, 'a failed write is not reported as an existing draft');
+        assert.match(out.error, /cannot write the draft .*rule-b\.md: .*EEXIST/);
+        assert.deepEqual(out.report.skipped, []);
+      } finally {
+        Math.random = real;
+      }
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-bootstrap-partial-failure-keeps-what-it-made: the error report names the drafts already created, and the text mode prints the warnings before the error', () => {
+  // the second draft's name is too long for the filesystem, so its write fails after the first
+  const memoryMd = `# Memory Index\n- [Aaa](feedback_aaa.md): first\n- [Long](feedback_${'b'.repeat(300)}.md): second\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, claudeHome, runFb }) => {
+      rmSync(join(claudeHome, 'CLAUDE.md')); // a warning of its own: no CLAUDE.md to read
+      const j = runFb(['--bootstrap', '--json']);
+      assert.equal(j.status, 1, j.stderr);
+      const body = JSON.parse(j.stdout);
+      assert.match(body.error, /cannot write the draft /);
+      assert.deepEqual(
+        body.created.map((c) => c.slug),
+        ['aaa'],
+        'the draft that was made is in the report',
+      );
+      assert.deepEqual(body.skipped, []);
+      assert.ok(
+        body.warnings.some((w) => /CLAUDE\.md not found/.test(w)),
+        `the run's warnings survive the error: ${JSON.stringify(body.warnings)}`,
+      );
+      assert.ok(existsSync(join(fbDraftsDir(wiki), 'aaa.md')), 'and on disk');
+      assert.ok(existsSync(fbHandRecord(wiki)), 'its hand line is recorded');
+      const t = runFb(['--bootstrap']);
+      assert.equal(t.status, 1);
+      const warn = t.stderr.indexOf('warn: CLAUDE.md not found');
+      const err = t.stderr.indexOf('cannot write the draft');
+      assert.ok(warn >= 0 && err > warn, `warnings come before the error: ${t.stderr}`);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-ensure-container-dry-run-writes-nothing: --dry-run reports the plan and leaves CLAUDE.md and .cache/ alone', () => {
+  const original = '# Global\n\nprose\n';
+  withFeedbackEnv(
+    {},
+    ({ wiki, claudeHome, runFb }) => {
+      const p = join(claudeHome, 'CLAUDE.md');
+      const j = runFb(['--ensure-container', '--dry-run', '--json']);
+      assert.equal(j.status, 0, j.stderr);
+      assert.deepEqual(JSON.parse(j.stdout), {
+        mode: 'ensure-container',
+        file: p,
+        action: 'would-create',
+        dryRun: true,
+      });
+      const t = runFb(['--ensure-container', '--dry-run']);
+      assert.match(
+        t.stderr,
+        /would append an empty <learned_behaviors>.*Nothing written \(--dry-run\)/,
+      );
+      assert.equal(readFileSync(p, 'utf-8'), original, 'CLAUDE.md is byte-identical');
+      assert.ok(!existsSync(fbKeptDir(wiki)), 'no copy was made');
+      // without --dry-run the same call does append
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      assert.ok(readFileSync(p, 'utf-8').includes('<learned_behaviors>'));
     },
     { claudeMd: original },
   );

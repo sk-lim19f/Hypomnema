@@ -226,15 +226,23 @@ function createNew(file, content, testHooks) {
     `.${basename(file)}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`,
   );
   try {
+    // an EEXIST here is a collision on the tmp name, a real failure: only the link below
+    // means "the name was taken"
     writeFileSync(tmp, content, { flag: 'wx' });
     testHooks?.beforePublish?.(tmp, file);
-    linkSync(tmp, file);
-    return true;
-  } catch (err) {
-    if (err.code === 'EEXIST') return false;
-    throw err;
+    try {
+      linkSync(tmp, file);
+      return true;
+    } catch (err) {
+      if (err.code === 'EEXIST') return false;
+      throw err;
+    }
   } finally {
-    rmSync(tmp, { force: true });
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort: an orphan tmp is inert, and must not turn a published draft into an error */
+    }
   }
 }
 
@@ -1370,7 +1378,7 @@ async function resolveProjectId(args, { prompt = defaultPrompt, isTTY } = {}) {
 // Both modes are *reverse* one-time helpers that scaffold wiki DRAFTS under
 // .cache/feedback-drafts/ — they NEVER write pages/feedback/<slug>.md directly
 // (the single-direction invariant). A human reviews each draft,
-// fills the decision fields (scope/tier/targets/promote_to_global), and moves
+// fills the decision fields (scope/tier/sensitivity/targets/promote_to_global), and moves
 // it into pages/feedback/. A draft is a verbatim copy of the user's own hand-written
 // lines or edited block, so it lives where the vault's git does not look: .cache/ is
 // gitignored by the vault template, and no draft is written unless git confirms it
@@ -1382,12 +1390,42 @@ async function resolveProjectId(args, { prompt = defaultPrompt, isTTY } = {}) {
 // Drafts used to be written to pages/feedback/_drafts/ (untracked, but visible to
 // `git add -A`). Those that are still there keep working: they are read (a bootstrap
 // does not draft a slug that has one, and a hand-line record waits for one), and they
-// are never moved or deleted. That directory stays excluded from sync candidates
-// (loadFeedbackPages) and from lint (collectPages skips `_`-dirs).
+// are never moved or deleted. They hold a copy of the user's own text and git can see
+// them, so a run that meets one says so (legacyDraftWarning). That directory stays
+// excluded from sync candidates (loadFeedbackPages) and from lint (collectPages skips
+// `_`-dirs).
 const DRAFTS_DIR = (hypoDir) => join(hypoDir, '.cache', 'feedback-drafts');
 const LEGACY_DRAFTS_DIR = (hypoDir) => join(hypoDir, 'pages', 'feedback', '_drafts');
 const draftExists = (hypoDir, slug) =>
   [DRAFTS_DIR, LEGACY_DRAFTS_DIR].some((dir) => existsSync(join(dir(hypoDir), `${slug}.md`)));
+
+// The notice for old-place drafts the vault's git could stage (unignored, or git cannot
+// say), null when there are none: no such dir, or git ignores them, or the vault is not a
+// git work tree. Nothing is moved or deleted; that stays the user's call.
+function legacyDraftWarning(hypoDir) {
+  let names = [];
+  try {
+    names = readdirSync(LEGACY_DRAFTS_DIR(hypoDir)).filter(
+      (f) => f.endsWith('.md') && !f.startsWith('.'),
+    );
+  } catch {
+    return null;
+  }
+  const rels = names.map((f) => `pages/feedback/_drafts/${f}`);
+  const bad = unignoredCachePaths(hypoDir, rels);
+  if (!bad.length) return null;
+  return (
+    `${bad.join(', ')} ${bad.length === 1 ? 'was' : 'were'} written by an earlier version: a copy of your own text that git can see ` +
+    `(it was marked sensitivity: public) and \`git add -A\` would stage. Move ${bad.length === 1 ? 'it' : 'them'} to .cache/feedback-drafts/ or delete ${bad.length === 1 ? 'it' : 'them'}; ` +
+    `--bootstrap and --write read drafts from there just the same`
+  );
+}
+const warnLegacyDrafts = (hypoDir, warnings, report) => {
+  const w = legacyDraftWarning(hypoDir);
+  if (!w) return;
+  warnings.push(w);
+  (report.warnings ||= []).push(w);
+};
 
 // Provenance header so re-running bootstrap/import is recognisable and humans
 // see at a glance the file is a generated scaffold awaiting review.
@@ -1637,6 +1675,7 @@ function runBootstrap(args) {
   const existing = existingPageSlugs(args.hypoDir);
   const { candidates, warnings, skipped } = loadBootstrapSources(args);
   const report = { mode: 'bootstrap', dryRun: args.dryRun, created: [], skipped: [...skipped] };
+  warnLegacyDrafts(args.hypoDir, warnings, report);
 
   const seen = new Set();
   const planned = [];
@@ -1650,11 +1689,16 @@ function runBootstrap(args) {
       report.skipped.push({ slug: c.slug, reason: 'page-exists' });
       continue;
     }
-    if (draftExists(args.hypoDir, c.slug)) {
+    const draftPath = join(draftsDir, `${c.slug}.md`);
+    const legacyPath = join(LEGACY_DRAFTS_DIR(args.hypoDir), `${c.slug}.md`);
+    if (existsSync(draftPath)) {
       report.skipped.push({ slug: c.slug, reason: 'draft-exists' });
       continue;
     }
-    const draftPath = join(draftsDir, `${c.slug}.md`);
+    if (existsSync(legacyPath)) {
+      report.skipped.push({ slug: c.slug, reason: 'draft-exists-legacy', path: legacyPath });
+      continue;
+    }
     assertUnderDrafts(draftsDir, draftPath);
     planned.push({ c, draftPath });
   }
@@ -1736,6 +1780,7 @@ function runImport(args) {
   const { file, conflicts } = src;
   const report = { mode: 'import', from: args.from, dryRun: args.dryRun, imported: [] };
   const warnings = [];
+  warnLegacyDrafts(args.hypoDir, warnings, report);
   if (!conflicts.length) {
     warnings.push(`no hand-edited (conflicting) managed blocks in ${file} — nothing to import`);
     return { code: 0, report, warnings };
@@ -1986,6 +2031,11 @@ function runEnsureContainer(args) {
         `container — ${c.reason}. ${REMEDY.containerCorrupt(file, c.reason)}`,
     };
   }
+  if (args.dryRun)
+    return {
+      code: 0,
+      report: { mode: 'ensure-container', file, action: 'would-create', dryRun: true },
+    };
   const sep = content.endsWith('\n') ? '' : '\n';
   const addition =
     `${sep}\n` +
@@ -2423,12 +2473,29 @@ async function main() {
 
   if (args.json) {
     // a failed --accept-wiki still says which targets were already rewritten
+    // and a failed --bootstrap / --import-target-change which drafts were already created
+    const mode = out.report?.mode;
     const errBody =
-      out.report && out.report.mode === 'accept'
+      mode === 'accept'
         ? { error: out.error, accepted: out.report.accepted, refused: out.report.refused }
-        : { error: out.error };
+        : mode === 'bootstrap'
+          ? {
+              error: out.error,
+              created: out.report.created,
+              skipped: out.report.skipped,
+              warnings: out.warnings ?? [],
+            }
+          : mode === 'import'
+            ? {
+                error: out.error,
+                imported: out.report.imported,
+                skipped: out.report.skipped,
+                warnings: out.warnings ?? [],
+              }
+            : { error: out.error };
     console.log(JSON.stringify(out.error ? errBody : out.report, null, 2));
   } else if (out.error) {
+    for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
     console.error(`[feedback-sync] ${out.error}`);
   } else if (out.report.mode === 'ensure-container') {
     for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
@@ -2437,6 +2504,11 @@ async function main() {
       console.error(
         `[feedback-sync] ensure-container: ${file} does not exist yet — nothing to provision ` +
           `(this is the ordinary first-run state, not something --ensure-container creates).`,
+      );
+    } else if (action === 'would-create') {
+      console.error(
+        `[feedback-sync] ensure-container: would append an empty <learned_behaviors></learned_behaviors> ` +
+          `container to ${file}. Nothing written (--dry-run).`,
       );
     } else if (action === 'noop-already-present') {
       console.error(
@@ -2456,11 +2528,17 @@ async function main() {
         `[feedback-sync] ${verb} draft: ${relative(args.hypoDir, c.path).split(sep).join('/')} (${c.origin})`,
       );
     for (const s of out.report.skipped)
-      console.error(`[feedback-sync] skipped ${s.slug}: ${s.reason}`);
+      console.error(
+        `[feedback-sync] skipped ${s.slug}: ${s.reason}${s.path ? ` (${s.path})` : ''}`,
+      );
+    // the pointer to where the drafts are only makes sense when this run made some
     console.error(
-      `[feedback-sync] bootstrap: ${out.report.created.length} ${verb}, ${out.report.skipped.length} skipped. ` +
-        `Fill scope/tier/targets/promote_to_global and move into pages/feedback/. ` +
-        `The drafts are in .cache/feedback-drafts/ (git ignores them and they are not synced to other machines).`,
+      `[feedback-sync] bootstrap: ${out.report.created.length} ${verb}, ${out.report.skipped.length} skipped.` +
+        (out.report.created.length
+          ? ` Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. ` +
+            `The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git ` +
+            `when the vault is a git work tree (feedback-sync checked that git ignores that path).`
+          : ''),
     );
   } else if (out.report.mode === 'accept') {
     for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
