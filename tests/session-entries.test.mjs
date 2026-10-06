@@ -2712,6 +2712,32 @@ test('a vault whose own .gitignore leaves .cache/ out gets no backup or archive:
   );
 });
 
+test('a .gitignore that names only the three probe files is not an ignored .cache/: the catch-up defers, writes no backup, and an add-all stages nothing under .cache/', () => {
+  withCatchUp(
+    ({ b }) => {
+      put(b, 'projects/p/hot.md', W1);
+      const r = clear(b);
+      assert.equal(r.ok, false);
+      assert.equal(r.deferred, 'cache-not-ignored');
+      assert.equal(existsSync(join(b, '.cache')), false, 'no backup was made');
+      assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the local bytes were not moved');
+      cgitOk(b, ['add', '-A']);
+      assert.equal(
+        cgitOk(b, ['ls-files'])
+          .split('\n')
+          .some((n) => n.startsWith('.cache/')),
+        false,
+      );
+    },
+    {
+      seed: {
+        '.gitignore':
+          '.cache/backups/probe.md\n.cache/pull-archive.json\n.cache/generated-views.json\n',
+      },
+    },
+  );
+});
+
 test('(a) the notices of the generator and of the root hot.md name the backup under .cache/backups', () => {
   withTmpDir((dir) => {
     assert.match(
@@ -4246,6 +4272,33 @@ test('an undo drops the archive record before the backups it names, so a stop be
   });
 });
 
+test('an undo syncs the restored bytes, then the record removal, and only then removes the backups', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    let undone;
+    const events = recordDurability(() => {
+      undone = undoClearedPaths(b, r);
+    });
+    assert.equal(undone.ok, true, JSON.stringify(undone));
+    const restore = events.indexOf('rename hot.md');
+    const record = events.indexOf('rm pull-archive.json');
+    const backup = events.indexOf(`rm ${basename(r.backups[0])}`);
+    const trace = events.join(' | ');
+    assert.ok(restore >= 0 && record > restore && backup > record, trace);
+    assert.equal(events[restore - 1], 'fsync-file', `the restored file is synced: ${trace}`);
+    assert.equal(events[restore + 1], 'fsync-dir', `its directory is synced: ${trace}`);
+    assert.equal(events[record + 1], 'fsync-dir', `the record removal is synced: ${trace}`);
+    // the same backup can be named by two items, so it is removed twice; the sync follows the last
+    assert.equal(
+      events[events.lastIndexOf(`rm ${basename(r.backups[0])}`) + 1],
+      'fsync-dir',
+      `the backup removal is synced: ${trace}`,
+    );
+  });
+});
+
 test('a resume that finds the record naming a backup that is gone keeps the record and says which', () => {
   withCatchUp(({ b }) => {
     put(b, 'projects/p/hot.md', W1);
@@ -4619,7 +4672,11 @@ test('the writer leaves .cache/ alone while a later rule un-ignores it, and says
     assert.equal(r.notMigrated, true);
     assert.deepEqual(r.written, []);
     assert.deepEqual(cacheNow(), cacheBefore, 'no backup or ownership record was added');
-    assert.ok(r.unignoredCache.includes('.cache/backups/probe.md'), JSON.stringify(r));
+    assert.ok(r.unignoredCache.includes('.cache/'), JSON.stringify(r));
+    assert.ok(
+      r.unignoredCache.includes('.cache/backups/projects/probe/hot.md.pre-projection-backup.md'),
+      JSON.stringify(r),
+    );
     assert.equal(readRel(dir, 'projects/p/hot.md'), 'hand written\n');
     assert.match(consumeRootHotHealthNotice(dir) ?? '', /\/\.cache\//);
   });

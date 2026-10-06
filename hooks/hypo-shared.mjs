@@ -25,7 +25,7 @@ import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
-import { atomicWrite } from './atomic-write.mjs';
+import { atomicWrite, fsyncDir } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
 import {
   GITIGNORE_BLOCK,
@@ -1904,21 +1904,30 @@ function gitOut(hypoDir, args) {
 /**
  * The files Hypomnema keeps under `.cache/` (a view backup, the ownership record, the pull archive)
  * that a `git add -A` would stage because no ignore rule covers them, as paths relative to the vault.
- * `[]` means every one is ignored, or git cannot answer (no repository: nothing to stage). The
+ * `[]` means every one is ignored, or there is no repository (nothing to stage). A repository whose
+ * check-ignore fails or answers with another code counts as nothing ignored. The
  * block this plugin writes ignores `/.cache/`, but a vault with its own `.gitignore` may not, and
  * the backups hold a person's own notes. Callers write nothing under `.cache/` while this is not
- * empty. A tracked path counts as not ignored, which is the safe side.
+ * empty. A tracked path counts as not ignored, which is the safe side. A vault that ignores only
+ * individual cache files is deferred too: the backups sit at paths no such rule names.
  */
 export function unignoredCachePaths(hypoDir) {
+  // `.cache/` itself, plus a backup path as deep as the ones `backUpGeneratedPath` writes, so a
+  // rule that names a few files (or one directory level) does not pass for ignoring the tree.
   const probes = [
-    '.cache/backups/probe.md',
+    '.cache/',
+    '.cache/backups/projects/probe/hot.md.pre-projection-backup.md',
     '.cache/pull-archive.json',
     '.cache/generated-views.json',
   ];
   const r = vaultGit(hypoDir, ['check-ignore', '--stdin', '-z'], {
     input: probes.map((p) => `${p}\0`).join(''),
   });
-  if (r.status !== 0 && r.status !== 1) return [];
+  if (r.status !== 0 && r.status !== 1) {
+    // git could not answer. Inside a repository that is not proof of an ignore rule, so defer;
+    // outside one there is nothing to stage.
+    return vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status === 0 ? probes : [];
+  }
   const ignored = new Set(String(r.stdout).split('\0'));
   return probes.filter((p) => !ignored.has(p));
 }
@@ -2575,7 +2584,9 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
     const now = lenient(abs);
     if (now === bytes) return true;
     if (now !== null && lfText(now) !== lfText(gitShowText(hypoDir, 'HEAD', relPath))) return false;
-    atomicWrite(abs, bytes);
+    // Durable: the backup this was read from is deleted below, and a power loss must not keep the
+    // delete while losing these bytes.
+    atomicWrite(abs, bytes, { durable: true });
     return true;
   };
   let allBack = true;
@@ -2597,14 +2608,21 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
     }
   }
   if (allBack) {
+    // Each deletion is synced before the next step relies on it: a power loss that replays the
+    // backup removal but not the record removal would leave a record naming a backup that is gone.
+    const syncDir = (dir) => {
+      if (existsSync(dir)) fsyncDir(dir);
+    };
     // The record goes first: a stop in between leaves a backup nobody names, not a record that
     // names a backup that is gone.
     if (!keepRecord && all.length + (moved.unowned ?? []).length > 0) {
-      rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
+      const record = join(hypoDir, PULL_ARCHIVE_REL);
+      rmSync(record, { force: true });
+      syncDir(dirname(record));
     }
-    for (const { backupPath } of [...all, ...(moved.unowned ?? [])]) {
-      rmSync(backupPath, { force: true });
-    }
+    const backups = [...all, ...(moved.unowned ?? [])].map((v) => v.backupPath);
+    for (const backupPath of backups) rmSync(backupPath, { force: true });
+    for (const dir of new Set(backups.map((b) => dirname(b)))) syncDir(dir);
   }
   return { ok: allBack, notices };
 }

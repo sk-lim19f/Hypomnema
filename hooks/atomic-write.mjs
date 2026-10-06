@@ -75,7 +75,11 @@ export function atomicWrite(path, content, { durable = false } = {}) {
   }
 }
 
-function fsyncDir(dir) {
+/**
+ * Sync a directory's entries (a created, renamed or removed name) to disk. A directory that
+ * cannot be opened for sync (EISDIR or EPERM on some platforms) is skipped; other errors propagate.
+ */
+export function fsyncDir(dir) {
   let fd;
   try {
     fd = openSync(dir, 'r');
