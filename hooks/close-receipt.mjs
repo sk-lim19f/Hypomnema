@@ -62,7 +62,16 @@ const TREE_MODE_RE = /^[0-7]{6}$/;
 // crystallize-close-apply.mjs: the apply path's write phases and
 // buildMarkCloseProof). verifyEntriesInCommit also understands 'absent', but no
 // writer files one, so a stored receipt that names it was not written by us.
-const RECEIPT_ENTRY_KINDS = new Set(['overwrite', 'create', 'append', 'schema-pending']);
+// 'local-create' is the session entry of a `.hypoignore` project: it never
+// reaches a commit, so it is proven by its bytes on disk (`expected.bytesSha256`,
+// the same hash the close pin's `localProofs` records), not by commit C.
+const RECEIPT_ENTRY_KINDS = new Set([
+  'overwrite',
+  'create',
+  'local-create',
+  'append',
+  'schema-pending',
+]);
 
 const GIT_TIMEOUT_MS = 30000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -205,6 +214,9 @@ function isWellFormedEntry(entry) {
     if (mode !== undefined && !(typeof mode === 'string' && TREE_MODE_RE.test(mode))) return false;
     return bytesSha256 !== undefined || blob !== undefined;
   }
+  if (kind === 'local-create') {
+    return typeof expected.bytesSha256 === 'string' && SHA256_HEX_RE.test(expected.bytesSha256);
+  }
   if (kind === 'append') return isNonEmptyStringArray(expected.entryBlocks);
   return isNonEmptyStringArray(expected.tags); // schema-pending
 }
@@ -306,7 +318,7 @@ export function readReceiptStrict(hypoDir, sessionId) {
  *
  * @param {string} hypoDir
  * @param {string} commit a commit-ish (full sha expected in practice)
- * @param {Array<{path: string, kind: 'overwrite'|'create'|'append'|'schema-pending'|'absent',
+ * @param {Array<{path: string, kind: 'overwrite'|'create'|'local-create'|'append'|'schema-pending'|'absent',
  *   expected?: {blob?: string, mode?: string, bytesSha256?: string, entryBlocks?: string[], tags?: string[]}}>} entries
  * @returns {{ok: boolean, mismatches: Array<{path: string, reason: string}>}}
  */
@@ -321,6 +333,23 @@ export function verifyEntriesInCommit(hypoDir, commit, entries) {
         path: typeof path === 'string' ? path : '(missing path)',
         reason: 'invalid-entry',
       });
+      continue;
+    }
+
+    if (kind === 'local-create') {
+      // Never in a commit by design: the claim is the bytes on disk. Read raw
+      // like a blob, for the same reason (no UTF-8 round trip).
+      let buf = null;
+      try {
+        buf = readFileSync(join(hypoDir, path));
+      } catch {
+        buf = null;
+      }
+      if (buf === null) {
+        mismatches.push({ path, reason: 'local-entry-missing' });
+      } else if (createHash('sha256').update(buf).digest('hex') !== expected.bytesSha256) {
+        mismatches.push({ path, reason: 'local-entry-mismatch' });
+      }
       continue;
     }
 

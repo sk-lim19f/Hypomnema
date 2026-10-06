@@ -41,8 +41,11 @@ import {
   sessionClosedMarkerPath,
   writeSessionClosedMarker,
   sanitizeSessionId,
+  readClosePin,
+  sessionCloseFileStatus,
 } from '../hooks/hypo-shared.mjs';
-import { SESSION_TMP_HOME } from './helpers.mjs';
+import { SESSION_TMP_HOME, runApply, withWiki } from './helpers.mjs';
+import { closeIdFor } from '../hooks/session-entries.mjs';
 
 function withTmpDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-close-receipt-'));
@@ -300,6 +303,11 @@ const WRITER_ENTRIES = [
   { path: 'projects/demo/index.md', kind: 'create', expected: { bytesSha256: 'c'.repeat(64) } },
   { path: 'log.md', kind: 'append', expected: { entryBlocks: ['## [2026-09-30] session\n'] } },
   { path: 'SCHEMA.md', kind: 'schema-pending', expected: { tags: ['new-tag'] } },
+  {
+    path: 'projects/demo/sessions/2026-09-30-s-1-0.md',
+    kind: 'local-create',
+    expected: { bytesSha256: 'd'.repeat(64) },
+  },
 ];
 
 function readWithEntries(dir, sessionId, entries) {
@@ -325,7 +333,7 @@ test('readReceiptStrict: an entry with a bad path, an unwritten kind, or an expe
   withTmpDir((dir) => {
     gitRepo(dir);
     commitAll(dir, 'init');
-    const [overwrite, create, append, pending] = WRITER_ENTRIES;
+    const [overwrite, create, append, pending, local] = WRITER_ENTRIES;
     const bad = {
       'empty path': { ...overwrite, path: '' },
       'non-string path': { ...overwrite, path: 7 },
@@ -345,6 +353,9 @@ test('readReceiptStrict: an entry with a bad path, an unwritten kind, or an expe
       'append with an empty block': { ...append, expected: { entryBlocks: [''] } },
       'schema-pending with no tags': { ...pending, expected: { tags: [] } },
       'schema-pending with a non-string tag': { ...pending, expected: { tags: [1] } },
+      // Proven by disk bytes only: a blob oid would name nothing a commit holds.
+      'local-create with nothing to compare': { ...local, expected: {} },
+      'local-create with only a blob oid': { ...local, expected: { blob: 'a'.repeat(40) } },
       'null entry': null,
     };
     for (const [label, entry] of Object.entries(bad)) {
@@ -884,5 +895,64 @@ test('closeCheckpointState: opts.marker replaces the marker read, so an expired 
     // Contrast: the default read expires (and unlinks) the same file.
     assert.equal(closeCheckpointState(dir, 'sess-cp-expired').state, 'open');
     assert.equal(existsSync(path), false);
+  });
+});
+
+suite('close-receipt.mjs, local-create: the entry of a .hypoignore project');
+
+// A `.hypoignore` project's entry never reaches a commit, so the close is proven by
+// its disk bytes against the close pin's local proof (X2): the session judgment, and
+// the receipt's local-create entry. Disabling the check (10): drop the ignored branch
+// of sessionCloseFileStatus's 'session' judgment so it asks HEAD: "complete" goes red.
+// Disabling (11): in that branch drop the `proof.entrySha256 !== fileSha256(...)` term:
+// "editing the bytes makes it incomplete" goes red. Disabling (11b): in
+// verifyEntriesInCommit's local-create branch drop the hash comparison: the
+// local-entry-mismatch assertion goes red.
+test('an ignored project close is proven by its local entry after the commit step cleared the journal, and editing the bytes undoes the proof (X2)', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = 's-receipt-local-x2';
+    const out = JSON.parse(
+      runApply(
+        dir,
+        {
+          project: 'test-project',
+          date: today,
+          summary: 'local close\n',
+          sessionLog: { entry: `## [${today}] local close\n` },
+        },
+        { sessionId: sid },
+      ).stdout,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(out.committed, true);
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
+    const closeId = closeIdFor(sid, 0);
+    const rel = `projects/test-project/sessions/${today}-${closeId}.md`;
+    assert.equal(
+      git(dir, ['ls-files', '--', rel]).stdout.trim(),
+      '',
+      'precondition: the entry is not in git',
+    );
+    const judge = () =>
+      sessionCloseFileStatus(dir, { scope: 'session', closeId, projectOverride: 'test-project' });
+    assert.equal(judge().ok, true, JSON.stringify(judge()));
+
+    const read = readReceiptStrict(dir, sid);
+    assert.equal(read.status, 'valid', JSON.stringify(read));
+    const entry = read.receipt.entries.find((e) => e.path === rel);
+    assert.equal(entry?.kind, 'local-create', JSON.stringify(read.receipt.entries));
+    assert.equal(
+      entry.expected.bytesSha256,
+      readClosePin(dir, sid).localProofs[closeId].entrySha256,
+    );
+    assert.equal(entry.expected.bytesSha256, hashOf(readFileSync(join(dir, rel))));
+
+    writeFileSync(join(dir, rel), `${readFileSync(join(dir, rel), 'utf-8')}edited\n`);
+    assert.equal(judge().ok, false, 'edited bytes no longer match the local proof');
+    assert.deepEqual(judge().stale, [rel]);
+    assert.deepEqual(verifyEntriesInCommit(dir, read.receipt.commit, [entry]).mismatches, [
+      { path: rel, reason: 'local-entry-mismatch' },
+    ]);
   });
 });

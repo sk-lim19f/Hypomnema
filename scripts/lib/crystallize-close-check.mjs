@@ -7,6 +7,7 @@ import {
 } from '../../hooks/hypo-shared.mjs';
 import { requireProjectDir, deriveTouchedProject } from './crystallize-close-gate.mjs';
 import { closeCheckpointState, isCloseComplete } from '../../hooks/close-receipt.mjs';
+import { closeGateStatus } from '../../hooks/close-gate-store.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
 // commands as `node <SELF_SCRIPT> ...` rather than a bare `crystallize` bin,
@@ -62,8 +63,21 @@ export function runSessionCloseCheck(args) {
   // The gate takes the marker only from a finished close, so a marker whose
   // receipt is missing or invalid cannot switch it into log-only mode.
   const gateMarker = checkpoint ? { closeMarker: closeComplete ? checkpoint.marker : null } : {};
+  // Which close id proves this session (the gate's cwd check reads it through
+  // sessionProofCloseId): is a close signal open now, and where was the last one
+  // resolved. Read once, for both gate calls below. Without a session id there
+  // is no pin to read and nothing open.
+  const closeGate = args.sessionId
+    ? closeGateStatus({
+        transcriptPath: checkTranscript,
+        hypoDir: args.hypoDir,
+        sessionId: args.sessionId,
+      })
+    : { ok: false, resolvedAtIndex: null };
+  const closeFacts = { closeOpen: closeGate.ok, resolvedAtIndex: closeGate.resolvedAtIndex };
   let status = precompactGateStatus(args.hypoDir, {
     ...gateMarker,
+    ...closeFacts,
     ...(args.project
       ? { projectOverride: args.project }
       : checkTranscript
@@ -96,6 +110,7 @@ export function runSessionCloseCheck(args) {
     if (inferredProject) {
       status = precompactGateStatus(args.hypoDir, {
         ...gateMarker,
+        ...closeFacts,
         projectOverride: inferredProject,
         ...(args.sessionId ? { sessionId: args.sessionId } : {}),
       });
@@ -200,10 +215,11 @@ export function runSessionCloseCheck(args) {
     `Close check (${scope === 'global' ? `project: ${proj}` : `scope: ${scope}, project: ${proj}`}, date: ${close.dates.join(' / ')}):\n`,
   );
 
+  // A close is proven by an entry under projects/<p>/sessions/, never by the
+  // generated hot.md / session-state.md views.
   const required = close.project
     ? [
-        `projects/${close.project}/session-state.md`,
-        `projects/${close.project}/hot.md`,
+        `projects/${close.project}/sessions/${close.dates[0]}-<close id>.md`,
         sessionLogShardPath(close.project, close.dates[0]),
         'log.md',
       ]

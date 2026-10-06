@@ -20,7 +20,7 @@ import {
   unlinkSync,
   linkSync,
 } from 'fs';
-import { join, relative, basename, dirname, isAbsolute, sep } from 'path';
+import { join, relative, basename, dirname, isAbsolute, sep, resolve as resolvePath } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { randomBytes, createHash } from 'crypto';
@@ -33,7 +33,10 @@ import {
   buildBaselineEntry,
   generatedViewSlug,
   isGeneratedViewPath,
+  isSessionEntryPath,
+  isSessionProjectDir,
   mergeAdditiveGitignore,
+  missingBlockLines,
   narrowestVisibilityScope,
   parseSessionEntry,
   scopeVisible,
@@ -1851,6 +1854,109 @@ export function vaultGitPrefix(hypoDir) {
   return r.status === 0 ? r.stdout.replace(/\r?\n$/, '') : '';
 }
 
+// ── session projects and migration state ─────────────────────────────────────
+// Defined here, not in session-views.mjs (which re-exports them), because the
+// close gate in this file needs them and session-views imports this file.
+
+/** Present in HEAD's tree when the vault was rolled back to the old flat files on purpose. */
+export const SESSION_ENTRIES_OFF_MARKER = '.hypo-session-entries-off';
+
+const statIs = (path, kind) => {
+  try {
+    return kind === 'dir' ? statSync(path).isDirectory() : statSync(path).isFile();
+  } catch {
+    return false;
+  }
+};
+
+/** Slugs of the `projects/` children that are session projects, in code-unit order. */
+export function listSessionProjects(hypoDir) {
+  let names;
+  try {
+    names = readdirSync(join(hypoDir, 'projects'));
+  } catch {
+    return [];
+  }
+  return names
+    .filter((slug) => {
+      const dir = join(hypoDir, 'projects', slug);
+      return (
+        statIs(dir, 'dir') &&
+        isSessionProjectDir({
+          slug,
+          hasIndex: statIs(join(dir, 'index.md'), 'file'),
+          hasSessions: statIs(join(dir, 'sessions'), 'dir'),
+        })
+      );
+    })
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/**
+ * The generated view paths git tracks. `source: 'index'` (default) is `git ls-files`, `'head'` is
+ * `git ls-tree -r HEAD`. Filtered by `isGeneratedViewPath`, never by a pathspec (`*` crosses `/`).
+ * Throws when git cannot answer: an empty list must always mean "nothing tracked".
+ */
+export function listTrackedGeneratedViews(hypoDir, { source = 'index' } = {}) {
+  if (source !== 'head' && source !== 'index') {
+    throw new Error(`listTrackedGeneratedViews: source must be 'head' or 'index', got ${source}`);
+  }
+  const args =
+    source === 'head' ? ['ls-tree', '-r', '-z', '--name-only', 'HEAD'] : ['ls-files', '-z'];
+  const r = vaultGit(hypoDir, args);
+  if (r.status !== 0) throw new Error(`git ${args[0]} failed: ${String(r.stderr).trim()}`);
+  return r.stdout.split('\0').filter((p) => isGeneratedViewPath(p));
+}
+
+// A `.git` in `dir` or a parent, a directory or the file a linked worktree or submodule has. Both
+// the path as given and its real path are walked: a vault reached through a symlink to a
+// subdirectory of a repository has its `.git` above the real path, not above the link.
+function hasGitEntry(dir) {
+  const starts = [resolvePath(dir)];
+  try {
+    starts.push(realpathSync(dir));
+  } catch {
+    // unresolvable: the path as given is all there is
+  }
+  for (const start of starts) {
+    for (let d = start; ; d = dirname(d)) {
+      if (existsSync(join(d, '.git'))) return true;
+      if (dirname(d) === d) break;
+    }
+  }
+  return false;
+}
+
+/**
+ * `'migrated' | 'not-migrated' | 'opted-out' | 'incomplete-block'`, read from HEAD's tree only (the real index is not
+ * consulted: a migration commit moves HEAD and the index together). The off marker in HEAD is
+ * `opted-out`; the `.gitignore` block in HEAD plus no tracked generated view in HEAD is
+ * `migrated`; a `.gitignore` in HEAD that has the block's first line but lacks one of its pattern
+ * lines is `incomplete-block` (a hand edit or a bad merge: nothing treats it as `migrated`, and
+ * migration waits for the user to restore it); anything else, including git failing to answer, is
+ * `not-migrated`. Only a vault with
+ * no `.git` entry in it or any parent (`hasGitEntry`) tracks nothing and counts as `migrated`: when
+ * git cannot say whether the directory is a work tree (not installed, dubious ownership, a timeout,
+ * a broken config) but the entry is there, the vault may well track views, so it is `not-migrated`.
+ */
+export function migrationState(hypoDir) {
+  if (vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status !== 0) {
+    return hasGitEntry(hypoDir) ? 'not-migrated' : 'migrated';
+  }
+  if (pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) return 'opted-out';
+  const shown = vaultGit(hypoDir, ['show', revPathArg('HEAD', '.gitignore')]);
+  const missing = shown.status === 0 ? missingBlockLines(shown.stdout, GITIGNORE_BLOCK) : null;
+  if (missing === null) return 'not-migrated';
+  if (missing.length) return 'incomplete-block';
+  try {
+    return listTrackedGeneratedViews(hypoDir, { source: 'head' }).length === 0
+      ? 'migrated'
+      : 'not-migrated';
+  } catch {
+    return 'not-migrated';
+  }
+}
+
 // Paths per git call in `localChangesOn`: a pathspec per path on the command line stays under the
 // argument-size limit of the platform however many paths a migration commit touches.
 const LOCAL_CHANGES_CHUNK = 500;
@@ -3564,85 +3670,59 @@ export function resolveActiveProject(hypoDir, cwd = null) {
   return null;
 }
 
-/**
- * Strict session-close verification (spec §5.2.7 / §8.3).
- * Confirms the memory files a session close must touch were updated today:
- *   - projects/<project>/session-state.md       — frontmatter `updated:` is today
- *   - projects/<project>/hot.md                 — frontmatter `updated:` is today
- *   - hot.md (root)                             — frontmatter `updated:` is today
- *   - projects/<project>/session-log/YYYY-MM-DD.md — has a `## [today]` heading
- *     (daily shard; legacy YYYY-MM.md is still accepted as fallback)
- *   - log.md                                    — has a `## [today] session | <project>` entry
- * The log.md check is project-scoped so a session close left incomplete for
- * project A can't be masked by a fresh close of project B (and vice versa).
- * open-questions.md (file #5) is conditional and not gated.
- *
- * `projectOverride` (same-date-tie fix): when the caller already holds the
- * authoritative project being closed (e.g. crystallize apply derives it from
- * `payload.project`), it passes that slug so verification checks the SAME
- * project it just wrote — instead of re-deriving via resolveActiveProject(),
- * which on a same-date root-hot.md tie can resolve a DIFFERENT project and
- * false-fail a completed close. When omitted, behavior is byte-identical to the
- * legacy single-arg version (resolve from root hot.md).
- *
- * @param {string} hypoDir
- * @param {{projectOverride?: string|null}} [opts]
- * @returns {{ok: boolean, project: string|null, dates: string[], stale: string[], missing: string[]}}
- */
-export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {}) {
-  const dates = freshDates();
-  const project = projectOverride || resolveActiveProject(hypoDir);
-  if (!project) {
-    return {
-      ok: false,
-      project: null,
-      dates,
-      stale: [],
-      missing: ['hot.md (no active project in pointer table)'],
-      sessionLogEvidence: null,
-    };
+// The session entries of `project` on disk whose file name starts with one of `dates`.
+function datedEntryPaths(hypoDir, project, dates) {
+  let names = [];
+  try {
+    names = readdirSync(join(hypoDir, 'projects', project, 'sessions'));
+  } catch {
+    return [];
   }
+  return names
+    .filter((n) => isSessionEntryPath(`projects/${project}/sessions/${n}`))
+    .filter((n) => dates.includes(n.slice(0, 10)) && n[10] === '-')
+    .sort()
+    .map((n) => `projects/${project}/sessions/${n}`);
+}
 
-  const stale = []; // exists but not updated this session
-  const missing = []; // file does not exist
+// The entry file of one close id in `project`, found by name on disk:
+// `<date>-<closeId>.md`, the date being whatever the close was first published with.
+function entryPathOfClose(hypoDir, project, closeId) {
+  let names = [];
+  try {
+    names = readdirSync(join(hypoDir, 'projects', project, 'sessions'));
+  } catch {
+    return null;
+  }
+  const name = names
+    .filter((n) => /^\d{4}-\d{2}-\d{2}-/.test(n) && n === `${n.slice(0, 10)}-${closeId}.md`)
+    .sort()[0];
+  return name ? `projects/${project}/sessions/${name}` : null;
+}
 
-  const checkUpdated = (relPath) => {
-    const full = join(hypoDir, relPath);
-    if (!existsSync(full)) {
-      missing.push(relPath);
-      return;
-    }
-    let content;
-    try {
-      content = readFileSync(full, 'utf-8');
-    } catch {
-      missing.push(relPath);
-      return;
-    }
-    if (!dates.includes(frontmatterUpdated(content))) stale.push(relPath);
-  };
+// sha256 of a file's raw bytes, null when it cannot be read.
+function fileSha256(absPath) {
+  try {
+    return createHash('sha256').update(readFileSync(absPath)).digest('hex');
+  } catch {
+    return null;
+  }
+}
 
-  checkUpdated(join('projects', project, 'session-state.md'));
-  checkUpdated(join('projects', project, 'hot.md'));
-  // Root hot.md is deliberately not checked here. Its `updated:` is a max
-  // across every project row (see formatRootHotProjection), not this project's
-  // own date, so a sibling project's later row would push the field past today
-  // and stale-flag a session that did everything right. The pointer table is a
-  // projection the hooks regenerate; it is not a file this close writes.
-  // Pinned by 'n1: root hot.md must not be reported stale by a sibling project
-  // whose row date is the max' in tests/session-hooks.test.mjs.
+// A close id is `<sessionId>-<openedAtIndex>` (closeIdFor), so the pin that holds its local proof
+// is the one of the session id in front of the last `-`.
+const sessionIdOfClose = (closeId) => closeId.replace(/-\d+$/, '');
 
-  // session-log: daily shard, with legacy monthly fallback: must
-  // carry a today-dated heading in whichever file holds it. Daily-first read
-  // order short-circuits on the small shard. When no match is found, the gap is
-  // reported under the canonical daily shard for the local date (dates[0]).
-  let sessionLogOk = false;
-  // The candidate that actually satisfied freshness, captured so a caller
-  // that must certify a SPECIFIC committed version (a close receipt) knows
-  // which of the (up to) four local/UTC × daily/monthly candidates is the
-  // one this check actually trusted, rather than re-deriving (and possibly
-  // picking a DIFFERENT one, since `closeFileTargetsForProject` recomputes
-  // both dates independently) which file to prove.
+// The session-log and log.md half of a close check, for one project and the dates its close
+// counts under. Pushes into `stale`/`missing` and returns the session-log file that carried the
+// heading (`{path, date}`), or null.
+function checkCloseLogs(hypoDir, project, dates, stale, missing) {
+  // session-log: daily shard, with legacy monthly fallback: must carry a heading for one of
+  // `dates` in whichever file holds it. Daily-first read order short-circuits on the small shard.
+  // When no match is found, the gap is reported under the canonical daily shard for dates[0].
+  // The candidate that actually satisfied the check is returned so a caller that must certify a
+  // SPECIFIC committed version (a close receipt) knows which of the (up to) four local/UTC ×
+  // daily/monthly candidates this check trusted, rather than re-deriving it.
   let sessionLogEvidence = null;
   for (const date of dates) {
     for (const rel of sessionLogReadCandidates(project, date)) {
@@ -3655,19 +3735,18 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
         continue;
       }
       if (hasSessionLogHeading(content, date)) {
-        sessionLogOk = true;
         sessionLogEvidence = { path: rel, date };
         break;
       }
     }
-    if (sessionLogOk) break;
+    if (sessionLogEvidence) break;
   }
-  if (!sessionLogOk) {
+  if (!sessionLogEvidence) {
     const logRel = sessionLogShardPath(project, dates[0]);
     (existsSync(join(hypoDir, logRel)) ? stale : missing).push(logRel);
   }
 
-  // log.md: must carry a today-dated `session` entry for the resolved project.
+  // log.md: must carry a `session` entry for the project on one of `dates`.
   const logFull = join(hypoDir, 'log.md');
   if (!existsSync(logFull)) {
     missing.push('log.md');
@@ -3681,6 +3760,120 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
     const logFresh = content && dates.some((d) => hasLogEntry(content, d, project));
     if (content && !logFresh) stale.push('log.md');
   }
+  return sessionLogEvidence;
+}
+
+/** Notice for a project whose session-log shows a close today but whose `sessions/` has no entry for it. */
+export const LEGACY_CLOSE_NOTICE_TYPE = 'close-legacy';
+
+/**
+ * Session-close verification (spec §5.2.7 / §8.3). A close writes one entry
+ * `projects/<p>/sessions/<date>-<closeId>.md`, a session-log heading and a
+ * log.md `## [<date>] session | <p>` line. The generated views (`hot.md`,
+ * `session-state.md`) are proof of nothing and are not read.
+ *
+ * `opts.scope` is required and picks what is proven:
+ *   'session'  THIS close, `opts.closeId` (the key is required, a null value is
+ *              "no close to prove" and reads as missing). Its entry must be in
+ *              HEAD's tree; for a `.hypoignore` project, which never commits
+ *              it, the entry's disk bytes must hash to the close pin's
+ *              `localProofs[closeId]` instead. The session-log and log.md lines
+ *              are looked up under the entry's own date, not today's, so a
+ *              close committed before midnight still proves itself after it.
+ *              Another close's entry, even one of the same session, proves nothing.
+ *   'global'   any close of the project today: an entry dated today on disk,
+ *              plus today's session-log heading and log.md line. A project with
+ *              today's heading and no entry dated today was closed by a writer
+ *              that predates entries (an older install, or by hand): that is
+ *              not a gap, and in a migrated vault it is reported as a
+ *              `close-legacy` notice.
+ * A missing or unknown scope throws: a call that forgot it must not fall back
+ * to the weaker global answer.
+ *
+ * `projectOverride`: the project to check; when omitted, the active project
+ * resolved from root hot.md (recency).
+ *
+ * @param {string} hypoDir
+ * @param {{scope: 'session'|'global', closeId?: string|null, projectOverride?: string|null}} opts
+ * @returns {{ok: boolean, project: string|null, dates: string[], stale: string[], missing: string[],
+ *   sessionLogEvidence: {path: string, date: string}|null, entry: string|null,
+ *   notices: {type: string, project: string, reason: string}[]}}
+ */
+export function sessionCloseFileStatus(hypoDir, opts) {
+  const scope = opts?.scope;
+  if (scope !== 'session' && scope !== 'global') {
+    throw new Error(`sessionCloseFileStatus: scope must be 'session' or 'global', got ${scope}`);
+  }
+  if (scope === 'session' && !('closeId' in opts)) {
+    throw new Error("sessionCloseFileStatus: scope 'session' requires a closeId key");
+  }
+  const project = opts.projectOverride || resolveActiveProject(hypoDir);
+  const notices = [];
+  if (!project) {
+    return {
+      ok: false,
+      project: null,
+      dates: freshDates(),
+      stale: [],
+      missing: ['hot.md (no active project in pointer table)'],
+      sessionLogEvidence: null,
+      entry: null,
+      notices,
+    };
+  }
+
+  const stale = []; // exists but does not prove the close
+  const missing = []; // does not exist
+  let dates = freshDates();
+  let entry = null;
+  let sessionLogEvidence = null;
+
+  if (scope === 'session') {
+    const closeId = opts.closeId;
+    entry = closeId ? entryPathOfClose(hypoDir, project, closeId) : null;
+    if (!entry) {
+      missing.push(
+        closeId
+          ? `projects/${project}/sessions/<date>-${closeId}.md`
+          : `projects/${project}/sessions/ (this session has no close entry to prove)`,
+      );
+    } else {
+      dates = [entry.split('/').pop().slice(0, 10)];
+      const ignorePatterns = loadHypoIgnore(hypoDir);
+      if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, entry), hypoDir, ignorePatterns)) {
+        const proof = readClosePin(hypoDir, sessionIdOfClose(closeId)).localProofs[closeId];
+        if (
+          !proof ||
+          proof.entryRelPath !== entry ||
+          proof.entrySha256 !== fileSha256(join(hypoDir, entry))
+        ) {
+          stale.push(entry);
+        }
+      } else if (!pathInHead(hypoDir, entry)) {
+        stale.push(entry);
+      }
+      sessionLogEvidence = checkCloseLogs(hypoDir, project, dates, stale, missing);
+    }
+  } else {
+    const todays = datedEntryPaths(hypoDir, project, dates);
+    entry = todays[0] ?? null;
+    sessionLogEvidence = checkCloseLogs(hypoDir, project, dates, stale, missing);
+    if (!entry) {
+      if (sessionLogEvidence) {
+        if (migrationState(hypoDir) === 'migrated') {
+          notices.push({
+            type: LEGACY_CLOSE_NOTICE_TYPE,
+            project,
+            reason:
+              `${project}: today's session-log has a close heading but projects/${project}/sessions/ ` +
+              `has no entry dated today. 구버전 Hypomnema나 손으로 쓴 close로 보입니다. 그 기계를 업그레이드하세요.`,
+          });
+        }
+      } else {
+        missing.push(`projects/${project}/sessions/${dates[0]}-<close id>.md`);
+      }
+    }
+  }
 
   return {
     ok: stale.length === 0 && missing.length === 0,
@@ -3689,6 +3882,8 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
     stale,
     missing,
     sessionLogEvidence,
+    entry,
+    notices,
   };
 }
 
@@ -3723,37 +3918,26 @@ function rootHotRows(hypoDir) {
   ].map((m) => ({ slug: m[3], date: m[2] || '' }));
 }
 
-// Candidate slugs the global gate must consider: real project dirs (with a
-// session-state.md, skip _template) ∪ slugs in a today-dated `## [today] session
-// | P` log.md entry ∪ slugs in a today-dated root hot.md row. The log/row unions
+// Candidate slugs the global gate must consider: the session projects
+// (listSessionProjects: a `projects/` child with an index.md or a sessions/
+// directory, never _template) ∪ slugs in a today-dated `## [today] session | P`
+// log.md entry ∪ slugs in a today-dated root hot.md row. The log/row unions
 // catch a dangling close whose own project files are missing —
-// sessionCloseFileStatus(projectOverride) reports those as `missing` correctly.
+// sessionCloseFileStatus reports those as `missing` correctly.
 function closeCandidateSlugs(hypoDir, dates) {
-  const slugs = new Set();
   const projectsDir = join(hypoDir, 'projects');
-  if (existsSync(projectsDir)) {
-    let entries = [];
-    try {
-      entries = readdirSync(projectsDir);
-    } catch {
-      // Swallowing this is the same shape as the fail-open hasTornCloseIntent
-      // was hardened out of (a judgment that could not be made reading as
-      // "nothing found"), and it is deliberate only because this is one of
-      // THREE unioned sources, not the whole answer: an unreadable projects/
-      // still leaves today's log.md entries and today's root hot.md rows to
-      // name the same slug. A close goes unnoticed only when all three miss it
-      // at once. Signalling the uncertainty instead would mean carrying a
-      // scanError out through sessionCloseGlobalStatus, whose result is read
-      // in five places, so it is a separate change rather than a line here.
-      // If you are adding a FOURTH source or removing one of the other two,
-      // this comment stops being true and the gate needs the scanError.
-      entries = [];
-    }
-    for (const p of entries) {
-      if (p === '_template') continue;
-      if (existsSync(join(projectsDir, p, 'session-state.md'))) slugs.add(p);
-    }
-  }
+  // An unreadable projects/ reads as no project here. Swallowing that is the
+  // same shape as the fail-open hasTornCloseIntent was hardened out of (a
+  // judgment that could not be made reading as "nothing found"), and it is
+  // deliberate only because this is one of THREE unioned sources, not the
+  // whole answer: an unreadable projects/ still leaves today's log.md entries
+  // and today's root hot.md rows to name the same slug. A close goes unnoticed
+  // only when all three miss it at once. Signalling the uncertainty instead
+  // would mean carrying a scanError out through sessionCloseGlobalStatus, whose
+  // result is read in five places, so it is a separate change rather than a
+  // line here. If you are adding a FOURTH source or removing one of the other
+  // two, this comment stops being true and the gate needs the scanError.
+  const slugs = new Set(listSessionProjects(hypoDir));
   for (const r of rootHotRows(hypoDir)) {
     if (r.date && dates.includes(r.date)) slugs.add(r.slug);
   }
@@ -3806,12 +3990,11 @@ function closeCandidateSlugs(hypoDir, dates) {
 // (Root hot.md *frontmatter* was already never a signal: it is shared, and it is
 // now the MAX row date across the projection, never today.)
 //
-// Tradeoff (documented, accepted): apply writes session-state.md FIRST, then the
-// project files, then the session-log + log entry. A process crash before the
-// session-log write leaves a torn close that this gate no longer flags. Accepted:
-// a torn close never reached apply's ok=true so it wrote no marker;
-// the surviving session-state is the resume pointer the next session overwrites;
-// what is lost is a narrative log entry, not continuity.
+// Tradeoff (documented, accepted): apply writes the session entry FIRST, then the
+// session-log + log entry. A process crash before the session-log write leaves a
+// torn close that this gate no longer flags. Accepted: a torn close never reached
+// apply's ok=true so it wrote no marker; the surviving entry is what the next
+// session reads; what is lost is a narrative log entry, not continuity.
 function hasTodayCloseActivity(hypoDir, project, dates) {
   for (const d of dates) {
     for (const rel of sessionLogReadCandidates(project, d)) {
@@ -3871,7 +4054,10 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // (`runMarkSessionClosed` and `runMarkerPhase`); the reader is
   // `markerCoversArtifact` in `scripts/doctor.mjs`.
   if (opts.projectOverride) {
-    const s = sessionCloseFileStatus(hypoDir, { projectOverride: opts.projectOverride });
+    const s = sessionCloseFileStatus(hypoDir, {
+      scope: 'global',
+      projectOverride: opts.projectOverride,
+    });
     return {
       ok: s.ok,
       projects: s.project
@@ -3883,6 +4069,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
       project: s.project,
       stale: s.stale,
       missing: s.missing,
+      notices: s.notices,
     };
   }
   const dates = freshDates();
@@ -3918,7 +4105,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // `verified_scope` names the recency project instead of the requested one is
   // unreachable, not merely fail-safe — do not write code defending that state.
   if (activeCandidates.length === 0) {
-    const legacy = sessionCloseFileStatus(hypoDir);
+    const legacy = sessionCloseFileStatus(hypoDir, { scope: 'global' });
     return {
       ok: legacy.ok,
       projects: legacy.project
@@ -3930,6 +4117,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
       project: legacy.project,
       stale: legacy.stale,
       missing: legacy.missing,
+      notices: legacy.notices,
     };
   }
 
@@ -3944,14 +4132,26 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   const primary = recency && todayActive.includes(recency) ? recency : todayActive[0];
   const ordered = [primary, ...todayActive.filter((p) => p !== primary)];
 
+  const notices = [];
   const projects = ordered.map((p) => {
-    const s = sessionCloseFileStatus(hypoDir, { projectOverride: p });
+    const s = sessionCloseFileStatus(hypoDir, { scope: 'global', projectOverride: p });
+    notices.push(...s.notices);
     return { project: p, ok: s.ok, stale: s.stale, missing: s.missing };
   });
   const ok = projects.every((x) => x.ok);
   const stale = [...new Set(projects.flatMap((x) => x.stale))];
   const missing = [...new Set(projects.flatMap((x) => x.missing))];
-  return { ok, projects, dates, fallback: false, primary, project: primary, stale, missing };
+  return {
+    ok,
+    projects,
+    dates,
+    fallback: false,
+    primary,
+    project: primary,
+    stale,
+    missing,
+    notices,
+  };
 }
 
 // ── derivable-artifact auto-derive: root log.md session entry ──────────────────
@@ -4304,7 +4504,7 @@ export function deriveRootLogEntries(hypoDir) {
   for (const slug of todayActive) {
     // Guard: only the log.md entry may be the gap; an otherwise-incomplete close
     // must keep blocking (do not mask missing authored files).
-    const st = sessionCloseFileStatus(hypoDir, { projectOverride: slug });
+    const st = sessionCloseFileStatus(hypoDir, { scope: 'global', projectOverride: slug });
     const problems = [...st.stale, ...st.missing];
     if (!(problems.length === 1 && problems[0] === 'log.md')) continue;
 
@@ -6135,7 +6335,7 @@ export function normalizeVerifiedScope(verifiedScope) {
 
 /**
  * Persist a per-session close proof. Caller MUST verify
- * `sessionCloseFileStatus(hypoDir).ok` before invoking — this helper does NOT
+ * `sessionCloseFileStatus(hypoDir, ...).ok` before invoking: this helper does NOT
  * re-check; that's the writer's contract (crystallize.mjs).
  *
  * Best-effort: stderr debug line on failure, no exception propagation.
@@ -6503,15 +6703,16 @@ export function extractTouchedWikiFiles(transcriptPath, hypoDir) {
  * path `crystallize.mjs --apply-session-close` writes these from inside a Bash
  * call, so they never surface as Edit/Write file_paths — they must seed the
  * scoped-lint set explicitly or a close-introduced error would escape the gate.
- * Mirrors the file list in sessionCloseFileStatus.
+ * Mirrors what sessionCloseFileStatus reads: today's session entries, the
+ * session-log evidence file, and the two root files.
  */
 export function closeFileTargets(hypoDir) {
   const out = new Set(['hot.md', 'log.md']);
   const project = resolveActiveProject(hypoDir);
   if (project) {
-    out.add(`projects/${project}/session-state.md`);
-    out.add(`projects/${project}/hot.md`);
-    out.add(sessionLogScopePath(hypoDir, project, freshDates()[0]));
+    const dates = freshDates();
+    for (const e of datedEntryPaths(hypoDir, project, dates)) out.add(e);
+    out.add(sessionLogScopePath(hypoDir, project, dates[0]));
   }
   return out;
 }
@@ -6524,16 +6725,15 @@ export function closeFileTargets(hypoDir) {
  * what sessionCloseFileStatus actually checks across a local/UTC date boundary.
  */
 // The lint-scope target set for ONE project's close: the shared root files
-// (hot.md / log.md) plus that project's mandatory close files — session-state,
-// project hot, and each fresh date's session-log evidence file. Used both by
+// (hot.md / log.md) plus that project's mandatory close files: today's session
+// entries and each fresh date's session-log evidence file. Used both by
 // `--check-session-close --project=<slug>` (a project-scoped diagnostic — see
 // precompactGateStatus opts.projectOverride) and as the per-project building
 // block of closeFileTargetsGlobal, so the two scopes stay identical per project.
 export function closeFileTargetsForProject(hypoDir, slug) {
   const dates = freshDates();
   const out = new Set(['hot.md', 'log.md']);
-  out.add(`projects/${slug}/session-state.md`);
-  out.add(`projects/${slug}/hot.md`);
+  for (const e of datedEntryPaths(hypoDir, slug, dates)) out.add(e);
   // Scope to the file each date's freshness is PROVEN by (daily shard or, via
   // fallback, the legacy monthly), so a corrupt evidence file can't pass the
   // gate while its lint error is demoted to an out-of-scope notice.
@@ -6612,14 +6812,16 @@ export function isUnderProjectDirs(file, slugs) {
 
 /**
  * The session-close FILES of some project, as a path matcher. Used to attribute a
- * close to a session: a transcript that edited `projects/<slug>/session-state.md`
- * (or that project's hot.md / a session-log shard) is evidence THIS session was
- * closing <slug>. Any other file under `projects/<slug>/` is NOT evidence — merely
+ * close to a session: a transcript that edited one of `projects/<slug>/`'s
+ * session-log shards is evidence THIS session was closing <slug>. The project's
+ * `hot.md` and `session-state.md` are generated views now, which a close never
+ * edits (close-guard refuses a Write/Edit there), so an edit to one is not a
+ * close signal. Any other file under `projects/<slug>/` is NOT evidence: merely
  * editing a page or an ADR there says nothing about whose close is whose, and
  * treating it as attribution would re-block a session for a project it only read
  * around in (codex design review).
  */
-const CLOSE_FILE_RE = /^projects\/([^/]+)\/(session-state\.md|hot\.md|session-log\/[^/]+\.md)$/;
+const CLOSE_FILE_RE = /^projects\/([^/]+)\/session-log\/[^/]+\.md$/;
 
 /** Slugs whose close files this session edited directly (Write/Edit tool_use). */
 function projectsFromTouchedCloseFiles(transcriptPath, hypoDir) {
@@ -6743,8 +6945,15 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * catching a session whose own project close was never started. Unmatched/ambiguous
  * cwd yields a best-effort notice, not a block. apply never passes it (its launch
  * cwd may differ from the authoritative payload.project).
+ * That check proves THIS session's close (sessionCloseFileStatus scope
+ * 'session'), so it needs the close id the session's close pin names, which
+ * depends on whether a new close signal is open: `opts.closeOpen`
+ * (`closeGateStatus(...).ok`) and `opts.resolvedAtIndex`
+ * (`closeGateStatus(...).resolvedAtIndex`). The caller computes both, the same
+ * way it injects `opts.closeMarker`: close-gate-store.mjs imports this module.
+ * A call that reaches the check without them throws (sessionProofCloseId).
  *
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[]}} [opts]
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[], closeOpen?: boolean, resolvedAtIndex?: number|null}} [opts]
  * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
@@ -6918,7 +7127,34 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             readTouchedPathsDrifted(hypoDir, opts.sessionId).map(posixPath),
           );
           const ignorePatterns = loadHypoIgnore(hypoDir);
+          // A session entry of a `.hypoignore` project is never committed by
+          // anything, so it is dirty for good and would refuse every close of
+          // that project. This session's own one is proven by its close pin's
+          // local proof instead (the receipt checks the same bytes); another
+          // session's is that session's to prove. Only an own entry whose bytes
+          // no longer match its proof still blocks, below.
+          const provenLocal = new Set(
+            Object.values(readClosePin(hypoDir, opts.sessionId).localProofs)
+              .filter((p) => fileSha256(join(hypoDir, p.entryRelPath)) === p.entrySha256)
+              .map((p) => posixPath(p.entryRelPath)),
+          );
           for (const f of dirty) {
+            const pf = posixPath(f);
+            if (
+              ignorePatterns.length > 0 &&
+              isSessionEntryPath(pf) &&
+              isIgnored(join(hypoDir, f), hypoDir, ignorePatterns) &&
+              (provenLocal.has(pf) || !touchedSet.has(pf))
+            ) {
+              notices.push({
+                type: 'local-entry',
+                file: f,
+                reason: provenLocal.has(pf)
+                  ? `${f} stays out of git (.hypoignore); this session's close pin proves its bytes`
+                  : `${f} stays out of git (.hypoignore) and belongs to another session's close`,
+              });
+              continue;
+            }
             if (touchedSet.has(posixPath(f))) {
               // A touched file .hypoignore keeps out of every commit stays
               // dirty forever on its own: say how to get out. A file whose
@@ -7103,6 +7339,8 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // partition still treats them as this session's, not foreign debt.
       mustEvaluate: attributedScope.direct,
     });
+    // A project that a pre-entry writer closed today: never a blocker, only said.
+    for (const n of close.notices || []) notices.push(n);
 
     // Attribute the close debt before blocking on it. An incomplete close belongs
     // to whichever session performed it; charging it to an unrelated session is the
@@ -7207,7 +7445,17 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       rejectAmbiguous: true,
     });
     if (cwdProject) {
-      const s = sessionCloseFileStatus(hypoDir, { projectOverride: cwdProject });
+      // THIS session's close, proven by its own close id: a fresh close of the
+      // same project by another session, or this session's earlier close while
+      // a new close request is open, does not count.
+      const s = sessionCloseFileStatus(hypoDir, {
+        scope: 'session',
+        closeId: sessionProofCloseId(hypoDir, opts.sessionId, {
+          closeOpen: opts.closeOpen,
+          resolvedAtIndex: opts.resolvedAtIndex,
+        }),
+        projectOverride: cwdProject,
+      });
       if (!s.ok) {
         // ALWAYS emit the typed close-cwd blocker when the cwd project's close is
         // incomplete — never suppress it as a duplicate of the global `close`

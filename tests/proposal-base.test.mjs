@@ -2269,51 +2269,76 @@ test('open-questions stale on disk → still passes (apply does not gate it)', (
   );
 });
 
-test('a stale session-state.md → exit 1, no auto-fix (advisor rule)', () => {
-  // A close writes none of the project's state files any more, so a state file that is stale
-  // stays stale and the final gate flags it: apply must NOT silently rewrite it.
+// session-state.md and the project hot.md are generated views of the entries: a close proves
+// itself by its entry, the session-log heading and the log.md line, and reads neither view.
+// So a stale view is no gap, and apply must not silently rewrite it either (advisor rule).
+// The pair that tells the two apart is the no-payload probe: the same probe finds the close
+// complete when only the views are stale, and refuses with "payload is required" when the
+// session-log is what is stale. That second half is what keeps "stale views pass" from being
+// a gate that passes everything.
+test('stale generated views → the close does not fail and apply does not rewrite them; a stale session-log still does', () => {
+  const staleViews = [
+    [
+      'session-state.md',
+      '---\ntitle: session-state\ntype: session-state\nupdated: 2020-01-01\n---\n\n## 다음 작업\n\n- next\n',
+    ],
+    ['hot.md', '---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n'],
+  ];
+  const writeStaleViews = (dir) => {
+    for (const [name, text] of staleViews) {
+      writeFileSync(join(dir, 'projects', 'test-project', name), text);
+    }
+  };
+  // views stale, close otherwise complete: the probe finds nothing to do
+  withWiki(writeStaleViews, (dir) => {
+    const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+    assert.equal(r.status, 0, `stale views must not make the close incomplete: ${r.stdout}`);
+    assert.equal(JSON.parse(r.stdout).alreadyComplete, true, r.stdout);
+  });
+  // views stale, a payload applied: ok, and the views are left exactly as they were
+  withWiki(writeStaleViews, (dir, today) => {
+    const r = runApply(dir, payloadForCleanWiki(dir, today));
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, r.stdout);
+    assert.deepEqual(out.verification.stale, [], JSON.stringify(out.verification));
+    for (const [name, text] of staleViews) {
+      assert.equal(
+        readFileSync(join(dir, 'projects', 'test-project', name), 'utf-8'),
+        text,
+        `${name} is left as it was`,
+      );
+    }
+  });
+  // the control: the session-log is stale instead, and the same probe refuses
   withWiki(
-    (dir) => {
+    (dir, today) => {
       writeFileSync(
-        join(dir, 'projects', 'test-project', 'session-state.md'),
-        '---\ntitle: session-state\ntype: session-state\nupdated: 2020-01-01\n---\n\n## 다음 작업\n\n- next\n',
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        '---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n',
       );
     },
-    (dir, today) => {
-      const r = runApply(dir, payloadForCleanWiki(dir, today));
-      assert.equal(
-        r.status,
-        1,
-        `a stale state file must fail the final gate, got status=${r.status}\n${r.stdout}`,
-      );
+    (dir) => {
+      const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json']);
+      assert.equal(r.status, 1, `a stale session-log must fail the probe: ${r.stdout}`);
       const out = JSON.parse(r.stdout);
       assert.equal(out.ok, false);
-      assert.ok(
-        out.verification.stale.includes('projects/test-project/session-state.md'),
-        `stale field should be flagged: ${JSON.stringify(out.verification)}`,
-      );
-      assert.ok(
-        readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8').includes(
-          'updated: 2020-01-01',
-        ),
-        'the stale file is left as it was',
-      );
+      assert.ok(/payload is required/.test(out.error), `refusal reason: ${out.error}`);
     },
   );
 });
 
 test('missing payload → exit 1 with clear error', () => {
-  // With fix #39 (option D) the probe early-exit only fires on a clean wiki.
-  // Mark the project hot.md stale so the gate fails → no early-exit →
-  // payload-required error is reachable as the original test intends. The ROOT
-  // hot.md used to carry this staleness; it stopped being a close-freshness
-  // target when it became a hook-generated projection, so backdating it no
-  // longer moves the gate at all.
+  // With fix #39 (option D) the probe early-exit only fires on a clean wiki. Backdate the
+  // project's session-log so there is no close today and the gate fails → no early-exit →
+  // the payload-required error is reachable as the original test intends. The generated
+  // views (the project hot.md, the root hot.md) are no close-freshness target, so backdating
+  // either of them no longer moves the gate at all.
   withWiki(
-    (dir) => {
+    (dir, today) => {
       writeFileSync(
-        join(dir, 'projects', 'test-project', 'hot.md'),
-        '---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n',
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        '---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n',
       );
     },
     (dir) => {

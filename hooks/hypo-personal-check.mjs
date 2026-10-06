@@ -36,6 +36,7 @@ import {
   resolveGateProjectOverride,
 } from './hypo-shared.mjs';
 import { closeCheckpointState, isCloseComplete } from './close-receipt.mjs';
+import { closeGateStatus } from './close-gate-store.mjs';
 
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
@@ -123,9 +124,15 @@ process.stdin.on('end', () => {
     // closeCheckpointState calls this session's close finished, the verdict
     // Stop uses too. A marker whose receipt is missing or invalid is ignored.
     const checkpoint = sessionId ? closeCheckpointState(HYPO_DIR, sessionId) : null;
+    // Is a close signal open now, and where was the last one resolved: which
+    // close id proves this session for the gate's cwd check. Injected, since
+    // close-gate-store.mjs imports hypo-shared.mjs.
+    const closeGate = closeGateStatus({ transcriptPath, hypoDir: HYPO_DIR, sessionId });
     gate = precompactGateStatus(HYPO_DIR, {
       transcriptPath,
       ...(sessionId ? { sessionId } : {}),
+      closeOpen: closeGate.ok,
+      resolvedAtIndex: closeGate.resolvedAtIndex,
       ...(checkpoint
         ? { closeMarker: isCloseComplete(checkpoint) ? checkpoint.marker : null }
         : {}),

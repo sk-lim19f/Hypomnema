@@ -52,7 +52,9 @@ import {
   rootHotProjectionIsCurrent,
   sessionCloseFileStatus,
   readTouchedPathsStrict,
+  writeClosePin,
 } from '../hooks/hypo-shared.mjs';
+import { closeIdFor, formatSessionEntry } from '../hooks/session-entries.mjs';
 import {
   snapshotBase,
   readBaseEntry,
@@ -4233,6 +4235,34 @@ test('checkpointMode omitted (Stop/PreCompact/check): the existing unscoped git 
   });
 });
 
+// A close of `sessionId` that committed its entry and stopped before its receipt:
+// the pin still holds it as pending, which is what `--mark-session-closed` proves
+// the session by. Only the entry is committed (`commit -- <path>`), so another
+// session's staged file stays staged. Duplicated from close-global.test.mjs and
+// crystallize-apply.test.mjs on purpose: it is a local fixture in each area.
+function pinCommittedClose(dir, sessionId, { project = 'test-project', date = todayLocal() } = {}) {
+  const closeId = closeIdFor(sessionId, 0);
+  const rel = `projects/${project}/sessions/${date}-${closeId}.md`;
+  mkdirSync(join(dir, 'projects', project, 'sessions'), { recursive: true });
+  writeFileSync(
+    join(dir, rel),
+    formatSessionEntry({ project, closeId, date, tracks: [], summary: 'fixture', bodies: {} }),
+  );
+  const git = (...a) =>
+    spawnSync('git', ['-C', dir, ...a], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+  git('add', '--', rel);
+  git('commit', '-q', '-m', `entry ${closeId}`, '--', rel);
+  writeClosePin(dir, sessionId, {
+    pending: { closeId, openedAtIndex: 0, entryRelPath: rel, entrySha256s: [] },
+    lastResolved: null,
+    localProofs: {},
+  });
+  return rel;
+}
+
 // Both marker-writing entry points (`--apply-session-close` and
 // `--mark-session-closed`) run the shared gate in checkpointMode, so a dirty
 // root file that belongs to ANOTHER session must not stop either one from
@@ -4271,6 +4301,8 @@ test("crystallize --apply-session-close and --mark-session-closed both issue a r
           );
           flags.push('--apply-session-close', `--payload=${payloadPath}`);
         } else {
+          // --mark proves this session by its own committed entry and pending pin
+          pinCommittedClose(dir, sid);
           flags.push('--mark-session-closed', '--project=test-project');
         }
         const r = run('crystallize.mjs', flags);
@@ -4364,6 +4396,8 @@ test("crystallize --apply-session-close and --mark-session-closed leave another 
           );
           flags.push('--apply-session-close', `--payload=${payloadPath}`);
         } else {
+          // --mark proves this session by its own committed entry and pending pin
+          pinCommittedClose(dir, sid);
           flags.push('--mark-session-closed', '--project=test-project');
         }
         const r = run('crystallize.mjs', flags);
@@ -6193,11 +6227,15 @@ test('n1: root hot.md must not be reported stale by a sibling project whose row 
     );
     writeFileSync(join(dir, 'log.md'), `## [${today}] session | active\n`);
 
-    const status = sessionCloseFileStatus(dir, { projectOverride: 'active' });
+    // 'global' is the any-close-of-today judgment this fixture models: today's session-log
+    // heading and log.md line, no entry file. The close as a whole must pass (ok), not just
+    // leave hot.md out of `stale`: a root hot.md at 2099 is no gap in any part of it.
+    const status = sessionCloseFileStatus(dir, { scope: 'global', projectOverride: 'active' });
     assert.ok(
-      !status.stale.includes('hot.md'),
+      !status.stale.includes('hot.md') && !status.missing.includes('hot.md'),
       `root hot.md must not go stale from a sibling project's row date: ${JSON.stringify(status)}`,
     );
+    assert.equal(status.ok, true, `the otherwise-complete close passes: ${JSON.stringify(status)}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

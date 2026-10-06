@@ -45,6 +45,7 @@ import {
   readClosePin,
   writeClosePin,
   normalizeClosePin,
+  sessionProofCloseId,
   pathInHead,
   revPathArg,
   recordTouchedPaths,
@@ -567,7 +568,8 @@ function obsoleteFieldNotices(payload) {
 // hashes the disk bytes for the proof entry. `null` on anything else (dirty,
 // untracked, unreadable, or not a git repo at all): the caller's contract is
 // to treat that as "this target is not provably closed", never as "clean".
-function markCloseWorktreeProofEntry(hypoDir, relPath) {
+// `kind` is 'overwrite' for the appended files and 'create' for a session entry.
+function markCloseWorktreeProofEntry(hypoDir, relPath, kind = 'overwrite') {
   const st = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '--', relPath], {
     encoding: 'utf-8',
   });
@@ -578,23 +580,48 @@ function markCloseWorktreeProofEntry(hypoDir, relPath) {
   } catch {
     return null;
   }
-  return { path: relPath, kind: 'overwrite', expected: { bytesSha256: bytesSha256(content) } };
+  return { path: relPath, kind, expected: { bytesSha256: bytesSha256(content) } };
 }
+
+// The proof entry of a `.hypoignore` project's session entry, which no commit
+// holds: its disk bytes. sessionCloseFileStatus has already matched them to the
+// close pin's local proof.
+function markCloseLocalProofEntry(hypoDir, relPath) {
+  let content;
+  try {
+    content = readFileSync(join(hypoDir, relPath));
+  } catch {
+    return null;
+  }
+  return { path: relPath, kind: 'local-create', expected: { bytesSha256: bytesSha256(content) } };
+}
+
+// What `--mark-session-closed` says when a new close signal is open and this
+// request has no entry yet: the earlier close of the session does not prove it.
+const CLOSE_AWAITING_APPLY =
+  '이 세션에 새 close 요청이 열려 있고 아직 이 요청의 원본이 없습니다. close payload로 apply를 먼저 실행하세요';
 
 /**
  * The certification proof for `--mark-session-closed`. `--log-only` needs
- * only `log.md` committed fresh; a project mark needs, for EVERY project in
- * `markerProjects`, session-state.md, hot.md, the exact session-log evidence
- * file `sessionCloseFileStatus` accepted for freshness (never a different
- * hybrid-cutover candidate), and log.md, all committed, not merely present.
- * A project whose status is not ok, or that has no session-log evidence file
- * to name, is incomplete: dropping the session-log target from the proof
- * would certify a close whose session-log was never checked. One incomplete
- * project withholds the WHOLE certification and names which project failed;
- * this never partially certifies.
+ * only `log.md` committed fresh. A project mark needs, for EVERY project in
+ * `markerProjects`, THIS session's close proven by `sessionCloseFileStatus`
+ * (scope 'session', `proof.closeId` from sessionProofCloseId): its entry
+ * committed (or, for a `.hypoignore` project, locally proven), plus the exact
+ * session-log evidence file that check accepted (never a different
+ * hybrid-cutover candidate) and log.md, both committed, not merely present.
+ * This function makes no judgment of its own: a project whose status is not
+ * ok, or that has no session-log evidence file to name, is incomplete. One
+ * incomplete project withholds the WHOLE certification and names which
+ * project failed; this never partially certifies.
+ * `proof` must carry the `closeId` key (null when there is no close to prove):
+ * sessionCloseFileStatus throws without it.
+ * @param {string} hypoDir
+ * @param {string[]} markerProjects
+ * @param {boolean} logOnly
+ * @param {{closeId?: string|null}} [proof]
  * @returns {{ok: boolean, entries: object[], incompleteProjects: string[]}}
  */
-export function buildMarkCloseProof(hypoDir, markerProjects, logOnly) {
+export function buildMarkCloseProof(hypoDir, markerProjects, logOnly, proof = {}) {
   if (logOnly) {
     const e = markCloseWorktreeProofEntry(hypoDir, 'log.md');
     return e
@@ -604,28 +631,26 @@ export function buildMarkCloseProof(hypoDir, markerProjects, logOnly) {
   const byPath = new Map();
   const incompleteProjects = [];
   for (const p of markerProjects) {
-    const status = sessionCloseFileStatus(hypoDir, { projectOverride: p });
+    const status = sessionCloseFileStatus(hypoDir, {
+      ...proof,
+      scope: 'session',
+      projectOverride: p,
+    });
     if (!status.ok || !status.sessionLogEvidence?.path) {
       incompleteProjects.push(p);
       continue;
     }
-    const targets = [
-      join('projects', p, 'session-state.md'),
-      join('projects', p, 'hot.md'),
-      status.sessionLogEvidence.path,
-      'log.md',
+    const ignorePatterns = loadHypoIgnore(hypoDir);
+    const local =
+      ignorePatterns.length > 0 && isIgnored(join(hypoDir, status.entry), hypoDir, ignorePatterns);
+    const projectEntries = [
+      local
+        ? markCloseLocalProofEntry(hypoDir, status.entry)
+        : markCloseWorktreeProofEntry(hypoDir, status.entry, 'create'),
+      markCloseWorktreeProofEntry(hypoDir, status.sessionLogEvidence.path),
+      markCloseWorktreeProofEntry(hypoDir, 'log.md'),
     ];
-    const projectEntries = [];
-    let projectOk = true;
-    for (const t of targets) {
-      const e = markCloseWorktreeProofEntry(hypoDir, t);
-      if (!e) {
-        projectOk = false;
-        break;
-      }
-      projectEntries.push(e);
-    }
-    if (!projectOk) {
+    if (projectEntries.some((e) => !e)) {
       incompleteProjects.push(p);
       continue;
     }
@@ -873,6 +898,17 @@ export function runMarkSessionClosed(args) {
     );
     process.exit(1);
   }
+  // Whether a close signal is open now and where the last one was resolved: the
+  // two facts that pick which close id proves this session (sessionProofCloseId),
+  // for the gate's cwd check below and for the proof this mark certifies. Read
+  // once. With no transcript there is no open signal to find.
+  const closeGate = closeGateStatus({
+    transcriptPath: closeTranscript ?? null,
+    hypoDir: args.hypoDir,
+    sessionId: args.sessionId,
+  });
+  const closeOpen = closeGate.ok;
+  const resolvedAtIndex = closeGate.resolvedAtIndex;
   const gate = precompactGateStatus(args.hypoDir, {
     ...(args.project && !args.logOnly ? { closeScope: [args.project] } : {}),
     ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
@@ -886,6 +922,8 @@ export function runMarkSessionClosed(args) {
     // site's identical comment).
     checkpointMode: true,
     sessionId: args.sessionId,
+    closeOpen,
+    resolvedAtIndex,
   });
   const status = gate.close;
   if (!gate.ok) {
@@ -923,13 +961,7 @@ export function runMarkSessionClosed(args) {
   // "runMarkSessionClosed stays on isCloseGateOpen" contract, and this result
   // is only ever read for its two strings. `null` when there is no transcript
   // to read either from.
-  const gateStatus = closeTranscript
-    ? closeGateStatus({
-        transcriptPath: closeTranscript,
-        hypoDir: args.hypoDir,
-        sessionId: args.sessionId,
-      })
-    : null;
+  const gateStatus = closeTranscript ? closeGate : null;
   // This path writes one thing, the marker, and makes no commit, so the undo
   // it offers is the marker alone. A revert instruction here would point at
   // something this run never created. No 5th argument: kind 'marker-only'
@@ -1034,9 +1066,18 @@ export function runMarkSessionClosed(args) {
   let receiptResult;
   try {
     receiptResult = withFileLock(vaultCommitLockTarget(args.hypoDir), () => {
-      const proof = buildMarkCloseProof(args.hypoDir, markerProjects, args.logOnly);
+      const closeId = args.logOnly
+        ? null
+        : sessionProofCloseId(args.hypoDir, args.sessionId, { closeOpen, resolvedAtIndex });
+      const proof = buildMarkCloseProof(args.hypoDir, markerProjects, args.logOnly, { closeId });
       if (!proof.ok)
-        return { ok: false, reason: 'incomplete', incompleteProjects: proof.incompleteProjects };
+        return {
+          ok: false,
+          reason: 'incomplete',
+          incompleteProjects: proof.incompleteProjects,
+          // A new close request with no entry yet: the earlier close cannot vouch for it.
+          ...(!args.logOnly && closeId === null && closeOpen ? { awaitingApply: true } : {}),
+        };
       const head = readHeadShaLocked(args.hypoDir);
       const repo = head ? repoIdentity(args.hypoDir) : null;
       if (!head || !repo) return { ok: false, reason: 'no-commit-identity' };
@@ -1093,7 +1134,9 @@ export function runMarkSessionClosed(args) {
   if (!receiptResult.ok) {
     const detail =
       receiptResult.reason === 'incomplete'
-        ? `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')} (session-state.md, hot.md, the session-log evidence file, and log.md must all be committed, not merely present)`
+        ? receiptResult.awaitingApply
+          ? `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')}. ${CLOSE_AWAITING_APPLY}`
+          : `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')} (this session's close entry, the session-log evidence file, and log.md must all be committed, not merely present)`
         : receiptResult.reason === 'mismatch'
           ? `proof mismatch: ${JSON.stringify(receiptResult.mismatches)}`
           : receiptResult.reason === 'write-failed'
@@ -1565,7 +1608,16 @@ function refuseUnlessCloseRequested(args) {
       process.exit(1);
     }
   }
-  return { hostTagWarning: closeAuth.hostTagWarning || null, closeId };
+  return {
+    hostTagWarning: closeAuth.hostTagWarning || null,
+    closeId,
+    // The authority check's own closeGateStatus read: a signal is open (it
+    // passed), and where the last one was resolved. Nothing records a
+    // resolution before this close's marker lands, so both still hold at the
+    // marker phase's gate.
+    closeOpen: closeAuth.ok === true,
+    resolvedAtIndex: closeAuth.resolvedAtIndex ?? null,
+  };
 }
 
 // Read the payload, check its shape, and bind it to THIS session. Exits 1 on any
@@ -1676,7 +1728,7 @@ function resolveCloseProject(args, payload) {
   // Resolved BEFORE preflight because preflight needs overwrite-target paths
   // (which require the project slug) to filter out errors in files this apply
   // is about to replace — see the filter rationale below.
-  const probe = sessionCloseFileStatus(args.hypoDir);
+  const probe = sessionCloseFileStatus(args.hypoDir, { scope: 'global' });
   // The freshness verification below (and at the post-apply check) already honors
   // payload.project — `project` wins over the inferred active project, and the
   // post-apply sessionCloseFileStatus call passes it as projectOverride. But when the
@@ -3732,6 +3784,9 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     proofEntries = [],
     attemptId = null,
     testHooks = null,
+    verify,
+    closeOpen = false,
+    resolvedAtIndex = null,
   } = receiptCtx;
   let markerWritten = false;
   let markerSkipReason = null;
@@ -3746,6 +3801,12 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
   // What the gate refused on, so a compact-gate-not-ok result names its own
   // blockers instead of sending the caller to a different, wider check.
   let gateBlockers = [];
+  // The post-apply verification (verify(): this close, by its close id). Its
+  // entry must be in HEAD, so it is read after the commit step. It decides
+  // the close only when that commit landed: a commit that failed or never ran
+  // already explains a missing entry, and keeps its own outcome.
+  let verification = null;
+  let verificationCounts = false;
   if (ok && args.sessionId) {
     // IO stays lazy so this preserves the exact side-effect order (codex design
     // review): commit first (the only mutation), then resolve the
@@ -3796,6 +3857,8 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     // failed leaves the journal in place on purpose: that is exactly the
     // case the next retry needs it for.
     if (commitOutcome.committed) clearJournal(args.hypoDir, args.sessionId);
+    verification = verify();
+    verificationCounts = commitOutcome.committed === true;
     let closeTranscript = null;
     let gateOk = false;
     // verified_scope evidence (session-close-scope-boundary spec §3, revised
@@ -3805,7 +3868,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     // 'global' scope to "field absent" rather than persist a false claim.
     let gateEvaluatedProjects = [];
     let gateSkipped = { lint: false, feedback: false };
-    if (commitOutcome.committed) {
+    if (commitOutcome.committed && verification.ok) {
       closeTranscript = resolveTranscriptBySessionId(args.sessionId);
       // closeScope: apply KNOWS which project it just closed, and it wrote
       // that project's files from inside this process, they never appear in the
@@ -3836,6 +3899,8 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
         // (close files, cwd, hot, lint, W8, feedback) is unchanged.
         checkpointMode: true,
         sessionId: args.sessionId,
+        closeOpen,
+        resolvedAtIndex,
       });
       gateOk = gateStatus.ok;
       gateNotices = gateStatus.notices || [];
@@ -3850,7 +3915,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
         .filter(Boolean);
     }
     const decision = planMarkerDecision({
-      ok,
+      ok: ok && (!verificationCounts || verification.ok),
       hasSessionId: true,
       committed: commitOutcome.committed,
       commitReason: commitOutcome.reason,
@@ -4050,6 +4115,8 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     gateNotices,
     gateBlockers,
     receiptMismatches,
+    verification: verification ?? verify(),
+    verificationCounts,
   };
 }
 
@@ -4057,16 +4124,16 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
 // a tree this apply declined to finish writing, so naming them would point the
 // reader at the wrong repair. A proposal-STORE failure outranks even that: the
 // withheld bytes never reached an artifact, so it is the most urgent repair.
-function resolveCloseStage({ ok, proposalStoreFailed, conflicts, verification, postLintOk }) {
+function resolveCloseStage({ ok, proposalStoreFailed, conflicts, verificationOk, postLintOk }) {
   return ok
     ? null
     : proposalStoreFailed
       ? 'proposal-store-failed'
       : conflicts.length > 0
         ? 'proposal-pending'
-        : !verification.ok && !postLintOk
+        : !verificationOk && !postLintOk
           ? 'post-apply-verification+lint'
-          : !verification.ok
+          : !verificationOk
             ? 'post-apply-verification'
             : 'post-apply-lint';
 }
@@ -4277,6 +4344,7 @@ function printCloseReport({
   markerSkipReason,
   markerGateReason,
   verification,
+  verificationOk,
   postLintOk,
   postBlocking,
   closeScopeNotice,
@@ -4472,13 +4540,15 @@ function printCloseReport({
     );
   }
   if (!ok) {
-    if (!verification.ok) {
+    if (!verificationOk) {
       const bad = [
         ...verification.missing.map((f) => `${f} (missing)`),
         ...verification.stale.map((f) => `${f} (stale)`),
       ].join(', ');
       console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
-      console.log('  Fix the payload (likely an `updated:` field) and retry.');
+      console.log(
+        "  This close's entry, its session-log heading and its log.md line must all be in place, the entry committed. Check them and retry.",
+      );
     }
     if (!postLintOk) {
       console.log('\n✗ post-apply lint failed:');
@@ -4562,7 +4632,7 @@ export function applySessionClose(args, testHooks = null) {
     // "payload is required" with the same error shape as before.
   }
 
-  const { hostTagWarning, closeId } = refuseUnlessCloseRequested(args);
+  const { hostTagWarning, closeId, closeOpen, resolvedAtIndex } = refuseUnlessCloseRequested(args);
   const { payload, legacyFormat } = loadValidatedPayload(args);
   // Computed off the payload as read, before any write phase can consume it.
   const obsoleteNotices = obsoleteFieldNotices(payload);
@@ -4718,26 +4788,19 @@ export function applySessionClose(args, testHooks = null) {
   // already counts unreadable files keeps counting the same set.
   const parkedOrphanTmp = proposalInventory.orphanTmp || [];
 
-  // Same-date-tie fix: verify against the SAME project this apply just wrote
-  // (`project` = payload.project || probe.project, resolved at the top). Without
-  // the override, sessionCloseFileStatus re-derives via resolveActiveProject and,
-  // on a same-date root-hot.md tie, can pick a different project — false-failing
-  // a completed close (the 2026-06-09 security-ops-kb incident).
-  const verification = sessionCloseFileStatus(args.hypoDir, { projectOverride: project });
-
   const { postApplyLint, postBlocking, postNotice, postLintOk, w19Notice } = runPostApplyLint(
     args,
     payloadScope,
   );
 
-  // `let` (not const): the close-result invariant self-check below may flip this
-  // to false when the settled close result is internally contradictory.
+  // What decides the commit. The post-apply verification joins it once the
+  // commit has landed (runMarkerPhase, below).
   //
   // A withheld conflict target must fail the close on its own, not merely via the
   // freshness gate. If the other session already touched that page TODAY, freshness
   // sees a fresh file and passes — and the close would report ok:true, write the
   // marker, and drop this session's payload silently. `conflicts` closes that hole.
-  let ok = verification.ok && postLintOk && conflicts.length === 0;
+  const preCommitOk = postLintOk && conflicts.length === 0;
 
   // Scope the non-blocking notice to the close-target project: debt under
   // projects/<project>/ stays listed; debt elsewhere folds to a count so the
@@ -4753,13 +4816,26 @@ export function applySessionClose(args, testHooks = null) {
     gateNotices,
     gateBlockers,
     receiptMismatches,
-  } = runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, {
+    verification,
+    verificationCounts,
+  } = runMarkerPhase(args, project, appliedPaths, preCommitOk, hostTagWarning, {
     preflightLint,
     hasConflicts: conflicts.length > 0,
     proofEntries,
     attemptId: intentResult.attemptId,
     testHooks,
+    // This close, by its pinned close id, in the project the payload named (the
+    // same-date-tie fix: never re-derived from root hot.md, which on a tie can
+    // name another project and false-fail a completed close).
+    verify: () =>
+      sessionCloseFileStatus(args.hypoDir, { scope: 'session', closeId, projectOverride: project }),
+    closeOpen,
+    resolvedAtIndex,
   });
+  const verificationOk = !verificationCounts || verification.ok;
+  // `let` (not const): the close-result invariant self-check below may flip this
+  // to false when the settled close result is internally contradictory.
+  let ok = preCommitOk && verificationOk;
   // Only a landed commit retires the close-intent record. Everything before
   // this point (the appends, a withheld conflict, a lint or commit failure)
   // leaves it in place: see closeIntentPath's doc comment for why an ok:false
@@ -4784,7 +4860,13 @@ export function applySessionClose(args, testHooks = null) {
     commitShaForUndo(commitOutcome),
   );
 
-  let stage = resolveCloseStage({ ok, proposalStoreFailed, conflicts, verification, postLintOk });
+  let stage = resolveCloseStage({
+    ok,
+    proposalStoreFailed,
+    conflicts,
+    verificationOk,
+    postLintOk,
+  });
   // Runtime close-result invariant self-check. When a
   // marker-write path (args.sessionId present) settles into an internally
   // contradictory shape — ok:true with the marker silently withheld and no
@@ -4869,6 +4951,7 @@ export function applySessionClose(args, testHooks = null) {
       markerSkipReason,
       markerGateReason,
       verification,
+      verificationOk,
       postLintOk,
       postBlocking,
       closeScopeNotice,

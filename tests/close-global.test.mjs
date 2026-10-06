@@ -40,6 +40,10 @@ import {
   rootLogHeadingKey,
   sessionClosedMarkerPath,
   vaultCommitLockTarget,
+  writeClosePin,
+  readClosePin,
+  sessionCloseFileStatus,
+  sessionProofCloseId,
 } from '../hooks/hypo-shared.mjs';
 import {
   RECEIPT_SCHEMA_VERSION,
@@ -50,6 +54,9 @@ import {
   verifyEntriesInCommit,
 } from '../hooks/close-receipt.mjs';
 import { createProject } from '../scripts/lib/project-create.mjs';
+import { GITIGNORE_BLOCK, closeIdFor, formatSessionEntry } from '../hooks/session-entries.mjs';
+import { closeGateStatus } from '../hooks/close-gate-store.mjs';
+import { buildMarkCloseProof } from '../scripts/lib/crystallize-close-apply.mjs';
 import { test, suite } from './harness.mjs';
 import {
   CLOSE_RECONFIRM_MARK,
@@ -72,6 +79,7 @@ import {
   precompactGateStatus,
   resolveGateProjectOverride,
   run,
+  runApply,
   runHook,
   runStop,
   runWithHome,
@@ -85,6 +93,46 @@ import {
   withWiki,
   writeSessionClosedMarker,
 } from './helpers.mjs';
+
+// A session entry of `slug` dated `date` at `projects/<slug>/sessions/`, as a close
+// writes it. Not committed: the global judgment reads the disk.
+function writeDatedEntry(dir, slug, date, closeId = 's-fixture-0') {
+  const rel = `projects/${slug}/sessions/${date}-${closeId}.md`;
+  mkdirSync(join(dir, 'projects', slug, 'sessions'), { recursive: true });
+  writeFileSync(
+    join(dir, rel),
+    formatSessionEntry({
+      project: slug,
+      closeId,
+      date,
+      tracks: [],
+      summary: 'fixture',
+      bodies: {},
+    }),
+  );
+  return rel;
+}
+
+// A close of `sessionId` that committed its entry and stopped before its receipt:
+// the pin still holds it as pending, which is what `--mark-session-closed` proves
+// the session by while its close signal is open. Only the entry is committed.
+function pinCommittedClose(dir, sessionId, { project = 'test-project', date = todayLocal() } = {}) {
+  const closeId = closeIdFor(sessionId, 0);
+  const rel = writeDatedEntry(dir, project, date, closeId);
+  const git = (...a) =>
+    spawnSync('git', ['-C', dir, ...a], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+  git('add', '--', rel);
+  git('commit', '-q', '-m', `entry ${closeId}`, '--', rel);
+  writeClosePin(dir, sessionId, {
+    pending: { closeId, openedAtIndex: 0, entryRelPath: rel, entrySha256s: [] },
+    lastResolved: null,
+    localProofs: {},
+  });
+  return rel;
+}
 
 // ── sessionCloseGlobalStatus — global close invariant (ADR 0043) ──────────────
 suite('sessionCloseGlobalStatus — global close invariant (ADR 0043)');
@@ -115,7 +163,8 @@ test('no-payload incident form: fully-closed B passes even though stale A is the
 test('masking guard: a DIFFERENT project with a partial close still blocks (no single-pick mask)', () => {
   withTmpDir((dir) => {
     const today = todayLocal();
-    // alpha fully closed; beta has a today log.md entry (activity) but stale own files.
+    // alpha fully closed; beta has a today log.md entry (activity) but no session-log
+    // heading and no entry for today.
     makeMultiProjectWiki(dir, today, [
       { slug: 'alpha', date: today },
       {
@@ -131,8 +180,9 @@ test('masking guard: a DIFFERENT project with a partial close still blocks (no s
     const beta = s.projects.find((p) => p.project === 'beta');
     assert.ok(beta && !beta.ok, 'beta reported incomplete');
     assert.ok(
-      s.stale.some((f) => f.includes('projects/beta/')),
-      `block names beta's stale files: ${JSON.stringify(s.stale)}`,
+      s.missing.some((f) => f.startsWith('projects/beta/sessions/')) &&
+        s.missing.some((f) => f.startsWith('projects/beta/session-log/')),
+      `block names beta's missing entry and session-log: ${JSON.stringify(s.missing)}`,
     );
   });
 });
@@ -160,20 +210,23 @@ test('multi today-active: both complete → ok; one partial → block only the p
     ]);
     assert.equal(sessionCloseGlobalStatus(dir).ok, true, 'both complete → ok');
 
-    // now break beta's session-state
+    // now break beta's session-log: its log.md line keeps it today-active
     writeFileSync(
-      join(dir, 'projects', 'beta', 'session-state.md'),
-      `---\ntitle: ss\ntype: session-state\nupdated: 2020-01-01\n---\n\n## next\n`,
+      join(dir, 'projects', 'beta', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] session\n`,
     );
     const s = sessionCloseGlobalStatus(dir);
     assert.equal(s.ok, false, 'beta now incomplete → block');
     assert.ok(s.projects.find((p) => p.project === 'alpha').ok, 'alpha still ok');
     assert.ok(!s.projects.find((p) => p.project === 'beta').ok, 'beta blocked');
     assert.ok(
-      s.stale.some((f) => f === 'projects/beta/session-state.md'),
-      'names beta session-state',
+      s.missing.some((f) => f.startsWith('projects/beta/session-log/')),
+      `names beta session-log: ${JSON.stringify(s.missing)}`,
     );
-    assert.ok(!s.stale.some((f) => f.startsWith('projects/alpha/')), 'does not flag alpha files');
+    assert.ok(
+      !s.missing.concat(s.stale).some((f) => f.startsWith('projects/alpha/')),
+      'does not flag alpha files',
+    );
   });
 });
 
@@ -197,10 +250,10 @@ test('project-dir-only candidate is gated (readdirSync leg) — guards the swall
     // alpha is fully closed and visible via root hot.md row + log.md entry.
     // gamma's only authoritative today signal is its own session-log heading
     // (ADR 0057); it is absent from both the root hot.md rows and log.md, so ONLY
-    // the project-dirs leg (readdirSync over projects/* for session-state.md) can
-    // surface it as a candidate. If that leg silently drops (e.g. an unimported
-    // readdirSync swallowed by the try/catch), gamma's dangling close is missed
-    // and the gate false-passes. (session-state exists but is stale — it is the
+    // the project-dirs leg (listSessionProjects: projects/* with an index.md or a
+    // sessions/ directory) can surface it as a candidate. If that leg silently
+    // drops (e.g. an unimported readdirSync swallowed by the try/catch), gamma's
+    // dangling close is missed and the gate false-passes. (index.md is the
     // discovery handle, not the activity signal.)
     makeMultiProjectWiki(dir, today, [
       { slug: 'alpha', date: today },
@@ -213,6 +266,10 @@ test('project-dir-only candidate is gated (readdirSync leg) — guards the swall
         projectHot: '2020-01-01',
       },
     ]);
+    writeFileSync(
+      join(dir, 'projects', 'gamma', 'index.md'),
+      '---\ntitle: gamma\ntype: project-index\nupdated: 2020-01-01\n---\n# gamma\n',
+    );
     const s = sessionCloseGlobalStatus(dir);
     assert.ok(
       s.projects.some((p) => p.project === 'gamma'),
@@ -320,11 +377,17 @@ test('closeFileTargetsGlobal: union over today-active projects, all freshDate mo
       { slug: 'alpha', date: today },
       { slug: 'beta', date: today },
     ]);
+    const entries = {
+      alpha: writeDatedEntry(dir, 'alpha', today),
+      beta: writeDatedEntry(dir, 'beta', today),
+    };
     const t = closeFileTargetsGlobal(dir);
     assert.ok(t.has('hot.md') && t.has('log.md'), 'root files always in scope');
     for (const p of ['alpha', 'beta']) {
-      assert.ok(t.has(`projects/${p}/session-state.md`), `${p} session-state in scope`);
-      assert.ok(t.has(`projects/${p}/hot.md`), `${p} hot in scope`);
+      assert.ok(t.has(entries[p]), `${p} entry of today in scope`);
+      // The generated views are proof of nothing, so they are not close targets.
+      assert.ok(!t.has(`projects/${p}/session-state.md`), `${p} session-state out of scope`);
+      assert.ok(!t.has(`projects/${p}/hot.md`), `${p} hot out of scope`);
       assert.ok(
         [...t].some((f) => new RegExp(`^projects/${p}/session-log/`).test(f)),
         `${p} session-log in scope`,
@@ -393,10 +456,10 @@ suite('--project=<slug> override (B-3 T2: scoped check + global-gate mark attrib
 test('sessionCloseGlobalStatus(projectOverride): scoped-green while global is red', () => {
   withTmpDir((dir) => {
     const today = todayLocal();
-    // alpha fully closed today; beta today-active but with a dangling session-state.
+    // alpha fully closed today; beta today-active (session-log heading) with no log.md line.
     makeMultiProjectWiki(dir, today, [
       { slug: 'alpha', date: today },
-      { slug: 'beta', date: today, sessionState: '2020-01-01' },
+      { slug: 'beta', date: today, logEntry: '2020-01-01' },
     ]);
     assert.equal(sessionCloseGlobalStatus(dir).ok, false, 'global blocks on beta');
     const a = sessionCloseGlobalStatus(dir, { projectOverride: 'alpha' });
@@ -437,12 +500,11 @@ test('closeFileTargetsForProject: root baseline + that project only', () => {
       { slug: 'alpha', date: today },
       { slug: 'beta', date: today },
     ]);
+    const alphaEntry = writeDatedEntry(dir, 'alpha', today);
+    writeDatedEntry(dir, 'beta', today);
     const t = closeFileTargetsForProject(dir, 'alpha');
     assert.ok(t.has('hot.md') && t.has('log.md'), 'root files in scope');
-    assert.ok(
-      t.has('projects/alpha/session-state.md') && t.has('projects/alpha/hot.md'),
-      'alpha files in scope',
-    );
+    assert.ok(t.has(alphaEntry), 'alpha entry in scope');
     assert.ok(
       [...t].some((f) => /^projects\/alpha\/session-log\//.test(f)),
       'alpha session-log in scope',
@@ -462,7 +524,7 @@ test('closeFileTargetsGlobal: no today-active project → recency-fallback files
     const scope = closeFileTargetsGlobal(dir);
     assert.ok(scope.has('hot.md') && scope.has('log.md'), 'root baseline present');
     assert.ok(
-      scope.has('projects/alpha/session-state.md') && scope.has('projects/alpha/hot.md'),
+      [...scope].some((f) => /^projects\/alpha\/session-log\//.test(f)),
       `recency fallback must keep alpha's files in scope, got ${JSON.stringify([...scope])}`,
     );
   });
@@ -697,6 +759,7 @@ test('--mark-session-closed --project=<absent> → exit 1 before the gate (exist
 test('--mark-session-closed --project=<real>: global gate passes + marker attributed to the slug', () => {
   withCleanWiki((dir) => {
     const cleanup = seedCloseTranscript('s-attr');
+    pinCommittedClose(dir, 's-attr');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -817,18 +880,33 @@ test('is idempotent — a second run appends nothing', () => {
   });
 });
 
-test('guard: does NOT derive when the authored close is otherwise incomplete', () => {
+// The guard's other half (a gap besides log.md) is the session-log heading, pinned
+// by the next test. A stale generated view is no gap at all: session-state.md and
+// hot.md prove nothing about a close, so they cannot hold back the derive. This
+// distinguishes the close files a gate reads from the views it no longer reads.
+test('guard: a stale generated view is not an authored-close gap, so log.md is still derived', () => {
   withTmpDir((dir) => {
     const today = todayLocal();
-    // beta is today-active (fresh session-log heading) but session-state is stale
-    // AND log.md missing → incomplete authored close, must keep blocking.
+    // beta is today-active (fresh session-log heading), its session-state.md and
+    // hot.md are stale, and log.md is missing its line.
     makeMultiProjectWiki(dir, today, [
-      { slug: 'beta', date: today, sessionState: '2020-01-01', logEntry: false },
+      {
+        slug: 'beta',
+        date: today,
+        sessionState: '2020-01-01',
+        projectHot: '2020-01-01',
+        logEntry: false,
+      },
     ]);
-    assert.equal(deriveRootLogEntries(dir), 0, 'log.md not masked while session-state stale');
+    assert.equal(
+      sessionCloseGlobalStatus(dir).ok,
+      false,
+      'precondition: the log.md line is missing',
+    );
+    assert.equal(deriveRootLogEntries(dir), 1, 'the stale views do not count as a gap');
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
-    assert.doesNotMatch(log, /session \| beta/, 'no beta entry derived');
-    assert.equal(sessionCloseGlobalStatus(dir).ok, false, 'gate still blocks the real gap');
+    assert.match(log, /session \| beta/, 'the beta entry is derived');
+    assert.equal(sessionCloseGlobalStatus(dir).ok, true, 'the gate passes after the derive');
   });
 });
 
@@ -895,11 +973,12 @@ test('B-1: a real project dir keeps its log.md slug as a close candidate (disk g
   withTmpDir((dir) => {
     const today = todayLocal();
     // alpha fully closed; beta has a today log.md entry + real dir but is
-    // INCOMPLETE (no session-state). The disk gate must still include beta so
-    // the gate keeps blocking — the fix excludes ghosts, not real directories.
+    // INCOMPLETE (no session-log heading, no entry). The disk gate must still
+    // include beta so the gate keeps blocking: the fix excludes ghosts, not
+    // real directories.
     makeMultiProjectWiki(dir, today, [
       { slug: 'alpha', date: today },
-      { slug: 'beta', date: today, sessionState: false },
+      { slug: 'beta', date: today, sessionLog: false },
     ]);
     const s = sessionCloseGlobalStatus(dir);
     assert.equal(s.ok, false, 'beta is an incomplete real close → gate blocks');
@@ -2324,6 +2403,7 @@ test('--mark-session-closed: an unattributed dirty root file demotes to a notice
 test('--mark-session-closed with ok gate + clean git → exit 0, marker created', () => {
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-success');
+    const entryRel = pinCommittedClose(dir, 's-success');
     // close attribution: attribution comes from evidence, never recency. A standalone
     // mark whose transcript touched no close file must name the project it closed.
     const r = run('crystallize.mjs', [
@@ -2352,7 +2432,10 @@ test('--mark-session-closed with ok gate + clean git → exit 0, marker created'
     const receipt = JSON.parse(readFileSync(receiptPath, 'utf-8'));
     assert.equal(receipt.certification, 'committed-close-files');
     assert.equal(receipt.generation, marker.receipt_generation);
-    assert.ok((receipt.entries || []).some((e) => e.path === 'projects/test-project/hot.md'));
+    assert.ok(
+      (receipt.entries || []).some((e) => e.path === entryRel && e.kind === 'create'),
+      `the receipt proves this session's entry: ${JSON.stringify(receipt.entries)}`,
+    );
   });
 });
 
@@ -2380,6 +2463,7 @@ test('--mark-session-closed in a vault nested inside a larger repository: the re
     );
 
     const cleanup = seedCloseTranscript('s-nested-mark');
+    const entryRel = pinCommittedClose(vault, 's-nested-mark');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${vault}`,
       '--mark-session-closed',
@@ -2392,7 +2476,7 @@ test('--mark-session-closed in a vault nested inside a larger repository: the re
     const read = readReceiptStrict(vault, 's-nested-mark');
     assert.equal(read.status, 'valid', JSON.stringify(read));
     assert.ok(
-      (read.receipt.entries || []).some((e) => e.path === 'projects/test-project/hot.md'),
+      (read.receipt.entries || []).some((e) => e.path === entryRel),
       `entries must be vault-relative: ${JSON.stringify(read.receipt.entries)}`,
     );
     const verified = verifyEntriesInCommit(vault, read.receipt.commit, read.receipt.entries);
@@ -2423,6 +2507,7 @@ test('--mark-session-closed in a vault whose directory name ends in a space: the
     );
 
     const cleanup = seedCloseTranscript('s-space-top');
+    pinCommittedClose(vault, 's-space-top');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${vault}`,
       '--mark-session-closed',
@@ -2450,6 +2535,7 @@ test('--mark-session-closed invalidates the prior receipt and marker even when t
   withWiki(null, (dir) => {
     const sessionId = 's-mark-invalidate-on-blocked-retry';
     const cleanup1 = seedCloseTranscript(sessionId);
+    pinCommittedClose(dir, sessionId);
     const r1 = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -2522,6 +2608,9 @@ test('--mark-session-closed invalidates the prior receipt and marker even when t
 // record is gone, so --mark refuses and leaves the old receipt and marker alone.
 function markOnce(dir, sessionId) {
   const cleanup = seedCloseTranscript(sessionId);
+  if (!existsSync(join(dir, 'projects', 'test-project', 'sessions'))) {
+    pinCommittedClose(dir, sessionId);
+  }
   const r = run('crystallize.mjs', [
     `--hypo-dir=${dir}`,
     '--mark-session-closed',
@@ -2767,6 +2856,7 @@ test('--mark-session-closed with no attribution evidence → fail closed, no mar
 test('--mark-session-closed stamps the v4 projects discriminator', () => {
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-disc');
+    pinCommittedClose(dir, 's-disc');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -2804,6 +2894,7 @@ test('--mark-session-closed stamps the v4 projects discriminator', () => {
 test('--mark-session-closed --project=<slug>: verified_scope is {kind: global, projects: [<gate-evaluated set>]}', () => {
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-vs-project');
+    pinCommittedClose(dir, 's-vs-project');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -2911,9 +3002,16 @@ test('--mark-session-closed --transcript-path: lint error only in an UNTOUCHED f
         '---\ntitle: note\ntype: concept\n\nbody never closes\n',
       );
     },
-    (dir) => {
-      // transcript edited a clean close file, NOT the broken note.md
-      const cleanAbs = join(dir, 'projects', 'test-project', 'session-state.md');
+    (dir, today) => {
+      // transcript edited a clean close file (a session-log shard), NOT the broken note.md
+      const cleanAbs = join(
+        dir,
+        'projects',
+        'test-project',
+        'session-log',
+        `${today.slice(0, 7)}.md`,
+      );
+      pinCommittedClose(dir, 's-untouch');
       const cleanup = seedCloseTranscript('s-untouch', {
         toolUseLines: [
           JSON.stringify({
@@ -2945,12 +3043,19 @@ test('--mark-session-closed --transcript-path: lint error only in an UNTOUCHED f
 // session-close-scope-boundary spec §3: with NO --project, precompactGateStatus
 // runs unnarrowed above (no closeScope key passed) — the gate ran the global
 // judgment, so verified_scope.kind must read 'global', never 'project'.
-// Attribution still comes from evidence: the transcript edits a mandatory
-// close file (session-state.md), which resolveCloseScope's touched-file signal
-// adds to scope even with no --project flag.
+// Attribution still comes from evidence: the transcript edits a close file (a
+// session-log shard), which resolveCloseScope's touched-file signal adds to
+// scope even with no --project flag.
 test('--mark-session-closed with no --project (evidence via touched close file): verified_scope.kind is global', () => {
-  withWiki(null, (dir) => {
-    const closeFileAbs = join(dir, 'projects', 'test-project', 'session-state.md');
+  withWiki(null, (dir, today) => {
+    const closeFileAbs = join(
+      dir,
+      'projects',
+      'test-project',
+      'session-log',
+      `${today.slice(0, 7)}.md`,
+    );
+    pinCommittedClose(dir, 's-vs-global');
     const cleanup = seedCloseTranscript('s-vs-global', {
       toolUseLines: [
         JSON.stringify({
@@ -3600,6 +3705,7 @@ test('E2E verified_scope: a real marker with the gate-evaluated project passes d
       const gitEnv = { env: { ...process.env, HOME: home } };
       spawnSync('git', ['-C', dir, 'add', '-A'], gitEnv);
       spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'close narrative'], gitEnv);
+      pinCommittedClose(dir, sessionId, { project: 'mine' });
       spawnSync('git', ['-C', dir, 'push', '-q', 'origin', 'HEAD'], gitEnv);
       const cleanup = seedCloseTranscript(sessionId, { home });
       try {
@@ -3663,11 +3769,14 @@ test('E2E verified_scope: a real marker with the gate-evaluated project passes d
 test('E2E verified_scope: a project the gate never evaluated withholds the WHOLE certification, not just its own share', () => {
   withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir, _transcript, home) => {
     const sessionId = 's-vs-e2e-warn';
+    // mine is this session's own, provable close; ghost is the phantom.
+    pinCommittedClose(dir, sessionId, { project: 'mine' });
     const ghostDir = join(dir, 'projects', 'ghost');
-    mkdirSync(ghostDir, { recursive: true });
+    const ghostShard = join(ghostDir, 'session-log', '2000-01.md');
+    mkdirSync(dirname(ghostShard), { recursive: true });
     writeFileSync(
-      join(ghostDir, 'session-state.md'),
-      '---\ntitle: ss\ntype: session-state\nupdated: 2000-01-01\n---\n\n## 다음 작업\n',
+      ghostShard,
+      '---\ntitle: log\ntype: session-log\nupdated: 2000-01-01\n---\n\n## [2000-01-01] session\n',
     );
     // HOME pinned to the test's own tmp home, same reason as the pass case above.
     const gitEnv = { env: { ...process.env, HOME: home } };
@@ -3694,7 +3803,7 @@ test('E2E verified_scope: a project the gate never evaluated withholds the WHOLE
               {
                 type: 'tool_use',
                 name: 'Edit',
-                input: { file_path: join(dir, 'projects', 'ghost', 'session-state.md') },
+                input: { file_path: ghostShard },
               },
             ],
           },
@@ -4120,6 +4229,7 @@ test("--mark-session-closed: only the local date's session-log shard is committe
       const [localDate, utcDate] = freshDates();
       const sessionId = 's-local-utc-shard';
       const cleanup = seedCloseTranscript(sessionId);
+      pinCommittedClose(dir, sessionId, { date: localDate });
       const r = run('crystallize.mjs', [
         `--hypo-dir=${dir}`,
         '--mark-session-closed',
@@ -4324,75 +4434,90 @@ test('ISSUE-140: a marker withheld by an unrelated gate failure leaves the close
 // future signature drift on printCloseReport's destructured params (e.g.
 // `postBlocking` renamed at the call site but not the function, or vice
 // versa) throws instead of silently rendering `undefined`.
-test('--apply-session-close text output: ok:false prints both the stale-verification line and the lint-blocker line', () => {
-  withWiki(
-    (dir, today) => {
-      // Stale the project hot.md BEFORE the initial commit (git stays clean).
-      const projHotPath = join(dir, 'projects', 'test-project', 'hot.md');
-      writeFileSync(
-        projHotPath,
-        readFileSync(projHotPath, 'utf-8').replace(`updated: ${today}`, 'updated: 2020-01-01'),
-      );
-    },
-    (dir, today) => {
-      // A close no longer writes the project hot.md, so nothing refreshes it: it stays
-      // stale on disk (committed stale above) and post-apply verification reports it,
-      // printCloseReport:1801-1809.
-      const payload = {
-        project: 'test-project',
-        date: today,
-        summary: 'ok-false text test\n',
-        // No `title`: a required frontmatter field. This lands ON DISK (preflight
-        // ignores errors in files about to be overwritten) and only post-apply
-        // lint, scoped to this apply's own payload files, catches it, which is
-        // exactly the blocker printCloseReport:1810-1814 renders. open-questions is
-        // the one page a payload still overwrites whole.
-        openQuestions: { content: `---\ntype: concept\nupdated: ${today}\n---\n\n- next\n` },
-        sessionLog: { entry: `## [${today}] ok-false text test\n` },
-        log: { entry: `## [${today}] session | test-project: ok-false text\n` },
-      };
-      const payloadPath = join(
-        tmpdir(),
-        `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
-      );
-      writeFileSync(payloadPath, JSON.stringify(payload));
-      const cleanup = seedCloseTranscript('s-okfalse-text');
-      // Without a recorded base, overwrite's conflict check (step 2) sees an
-      // 'unknown' base for ANY session id and parks open-questions.md instead of
-      // writing it: a real SessionStart hook would have snapshotted this by now, so
-      // seed it directly ("this session already read the page", which is absent).
-      snapshotBase(dir, 's-okfalse-text', [join('pages', 'open-questions.md')]);
-      let r;
-      try {
-        r = run('crystallize.mjs', [
-          `--hypo-dir=${dir}`,
-          '--apply-session-close',
-          `--payload=${payloadPath}`,
-          '--session-id=s-okfalse-text',
-        ]);
-      } finally {
-        cleanup();
-        rmSync(payloadPath, { force: true });
-      }
-      assert.equal(r.status, 1, `ok:false apply must exit 1: ${r.stdout}\n${r.stderr}`);
-      assert.ok(
-        r.stdout.includes('✗ session-close still incomplete after apply:'),
-        `stdout must report the stale verification: ${JSON.stringify(r.stdout)}`,
-      );
-      assert.ok(
-        r.stdout.includes('hot.md'),
-        `stale reason must name the untouched project hot.md: ${JSON.stringify(r.stdout)}`,
-      );
-      assert.ok(
-        r.stdout.includes('✗ post-apply lint failed:'),
-        `stdout must report the lint blocker: ${JSON.stringify(r.stdout)}`,
-      );
-      assert.ok(
-        r.stdout.includes('Missing required frontmatter field: title'),
-        `lint blocker must name the payload-introduced error: ${JSON.stringify(r.stdout)}`,
-      );
-    },
+// A pre-commit hook that takes every session entry back out of the commit being
+// made: the close commits its appends, but its entry never reaches HEAD, so the
+// post-apply verification (read after the commit) fails.
+function dropEntriesFromCommits(dir) {
+  const hook = join(dir, '.git', 'hooks', 'pre-commit');
+  mkdirSync(dirname(hook), { recursive: true });
+  writeFileSync(
+    hook,
+    '#!/bin/sh\ngit rm -q -r --cached --ignore-unmatch -- projects/test-project/sessions >/dev/null\n',
+    { mode: 0o755 },
   );
+}
+
+// The verification and the lint failure can no longer come together: lint fails
+// before the commit, and the verification only decides a close once the commit
+// has landed. Each line is printed for its own failure.
+test('--apply-session-close text output: ok:false prints the stale-verification line and the lint-blocker line, each for its own failure', () => {
+  const applyText = (dir, today, sessionId, extra = {}) => {
+    const payload = {
+      project: 'test-project',
+      date: today,
+      summary: 'ok-false text test\n',
+      sessionLog: { entry: `## [${today}] ok-false text test\n` },
+      log: { entry: `## [${today}] session | test-project: ok-false text\n` },
+      ...extra,
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      return run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        `--payload=${payloadPath}`,
+        `--session-id=${sessionId}`,
+      ]);
+    } finally {
+      cleanup();
+      rmSync(payloadPath, { force: true });
+    }
+  };
+  withWiki(null, (dir, today) => {
+    dropEntriesFromCommits(dir);
+    const r = applyText(dir, today, 's-okfalse-verify');
+    assert.equal(r.status, 1, `ok:false apply must exit 1: ${r.stdout}\n${r.stderr}`);
+    assert.ok(
+      r.stdout.includes('✗ session-close still incomplete after apply:'),
+      `stdout must report the stale verification: ${JSON.stringify(r.stdout)}`,
+    );
+    assert.ok(
+      /projects\/test-project\/sessions\/\S+-s-okfalse-verify-0\.md \(stale\)/.test(r.stdout),
+      `the reason must name this close's uncommitted entry: ${JSON.stringify(r.stdout)}`,
+    );
+    assert.ok(!r.stdout.includes('✗ post-apply lint failed:'), r.stdout);
+  });
+  withWiki(null, (dir, today) => {
+    // Without a recorded base, overwrite's conflict check (step 2) sees an
+    // 'unknown' base for ANY session id and parks open-questions.md instead of
+    // writing it: a real SessionStart hook would have snapshotted this by now, so
+    // seed it directly ("this session already read the page", which is absent).
+    snapshotBase(dir, 's-okfalse-lint', [join('pages', 'open-questions.md')]);
+    // No `title`: a required frontmatter field. This lands ON DISK (preflight
+    // ignores errors in files about to be overwritten) and only post-apply lint,
+    // scoped to this apply's own payload files, catches it.
+    const r = applyText(dir, today, 's-okfalse-lint', {
+      openQuestions: { content: `---\ntype: concept\nupdated: ${today}\n---\n\n- next\n` },
+    });
+    assert.equal(r.status, 1, `ok:false apply must exit 1: ${r.stdout}\n${r.stderr}`);
+    assert.ok(
+      r.stdout.includes('✗ post-apply lint failed:'),
+      `stdout must report the lint blocker: ${JSON.stringify(r.stdout)}`,
+    );
+    assert.ok(
+      r.stdout.includes('Missing required frontmatter field: title'),
+      `lint blocker must name the payload-introduced error: ${JSON.stringify(r.stdout)}`,
+    );
+    assert.ok(
+      !r.stdout.includes('✗ session-close still incomplete after apply:'),
+      `no commit was made, so the verification does not decide this close: ${r.stdout}`,
+    );
+  });
 });
 
 test('--apply-session-close routes the marker write through the full gate — refuses on feedback over-cap', () => {
@@ -4473,6 +4598,7 @@ test('--mark-session-closed writes the marker on PURE feedback drift and surface
     adr47CommitWiki(wiki);
     const home = adr47ControlledHome(dir);
     const cleanup = seedCloseTranscript('s-drift', { home });
+    pinCommittedClose(wiki, 's-drift');
     const r = spawnSync(
       process.execPath,
       [
@@ -5308,7 +5434,14 @@ test('IMPR-34: foreign incomplete close is a notice, not a blocker, when scope n
 test('E2E: --mark-session-closed blocks on a foreign project this session touched but never actually closed', () => {
   withClosePartitionWiki(INCIDENT(todayLocal()), [], (dir, _transcript, home) => {
     const sessionId = 's-f1-e2e-marker';
-    const foreignHot = join(dir, 'projects', 'foreign', 'hot.md');
+    // A session-log shard is the close file that attributes (hot.md is a generated view).
+    const foreignHot = join(
+      dir,
+      'projects',
+      'foreign',
+      'session-log',
+      `${todayLocal().slice(0, 7)}.md`,
+    );
     const cleanup = seedCloseTranscript(sessionId, {
       home,
       toolUseLines: [
@@ -5547,9 +5680,13 @@ test('P2: a never-started cwd project close is caught even when recency is green
       );
       // With the authoritative session cwd: the independent check evaluates
       // cwd-proj's close, finds it incomplete, and blocks — no longer green.
+      // A session with no close of its own (no close pin, no open signal).
       const gated = precompactGateStatus(dir, {
         claudeHome: join(dir, '.claude-none'),
         sessionCwd: CWD,
+        sessionId: 's-p2-never-started',
+        closeOpen: false,
+        resolvedAtIndex: null,
       });
       const cwdBlocker = gated.blockers.find((b) => b.type === 'close-cwd');
       assert.ok(
@@ -5569,14 +5706,17 @@ test('P2: close-cwd is emitted even when the cwd project is also a normal close 
   // would honor a stale marker (codex pre-commit BLOCKER).
   const CWD = '/tmp/cwdproj-both';
   withClosePartitionWiki(
-    // session-state stale → incomplete; session-log fresh → today-active.
-    [{ slug: 'cwd-proj', date: todayLocal(), sessionState: '2000-01-01' }],
+    // log.md line stale → incomplete; session-log fresh → today-active.
+    [{ slug: 'cwd-proj', date: todayLocal(), logEntry: '2000-01-01' }],
     [],
     (dir) => {
       setWorkingDir(dir, 'cwd-proj', CWD);
       const gate = precompactGateStatus(dir, {
         claudeHome: join(dir, '.claude-none'),
         sessionCwd: CWD,
+        sessionId: 's-p2-both',
+        closeOpen: false,
+        resolvedAtIndex: null,
       });
       assert.ok(
         gate.blockers.some((b) => b.type === 'close'),
@@ -5594,9 +5734,14 @@ test('P2: a complete cwd project close adds no blocker', () => {
   const CWD = '/tmp/cwdproj-done';
   withClosePartitionWiki([{ slug: 'cwd-proj', date: todayLocal() }], [], (dir) => {
     setWorkingDir(dir, 'cwd-proj', CWD);
+    // This session's own close of cwd-proj, committed and pinned.
+    pinCommittedClose(dir, 's-p2-done', { project: 'cwd-proj' });
     const gate = precompactGateStatus(dir, {
       claudeHome: join(dir, '.claude-none'),
       sessionCwd: CWD,
+      sessionId: 's-p2-done',
+      closeOpen: false,
+      resolvedAtIndex: null,
     });
     assert.equal(
       gate.blockers.some((b) => b.type === 'close-cwd'),
@@ -5704,7 +5849,7 @@ test('IMPR-34 (revert check): with NO attribution signal the foreign close still
 test('IMPR-34: a hand-written close attributes via the transcript, not just opts', () => {
   withClosePartitionWiki(
     INCIDENT(todayLocal()),
-    ['projects/mine/session-state.md'],
+    [`projects/mine/session-log/${todayLocal().slice(0, 7)}.md`],
     (dir, transcript) => {
       const gate = precompactGateStatus(dir, {
         transcriptPath: transcript,
@@ -5713,7 +5858,7 @@ test('IMPR-34: a hand-written close attributes via the transcript, not just opts
       assert.equal(
         gate.blockers.some((b) => b.type === 'close'),
         false,
-        'editing mine’s close files puts mine (and only mine) in scope',
+        'editing mine’s session-log shard puts mine (and only mine) in scope',
       );
     },
   );
@@ -5725,7 +5870,10 @@ test('IMPR-34: a hand-written close attributes via the transcript, not just opts
 test('IMPR-34: a non-close file under the foreign project does NOT put it in scope', () => {
   withClosePartitionWiki(
     INCIDENT(todayLocal()),
-    ['projects/mine/session-state.md', 'projects/foreign/design-history.md'],
+    [
+      `projects/mine/session-log/${todayLocal().slice(0, 7)}.md`,
+      'projects/foreign/design-history.md',
+    ],
     (dir, transcript) => {
       const gate = precompactGateStatus(dir, {
         transcriptPath: transcript,
@@ -5868,7 +6016,7 @@ test('IMPR-34: --check-session-close renders demoted debt without contradicting 
       { slug: 'foreign', date: today, sessionLog: false },
       { slug: 'mine', date: today },
     ],
-    ['projects/mine/session-state.md'],
+    [`projects/mine/session-log/${todayLocal().slice(0, 7)}.md`],
     (dir, transcript, home) => {
       const r = runWithHome(
         'crystallize.mjs',
@@ -6106,10 +6254,12 @@ test('a red check never says /compact blocks or waits, while PreCompact on the s
     'blockClaim must not match a true statement about the Stop hook',
   );
   withWiki(
-    (dir) => {
+    (dir, today) => {
+      // Nothing closed today: the session-log heading is an old day's. (The
+      // generated hot.md proves nothing, so staling it no longer makes a red vault.)
       writeFileSync(
-        join(dir, 'projects', 'test-project', 'hot.md'),
-        '---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n',
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        '---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n',
       );
     },
     (dir) => {
@@ -6121,7 +6271,7 @@ test('a red check never says /compact blocks or waits, while PreCompact on the s
         `PreCompact must carry no block decision: ${hook.stdout}`,
       );
       assert.ok(
-        hookOut.systemMessage.includes('projects/test-project/hot.md'),
+        hookOut.systemMessage.includes('projects/test-project/session-log/'),
         `precondition: the hook must see the same red state: ${hook.stdout}`,
       );
       // The hook's checklist tells the model what line to wait for. It must name
@@ -6138,7 +6288,7 @@ test('a red check never says /compact blocks or waits, while PreCompact on the s
       const r = run('crystallize.mjs', [`--hypo-dir=${dir}`, '--check-session-close']);
       assert.equal(r.status, 1, `precondition: the check must be red here: ${r.stdout}`);
       assert.ok(
-        r.stdout.includes('projects/test-project/hot.md'),
+        r.stdout.includes('projects/test-project/session-log/'),
         `the red check must name the stale file: ${r.stdout}`,
       );
       assert.ok(
@@ -6184,10 +6334,12 @@ test('--session-id: the CLI text prints close_state by name, the same token the 
   const blockClaim =
     /\/compact\b[^.\n]*\b(would|will|still)\b[^.\n]*\b(block|wait)|would block on these|^\s*[✓✗] (not )?compact-ready/im;
   withWiki(
-    (dir) => {
+    (dir, today) => {
+      // Nothing closed today: the session-log heading is an old day's. (The
+      // generated hot.md proves nothing, so staling it no longer makes a red vault.)
       writeFileSync(
-        join(dir, 'projects', 'test-project', 'hot.md'),
-        '---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n',
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        '---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n',
       );
     },
     (dir) => {
@@ -6274,4 +6426,562 @@ test('precompactGateStatus: a W19-only vault has no lint or design-history block
       `W19 must not surface as a gate notice either: ${JSON.stringify(gate.notices)}`,
     );
   });
+});
+
+// ── a close is proven by its own close id (T10) ──────────────────────────────
+// "This session" is judged by the entry of the close id its close pin names
+// (sessionProofCloseId), committed. Another session's entry of today, this
+// session's earlier close, and the generated views prove nothing.
+suite('a close is proven by its own close id');
+
+const T10_CWD = join(tmpdir(), 'hypo-t10-workdir');
+const T10_CLOSE_LINE = JSON.stringify({
+  type: 'user',
+  message: { role: 'user', content: '세션 마무리 해줘' },
+});
+
+const t10Transcript = (sessionId) =>
+  join(SESSION_TMP_HOME, '.claude', 'projects', 'hypo-test-proj', `${sessionId}.jsonl`);
+
+// test-project anchored at T10_CWD (so a session cwd resolves to it).
+function anchorTestProject(dir, today) {
+  writeFileSync(
+    join(dir, 'projects', 'test-project', 'index.md'),
+    `---\ntitle: test-project\ntype: project-index\nupdated: ${today}\nworking_dir: "${T10_CWD}"\n---\n# test-project\n`,
+  );
+}
+
+// An entry of `closeId` in test-project, dated `date` and committed, as another
+// session's (or an earlier) close leaves it.
+function commitEntry(dir, date, closeId) {
+  const rel = writeDatedEntry(dir, 'test-project', date, closeId);
+  const git = (...a) =>
+    spawnSync('git', ['-C', dir, ...a], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+  git('add', '--', rel);
+  git('commit', '-q', '-m', `entry ${closeId}`, '--', rel);
+  return rel;
+}
+
+// What the verdict sites inject: whether a close signal is open, and where the last one resolved.
+function closeFacts(dir, sessionId) {
+  const g = closeGateStatus({
+    transcriptPath: t10Transcript(sessionId),
+    hypoDir: dir,
+    sessionId,
+  });
+  return { closeOpen: g.ok, resolvedAtIndex: g.resolvedAtIndex };
+}
+
+function markJson(dir, sessionId, extra = []) {
+  const r = run('crystallize.mjs', [
+    `--hypo-dir=${dir}`,
+    '--mark-session-closed',
+    `--session-id=${sessionId}`,
+    '--project=test-project',
+    '--json',
+    ...extra,
+  ]);
+  let out = null;
+  try {
+    out = JSON.parse(r.stdout);
+  } catch {
+    out = null;
+  }
+  return { r, out };
+}
+
+const cwdGate = (dir, sessionId) =>
+  precompactGateStatus(dir, {
+    claudeHome: join(dir, '.claude-none'),
+    sessionCwd: T10_CWD,
+    sessionId,
+    ...closeFacts(dir, sessionId),
+  });
+
+const hasCwdBlocker = (gate) =>
+  gate.blockers.some((b) => b.type === 'close-cwd' && b.project === 'test-project');
+
+// Disabling the check (1): in sessionCloseFileStatus's 'session' branch, judge by
+// `datedEntryPaths(hypoDir, project, freshDates())[0]` instead of the close id's own
+// entry. These two tests and the same-session test below go red: the judgment is
+// one place. Disabling (5), the precompactGateStatus cwd site passing
+// {scope: 'global'}, reds only the (5965) one; (6), the buildMarkCloseProof site
+// passing {scope: 'global'}, reds only the (504) one.
+function withOtherSessionEntryOnly(sid, fn) {
+  withWiki(anchorTestProject, (dir, today) => {
+    commitEntry(dir, today, closeIdFor('s-t10-other', 0));
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      fn(dir);
+    } finally {
+      cleanup();
+    }
+  });
+}
+
+test("another session's committed entry of today does not prove this session: the cwd gate blocks (5965)", () => {
+  withOtherSessionEntryOnly('s-t10-mine-5965', (dir) => {
+    const gate = cwdGate(dir, 's-t10-mine-5965');
+    assert.ok(hasCwdBlocker(gate), `close-cwd expected: ${JSON.stringify(gate.blockers)}`);
+  });
+});
+
+test("another session's committed entry of today does not prove this session: --mark is incomplete (504)", () => {
+  withOtherSessionEntryOnly('s-t10-mine-504', (dir) => {
+    const sid = 's-t10-mine-504';
+    const { r, out } = markJson(dir, sid);
+    assert.equal(r.status, 1, r.stdout);
+    assert.equal(out.reason, 'incomplete', r.stdout);
+    assert.deepEqual(out.incompleteProjects, ['test-project']);
+    assert.ok(!existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')));
+  });
+});
+
+// The same-session half of disable (1) above. Not run through --mark: the second
+// close's uncommitted entry sits in the project folder, and the checkpoint gate
+// refuses that before the proof runs. buildMarkCloseProof is the proof --mark runs.
+test("the same session's earlier close does not prove its later close whose entry is not committed yet", () => {
+  withWiki(null, (dir, today) => {
+    const sid = 's-t10-two-closes';
+    const first = closeIdFor(sid, 0);
+    const second = closeIdFor(sid, 5);
+    commitEntry(dir, today, first);
+    const secondRel = writeDatedEntry(dir, 'test-project', today, second);
+    writeClosePin(dir, sid, {
+      pending: { closeId: second, openedAtIndex: 5, entryRelPath: secondRel, entrySha256s: [] },
+      lastResolved: first,
+      localProofs: {},
+    });
+    const proofId = sessionProofCloseId(dir, sid, { closeOpen: false, resolvedAtIndex: null });
+    assert.equal(proofId, second, 'the pending close is the one to prove');
+    const s = sessionCloseFileStatus(dir, {
+      scope: 'session',
+      closeId: proofId,
+      projectOverride: 'test-project',
+    });
+    assert.equal(s.ok, false, JSON.stringify(s));
+    assert.deepEqual(s.stale, [secondRel], 'only the uncommitted entry is short');
+    const proof = buildMarkCloseProof(dir, ['test-project'], false, { closeId: proofId });
+    assert.deepEqual(proof.incompleteProjects, ['test-project']);
+    // Paired: the earlier close, judged by its own id, is complete.
+    assert.equal(
+      sessionCloseFileStatus(dir, {
+        scope: 'session',
+        closeId: first,
+        projectOverride: 'test-project',
+      }).ok,
+      true,
+    );
+  });
+});
+
+test("--mark issues the receipt when this close's own entry is committed", () => {
+  withWiki(null, (dir) => {
+    const sid = 's-t10-own-committed';
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const rel = pinCommittedClose(dir, sid);
+      const { r, out } = markJson(dir, sid);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.equal(out.ok, true);
+      const receipt = readReceiptStrict(dir, sid);
+      assert.equal(receipt.status, 'valid', JSON.stringify(receipt));
+      assert.ok(
+        receipt.receipt.entries.some((e) => e.path === rel && e.kind === 'create'),
+        JSON.stringify(receipt.receipt.entries),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('generated views updated today with no entry of this close issue no receipt', () => {
+  // buildCleanWikiTree's session-state.md and hot.md carry today's `updated:`.
+  withWiki(null, (dir) => {
+    const sid = 's-t10-views-only';
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const { r, out } = markJson(dir, sid);
+      assert.equal(r.status, 1, r.stdout);
+      assert.equal(out.reason, 'incomplete', r.stdout);
+      assert.ok(!existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')));
+      assert.ok(!existsSync(sessionClosedMarkerPath(dir, sid)));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// A vault whose HEAD .gitignore carries the session-entries block and tracks no
+// generated view: migrationState 'migrated'. `mine` is closed by an entry; test-project
+// only has today's session-log heading and log.md line (a pre-entry writer).
+function withMigratedLegacyVault(migrated, fn) {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    if (migrated) writeFileSync(join(dir, '.gitignore'), `.cache/\n${GITIGNORE_BLOCK}`);
+    mkdirSync(join(dir, 'projects', 'mine', 'session-log'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'mine', 'session-log', `${today}.md`),
+      `---\ntitle: Session Log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] mine session\n`,
+    );
+    writeDatedEntry(dir, 'mine', today, 's-t10-mine-0');
+    appendFileSync(join(dir, 'log.md'), `## [${today}] session | mine\n`);
+    const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8' });
+    git('init', '-q');
+    git('config', 'user.email', 't@t.test');
+    git('config', 'user.name', 'T');
+    git('add', '-A');
+    git('commit', '-q', '-m', 'init');
+    fn(dir);
+  });
+}
+
+// Disabling the check (2): in sessionCloseFileStatus's 'global' branch, push the
+// missing entry even when today's session-log heading is there: the gate turns red.
+test("a project with today's session-log and no entry is a notice in a migrated vault and blocks nothing", () => {
+  withMigratedLegacyVault(true, (dir) => {
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, true, JSON.stringify(s));
+    assert.ok(
+      s.notices.some((n) => n.type === 'close-legacy' && n.project === 'test-project'),
+      JSON.stringify(s.notices),
+    );
+    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      false,
+      JSON.stringify(gate.blockers),
+    );
+    assert.ok(
+      gate.notices.some((n) => n.type === 'close-legacy'),
+      JSON.stringify(gate.notices),
+    );
+  });
+  // Paired: before migration the same state is normal, so it is not even a notice.
+  withMigratedLegacyVault(false, (dir) => {
+    const s = sessionCloseGlobalStatus(dir);
+    assert.equal(s.ok, true, JSON.stringify(s));
+    assert.deepEqual(s.notices, []);
+  });
+});
+
+// Disabling the check (3): CLOSE_FILE_RE back to
+// /^projects\/([^/]+)\/(session-state\.md|hot\.md|session-log\/[^/]+\.md)$/.
+test("an edit of a project's hot.md does not put that project in this session's close scope", () => {
+  const ym = todayLocal().slice(0, 7);
+  withClosePartitionWiki(INCIDENT(todayLocal()), ['projects/foreign/hot.md'], (dir, transcript) => {
+    const gate = precompactGateStatus(dir, {
+      transcriptPath: transcript,
+      claudeHome: join(dir, '.claude-none'),
+    });
+    assert.equal(gate.close.scope.includes('foreign'), false, JSON.stringify(gate.close.scope));
+  });
+  // Paired: a session-log shard edit does.
+  withClosePartitionWiki(
+    INCIDENT(todayLocal()),
+    [`projects/foreign/session-log/${ym}.md`],
+    (dir, transcript) => {
+      const gate = precompactGateStatus(dir, {
+        transcriptPath: transcript,
+        claudeHome: join(dir, '.claude-none'),
+      });
+      assert.equal(gate.close.scope.includes('foreign'), true, JSON.stringify(gate.close.scope));
+    },
+  );
+});
+
+// Disabling the check (4): delete the scope check at the top of sessionCloseFileStatus
+// so a missing scope falls through to the global branch.
+test('sessionCloseFileStatus throws without a scope, and on a session scope with no closeId key (N7)', () => {
+  withWiki(null, (dir) => {
+    assert.throws(() => sessionCloseFileStatus(dir, {}), /scope must be/);
+    assert.throws(() => sessionCloseFileStatus(dir, { projectOverride: 'test-project' }), /scope/);
+    assert.throws(
+      () => sessionCloseFileStatus(dir, { scope: 'session', projectOverride: 'test-project' }),
+      /requires a closeId key/,
+    );
+    // Paired: a null closeId is "nothing to prove", not a throw.
+    const s = sessionCloseFileStatus(dir, {
+      scope: 'session',
+      closeId: null,
+      projectOverride: 'test-project',
+    });
+    assert.equal(s.ok, false);
+  });
+});
+
+// Disabling the check (7): the post-apply verification passes {scope: 'global'}: it
+// then finds today's entries on disk and reports ok, and this test goes red.
+test("the post-apply verification reports this close's entry missing from HEAD when its commit failed, another session's entry notwithstanding (4180)", () => {
+  withWiki(null, (dir, today) => {
+    commitEntry(dir, today, closeIdFor('s-t10-other-4180', 0));
+    const hook = join(dir, '.git', 'hooks', 'pre-commit');
+    mkdirSync(dirname(hook), { recursive: true });
+    writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const sid = 's-t10-commit-fails';
+    const r = runApply(
+      dir,
+      {
+        project: 'test-project',
+        date: today,
+        summary: 'commit fails\n',
+        sessionLog: { entry: `## [${today}] commit fails\n` },
+      },
+      { sessionId: sid },
+    );
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.committed, false, r.stdout);
+    assert.equal(out.markerWritten, false);
+    assert.equal(out.verification.ok, false, JSON.stringify(out.verification));
+    assert.equal(
+      out.verification.entry,
+      `projects/test-project/sessions/${today}-${closeIdFor(sid, 0)}.md`,
+    );
+    assert.deepEqual(out.verification.stale, [out.verification.entry]);
+  });
+});
+
+// A session that closed test-project once through a real apply (receipt, marker,
+// resolution, pin moved to lastResolved). With `secondSignal` the user then asks to
+// close again, and nothing has applied that request yet (X1).
+function withResolvedClose(sessionId, { secondSignal, toolUseLines = [] }, fn) {
+  withWiki(anchorTestProject, (dir, today) => {
+    const cleanup = seedCloseTranscript(sessionId, { toolUseLines });
+    try {
+      const first = JSON.parse(
+        runApply(
+          dir,
+          {
+            project: 'test-project',
+            date: today,
+            summary: 'first close\n',
+            tracks: [{ id: 'main', new: true, next: '- next\n' }],
+            sessionLog: { entry: `## [${today}] first close\n` },
+          },
+          { sessionId },
+        ).stdout,
+      );
+      assert.equal(first.ok, true, JSON.stringify(first));
+      assert.equal(first.markerWritten, true, JSON.stringify(first));
+      if (secondSignal) appendFileSync(t10Transcript(sessionId), T10_CLOSE_LINE + '\n');
+      fn(dir, today);
+    } finally {
+      cleanup();
+    }
+  });
+}
+
+// Disabling the check (8): in sessionProofCloseId return `pin.lastResolved` whatever
+// `closeOpen` says: both halves of the X1 case go red, the paired case stays green.
+test('a second close request with no entry yet: --mark is incomplete with the apply-first message, and the cwd gate blocks (X1)', () => {
+  const sid = 's-t10-x1';
+  withResolvedClose(sid, { secondSignal: true }, (dir) => {
+    assert.equal(readClosePin(dir, sid).pending, null, 'precondition: the first close resolved');
+    assert.ok(hasCwdBlocker(cwdGate(dir, sid)), 'the gate sees this session close as open');
+    const { r, out } = markJson(dir, sid);
+    assert.equal(r.status, 1, r.stdout);
+    assert.equal(out.reason, 'incomplete', r.stdout);
+    assert.equal(out.awaitingApply, true, r.stdout);
+    assert.match(
+      out.error,
+      /이 세션에 새 close 요청이 열려 있고 아직 이 요청의 원본이 없습니다\. close payload로 apply를 먼저 실행하세요/,
+    );
+  });
+});
+
+test('without a second close request the same session reads as closed by its resolved close (X1 pair)', () => {
+  const sid = 's-t10-x1-pair';
+  withResolvedClose(sid, { secondSignal: false }, (dir) => {
+    assert.equal(hasCwdBlocker(cwdGate(dir, sid)), false, 'the resolved close proves the session');
+    const { r, out } = markJson(dir, sid);
+    assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+    assert.equal(out.ok, true);
+  });
+});
+
+// The four precompactGateStatus call sites that reach the session judgment, each run
+// for real in the X1 state. Disabling (12), one site at a time: drop `closeOpen`
+// (or `resolvedAtIndex`) from that site's call. Its test goes red (the throw fails
+// open in the hooks, crashes the CLI); the other three stay green. The apply marker
+// gate and the inferred-project check retry never pass a session cwd, so they never
+// reach the judgment that reads the injection (see not_executable).
+// One mutating tool call, so Stop counts the session as substantial. Its file sits
+// outside the vault: it widens nothing the gate judges.
+const T10_EDIT_LINE = JSON.stringify({
+  type: 'assistant',
+  message: {
+    content: [
+      {
+        type: 'tool_use',
+        name: 'Edit',
+        input: { file_path: join(tmpdir(), 'hypo-t10-outside', 'notes.md') },
+      },
+    ],
+  },
+});
+
+test('Q7 (126): the PreCompact hook reports this session close as open in the X1 state', () => {
+  const sid = 's-t10-q7-precompact';
+  withResolvedClose(sid, { secondSignal: true }, (dir) => {
+    const hook = runHook(
+      'hypo-personal-check.mjs',
+      { session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD },
+      { HYPO_DIR: dir },
+    );
+    const out = JSON.parse(hook.stdout);
+    assert.match(
+      out.systemMessage || '',
+      /session cwd project 'test-project' has an incomplete session close/,
+      hook.stdout,
+    );
+  });
+});
+
+test('Q7 (344): the Stop hook blocks on this session close in the X1 state', () => {
+  const sid = 's-t10-q7-stop';
+  withResolvedClose(sid, { secondSignal: true, toolUseLines: [T10_EDIT_LINE] }, (dir) => {
+    const r = runStop('hypo-auto-minimal-crystallize.mjs', dir, {
+      session_id: sid,
+      transcript_path: t10Transcript(sid),
+      cwd: T10_CWD,
+    });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', r.stdout);
+  });
+  // Paired: with no second request the finished close lets Stop through.
+  const pair = 's-t10-q7-stop-pair';
+  withResolvedClose(pair, { secondSignal: false, toolUseLines: [T10_EDIT_LINE] }, (dir) => {
+    const r = runStop('hypo-auto-minimal-crystallize.mjs', dir, {
+      session_id: pair,
+      transcript_path: t10Transcript(pair),
+      cwd: T10_CWD,
+    });
+    assert.notEqual(JSON.parse(r.stdout).decision, 'block', r.stdout);
+  });
+});
+
+test('Q7 (772): --mark-session-closed with a session cwd refuses at its gate in the X1 state', () => {
+  const sid = 's-t10-q7-mark';
+  withResolvedClose(sid, { secondSignal: true }, (dir) => {
+    const { r, out } = markJson(dir, sid, [`--session-cwd=${T10_CWD}`]);
+    assert.equal(r.status, 1, r.stdout);
+    assert.ok(out, `JSON expected: ${r.stdout}\n${r.stderr}`);
+    assert.ok(
+      (out.blockers || []).some((b) => b.type === 'close-cwd'),
+      JSON.stringify(out),
+    );
+  });
+});
+
+test('Q7 (64): --check-session-close with a session id and cwd reports this session close as open in the X1 state', () => {
+  const sid = 's-t10-q7-check';
+  withResolvedClose(sid, { secondSignal: true }, (dir) => {
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      `--session-id=${sid}`,
+      `--session-cwd=${T10_CWD}`,
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.ok(
+      (out.blockers || []).some((b) => b.type === 'close-cwd'),
+      JSON.stringify(out.blockers),
+    );
+  });
+});
+
+// Disabling the check (8b): in sessionProofCloseId pass `null` to normalizeClosePin
+// instead of `opts.resolvedAtIndex`: the stale pending (already resolved) then proves
+// the new request and both assertions go red. The X1 tests above stay green: their
+// pin already moved to lastResolved.
+test('a resolved close whose pin move was lost does not prove a new close request: --mark and PreCompact both see it open (P2)', () => {
+  const sid = 's-t10-p2';
+  withResolvedClose(sid, { secondSignal: false }, (dir) => {
+    // The resolution landed, the pin move did not (a crash between the two).
+    const pin = readClosePin(dir, sid);
+    const id = pin.lastResolved;
+    const rel = readdirSync(join(dir, 'projects', 'test-project', 'sessions'))
+      .map((n) => `projects/test-project/sessions/${n}`)
+      .find((p) => p.endsWith(`-${id}.md`));
+    writeClosePin(dir, sid, {
+      pending: { closeId: id, openedAtIndex: 0, entryRelPath: rel, entrySha256s: [] },
+      lastResolved: null,
+      localProofs: pin.localProofs,
+    });
+    appendFileSync(t10Transcript(sid), T10_CLOSE_LINE + '\n');
+
+    const { r, out } = markJson(dir, sid);
+    assert.equal(r.status, 1, r.stdout);
+    assert.equal(out.reason, 'incomplete', r.stdout);
+
+    const hook = runHook(
+      'hypo-personal-check.mjs',
+      { session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD },
+      { HYPO_DIR: dir },
+    );
+    assert.match(
+      JSON.parse(hook.stdout).systemMessage || '',
+      /session cwd project 'test-project' has an incomplete session close/,
+      hook.stdout,
+    );
+  });
+});
+
+// Disabling the check (9): the 'session' branch of sessionCloseFileStatus keeps
+// `dates = freshDates()` instead of the entry's own date: the retry's verification
+// fails and this test goes red. The paired global assertion stays green.
+// The real clock cannot be moved here, so the close is dated D, three days back, and
+// "today" plays D+3: the same as a retry after midnight, with no log of today.
+test("a retry of a close committed on an earlier day is verified by that day's logs, while the global judgment sees no entry today (X3)", () => {
+  withWiki(
+    (dir, today) => {
+      // Nothing of today for test-project: an old session-log heading, no log.md line.
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        '---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old\n',
+      );
+      writeFileSync(join(dir, 'log.md'), '## [2020-01-01] session | test-project\n');
+    },
+    (dir, today) => {
+      const [y, m, d] = today.split('-').map(Number);
+      const back = new Date(y, m - 1, d - 3);
+      const D = `${back.getFullYear()}-${String(back.getMonth() + 1).padStart(2, '0')}-${String(back.getDate()).padStart(2, '0')}`;
+      assert.ok(!freshDates().includes(D), 'precondition: D is not today');
+      const sid = 's-t10-x3';
+      const payload = {
+        project: 'test-project',
+        date: D,
+        summary: 'closed on D\n',
+        sessionLog: { entry: `## [${D}] closed on D\n` },
+      };
+      const cleanup = seedCloseTranscript(sid);
+      try {
+        const first = JSON.parse(runApply(dir, payload, { sessionId: sid }).stdout);
+        assert.equal(first.committed, true, JSON.stringify(first));
+        assert.equal(first.markerWritten, false, 'the receipt step did not land');
+        const retry = JSON.parse(runApply(dir, payload, { sessionId: sid }).stdout);
+        assert.equal(retry.ok, true, JSON.stringify(retry));
+        assert.equal(retry.committed, true);
+        assert.equal(retry.verification.ok, true, JSON.stringify(retry.verification));
+        assert.deepEqual(retry.verification.dates, [D]);
+        const global = sessionCloseFileStatus(dir, {
+          scope: 'global',
+          projectOverride: 'test-project',
+        });
+        assert.equal(global.ok, false);
+        assert.ok(
+          global.missing.includes(`projects/test-project/sessions/${today}-<close id>.md`),
+          JSON.stringify(global.missing),
+        );
+      } finally {
+        cleanup();
+      }
+    },
+  );
 });

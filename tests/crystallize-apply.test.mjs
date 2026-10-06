@@ -53,7 +53,7 @@ import {
   writeSessionClosedMarker,
 } from '../hooks/hypo-shared.mjs';
 import { ensureProjectIndex } from '../scripts/crystallize.mjs';
-import { receiptPath } from '../hooks/close-receipt.mjs';
+import { receiptPath, verifyEntriesInCommit } from '../hooks/close-receipt.mjs';
 import {
   buildMarkCloseProof,
   classifyExistingEntry,
@@ -656,12 +656,14 @@ test('probe (#39): --force without --payload → payload-required (force does NO
 test('probe (#39): gate NOT ok + no payload → falls through to payload-required (no skip)', () => {
   // Stale gate must NOT trigger the alreadyComplete probe — fallthrough
   // surfaces the "payload is required" error so the caller knows to supply
-  // close content.
+  // close content. Stale here means no close today: the only session-log
+  // heading is an old day's, and no entry is dated today (the generated
+  // hot.md proves nothing either way).
   withWiki(
-    (dir) => {
+    (dir, today) => {
       writeFileSync(
-        join(dir, 'projects', 'test-project', 'hot.md'),
-        `---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n`,
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        `---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n`,
       );
     },
     (dir) => {
@@ -880,7 +882,16 @@ test('post-apply (#40): payload introduces lint blocker → exit 1 stage=post-ap
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.equal(out.stage, 'post-apply-lint', `stage should be post-apply-lint: ${r.stdout}`);
-    assert.equal(out.verification.ok, true, 'freshness gate should still pass');
+    // Lint failed before the commit, so the verification (read after the commit
+    // step) does not decide this close. What it still shows: the session-log and
+    // log.md lines are in place, and only the entry waits for the commit lint withheld.
+    assert.equal(out.committed, null, 'a lint failure stops before the commit');
+    assert.deepEqual(out.verification.missing, [], JSON.stringify(out.verification));
+    assert.deepEqual(
+      out.verification.stale,
+      [out.verification.entry],
+      JSON.stringify(out.verification),
+    );
     const onDisk = readFileSync(join(dir, OQ_REL), 'utf-8');
     assert.ok(onDisk.includes(sentinel), 'post-apply path must have written the payload sentinel');
   });
@@ -2037,6 +2048,8 @@ test('--mark-session-closed warns too, with the marker-only undo (it makes no co
   withWiki(null, (dir) => {
     const sessionId = `hosttag-mark-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
     const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    // --mark proves THIS session's close, so the session needs one to prove.
+    pinCommittedClose(dir, sessionId, todayLocal());
     try {
       const r = run('crystallize.mjs', [
         `--hypo-dir=${dir}`,
@@ -2253,24 +2266,26 @@ test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is wi
   });
 });
 
-// The original fixture of the test above: hot.md sits inside the project folder
-// being closed. Since the gate blocks any dirty file there, the close is now
-// refused one step earlier, as compact-gate-not-ok, with no marker and no receipt.
-test('a project whose hot.md is .hypoignore-excluded keeps its entry out of git: the gate refuses (compact-gate-not-ok), no marker, no receipt', () => {
+// The test above with a file inside the project folder being closed instead:
+// the gate blocks any dirty file there, so the close is refused one step
+// earlier, as compact-gate-not-ok, with no marker and no receipt. (Its original
+// fixture, an ignored project's entry, now passes the gate on its local proof:
+// see the .hypoignore suite below.)
+test('a dirty file in the project folder being closed refuses the gate (compact-gate-not-ok), no marker, no receipt', () => {
   withWiki(null, (dir, today) => {
-    // An ignored view hides the project's entries too (they are the source of the view).
-    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    // Not a .md page, so preflight lint has nothing to say about it.
+    writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
     const sessionId = 's-hypoignore-gate-refusal';
     const r = runApply(dir, payload, { sessionId });
     const out = JSON.parse(r.stdout);
+    assert.equal(out.committed, true, `the close itself committed: ${r.stdout}`);
     assert.equal(out.markerSkipReason, 'compact-gate-not-ok', `stage: ${r.stdout}\n${r.stderr}`);
     assert.equal(out.markerWritten, false);
     // The result names the checkpoint gate's own blocker, so a caller does not
     // have to reach for --check-session-close, which judges a wider git axis.
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file.startsWith('projects/test-project/sessions/')),
+      (out.gateBlockers || []).some((b) => b.file === 'projects/test-project/scratch.txt'),
       `gateBlockers must name the refused file: ${JSON.stringify(out.gateBlockers)}`,
     );
     assert.ok(
@@ -2319,9 +2334,8 @@ test('the console report for receipt-proof-mismatch says ok:false and points at 
 // blocker in the vault is what stopped the marker.
 test('the console report for compact-gate-not-ok names the gate blocker, not --session-id or a new close phrase', () => {
   withWiki(null, (dir, today) => {
-    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
     const sessionId = `s-hypoignore-gate-console-${process.pid}`;
     const cleanup = seedCloseTranscript(sessionId);
     let r;
@@ -3148,8 +3162,10 @@ test('buildMarkCloseProof marks a project incomplete when it has no session-log 
       // has no evidence path to name, and every OTHER target is committed and clean.
       rmSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`));
     },
-    (dir) => {
-      const proof = buildMarkCloseProof(dir, ['test-project'], false);
+    (dir, today) => {
+      const closeId = closeIdFor('s-proof-nolog', 0);
+      writeEntryFile(dir, { closeId, date: today, tracks: [{ id: 'main', new: true }] });
+      const proof = buildMarkCloseProof(dir, ['test-project'], false, { closeId });
       assert.equal(
         proof.ok,
         false,
@@ -3162,12 +3178,18 @@ test('buildMarkCloseProof marks a project incomplete when it has no session-log 
 });
 
 test('buildMarkCloseProof certifies a project whose session-log evidence is committed (negative control)', () => {
-  withWiki(null, (dir) => {
-    const proof = buildMarkCloseProof(dir, ['test-project'], false);
+  withWiki(null, (dir, today) => {
+    const closeId = closeIdFor('s-proof-ok', 0);
+    const rel = writeEntryFile(dir, { closeId, date: today, tracks: [{ id: 'main', new: true }] });
+    const proof = buildMarkCloseProof(dir, ['test-project'], false, { closeId });
     assert.equal(proof.ok, true, JSON.stringify(proof));
     assert.ok(
       proof.entries.some((e) => /session-log\//.test(e.path)),
       `the session-log evidence file must be among the proven paths: ${JSON.stringify(proof.entries)}`,
+    );
+    assert.ok(
+      proof.entries.some((e) => e.path === rel && e.kind === 'create'),
+      `this close's committed entry is proven as a create: ${JSON.stringify(proof.entries)}`,
     );
   });
 });
@@ -3884,6 +3906,20 @@ function applyJson(dir, payload, sessionId) {
     assert.fail(`apply printed no JSON (status ${r.status}): ${r.stdout}\n${r.stderr}`);
   }
   return { r, out };
+}
+
+// A close of `sessionId` that committed its entry and stopped before its receipt:
+// the pin still holds it as pending, which is what `--mark-session-closed` proves
+// this session by while the close signal is still open.
+function pinCommittedClose(dir, sessionId, date) {
+  const closeId = closeIdFor(sessionId, 0);
+  const rel = writeEntryFile(dir, { closeId, date, tracks: [{ id: 'main', new: true }] });
+  writeClosePin(dir, sessionId, {
+    pending: { closeId, openedAtIndex: 0, entryRelPath: rel, entrySha256s: [] },
+    lastResolved: null,
+    localProofs: {},
+  });
+  return closeId;
 }
 
 /** An entry file written (and committed) as if another session had closed. */
@@ -4963,8 +4999,11 @@ test('an ignored project: the entry is never committed, the local proof outlives
   withWiki(null, (dir, today) => {
     writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
     const sid = newPinSession('ignored');
+    // The receipt step fails throughout, so the close request stays open for the retries.
+    blockReceipt(dir, sid);
     const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
     assert.equal(first.out.committed, true, JSON.stringify(first.out));
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
     assert.deepEqual(readJournal(dir, sid), {}, 'the commit step cleared the journal');
     const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
     const bytes = readFileSync(file, 'utf-8');
@@ -4980,6 +5019,7 @@ test('an ignored project: the entry is never committed, the local proof outlives
     );
 
     const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.stage, 'receipt-write-failed', JSON.stringify(retry.out));
     assert.equal(readFileSync(file, 'utf-8'), bytes, 'bytes unchanged');
     assert.ok(
       retry.out.notices.some((n) => /이번 payload의 요약은 반영되지 않았습니다/.test(n)),
@@ -4990,6 +5030,72 @@ test('an ignored project: the entry is never committed, the local proof outlives
     const conflict = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
     assert.equal(conflict.out.stage, 'entry-conflict', JSON.stringify(conflict.out));
     assert.equal(readFileSync(file, 'utf-8'), `${bytes}\nhand edit\n`);
+  });
+});
+
+// The two halves the gate and the receipt used to block: the ignored entry stays
+// dirty for good (the checkpoint gate refused it as this session's own uncommitted
+// write), and no commit holds it (the receipt had no kind to prove it with).
+// Disabling the check: in precompactGateStatus drop the `provenLocal.has(pf) ||` term,
+// or in close-receipt.mjs drop 'local-create' from RECEIPT_ENTRY_KINDS. Either way
+// the retry ends compact-gate-not-ok or receipt-proof-mismatch, not ok.
+test('an ignored project: a retry with a fixed summary after a failed receipt is ok:true and lands the marker (X2)', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored-fixed');
+    const unblock = blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    assert.equal(first.out.committed, true);
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    const bytes = readFileSync(file, 'utf-8');
+
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(retry.out.committed, true);
+    assert.equal(retry.out.markerWritten, true, JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), bytes, 'the proven bytes are kept');
+    assert.ok(
+      retry.out.notices.some((n) => /이번 payload의 요약은 반영되지 않았습니다/.test(n)),
+      JSON.stringify(retry.out.notices),
+    );
+    assert.ok(existsSync(sessionClosedMarkerPath(dir, sid)), 'the marker landed');
+  });
+});
+
+// Disabling the check: in close-receipt.mjs verifyEntriesInCommit, drop the hash
+// comparison of the local-create branch (only the missing-file check stays): the
+// disk-edit mismatch below disappears.
+test('an ignored project: the receipt proves the entry as local-create with the hash of the bytes on disk (X2)', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored-receipt');
+    const { out } = applyJson(dir, v2Payload(today, { summary: 'local summary' }), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    const receipt = JSON.parse(readFileSync(receiptPath(dir, sid), 'utf-8'));
+    const entry = receipt.entries.find((e) => e.path === rel);
+    assert.ok(entry, `the receipt names the entry: ${JSON.stringify(receipt.entries)}`);
+    assert.equal(entry.kind, 'local-create');
+    assert.equal(
+      entry.expected.bytesSha256,
+      createHash('sha256')
+        .update(readFileSync(join(dir, rel)))
+        .digest('hex'),
+    );
+    assert.equal(
+      entry.expected.bytesSha256,
+      readClosePin(dir, sid).localProofs[closeIdFor(sid, 0)].entrySha256,
+      'the same hash the close pin records',
+    );
+    assert.equal(verifyEntriesInCommit(dir, receipt.commit, receipt.entries).ok, true);
+
+    appendFileSync(join(dir, rel), 'edited after the close\n');
+    assert.deepEqual(verifyEntriesInCommit(dir, receipt.commit, [entry]).mismatches, [
+      { path: rel, reason: 'local-entry-mismatch' },
+    ]);
   });
 });
 

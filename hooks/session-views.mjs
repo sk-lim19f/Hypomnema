@@ -11,9 +11,9 @@
 // besides those. Listed in `hooks/shared.json`.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, resolve } from 'node:path';
+import { join, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { atomicWrite } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
@@ -27,7 +27,6 @@ import {
   isBaselineId,
   isGeneratedViewPath,
   isSessionEntryPath,
-  isSessionProjectDir,
   missingBlockLines,
   narrowestVisibilityScope,
   parseSessionEntry,
@@ -42,8 +41,11 @@ import {
   currentDevice,
   frontmatterScalar,
   legacyBaselineDate,
+  listSessionProjects,
+  listTrackedGeneratedViews,
   loadHypoIgnore,
   markPullArchiveMerged,
+  migrationState,
   pathInHead,
   projectHiddenByHypoignore,
   readGeneratedViewsRecord,
@@ -52,6 +54,7 @@ import {
   resumePullArchive,
   setAsideNotices,
   revPathArg,
+  SESSION_ENTRIES_OFF_MARKER,
   undoClearedPaths,
   unignoredCachePaths,
   vaultCommitLockTarget,
@@ -61,8 +64,14 @@ import {
   writeRootHotHealthNotice,
 } from './hypo-shared.mjs';
 
-/** Present in HEAD's tree when the vault was rolled back to the old flat files on purpose. */
-export const SESSION_ENTRIES_OFF_MARKER = '.hypo-session-entries-off';
+// Defined in hypo-shared.mjs, whose close gate needs them; this module stays where callers import
+// them from.
+export {
+  SESSION_ENTRIES_OFF_MARKER,
+  listSessionProjects,
+  listTrackedGeneratedViews,
+  migrationState,
+} from './hypo-shared.mjs';
 
 // `entry_scope` has the grammar of `visibility_scope`; anything else closes the project.
 const ENTRY_SCOPE_RE = /^(shared|machine:\S*|agent:\S+)$/;
@@ -94,48 +103,9 @@ const lenientRead = (path) => {
   }
 };
 
-const isDir = (path) => {
-  try {
-    return statSync(path).isDirectory();
-  } catch {
-    return false;
-  }
-};
-
-const isFile = (path) => {
-  try {
-    return statSync(path).isFile();
-  } catch {
-    return false;
-  }
-};
-
 const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // ── projects and entries ─────────────────────────────────────────────────────
-
-/** Slugs of the `projects/` children that are session projects, in code-unit order. */
-export function listSessionProjects(hypoDir) {
-  let names;
-  try {
-    names = readdirSync(join(hypoDir, 'projects'));
-  } catch {
-    return [];
-  }
-  return names
-    .filter((slug) => {
-      const dir = join(hypoDir, 'projects', slug);
-      return (
-        isDir(dir) &&
-        isSessionProjectDir({
-          slug,
-          hasIndex: isFile(join(dir, 'index.md')),
-          hasSessions: isDir(join(dir, 'sessions')),
-        })
-      );
-    })
-    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-}
 
 /**
  * The parsed entries of one project plus the files that could not be read: `{entries, unreadable}`.
@@ -176,73 +146,6 @@ export function listSessionEntries(hypoDir, project, { testHooks } = {}) {
     else if (!entries.some((e) => e.closeId === parsed.entry.closeId)) entries.push(parsed.entry);
   }
   return { entries, unreadable };
-}
-
-// ── git state ────────────────────────────────────────────────────────────────
-
-/**
- * The generated view paths git tracks. `source: 'index'` (default) is `git ls-files`, `'head'` is
- * `git ls-tree -r HEAD`. Filtered by `isGeneratedViewPath`, never by a pathspec (`*` crosses `/`).
- * Throws when git cannot answer: an empty list must always mean "nothing tracked".
- */
-export function listTrackedGeneratedViews(hypoDir, { source = 'index' } = {}) {
-  if (source !== 'head' && source !== 'index') {
-    throw new Error(`listTrackedGeneratedViews: source must be 'head' or 'index', got ${source}`);
-  }
-  const args =
-    source === 'head' ? ['ls-tree', '-r', '-z', '--name-only', 'HEAD'] : ['ls-files', '-z'];
-  const r = git(hypoDir, args);
-  if (r.status !== 0) throw new Error(`git ${args[0]} failed: ${String(r.stderr).trim()}`);
-  return r.stdout.split('\0').filter((p) => isGeneratedViewPath(p));
-}
-
-// A `.git` in `dir` or a parent, a directory or the file a linked worktree or submodule has. Both
-// the path as given and its real path are walked: a vault reached through a symlink to a
-// subdirectory of a repository has its `.git` above the real path, not above the link.
-function hasGitEntry(dir) {
-  const starts = [resolve(dir)];
-  try {
-    starts.push(realpathSync(dir));
-  } catch {
-    // unresolvable: the path as given is all there is
-  }
-  for (const start of starts) {
-    for (let d = start; ; d = dirname(d)) {
-      if (existsSync(join(d, '.git'))) return true;
-      if (dirname(d) === d) break;
-    }
-  }
-  return false;
-}
-
-/**
- * `'migrated' | 'not-migrated' | 'opted-out' | 'incomplete-block'`, read from HEAD's tree only (the real index is not
- * consulted: a migration commit moves HEAD and the index together). The off marker in HEAD is
- * `opted-out`; the `.gitignore` block in HEAD plus no tracked generated view in HEAD is
- * `migrated`; a `.gitignore` in HEAD that has the block's first line but lacks one of its pattern
- * lines is `incomplete-block` (a hand edit or a bad merge: nothing treats it as `migrated`, and
- * migration waits for the user to restore it); anything else, including git failing to answer, is
- * `not-migrated`. Only a vault with
- * no `.git` entry in it or any parent (`hasGitEntry`) tracks nothing and counts as `migrated`: when
- * git cannot say whether the directory is a work tree (not installed, dubious ownership, a timeout,
- * a broken config) but the entry is there, the vault may well track views, so it is `not-migrated`.
- */
-export function migrationState(hypoDir) {
-  if (git(hypoDir, ['rev-parse', '--is-inside-work-tree']).status !== 0) {
-    return hasGitEntry(hypoDir) ? 'not-migrated' : 'migrated';
-  }
-  if (pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) return 'opted-out';
-  const shown = git(hypoDir, ['show', revPathArg('HEAD', '.gitignore')]);
-  const missing = shown.status === 0 ? missingBlockLines(shown.stdout, GITIGNORE_BLOCK) : null;
-  if (missing === null) return 'not-migrated';
-  if (missing.length) return 'incomplete-block';
-  try {
-    return listTrackedGeneratedViews(hypoDir, { source: 'head' }).length === 0
-      ? 'migrated'
-      : 'not-migrated';
-  } catch {
-    return 'not-migrated';
-  }
 }
 
 // ── model ────────────────────────────────────────────────────────────────────

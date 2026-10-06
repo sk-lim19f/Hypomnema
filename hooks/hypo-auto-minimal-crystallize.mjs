@@ -87,6 +87,7 @@ import {
   gitDirtyFiles,
 } from './hypo-shared.mjs';
 import { closeCheckpointState, isCloseComplete, receiptPath } from './close-receipt.mjs';
+import { closeGateStatus } from './close-gate-store.mjs';
 import { atomicWrite } from './atomic-write.mjs';
 
 // Carrying a systemMessage does not turn this into a block: the session is
@@ -341,7 +342,12 @@ process.stdin.on('end', () => {
         // a notice instead of holding this session's Stop hostage on debt it
         // never touched.
         const attributionScope = resolveGateProjectOverride(HYPO_DIR, { sessionCwd });
+        // Which close id proves this session for the gate's cwd check (injected:
+        // close-gate-store.mjs imports hypo-shared.mjs).
+        const closeGate = closeGateStatus({ transcriptPath, hypoDir: HYPO_DIR, sessionId });
         return precompactGateStatus(HYPO_DIR, {
+          closeOpen: closeGate.ok,
+          resolvedAtIndex: closeGate.resolvedAtIndex,
           ...(transcriptPath ? { transcriptPath } : {}),
           ...(sessionCwd ? { sessionCwd } : {}),
           ...(sessionId ? { sessionId } : {}),
