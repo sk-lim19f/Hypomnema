@@ -19,7 +19,7 @@ If `/hypo:crystallize` was invoked to close a session (via an explicit close sig
 
 Before composing the payload (Step 2), run these four reflections and surface each to the user. Every one is **advisory** (identity guard): the user confirms or declines, and none performs an automatic action, writes a file on its own, or bypasses the mandatory gate.
 
-1. **Trivial-session check (#44).** Was this session trivial (a single bug fix, a single-file edit, or Q&A with no durable artifact)? If so, recommend skipping session-close: *"이 세션은 trivial해 보입니다. session-close를 건너뛸까요?"* and proceed only if the user wants a close. A trivial skip is a recommendation, **not** a bypass: it must not mark the session closed, must not run `--mark-session-closed`, and must not claim `/compact` can pass. Any real close still requires all 4 mandatory files.
+1. **Trivial-session check (#44).** Was this session trivial (a single bug fix, a single-file edit, or Q&A with no durable artifact)? If so, recommend skipping session-close: *"이 세션은 trivial해 보입니다. session-close를 건너뛸까요?"* and proceed only if the user wants a close. A trivial skip is a recommendation, **not** a bypass: it must not mark the session closed, must not run `--mark-session-closed`, and must not claim the close check is green. Any real close still requires all 4 mandatory files.
 2. **ADR-candidate check (#41).** Did this session make an architectural or design decision (a new pattern, a tradeoff chosen, a convention established)? If yes, ask whether it warrants an ADR and, if so, capture that intent in the `sessionLog` entry you compose in Step 2. If nothing rose to ADR level, you may record `ADR 없음: <one-line reason>` in that same `sessionLog` entry, but gate it on #42's bar: the marker is machine-read and W8 excludes an entry carrying `ADR 없음` (with no ADR reference) from the design-history staleness check. Write it only when the session had **no design change at all**; a sub-ADR design shift takes #42a (append) instead, since the marker would suppress the W8 nudge it needs. **Never auto-write an ADR file.** Recording the decision (or its absence) in the session-log payload is the only action here. This check carries no `decisions/` directory precondition: run it whether or not that directory exists.
 3. **design-history staleness check (#42).** Two branches, so a stale W8 never blocks a clean close: (a) if this session changed design decisions `projects/<name>/design-history.md` does not yet reflect (including sub-ADR background, tradeoff, or differentiation shifts), recommend appending now: the W8 lint warning flags this mechanically, and an active-project W8 still counts as a `--check-session-close` blocker even though the PreCompact hook no longer stops `/compact` on it, so append before you commit. **If the file does not exist yet and this session had a design change, recommend creating it now** with that change as the first entry; lint separately flags a missing-but-needed file as W14, a warning that never blocks. (b) only if the session made **no** design change does the `ADR 없음` marker (#41) exempt the entry from W8; do not touch design-history, and do not create the file just to satisfy this branch's check. `ADR 없음` means "no design change," a stricter bar than "no ADR-level decision." Never auto-write the file yourself in either branch: recommend it, and let the user decide.
 4. **Ingest check (#43)** — Did this session consume trustworthy external knowledge (a fetched URL, official docs, or code you verified directly)? If so, recommend running `/hypo:ingest` to capture it under `sources/`. Proceed only on the user's confirmation.
@@ -114,14 +114,14 @@ the apply first files a commit-backed close checkpoint receipt at
 `HYPO_DIR/.cache/sessions/<id>/close-receipt.json`, then writes the per-session compat marker
 `HYPO_DIR/.cache/session-closed-<id>.marker` as a projection of it. If the marker does not land,
 the receipt is withdrawn again, so a run that reports the marker as failed never leaves a valid
-receipt behind. The checkpoint gate reads git more narrowly than `/compact` does. An uncommitted
+receipt behind. The checkpoint gate reads git more narrowly than the PreCompact gate and `--check-session-close` do. An uncommitted
 file inside the project folder being closed (`projects/<project>/`) blocks whether or not this
 session has a record of writing it. An uncommitted file at the vault root or in another project's
 folder blocks only when this session wrote it through Write or Edit since its last auto-commit;
 otherwise it is reported as a notice. If the record of what this session wrote cannot be read, the
 gate does not block on it: it treats the session as having no record and adds a notice that it could
-not determine who owns those files. So the checkpoint can land while `/compact` still waits on
-someone else's dirty file. The checkpoint receipt is the thing the
+not determine who owns those files. So the checkpoint can land while `--check-session-close` stays red on
+someone else's dirty file. Neither one stops `/compact`: the PreCompact hook only shows a notice. The checkpoint receipt is the thing the
 Stop-chain Layer 3 hook (`hypo-auto-minimal-crystallize`) actually checks: it proves only that
 the file versions it names are in a specific commit, never that every change this session made
 is saved. (It has nothing to do with the `close-receipt-failed` result of `proposal resolve`
@@ -190,7 +190,7 @@ Both gates judge only the **payload files** (the 4 mandatory close files + `open
 >
 > Three refusals come before the receipt proof and carry no `reason`. A gate refusal (`blockers[]` plus `missing` and `stale`, with `error: 'session-close gate not satisfied'`) means the same close-file, lint or feedback checks as `--check-session-close` found something this session owns: fix it and re-run. A `skipReason` of `no-user-close-signal` (with `gateReason` when the gate has one) or `no-attribution-evidence` means the transcript shows no close request, or nothing ties this session to a project (pass `--project=<slug>` or `--log-only`). A bare `error` with none of these fields means the prior receipt or marker could not be set aside; fix the permission or disk problem under `.cache/` it names.
 >
-> A close is complete once the receipt is issued: `ok: true` from this command, and `close_state: closed` from `--check-session-close --session-id=<id>`. The "Compact-ready" line of `--check-session-close` covers the whole vault, so another session's uncommitted file can keep it red after your close has landed.
+> The close checkpoint is recorded once the receipt is issued: `ok: true` from this command, and `close_state: closed` from `--check-session-close --session-id=<id>`. The Stop hook still checks this session's own project folder and has the final say. The final "Close check" line of `--check-session-close` covers the whole vault, so another session's uncommitted file can keep it red after your close has landed. A red line never stops `/compact`: PreCompact only shows a notice.
 
 ---
 
@@ -232,7 +232,7 @@ Once `ok: true`, report from the result JSON's `applied` and `skipped` arrays to
 - **`parkedTotal`** (report it if not `null` and > 0): the vault-wide count of parked write-proposal artifacts, not just what this close just parked (`proposals[]` above is only this run's own). It mixes pending, already-approved-but-unreconciled, and evidence-broken artifacts; the breakdown by state lives in doctor, not here. Tell the user, in one line, that N parked write-proposal artifact(s) exist vault-wide and that doctor shows what state each one is in: `/hypo:doctor` in Claude Code, or `hypomnema doctor` from a shell with the npm CLI (a plugin-only install has no `hypomnema` command). Do not repeat the per-id detail already covered by `proposals[]`. `null` means `.cache/proposals` itself could not be listed: report that as a measurement failure, never as "no parked proposals."
 - **`parkedUnreadable`** (report it whenever non-empty, regardless of `parkedTotal`): filenames under `.cache/proposals` that exist as `.json` candidates but could not be parsed into an artifact (corrupt, permission-denied, or hand-edited into an unrecognizable shape). These are **not** counted in `parkedTotal` above; do not add the two numbers together. Tell the user, by name, which file(s) are unreadable and that doctor is where to inspect them (`/hypo:doctor` in Claude Code, or `hypomnema doctor` with the npm CLI); neither `proposal list` nor `proposal reconcile` can see these. This can be non-empty even when `parkedTotal` is `0`: a vault whose only proposal file is broken must never read as "nothing parked."
 
-If `markerWritten: true`: ask: "Session closed. Would you like to also run knowledge synthesis now, or stop here?"
+If `markerWritten: true`: ask: "The close checkpoint is recorded. Would you like to also run knowledge synthesis now, or stop here?"
 
 **If `ok: false` with an authority `reason`, the close did not happen at all.** Nothing was written, nothing was committed. Do not report a partial close, and do not go looking for another way in.
 
@@ -247,7 +247,7 @@ If `markerWritten: true`: ask: "Session closed. Would you like to also run knowl
 
 If the apply succeeded but `markerWritten: false`, do NOT say "session closed." Branch on `markerSkipReason`, which carries one of four values here. Three more (`marker-did-not-land`, `receipt-proof-mismatch`, `receipt-write-failed`) no longer reach this branch: when every other precondition cleared and the close still could not certify itself, that is a failure and not a policy withhold, so the result comes back `ok: false` with that value as `stage` and exit 1. Each has its own row in the stage table above.
 
-- `compact-gate-not-ok`, `commit-failed: …`: surface the reason verbatim and address it (resolve the compact blocker, fix the git issue) before re-running. The JSON's `gateBlockers[]` names what the checkpoint gate refused on; read the cause there, not from `--check-session-close`, which judges the whole vault on a wider git axis and also lists other sessions' files that did not block this close. One `compact-gate-not-ok` blocker is an uncommitted file in the project folder being closed, which blocks even when this session has no record of writing it: commit it or revert it. **The re-run needs no fresh close phrase from the user for these two.** The resolution that spends a close signal is written only once the marker lands, so a run denied its marker at this stage leaves that signal unspent and the retry is authorized by the same one.
+- `compact-gate-not-ok`, `commit-failed: …`: surface the reason verbatim and address it (resolve the gate blocker, fix the git issue) before re-running. The JSON's `gateBlockers[]` names what the checkpoint gate refused on; read the cause there, not from `--check-session-close`, which judges the whole vault on a wider git axis and also lists other sessions' files that did not block this close. One `compact-gate-not-ok` blocker is an uncommitted file in the project folder being closed, which blocks even when this session has no record of writing it: commit it or revert it. **The re-run needs no fresh close phrase from the user for these two.** The resolution that spends a close signal is written only once the marker lands, so a run denied its marker at this stage leaves that signal unspent and the retry is authorized by the same one.
   **A `commit-failed:` retry can need a hand first.** The payload writes land before the commit does, so after a failed commit those files already match what the retry would write. The retry skips them as already current, which leaves them out of the commit it makes, and they stay uncommitted and keep blocking the marker. If a retry reports `commit-failed:` or `compact-gate-not-ok` a second time on the same close, or comes back with `stage: 'receipt-proof-mismatch'` naming those close files, stop retrying and look at `git status` in the vault: stage and commit the close files yourself, or ask the user to, then run the close again.
 - `transcript-unresolved`: the marker writer could not resolve any transcript for this `--session-id` at all, so it never got as far as checking for a close signal. Passing the exact same id again changes nothing; get the main conversation's real session id (not a background-task or Agent-thread uuid) and re-run.
 - `no-user-close-signal`: a transcript was found, but it carries no close signal the gate recognizes. This is the one branch where the re-run DOES need a fresh signal: confirm intent once with `AskUserQuestion` (the same 세션 마무리 flow described under Step 3's `no-user-close-signal` table above), then re-run only after the user confirms. **Read `markerGateReason` first.** It carries the same three values as the authority refusal's `gateReason` (`no-open`, `transcript-rewrite-detected`, `no-new-open-since-resolution`), and only `no-open` means the user never asked. It also names a queued item shaped like an unregistered host tag when one retracted the close, which is a stale allowlist rather than a change of mind: report that name to the user instead of asking them to close again.
@@ -268,8 +268,6 @@ Add `--hypo-dir="<path>"` only when the user specified a Hypomnema directory exp
 otherwise omit it.
 
 An unrecognized flag exits 2 instead of being ignored.
-
-Its verdict covers the whole vault, so it can stay red on another session's uncommitted file after your own close has landed. Whether this session is closed is decided by the close checkpoint receipt: pass `--session-id=<id>` and read `close_state` (`closed` once the receipt is valid), not the vault-wide verdict.
 
 Show the output to the user. If no candidates are found, tell them Hypomnema looks well-connected and no crystallization is needed.
 
@@ -341,7 +339,7 @@ Show what was created or modified, and offer to run `/hypo:lint` to verify all n
 `--check-session-close` (read-only strict gate, same check PreCompact runs) is still supported as a probe-only verification. Use it when you only want to verify that today's session-close is complete without applying anything:
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --check-session-close
+node ${CLAUDE_PLUGIN_ROOT}/scripts/crystallize.mjs --check-session-close --session-id=<current-session-id>
 ```
 
 Add `--hypo-dir="<path>"` only when the user specified a Hypomnema directory explicitly;
@@ -349,8 +347,10 @@ otherwise omit it.
 
 An unrecognized flag exits 2 instead of being ignored.
 
+Its verdict covers the whole vault (with `--session-id` for a session whose close was log-only, the project-close checks are skipped), so it can stay red on another session's uncommitted file after your own close has landed. Whether this session is closed is decided by the close checkpoint receipt: pass `--session-id=<id>` and read `close_state` (`closed` once the receipt is valid, or `legacy-closed` for an older marker written before receipts existed), not the vault-wide verdict. The Stop hook still checks this session's own project folder and has the final say.
+
 It reports any file as `missing` or `stale`. For an actual close, prefer `--apply-session-close --payload=<path>` (Step 3): it bundles freshness and lint into one gate and is the documented dogfood path. `parseArgs` only accepts the `--payload=<path|->` spelling (a path, or `-` for stdin); a space-separated `--payload <path>` is rejected outright with exit 2, not silently dropped.
 
-Add `--project=<slug>` to scope the check to one project (close status + lint scope) when recency picks the wrong one. This is a project-scoped diagnostic only: a green scoped result (JSON `scope: "project"`) attests that slug is close-complete, **not** that `/compact` is unblocked globally.
+Add `--project=<slug>` to scope the check to one project (close status + lint scope) when recency picks the wrong one. This is a project-scoped diagnostic only: a green scoped result (JSON `scope: "project"`) attests that slug is close-complete, **not** that the whole vault is clean.
 
 On the marker writer (`--mark-session-closed --project=<slug>`), `--project` names the project this session closed: it sets the marker's attribution slug and enters the close scope, so another session's incomplete close is reported as `close_debt` (a notice) instead of refusing your marker. Every other gate check stays global.

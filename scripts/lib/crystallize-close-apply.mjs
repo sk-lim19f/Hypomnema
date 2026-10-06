@@ -649,8 +649,8 @@ function priorReceiptCommitRewritten(hypoDir, sessionId) {
 // crystallize` is the only Reader; writer authority is intentionally split
 // between this CLI and the auto-write at the tail of applySessionClose.
 //
-// Contract: the marker is written only when the FULL /compact gate
-// (precompactGateStatus) is green. A failed gate exits 1 with no
+// Contract: the marker is written only when precompactGateStatus, run in
+// checkpointMode (the git axis narrowed), is green. A failed gate exits 1 with no
 // marker — the next Stop hook re-blocks.
 
 export function runMarkSessionClosed(args) {
@@ -672,11 +672,12 @@ export function runMarkSessionClosed(args) {
   if (args.project && !args.logOnly) requireProjectDir(args, args.project);
   // The per-session marker is the THIRD session-close completion
   // signal (after the PreCompact gate and `--check-session-close`). It uses
-  // precompactGateStatus, the gate /compact uses, with one deliberate
-  // difference: `checkpointMode` (set below) replaces the git axis. /compact
-  // blocks on any uncommitted vault change, while the checkpoint blocks only
+  // precompactGateStatus, the gate the PreCompact notice reads, with one deliberate
+  // difference: `checkpointMode` (set below) replaces the git axis. The gate
+  // flags any uncommitted vault change, while the checkpoint blocks only
   // on an uncommitted write THIS session still owns, so another session's
-  // dirty file can make /compact wait while this checkpoint still lands.
+  // dirty file can keep the gate red while this checkpoint still lands.
+  // Neither one stops /compact: PreCompact only shows a notice.
   // Every other axis is the same, so the marker still enforces feedback
   // projection (over-cap/conflict), W8 design-history staleness, and root
   // hot.md structure, the checks the earlier narrower marker gate skipped.
@@ -773,7 +774,7 @@ export function runMarkSessionClosed(args) {
     ...(args.project && !args.logOnly ? { closeScope: [args.project] } : {}),
     ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
     ...(args.logOnly ? { logOnly: true } : {}),
-    // P2 (session-close attribution): the marker gate must refuse to attest compact-ready while the
+    // P2 (session-close attribution): the marker gate must refuse to attest a green gate while the
     // session's cwd project has an unstarted close. logOnly exempts it in-gate.
     ...(args.sessionCwd ? { sessionCwd: args.sessionCwd } : {}),
     ...(attributionScope ? { attributionScope } : {}),
@@ -804,8 +805,8 @@ export function runMarkSessionClosed(args) {
     }
     process.exit(1);
   }
-  // User-close hard gate: the compact gate above only proves the wiki
-  // is compact-ready; it does NOT prove the USER asked to close. Refuse the marker
+  // User-close hard gate: the close gate above only proves the wiki
+  // has no human-fixable close item; it does NOT prove the USER asked to close. Refuse the marker
   // unless the transcript carries a genuine user close signal (NL close phrase,
   // /compact, or an AskUserQuestion close answer). This is the hard backstop for
   // model over-close, where prose guidance lost to a conflicting global rule.
@@ -1034,7 +1035,7 @@ export function runMarkSessionClosed(args) {
     // carrying the marker-only undo (no commit exists on this path).
     ...(hostTagWarning ? { hostTagWarning } : {}),
     // pure feedback-projection drift is a non-blocker: the marker
-    // attests "compact-ready (no human-fixable blocker)", and the PreCompact
+    // attests "gate green (no human-fixable blocker)", and the PreCompact
     // hook self-heals the projection (feedback-sync --write) at /compact. Surface
     // the deferral so the caller knows MEMORY/CLAUDE sync is pending, not lost.
     drift_deferred: gate.driftTargets,
@@ -3935,7 +3936,7 @@ function printCloseReport({
             // by a compact-gate blocker. It is not a session-id problem and not a receipt
             // problem, so it gets its own words.
             markerSkipReason === 'compact-gate-not-ok'
-            ? `    The 4 mandatory files were applied and verified, but the compact gate\n` +
+            ? `    The 4 mandatory files were applied and verified, but the close gate\n` +
               `    refused the per-session Stop-chain marker because a gate blocker\n` +
               `    remains. The session is NOT fully closed: the Stop hook will re-prompt\n` +
               `    until the marker is present. This is not a --session-id problem.\n` +

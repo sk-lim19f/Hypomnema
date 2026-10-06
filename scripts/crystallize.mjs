@@ -15,9 +15,9 @@
  *   --check-session-close    Verify the strict session-close memory files: 4 mandatory + open-questions conditional
  *   --project=<slug>         Override the recency-inferred project on --check / --mark (single segment
  *                            [A-Za-z0-9._-]+, projects/<slug>/ must exist). On --check it NARROWS the
- *                            gate to that one project — a project-scoped diagnostic, NOT a global
- *                            compact-ready verdict. On --mark it is ATTRIBUTION only; the gate stays
- *                            global (the marker == compact-ready invariant). Ignored on --apply.
+ *                            gate to that one project: a project-scoped diagnostic, NOT a global
+ *                            close verdict. On --mark it is ATTRIBUTION only; the gate stays
+ *                            global (the marker gate is the global gate with the git axis narrowed). Ignored on --apply.
  *   --apply-session-close    Apply a JSON payload that updates the 4 mandatory memory files
  *                            (+ optional open-questions). Idempotent — re-running with the same
  *                            payload is a no-op. Always finishes with the strict gate check.
