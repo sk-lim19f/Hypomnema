@@ -26,6 +26,8 @@ import { tmpdir } from 'node:os';
 // entry check, so importing it for unit tests does not run the CLI.
 import {
   resolveProjectId as fbResolveProjectId,
+  parseArgs as fbParseArgs,
+  run as fbRun,
   evaluateTarget,
   applyTarget,
   runAccept,
@@ -46,6 +48,9 @@ import {
   withFeedbackEnv,
   withWiki,
 } from './helpers.mjs';
+
+// where --bootstrap and --import-target-change write their drafts
+const fbDraftsDir = (wiki) => join(wiki, '.cache', 'feedback-drafts');
 
 // ── hypo-personal-check.mjs — feedback projection gate ──────
 // The PreCompact gate runs `feedback-sync --check --strict` when PKG_ROOT
@@ -454,7 +459,7 @@ test('feedback-sync-bootstrap-reads-both-index-forms: colon and legacy dash line
     { 'rule-a': FB_GLOBAL_L1 },
     ({ wiki, runFb }) => {
       assert.equal(runFb(['--bootstrap']).status, 0);
-      const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+      const draftsDir = fbDraftsDir(wiki);
       const read = (f) => readFileSync(join(draftsDir, f), 'utf-8');
       assert.ok(read('new-form.md').includes('memory_summary: colon summary'));
       assert.ok(read('old-form.md').includes('memory_summary: dash summary'));
@@ -1222,7 +1227,7 @@ test('feedback-sync-explicit-project-id-wins: MEMORY target present, no prompt p
 
 suite('feedback-sync.mjs — bootstrap + import (fix #37 Phase D)');
 
-test('feedback-sync-bootstrap-creates-drafts: legacy surfaces → _drafts scaffolds, idempotent', () => {
+test('feedback-sync-bootstrap-creates-drafts: legacy surfaces → draft scaffolds, idempotent', () => {
   const claudeMd =
     '# Global\n<learned_behaviors>\n' +
     '- [2026-05-20] always run the formatter before commit — 이유: consistency\n' +
@@ -1240,7 +1245,7 @@ test('feedback-sync-bootstrap-creates-drafts: legacy surfaces → _drafts scaffo
       const rep = JSON.parse(r.stdout);
       // 2 learned_behaviors + 1 feedback_* memory entry = 3; non-feedback_ entry ignored
       assert.equal(rep.created.length, 3, `expected 3 drafts, got ${rep.created.length}`);
-      const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+      const draftsDir = fbDraftsDir(wiki);
       const files = readdirSync(draftsDir);
       assert.ok(
         files.some((f) => f.startsWith('legacy-claude-20260520-')),
@@ -1272,7 +1277,10 @@ test('feedback-sync-bootstrap-dry-run-writes-nothing: --dry-run reports but crea
       const rep = JSON.parse(runFb(['--bootstrap', '--dry-run', '--json']).stdout);
       assert.equal(rep.dryRun, true);
       assert.ok(rep.created.length >= 1, 'dry-run still reports planned drafts');
-      assert.ok(!existsSync(join(wiki, 'pages', 'feedback', '_drafts')), 'no _drafts dir written');
+      assert.ok(!existsSync(fbDraftsDir(wiki)), 'no drafts dir written');
+      const t = runFb(['--bootstrap', '--dry-run']);
+      assert.match(t.stderr, /would create/);
+      assert.doesNotMatch(t.stderr, /The drafts are in/, 'no pointer to drafts that were not made');
     },
     { claudeMd },
   );
@@ -1289,7 +1297,7 @@ test('feedback-sync-import-target-change: hand-edited block → draft, SoT page 
     const rep = JSON.parse(r.stdout);
     assert.equal(rep.imported.length, 1);
     assert.equal(rep.imported[0].slug, 'rule-a');
-    const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+    const draftsDir = fbDraftsDir(wiki);
     const f = readdirSync(draftsDir).find((x) => x.startsWith('rule-a.import-'));
     assert.ok(f, 'import draft created with import-<date> suffix');
     assert.ok(
@@ -1746,7 +1754,7 @@ test('feedback-sync-import-skips-auto-accepted-block: a hand edit the page alrea
     const r = runFb(['--import-target-change', '--from=claude', '--json']);
     assert.equal(r.status, 0, r.stderr);
     assert.equal(JSON.parse(r.stdout).imported.length, 0, 'matched block: no draft');
-    assert.ok(!existsSync(join(wiki, 'pages', 'feedback', '_drafts')), 'no drafts dir created');
+    assert.ok(!existsSync(fbDraftsDir(wiki)), 'no drafts dir created');
   });
 });
 
@@ -1776,7 +1784,7 @@ test('feedback-sync-import-bad-from-errors: missing/invalid --from → exit 1', 
 
 test('feedback-sync-bootstrap-traversal-slug-stays-in-drafts: MEMORY ../ neutralized, pure-dots rejected', () => {
   // codex BLOCKER regression: a crafted `feedback_../escaped.md` must NOT escape
-  // _drafts into pages/feedback/. basename() collapses traversal to the final
+  // the drafts dir into pages/feedback/. basename() collapses traversal to the final
   // segment; a slug that reduces to nothing (`..`) is rejected as unsafe-slug.
   const memoryMd =
     '# Memory Index\n' +
@@ -1791,8 +1799,8 @@ test('feedback-sync-bootstrap-traversal-slug-stays-in-drafts: MEMORY ../ neutral
         'must not escape into pages/feedback/',
       );
       assert.ok(
-        existsSync(join(wiki, 'pages', 'feedback', '_drafts', 'escaped.md')),
-        'traversal neutralized to a draft under _drafts',
+        existsSync(join(fbDraftsDir(wiki), 'escaped.md')),
+        'traversal neutralized to a draft under the drafts dir',
       );
       assert.ok(
         rep.skipped.some((s) => s.reason === 'unsafe-slug'),
@@ -1817,7 +1825,7 @@ test('feedback-sync-bootstrap-skips-managed-memory-block: projected MEMORY entri
     { 'rule-a': FB_GLOBAL_L1 },
     ({ wiki, runFb }) => {
       runFb(['--bootstrap']);
-      const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+      const draftsDir = fbDraftsDir(wiki);
       const drafts = existsSync(draftsDir) ? readdirSync(draftsDir) : [];
       assert.ok(drafts.includes('loose-y.md'), 'loose legacy MEMORY entry is drafted');
       assert.ok(!drafts.includes('managed-x.md'), 'managed-block entry must NOT be re-drafted');
@@ -1858,7 +1866,7 @@ for (const [form, handLine] of [
       {},
       ({ wiki, memDir, runFb }) => {
         assert.equal(runFb(['--bootstrap']).status, 0);
-        assert.ok(existsSync(join(wiki, 'pages', 'feedback', '_drafts', 'rule-b.md')), 'drafted');
+        assert.ok(existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'drafted');
         assert.ok(existsSync(fbHandRecord(wiki)), 'bootstrap recorded the line in the vault');
         fbPromoteB(wiki);
         assert.deepEqual(fbBLines(memDir), [handLine], 'precondition: only the hand line yet');
@@ -1882,13 +1890,20 @@ test('feedback-sync-bootstrap-record-failure-is-a-warning: an unwritable line re
   withFeedbackEnv(
     {},
     ({ wiki, runFb }) => {
-      // a regular file where the record's directory should be makes the write throw
-      rmSync(join(wiki, '.cache'), { recursive: true, force: true });
-      writeFileSync(join(wiki, '.cache'), 'not a directory');
+      // a directory where the record file should be makes its rename throw; the drafts,
+      // beside it under .cache/, are still written
+      mkdirSync(fbHandRecord(wiki), { recursive: true });
       const r = runFb(['--bootstrap']);
       assert.equal(r.status, 0, r.stderr);
-      assert.ok(existsSync(join(wiki, 'pages', 'feedback', '_drafts', 'rule-b.md')), 'drafted');
+      assert.ok(existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'drafted');
       assert.match(r.stderr, /could not record hand lines; they will not be removed on promotion/);
+      rmSync(join(fbDraftsDir(wiki), 'rule-b.md'));
+      const j = runFb(['--bootstrap', '--json']);
+      assert.equal(j.status, 0, j.stderr);
+      assert.ok(
+        (JSON.parse(j.stdout).warnings || []).some((w) => /could not record hand lines/.test(w)),
+        'the --json report carries the same warning',
+      );
     },
     { memoryMd },
   );
@@ -2160,7 +2175,7 @@ test('feedback-sync-bootstrap-hand-line-underscore-link-is-kept: a user memory f
       const own = join(memDir, 'feedback_no_mocks.md');
       writeFileSync(own, '---\nname: no mocks\n---\nnever mock the database\n');
       assert.equal(runFb(['--bootstrap']).status, 0);
-      assert.ok(existsSync(join(wiki, 'pages', 'feedback', '_drafts', 'no-mocks.md')), 'drafted');
+      assert.ok(existsSync(join(fbDraftsDir(wiki), 'no-mocks.md')), 'drafted');
       writeFileSync(
         join(wiki, 'pages', 'feedback', 'no-mocks.md'),
         fbPage({ ...FB_PROJECT_L2, title: 'No mocks', bootstrap_origin: 'memory-index' }),
@@ -2190,7 +2205,7 @@ test('feedback-sync-bootstrap-hand-line-needs-bootstrap-origin: a lingering reco
       assert.equal(runFb(['--bootstrap']).status, 0);
       assert.ok(existsSync(fbHandRecord(wiki)), 'precondition: recorded');
       // the draft was rejected, but its record lingers; later an unrelated page takes the slug
-      rmSync(join(wiki, 'pages', 'feedback', '_drafts', 'rule-b.md'));
+      rmSync(join(fbDraftsDir(wiki), 'rule-b.md'));
       const page = join(wiki, 'pages', 'feedback', 'rule-b.md');
       writeFileSync(page, fbPage(FB_PROJECT_L2));
       const r = runFb(['--write']);
@@ -2210,7 +2225,7 @@ test('feedback-sync-bootstrap-hand-line-needs-bootstrap-origin: a lingering reco
 
 test('feedback-sync-import-traversal-source-stays-in-drafts: tampered source= neutralized', () => {
   // codex BLOCKER regression: a tampered `source=../escaped` managed marker must
-  // not let --import write outside _drafts.
+  // not let --import write outside the drafts dir.
   const claudeMd =
     '# Global\n<learned_behaviors>\n' +
     `<!-- HYPO:FEEDBACK-SYNC:START source=../escaped sha256=${'0'.repeat(64)} -->\n` +
@@ -2227,10 +2242,8 @@ test('feedback-sync-import-traversal-source-stays-in-drafts: tampered source= ne
         'nothing named escaped at pages/feedback top level',
       );
       assert.ok(
-        readdirSync(join(wiki, 'pages', 'feedback', '_drafts')).some((f) =>
-          f.startsWith('escaped.import-claude-'),
-        ),
-        'tampered source neutralized into _drafts',
+        readdirSync(fbDraftsDir(wiki)).some((f) => f.startsWith('escaped.import-claude-')),
+        'tampered source neutralized into the drafts dir',
       );
     },
     { claudeMd },
@@ -2245,7 +2258,7 @@ test('feedback-sync-import-no-clobber: re-import same day preserves the prior dr
     const p = join(claudeHome, 'CLAUDE.md');
     writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED'));
     runFb(['--import-target-change', '--from=claude']);
-    const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+    const draftsDir = fbDraftsDir(wiki);
     const first = readdirSync(draftsDir).find((x) => x.startsWith('rule-a.import-claude-'));
     writeFileSync(join(draftsDir, first), 'HUMAN RECONCILED');
     runFb(['--import-target-change', '--from=claude']); // second import, same day
@@ -2288,7 +2301,7 @@ function fbSnapshotFiles(norm, wiki, claudeHome, memDir) {
     .filter((f) => /^feedback_.+\.md$/.test(f))
     .sort())
     collect(f, join(memDir, f));
-  const draftsDir = join(wiki, 'pages', 'feedback', '_drafts');
+  const draftsDir = fbDraftsDir(wiki);
   const draftList = (existsSync(draftsDir) ? readdirSync(draftsDir) : []).sort();
   out.push(`### DRAFT_LIST\n${draftList.map(norm).join('\n')}`);
   for (const f of draftList)
@@ -2439,12 +2452,12 @@ STDOUT
     {
       "slug": "legacy-claude-20260501-legacy-rule-one",
       "origin": "claude-learned",
-      "path": "<BASE>/wiki/pages/feedback/_drafts/legacy-claude-20260501-legacy-rule-one.md"
+      "path": "<BASE>/wiki/.cache/feedback-drafts/legacy-claude-20260501-legacy-rule-one.md"
     },
     {
       "slug": "loose-y",
       "origin": "memory-index",
-      "path": "<BASE>/wiki/pages/feedback/_drafts/loose-y.md"
+      "path": "<BASE>/wiki/.cache/feedback-drafts/loose-y.md"
     }
   ],
   "skipped": []
@@ -2457,9 +2470,9 @@ STATUS 0
 STDOUT
 
 STDERR
-[feedback-sync] created draft: pages/feedback/_drafts/legacy-claude-20260501-legacy-rule-one.md (claude-learned)
-[feedback-sync] created draft: pages/feedback/_drafts/loose-y.md (memory-index)
-[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/targets/promote_to_global and move into pages/feedback/.
+[feedback-sync] created draft: .cache/feedback-drafts/legacy-claude-20260501-legacy-rule-one.md (claude-learned)
+[feedback-sync] created draft: .cache/feedback-drafts/loose-y.md (memory-index)
+[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git when the vault is a git work tree (feedback-sync checked that git ignores .cache/).
 
 ### FILE CLAUDE.md
 # Global
@@ -2483,7 +2496,7 @@ status: draft
 scope: TODO              # global | project:<project-id>
 tier: TODO               # L1 (CLAUDE.md <learned_behaviors> candidate) | L2
 targets: [project-memory]   # + claude-learned for a global L1 rule
-sensitivity: public      # public | sanitized (private is forbidden)
+sensitivity: TODO        # public | sanitized (private is forbidden); this draft holds your own text
 priority: 3              # 1-5, higher wins over-cap
 memory_summary: legacy rule one
 global_summary: legacy rule one
@@ -2509,7 +2522,7 @@ status: draft
 scope: TODO              # global | project:<project-id>
 tier: TODO               # L1 (CLAUDE.md <learned_behaviors> candidate) | L2
 targets: [project-memory]   # + claude-learned for a global L1 rule
-sensitivity: public      # public | sanitized (private is forbidden)
+sensitivity: TODO        # public | sanitized (private is forbidden); this draft holds your own text
 priority: 3              # 1-5, higher wins over-cap
 memory_summary: legacy hand entry
 global_summary: legacy hand entry
@@ -2535,7 +2548,7 @@ STDOUT
   "imported": [
     {
       "slug": "rule-a",
-      "path": "<BASE>/wiki/pages/feedback/_drafts/rule-a.import-claude-<STAMP>.md"
+      "path": "<BASE>/wiki/.cache/feedback-drafts/rule-a.import-claude-<STAMP>.md"
     }
   ],
   "skipped": []
@@ -2548,7 +2561,7 @@ STATUS 0
 STDOUT
 
 STDERR
-[feedback-sync] imported rule-a → <BASE>/wiki/pages/feedback/_drafts/rule-a.import-claude-<STAMP>.md
+[feedback-sync] imported rule-a → <BASE>/wiki/.cache/feedback-drafts/rule-a.import-claude-<STAMP>.md
 [feedback-sync] import: 1 draft(s). Reconcile into the SoT page, then feedback-sync --write.
 
 ### FILE CLAUDE.md
@@ -2597,7 +2610,7 @@ status: draft
 scope: TODO
 tier: TODO
 targets: [project-memory]
-sensitivity: public
+sensitivity: TODO        # public | sanitized (private is forbidden); this draft holds your own text
 priority: 3
 memory_summary: - [2026-05-20] HAND EDITED. 근거: [[rule-a]]
 global_summary: - [2026-05-20] HAND EDITED. 근거: [[rule-a]]
@@ -4433,13 +4446,621 @@ test('feedback-sync-kept-copy-needs-an-ignored-cache: accept and the bootstrap l
   withFeedbackEnv(
     {},
     ({ wiki, runFb }) => {
-      fbGitInit(wiki, null);
-      const r = runFb(['--bootstrap']);
-      assert.equal(r.status, 0, r.stderr);
-      assert.match(r.stderr, /could not record hand lines.*not ignored by the vault's git/);
-      assert.ok(!existsSync(fbHandRecord(wiki)), 'the hand lines are not copied under .cache/');
+      // only the drafts dir is ignored: the record beside it, and the temp file a draft is
+      // written to before it is linked into place, would not be, so nothing is written at all
+      for (const rule of ['.cache/feedback-drafts/\n', '/.cache/feedback-drafts/*.md\n']) {
+        fbGitInit(wiki, rule);
+        const r = runFb(['--bootstrap']);
+        assert.equal(r.status, 1, `${rule}: ${r.stderr}`);
+        assert.match(r.stderr, /no draft was written: \.cache\/ is not ignored by the vault's git/);
+        assert.ok(!existsSync(fbHandRecord(wiki)), 'the hand lines are not copied under .cache/');
+        assert.ok(!existsSync(fbDraftsDir(wiki)), 'and no draft or temp file was made');
+      }
     },
     { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+});
+
+// ── drafts hold the user's own text: they go where git does not look, and are never replaced ──
+
+// A run of one mode in this process, with the test-only hooks that stand in for a second
+// run (or a crash) landing between two steps.
+const fbInProcess = ({ wiki, claudeHome }, flags, testHooks) =>
+  fbRun({
+    ...fbParseArgs([
+      'node',
+      'feedback-sync.mjs',
+      ...flags,
+      `--hypo-dir=${wiki}`,
+      `--claude-home=${claudeHome}`,
+      '--project-id=proj',
+    ]),
+    testHooks,
+  });
+// the files git would stage in the vault right now
+const fbGitStaged = (wiki) => {
+  const r = spawnSync('git', ['-C', wiki, 'status', '--porcelain', '--untracked-files=all'], {
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  return r.stdout.split('\n').filter(Boolean);
+};
+// a managed block in CLAUDE.md that somebody edited by hand: --import-target-change has work
+const fbHandEditClaude = (claudeHome, runFb) => {
+  assert.equal(runFb(['--write']).status, 0);
+  const p = join(claudeHome, 'CLAUDE.md');
+  writeFileSync(p, readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED A'));
+};
+
+test('feedback-sync-drafts-are-invisible-to-git: bootstrap and import drafts land under an ignored .cache/ and git status does not list them', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, claudeHome, runFb }) => {
+      fbGitInit(wiki, '.cache/\n');
+      fbHandEditClaude(claudeHome, runFb);
+      const rb = runFb(['--bootstrap', '--json']);
+      assert.equal(rb.status, 0, rb.stderr);
+      const ri = runFb(['--import-target-change', '--from=claude', '--json']);
+      assert.equal(ri.status, 0, ri.stderr);
+      const made = [
+        ...JSON.parse(rb.stdout).created.map((c) => c.path),
+        ...JSON.parse(ri.stdout).imported.map((c) => c.path),
+      ];
+      assert.equal(made.length, 2, 'one bootstrap draft and one import draft');
+      for (const path of made) {
+        assert.equal(join(path, '..'), fbDraftsDir(wiki), `${path} is in the drafts dir`);
+        assert.ok(existsSync(path));
+        const ignored = spawnSync('git', ['-C', wiki, 'check-ignore', '-q', path], {
+          env: { ...process.env, HOME: SESSION_TMP_HOME },
+        });
+        assert.equal(ignored.status, 0, `git ignores ${path}`);
+      }
+      assert.ok(
+        readFileSync(made[1], 'utf-8').includes('HAND EDITED A'),
+        'the import draft holds the edited block',
+      );
+      assert.ok(
+        !fbGitStaged(wiki).some((l) => /feedback-drafts|\.cache/.test(l)),
+        `git sees no draft: ${fbGitStaged(wiki)}`,
+      );
+      assert.ok(
+        !existsSync(join(wiki, 'pages', 'feedback', '_drafts')),
+        'nothing is written to the old place',
+      );
+      // a draft is a copy of your own text and has no sensitivity decided yet
+      assert.match(readFileSync(made[0], 'utf-8'), /^sensitivity: TODO\b/m);
+      assert.match(readFileSync(made[1], 'utf-8'), /^sensitivity: TODO\b/m);
+    },
+    {
+      claudeMd: '# Global\n<learned_behaviors>\n- [2026-05-20] a hand rule\n</learned_behaviors>\n',
+    },
+  );
+});
+
+test('feedback-sync-drafts-need-an-ignored-cache: a vault whose git would stage .cache/ gets no draft, and the reason is reported', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, claudeHome, runFb }) => {
+      fbHandEditClaude(claudeHome, runFb);
+      fbGitInit(wiki, 'node_modules/\n');
+      const reason = /no draft was written: .*not ignored by the vault's git/;
+      for (const args of [
+        ['--bootstrap'],
+        ['--bootstrap', '--dry-run'],
+        ['--import-target-change', '--from=claude'],
+        ['--import-target-change', '--from=claude', '--dry-run'],
+      ]) {
+        const r = runFb(args);
+        assert.equal(r.status, 1, `${args}: ${r.stderr}`);
+        assert.match(r.stderr, reason, args.join(' '));
+      }
+      const j = runFb(['--bootstrap', '--json']);
+      assert.equal(j.status, 1);
+      assert.match(JSON.parse(j.stdout).error, reason, 'the --json report says why');
+      assert.ok(!existsSync(join(wiki, '.cache', 'feedback-drafts')), 'no draft dir, no draft');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'and no hand line record');
+      // ignoring .cache/ is the way out
+      writeFileSync(join(wiki, '.gitignore'), '.cache/\n');
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      assert.equal(runFb(['--import-target-change', '--from=claude']).status, 0);
+      assert.equal(readdirSync(fbDraftsDir(wiki)).length, 2);
+    },
+    {
+      claudeMd: '# Global\n<learned_behaviors>\n- [2026-05-20] a hand rule\n</learned_behaviors>\n',
+    },
+  );
+});
+
+test('feedback-sync-draft-name-taken-meanwhile-is-not-overwritten: a draft that appears after the name was chosen keeps its bytes', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    (ctx) => {
+      const { wiki, claudeHome, runFb } = ctx;
+      // bootstrap: somebody creates rule-b's draft after it was found missing
+      const theirs = join(fbDraftsDir(wiki), 'rule-b.md');
+      const out = fbInProcess(ctx, ['--bootstrap'], {
+        beforePublish: (tmp, file) => {
+          mkdirSync(fbDraftsDir(wiki), { recursive: true });
+          writeFileSync(file, 'THEIR DRAFT');
+        },
+      });
+      assert.equal(out.code, 0, out.error);
+      assert.equal(readFileSync(theirs, 'utf-8'), 'THEIR DRAFT', 'their bytes are untouched');
+      assert.deepEqual(out.report.created, []);
+      assert.deepEqual(out.report.skipped, [{ slug: 'rule-b', reason: 'draft-exists' }]);
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'a draft this run did not write records no line');
+      assert.deepEqual(readdirSync(fbDraftsDir(wiki)), ['rule-b.md'], 'no tmp file is left');
+
+      // import: the name that was picked is taken too, the draft goes to the next free one
+      fbHandEditClaude(claudeHome, runFb);
+      let taken = null;
+      const imp = fbInProcess(ctx, ['--import-target-change', '--from=claude'], {
+        beforePublish: (tmp, file) => {
+          if (taken) return;
+          taken = file;
+          writeFileSync(file, 'THEIR IMPORT');
+        },
+      });
+      assert.equal(imp.code, 0, imp.error);
+      assert.equal(readFileSync(taken, 'utf-8'), 'THEIR IMPORT', 'their bytes are untouched');
+      assert.equal(imp.report.imported.length, 1);
+      assert.notEqual(imp.report.imported[0].path, taken, 'it moved on to another name');
+      assert.ok(readFileSync(imp.report.imported[0].path, 'utf-8').includes('HAND EDITED A'));
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-draft-failed-before-publish-leaves-no-draft-and-no-tmp: a finished tmp file is removed when the step before the link throws, nothing is under the final name, and a re-run drafts it', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki } = ctx;
+      const out = fbInProcess(ctx, ['--bootstrap'], {
+        beforePublish: () => {
+          throw new Error('disk gone');
+        },
+      });
+      assert.equal(out.code, 1);
+      assert.match(out.error, /cannot write the draft .*rule-b\.md: disk gone/);
+      assert.deepEqual(readdirSync(fbDraftsDir(wiki)), [], 'no draft, no stray tmp file');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'no line is recorded for a draft that failed');
+      // the re-run is not told "draft-exists"
+      const again = fbInProcess(ctx, ['--bootstrap']);
+      assert.equal(again.code, 0, again.error);
+      assert.deepEqual(
+        again.report.created.map((c) => c.slug),
+        ['rule-b'],
+      );
+      assert.match(readFileSync(join(fbDraftsDir(wiki), 'rule-b.md'), 'utf-8'), /written by hand/);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-draft-write-cut-short-leaves-no-half-draft: a tmp file that fails part way through its own write is removed, the final name never appears, and a re-run drafts it', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki } = ctx;
+      let tmpSeen = null;
+      const out = fbInProcess(ctx, ['--bootstrap'], {
+        // half of the bytes reach the disk, then the write fails
+        writeTmp: (tmp, content) => {
+          tmpSeen = tmp;
+          writeFileSync(tmp, content.slice(0, Math.floor(content.length / 2)), { flag: 'wx' });
+          throw Object.assign(new Error('no space left'), { code: 'ENOSPC' });
+        },
+      });
+      assert.equal(out.code, 1);
+      assert.match(out.error, /cannot write the draft .*rule-b\.md: no space left/);
+      assert.ok(tmpSeen, 'precondition: the injected write ran');
+      assert.deepEqual(readdirSync(fbDraftsDir(wiki)), [], 'the half-written tmp file is gone');
+      assert.ok(!existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'and no half draft');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'no line is recorded for a draft that failed');
+      const again = fbInProcess(ctx, ['--bootstrap']);
+      assert.equal(again.code, 0, again.error);
+      assert.match(readFileSync(join(fbDraftsDir(wiki), 'rule-b.md'), 'utf-8'), /written by hand/);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-legacy-drafts-are-still-read: a draft in the old pages/feedback/_drafts/ is neither redrafted nor lets its hand line record go', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      // a draft an earlier version wrote, with the record that goes with it
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const legacyDir = join(wiki, 'pages', 'feedback', '_drafts');
+      mkdirSync(legacyDir, { recursive: true });
+      const legacy = join(legacyDir, 'rule-b.md');
+      const bytes = readFileSync(join(fbDraftsDir(wiki), 'rule-b.md'), 'utf-8');
+      writeFileSync(legacy, bytes);
+      rmSync(join(fbDraftsDir(wiki), 'rule-b.md'));
+      // bootstrap sees it and drafts nothing
+      const r = JSON.parse(runFb(['--bootstrap', '--json']).stdout);
+      assert.deepEqual(r.created, []);
+      assert.deepEqual(r.skipped, [
+        { slug: 'rule-b', reason: 'draft-exists-legacy', path: legacy },
+      ]);
+      assert.equal(r.warnings, undefined, 'a vault that is not a git tree has nothing to warn of');
+      assert.ok(!existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'no second copy');
+      // a write with neither page nor new-place draft keeps the record while the old draft is there
+      assert.equal(runFb(['--write']).status, 0);
+      assert.ok(existsSync(fbHandRecord(wiki)), 'the record waits for the old draft');
+      assert.equal(readFileSync(legacy, 'utf-8'), bytes, 'and the old draft is not touched');
+      // once the old draft is gone too, the record is pruned
+      rmSync(legacy);
+      assert.equal(runFb(['--write']).status, 0);
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'orphan record pruned');
+      assert.deepEqual(fbBLines(memDir), [FB_HAND_COLON], 'the hand line is still there');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-ensure-container-reads-again-and-keeps-a-copy: a CLAUDE.md saved after it was read is not replaced, a normal run keeps the original', () => {
+  const original = '# Global\n\nprose the user cares about\n';
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki, claudeHome } = ctx;
+      const p = join(claudeHome, 'CLAUDE.md');
+      const edited = original + 'a line saved a moment ago\n';
+      const out = fbInProcess(ctx, ['--ensure-container'], {
+        beforeEnsureWrite: () => writeFileSync(p, edited),
+      });
+      assert.equal(out.code, 1);
+      assert.match(
+        out.error,
+        /CLAUDE\.md changed after it was read for this write.*not overwritten/,
+      );
+      assert.equal(readFileSync(p, 'utf-8'), edited, 'the saved bytes are still there');
+      // run from the start: the container is added, and the file as it was is kept
+      const ok = fbInProcess(ctx, ['--ensure-container']);
+      assert.equal(ok.code, 0, ok.error);
+      assert.ok(readFileSync(p, 'utf-8').startsWith(edited));
+      const copies = readdirSync(fbKeptDir(wiki)).filter((f) =>
+        /claude-before-ensure-container/.test(f),
+      );
+      assert.equal(copies.length, 2, 'one copy per run that reached the write step');
+      assert.ok(
+        copies.some((f) => readFileSync(join(fbKeptDir(wiki), f), 'utf-8') === edited),
+        'the copy holds the bytes the replace was about to cover',
+      );
+    },
+    { claudeMd: original },
+  );
+  // a vault whose git would stage .cache/ gets no copy: the append goes on, with a warning
+  withFeedbackEnv(
+    {},
+    ({ wiki, claudeHome, runFb }) => {
+      // a child process, so the vault's git sees the pinned HOME and not the runner's
+      // global excludes
+      fbGitInit(wiki, 'node_modules/\n');
+      const p = join(claudeHome, 'CLAUDE.md');
+      const warned = /no copy of .*CLAUDE\.md was kept.*not ignored/;
+      const j = runFb(['--ensure-container', '--json']);
+      assert.equal(j.status, 0, j.stderr);
+      assert.match(JSON.parse(j.stdout).warnings[0], warned, 'the --json report carries it');
+      assert.ok(readFileSync(p, 'utf-8').includes('<learned_behaviors>'), 'the append went on');
+      assert.ok(!existsSync(fbKeptDir(wiki)), 'nothing went under .cache/');
+      // the text mode prints it
+      writeFileSync(p, original);
+      const t = runFb(['--ensure-container']);
+      assert.equal(t.status, 0, t.stderr);
+      assert.match(t.stderr, /warn: no copy of .*CLAUDE\.md was kept.*not ignored/);
+    },
+    { claudeMd: original },
+  );
+});
+
+test('feedback-sync-legacy-drafts-visible-to-git-are-warned-about: an old _drafts file git could stage is named with the way out, and the pointer to the new place is not printed when nothing was drafted', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  const legacyBody = '<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=memory-index -->\nsensitivity: public\n';
+  const seed = (wiki) => {
+    const dir = join(wiki, 'pages', 'feedback', '_drafts');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'rule-b.md'), legacyBody);
+    return join(dir, 'rule-b.md');
+  };
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, claudeHome, runFb }) => {
+      fbGitInit(wiki, '.cache/\n');
+      const legacy = seed(wiki);
+      assert.ok(
+        fbGitStaged(wiki).some((l) => l.endsWith('pages/feedback/_drafts/rule-b.md')),
+        'precondition: git sees the old draft',
+      );
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(
+        r.stderr,
+        /warn: pages\/feedback\/_drafts\/rule-b\.md was written by an earlier version.*git add -A.*Move it to \.cache\/feedback-drafts\/ or delete it/,
+      );
+      assert.match(r.stderr, /skipped rule-b: draft-exists-legacy \(.*_drafts\/rule-b\.md\)/);
+      assert.ok(!/The drafts are in/.test(r.stderr), 'no pointer when this run drafted nothing');
+      assert.equal(readFileSync(legacy, 'utf-8'), legacyBody, 'the old draft is not touched');
+      const rep = JSON.parse(runFb(['--bootstrap', '--json']).stdout);
+      assert.deepEqual(rep.skipped, [
+        { slug: 'rule-b', reason: 'draft-exists-legacy', path: legacy },
+      ]);
+      assert.equal(rep.warnings.length, 1, 'the --json report carries the warning');
+      // --import-target-change says it too
+      fbHandEditClaude(claudeHome, runFb);
+      const i = runFb(['--import-target-change', '--from=claude']);
+      assert.equal(i.status, 0, i.stderr);
+      assert.match(
+        i.stderr,
+        /warn: pages\/feedback\/_drafts\/rule-b\.md was written by an earlier version/,
+      );
+      // moved to the new place, git no longer sees it, and the warning goes
+      mkdirSync(fbDraftsDir(wiki), { recursive: true });
+      writeFileSync(join(fbDraftsDir(wiki), 'rule-b.md'), legacyBody);
+      rmSync(legacy);
+      const moved = runFb(['--bootstrap']);
+      assert.equal(moved.status, 0, moved.stderr);
+      assert.ok(!/earlier version/.test(moved.stderr), 'no warning once it is moved');
+      assert.match(
+        moved.stderr,
+        /skipped rule-b: draft-exists\b(?!-)/,
+        'and the new place is recognised',
+      );
+    },
+    { memoryMd, claudeMd: '# Global\n<learned_behaviors>\n- manual entry\n</learned_behaviors>\n' },
+  );
+  // the same file where git ignores it: nothing to warn of
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      fbGitInit(wiki, '.cache/\npages/feedback/_drafts/\n');
+      seed(wiki);
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(!/earlier version/.test(r.stderr), r.stderr);
+      assert.match(r.stderr, /draft-exists-legacy/);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-accept-says-where-the-replaced-hand-edit-lives: after import then accept the edited text is only under .cache/, and the warning names the kept copy and the import draft', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    fbGitInit(wiki, '.cache/\n');
+    fbHandEditClaude(claudeHome, runFb);
+    const imp = JSON.parse(runFb(['--import-target-change', '--from=claude', '--json']).stdout);
+    const draft = imp.imported[0].path;
+    const j = runFb(['--accept-wiki=rule-a', '--json']);
+    assert.equal(j.status, 0, j.stderr);
+    const rep = JSON.parse(j.stdout);
+    assert.equal(rep.warnings.length, 1, 'the --json report carries the warning');
+    const [w] = rep.warnings;
+    assert.match(w, /now only under \.cache\/.*move what you want to keep to pages\/feedback\//i);
+    assert.ok(w.includes(rep.accepted[0].kept), `the kept copy is named: ${w}`);
+    assert.ok(w.includes(draft), `the import draft is named: ${w}`);
+    assert.ok(
+      readFileSync(rep.accepted[0].kept, 'utf-8').includes('HAND EDITED A'),
+      'the named copy holds the replaced text',
+    );
+    // the text mode prints it on stderr; no import draft exists for this edit, so none is named
+    rmSync(draft);
+    fbHandEditClaude(claudeHome, runFb);
+    const t = runFb(['--accept-wiki=rule-a']);
+    assert.equal(t.status, 0, t.stderr);
+    const line = t.stderr.split('\n').find((l) => l.includes('warn: '));
+    assert.ok(line, `a warning is printed: ${t.stderr}`);
+    const kept = /is kept at (\S+\.txt)/.exec(t.stderr)[1];
+    assert.ok(line.includes(kept), `the new kept copy is named: ${line}`);
+    assert.ok(!line.includes('feedback-drafts'), `no draft, none named: ${line}`);
+    // pair: an accept that replaces nothing (the block is not in conflict) warns of nothing
+    const none = runFb(['--accept-wiki=rule-a', '--json']);
+    assert.equal(none.status, 1, none.stderr);
+    assert.deepEqual(JSON.parse(none.stdout).warnings, [], 'nothing was replaced, nothing to say');
+    assert.ok(!/only under \.cache\//.test(runFb(['--accept-wiki=rule-a']).stderr));
+  });
+});
+
+test('feedback-sync-write-warns-about-old-drafts-git-can-see: --write names an old _drafts file in text and in --json, a git-ignored one and --check stay quiet', () => {
+  const legacyBody = '<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=memory-index -->\nsensitivity: public\n';
+  const seed = (wiki) => {
+    const dir = join(wiki, 'pages', 'feedback', '_drafts');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'rule-b.md'), legacyBody);
+  };
+  const earlier = /pages\/feedback\/_drafts\/rule-b\.md was written by an earlier version/;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, runFb }) => {
+    fbGitInit(wiki, '.cache/\n');
+    seed(wiki);
+    const j = runFb(['--write', '--json']);
+    assert.equal(j.status, 0, j.stderr);
+    const warnings = JSON.parse(j.stdout).warnings;
+    assert.equal(warnings.length, 1, j.stdout);
+    assert.match(warnings[0], earlier);
+    const t = runFb(['--write']);
+    assert.equal(t.status, 0, t.stderr);
+    assert.match(t.stderr, /warn: pages\/feedback\/_drafts\/rule-b\.md was written by an earlier/);
+    assert.ok(!earlier.test(runFb(['--check']).stderr), '--check does not write, so it is quiet');
+  });
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, runFb }) => {
+    fbGitInit(wiki, '.cache/\npages/feedback/_drafts/\n');
+    seed(wiki);
+    const j = runFb(['--write', '--json']);
+    assert.equal(j.status, 0, j.stderr);
+    assert.equal(JSON.parse(j.stdout).warnings, undefined, 'git ignores it: nothing to warn of');
+    assert.ok(!earlier.test(runFb(['--write']).stderr));
+  });
+});
+
+test('feedback-sync-git-that-cannot-answer-is-not-a-non-git-vault: a broken .git/config refuses the draft and the line record, a directory that is not a repository still writes them', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      fbGitInit(wiki, null); // no .gitignore at all: git would stage .cache/
+      const config = join(wiki, '.git', 'config');
+      const good = readFileSync(config, 'utf-8');
+      writeFileSync(config, '[core\n  broken\n');
+      for (const args of [['--bootstrap'], ['--bootstrap', '--dry-run']]) {
+        const r = runFb(args);
+        assert.equal(r.status, 1, `${args}: ${r.stderr}`);
+        assert.match(
+          r.stderr,
+          /no draft was written: .*is not ignored by the vault's git/,
+          args.join(' '),
+        );
+      }
+      assert.ok(!existsSync(fbDraftsDir(wiki)), 'no draft');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'and no hand line record');
+      // the config repaired and nothing ignoring .cache/: still refused, for the real reason
+      writeFileSync(config, good);
+      assert.equal(runFb(['--bootstrap']).status, 1, 'git answers now, and says unignored');
+      writeFileSync(join(wiki, '.gitignore'), '.cache/\n');
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      assert.ok(existsSync(fbHandRecord(wiki)));
+    },
+    { memoryMd },
+  );
+  // a .git file pointing at a gitdir that is gone: git says "not a git repository" too, but
+  // the repository comes back once the pointer is repaired, so this is refused as well
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      writeFileSync(join(wiki, '.git'), `gitdir: ${join(wiki, 'missing-gitdir')}\n`);
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.ok(!existsSync(fbDraftsDir(wiki)), 'no draft');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'and no hand line record');
+    },
+    { memoryMd },
+  );
+  // pair: git answers "not a git repository", so nothing can stage the copy and it is written
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      assert.ok(!existsSync(join(wiki, '.git')), 'precondition: not a repository');
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(existsSync(join(fbDraftsDir(wiki), 'rule-b.md')));
+      assert.ok(existsSync(fbHandRecord(wiki)));
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-no-draft-to-write-needs-no-ignored-cache: a git vault whose .gitignore lacks .cache/ and that has nothing to draft exits 0 with nothing created', () => {
+  withFeedbackEnv({}, ({ wiki, runFb }) => {
+    fbGitInit(wiki, 'node_modules/\n');
+    const r = runFb(['--bootstrap', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout).created, []);
+    assert.ok(!existsSync(fbDraftsDir(wiki)), 'nothing was written');
+  });
+  // pair: the same vault with something to draft is still refused
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      fbGitInit(wiki, 'node_modules/\n');
+      assert.equal(runFb(['--bootstrap']).status, 1);
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+});
+
+test('feedback-sync-draft-tmp-name-collision-is-an-error-not-a-taken-name: a stray tmp file with the picked name makes the run fail instead of skipping the draft', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki } = ctx;
+      const real = Math.random;
+      Math.random = () => 0.5;
+      try {
+        mkdirSync(fbDraftsDir(wiki), { recursive: true });
+        const tmp = `.rule-b.md.${process.pid}.${(0.5).toString(36).slice(2, 10)}.tmp`;
+        writeFileSync(join(fbDraftsDir(wiki), tmp), 'stray');
+        const out = fbInProcess(ctx, ['--bootstrap']);
+        assert.equal(out.code, 1, 'a failed write is not reported as an existing draft');
+        assert.match(out.error, /cannot write the draft .*rule-b\.md: .*EEXIST/);
+        assert.deepEqual(out.report.skipped, []);
+        assert.equal(
+          readFileSync(join(fbDraftsDir(wiki), tmp), 'utf-8'),
+          'stray',
+          'the file already under that tmp name is not ours to remove',
+        );
+      } finally {
+        Math.random = real;
+      }
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-bootstrap-partial-failure-keeps-what-it-made: the error report names the drafts already created, and the text mode prints the warnings before the error', () => {
+  // the second draft's name is too long for the filesystem, so its write fails after the first
+  const memoryMd = `# Memory Index\n- [Aaa](feedback_aaa.md): first\n- [Long](feedback_${'b'.repeat(300)}.md): second\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, claudeHome, runFb }) => {
+      rmSync(join(claudeHome, 'CLAUDE.md')); // a warning of its own: no CLAUDE.md to read
+      const j = runFb(['--bootstrap', '--json']);
+      assert.equal(j.status, 1, j.stderr);
+      const body = JSON.parse(j.stdout);
+      assert.match(body.error, /cannot write the draft /);
+      assert.deepEqual(
+        body.created.map((c) => c.slug),
+        ['aaa'],
+        'the draft that was made is in the report',
+      );
+      assert.deepEqual(body.skipped, []);
+      assert.ok(
+        body.warnings.some((w) => /CLAUDE\.md not found/.test(w)),
+        `the run's warnings survive the error: ${JSON.stringify(body.warnings)}`,
+      );
+      assert.ok(existsSync(join(fbDraftsDir(wiki), 'aaa.md')), 'and on disk');
+      assert.ok(existsSync(fbHandRecord(wiki)), 'its hand line is recorded');
+      const t = runFb(['--bootstrap']);
+      assert.equal(t.status, 1);
+      const warn = t.stderr.indexOf('warn: CLAUDE.md not found');
+      const err = t.stderr.indexOf('cannot write the draft');
+      assert.ok(warn >= 0 && err > warn, `warnings come before the error: ${t.stderr}`);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-ensure-container-dry-run-writes-nothing: --dry-run reports the plan and leaves CLAUDE.md and .cache/ alone', () => {
+  const original = '# Global\n\nprose\n';
+  withFeedbackEnv(
+    {},
+    ({ wiki, claudeHome, runFb }) => {
+      const p = join(claudeHome, 'CLAUDE.md');
+      const j = runFb(['--ensure-container', '--dry-run', '--json']);
+      assert.equal(j.status, 0, j.stderr);
+      assert.deepEqual(JSON.parse(j.stdout), {
+        mode: 'ensure-container',
+        file: p,
+        action: 'would-create',
+        dryRun: true,
+      });
+      const t = runFb(['--ensure-container', '--dry-run']);
+      assert.match(
+        t.stderr,
+        /would append an empty <learned_behaviors>.*Nothing written \(--dry-run\)/,
+      );
+      assert.equal(readFileSync(p, 'utf-8'), original, 'CLAUDE.md is byte-identical');
+      assert.ok(!existsSync(fbKeptDir(wiki)), 'no copy was made');
+      // without --dry-run the same call does append
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      assert.ok(readFileSync(p, 'utf-8').includes('<learned_behaviors>'));
+    },
+    { claudeMd: original },
   );
 });
 
