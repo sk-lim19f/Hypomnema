@@ -5964,6 +5964,148 @@ export function sessionClosedMarkerPath(hypoDir, sessionId) {
   return join(hypoDir, '.cache', `session-closed-${sanitizeSessionId(sessionId)}.marker`);
 }
 
+// ── close pin: one close id per close request ───────────────────────────────
+// `.cache/close-pin/<sessionId>.json` remembers which close id a session's
+// open close request writes under, so every retry of that request lands on the
+// same session entry. It is not kept in the close journal: `clearJournal` wipes
+// that file as soon as the commit lands, and a retry after a failed receipt
+// would lose the id.
+//
+// Shape: `{v: 2, pending, lastResolved, localProofs}`.
+//   pending       `{closeId, openedAtIndex, entryRelPath, entrySha256s}` of the
+//                 close in flight, or null
+//   lastResolved  the closeId of the last close that finished, or null
+//   localProofs   `{closeId: {entryRelPath, entrySha256}}`, never cleared on resolution
+//
+// The functions below sit here, not in close-gate-store.mjs or
+// close-journal.mjs, because both import this file: `sessionProofCloseId`
+// (called by the PreCompact gate in this file) would otherwise close an import
+// cycle. That is also why nothing here calls `closeGateStatus`; callers pass
+// its answers in.
+
+const EMPTY_CLOSE_PIN = Object.freeze({ pending: null, lastResolved: null, localProofs: {} });
+
+/** `<hypoDir>/.cache/close-pin/<sessionId>.json`, or null for an id unsafe as a filename. */
+export function closePinPath(hypoDir, sessionId) {
+  if (!isValidSessionId(sessionId)) return null;
+  return join(hypoDir, '.cache', 'close-pin', `${sessionId}.json`);
+}
+
+function wellFormedClosePin(pin) {
+  if (!pin || typeof pin !== 'object' || Array.isArray(pin) || pin.v !== 2) return false;
+  const { pending, lastResolved, localProofs } = pin;
+  if (pending !== null) {
+    if (!pending || typeof pending !== 'object' || Array.isArray(pending)) return false;
+    if (!isValidSessionId(pending.closeId)) return false;
+    if (!Number.isSafeInteger(pending.openedAtIndex) || pending.openedAtIndex < 0) return false;
+    if (pending.entryRelPath !== null && typeof pending.entryRelPath !== 'string') return false;
+    if (
+      !Array.isArray(pending.entrySha256s) ||
+      !pending.entrySha256s.every((h) => typeof h === 'string')
+    ) {
+      return false;
+    }
+  }
+  if (lastResolved !== null && !isValidSessionId(lastResolved)) return false;
+  if (!localProofs || typeof localProofs !== 'object' || Array.isArray(localProofs)) return false;
+  return Object.values(localProofs).every(
+    (p) =>
+      p &&
+      typeof p === 'object' &&
+      typeof p.entryRelPath === 'string' &&
+      typeof p.entrySha256 === 'string',
+  );
+}
+
+/**
+ * Read the pin. An absent, unreadable, wrongly shaped or older-format (`v: 1`)
+ * file reads as an empty pin, never as a throw: a pin that cannot be trusted
+ * must not block a close, it just means no id is pinned yet.
+ *
+ * @returns {{pending: object|null, lastResolved: string|null, localProofs: object}}
+ */
+export function readClosePin(hypoDir, sessionId) {
+  const path = closePinPath(hypoDir, sessionId);
+  if (!path) return { ...EMPTY_CLOSE_PIN, localProofs: {} };
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    if (wellFormedClosePin(parsed)) {
+      const { pending, lastResolved, localProofs } = parsed;
+      return { pending, lastResolved, localProofs };
+    }
+  } catch {
+    // absent or unparseable: same answer as a malformed file
+  }
+  return { ...EMPTY_CLOSE_PIN, localProofs: {} };
+}
+
+/**
+ * Write the pin durably (temp file, fsync, rename). Throws on any failure and
+ * on an id unsafe as a filename: the pin must be on disk before the entry it
+ * names is published, so a write that did not land has to stop the caller.
+ */
+export function writeClosePin(hypoDir, sessionId, pin) {
+  const path = closePinPath(hypoDir, sessionId);
+  if (!path) throw new Error(`close pin refused for unsafe session id: ${String(sessionId)}`);
+  atomicWrite(
+    path,
+    JSON.stringify({
+      v: 2,
+      pending: pin.pending ?? null,
+      lastResolved: pin.lastResolved ?? null,
+      localProofs: pin.localProofs ?? {},
+    }),
+    { durable: true },
+  );
+}
+
+/**
+ * Retire a `pending` that the recorded resolution already covers. Pure.
+ *
+ * A close resolves in two steps (resolution record first, then `pending`
+ * moves to `lastResolved`); a crash between them leaves `pending` standing,
+ * and the next close request would reuse its id and adopt the entry the
+ * earlier close already committed. `resolvedAtIndex` is a record COUNT and
+ * `openedAtIndex` a 0-based position, so `<` is "the resolution includes that
+ * signal". Do not change it to `<=` (see `closeGateStatus` for the same base
+ * difference). `resolvedAtIndex` is `null` when no usable resolution exists.
+ */
+export function normalizeClosePin(pin, resolvedAtIndex) {
+  if (pin.pending && resolvedAtIndex !== null && pin.pending.openedAtIndex < resolvedAtIndex) {
+    return { ...pin, pending: null, lastResolved: pin.pending.closeId };
+  }
+  return pin;
+}
+
+/**
+ * The close id that proves THIS session's close, for a verdict site that
+ * cannot write (PreCompact gate, `--check-session-close`, `--mark-session-closed`).
+ *
+ * `closeOpen` is "a close signal is open and unresolved right now" and
+ * `resolvedAtIndex` the resolution position, both read off `closeGateStatus`
+ * by the caller (this file cannot call it, see the note above). Both keys are
+ * required: a call that forgot one would silently take the weaker branch.
+ * The pin is normalized in memory only; this function never writes.
+ *
+ *   pending exists            its closeId
+ *   no pending, closeOpen     null (a new request with nothing published yet,
+ *                             so the previous close must not vouch for it)
+ *   no pending, !closeOpen    lastResolved, or null
+ *
+ * @returns {string|null}
+ */
+export function sessionProofCloseId(hypoDir, sessionId, opts) {
+  if (!opts || typeof opts.closeOpen !== 'boolean') {
+    throw new Error('sessionProofCloseId requires a boolean closeOpen');
+  }
+  if (!(opts.resolvedAtIndex === null || Number.isSafeInteger(opts.resolvedAtIndex))) {
+    throw new Error('sessionProofCloseId requires resolvedAtIndex (a number or null)');
+  }
+  const pin = normalizeClosePin(readClosePin(hypoDir, sessionId), opts.resolvedAtIndex);
+  if (pin.pending) return pin.pending.closeId;
+  return opts.closeOpen ? null : pin.lastResolved;
+}
+
 // verified_scope (session-close-scope-boundary spec §3) records the scope the
 // gate ABOVE this write actually verified, not merely the attribution the
 // marker's `projects` field carries — those can diverge whenever a gate run

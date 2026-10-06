@@ -376,7 +376,11 @@ export function readResolution(hypoDir, sessionId, rawTranscript) {
  * doing so.
  *
  * @param {{transcriptPath: string|null, hypoDir: string, sessionId: string|null}} args
- * @returns {{ok: boolean, open: boolean, reason: string|null, hostTagWarning?: string}}
+ * @returns {{ok: boolean, open: boolean, openedAtIndex: number, resolvedAtIndex: number|null, reason: string|null, hostTagWarning?: string}}
+ *   `openedAtIndex` is `walkCloseGate`'s position of the signal that opened
+ *   the gate (only meaningful when `open` is true). `resolvedAtIndex` is the recorded
+ *   resolution's `closedAtIndex`, or `null` when no resolution exists or its
+ *   prefix hash no longer matches. Both are on every return.
  *   `hostTagWarning` is present on any result whose gate reads OPEN and whose
  *   `walkCloseGate` reported a `neutralizedHostTagName`: the close in effect
  *   survived a HOST_TAG_NAMES-shaped queue item reading as neutral rather
@@ -394,10 +398,27 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
   const { open, openedAtIndex, retractedByUnknownTagName, neutralizedHostTagName } = walkCloseGate(
     transcriptPath ?? null,
   );
+  // Read ahead of the `!open` return so every branch below carries the same
+  // two positions. A caller that pins a close id (`sessionProofCloseId`) needs
+  // `resolvedAtIndex` exactly when no signal is open, which is the branch that
+  // used to skip the resolution read.
+  let rawTranscript = null;
+  try {
+    rawTranscript = transcriptPath ? readFileSync(transcriptPath) : null;
+  } catch {
+    rawTranscript = null; // unreadable at the moment of the check; readResolution treats this as unverifiable, not absent
+  }
+  const { closedAtIndex, prefixMatches } = readResolution(hypoDir, sessionId, rawTranscript);
+  // `null` unless a resolution was recorded AND its prefix hash still matches:
+  // the rejected sentinel (`REJECTED_INDEX`) must never reach a consumer that
+  // compares positions.
+  const resolvedAtIndex = prefixMatches === true ? closedAtIndex : null;
+  const positions = { openedAtIndex, resolvedAtIndex };
   if (!open) {
     return {
       ok: false,
       open: false,
+      ...positions,
       reason:
         'no-open: this session carries no close signal in its transcript yet — ' +
         'ask the user whether they actually want to close before treating this as one.' +
@@ -432,18 +453,16 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
       'reflect a decision the user actually made.'
     : null;
 
-  let rawTranscript = null;
-  try {
-    rawTranscript = transcriptPath ? readFileSync(transcriptPath) : null;
-  } catch {
-    rawTranscript = null; // unreadable at the moment of the check; readResolution treats this as unverifiable, not absent
-  }
-  const { closedAtIndex, prefixMatches } = readResolution(hypoDir, sessionId, rawTranscript);
-
   if (closedAtIndex === null) {
     // NO_CONSTRAINT: no valid resolution record exists for this session, so
     // the open found above is unconstrained.
-    return { ok: true, open: true, reason: null, ...(hostTagWarning ? { hostTagWarning } : {}) };
+    return {
+      ok: true,
+      open: true,
+      ...positions,
+      reason: null,
+      ...(hostTagWarning ? { hostTagWarning } : {}),
+    };
   }
   if (prefixMatches === false) {
     // Checked ahead of the index comparison on purpose, even though
@@ -453,6 +472,7 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
     return {
       ok: false,
       open: true,
+      ...positions,
       reason:
         'transcript-rewrite-detected: the recorded resolution no longer matches this ' +
         "transcript's history — treat this session's prior resolution as untrustworthy " +
@@ -461,11 +481,18 @@ export function closeGateStatus({ transcriptPath, hypoDir, sessionId }) {
     };
   }
   if (openedAtIndex >= closedAtIndex) {
-    return { ok: true, open: true, reason: null, ...(hostTagWarning ? { hostTagWarning } : {}) };
+    return {
+      ok: true,
+      open: true,
+      ...positions,
+      reason: null,
+      ...(hostTagWarning ? { hostTagWarning } : {}),
+    };
   }
   return {
     ok: false,
     open: true,
+    ...positions,
     reason:
       'no-new-open-since-resolution: this session already resolved its last close signal — ' +
       'a fresh close phrase from the user is needed before this can pass again.',

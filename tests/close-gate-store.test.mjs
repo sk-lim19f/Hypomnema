@@ -4,7 +4,7 @@
 // build on each other; suites may not — that is what lets the runner shard.
 
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test, suite } from './harness.mjs';
 import { withTmpDir } from './helpers.mjs';
@@ -16,7 +16,14 @@ import {
   recordGateClosed,
   resolutionStamp,
 } from '../hooks/close-gate-store.mjs';
-import { sessionClosedMarkerPath } from '../hooks/hypo-shared.mjs';
+import {
+  closePinPath,
+  normalizeClosePin,
+  readClosePin,
+  sessionClosedMarkerPath,
+  sessionProofCloseId,
+  writeClosePin,
+} from '../hooks/hypo-shared.mjs';
 import { receiptPath } from '../hooks/close-receipt.mjs';
 
 const SESSION = 'sess-1';
@@ -611,6 +618,256 @@ test('(e) polarity invariant: a forged resolution file never passes MORE than an
     assert.equal(
       closeGateStatus({ transcriptPath: noOpenPath, hypoDir, sessionId: SESSION }).ok,
       false,
+    );
+  });
+});
+
+// --- closeGateStatus carries both positions on every branch ---
+
+suite('close-gate-store: closeGateStatus openedAtIndex and resolvedAtIndex');
+
+test('an open with no resolution: openedAtIndex is the signal, resolvedAtIndex is null', () => {
+  withTmpDir((hypoDir) => {
+    const transcriptPath = writeTranscript(hypoDir, closeRecord());
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.openedAtIndex, 0);
+    assert.equal(result.resolvedAtIndex, null);
+  });
+});
+
+test('a resolved close: resolvedAtIndex is the recorded closedAtIndex, on the rejected and the passing branch', () => {
+  withTmpDir((hypoDir) => {
+    const stamp = resolutionStamp(Buffer.from(closeRecord() + '\n', 'utf-8'));
+    recordGateClosed(hypoDir, SESSION, stamp);
+
+    const spent = closeGateStatus({
+      transcriptPath: writeTranscript(hypoDir, closeRecord()),
+      hypoDir,
+      sessionId: SESSION,
+    });
+    assert.equal(spent.ok, false);
+    assert.equal(spent.openedAtIndex, 0);
+    assert.equal(spent.resolvedAtIndex, stamp.index);
+
+    const fresh = closeGateStatus({
+      transcriptPath: writeTranscript(hypoDir, closeRecord(), closeRecord()),
+      hypoDir,
+      sessionId: SESSION,
+    });
+    assert.equal(fresh.ok, true);
+    assert.equal(fresh.openedAtIndex, 1);
+    assert.equal(fresh.resolvedAtIndex, stamp.index);
+  });
+});
+
+test('a resolved close later retracted by an unregistered host tag: the open:false branch still reports resolvedAtIndex', () => {
+  withTmpDir((hypoDir) => {
+    const stamp = resolutionStamp(Buffer.from(closeRecord() + '\n', 'utf-8'));
+    recordGateClosed(hypoDir, SESSION, stamp);
+    // The first record is the close signal the resolution covered, so the prefix
+    // hash still matches. The queued item shaped like an unregistered host tag
+    // then retracts it: the walk reads no open signal.
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      closeRecord(),
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content: '<any-new-host-tag foo="x">something</any-new-host-tag>',
+      }),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.equal(result.open, false, 'this must go through the no-open return');
+    assert.match(result.reason, /^no-open:/);
+    assert.equal(result.resolvedAtIndex, stamp.index);
+    assert.equal(typeof result.openedAtIndex, 'number');
+  });
+});
+
+test('a rewritten transcript reports resolvedAtIndex null, never the rejected sentinel', () => {
+  withTmpDir((hypoDir) => {
+    const stamp = resolutionStamp(Buffer.from(closeRecord() + '\n', 'utf-8'));
+    recordGateClosed(hypoDir, SESSION, stamp);
+    const transcriptPath = writeTranscript(
+      hypoDir,
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } }),
+      closeRecord(),
+    );
+    const result = closeGateStatus({ transcriptPath, hypoDir, sessionId: SESSION });
+    assert.match(result.reason, /transcript-rewrite-detected/);
+    assert.equal(result.resolvedAtIndex, null);
+  });
+});
+
+// --- close pin: file, normalization, session proof id ---
+
+suite(
+  'close-gate-store: close pin (readClosePin, writeClosePin, normalizeClosePin, sessionProofCloseId)',
+);
+
+const EMPTY_PIN = { pending: null, lastResolved: null, localProofs: {} };
+function pendingOf(closeId, openedAtIndex) {
+  return { closeId, openedAtIndex, entryRelPath: null, entrySha256s: [] };
+}
+
+test('closePinPath is .cache/close-pin/<sessionId>.json and null for an id unsafe as a filename', () => {
+  assert.equal(
+    closePinPath('/vault', 'sess-1'),
+    join('/vault', '.cache', 'close-pin', 'sess-1.json'),
+  );
+  assert.equal(closePinPath('/vault', '../x'), null);
+  assert.equal(closePinPath('/vault', ''), null);
+  assert.equal(closePinPath('/vault', null), null);
+});
+
+test('writeClosePin then readClosePin round-trips, and the file is the v2 shape', () => {
+  withTmpDir((hypoDir) => {
+    const pin = {
+      pending: {
+        closeId: 'sess-1-3',
+        openedAtIndex: 3,
+        entryRelPath: 'a/b.md',
+        entrySha256s: ['h1'],
+      },
+      lastResolved: 'sess-1-0',
+      localProofs: { 'sess-1-0': { entryRelPath: 'a/c.md', entrySha256: 'h0' } },
+    };
+    writeClosePin(hypoDir, SESSION, pin);
+    assert.deepEqual(readClosePin(hypoDir, SESSION), pin);
+    const onDisk = JSON.parse(readFileSync(closePinPath(hypoDir, SESSION), 'utf-8'));
+    assert.equal(onDisk.v, 2);
+  });
+});
+
+test('readClosePin: absent, unparseable, v1 and wrongly shaped files all read as the empty pin', () => {
+  withTmpDir((hypoDir) => {
+    assert.deepEqual(readClosePin(hypoDir, SESSION), EMPTY_PIN);
+    const path = closePinPath(hypoDir, SESSION);
+    mkdirSync(dirname(path), { recursive: true });
+    const bad = [
+      'not json{',
+      JSON.stringify({
+        v: 1,
+        pending: pendingOf('sess-1-0', 0),
+        lastResolved: null,
+        localProofs: {},
+      }),
+      JSON.stringify({
+        v: 2,
+        pending: { closeId: '../x', openedAtIndex: 0, entryRelPath: null, entrySha256s: [] },
+        lastResolved: null,
+        localProofs: {},
+      }),
+      JSON.stringify({
+        v: 2,
+        pending: { closeId: 'sess-1-0', openedAtIndex: -1, entryRelPath: null, entrySha256s: [] },
+        lastResolved: null,
+        localProofs: {},
+      }),
+      JSON.stringify({ v: 2, pending: null, lastResolved: 5, localProofs: {} }),
+      JSON.stringify({ v: 2, pending: null, lastResolved: null }),
+      JSON.stringify([]),
+    ];
+    for (const text of bad) {
+      writeFileSync(path, text);
+      assert.deepEqual(readClosePin(hypoDir, SESSION), EMPTY_PIN, text);
+    }
+  });
+});
+
+test('a ../x session id never creates a pin file: write throws, read is empty, nothing lands outside close-pin', () => {
+  withTmpDir((hypoDir) => {
+    assert.throws(() => writeClosePin(hypoDir, '../x', { pending: pendingOf('x-0', 0) }));
+    assert.deepEqual(readClosePin(hypoDir, '../x'), EMPTY_PIN);
+    // `.cache/close-pin/../x.json` is `.cache/x.json`: the escape this guards.
+    assert.equal(existsSync(join(hypoDir, '.cache', 'x.json')), false);
+    assert.equal(existsSync(join(hypoDir, '.cache', 'close-pin')), false);
+  });
+});
+
+test('normalizeClosePin: a pending the resolution covers moves to lastResolved, an equal position does not', () => {
+  const pin = { pending: pendingOf('sess-1-5', 5), lastResolved: 'sess-1-0', localProofs: {} };
+  const moved = normalizeClosePin(pin, 6);
+  assert.equal(moved.pending, null);
+  assert.equal(moved.lastResolved, 'sess-1-5');
+  // The base difference (0-based position vs record count) makes 5 vs 5 a NEW
+  // signal that the resolution did not include.
+  assert.equal(normalizeClosePin(pin, 5), pin);
+  assert.equal(normalizeClosePin(pin, 4), pin);
+  assert.equal(normalizeClosePin(pin, null), pin);
+  const noPending = { pending: null, lastResolved: 'sess-1-0', localProofs: {} };
+  assert.equal(normalizeClosePin(noPending, 6), noPending);
+  assert.deepEqual(pin.pending, pendingOf('sess-1-5', 5), 'the input is not mutated');
+});
+
+test('sessionProofCloseId: pending wins, a no-pending open request is null, no open signal falls back to lastResolved', () => {
+  withTmpDir((hypoDir) => {
+    writeClosePin(hypoDir, SESSION, {
+      pending: pendingOf('sess-1-2', 2),
+      lastResolved: 'sess-1-0',
+    });
+    assert.equal(
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: true, resolvedAtIndex: null }),
+      'sess-1-2',
+    );
+    assert.equal(
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: false, resolvedAtIndex: null }),
+      'sess-1-2',
+    );
+  });
+});
+
+test('sessionProofCloseId: after a resolution, a second open signal is null and no open signal is lastResolved', () => {
+  withTmpDir((hypoDir) => {
+    writeClosePin(hypoDir, SESSION, { pending: null, lastResolved: 'sess-1-0' });
+    // The second signal is open and unresolved, so the earlier close must not vouch for it.
+    assert.equal(
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: true, resolvedAtIndex: 1 }),
+      null,
+    );
+    // Paired: the same pin with no open signal is the earlier close's proof.
+    assert.equal(
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: false, resolvedAtIndex: 1 }),
+      'sess-1-0',
+    );
+    assert.equal(
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: false, resolvedAtIndex: null }),
+      'sess-1-0',
+    );
+  });
+});
+
+test('sessionProofCloseId normalizes in memory and never writes the pin', () => {
+  withTmpDir((hypoDir) => {
+    writeClosePin(hypoDir, SESSION, { pending: pendingOf('sess-1-0', 0), lastResolved: null });
+    const before = readFileSync(closePinPath(hypoDir, SESSION), 'utf-8');
+    // The resolution (position 1) already covers pending (position 0), and a new signal is open.
+    assert.equal(
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: true, resolvedAtIndex: 1 }),
+      null,
+    );
+    assert.equal(
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: false, resolvedAtIndex: 1 }),
+      'sess-1-0',
+    );
+    assert.equal(readFileSync(closePinPath(hypoDir, SESSION), 'utf-8'), before);
+  });
+});
+
+test('sessionProofCloseId throws when a key is missing or the wrong type', () => {
+  withTmpDir((hypoDir) => {
+    assert.throws(
+      () => sessionProofCloseId(hypoDir, SESSION, { resolvedAtIndex: null }),
+      /closeOpen/,
+    );
+    assert.throws(
+      () => sessionProofCloseId(hypoDir, SESSION, { closeOpen: false }),
+      /resolvedAtIndex/,
+    );
+    assert.throws(() => sessionProofCloseId(hypoDir, SESSION, undefined), /closeOpen/);
+    assert.throws(
+      () => sessionProofCloseId(hypoDir, SESSION, { closeOpen: 'yes', resolvedAtIndex: null }),
+      /closeOpen/,
     );
   });
 });

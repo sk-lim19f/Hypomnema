@@ -21,10 +21,16 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { snapshotBase, overwriteTargets, advanceBaseForWrite } from '../hooks/base-store.mjs';
-import { closeGateStatus } from '../hooks/close-gate-store.mjs';
+import { closeGatePath, closeGateStatus } from '../hooks/close-gate-store.mjs';
+import { readJournal } from '../hooks/close-journal.mjs';
+import { closeIdFor } from '../hooks/session-entries.mjs';
 import {
+  closePinPath,
   findBackfillCandidate,
+  readClosePin,
+  sessionProofCloseId,
   rootLogEntry,
   sessionClosedMarkerPath,
   vaultCommitLockTarget,
@@ -3510,6 +3516,272 @@ test('overflow heading in a project without design-history.md: close lists it as
       assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
       assert.match(r.stdout, /⚠ [^\n]*2026-02-30[^\n]*\(not blocking\)/, r.stdout);
       assert.ok(!r.stdout.includes('lint clean'), r.stdout);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── close pin: one close id per close request ────────────────────────────────
+// Until the original-entry writer lands, the observable face of "the same
+// original path" is the id the pin hands out: the entry file name is
+// `<date>-<closeId>.md`.
+
+suite('crystallize.mjs close pin (one close id per close request)');
+
+const PIN_CLOSE_PHRASE = JSON.stringify({
+  type: 'user',
+  message: { role: 'user', content: '세션 마무리 해줘' },
+});
+
+function pinTranscriptPath(sessionId) {
+  return join(SESSION_TMP_HOME, '.claude', 'projects', 'hypo-test-proj', `${sessionId}.jsonl`);
+}
+
+/** The user types the close phrase again: one more genuine close record. */
+function typeCloseAgain(sessionId) {
+  appendFileSync(pinTranscriptPath(sessionId), PIN_CLOSE_PHRASE + '\n');
+}
+
+function pinGate(dir, sessionId) {
+  return closeGateStatus({
+    transcriptPath: pinTranscriptPath(sessionId),
+    hypoDir: dir,
+    sessionId,
+  });
+}
+
+/** What the PreCompact and `--mark-session-closed` verdict sites compute. */
+function pinProofId(dir, sessionId) {
+  const gate = pinGate(dir, sessionId);
+  return sessionProofCloseId(dir, sessionId, {
+    closeOpen: gate.ok,
+    resolvedAtIndex: gate.resolvedAtIndex,
+  });
+}
+
+// An apply that stops at payload validation: authority passed and the pin was
+// taken, but nothing resolved, so the close request stays open.
+function unresolvedApply(dir, today, sessionId) {
+  const out = JSON.parse(
+    runApply(dir, { project: 'test-project', date: today }, { sessionId }).stdout,
+  );
+  assert.equal(out.ok, false);
+  assert.match(out.error, /payload schema invalid/);
+}
+
+function newPinSession(label) {
+  return `${label}-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// Disabling the check: in applying a close, skip the stored-pin lookup in
+// pinCloseId (always build the pending from the current openedAtIndex).
+test('a retry after the user typed the close phrase again keeps the first close id', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-retype');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      unresolvedApply(dir, today, sessionId);
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, closeIdFor(sessionId, 0));
+
+      typeCloseAgain(sessionId);
+      assert.equal(
+        pinGate(dir, sessionId).openedAtIndex,
+        1,
+        'the fixture must move the signal, or this test pins nothing',
+      );
+      unresolvedApply(dir, today, sessionId);
+      const pending = readClosePin(dir, sessionId).pending;
+      assert.equal(pending.closeId, closeIdFor(sessionId, 0));
+      assert.equal(pending.openedAtIndex, 0);
+
+      // The close has not resolved: the open request's id is the pending one.
+      assert.equal(pinProofId(dir, sessionId), closeIdFor(sessionId, 0));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in pinCloseId, build the pending from `openedAtIndex`
+// whenever the signal moved, or in resolveClosePin drop the lastResolved write.
+test('a failed receipt after the commit (journal cleared) retries under the same id, and a resolved close hands out its id until a new request opens', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-receipt');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const sessionCacheDir = join(dir, '.cache', 'sessions', sessionId);
+      mkdirSync(dirname(sessionCacheDir), { recursive: true });
+      writeFileSync(sessionCacheDir, 'occupied by a file, not a directory\n');
+      const payload = payloadForCleanWiki(dir, today);
+      const first = JSON.parse(runApply(dir, payload, { sessionId }).stdout);
+      assert.equal(first.stage, 'receipt-write-failed', JSON.stringify(first));
+      assert.equal(first.committed, true);
+      assert.deepEqual(
+        readJournal(dir, sessionId),
+        {},
+        'the commit landed, so the journal is gone',
+      );
+
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, id);
+      assert.equal(
+        pinProofId(dir, sessionId),
+        id,
+        'closeOpen:true still resolves to the pinned id',
+      );
+
+      unlinkSync(sessionCacheDir);
+      typeCloseAgain(sessionId);
+      const retry = JSON.parse(runApply(dir, payload, { sessionId }).stdout);
+      assert.equal(retry.ok, true, JSON.stringify(retry));
+      const resolved = readClosePin(dir, sessionId);
+      assert.equal(resolved.pending, null);
+      assert.equal(resolved.lastResolved, id, 'the retry kept the id although the signal moved');
+
+      // Resolved, no open signal: the finished close vouches for itself.
+      const afterGate = pinGate(dir, sessionId);
+      assert.equal(afterGate.ok, false);
+      assert.equal(pinProofId(dir, sessionId), id);
+
+      // A new close request after the resolution gets a new id.
+      typeCloseAgain(sessionId);
+      const newGate = pinGate(dir, sessionId);
+      assert.equal(newGate.ok, true);
+      unresolvedApply(dir, today, sessionId);
+      const next = readClosePin(dir, sessionId);
+      assert.equal(next.pending.closeId, closeIdFor(sessionId, newGate.openedAtIndex));
+      assert.notEqual(next.pending.closeId, id);
+      assert.equal(next.lastResolved, id);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in sessionProofCloseId delete the `closeOpen ? null :`
+// branch (return lastResolved whenever there is no pending).
+test('after a resolution, a second close signal that has not been applied yet is not proven by the earlier close id', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-second-signal');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const ok = JSON.parse(runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout);
+      assert.equal(ok.ok, true, JSON.stringify(ok));
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+
+      typeCloseAgain(sessionId);
+      assert.equal(pinGate(dir, sessionId).ok, true, 'the new signal is open');
+      assert.equal(pinProofId(dir, sessionId), null);
+      // Paired: the same pin with no open signal is the earlier close's proof.
+      const gate = pinGate(dir, sessionId);
+      assert.equal(
+        sessionProofCloseId(dir, sessionId, {
+          closeOpen: false,
+          resolvedAtIndex: gate.resolvedAtIndex,
+        }),
+        id,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Runs applySessionClose in a child with the seam that crashes a close between
+// the gate resolution record and the pin move.
+function applyCrashingAfterResolution(dir, payload, sessionId) {
+  const payloadPath = join(
+    tmpdir(),
+    `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+  );
+  writeFileSync(payloadPath, JSON.stringify(payload));
+  const argv = [
+    'node',
+    'crystallize.mjs',
+    `--hypo-dir=${dir}`,
+    '--apply-session-close',
+    `--payload=${payloadPath}`,
+    '--json',
+    `--session-id=${sessionId}`,
+  ];
+  const script = `
+    import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
+    import { applySessionClose } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
+    applySessionClose(parseArgs(${JSON.stringify(argv)}), {
+      afterResolutionBeforePin() {
+        throw new Error('crash between resolution and pin');
+      },
+    });
+  `;
+  try {
+    return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+  } finally {
+    rmSync(payloadPath, { force: true });
+  }
+}
+
+// Disabling the check: delete the normalizeClosePin call in pinCloseId and in
+// sessionProofCloseId. The "new request gets a new id" assertion goes red; the
+// retry-keeps-its-id test above stays green.
+test('a close that crashed between its resolution record and the pin move does not lend its id to the next request', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-crash');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const r = applyCrashingAfterResolution(dir, payloadForCleanWiki(dir, today), sessionId);
+      assert.notEqual(r.status, 0, `the seam must crash the child: ${r.stdout}`);
+      assert.match(r.stderr, /crash between resolution and pin/);
+      assert.ok(existsSync(closeGatePath(dir, sessionId)), 'the resolution record landed first');
+      const stale = closeIdFor(sessionId, 0);
+      assert.equal(
+        readClosePin(dir, sessionId).pending?.closeId,
+        stale,
+        'pending was left standing',
+      );
+
+      typeCloseAgain(sessionId);
+      const gate = pinGate(dir, sessionId);
+      assert.equal(gate.ok, true);
+      // Before any apply: the already-resolved pending must not prove the new request.
+      assert.equal(pinProofId(dir, sessionId), null);
+
+      unresolvedApply(dir, today, sessionId);
+      const pin = readClosePin(dir, sessionId);
+      assert.equal(pin.pending.closeId, closeIdFor(sessionId, gate.openedAtIndex));
+      assert.notEqual(pin.pending.closeId, stale);
+      assert.equal(pin.lastResolved, stale);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in the `if (resolutionLanded)` guard, make it
+// unconditional. Not reachable from outside (recordGateClosed cannot be made to
+// fail while the receipt still lands), so it has no test of its own.
+
+test('a pin that cannot be written stops the close before any wiki write, at stage close-pin', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-unwritable');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      // A plain file where the pin directory must go makes the durable write fail.
+      mkdirSync(join(dir, '.cache'), { recursive: true });
+      writeFileSync(dirname(closePinPath(dir, sessionId)), 'occupied by a file\n');
+      const headBefore = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf-8' });
+      const r = runApply(dir, payloadForCleanWiki(dir, today), { sessionId });
+      const out = JSON.parse(r.stdout);
+      assert.equal(r.status, 1, r.stdout);
+      assert.equal(out.stage, 'close-pin', r.stdout);
+      assert.equal(out.committed, null);
+      const headAfter = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf-8' });
+      assert.equal(headAfter.stdout, headBefore.stdout, 'no commit was made');
+      assert.equal(existsSync(closeGatePath(dir, sessionId)), false, 'nothing resolved');
     } finally {
       cleanup();
     }

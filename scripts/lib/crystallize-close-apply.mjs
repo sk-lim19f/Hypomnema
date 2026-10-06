@@ -40,7 +40,11 @@ import {
   currentDevice,
   withFileLock,
   resolveGateProjectOverride,
+  readClosePin,
+  writeClosePin,
+  normalizeClosePin,
 } from '../../hooks/hypo-shared.mjs';
+import { closeIdFor } from '../../hooks/session-entries.mjs';
 import {
   CERT_CHECKPOINT,
   CERT_CLOSE_FILES,
@@ -1240,8 +1244,53 @@ function verifyCloseAuthority(sessionId, hypoDir) {
   }
   return {
     ok: true,
+    openedAtIndex: gateStatus.openedAtIndex,
+    resolvedAtIndex: gateStatus.resolvedAtIndex,
     ...(gateStatus.hostTagWarning ? { hostTagWarning: gateStatus.hostTagWarning } : {}),
   };
+}
+
+// Pin the close id this request writes under, right after authority passes.
+// A retry of the same request finds `pending` and reuses its id even when the
+// user typed the close phrase again (`openedAtIndex` moved). A `pending` that
+// the recorded resolution already covers is retired first, so a close that
+// crashed between its resolution record and the pin move cannot hand its id to
+// the next request. Throws when the pin cannot be written.
+function pinCloseId(hypoDir, sessionId, { openedAtIndex, resolvedAtIndex }) {
+  const stored = readClosePin(hypoDir, sessionId);
+  let pin = normalizeClosePin(stored, resolvedAtIndex);
+  if (!pin.pending) {
+    pin = {
+      ...pin,
+      pending: {
+        closeId: closeIdFor(sessionId, openedAtIndex),
+        openedAtIndex,
+        entryRelPath: null,
+        entrySha256s: [],
+      },
+    };
+  }
+  if (pin !== stored) writeClosePin(hypoDir, sessionId, pin);
+  return pin.pending.closeId;
+}
+
+// The close resolved (receipt and marker landed, gate resolution recorded):
+// move `pending` to `lastResolved`. Best-effort on purpose. A failure here
+// leaves `pending` standing, and `normalizeClosePin` retires it on the next
+// read because the resolution record already covers it.
+function resolveClosePin(hypoDir, sessionId) {
+  try {
+    const pin = readClosePin(hypoDir, sessionId);
+    if (pin.pending) {
+      writeClosePin(hypoDir, sessionId, {
+        ...pin,
+        pending: null,
+        lastResolved: pin.pending.closeId,
+      });
+    }
+  } catch {
+    // see above
+  }
 }
 
 // A-1 (project index lifecycle): seed projects/<project>/index.md from the
@@ -1379,6 +1428,19 @@ function refuseUnlessCloseRequested(args) {
       args.json ? JSON.stringify(out, null, 2) : `✗ ${closeAuth.error}\n\n${CLOSE_REFUSAL_HELP}`,
     );
     process.exit(1);
+  }
+  if (args.payload && args.sessionId) {
+    try {
+      pinCloseId(args.hypoDir, args.sessionId, closeAuth);
+    } catch (err) {
+      const msg =
+        `session-close apply refused before any wiki write or commit: could not pin this ` +
+        `close request's id (${err?.message || err}). Fix the underlying problem (usually a ` +
+        `permission or disk issue under .cache/) and retry; nothing was written.`;
+      const out = { ok: false, stage: 'close-pin', error: msg, applied: [], committed: null };
+      console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${msg}`);
+      process.exit(1);
+    }
   }
   // Invalidate this session's prior close receipt and compat marker the
   // moment a NEW close is authorized, before payload validation or preflight,
@@ -3209,6 +3271,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     hasConflicts = false,
     proofEntries = [],
     attemptId = null,
+    testHooks = null,
   } = receiptCtx;
   let markerWritten = false;
   let markerSkipReason = null;
@@ -3470,8 +3533,9 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
             // refuses a null stamp, and both fail silently, so a transcript that
             // vanishes mid-read (or a cache-write failure) can never turn an
             // otherwise-successful close into a failure.
+            let resolutionLanded = false;
             try {
-              recordGateClosed(
+              resolutionLanded = recordGateClosed(
                 args.hypoDir,
                 args.sessionId,
                 resolutionStamp(readFileSync(closeTranscript)),
@@ -3481,6 +3545,13 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
               // apply's problem to surface, the resolution just stays
               // unrecorded, same as if this session had never resolved at all
               // (NO_CONSTRAINT).
+            }
+            // Only a landed resolution retires the pin's `pending`: an
+            // unrecorded one leaves the signal unspent, so a retry must keep
+            // its id. Outside the try above so a test seam can throw here.
+            if (resolutionLanded) {
+              testHooks?.afterResolutionBeforePin?.();
+              resolveClosePin(args.hypoDir, args.sessionId);
             }
           } else if (landed.reason === 'receipt-write-failed') {
             markerSkipReason = 'receipt-write-failed';
@@ -3983,7 +4054,10 @@ function printCloseReport({
   }
 }
 
-export function applySessionClose(args) {
+// `testHooks` is test-only. `afterResolutionBeforePin` runs once the gate
+// resolution record has landed and before the close pin's `pending` moves, so a
+// test can crash a close in the one gap between those two writes.
+export function applySessionClose(args, testHooks = null) {
   // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
   // the full apply path — the per-entry idempotency (overwrite's step-1 skip +
@@ -4194,6 +4268,7 @@ export function applySessionClose(args) {
     hasConflicts: conflicts.length > 0,
     proofEntries,
     attemptId: intentResult.attemptId,
+    testHooks,
   });
   // Only a landed commit retires the close-intent record. Everything before
   // this point (the appends, a withheld conflict, a lint or commit failure)
