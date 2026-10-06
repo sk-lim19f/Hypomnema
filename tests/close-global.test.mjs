@@ -6933,6 +6933,162 @@ test('a resolved close whose pin move was lost does not prove a new close reques
   });
 });
 
+// One session closes its cwd project, then (a new close signal) another project.
+// Each project stays proven by its own close.
+const OTHER_INDEX = (today) =>
+  `---\ntitle: other\ntype: project-index\nstatus: active\nstarted: ${today}\nupdated: ${today}\n---\n# other\n`;
+
+function withCwdThenOtherClose(sessionId, { thirdSignal = false } = {}, fn) {
+  withWiki(
+    (dir, today) => {
+      anchorTestProject(dir, today);
+      mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+      writeFileSync(join(dir, 'projects', 'other', 'index.md'), OTHER_INDEX(today));
+    },
+    (dir, today) => {
+      const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [T10_EDIT_LINE] });
+      try {
+        const close = (project, label) => {
+          const out = JSON.parse(
+            runApply(
+              dir,
+              {
+                project,
+                date: today,
+                summary: `${label}\n`,
+                tracks: [{ id: 'main', new: true, next: '- next\n' }],
+                sessionLog: { entry: `## [${today}] ${label}\n` },
+              },
+              { sessionId },
+            ).stdout,
+          );
+          assert.equal(out.ok, true, JSON.stringify(out));
+          assert.equal(out.markerWritten, true, JSON.stringify(out));
+          return out;
+        };
+        close('test-project', 'cwd project close');
+        appendFileSync(t10Transcript(sessionId), T10_CLOSE_LINE + '\n');
+        close('other', 'other project close');
+        if (thirdSignal) appendFileSync(t10Transcript(sessionId), T10_CLOSE_LINE + '\n');
+        fn(dir, today);
+      } finally {
+        cleanup();
+      }
+    },
+  );
+}
+
+// Disabling the check (F2): at the cwd site in precompactGateStatus drop
+// `project: cwdProject` from the sessionProofCloseId call. The session-wide answer
+// is then the other project's close, test-project has no entry of it, and the cwd
+// assertion goes red (Stop's would too: it reads the same site). The --mark
+// assertion does not read this site; its own disable is below.
+test('a session that closed its cwd project and then another project stays closed for its cwd project: no cwd blocker, Stop lets it through, --mark certifies', () => {
+  const sid = 's-t10-two-projects';
+  withCwdThenOtherClose(sid, {}, (dir) => {
+    assert.equal(
+      hasCwdBlocker(cwdGate(dir, sid)),
+      false,
+      JSON.stringify(cwdGate(dir, sid).blockers),
+    );
+    const r = runStop('hypo-auto-minimal-crystallize.mjs', dir, {
+      session_id: sid,
+      transcript_path: t10Transcript(sid),
+      cwd: T10_CWD,
+    });
+    assert.notEqual(JSON.parse(r.stdout).decision, 'block', r.stdout);
+    const { r: mr, out } = markJson(dir, sid);
+    assert.equal(mr.status, 0, `${mr.stdout}\n${mr.stderr}`);
+    assert.equal(out.ok, true, mr.stdout);
+  });
+});
+
+// Disabling the check (F2, --mark half): in runMarkSessionClosed make closeIdOf
+// ignore its project (call sessionProofCloseId without `project`). --mark for
+// test-project then proves it by the other project's close: this test and the
+// --mark assertion of the test above go red; the X1 test below stays green.
+test('--mark-session-closed for both projects a session closed in turn proves each by its own close', () => {
+  const sid = 's-t10-two-projects-mark';
+  withCwdThenOtherClose(sid, {}, (dir) => {
+    const { r, out } = markJson(dir, sid, ['--project=other']);
+    assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+    assert.equal(out.ok, true, r.stdout);
+    const tp = markJson(dir, sid);
+    assert.equal(tp.r.status, 0, `${tp.r.stdout}\n${tp.r.stderr}`);
+  });
+});
+
+// The date boundary: an old close of the cwd project must not cover work after it.
+// Once this session opens a new close request, no earlier close proves any project.
+test('after the two closes, a new close request makes the cwd project open again (X1 across projects)', () => {
+  const sid = 's-t10-two-projects-x1';
+  withCwdThenOtherClose(sid, { thirdSignal: true }, (dir) => {
+    assert.ok(hasCwdBlocker(cwdGate(dir, sid)), 'the new request is not covered by the old close');
+  });
+});
+
+// Another session's entry that is published and waiting for its own commit, on the
+// two git partitions outside checkpointMode (Stop, PreCompact, --check).
+// Disabling the check (F1, scoped half): in precompactGateStatus's scoped branch
+// set `foreignEntries` to `[]`. The first gate's assertions go red. (F1, unscoped
+// half): same in the trusted unscoped branch: the second gate's go red.
+test("another session's new uncommitted entry is a foreign-entry notice, not a git blocker, on the scoped and the trusted unscoped git partitions", () => {
+  withWiki(anchorTestProject, (dir, today) => {
+    const sid = 's-t10-foreign-entry';
+    const rel = writeDatedEntry(dir, 'test-project', today, closeIdFor('s-t10-someone-else', 0));
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const gitBlockers = (gate) => gate.blockers.filter((b) => b.type === 'git');
+      const foreignNotice = (gate) =>
+        gate.notices.some((n) => n.type === 'foreign-entry' && n.file === rel);
+      const scoped = precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        attributionScope: 'test-project',
+        sessionId: sid,
+      });
+      assert.deepEqual(gitBlockers(scoped), [], JSON.stringify(scoped.blockers));
+      assert.ok(foreignNotice(scoped), JSON.stringify(scoped.notices));
+      const unscoped = precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        transcriptPath: t10Transcript(sid),
+        sessionId: sid,
+      });
+      assert.deepEqual(gitBlockers(unscoped), [], JSON.stringify(unscoped.blockers));
+      assert.ok(foreignNotice(unscoped), JSON.stringify(unscoped.notices));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test("this session's own uncommitted entry, and another session's committed entry edited since, still block on the scoped partition (pair)", () => {
+  withWiki(anchorTestProject, (dir, today) => {
+    const sid = 's-t10-own-entry';
+    const own = writeDatedEntry(dir, 'test-project', today, closeIdFor(sid, 0));
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      attributionScope: 'test-project',
+      sessionId: sid,
+    });
+    assert.ok(
+      gate.blockers.some((b) => b.type === 'git' && b.reason.includes(own)),
+      JSON.stringify(gate.blockers),
+    );
+    rmSync(join(dir, own));
+    const theirs = commitEntry(dir, today, closeIdFor('s-t10-someone-else', 0));
+    appendFileSync(join(dir, theirs), '\nedited\n');
+    const edited = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      attributionScope: 'test-project',
+      sessionId: sid,
+    });
+    assert.ok(
+      edited.blockers.some((b) => b.type === 'git' && b.reason.includes(theirs)),
+      JSON.stringify(edited.blockers),
+    );
+  });
+});
+
 // Disabling the check (9): the 'session' branch of sessionCloseFileStatus keeps
 // `dates = freshDates()` instead of the entry's own date: the retry's verification
 // fails and this test goes red. The paired global assertion stays green.

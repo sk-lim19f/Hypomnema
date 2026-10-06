@@ -331,6 +331,52 @@ test('probe (#39): no payload + gate ok → exit 0 with alreadyComplete', () => 
   });
 });
 
+// Disabling the check (F7): in applySessionClose make the probe always call
+// sessionCloseGlobalStatus. The session-scoped probe below then answers complete
+// for another session's close, and its first assertion goes red.
+test("probe: with --session-id, another session's close of today is not this session's: not complete", () => {
+  withWiki(null, (dir, today) => {
+    const other = JSON.parse(runApply(dir, payloadForCleanWiki(dir, today)).stdout);
+    assert.equal(other.ok, true, JSON.stringify(other));
+    const mine = `probe-mine-${process.pid}`;
+    const probe = (extra) =>
+      run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json', ...extra]);
+    const r = probe([`--session-id=${mine}`]);
+    assert.notEqual(r.status, 0, r.stdout);
+    assert.ok(!/"alreadyComplete": true/.test(r.stdout), r.stdout);
+    // Without a session id the probe can only say a close of today exists, and says so.
+    const g = probe([]);
+    assert.equal(g.status, 0, g.stdout);
+    const out = JSON.parse(g.stdout);
+    assert.equal(out.scope, 'global');
+    assert.match(out.message, /이 세션의 close인지는 확인하지 않았음/);
+  });
+});
+
+test("probe: with --session-id, this session's own finished close reads as complete (pair)", () => {
+  withWiki(null, (dir, today) => {
+    const sid = `probe-own-${process.pid}`;
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const closed = JSON.parse(runApply(dir, v2Payload(today), { sessionId: sid }).stdout);
+      assert.equal(closed.markerWritten, true, JSON.stringify(closed));
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        '--json',
+        `--session-id=${sid}`,
+      ]);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.alreadyComplete, true);
+      assert.equal(out.scope, 'session');
+      assert.equal(out.project, 'test-project');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 // major finding: applyOverwrites writes session-state.md, project hot.md, and
 // open-questions.md as three separate atomicWrite calls; a SIGKILL between the
 // first rename and the second leaves the set torn even though each individual
@@ -4027,7 +4073,7 @@ test('two sessions close one project on different tracks one after the other: bo
 });
 
 await testAsync(
-  'two processes closing the same project at the same moment both succeed with no proposal',
+  'two processes closing the same project at the same moment both succeed with no proposal and both write their marker',
   async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
     try {
@@ -4086,6 +4132,10 @@ await testAsync(
         assert.equal(out.ok, true, `${res.stdout}\n${res.stderr}`);
         assert.deepEqual(out.proposals, []);
         assert.deepEqual(out.conflicts, []);
+        // The first to commit must not be refused its marker over the other one's
+        // entry, published and not committed yet (F1).
+        assert.equal(out.committed, true, res.stdout);
+        assert.equal(out.markerWritten, true, res.stdout);
       }
       assert.equal(sessionFilesOf(dir).length, 2);
       const parked = join(dir, '.cache', 'proposals');
@@ -4941,9 +4991,14 @@ test('a retry that crosses midnight keeps the first date: the same close id foun
     unblock();
     const [y, m, d] = today.split('-').map(Number);
     const tomorrow = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+    // The logs go under the entry's date (today here), so the retry's heading
+    // carries it although the payload date moved (see the day-alignment tests).
     const retry = applyJson(
       dir,
-      v2Payload(tomorrow, { summary: 'second', tag: 'second day' }),
+      {
+        ...v2Payload(tomorrow, { summary: 'second' }),
+        sessionLog: { entry: `## [${today}] second day\n` },
+      },
       sid,
     );
     assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
@@ -4964,9 +5019,14 @@ test('a retry that crosses midnight with no close pin left still finds the entry
     rmSync(closePinPath(dir, sid), { force: true });
     const [y, m, d] = today.split('-').map(Number);
     const tomorrow = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+    // The logs go under the entry's date (today here), so the retry's heading
+    // carries it although the payload date moved (see the day-alignment tests).
     const retry = applyJson(
       dir,
-      v2Payload(tomorrow, { summary: 'second', tag: 'second day' }),
+      {
+        ...v2Payload(tomorrow, { summary: 'second' }),
+        sessionLog: { entry: `## [${today}] second day\n` },
+      },
       sid,
     );
     assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
@@ -5052,6 +5112,272 @@ test('twelve closes over forty days, three of them superseding an earlier entry 
       assert.ok(!headsOf(dir).main.includes(closeIds[i - 1]), `entry ${i - 1} is no longer a head`);
     }
     assert.equal(entryAt(dir, written[doneAt]).tracks[0].done, true);
+  });
+});
+
+// A second project to move a close to.
+const addOtherProject = (dir, today) => {
+  mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+  writeFileSync(
+    join(dir, 'projects', 'other', 'index.md'),
+    `---\ntitle: other\ntype: project-index\nstatus: active\nstarted: ${today}\nupdated: ${today}\n---\n# other\n`,
+  );
+};
+
+// `today` moved `n` days back, as a local date.
+function daysBefore(today, n) {
+  const [y, m, d] = today.split('-').map(Number);
+  const t = new Date(y, m - 1, d - n);
+  return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+}
+
+// Disabling the check (F3): in entryPathFor drop the `if (elsewhere) failEntry(...)`
+// refusal. The retry then replaces test-project's entry with the other project's
+// summary and commits it: the stage assertion and the bytes assertion go red.
+test('a retry that names another project than the one its entry is in is refused before any write (entry-project-mismatch)', () => {
+  withWiki(addOtherProject, (dir, today) => {
+    const sid = newPinSession('proj-move');
+    const unblock = blockCommits(dir);
+    const first = applyJson(dir, v2Payload(today, { summary: 'test-project summary' }), sid);
+    unblock();
+    assert.equal(first.out.committed, false, JSON.stringify(first.out));
+    const [file] = sessionFilesOf(dir);
+    const bytes = readFileSync(join(sessionsDirOf(dir), file), 'utf-8');
+    const head = gitHead(dir);
+
+    const moved = applyJson(
+      dir,
+      v2Payload(today, { project: 'other', summary: 'other summary', tag: 'other close' }),
+      sid,
+    );
+    assert.equal(moved.out.stage, 'entry-project-mismatch', JSON.stringify(moved.out));
+    assert.equal(moved.out.committed, null);
+    assert.match(moved.out.error, /Re-run with "project": "test-project"/);
+    assert.match(moved.out.error, new RegExp(file.replace(/\./g, '\\.')));
+    assert.equal(readFileSync(join(sessionsDirOf(dir), file), 'utf-8'), bytes);
+    assert.deepEqual(sessionFilesOf(dir, 'other'), []);
+    assert.equal(gitHead(dir), head, 'nothing was committed');
+
+    // The way out the refusal names works: the first project finishes the close.
+    const back = applyJson(dir, v2Payload(today, { summary: 'test-project summary' }), sid);
+    assert.equal(back.out.ok, true, JSON.stringify(back.out));
+    assert.equal(back.out.markerWritten, true, JSON.stringify(back.out));
+  });
+});
+
+// Disabling the check (F3, scan half): in entryPathFor replace the
+// listSessionProjects(...) scan with `undefined`. With no pin left only the scan
+// knows where the entry is, so this test goes red and the one above stays green.
+test('with its close pin gone, a retry naming another project still finds the entry by its close id and is refused (entry-project-mismatch)', () => {
+  withWiki(addOtherProject, (dir, today) => {
+    const sid = newPinSession('proj-move-nopin');
+    const unblock = blockCommits(dir);
+    applyJson(dir, v2Payload(today, { summary: 'test-project summary' }), sid);
+    unblock();
+    const [file] = sessionFilesOf(dir);
+    const bytes = readFileSync(join(sessionsDirOf(dir), file), 'utf-8');
+    rmSync(closePinPath(dir, sid), { force: true });
+    const moved = applyJson(
+      dir,
+      v2Payload(today, { project: 'other', summary: 'other summary', tag: 'other close' }),
+      sid,
+    );
+    assert.equal(moved.out.stage, 'entry-project-mismatch', JSON.stringify(moved.out));
+    assert.equal(readFileSync(join(sessionsDirOf(dir), file), 'utf-8'), bytes);
+    assert.deepEqual(sessionFilesOf(dir, 'other'), []);
+  });
+});
+
+// Disabling the check (F4): in applySessionClose set `date` to `requestedDate`
+// instead of `entryPath.date`. The retry is then refused at pre-apply (its
+// heading is dated D, the payload today) and this test goes red; with the
+// heading of today instead it appends under today and fails verification, which
+// is the next test.
+test('a retry on a later day writes its logs under the day its entry was published, and the close verifies and marks', () => {
+  withWiki(null, (dir, today) => {
+    const D = daysBefore(today, 3);
+    const sid = newPinSession('day-align');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      // The first attempt published the entry dated D and died before any log.
+      applyWithHooks(dir, v2Payload(D, { summary: 'first' }), sid, CRASH_AFTER_PUBLISH);
+      const [file] = sessionFilesOf(dir);
+      assert.ok(file.startsWith(`${D}-`), file);
+      const shardD = join(dir, 'projects', 'test-project', 'session-log', `${D}.md`);
+      assert.equal(existsSync(shardD), false, 'precondition: no log of D yet');
+
+      const retry = applyJson(
+        dir,
+        { ...v2Payload(today, { summary: 'first' }), sessionLog: { entry: `## [${D}] retried\n` } },
+        sid,
+      );
+      assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+      assert.equal(retry.out.committed, true);
+      assert.equal(retry.out.markerWritten, true, JSON.stringify(retry.out));
+      assert.equal(retry.out.date, D);
+      assert.match(readFileSync(shardD, 'utf-8'), new RegExp(`## \\[${D}\\] retried`));
+      assert.match(
+        readFileSync(join(dir, 'log.md'), 'utf-8'),
+        new RegExp(`## \\[${D}\\] session \\| test-project`),
+      );
+      assert.deepEqual(sessionFilesOf(dir), [file]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check (F4, refusal half): same disable as above. The retry
+// below then passes pre-apply, appends under today and ends at
+// post-apply-verification: the stage assertion goes red.
+test('a retry on a later day whose heading carries the new day is refused before any write, and says the entry fixed the date', () => {
+  withWiki(null, (dir, today) => {
+    const D = daysBefore(today, 3);
+    const sid = newPinSession('day-refuse');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      applyWithHooks(dir, v2Payload(D, { summary: 'first' }), sid, CRASH_AFTER_PUBLISH);
+      const [file] = sessionFilesOf(dir);
+      const head = gitHead(dir);
+      const logBefore = readFileSync(join(dir, 'log.md'), 'utf-8');
+      const retry = applyJson(dir, v2Payload(today, { summary: 'first', tag: 'next day' }), sid);
+      assert.equal(retry.out.stage, 'pre-apply-verification', JSON.stringify(retry.out));
+      assert.match(retry.out.error, new RegExp(`already published dated ${D}`));
+      assert.ok(retry.out.error.includes(file), retry.out.error);
+      assert.match(retry.out.error, new RegExp(`## \\[${D}\\]`));
+      assert.equal(gitHead(dir), head);
+      assert.equal(readFileSync(join(dir, 'log.md'), 'utf-8'), logBefore);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check (F5): in classifyExistingEntry delete the
+// `if (inHead === 'error') return ...` line. A broken HEAD then reads as "not
+// committed", the pin licenses the bytes, and the second assertion goes red.
+test('classifyExistingEntry: when git cannot read HEAD, bytes the pin would license are not replaced (head-unreadable)', () => {
+  withWiki(null, (dir) => {
+    const text = 'new bytes\n';
+    const disk = 'old bytes\n';
+    const relPath = 'projects/test-project/sessions/2026-10-01-s-1.md';
+    const pin = {
+      pending: {
+        closeId: 's-1',
+        openedAtIndex: 1,
+        entryRelPath: relPath,
+        entrySha256s: [createHash('sha256').update(disk).digest('hex')],
+      },
+      lastResolved: null,
+      localProofs: {},
+    };
+    const args = { hypoDir: dir, sessionId: 'no-journal', closeId: 's-1', relPath, text, disk };
+    assert.equal(classifyExistingEntry({ ...args, ignored: false, pin }).action, 'replace');
+    writeFileSync(join(dir, '.git', 'HEAD'), 'not a ref\n');
+    assert.deepEqual(classifyExistingEntry({ ...args, ignored: false, pin }), {
+      action: 'conflict',
+      reason: 'head-unreadable',
+    });
+  });
+});
+
+// Disabling the check (F9): in runMarkerPhase return `verification` as it is.
+// The `counted: false` assertion goes red; the committed retry stays green.
+test('a close whose commit failed marks its verification as not counted', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('not-counted');
+    const unblock = blockCommits(dir);
+    const failed = applyJson(dir, v2Payload(today), sid);
+    unblock();
+    assert.equal(failed.out.committed, false, JSON.stringify(failed.out));
+    assert.equal(failed.out.verification.counted, false, JSON.stringify(failed.out.verification));
+    const done = applyJson(dir, v2Payload(today), sid);
+    assert.equal(done.out.committed, true, JSON.stringify(done.out));
+    assert.equal('counted' in done.out.verification, false);
+  });
+});
+
+// Disabling the check (F1, the seeded index half): in applyOverwrites make
+// adoptSeededIndex return at once. Another session's seeded index.md then stays
+// out of this close's commit, the gate refuses on it, and markerWritten goes red.
+test("another session's seeded index.md, not committed yet, is committed with this close when its bytes are this close's own seed", () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'test-project', 'index.md');
+    assert.equal(
+      ensureProjectIndex(dir, 'test-project', rel, today, newPinSession('seeder')),
+      rel,
+      'precondition: the other session seeded it',
+    );
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('index-adopt'));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
+    const tracked = spawnSync('git', ['ls-files', '--', rel], { cwd: dir, encoding: 'utf-8' });
+    assert.equal(tracked.stdout.trim(), rel);
+  });
+});
+
+test("an uncommitted index.md that is not this close's seed stays out of its commit and still blocks the marker (pair)", () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'test-project', 'index.md');
+    writeFileSync(
+      join(dir, rel),
+      `---\ntitle: test-project\ntype: project-index\n---\n# hand made\n`,
+    );
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('index-hand'));
+    assert.equal(out.markerWritten, false, JSON.stringify(out));
+    assert.ok(
+      (out.gateBlockers || []).some((b) => b.file === rel),
+      JSON.stringify(out.gateBlockers),
+    );
+  });
+});
+
+// Disabling the check (F1, checkpoint half): in precompactGateStatus's
+// checkpointMode loop delete the `isForeignUncommittedEntry` branch. The other
+// session's entry then blocks as a dirty file of the project folder:
+// markerWritten goes red. The modified-entry pair below stays green.
+test("another session's new entry, published and not committed yet, does not keep this close from its marker, and is left alone", () => {
+  withWiki(null, (dir, today) => {
+    const otherId = closeIdFor(newPinSession('other-close'), 0);
+    const text = formatSessionEntry({
+      project: 'test-project',
+      closeId: otherId,
+      date: today,
+      tracks: [{ id: 'other-track', new: true }],
+      summary: 'the other session',
+      bodies: {},
+    });
+    const otherRel = join('projects', 'test-project', 'sessions', `${today}-${otherId}.md`);
+    mkdirSync(sessionsDirOf(dir), { recursive: true });
+    writeFileSync(join(dir, otherRel), text);
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('mine'));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
+    assert.ok(
+      (out.gateNotices || []).some((n) => n.type === 'foreign-entry' && n.file === otherRel),
+      JSON.stringify(out.gateNotices),
+    );
+    assert.equal(readFileSync(join(dir, otherRel), 'utf-8'), text, 'left alone');
+    const tracked = spawnSync('git', ['ls-files', '--', otherRel], { cwd: dir, encoding: 'utf-8' });
+    assert.equal(tracked.stdout, '', 'not committed by this close');
+  });
+});
+
+test("another session's committed entry edited since its commit still keeps this close from its marker (pair)", () => {
+  withWiki(null, (dir, today) => {
+    const otherId = closeIdFor(newPinSession('other-close-m'), 0);
+    const file = writeEntryFile(dir, {
+      closeId: otherId,
+      date: today,
+      tracks: [{ id: 'other-track', new: true }],
+    });
+    appendFileSync(join(dir, file), '\nedited after its commit\n');
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('mine-m'));
+    assert.equal(out.markerWritten, false, JSON.stringify(out));
+    assert.ok(
+      (out.gateBlockers || []).some((b) => b.file === file),
+      JSON.stringify(out.gateBlockers),
+    );
   });
 });
 

@@ -20,6 +20,7 @@ import {
   closePinPath,
   normalizeClosePin,
   readClosePin,
+  retireClosePending,
   sessionClosedMarkerPath,
   sessionProofCloseId,
   writeClosePin,
@@ -705,7 +706,7 @@ suite(
   'close-gate-store: close pin (readClosePin, writeClosePin, normalizeClosePin, sessionProofCloseId)',
 );
 
-const EMPTY_PIN = { pending: null, lastResolved: null, localProofs: {} };
+const EMPTY_PIN = { pending: null, lastResolved: null, resolvedByProject: {}, localProofs: {} };
 function pendingOf(closeId, openedAtIndex) {
   return { closeId, openedAtIndex, entryRelPath: null, entrySha256s: [] };
 }
@@ -730,6 +731,7 @@ test('writeClosePin then readClosePin round-trips, and the file is the v2 shape'
         entrySha256s: ['h1'],
       },
       lastResolved: 'sess-1-0',
+      resolvedByProject: { alpha: 'sess-1-0' },
       localProofs: { 'sess-1-0': { entryRelPath: 'a/c.md', entrySha256: 'h0' } },
     };
     writeClosePin(hypoDir, SESSION, pin);
@@ -766,6 +768,20 @@ test('readClosePin: absent, unparseable, v1 and wrongly shaped files all read as
       }),
       JSON.stringify({ v: 2, pending: null, lastResolved: 5, localProofs: {} }),
       JSON.stringify({ v: 2, pending: null, lastResolved: null }),
+      JSON.stringify({
+        v: 2,
+        pending: null,
+        lastResolved: null,
+        resolvedByProject: [],
+        localProofs: {},
+      }),
+      JSON.stringify({
+        v: 2,
+        pending: null,
+        lastResolved: null,
+        resolvedByProject: { alpha: '../x' },
+        localProofs: {},
+      }),
       JSON.stringify([]),
     ];
     for (const text of bad) {
@@ -870,6 +886,107 @@ test('sessionProofCloseId throws when a key is missing or the wrong type', () =>
       /closeOpen/,
     );
   });
+});
+
+// One session closes several projects in turn. Each project is proven by its own
+// close, not by whichever close resolved last.
+// Disabling the check (F2): in sessionProofCloseId replace the project branch's
+// `pin.resolvedByProject[project]` lookup with `undefined`. alpha's answer goes red;
+// beta's (its entry is lastResolved's) and the closeOpen nulls stay green.
+test('sessionProofCloseId with a project: each project answers with its own last close, an open request with none', () => {
+  withTmpDir((hypoDir) => {
+    writeClosePin(hypoDir, SESSION, {
+      pending: null,
+      lastResolved: 'sess-1-2',
+      resolvedByProject: { alpha: 'sess-1-0', beta: 'sess-1-2' },
+      localProofs: {},
+    });
+    const at = (project, closeOpen) =>
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen, resolvedAtIndex: 3, project });
+    assert.equal(at('alpha', false), 'sess-1-0');
+    assert.equal(at('beta', false), 'sess-1-2');
+    assert.equal(at('gamma', false), null, 'a project this session never closed');
+    // A new request is open: no earlier close vouches for it, in any project (X1).
+    assert.equal(at('alpha', true), null);
+    assert.equal(at('beta', true), null);
+  });
+});
+
+test('sessionProofCloseId with a project: a pending proves its own project (or any while it has no entry yet), not another', () => {
+  withTmpDir((hypoDir) => {
+    writeClosePin(hypoDir, SESSION, {
+      pending: {
+        closeId: 'sess-1-4',
+        openedAtIndex: 4,
+        entryRelPath: 'projects/beta/sessions/2026-10-01-sess-1-4.md',
+        entrySha256s: [],
+      },
+      lastResolved: 'sess-1-0',
+      resolvedByProject: { alpha: 'sess-1-0' },
+      localProofs: {},
+    });
+    const at = (project, closeOpen) =>
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen, resolvedAtIndex: 1, project });
+    assert.equal(at('beta', true), 'sess-1-4');
+    assert.equal(at('alpha', true), null, "the open request is beta's; alpha has no proof now");
+    assert.equal(at('alpha', false), 'sess-1-0');
+    writeClosePin(hypoDir, SESSION, {
+      pending: pendingOf('sess-1-4', 4),
+      lastResolved: null,
+      localProofs: {},
+    });
+    assert.equal(at('alpha', true), 'sess-1-4', 'no entry yet: the pending is the answer');
+    // No project key: the session-wide answer, unchanged.
+    assert.equal(
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: true, resolvedAtIndex: 1 }),
+      'sess-1-4',
+    );
+  });
+});
+
+// Disabling the check (F2, old pins): in sessionProofCloseId return `null` instead
+// of the `entryPathOfClose(...) ? pin.lastResolved` fallback. alpha goes red.
+test("sessionProofCloseId with a project reads a pin written before resolvedByProject by where lastResolved's entry is", () => {
+  withTmpDir((hypoDir) => {
+    const path = closePinPath(hypoDir, SESSION);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({ v: 2, pending: null, lastResolved: 'sess-1-0', localProofs: {} }),
+    );
+    mkdirSync(join(hypoDir, 'projects', 'alpha', 'sessions'), { recursive: true });
+    writeFileSync(join(hypoDir, 'projects', 'alpha', 'sessions', '2026-10-01-sess-1-0.md'), 'x');
+    assert.deepEqual(readClosePin(hypoDir, SESSION).resolvedByProject, {});
+    const at = (project) =>
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: false, resolvedAtIndex: 1, project });
+    assert.equal(at('alpha'), 'sess-1-0');
+    assert.equal(at('beta'), null);
+  });
+});
+
+// Disabling the check (F2, the record): in retireClosePending drop the
+// `[project]: closeId` entry. Both assertions on resolvedByProject go red.
+test('retiring a pending records its close under the project its entry went to', () => {
+  const pin = {
+    pending: {
+      closeId: 'sess-1-5',
+      openedAtIndex: 5,
+      entryRelPath: 'projects/beta/sessions/2026-10-01-sess-1-5.md',
+      entrySha256s: [],
+    },
+    lastResolved: 'sess-1-0',
+    resolvedByProject: { alpha: 'sess-1-0' },
+    localProofs: {},
+  };
+  const retired = retireClosePending(pin);
+  assert.equal(retired.pending, null);
+  assert.equal(retired.lastResolved, 'sess-1-5');
+  assert.deepEqual(retired.resolvedByProject, { alpha: 'sess-1-0', beta: 'sess-1-5' });
+  assert.deepEqual(normalizeClosePin(pin, 6).resolvedByProject, retired.resolvedByProject);
+  // A pending that never recorded an entry names no project.
+  const noPath = retireClosePending({ ...pin, pending: pendingOf('sess-1-6', 6) });
+  assert.deepEqual(noPath.resolvedByProject, { alpha: 'sess-1-0' });
+  assert.equal(noPath.lastResolved, 'sess-1-6');
 });
 
 // --- no-open reason: unrecognized-tag diagnostic (closeGateStatus's own

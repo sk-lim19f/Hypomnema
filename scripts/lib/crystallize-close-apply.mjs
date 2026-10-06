@@ -46,7 +46,10 @@ import {
   writeClosePin,
   normalizeClosePin,
   sessionProofCloseId,
-  pathInHead,
+  retireClosePending,
+  entryPathOfClose,
+  listSessionProjects,
+  headPathState,
   revPathArg,
   recordTouchedPaths,
   loadHypoIgnore,
@@ -605,7 +608,7 @@ const CLOSE_AWAITING_APPLY =
  * The certification proof for `--mark-session-closed`. `--log-only` needs
  * only `log.md` committed fresh. A project mark needs, for EVERY project in
  * `markerProjects`, THIS session's close proven by `sessionCloseFileStatus`
- * (scope 'session', `proof.closeId` from sessionProofCloseId): its entry
+ * (scope 'session', the close id from sessionProofCloseId for that project): its entry
  * committed (or, for a `.hypoignore` project, locally proven), plus the exact
  * session-log evidence file that check accepted (never a different
  * hybrid-cutover candidate) and log.md, both committed, not merely present.
@@ -613,12 +616,14 @@ const CLOSE_AWAITING_APPLY =
  * ok, or that has no session-log evidence file to name, is incomplete. One
  * incomplete project withholds the WHOLE certification and names which
  * project failed; this never partially certifies.
- * `proof` must carry the `closeId` key (null when there is no close to prove):
- * sessionCloseFileStatus throws without it.
+ * `proof` carries `closeIdOf(project)`, the close that proves each project (one
+ * session can close several projects in turn, each by its own close), or one
+ * `closeId` for all of them (null when there is no close to prove).
+ * sessionCloseFileStatus throws when neither is given.
  * @param {string} hypoDir
  * @param {string[]} markerProjects
  * @param {boolean} logOnly
- * @param {{closeId?: string|null}} [proof]
+ * @param {{closeId?: string|null, closeIdOf?: (project: string) => string|null}} [proof]
  * @returns {{ok: boolean, entries: object[], incompleteProjects: string[]}}
  */
 export function buildMarkCloseProof(hypoDir, markerProjects, logOnly, proof = {}) {
@@ -632,7 +637,7 @@ export function buildMarkCloseProof(hypoDir, markerProjects, logOnly, proof = {}
   const incompleteProjects = [];
   for (const p of markerProjects) {
     const status = sessionCloseFileStatus(hypoDir, {
-      ...proof,
+      ...(proof.closeIdOf ? { closeId: proof.closeIdOf(p) } : proof),
       scope: 'session',
       projectOverride: p,
     });
@@ -1066,17 +1071,20 @@ export function runMarkSessionClosed(args) {
   let receiptResult;
   try {
     receiptResult = withFileLock(vaultCommitLockTarget(args.hypoDir), () => {
-      const closeId = args.logOnly
-        ? null
-        : sessionProofCloseId(args.hypoDir, args.sessionId, { closeOpen, resolvedAtIndex });
-      const proof = buildMarkCloseProof(args.hypoDir, markerProjects, args.logOnly, { closeId });
+      const closeIdOf = (project) =>
+        sessionProofCloseId(args.hypoDir, args.sessionId, { closeOpen, resolvedAtIndex, project });
+      const proof = buildMarkCloseProof(args.hypoDir, markerProjects, args.logOnly, { closeIdOf });
       if (!proof.ok)
         return {
           ok: false,
           reason: 'incomplete',
           incompleteProjects: proof.incompleteProjects,
           // A new close request with no entry yet: the earlier close cannot vouch for it.
-          ...(!args.logOnly && closeId === null && closeOpen ? { awaitingApply: true } : {}),
+          ...(!args.logOnly &&
+          closeOpen &&
+          sessionProofCloseId(args.hypoDir, args.sessionId, { closeOpen, resolvedAtIndex }) === null
+            ? { awaitingApply: true }
+            : {}),
         };
       const head = readHeadShaLocked(args.hypoDir);
       const repo = head ? repoIdentity(args.hypoDir) : null;
@@ -1415,22 +1423,30 @@ function pinCloseId(hypoDir, sessionId, { openedAtIndex, resolvedAtIndex }) {
 }
 
 // The close resolved (receipt and marker landed, gate resolution recorded):
-// move `pending` to `lastResolved`. Best-effort on purpose. A failure here
+// move `pending` to `lastResolved` and to its project's slot in
+// `resolvedByProject` (retireClosePending). Best-effort on purpose. A failure here
 // leaves `pending` standing, and `normalizeClosePin` retires it on the next
 // read because the resolution record already covers it.
 function resolveClosePin(hypoDir, sessionId) {
   try {
     const pin = readClosePin(hypoDir, sessionId);
-    if (pin.pending) {
-      writeClosePin(hypoDir, sessionId, {
-        ...pin,
-        pending: null,
-        lastResolved: pin.pending.closeId,
-      });
-    }
+    if (pin.pending) writeClosePin(hypoDir, sessionId, retireClosePending(pin));
   } catch {
     // see above
   }
+}
+
+// The bytes ensureProjectIndex seeds for `project` on `today`, null when the
+// template is missing.
+function projectIndexSeed(project, today) {
+  const src = join(TEMPLATE_DIR, 'index.md');
+  if (!existsSync(src)) return null;
+  return substituteTokens(readFileSync(src, 'utf-8'), {
+    name: project,
+    started: today,
+    workingDir: '',
+    today,
+  });
 }
 
 // A-1 (project index lifecycle): seed projects/<project>/index.md from the
@@ -1481,14 +1497,8 @@ function resolveClosePin(hypoDir, sessionId) {
 // guard makes the call a no-op.
 export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) {
   const dest = join(hypoDir, relPath);
-  const src = join(TEMPLATE_DIR, 'index.md');
-  if (!existsSync(src)) return null; // template missing — nothing to scaffold from
-  const content = substituteTokens(readFileSync(src, 'utf-8'), {
-    name: project,
-    started: today,
-    workingDir: '',
-    today,
-  });
+  const content = projectIndexSeed(project, today);
+  if (content === null) return null; // template missing: nothing to scaffold from
   mkdirSync(dirname(dest), { recursive: true });
   let fd;
   try {
@@ -1752,12 +1762,19 @@ function resolveCloseProject(args, payload) {
 // here as a format mismatch — not written and then misdiagnosed downstream as
 // "stale" (the "not updated" vs "format mismatch" conflation). All checks
 // exit 1 with stage='pre-apply-verification' and leave the tree untouched.
-function assertPayloadFreshnessContract(args, payload, project, date) {
+// `publishedEntry` is set when `date` is not the payload's own date but the
+// date this close's entry was already published with; the refusal then says so.
+function assertPayloadFreshnessContract(args, payload, project, date, publishedEntry = null) {
+  const why = publishedEntry
+    ? `This close's session entry was already published dated ${date} (${publishedEntry}), ` +
+      `so its logs go under ${date} too, whatever payload.date says. `
+    : '';
   const failPreApply = (msg) => {
+    const error = why + msg;
     console.log(
       args.json
-        ? JSON.stringify({ ok: false, stage: 'pre-apply-verification', error: msg }, null, 2)
-        : `✗ ${msg}`,
+        ? JSON.stringify({ ok: false, stage: 'pre-apply-verification', error }, null, 2)
+        : `✗ ${error}`,
     );
     process.exit(1);
   };
@@ -1810,24 +1827,37 @@ function failEntry(args, stage, error) {
 // the pin, so a file that already carries it (written on another date, the retry
 // crossing midnight) IS this close's entry: reuse its path and date. Else the
 // path the pin recorded, else a fresh one for `date`.
+//
+// One close request writes one entry in one project. A retry whose payload names
+// another project than the one this close already published in (or recorded the
+// intent to) is refused with `entry-project-mismatch` before any write: taking the
+// recorded path would put this project's summary into the first project's file.
 function entryPathFor(args, project, closeId, date, pin) {
-  const dir = join('projects', project, 'sessions');
-  let names = [];
-  try {
-    names = readdirSync(join(args.hypoDir, dir));
-  } catch {
-    // no sessions/ yet
+  const found = entryPathOfClose(args.hypoDir, project, closeId);
+  const pinned = pin.pending?.closeId === closeId ? pin.pending.entryRelPath : null;
+  if (!found) {
+    const elsewhere =
+      pinned && !pinned.split('\\').join('/').startsWith(`projects/${project}/sessions/`)
+        ? pinned
+        : listSessionProjects(args.hypoDir)
+            .filter((p) => p !== project)
+            .map((p) => entryPathOfClose(args.hypoDir, p, closeId))
+            .find(Boolean);
+    if (elsewhere) {
+      const first = elsewhere.split(/[\\/]/)[1];
+      failEntry(
+        args,
+        'entry-project-mismatch',
+        `this close request already has its session entry in project "${first}" ` +
+          `(${elsewhere}), and this payload names project "${project}". One close request ` +
+          `writes one entry in one project. Re-run with "project": "${first}" to finish ` +
+          `that close; nothing was written.`,
+      );
+    }
   }
-  const found = names
-    .filter((n) => /^\d{4}-\d{2}-\d{2}-/.test(n) && n.endsWith(`-${closeId}.md`))
-    .filter((n) => n.length === 10 + 1 + closeId.length + 3)
-    .sort()[0];
-  const rel = found
-    ? join(dir, found)
-    : pin.pending?.closeId === closeId && pin.pending.entryRelPath
-      ? pin.pending.entryRelPath
-      : join(dir, entryFileName(date, closeId));
-  return { relPath: rel, date: rel.match(/(\d{4}-\d{2}-\d{2})-[^/]*$/)[1] };
+  const rel =
+    found || pinned || join('projects', project, 'sessions', entryFileName(date, closeId));
+  return { relPath: rel, date: rel.match(/(\d{4}-\d{2}-\d{2})-[^/\\]*$/)[1] };
 }
 
 // HEAD's bytes of `relPath`, `null` when HEAD has none (or git cannot say).
@@ -1850,7 +1880,9 @@ function headBlobText(hypoDir, relPath) {
  *              though this attempt's payload would have written other bytes
  *   replace    uncommitted and recognizably ours: the pin lists the bytes'
  *              hash for this id and path, or the close journal does
- *   conflict   anything else: leave the file alone
+ *   conflict   anything else: leave the file alone. `reason: 'head-unreadable'`
+ *              when git could not say whether HEAD has the path: committed bytes
+ *              read as uncommitted would be replaced, so no answer is no replace
  */
 export function classifyExistingEntry({
   hypoDir,
@@ -1882,25 +1914,31 @@ export function classifyExistingEntry({
     }
     return pinHit || journalHit ? { action: 'replace' } : { action: 'conflict' };
   }
-  if (pathInHead(hypoDir, relPath)) {
+  const inHead = headPathState(hypoDir, relPath);
+  if (inHead === 'error') return { action: 'conflict', reason: 'head-unreadable' };
+  if (inHead === 'present') {
     return disk === headBlobText(hypoDir, relPath) ? { action: 'adopt' } : { action: 'conflict' };
   }
   return pinHit || journalHit ? { action: 'replace' } : { action: 'conflict' };
 }
 
-const ENTRY_CONFLICT_HELP = (relPath) =>
-  `${relPath} holds bytes this close did not write (or has been edited since it was committed). ` +
-  `Nothing was changed. Look at the file and the vault history, then move or remove the ` +
-  `foreign bytes yourself and retry.`;
+const ENTRY_CONFLICT_HELP = (relPath, reason) =>
+  reason === 'head-unreadable'
+    ? `git could not say whether ${relPath} is committed (reading HEAD failed), so this close ` +
+      `cannot tell its own uncommitted bytes from committed ones. Nothing was changed. Check ` +
+      `the repository (\`git status\`, \`git log -1\`) and retry once git answers.`
+    : `${relPath} holds bytes this close did not write (or has been edited since it was committed). ` +
+      `Nothing was changed. Look at the file and the vault history, then move or remove the ` +
+      `foreign bytes yourself and retry.`;
 
 /**
  * Everything about this close's entry that can be decided before a byte is
- * written: track checks, default and explicit `supersedes`, the entry bytes, the
- * path, and what is there already. Refuses (`track-duplicate`, `track-unknown`,
+ * written: track checks, default and explicit `supersedes`, the entry bytes, and
+ * what is already at `entryPath` (from entryPathFor). Refuses (`track-duplicate`, `track-unknown`,
  * `track-exists`, `supersedes-unknown`, `payload-reserved-marker`,
  * `invalid-entry`, `entry-conflict`) with nothing written.
  */
-function planSessionEntry(args, payload, project, date, closeId, legacyFormat) {
+function planSessionEntry(args, payload, project, entryPath, closeId, legacyFormat) {
   const tracks = payload.tracks ?? [];
   const seen = new Set();
   for (const t of tracks) {
@@ -1979,7 +2017,7 @@ function planSessionEntry(args, payload, project, date, closeId, legacyFormat) {
   }
 
   const pin = readClosePin(args.hypoDir, args.sessionId);
-  const { relPath, date: entryDate } = entryPathFor(args, project, closeId, date, pin);
+  const { relPath, date: entryDate } = entryPath;
   let text;
   try {
     text = formatSessionEntry({
@@ -2019,7 +2057,9 @@ function planSessionEntry(args, payload, project, date, closeId, legacyFormat) {
       ignored,
       pin,
     });
-    if (d.action === 'conflict') failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath));
+    if (d.action === 'conflict') {
+      failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath, d.reason));
+    }
     if (d.action === 'adopt') finalText = disk;
   }
   const heads = Object.fromEntries(entryTracks.map((t) => [t.id, [closeId]]));
@@ -2059,7 +2099,8 @@ function publishNewEntry(abs, text) {
     try {
       unlinkSync(tmp);
     } catch {
-      // best-effort: a leftover temp name is ignored by `.gitignore`
+      // best-effort: a leftover temp name is ignored by `.gitignore` only in a
+      // vault migrated to session entries (its block carries `/projects/*/sessions/*.tmp`)
     }
   }
 }
@@ -2113,7 +2154,9 @@ function writeSessionEntry(args, plan, acc, testHooks) {
       ignored,
       pin: readClosePin(args.hypoDir, args.sessionId),
     });
-    if (d.action === 'conflict') failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath));
+    if (d.action === 'conflict') {
+      failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath, d.reason));
+    }
     if (d.action === 'replace') {
       try {
         recordPublishIntent(args.hypoDir, args.sessionId, closeId, relPath, bytesSha256(text));
@@ -3015,6 +3058,24 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
 
   overwrite('openQuestions', join('pages', 'open-questions.md'), payload.openQuestions);
 
+  // Two sessions closing a project that has no index.md yet both try to seed
+  // it, and the one that lost the create finds the other's file, not committed
+  // yet, in the folder its gate refuses to leave dirty. Bytes identical to what
+  // this close would have seeded, in a file HEAD does not have, are committed
+  // by this close too: whoever wrote them, the content is this close's own
+  // seed. Anything else (a hand-edited index.md) stays out of the commit.
+  const adoptSeededIndex = () => {
+    const disk = readTarget(join(args.hypoDir, indexRelPath));
+    if (typeof disk !== 'string' || disk !== projectIndexSeed(project, date)) return;
+    if (headPathState(args.hypoDir, indexRelPath) !== 'absent') return;
+    appliedPaths.push(indexRelPath);
+    proofEntries.push({
+      path: indexRelPath,
+      kind: 'create',
+      expected: { bytesSha256: bytesSha256(disk) },
+    });
+  };
+
   // A-1: fill a missing project index as part of this close's writes (after
   // preflight passed, so an aborted close never leaves a half-applied side
   // effect on disk).
@@ -3051,6 +3112,8 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
           bytesSha256: bytesSha,
         });
       }
+    } else {
+      adoptSeededIndex();
     }
   } else {
     // The retry path. A first attempt that seeds index.md and then fails to
@@ -3092,6 +3155,8 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
           kind: 'create',
           expected: { bytesSha256: priorIndex.bytesSha256 },
         });
+      } else {
+        adoptSeededIndex();
       }
     }
   }
@@ -4115,7 +4180,11 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     gateNotices,
     gateBlockers,
     receiptMismatches,
-    verification: verification ?? verify(),
+    // A verification that does not decide the close (no commit landed) still
+    // goes out, marked so a reader does not take its `ok` for the close's.
+    verification: verificationCounts
+      ? verification
+      : { ...(verification ?? verify()), counted: false },
     verificationCounts,
   };
 }
@@ -4591,6 +4660,34 @@ function printCloseReport({
 // test can crash a close in the one gap between those two writes. `beforePublish`,
 // `afterPublish` and `afterPinBeforeReplace` do the same for the entry write (see
 // `writeSessionEntry`).
+// The no-payload probe with a session id: is there a project this session's own
+// close proves complete right now? Same judgment as the verdict sites
+// (closeGateStatus, then sessionProofCloseId per project, then the session
+// scope of sessionCloseFileStatus), so another session's close of today never
+// reads as this one's, and an open new close request reads as not done.
+function sessionProbeStatus(hypoDir, sessionId) {
+  const gate = closeGateStatus({
+    transcriptPath: resolveTranscriptBySessionId(sessionId) ?? null,
+    hypoDir,
+    sessionId,
+  });
+  for (const project of listSessionProjects(hypoDir)) {
+    const closeId = sessionProofCloseId(hypoDir, sessionId, {
+      closeOpen: gate.ok,
+      resolvedAtIndex: gate.resolvedAtIndex,
+      project,
+    });
+    if (!closeId) continue;
+    const status = sessionCloseFileStatus(hypoDir, {
+      scope: 'session',
+      closeId,
+      projectOverride: project,
+    });
+    if (status.ok) return status;
+  }
+  return { ok: false };
+}
+
 export function applySessionClose(args, testHooks = null) {
   // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
@@ -4602,9 +4699,12 @@ export function applySessionClose(args, testHooks = null) {
   // for any actual apply work (readPayload below surfaces "payload is
   // required" the same way it always has).
   if (!args.force && !args.payload) {
-    // No-payload "already complete?" probe uses the
-    // global invariant, not a recency pick.
-    const probe = sessionCloseGlobalStatus(args.hypoDir);
+    // No-payload "already complete?" probe. With a session id it asks about THIS
+    // session's close (the same proof the verdict sites use); without one it can
+    // only say that some close of today exists, which may be another session's.
+    const probe = args.sessionId
+      ? sessionProbeStatus(args.hypoDir, args.sessionId)
+      : sessionCloseGlobalStatus(args.hypoDir);
     // A leftover close-intent record (see closeIntentPath's doc comment)
     // means some earlier apply began this file set and never finished it.
     // `probe.ok` is a freshness read alone, so trusting it here would be
@@ -4620,7 +4720,10 @@ export function applySessionClose(args, testHooks = null) {
         alreadyComplete: true,
         project: probe.project,
         date: probe.dates[0],
-        message: '오늘 이미 close 완료로 보임 (probe 모드 — payload 미지정).',
+        scope: args.sessionId ? 'session' : 'global',
+        message: args.sessionId
+          ? '이 세션의 close가 이미 완료됨 (probe 모드: payload 미지정).'
+          : '이 프로젝트에 오늘 close가 있음. 이 세션의 close인지는 확인하지 않았음 (probe 모드: payload와 --session-id 미지정).',
       };
       if (args.json) {
         console.log(JSON.stringify(result, null, 2));
@@ -4644,9 +4747,27 @@ export function applySessionClose(args, testHooks = null) {
     );
   }
   const project = resolveCloseProject(args, payload);
-  const date = payload.date || todayLocal();
-  assertPayloadFreshnessContract(args, payload, project, date);
-  const entryPlan = planSessionEntry(args, payload, project, date, closeId, legacyFormat);
+  // A close keeps the date its entry was first published with, and its logs go
+  // under that same date: the post-apply check reads them there. A retry after
+  // midnight (or a payload that moved its date) would otherwise append under the
+  // new day and leave this close's own day without a log for good.
+  const requestedDate = payload.date || todayLocal();
+  const entryPath = entryPathFor(
+    args,
+    project,
+    closeId,
+    requestedDate,
+    readClosePin(args.hypoDir, args.sessionId),
+  );
+  const date = entryPath.date;
+  assertPayloadFreshnessContract(
+    args,
+    payload,
+    project,
+    date,
+    date === requestedDate ? null : entryPath.relPath,
+  );
+  const entryPlan = planSessionEntry(args, payload, project, entryPath, closeId, legacyFormat);
   const { preflightLint, payloadScope, indexRelPath, indexMissing } = runPreflight(
     args,
     payload,

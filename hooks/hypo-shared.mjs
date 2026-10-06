@@ -1844,9 +1844,24 @@ export function revPathArg(rev, relPath) {
   return `${rev}:./${relPath}`;
 }
 
+/**
+ * Whether HEAD's tree has `relPath`: `'present'`, `'absent'` (also when the
+ * repository has no commit yet), or `'error'` when git could not answer (no
+ * repository, a broken one). A caller that would act on "absent" must not read an
+ * error as one.
+ */
+export function headPathState(hypoDir, relPath) {
+  const r = vaultGit(hypoDir, ['ls-tree', '--name-only', 'HEAD', '--', relPath]);
+  if (!r.error && r.status === 0) return r.stdout.length > 0 ? 'present' : 'absent';
+  // A repository with no commit yet (unborn HEAD) has no path in HEAD at all.
+  const head = vaultGit(hypoDir, ['rev-parse', '--verify', '-q', 'HEAD']);
+  const repo = vaultGit(hypoDir, ['rev-parse', '--git-dir']);
+  return !head.error && head.status === 1 && repo.status === 0 ? 'absent' : 'error';
+}
+
 /** Whether HEAD's tree has `relPath` (a blob or a tree). False with no HEAD or no repository. */
 export function pathInHead(hypoDir, relPath) {
-  return vaultGit(hypoDir, ['cat-file', '-e', revPathArg('HEAD', relPath)]).status === 0;
+  return headPathState(hypoDir, relPath) === 'present';
 }
 
 /** The vault's path inside its repository (`vault/`, or `''` at the top or outside a repository). */
@@ -3688,7 +3703,7 @@ function datedEntryPaths(hypoDir, project, dates) {
 
 // The entry file of one close id in `project`, found by name on disk:
 // `<date>-<closeId>.md`, the date being whatever the close was first published with.
-function entryPathOfClose(hypoDir, project, closeId) {
+export function entryPathOfClose(hypoDir, project, closeId) {
   let names = [];
   try {
     names = readdirSync(join(hypoDir, 'projects', project, 'sessions'));
@@ -3713,6 +3728,24 @@ function fileSha256(absPath) {
 // A close id is `<sessionId>-<openedAtIndex>` (closeIdFor), so the pin that holds its local proof
 // is the one of the session id in front of the last `-`.
 const sessionIdOfClose = (closeId) => closeId.replace(/-\d+$/, '');
+
+// A session entry another session published that no commit holds yet: a file not in
+// HEAD whose name carries a close id of a different session. That session's own close
+// commits it, so a gate of this session neither blocks on it nor tells anyone to
+// commit or revert it (it is the only copy of that session's summary). An entry
+// already in HEAD and since modified is not new, and git failing to answer is not
+// "absent": both stay blocking.
+function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
+  if (!isValidSessionId(sessionId) || !isSessionEntryPath(relPath)) return false;
+  const m = /^\d{4}-\d{2}-\d{2}-(.+-\d+)\.md$/.exec(relPath.split('/').pop());
+  if (!m || sessionIdOfClose(m[1]) === sessionId) return false;
+  return headPathState(hypoDir, relPath) === 'absent';
+}
+
+const FOREIGN_ENTRY_NOTICE = (f) =>
+  `${f} is another session's new session entry, not committed yet. That session's close ` +
+  `commits it, so do not commit or revert it here (다른 세션 close 의 원본이다. 그 세션의 ` +
+  `커밋이 실패해 남은 것이면 그 세션이 close 를 다시 실행해야 동기화된다)`;
 
 // The session-log and log.md half of a close check, for one project and the dates its close
 // counts under. Pushes into `stale`/`missing` and returns the session-log file that carried the
@@ -6172,11 +6205,15 @@ export function sessionClosedMarkerPath(hypoDir, sessionId) {
 // that file as soon as the commit lands, and a retry after a failed receipt
 // would lose the id.
 //
-// Shape: `{v: 2, pending, lastResolved, localProofs}`.
-//   pending       `{closeId, openedAtIndex, entryRelPath, entrySha256s}` of the
-//                 close in flight, or null
-//   lastResolved  the closeId of the last close that finished, or null
-//   localProofs   `{closeId: {entryRelPath, entrySha256}}`, never cleared on resolution
+// Shape: `{v: 2, pending, lastResolved, resolvedByProject, localProofs}`.
+//   pending            `{closeId, openedAtIndex, entryRelPath, entrySha256s}` of the
+//                      close in flight, or null
+//   lastResolved       the closeId of the last close that finished, or null
+//   resolvedByProject  `{project: closeId}`, the last finished close per project its
+//                      entry went to. One session can close several projects in turn,
+//                      and each one is proven by its own close, not by the last one.
+//                      A pin written before this field existed reads as `{}`.
+//   localProofs        `{closeId: {entryRelPath, entrySha256}}`, never cleared on resolution
 //
 // The functions below sit here, not in close-gate-store.mjs or
 // close-journal.mjs, because both import this file: `sessionProofCloseId`
@@ -6184,7 +6221,13 @@ export function sessionClosedMarkerPath(hypoDir, sessionId) {
 // cycle. That is also why nothing here calls `closeGateStatus`; callers pass
 // its answers in.
 
-const EMPTY_CLOSE_PIN = Object.freeze({ pending: null, lastResolved: null, localProofs: {} });
+const EMPTY_CLOSE_PIN = Object.freeze({
+  pending: null,
+  lastResolved: null,
+  resolvedByProject: {},
+  localProofs: {},
+});
+const emptyClosePin = () => ({ ...EMPTY_CLOSE_PIN, resolvedByProject: {}, localProofs: {} });
 
 /** `<hypoDir>/.cache/close-pin/<sessionId>.json`, or null for an id unsafe as a filename. */
 export function closePinPath(hypoDir, sessionId) {
@@ -6194,7 +6237,7 @@ export function closePinPath(hypoDir, sessionId) {
 
 function wellFormedClosePin(pin) {
   if (!pin || typeof pin !== 'object' || Array.isArray(pin) || pin.v !== 2) return false;
-  const { pending, lastResolved, localProofs } = pin;
+  const { pending, lastResolved, resolvedByProject, localProofs } = pin;
   if (pending !== null) {
     if (!pending || typeof pending !== 'object' || Array.isArray(pending)) return false;
     if (!isValidSessionId(pending.closeId)) return false;
@@ -6208,6 +6251,11 @@ function wellFormedClosePin(pin) {
     }
   }
   if (lastResolved !== null && !isValidSessionId(lastResolved)) return false;
+  if (resolvedByProject !== undefined) {
+    if (!resolvedByProject || typeof resolvedByProject !== 'object') return false;
+    if (Array.isArray(resolvedByProject)) return false;
+    if (!Object.values(resolvedByProject).every((id) => isValidSessionId(id))) return false;
+  }
   if (!localProofs || typeof localProofs !== 'object' || Array.isArray(localProofs)) return false;
   return Object.values(localProofs).every(
     (p) =>
@@ -6223,21 +6271,21 @@ function wellFormedClosePin(pin) {
  * file reads as an empty pin, never as a throw: a pin that cannot be trusted
  * must not block a close, it just means no id is pinned yet.
  *
- * @returns {{pending: object|null, lastResolved: string|null, localProofs: object}}
+ * @returns {{pending: object|null, lastResolved: string|null, resolvedByProject: object, localProofs: object}}
  */
 export function readClosePin(hypoDir, sessionId) {
   const path = closePinPath(hypoDir, sessionId);
-  if (!path) return { ...EMPTY_CLOSE_PIN, localProofs: {} };
+  if (!path) return emptyClosePin();
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8'));
     if (wellFormedClosePin(parsed)) {
-      const { pending, lastResolved, localProofs } = parsed;
-      return { pending, lastResolved, localProofs };
+      const { pending, lastResolved, resolvedByProject = {}, localProofs } = parsed;
+      return { pending, lastResolved, resolvedByProject, localProofs };
     }
   } catch {
     // absent or unparseable: same answer as a malformed file
   }
-  return { ...EMPTY_CLOSE_PIN, localProofs: {} };
+  return emptyClosePin();
 }
 
 /**
@@ -6254,6 +6302,7 @@ export function writeClosePin(hypoDir, sessionId, pin) {
       v: 2,
       pending: pin.pending ?? null,
       lastResolved: pin.lastResolved ?? null,
+      resolvedByProject: pin.resolvedByProject ?? {},
       localProofs: pin.localProofs ?? {},
     }),
     { durable: true },
@@ -6273,9 +6322,34 @@ export function writeClosePin(hypoDir, sessionId, pin) {
  */
 export function normalizeClosePin(pin, resolvedAtIndex) {
   if (pin.pending && resolvedAtIndex !== null && pin.pending.openedAtIndex < resolvedAtIndex) {
-    return { ...pin, pending: null, lastResolved: pin.pending.closeId };
+    return retireClosePending(pin);
   }
   return pin;
+}
+
+// The project a session entry path belongs to, null for any other path.
+function projectOfEntryPath(relPath) {
+  const p = posixPath(relPath);
+  return isSessionEntryPath(p) ? p.split('/')[1] : null;
+}
+
+/**
+ * `pending` finished: it becomes `lastResolved`, and the last resolved close of
+ * the project its entry went to. A pending that never recorded an entry path
+ * names no project and only moves to `lastResolved`. Pure.
+ */
+export function retireClosePending(pin) {
+  const { closeId, entryRelPath } = pin.pending;
+  const project = entryRelPath ? projectOfEntryPath(entryRelPath) : null;
+  return {
+    ...pin,
+    pending: null,
+    lastResolved: closeId,
+    resolvedByProject: {
+      ...(pin.resolvedByProject ?? {}),
+      ...(project ? { [project]: closeId } : {}),
+    },
+  };
 }
 
 /**
@@ -6288,11 +6362,21 @@ export function normalizeClosePin(pin, resolvedAtIndex) {
  * required: a call that forgot one would silently take the weaker branch.
  * The pin is normalized in memory only; this function never writes.
  *
+ * With `opts.project` the answer is the close that proves THAT project, since
+ * one session can close several projects in turn:
+ *   pending in this project, or with no entry yet    its closeId
+ *   otherwise, closeOpen                             null (a new request is open:
+ *                                                    no earlier close vouches for it)
+ *   otherwise                                        resolvedByProject[project], or
+ *                                                    lastResolved when its entry is in
+ *                                                    this project (a pin written before
+ *                                                    resolvedByProject), or null
+ * Without it (no production caller; kept for the session-wide question):
  *   pending exists            its closeId
- *   no pending, closeOpen     null (a new request with nothing published yet,
- *                             so the previous close must not vouch for it)
+ *   no pending, closeOpen     null
  *   no pending, !closeOpen    lastResolved, or null
  *
+ * @param {{closeOpen: boolean, resolvedAtIndex: number|null, project?: string}} opts
  * @returns {string|null}
  */
 export function sessionProofCloseId(hypoDir, sessionId, opts) {
@@ -6303,8 +6387,21 @@ export function sessionProofCloseId(hypoDir, sessionId, opts) {
     throw new Error('sessionProofCloseId requires resolvedAtIndex (a number or null)');
   }
   const pin = normalizeClosePin(readClosePin(hypoDir, sessionId), opts.resolvedAtIndex);
-  if (pin.pending) return pin.pending.closeId;
-  return opts.closeOpen ? null : pin.lastResolved;
+  const { project } = opts;
+  if (project === undefined) {
+    if (pin.pending) return pin.pending.closeId;
+    return opts.closeOpen ? null : pin.lastResolved;
+  }
+  if (pin.pending) {
+    const rel = pin.pending.entryRelPath;
+    if (!rel || projectOfEntryPath(rel) === project) return pin.pending.closeId;
+  }
+  if (opts.closeOpen) return null;
+  const byProject = pin.resolvedByProject[project];
+  if (byProject) return byProject;
+  return pin.lastResolved && entryPathOfClose(hypoDir, project, pin.lastResolved)
+    ? pin.lastResolved
+    : null;
 }
 
 // verified_scope (session-close-scope-boundary spec §3) records the scope the
@@ -7171,6 +7268,10 @@ export function precompactGateStatus(hypoDir, opts = {}) {
                 file: f,
                 reason: `this session's own write is still uncommitted: ${f}${ignoredHint}`,
               });
+            } else if (isForeignUncommittedEntry(hypoDir, pf, opts.sessionId)) {
+              // Two sessions closing one project at once: the other one's entry
+              // is published and its commit has not landed yet.
+              notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
             } else if (inClosedProject(posixPath(f))) {
               blockers.push({
                 type: 'git',
@@ -7257,7 +7358,13 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // its source instead: applyOverwrites re-stages index.md on the retry
       // path (crystallize-close-apply.mjs), so the file this branch used to
       // demote is now in the close's own commit scope and never reaches here.
-      const rest = dirty.filter((f) => !isForeign(f));
+      // Another session's entry still waiting for its own commit is not
+      // this session's to commit, inside the scoped project or not (the
+      // checkpoint branch above demotes it the same way).
+      const foreignEntries = dirty.filter(
+        (f) => !isForeign(f) && isForeignUncommittedEntry(hypoDir, posixPath(f), opts.sessionId),
+      );
+      const rest = dirty.filter((f) => !isForeign(f) && !foreignEntries.includes(f));
       if (rest.length > 0) {
         blockers.push({
           type: 'git',
@@ -7271,11 +7378,27 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           reason: `uncommitted changes outside this session's scope: ${f}`,
         });
       }
+      for (const f of foreignEntries) {
+        notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
+      }
     } else if (!sessionTouchTrusted) {
       blockers.push({ type: 'git', reason: git.reason });
     } else {
-      const mine = dirty.filter((f) => closeAccountableScope.has(posixPath(f)));
-      const foreign = dirty.filter((f) => !closeAccountableScope.has(posixPath(f)));
+      // closeAccountableScope holds every entry of today in the project, the
+      // other sessions' too, so a foreign one still waiting for its commit is
+      // taken out here like in the scoped branch above.
+      const foreignEntries = dirty.filter((f) =>
+        isForeignUncommittedEntry(hypoDir, posixPath(f), opts.sessionId),
+      );
+      for (const f of foreignEntries) {
+        notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
+      }
+      const mine = dirty.filter(
+        (f) => closeAccountableScope.has(posixPath(f)) && !foreignEntries.includes(f),
+      );
+      const foreign = dirty.filter(
+        (f) => !closeAccountableScope.has(posixPath(f)) && !foreignEntries.includes(f),
+      );
       if (mine.length > 0) {
         blockers.push({
           type: 'git',
@@ -7453,6 +7576,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         closeId: sessionProofCloseId(hypoDir, opts.sessionId, {
           closeOpen: opts.closeOpen,
           resolvedAtIndex: opts.resolvedAtIndex,
+          project: cwdProject,
         }),
         projectOverride: cwdProject,
       });
