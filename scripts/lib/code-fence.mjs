@@ -6,7 +6,17 @@
 // Public API, both take the whole file text:
 //   fencedLineMask(text)  boolean[] per `\n`-split line, true on a fence line
 //                         (opener, body, closer)
-//   maskNonProse(text)    copy of `text` with fences and HTML comments blanked
+//   retiredLineMask(text) boolean[] per line, true where an unclosed opener was reread as text
+//   maskNonProse(text)    copy of `text` with fences, HTML comments and a leading
+//                         frontmatter block blanked
+//
+// A session entry heading (`## [YYYY-MM-DD] session | `, column 0) ends whatever fence or
+// comment is still open, so an opener one session left unclosed cannot pair with a
+// marker a later session appended and hide that session's real heading. The price: an
+// example heading of exactly that shape inside a fence reads as live, which shows up as
+// a visible false warning instead of a silent W8 loss. The text such an ended opener
+// leaves exposed is flagged by retiredLineMask, and a genuine `ADR 없음` inside it is
+// likewise not counted, so that failure too shows up as a W8 rather than a missing one.
 
 // A fence marker line: 0-3 leading spaces (CommonMark still calls that "unindented"),
 // then a run of 3+ backticks or 3+ tildes, then the rest of the line. `m[1]` is the
@@ -14,6 +24,10 @@
 // whatever follows, an info string on the opening line, and required to be blank
 // (after trim) on a line being checked as a close.
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+// The heading crystallize writes at the start of a session entry (the same shape as
+// the log.md line, see hasLogEntry's contract in crystallize-close-apply.mjs).
+const ENTRY_BOUNDARY_RE = /^## \[\d{4}-\d{2}-\d{2}\] session \| /;
 
 // One pass over the lines, fences and comments tracked together so neither can be
 // read out of the other: a marker inside a comment is not a fence, and a comment
@@ -34,6 +48,13 @@ function scanOnce(text, skip) {
   let comment = null; // { key }
   for (let i = from; i < lines.length; i++) {
     const line = lines[i];
+    if (ENTRY_BOUNDARY_RE.test(line)) {
+      // A new entry starts here. An opener still open is retired and the scan reruns
+      // with it read as plain text; with nothing open the line is just prose.
+      const open = (fence || comment)?.key;
+      if (open) return { lines, fenced, spans, from, unclosed: open, end: i };
+      continue;
+    }
     if (fence) {
       fenced[i] = true;
       const m = line.match(FENCE_RE);
@@ -71,7 +92,14 @@ function scanOnce(text, skip) {
       col = e + 3;
     }
   }
-  return { lines, fenced, spans, unclosed: (fence || comment)?.key ?? null };
+  return {
+    lines,
+    fenced,
+    spans,
+    from,
+    unclosed: (fence || comment)?.key ?? null,
+    end: lines.length,
+  };
 }
 
 /**
@@ -80,7 +108,8 @@ function scanOnce(text, skip) {
  * with nothing after it. An HTML comment runs from `<!--` to the next `-->`, across
  * lines.
  *
- * An opener that never finds its close before EOF is treated as NEVER HAVING
+ * An opener that never finds its close before EOF, or before the next session entry
+ * heading (ENTRY_BOUNDARY_RE), is treated as NEVER HAVING
  * OPENED: the scan reruns with that opener read as plain text, so every line from
  * it to EOF is visible again. That is the safe direction for both callers. The
  * section-loss guard extracts headings from disk and payload with the same
@@ -98,9 +127,15 @@ function scanOnce(text, skip) {
  */
 function scan(text) {
   const skip = new Set();
+  const retired = []; // [first, end) line ranges of openers read as plain text
   for (;;) {
     const r = scanOnce(text, skip);
-    if (r.unclosed === null) return r;
+    if (r.unclosed === null) {
+      const mask = new Array(r.lines.length).fill(false);
+      for (const [a, b] of retired) mask.fill(true, a, b);
+      return { ...r, retired: mask };
+    }
+    retired.push([Number(r.unclosed.match(/^[fc](\d+)/)[1]), r.end]);
     skip.add(r.unclosed); // each rescan retires one opener, so this terminates
   }
 }
@@ -119,12 +154,27 @@ export function fencedLineMask(text) {
   return scan(text).fenced;
 }
 
+/**
+ * Which lines sit in a region whose opener never closed (before EOF or before the
+ * next session entry heading) and was therefore read as plain text. Their headings
+ * stay live, but whatever else they say (an `ADR 없음` marker) may be an earlier
+ * session's example, so a caller that must not trust such text can skip these lines.
+ *
+ * @param {string} text
+ * @returns {boolean[]}
+ */
+export function retiredLineMask(text) {
+  return scan(text).retired;
+}
+
 const blank = (s) => s.replace(/[^\n]/g, ' ');
 
 /**
  * A copy of `text` with fenced code and HTML comments blanked to spaces, same
  * length and same newline positions, so a match index in the copy is the same
- * index in `text`. Frontmatter text is left as written. A comment is blanked from
+ * index in `text`. A recognised leading frontmatter block (opening `---` through the
+ * closing `---`) is blanked whole, so a YAML comment such as `## 2026-12-25 x` is
+ * never read as a heading. A comment is blanked from
  * its `<!--` to its `-->` only, so the rest of a line stays readable.
  *
  * A CRLF line is matched without its `\r`; the `\r` stays in the copy, except on a
@@ -134,11 +184,11 @@ const blank = (s) => s.replace(/[^\n]/g, ' ');
  * @returns {string}
  */
 export function maskNonProse(text) {
-  const { lines, fenced, spans } = scan(text);
+  const { lines, fenced, spans, from } = scan(text);
   const raw = text.split('\n');
   return raw
     .map((l, i) => {
-      if (fenced[i]) return blank(l);
+      if (fenced[i] || i < from) return blank(l);
       let out = lines[i];
       for (const [s, e] of spans[i]) out = out.slice(0, s) + blank(out.slice(s, e)) + out.slice(e);
       return out + l.slice(lines[i].length);

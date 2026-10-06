@@ -1,7 +1,7 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { DAY_MS, parseStrictDate } from './time.mjs';
-import { maskNonProse } from './code-fence.mjs';
+import { maskNonProse, retiredLineMask } from './code-fence.mjs';
 
 // session-log headings appear in two shapes in the wild: bracketed
 // `## [YYYY-MM-DD]` (spec convention) and bare `## YYYY-MM-DD` (some entries,
@@ -71,6 +71,14 @@ function parseSessionDates(text) {
   // marker test below reads this copy too, so a fenced example's `ADR 없음`
   // cannot exclude the real entry around it. Blocking W8 depends on that.
   const live = maskNonProse(text);
+  // Lines of an opener that never closed are read as prose so their headings count,
+  // but an `ADR 없음` marker there may be an earlier session's example, so the
+  // marker test reads a copy without them: a wrongly kept W8 shows, a lost one does not.
+  const retired = retiredLineMask(text);
+  const markerLive = live
+    .split('\n')
+    .map((l, i) => (retired[i] ? l.replace(/[^\r]/g, ' ') : l))
+    .join('\n');
   SESSION_LOG_HEADING_RE.lastIndex = 0;
   let m;
   while ((m = SESSION_LOG_HEADING_RE.exec(live)) !== null) {
@@ -82,10 +90,10 @@ function parseSessionDates(text) {
     const end = headings[i + 1]?.start ?? text.length;
     // Exclude only an explicit no-design-change entry. An entry carrying both
     // the marker and an ADR reference is treated as a design entry (included).
-    // The marker is read from the live copy, the ADR reference from the raw
+    // The marker is read from the live copy without retired lines, the ADR reference from the raw
     // text: a fenced ADR reference keeps the entry included (the safe side).
     const excluded =
-      NO_ADR_MARKER_RE.test(live.slice(headings[i].start, end)) &&
+      NO_ADR_MARKER_RE.test(markerLive.slice(headings[i].start, end)) &&
       !ADR_REF_RE.test(text.slice(headings[i].start, end));
     const { literal } = headings[i];
     if (parseStrictDate(literal) != null) {
