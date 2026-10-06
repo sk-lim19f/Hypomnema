@@ -225,10 +225,22 @@ function createNew(file, content, testHooks) {
     dir,
     `.${basename(file)}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`,
   );
+  const dropTmp = () => {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort: an orphan tmp is inert, and must not turn a published draft into an error */
+    }
+  };
   try {
-    // an EEXIST here is a collision on the tmp name, a real failure: only the link below
-    // means "the name was taken"
     writeFileSync(tmp, content, { flag: 'wx' });
+  } catch (err) {
+    // An EEXIST is a collision on the tmp name, a real failure (only the link below means
+    // "the name was taken"), and that file belongs to someone else, so it stays.
+    if (err.code !== 'EEXIST') dropTmp();
+    throw err;
+  }
+  try {
     testHooks?.beforePublish?.(tmp, file);
     try {
       linkSync(tmp, file);
@@ -238,11 +250,7 @@ function createNew(file, content, testHooks) {
       throw err;
     }
   } finally {
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      /* best-effort: an orphan tmp is inert, and must not turn a published draft into an error */
-    }
+    dropTmp();
   }
 }
 
@@ -857,12 +865,13 @@ function unignoredCachePaths(hypoDir, relPaths) {
 }
 
 // Throws when any of `files` (under the vault's .cache/) is a path the vault's git would
-// not ignore.
+// not ignore, or when .cache/ itself is not: a rule that names only the final file leaves
+// the temp file written next to it, and an import's next numbered name, open to `git add -A`.
 function assertCacheIgnored(hypoDir, ...files) {
-  const bad = unignoredCachePaths(
-    hypoDir,
-    files.map((f) => relative(hypoDir, f).split(sep).join('/')),
-  );
+  const bad = unignoredCachePaths(hypoDir, [
+    '.cache/',
+    ...files.map((f) => relative(hypoDir, f).split(sep).join('/')),
+  ]);
   if (bad.length)
     throw Object.assign(
       new Error(
@@ -1738,9 +1747,10 @@ function runBootstrap(args) {
     try {
       saveHandLines(args.hypoDir, [...kept, ...recorded]);
     } catch (err) {
-      warnings.push(
-        `could not record hand lines; they will not be removed on promotion: ${err.message}`,
-      );
+      // also in the --json report: a draft was made whose hand line will now never be removed
+      const w = `could not record hand lines; they will not be removed on promotion: ${err.message}`;
+      warnings.push(w);
+      (report.warnings ||= []).push(w);
     }
   }
   if (failure) return { code: 1, error: failure, report, warnings };
@@ -2534,10 +2544,10 @@ async function main() {
     // the pointer to where the drafts are only makes sense when this run made some
     console.error(
       `[feedback-sync] bootstrap: ${out.report.created.length} ${verb}, ${out.report.skipped.length} skipped.` +
-        (out.report.created.length
+        (out.report.created.length && !out.report.dryRun
           ? ` Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. ` +
             `The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git ` +
-            `when the vault is a git work tree (feedback-sync checked that git ignores that path).`
+            `when the vault is a git work tree (feedback-sync checked that git ignores .cache/).`
           : ''),
     );
   } else if (out.report.mode === 'accept') {

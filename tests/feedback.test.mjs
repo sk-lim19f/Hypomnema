@@ -1278,6 +1278,9 @@ test('feedback-sync-bootstrap-dry-run-writes-nothing: --dry-run reports but crea
       assert.equal(rep.dryRun, true);
       assert.ok(rep.created.length >= 1, 'dry-run still reports planned drafts');
       assert.ok(!existsSync(fbDraftsDir(wiki)), 'no drafts dir written');
+      const t = runFb(['--bootstrap', '--dry-run']);
+      assert.match(t.stderr, /would create/);
+      assert.doesNotMatch(t.stderr, /The drafts are in/, 'no pointer to drafts that were not made');
     },
     { claudeMd },
   );
@@ -1894,6 +1897,13 @@ test('feedback-sync-bootstrap-record-failure-is-a-warning: an unwritable line re
       assert.equal(r.status, 0, r.stderr);
       assert.ok(existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'drafted');
       assert.match(r.stderr, /could not record hand lines; they will not be removed on promotion/);
+      rmSync(join(fbDraftsDir(wiki), 'rule-b.md'));
+      const j = runFb(['--bootstrap', '--json']);
+      assert.equal(j.status, 0, j.stderr);
+      assert.ok(
+        (JSON.parse(j.stdout).warnings || []).some((w) => /could not record hand lines/.test(w)),
+        'the --json report carries the same warning',
+      );
     },
     { memoryMd },
   );
@@ -2462,7 +2472,7 @@ STDOUT
 STDERR
 [feedback-sync] created draft: .cache/feedback-drafts/legacy-claude-20260501-legacy-rule-one.md (claude-learned)
 [feedback-sync] created draft: .cache/feedback-drafts/loose-y.md (memory-index)
-[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git when the vault is a git work tree (feedback-sync checked that git ignores that path).
+[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git when the vault is a git work tree (feedback-sync checked that git ignores .cache/).
 
 ### FILE CLAUDE.md
 # Global
@@ -4436,12 +4446,16 @@ test('feedback-sync-kept-copy-needs-an-ignored-cache: accept and the bootstrap l
   withFeedbackEnv(
     {},
     ({ wiki, runFb }) => {
-      // the drafts dir is ignored, the record file beside it is not
-      fbGitInit(wiki, '.cache/feedback-drafts/\n');
-      const r = runFb(['--bootstrap']);
-      assert.equal(r.status, 0, r.stderr);
-      assert.match(r.stderr, /could not record hand lines.*not ignored by the vault's git/);
-      assert.ok(!existsSync(fbHandRecord(wiki)), 'the hand lines are not copied under .cache/');
+      // only the drafts dir is ignored: the record beside it, and the temp file a draft is
+      // written to before it is linked into place, would not be, so nothing is written at all
+      for (const rule of ['.cache/feedback-drafts/\n', '/.cache/feedback-drafts/*.md\n']) {
+        fbGitInit(wiki, rule);
+        const r = runFb(['--bootstrap']);
+        assert.equal(r.status, 1, `${rule}: ${r.stderr}`);
+        assert.match(r.stderr, /no draft was written: \.cache\/ is not ignored by the vault's git/);
+        assert.ok(!existsSync(fbHandRecord(wiki)), 'the hand lines are not copied under .cache/');
+        assert.ok(!existsSync(fbDraftsDir(wiki)), 'and no draft or temp file was made');
+      }
     },
     { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
   );
@@ -4804,6 +4818,11 @@ test('feedback-sync-draft-tmp-name-collision-is-an-error-not-a-taken-name: a str
         assert.equal(out.code, 1, 'a failed write is not reported as an existing draft');
         assert.match(out.error, /cannot write the draft .*rule-b\.md: .*EEXIST/);
         assert.deepEqual(out.report.skipped, []);
+        assert.equal(
+          readFileSync(join(fbDraftsDir(wiki), tmp), 'utf-8'),
+          'stray',
+          'the file already under that tmp name is not ours to remove',
+        );
       } finally {
         Math.random = real;
       }
