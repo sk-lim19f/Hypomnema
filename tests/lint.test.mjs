@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'nod
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
+import { fencedLineMask, maskNonProse, retiredLineMask } from '../scripts/lib/code-fence.mjs';
 import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
 import { test, suite } from './harness.mjs';
 import {
@@ -2300,7 +2301,7 @@ function lintWarnsFor(root, id, extraArgs = []) {
       env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
     },
   );
-  // default (non-strict) --json exposes ids for W8 only, so match W14 by message
+  // default (non-strict) --json exposes ids for W8 and W19 only, so match W14 by message
   return (JSON.parse(r.stdout).warns || []).filter((w) =>
     id === 'W14' ? w.message.includes('design-history missing') : w.id === id,
   );
@@ -2328,6 +2329,20 @@ test('w19-lint-overflow-only: W19 not W8, no ">" comparison, names file and lite
   });
 });
 
+test('w19-lint-default-json: default --json (no --strict) exposes W19 with its id, as W8 is, and stays a warn', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-03-02\nfoo\n',
+      sessionLogMd: '## [2026-02-30] s\n',
+    });
+    const w19 = lintWarnsFor(root, 'W19');
+    assert.equal(w19.length, 1, 'W19 must carry its id without --strict');
+    assert.equal(w19[0].severity, 'warn');
+    assert.equal(w19[0].file, 'projects/demo/design-history.md');
+    assert.ok(w19[0].message.includes('2026-02-30'));
+  });
+});
+
 test('w19-lint-strict: W19 is not promoted, exit 0 and still a warn', () => {
   withTmpDir((root) => {
     setupDhProject(root, 'demo', {
@@ -2344,13 +2359,329 @@ test('w19-lint-strict: W19 is not promoted, exit 0 and still a warn', () => {
   });
 });
 
+test('w19-lint-fenced-heading: an overflow heading inside a ``` fence is example text, no W19', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-02-25\nfoo\n',
+      // daily-shard shape: frontmatter, then `## [date] session | project`
+      sessionLogMd:
+        '---\ntitle: sl\ntype: session-log\nupdated: 2026-02-25\n---\n\n## [2026-02-25] session | demo\n\n```md\n## [2026-02-30] example\n```\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W19', ['--strict']).length, 0);
+    assert.equal(lintWarnsFor(root, 'W8').length, 0);
+  });
+});
+
+test('w8-lint-fenced-real-date: a fenced later real date does not raise W8', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-02-25\nfoo\n',
+      sessionLogMd: '## [2026-02-25] a\n\n~~~\n## [2026-12-25] example\n~~~\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 0);
+  });
+});
+
+test('w8-lint-fenced-heading-stays-in-entry: a fenced heading does not split an ADR 없음 entry', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-02-01\nfoo\n',
+      sessionLogMd: '## [2026-02-10] a\n```\n## [2026-02-20] x\n```\nADR 없음\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 0, 'whole entry is one no-design entry');
+  });
+});
+
+test('w19-lint-fenced-unclosed: an unclosed fence never opened, so later headings still count', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-02-25\nfoo\n',
+      sessionLogMd: '## [2026-02-25] a\n\n```\n## [2026-02-30] x\n\n## [2026-12-25] y\n',
+    });
+    // fail-closed: the heading after the unclosed fence is a real later date
+    const w8 = lintWarnsFor(root, 'W8');
+    assert.equal(w8.length, 1, 'unclosed fence must not hide the later heading');
+    assert.ok(w8[0].message.includes('2026-12-25'), w8[0].message);
+    assert.ok(w8[0].message.includes('2026-02-30'), w8[0].message);
+  });
+});
+
+test('w8-lint-fenced-adr-marker-stays-fenced: a fenced example ADR 없음 does not exclude the real entry around it', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-10-02] session | p\ndesigned X...\n\n```md\n## [2026-01-01] example\nADR 없음: example\n```\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1);
+  });
+});
+
+test('w8-lint-unclosed-fence-then-no-adr-entry: an unclosed fence in a design entry does not swallow a same-day ADR 없음 entry', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-10-02] session | p\ndesigned X\n\n```\nsnippet\n\n## [2026-02-30] session | p\nADR 없음\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1);
+    // W8 comes from the first entry alone; the later heading's own outcome is W19
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1, 'the later heading must survive the unclosed fence');
+    assert.ok(w19[0].message.includes('2026-02-30'), w19[0].message);
+  });
+});
+
+test('w8-lint-nested-same-length-fence: a ```md fence closed by an inner ``` leaves the last ``` unclosed, headings after it still count', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-10-02] session | p\ndesigned X\n\n```md\nexample:\n```js\nx\n```\n```\n\n## [2026-02-30] session | p\nADR 없음\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1);
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1, 'the later heading must survive the fence');
+    assert.ok(w19[0].message.includes('2026-02-30'), w19[0].message);
+  });
+});
+
+test('w8-lint-fence-opened-by-earlier-session: a ``` left unclosed by one session is not closed by a later session, so the later real heading still counts', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-09-01] session | demo\nADR 없음\n\n```\nleft open\n\n## [2026-10-02] session | demo\ndesigned X\n\n```\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1, 'the later session heading is live');
+  });
+});
+
+test('w8-lint-comment-opened-by-earlier-session: a <!-- left open by one session is not closed by a later session --> either', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-09-01] session | demo\nADR 없음\n\n<!-- left open\n\n## [2026-10-02] session | demo\ndesigned X\n\nnote -->\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1, 'the later session heading is live');
+  });
+});
+
+test('w8-lint-retired-fence-adr-example: an ADR 없음 example in a fence left open until the next entry does not exclude the real design entry', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-10-02] session | demo\ndesigned X\n\n```\nADR 없음: example\n\n## [2026-10-02] session | demo\nADR 없음\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1, 'the example marker must not count');
+  });
+});
+
+test('w8-lint-retired-comment-adr-example: the same for a <!-- left open until the next entry', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-10-02] session | demo\ndesigned X\n\n<!--\nADR 없음: example\n\n## [2026-10-02] session | demo\nADR 없음\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1, 'the example marker must not count');
+  });
+});
+
+test('w8-lint-eof-unclosed-fence-adr-example: an ADR 없음 example in a fence left open to EOF does not exclude the real design entry', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd: '## [2026-10-02] session | demo\ndesigned X\n\n```\nADR 없음: example\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1);
+  });
+});
+
+test('w8-lint-design-history-frontmatter-heading: a `## 2026-12-25` YAML comment in design-history frontmatter is not a date', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '---\ntitle: dh\n## 2026-12-25 example\n---\n\n## 2026-09-01\nfoo\n',
+      sessionLogMd: '## [2026-10-02] session | demo\ndesigned X\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1, 'the frontmatter date must not cover October');
+  });
+});
+
+test('w8-lint-session-log-frontmatter-heading: a `## [date]` YAML comment in session-log frontmatter makes no false W8', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd: '---\ntitle: sl\n## [2026-12-25] example\n---\n\n## [2026-08-30] s\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 0, 'the frontmatter line is not an entry');
+  });
+});
+
+test('w8-lint-frontmatter-fence-scalar: a ``` in a frontmatter block scalar does not open a fence over the body', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '---\ntitle: sl\nnote: |\n  ```\n---\n\n## [2026-10-02] session | p\ndesigned X\n\n```\nex\n```\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1);
+  });
+});
+
+test('w19-lint-bom-frontmatter-fence-scalar: a BOM before the frontmatter does not let a ``` block scalar swallow the body', () => {
+  withTmpDir((root) => {
+    const sessionLogMd =
+      '\uFEFF---\ntitle: sl\nnote: |\n  ```\n---\n\n## [2026-02-30] x\n\n```\nex\n```\n';
+    assert.equal(sessionLogMd.charCodeAt(0), 0xfeff, 'precondition: the shard starts with a BOM');
+    setupDhProject(root, 'demo', { dh: '## 2026-02-25\nfoo\n', sessionLogMd });
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1, JSON.stringify(w19));
+    assert.ok(w19[0].message.includes('2026-02-30'), w19[0].message);
+  });
+});
+
+test('w19-lint-html-comment-heading: an overflow heading inside an HTML comment is example text, no W19', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-03-02\nfoo\n',
+      sessionLogMd: '## [2026-03-01] s\n\n<!--\n## [2026-02-30] example\n-->\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W19', ['--strict']).length, 0);
+  });
+});
+
+test('w8-lint-fenced-design-history-date: a fenced ## date in design-history.md does not count as the latest entry', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n\n```\n## 2026-12-31\n```\n',
+      sessionLogMd: '## [2026-10-02] session | p\ndesigned X\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1);
+  });
+});
+
+test('w19-lint-fenced-mixed-chars: a ~~~ fence is not closed by ```, and is closed by ~~~', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-02-25\nfoo\n',
+      sessionLogMd:
+        '## [2026-02-25] a\n\n~~~\n```\n## [2026-02-30] x\n```\n~~~\n\n## [2026-02-31] y\n',
+    });
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1);
+    assert.ok(w19[0].message.includes('2026-02-31'), w19[0].message);
+    assert.ok(!w19[0].message.includes('2026-02-30'), w19[0].message);
+  });
+});
+
+test('w19-lint-fenced-crlf: CRLF fence lines still open and close a fence', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-02-25\nfoo\n',
+      sessionLogMd:
+        '## [2026-02-25] a\r\n\r\n```\r\n## [2026-02-30] x\r\n```\r\n\r\n## [2026-02-31] y\r\n',
+    });
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1);
+    assert.ok(w19[0].message.includes('2026-02-31'), w19[0].message);
+    assert.ok(!w19[0].message.includes('2026-02-30'), w19[0].message);
+  });
+});
+
+test('w19-lint-unfenced-still-flagged: an overflow heading after a closed fence is still W19', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-03-02\nfoo\n',
+      sessionLogMd: '```\nexample\n```\n\n## [2026-02-30] s\n',
+    });
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1);
+    assert.ok(w19[0].message.includes('2026-02-30'), w19[0].message);
+  });
+});
+
+// Disabling the check: in scripts/lib/code-fence.mjs scanOnce, change `comment || skip.has(key)`
+// to `skip.has(key)` so a fence marker is read even on a line inside a comment.
+test('w8-lint-fence-markers-in-comments-do-not-pair: markers inside two comments do not hide the real heading between them', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '---\ntitle: sl\ntype: session-log\nupdated: 2026-10-02\n---\n\n<!--\n```\n-->\n\n## [2026-10-02] session | demo\ndesigned X\n\n<!--\n```\n-->\n',
+    });
+    assert.equal(
+      lintWarnsFor(root, 'W8').length,
+      1,
+      'real heading between the comments stays live',
+    );
+  });
+});
+
+// Disabling the check: in scripts/lib/code-fence.mjs scanOnce, drop the
+// `!(m[1][0] === '`' && m[2].includes('`'))` clause so a backtick in the info string still opens.
+test('w8-lint-backtick-info-string-is-not-a-fence: ```js`x` opens nothing, so the heading after it stays live', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '## [2026-09-01] a\n\n```js`x`\n## [2026-10-02] session | demo\ndesigned X\n```\n',
+    });
+    assert.equal(lintWarnsFor(root, 'W8').length, 1);
+  });
+});
+
+// Disabling the check: in scripts/lib/design-history-stale.mjs parseSessionDates, push the
+// overflow literal only when `!excluded`.
+test('w19-lint-adr-none-overflow: an overflow heading inside an `ADR 없음` entry is W19, and never W8', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd:
+        '---\ntitle: sl\ntype: session-log\nupdated: 2026-09-01\n---\n\n## [2026-02-30] session | demo\nADR 없음\n',
+    });
+    const w19 = lintWarnsFor(root, 'W19');
+    assert.equal(w19.length, 1, JSON.stringify(w19));
+    assert.ok(w19[0].message.includes('projects/demo/session-log.md: 2026-02-30'), w19[0].message);
+    assert.equal(lintWarnsFor(root, 'W8').length, 0, 'a no-design entry never makes W8');
+  });
+});
+
+test('w19-lint-adr-none-overflow-no-dh: an `ADR 없음` overflow heading with no design-history.md is W19 only, no W14', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', { sessionLogMd: '## [2026-02-30] session | demo\nADR 없음\n' });
+    assert.equal(lintWarnsFor(root, 'W19').length, 1);
+    assert.equal(lintWarnsFor(root, 'W14').length, 0);
+  });
+});
+
+test('w19-findDesignHistoryStale-kind-overflow: only a no-design overflow heading gives kind overflow with the literal and file', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'p', {
+      dh: '## 2026-09-01\nfoo\n',
+      sessionLogMd: '## [2026-08-01] a\nADR 없음\n\n## [2026-02-30] b\nADR 없음\n',
+    });
+    const stale = findDesignHistoryStale(root);
+    assert.equal(stale.length, 1);
+    assert.equal(stale[0].kind, 'overflow');
+    assert.deepEqual(stale[0].calendarOverflow, [
+      { literal: '2026-02-30', file: 'projects/p/session-log.md' },
+    ]);
+  });
+});
+
 test('w8-lint-real-later-with-overflow: a real later date keeps id W8 and its overflow tail', () => {
   withTmpDir((root) => {
     setupDhProject(root, 'demo', {
       dh: '## 2026-02-20\nfoo\n',
       sessionLogMd: '## [2026-02-30] a\n\n## [2026-02-25] b\n',
     });
-    assert.equal(lintWarnsFor(root, 'W19', ['--strict']).length, 0);
+    // The overflow heading is also its own W19 now (close lists only W19 as a notice).
+    const w19 = lintWarnsFor(root, 'W19', ['--strict']);
+    assert.equal(w19.length, 1, JSON.stringify(w19));
+    assert.ok(w19[0].message.includes('2026-02-30'), w19[0].message);
     const w8 = lintWarnsFor(root, 'W8');
     assert.equal(w8.length, 1);
     assert.ok(w8[0].message.includes('2026-02-30'));
@@ -2397,6 +2728,33 @@ test('w14-lint-overflow-only: missing design-history with no real date also says
   });
 });
 
+// Disabling the check: remove the W19 issue() in the `s.kind === 'missing'`
+// branch of the design-history loop in scripts/lint.mjs.
+test('w19-missing-dh-overflow: missing design-history plus an overflow heading also emits one W19 with its id; W14 is unchanged', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', { sessionLogMd: '## [2026-02-30] a\n\n## [2026-02-25] b\n' });
+    const w19 = lintWarnsFor(root, 'W19');
+    assert.equal(w19.length, 1, 'default --json shows the overflow as W19');
+    assert.equal(w19[0].severity, 'warn');
+    assert.equal(w19[0].file, 'projects/demo/design-history.md');
+    assert.ok(w19[0].message.includes('projects/demo/session-log.md: 2026-02-30'), w19[0].message);
+    assert.ok(w19[0].message.includes('실제 날짜로 고치세요'), w19[0].message);
+    assert.ok(
+      !w19[0].message.includes('design-history와'),
+      'no compare-with-design-history advice',
+    );
+    assert.equal(lintWarnsFor(root, 'W14').length, 1, 'W14 itself is still emitted once');
+  });
+});
+
+test('w19-missing-dh-no-overflow: missing design-history without an overflow heading emits no W19', () => {
+  withTmpDir((root) => {
+    setupDhProject(root, 'demo', { sessionLogMd: '## [2026-05-20] s\n' });
+    assert.equal(lintWarnsFor(root, 'W19').length, 0);
+    assert.equal(lintWarnsFor(root, 'W14').length, 1);
+  });
+});
+
 test('w8-lint-omits-id-for-other-warns', () => {
   withTmpDir((root) => {
     // page with frontmatter missing `updated` field → W warn without id
@@ -2414,7 +2772,7 @@ test('w8-lint-omits-id-for-other-warns', () => {
     const nonId = (parsed.warns || []).filter((w) => !('id' in w));
     assert.ok(
       nonId.length >= 1,
-      `expected non-W8 warns to omit id field: ${JSON.stringify(parsed.warns)}`,
+      `expected warns other than W8 and W19 to omit id field: ${JSON.stringify(parsed.warns)}`,
     );
   });
 });
@@ -2442,7 +2800,7 @@ test('w14-lint-emits-warn-with-distinct-message-and-no-W8-id', () => {
     assert.equal(missing[0].file, 'projects/demo/design-history.md');
     // must not be mistaken for a stale (W8) finding — different message body
     assert.ok(!missing[0].message.includes('design-history stale'));
-    // default (non-strict) --json hides ids for anything but W8
+    // default (non-strict) --json hides ids for anything but W8 and W19
     assert.ok(!('id' in missing[0]));
     const w8 = (parsed.warns || []).filter((w) => w.id === 'W8');
     assert.equal(w8.length, 0, 'a missing file has nothing to compare, so it is never W8');
@@ -2514,7 +2872,10 @@ test('source newer than synthesis → W15 warn with distinct message and no W8/W
     const stale = (parsed.warns || []).filter((w) => w.message.includes('synthesis stale'));
     assert.equal(stale.length, 1, `expected one W15 warn: ${JSON.stringify(parsed.warns)}`);
     assert.equal(stale[0].file, 'pages/syn.md');
-    assert.ok(!('id' in stale[0]), 'default (non-strict) --json hides ids for anything but W8');
+    assert.ok(
+      !('id' in stale[0]),
+      'default (non-strict) --json hides ids for anything but W8 and W19',
+    );
   });
 });
 
@@ -3146,7 +3507,7 @@ test('--strict does not promote W12 (stays a warn, exit 0)', () => {
 // spec-v1.3.0 Track E. Stable warning IDs (W1 no-frontmatter / W2 unknown-type
 // / W3 missing-updated / W4 broken-wikilink; W8 design-history-stale predates).
 // `--strict` promotes STRICT_PROMOTE_IDS = {W1,W2,W4,W9} to errors (exit 1).
-// Default mode must stay byte-identical (only W8 exposes `id` in --json).
+// Default mode must stay byte-identical (only W8 and W19 expose `id` in --json).
 
 suite('Track E: lint --strict warning ID promotion');
 
@@ -3179,7 +3540,7 @@ test('strict: default --json keeps W1/W2/W4 ids internal (byte-identical guard)'
     assert.equal(
       withId.length,
       0,
-      `default --json must not leak non-W8 ids: ${JSON.stringify(parsed.warns)}`,
+      `default --json must not leak ids other than W8 and W19: ${JSON.stringify(parsed.warns)}`,
     );
     assert.equal((parsed.warns || []).length, 3);
   });
@@ -3279,4 +3640,87 @@ test('strict: the closeRootTargets W1 exemption does not leak to pages/ (ISSUE-9
       `log.md's W1 must stay a warn: ${JSON.stringify(parsed.warns)}`,
     );
   });
+});
+
+suite('code-fence.mjs: one place for fence and comment decisions');
+
+test('fencedLineMask: a fence marker inside an HTML comment is not a fence, so two of them never pair', () => {
+  const text = '<!--\n```\n-->\n## real\n<!--\n```\n-->\n';
+  assert.deepEqual(fencedLineMask(text), new Array(8).fill(false));
+  assert.ok(maskNonProse(text).includes('## real'));
+});
+
+test('fencedLineMask: a comment opener inside a fence is fence content, not a comment', () => {
+  const text = '```\n<!--\n```\n## real\n-->\n';
+  assert.deepEqual(fencedLineMask(text), [true, true, true, false, false, false]);
+  assert.ok(maskNonProse(text).includes('## real'), 'the unclosed `<!--` was never opened');
+});
+
+test('fencedLineMask: a backtick fence whose info string has a backtick is not an opener; a tilde one is', () => {
+  assert.deepEqual(fencedLineMask('```js`x`\na\n```\n'), [false, false, false, false]);
+  assert.deepEqual(fencedLineMask('~~~js`x`\na\n~~~\n'), [true, true, true, false]);
+  assert.deepEqual(fencedLineMask('```js\na\n```\n'), [true, true, true, false]);
+});
+
+test('fencedLineMask: frontmatter lines are never fenced, so a scalar ``` cannot swallow the body', () => {
+  const text = '---\nnote: |\n  ```\n## fm\n---\n## h\n```\nx\n```\n';
+  assert.deepEqual(fencedLineMask(text), [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    true,
+    false,
+  ]);
+  const masked = maskNonProse(text);
+  assert.ok(!masked.includes('## fm'), 'frontmatter text is not prose');
+  assert.ok(masked.includes('## h'));
+});
+
+test('fencedLineMask: a session entry heading ends an open fence or comment, which then never opened', () => {
+  const h = '## [2026-10-02] session | demo';
+  assert.deepEqual(fencedLineMask(`\`\`\`\nx\n${h}\ny\n\`\`\`\n`), new Array(6).fill(false));
+  assert.ok(maskNonProse(`<!--\nx\n${h}\ny\n-->\n`).includes(h));
+  // a plain `## [date] title` heading is no boundary: the fence still pairs across it
+  assert.ok(!maskNonProse('```\n## [2026-10-02] title\n```\n').includes('title'));
+});
+
+test('retiredLineMask: marks the lines from an unclosed opener to the next entry heading or EOF, nothing else', () => {
+  const h = '## [2026-10-02] session | demo';
+  assert.deepEqual(retiredLineMask(`a\n\`\`\`\nx\n${h}\ny\n`), [
+    false,
+    true,
+    true,
+    false,
+    false,
+    false,
+  ]);
+  assert.deepEqual(retiredLineMask('a\n<!--\nx\n'), [false, true, true, true]);
+  assert.deepEqual(retiredLineMask('a\n```\nx\n```\nb\n'), new Array(6).fill(false));
+});
+
+test('maskNonProse: a leading frontmatter block is blanked whole, same length; no closing --- means no frontmatter', () => {
+  const fm = '---\ntitle: t\n## 2026-12-25 x\n---\n## real\n';
+  assert.equal(maskNonProse(fm), '   \n        \n               \n   \n## real\n');
+  const bom = `\uFEFF${fm}`;
+  assert.equal(maskNonProse(bom).length, bom.length);
+  assert.ok(!maskNonProse(bom).includes('2026-12-25'));
+  const open = '---\n## kept\n';
+  assert.equal(maskNonProse(open), open);
+});
+
+test('fencedLineMask: an unclosed fence and an unclosed comment never opened', () => {
+  assert.deepEqual(fencedLineMask('a\n```\nb\n'), [false, false, false, false]);
+  assert.equal(maskNonProse('a <!-- b\n## h\n'), 'a <!-- b\n## h\n');
+});
+
+test('maskNonProse: keeps length and newlines, blanks only the comment span and whole fence lines', () => {
+  const text = 'x <!-- c --> y\n```\nf\n```\nz\n';
+  const out = maskNonProse(text);
+  assert.equal(out.length, text.length);
+  assert.equal(out, `x${' '.repeat(12)}y\n   \n \n   \nz\n`);
 });

@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { DAY_MS, parseStrictDate } from './time.mjs';
+import { maskNonProse, retiredLineMask } from './code-fence.mjs';
 
 // session-log headings appear in two shapes in the wild: bracketed
 // `## [YYYY-MM-DD]` (spec convention) and bare `## YYYY-MM-DD` (some entries,
@@ -44,9 +45,12 @@ function isValidDesignHistoryDate(literal) {
 
 function parseDates(text, pattern) {
   const dates = [];
+  // A fenced or commented `## 2026-12-31` is example text, not a design-history
+  // entry; counting it would push lastDH forward and silence W8.
+  const live = maskNonProse(text);
   pattern.lastIndex = 0;
   let m;
-  while ((m = pattern.exec(text)) !== null) {
+  while ((m = pattern.exec(live)) !== null) {
     if (isValidDesignHistoryDate(m[1])) dates.push(new Date(m[1]));
   }
   return dates;
@@ -56,25 +60,45 @@ function parseDates(text, pattern) {
 // Entries are sliced by heading start-index (not a single `$`-anchored block
 // regex — multiline `$` terminates at line ends, not true EOF, so the last
 // entry would be truncated). The last entry runs to EOF.
-// Returns { dates, overflow }: real dates as Date, calendar-overflow literals
-// as the original strings.
+// Returns { dates, overflow }: real dates as Date (no-design entries left out),
+// and every calendar-overflow literal in source order as { literal, excluded }.
+// An `excluded` literal sits in an `ADR 없음` entry: it cannot make W8 or W14,
+// but it is still a heading typo, so W19 reports it.
 function parseSessionDates(text) {
   const headings = [];
+  // Length-preserving copy with fenced code and HTML comments blanked. A heading
+  // in it is a real entry start; a heading in a fence is example text. The
+  // marker test below reads this copy too, so a fenced example's `ADR 없음`
+  // cannot exclude the real entry around it. Blocking W8 depends on that.
+  const live = maskNonProse(text);
+  // Lines of an opener that never closed are read as prose so their headings count,
+  // but an `ADR 없음` marker there may be an earlier session's example, so the
+  // marker test reads a copy without them: a wrongly kept W8 shows, a lost one does not.
+  const retired = retiredLineMask(text);
+  const markerLive = live
+    .split('\n')
+    .map((l, i) => (retired[i] ? l.replace(/[^\r]/g, ' ') : l))
+    .join('\n');
   SESSION_LOG_HEADING_RE.lastIndex = 0;
   let m;
-  while ((m = SESSION_LOG_HEADING_RE.exec(text)) !== null) {
+  while ((m = SESSION_LOG_HEADING_RE.exec(live)) !== null) {
     headings.push({ literal: m[1] ?? m[2], start: m.index });
   }
   const dates = [];
   const overflow = [];
   for (let i = 0; i < headings.length; i++) {
-    const body = text.slice(headings[i].start, headings[i + 1]?.start ?? text.length);
+    const end = headings[i + 1]?.start ?? text.length;
     // Exclude only an explicit no-design-change entry. An entry carrying both
     // the marker and an ADR reference is treated as a design entry (included).
-    if (NO_ADR_MARKER_RE.test(body) && !ADR_REF_RE.test(body)) continue;
+    // The marker is read from the live copy without retired lines, the ADR reference from the raw
+    // text: a fenced ADR reference keeps the entry included (the safe side).
+    const excluded =
+      NO_ADR_MARKER_RE.test(markerLive.slice(headings[i].start, end)) &&
+      !ADR_REF_RE.test(text.slice(headings[i].start, end));
     const { literal } = headings[i];
-    if (parseStrictDate(literal) != null) dates.push(new Date(literal));
-    else overflow.push(literal);
+    if (parseStrictDate(literal) != null) {
+      if (!excluded) dates.push(new Date(literal));
+    } else overflow.push({ literal, excluded });
   }
   return { dates, overflow };
 }
@@ -90,13 +114,14 @@ function maxDate(dates) {
 
 // Returns findings:
 // { project, kind, lastSession, lastDesignHistory, diffDays, calendarOverflow,
-//   realLater }. `realLater` (kind 'stale' only) is true when a REAL date, not
+//   realLater }. `kind` 'overflow' carries no W8/W14 verdict: the only finding
+// is a calendar-overflow heading, which lint reports as W19 alone. `realLater` (kind 'stale' only) is true when a REAL date, not
 // an overflow literal, makes the project stale; false means the overflow
 // literals alone raised the finding.
 // `calendarOverflow` lists session-log headings, as { literal, file } with file
 // vault-relative, whose literal names a day that
-// does not exist. Any such literal makes a finding (it cannot be compared, so
-// it is never read as caught up). `lastSession` is the latest REAL date, null
+// does not exist, `ADR 없음` entries included. Any such literal makes a finding
+// (it cannot be compared, so it is never read as caught up). `lastSession` is the latest REAL date, null
 // when every heading overflowed, and `diffDays` is null unless that real date
 // is itself later than design-history.
 // `kind` is 'stale' (the file exists but session-log has moved past it) or
@@ -126,10 +151,14 @@ export function findDesignHistoryStale(hypoDir) {
     // file still needs this to decide whether it has a design-relevant entry.
     const sessionDates = [];
     const calendarOverflow = [];
+    let verdictOverflow = 0; // overflow headings in entries that count toward W8/W14
     const addSession = (text, file) => {
       const r = parseSessionDates(text);
       sessionDates.push(...r.dates);
-      calendarOverflow.push(...r.overflow.map((literal) => ({ literal, file })));
+      for (const { literal, excluded } of r.overflow) {
+        calendarOverflow.push({ literal, file });
+        if (!excluded) verdictOverflow++;
+      }
     };
     const flatSlPath = join(projectDir, 'session-log.md');
     if (existsSync(flatSlPath)) {
@@ -145,7 +174,21 @@ export function findDesignHistoryStale(hypoDir) {
         );
       }
     }
-    if (sessionDates.length === 0 && calendarOverflow.length === 0) continue;
+    if (calendarOverflow.length === 0 && sessionDates.length === 0) continue;
+
+    // Only `ADR 없음` entries are left: W8 and W14 have nothing to say, but a
+    // calendar-overflow heading among them is still a typo W19 must show.
+    if (sessionDates.length === 0 && verdictOverflow === 0) {
+      stale.push({
+        project: name,
+        kind: 'overflow',
+        lastSession: null,
+        lastDesignHistory: null,
+        diffDays: null,
+        calendarOverflow,
+      });
+      continue;
+    }
 
     if (!existsSync(dhPath)) {
       // The file was never created, so there is nothing to compare dates
@@ -170,7 +213,7 @@ export function findDesignHistoryStale(hypoDir) {
     const lastDH = maxDate(parseDates(dhText, DESIGN_HISTORY_DATE_RE));
 
     const pastDH = lastSession != null && lastDH != null && lastSession > lastDH;
-    if (!lastDH || lastSession == null || pastDH || calendarOverflow.length > 0) {
+    if (!lastDH || lastSession == null || pastDH || verdictOverflow > 0) {
       stale.push({
         project: name,
         kind: 'stale',
@@ -179,6 +222,16 @@ export function findDesignHistoryStale(hypoDir) {
         diffDays: pastDH ? Math.round((lastSession - lastDH) / DAY_MS) : null,
         calendarOverflow,
         realLater: pastDH || (!lastDH && lastSession != null),
+      });
+    } else if (calendarOverflow.length > 0) {
+      // Verdict is clean, but an `ADR 없음` entry carries a heading typo.
+      stale.push({
+        project: name,
+        kind: 'overflow',
+        lastSession: isoDay(lastSession),
+        lastDesignHistory: isoDay(lastDH),
+        diffDays: null,
+        calendarOverflow,
       });
     }
   }

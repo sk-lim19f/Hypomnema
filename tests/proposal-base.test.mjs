@@ -4102,6 +4102,31 @@ test('sectionLossReason: moving disk headings into a fenced code block must not 
   assert.equal(loss.diskCount, 3);
 });
 
+// Disabling the check: in scripts/lib/crystallize-close-apply.mjs h2Headings, scan the raw
+// lines with the old whole-file fence loop instead of maskNonProse (no frontmatter skip).
+test('sectionLossReason: a ``` inside a frontmatter block scalar cannot hide two real headings from the guard', () => {
+  const disk = '---\ntitle: t\nnote: |\n  ```md\n---\n## A\ntext\n## B\ntext\n\n```\nx\n```\n';
+  const payload = '---\ntitle: t\nnote: |\n  ```md\n---\n\n```\nx\n```\n';
+  const loss = sectionLossReason(disk, payload);
+  assert.ok(loss, 'dropping both body headings must park');
+  assert.deepEqual(loss.lost, ['## A', '## B']);
+});
+
+// Disabling the check: in code-fence.mjs maskNonProse, drop `|| i < from` so frontmatter lines stay visible.
+test('sectionLossReason: `##` YAML comments in frontmatter are not sections, dropping them is no loss', () => {
+  const disk = '---\ntitle: t\n## x\n## y\n---\n## A\ntext\n';
+  const payload = '---\ntitle: t\n---\n## A\ntext\n';
+  assert.equal(sectionLossReason(disk, payload), null);
+});
+
+test('sectionLossReason: moving disk headings into an HTML comment is a loss, not a pass', () => {
+  const disk = '# T\n## A\nbody\n## B\nbody\n';
+  const payload = '# T\n<!--\n## A\n## B\n-->\n';
+  const loss = sectionLossReason(disk, payload);
+  assert.ok(loss, 'commented headings are not real headings');
+  assert.deepEqual(loss.lost, ['## A', '## B']);
+});
+
 test('sectionLossReason: a duplicated ## heading is counted as a multiset, not deduped away (2026-09-14 dup-collapse bypass)', () => {
   // Disk carries the same heading line three times; the payload keeps only one
   // copy. A Set-based extraction collapses disk's three occurrences into one
