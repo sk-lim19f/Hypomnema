@@ -4927,6 +4927,19 @@ test('feedback-sync-git-that-cannot-answer-is-not-a-non-git-vault: a broken .git
     },
     { memoryMd },
   );
+  // a .git file pointing at a gitdir that is gone: git says "not a git repository" too, but
+  // the repository comes back once the pointer is repaired, so this is refused as well
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      writeFileSync(join(wiki, '.git'), `gitdir: ${join(wiki, 'missing-gitdir')}\n`);
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.ok(!existsSync(fbDraftsDir(wiki)), 'no draft');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'and no hand line record');
+    },
+    { memoryMd },
+  );
   // pair: git answers "not a git repository", so nothing can stage the copy and it is written
   withFeedbackEnv(
     {},

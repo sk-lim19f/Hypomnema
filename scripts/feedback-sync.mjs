@@ -851,8 +851,10 @@ function saveHandLines(hypoDir, lines) {
 // Anything written under .cache/ here holds the user's own MEMORY.md or CLAUDE.md text,
 // and the vault's auto-commit stages whatever git does not ignore. The default
 // .gitignore ignores .cache/, but a hand-written one may not.
-//   not a git work tree (git says "not a git repository", or there is no git at all): nothing
-//   can stage it, so nothing is unignored.
+//   not a git work tree (git says "not a git repository" and there is no .git entry in the
+//   vault or above it, or there is no git at all): nothing can stage it, so nothing is
+//   unignored. A .git entry that git still calls "not a git repository" (a .git file pointing
+//   at a gitdir that is gone) is a repository that is broken for now, not an absent one.
 //   git fails any other way (a broken config, an ownership refusal), answers anything but 0
 //   or 1, or times out: unknown, counted as unignored. A vault git cannot read may still be
 //   one the auto-commit stages, so "unknown" must never read as "not a repository".
@@ -868,7 +870,19 @@ function unignoredCachePaths(hypoDir, relPaths) {
     });
   const probe = git(['rev-parse', '--is-inside-work-tree']);
   if (probe.error?.code === 'ENOENT') return [];
-  const notRepo = probe.status === 128 && /not a git repository/i.test(probe.stderr ?? '');
+  const hasGitEntry = () => {
+    for (let d = resolve(hypoDir); ; d = dirname(d)) {
+      try {
+        lstatSync(join(d, '.git'));
+        return true;
+      } catch {
+        /* none here: look further up */
+      }
+      if (dirname(d) === d) return false;
+    }
+  };
+  const notRepo =
+    probe.status === 128 && /not a git repository/i.test(probe.stderr ?? '') && !hasGitEntry();
   if (notRepo || (probe.status === 0 && probe.stdout.trim() !== 'true')) return [];
   if (probe.error || probe.status !== 0) return [...relPaths];
   const r = git(['check-ignore', '--stdin', '-z'], relPaths.join('\0') + '\0');
