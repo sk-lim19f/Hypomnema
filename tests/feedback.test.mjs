@@ -24,7 +24,14 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 // static import (no top-level await) — feedback-sync.mjs guards main() behind an
 // entry check, so importing it for unit tests does not run the CLI.
-import { resolveProjectId as fbResolveProjectId } from '../scripts/feedback-sync.mjs';
+import {
+  resolveProjectId as fbResolveProjectId,
+  evaluateTarget,
+  applyTarget,
+  runAccept,
+  memoryTarget,
+  loadFeedbackPages,
+} from '../scripts/feedback-sync.mjs';
 import { test, testAsync, suite } from './harness.mjs';
 import {
   FB_GLOBAL_L1,
@@ -1555,17 +1562,21 @@ test('feedback-sync-accept-discarded: accept reports the exact inner text it rep
     assert.ok(r.stderr.includes(`discarded hand edit in ${p} for rule-a:\n${expected}`), r.stderr);
     assert.equal(readFileSync(p, 'utf-8'), clean, 'the wiki rendering is back');
 
-    // rule-a's END and rule-c's START both deleted: the marker counts still pair, the
-    // two blocks read as one, and accept overwrites the fused span. The report is
-    // the only place that span stays visible.
+    // rule-a's END and rule-c's START both deleted: the marker counts still pair and the
+    // two blocks read as one. While rule-c's entry is still recognizable inside the span
+    // accept refuses (see feedback-sync-accept-refuses-two-fused-blocks). Once the
+    // neighbor's text was edited past recognition it cannot tell, and the report is
+    // the only place the swallowed span stays visible.
     const fused = clean
       .replace('always do A', 'HAND EDITED A')
+      .replace('always do C', 'HAND EDITED C')
+      .replace('근거: [[rule-c]]', 'a note of mine')
       .replace('<!-- HYPO:FEEDBACK-SYNC:END -->\n', '')
       .replace(/<!-- HYPO:FEEDBACK-SYNC:START source=rule-c [^\n]*-->\n/, '');
     writeFileSync(p, fused);
     const rep = JSON.parse(runFb(['--accept-wiki=rule-a', '--json']).stdout);
     const got = rep.accepted[0].discarded;
-    assert.ok(got.includes('HAND EDITED A') && got.includes('always do C'), got);
+    assert.ok(got.includes('HAND EDITED A') && got.includes('HAND EDITED C'), got);
   });
 });
 
@@ -3314,6 +3325,7 @@ test('feedback-sync-entry-guard-tolerates-space-in-path: CLI runs, not a silent 
   const base = mkdtempSync(join(tmpdir(), 'hypo fb space-'));
   try {
     cpSync(SCRIPTS, join(base, 'scripts'), { recursive: true }); // incl. lib/ for relative imports
+    cpSync(join(REPO, 'hooks'), join(base, 'hooks'), { recursive: true }); // the vault lock lives there
     const wiki = join(base, 'wiki');
     mkdirSync(join(wiki, 'pages', 'feedback'), { recursive: true });
     writeFileSync(join(wiki, 'hypo-config.md'), '# config');
@@ -3830,4 +3842,870 @@ test('feedback.mjs append: bumpUpdated leaves a body "updated:" line untouched',
       'frontmatter updated bumped to today',
     );
   });
+});
+
+// ── hand-line removal keeps a copy and only takes the line that is still where it was ──
+
+const fbKeptDir = (wiki) => join(wiki, '.cache', 'feedback-kept');
+
+test('feedback-sync-hand-line-removal-keeps-a-copy: the removed line is saved under .cache/feedback-kept and named in the report', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbPromoteB(wiki);
+      const r = runFb(['--write', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      const t = JSON.parse(r.stdout).targets.memory;
+      assert.deepEqual(fbBLines(memDir), [FB_MANAGED_B], 'precondition: the hand line is gone');
+      assert.ok(t.handRemovedCopy && existsSync(t.handRemovedCopy), 'the report names the copy');
+      assert.ok(t.handRemovedCopy.startsWith(fbKeptDir(wiki)), t.handRemovedCopy);
+      assert.ok(readFileSync(t.handRemovedCopy, 'utf-8').includes(FB_HAND_COLON), 'line saved');
+    },
+    { memoryMd },
+  );
+  // the copy cannot be written: nothing is removed, nothing is written, exit 1
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbPromoteB(wiki);
+      writeFileSync(fbKeptDir(wiki), 'a file where the copy directory should be');
+      const before = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      const r = runFb(['--write']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /cannot keep a copy of the hand lines/);
+      assert.equal(readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'), before, 'MEMORY.md untouched');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-hand-line-moved-is-kept: a recorded line moved under another heading is the user line now', () => {
+  const memoryMd = `# Memory Index\n## Old\n${FB_HAND_COLON}\n## New\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const p = join(memDir, 'MEMORY.md');
+      // same bytes, different place
+      writeFileSync(p, `# Memory Index\n## Old\n## New\n${FB_HAND_COLON}\n`);
+      fbPromoteB(wiki);
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /kept the hand-written line in .*MEMORY\.md.*"rule-b"/);
+      assert.deepEqual(fbBLines(memDir), [FB_HAND_COLON, FB_MANAGED_B], 'the moved line survives');
+      assert.deepEqual(
+        readdirSync(fbKeptDir(wiki)).filter((f) => f.includes('hand-lines')),
+        [],
+        'nothing was removed, so no hand-line copy was made',
+      );
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-hand-line-with-a-second-link-is-kept: the other file keeps its only index link', () => {
+  const hand = `${FB_HAND_COLON}, see [detail](feedback_detail.md)`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      assert.ok(existsSync(fbHandRecord(wiki)), 'precondition: recorded');
+      fbPromoteB(wiki);
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /kept the hand-written line/);
+      const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      assert.ok(mem.split('\n').includes(hand), 'the two-link line survives whole');
+      assert.ok(mem.includes(FB_MANAGED_B), 'managed entry added beside it');
+    },
+    { memoryMd: `# Memory Index\n${hand}\n` },
+  );
+});
+
+test('feedback-sync-hand-line-record-without-a-place-is-kept: an older record shape never deletes', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const rec = JSON.parse(readFileSync(fbHandRecord(wiki), 'utf-8'));
+      for (const l of rec.lines) delete l.section;
+      writeFileSync(fbHandRecord(wiki), JSON.stringify(rec));
+      fbPromoteB(wiki);
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /kept the hand-written line/);
+      assert.deepEqual(fbBLines(memDir), [FB_HAND_COLON, FB_MANAGED_B]);
+    },
+    { memoryMd },
+  );
+});
+
+// ── accept: a copy first, an exit code that says so when a target is refused ──
+
+test('feedback-sync-accept-keeps-the-original: the file as it was is copied before it is replaced, and an unwritable copy stops the write', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C },
+    ({ wiki, claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const p = join(claudeHome, 'CLAUDE.md');
+      const edited = readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED A');
+      writeFileSync(p, edited);
+
+      // the copy cannot be written: exit 1, the file keeps every byte
+      mkdirSync(join(wiki, '.cache'), { recursive: true });
+      rmSync(fbKeptDir(wiki), { recursive: true, force: true }); // the --write above kept copies
+      writeFileSync(fbKeptDir(wiki), 'a file where the copy directory should be');
+      const bad = runFb(['--accept-wiki=rule-a']);
+      assert.equal(bad.status, 1, bad.stderr);
+      assert.match(bad.stderr, /cannot keep a copy of .*CLAUDE\.md.*Nothing was written to it/);
+      assert.equal(readFileSync(p, 'utf-8'), edited, 'not replaced without a copy');
+      rmSync(fbKeptDir(wiki));
+
+      const r = runFb(['--accept-wiki=rule-a', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      const a = JSON.parse(r.stdout).accepted[0];
+      assert.ok(a.kept.startsWith(fbKeptDir(wiki)), a.kept);
+      assert.equal(readFileSync(a.kept, 'utf-8'), edited, 'the copy is the whole file as it was');
+      assert.ok(readFileSync(p, 'utf-8').includes('always do A'), 'and the file was replaced');
+      // a dry run writes no copy
+      writeFileSync(p, edited);
+      const before = readdirSync(fbKeptDir(wiki)).length;
+      assert.equal(runFb(['--accept-wiki=rule-a', '--dry-run']).status, 0);
+      assert.equal(readdirSync(fbKeptDir(wiki)).length, before, 'dry run copies nothing');
+    },
+  );
+});
+
+test('feedback-sync-accept-partial-refusal-exits-3: one target accepted, another malformed, the exit code says it is not done', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C },
+    ({ memDir, claudeHome, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const mem = join(memDir, 'MEMORY.md');
+      writeFileSync(mem, readFileSync(mem, 'utf-8').replace('do A', 'HAND A'));
+      const p = join(claudeHome, 'CLAUDE.md');
+      const damaged = readFileSync(p, 'utf-8')
+        .replace('always do A', 'HAND EDITED A')
+        .replace('<!-- HYPO:FEEDBACK-SYNC:END -->', '- note');
+      writeFileSync(p, damaged);
+
+      const r = runFb(['--accept-wiki=rule-a', '--json']);
+      assert.equal(r.status, 3, r.stderr);
+      const rep = JSON.parse(r.stdout);
+      assert.deepEqual(
+        rep.accepted.map((a) => a.target),
+        ['memory'],
+      );
+      assert.deepEqual(
+        rep.refused.filter((x) => x.unresolved).map((x) => x.target),
+        ['claude'],
+      );
+      assert.equal(readFileSync(p, 'utf-8'), damaged, 'the malformed file is untouched');
+      assert.match(
+        runFb(['--accept-wiki=rule-a']).stderr,
+        /NOT accepted in claude|not in conflict/,
+      );
+      assert.equal(runFb(['--check']).status, 3, 'and it is indeed still blocked');
+    },
+  );
+});
+
+test('feedback-sync-conflict-remedy-mixed-shape: a conflict that is also an intruder names the move step, and accept alone leaves it blocked', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C }, ({ claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    writeFileSync(
+      p,
+      readFileSync(p, 'utf-8')
+        .replace('always do A', 'HAND EDITED A')
+        .replace(
+          '<!-- HYPO:FEEDBACK-SYNC:END -->\n<!-- HYPO:FEEDBACK-SYNC:START',
+          '<!-- HYPO:FEEDBACK-SYNC:END -->\n- intruder line\n<!-- HYPO:FEEDBACK-SYNC:START',
+        ),
+    );
+    const t = JSON.parse(runFb(['--check', '--json']).stdout).targets.claude;
+    assert.deepEqual([t.conflicts, t.intruder], [['rule-a'], true], 'precondition: mixed');
+    assert.match(t.conflictRemedy, /--import-target-change --from=claude/);
+    assert.match(t.conflictRemedy, /--accept-wiki=rule-a/);
+    assert.match(t.conflictRemedy, /Move the hand-written lines outside the HYPO blocks/);
+    assert.ok(!/[—–]| -- /.test(t.conflictRemedy), 'no dash in the text');
+
+    assert.equal(runFb(['--import-target-change', '--from=claude']).status, 0);
+    assert.equal(runFb(['--accept-wiki=rule-a']).status, 0);
+    const after = JSON.parse(runFb(['--check', '--json']).stdout).targets.claude;
+    assert.deepEqual([after.conflicts, after.intruder], [[], true], 'accept did not clear it');
+    assert.match(after.conflictRemedy, /Move the hand-written lines/);
+  });
+});
+
+test('feedback-sync-accept-remove-block-at-eof-in-a-crlf-file: the line ending before the block goes with it, no lone CR is left', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const mem = join(memDir, 'MEMORY.md');
+    const crlf = readFileSync(mem, 'utf-8')
+      .replace('do A', 'HAND A')
+      .replace(/\n/g, '\r\n')
+      .replace(/\r\n$/, '');
+    writeFileSync(mem, crlf);
+    writeFileSync(
+      join(wiki, 'pages', 'feedback', 'rule-a.md'),
+      fbPage({ ...FB_GLOBAL_L1, status: 'archived' }),
+    );
+    assert.ok(crlf.startsWith('# Memory Index\r\n') && !crlf.endsWith('\n'), 'precondition');
+    const r = runFb(['--accept-wiki=rule-a', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).accepted.find((a) => a.target === 'memory').action, 'remove');
+    assert.equal(readFileSync(mem, 'utf-8'), '# Memory Index', 'no \\r left on the line before');
+  });
+});
+
+// ── the gate and doctor read the report shapes they can get ──
+
+test('PreCompact notices a side-file warning that comes with a clean (exit 0) check', () => {
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-cleanside-'));
+      const projectId = process.cwd().replace(/[/.]/g, '-');
+      const memDir = join(home, '.claude', 'projects', projectId, 'memory');
+      try {
+        mkdirSync(memDir, { recursive: true });
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+        writeFileSync(
+          join(home, '.claude', 'CLAUDE.md'),
+          '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+        );
+        writeFileSync(join(memDir, 'MEMORY.md'), '# Memory Index\n');
+        const side = join(memDir, 'feedback_rule-a.md');
+        writeFileSync(side, '# My own rule A\n');
+        const fb = (mode) =>
+          spawnSync(
+            process.execPath,
+            [
+              join(REPO, 'scripts', 'feedback-sync.mjs'),
+              mode,
+              '--json',
+              '--no-input',
+              `--hypo-dir=${dir}`,
+              `--claude-home=${join(home, '.claude')}`,
+              `--project-id=${projectId}`,
+            ],
+            { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
+          );
+        assert.equal(fb('--write').status, 0, 'precondition: projected');
+        const chk = fb('--check');
+        assert.equal(chk.status, 0, 'precondition: the check is clean');
+        assert.ok(
+          (JSON.parse(chk.stdout).targets.memory.sideWarnings || []).length,
+          'precondition: and still carries the side warning',
+        );
+        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        assert.match(
+          JSON.parse(r.stdout).systemMessage || '',
+          /side file warning \(memory\): not overwriting .*feedback_rule-a\.md/,
+          r.stdout,
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('PreCompact conflict notice for an older script report: no state-specific command, a generic pointer', () => {
+  withWiki(
+    (dir) => {
+      mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'feedback', 'rule-a.md'), fbPage(FB_GLOBAL_L1));
+    },
+    (dir) => {
+      const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-oldscript-'));
+      const pkg = mkdtempSync(join(tmpdir(), 'hypo-fbhook-oldpkg-'));
+      try {
+        mkdirSync(join(home, '.claude'), { recursive: true });
+        mkdirSync(join(pkg, 'scripts'), { recursive: true });
+        // an older feedback-sync: an intruder-only target, and no conflictRemedy field
+        writeFileSync(
+          join(pkg, 'scripts', 'feedback-sync.mjs'),
+          'console.log(JSON.stringify({ targets: { claude: { candidates: 1, conflicts: [], unpaired: false, intruder: true, outOfContainer: false, overCap: false, dirty: false } } }));\nprocess.exit(3);\n',
+        );
+        writeFileSync(
+          join(pkg, 'package.json'),
+          JSON.stringify({ name: 'hypomnema', version: '1.0.0' }),
+        );
+        writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: pkg }));
+        // the hook as an installed copy: with no package beside it, the provenance file
+        // beside the copy is what points it at the stub script (self-location would find
+        // this checkout instead)
+        const hooks = join(home, '.claude', 'hooks');
+        cpSync(join(REPO, 'hooks'), hooks, { recursive: true });
+        writeFileSync(
+          join(hooks, '.hypo-provenance.json'),
+          JSON.stringify({
+            pkgRoot: pkg,
+            hypoSharedSha256: createHash('sha256')
+              .update(readFileSync(join(hooks, 'hypo-shared.mjs')))
+              .digest('hex'),
+          }),
+        );
+        const r = spawnSync(process.execPath, [join(hooks, 'hypo-personal-check.mjs')], {
+          input: '',
+          encoding: 'utf-8',
+          env: { ...process.env, HOME: home, HYPO_DIR: dir },
+        });
+        const msg = JSON.parse(r.stdout).systemMessage || '';
+        assert.match(msg, /feedback projection conflict \(manual edit of claude\)/, r.stdout);
+        assert.match(msg, /sent no remedy for this target/, r.stdout);
+        assert.ok(!msg.includes('--import-target-change'), `no import advice: ${msg}`);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(pkg, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('doctor-side-file-advice-by-kind: a hand-written side file is told to rename or delete, not to fix permissions', () => {
+  withDoctorFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ runFb, runDoctor, memDir }) => {
+    writeFileSync(join(memDir, 'feedback_rule-a.md'), '# My own rule A\n');
+    assert.equal(runFb(['--write']).status, 0, 'precondition: projected around the hand file');
+    const hit = runDoctor().fb.find((c) => c.label === 'Feedback projection side file');
+    assert.ok(hit, 'the warning reaches doctor');
+    assert.match(hit.detail, /not overwriting .*feedback_rule-a\.md.*Rename or delete it/);
+    assert.ok(!/permissions/i.test(hit.detail), `no permission advice: ${hit.detail}`);
+  });
+});
+
+// ── F2: user work in generated files, concurrent writers, a kept copy that must stay local ──
+
+// the managed side-file copy of rule b, with the provenance header on line 1
+const fbSideB = (memDir) => join(memDir, 'feedback_rule-b.md');
+const fbRuleBV2 = { ...FB_PROJECT_L2, reason: 'because B, second version' };
+
+test('feedback-sync-side-file-edited-after-generation-is-not-overwritten: user text appended under the provenance header blocks the rewrite, exit 3, bytes kept', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const side = fbSideB(memDir);
+    assert.ok(readFileSync(side, 'utf-8').startsWith('<!-- HYPO:FEEDBACK-SYNC source=rule-b -->'));
+    const edited = readFileSync(side, 'utf-8') + '\nMY OWN NOTES ON RULE B\n';
+    writeFileSync(side, edited);
+    // the wiki page moves on, so the copy would be rewritten
+    writeFileSync(join(wiki, 'pages', 'feedback', 'rule-b.md'), fbPage(fbRuleBV2));
+    const mem = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+
+    const r = runFb(['--write', '--json']);
+    assert.equal(r.status, 3, r.stderr + r.stdout);
+    const t = JSON.parse(r.stdout).targets.memory;
+    assert.deepEqual(t.sideEdited, [side]);
+    assert.match(t.conflictRemedy, /Copy your edits out of .*feedback_rule-b\.md/);
+    assert.ok(
+      (t.sideWarnings || []).some((w) => /not overwriting/.test(w) && w.includes(side)),
+      JSON.stringify(t.sideWarnings),
+    );
+    assert.equal(readFileSync(side, 'utf-8'), edited, 'the edited file keeps every byte');
+    assert.equal(readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'), mem, 'nothing else was written');
+    assert.equal(runFb(['--check']).status, 3, 'check says so too');
+
+    // the way out the message names: move the edits, delete the file, write again
+    rmSync(side);
+    assert.equal(runFb(['--write']).status, 0);
+    assert.ok(readFileSync(side, 'utf-8').includes('because B, second version'));
+    assert.equal(runFb(['--check']).status, 0, 'recorded again, clean');
+  });
+});
+
+test('feedback-sync-side-file-edited-after-generation-is-not-removed: a demoted page keeps the copy that holds user text', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const side = fbSideB(memDir);
+    const edited = readFileSync(side, 'utf-8') + '\nMY OWN NOTES\n';
+    writeFileSync(side, edited);
+    writeFileSync(
+      join(wiki, 'pages', 'feedback', 'rule-b.md'),
+      fbPage({ ...FB_PROJECT_L2, status: 'archived' }),
+    );
+    const r = runFb(['--write', '--json']);
+    assert.equal(r.status, 3, r.stderr + r.stdout);
+    assert.deepEqual(JSON.parse(r.stdout).targets.memory.sideEdited, [side]);
+    assert.equal(readFileSync(side, 'utf-8'), edited, 'not removed');
+  });
+});
+
+test('feedback-sync-side-file-without-a-record-is-trusted-once: an older generated copy is refreshed and recorded', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const record = join(wiki, '.cache', 'feedback-side-files.json');
+    assert.ok(existsSync(record), 'the write recorded the hash of what it generated');
+    rmSync(record);
+    writeFileSync(fbSideB(memDir), '<!-- HYPO:FEEDBACK-SYNC source=rule-b -->\nolder copy\n');
+    assert.equal(runFb(['--write']).status, 0, 'no record: trusted this once');
+    assert.ok(readFileSync(fbSideB(memDir), 'utf-8').includes('body'));
+    assert.ok(existsSync(record), 'and recorded by that write');
+    writeFileSync(fbSideB(memDir), readFileSync(fbSideB(memDir), 'utf-8') + 'late edit\n');
+    assert.equal(runFb(['--write']).status, 3, 'from then on it is protected');
+  });
+});
+
+test('feedback-sync-write-reads-each-file-again-before-replacing-it: a target changed after preflight is not overwritten', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, claudeHome, memDir }) => {
+    const target = memoryTarget({ claudeHome }, 'proj');
+    const res = evaluateTarget(loadFeedbackPages(wiki), target, [], {});
+    assert.ok(res.dirty, 'precondition: a write is planned');
+    // somebody edits MEMORY.md after the plan was made
+    const edited = '# Memory Index\n- my own line, added a moment ago\n';
+    writeFileSync(join(memDir, 'MEMORY.md'), edited);
+    assert.throws(
+      () => applyTarget(target, res),
+      (err) => err.code === 'ECHANGED' && /MEMORY\.md changed after it was read/.test(err.message),
+    );
+    assert.equal(readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'), edited, 'not overwritten');
+  });
+});
+
+test('feedback-sync-writes-hold-a-vault-lock: a held lock stops a write with exit 1, a normal run leaves no lock behind', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    const lock = join(wiki, '.cache', 'feedback-sync.lock');
+    assert.equal(runFb(['--write']).status, 0);
+    assert.ok(!existsSync(lock), 'released after the run');
+    const claude = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+    // a live holder (this test process) with a fresh lock file
+    writeFileSync(lock, String(process.pid));
+    const r = runFb(['--write']);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /another feedback-sync run holds the vault lock/);
+    assert.equal(readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8'), claude);
+    assert.equal(runFb(['--check']).status, 0, 'a read-only check does not wait for the lock');
+  });
+});
+
+// A vault whose own .gitignore lacks .cache/: the copies of the user's files would be
+// staged by the auto-commit, so nothing is written there.
+const fbGitInit = (wiki, ignore) => {
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  assert.equal(spawnSync('git', ['init', '-q', wiki], { env }).status, 0);
+  if (ignore !== null) writeFileSync(join(wiki, '.gitignore'), ignore);
+};
+
+test('feedback-sync-kept-copy-needs-an-ignored-cache: a vault git that would stage .cache/ gets no copy and the write is refused', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      fbGitInit(wiki, '.cache/\n');
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      assert.ok(
+        existsSync(fbHandRecord(wiki)),
+        'precondition: the record is written while ignored',
+      );
+      fbPromoteB(wiki);
+      const before = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      // the vault's own .gitignore does not name .cache/
+      writeFileSync(join(wiki, '.gitignore'), 'node_modules/\n');
+      const r = runFb(['--write']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /cannot keep a copy .*not ignored by the vault's git/);
+      assert.equal(readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'), before, 'nothing written');
+      assert.ok(!existsSync(fbKeptDir(wiki)), 'and no copy of the file was made');
+      // ignoring it is the way out
+      writeFileSync(join(wiki, '.gitignore'), '/.cache/\n');
+      assert.equal(runFb(['--write']).status, 0);
+      assert.ok(readdirSync(fbKeptDir(wiki)).length > 0, 'the copy is made once git ignores it');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-kept-copy-needs-an-ignored-cache: accept and the bootstrap line record are held to the same rule', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const p = join(claudeHome, 'CLAUDE.md');
+    const edited = readFileSync(p, 'utf-8').replace('always do A', 'HAND EDITED A');
+    writeFileSync(p, edited);
+    fbGitInit(wiki, '# no cache rule\n');
+    const copies = readdirSync(fbKeptDir(wiki)).length;
+    const r = runFb(['--accept-wiki=rule-a']);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /not ignored by the vault's git/);
+    assert.equal(readFileSync(p, 'utf-8'), edited, 'not replaced without a copy');
+    assert.equal(readdirSync(fbKeptDir(wiki)).length, copies, 'no copy was made');
+  });
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      fbGitInit(wiki, null);
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /could not record hand lines.*not ignored by the vault's git/);
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'the hand lines are not copied under .cache/');
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+});
+
+test('feedback-sync-hand-line-record-without-a-place-is-kept (top of file): a line above every heading is not matched by the empty place', () => {
+  // the first line of the file has no heading above it: its recorded place is ''. A
+  // record from before places were recorded has none, and must not read as ''.
+  const memoryMd = `${FB_HAND_COLON}\n\n# Memory Index\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const rec = JSON.parse(readFileSync(fbHandRecord(wiki), 'utf-8'));
+      assert.equal(rec.lines[0].section, '', 'precondition: recorded with the empty place');
+      for (const l of rec.lines) delete l.section;
+      writeFileSync(fbHandRecord(wiki), JSON.stringify(rec));
+      fbPromoteB(wiki);
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /kept the hand-written line/);
+      assert.deepEqual(fbBLines(memDir), [FB_HAND_COLON, FB_MANAGED_B]);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-accept-refuses-two-fused-blocks: a deleted END plus a deleted START keep the counts balanced, accept still refuses', () => {
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, 'rule-c': FB_GLOBAL_C },
+    ({ wiki, claudeHome, memDir, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0);
+      const p = join(claudeHome, 'CLAUDE.md');
+      const lines = readFileSync(p, 'utf-8').split('\n');
+      const end = lines.findIndex((l) => l === '<!-- HYPO:FEEDBACK-SYNC:END -->');
+      const start = lines.findIndex(
+        (l, i) => i > end && l.startsWith('<!-- HYPO:FEEDBACK-SYNC:START'),
+      );
+      assert.ok(end > 0 && start > end, 'precondition: two blocks');
+      const fused = lines.filter((_, i) => i !== end && i !== start).join('\n');
+      writeFileSync(p, fused);
+      const first = /source=(\S+)/.exec(lines[lines.findIndex((l) => l.includes('START'))])[1];
+
+      assert.equal(runFb(['--check']).status, 3, 'precondition: the fused block is a conflict');
+      const copies = readdirSync(fbKeptDir(wiki)).length;
+      const r = runFb([`--accept-wiki=${first}`, '--json']);
+      assert.equal(r.status, 1, 'nothing could be accepted: ' + r.stderr + r.stdout);
+      const rep = JSON.parse(r.stdout);
+      assert.deepEqual(rep.accepted, []);
+      const refusal = rep.refused.find((x) => x.target === 'claude');
+      assert.equal(refusal.unresolved, true);
+      assert.match(refusal.reason, /also holds the text of/);
+      assert.equal(readFileSync(p, 'utf-8'), fused, 'not replaced');
+      assert.equal(readdirSync(fbKeptDir(wiki)).length, copies, 'nothing was replaced or copied');
+
+      // another target accepted in the same command: the fused one is still blocked, exit 3
+      const mem = join(memDir, 'MEMORY.md');
+      writeFileSync(mem, readFileSync(mem, 'utf-8').replace('do A', 'HAND A'));
+      const r2 = runFb([`--accept-wiki=${first}`, '--json']);
+      assert.equal(r2.status, 3, r2.stderr + r2.stdout);
+      assert.deepEqual(
+        JSON.parse(r2.stdout).accepted.map((a) => a.target),
+        ['memory'],
+      );
+      assert.equal(readFileSync(p, 'utf-8'), fused, 'the fused file is still not replaced');
+    },
+  );
+});
+
+test('feedback-sync-write-keeps-the-primary-file-first: a write that changes CLAUDE.md copies it as it was, and a failed copy writes nothing', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    const p = join(claudeHome, 'CLAUDE.md');
+    const before = readFileSync(p, 'utf-8');
+    // the copy cannot be made: exit 1, the file keeps every byte
+    mkdirSync(join(wiki, '.cache'), { recursive: true });
+    writeFileSync(fbKeptDir(wiki), 'a file where the copy directory should be');
+    const bad = runFb(['--write']);
+    assert.equal(bad.status, 1, bad.stderr);
+    assert.match(bad.stderr, /cannot keep a copy of .* before replacing it.*Nothing was written/);
+    assert.equal(readFileSync(p, 'utf-8'), before);
+    rmSync(fbKeptDir(wiki));
+
+    assert.equal(runFb(['--write']).status, 0);
+    const copies = readdirSync(fbKeptDir(wiki)).filter((f) =>
+      f.endsWith('claude-before-write.txt'),
+    );
+    assert.equal(copies.length, 1, 'one copy of CLAUDE.md');
+    assert.equal(readFileSync(join(fbKeptDir(wiki), copies[0]), 'utf-8'), before, 'as it was');
+    // nothing changes on a clean run, so nothing is copied again
+    assert.equal(runFb(['--write']).status, 0);
+    assert.equal(
+      readdirSync(fbKeptDir(wiki)).filter((f) => f.endsWith('claude-before-write.txt')).length,
+      1,
+    );
+  });
+});
+
+test('feedback-sync-kept-copies-are-capped-per-label: after the 11th changing write only the newest 10 before-write copies stay', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, runFb }) => {
+    const beforeWrite = () =>
+      readdirSync(fbKeptDir(wiki))
+        .filter((f) => f.endsWith('-claude-before-write.txt'))
+        .sort();
+    let oldest = null;
+    for (let i = 1; i <= 11; i++) {
+      writeFileSync(
+        join(wiki, 'pages', 'feedback', 'rule-a.md'),
+        fbPage({ ...FB_GLOBAL_L1, global_summary: `always do A, version ${i}` }),
+      );
+      const r = runFb(['--write']);
+      assert.equal(r.status, 0, `write ${i}: ${r.stderr}`);
+      if (i === 1) {
+        assert.equal(beforeWrite().length, 1);
+        oldest = beforeWrite()[0];
+      }
+    }
+    const left = beforeWrite();
+    assert.equal(left.length, 10, left.join(', '));
+    assert.ok(!left.includes(oldest), 'the oldest copy is the one that went');
+    // the cap is per label: the MEMORY.md copies are counted on their own
+    assert.ok(
+      readdirSync(fbKeptDir(wiki)).filter((f) => f.endsWith('-memory-before-write.txt')).length <=
+        10,
+    );
+  });
+});
+
+test('feedback-sync-kept-copy-needs-an-ignored-cache: an ordinary write still goes ahead without its before-write copy, with a warning', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    fbGitInit(wiki, 'node_modules/\n');
+    const r = runFb(['--write', '--json']);
+    assert.equal(r.status, 0, r.stderr + r.stdout);
+    assert.ok(
+      readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8').includes('always do A'),
+      'the projection was written',
+    );
+    const rep = JSON.parse(r.stdout);
+    assert.ok(
+      (rep.warnings || []).some((w) => /no copy of .*CLAUDE\.md was kept.*not ignored/.test(w)),
+      JSON.stringify(rep.warnings),
+    );
+    assert.ok(!existsSync(fbKeptDir(wiki)), 'and nothing was copied under .cache/');
+    // the same run without --json says so on stderr
+    writeFileSync(
+      join(wiki, 'pages', 'feedback', 'rule-a.md'),
+      fbPage({ ...FB_GLOBAL_L1, global_summary: 'always do A, again' }),
+    );
+    const r2 = runFb(['--write']);
+    assert.equal(r2.status, 0, r2.stderr);
+    assert.match(r2.stderr, /warn: .*no copy of .*CLAUDE\.md was kept/);
+  });
+});
+
+// ── F4: a side file with no hash record keeps a copy, accept reads again, the copy cap waits
+// for a successful run, PreCompact and doctor see an edited side file, --json carries the
+// write-time warnings ──
+
+const fbSideCopies = (wiki) =>
+  existsSync(fbKeptDir(wiki))
+    ? readdirSync(fbKeptDir(wiki)).filter((f) => f.endsWith('-side-rule-b.txt'))
+    : [];
+
+test('feedback-sync-side-file-without-a-record-is-copied-first: a rewrite or a removal keeps the bytes it replaces', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, memDir, runFb }) => {
+    const page = join(wiki, 'pages', 'feedback', 'rule-b.md');
+    const record = join(wiki, '.cache', 'feedback-side-files.json');
+    // rewrite
+    assert.equal(runFb(['--write']).status, 0);
+    const edited = readFileSync(fbSideB(memDir), 'utf-8') + '\nMY OWN LINE\n';
+    writeFileSync(fbSideB(memDir), edited);
+    rmSync(record);
+    writeFileSync(page, fbPage(fbRuleBV2));
+    assert.equal(runFb(['--write']).status, 0, 'no record: trusted once, as before');
+    assert.ok(readFileSync(fbSideB(memDir), 'utf-8').includes('second version'));
+    const [copy] = fbSideCopies(wiki);
+    assert.ok(copy, 'the bytes it replaced are kept');
+    assert.equal(readFileSync(join(fbKeptDir(wiki), copy), 'utf-8'), edited);
+    // a recorded file matches its record: nothing of the user's to keep
+    writeFileSync(page, fbPage({ ...FB_PROJECT_L2, reason: 'because B, third version' }));
+    assert.equal(runFb(['--write']).status, 0);
+    assert.equal(fbSideCopies(wiki).length, 1, 'a recorded file is not copied again');
+    // removal
+    const edited2 = readFileSync(fbSideB(memDir), 'utf-8') + '\nANOTHER LINE\n';
+    writeFileSync(fbSideB(memDir), edited2);
+    rmSync(record);
+    writeFileSync(page, fbPage({ ...FB_PROJECT_L2, status: 'archived' }));
+    assert.equal(runFb(['--write']).status, 0);
+    assert.ok(!existsSync(fbSideB(memDir)), 'the stale copy is removed');
+    const kept = fbSideCopies(wiki).map((f) => readFileSync(join(fbKeptDir(wiki), f), 'utf-8'));
+    assert.ok(kept.includes(edited2), 'and its last bytes are kept');
+  });
+});
+
+test('feedback-sync-side-file-without-a-record-is-copied-first: when the copy cannot be kept the file is left alone, with a warning in the JSON report', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const edited = readFileSync(fbSideB(memDir), 'utf-8') + '\nMY OWN LINE\n';
+    writeFileSync(fbSideB(memDir), edited);
+    rmSync(join(wiki, '.cache', 'feedback-side-files.json'));
+    writeFileSync(join(wiki, 'pages', 'feedback', 'rule-b.md'), fbPage(fbRuleBV2));
+    fbGitInit(wiki, 'node_modules/\n'); // git would stage .cache/: no copy may go there
+    const r = runFb(['--write', '--json']);
+    assert.equal(r.status, 0, 'the primary write is not held up: ' + r.stderr + r.stdout);
+    assert.equal(readFileSync(fbSideB(memDir), 'utf-8'), edited, 'the side file keeps every byte');
+    assert.equal(fbSideCopies(wiki).length, 0, 'no copy of the side file went under .cache/');
+    assert.ok(
+      (JSON.parse(r.stdout).warnings || []).some((w) =>
+        /left .*feedback_rule-b\.md as it is.*no copy of it could be kept/.test(w),
+      ),
+      r.stdout,
+    );
+    // the way out: git ignores .cache/, so the copy is made and the file rewritten
+    writeFileSync(join(wiki, '.gitignore'), '.cache/\n');
+    assert.equal(runFb(['--write']).status, 0);
+    assert.ok(readFileSync(fbSideB(memDir), 'utf-8').includes('second version'));
+    assert.equal(fbSideCopies(wiki).length, 1);
+  });
+});
+
+test('feedback-sync-accept-reads-the-file-again: a target saved after preflight is neither copied nor replaced', () => {
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ wiki, claudeHome, memDir, runFb }) => {
+    assert.equal(runFb(['--write']).status, 0);
+    const mem = join(memDir, 'MEMORY.md');
+    writeFileSync(mem, readFileSync(mem, 'utf-8').replace('do B', 'HAND B'));
+    const target = memoryTarget({ claudeHome }, 'proj');
+    const evals = [{ target, res: evaluateTarget(loadFeedbackPages(wiki), target, [], {}) }];
+    assert.equal(evals[0].res.conflicts.length, 1, 'precondition: a conflicting block');
+    // an editor saves between the preflight and the accept
+    const saved = readFileSync(mem, 'utf-8') + '- a line saved a moment ago\n';
+    writeFileSync(mem, saved);
+    const out = runAccept({ acceptSlug: 'rule-b', dryRun: false, hypoDir: wiki }, evals);
+    assert.equal(out.code, 1);
+    assert.match(out.error, /MEMORY\.md changed after it was read for this accept.*not replaced/);
+    assert.equal(readFileSync(mem, 'utf-8'), saved, 'the saved bytes are still there');
+    assert.ok(
+      !existsSync(fbKeptDir(wiki)) || !readdirSync(fbKeptDir(wiki)).some((f) => /accept/.test(f)),
+      'no copy of the stale bytes was made as if they were the file',
+    );
+    // run from the start it still accepts: the guard is about the read, not about the edit
+    const ok = runFb(['--accept-wiki=rule-b']);
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.ok(readFileSync(mem, 'utf-8').includes('do B'));
+  });
+});
+
+test('feedback-sync-kept-copies-are-pruned-after-a-successful-run: a run that fails keeps the older copies, the next good run caps them at 10', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    const setSummary = (i) =>
+      writeFileSync(
+        join(wiki, 'pages', 'feedback', 'rule-a.md'),
+        fbPage({ ...FB_GLOBAL_L1, global_summary: `always do A, version ${i}` }),
+      );
+    const beforeWrite = () =>
+      readdirSync(fbKeptDir(wiki))
+        .filter((f) => f.endsWith('-claude-before-write.txt'))
+        .sort();
+    for (let i = 1; i <= 10; i++) {
+      setSummary(i);
+      assert.equal(runFb(['--write']).status, 0, `write ${i}`);
+    }
+    const oldest = beforeWrite()[0];
+    assert.equal(beforeWrite().length, 10);
+    // the 11th write copies CLAUDE.md, then cannot replace it
+    setSummary(11);
+    chmodSync(claudeHome, 0o500);
+    try {
+      const bad = runFb(['--write']);
+      assert.equal(bad.status, 1, bad.stderr);
+      assert.equal(beforeWrite().length, 11, 'the failed run added its copy and removed none');
+      assert.ok(beforeWrite().includes(oldest), 'the oldest copy is still there');
+    } finally {
+      chmodSync(claudeHome, 0o755); // so the cleanup can remove the tree
+    }
+    assert.equal(runFb(['--write']).status, 0);
+    assert.equal(beforeWrite().length, 10, beforeWrite().join(', '));
+    assert.ok(!beforeWrite().includes(oldest), 'the good run is the one that prunes');
+  });
+});
+
+// PreCompact and doctor: an edited generated side file is exit 3 from feedback-sync, and
+// neither consumer may call that state healthy.
+const fbEditedSide = (memDir, runFb) => {
+  assert.equal(runFb(['--write']).status, 0);
+  const side = fbSideB(memDir);
+  writeFileSync(side, readFileSync(side, 'utf-8') + '\nMY OWN NOTES ON RULE B\n');
+  assert.equal(runFb(['--check']).status, 3, 'precondition: only the side file is edited');
+  return side;
+};
+
+test('doctor-edited-side-file-is-an-integrity-failure: exit-3 sideEdited is neither "in sync" nor a bare warning, and it names the remedy', () => {
+  withDoctorFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ memDir, runFb, runDoctor }) => {
+    const side = fbEditedSide(memDir, runFb);
+    const { fb } = runDoctor();
+    const hit = fb.find((c) => c.label === 'Feedback projection integrity');
+    assert.ok(hit && hit.status === 'fail', JSON.stringify(fb));
+    assert.ok(hit.detail.includes(side), hit.detail);
+    assert.match(hit.detail, /Copy your edits out of .*feedback_rule-b\.md/);
+    assert.ok(!fb.some((c) => c.status === 'pass'), 'nothing reads it as in sync');
+  });
+});
+
+// A home with a pkg pointer, a project memory dir and one project-scoped page, run through
+// the PreCompact hook. `setup` may add to the wiki; `check` gets the wiki dir.
+function withPrecompactFeedbackHome(page, setup, check) {
+  const home = mkdtempSync(join(tmpdir(), 'hypo-fbhook-f4-'));
+  try {
+    const id = process.cwd().replace(/[/.]/g, '-');
+    const claudeHome = join(home, '.claude');
+    const memDir = join(claudeHome, 'projects', id, 'memory');
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(claudeHome, 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
+    writeFileSync(
+      join(claudeHome, 'CLAUDE.md'),
+      '# Global\n<learned_behaviors>\n</learned_behaviors>\n',
+    );
+    writeFileSync(join(memDir, 'MEMORY.md'), '# Memory Index\n');
+    withWiki(
+      (dir) => {
+        mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+        writeFileSync(
+          join(dir, 'pages', 'feedback', 'rule.md'),
+          fbPage({ ...page, scope: page.scope === 'global' ? 'global' : `project:${id}` }),
+        );
+        setup?.(dir);
+      },
+      (dir) => check({ dir, home, id, claudeHome, memDir }),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+test('precompact-edited-side-file-is-reported: the gate names the side file and the remedy instead of passing quietly', () => {
+  withPrecompactFeedbackHome(FB_PROJECT_L2, null, ({ dir, home, id, claudeHome, memDir }) => {
+    const fbArgs = [`--hypo-dir=${dir}`, `--claude-home=${claudeHome}`, `--project-id=${id}`];
+    assert.equal(run('feedback-sync.mjs', ['--write', ...fbArgs]).status, 0);
+    const side = join(memDir, 'feedback_rule.md');
+    writeFileSync(side, readFileSync(side, 'utf-8') + '\nMY OWN NOTES\n');
+    assert.equal(run('feedback-sync.mjs', ['--check', ...fbArgs]).status, 3, 'precondition');
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const msg = JSON.parse(r.stdout).systemMessage || '';
+    assert.match(msg, /feedback projection conflict/, r.stdout);
+    assert.ok(msg.includes(side), `names the side file: ${msg}`);
+    assert.match(msg, /Copy your edits out of/, 'and the way out');
+  });
+});
+
+test('precompact-self-heal-shows-write-time-warnings: the --write --json warnings reach the notice', () => {
+  withPrecompactFeedbackHome(
+    FB_GLOBAL_L1,
+    // the vault's git does not ignore .cache/: the routine before-write copy is skipped
+    (dir) => writeFileSync(join(dir, '.gitignore'), 'node_modules/\n'),
+    ({ dir, home }) => {
+      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+      const msg = JSON.parse(r.stdout).systemMessage || '';
+      assert.match(msg, /re-synced/, `precondition: self-healed: ${r.stdout}`);
+      assert.match(
+        msg,
+        /feedback-sync warning while re-syncing: .*no copy of .*CLAUDE\.md was kept/,
+        msg,
+      );
+    },
+  );
 });

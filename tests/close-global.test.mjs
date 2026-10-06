@@ -37,6 +37,7 @@ import { recordJournalEntry } from '../hooks/close-journal.mjs';
 import {
   freshDates,
   recordTouchedPaths,
+  rootLogHeadingKey,
   sessionClosedMarkerPath,
   vaultCommitLockTarget,
 } from '../hooks/hypo-shared.mjs';
@@ -920,10 +921,7 @@ test('normalises a non-"session | slug" heading into the canonical entry', () =>
     );
     assert.equal(deriveRootLogEntries(dir), 1);
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
-    assert.match(
-      log,
-      new RegExp(`^## \\[${today}\\] session \\| alpha — Refactor the parser`, 'm'),
-    );
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha: Refactor the parser`, 'm'));
   });
 });
 
@@ -938,8 +936,8 @@ test('derives one entry per same-day session-log heading', () => {
     );
     assert.equal(deriveRootLogEntries(dir), 2, 'both same-day sessions derived');
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
-    assert.match(log, /session \| alpha — first/);
-    assert.match(log, /session \| alpha — second/);
+    assert.match(log, /session \| alpha: first/);
+    assert.match(log, /session \| alpha: second/);
   });
 });
 
@@ -953,7 +951,7 @@ test('does not leak a renamed-project old slug into the derived title', () => {
     );
     assert.equal(deriveRootLogEntries(dir), 1);
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
-    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| newslug — Migrate$`, 'm'));
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| newslug: Migrate$`, 'm'));
     assert.doesNotMatch(log, /oldslug/, 'old slug must not appear in the derived entry');
   });
 });
@@ -971,9 +969,49 @@ test('exact-line dedup keeps a titleless heading distinct from a titled one', ()
     );
     assert.equal(deriveRootLogEntries(dir), 2, 'both the titled and titleless entries derived');
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
-    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha — first$`, 'm'));
+    assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha: first$`, 'm'));
     assert.match(log, new RegExp(`^## \\[${today}\\] session \\| alpha$`, 'm'));
   });
+});
+
+test('an old em-dash derived heading in log.md still counts as the entry, so derive does not append it again', () => {
+  withTmpDir((dir) => {
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    writeFileSync(
+      join(dir, 'projects', 'alpha', 'session-log', `${today.slice(0, 7)}.md`),
+      `---\ntitle: log\ntype: session-log\nupdated: ${today}\n---\n\n## [${today}] session | alpha: Ship it\n`,
+    );
+    const logPath = join(dir, 'log.md');
+    // what an earlier version wrote for this same session-log heading
+    writeFileSync(
+      logPath,
+      `${readFileSync(logPath, 'utf-8')}\n## [${today}] session | alpha \u2014 Ship it\n\u2192 [[projects/alpha/hot]]\n`,
+    );
+    assert.equal(deriveRootLogEntries(dir), 0, 'the old-format heading is the same entry');
+    assert.equal(
+      (readFileSync(logPath, 'utf-8').match(/session \| alpha/g) || []).length,
+      1,
+      'no second alpha entry',
+    );
+    assert.equal(
+      rootLogHeadingKey(`## [${today}] session | alpha \u2014 Ship it`),
+      `## [${today}] session | alpha: Ship it`,
+    );
+  });
+});
+
+test('rootLogHeadingKey rewrites only the separator after the slug', () => {
+  assert.equal(
+    rootLogHeadingKey('## [2026-10-06] session | a \u2014 t \u2014 u'),
+    '## [2026-10-06] session | a: t \u2014 u',
+  );
+  assert.equal(
+    rootLogHeadingKey('## [2026-10-06] session | a: t \u2014 u'),
+    '## [2026-10-06] session | a: t \u2014 u',
+  );
+  assert.equal(rootLogHeadingKey('## [2026-10-06] session | a'), '## [2026-10-06] session | a');
+  assert.equal(rootLogHeadingKey('x \u2014 y'), 'x \u2014 y');
 });
 
 test('hypo-hot-rebuild Stop hook fills the missing log.md entry end-to-end', () => {

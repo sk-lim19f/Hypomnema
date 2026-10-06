@@ -30,6 +30,7 @@ import {
   sessionLogReadCandidates,
   sessionLogScopePath,
   rootLogEntry,
+  rootLogHeadingKey,
   hasSessionLogHeading,
   hasLogEntry,
   resolveTranscriptBySessionId,
@@ -2756,10 +2757,18 @@ function appendRootLogEntry(args, payload, project, date, acc) {
           let w = false;
           for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
             const { heading, block } = rootLogEntry(project, date, m[1]);
-            derivedBlocks.push(block);
-            const wrote = appendIfAbsent(logFull, block, (c) =>
-              (c || '').split(/\r?\n/).includes(heading),
-            );
+            // Earlier versions put an em dash after the slug where this one puts a
+            // colon. That heading is the same entry, and its block is what the
+            // receipt proof has to find in the file.
+            let proofBlock = block;
+            const wrote = appendIfAbsent(logFull, block, (c) => {
+              const lines = (c || '').split(/\r?\n/);
+              if (lines.includes(heading)) return true;
+              if (!lines.map(rootLogHeadingKey).includes(heading)) return false;
+              proofBlock = block.replace(`| ${project}: `, `| ${project} \u2014 `);
+              return true;
+            });
+            derivedBlocks.push(proofBlock);
             w = w || wrote;
           }
           return w;

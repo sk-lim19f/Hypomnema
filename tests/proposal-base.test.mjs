@@ -2685,8 +2685,30 @@ test('B-1: same-day second close without payload.log derives the distinct entry'
       assert.match(log, /session \| test-project — first/, 'first close entry retained');
       assert.match(
         log,
-        /session \| test-project — second/,
+        /session \| test-project: second/,
         'second same-day close must derive its own distinct root entry',
+      );
+    },
+  );
+});
+
+test('B-1: a log.md entry an earlier version derived with an em dash is not appended again on re-apply', () => {
+  const seeded = (today) =>
+    `## [${today}] session | test-project \u2014 second\n\u2192 [[projects/test-project/hot]]\n`;
+  withWiki(
+    (dir, today) => {
+      writeFileSync(join(dir, 'log.md'), seeded(today));
+    },
+    (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      payload.sessionLog = { entry: `## [${today}] session | test-project \u2014 second\n` };
+      delete payload.log;
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+      assert.equal(
+        readFileSync(join(dir, 'log.md'), 'utf-8'),
+        seeded(today),
+        'the old-format heading is the same entry: log.md stays byte for byte',
       );
     },
   );

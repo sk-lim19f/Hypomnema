@@ -2170,7 +2170,12 @@ function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
 
   // 1) integrity violations → FAIL
   const broken = targets.find(
-    ([, t]) => (t.conflicts && t.conflicts.length) || t.unpaired || t.intruder || t.outOfContainer,
+    ([, t]) =>
+      (t.conflicts && t.conflicts.length) ||
+      t.unpaired ||
+      t.intruder ||
+      t.outOfContainer ||
+      (t.sideEdited && t.sideEdited.length),
   );
   if (broken) {
     const [name, t] = broken;
@@ -2181,16 +2186,19 @@ function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
           ? 'unpaired managed marker'
           : t.intruder
             ? 'hand-edited line inside managed region'
-            : 'managed block outside its container';
+            : t.outOfContainer
+              ? 'managed block outside its container'
+              : `side file edited after it was generated (${t.sideEdited.join(', ')})`;
     fail(
       'Feedback projection integrity',
       // feedback-sync decides the remedy by shape (import and accept for a
       // conflicting block, move the lines for an intruder, repair for unpaired
-      // markers). An older installed script that does not send one gets the import
-      // command alone, which is only right when a block is in conflict.
+      // markers). An older installed script that does not send one gets a generic
+      // pointer: the import command it used to get is only right when a block is in
+      // conflict.
       `${name}: ${reason}. ` +
         (t.conflictRemedy ||
-          `Run \`hypomnema feedback-sync --import-target-change --from=${name}\` to keep a copy of the hand edit as a draft.`),
+          'The installed feedback-sync sent no remedy for this target (its version differs from this doctor): run `hypomnema feedback-sync --check` for the details, and update Hypomnema so the script matches.'),
     );
   } else {
     // 2) build error. Split by kind:
@@ -2251,10 +2259,14 @@ function checkFeedbackProjection(hypoDir, claudeHome, projectId) {
   //    touch. feedback-sync already put the path in the message.
   for (const [name, t] of targets) {
     for (const w of t.sideWarnings || []) {
+      // The advice follows the kind, as in the PreCompact gate: only an unreadable file
+      // is a permission problem; "not overwriting ..." already says to rename or delete.
       warn(
         'Feedback projection side file',
-        `${name}: ${w} — fix the permissions on that path; the primary projection still loads ` +
-          `(\`--ensure-container\` does not fix this)`,
+        `${name}: ${w}. ` +
+          (w.startsWith('cannot read side file')
+            ? 'fix the permissions on that path; the primary projection still loads (`--ensure-container` does not fix this)'
+            : 'the primary projection still loads every rule'),
       );
     }
   }
