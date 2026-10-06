@@ -3734,11 +3734,21 @@ const sessionIdOfClose = (closeId) => closeId.replace(/-\d+$/, '');
 // commits it, so a gate of this session neither blocks on it nor tells anyone to
 // commit or revert it (it is the only copy of that session's summary). An entry
 // already in HEAD and since modified is not new, and git failing to answer is not
-// "absent": both stay blocking.
-function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
+// "absent": both stay blocking. A name is easy to type by hand, so the file must
+// also parse as the entry of the close its name carries.
+export function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
   if (!isValidSessionId(sessionId) || !isSessionEntryPath(relPath)) return false;
   const m = /^\d{4}-\d{2}-\d{2}-(.+-\d+)\.md$/.exec(relPath.split('/').pop());
-  if (!m || sessionIdOfClose(m[1]) === sessionId) return false;
+  if (!m) return false;
+  const owner = sessionIdOfClose(m[1]);
+  if (owner === sessionId || !isValidSessionId(owner)) return false;
+  let parsed;
+  try {
+    parsed = parseSessionEntry(readFileSync(join(hypoDir, relPath), 'utf-8'));
+  } catch {
+    return false;
+  }
+  if (!parsed.ok || parsed.entry.closeId !== m[1]) return false;
   return headPathState(hypoDir, relPath) === 'absent';
 }
 
@@ -3746,6 +3756,52 @@ const FOREIGN_ENTRY_NOTICE = (f) =>
   `${f} is another session's new session entry, not committed yet. That session's close ` +
   `commits it, so do not commit or revert it here (다른 세션 close 의 원본이다. 그 세션의 ` +
   `커밋이 실패해 남은 것이면 그 세션이 close 를 다시 실행해야 동기화된다)`;
+
+// A session-log shard another writer is appending to: in HEAD, and the bytes on disk
+// are HEAD's bytes with more after them. Two closes of one project share the day's
+// shard, so the later close's heading sits uncommitted while the earlier close's
+// marker gate still runs. A shard this session recorded counts only when the bytes
+// it recorded are the ones HEAD holds (its own write committed, the tail written by
+// someone else), the same retirement commitTouchedPaths applies. A changed prefix, a
+// deleted shard, a tail with no dated heading, a HEAD git cannot read and this
+// session's own uncommitted append all stay blocking.
+export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId) {
+  if (!isValidSessionId(sessionId) || !CLOSE_FILE_RE.test(relPath)) return false;
+  const head = headBlob(hypoDir, relPath);
+  if (!head) return false;
+  let disk;
+  try {
+    disk = readFileSync(join(hypoDir, relPath));
+  } catch {
+    return false;
+  }
+  // Equal bytes count too: a pathspec commit (`--only`) reads each path from the work
+  // tree twice (once for the real index, once for the commit), so an append landing
+  // between the two reads is committed while the real index keeps the shorter version.
+  if (disk.length < head.length || !disk.subarray(0, head.length).equals(head)) return false;
+  // What a close appends carries a dated heading (apply refuses a payload without one
+  // before any write), so a tail with none is not another close's.
+  const tail = disk.subarray(head.length).toString('utf-8');
+  if (tail && !/^#{1,6} \[\d{4}-\d{2}-\d{2}\]/m.test(tail)) return false;
+  const touched = readTouchedPathsStrict(hypoDir, sessionId);
+  if (touched.state === 'locked' || touched.state === 'unreadable') return false;
+  if (!touched.paths.map(posixPath).includes(relPath)) return true;
+  // The bytes this session recorded must be HEAD's, or HEAD's up to a line end (the
+  // same race: the other close's append was committed along with this one's).
+  const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+  if (!Object.hasOwn(hashes, relPath)) return false;
+  // One hash per line end: a day's shard is a few hundred lines at most.
+  for (let end = head.indexOf(10); end !== -1; end = head.indexOf(10, end + 1)) {
+    if (sha256Hex(head.subarray(0, end + 1)) === hashes[relPath]) return true;
+  }
+  return sha256Hex(head) === hashes[relPath];
+}
+
+const FOREIGN_APPEND_NOTICE = (f) =>
+  `${f} differs from its committed version only by lines added after it, or only in the ` +
+  `index, and this session did not write them (most likely another session's close, still ` +
+  `committing), so do not commit or revert it here (다른 세션이 덧붙이고 있는 session-log ` +
+  `샤드다. 그 세션의 close 가 커밋한다)`;
 
 // The session-log and log.md half of a close check, for one project and the dates its close
 // counts under. Pushes into `stale`/`missing` and returns the session-log file that carried the
@@ -5085,11 +5141,17 @@ function vaultFileHash(hypoDir, relPath) {
  * (or there is no HEAD to read). `./` makes git resolve the path from the
  * vault, which may sit below the repository root. */
 function headFileHash(hypoDir, relPath) {
+  const blob = headBlob(hypoDir, relPath);
+  return blob ? sha256Hex(blob) : null;
+}
+
+/** A vault path's blob in HEAD as a Buffer, `null` when git cannot give it. */
+function headBlob(hypoDir, relPath) {
   const r = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', `HEAD:./${relPath}`], {
     timeout: 30000,
     maxBuffer: 64 * 1024 * 1024,
   });
-  return r.status === 0 && r.stdout ? sha256Hex(r.stdout) : null;
+  return r.status === 0 && r.stdout ? r.stdout : null;
 }
 
 /** Whether a hash was recorded for `relPath` and the bytes on disk no longer
@@ -6397,7 +6459,9 @@ export function sessionProofCloseId(hypoDir, sessionId, opts) {
     if (!rel || projectOfEntryPath(rel) === project) return pin.pending.closeId;
   }
   if (opts.closeOpen) return null;
-  const byProject = pin.resolvedByProject[project];
+  const byProject = Object.hasOwn(pin.resolvedByProject, project)
+    ? pin.resolvedByProject[project]
+    : null;
   if (byProject) return byProject;
   return pin.lastResolved && entryPathOfClose(hypoDir, project, pin.lastResolved)
     ? pin.lastResolved
@@ -7252,6 +7316,13 @@ export function precompactGateStatus(hypoDir, opts = {}) {
               });
               continue;
             }
+            if (isForeignAppendOnlyShard(hypoDir, pf, opts.sessionId)) {
+              // Ahead of the touched-set check: the shard this session's close
+              // committed stays in its set until Stop, and the later close of the
+              // same project appends to it before this marker gate is done.
+              notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
+              continue;
+            }
             if (touchedSet.has(posixPath(f))) {
               // A touched file .hypoignore keeps out of every commit stays
               // dirty forever on its own: say how to get out. A file whose
@@ -7358,13 +7429,22 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // its source instead: applyOverwrites re-stages index.md on the retry
       // path (crystallize-close-apply.mjs), so the file this branch used to
       // demote is now in the close's own commit scope and never reaches here.
-      // Another session's entry still waiting for its own commit is not
-      // this session's to commit, inside the scoped project or not (the
-      // checkpoint branch above demotes it the same way).
+      // Another session's entry still waiting for its own commit, or its
+      // append to a shared session-log shard, is not this session's to commit,
+      // inside the scoped project or not (the checkpoint branch above demotes
+      // both the same way).
       const foreignEntries = dirty.filter(
         (f) => !isForeign(f) && isForeignUncommittedEntry(hypoDir, posixPath(f), opts.sessionId),
       );
-      const rest = dirty.filter((f) => !isForeign(f) && !foreignEntries.includes(f));
+      const foreignAppends = dirty.filter(
+        (f) =>
+          !isForeign(f) &&
+          !foreignEntries.includes(f) &&
+          isForeignAppendOnlyShard(hypoDir, posixPath(f), opts.sessionId),
+      );
+      const rest = dirty.filter(
+        (f) => !isForeign(f) && !foreignEntries.includes(f) && !foreignAppends.includes(f),
+      );
       if (rest.length > 0) {
         blockers.push({
           type: 'git',
@@ -7381,24 +7461,33 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       for (const f of foreignEntries) {
         notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
       }
+      for (const f of foreignAppends) {
+        notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
+      }
     } else if (!sessionTouchTrusted) {
       blockers.push({ type: 'git', reason: git.reason });
     } else {
       // closeAccountableScope holds every entry of today in the project, the
-      // other sessions' too, so a foreign one still waiting for its commit is
-      // taken out here like in the scoped branch above.
+      // other sessions' too, and the day's session-log shard they all append
+      // to, so a foreign entry still waiting for its commit and a foreign
+      // append are taken out here like in the scoped branch above.
       const foreignEntries = dirty.filter((f) =>
         isForeignUncommittedEntry(hypoDir, posixPath(f), opts.sessionId),
+      );
+      const foreignAppends = dirty.filter(
+        (f) =>
+          !foreignEntries.includes(f) &&
+          isForeignAppendOnlyShard(hypoDir, posixPath(f), opts.sessionId),
       );
       for (const f of foreignEntries) {
         notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
       }
-      const mine = dirty.filter(
-        (f) => closeAccountableScope.has(posixPath(f)) && !foreignEntries.includes(f),
-      );
-      const foreign = dirty.filter(
-        (f) => !closeAccountableScope.has(posixPath(f)) && !foreignEntries.includes(f),
-      );
+      for (const f of foreignAppends) {
+        notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
+      }
+      const demoted = (f) => foreignEntries.includes(f) || foreignAppends.includes(f);
+      const mine = dirty.filter((f) => closeAccountableScope.has(posixPath(f)) && !demoted(f));
+      const foreign = dirty.filter((f) => !closeAccountableScope.has(posixPath(f)) && !demoted(f));
       if (mine.length > 0) {
         blockers.push({
           type: 'git',

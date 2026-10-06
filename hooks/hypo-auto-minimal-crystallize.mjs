@@ -85,6 +85,8 @@ import {
   CLOSE_RECONFIRM_MARK,
   resolveGateProjectOverride,
   gitDirtyFiles,
+  isForeignAppendOnlyShard,
+  isForeignUncommittedEntry,
 } from './hypo-shared.mjs';
 import { closeCheckpointState, isCloseComplete, receiptPath } from './close-receipt.mjs';
 import { closeGateStatus } from './close-gate-store.mjs';
@@ -112,7 +114,15 @@ function emitContinue(systemMessage) {
 // replaced receipt (a fresh close attempt) starts this notice fresh too.
 function notifyUnresolved(hypoDir, sessionId, receipt) {
   const certified = new Set((receipt.entries || []).map((e) => e && e.path));
-  const dirty = gitDirtyFiles(hypoDir).sort();
+  // Another session's close still committing (its new entry, its append to a
+  // session-log shard) is not this session's to resolve.
+  const dirty = gitDirtyFiles(hypoDir)
+    .filter(
+      (f) =>
+        !isForeignUncommittedEntry(hypoDir, f, sessionId) &&
+        !isForeignAppendOnlyShard(hypoDir, f, sessionId),
+    )
+    .sort();
   if (dirty.length === 0) return null;
   const rp = receiptPath(hypoDir, sessionId);
   if (!rp) return null;

@@ -4072,78 +4072,89 @@ test('two sessions close one project on different tracks one after the other: bo
   });
 });
 
+// Two real `--apply-session-close` processes on one project, the second started `staggerMs`
+// after the first. Every run must end ok, committed and with its marker written.
+async function closeTwiceInParallel(staggerMs) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
+  try {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    spawnSync('git', ['init'], { cwd: dir, env });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir, env });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir, env });
+    spawnSync('git', ['add', '-A'], { cwd: dir, env });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, env });
+
+    const spawnClose = (label, trackId) => {
+      const sessionId = newPinSession(label);
+      const cleanup = seedCloseTranscript(sessionId);
+      const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
+      writeFileSync(
+        payloadPath,
+        JSON.stringify(
+          v2Payload(today, {
+            tracks: [{ id: trackId, new: true, next: `- ${trackId}` }],
+            tag: `close ${trackId}`,
+          }),
+        ),
+      );
+      const child = spawn(
+        process.execPath,
+        [
+          join(REPO, 'scripts', 'crystallize.mjs'),
+          `--hypo-dir=${dir}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          `--session-id=${sessionId}`,
+          '--json',
+        ],
+        { env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d));
+      child.stderr.on('data', (d) => (stderr += d));
+      return new Promise((resolve) =>
+        child.on('exit', (code) => {
+          cleanup();
+          rmSync(payloadPath, { force: true });
+          resolve({ code, stdout, stderr });
+        }),
+      );
+    };
+    const first = spawnClose('par-a', 'par-a');
+    if (staggerMs > 0) await sleep(staggerMs);
+    const [one, two] = await Promise.all([first, spawnClose('par-b', 'par-b')]);
+    for (const res of [one, two]) {
+      const out = JSON.parse(res.stdout);
+      assert.equal(out.ok, true, `${res.stdout}\n${res.stderr}`);
+      assert.deepEqual(out.proposals, []);
+      assert.deepEqual(out.conflicts, []);
+      // The first to commit must not be refused its marker over the other one's
+      // entry, published and not committed yet (F1).
+      assert.equal(out.committed, true, res.stdout);
+      assert.equal(out.markerWritten, true, res.stdout);
+    }
+    assert.equal(sessionFilesOf(dir).length, 2);
+    const parked = join(dir, '.cache', 'proposals');
+    assert.deepEqual(existsSync(parked) ? readdirSync(parked) : [], []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 await testAsync(
   'two processes closing the same project at the same moment both succeed with no proposal and both write their marker',
-  async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
-    try {
-      const today = todayLocal();
-      buildCleanWikiTree(dir, today);
-      const env = { ...process.env, HOME: SESSION_TMP_HOME };
-      spawnSync('git', ['init'], { cwd: dir, env });
-      spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir, env });
-      spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir, env });
-      spawnSync('git', ['add', '-A'], { cwd: dir, env });
-      spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, env });
+  () => closeTwiceInParallel(0),
+);
 
-      const spawnClose = (label, trackId) => {
-        const sessionId = newPinSession(label);
-        const cleanup = seedCloseTranscript(sessionId);
-        const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
-        writeFileSync(
-          payloadPath,
-          JSON.stringify(
-            v2Payload(today, {
-              tracks: [{ id: trackId, new: true, next: `- ${trackId}` }],
-              tag: `close ${trackId}`,
-            }),
-          ),
-        );
-        const child = spawn(
-          process.execPath,
-          [
-            join(REPO, 'scripts', 'crystallize.mjs'),
-            `--hypo-dir=${dir}`,
-            '--apply-session-close',
-            `--payload=${payloadPath}`,
-            `--session-id=${sessionId}`,
-            '--json',
-          ],
-          { env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
-        );
-        let stdout = '';
-        let stderr = '';
-        child.stdout.on('data', (d) => (stdout += d));
-        child.stderr.on('data', (d) => (stderr += d));
-        return new Promise((resolve) =>
-          child.on('exit', (code) => {
-            cleanup();
-            rmSync(payloadPath, { force: true });
-            resolve({ code, stdout, stderr });
-          }),
-        );
-      };
-      const [one, two] = await Promise.all([
-        spawnClose('par-a', 'par-a'),
-        spawnClose('par-b', 'par-b'),
-      ]);
-      for (const res of [one, two]) {
-        const out = JSON.parse(res.stdout);
-        assert.equal(out.ok, true, `${res.stdout}\n${res.stderr}`);
-        assert.deepEqual(out.proposals, []);
-        assert.deepEqual(out.conflicts, []);
-        // The first to commit must not be refused its marker over the other one's
-        // entry, published and not committed yet (F1).
-        assert.equal(out.committed, true, res.stdout);
-        assert.equal(out.markerWritten, true, res.stdout);
-      }
-      assert.equal(sessionFilesOf(dir).length, 2);
-      const parked = join(dir, '.cache', 'proposals');
-      assert.deepEqual(existsSync(parked) ? readdirSync(parked) : [], []);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  },
+// S1 regression sample: started 400ms apart, the second close appends its session-log heading
+// while the first one's marker gate is still running lint, after its commit landed. The
+// deterministic pin of the rule is the gate-level test of foreign appends in close-global.
+await testAsync(
+  'two closes of one project started 400ms apart both commit and both write their marker',
+  () => closeTwiceInParallel(400),
 );
 
 test('the 2026-10-01 shape: session 229 on track a, another project closes in between, session 230 on track b: no approval asked', () => {

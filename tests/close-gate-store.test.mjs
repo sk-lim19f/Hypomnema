@@ -912,6 +912,25 @@ test('sessionProofCloseId with a project: each project answers with its own last
   });
 });
 
+// S5: a project slug that names an Object.prototype member is a project with no close,
+// not the inherited function. Disabling the check: read `pin.resolvedByProject[project]`
+// without the Object.hasOwn guard. Both answers go red (a function, then the prototype).
+test('sessionProofCloseId with a project named like an Object.prototype member answers null', () => {
+  withTmpDir((hypoDir) => {
+    writeClosePin(hypoDir, SESSION, {
+      pending: null,
+      lastResolved: null,
+      resolvedByProject: { alpha: 'sess-1-0' },
+      localProofs: {},
+    });
+    const at = (project) =>
+      sessionProofCloseId(hypoDir, SESSION, { closeOpen: false, resolvedAtIndex: 1, project });
+    assert.equal(at('constructor'), null);
+    assert.equal(at('__proto__'), null);
+    assert.equal(at('alpha'), 'sess-1-0', 'an own key still answers');
+  });
+});
+
 test('sessionProofCloseId with a project: a pending proves its own project (or any while it has no entry yet), not another', () => {
   withTmpDir((hypoDir) => {
     writeClosePin(hypoDir, SESSION, {

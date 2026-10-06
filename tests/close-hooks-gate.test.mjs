@@ -14,12 +14,15 @@ import {
   existsSync,
   unlinkSync,
   chmodSync,
+  appendFileSync,
+  readdirSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { recordGateClosed, resolutionStamp } from '../hooks/close-gate-store.mjs';
 import { gitDirtyFiles, hypoIsClean } from '../hooks/hypo-shared.mjs';
+import { closeIdFor, formatSessionEntry } from '../hooks/session-entries.mjs';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 import {
   HOME,
@@ -435,6 +438,45 @@ test('/compact with uncommitted change → blocks (git axis still enforced, ADR 
       /WIKI_AUTOCLOSE/.test(injectedContext(out) || ''),
       `uncommitted work must still block /compact: ${r.stdout}`,
     );
+  });
+});
+
+// S4: another session's close still committing (its new entry, its heading appended
+// to a committed session-log shard) is not this session's unsaved work. Disabling the
+// check: in hypo-compact-guard.mjs drop both foreign filters (`own = dirty`). The
+// first run goes red; the pair (the entry's own session) stays green either way.
+test("/compact with only another session's new entry and shard append dirty → pass-through, the entry's own session still blocks", () => {
+  withCleanWiki((dir) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const closeId = closeIdFor('s-cg-other', 0);
+    const entry = `projects/test-project/sessions/${today}-${closeId}.md`;
+    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
+    writeFileSync(
+      join(dir, entry),
+      formatSessionEntry({
+        project: 'test-project',
+        closeId,
+        date: today,
+        tracks: [],
+        summary: 'other',
+        bodies: {},
+      }),
+    );
+    const logDir = join(dir, 'projects', 'test-project', 'session-log');
+    const shards = readdirSync(logDir);
+    assert.equal(shards.length, 1, 'precondition: the fixture commits one session-log shard');
+    const shard = join(logDir, shards[0]);
+    appendFileSync(shard, `\n## [${today}] other close\n`);
+    const run = (session_id) =>
+      JSON.parse(
+        runHook('hypo-compact-guard.mjs', { prompt: '/compact', session_id }, { HYPO_DIR: dir })
+          .stdout,
+      );
+    const mine = run('s-cg-mine');
+    assert.equal(mine.continue, true);
+    assert.equal(mine.suppressOutput, true, JSON.stringify(mine));
+    const owner = run('s-cg-other');
+    assert.ok(/WIKI_AUTOCLOSE/.test(injectedContext(owner) || ''), JSON.stringify(owner));
   });
 });
 

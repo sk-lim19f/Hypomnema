@@ -35,6 +35,8 @@ import {
   isGateSkipped,
   resolveGateProjectOverride,
   classifyForeignOnlyDirty,
+  isForeignAppendOnlyShard,
+  isForeignUncommittedEntry,
   buildOutput,
   HYPO_DIR,
 } from './hypo-shared.mjs';
@@ -139,9 +141,19 @@ process.stdin.on('end', () => {
           `[hypo-compact-guard] error: resolveGateProjectOverride failed, treating as no override: ${err?.message ?? String(err)}\n`,
         );
       }
-      if (attributionScope) {
-        const dirty = gitDirtyFiles(HYPO_DIR, { deadline });
-        const classification = classifyForeignOnlyDirty(HYPO_DIR, dirty, {
+      // Another session's close still committing (its new entry, its append
+      // to a session-log shard) is not this session's unsaved work, scoped or
+      // not. An empty list is an enumeration that failed, never "clean".
+      const dirty = gitDirtyFiles(HYPO_DIR, { deadline });
+      const own = dirty.filter(
+        (f) =>
+          !isForeignUncommittedEntry(HYPO_DIR, f, data.session_id) &&
+          !isForeignAppendOnlyShard(HYPO_DIR, f, data.session_id),
+      );
+      if (dirty.length > 0 && own.length === 0) {
+        gitReason = '';
+      } else if (attributionScope) {
+        const classification = classifyForeignOnlyDirty(HYPO_DIR, own, {
           effectiveOverride: attributionScope,
         });
         if (classification === 'foreign-only') gitReason = '';
