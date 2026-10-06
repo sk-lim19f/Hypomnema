@@ -4613,7 +4613,7 @@ test('feedback-sync-draft-name-taken-meanwhile-is-not-overwritten: a draft that 
   );
 });
 
-test('feedback-sync-draft-write-cut-short-leaves-no-half-draft: a failure before the draft is complete leaves no file under its name, and a re-run drafts it', () => {
+test('feedback-sync-draft-failed-before-publish-leaves-no-draft-and-no-tmp: a finished tmp file is removed when the step before the link throws, nothing is under the final name, and a re-run drafts it', () => {
   const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
   withFeedbackEnv(
     {},
@@ -4635,6 +4635,35 @@ test('feedback-sync-draft-write-cut-short-leaves-no-half-draft: a failure before
         again.report.created.map((c) => c.slug),
         ['rule-b'],
       );
+      assert.match(readFileSync(join(fbDraftsDir(wiki), 'rule-b.md'), 'utf-8'), /written by hand/);
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-draft-write-cut-short-leaves-no-half-draft: a tmp file that fails part way through its own write is removed, the final name never appears, and a re-run drafts it', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki } = ctx;
+      let tmpSeen = null;
+      const out = fbInProcess(ctx, ['--bootstrap'], {
+        // half of the bytes reach the disk, then the write fails
+        writeTmp: (tmp, content) => {
+          tmpSeen = tmp;
+          writeFileSync(tmp, content.slice(0, Math.floor(content.length / 2)), { flag: 'wx' });
+          throw Object.assign(new Error('no space left'), { code: 'ENOSPC' });
+        },
+      });
+      assert.equal(out.code, 1);
+      assert.match(out.error, /cannot write the draft .*rule-b\.md: no space left/);
+      assert.ok(tmpSeen, 'precondition: the injected write ran');
+      assert.deepEqual(readdirSync(fbDraftsDir(wiki)), [], 'the half-written tmp file is gone');
+      assert.ok(!existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'and no half draft');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'no line is recorded for a draft that failed');
+      const again = fbInProcess(ctx, ['--bootstrap']);
+      assert.equal(again.code, 0, again.error);
       assert.match(readFileSync(join(fbDraftsDir(wiki), 'rule-b.md'), 'utf-8'), /written by hand/);
     },
     { memoryMd },
@@ -4799,6 +4828,135 @@ test('feedback-sync-legacy-drafts-visible-to-git-are-warned-about: an old _draft
       assert.match(r.stderr, /draft-exists-legacy/);
     },
     { memoryMd },
+  );
+});
+
+test('feedback-sync-accept-says-where-the-replaced-hand-edit-lives: after import then accept the edited text is only under .cache/, and the warning names the kept copy and the import draft', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    fbGitInit(wiki, '.cache/\n');
+    fbHandEditClaude(claudeHome, runFb);
+    const imp = JSON.parse(runFb(['--import-target-change', '--from=claude', '--json']).stdout);
+    const draft = imp.imported[0].path;
+    const j = runFb(['--accept-wiki=rule-a', '--json']);
+    assert.equal(j.status, 0, j.stderr);
+    const rep = JSON.parse(j.stdout);
+    assert.equal(rep.warnings.length, 1, 'the --json report carries the warning');
+    const [w] = rep.warnings;
+    assert.match(w, /now only under \.cache\/.*move what you want to keep to pages\/feedback\//i);
+    assert.ok(w.includes(rep.accepted[0].kept), `the kept copy is named: ${w}`);
+    assert.ok(w.includes(draft), `the import draft is named: ${w}`);
+    assert.ok(
+      readFileSync(rep.accepted[0].kept, 'utf-8').includes('HAND EDITED A'),
+      'the named copy holds the replaced text',
+    );
+    // the text mode prints it on stderr; no import draft exists for this edit, so none is named
+    rmSync(draft);
+    fbHandEditClaude(claudeHome, runFb);
+    const t = runFb(['--accept-wiki=rule-a']);
+    assert.equal(t.status, 0, t.stderr);
+    const line = t.stderr.split('\n').find((l) => l.includes('warn: '));
+    assert.ok(line, `a warning is printed: ${t.stderr}`);
+    const kept = /is kept at (\S+\.txt)/.exec(t.stderr)[1];
+    assert.ok(line.includes(kept), `the new kept copy is named: ${line}`);
+    assert.ok(!line.includes('feedback-drafts'), `no draft, none named: ${line}`);
+    // pair: an accept that replaces nothing (the block is not in conflict) warns of nothing
+    const none = runFb(['--accept-wiki=rule-a', '--json']);
+    assert.equal(none.status, 1, none.stderr);
+    assert.deepEqual(JSON.parse(none.stdout).warnings, [], 'nothing was replaced, nothing to say');
+    assert.ok(!/only under \.cache\//.test(runFb(['--accept-wiki=rule-a']).stderr));
+  });
+});
+
+test('feedback-sync-write-warns-about-old-drafts-git-can-see: --write names an old _drafts file in text and in --json, a git-ignored one and --check stay quiet', () => {
+  const legacyBody = '<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=memory-index -->\nsensitivity: public\n';
+  const seed = (wiki) => {
+    const dir = join(wiki, 'pages', 'feedback', '_drafts');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'rule-b.md'), legacyBody);
+  };
+  const earlier = /pages\/feedback\/_drafts\/rule-b\.md was written by an earlier version/;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, runFb }) => {
+    fbGitInit(wiki, '.cache/\n');
+    seed(wiki);
+    const j = runFb(['--write', '--json']);
+    assert.equal(j.status, 0, j.stderr);
+    const warnings = JSON.parse(j.stdout).warnings;
+    assert.equal(warnings.length, 1, j.stdout);
+    assert.match(warnings[0], earlier);
+    const t = runFb(['--write']);
+    assert.equal(t.status, 0, t.stderr);
+    assert.match(t.stderr, /warn: pages\/feedback\/_drafts\/rule-b\.md was written by an earlier/);
+    assert.ok(!earlier.test(runFb(['--check']).stderr), '--check does not write, so it is quiet');
+  });
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, runFb }) => {
+    fbGitInit(wiki, '.cache/\npages/feedback/_drafts/\n');
+    seed(wiki);
+    const j = runFb(['--write', '--json']);
+    assert.equal(j.status, 0, j.stderr);
+    assert.equal(JSON.parse(j.stdout).warnings, undefined, 'git ignores it: nothing to warn of');
+    assert.ok(!earlier.test(runFb(['--write']).stderr));
+  });
+});
+
+test('feedback-sync-git-that-cannot-answer-is-not-a-non-git-vault: a broken .git/config refuses the draft and the line record, a directory that is not a repository still writes them', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      fbGitInit(wiki, null); // no .gitignore at all: git would stage .cache/
+      const config = join(wiki, '.git', 'config');
+      const good = readFileSync(config, 'utf-8');
+      writeFileSync(config, '[core\n  broken\n');
+      for (const args of [['--bootstrap'], ['--bootstrap', '--dry-run']]) {
+        const r = runFb(args);
+        assert.equal(r.status, 1, `${args}: ${r.stderr}`);
+        assert.match(
+          r.stderr,
+          /no draft was written: .*is not ignored by the vault's git/,
+          args.join(' '),
+        );
+      }
+      assert.ok(!existsSync(fbDraftsDir(wiki)), 'no draft');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'and no hand line record');
+      // the config repaired and nothing ignoring .cache/: still refused, for the real reason
+      writeFileSync(config, good);
+      assert.equal(runFb(['--bootstrap']).status, 1, 'git answers now, and says unignored');
+      writeFileSync(join(wiki, '.gitignore'), '.cache/\n');
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      assert.ok(existsSync(fbHandRecord(wiki)));
+    },
+    { memoryMd },
+  );
+  // pair: git answers "not a git repository", so nothing can stage the copy and it is written
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      assert.ok(!existsSync(join(wiki, '.git')), 'precondition: not a repository');
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(existsSync(join(fbDraftsDir(wiki), 'rule-b.md')));
+      assert.ok(existsSync(fbHandRecord(wiki)));
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-no-draft-to-write-needs-no-ignored-cache: a git vault whose .gitignore lacks .cache/ and that has nothing to draft exits 0 with nothing created', () => {
+  withFeedbackEnv({}, ({ wiki, runFb }) => {
+    fbGitInit(wiki, 'node_modules/\n');
+    const r = runFb(['--bootstrap', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout).created, []);
+    assert.ok(!existsSync(fbDraftsDir(wiki)), 'nothing was written');
+  });
+  // pair: the same vault with something to draft is still refused
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      fbGitInit(wiki, 'node_modules/\n');
+      assert.equal(runFb(['--bootstrap']).status, 1);
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
   );
 });
 

@@ -216,8 +216,9 @@ function atomicWrite(file, content) {
 // taken, true when this call created it.
 // ponytail: needs a filesystem with hard links (not FAT/exFAT), and a failed link
 // surfaces as an error; add a plain wx fallback if such a vault turns up.
-// `testHooks.beforePublish(tmp, file)` is test-only: called with the finished tmp file
-// just before it is linked into `file`.
+// Test-only hooks: `testHooks.beforePublish(tmp, file)` is called with the finished tmp
+// file just before it is linked into `file`; `testHooks.writeTmp(tmp, content)` stands in
+// for the write of the tmp file itself (to fail it part way).
 function createNew(file, content, testHooks) {
   const dir = dirname(file);
   mkdirSync(dir, { recursive: true });
@@ -233,7 +234,8 @@ function createNew(file, content, testHooks) {
     }
   };
   try {
-    writeFileSync(tmp, content, { flag: 'wx' });
+    if (testHooks?.writeTmp) testHooks.writeTmp(tmp, content);
+    else writeFileSync(tmp, content, { flag: 'wx' });
   } catch (err) {
     // An EEXIST is a collision on the tmp name, a real failure (only the link below means
     // "the name was taken"), and that file belongs to someone else, so it stays.
@@ -849,15 +851,26 @@ function saveHandLines(hypoDir, lines) {
 // Anything written under .cache/ here holds the user's own MEMORY.md or CLAUDE.md text,
 // and the vault's auto-commit stages whatever git does not ignore. The default
 // .gitignore ignores .cache/, but a hand-written one may not.
-//   not a git work tree (or no git at all): nothing can stage it, so nothing is unignored.
-//   git answers anything but 0 or 1, or times out: unknown, counted as unignored.
+//   not a git work tree (git says "not a git repository", or there is no git at all): nothing
+//   can stage it, so nothing is unignored.
+//   git fails any other way (a broken config, an ownership refusal), answers anything but 0
+//   or 1, or times out: unknown, counted as unignored. A vault git cannot read may still be
+//   one the auto-commit stages, so "unknown" must never read as "not a repository".
+//   LC_ALL=C pins the language of the "not a git repository" message that is matched.
 function unignoredCachePaths(hypoDir, relPaths) {
   if (!relPaths.length) return [];
   const git = (argv, input) =>
-    spawnSync('git', ['-C', hypoDir, ...argv], { input, encoding: 'utf-8', timeout: 10000 });
+    spawnSync('git', ['-C', hypoDir, ...argv], {
+      input,
+      encoding: 'utf-8',
+      timeout: 10000,
+      env: { ...process.env, LC_ALL: 'C' },
+    });
   const probe = git(['rev-parse', '--is-inside-work-tree']);
   if (probe.error?.code === 'ENOENT') return [];
-  if (probe.status === 128 || (probe.status === 0 && probe.stdout.trim() !== 'true')) return [];
+  const notRepo = probe.status === 128 && /not a git repository/i.test(probe.stderr ?? '');
+  if (notRepo || (probe.status === 0 && probe.stdout.trim() !== 'true')) return [];
+  if (probe.error || probe.status !== 0) return [...relPaths];
   const r = git(['check-ignore', '--stdin', '-z'], relPaths.join('\0') + '\0');
   if (r.error || (r.status !== 0 && r.status !== 1)) return [...relPaths];
   const ignored = new Set(r.stdout.split('\0').filter(Boolean));
@@ -1711,8 +1724,9 @@ function runBootstrap(args) {
     assertUnderDrafts(draftsDir, draftPath);
     planned.push({ c, draftPath });
   }
+  // nothing to write, nothing to check: a vault with no candidates is not an error
   try {
-    assertCacheIgnored(args.hypoDir, ...planned.map((p) => p.draftPath));
+    if (planned.length) assertCacheIgnored(args.hypoDir, ...planned.map((p) => p.draftPath));
   } catch (err) {
     return { code: 1, error: `no draft was written: ${err.message}`, report, warnings };
   }
@@ -1819,7 +1833,7 @@ function runImport(args) {
     planned.push({ slug, path, n, inner: b.inner });
   }
   try {
-    assertCacheIgnored(args.hypoDir, ...planned.map((p) => p.path));
+    if (planned.length) assertCacheIgnored(args.hypoDir, ...planned.map((p) => p.path));
   } catch (err) {
     return { code: 1, error: `no draft was written: ${err.message}`, report, warnings };
   }
@@ -1867,9 +1881,29 @@ function fusedWith(b, blocks, desired, target) {
   )?.slug;
 }
 
+// What an accept leaves behind: the hand-edited bytes it replaced exist only under .cache/
+// now (the kept copy of the whole file, and any import draft of this slug for this target),
+// a directory that is not synced and that clearing deletes. Names where they are and says
+// to move out what is worth keeping; nothing is moved for the user.
+function acceptKeptWarning(hypoDir, target, slug, kept) {
+  const dir = DRAFTS_DIR(hypoDir);
+  let drafts = [];
+  try {
+    drafts = readdirSync(dir)
+      .filter((f) => f.startsWith(`${slug}.import-${target.name}-`) && f.endsWith('.md'))
+      .map((f) => join(dir, f));
+  } catch {}
+  return (
+    `the hand edit in ${target.file} that this accept replaced is now only under .cache/: ` +
+    `${[kept, ...drafts].join(', ')}. That directory is not synced to other machines and is deleted ` +
+    `when .cache/ is cleared. Move what you want to keep to pages/feedback/ or elsewhere`
+  );
+}
+
 function runAccept(args, evals) {
   const slug = args.acceptSlug;
   const report = { mode: 'accept', slug, dryRun: args.dryRun, accepted: [], refused: [] };
+  const warnings = [];
   if (args.dryRun) report.planned = [];
   const plans = [];
   for (const { target, res } of evals) {
@@ -1928,6 +1962,7 @@ function runAccept(args, evals) {
           ? `${target.file} changed after it was read for this accept. It was not replaced; run --accept-wiki again.${doneNote}`
           : `cannot read ${target.file}: ${err.message}. Nothing was written to it.${doneNote}`,
       report,
+      warnings,
     });
     try {
       assertUnchanged(target.file, content);
@@ -1942,6 +1977,7 @@ function runAccept(args, evals) {
         code: 1,
         error: `cannot keep a copy of ${target.file} before replacing it: ${err.message}. Nothing was written to it.${doneNote}`,
         report,
+        warnings,
       };
     }
     try {
@@ -1956,14 +1992,20 @@ function runAccept(args, evals) {
         code: 1,
         error: `cannot write ${target.file}: ${err.message}. ${REMEDY.io(target.file)}${doneNote}`,
         report,
+        warnings,
       };
     }
     report.accepted.push({ target: target.name, file: target.file, action, discarded, kept });
+    // every plan is a conflict (the block differs from the wiki's rendering), so the
+    // bytes just replaced are hand-edited ones
+    const w = acceptKeptWarning(args.hypoDir, target, slug, kept);
+    warnings.push(w);
+    (report.warnings ||= []).push(w);
   }
   // Exit codes: 0 every relevant target resolved, 1 usage error / nothing accepted /
   // write failure, 3 something was accepted but a target that holds the block still
   // needs a hand repair (same meaning as 3 from --check: the projection is still blocked).
-  return { code: report.refused.some((r) => r.unresolved) ? 3 : 0, report };
+  return { code: report.refused.some((r) => r.unresolved) ? 3 : 0, report, warnings };
 }
 
 // Cut one managed block out of `content` together with its line ending, so no blank
@@ -2196,6 +2238,8 @@ function runUnlocked(args, resolvedPid = null) {
   // at the source) so it stays strict-escalatable as defense-in-depth.
   const warnings = [];
   const strictWarnings = [];
+  // not a strict warning: it is about files an earlier version left, not about drift
+  if (args.mode === 'write') warnLegacyDrafts(args.hypoDir, warnings, report);
   if (pid.skipMemory) {
     warnings.push(
       `project-id "${pid.id}" dir not found under ${args.claudeHome}/projects — MEMORY projection skipped (pass --project-id to override)`,
@@ -2487,7 +2531,12 @@ async function main() {
     const mode = out.report?.mode;
     const errBody =
       mode === 'accept'
-        ? { error: out.error, accepted: out.report.accepted, refused: out.report.refused }
+        ? {
+            error: out.error,
+            accepted: out.report.accepted,
+            refused: out.report.refused,
+            warnings: out.warnings ?? [],
+          }
         : mode === 'bootstrap'
           ? {
               error: out.error,
