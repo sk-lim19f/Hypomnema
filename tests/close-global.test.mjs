@@ -6175,6 +6175,9 @@ test('--session-id: the CLI text prints close_state by name, the same token the 
     assert.ok(
       cliText(dir, sid).includes('close_state: broken'),
       'a broken checkpoint must print close_state: broken',
+    );
+  });
+});
 
 // W19 fixture: design-history is as new as today and a session-log heading
 // carries a date that is not on the calendar, so lint reports W19 (never W8).
