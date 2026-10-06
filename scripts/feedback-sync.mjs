@@ -11,8 +11,8 @@
  *
  * --check / --write engine: per-slug managed blocks + sha256 idempotency +
  * conflict (exit 3) + over-cap (exit 2) [Phase A]. --bootstrap / --import-target-
- * change: reverse one-time helpers that scaffold pages/feedback/_drafts/ for human
- * review — never write pages/feedback/<slug>.md directly [Phase D]. --ensure-
+ * change: reverse one-time helpers that scaffold drafts under .cache/feedback-drafts/
+ * for human review — never write pages/feedback/<slug>.md directly [Phase D]. --ensure-
  * container: provisions the ONE thing --write can never create on its own — the
  * `<learned_behaviors>` container itself is a precondition for --write, not
  * something it can bootstrap into existence (that would mean guessing WHERE in
@@ -94,6 +94,7 @@ import {
   statSync,
   chmodSync,
   renameSync,
+  linkSync,
 } from 'node:fs';
 import { join, basename, dirname, resolve, relative, sep } from 'node:path';
 import { homedir } from 'node:os';
@@ -204,6 +205,36 @@ function atomicWrite(file, content) {
       /* best-effort: an orphan tmp is inert, the original file is intact either way */
     }
     throw err;
+  }
+}
+
+// Creates `file` and never replaces one that is already there. The bytes go to a tmp file
+// beside it first and are hard-linked into place: link(2) fails with EEXIST instead of
+// replacing, and the final name is only ever linked once the tmp file is whole, so it is
+// either absent or complete (a crash mid-write leaves an inert tmp file, never a half
+// draft that a re-run would skip as "already there"). Returns false when the name was
+// taken, true when this call created it.
+// ponytail: needs a filesystem with hard links (not FAT/exFAT), and a failed link
+// surfaces as an error; add a plain wx fallback if such a vault turns up.
+// `testHooks.beforePublish(tmp, file)` is test-only: called with the finished tmp file
+// just before it is linked into `file`.
+function createNew(file, content, testHooks) {
+  const dir = dirname(file);
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(
+    dir,
+    `.${basename(file)}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`,
+  );
+  try {
+    writeFileSync(tmp, content, { flag: 'wx' });
+    testHooks?.beforePublish?.(tmp, file);
+    linkSync(tmp, file);
+    return true;
+  } catch (err) {
+    if (err.code === 'EEXIST') return false;
+    throw err;
+  } finally {
+    rmSync(tmp, { force: true });
   }
 }
 
@@ -817,13 +848,17 @@ function unignoredCachePaths(hypoDir, relPaths) {
   return relPaths.filter((p) => !ignored.has(p));
 }
 
-// Throws when `file` (under the vault's .cache/) is a path the vault's git would not ignore.
-function assertCacheIgnored(hypoDir, file) {
-  const rel = relative(hypoDir, file).split(sep).join('/');
-  if (unignoredCachePaths(hypoDir, [rel]).length)
+// Throws when any of `files` (under the vault's .cache/) is a path the vault's git would
+// not ignore.
+function assertCacheIgnored(hypoDir, ...files) {
+  const bad = unignoredCachePaths(
+    hypoDir,
+    files.map((f) => relative(hypoDir, f).split(sep).join('/')),
+  );
+  if (bad.length)
     throw Object.assign(
       new Error(
-        `${rel} is not ignored by the vault's git, so a copy of your own file there would be staged by the auto-commit. Add .cache/ to the vault's .gitignore first`,
+        `${bad.join(', ')} is not ignored by the vault's git, so a copy of your own file there would be staged by the auto-commit. Add .cache/ to the vault's .gitignore first`,
       ),
       { code: 'EUNIGNORED' },
     );
@@ -1333,12 +1368,26 @@ async function resolveProjectId(args, { prompt = defaultPrompt, isTTY } = {}) {
 // ── bootstrap + import (contract §11) ────────────────────────
 //
 // Both modes are *reverse* one-time helpers that scaffold wiki DRAFTS under
-// pages/feedback/_drafts/ — they NEVER write pages/feedback/<slug>.md directly
+// .cache/feedback-drafts/ — they NEVER write pages/feedback/<slug>.md directly
 // (the single-direction invariant). A human reviews each draft,
 // fills the decision fields (scope/tier/targets/promote_to_global), and moves
-// it into pages/feedback/. _drafts/ is excluded from sync candidates
-// (loadFeedbackPages) and from lint (collectPages skips `_`-dirs), so an
-// incomplete scaffold never trips required-field errors or projection.
+// it into pages/feedback/. A draft is a verbatim copy of the user's own hand-written
+// lines or edited block, so it lives where the vault's git does not look: .cache/ is
+// gitignored by the vault template, and no draft is written unless git confirms it
+// ignores the path (assertCacheIgnored). The cost is that drafts are not synced to
+// another machine and go when .cache/ is cleared. Nothing outside pages/feedback/ is
+// read as a page, so an incomplete scaffold never trips required-field errors or
+// projection.
+//
+// Drafts used to be written to pages/feedback/_drafts/ (untracked, but visible to
+// `git add -A`). Those that are still there keep working: they are read (a bootstrap
+// does not draft a slug that has one, and a hand-line record waits for one), and they
+// are never moved or deleted. That directory stays excluded from sync candidates
+// (loadFeedbackPages) and from lint (collectPages skips `_`-dirs).
+const DRAFTS_DIR = (hypoDir) => join(hypoDir, '.cache', 'feedback-drafts');
+const LEGACY_DRAFTS_DIR = (hypoDir) => join(hypoDir, 'pages', 'feedback', '_drafts');
+const draftExists = (hypoDir, slug) =>
+  [DRAFTS_DIR, LEGACY_DRAFTS_DIR].some((dir) => existsSync(join(dir(hypoDir), `${slug}.md`)));
 
 // Provenance header so re-running bootstrap/import is recognisable and humans
 // see at a glance the file is a generated scaffold awaiting review.
@@ -1362,7 +1411,7 @@ function kebabSlug(text, max = 48) {
 // final component, then we strip everything but unicode word chars / . _ - and
 // leading dots. Returns null when nothing safe remains → caller skips it. Without
 // this a crafted `source=../evil` / `feedback_../evil.md` would let --bootstrap /
-// --import write outside _drafts (e.g. into pages/feedback/), breaking the
+// --import write outside the drafts dir (e.g. into pages/feedback/), breaking the
 // one-way invariant.
 function safeDraftSlug(raw) {
   const seg = basename(String(raw).replace(/\\/g, '/'));
@@ -1373,11 +1422,11 @@ function safeDraftSlug(raw) {
   return cleaned && cleaned !== '.' && cleaned !== '..' ? cleaned : null;
 }
 
-// Defense-in-depth: refuse to write a draft whose resolved path escapes _drafts.
+// Defense-in-depth: refuse to write a draft whose resolved path escapes the drafts dir.
 function assertUnderDrafts(draftsDir, target) {
   const root = resolve(draftsDir) + sep;
   if (!resolve(target).startsWith(root)) {
-    throw new Error(`refusing to write outside _drafts: ${target}`);
+    throw new Error(`refusing to write outside the drafts dir: ${target}`);
   }
 }
 
@@ -1448,7 +1497,7 @@ function bootstrapDraftContent({ title, summary, body, date, origin }) {
     'scope: TODO              # global | project:<project-id>',
     'tier: TODO               # L1 (CLAUDE.md <learned_behaviors> candidate) | L2',
     'targets: [project-memory]   # + claude-learned for a global L1 rule',
-    'sensitivity: public      # public | sanitized (private is forbidden)',
+    'sensitivity: TODO        # public | sanitized (private is forbidden); this draft holds your own text',
     'priority: 3              # 1-5, higher wins over-cap',
     `memory_summary: ${summary}`,
     `global_summary: ${summary}`,
@@ -1483,7 +1532,7 @@ function importDraftContent({ slug, inner, from }) {
     'scope: TODO',
     'tier: TODO',
     'targets: [project-memory]',
-    'sensitivity: public',
+    'sensitivity: TODO        # public | sanitized (private is forbidden); this draft holds your own text',
     'priority: 3',
     `memory_summary: ${oneLineSummary(inner)}`,
     `global_summary: ${oneLineSummary(inner)}`,
@@ -1580,15 +1629,17 @@ function loadBootstrapSources(args) {
 }
 
 // --bootstrap: load the two legacy projection surfaces (loadBootstrapSources)
-// and scaffold one draft per deduped candidate.
+// and scaffold one draft per deduped candidate. Nothing is written when the vault's
+// git would not ignore the drafts dir (the drafts copy the user's own lines). A draft
+// whose name another run took in between is left as that run wrote it.
 function runBootstrap(args) {
-  const draftsDir = join(args.hypoDir, 'pages', 'feedback', '_drafts');
+  const draftsDir = DRAFTS_DIR(args.hypoDir);
   const existing = existingPageSlugs(args.hypoDir);
   const { candidates, warnings, skipped } = loadBootstrapSources(args);
   const report = { mode: 'bootstrap', dryRun: args.dryRun, created: [], skipped: [...skipped] };
 
   const seen = new Set();
-  const recorded = [];
+  const planned = [];
   for (const c of candidates) {
     if (seen.has(c.slug)) {
       report.skipped.push({ slug: c.slug, reason: 'duplicate-in-batch' });
@@ -1599,16 +1650,33 @@ function runBootstrap(args) {
       report.skipped.push({ slug: c.slug, reason: 'page-exists' });
       continue;
     }
-    const draftPath = join(draftsDir, `${c.slug}.md`);
-    if (existsSync(draftPath)) {
+    if (draftExists(args.hypoDir, c.slug)) {
       report.skipped.push({ slug: c.slug, reason: 'draft-exists' });
       continue;
     }
+    const draftPath = join(draftsDir, `${c.slug}.md`);
     assertUnderDrafts(draftsDir, draftPath);
-    report.created.push({ slug: c.slug, origin: c.origin, path: draftPath });
+    planned.push({ c, draftPath });
+  }
+  try {
+    assertCacheIgnored(args.hypoDir, ...planned.map((p) => p.draftPath));
+  } catch (err) {
+    return { code: 1, error: `no draft was written: ${err.message}`, report, warnings };
+  }
+
+  const recorded = [];
+  let failure = null;
+  for (const { c, draftPath } of planned) {
     if (!args.dryRun) {
-      mkdirSync(draftsDir, { recursive: true });
-      writeFileSync(draftPath, bootstrapDraftContent(c));
+      try {
+        if (!createNew(draftPath, bootstrapDraftContent(c), args.testHooks)) {
+          report.skipped.push({ slug: c.slug, reason: 'draft-exists' });
+          continue;
+        }
+      } catch (err) {
+        failure = `cannot write the draft ${draftPath}: ${err.message}`;
+        break;
+      }
       recorded.push({
         slug: c.slug,
         target: c.target,
@@ -1617,6 +1685,7 @@ function runBootstrap(args) {
         section: c.section,
       });
     }
+    report.created.push({ slug: c.slug, origin: c.origin, path: draftPath });
   }
   if (recorded.length) {
     const kept = loadHandLines(args.hypoDir).filter(
@@ -1630,6 +1699,7 @@ function runBootstrap(args) {
       );
     }
   }
+  if (failure) return { code: 1, error: failure, report, warnings };
   return { code: 0, report, warnings };
 }
 
@@ -1670,30 +1740,51 @@ function runImport(args) {
     warnings.push(`no hand-edited (conflicting) managed blocks in ${file} — nothing to import`);
     return { code: 0, report, warnings };
   }
-  const draftsDir = join(args.hypoDir, 'pages', 'feedback', '_drafts');
+  const draftsDir = DRAFTS_DIR(args.hypoDir);
   const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   report.skipped = [];
+  // `from` is in the name to disambiguate memory vs claude imports of the same slug, and
+  // a taken name gets -2, -3, ... so a re-run / a same-day import from both targets never
+  // clobbers a prior draft (or human edits to it).
+  const nameFor = (slug, n) =>
+    join(draftsDir, `${slug}.import-${args.from}-${stamp}${n > 1 ? `-${n}` : ''}.md`);
+  const planned = [];
   for (const b of conflicts) {
-    // sanitize the marker-supplied slug (a tampered `source=../x` must not escape
-    // _drafts — codex BLOCKER), then pick a collision-free name so a re-run / a
-    // same-day import from both targets never clobbers a prior draft (or human
-    // edits to it — codex IMPORTANT). `from` is in the name to disambiguate
-    // memory vs claude imports of the same slug.
+    // sanitize the marker-supplied slug: a tampered `source=../x` must not escape the
+    // drafts dir
     const slug = safeDraftSlug(b.slug);
     if (!slug) {
       report.skipped.push({ slug: b.slug, reason: 'unsafe-slug' });
       continue;
     }
-    let draftPath = join(draftsDir, `${slug}.import-${args.from}-${stamp}.md`);
-    for (let n = 2; existsSync(draftPath); n++) {
-      draftPath = join(draftsDir, `${slug}.import-${args.from}-${stamp}-${n}.md`);
-    }
-    assertUnderDrafts(draftsDir, draftPath);
-    report.imported.push({ slug, path: draftPath });
+    let n = 1;
+    while (existsSync(nameFor(slug, n)) || planned.some((p) => p.path === nameFor(slug, n))) n++;
+    const path = nameFor(slug, n);
+    assertUnderDrafts(draftsDir, path);
+    planned.push({ slug, path, n, inner: b.inner });
+  }
+  try {
+    assertCacheIgnored(args.hypoDir, ...planned.map((p) => p.path));
+  } catch (err) {
+    return { code: 1, error: `no draft was written: ${err.message}`, report, warnings };
+  }
+  for (const p of planned) {
+    let { path, n } = p;
     if (!args.dryRun) {
-      mkdirSync(draftsDir, { recursive: true });
-      writeFileSync(draftPath, importDraftContent({ slug, inner: b.inner, from: args.from }));
+      const content = importDraftContent({ slug: p.slug, inner: p.inner, from: args.from });
+      try {
+        // another run may take the name after it was picked: move on to the next free one
+        while (!createNew(path, content, args.testHooks)) path = nameFor(p.slug, ++n);
+      } catch (err) {
+        return {
+          code: 1,
+          error: `cannot write the draft ${path}: ${err.message}`,
+          report,
+          warnings,
+        };
+      }
     }
+    report.imported.push({ slug: p.slug, path });
   }
   return { code: 0, report, warnings };
 }
@@ -1860,6 +1951,9 @@ function removeBlock(content, b) {
 //     wholly new. (The previous writeFileSync(file, content + addition) truncated
 //     first and wrote second: the one command that promises "existing content is
 //     never touched" was the one that could shred it.)
+//     The file as read is kept under .cache/feedback-kept/ first and is read again
+//     just before the replace (assertUnchanged), so a save that landed in between
+//     stops the run instead of being overwritten.
 function runEnsureContainer(args) {
   const target = claudeTarget(args);
   const file = target.file;
@@ -1899,12 +1993,41 @@ function runEnsureContainer(args) {
     'region feedback-sync projects wiki-sourced learned behaviors into. Do not hand-edit its\n' +
     'contents: a hand-edit becomes a sync conflict. -->\n' +
     '<learned_behaviors>\n</learned_behaviors>\n';
+  // The write rewrites the whole file from the bytes read above, so it goes through the
+  // same two guards as --write: the file as read goes aside first (when git ignores
+  // .cache/; no user bytes are removed, so a vault that does not gets a warning and the
+  // write goes on), and it is read again right before the replace, because the lock does
+  // not stop an editor.
+  const warnings = [];
   try {
+    keepCopy(args.hypoDir, 'claude-before-ensure-container', content);
+  } catch (err) {
+    if (err.code !== 'EUNIGNORED')
+      return {
+        code: 1,
+        error: `cannot keep a copy of ${file} before replacing it: ${err.message}. Nothing was written.`,
+      };
+    warnings.push(`no copy of ${file} was kept before replacing it: ${err.message}`);
+  }
+  try {
+    args.testHooks?.beforeEnsureWrite?.(file);
+    assertUnchanged(file, content);
     atomicWrite(file, content + addition);
   } catch (err) {
+    if (err.code === 'ECHANGED')
+      return { code: 1, error: `${err.message}. It was not overwritten; run it again.` };
     return { code: 1, error: `cannot write ${file}: ${err.message} — ${REMEDY.io(file)}` };
   }
-  return { code: 0, report: { mode: 'ensure-container', file, action: 'created' } };
+  return {
+    code: 0,
+    report: {
+      mode: 'ensure-container',
+      file,
+      action: 'created',
+      ...(warnings.length ? { warnings } : {}),
+    },
+    warnings,
+  };
 }
 
 // ── modes ─────────────────────────────────────────────────────────────────────
@@ -2260,9 +2383,8 @@ function runUnlocked(args, resolvedPid = null) {
     }
     // a record whose draft and page are both gone can never be consumed: drop it
     // so it cannot meet an unrelated page that reuses the slug later
-    const draftsDir = join(args.hypoDir, 'pages', 'feedback', '_drafts');
     for (const r of handRecs) {
-      if (!pages.some((p) => p.slug === r.slug) && !existsSync(join(draftsDir, `${r.slug}.md`)))
+      if (!pages.some((p) => p.slug === r.slug) && !draftExists(args.hypoDir, r.slug))
         spent.push(r);
     }
     if (spent.length) {
@@ -2309,6 +2431,7 @@ async function main() {
   } else if (out.error) {
     console.error(`[feedback-sync] ${out.error}`);
   } else if (out.report.mode === 'ensure-container') {
+    for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
     const { action, file } = out.report;
     if (action === 'target-missing') {
       console.error(
@@ -2330,13 +2453,14 @@ async function main() {
     const verb = out.report.dryRun ? 'would create' : 'created';
     for (const c of out.report.created)
       console.error(
-        `[feedback-sync] ${verb} draft: pages/feedback/_drafts/${c.slug}.md (${c.origin})`,
+        `[feedback-sync] ${verb} draft: ${relative(args.hypoDir, c.path).split(sep).join('/')} (${c.origin})`,
       );
     for (const s of out.report.skipped)
       console.error(`[feedback-sync] skipped ${s.slug}: ${s.reason}`);
     console.error(
       `[feedback-sync] bootstrap: ${out.report.created.length} ${verb}, ${out.report.skipped.length} skipped. ` +
-        `Fill scope/tier/targets/promote_to_global and move into pages/feedback/.`,
+        `Fill scope/tier/targets/promote_to_global and move into pages/feedback/. ` +
+        `The drafts are in .cache/feedback-drafts/ (git ignores them and they are not synced to other machines).`,
     );
   } else if (out.report.mode === 'accept') {
     for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
