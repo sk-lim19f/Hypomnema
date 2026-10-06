@@ -408,11 +408,20 @@ test('FEAT-11 T6: a symlinked proposals dir cannot escape the vault (read/delete
 });
 
 // The whole-file overwrite target these T6 tests drift. It used to be the root
-// `hot.md`; that file left `overwriteTargets` when it became a hook-generated
-// projection, so the park it demonstrates has to be shown on a target the guard
-// still covers. The project hot.md is the same kind of page (frontmatter plus
-// prose, replaced wholesale) and is still in the payload.
-const PROJ_HOT_REL = join('projects', 'test-project', 'hot.md');
+// `hot.md`, then the project `hot.md`; both are generated from entries now, so the
+// park it demonstrates has to be shown on the one target a payload still overwrites:
+// `pages/open-questions.md`. The name is kept to leave the assertions below alone.
+const PROJ_HOT_REL = join('pages', 'open-questions.md');
+
+// A `withWiki` mutate step: the target page exists (same bytes the project hot.md
+// fixture has) and is committed before the close.
+function seedOpenQuestionsPage(dir, today) {
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  writeFileSync(
+    join(dir, PROJ_HOT_REL),
+    `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot\n`,
+  );
+}
 
 test('FEAT-11 T6: makeProposalId is filename-safe and carries the target slug', () => {
   const id = psMakeProposalId('2026-07-09T12:34:56.789Z', join('projects', 'p', 'hot.md'));
@@ -424,12 +433,11 @@ test('FEAT-11 T6: makeProposalId is filename-safe and carries the target slug', 
 // artifact carrying every required field, the close reports proposal-pending, and
 // the marker is NOT written.
 test('FEAT-11 T6: overwrite conflict parks an artifact with all required fields, marker withheld', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestionsPage, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
     // No base snapshot for this session → the overwrite guard sees base-unknown and
-    // withholds projectHot rather than clobber. Only projectHot differs from disk;
-    // the other overwrite fields are byte-identical (idempotent skip, no conflict).
-    payload.projectHot = {
+    // withholds openQuestions rather than clobber.
+    payload.openQuestions = {
       content: `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot DRIFTED\n`,
     };
     const r = runApply(dir, payload, { sessionId: 's-t6-artifact' });
@@ -1034,24 +1042,21 @@ test('the non-JSON close report prints the parked-artifact total on a proposal-p
 
 // spec success criterion: partial conflict is per-target — non-drifted overwrites
 // write directly, only the drifted one parks, and the result says so honestly.
-test('FEAT-11 T6: partial conflict — non-drifted overwrites write, drifted one parks', () => {
-  withWiki(null, (dir, today) => {
+test('FEAT-11 T6: partial conflict, the entry and appends write and the drifted overwrite parks', () => {
+  withWiki(seedOpenQuestionsPage, (dir, today) => {
     const sid = 's-t6-partial';
     // Snapshot the base from the committed clean tree.
-    snapshotBase(dir, sid, overwriteTargets('test-project'));
-    // Another writer drifts ONE target (project hot.md) AFTER the snapshot.
-    const projHot = join(dir, 'projects', 'test-project', 'hot.md');
+    snapshotBase(dir, sid, baseTargets('test-project'));
+    // Another writer drifts the target AFTER the snapshot.
+    const target = join(dir, PROJ_HOT_REL);
     writeFileSync(
-      projHot,
+      target,
       `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot DRIFTED BY OTHER\n`,
     );
-    const driftedBytes = readFileSync(projHot, 'utf-8');
+    const driftedBytes = readFileSync(target, 'utf-8');
 
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = {
-      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- new next\n`,
-    };
-    payload.projectHot = {
+    payload.openQuestions = {
       content: `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot FROM PAYLOAD\n`,
     };
     const r = runApply(dir, payload, { sessionId: sid });
@@ -1061,19 +1066,20 @@ test('FEAT-11 T6: partial conflict — non-drifted overwrites write, drifted one
     assert.equal(out.stage, 'proposal-pending');
     assert.equal(out.partialConflict, true, `partialConflict expected: ${r.stdout}`);
     assert.ok(
-      Array.isArray(out.appliedUncommitted) && out.appliedUncommitted.length > 0,
-      'appliedUncommitted lists the writes that landed but are not committed',
+      Array.isArray(out.appliedUncommitted) &&
+        out.appliedUncommitted.some((a) => a.startsWith('sessionEntry (')),
+      `appliedUncommitted lists the writes that landed but are not committed: ${JSON.stringify(out.appliedUncommitted)}`,
     );
     assert.equal(out.proposals.length, 1, `exactly one proposal: ${JSON.stringify(out.proposals)}`);
-    assert.equal(out.proposals[0].target, join('projects', 'test-project', 'hot.md'));
-    assert.ok(
-      readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8').includes(
-        'new next',
-      ),
-      'the non-drifted sessionState was written directly',
+    assert.equal(out.proposals[0].target, PROJ_HOT_REL);
+    const sessionsDir = join(dir, 'projects', 'test-project', 'sessions');
+    assert.equal(
+      readdirSync(sessionsDir).filter((f) => f.endsWith('.md')).length,
+      1,
+      'the entry was written directly, the conflict does not withhold it',
     );
     assert.equal(
-      readFileSync(projHot, 'utf-8'),
+      readFileSync(target, 'utf-8'),
       driftedBytes,
       'the drifted target keeps the other writer bytes — the payload must not clobber it',
     );
@@ -1084,9 +1090,9 @@ test('FEAT-11 T6: partial conflict — non-drifted overwrites write, drifted one
 // spec success criterion (fail-closed): a proposal-store WRITE failure must not
 // write the target, must surface loudly, and must stage proposal-store-failed.
 test('FEAT-11 T6: proposal-store write failure → proposal-store-failed, fail-loud, target unwritten', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestionsPage, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot = {
+    payload.openQuestions = {
       content: `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot DRIFTED\n`,
     };
     // Occupy `.cache/proposals` with a regular FILE so writeProposal's mkdir fails.
@@ -1115,13 +1121,13 @@ test('FEAT-11 T6: proposal-store write failure → proposal-store-failed, fail-l
 // forcing a genuinely new artifact that must supersede (not accumulate beside) the
 // first — otherwise every close would leave a stale artifact and inflate the count.
 test('FEAT-11 T6: repeated closes on a re-drifting target keep exactly one artifact', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestionsPage, (dir, today) => {
     const sid = 's-t6-supersede';
     const projHotPath = join(dir, PROJ_HOT_REL);
     const dirp = join(dir, '.cache', 'proposals');
 
     const p1 = payloadForCleanWiki(dir, today);
-    p1.projectHot = { content: `${readFileSync(projHotPath, 'utf-8')}\n<!-- close1 -->\n` };
+    p1.openQuestions = { content: `${readFileSync(projHotPath, 'utf-8')}\n<!-- close1 -->\n` };
     const r1 = runApply(dir, p1, { sessionId: sid });
     assert.notEqual(r1.status, 0);
     assert.equal(
@@ -1134,7 +1140,7 @@ test('FEAT-11 T6: repeated closes on a re-drifting target keep exactly one artif
     // Another writer drifts the disk so the next close withholds FRESH bytes.
     writeFileSync(projHotPath, `${readFileSync(projHotPath, 'utf-8')}\n<!-- other drift -->\n`);
     const p2 = payloadForCleanWiki(dir, today);
-    p2.projectHot = { content: `${readFileSync(projHotPath, 'utf-8')}\n<!-- close2 -->\n` };
+    p2.openQuestions = { content: `${readFileSync(projHotPath, 'utf-8')}\n<!-- close2 -->\n` };
     const r2 = runApply(dir, p2, { sessionId: sid });
     assert.notEqual(r2.status, 0);
     const files2 = readdirSync(dirp).filter((f) => f.endsWith('.json'));
@@ -1155,10 +1161,10 @@ test('FEAT-11 T6: repeated closes on a re-drifting target keep exactly one artif
 // idempotent-reuse (the OTHER supersede path): an identical re-close — same base,
 // same disk, same bytes — reuses the existing id and writes no second artifact.
 test('FEAT-11 T6: identical re-close reuses the artifact id (idempotent, one file)', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestionsPage, (dir, today) => {
     const sid = 's-t6-idem';
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot = {
+    payload.openQuestions = {
       content: readFileSync(join(dir, PROJ_HOT_REL), 'utf-8').replace('# Hot', '# Hot DRIFT'),
     };
     const r1 = runApply(dir, payload, { sessionId: sid });
@@ -2089,10 +2095,12 @@ test('idempotent: re-running same payload produces no new bytes (file mtimes unc
 
 // PRAC-17: the test above measures the LEGACY MONTHLY shard path; the apply code
 // writes the DAILY shard for a distinct entry. This dedicated test targets the
-// daily shard and pins both (a) the new audit frontmatter (device present once,
-// no session_id when --session-id is not passed) and (b) byte-equal idempotency
-// on the daily shard — the gap the monthly-path test cannot catch.
-test('PRAC-17: daily shard seeds device frontmatter once + byte-equal on re-apply', () => {
+// daily shard and pins both (a) the header the shard is seeded with and (b)
+// byte-equal idempotency on the daily shard (the gap the monthly-path test cannot
+// catch). The header used to carry `device` and `session_id`; two clones that each
+// create today's first shard then wrote different header bytes and the union merge
+// kept both sets of lines, so the header now holds neither.
+test('PRAC-17: a new daily shard carries no device or session_id, and is byte-equal on re-apply', () => {
   withWiki(null, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
     payload.sessionLog = { entry: `## [${today}] prac17 daily entry\n\nbody\n` };
@@ -2101,14 +2109,15 @@ test('PRAC-17: daily shard seeds device frontmatter once + byte-equal on re-appl
     const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
     assert.ok(existsSync(shard), 'daily shard must be created');
     const fm1 = readFileSync(shard, 'utf-8');
-    // device is always seeded; appears exactly once (in the seeded header).
-    assert.ok(/\ndevice: \S+\n/.test(fm1), `shard frontmatter must carry device: ${fm1}`);
-    assert.equal((fm1.match(/^device: /gm) || []).length, 1, 'device must appear exactly once');
-    // The close-authority gate now requires --session-id on every apply (runApply's
-    // default seeds a throwaway authorized one), so the shard always carries a
-    // session_id — unlike the old legacy path where omitting it left the field absent.
-    assert.ok(/^session_id: \S+$/m.test(fm1), `shard frontmatter must carry a session_id: ${fm1}`);
-    // Post-apply lint stays clean with the extra fields (lint requires only title+type).
+    assert.ok(
+      fm1.startsWith(
+        `---\ntitle: Session Log ${today} (test-project)\ntype: session-log\nupdated: ${today}\n---\n`,
+      ),
+      `shard header must be exactly title, type, updated: ${fm1}`,
+    );
+    assert.equal((fm1.match(/^device: /gm) || []).length, 0, 'no device in the shard');
+    assert.equal((fm1.match(/^session_id: /gm) || []).length, 0, 'no session_id in the shard');
+    // Post-apply lint stays clean (lint requires only title+type).
     assert.equal(JSON.parse(r1.stdout).ok, true, `post-apply lint must be clean: ${r1.stdout}`);
 
     const r2 = runApply(dir, payload);
@@ -2121,7 +2130,7 @@ test('PRAC-17: daily shard seeds device frontmatter once + byte-equal on re-appl
   });
 });
 
-test('PRAC-17: --session-id seeds the session_id frontmatter line on the daily shard', () => {
+test('PRAC-17: --session-id does not reach the daily shard frontmatter', () => {
   withWiki(null, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
     payload.sessionLog = { entry: `## [${today}] prac17 session-id entry\n\nbody\n` };
@@ -2130,11 +2139,8 @@ test('PRAC-17: --session-id seeds the session_id frontmatter line on the daily s
     assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
     const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
     const fm = readFileSync(shard, 'utf-8');
-    assert.ok(
-      new RegExp(`^session_id: ${sid}$`, 'm').test(fm),
-      `shard frontmatter must carry the passed session_id: ${fm}`,
-    );
-    assert.ok(/^device: \S+$/m.test(fm), `device must still be present: ${fm}`);
+    assert.ok(!fm.includes(sid), `the session id must not be written into the shard: ${fm}`);
+    assert.ok(!/^session_id:/m.test(fm), `no session_id key: ${fm}`);
     assert.equal(JSON.parse(r.stdout).ok, true, `post-apply lint must be clean: ${r.stdout}`);
   });
 });
@@ -2183,7 +2189,7 @@ test('scope: index.jsonl device stamp is routed through currentDevice (HYPO_DEVI
   });
 });
 
-test('scope: daily shard device stamp is routed through currentDevice (HYPO_DEVICE honored)', () => {
+test('scope: HYPO_DEVICE does not reach the daily shard header', () => {
   withWiki(null, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
     payload.sessionLog = { entry: `## [${today}] scope device entry\n\nbody\n` };
@@ -2196,10 +2202,8 @@ test('scope: daily shard device stamp is routed through currentDevice (HYPO_DEVI
       assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
       const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
       const fm = readFileSync(shard, 'utf-8');
-      assert.ok(
-        /^device: dev-shard$/m.test(fm),
-        `currentDevice() must route the shard device stamp: ${fm}`,
-      );
+      assert.ok(!fm.includes('dev-shard'), `the device must not be stamped into the shard: ${fm}`);
+      assert.ok(!/^device:/m.test(fm), `no device key: ${fm}`);
     } finally {
       if (prev === undefined) delete process.env.HYPO_DEVICE;
       else process.env.HYPO_DEVICE = prev;
@@ -2207,26 +2211,28 @@ test('scope: daily shard device stamp is routed through currentDevice (HYPO_DEVI
   });
 });
 
-test('--hypo-dir isolation: overwrite fields land in the supplied dir', () => {
+test('--hypo-dir isolation: the entry and the overwrite field land in the supplied dir', () => {
   // run() forces HYPO_DIR='' in env, so any write that lands inside `dir` is
-  // proof --hypo-dir was honored. Use an overwrite field (sessionState) with a
+  // proof --hypo-dir was honored. Use the overwrite field (openQuestions) with a
   // unique sentinel — append fields are per-day deduped so they're a poor
   // isolation probe. An overwrite field only writes cleanly when its base is
   // observed and matches disk (FEAT-11 T4), so snapshot that base first under
   // the same session-id the apply uses — otherwise this hits base-unknown and
   // never exercises the isolation this test is actually about.
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestionsPage, (dir, today) => {
     const sid = 'isolation-probe-session';
-    snapshotBase(dir, sid, overwriteTargets('test-project'));
+    snapshotBase(dir, sid, baseTargets('test-project'));
     const sentinel = `<!-- isolation-probe-${Date.now()} -->`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = {
-      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
+    payload.openQuestions = {
+      content: `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\n${sentinel}\n`,
     };
     const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
-    const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    const onDisk = readFileSync(join(dir, PROJ_HOT_REL), 'utf-8');
     assert.ok(onDisk.includes(sentinel), 'sentinel must land in --hypo-dir, proving isolation');
+    const sessionsDir = join(dir, 'projects', 'test-project', 'sessions');
+    assert.equal(readdirSync(sessionsDir).length, 1, 'the entry must land in --hypo-dir too');
   });
 });
 
@@ -2263,32 +2269,37 @@ test('open-questions stale on disk → still passes (apply does not gate it)', (
   );
 });
 
-test('payload with stale `updated:` → exit 1, no auto-fix (advisor rule)', () => {
-  withWiki(null, (dir, today) => {
-    // The stale content must actually LAND on disk for verification to flag it,
-    // so the overwrite base must be observed and match disk first (FEAT-11 T4) —
-    // otherwise the write is refused as base-unknown before it ever gets stale.
-    const sid = 'stale-updated-session';
-    snapshotBase(dir, sid, overwriteTargets('test-project'));
-    const payload = payloadForCleanWiki(dir, today);
-    // Inject a stale-dated session-state. Helper must NOT silently rewrite it.
-    payload.sessionState = {
-      content:
+test('a stale session-state.md → exit 1, no auto-fix (advisor rule)', () => {
+  // A close writes none of the project's state files any more, so a state file that is stale
+  // stays stale and the final gate flags it: apply must NOT silently rewrite it.
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
         '---\ntitle: session-state\ntype: session-state\nupdated: 2020-01-01\n---\n\n## 다음 작업\n\n- next\n',
-    };
-    const r = runApply(dir, payload, { sessionId: sid });
-    assert.equal(
-      r.status,
-      1,
-      `stale payload must fail final gate, got status=${r.status}\n${r.stdout}`,
-    );
-    const out = JSON.parse(r.stdout);
-    assert.equal(out.ok, false);
-    assert.ok(
-      out.verification.stale.includes('projects/test-project/session-state.md'),
-      `stale field should be flagged: ${JSON.stringify(out.verification)}`,
-    );
-  });
+      );
+    },
+    (dir, today) => {
+      const r = runApply(dir, payloadForCleanWiki(dir, today));
+      assert.equal(
+        r.status,
+        1,
+        `a stale state file must fail the final gate, got status=${r.status}\n${r.stdout}`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false);
+      assert.ok(
+        out.verification.stale.includes('projects/test-project/session-state.md'),
+        `stale field should be flagged: ${JSON.stringify(out.verification)}`,
+      );
+      assert.ok(
+        readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8').includes(
+          'updated: 2020-01-01',
+        ),
+        'the stale file is left as it was',
+      );
+    },
+  );
 });
 
 test('missing payload → exit 1 with clear error', () => {
@@ -2858,21 +2869,31 @@ test('hashContent is stable and hashFile returns null for an absent file', () =>
   });
 });
 
-// The root `hot.md` is deliberately absent from both lists: a hook regenerates
-// it, so snapshotting it turned the hook's own rewrite into a foreign edit and
-// parked an untouched file. This assertion is the one that goes red if it is
-// ever put back without taking the regeneration out of the hooks first.
-test('overwriteTargets covers the three overwrite pages, omits root hot.md, and omits project pages with no project', () => {
-  assert.deepEqual(overwriteTargets('p1').sort(), [
+// The base store tracks any path it is handed. These tests exercise its mechanics on the
+// three pages a close once overwrote, which `overwriteTargets` no longer lists as a set.
+function baseTargets(project) {
+  return [
+    ...(project
+      ? [join('projects', project, 'hot.md'), join('projects', project, 'session-state.md')]
+      : []),
     join('pages', 'open-questions.md'),
-    join('projects', 'p1', 'hot.md'),
-    join('projects', 'p1', 'session-state.md'),
-  ]);
+  ];
+}
+
+// The root `hot.md` is deliberately absent: a hook regenerates it, so snapshotting it turned
+// the hook's own rewrite into a foreign edit and parked an untouched file. The project's
+// `hot.md` and `session-state.md` are gone from the list for the same kind of reason: a close
+// writes them nowhere (they are generated from the original entries), so no payload can drift
+// against a base for them. This assertion goes red if either comes back.
+test('overwriteTargets is open-questions.md only: no root hot.md and no project page, with or without a project', () => {
+  assert.deepEqual(overwriteTargets('p1'), [join('pages', 'open-questions.md')]);
   assert.deepEqual(overwriteTargets(null), [join('pages', 'open-questions.md')]);
   for (const project of ['p1', null]) {
+    const targets = overwriteTargets(project);
+    assert.ok(!targets.includes('hot.md'), 'the root pointer table must not be a snapshot target');
     assert.ok(
-      !overwriteTargets(project).includes('hot.md'),
-      'the root pointer table is hook-generated and must not be a snapshot target',
+      !targets.some((t) => t.startsWith(join('projects', 'p1'))),
+      'a project page is generated from entries and must not be a snapshot target',
     );
   }
 });
@@ -2880,7 +2901,7 @@ test('overwriteTargets covers the three overwrite pages, omits root hot.md, and 
 test('snapshotBase records a hash per target and an observed-absent target as null', () => {
   withBaseWiki((dir) => {
     rmSync(join(dir, 'pages', 'open-questions.md'));
-    const r = snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const r = snapshotBase(dir, 's1', baseTargets('p1'));
     assert.equal(r.created, true);
     const parsed = JSON.parse(readFileSync(bsBasePath(dir, 's1'), 'utf-8'));
     assert.equal(parsed.session_id, 's1');
@@ -2895,11 +2916,11 @@ test('snapshotBase records a hash per target and an observed-absent target as nu
 
 test('snapshotBase is existence-checked: a second call does not move the base (정합성 요건)', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const before = readBaseEntry(dir, 's1', OQ_REL).hash;
     // another session (or another machine's pull) rewrites the page
     writeFileSync(join(dir, OQ_REL), '# rewritten by someone else\n');
-    const r = snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const r = snapshotBase(dir, 's1', baseTargets('p1'));
     assert.equal(r.created, false);
     assert.equal(r.reason, 'already-snapshotted');
     assert.equal(
@@ -2912,13 +2933,13 @@ test('snapshotBase is existence-checked: a second call does not move the base (�
 
 test('snapshotBase late-enrolls a key a later call names that the first call never saw (ISSUE-100)', () => {
   // The motivating case: hypo-session-start.mjs's first SessionStart resolves
-  // no project from cwd (a MISS), so overwriteTargets(null) never names the
+  // no project from cwd (a MISS), so baseTargets(null) never names the
   // two project-scoped targets at all, not even as 'unknown'. A later
   // SessionStart with the SAME session_id (resume/compact) then resolves the
   // project and calls snapshotBase again with the full four-target list.
   withBaseWiki((dir) => {
     // First call: no project resolved, root-only targets.
-    const r1 = snapshotBase(dir, 's1', overwriteTargets(null));
+    const r1 = snapshotBase(dir, 's1', baseTargets(null));
     assert.equal(r1.created, true);
     assert.equal(
       readBaseEntry(dir, 's1', join('projects', 'p1', 'hot.md')).state,
@@ -2933,7 +2954,7 @@ test('snapshotBase late-enrolls a key a later call names that the first call nev
 
     // Second call, same session_id, project now resolved: enrolls the two
     // project-scoped targets, leaves the already-tracked root targets alone.
-    const r2 = snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const r2 = snapshotBase(dir, 's1', baseTargets('p1'));
     assert.equal(r2.created, false);
     assert.equal(r2.reason, 'enrolled');
     assert.deepEqual(
@@ -2955,8 +2976,8 @@ test('snapshotBase late-enrolls a key a later call names that the first call nev
 
 test('snapshotBase enrollment is itself existence-checked per key: a third call adds nothing new', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets(null));
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets(null));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     // This must be 'hash', not 'unknown', BEFORE the vacuous part of this test
     // below runs. Without it, disabling enrollment entirely also makes the
     // "adds nothing new" assertion pass (an always-unknown key never moves
@@ -2970,7 +2991,7 @@ test('snapshotBase enrollment is itself existence-checked per key: a third call 
     const before = readBaseEntry(dir, 's1', join('projects', 'p1', 'hot.md')).hash;
     // Someone edits the now-tracked project file before the next SessionStart.
     writeFileSync(join(dir, 'projects', 'p1', 'hot.md'), '# rewritten p1 hot\n');
-    const r3 = snapshotBase(dir, 's1', overwriteTargets('p1'));
+    const r3 = snapshotBase(dir, 's1', baseTargets('p1'));
     assert.equal(r3.reason, 'already-snapshotted');
     assert.equal(
       readBaseEntry(dir, 's1', join('projects', 'p1', 'hot.md')).hash,
@@ -2982,7 +3003,7 @@ test('snapshotBase enrollment is itself existence-checked per key: a third call 
 
 test('snapshotBase with no session id is a no-op', () => {
   withBaseWiki((dir) => {
-    const r = snapshotBase(dir, '', overwriteTargets('p1'));
+    const r = snapshotBase(dir, '', baseTargets('p1'));
     assert.equal(r.created, false);
     assert.equal(r.reason, 'no-session-id');
     assert.equal(existsSync(join(dir, '.cache', 'sessions')), false);
@@ -2992,7 +3013,7 @@ test('snapshotBase with no session id is a no-op', () => {
 test('readBaseEntry discriminates hash / absent / unknown so consumers cannot collapse them', () => {
   withBaseWiki((dir) => {
     rmSync(join(dir, 'pages', 'open-questions.md'));
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     assert.deepEqual(readBaseEntry(dir, 's1', join('pages', 'open-questions.md')), {
       state: 'absent',
       hash: null,
@@ -3033,7 +3054,7 @@ test('readBaseEntry treats a malformed base.json as unknown, not as unchanged', 
 // silently read-modify-write around it.
 test('an externally held base.json.lock blocks a mutator from moving the base, instead of writing around it (review r5-w3 major 1)', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const before = readBaseEntry(dir, 's1', OQ_REL).hash;
 
     // Publish a lock file the way withFileLock itself does (link target
@@ -3061,7 +3082,7 @@ test('an externally held base.json.lock blocks a mutator from moving the base, i
 
 test('advanceBase moves one target and no-ops when the session has no snapshot', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const next = bsHashContent('# written by this session\n');
     assert.equal(advanceBase(dir, 's1', OQ_REL, next), true);
     assert.equal(readBaseEntry(dir, 's1', OQ_REL).hash, next);
@@ -3076,7 +3097,7 @@ test('advanceBase moves one target and no-ops when the session has no snapshot',
 
 test('advanceBaseAndRecordApplied moves base and applied hash together', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const next = bsHashContent('# applied by this close\n');
     assert.equal(advanceBaseAndRecordApplied(dir, 's1', OQ_REL, next), true);
     assert.equal(readBaseEntry(dir, 's1', OQ_REL).hash, next);
@@ -3093,7 +3114,7 @@ test('advanceBaseAndRecordApplied fails safe: a write failure leaves BOTH fields
   // check exists to catch, except self-inflicted). A merged, single write must
   // either land both fields or move neither.
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const first = bsHashContent('# first apply\n');
     assert.equal(advanceBaseAndRecordApplied(dir, 's1', OQ_REL, first), true);
 
@@ -3133,7 +3154,7 @@ test('advanceBaseAndRecordApplied fails safe: a write failure leaves BOTH fields
 // The base moves to `second` while the applied hash stays at `first`.
 test('advanceBaseAndRecordApplied saves once: a failing second save cannot leave the base moved without its applied hash', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const first = bsHashContent('# first apply\n');
     assert.equal(advanceBaseAndRecordApplied(dir, 's1', OQ_REL, first), true);
 
@@ -3160,7 +3181,7 @@ test('advanceBaseAndRecordApplied saves once: a failing second save cannot leave
 
 test('advanceBaseForWrite advances a tracked target to its current on-disk bytes', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const oq = join(dir, 'pages', 'open-questions.md');
     writeFileSync(oq, '# open questions\n\n## edited directly by this session\n');
     assert.equal(advanceBaseForWrite(dir, 's1', join('pages', 'open-questions.md'), oq), true);
@@ -3183,7 +3204,7 @@ test('advanceBaseForWrite no-ops for an untracked path — it never mints a new 
   // never widen the guard's surface. Mutation target: dropping the hasOwnProperty
   // check makes this fail.
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const before = readFileSync(bsBasePath(dir, 's1'), 'utf-8');
     mkdirSync(join(dir, 'pages'), { recursive: true });
     const other = join(dir, 'pages', 'some-note.md');
@@ -3208,7 +3229,7 @@ test('advanceBaseForWrite no-ops with no session, no snapshot, or a vanished tar
       false,
     );
 
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const before = readBaseEntry(dir, 's1', join('pages', 'open-questions.md')).hash;
     rmSync(oq);
     // a tracked target that is absent post-write must NOT advance the base to
@@ -3226,7 +3247,7 @@ test('advanceBaseForWrite with a knownHash advances to it, ignoring on-disk byte
   // The Write race-safe path: the caller supplies the hash of the exact bytes the
   // tool wrote, so the base tracks those even if disk already drifted.
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     const oq = join(dir, 'pages', 'open-questions.md');
     writeFileSync(oq, '# a concurrent write already on disk\n');
     const intended = bsHashContent('# what my Write actually wrote\n');
@@ -3262,7 +3283,7 @@ test('recordObserved is a no-op when the session has no snapshot yet', () => {
 
 test('recordObserved is a no-op for a key outside targets (cannot widen the guard)', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     assert.equal(recordObserved(dir, 's1', 'not-a-target.md', bsHashContent('x')), false);
     const parsed = JSON.parse(readFileSync(bsBasePath(dir, 's1'), 'utf-8'));
     assert.equal(
@@ -3282,7 +3303,7 @@ test('recordObserved twice in one generation (hot + session-state) keeps both re
   // PROJECT-scoped hot.md, not the root one (the root only appears in the
   // MISS branch — see hypo-session-start.mjs:765).
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     beginObservedGeneration(dir, 's1');
     recordObserved(dir, 's1', join('projects', 'p1', 'hot.md'), bsHashContent('h'));
     recordObserved(dir, 's1', join('projects', 'p1', 'session-state.md'), bsHashContent('s'));
@@ -3296,7 +3317,7 @@ test('recordObserved twice in one generation (hot + session-state) keeps both re
 
 test('beginObservedGeneration expires an observation no later SessionStart refreshed', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     beginObservedGeneration(dir, 's1'); // generation 1
     recordObserved(dir, 's1', OQ_REL, bsHashContent('gen1'));
     assert.equal(readObservedHash(dir, 's1', OQ_REL), bsHashContent('gen1'));
@@ -3312,7 +3333,7 @@ test('beginObservedGeneration expires an observation no later SessionStart refre
 
 test('recordObserved(..., truncated=true) is stored but never licenses a write', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     beginObservedGeneration(dir, 's1');
     recordObserved(dir, 's1', OQ_REL, bsHashContent('sliced'), true);
     assert.equal(
@@ -3332,7 +3353,7 @@ test('recordObserved(..., truncated=true) is stored but never licenses a write',
 // way licenses exactly the observation the field exists to deny.
 test('a corrupt observed entry parks instead of licensing (truncated is not a strict boolean)', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     beginObservedGeneration(dir, 's1');
     const disk = 'bytes on disk';
     recordObserved(dir, 's1', OQ_REL, bsHashContent(disk), false);
@@ -3369,7 +3390,7 @@ test('a corrupt observed entry parks instead of licensing (truncated is not a st
 
 test('recordObserved defaults truncated to false when the caller omits it', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     beginObservedGeneration(dir, 's1');
     recordObserved(dir, 's1', OQ_REL, bsHashContent('full'));
     assert.equal(readObservedHash(dir, 's1', OQ_REL), bsHashContent('full'));
@@ -3379,7 +3400,7 @@ test('recordObserved defaults truncated to false when the caller omits it', () =
 
 test('wasObservedTruncated goes false, not true, once a later generation expires the entry', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     beginObservedGeneration(dir, 's1');
     recordObserved(dir, 's1', OQ_REL, bsHashContent('sliced'), true);
     beginObservedGeneration(dir, 's1'); // a later SessionStart, injecting nothing this time
@@ -3401,7 +3422,7 @@ test('readObservedHash refuses when observedGeneration was never created, regard
   // would match a "current generation" of 0 and license a write despite the
   // counter that is supposed to gate it never having been created at all.
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1'));
+    snapshotBase(dir, 's1', baseTargets('p1'));
     recordObserved(dir, 's1', OQ_REL, bsHashContent('h')); // no beginObservedGeneration call
     const parsed = JSON.parse(readFileSync(bsBasePath(dir, 's1'), 'utf-8'));
     assert.equal(parsed.observedGeneration, undefined, 'no beginObservedGeneration call ran');
@@ -3420,7 +3441,7 @@ test('readObservedHash refuses when observedGeneration was never created, regard
 
 test('a legacy base.json (no observed/observedGeneration) reads exactly as before ISSUE-116', () => {
   withBaseWiki((dir) => {
-    snapshotBase(dir, 's1', overwriteTargets('p1')); // writes the pre-ISSUE-116 shape
+    snapshotBase(dir, 's1', baseTargets('p1')); // writes the pre-ISSUE-116 shape
     assert.equal(
       readObservedHash(dir, 's1', OQ_REL),
       null,
@@ -3757,7 +3778,7 @@ test('snapshotBase records the knownHashes value, not a fresh disk read, forcing
 
     // Root-only snapshot first, exactly like hypo-session-start.mjs's own
     // sequencing, so this call below takes the "enroll" branch, not "create".
-    snapshotBase(dir, 's-race', overwriteTargets(null));
+    snapshotBase(dir, 's-race', baseTargets(null));
 
     // T2: the caller enrolls the target it read at T0, passing the hash of
     // the bytes it actually showed (hashA): never re-deriving it from disk,
@@ -3856,23 +3877,27 @@ suite('crystallize.mjs — overwrite observed-base guard (FEAT-11 T4)');
 
 const T4_PROJECT = 'test-project';
 
-const t4ProjectHot = (dir) => join(dir, 'projects', T4_PROJECT, 'hot.md');
+// The one whole-file overwrite target a close payload still carries. These tests used to aim at
+// the project's hot.md, which a close no longer writes (it is generated from the entries).
+const t4Rel = join('pages', 'open-questions.md');
 
-const t4Rel = join('projects', T4_PROJECT, 'hot.md');
+const t4ProjectHot = (dir) => join(dir, t4Rel);
+
+// A `withWiki` mutate step: the target page exists and is committed before the close. Same
+// bytes the project hot.md fixture has.
+const t4Seed = seedOpenQuestionsPage;
 
 /**
- * An apply payload whose sessionState / rootHot mirror disk (so they hit the
- * idempotent skip and stay out of the way) and whose projectHot carries
- * `projectHotContent` — the single target each T4 test exercises.
+ * An apply payload (summary only, no track) whose openQuestions carries `targetContent`, the
+ * single target each T4 test exercises. Every close also writes its own entry.
  */
-function t4Payload(dir, today, projectHotContent, tag) {
+function t4Payload(dir, today, targetContent, tag) {
   return {
     project: T4_PROJECT,
     date: today,
-    sessionState: {
-      content: readFileSync(join(dir, 'projects', T4_PROJECT, 'session-state.md'), 'utf-8'),
-    },
-    projectHot: { content: projectHotContent },
+    summary: `T4 close: ${tag}`,
+    tracks: [],
+    openQuestions: { content: targetContent },
     rootHot: { content: readFileSync(join(dir, 'hot.md'), 'utf-8') },
     sessionLog: { entry: `## [${today}] ${tag}\n` },
     log: { entry: `## [${today}] session | ${T4_PROJECT} — ${tag}\n` },
@@ -3903,8 +3928,8 @@ function t4Apply(dir, payload, sessionId) {
 }
 
 test('base matches disk → direct write, no conflict, and the base advances', () => {
-  withWiki(null, (dir, today) => {
-    snapshotBase(dir, 's-clean', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir, today) => {
+    snapshotBase(dir, 's-clean', baseTargets(T4_PROJECT));
     const next = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nthis session wrote this.\n`;
     const { out } = t4Apply(dir, t4Payload(dir, today, next, 'clean write'), 's-clean');
 
@@ -3919,8 +3944,8 @@ test('base matches disk → direct write, no conflict, and the base advances', (
 });
 
 test('base snapshotted, then another session writes the page → conflict, target untouched', () => {
-  withWiki(null, (dir, today) => {
-    snapshotBase(dir, 's-conf', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir, today) => {
+    snapshotBase(dir, 's-conf', baseTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
     const otherSession = `${observed}\nthe OTHER session wrote this.\n`;
     writeFileSync(t4ProjectHot(dir), otherSession);
@@ -3950,7 +3975,7 @@ test('session-id present but NO snapshot → fail-safe conflict (base-unknown, n
   // Guards the discriminated union. `readBaseEntry` returns hash:null for BOTH
   // observed-absent and never-observed; a consumer branching on `if (!entry.hash)`
   // would treat never-observed as safe-to-write and silently defeat the gate.
-  withWiki(null, (dir, today) => {
+  withWiki(t4Seed, (dir, today) => {
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
     const mine = `${observed}\nwritten with no base on record.\n`;
     const { r, out } = t4Apply(dir, t4Payload(dir, today, mine, 'no base'), 's-nobase');
@@ -4242,7 +4267,7 @@ test('sectionLossReason: an unclosed fence running to EOF is treated as outside,
 });
 
 test('ISSUE-76 c3: an overwrite that drops most of the current sections parks, and restructure:true does not get it out', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(t4Seed, (dir, today) => {
     const base = readFileSync(t4ProjectHot(dir), 'utf-8');
     const multiTrack = `${base}\n## Track A\nnote A\n\n## Track B\nnote B\n\n## Track C\nnote C\n`;
     writeFileSync(t4ProjectHot(dir), multiTrack);
@@ -4250,7 +4275,7 @@ test('ISSUE-76 c3: an overwrite that drops most of the current sections parks, a
     // sees no drift at all — this test isolates the section-loss guard (step 3)
     // from the base-conflict guard (step 2), exactly as the real incident did
     // (a clean, unopposed overwrite that still threw sections away).
-    snapshotBase(dir, 's-loss', overwriteTargets(T4_PROJECT));
+    snapshotBase(dir, 's-loss', baseTargets(T4_PROJECT));
 
     const onlyTrackA = `${base}\n## Track A\nnote A, updated this session\n`;
     const { r, out } = t4Apply(
@@ -4297,7 +4322,7 @@ test('ISSUE-76 c3: an overwrite that drops most of the current sections parks, a
     // assertions below are deliberately the opposite of what they used to be:
     // the retry parks too, and the flag changes only which reason is recorded.
     const payloadWithClaim = t4Payload(dir, today, onlyTrackA, 'deliberate consolidation');
-    payloadWithClaim.projectHot.restructure = true;
+    payloadWithClaim.openQuestions.restructure = true;
     const { r: r2, out: out2 } = t4Apply(dir, payloadWithClaim, 's-loss');
 
     assert.notEqual(r2.status, 0, `restructure:true must NOT let the write through: ${r2.stderr}`);
@@ -4357,14 +4382,14 @@ test('every park reason names the approval step without the npm-only bin', () =>
 });
 
 test('restructureWaivers stays empty when restructure:true is set on a field that never had a loss to waive', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(t4Seed, (dir, today) => {
     // Ordinary edit, no section dropped at all: `restructure: true` is set but
     // has nothing to waive, so it must add no entry (a `true` flag alone is
     // not evidence of a real waiver).
-    snapshotBase(dir, 's-noop-waiver', overwriteTargets(T4_PROJECT));
+    snapshotBase(dir, 's-noop-waiver', baseTargets(T4_PROJECT));
     const onDisk = readFileSync(t4ProjectHot(dir), 'utf-8');
     const payload = t4Payload(dir, today, `${onDisk}\nadded, nothing dropped\n`, 'no-op flag');
-    payload.projectHot.restructure = true;
+    payload.openQuestions.restructure = true;
     const { out } = t4Apply(dir, payload, 's-noop-waiver');
 
     assert.deepEqual(out.conflicts, []);
@@ -4381,14 +4406,14 @@ test('idempotent-first: payload equals disk → no write, no conflict, even with
   // read their payload straight off disk and carry no base, so they only stay green
   // while the idempotent skip runs BEFORE the base check. It also breaks the
   // apply-then-reclose loop: after a human applies a proposal, disk == payload.
-  withWiki(null, (dir, today) => {
+  withWiki(t4Seed, (dir, today) => {
     const onDisk = readFileSync(t4ProjectHot(dir), 'utf-8');
     const { out } = t4Apply(dir, t4Payload(dir, today, onDisk, 'idempotent'), 's-idem');
 
     assert.deepEqual(out.conflicts, [], 'identical bytes are not a conflict');
     assert.ok(
-      out.skipped.some((s) => s.includes('projectHot')),
-      `projectHot must be skipped as already-current: ${JSON.stringify(out.skipped)}`,
+      out.skipped.some((s) => s.includes('openQuestions')),
+      `openQuestions must be skipped as already-current: ${JSON.stringify(out.skipped)}`,
     );
     assert.equal(readFileSync(t4ProjectHot(dir), 'utf-8'), onDisk);
   });
@@ -4407,8 +4432,8 @@ test('same session closing twice does not raise a false-positive against its own
   // second apply — exactly the evidence a real second close of the same
   // session would carry. The base-store invariant this test pins (self-conflict
   // without advanceBase) is otherwise untouched.
-  withWiki(null, (dir, today) => {
-    snapshotBase(dir, 's-twice', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir, today) => {
+    snapshotBase(dir, 's-twice', baseTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
 
     const cleanupTranscript = seedCloseTranscript('s-twice');
@@ -4450,8 +4475,8 @@ test('no --session-id → apply is refused before any write (no legacy escape ha
   // BEFORE any wiki write or commit, and refuses outright when --session-id is
   // absent. A caller can no longer opt out of the base-store guard by omitting
   // the flag; that omission is itself the thing that gets refused.
-  withWiki(null, (dir, today) => {
-    snapshotBase(dir, 's-unused', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir, today) => {
+    snapshotBase(dir, 's-unused', baseTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
     const otherWrote = `${observed}\nsomeone else.\n`;
     writeFileSync(t4ProjectHot(dir), otherWrote);
@@ -4496,36 +4521,48 @@ test('a conflicted close registers no pending tags — no silent SCHEMA.md side 
   };
 
   // control: a clean close DOES register the tag
-  withWiki(seedUnknownTag, (dir, today) => {
-    snapshotBase(dir, 's-tag-ok', overwriteTargets(T4_PROJECT));
-    const next = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nclean.\n`;
-    t4Apply(dir, t4Payload(dir, today, next, 'tag control'), 's-tag-ok');
-    assert.ok(
-      readFileSync(join(dir, 'SCHEMA.md'), 'utf-8').includes('zzz-unregistered-tag'),
-      'control arm must actually register, else the assertion below is vacuous',
-    );
-  });
+  withWiki(
+    (d, t) => {
+      seedUnknownTag(d, t);
+      t4Seed(d, t);
+    },
+    (dir, today) => {
+      snapshotBase(dir, 's-tag-ok', baseTargets(T4_PROJECT));
+      const next = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nclean.\n`;
+      t4Apply(dir, t4Payload(dir, today, next, 'tag control'), 's-tag-ok');
+      assert.ok(
+        readFileSync(join(dir, 'SCHEMA.md'), 'utf-8').includes('zzz-unregistered-tag'),
+        'control arm must actually register, else the assertion below is vacuous',
+      );
+    },
+  );
 
   // conflicted close: registers nothing
-  withWiki(seedUnknownTag, (dir, today) => {
-    snapshotBase(dir, 's-tag-conf', overwriteTargets(T4_PROJECT));
-    const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
-    writeFileSync(t4ProjectHot(dir), `${observed}\nthe OTHER session.\n`);
-    const schemaBefore = readFileSync(join(dir, 'SCHEMA.md'), 'utf-8');
+  withWiki(
+    (d, t) => {
+      seedUnknownTag(d, t);
+      t4Seed(d, t);
+    },
+    (dir, today) => {
+      snapshotBase(dir, 's-tag-conf', baseTargets(T4_PROJECT));
+      const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
+      writeFileSync(t4ProjectHot(dir), `${observed}\nthe OTHER session.\n`);
+      const schemaBefore = readFileSync(join(dir, 'SCHEMA.md'), 'utf-8');
 
-    const { out } = t4Apply(
-      dir,
-      t4Payload(dir, today, `${observed}\nmine.\n`, 'tag'),
-      's-tag-conf',
-    );
+      const { out } = t4Apply(
+        dir,
+        t4Payload(dir, today, `${observed}\nmine.\n`, 'tag'),
+        's-tag-conf',
+      );
 
-    assert.equal(out.conflicts.length, 1, 'fixture must actually conflict');
-    assert.equal(
-      readFileSync(join(dir, 'SCHEMA.md'), 'utf-8'),
-      schemaBefore,
-      'a withheld close must not mutate SCHEMA.md behind the caller’s back',
-    );
-  });
+      assert.equal(out.conflicts.length, 1, 'fixture must actually conflict');
+      assert.equal(
+        readFileSync(join(dir, 'SCHEMA.md'), 'utf-8'),
+        schemaBefore,
+        'a withheld close must not mutate SCHEMA.md behind the caller’s back',
+      );
+    },
+  );
 });
 
 // ── FEAT-11 self-edit provenance seam (PostToolUse → crystallize) ────────────
@@ -4558,8 +4595,8 @@ function runAutoStageHook(dir, sessionId, filePath, toolName = 'Edit', content =
 }
 
 test('session directly edits a target, the hook advances its base, close writes cleanly', () => {
-  withWiki(null, (dir, today) => {
-    snapshotBase(dir, 's-selfedit', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir, today) => {
+    snapshotBase(dir, 's-selfedit', baseTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
 
     // the session edits the target itself, mid-session, with the Edit tool
@@ -4591,8 +4628,8 @@ test('session directly edits a target, the hook advances its base, close writes 
 test('control: WITHOUT the hook the very same flow self-conflicts (bug reproduced)', () => {
   // Proves the hook subprocess is what prevents the conflict. Identical to the
   // test above except the auto-stage step is omitted, so the base never advances.
-  withWiki(null, (dir, today) => {
-    snapshotBase(dir, 's-noprov', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir, today) => {
+    snapshotBase(dir, 's-noprov', baseTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
 
     const edited = `${observed}\ndirectly edited by this session.\n`;
@@ -4616,8 +4653,8 @@ test('control: WITHOUT the hook the very same flow self-conflicts (bug reproduce
 test('the hook does not advance the base for a write to a non-target wiki page', () => {
   // Scoping across the real process boundary: a Write/Edit to an ordinary wiki
   // page must not touch base.json, so the hook cannot widen the guard's surface.
-  withWiki(null, (dir) => {
-    snapshotBase(dir, 's-scope', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir) => {
+    snapshotBase(dir, 's-scope', baseTargets(T4_PROJECT));
     const before = readFileSync(bsBasePath(dir, 's-scope'), 'utf-8');
     mkdirSync(join(dir, 'pages'), { recursive: true });
     const note = join(dir, 'pages', 'a-random-note.md');
@@ -4638,8 +4675,8 @@ test('a NON-write tool (Read) on a drifted target must NOT advance the base', ()
   // advanced the base, merely LOOKING at a page another session wrote would adopt
   // that other session's bytes as ours, and the close would clobber it with no
   // conflict. Only Write/Edit/MultiEdit may advance.
-  withWiki(null, (dir, today) => {
-    snapshotBase(dir, 's-read', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir, today) => {
+    snapshotBase(dir, 's-read', baseTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
     const otherSession = `${observed}\nthe OTHER session wrote this.\n`;
     writeFileSync(t4ProjectHot(dir), otherSession); // B's write drifts disk from base
@@ -4672,8 +4709,8 @@ test('a Write advances the base to the bytes it wrote, not a racy disk re-read',
   // Simulated by handing the hook a payload whose content differs from the bytes
   // currently on disk (as if a concurrent write landed in between). The base must
   // track the payload content, so a close still detects the concurrent bytes.
-  withWiki(null, (dir) => {
-    snapshotBase(dir, 's-write', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir) => {
+    snapshotBase(dir, 's-write', baseTargets(T4_PROJECT));
     const myContent = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\nwhat THIS session's Write wrote.\n`;
     const raced = `${readFileSync(t4ProjectHot(dir), 'utf-8')}\na concurrent write that landed first.\n`;
     writeFileSync(t4ProjectHot(dir), raced); // disk != my Write's content
@@ -4709,6 +4746,7 @@ function withObservedProject(fn) {
   try {
     withWiki(
       (dir, today) => {
+        t4Seed(dir, today);
         writeFileSync(
           join(dir, 'projects', T4_PROJECT, 'index.md'),
           `---\ntitle: ${T4_PROJECT}\ntype: project-index\nupdated: ${today}\nworking_dir: "${work}"\n---\n# ${T4_PROJECT}\n`,
@@ -4721,7 +4759,12 @@ function withObservedProject(fn) {
   }
 }
 
-test('AC1: resume that injected the drifted content unparks the target at close', () => {
+// What a close still overwrites is `pages/open-questions.md`, which SessionStart never injects.
+// The tests below that chain "resume injects the page, close writes it" therefore record the
+// observation the way an injection would (`recordObserved` with the shown bytes' hash) after the
+// real resume, and keep the real SessionStart for the generation bump and the base enrollment.
+
+test('AC1: a resume that observed the drifted content unparks the target at close', () => {
   withObservedProject((dir, today, work) => {
     let r = runHook(
       'hypo-session-start.mjs',
@@ -4739,14 +4782,15 @@ test('AC1: resume that injected the drifted content unparks the target at close'
     spawnSync('git', ['-C', dir, 'add', '-A']);
     spawnSync('git', ['-C', dir, 'commit', '-m', 'other session'], { cwd: dir });
 
-    // Resume: SAME session_id, so the base must not move (existence-check), but
-    // the injection this run performs records the drifted bytes as observed.
+    // Resume: SAME session_id, so the base must not move (existence-check); the
+    // session is then shown the drifted bytes, which the observed set records.
     r = runHook(
       'hypo-session-start.mjs',
       { cwd: work, session_id: 'ac1-sess', source: 'resume' },
       { HYPO_DIR: dir },
     );
     assert.equal(r.status, 0, `resume SessionStart stderr: ${r.stderr}`);
+    assert.equal(recordObserved(dir, 'ac1-sess', t4Rel, bsHashContent(drifted)), true);
     assert.equal(
       readBaseEntry(dir, 'ac1-sess', t4Rel).hash,
       baseBefore,
@@ -4768,8 +4812,8 @@ test('AC1: resume that injected the drifted content unparks the target at close'
 test('AC5: a committed external write, with no resume in between, still parks (a commit is not a licence)', () => {
   // The axis the spec explicitly rejects as a licence (커밋 결합): pins that a
   // commit by itself never substitutes for an actual SessionStart observation.
-  withWiki(null, (dir, today) => {
-    snapshotBase(dir, 's-committed', overwriteTargets(T4_PROJECT));
+  withWiki(t4Seed, (dir, today) => {
+    snapshotBase(dir, 's-committed', baseTargets(T4_PROJECT));
     const observed = readFileSync(t4ProjectHot(dir), 'utf-8');
     const otherSession = `${observed}\nthe OTHER session wrote AND committed this.\n`;
     writeFileSync(t4ProjectHot(dir), otherSession);
@@ -4839,6 +4883,15 @@ test('a resumed drift that arrived AFTER the observing SessionStart still parks 
       { HYPO_DIR: dir },
     );
     assert.equal(r.status, 0, `resume stderr: ${r.stderr}`);
+    assert.equal(
+      recordObserved(
+        dir,
+        'resid2-sess',
+        t4Rel,
+        bsHashContent(readFileSync(t4ProjectHot(dir), 'utf-8')),
+      ),
+      true,
+    );
     assert.ok(
       readObservedHash(dir, 'resid2-sess', t4Rel),
       'the resume must have recorded an observation to begin with',
@@ -4875,7 +4928,9 @@ test('a SessionStart that injects nothing this generation expires a prior observ
   // real hook process boundary: `beginObservedGeneration`'s call site in
   // hypo-session-start.mjs, not a direct base-store call, is what must bump
   // the generation on every SessionStart — deleting that call site left this
-  // green (readObservedHash's generation compare then always matches).
+  // green (readObservedHash's generation compare then always matches). The
+  // page is never injected by this hook any more, so every resume here is an
+  // injection-free one for it.
   withObservedProject((dir, today, work) => {
     let r = runHook(
       'hypo-session-start.mjs',
@@ -4889,29 +4944,19 @@ test('a SessionStart that injects nothing this generation expires a prior observ
     spawnSync('git', ['-C', dir, 'add', '-A']);
     spawnSync('git', ['-C', dir, 'commit', '-m', 'other session'], { cwd: dir });
 
+    assert.equal(recordObserved(dir, 'expire-sess', t4Rel, bsHashContent(drifted)), true);
+    assert.equal(
+      readObservedHash(dir, 'expire-sess', t4Rel),
+      bsHashContent(drifted),
+      'the observation must be live before the next SessionStart',
+    );
+
     r = runHook(
       'hypo-session-start.mjs',
       { cwd: work, session_id: 'expire-sess', source: 'resume' },
       { HYPO_DIR: dir },
     );
     assert.equal(r.status, 0, `resume stderr: ${r.stderr}`);
-    assert.equal(
-      readObservedHash(dir, 'expire-sess', t4Rel),
-      bsHashContent(drifted),
-      'resume must have observed the drift',
-    );
-
-    // Hide the target from injection so the NEXT SessionStart shows this
-    // session nothing for it — the injection-free resume the expiry
-    // mechanism must expire the prior observation over.
-    writeFileSync(join(dir, '.hypoignore'), `${t4Rel}\n`);
-
-    r = runHook(
-      'hypo-session-start.mjs',
-      { cwd: work, session_id: 'expire-sess', source: 'resume' },
-      { HYPO_DIR: dir },
-    );
-    assert.equal(r.status, 0, `second resume stderr: ${r.stderr}`);
     assert.equal(
       readObservedHash(dir, 'expire-sess', t4Rel),
       null,
@@ -4985,6 +5030,7 @@ test('a truncated injection is stored but never licenses a close-time write (end
       { HYPO_DIR: dir },
     );
     assert.equal(r.status, 0, `resume stderr: ${r.stderr}`);
+    assert.equal(recordObserved(dir, 'trunc-sess', t4Rel, bsHashContent(big), true), true);
     assert.equal(
       readObservedHash(dir, 'trunc-sess', t4Rel),
       null,
@@ -6082,47 +6128,45 @@ test('ISSUE-49: no hook invokes an apply path — approval is a human’s, never
 // must be able to finish without ever re-running as Y.
 suite('close handoff receipt — resolve credits the ORIGINATING close');
 
-// Builds a wiki whose project hot.md carries 3 `## Track` sections (needed to
-// trip the section-loss guard for real) and returns the payload pieces every
-// test in this suite shares.
+// Builds a wiki whose open-questions page (the one page a payload still overwrites) carries 3
+// `## Track` sections (needed to trip the section-loss guard for real) and returns the payload
+// pieces every test in this suite shares.
+const HANDOFF_TARGET = join('pages', 'open-questions.md');
+
 function mutateThreeTrackHot(dir, today) {
+  mkdirSync(join(dir, 'pages'), { recursive: true });
   writeFileSync(
-    join(dir, 'projects', 'test-project', 'hot.md'),
+    join(dir, HANDOFF_TARGET),
     `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n` +
       `# Hot\n\n## Track A\n\nnote A\n\n## Track B\n\nnote B\n\n## Track C\n\nnote C\n`,
   );
 }
 
-function parkingPayload(dir, today, { sibling = true } = {}) {
-  const sessionStatePath = join(dir, 'projects', 'test-project', 'session-state.md');
+function parkingPayload(dir, today) {
   const payload = payloadForCleanWiki(dir, today);
   // Drops Track B and Track C: a real section-loss trip, marked deliberate —
   // exactly the shape that now reaches this path from ANY close, not just a
   // base conflict.
-  payload.projectHot = {
+  payload.openQuestions = {
     content:
       `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n` +
       `# Hot\n\n## Track A\n\nnote A (updated)\n`,
     restructure: true,
   };
-  if (sibling) {
-    // A field this SAME close writes directly (no conflict): the bug's other
-    // half — a normal direct write left dirty by a partially-parked close.
-    payload.sessionState = {
-      content: `${readFileSync(sessionStatePath, 'utf-8')}- handoff sibling\n`,
-    };
-  }
   return payload;
 }
 
 // Every direct write a first (parked) close attempt leaves uncommitted,
 // beyond the parked target itself — observed from a real run, not assumed:
-// the project index gets auto-created on a project's first close, and the two
-// append fields always write a fresh entry. All four must land in the SAME
-// commit as the handed-off park once X's reclose finishes.
-function siblingRelPaths(today) {
+// the close's own original entry, the project index (auto-created on a project's first
+// close), and the two append fields. All four must land in the SAME commit as the
+// handed-off park once X's reclose finishes.
+function siblingRelPaths(dir, today) {
+  const sessionsDir = join(dir, 'projects', 'test-project', 'sessions');
+  const entries = readdirSync(sessionsDir).filter((f) => f.endsWith('.md'));
+  assert.equal(entries.length, 1, `the first close wrote exactly one entry: ${entries}`);
   return [
-    join('projects', 'test-project', 'session-state.md'),
+    join('projects', 'test-project', 'sessions', entries[0]),
     join('projects', 'test-project', 'index.md'),
     join('projects', 'test-project', 'session-log', `${today}.md`),
     'log.md',
@@ -6136,10 +6180,9 @@ test("handoff receipt: Y resolves the park X parked; X's reclose commits it and 
     // sees "base unknown" and parks on THAT before section-loss is ever
     // reached (T6's own park test relies on the opposite — no snapshot — to
     // hit the base-conflict branch instead).
-    snapshotBase(dir, sidX, overwriteTargets('test-project'));
+    snapshotBase(dir, sidX, baseTargets('test-project'));
 
-    const projHotPath = join(dir, 'projects', 'test-project', 'hot.md');
-    const sessionStatePath = join(dir, 'projects', 'test-project', 'session-state.md');
+    const projHotPath = join(dir, HANDOFF_TARGET);
     const originalProjHot = readFileSync(projHotPath, 'utf-8');
     const payload = parkingPayload(dir, today);
 
@@ -6151,10 +6194,11 @@ test("handoff receipt: Y resolves the park X parked; X's reclose commits it and 
     assert.equal(out1.partialConflict, true, `partialConflict expected: ${r1.stdout}`);
     assert.equal(out1.proposals.length, 1, `exactly one park: ${JSON.stringify(out1.proposals)}`);
     const proposalId = out1.proposals[0].id;
-    assert.equal(out1.proposals[0].target, join('projects', 'test-project', 'hot.md'));
-    assert.ok(
-      readFileSync(sessionStatePath, 'utf-8').includes('handoff sibling'),
-      'the non-conflicting sibling field was written directly, uncommitted',
+    assert.equal(out1.proposals[0].target, HANDOFF_TARGET);
+    assert.equal(
+      siblingRelPaths(dir, today).filter((p) => /sessions\//.test(p)).length,
+      1,
+      'the non-conflicting sibling (the close entry) was written directly, uncommitted',
     );
     assert.equal(
       readFileSync(projHotPath, 'utf-8'),
@@ -6210,7 +6254,7 @@ test("handoff receipt: Y resolves the park X parked; X's reclose commits it and 
     assert.equal(rResolve.ok, true, `resolve should apply: ${JSON.stringify(rResolve)}`);
     assert.equal(
       readFileSync(projHotPath, 'utf-8'),
-      payload.projectHot.content,
+      payload.openQuestions.content,
       'the approved bytes landed on the page',
     );
     assert.equal(psReadProposal(dir, proposalId), null, 'the artifact is consumed');
@@ -6218,8 +6262,8 @@ test("handoff receipt: Y resolves the park X parked; X's reclose commits it and 
     // The receipt lands in X's journal, never Y's.
     const journalX = readJournal(dir, sidX);
     assert.equal(
-      journalX[join('projects', 'test-project', 'hot.md')],
-      bsHashContent(payload.projectHot.content),
+      journalX[HANDOFF_TARGET],
+      bsHashContent(payload.openQuestions.content),
       "X's journal carries the handoff receipt for the resolved target",
     );
     assert.equal(
@@ -6249,7 +6293,7 @@ test("handoff receipt: Y resolves the park X parked; X's reclose commits it and 
       .split('\n')
       .filter(Boolean)
       .sort();
-    const expected = [join('projects', 'test-project', 'hot.md'), ...siblingRelPaths(today)].sort();
+    const expected = [HANDOFF_TARGET, ...siblingRelPaths(dir, today)].sort();
     assert.deepEqual(
       changed,
       expected,
@@ -6279,9 +6323,9 @@ test("handoff receipt: Y resolves the park X parked; X's reclose commits it and 
 test('handoff receipt: a hand-edit after resolve is not stage-able by hash, and stays dirty', () => {
   withWiki(mutateThreeTrackHot, (dir, today) => {
     const sidX = 's-handoff-edit-x';
-    snapshotBase(dir, sidX, overwriteTargets('test-project'));
-    const projHotPath = join(dir, 'projects', 'test-project', 'hot.md');
-    const payload = parkingPayload(dir, today, { sibling: false });
+    snapshotBase(dir, sidX, baseTargets('test-project'));
+    const projHotPath = join(dir, HANDOFF_TARGET);
+    const payload = parkingPayload(dir, today);
 
     const r1 = runApply(dir, payload, { sessionId: sidX });
     assert.notEqual(r1.status, 0);
@@ -6323,15 +6367,11 @@ test('handoff receipt: a hand-edit after resolve is not stage-able by hash, and 
       'the hand-edited bytes are preserved, not clobbered by the payload',
     );
     assert.equal(
-      spawnSync(
-        'git',
-        ['status', '--porcelain', '--', join('projects', 'test-project', 'hot.md')],
-        {
-          cwd: dir,
-          encoding: 'utf-8',
-        },
-      ).stdout.trim(),
-      'M ' + join('projects', 'test-project', 'hot.md'),
+      spawnSync('git', ['status', '--porcelain', '--', HANDOFF_TARGET], {
+        cwd: dir,
+        encoding: 'utf-8',
+      }).stdout.trim(),
+      'M ' + HANDOFF_TARGET,
       'the hand-edited page stays dirty; the reclose never staged it',
     );
   });
@@ -6343,9 +6383,9 @@ test('handoff receipt: a hand-edit after resolve is not stage-able by hash, and 
 test('handoff receipt failure: resolve refuses close-receipt-failed and keeps the artifact + audit; reconcile recovers it', () => {
   withWiki(mutateThreeTrackHot, (dir, today) => {
     const sidX = 's-handoff-fail-x';
-    snapshotBase(dir, sidX, overwriteTargets('test-project'));
-    const projHotPath = join(dir, 'projects', 'test-project', 'hot.md');
-    const payload = parkingPayload(dir, today, { sibling: false });
+    snapshotBase(dir, sidX, baseTargets('test-project'));
+    const projHotPath = join(dir, HANDOFF_TARGET);
+    const payload = parkingPayload(dir, today);
 
     const r1 = runApply(dir, payload, { sessionId: sidX });
     assert.notEqual(r1.status, 0);
@@ -6390,7 +6430,7 @@ test('handoff receipt failure: resolve refuses close-receipt-failed and keeps th
     );
     assert.equal(
       readFileSync(projHotPath, 'utf-8'),
-      payload.projectHot.content,
+      payload.openQuestions.content,
       'the approved bytes still landed on the page — this is a bookkeeping failure, not a write failure',
     );
     assert.ok(
@@ -6403,7 +6443,7 @@ test('handoff receipt failure: resolve refuses close-receipt-failed and keeps th
     const auditEntry = JSON.parse(logLines[logLines.length - 1]);
     assert.equal(auditEntry.id, proposalId, 'the audit entry for this write survives too');
     assert.equal(auditEntry.closeSessionId, sidX);
-    assert.equal(auditEntry.appliedHash, bsHashContent(payload.projectHot.content));
+    assert.equal(auditEntry.appliedHash, bsHashContent(payload.openQuestions.content));
 
     // Already unblocked above; recover the receipt without touching the page at all.
     const beforeReconcile = readFileSync(projHotPath, 'utf-8');
@@ -6423,8 +6463,8 @@ test('handoff receipt failure: resolve refuses close-receipt-failed and keeps th
       'reconcile removes the now-redundant artifact',
     );
     assert.equal(
-      readJournal(dir, sidX)[join('projects', 'test-project', 'hot.md')],
-      bsHashContent(payload.projectHot.content),
+      readJournal(dir, sidX)[HANDOFF_TARGET],
+      bsHashContent(payload.openQuestions.content),
       "X's journal now carries the recovered receipt",
     );
 

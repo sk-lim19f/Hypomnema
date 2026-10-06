@@ -18,6 +18,7 @@ import {
   rmSync,
   statSync,
   readdirSync,
+  chmodSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -25,11 +26,26 @@ import { pathToFileURL } from 'node:url';
 import { snapshotBase, overwriteTargets, advanceBaseForWrite } from '../hooks/base-store.mjs';
 import { closeGatePath, closeGateStatus } from '../hooks/close-gate-store.mjs';
 import { readJournal } from '../hooks/close-journal.mjs';
-import { closeIdFor } from '../hooks/session-entries.mjs';
+import {
+  GITATTRIBUTES_BLOCK,
+  closeIdFor,
+  formatSessionEntry,
+  parseSessionEntry,
+  renderViews,
+  trackHeads,
+} from '../hooks/session-entries.mjs';
+import {
+  loadSessionModel,
+  migrateVaultToSessionEntries,
+  readObservedHeads,
+  recordObservedHeads,
+} from '../hooks/session-views.mjs';
 import {
   closePinPath,
   findBackfillCandidate,
   readClosePin,
+  readTouchedPathsStrict,
+  writeClosePin,
   sessionProofCloseId,
   rootLogEntry,
   sessionClosedMarkerPath,
@@ -40,6 +56,7 @@ import { ensureProjectIndex } from '../scripts/crystallize.mjs';
 import { receiptPath } from '../hooks/close-receipt.mjs';
 import {
   buildMarkCloseProof,
+  classifyExistingEntry,
   landReceiptThenMarker,
   withdrawOwnReceipt,
   markerWriteGenuinelyFailed,
@@ -54,6 +71,7 @@ import {
   REPO,
   SESSION_TMP_HOME,
   buildCleanWikiTree,
+  gitHead,
   hasLogEntry,
   makeMultiProjectWiki,
   payloadForCleanWiki,
@@ -65,6 +83,20 @@ import {
   withTmpDir,
   withWiki,
 } from './helpers.mjs';
+
+// The one overwrite target a close payload still carries is pages/open-questions.md.
+// The guard tests below (base mismatch, local edit, section loss, lint) used to aim at
+// the project's hot.md / session-state.md, which a close no longer writes.
+const OQ_REL = join('pages', 'open-questions.md');
+const openQuestionsText = (today, marker = 'initial') =>
+  `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\n## Questions\n\n- ${marker}\n`;
+// A `withWiki` mutate step: the page exists (and is committed) before the close.
+const seedOpenQuestions =
+  (text = null) =>
+  (dir, today) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, OQ_REL), text ?? openQuestionsText(today));
+  };
 
 // ── fix #38: --apply-session-close --payload=<path|-> ─────────────────────────
 // @fix #38: clean-wiki payload → ok:true, new entries appended (apply dedup is exact-entry, not date-based)
@@ -81,24 +113,25 @@ suite('crystallize.mjs --apply-session-close (#38)');
 // two early-refusal branches) tells apart a commit that ran and found
 // nothing to stage (`true`) from one that never ran at all (`null`, a
 // verification/lint failure) or that ran and failed (`false`).
-test('a second apply of an unchanged payload: applied:[], skipped names every field, committed:true', () => {
+test('a second close with an unchanged payload appends nothing twice and writes one new entry, committed:true', () => {
   withWiki(null, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
     const first = runApply(dir, payload);
     const firstOut = JSON.parse(first.stdout);
     assert.equal(firstOut.ok, true, `first apply must succeed: ${first.stdout}`);
 
+    // runApply seeds a fresh session per call, so this is a second close request: it
+    // gets its own entry, while the appends dedupe on their exact text.
     const second = runApply(dir, payload);
     const out = JSON.parse(second.stdout);
     assert.equal(out.ok, true, `second apply must still succeed: ${second.stdout}`);
-    assert.deepEqual(out.applied, [], 'nothing new to write on an identical re-run');
+    assert.equal(out.applied.length, 1, JSON.stringify(out.applied));
+    assert.match(out.applied[0], /^sessionEntry \(projects\/test-project\/sessions\//);
     assert.ok(
-      ['sessionState', 'projectHot', 'sessionLog', 'log'].every((k) =>
-        out.skipped.some((s) => s.startsWith(k)),
-      ),
-      `skipped must name every field the payload carries: ${JSON.stringify(out.skipped)}`,
+      ['sessionLog', 'log'].every((k) => out.skipped.some((s) => s.startsWith(k))),
+      `skipped must name every append the payload carries: ${JSON.stringify(out.skipped)}`,
     );
-    assert.equal(out.committed, true, 'nothing to stage is still a successful commit outcome');
+    assert.equal(out.committed, true, 'a commit outcome, not a skipped one');
   });
 });
 
@@ -681,17 +714,18 @@ suite('fix #40: helper lint preflight + post-apply check');
 
 test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT abort, apply proceeds (scoped)', () => {
   // Bug B fix: lint debt OUTSIDE the files this close writes (here a malformed
-  // page under projects/, not one of the 5 mandatory close files) must NOT block
-  // the documented apply path. It is surfaced as a notice and the payload lands.
+  // page under projects/, not a file this close writes) must NOT block the
+  // documented apply path. It is surfaced as a notice and the payload lands.
   withWiki(
-    (dir) => {
+    (dir, today) => {
       writeFileSync(
         join(dir, 'projects', 'test-project', 'broken.md'),
         '---\ntitle: broken\ntype: concept\n\nbody (frontmatter never closes)\n',
       );
+      seedOpenQuestions()(dir, today);
     },
     (dir, today) => {
-      // Overwrite fields only write cleanly with an observed, matching base
+      // The overwrite field only writes cleanly with an observed, matching base
       // (FEAT-11 T4); seed it under the session-id this apply uses, or the
       // sentinel write is refused as base-unknown before it reaches the
       // out-of-scope-debt logic this test is actually about.
@@ -699,9 +733,7 @@ test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT
       snapshotBase(dir, sid, overwriteTargets('test-project'));
       const sentinel = `<!-- preflight-sentinel-${Date.now()} -->`;
       const payload = payloadForCleanWiki(dir, today);
-      payload.sessionState = {
-        content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
-      };
+      payload.openQuestions = { content: `${openQuestionsText(today)}\n${sentinel}\n` };
       const r = runApply(dir, payload, { sessionId: sid });
       assert.equal(
         r.status,
@@ -714,10 +746,7 @@ test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT
         out.notices.some((f) => f.endsWith('broken.md')),
         `out-of-scope blocker should surface as a notice: ${r.stdout}`,
       );
-      const onDisk = readFileSync(
-        join(dir, 'projects', 'test-project', 'session-state.md'),
-        'utf-8',
-      );
+      const onDisk = readFileSync(join(dir, OQ_REL), 'utf-8');
       assert.ok(onDisk.includes(sentinel), 'apply should have written the payload sentinel');
     },
   );
@@ -817,30 +846,34 @@ test('preflight (#40 + Bug B): corrupt APPEND target (session-log) STILL blocks 
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.equal(out.stage, 'preflight-lint', `stage should be preflight-lint: ${r.stdout}`);
-    const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    const sessionsDir = join(dir, 'projects', 'test-project', 'sessions');
+    assert.deepEqual(
+      existsSync(sessionsDir) ? readdirSync(sessionsDir) : [],
+      [],
+      'preflight failure must NOT have written the entry',
+    );
     assert.ok(
-      !onDisk.includes(sentinel),
-      'preflight failure must NOT have written payload sentinel',
+      !JSON.stringify(readdirSync(join(dir, 'projects', 'test-project'))).includes(sentinel),
+      sentinel,
     );
   });
 });
 
 test('post-apply (#40): payload introduces lint blocker → exit 1 stage=post-apply-lint, bytes written', () => {
-  // Payload writes a session-state body that omits the required "## 다음 작업"
-  // heading — lint raises an error, but freshness gate still passes (updated:
-  // today). Apply DID write (sentinel present on disk), but final result is
-  // ok:false with stage=post-apply-lint so caller distinguishes "wiki was
-  // damaged" from "frontmatter stale".
+  // The payload's open-questions page omits the required `title`: lint raises an
+  // error, but the freshness gate still passes. Apply DID write (sentinel present on
+  // disk), but the final result is ok:false with stage=post-apply-lint so the caller
+  // distinguishes "wiki was damaged" from "frontmatter stale".
   withWiki(null, (dir, today) => {
-    // Overwrite fields only write cleanly with an observed, matching base
-    // (FEAT-11 T4); seed it under the session-id this apply uses, or the write
-    // is refused as base-unknown before it ever reaches post-apply lint.
+    // The overwrite only writes cleanly with an observed, matching base (FEAT-11 T4);
+    // seed it under the session-id this apply uses, or the write is refused as
+    // base-unknown before it ever reaches post-apply lint.
     const sid = 'post-apply-lint-session';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
     const sentinel = `<!-- post-apply-sentinel-${Date.now()} -->`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = {
-      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## random heading without required label\n\n- next\n`,
+    payload.openQuestions = {
+      content: `---\ntype: concept\nupdated: ${today}\n---\n\n${sentinel}\n`,
     };
     const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(r.status, 1, `post-apply lint must fail, got ${r.status}\n${r.stdout}`);
@@ -848,7 +881,7 @@ test('post-apply (#40): payload introduces lint blocker → exit 1 stage=post-ap
     assert.equal(out.ok, false);
     assert.equal(out.stage, 'post-apply-lint', `stage should be post-apply-lint: ${r.stdout}`);
     assert.equal(out.verification.ok, true, 'freshness gate should still pass');
-    const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    const onDisk = readFileSync(join(dir, OQ_REL), 'utf-8');
     assert.ok(onDisk.includes(sentinel), 'post-apply path must have written the payload sentinel');
   });
 });
@@ -866,20 +899,16 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
     const sid = 'post-apply-retry-session';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    // 1. Apply a bad payload (session-state missing required heading)
+    // 1. Apply a bad payload (open-questions page without a title)
     const bad = payloadForCleanWiki(dir, today);
-    bad.sessionState = {
-      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## wrong heading\n\n- next\n`,
-    };
+    bad.openQuestions = { content: `---\ntype: concept\nupdated: ${today}\n---\n\n- bad\n` };
     const r1 = runApply(dir, bad, { sessionId: sid });
     assert.equal(r1.status, 1, `bad payload must fail: ${r1.stdout}`);
     assert.equal(JSON.parse(r1.stdout).stage, 'post-apply-lint');
 
     // 2. Retry with corrected payload — must succeed (was dead-locked before fix)
     const good = payloadForCleanWiki(dir, today);
-    good.sessionState = {
-      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- fixed\n`,
-    };
+    good.openQuestions = { content: openQuestionsText(today, 'fixed') };
     good.sessionLog.entry = `## [${today}] retry after fix\n`;
     good.log.entry = `## [${today}] session | test-project — retry\n`;
     const r2 = runApply(dir, good, { sessionId: sid });
@@ -906,22 +935,18 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
 // frontmatter-less log.md, W1) must stay untouched.
 suite('W9 promotion: payload-scope invalid-YAML frontmatter blocks close');
 
-test('post-apply: broken YAML in a payload-scope file (project hot.md) → ok:false, exit 1', () => {
+test('post-apply: broken YAML in a payload-scope file (open-questions page) → ok:false, exit 1', () => {
   // "title: hot: broken" is an unquoted top-level value containing ": ", the
   // exact shape lint.mjs's checkYamlInvalid (W9) narrow detector flags. Not
   // W1: the frontmatter block itself opens and closes cleanly, only its
-  // content is invalid YAML.
-  //
-  // The root hot.md carried this before it left the payload. The axis the
-  // suite tests is in-payload-scope versus out-of-scope, not root versus
-  // project, so the broken bytes move to a file the payload still writes.
-  const projHotRel = join('projects', 'test-project', 'hot.md');
+  // content is invalid YAML. The axis the suite tests is in-payload-scope versus
+  // out-of-scope; open-questions is the one page a payload still writes whole.
   withWiki(null, (dir, today) => {
     const sid = 'w9-promotion-session';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot = {
-      content: `---\ntitle: hot: broken\ntype: hot\nupdated: ${today}\n---\n\nbody\n`,
+    payload.openQuestions = {
+      content: `---\ntitle: hot: broken\ntype: concept\nupdated: ${today}\n---\n\nbody\n`,
     };
     const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(
@@ -932,7 +957,7 @@ test('post-apply: broken YAML in a payload-scope file (project hot.md) → ok:fa
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.equal(out.stage, 'post-apply-lint', `stage should be post-apply-lint: ${r.stdout}`);
-    const onDisk = readFileSync(join(dir, projHotRel), 'utf-8');
+    const onDisk = readFileSync(join(dir, OQ_REL), 'utf-8');
     assert.ok(
       onDisk.includes('title: hot: broken'),
       'apply still writes the payload bytes to disk (post-apply lint runs AFTER the write)',
@@ -1004,8 +1029,8 @@ test('payload.sessionId ≠ --session-id → session-id-mismatch, zero bytes', (
     // A distinct entry a successful apply WOULD append. Its absence proves the
     // guard blocked the write — and proves the test red: strip the guard and the
     // unknown field is simply ignored, so this entry lands and the assert fails.
-    // The payload also rewrites overwrite targets (session-state, both hot files)
-    // that a successful apply touches BEFORE the shard append. Assert the whole
+    // The payload also carries an entry that a successful apply writes BEFORE the
+    // shard append. Assert the whole
     // committed tree is untouched — not just the shard — so a future guard misplaced
     // after the overwrites but before the append can't pass this vacuously. `git
     // diff --quiet` ignores the untracked .payload.json runApply drops in.
@@ -1141,11 +1166,8 @@ test('apply commit excludes an unrelated pre-existing dirty file outside the pay
     writeFileSync(join(dir, 'unrelated-debt.md'), '# pre-existing, unrelated debt\n');
 
     const payload = payloadForCleanWiki(dir, today);
-    // sessionState/projectHot/rootHot re-assert identical content (idempotent
-    // skip); sessionLog + log carry fresh entries, so this close DOES write
-    // bytes — session-log/<ym>.md and log.md — while leaving the three
-    // overwrite targets untouched. That is exactly the mixed applied/skipped
-    // shape the scoped commit must handle correctly.
+    // The close writes its entry, the session-log shard and log.md, and must
+    // commit exactly those: the scoped commit is what this test pins.
     const r = runApply(dir, payload, { sessionId: 'sess-issue69-apply' });
     assert.equal(r.status, 0, `apply must succeed: ${r.stdout}`);
     const out = JSON.parse(r.stdout);
@@ -1352,31 +1374,27 @@ test('apply on a project that already has an index.md leaves it byte-for-byte un
 suite('every whole-file base-mismatch parks');
 
 test('an overwrite target parks on a mismatch even when the payload keeps every disk line', () => {
-  // The root hot.md used to be the target here, because a pointer table is
-  // where "the payload is a superset of disk" shows up naturally. That file is
-  // no longer an overwrite target, so the same shape moves to the project
-  // hot.md: a foreign write lands after the snapshot, the payload carries every
-  // byte of it plus one more, and the close still parks rather than write.
-  const projHotRel = join('projects', 'test-project', 'hot.md');
-  withWiki(null, (dir, today) => {
+  // A foreign write lands after the snapshot, the payload carries every byte of it
+  // plus one more, and the close still parks rather than write.
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'mismatch-parks';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const original = readFileSync(join(dir, projHotRel), 'utf-8');
+    const original = readFileSync(join(dir, OQ_REL), 'utf-8');
     const drifted = `${original.trimEnd()}\n\n## Added by the other machine\n`;
-    writeFileSync(join(dir, projHotRel), drifted);
+    writeFileSync(join(dir, OQ_REL), drifted);
 
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot = { content: `${drifted.trimEnd()}\n\n## And by this session\n` };
+    payload.openQuestions = { content: `${drifted.trimEnd()}\n\n## And by this session\n` };
 
     const r = runApply(dir, payload, { sessionId: sid });
     assert.notEqual(r.status, 0, 'a drifted overwrite must not write');
     const out = JSON.parse(r.stdout);
-    const c = out.conflicts.find((x) => x.target === projHotRel);
-    assert.ok(c, `${projHotRel} must park: ${JSON.stringify(out.conflicts)}`);
+    const c = out.conflicts.find((x) => x.target === OQ_REL);
+    assert.ok(c, `${OQ_REL} must park: ${JSON.stringify(out.conflicts)}`);
     assert.equal(c.reason, 'base-mismatch');
     assert.equal(
-      readFileSync(join(dir, projHotRel), 'utf-8'),
+      readFileSync(join(dir, OQ_REL), 'utf-8'),
       drifted,
       "the other machine's bytes are left exactly as they were",
     );
@@ -1437,15 +1455,15 @@ test('a legacy payload carrying rootHot closes clean, writes nothing to hot.md, 
 suite('local edit protection: reapplying a payload must not bury a hand edit');
 
 test('a hand edit after a successful apply parks a reapply of the SAME payload, and survives it', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'local-edit-reapply';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const rel = join('projects', 'test-project', 'session-state.md');
+    const rel = OQ_REL;
     const target = join(dir, rel);
-    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const appliedContent = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\napplied by payload\n\n## Questions\n\n- next\n`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = { content: appliedContent };
+    payload.openQuestions = { content: appliedContent };
 
     const r1 = runApply(dir, payload, { sessionId: sid });
     assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
@@ -1491,7 +1509,7 @@ test('a hand edit after a successful apply parks a reapply of the SAME payload, 
       assert.notEqual(r2.status, 0, 'a reapply that would bury a local edit must not exit 0');
       const out2 = JSON.parse(r2.stdout);
       const c = out2.conflicts.find((x) => x.target === rel);
-      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.ok(c, `openQuestions must park: ${JSON.stringify(out2.conflicts)}`);
       assert.equal(c.reason, 'will-overwrite-local-change');
       assert.equal(
         readFileSync(target, 'utf-8'),
@@ -1505,15 +1523,15 @@ test('a hand edit after a successful apply parks a reapply of the SAME payload, 
 });
 
 test('a reapply with NO intervening edit still writes a genuinely new payload through (no false park)', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'local-edit-no-edit-inbetween';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const rel = join('projects', 'test-project', 'session-state.md');
+    const rel = OQ_REL;
     const target = join(dir, rel);
-    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const appliedContent = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\napplied by payload\n\n## Questions\n\n- next\n`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = { content: appliedContent };
+    payload.openQuestions = { content: appliedContent };
 
     const r1 = runApply(dir, payload, { sessionId: sid });
     assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
@@ -1534,7 +1552,7 @@ test('a reapply with NO intervening edit still writes a genuinely new payload th
     try {
       const payload2 = payloadForCleanWiki(dir, today);
       const updatedContent = appliedContent.replace('applied by payload', 'second close, no edit');
-      payload2.sessionState = { content: updatedContent };
+      payload2.openQuestions = { content: updatedContent };
       const r2 = runApply(dir, payload2, { sessionId: sid });
       assert.equal(
         r2.status,
@@ -1561,15 +1579,15 @@ test('a hand edit folded into a genuinely new payload STILL parks (review r5-w3 
   // drift from `appliedHash`, folded-in or not, and a human decides through
   // `proposal challenge`/`proposal resolve`: this is the accepted friction
   // cost, not a bug.
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'local-edit-folded-payload';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const rel = join('projects', 'test-project', 'session-state.md');
+    const rel = OQ_REL;
     const target = join(dir, rel);
-    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const appliedContent = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\napplied by payload\n\n## Questions\n\n- next\n`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = { content: appliedContent };
+    payload.openQuestions = { content: appliedContent };
 
     const r1 = runApply(dir, payload, { sessionId: sid });
     assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
@@ -1601,7 +1619,7 @@ test('a hand edit folded into a genuinely new payload STILL parks (review r5-w3 
       // the guard has no way to credit it for folding the edit in.
       const folded = handEdited.replace('- next', '- next\n- folded the hand edit in, plus this');
       const payload2 = payloadForCleanWiki(dir, today);
-      payload2.sessionState = { content: folded };
+      payload2.openQuestions = { content: folded };
       const r2 = runApply(dir, payload2, { sessionId: sid });
       assert.notEqual(
         r2.status,
@@ -1610,7 +1628,7 @@ test('a hand edit folded into a genuinely new payload STILL parks (review r5-w3 
       );
       const out2 = JSON.parse(r2.stdout);
       const c = out2.conflicts.find((x) => x.target === rel);
-      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.ok(c, `openQuestions must park: ${JSON.stringify(out2.conflicts)}`);
       assert.equal(c.reason, 'will-overwrite-local-change');
       assert.equal(
         readFileSync(target, 'utf-8'),
@@ -1632,15 +1650,15 @@ test('a genuinely different payload that does NOT fold the hand edit in also par
   // different from the old applied bytes, silently discarding the edit with
   // no proposal. It must now park exactly like the exact-reapply and the
   // folded-payload cases.
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'local-edit-unrelated-payload';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const rel = join('projects', 'test-project', 'session-state.md');
+    const rel = OQ_REL;
     const target = join(dir, rel);
-    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const appliedContent = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\napplied by payload\n\n## Questions\n\n- next\n`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = { content: appliedContent };
+    payload.openQuestions = { content: appliedContent };
 
     const r1 = runApply(dir, payload, { sessionId: sid });
     assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
@@ -1666,9 +1684,9 @@ test('a genuinely different payload that does NOT fold the hand edit in also par
       // Different from BOTH the original apply and the hand edit, and does
       // NOT carry "hand-edited after apply" forward at all: the shape review
       // r5-w3 blocker 2 called out as unprotected.
-      const unrelated = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\nunrelated new content, does not mention the edit\n\n## 다음 작업\n\n- something else\n`;
+      const unrelated = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\nunrelated new content, does not mention the edit\n\n## Questions\n\n- something else\n`;
       const payload2 = payloadForCleanWiki(dir, today);
-      payload2.sessionState = { content: unrelated };
+      payload2.openQuestions = { content: unrelated };
       const r2 = runApply(dir, payload2, { sessionId: sid });
       assert.notEqual(
         r2.status,
@@ -1677,7 +1695,7 @@ test('a genuinely different payload that does NOT fold the hand edit in also par
       );
       const out2 = JSON.parse(r2.stdout);
       const c = out2.conflicts.find((x) => x.target === rel);
-      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.ok(c, `openQuestions must park: ${JSON.stringify(out2.conflicts)}`);
       assert.equal(c.reason, 'will-overwrite-local-change');
       assert.equal(
         readFileSync(target, 'utf-8'),
@@ -1703,27 +1721,25 @@ suite('ISSUE-149: restructure:true no longer self-approves a destructive overwri
 
 test('a real section-loss trip parks whether or not restructure:true is set: the flag only changes the park reason', () => {
   withWiki(
-    (dir) => {
-      const projHot = join(dir, 'projects', 'test-project', 'hot.md');
-      writeFileSync(
-        projHot,
-        readFileSync(projHot, 'utf-8') +
+    (dir, today) => {
+      seedOpenQuestions(
+        openQuestionsText(today) +
           `\n## Track A\nnote A\n\n## Track B\nnote B\n\n## Track C\nnote C\n`,
-      );
+      )(dir, today);
     },
     (dir, today) => {
       const sid = 'issue149-restructure-park';
       snapshotBase(dir, sid, overwriteTargets('test-project'));
-      const hotPath = join(dir, 'projects', 'test-project', 'hot.md');
+      const hotPath = join(dir, OQ_REL);
       const multiTrack = readFileSync(hotPath, 'utf-8');
       // Drops Track B and Track C, keeps Track A: the same 2-of-3 shape the
       // real incident (security-backoffice) tripped on.
       const onlyTrackA = multiTrack.replace(/\n## Track B[\s\S]*## Track C\nnote C\n/, '\n');
-      const target = join('projects', 'test-project', 'hot.md');
+      const target = OQ_REL;
 
       // Phase 1: no `restructure` flag, the pre-existing guard, unchanged.
       const payload1 = payloadForCleanWiki(dir, today);
-      payload1.projectHot = { content: onlyTrackA };
+      payload1.openQuestions = { content: onlyTrackA };
       const r1 = runApply(dir, payload1, { sessionId: sid });
       const out1 = JSON.parse(r1.stdout);
       assert.notEqual(r1.status, 0, `dropping 2 of 3 sections must park: ${r1.stdout}`);
@@ -1739,7 +1755,7 @@ test('a real section-loss trip parks whether or not restructure:true is set: the
       // signal is still open for this retry, mirroring every other
       // park-then-retry test in this suite.
       const payload2 = payloadForCleanWiki(dir, today);
-      payload2.projectHot = { content: onlyTrackA, restructure: true };
+      payload2.openQuestions = { content: onlyTrackA, restructure: true };
       payload2.sessionLog.entry = `## [${today}] restructure retry\n`;
       payload2.log.entry = `## [${today}] session | test-project — restructure retry\n`;
       const r2 = runApply(dir, payload2, { sessionId: sid });
@@ -2240,13 +2256,13 @@ test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is wi
 // The original fixture of the test above: hot.md sits inside the project folder
 // being closed. Since the gate blocks any dirty file there, the close is now
 // refused one step earlier, as compact-gate-not-ok, with no marker and no receipt.
-test('a .hypoignore-excluded hot.md in the project folder is refused by the gate (compact-gate-not-ok), no marker, no receipt', () => {
+test('a project whose hot.md is .hypoignore-excluded keeps its entry out of git: the gate refuses (compact-gate-not-ok), no marker, no receipt', () => {
   withWiki(null, (dir, today) => {
+    // An ignored view hides the project's entries too (they are the source of the view).
     writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
     const payload = payloadForCleanWiki(dir, today);
     payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
     const sessionId = 's-hypoignore-gate-refusal';
-    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
     const r = runApply(dir, payload, { sessionId });
     const out = JSON.parse(r.stdout);
     assert.equal(out.markerSkipReason, 'compact-gate-not-ok', `stage: ${r.stdout}\n${r.stderr}`);
@@ -2254,7 +2270,7 @@ test('a .hypoignore-excluded hot.md in the project folder is refused by the gate
     // The result names the checkpoint gate's own blocker, so a caller does not
     // have to reach for --check-session-close, which judges a wider git axis.
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file === 'projects/test-project/hot.md'),
+      (out.gateBlockers || []).some((b) => b.file.startsWith('projects/test-project/sessions/')),
       `gateBlockers must name the refused file: ${JSON.stringify(out.gateBlockers)}`,
     );
     assert.ok(
@@ -2308,7 +2324,6 @@ test('the console report for compact-gate-not-ok names the gate blocker, not --s
     payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
     const sessionId = `s-hypoignore-gate-console-${process.pid}`;
     const cleanup = seedCloseTranscript(sessionId);
-    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
     let r;
     try {
       r = runApplyConsole(dir, payload, sessionId);
@@ -2346,10 +2361,9 @@ test('a skipped target whose bytes are already committed (idempotent same-sessio
     assert.equal(out1.ok, true, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
     assert.equal(out1.markerWritten, true);
 
-    // Re-apply the SAME payload. sessionState and projectHot are both
-    // idempotent skips now (disk already matches, and it is THIS commit,
-    // not just dirty disk); only the append targets (session-log, log.md)
-    // are already-present skips too, since the entry text is unchanged.
+    // Re-apply the SAME payload. The append targets (session-log, log.md) are
+    // already-present skips (the entry text is unchanged), and the entry is the
+    // one this same close already committed.
     // A second, distinct close phrase (attempt 1 already spent the first):
     // seedCloseTranscript overwrites the file, so the fixture repeats the
     // same opening line and adds a fresh one after it.
@@ -3597,6 +3611,12 @@ test('a retry after the user typed the close phrase again keeps the first close 
 
       // The close has not resolved: the open request's id is the pending one.
       assert.equal(pinProofId(dir, sessionId), closeIdFor(sessionId, 0));
+
+      // The retry that finally carries a valid payload publishes under the FIRST id: the
+      // entry path is what the pin pins, not a pending record the observable id stands for.
+      const done = JSON.parse(runApply(dir, v2Payload(today), { sessionId }).stdout);
+      assert.equal(done.ok, true, JSON.stringify(done));
+      assert.deepEqual(sessionFilesOf(dir), [`${today}-${closeIdFor(sessionId, 0)}.md`]);
     } finally {
       cleanup();
     }
@@ -3625,6 +3645,7 @@ test('a failed receipt after the commit (journal cleared) retries under the same
 
       const id = closeIdFor(sessionId, 0);
       assert.equal(readClosePin(dir, sessionId).pending.closeId, id);
+      assert.deepEqual(sessionFilesOf(dir), [`${today}-${id}.md`], 'the entry is under that id');
       assert.equal(
         pinProofId(dir, sessionId),
         id,
@@ -3638,6 +3659,11 @@ test('a failed receipt after the commit (journal cleared) retries under the same
       const resolved = readClosePin(dir, sessionId);
       assert.equal(resolved.pending, null);
       assert.equal(resolved.lastResolved, id, 'the retry kept the id although the signal moved');
+      assert.deepEqual(
+        sessionFilesOf(dir),
+        [`${today}-${id}.md`],
+        'the retry adopted the same entry file, it did not write a second one',
+      );
 
       // Resolved, no open signal: the finished close vouches for itself.
       const afterGate = pinGate(dir, sessionId);
@@ -3743,6 +3769,8 @@ test('a close that crashed between its resolution record and the pin move does n
         stale,
         'pending was left standing',
       );
+      const staleFile = join(sessionsDirOf(dir), `${today}-${stale}.md`);
+      const staleBytes = readFileSync(staleFile, 'utf-8');
 
       typeCloseAgain(sessionId);
       const gate = pinGate(dir, sessionId);
@@ -3755,6 +3783,27 @@ test('a close that crashed between its resolution record and the pin move does n
       assert.equal(pin.pending.closeId, closeIdFor(sessionId, gate.openedAtIndex));
       assert.notEqual(pin.pending.closeId, stale);
       assert.equal(pin.lastResolved, stale);
+
+      // The new request writes its own entry; the earlier close's bytes are untouched.
+      const next = JSON.parse(
+        runApply(
+          dir,
+          v2Payload(today, {
+            tracks: [{ id: 'p2-track', new: true, next: '- p2' }],
+            tag: 'p2 new request',
+          }),
+          { sessionId },
+        ).stdout,
+      );
+      assert.equal(next.ok, true, JSON.stringify(next));
+      assert.equal(
+        existsSync(
+          join(sessionsDirOf(dir), `${today}-${closeIdFor(sessionId, gate.openedAtIndex)}.md`),
+        ),
+        true,
+        'the new request has its own entry path',
+      );
+      assert.equal(readFileSync(staleFile, 'utf-8'), staleBytes, 'the earlier entry is unchanged');
     } finally {
       cleanup();
     }
@@ -3786,4 +3835,1095 @@ test('a pin that cannot be written stops the close before any wiki write, at sta
       cleanup();
     }
   });
+});
+
+// ── original session entries: what a close writes ────────────────────────────
+// A close writes one immutable `projects/<p>/sessions/<date>-<close_id>.md` and no state file.
+// Helpers shared by the suites below. Each suite is its own selection unit.
+
+function sessionsDirOf(dir, project = 'test-project') {
+  return join(dir, 'projects', project, 'sessions');
+}
+
+function sessionFilesOf(dir, project = 'test-project') {
+  const d = sessionsDirOf(dir, project);
+  return existsSync(d)
+    ? readdirSync(d)
+        .filter((f) => f.endsWith('.md'))
+        .sort()
+    : [];
+}
+
+function entryAt(dir, file, project = 'test-project') {
+  const parsed = parseSessionEntry(readFileSync(join(sessionsDirOf(dir, project), file), 'utf-8'));
+  assert.equal(parsed.ok, true, `${file} must parse: ${parsed.reason}`);
+  return parsed.entry;
+}
+
+/** A current-format payload; `tag` keeps each close's session-log entry distinct. */
+function v2Payload(
+  today,
+  { summary = 'close summary', tracks, tag = 'entry close', ...rest } = {},
+) {
+  return {
+    project: 'test-project',
+    date: today,
+    summary,
+    tracks: tracks ?? [{ id: 'main', new: true, next: '- next step' }],
+    sessionLog: { entry: `## [${today}] ${tag}\n` },
+    ...rest,
+  };
+}
+
+function applyJson(dir, payload, sessionId) {
+  const r = runApply(dir, payload, { sessionId });
+  let out = null;
+  try {
+    out = JSON.parse(r.stdout);
+  } catch {
+    assert.fail(`apply printed no JSON (status ${r.status}): ${r.stdout}\n${r.stderr}`);
+  }
+  return { r, out };
+}
+
+/** An entry file written (and committed) as if another session had closed. */
+function writeEntryFile(dir, { closeId, date, tracks, summary = 'other session', bodies = {} }) {
+  const text = formatSessionEntry({
+    project: 'test-project',
+    closeId,
+    date,
+    tracks,
+    summary,
+    bodies,
+  });
+  const rel = join('projects', 'test-project', 'sessions', `${date}-${closeId}.md`);
+  mkdirSync(sessionsDirOf(dir), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  spawnSync('git', ['add', '-A'], { cwd: dir, env });
+  spawnSync('git', ['commit', '-m', `entry ${closeId}`], { cwd: dir, env });
+  return rel;
+}
+
+function headsOf(dir, project = 'test-project') {
+  const model = loadSessionModel(dir, project);
+  return Object.fromEntries(
+    trackHeads(model.entries).map((t) => [t.trackId, t.heads.map((h) => h.closeId)]),
+  );
+}
+
+const commitCountOf = (dir) =>
+  Number(spawnSync('git', ['rev-list', '--count', 'HEAD'], { cwd: dir, encoding: 'utf-8' }).stdout);
+
+// A pre-commit hook that rejects every commit: the close commits nothing, which is the
+// "commit failed" state a retry has to cope with.
+function blockCommits(dir) {
+  const hook = join(dir, '.git', 'hooks', 'pre-commit');
+  mkdirSync(dirname(hook), { recursive: true });
+  writeFileSync(hook, '#!/bin/sh\necho blocked by test >&2\nexit 1\n', { mode: 0o755 });
+  return () => rmSync(hook, { force: true });
+}
+
+/**
+ * `applySessionClose` in a child with test seams: `hooksSource` is the source of the
+ * `testHooks` object literal (it may use `writeFileSync`).
+ */
+function applyWithHooks(dir, payload, sessionId, hooksSource) {
+  const payloadPath = join(
+    tmpdir(),
+    `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+  );
+  writeFileSync(payloadPath, JSON.stringify(payload));
+  const argv = [
+    'node',
+    'crystallize.mjs',
+    `--hypo-dir=${dir}`,
+    '--apply-session-close',
+    `--payload=${payloadPath}`,
+    '--json',
+    `--session-id=${sessionId}`,
+  ];
+  const script = `
+    import { writeFileSync } from 'node:fs';
+    import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
+    import { applySessionClose } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
+    applySessionClose(parseArgs(${JSON.stringify(argv)}), ${hooksSource});
+  `;
+  try {
+    return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+  } finally {
+    rmSync(payloadPath, { force: true });
+  }
+}
+
+const CRASH_AFTER_PUBLISH = `{ afterPublish() { throw new Error('crash after publish'); } }`;
+const CRASH_AFTER_PIN = `{ afterPinBeforeReplace() { throw new Error('crash after pin'); } }`;
+
+suite('close entries: tracks, supersedes and heads');
+
+test('two sessions close one project on different tracks one after the other: both ok, no proposal, no parked file', () => {
+  withWiki(null, (dir, today) => {
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'track-a', new: true, next: '- a' }], tag: 'close a' }),
+      newPinSession('seq-a'),
+    );
+    const b = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'track-b', new: true, next: '- b' }], tag: 'close b' }),
+      newPinSession('seq-b'),
+    );
+    for (const { out } of [a, b]) {
+      assert.equal(out.ok, true, JSON.stringify(out));
+      assert.deepEqual(out.proposals, []);
+      assert.deepEqual(out.conflicts, []);
+    }
+    const parked = join(dir, '.cache', 'proposals');
+    assert.deepEqual(existsSync(parked) ? readdirSync(parked) : [], [], 'nothing was parked');
+    assert.equal(sessionFilesOf(dir).length, 2);
+    const heads = headsOf(dir);
+    assert.equal(heads['track-a'].length, 1);
+    assert.equal(heads['track-b'].length, 1);
+  });
+});
+
+await testAsync(
+  'two processes closing the same project at the same moment both succeed with no proposal',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
+    try {
+      const today = todayLocal();
+      buildCleanWikiTree(dir, today);
+      const env = { ...process.env, HOME: SESSION_TMP_HOME };
+      spawnSync('git', ['init'], { cwd: dir, env });
+      spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir, env });
+      spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir, env });
+      spawnSync('git', ['add', '-A'], { cwd: dir, env });
+      spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, env });
+
+      const spawnClose = (label, trackId) => {
+        const sessionId = newPinSession(label);
+        const cleanup = seedCloseTranscript(sessionId);
+        const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
+        writeFileSync(
+          payloadPath,
+          JSON.stringify(
+            v2Payload(today, {
+              tracks: [{ id: trackId, new: true, next: `- ${trackId}` }],
+              tag: `close ${trackId}`,
+            }),
+          ),
+        );
+        const child = spawn(
+          process.execPath,
+          [
+            join(REPO, 'scripts', 'crystallize.mjs'),
+            `--hypo-dir=${dir}`,
+            '--apply-session-close',
+            `--payload=${payloadPath}`,
+            `--session-id=${sessionId}`,
+            '--json',
+          ],
+          { env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+        );
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d) => (stdout += d));
+        child.stderr.on('data', (d) => (stderr += d));
+        return new Promise((resolve) =>
+          child.on('exit', (code) => {
+            cleanup();
+            rmSync(payloadPath, { force: true });
+            resolve({ code, stdout, stderr });
+          }),
+        );
+      };
+      const [one, two] = await Promise.all([
+        spawnClose('par-a', 'par-a'),
+        spawnClose('par-b', 'par-b'),
+      ]);
+      for (const res of [one, two]) {
+        const out = JSON.parse(res.stdout);
+        assert.equal(out.ok, true, `${res.stdout}\n${res.stderr}`);
+        assert.deepEqual(out.proposals, []);
+        assert.deepEqual(out.conflicts, []);
+      }
+      assert.equal(sessionFilesOf(dir).length, 2);
+      const parked = join(dir, '.cache', 'proposals');
+      assert.deepEqual(existsSync(parked) ? readdirSync(parked) : [], []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test('the 2026-10-01 shape: session 229 on track a, another project closes in between, session 230 on track b: no approval asked', () => {
+  withWiki(
+    (dir, today) => {
+      const other = join(dir, 'projects', 'other-proj');
+      mkdirSync(join(other, 'session-log'), { recursive: true });
+      writeFileSync(
+        join(other, 'session-state.md'),
+        `---\ntitle: ss\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- n\n`,
+      );
+      writeFileSync(
+        join(other, 'hot.md'),
+        `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot\n`,
+      );
+    },
+    (dir, today) => {
+      const s229 = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'a', new: true, next: '- a' }], tag: 'session 229' }),
+        newPinSession('s229'),
+      );
+      const between = applyJson(
+        dir,
+        v2Payload(today, {
+          project: 'other-proj',
+          tracks: [{ id: 'x', new: true, next: '- x' }],
+          tag: 'other project close',
+        }),
+        newPinSession('s-other'),
+      );
+      const s230 = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'b', new: true, next: '- b' }], tag: 'session 230' }),
+        newPinSession('s230'),
+      );
+      for (const { out } of [s229, between, s230]) {
+        assert.equal(out.ok, true, JSON.stringify(out));
+        assert.deepEqual(out.proposals, [], 'no approval is asked for');
+        assert.deepEqual(out.conflicts, []);
+      }
+    },
+  );
+});
+
+test('an unregistered track id is refused before anything is written, and "new": true starts it', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('track-unknown');
+    const bad = applyJson(dir, v2Payload(today, { tracks: [{ id: 'nope', next: '- x' }] }), sid);
+    assert.equal(bad.out.ok, false);
+    assert.equal(bad.out.stage, 'track-unknown', JSON.stringify(bad.out));
+    assert.match(bad.out.error, /legacy/, 'the message lists the registered ids');
+    assert.deepEqual(sessionFilesOf(dir), []);
+    assert.deepEqual(readJournal(dir, sid), {}, 'no journal record either');
+
+    const good = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'nope', new: true, next: '- x' }] }),
+      sid,
+    );
+    assert.equal(good.out.ok, true, JSON.stringify(good.out));
+  });
+});
+
+test('"new": true on a registered track is refused (track-exists), a plain update of it is accepted', () => {
+  withWiki(null, (dir, today) => {
+    const first = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', new: true, next: '- one' }], tag: 'first' }),
+      newPinSession('exists-1'),
+    );
+    assert.equal(first.out.ok, true, JSON.stringify(first.out));
+    const again = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', new: true, next: '- two' }], tag: 'second' }),
+      newPinSession('exists-2'),
+    );
+    assert.equal(again.out.stage, 'track-exists', JSON.stringify(again.out));
+    assert.equal(sessionFilesOf(dir).length, 1);
+    const plain = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', next: '- two' }], tag: 'third' }),
+      newPinSession('exists-3'),
+    );
+    assert.equal(plain.out.ok, true, JSON.stringify(plain.out));
+  });
+});
+
+test('the same track id twice in one payload is refused (track-duplicate) with no file and no journal record; two different ids pass', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('dup');
+    const dup = applyJson(
+      dir,
+      v2Payload(today, {
+        tracks: [
+          { id: 'a', new: true, next: '- one' },
+          { id: 'a', done: true },
+        ],
+      }),
+      sid,
+    );
+    assert.equal(dup.out.stage, 'track-duplicate', JSON.stringify(dup.out));
+    assert.deepEqual(sessionFilesOf(dir), []);
+    assert.deepEqual(readJournal(dir, sid), {});
+
+    const ok = applyJson(
+      dir,
+      v2Payload(today, {
+        tracks: [
+          { id: 'a', new: true, next: '- one' },
+          { id: 'b', new: true, next: '- two' },
+        ],
+      }),
+      sid,
+    );
+    assert.equal(ok.out.ok, true, JSON.stringify(ok.out));
+  });
+});
+
+test('an entry marker line of this close inside the summary is refused (payload-reserved-marker), a look-alike of another close passes', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('marker');
+    const closeId = closeIdFor(sid, 0);
+    const bad = applyJson(
+      dir,
+      v2Payload(today, { summary: `before\n<!-- hypomnema:summary ${closeId} -->\nafter` }),
+      sid,
+    );
+    assert.equal(bad.out.stage, 'payload-reserved-marker', JSON.stringify(bad.out));
+    assert.deepEqual(sessionFilesOf(dir), []);
+    const fine = applyJson(
+      dir,
+      v2Payload(today, { summary: 'talks about <!-- hypomnema:summary other-close --> in prose' }),
+      sid,
+    );
+    assert.equal(fine.out.ok, true, JSON.stringify(fine.out));
+  });
+});
+
+test('supersedes: a unique prefix resolves and the file carries the full id, an ambiguous or unknown one is refused', () => {
+  withWiki(null, (dir, today) => {
+    const idA = 'aaaa1111-1';
+    const idB = 'aaaa2222-1';
+    writeEntryFile(dir, { closeId: idA, date: today, tracks: [{ id: 'main', new: true }] });
+    writeEntryFile(dir, { closeId: idB, date: today, tracks: [{ id: 'main' }] });
+    const sid = newPinSession('prefix');
+    const ambiguous = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', supersedes: ['aaaa'], next: '- x' }] }),
+      sid,
+    );
+    assert.equal(ambiguous.out.stage, 'supersedes-unknown', JSON.stringify(ambiguous.out));
+    const unknown = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', supersedes: ['zzzz'], next: '- x' }] }),
+      sid,
+    );
+    assert.equal(unknown.out.stage, 'supersedes-unknown');
+    const ok = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', supersedes: ['aaaa1'], next: '- x' }] }),
+      sid,
+    );
+    assert.equal(ok.out.ok, true, JSON.stringify(ok.out));
+    const mine = sessionFilesOf(dir).find((f) => f.includes(sid));
+    assert.deepEqual(entryAt(dir, mine).tracks[0].supersedes, [idA], 'the full id is written');
+  });
+});
+
+test('an unambiguous baseline prefix is resolved and written as the full id', () => {
+  withWiki(null, (dir, today) => {
+    const baseline = loadSessionModel(dir, 'test-project').entries.find((e) =>
+      e.closeId.startsWith('baseline-'),
+    );
+    assert.ok(baseline, 'the fixture tracks the old state files, so a virtual baseline exists');
+    const sid = newPinSession('baseline-prefix');
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, {
+        tracks: [
+          {
+            id: 'legacy',
+            supersedes: [baseline.closeId.slice(0, 'baseline-'.length + 2)],
+            done: true,
+          },
+        ],
+      }),
+      sid,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const mine = sessionFilesOf(dir).find((f) => f.includes(sid));
+    assert.ok(entryAt(dir, mine).tracks[0].supersedes.includes(baseline.closeId));
+    assert.deepEqual(headsOf(dir).legacy, [closeIdFor(sid, 0)]);
+  });
+});
+
+test('the same session closing a track twice leaves one head: the second entry replaces the first without an observed record written by hand (N1)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('n1');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const first = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'a', new: true, next: '- one' }], tag: 'n1 first' }),
+        sid,
+      );
+      assert.equal(first.out.ok, true, JSON.stringify(first.out));
+      typeCloseAgain(sid);
+      const second = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'a', next: '- two' }], tag: 'n1 second' }),
+        sid,
+      );
+      assert.equal(second.out.ok, true, JSON.stringify(second.out));
+      const heads = headsOf(dir);
+      assert.equal(heads.a.length, 1, JSON.stringify(heads));
+      assert.notEqual(heads.a[0], closeIdFor(sid, 0), 'the head is the second entry');
+      assert.equal(readObservedHeads(dir, sid, 'test-project').full.a.length, 2);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a head this session saw only as a pointer is replaced by its close; a head another session wrote after is not (N1)', () => {
+  withWiki(null, (dir, today) => {
+    writeEntryFile(dir, { closeId: 'seen-1', date: today, tracks: [{ id: 'a', new: true }] });
+    const sid = newPinSession('pointer');
+    recordObservedHeads(dir, sid, 'test-project', { level: 'pointer', heads: { a: ['seen-1'] } });
+    writeEntryFile(dir, { closeId: 'later-1', date: today, tracks: [{ id: 'a' }] });
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'a', next: '- mine' }], tag: 'pointer close' }),
+      sid,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const heads = headsOf(dir).a;
+    assert.ok(!heads.includes('seen-1'), `the pointer-only head is replaced: ${heads}`);
+    assert.ok(heads.includes('later-1'), `the head written after the observation stays: ${heads}`);
+    assert.ok(heads.includes(closeIdFor(sid, 0)));
+  });
+});
+
+test('"done" closes only the heads the session knew: a concurrent head stays active and out of Finished tracks (Q5)', () => {
+  const render = (dir) =>
+    renderViews([loadSessionModel(dir, 'test-project')], { device: 'dev-test' }).projects[
+      'test-project'
+    ].sessionState;
+  withWiki(null, (dir, today) => {
+    writeEntryFile(dir, {
+      closeId: 'h1-1',
+      date: today,
+      tracks: [{ id: 't', new: true, title: 'T' }],
+      bodies: { t: 'body h1' },
+    });
+    const sid = newPinSession('q5');
+    recordObservedHeads(dir, sid, 'test-project', { level: 'pointer', heads: { t: ['h1-1'] } });
+    writeEntryFile(dir, {
+      closeId: 'h2-1',
+      date: today,
+      tracks: [{ id: 't' }],
+      bodies: { t: 'body h2 concurrent' },
+    });
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 't', done: true }], tag: 'q5 done' }),
+      sid,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.ok(!headsOf(dir).t.includes('h1-1'), 'h1 is replaced');
+    assert.ok(headsOf(dir).t.includes('h2-1'), 'h2 is still a head');
+    const view = render(dir);
+    const nextUp = view.slice(
+      view.indexOf('## Next Up'),
+      view.indexOf('## Finished tracks') === -1 ? undefined : view.indexOf('## Finished tracks'),
+    );
+    assert.ok(nextUp.includes('body h2 concurrent'), `h2 is in Next Up: ${view}`);
+    assert.ok(!view.includes('## Finished tracks'), `t is not folded: ${view}`);
+    assert.ok(
+      !(out.notices ?? []).some((n) => /h2/.test(n)),
+      `no notice about h2: ${JSON.stringify(out.notices)}`,
+    );
+  });
+  // The pair: with no concurrent head the same close folds the track.
+  withWiki(null, (dir, today) => {
+    writeEntryFile(dir, {
+      closeId: 'h1-1',
+      date: today,
+      tracks: [{ id: 't', new: true, title: 'T' }],
+      bodies: { t: 'body h1' },
+    });
+    const sid = newPinSession('q5-pair');
+    recordObservedHeads(dir, sid, 'test-project', { level: 'pointer', heads: { t: ['h1-1'] } });
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 't', done: true }], tag: 'q5 done pair' }),
+      sid,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const view = render(dir);
+    assert.ok(view.includes('## Finished tracks'), `t is folded: ${view}`);
+  });
+});
+
+test('a large legacy baseline seen only as a pointer is folded by "done" (Q5)', () => {
+  withWiki(
+    (dir, today) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n${'long body line\n'.repeat(400)}`,
+      );
+    },
+    (dir, today) => {
+      const model = loadSessionModel(dir, 'test-project');
+      const baseline = model.entries.find((e) => e.closeId.startsWith('baseline-'));
+      assert.ok(baseline.bodies.legacy.length > 5000);
+      const sid = newPinSession('big-legacy');
+      recordObservedHeads(dir, sid, 'test-project', {
+        level: 'pointer',
+        heads: { legacy: [baseline.closeId] },
+      });
+      const { out } = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'legacy', done: true }], tag: 'big legacy' }),
+        sid,
+      );
+      assert.equal(out.ok, true, JSON.stringify(out));
+      const view = renderViews([loadSessionModel(dir, 'test-project')], { device: 'dev-test' })
+        .projects['test-project'].sessionState;
+      assert.ok(view.includes('## Finished tracks'), view);
+      assert.deepEqual(headsOf(dir).legacy, [closeIdFor(sid, 0)]);
+    },
+  );
+});
+
+test('a close in a vault that has not moved to entries writes only the entry and leaves the two old files byte-identical', () => {
+  withWiki(null, (dir, today) => {
+    const stateBefore = readFileSync(
+      join(dir, 'projects', 'test-project', 'session-state.md'),
+      'utf-8',
+    );
+    const hotBefore = readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8');
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('pre-migration'));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(sessionFilesOf(dir).length, 1);
+    assert.equal(
+      readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      stateBefore,
+    );
+    assert.equal(readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'), hotBefore);
+  });
+});
+
+test('a close in a migrated vault regenerates the project views from the new entry', () => {
+  withWiki(null, (dir, today) => {
+    const moved = migrateVaultToSessionEntries(dir);
+    assert.equal(moved.migrated, true, JSON.stringify(moved));
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, {
+        summary: 'regen-summary-marker',
+        tracks: [{ id: 'main', new: true, next: '- regen-next-marker' }],
+      }),
+      newPinSession('regen'),
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const hot = readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8');
+    const state = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    assert.ok(hot.includes('regen-summary-marker'), hot);
+    assert.ok(state.includes('regen-next-marker'), state);
+  });
+});
+
+test('the new entry takes the narrowest scope: a shared index and a machine baseline give machine:devA (W1)', () => {
+  withWiki(
+    (dir, today) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'index.md'),
+        `---\ntitle: test-project\ntype: project-index\nupdated: ${today}\nvisibility_scope: shared\n---\n# test-project\n`,
+      );
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\nvisibility_scope: machine:devA\n---\n\n## 다음 작업\n\n- next\n`,
+      );
+    },
+    (dir, today) => {
+      const sid = newPinSession('scope');
+      const { out } = applyJson(dir, v2Payload(today), sid);
+      assert.equal(out.ok, true, JSON.stringify(out));
+      const mine = sessionFilesOf(dir).find((f) => f.includes(sid));
+      assert.equal(entryAt(dir, mine).visibilityScope, 'machine:devA');
+    },
+  );
+});
+
+test('legacy payload: the old two fields become the summary and a legacy track body, one notice says so, and a mix of both forms is refused', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const sid = newPinSession('legacy-form');
+    const { out } = applyJson(dir, payload, sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.ok(
+      out.notices.some((n) => /구버전 형식 payload/.test(n)),
+      JSON.stringify(out.notices),
+    );
+    const entry = entryAt(
+      dir,
+      sessionFilesOf(dir).find((f) => f.includes(sid)),
+    );
+    assert.ok(
+      entry.summary.includes('# Hot'),
+      'projectHot became the summary, frontmatter stripped',
+    );
+    assert.ok(!entry.summary.startsWith('---'));
+    assert.ok(
+      entry.bodies.legacy.includes('## 다음 작업'),
+      'sessionState became the legacy track body',
+    );
+
+    const mixed = { ...payloadForCleanWiki(dir, today), summary: 'x', tracks: [] };
+    const bad = applyJson(dir, mixed, newPinSession('legacy-mixed'));
+    assert.equal(bad.out.ok, false);
+    assert.match(JSON.stringify(bad.out.details), /both the old fields/);
+    assert.equal(sessionFilesOf(dir).length, 1, 'the refused payload wrote nothing');
+  });
+});
+
+suite('close entries: publishing and retrying one close');
+
+// Occupy the receipt directory with a file: the commit lands, the receipt cannot.
+function blockReceipt(dir, sessionId) {
+  const blocker = join(dir, '.cache', 'sessions', sessionId);
+  mkdirSync(dirname(blocker), { recursive: true });
+  writeFileSync(blocker, 'occupied by a file, not a directory\n');
+  return () => rmSync(blocker, { force: true });
+}
+
+test('a close that committed and failed at the receipt keeps its entry when retried with a fixed summary, says so, and issues the receipt (N2)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('n2');
+    const unblock = blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    assert.equal(first.out.committed, true);
+    const file = sessionFilesOf(dir)[0];
+    const bytes = readFileSync(join(sessionsDirOf(dir), file), 'utf-8');
+    const head = gitHead(dir);
+
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(readFileSync(join(sessionsDirOf(dir), file), 'utf-8'), bytes, 'bytes unchanged');
+    assert.ok(
+      retry.out.notices.some((n) => /이번 payload의 요약은 반영되지 않았습니다/.test(n)),
+      JSON.stringify(retry.out.notices),
+    );
+    assert.ok(existsSync(receiptPath(dir, sid)), 'the receipt was issued');
+    assert.equal(gitHead(dir), head, 'no new commit');
+  });
+});
+
+test('a committed entry edited by hand is not adopted or replaced: the retry fails with entry-conflict and leaves the bytes alone', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('hand-edit');
+    const unblock = blockReceipt(dir, sid);
+    applyJson(dir, v2Payload(today), sid);
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    const edited = `${readFileSync(file, 'utf-8')}\nhand edit\n`;
+    writeFileSync(file, edited);
+    unblock();
+    const retry = applyJson(dir, v2Payload(today), sid);
+    assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), edited);
+  });
+});
+
+test('bytes another writer puts at the entry path just before the publish are never replaced (entry-conflict)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('race');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const r = applyWithHooks(
+        dir,
+        v2Payload(today),
+        sid,
+        `{ beforePublish({ abs }) { writeFileSync(abs, 'foreign bytes\\n'); } }`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.stage, 'entry-conflict', `${r.stdout}\n${r.stderr}`);
+      const files = sessionFilesOf(dir);
+      assert.equal(files.length, 1);
+      assert.equal(readFileSync(join(sessionsDirOf(dir), files[0]), 'utf-8'), 'foreign bytes\n');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a commit failure then a retry with a fixed summary replaces the uncommitted entry and succeeds; touched-paths and the journal name the entry', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('commit-fail');
+    const unblock = blockCommits(dir);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.committed, false, JSON.stringify(first.out));
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    const shard = join('projects', 'test-project', 'session-log', `${today}.md`);
+    const touched = readTouchedPathsStrict(dir, sid);
+    assert.ok(touched.paths.includes(rel), `touched-paths names the entry: ${touched.paths}`);
+    assert.ok(touched.paths.includes(shard), `and the shard: ${touched.paths}`);
+    assert.ok(readJournal(dir, sid)[rel], 'the close journal has the entry path as a key');
+
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(retry.out.committed, true);
+    assert.equal(entryAt(dir, sessionFilesOf(dir)[0]).summary, 'fixed summary');
+    const blob = spawnSync('git', ['show', `HEAD:${rel}`], { cwd: dir, encoding: 'utf-8' }).stdout;
+    assert.ok(blob.includes('fixed summary'), 'the committed bytes are the fixed ones');
+  });
+});
+
+test('an uncommitted entry another process changed, matching neither the journal nor the pinned hashes, is a conflict', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('uncommitted-foreign');
+    const unblock = blockCommits(dir);
+    applyJson(dir, v2Payload(today), sid);
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    writeFileSync(file, 'someone else rewrote this\n');
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed' }), sid);
+    assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), 'someone else rewrote this\n');
+  });
+});
+
+test('a crash right after the publish (before the journal) is repaired by a retry with a fixed summary: one commit, new bytes, with or without a journal (P1)', () => {
+  for (const dropJournal of [false, true]) {
+    withWiki(null, (dir, today) => {
+      const sid = newPinSession(`p1-${dropJournal}`);
+      const cleanup = seedCloseTranscript(sid);
+      try {
+        const crash = applyWithHooks(
+          dir,
+          v2Payload(today, { summary: 'first summary' }),
+          sid,
+          CRASH_AFTER_PUBLISH,
+        );
+        assert.notEqual(crash.status, 0, 'the seam crashes the child');
+        assert.match(crash.stderr, /crash after publish/);
+        const file = sessionFilesOf(dir)[0];
+        const rel = join('projects', 'test-project', 'sessions', file);
+        assert.equal(readJournal(dir, sid)[rel], undefined, 'the journal never heard of the entry');
+        assert.equal(readClosePin(dir, sid).pending.entrySha256s.length, 1, 'the pin did');
+        if (dropJournal)
+          rmSync(join(dir, '.cache', 'close-journal', `${sid}.json`), { force: true });
+
+        const before = commitCountOf(dir);
+        const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+        assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+        assert.equal(entryAt(dir, file).summary, 'fixed summary');
+        assert.equal(commitCountOf(dir), before + 1, 'one commit');
+      } finally {
+        cleanup();
+      }
+    });
+  }
+});
+
+test('a crash after the pin took the fixed bytes but before the replace leaves both hashes pinned: a third payload still replaces (P1)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('p1-third');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      applyWithHooks(dir, v2Payload(today, { summary: 'first summary' }), sid, CRASH_AFTER_PUBLISH);
+      const file = sessionFilesOf(dir)[0];
+      const second = applyWithHooks(
+        dir,
+        v2Payload(today, { summary: 'second summary' }),
+        sid,
+        CRASH_AFTER_PIN,
+      );
+      assert.match(second.stderr, /crash after pin/);
+      assert.equal(entryAt(dir, file).summary, 'first summary', 'the replace never happened');
+      assert.equal(readClosePin(dir, sid).pending.entrySha256s.length, 2);
+
+      const third = applyJson(dir, v2Payload(today, { summary: 'third summary' }), sid);
+      assert.equal(third.out.ok, true, JSON.stringify(third.out));
+      assert.equal(entryAt(dir, file).summary, 'third summary');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('the pinned hashes license a replace only for the pinned path: a pin that names another path leaves the same disk bytes alone (P1)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('p1-path');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      applyWithHooks(dir, v2Payload(today, { summary: 'first summary' }), sid, CRASH_AFTER_PUBLISH);
+      const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+      const bytes = readFileSync(file, 'utf-8');
+      const pin = readClosePin(dir, sid);
+      writeClosePin(dir, sid, {
+        ...pin,
+        pending: { ...pin.pending, entryRelPath: 'projects/test-project/sessions/elsewhere.md' },
+      });
+      const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+      assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+      assert.equal(readFileSync(file, 'utf-8'), bytes);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('classifyExistingEntry: the same disk bytes are replaceable for the pinned close and path, and not for another close id or path (P1)', () => {
+  withWiki(null, (dir) => {
+    const text = 'new bytes\n';
+    const disk = 'old bytes\n';
+    const relPath = 'projects/test-project/sessions/2026-10-01-s-1.md';
+    const pinFor = (closeId, entryRelPath) => ({
+      pending: {
+        closeId,
+        openedAtIndex: 1,
+        entryRelPath,
+        entrySha256s: [createHash('sha256').update(disk).digest('hex')],
+      },
+      lastResolved: null,
+      localProofs: {},
+    });
+    const base = { hypoDir: dir, sessionId: 'no-journal', relPath, text, disk, ignored: false };
+    assert.equal(
+      classifyExistingEntry({ ...base, closeId: 's-1', pin: pinFor('s-1', relPath) }).action,
+      'replace',
+    );
+    assert.equal(
+      classifyExistingEntry({ ...base, closeId: 's-2', pin: pinFor('s-1', relPath) }).action,
+      'conflict',
+    );
+    assert.equal(
+      classifyExistingEntry({
+        ...base,
+        closeId: 's-1',
+        pin: pinFor('s-1', 'projects/test-project/sessions/other.md'),
+      }).action,
+      'conflict',
+    );
+  });
+});
+
+test('an unwritable close-pin directory stops the close at stage close-pin before anything is published', () => {
+  if (process.getuid && process.getuid() === 0) return; // root ignores directory modes
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('pin-dir');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      unresolvedApply(dir, today, sid); // takes the pin: later writes are the publish intent only
+      const pinDir = dirname(closePinPath(dir, sid));
+      chmodSync(pinDir, 0o500);
+      try {
+        const { out } = applyJson(dir, v2Payload(today), sid);
+        assert.equal(out.stage, 'close-pin', JSON.stringify(out));
+        assert.deepEqual(sessionFilesOf(dir), [], 'nothing was published');
+      } finally {
+        chmodSync(pinDir, 0o700);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a retry that crosses midnight keeps the first date: the same close id found under another date is the entry', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('date-move');
+    const unblock = blockCommits(dir);
+    applyJson(dir, v2Payload(today, { summary: 'first' }), sid);
+    const file = sessionFilesOf(dir)[0];
+    unblock();
+    const [y, m, d] = today.split('-').map(Number);
+    const tomorrow = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+    const retry = applyJson(
+      dir,
+      v2Payload(tomorrow, { summary: 'second', tag: 'second day' }),
+      sid,
+    );
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    // The payload date moves, the entry stays under the date it was first published with.
+    assert.deepEqual(sessionFilesOf(dir), [file], JSON.stringify(retry.out));
+    assert.equal(entryAt(dir, file).date, today);
+  });
+});
+
+test('a retry that crosses midnight with no close pin left still finds the entry on disk by its close id', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('date-move-nopin');
+    const unblock = blockCommits(dir);
+    applyJson(dir, v2Payload(today, { summary: 'first' }), sid);
+    const file = sessionFilesOf(dir)[0];
+    unblock();
+    // the pin also names the path; without it only the scan of sessions/ can find the entry
+    rmSync(closePinPath(dir, sid), { force: true });
+    const [y, m, d] = today.split('-').map(Number);
+    const tomorrow = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+    const retry = applyJson(
+      dir,
+      v2Payload(tomorrow, { summary: 'second', tag: 'second day' }),
+      sid,
+    );
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.deepEqual(sessionFilesOf(dir), [file], JSON.stringify(retry.out));
+    assert.equal(entryAt(dir, file).date, today);
+  });
+});
+
+suite('close entries: a project that .hypoignore keeps out of git');
+
+test('an ignored project: the entry is never committed, the local proof outlives the commit step, and a fixed retry keeps the bytes (X2)', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored');
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.committed, true, JSON.stringify(first.out));
+    assert.deepEqual(readJournal(dir, sid), {}, 'the commit step cleared the journal');
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    const bytes = readFileSync(file, 'utf-8');
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    const closeId = closeIdFor(sid, 0);
+    const proof = readClosePin(dir, sid).localProofs[closeId];
+    assert.equal(proof.entryRelPath, rel);
+    assert.equal(proof.entrySha256, createHash('sha256').update(bytes).digest('hex'));
+    assert.equal(
+      spawnSync('git', ['ls-files', '--', rel], { cwd: dir, encoding: 'utf-8' }).stdout.trim(),
+      '',
+      'the entry is not in git',
+    );
+
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(readFileSync(file, 'utf-8'), bytes, 'bytes unchanged');
+    assert.ok(
+      retry.out.notices.some((n) => /이번 payload의 요약은 반영되지 않았습니다/.test(n)),
+      JSON.stringify(retry.out),
+    );
+
+    writeFileSync(file, `${bytes}\nhand edit\n`);
+    const conflict = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(conflict.out.stage, 'entry-conflict', JSON.stringify(conflict.out));
+    assert.equal(readFileSync(file, 'utf-8'), `${bytes}\nhand edit\n`);
+  });
+});
+
+test('an ignored project whose close failed before the commit step can still correct its payload: the journal still names the bytes, so they are replaced', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored-precommit');
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+    const bad = applyJson(
+      dir,
+      v2Payload(today, {
+        summary: 'first summary',
+        openQuestions: { content: `---\ntype: concept\nupdated: ${today}\n---\n\n- no title\n` },
+      }),
+      sid,
+    );
+    assert.equal(bad.out.stage, 'post-apply-lint', JSON.stringify(bad.out));
+    const file = sessionFilesOf(dir)[0];
+    assert.ok(
+      Object.keys(readJournal(dir, sid)).some((k) => k.endsWith(file)),
+      'journal still has it',
+    );
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(entryAt(dir, file).summary, 'fixed summary');
+    assert.ok(!(retry.out.notices ?? []).some((n) => /반영되지 않았습니다/.test(n)));
+  });
+});
+
+suite('close entries: the first session-log shard header');
+
+function firstShardHeader(sessionId, device) {
+  let header = null;
+  const prev = process.env.HYPO_DEVICE;
+  process.env.HYPO_DEVICE = device;
+  try {
+    withWiki(null, (dir, today) => {
+      const payload = v2Payload(today, { tag: 'header probe' });
+      // The fixture already has a monthly log; a daily shard for today is what a close creates.
+      const { out } = applyJson(dir, payload, sessionId);
+      assert.equal(out.ok, true, JSON.stringify(out));
+      const text = readFileSync(
+        join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
+        'utf-8',
+      );
+      header = text.slice(0, text.indexOf('\n## ')).replaceAll(today, '<today>');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.HYPO_DEVICE;
+    else process.env.HYPO_DEVICE = prev;
+  }
+  return header;
+}
+
+test('the first shard of a day has the same header bytes whatever the session id and device', () => {
+  const a = firstShardHeader(newPinSession('hdr-a'), 'device-one');
+  const b = firstShardHeader(newPinSession('hdr-b'), 'device-two');
+  assert.equal(a, b);
+  assert.ok(!/session_id|device/.test(a), a);
+});
+
+test('two clones that each create the first shard of a day pull each other without session_id or device keys in the result', () => {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-clones-'));
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  const git = (cwd, ...args) => spawnSync('git', args, { cwd, env, encoding: 'utf-8' });
+  try {
+    const today = todayLocal();
+    const seed = join(base, 'seed');
+    mkdirSync(seed);
+    buildCleanWikiTree(seed, today);
+    // log.md is shared by every close: the union driver keeps both sides' lines there too.
+    writeFileSync(join(seed, '.gitattributes'), `${GITATTRIBUTES_BLOCK}log.md merge=union\n`);
+    git(seed, 'init', '-q');
+    git(seed, 'config', 'user.email', 't@t.test');
+    git(seed, 'config', 'user.name', 'T');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'init');
+    git(base, 'init', '--bare', '-q', 'remote.git');
+    git(seed, 'remote', 'add', 'origin', join(base, 'remote.git'));
+    git(seed, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+    const cloneOf = (name) => {
+      const dir = join(base, name);
+      git(base, 'clone', '-q', '-b', 'main', join(base, 'remote.git'), name);
+      git(dir, 'config', 'user.email', 't@t.test');
+      git(dir, 'config', 'user.name', 'T');
+      return dir;
+    };
+    const one = cloneOf('one');
+    const two = cloneOf('two');
+    const closeIn = (dir, label, device) => {
+      const prev = process.env.HYPO_DEVICE;
+      process.env.HYPO_DEVICE = device;
+      try {
+        const { out } = applyJson(
+          dir,
+          v2Payload(today, { tag: `close ${label}` }),
+          newPinSession(label),
+        );
+        assert.equal(out.ok, true, JSON.stringify(out));
+      } finally {
+        if (prev === undefined) delete process.env.HYPO_DEVICE;
+        else process.env.HYPO_DEVICE = prev;
+      }
+    };
+    closeIn(one, 'clone-one', 'device-one');
+    closeIn(two, 'clone-two', 'device-two');
+    assert.equal(git(one, 'push', '-q', 'origin', 'HEAD:main').status, 0);
+    const pulled = git(two, 'pull', '--no-rebase', '--no-edit', 'origin', 'main');
+    assert.equal(pulled.status, 0, `${pulled.stdout}\n${pulled.stderr}`);
+    const shard = readFileSync(
+      join(two, 'projects', 'test-project', 'session-log', `${today}.md`),
+      'utf-8',
+    );
+    const frontmatter = shard.slice(0, shard.indexOf('\n---\n', 4));
+    assert.ok(!/^session_id:/m.test(frontmatter) && !/^device:/m.test(frontmatter), frontmatter);
+    assert.ok(shard.includes('close clone-one') && shard.includes('close clone-two'), shard);
+    assert.equal((shard.match(/^---$/gm) || []).length, 2, 'one frontmatter block, not two merged');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

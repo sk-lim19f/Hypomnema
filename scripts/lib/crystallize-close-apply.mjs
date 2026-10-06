@@ -8,6 +8,8 @@ import {
   closeSync,
   unlinkSync,
   readdirSync,
+  linkSync,
+  writeFileSync,
 } from 'fs';
 import { join, dirname } from 'path';
 import { spawnSync } from 'child_process';
@@ -43,8 +45,27 @@ import {
   readClosePin,
   writeClosePin,
   normalizeClosePin,
+  pathInHead,
+  revPathArg,
+  recordTouchedPaths,
+  loadHypoIgnore,
+  isIgnored,
 } from '../../hooks/hypo-shared.mjs';
-import { closeIdFor } from '../../hooks/session-entries.mjs';
+import {
+  TRACK_ID_RE,
+  closeIdFor,
+  entryFileName,
+  formatSessionEntry,
+  resolveSupersedesPrefix,
+  splitLegacyFrontmatter,
+} from '../../hooks/session-entries.mjs';
+import {
+  loadSessionModel,
+  projectEntryScope,
+  readObservedHeads,
+  recordObservedHeads,
+  writeGeneratedViews,
+} from '../../hooks/session-views.mjs';
 import {
   CERT_CHECKPOINT,
   CERT_CLOSE_FILES,
@@ -135,20 +156,23 @@ function runLint(hypoDir) {
 }
 
 // ── session-close apply ────────────────────────────────────────────
-// Idempotent payload-driven application of the 4 mandatory session-close memory
-// files (+ optional open-questions). Used by the LLM session-close flow as the
-// canonical entrypoint instead of issuing 5+ Write tool calls by hand.
+// Idempotent payload-driven application of a session close. Used by the LLM
+// session-close flow as the canonical entrypoint instead of issuing 5+ Write tool
+// calls by hand.
 //
-// The root pointer table (`hot.md`) used to be a fifth file here, composed by
-// hand into every payload. It is now a projection the SessionStart and Stop
-// hooks regenerate from `projects/*/hot.md`, so a close that wrote it would
-// only be overwritten by its own turn's Stop hook. It left the payload, the
-// overwrite set, and the base snapshot together; a payload that still carries
-// `rootHot` is reported, not applied (see `obsoleteFieldNotices`).
+// A close writes one immutable original entry, `projects/<p>/sessions/<date>-<close_id>.md`
+// (summary plus one section per track update), appends the session-log shard and
+// log.md, and optionally overwrites `pages/open-questions.md`. The project's
+// `hot.md`, `session-state.md` and the root `hot.md` are views generated from the
+// entries: a close never writes them from a payload (a migrated vault gets them
+// regenerated right after the entry lands). An old-format payload that still
+// carries `sessionState`/`projectHot` is converted to an entry, see
+// `absorbLegacyPayload`; `rootHot` is reported, not applied (`obsoleteFieldNotices`).
 //
 // Idempotency:
-//   • full-content fields (sessionState/projectHot/openQuestions): write
-//     only when on-disk bytes differ — re-running with same payload is a no-op.
+//   • the entry: its path carries the close id the close-pin fixes for the whole
+//     close request, so a retry finds its own file (see `classifyExistingEntry`).
+//   • full-content field (openQuestions): write only when on-disk bytes differ.
 //   • append fields (sessionLog/log): skip when the dated heading/entry is
 //     already present (regex shared with sessionCloseFileStatus via hypo-shared).
 //
@@ -374,25 +398,78 @@ function todayLocal() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-// Spec §5.2.7 / §8.3: 3 mandatory + 2 optional (`log`, `openQuestions`).
-// The payload shape MUST mirror that contract — missing a mandatory field is a
-// payload bug, not a no-op. Caller is the LLM session-close flow, which composes
-// the payload deliberately; partial payloads must fail loudly so caller fixes
-// them rather than silently relying on yesterday's freshness state. (Codex review
-// of the apply path — Worker 1 finding 1.) `log` left the mandatory set in B-1:
-// the root log.md entry is a DERIVABLE artifact (rootLogEntry over this close's
+// The close payload contract (commands/crystallize.md Step 2): `summary` and
+// `sessionLog.entry` are mandatory, `tracks` is an optional array of track
+// updates, `log` and `openQuestions` stay optional. A payload that carries
+// `sessionState` + `projectHot` instead is the old format; `absorbLegacyPayload`
+// turns it into the same shape before anything else reads it. The payload shape
+// MUST be checked here: a missing mandatory field is a payload bug, not a no-op,
+// and partial payloads must fail loudly so the caller fixes them rather than
+// silently relying on yesterday's freshness state. `log` is not mandatory: the
+// root log.md entry is a DERIVABLE artifact (rootLogEntry over this close's
 // sessionLog heading), so apply auto-fills it when the field is absent.
-const REQUIRED_PAYLOAD_FIELDS = [
+const REQUIRED_PAYLOAD_FIELDS = [['sessionLog', 'entry']];
+const LEGACY_PAYLOAD_FIELDS = [
   ['sessionState', 'content'],
   ['projectHot', 'content'],
-  ['sessionLog', 'entry'],
 ];
+
+function validateTracksShape(tracks) {
+  const errs = [];
+  if (!Array.isArray(tracks)) return ['payload.tracks, when present, must be an array'];
+  tracks.forEach((t, i) => {
+    const at = `payload.tracks[${i}]`;
+    if (!t || typeof t !== 'object' || Array.isArray(t)) {
+      errs.push(`${at} must be an object`);
+      return;
+    }
+    if (typeof t.id !== 'string' || !TRACK_ID_RE.test(t.id)) {
+      errs.push(`${at}.id must be a string matching ${TRACK_ID_RE}`);
+    }
+    for (const key of ['title', 'next']) {
+      if (t[key] !== undefined && typeof t[key] !== 'string') {
+        errs.push(`${at}.${key}, when present, must be a string`);
+      }
+    }
+    for (const flag of ['new', 'done']) {
+      if (t[flag] !== undefined && typeof t[flag] !== 'boolean') {
+        errs.push(`${at}.${flag}, when present, must be a boolean`);
+      }
+    }
+    if (
+      t.supersedes !== undefined &&
+      (!Array.isArray(t.supersedes) || t.supersedes.some((x) => typeof x !== 'string'))
+    ) {
+      errs.push(`${at}.supersedes, when present, must be an array of strings`);
+    }
+  });
+  return errs;
+}
 
 function validatePayloadShape(payload) {
   const errs = [];
   if (!payload || typeof payload !== 'object') {
     errs.push('payload must be a JSON object');
     return errs;
+  }
+  const hasLegacy = payload.sessionState !== undefined || payload.projectHot !== undefined;
+  const hasCurrent = payload.summary !== undefined || payload.tracks !== undefined;
+  if (hasLegacy && hasCurrent) {
+    errs.push(
+      'payload carries both the old fields (sessionState/projectHot) and summary/tracks: send one form',
+    );
+  } else if (hasLegacy) {
+    for (const [field, key] of LEGACY_PAYLOAD_FIELDS) {
+      const slot = payload[field];
+      if (!slot || typeof slot !== 'object') {
+        errs.push(`payload.${field} is required (object with .${key})`);
+      } else if (typeof slot[key] !== 'string') {
+        errs.push(`payload.${field}.${key} must be a string`);
+      }
+    }
+  } else {
+    if (typeof payload.summary !== 'string') errs.push('payload.summary is required (string)');
+    if (payload.tracks !== undefined) errs.push(...validateTracksShape(payload.tracks));
   }
   for (const [field, key] of REQUIRED_PAYLOAD_FIELDS) {
     const slot = payload[field];
@@ -435,6 +512,26 @@ function validatePayloadShape(payload) {
     errs.push('payload.sessionId, when present, must be a string');
   }
   return errs;
+}
+
+// The old payload form carried the two overwrite files whole. It becomes one
+// original entry: `projectHot` is the summary and `sessionState` the body of a
+// `legacy` track, both without their frontmatter. Whether `legacy` is a new
+// track is decided with the other track checks (`planSessionEntry`), which know
+// what is registered. Runs on a payload `validatePayloadShape` already passed.
+function absorbLegacyPayload(payload) {
+  if (payload.sessionState === undefined && payload.projectHot === undefined) {
+    return { payload, legacyFormat: false };
+  }
+  const { sessionState, projectHot, ...rest } = payload;
+  return {
+    payload: {
+      ...rest,
+      summary: splitLegacyFrontmatter(projectHot.content).body,
+      tracks: [{ id: 'legacy', next: splitLegacyFrontmatter(sessionState.content).body }],
+    },
+    legacyFormat: true,
+  };
 }
 
 // Payload fields this apply no longer applies. `rootHot` is the only one so far:
@@ -1429,9 +1526,10 @@ function refuseUnlessCloseRequested(args) {
     );
     process.exit(1);
   }
+  let closeId = null;
   if (args.payload && args.sessionId) {
     try {
-      pinCloseId(args.hypoDir, args.sessionId, closeAuth);
+      closeId = pinCloseId(args.hypoDir, args.sessionId, closeAuth);
     } catch (err) {
       const msg =
         `session-close apply refused before any wiki write or commit: could not pin this ` +
@@ -1467,11 +1565,12 @@ function refuseUnlessCloseRequested(args) {
       process.exit(1);
     }
   }
-  return closeAuth.hostTagWarning || null;
+  return { hostTagWarning: closeAuth.hostTagWarning || null, closeId };
 }
 
 // Read the payload, check its shape, and bind it to THIS session. Exits 1 on any
-// of the three failures; returns the parsed payload otherwise.
+// of the three failures; returns `{payload, legacyFormat}` otherwise (an old-format
+// payload already converted, see `absorbLegacyPayload`).
 function loadValidatedPayload(args) {
   let payload;
   try {
@@ -1532,7 +1631,7 @@ function loadValidatedPayload(args) {
     process.exit(1);
   }
 
-  return payload;
+  return absorbLegacyPayload(payload);
 }
 
 // Resolve project: payload.project is REQUIRED (B-3, close-gate-hardening). The
@@ -1641,6 +1740,386 @@ function assertPayloadFreshnessContract(args, payload, project, date) {
   }
 }
 
+// ── original session entry ──────────────────────────────────────────────────
+// A close writes ONE immutable file per close request,
+// `projects/<p>/sessions/<date>-<close_id>.md`. Nothing else of the project's
+// state is overwritten, so two sessions closing the same project never contend
+// for a file. The status views are generated from these entries on read.
+
+// A refusal that fires before this close has written anything the retry would
+// have to undo: same shape as the other early refusals (`committed: null`).
+function failEntry(args, stage, error) {
+  const out = { ok: false, stage, error, applied: [], committed: null };
+  console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${error}`);
+  process.exit(1);
+}
+
+// The vault-relative path this close's entry lives at. The close id is fixed by
+// the pin, so a file that already carries it (written on another date, the retry
+// crossing midnight) IS this close's entry: reuse its path and date. Else the
+// path the pin recorded, else a fresh one for `date`.
+function entryPathFor(args, project, closeId, date, pin) {
+  const dir = join('projects', project, 'sessions');
+  let names = [];
+  try {
+    names = readdirSync(join(args.hypoDir, dir));
+  } catch {
+    // no sessions/ yet
+  }
+  const found = names
+    .filter((n) => /^\d{4}-\d{2}-\d{2}-/.test(n) && n.endsWith(`-${closeId}.md`))
+    .filter((n) => n.length === 10 + 1 + closeId.length + 3)
+    .sort()[0];
+  const rel = found
+    ? join(dir, found)
+    : pin.pending?.closeId === closeId && pin.pending.entryRelPath
+      ? pin.pending.entryRelPath
+      : join(dir, entryFileName(date, closeId));
+  return { relPath: rel, date: rel.match(/(\d{4}-\d{2}-\d{2})-[^/]*$/)[1] };
+}
+
+// HEAD's bytes of `relPath`, `null` when HEAD has none (or git cannot say).
+function headBlobText(hypoDir, relPath) {
+  const r = spawnSync('git', ['-C', hypoDir, 'show', revPathArg('HEAD', relPath)], {
+    encoding: 'utf-8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return r.status === 0 ? r.stdout : null;
+}
+
+/**
+ * What to do when the entry path already holds bytes. `text` is what this
+ * attempt would write, `disk` what is there (`undefined`: unreadable), `pin` the
+ * close-pin. The path carries this close's fixed id, so these bytes are this
+ * close's own work or a foreign write; the question is which.
+ *   identical  same bytes: nothing to write
+ *   adopt      committed by this close already (HEAD blob, or for a
+ *              `.hypoignore` project the recorded local proof): keep it, even
+ *              though this attempt's payload would have written other bytes
+ *   replace    uncommitted and recognizably ours: the pin lists the bytes'
+ *              hash for this id and path, or the close journal does
+ *   conflict   anything else: leave the file alone
+ */
+export function classifyExistingEntry({
+  hypoDir,
+  sessionId,
+  closeId,
+  relPath,
+  text,
+  disk,
+  ignored,
+  pin,
+}) {
+  if (disk === text) return { action: 'identical' };
+  if (disk === undefined) return { action: 'conflict', reason: 'unreadable' };
+  const diskHash = bytesSha256(disk);
+  const journalHit = readJournal(hypoDir, sessionId)[relPath] === diskHash;
+  const pending = pin.pending;
+  const pinHit =
+    !!pending &&
+    pending.closeId === closeId &&
+    pending.entryRelPath === relPath &&
+    pending.entrySha256s.includes(diskHash);
+  if (ignored) {
+    // Never in HEAD. The proof outlives the commit step, the journal does not:
+    // a journal that still names the bytes means the commit step has not run
+    // yet, so the payload can still be corrected.
+    const proof = pin.localProofs[closeId];
+    if (proof && proof.entryRelPath === relPath && proof.entrySha256 === diskHash) {
+      return { action: journalHit ? 'replace' : 'adopt' };
+    }
+    return pinHit || journalHit ? { action: 'replace' } : { action: 'conflict' };
+  }
+  if (pathInHead(hypoDir, relPath)) {
+    return disk === headBlobText(hypoDir, relPath) ? { action: 'adopt' } : { action: 'conflict' };
+  }
+  return pinHit || journalHit ? { action: 'replace' } : { action: 'conflict' };
+}
+
+const ENTRY_CONFLICT_HELP = (relPath) =>
+  `${relPath} holds bytes this close did not write (or has been edited since it was committed). ` +
+  `Nothing was changed. Look at the file and the vault history, then move or remove the ` +
+  `foreign bytes yourself and retry.`;
+
+/**
+ * Everything about this close's entry that can be decided before a byte is
+ * written: track checks, default and explicit `supersedes`, the entry bytes, the
+ * path, and what is there already. Refuses (`track-duplicate`, `track-unknown`,
+ * `track-exists`, `supersedes-unknown`, `payload-reserved-marker`,
+ * `invalid-entry`, `entry-conflict`) with nothing written.
+ */
+function planSessionEntry(args, payload, project, date, closeId, legacyFormat) {
+  const tracks = payload.tracks ?? [];
+  const seen = new Set();
+  for (const t of tracks) {
+    if (seen.has(t.id)) {
+      failEntry(
+        args,
+        'track-duplicate',
+        `payload.tracks names track "${t.id}" more than once. An update is addressed by ` +
+          `(track id, close id), so one close carries one update per track: merge them.`,
+      );
+    }
+    seen.add(t.id);
+  }
+  const model = loadSessionModel(args.hypoDir, project);
+  // This close's own earlier entry (a retry) must not make its tracks look registered.
+  const registered = new Set();
+  const updates = new Map();
+  for (const e of model.entries) {
+    if (e.closeId === closeId) continue;
+    for (const t of e.tracks) {
+      registered.add(t.id);
+      if (!updates.has(t.id)) updates.set(t.id, []);
+      updates.get(t.id).push(e.closeId);
+    }
+  }
+  const observed = readObservedHeads(args.hypoDir, args.sessionId, project);
+  const entryTracks = [];
+  const bodies = {};
+  for (const t of tracks) {
+    const isNew = t.new === true || (legacyFormat && t.id === 'legacy' && !registered.has(t.id));
+    if (!registered.has(t.id) && !isNew) {
+      failEntry(
+        args,
+        'track-unknown',
+        `track "${t.id}" is not registered in ${project}. Registered tracks: ` +
+          `${[...registered].sort().join(', ') || '(none)'}. To start a new track send "new": true.`,
+      );
+    }
+    if (registered.has(t.id) && t.new === true) {
+      failEntry(
+        args,
+        'track-exists',
+        `track "${t.id}" already exists in ${project}: drop "new": true to update it. ` +
+          `Registered tracks: ${[...registered].sort().join(', ')}.`,
+      );
+    }
+    const existing = updates.get(t.id) ?? [];
+    const known = [
+      ...new Set([...(observed.full[t.id] ?? []), ...(observed.pointer[t.id] ?? [])]),
+    ].filter((id) => existing.includes(id));
+    let supersedes = known;
+    if (t.supersedes !== undefined) {
+      const explicit = [];
+      for (const prefix of t.supersedes) {
+        const r = resolveSupersedesPrefix(prefix, existing);
+        if (!r.ok) {
+          failEntry(
+            args,
+            'supersedes-unknown',
+            `supersedes "${prefix}" of track "${t.id}" is ${r.reason}: it must be a close id of ` +
+              `an update of that track, or a prefix of exactly one. Updates: ${existing.join(', ') || '(none)'}.`,
+          );
+        }
+        explicit.push(r.id);
+      }
+      supersedes = [...new Set(t.done === true ? [...explicit, ...known] : explicit)];
+    }
+    entryTracks.push({
+      id: t.id,
+      ...(t.title !== undefined ? { title: t.title } : {}),
+      ...(supersedes.length ? { supersedes } : {}),
+      ...(isNew ? { new: true } : {}),
+      ...(t.done === true ? { done: true } : {}),
+    });
+    if (typeof t.next === 'string') bodies[t.id] = t.next;
+  }
+
+  const pin = readClosePin(args.hypoDir, args.sessionId);
+  const { relPath, date: entryDate } = entryPathFor(args, project, closeId, date, pin);
+  let text;
+  try {
+    text = formatSessionEntry({
+      project,
+      closeId,
+      sessionId: args.sessionId,
+      date: entryDate,
+      visibilityScope: projectEntryScope(args.hypoDir, project, model),
+      tracks: entryTracks,
+      summary: payload.summary,
+      bodies,
+    });
+  } catch (err) {
+    failEntry(
+      args,
+      err?.code === 'payload-reserved-marker' ? 'payload-reserved-marker' : 'invalid-entry',
+      err?.code === 'payload-reserved-marker'
+        ? `${err.message}. A summary or track body must not hold a line that is exactly an entry marker of this close.`
+        : `the entry could not be formatted: ${err?.message || err}`,
+    );
+  }
+  const ignored = isIgnored(
+    join(args.hypoDir, relPath),
+    args.hypoDir,
+    loadHypoIgnore(args.hypoDir),
+  );
+  const disk = readTarget(join(args.hypoDir, relPath));
+  let finalText = text;
+  if (disk !== null) {
+    const d = classifyExistingEntry({
+      hypoDir: args.hypoDir,
+      sessionId: args.sessionId,
+      closeId,
+      relPath,
+      text,
+      disk,
+      ignored,
+      pin,
+    });
+    if (d.action === 'conflict') failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath));
+    if (d.action === 'adopt') finalText = disk;
+  }
+  const heads = Object.fromEntries(entryTracks.map((t) => [t.id, [closeId]]));
+  return { relPath, text, finalText, closeId, project, ignored, heads };
+}
+
+// Close-pin write that must land before the entry is published or replaced:
+// `pending.entrySha256s` gains the bytes' hash, so a retry after a crash
+// anywhere past this point can recognize what is on disk as its own.
+function recordPublishIntent(hypoDir, sessionId, closeId, relPath, sha) {
+  const pin = readClosePin(hypoDir, sessionId);
+  const pending = pin.pending;
+  if (!pending || pending.closeId !== closeId) {
+    throw new Error(`the close pin no longer holds close ${closeId}`);
+  }
+  if (pending.entryRelPath === relPath && pending.entrySha256s.includes(sha)) return;
+  writeClosePin(hypoDir, sessionId, {
+    ...pin,
+    pending: {
+      ...pending,
+      entryRelPath: relPath,
+      entrySha256s: pending.entrySha256s.includes(sha)
+        ? pending.entrySha256s
+        : [...pending.entrySha256s, sha],
+    },
+  });
+}
+
+// Publish a new file without ever replacing one: link, then drop the temp name.
+// An existing destination is EEXIST.
+function publishNewEntry(abs, text) {
+  const tmp = `${abs}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  writeFileSync(tmp, text, { flag: 'wx' });
+  try {
+    linkSync(tmp, abs);
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // best-effort: a leftover temp name is ignored by `.gitignore`
+    }
+  }
+}
+
+const ENTRY_NOT_REFLECTED_NOTICE = (relPath) =>
+  `이미 기록된 원본이 있어 이번 payload의 요약은 반영되지 않았습니다 (${relPath}). ` +
+  `바꾸고 싶은 내용은 다음 close의 요약에 옮기세요.`;
+
+// Write (publish, replace, or adopt) this close's entry and record everything the
+// retry, the commit and the next close lean on. `testHooks` seams, all test-only:
+// `beforePublish`, `afterPublish` (link done, journal not yet), `afterPinBeforeReplace`.
+function writeSessionEntry(args, plan, acc, testHooks) {
+  const { applied, skipped, appliedPaths, proofEntries, notices } = acc;
+  const { relPath, text, closeId, project, ignored } = plan;
+  const abs = join(args.hypoDir, relPath);
+  const pinFail = (what, err) =>
+    failEntry(
+      args,
+      'close-pin',
+      `could not ${what} in .cache/close-pin (${err?.message || err}). Fix the underlying ` +
+        `problem (usually a permission or disk issue under .cache/) and retry with the same payload.`,
+    );
+  mkdirSync(dirname(abs), { recursive: true });
+  let outcome;
+  for (let attempt = 0; ; attempt++) {
+    const disk = readTarget(abs);
+    if (disk === null) {
+      try {
+        recordPublishIntent(args.hypoDir, args.sessionId, closeId, relPath, bytesSha256(text));
+      } catch (err) {
+        pinFail('record the intent to publish this entry', err);
+      }
+      testHooks?.beforePublish?.({ abs, relPath });
+      try {
+        publishNewEntry(abs, text);
+      } catch (err) {
+        if (err?.code === 'EEXIST' && attempt < 3) continue; // someone got there: judge their bytes
+        throw err;
+      }
+      testHooks?.afterPublish?.({ abs, relPath });
+      outcome = 'created';
+      break;
+    }
+    const d = classifyExistingEntry({
+      hypoDir: args.hypoDir,
+      sessionId: args.sessionId,
+      closeId,
+      relPath,
+      text,
+      disk,
+      ignored,
+      pin: readClosePin(args.hypoDir, args.sessionId),
+    });
+    if (d.action === 'conflict') failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath));
+    if (d.action === 'replace') {
+      try {
+        recordPublishIntent(args.hypoDir, args.sessionId, closeId, relPath, bytesSha256(text));
+      } catch (err) {
+        pinFail('record the intent to replace this entry', err);
+      }
+      testHooks?.afterPinBeforeReplace?.({ abs, relPath });
+      atomicWrite(abs, text);
+      outcome = 'replaced';
+    } else {
+      outcome = d.action === 'adopt' ? 'adopted' : 'identical';
+    }
+    break;
+  }
+
+  const bytes = outcome === 'adopted' ? readTarget(abs) : text;
+  const sha = bytesSha256(bytes);
+  if (outcome !== 'adopted') {
+    recordJournalEntry(args.hypoDir, args.sessionId, relPath, sha);
+    appliedPaths.push(relPath);
+    recordTouchedPaths(args.hypoDir, args.sessionId, [relPath]);
+  }
+  if (ignored && outcome !== 'adopted') {
+    // The journal goes at the commit step and an ignored entry is never in HEAD, so
+    // this is what a retry after that step can still prove the entry with.
+    try {
+      const pin = readClosePin(args.hypoDir, args.sessionId);
+      writeClosePin(args.hypoDir, args.sessionId, {
+        ...pin,
+        localProofs: { ...pin.localProofs, [closeId]: { entryRelPath: relPath, entrySha256: sha } },
+      });
+    } catch (err) {
+      pinFail('record the local proof of this entry', err);
+    }
+  }
+  // Best-effort: a missing record only means this session's next close does not replace
+  // this entry by default, it must not fail a close whose entry is already on disk.
+  try {
+    recordObservedHeads(args.hypoDir, args.sessionId, project, {
+      level: 'full',
+      heads: plan.heads,
+    });
+  } catch (err) {
+    process.stderr.write(
+      `[crystallize] warning: could not record the heads this entry made (${err?.message || err}): the next close of this session will not replace them by default\n`,
+    );
+  }
+  (outcome === 'created' || outcome === 'replaced' ? applied : skipped).push(
+    `sessionEntry (${relPath})`,
+  );
+  if (outcome === 'adopted' && bytes !== text) notices.push(ENTRY_NOT_REFLECTED_NOTICE(relPath));
+  proofEntries.push({
+    path: relPath,
+    kind: ignored ? 'local-create' : 'create',
+    expected: { bytesSha256: sha },
+  });
+}
+
 // Preflight: lint the wiki BEFORE writing any payload bytes. If lint
 // has blockers (errors) in files this apply WON'T overwrite, the wiki is in
 // a degraded state and apply would mask the root cause — abort fail-fast.
@@ -1662,10 +2141,10 @@ function assertPayloadFreshnessContract(args, payload, project, date) {
 // Returns the payload scope and the A-1 index facts alongside the lint result:
 // both are derived here (before any write) and consumed by the write and
 // post-apply phases.
-function runPreflight(args, payload, project, date) {
-  const overwriteTargets = new Set();
-  if (payload.sessionState) overwriteTargets.add(join('projects', project, 'session-state.md'));
-  if (payload.projectHot) overwriteTargets.add(join('projects', project, 'hot.md'));
+function runPreflight(args, payload, project, date, entryRelPath) {
+  // The entry is this close's own file: a retry may replace it, so lint debt in
+  // it is moot here, exactly like an overwrite target's.
+  const overwriteTargets = new Set([entryRelPath]);
   if (payload.openQuestions) overwriteTargets.add(join('pages', 'open-questions.md'));
 
   // Bug B: the documented close path must not be blocked by lint debt OUTSIDE
@@ -1693,9 +2172,7 @@ function runPreflight(args, payload, project, date) {
   const indexRelPath = join('projects', project, 'index.md');
   const indexMissing = !existsSync(join(args.hypoDir, indexRelPath));
   const payloadScope = new Set([
-    join('projects', project, 'session-state.md'),
-    join('projects', project, 'hot.md'),
-    'hot.md',
+    entryRelPath,
     sessionLogWriteTarget,
     sessionLogEvidence, // == write target, except a hybrid-month monthly fallback
     'log.md',
@@ -1983,17 +2460,8 @@ export function closeIntentPath(hypoDir, sessionId) {
   return join(hypoDir, '.cache', 'close-intent', `${sessionId}.json`);
 }
 
-function closeIntentTargetsFor(payload, project) {
-  const targets = [
-    {
-      relPath: join('projects', project, 'session-state.md'),
-      hash: hashContent(payload.sessionState.content),
-    },
-    {
-      relPath: join('projects', project, 'hot.md'),
-      hash: hashContent(payload.projectHot.content),
-    },
-  ];
+function closeIntentTargetsFor(payload, plan) {
+  const targets = [{ relPath: plan.relPath, hash: hashContent(plan.finalText) }];
   if (payload.openQuestions) {
     targets.push({
       relPath: join('pages', 'open-questions.md'),
@@ -2493,8 +2961,6 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
     });
   };
 
-  overwrite('sessionState', join('projects', project, 'session-state.md'), payload.sessionState);
-  overwrite('projectHot', join('projects', project, 'hot.md'), payload.projectHot);
   overwrite('openQuestions', join('pages', 'open-questions.md'), payload.openQuestions);
 
   // A-1: fill a missing project index as part of this close's writes (after
@@ -2640,22 +3106,14 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
           // otherwise mistake it for the evidence file. The dated `## [date] ...`
           // heading lives inside the entry, so freshness / derive / design-history
           // are unchanged.
-          // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
-          // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
-          // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
-          // machine that first seeds the daily shard is recorded; later same-day
-          // appends do not touch it. The per-session-accurate store is the LOCAL
-          // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
-          // `session_id` is honest naming: the value is the Claude session UUID, and
-          // it is present only on the Stop-chain close path that passes --session-id.
-          const device = currentDevice();
-          const auditFm =
-            (args.sessionId
-              ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n`
-              : '') + `device: ${device}\n`;
+          // No `device` or `session_id` in the header: the shard is git-tracked and two
+          // clones that each create today's first shard must write the same header bytes,
+          // or the union merge keeps both sets of lines. The per-session record of who
+          // wrote what lives in the local (.cache/, gitignored) index.jsonl written by
+          // hypo-session-record.mjs.
           const header =
             `---\ntitle: Session Log ${date} (${project})\n` +
-            `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
+            `type: session-log\nupdated: ${date}\n---\n\n` +
             `# Session Log ${date} (${project})\n`;
           const entry = payload.sessionLog.entry;
           const body = entry.endsWith('\n') ? entry : `${entry}\n`;
@@ -2669,6 +3127,7 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
     (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
     if (outcome !== 'skipped') {
       appliedPaths.push(rel);
+      recordTouchedPaths(args.hypoDir, args.sessionId, [rel]);
       // Same journal contract as applyOverwrites: record the FULL file's hash
       // right after this write, not just the entry, since a retry's own
       // "already present" skip below reads the whole file back to compare.
@@ -2690,6 +3149,7 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
         const disk = readTarget(full);
         if (typeof disk === 'string' && journalHash === hashContent(disk)) {
           appliedPaths.push(rel);
+          recordTouchedPaths(args.hypoDir, args.sessionId, [rel]);
         }
       }
     }
@@ -4056,7 +4516,9 @@ function printCloseReport({
 
 // `testHooks` is test-only. `afterResolutionBeforePin` runs once the gate
 // resolution record has landed and before the close pin's `pending` moves, so a
-// test can crash a close in the one gap between those two writes.
+// test can crash a close in the one gap between those two writes. `beforePublish`,
+// `afterPublish` and `afterPinBeforeReplace` do the same for the entry write (see
+// `writeSessionEntry`).
 export function applySessionClose(args, testHooks = null) {
   // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
@@ -4100,18 +4562,25 @@ export function applySessionClose(args, testHooks = null) {
     // "payload is required" with the same error shape as before.
   }
 
-  const hostTagWarning = refuseUnlessCloseRequested(args);
-  const payload = loadValidatedPayload(args);
+  const { hostTagWarning, closeId } = refuseUnlessCloseRequested(args);
+  const { payload, legacyFormat } = loadValidatedPayload(args);
   // Computed off the payload as read, before any write phase can consume it.
   const obsoleteNotices = obsoleteFieldNotices(payload);
+  if (legacyFormat) {
+    obsoleteNotices.push(
+      '구버전 형식 payload를 받아 원본 항목으로 기록했습니다. 다음 close부터 summary/tracks 형식을 쓰세요',
+    );
+  }
   const project = resolveCloseProject(args, payload);
   const date = payload.date || todayLocal();
   assertPayloadFreshnessContract(args, payload, project, date);
+  const entryPlan = planSessionEntry(args, payload, project, date, closeId, legacyFormat);
   const { preflightLint, payloadScope, indexRelPath, indexMissing } = runPreflight(
     args,
     payload,
     project,
     date,
+    entryPlan.relPath,
   );
 
   const applied = [];
@@ -4141,7 +4610,17 @@ export function applySessionClose(args, testHooks = null) {
   // One bag for the six accumulators, passed to every write phase below. They
   // push into it in call order; nothing is merged back afterwards, so the
   // report lines keep the exact order the inline version produced.
-  const acc = { applied, skipped, appliedPaths, conflicts, restructureWaivers, proofEntries };
+  // `notices` collects what the entry step wants the reader to see (an adopted entry).
+  const notices = [];
+  const acc = {
+    applied,
+    skipped,
+    appliedPaths,
+    conflicts,
+    restructureWaivers,
+    proofEntries,
+    notices,
+  };
 
   // Record this set's targets BEFORE the first byte is written (see
   // closeIntentPath's doc comment above applyOverwrites), and remove the
@@ -4159,7 +4638,7 @@ export function applySessionClose(args, testHooks = null) {
   const intentResult = writeCloseIntent(
     args.hypoDir,
     args.sessionId,
-    closeIntentTargetsFor(payload, project),
+    closeIntentTargetsFor(payload, entryPlan),
   );
   if (!intentResult.ok) {
     const msg =
@@ -4176,6 +4655,7 @@ export function applySessionClose(args, testHooks = null) {
     console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
+  writeSessionEntry(args, entryPlan, acc, testHooks);
   applyOverwrites(
     args,
     payload,
@@ -4189,6 +4669,16 @@ export function applySessionClose(args, testHooks = null) {
   markCloseIntentApplied(args.hypoDir, args.sessionId, intentResult.attemptId);
   appendSessionLogEntry(args, payload, project, date, acc);
   appendRootLogEntry(args, payload, project, date, acc);
+
+  // A migrated vault shows the new entry in its generated views right away. A vault
+  // that has not moved to entries has nothing to render (this is a no-op there).
+  try {
+    writeGeneratedViews(args.hypoDir, { projects: [project] });
+  } catch (err) {
+    process.stderr.write(
+      `[crystallize] warning: could not refresh the generated session views (${err?.message || err}); the next session start or stop rewrites them\n`,
+    );
+  }
 
   const { proposals, proposalStoreFailures } = parkOverwriteConflicts(args, conflicts);
   const proposalStoreFailed = proposalStoreFailures.length > 0;
@@ -4357,7 +4847,7 @@ export function applySessionClose(args, testHooks = null) {
     gateNotices,
     gateBlockers,
     restructureWaivers,
-    obsoleteNotices,
+    obsoleteNotices: [...obsoleteNotices, ...notices],
     hostTagWarning: hostTagNotice,
   });
 
@@ -4385,7 +4875,7 @@ export function applySessionClose(args, testHooks = null) {
       otherDebtCount,
       w19Notice,
       restructureWaivers,
-      obsoleteNotices,
+      obsoleteNotices: [...obsoleteNotices, ...notices],
       hostTagWarning: hostTagNotice,
     });
   }

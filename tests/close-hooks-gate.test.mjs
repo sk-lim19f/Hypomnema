@@ -2193,32 +2193,51 @@ test('a marker withheld by a real vault-commit failure leaves the close signal u
 });
 
 test('a failed apply leaves no close-gate resolution behind', () => {
-  withCleanWiki((wiki) => {
-    const today = todayLocal();
-    const projDir = join(wiki, 'projects', 'test-project');
-    const payload = {
-      project: 'test-project',
-      date: today,
-      // A genuine user close signal already authorized this apply (runApply
-      // seeds one below) — this is not an early auth refusal. The writes are
-      // attempted and only the post-write freshness check fails, because
-      // this `updated:` date can never be "today".
-      sessionState: {
-        content:
-          '---\ntitle: session-state\ntype: session-state\nupdated: 2000-01-01\n---\n\nstale\n',
-      },
-      projectHot: { content: readFileSync(join(projDir, 'hot.md'), 'utf-8') },
-      sessionLog: { entry: `## [${today}] test session\n` },
-      log: { entry: `## [${today}] session | test-project\n` },
-    };
-    const sessionId = 's-t3-apply-failed';
-    const r = runApply(wiki, payload, { sessionId });
-    const out = JSON.parse(r.stdout);
-    assert.equal(out.ok, false, `apply must fail on the stale field: ${r.stdout}\n${r.stderr}`);
+  // A close no longer writes the project's session-state.md, so a payload cannot make
+  // the post-write freshness check fail any more. The stale file has to be on disk
+  // already: it is committed stale, the close writes its entry and appends but never
+  // touches it, and verification still reports it.
+  withWiki(
+    (dir) => {
+      const statePath = join(dir, 'projects', 'test-project', 'session-state.md');
+      writeFileSync(
+        statePath,
+        readFileSync(statePath, 'utf-8').replace(
+          /updated: \d{4}-\d{2}-\d{2}/,
+          'updated: 2000-01-01',
+        ),
+      );
+    },
+    (wiki, today) => {
+      // A genuine user close signal already authorized this apply (runApply seeds one
+      // below), so this is not an early auth refusal. The entry is written and only the
+      // post-write freshness check fails.
+      const payload = {
+        project: 'test-project',
+        date: today,
+        summary: 'closing a project whose session-state.md is stale\n',
+        sessionLog: { entry: `## [${today}] test session\n` },
+        log: { entry: `## [${today}] session | test-project\n` },
+      };
+      const sessionId = 's-t3-apply-failed';
+      const r = runApply(wiki, payload, { sessionId });
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, false, `apply must fail on the stale field: ${r.stdout}\n${r.stderr}`);
+      assert.equal(out.stage, 'post-apply-verification', `not an early refusal: ${r.stdout}`);
+      assert.deepEqual(
+        out.verification.stale,
+        [join('projects', 'test-project', 'session-state.md')],
+        'the stale file is the one fixture-made stale, nothing else',
+      );
+      assert.ok(
+        out.applied.some((a) => a.startsWith('sessionEntry')),
+        `the writes were attempted before the check failed: ${JSON.stringify(out.applied)}`,
+      );
 
-    const gatePath = join(wiki, '.cache', 'close-gate', `${sessionId}.json`);
-    assert.equal(existsSync(gatePath), false, 'a failed apply must leave no resolution file');
-  });
+      const gatePath = join(wiki, '.cache', 'close-gate', `${sessionId}.json`);
+      assert.equal(existsSync(gatePath), false, 'a failed apply must leave no resolution file');
+    },
+  );
 });
 
 // design.md v2 §D retry restage: a first attempt registers an unknown tag

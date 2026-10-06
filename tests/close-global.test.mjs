@@ -3093,67 +3093,78 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
 });
 
 // index.md is the file the deadlock was FOUND on, not the only file it happens
-// to. Every payload overwrite takes the same retry branch: a first attempt
+// to. Every file a close writes takes the same retry branch: a first attempt
 // writes the bytes, its commit fails, and the retry finds them already-current
-// and skips the field — which used to drop the path from the commit scope, so
-// the gate blocked on it and no number of retries ever got past. Pinning only
-// index.md would leave the four paths a real close actually carries untested,
-// and a regression there reads as "all green" while the deadlock comes back on
-// session-state.md instead. The fixture writes the payload bytes to disk and
-// records the same hash in the journal, which is the pair a first attempt's own
-// write leaves behind.
-test('--apply-session-close: a retry re-stages payload files a failed commit left dirty', () => {
+// and skips the write, which used to drop the path from the commit scope, so the
+// gate blocked on it and no number of retries ever got past. A close now writes
+// the original session entry and the session-log shard. Pinning only index.md
+// would leave those two untested, and a regression there reads as "all green"
+// while the deadlock comes back on the entry instead. The first attempt is a REAL
+// failed commit (a pre-commit hook that rejects), so what it leaves dirty is the
+// pair a first attempt's own write leaves behind, journal included.
+test('--apply-session-close: a retry re-stages the entry and shard a failed commit left dirty', () => {
   withWiki(null, (dir, today) => {
-    const stateRel = join('projects', 'test-project', 'session-state.md');
-    const hotRel = join('projects', 'test-project', 'hot.md');
-    // Bytes a first attempt wrote and failed to commit. Reading them back as
-    // the payload content is what puts the retry on the already-current branch.
-    const stateContent = `${readFileSync(join(dir, stateRel), 'utf-8')}\n<!-- first attempt -->\n`;
-    const hotContent = `${readFileSync(join(dir, hotRel), 'utf-8')}\n<!-- first attempt -->\n`;
-    writeFileSync(join(dir, stateRel), stateContent);
-    writeFileSync(join(dir, hotRel), hotContent);
-    recordJournalEntry(dir, 's-apply-retry-payload', stateRel, hashContent(stateContent));
-    recordJournalEntry(dir, 's-apply-retry-payload', hotRel, hashContent(hotContent));
-    const before = spawnSync('git', ['status', '--porcelain'], {
-      cwd: dir,
-      encoding: 'utf-8',
-    }).stdout;
-    assert.ok(
-      before.includes('session-state.md') && before.includes('hot.md'),
-      `fixture must start dirty on both, or this test proves nothing: ${before}`,
-    );
+    const sessionId = 's-apply-retry-payload';
+    const entryDir = join('projects', 'test-project', 'sessions');
+    const shardRel = join('projects', 'test-project', 'session-log', `${today}.md`);
     const payload = {
       project: 'test-project',
       date: today,
-      sessionState: { content: stateContent },
-      projectHot: { content: hotContent },
+      summary: 'retry re-stages payload files\n',
       sessionLog: { entry: `## [${today}] retry re-stages payload files\n` },
-      log: { entry: `## [${today}] session | test-project — retry re-stages payload files\n` },
+      log: { entry: `## [${today}] session | test-project: retry re-stages payload files\n` },
     };
     const payloadPath = join(
       tmpdir(),
       `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
     );
     writeFileSync(payloadPath, JSON.stringify(payload));
-    const cleanup = seedCloseTranscript('s-apply-retry-payload');
-    const r = run('crystallize.mjs', [
-      `--hypo-dir=${dir}`,
-      '--apply-session-close',
-      `--payload=${payloadPath}`,
-      '--session-id=s-apply-retry-payload',
-      '--json',
-    ]);
-    cleanup();
-    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
-    const left = spawnSync('git', ['status', '--porcelain'], {
-      cwd: dir,
-      encoding: 'utf-8',
-    }).stdout;
-    assert.ok(
-      !left.includes('session-state.md') && !left.includes('projects/test-project/hot.md'),
-      `a retry must carry the bytes its first attempt already wrote, or the gate ` +
-        `blocks on them forever: ${left}`,
-    );
+    const apply = () => {
+      const cleanup = seedCloseTranscript(sessionId);
+      try {
+        return run('crystallize.mjs', [
+          `--hypo-dir=${dir}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          `--session-id=${sessionId}`,
+          '--json',
+        ]);
+      } finally {
+        cleanup();
+      }
+    };
+    const porcelain = () =>
+      spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+        cwd: dir,
+        encoding: 'utf-8',
+      }).stdout;
+
+    const hookPath = join(dir, '.git', 'hooks', 'pre-commit');
+    mkdirSync(dirname(hookPath), { recursive: true });
+    writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+    chmodSync(hookPath, 0o755);
+    try {
+      const r1 = apply();
+      assert.equal(JSON.parse(r1.stdout).committed, false, `commit must fail: ${r1.stdout}`);
+      const before = porcelain();
+      assert.ok(
+        before.includes(entryDir) && before.includes(shardRel),
+        `fixture must start dirty on the entry and the shard, or this test proves nothing: ${before}`,
+      );
+
+      rmSync(hookPath);
+      const r2 = apply();
+      assert.equal(r2.status, 0, `retry failed: ${r2.stdout}\n${r2.stderr}`);
+      assert.equal(JSON.parse(r2.stdout).committed, true, r2.stdout);
+      const left = porcelain();
+      assert.ok(
+        !left.includes(entryDir) && !left.includes(shardRel),
+        `a retry must carry the bytes its first attempt already wrote, or the gate ` +
+          `blocks on them forever: ${left}`,
+      );
+    } finally {
+      rmSync(payloadPath, { force: true });
+    }
   });
 });
 
@@ -4324,22 +4335,19 @@ test('--apply-session-close text output: ok:false prints both the stale-verifica
       );
     },
     (dir, today) => {
-      // REQUIRED_PAYLOAD_FIELDS forces `projectHot` to be present, but echoing
-      // the stale on-disk bytes back hits the overwrite's idempotent-skip step
-      // (disk === field.content): nothing refreshes the file, so post-apply
-      // verification still reports it stale — printCloseReport:1801-1809.
-      const staleProjHot = readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8');
+      // A close no longer writes the project hot.md, so nothing refreshes it: it stays
+      // stale on disk (committed stale above) and post-apply verification reports it,
+      // printCloseReport:1801-1809.
       const payload = {
         project: 'test-project',
         date: today,
-        sessionState: {
-          // No `title`: a required frontmatter field. This lands ON DISK (preflight
-          // ignores errors in files about to be overwritten) and only post-apply
-          // lint — scoped to this apply's own payload files — catches it, which is
-          // exactly the blocker printCloseReport:1810-1814 renders.
-          content: `---\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- next\n`,
-        },
-        projectHot: { content: staleProjHot },
+        summary: 'ok-false text test\n',
+        // No `title`: a required frontmatter field. This lands ON DISK (preflight
+        // ignores errors in files about to be overwritten) and only post-apply
+        // lint, scoped to this apply's own payload files, catches it, which is
+        // exactly the blocker printCloseReport:1810-1814 renders. open-questions is
+        // the one page a payload still overwrites whole.
+        openQuestions: { content: `---\ntype: concept\nupdated: ${today}\n---\n\n- next\n` },
         sessionLog: { entry: `## [${today}] ok-false text test\n` },
         log: { entry: `## [${today}] session | test-project: ok-false text\n` },
       };
@@ -4350,11 +4358,10 @@ test('--apply-session-close text output: ok:false prints both the stale-verifica
       writeFileSync(payloadPath, JSON.stringify(payload));
       const cleanup = seedCloseTranscript('s-okfalse-text');
       // Without a recorded base, overwrite's conflict check (step 2) sees an
-      // 'unknown' base for ANY session id and parks session-state.md instead of
-      // writing it — a real SessionStart hook would have snapshotted this by now,
-      // so seed it directly: "this session already read the current (title-having)
-      // bytes", which is still true for the broken payload below.
-      snapshotBase(dir, 's-okfalse-text', [join('projects', 'test-project', 'session-state.md')]);
+      // 'unknown' base for ANY session id and parks open-questions.md instead of
+      // writing it: a real SessionStart hook would have snapshotted this by now, so
+      // seed it directly ("this session already read the page", which is absent).
+      snapshotBase(dir, 's-okfalse-text', [join('pages', 'open-questions.md')]);
       let r;
       try {
         r = run('crystallize.mjs', [
