@@ -5,6 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   mkdtempSync,
   mkdirSync,
@@ -6541,6 +6542,82 @@ test("another session's committed entry of today does not prove this session: --
   });
 });
 
+const OTHER_CLOSE_TEXT = (today) =>
+  formatSessionEntry({
+    project: 'test-project',
+    closeId: closeIdFor('s-borrowed-from', 0),
+    date: today,
+    tracks: [],
+    summary: 'another close',
+    bodies: {},
+  });
+
+// Disabling the check: in sessionCloseFileStatus's 'session' branch, judge a
+// committed entry by `pathInHead(hypoDir, entry)` again (presence only). --mark then
+// certifies the borrowed bytes; the paired run stays green.
+test("another close's entry committed under this close's file name does not prove this close: --mark is incomplete", () => {
+  for (const borrowed of [true, false]) {
+    withWiki(null, (dir, today) => {
+      const sid = `s-borrowed-name-${borrowed}`;
+      const rel = pinCommittedClose(dir, sid);
+      if (borrowed) {
+        writeFileSync(join(dir, rel), OTHER_CLOSE_TEXT(today));
+        spawnSync('git', ['-C', dir, 'commit', '-q', '-am', 'borrowed bytes'], {
+          env: { ...process.env, HOME: SESSION_TMP_HOME },
+        });
+      }
+      const cleanup = seedCloseTranscript(sid);
+      try {
+        const { r, out } = markJson(dir, sid);
+        if (borrowed) {
+          assert.equal(r.status, 1, r.stdout);
+          assert.equal(out.reason, 'incomplete', r.stdout);
+          assert.ok(!existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')));
+        } else {
+          assert.equal(r.status, 0, `the paired close proves itself: ${r.stdout}\n${r.stderr}`);
+          assert.equal(out.ok, true);
+        }
+      } finally {
+        cleanup();
+      }
+    });
+  }
+});
+
+// The local-create half: a .hypoignore project proves its entry by the pin's hash,
+// and a hash recorded for another close's bytes must not do it either. Disabling the
+// check: drop the `!entryMatchesPath(text, entry)` term of the ignored branch.
+test("an ignored project's entry that holds another close's bytes is not proven, even with a matching local proof", () => {
+  for (const borrowed of [true, false]) {
+    withWiki(null, (dir, today) => {
+      writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+      const sid = `s-borrowed-local-${borrowed}`;
+      const closeId = closeIdFor(sid, 0);
+      const rel = borrowed
+        ? `projects/test-project/sessions/${today}-${closeId}.md`
+        : writeDatedEntry(dir, 'test-project', today, closeId);
+      if (borrowed) {
+        mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
+        writeFileSync(join(dir, rel), OTHER_CLOSE_TEXT(today));
+      }
+      const sha = createHash('sha256')
+        .update(readFileSync(join(dir, rel)))
+        .digest('hex');
+      writeClosePin(dir, sid, {
+        pending: null,
+        lastResolved: closeId,
+        localProofs: { [closeId]: { entryRelPath: rel, entrySha256: sha } },
+      });
+      const s = sessionCloseFileStatus(dir, {
+        scope: 'session',
+        closeId,
+        projectOverride: 'test-project',
+      });
+      assert.equal(s.stale.includes(rel), borrowed, JSON.stringify(s));
+    });
+  }
+});
+
 // The same-session half of disable (1) above. Not run through --mark: the second
 // close's uncommitted entry sits in the project folder, and the checkpoint gate
 // refuses that before the proof runs. buildMarkCloseProof is the proof --mark runs.
@@ -6668,6 +6745,33 @@ test("a project with today's session-log and no entry is a notice in a migrated 
     const s = sessionCloseGlobalStatus(dir);
     assert.equal(s.ok, true, JSON.stringify(s));
     assert.deepEqual(s.notices, []);
+  });
+});
+
+// Disabling the check: in crystallize-close-check.mjs make the `!entryOnDisk` notice
+// branch unreachable (`if (false)`). The test-project line gets a ✓ again.
+test('--check-session-close text: the entry line is ticked only when an entry is on disk, a heading-only close gets a notice line', () => {
+  withMigratedLegacyVault(true, (dir) => {
+    const today = todayLocal();
+    const legacy = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--project=test-project',
+    ]);
+    const placeholder = `projects/test-project/sessions/${today}-<close id>.md`;
+    assert.equal(legacy.status, 0, `precondition: the heading-only close passes: ${legacy.stdout}`);
+    assert.ok(!legacy.stdout.includes(`✓ ${placeholder}`), legacy.stdout);
+    assert.ok(legacy.stdout.includes(`· ${placeholder}: none`), legacy.stdout);
+    // Paired: a project closed by an entry gets the ✓ on that entry's own path.
+    const entry = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      '--project=mine',
+    ]);
+    assert.ok(
+      entry.stdout.includes(`✓ projects/mine/sessions/${today}-s-t10-mine-0.md`),
+      entry.stdout,
+    );
   });
 });
 
@@ -6894,6 +6998,36 @@ test('Q7 (64): --check-session-close with a session id and cwd reports this sess
       (out.blockers || []).some((b) => b.type === 'close-cwd'),
       JSON.stringify(out.blockers),
     );
+  });
+});
+
+// Disabling the check: in runSessionCloseCheck pass `checkTranscript` to
+// closeGateStatus instead of `sessionTranscript`. The old copy carries no close
+// request after the resolution, so the open one reads as finished and close-cwd goes.
+test('--check-session-close reads whether a close is open from the session transcript, not from an older --transcript-path copy', () => {
+  const sid = 's-t10-old-transcript';
+  withResolvedClose(sid, { secondSignal: false }, (dir) => {
+    const old = join(dir, '..', `${sid}-old.jsonl`);
+    writeFileSync(old, readFileSync(t10Transcript(sid)));
+    try {
+      appendFileSync(t10Transcript(sid), T10_CLOSE_LINE + '\n');
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--check-session-close',
+        `--session-id=${sid}`,
+        `--session-cwd=${T10_CWD}`,
+        `--transcript-path=${old}`,
+        '--json',
+      ]);
+      const out = JSON.parse(r.stdout);
+      assert.ok(
+        (out.blockers || []).some((b) => b.type === 'close-cwd'),
+        JSON.stringify(out.blockers),
+      );
+      assert.ok(out.close_signal_transcript?.endsWith(`/${sid}.jsonl`), r.stdout);
+    } finally {
+      rmSync(old, { force: true });
+    }
   });
 });
 

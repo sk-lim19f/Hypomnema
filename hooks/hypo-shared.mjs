@@ -3690,7 +3690,7 @@ export function resolveActiveProject(hypoDir, cwd = null) {
 }
 
 // The session entries of `project` on disk whose file name starts with one of `dates`.
-function datedEntryPaths(hypoDir, project, dates) {
+export function datedEntryPaths(hypoDir, project, dates) {
   let names = [];
   try {
     names = readdirSync(join(hypoDir, 'projects', project, 'sessions'));
@@ -3732,31 +3732,40 @@ function fileSha256(absPath) {
 // is the one of the session id in front of the last `-`.
 const sessionIdOfClose = (closeId) => closeId.replace(/-\d+$/, '');
 
+// Whether `text` parses as the entry `relPath` names: that close id, that project
+// folder, that date, and (when it carries one) the session the close id belongs
+// to. A file name is easy to type or copy, so a name alone proves nothing.
+function entryMatchesPath(text, relPath) {
+  const m = /^projects\/([^/]+)\/sessions\/(\d{4}-\d{2}-\d{2})-(.+-\d+)\.md$/.exec(relPath);
+  if (!m) return false;
+  const [, project, date, closeId] = m;
+  const parsed = parseSessionEntry(text);
+  if (!parsed.ok) return false;
+  const e = parsed.entry;
+  if (e.closeId !== closeId || e.project !== project || e.date !== date) return false;
+  return e.sessionId === null || e.sessionId === sessionIdOfClose(closeId);
+}
+
 // A session entry another session published that no commit holds yet: a file not in
 // HEAD whose name carries a close id of a different session. That session's own close
 // commits it, so a gate of this session neither blocks on it nor tells anyone to
 // commit or revert it (it is the only copy of that session's summary). An entry
 // already in HEAD and since modified is not new, and git failing to answer is not
-// "absent": both stay blocking. A name is easy to type by hand, so the file must
-// also parse as the entry its path names: that close id, that project folder, that
-// date, and (when it carries one) the session the close id belongs to.
+// "absent": both stay blocking. The file must also be the entry its path names
+// (entryMatchesPath).
 export function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
   if (!isValidSessionId(sessionId) || !isSessionEntryPath(relPath)) return false;
-  const m = /^projects\/([^/]+)\/sessions\/(\d{4}-\d{2}-\d{2})-(.+-\d+)\.md$/.exec(relPath);
+  const m = /^projects\/[^/]+\/sessions\/\d{4}-\d{2}-\d{2}-(.+-\d+)\.md$/.exec(relPath);
   if (!m) return false;
-  const [, project, date, closeId] = m;
-  const owner = sessionIdOfClose(closeId);
+  const owner = sessionIdOfClose(m[1]);
   if (owner === sessionId || !isValidSessionId(owner)) return false;
-  let parsed;
+  let text;
   try {
-    parsed = parseSessionEntry(readFileSync(join(hypoDir, relPath), 'utf-8'));
+    text = readFileSync(join(hypoDir, relPath), 'utf-8');
   } catch {
     return false;
   }
-  if (!parsed.ok) return false;
-  const e = parsed.entry;
-  if (e.closeId !== closeId || e.project !== project || e.date !== date) return false;
-  if (e.sessionId !== null && e.sessionId !== owner) return false;
+  if (!entryMatchesPath(text, relPath)) return false;
   return headPathState(hypoDir, relPath) === 'absent';
 }
 
@@ -3968,7 +3977,9 @@ export const LEGACY_CLOSE_NOTICE_TYPE = 'close-legacy';
  *              "no close to prove" and reads as missing). Its entry must be in
  *              HEAD's tree; for a `.hypoignore` project, which never commits
  *              it, the entry's disk bytes must hash to the close pin's
- *              `localProofs[closeId]` instead. The session-log and log.md lines
+ *              `localProofs[closeId]` instead. Either way those bytes must be
+ *              the entry the path names (entryMatchesPath): another close's
+ *              entry committed under this close's name proves nothing. The session-log and log.md lines
  *              are looked up under the entry's own date, not today's, so a
  *              close committed before midnight still proves itself after it.
  *              Another close's entry, even one of the same session, proves nothing.
@@ -4033,15 +4044,23 @@ export function sessionCloseFileStatus(hypoDir, opts) {
       const ignorePatterns = loadHypoIgnore(hypoDir);
       if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, entry), hypoDir, ignorePatterns)) {
         const proof = readClosePin(hypoDir, sessionIdOfClose(closeId)).localProofs[closeId];
+        let text = null;
+        try {
+          text = readFileSync(join(hypoDir, entry), 'utf-8');
+        } catch {
+          // unreadable: no proof
+        }
         if (
           !proof ||
           proof.entryRelPath !== entry ||
-          proof.entrySha256 !== fileSha256(join(hypoDir, entry))
+          proof.entrySha256 !== fileSha256(join(hypoDir, entry)) ||
+          !entryMatchesPath(text, entry)
         ) {
           stale.push(entry);
         }
-      } else if (!pathInHead(hypoDir, entry)) {
-        stale.push(entry);
+      } else {
+        const blob = headBlob(hypoDir, entry);
+        if (!blob || !entryMatchesPath(blob.toString('utf-8'), entry)) stale.push(entry);
       }
       sessionLogEvidence = checkCloseLogs(hypoDir, project, dates, stale, missing);
     }

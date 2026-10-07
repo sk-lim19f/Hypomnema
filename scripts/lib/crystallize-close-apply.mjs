@@ -756,6 +756,17 @@ export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker) 
   };
 }
 
+// One wording for both writers of `close-resolution-failed`.
+const CLOSE_RESOLUTION_FAILED_HELP = (retractFailed) =>
+  'the close could not record its resolution under .cache/close-gate/ (likely a permission ' +
+  'or disk issue), so the receipt and marker it filed were withdrawn and the session is NOT ' +
+  'closed' +
+  (retractFailed
+    ? `; withdrawing them failed (${retractFailed}), so a stale receipt or marker may remain`
+    : '') +
+  '. Fix the directory and re-run the same close: the close signal is still open, so no ' +
+  'fresh close phrase is needed.';
+
 // The commit a session's OLD close receipt certified, when that commit is no
 // longer an ancestor of HEAD (a `git reset --hard` or rebase dropped it).
 // Reads the receipt JSON itself instead of readReceiptStrict: that returns no
@@ -1124,7 +1135,20 @@ export function runMarkSessionClosed(args) {
           receiptGeneration: generation,
         }),
       );
-      if (landed.ok) return { ok: true };
+      if (landed.ok) {
+        // A log-only mark proves no project close, so it spends no close signal and
+        // leaves the pin alone: a pending close of this session keeps its id.
+        if (args.logOnly) return { ok: true };
+        // Same rule as the apply marker phase: a close whose signal cannot be
+        // spent is not finished (settleCloseResolution).
+        const settled = settleCloseResolution(args.hypoDir, args.sessionId, closeTranscript);
+        if (settled.ok) return { ok: true };
+        return {
+          ok: false,
+          reason: 'close-resolution-failed',
+          ...(settled.retractFailed ? { retractFailed: settled.retractFailed } : {}),
+        };
+      }
       return landed.reason === 'receipt-write-failed'
         ? {
             ok: false,
@@ -1168,7 +1192,9 @@ export function runMarkSessionClosed(args) {
           (receiptResult.retractFailed
             ? `, but withdrawing it failed (${receiptResult.retractFailed}), so a stale receipt may remain`
             : '')
-        : `session-close checkpoint could not be certified, marker not written (${detail})`;
+        : receiptResult.reason === 'close-resolution-failed'
+          ? CLOSE_RESOLUTION_FAILED_HELP(receiptResult.retractFailed)
+          : `session-close checkpoint could not be certified, marker not written (${detail})`;
     console.log(
       args.json
         ? JSON.stringify(
@@ -1309,7 +1335,8 @@ export function markerWriteGenuinelyFailed({ markerWritten, markerSkipReason }) 
     markerWritten !== true &&
     (markerSkipReason === 'marker-did-not-land' ||
       markerSkipReason === 'receipt-proof-mismatch' ||
-      markerSkipReason === 'receipt-write-failed')
+      markerSkipReason === 'receipt-write-failed' ||
+      markerSkipReason === 'close-resolution-failed')
   );
 }
 
@@ -1423,6 +1450,33 @@ function pinCloseId(hypoDir, sessionId, { openedAtIndex, resolvedAtIndex }) {
   }
   if (pin !== stored) writeClosePin(hypoDir, sessionId, pin);
   return pin.pending.closeId;
+}
+
+// Spend the close signal once the receipt and marker of this session's close
+// have landed: record the close-gate resolution, then retire the pin's
+// `pending`. A resolution that cannot be recorded (an unreadable transcript, a
+// failed write under .cache/close-gate) takes the receipt and marker back, and
+// the close fails with `close-resolution-failed`. The pin keeps `pending`, the
+// signal stays open, so a retry runs under the same id and adopts the entry this
+// close committed. Shared by the apply marker phase and a project
+// `--mark-session-closed` (a `--log-only` mark spends nothing).
+// `testHooks.afterResolutionBeforePin` is test-only.
+// @returns {{ok: true} | {ok: false, retractFailed?: string}}
+function settleCloseResolution(hypoDir, sessionId, transcriptPath, testHooks = null) {
+  let landed = false;
+  try {
+    landed = recordGateClosed(hypoDir, sessionId, resolutionStamp(readFileSync(transcriptPath)));
+  } catch {
+    // an unreadable transcript records nothing, same as a failed write
+  }
+  if (!landed) {
+    const retracted = invalidateCloseArtifacts(hypoDir, sessionId);
+    return retracted.ok ? { ok: false } : { ok: false, retractFailed: retracted.reason };
+  }
+  // Outside the try above so a test seam can throw here.
+  testHooks?.afterResolutionBeforePin?.();
+  resolveClosePin(hypoDir, sessionId);
+  return { ok: true };
 }
 
 // The close resolved (receipt and marker landed, gate resolution recorded):
@@ -1886,6 +1940,9 @@ function headBlobText(hypoDir, relPath) {
  *   conflict   anything else: leave the file alone. `reason: 'head-unreadable'`
  *              when git could not say whether HEAD has the path: committed bytes
  *              read as uncommitted would be replaced, so no answer is no replace
+ * Whether the path is committed is asked before whether the bytes equal `text`:
+ * a committed entry edited by hand into this attempt's payload is still an edit
+ * of committed bytes, and reading it as `identical` would commit the edit.
  */
 export function classifyExistingEntry({
   hypoDir,
@@ -1897,8 +1954,8 @@ export function classifyExistingEntry({
   ignored,
   pin,
 }) {
-  if (disk === text) return { action: 'identical' };
   if (disk === undefined) return { action: 'conflict', reason: 'unreadable' };
+  const same = disk === text;
   const diskHash = bytesSha256(disk);
   const journalHit = readJournal(hypoDir, sessionId)[relPath] === diskHash;
   const pending = pin.pending;
@@ -1912,16 +1969,22 @@ export function classifyExistingEntry({
     // a journal that still names the bytes means the commit step has not run
     // yet, so the payload can still be corrected.
     const proof = pin.localProofs[closeId];
-    if (proof && proof.entryRelPath === relPath && proof.entrySha256 === diskHash) {
-      return { action: journalHit ? 'replace' : 'adopt' };
+    const proven = !!proof && proof.entryRelPath === relPath;
+    if (proven && proof.entrySha256 === diskHash) {
+      return { action: same ? 'identical' : journalHit ? 'replace' : 'adopt' };
     }
-    return pinHit || journalHit ? { action: 'replace' } : { action: 'conflict' };
+    if (pinHit || journalHit) return { action: same ? 'identical' : 'replace' };
+    // A proven entry whose bytes moved with no record of ours is the local
+    // counterpart of a committed entry edited by hand.
+    return same && !proven ? { action: 'identical' } : { action: 'conflict' };
   }
   const inHead = headPathState(hypoDir, relPath);
   if (inHead === 'error') return { action: 'conflict', reason: 'head-unreadable' };
   if (inHead === 'present') {
-    return disk === headBlobText(hypoDir, relPath) ? { action: 'adopt' } : { action: 'conflict' };
+    if (disk !== headBlobText(hypoDir, relPath)) return { action: 'conflict' };
+    return { action: same ? 'identical' : 'adopt' };
   }
+  if (same) return { action: 'identical' };
   return pinHit || journalHit ? { action: 'replace' } : { action: 'conflict' };
 }
 
@@ -2167,6 +2230,13 @@ function writeSessionEntry(args, plan, acc, testHooks) {
         pinFail('record the intent to replace this entry', err);
       }
       testHooks?.afterPinBeforeReplace?.({ abs, relPath });
+      // The judgment above read `disk`. Bytes that landed since are not the ones
+      // it licensed, so they stay and the close stops.
+      // ponytail: this read and the rename are two steps; a write between them is
+      // still replaced. Closing that needs a lock every entry writer takes.
+      if (readTarget(abs) !== disk) {
+        failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath));
+      }
       atomicWrite(abs, text);
       outcome = 'replaced';
     } else {
@@ -4134,30 +4204,24 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
             // true when `transcriptResolved` was true in `planMarkerDecision`'s
             // inputs above, so it is guaranteed non-null at this point.
             //
-            // Best-effort like every other write in this store: resolutionStamp
-            // returns null on anything it cannot read as a Buffer, recordGateClosed
-            // refuses a null stamp, and both fail silently, so a transcript that
-            // vanishes mid-read (or a cache-write failure) can never turn an
-            // otherwise-successful close into a failure.
-            let resolutionLanded = false;
-            try {
-              resolutionLanded = recordGateClosed(
-                args.hypoDir,
-                args.sessionId,
-                resolutionStamp(readFileSync(closeTranscript)),
-              );
-            } catch {
-              // Unreadable at the moment of a successful close is not this
-              // apply's problem to surface, the resolution just stays
-              // unrecorded, same as if this session had never resolved at all
-              // (NO_CONSTRAINT).
-            }
-            // Only a landed resolution retires the pin's `pending`: an
-            // unrecorded one leaves the signal unspent, so a retry must keep
-            // its id. Outside the try above so a test seam can throw here.
-            if (resolutionLanded) {
-              testHooks?.afterResolutionBeforePin?.();
-              resolveClosePin(args.hypoDir, args.sessionId);
+            // A resolution that does not land fails the close (see
+            // settleCloseResolution): the pin's `pending` would stay, and the
+            // next close request would borrow this close's id and lose its own
+            // summary to this close's committed entry.
+            const settled = settleCloseResolution(
+              args.hypoDir,
+              args.sessionId,
+              closeTranscript,
+              testHooks,
+            );
+            if (!settled.ok) {
+              markerWritten = false;
+              markerSkipReason = 'close-resolution-failed';
+              if (settled.retractFailed) {
+                receiptMismatches = [
+                  { path: '(receipt)', reason: `retract-failed: ${settled.retractFailed}` },
+                ];
+              }
             }
           } else if (landed.reason === 'receipt-write-failed') {
             markerSkipReason = 'receipt-write-failed';
@@ -4597,7 +4661,9 @@ function printCloseReport({
               `    clear whichever other blocker the gate names), then re-run the same\n` +
               `    close. No fresh close phrase is needed: a close signal is spent only\n` +
               `    once the marker lands.\n`
-            : null;
+            : markerSkipReason === 'close-resolution-failed'
+              ? `    ${CLOSE_RESOLUTION_FAILED_HELP(null)}\n`
+              : null;
     process.stderr.write(
       `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
         // MAJOR FIX (codex cross-review round 5): only present when the reason

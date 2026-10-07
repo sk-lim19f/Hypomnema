@@ -3879,9 +3879,176 @@ test('a close that crashed between its resolution record and the pin move does n
   });
 });
 
-// Disabling the check: in the `if (resolutionLanded)` guard, make it
-// unconditional. Not reachable from outside (recordGateClosed cannot be made to
-// fail while the receipt still lands), so it has no test of its own.
+// The close-gate resolution directory refuses writes while the receipt and marker
+// still land: the one state where a close spends nothing and must say so.
+function withUnwritableGateDir(dir, sessionId, fn) {
+  const gateDir = dirname(closeGatePath(dir, sessionId));
+  mkdirSync(gateDir, { recursive: true });
+  chmodSync(gateDir, 0o500);
+  try {
+    return fn();
+  } finally {
+    chmodSync(gateDir, 0o700);
+  }
+}
+
+// The second close request after a recovered close: a new id, a new entry, and the
+// first close's bytes untouched (the state a lent id would have broken).
+function assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, firstId, firstBytes) {
+  typeCloseAgain(sessionId);
+  const gate = pinGate(dir, sessionId);
+  assert.equal(gate.ok, true, 'the new request is open');
+  const second = JSON.parse(
+    runApply(
+      dir,
+      v2Payload(today, {
+        summary: 'second request summary',
+        tracks: [{ id: 'second-request', new: true, next: '- second' }],
+        tag: 'second request',
+      }),
+      { sessionId },
+    ).stdout,
+  );
+  assert.equal(second.ok, true, JSON.stringify(second));
+  const secondId = closeIdFor(sessionId, gate.openedAtIndex);
+  assert.notEqual(secondId, firstId);
+  assert.equal(entryAt(dir, `${today}-${secondId}.md`).summary, 'second request summary');
+  assert.equal(
+    readFileSync(join(sessionsDirOf(dir), `${today}-${firstId}.md`), 'utf-8'),
+    firstBytes,
+    'the first close entry is unchanged',
+  );
+}
+
+// Disabling the check: in settleCloseResolution return `{ ok: true }` when the
+// record did not land (skip the withdrawal). The first apply then ends ok with its
+// marker, and the stage assertion goes red.
+test('a close whose gate resolution cannot be recorded fails at close-resolution-failed and takes back its receipt and marker; the retry finishes it and the next request gets a new id', () => {
+  if (process.getuid && process.getuid() === 0) return; // root ignores directory modes
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-resolution');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const first = withUnwritableGateDir(dir, sessionId, () =>
+        JSON.parse(runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout),
+      );
+      assert.equal(first.ok, false, JSON.stringify(first));
+      assert.equal(first.stage, 'close-resolution-failed', JSON.stringify(first));
+      assert.equal(first.committed, true);
+      assert.equal(first.markerWritten, false);
+      assert.equal(existsSync(sessionClosedMarkerPath(dir, sessionId)), false, 'marker taken back');
+      assert.equal(existsSync(receiptPath(dir, sessionId)), false, 'receipt taken back');
+      assert.equal(existsSync(closeGatePath(dir, sessionId)), false, 'nothing resolved');
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, id, 'the close stays pending');
+      const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
+
+      // No new close phrase: the signal was never spent, the retry adopts the entry.
+      const retry = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(retry.ok, true, JSON.stringify(retry));
+      assert.equal(retry.markerWritten, true, JSON.stringify(retry));
+      assert.ok(existsSync(closeGatePath(dir, sessionId)), 'the retry recorded the resolution');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+
+      assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in runMarkSessionClosed's lock body return `{ ok: true }` on
+// `landed.ok` without calling settleCloseResolution. The first --mark then ends ok,
+// and with no resolution recorded the pin keeps lending the id.
+test('--mark-session-closed records the resolution too: one that cannot be written fails it with its receipt and marker taken back, and the fixed re-run spends the signal', () => {
+  if (process.getuid && process.getuid() === 0) return; // root ignores directory modes
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-resolution');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const unblock = blockReceipt(dir, sessionId);
+      const applied = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(applied.stage, 'receipt-write-failed', JSON.stringify(applied));
+      unblock();
+      const id = closeIdFor(sessionId, 0);
+      const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
+      const mark = () => {
+        const r = run('crystallize.mjs', [
+          `--hypo-dir=${dir}`,
+          '--mark-session-closed',
+          `--session-id=${sessionId}`,
+          '--project=test-project',
+          '--json',
+        ]);
+        return { r, out: JSON.parse(r.stdout) };
+      };
+
+      const refused = withUnwritableGateDir(dir, sessionId, mark);
+      assert.equal(refused.r.status, 1, refused.r.stdout);
+      assert.equal(refused.out.reason, 'close-resolution-failed', refused.r.stdout);
+      assert.equal(existsSync(sessionClosedMarkerPath(dir, sessionId)), false, 'marker taken back');
+      assert.equal(existsSync(receiptPath(dir, sessionId)), false, 'receipt taken back');
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, id);
+
+      const marked = mark();
+      assert.equal(marked.r.status, 0, `${marked.r.stdout}\n${marked.r.stderr}`);
+      assert.equal(marked.out.ok, true);
+      assert.ok(existsSync(closeGatePath(dir, sessionId)), '--mark recorded the resolution');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+
+      assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in runMarkSessionClosed drop the `if (args.logOnly) return
+// { ok: true };` line. The log-only mark then records a resolution and retires the
+// pending close, and the retry gets a new id.
+// The pending close here is committed and failed at its receipt: with its entry still
+// uncommitted the checkpoint gate refuses the log-only mark (known-session-write)
+// before it reaches this branch.
+test('a --log-only mark spends no close signal: a pending close keeps its id, and the retry finishes under it', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-log-only');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const unblock = blockReceipt(dir, sessionId);
+      const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sessionId);
+      assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+      unblock();
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, id);
+
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        `--session-id=${sessionId}`,
+        '--log-only',
+        '--json',
+      ]);
+      assert.equal(r.status, 0, `precondition: the log-only mark lands: ${r.stdout}\n${r.stderr}`);
+      assert.equal(JSON.parse(r.stdout).ok, true);
+      assert.equal(existsSync(closeGatePath(dir, sessionId)), false, 'no resolution recorded');
+      const pin = readClosePin(dir, sessionId);
+      assert.equal(pin.pending?.closeId, id, 'the pending close is untouched');
+      assert.equal(pin.lastResolved, null);
+
+      const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sessionId);
+      assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+      assert.equal(retry.out.markerWritten, true, JSON.stringify(retry.out));
+      assert.deepEqual(sessionFilesOf(dir), [`${today}-${id}.md`], 'the retry kept the close id');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+    } finally {
+      cleanup();
+    }
+  });
+});
 
 test('a pin that cannot be written stops the close before any wiki write, at stage close-pin', () => {
   withWiki(null, (dir, today) => {
@@ -4150,11 +4317,14 @@ await testAsync(
   () => closeTwiceInParallel(0),
 );
 
-// S1 regression sample: started 400ms apart, the second close appends its session-log heading
-// while the first one's marker gate is still running lint, after its commit landed. The
-// deterministic pin of the rule is the gate-level test of foreign appends in close-global.
+// A timing sample, not a pin. Started 400ms apart, the second close usually appends its
+// session-log heading while the first one's marker gate runs lint after its commit, but
+// nothing here forces that overlap: on a fast or a loaded machine the two can run apart,
+// and the test then passes without exercising it. The overlap is pinned deterministically
+// by the gate-level test of foreign appends in close-global. A barrier would need a seam
+// in the marker gate that only this test uses.
 await testAsync(
-  'two closes of one project started 400ms apart both commit and both write their marker',
+  'timing sample: two closes of one project started 400ms apart both commit and both write their marker',
   () => closeTwiceInParallel(400),
 );
 
@@ -4848,6 +5018,27 @@ test('a committed entry edited by hand is not adopted or replaced: the retry fai
   });
 });
 
+// Disabling the check: in classifyExistingEntry answer `identical` first whenever
+// `disk === text`, before asking HEAD. The retry then commits the edited bytes.
+test('a committed entry edited by hand into exactly the retry payload bytes is still a conflict, and the edit is not committed', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('hand-edit-to-payload');
+    const unblock = blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    // What the retry payload formats to: the same entry with the fixed summary.
+    const edited = readFileSync(file, 'utf-8').replace('first summary', 'fixed summary');
+    writeFileSync(file, edited);
+    const head = gitHead(dir);
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), edited);
+    assert.equal(gitHead(dir), head, 'nothing was committed');
+  });
+});
+
 test('bytes another writer puts at the entry path just before the publish are never replaced (entry-conflict)', () => {
   withWiki(null, (dir, today) => {
     const sid = newPinSession('race');
@@ -4904,6 +5095,35 @@ test('an uncommitted entry another process changed, matching neither the journal
     const retry = applyJson(dir, v2Payload(today, { summary: 'fixed' }), sid);
     assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
     assert.equal(readFileSync(file, 'utf-8'), 'someone else rewrote this\n');
+  });
+});
+
+// Disabling the check: in writeSessionEntry drop the re-read before the replace
+// (`readTarget(abs) !== disk`). The retry then writes over the bytes the seam put there.
+test('bytes that land after the retry judged its uncommitted entry and before it replaces it are kept (entry-conflict)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('replace-race');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const unblock = blockCommits(dir);
+      const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+      assert.equal(first.out.committed, false, JSON.stringify(first.out));
+      unblock();
+      const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+      const head = gitHead(dir);
+      const r = applyWithHooks(
+        dir,
+        v2Payload(today, { summary: 'fixed summary' }),
+        sid,
+        `{ afterPinBeforeReplace({ abs }) { writeFileSync(abs, 'landed in between\\n'); } }`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.stage, 'entry-conflict', `${r.stdout}\n${r.stderr}`);
+      assert.equal(readFileSync(file, 'utf-8'), 'landed in between\n');
+      assert.equal(gitHead(dir), head, 'nothing was committed');
+    } finally {
+      cleanup();
+    }
   });
 });
 
@@ -5484,6 +5704,25 @@ test('an ignored project: the entry is never committed, the local proof outlives
   });
 });
 
+// The local counterpart of the committed hand edit above. Disabling the check: in
+// classifyExistingEntry's ignored branch return `identical` whenever `same`.
+test('an ignored project: a proven entry edited by hand into exactly the retry payload bytes is a conflict', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored-edit-to-payload');
+    const unblock = blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    const edited = readFileSync(file, 'utf-8').replace('first summary', 'fixed summary');
+    writeFileSync(file, edited);
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), edited);
+  });
+});
+
 // The two halves the gate and the receipt used to block: the ignored entry stays
 // dirty for good (the checkpoint gate refused it as this session's own uncommitted
 // write), and no commit holds it (the receipt had no kind to prove it with).
@@ -5607,7 +5846,9 @@ test('the first shard of a day has the same header bytes whatever the session id
   assert.ok(!/session_id|device/.test(a), a);
 });
 
-test('two clones that each create the first shard of a day pull each other without session_id or device keys in the result', () => {
+// The seed below adds a union driver for log.md, which every close also appends to:
+// without it the pull conflicts in log.md. This test answers only how the shard merges.
+test('the session-log shard that two clones each create on one day merges into one frontmatter block with no session_id or device keys', () => {
   const base = mkdtempSync(join(tmpdir(), 'hypo-clones-'));
   const env = { ...process.env, HOME: SESSION_TMP_HOME };
   const git = (cwd, ...args) => spawnSync('git', args, { cwd, env, encoding: 'utf-8' });

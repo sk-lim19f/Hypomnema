@@ -1,6 +1,8 @@
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { realpathSync } from 'fs';
+import { dirname, join, resolve } from 'path';
 import {
+  datedEntryPaths,
   precompactGateStatus,
   resolveTranscriptBySessionId,
   sessionLogShardPath,
@@ -51,10 +53,26 @@ export function runSessionCloseCheck(args) {
   // close scope, fall back to the global block, and report RED for debt that the
   // PreCompact notice demotes. Checklist step 14 tells the model to trust this command, so an over-red
   // check is as harmful as an over-green one.
-  const checkTranscript =
-    args.transcriptPath ||
-    (args.sessionId ? resolveTranscriptBySessionId(args.sessionId) : null) ||
-    null;
+  const sessionTranscript = args.sessionId ? resolveTranscriptBySessionId(args.sessionId) : null;
+  const checkTranscript = args.transcriptPath || sessionTranscript || null;
+  // Whether a close is open is read only from the transcript --session-id resolves,
+  // never from --transcript-path: an older copy of the transcript would hide a close
+  // request typed since and read an open close as finished (the marker writers
+  // resolve it the same way). --transcript-path keeps its lint scope role above.
+  const samePath = (a, b) => {
+    const real = (p) => {
+      try {
+        return realpathSync(p);
+      } catch {
+        return resolve(p);
+      }
+    };
+    return real(a) === real(b);
+  };
+  const closeSignalTranscriptDiffers =
+    !!args.transcriptPath &&
+    !!args.sessionId &&
+    (!sessionTranscript || !samePath(sessionTranscript, args.transcriptPath));
   // This session's close verdict, the same closeCheckpointState Stop blocks on.
   // Read first, and only once: readSessionClosedMarker (inside it) unlinks an
   // expired or corrupt marker as it reads, exactly as the next Stop would.
@@ -69,7 +87,7 @@ export function runSessionCloseCheck(args) {
   // is no pin to read and nothing open.
   const closeGate = args.sessionId
     ? closeGateStatus({
-        transcriptPath: checkTranscript,
+        transcriptPath: sessionTranscript,
         hypoDir: args.hypoDir,
         sessionId: args.sessionId,
       })
@@ -183,6 +201,11 @@ export function runSessionCloseCheck(args) {
                 marker_present: markerPresent,
                 close_state: checkpoint.state,
                 ...(checkpoint.reason ? { close_state_reason: checkpoint.reason } : {}),
+                // Present when --transcript-path is not the session's own transcript:
+                // the close signal was read from this one (null: none resolved).
+                ...(closeSignalTranscriptDiffers
+                  ? { close_signal_transcript: sessionTranscript }
+                  : {}),
               }
             : {}),
         },
@@ -215,6 +238,12 @@ export function runSessionCloseCheck(args) {
     `Close check (${scope === 'global' ? `project: ${proj}` : `scope: ${scope}, project: ${proj}`}, date: ${close.dates.join(' / ')}):\n`,
   );
 
+  if (closeSignalTranscriptDiffers) {
+    console.log(
+      `Note: --transcript-path only scopes lint. Whether a close is open was read from this session's own transcript (${sessionTranscript ?? 'none resolved'}).\n`,
+    );
+  }
+
   // A close is proven by an entry under projects/<p>/sessions/, never by the
   // generated hot.md / session-state.md views.
   const required = close.project
@@ -224,9 +253,20 @@ export function runSessionCloseCheck(args) {
         'log.md',
       ]
     : [];
+  // The entry line gets a ✓ only for an entry that is on disk. A close that the
+  // gate passed on its session-log heading alone (an older writer) has none.
+  const entryOnDisk = close.project
+    ? datedEntryPaths(args.hypoDir, close.project, close.dates)[0]
+    : null;
   for (const f of required) {
     const bad = close.missing.includes(f) ? 'missing' : close.stale.includes(f) ? 'stale' : '';
-    console.log(`  ${bad ? '✗' : '✓'} ${f}${bad ? ` — ${bad}` : ''}`);
+    if (!bad && f === required[0] && !entryOnDisk) {
+      console.log(`  · ${f}: none, this close was recorded without an entry (an older writer)`);
+      continue;
+    }
+    console.log(
+      `  ${bad ? '✗' : '✓'} ${bad || f !== required[0] ? f : entryOnDisk}${bad ? ` — ${bad}` : ''}`,
+    );
   }
   // Surface anything not covered by the canonical list (e.g. unresolved project).
   for (const f of [...close.missing, ...close.stale]) {
