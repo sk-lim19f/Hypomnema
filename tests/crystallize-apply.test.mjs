@@ -4017,8 +4017,16 @@ test('--mark-session-closed records the resolution too: one that cannot be writt
 // Runs `--mark-session-closed` or `--apply-session-close` in a child whose
 // `beforeResolution` seam appends a genuine second close request to the transcript:
 // the user typing between this close's gate check and its resolution record.
-// `payload` is only for the apply mode.
-function runTypingBeforeResolution(dir, sessionId, mode, payload = null) {
+// `payload` is only for the apply mode. `hook` picks the seam that types: the default
+// `beforeResolution`, or the mark's `afterCloseGateRead`, which fires right after its
+// one gate read. `lines` are the transcript lines it appends.
+function runTypingBeforeResolution(
+  dir,
+  sessionId,
+  mode,
+  payload = null,
+  { hook = 'beforeResolution', lines = [PIN_CLOSE_PHRASE] } = {},
+) {
   const payloadPath = join(
     tmpdir(),
     `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
@@ -4040,8 +4048,8 @@ function runTypingBeforeResolution(dir, sessionId, mode, payload = null) {
     import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
     import { ${entry} } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
     ${entry}(parseArgs(${JSON.stringify(argv)}), {
-      beforeResolution() {
-        appendFileSync(${JSON.stringify(pinTranscriptPath(sessionId))}, ${JSON.stringify(PIN_CLOSE_PHRASE + '\n')});
+      ${hook}() {
+        appendFileSync(${JSON.stringify(pinTranscriptPath(sessionId))}, ${JSON.stringify(lines.join('\n') + '\n')});
       },
     });
   `;
@@ -4118,6 +4126,112 @@ test('an apply does not resolve a close request typed between its gate check and
       const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
 
       assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes, { typeAgain: false });
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in runMarkSessionClosed gate on a second read again,
+// `!closeTranscript || !isCloseGateOpen(closeTranscript)`. The close request typed
+// after the gate read then authorizes the mark, which stamps the first read's bound
+// (the old close's position) and succeeds, so the refusal assertion goes red.
+// The gate read sees a retracted close: the mark has no user close signal and refuses.
+// A phrase typed after that read is a new request the mark neither authorizes nor
+// spends, so the next apply uses it once and a second apply is refused.
+test('--mark-session-closed judges the user close signal on the same read that bounds its resolution: a close phrase typed after that read neither authorizes the mark nor gets spent', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-reread');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const unblock = blockReceipt(dir, sessionId);
+      const applied = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(applied.stage, 'receipt-write-failed', JSON.stringify(applied));
+      assert.equal(applied.committed, true, JSON.stringify(applied));
+      unblock();
+      appendFileSync(pinTranscriptPath(sessionId), UNREGISTERED_HOST_TAG_ENQUEUE + '\n');
+      assert.equal(pinGate(dir, sessionId).open, false, 'the fixture must retract the close');
+
+      const r = runTypingBeforeResolution(dir, sessionId, 'mark', null, {
+        hook: 'afterCloseGateRead',
+      });
+      const out = JSON.parse(r.stdout);
+      assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+      assert.equal(out.ok, false, r.stdout);
+      assert.equal(out.skipReason, 'no-user-close-signal', r.stdout);
+      assert.equal(existsSync(sessionClosedMarkerPath(dir, sessionId)), false, 'no marker');
+      assert.equal(existsSync(receiptPath(dir, sessionId)), false, 'no receipt');
+      assert.equal(existsSync(closeGatePath(dir, sessionId)), false, 'nothing resolved');
+      const gate = pinGate(dir, sessionId);
+      assert.equal(gate.ok, true, 'the phrase typed after the read is still an open request');
+      assert.equal(gate.openedAtIndex, 2);
+
+      const next = () =>
+        JSON.parse(runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout);
+      const used = next();
+      assert.equal(used.ok, true, JSON.stringify(used));
+      assert.equal(used.committed, true, JSON.stringify(used));
+      assert.equal(used.markerWritten, true, JSON.stringify(used));
+      assert.equal(recordedClosedAtIndex(dir, sessionId), 3, 'resolved at the new phrase');
+      const again = next();
+      assert.equal(again.ok, false, JSON.stringify(again));
+      assert.equal(again.stage, 'no-user-close-signal', JSON.stringify(again));
+      assert.equal(again.committed, null, JSON.stringify(again));
+      assert.match(again.gateReason, /^no-new-open-since-resolution/, JSON.stringify(again));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in settleCloseResolution drop `storedResolutionCount(...)` from
+// the Math.max. The re-mark then records 1 (the first signal's count) over the stored 3,
+// the restored transcript matches that record again, and the last apply goes through.
+// Position 2 is the phrase the first close spent; rewriting it keeps the record count
+// and breaks the stored hash, while the phrase at position 0 stays open.
+test('a re-mark after the transcript was rewritten does not lower the stored resolution: the restored transcript does not reopen a phrase an earlier close spent', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-rewrite');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const tp = pinTranscriptPath(sessionId);
+      const neutral = JSON.stringify({ type: 'user', message: { role: 'user', content: '계속' } });
+      const original = [PIN_CLOSE_PHRASE, neutral, PIN_CLOSE_PHRASE].join('\n') + '\n';
+      writeFileSync(tp, original);
+      const applied = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(applied.ok, true, JSON.stringify(applied));
+      assert.equal(applied.markerWritten, true, JSON.stringify(applied));
+      assert.equal(recordedClosedAtIndex(dir, sessionId), 3);
+
+      writeFileSync(tp, [PIN_CLOSE_PHRASE, neutral, neutral].join('\n') + '\n');
+      rmSync(receiptPath(dir, sessionId), { force: true });
+      rmSync(sessionClosedMarkerPath(dir, sessionId), { force: true });
+      const gate = pinGate(dir, sessionId);
+      assert.equal(gate.open, true, 'the earlier phrase is still open');
+      assert.equal(gate.resolvedAtIndex, null, 'the stored hash no longer matches');
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        `--session-id=${sessionId}`,
+        '--project=test-project',
+        '--json',
+      ]);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.equal(JSON.parse(r.stdout).ok, true, r.stdout);
+      assert.ok(recordedClosedAtIndex(dir, sessionId) >= 3, 'the stored count never goes back');
+
+      writeFileSync(tp, original);
+      const replay = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(replay.ok, false, JSON.stringify(replay));
+      assert.equal(replay.stage, 'no-user-close-signal', JSON.stringify(replay));
+      assert.equal(replay.committed, null, JSON.stringify(replay));
+      assert.match(replay.gateReason, /^transcript-rewrite-detected/, JSON.stringify(replay));
     } finally {
       cleanup();
     }

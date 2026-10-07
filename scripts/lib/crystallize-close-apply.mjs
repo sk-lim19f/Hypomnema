@@ -94,6 +94,7 @@ import {
   isValidSessionId,
 } from '../../hooks/proposal-store.mjs';
 import {
+  closeGatePath,
   recordGateClosed,
   resolutionStamp,
   closeGateStatus,
@@ -927,6 +928,9 @@ export function runMarkSessionClosed(args, testHooks = null) {
     hypoDir: args.hypoDir,
     sessionId: args.sessionId,
   });
+  // Test-only seam: runs right after the one gate read, so a test can type into
+  // the transcript where the old second read (the user-close check below) sat.
+  testHooks?.afterCloseGateRead?.();
   const closeOpen = closeGate.ok;
   const resolvedAtIndex = closeGate.resolvedAtIndex;
   const gate = precompactGateStatus(args.hypoDir, {
@@ -976,11 +980,10 @@ export function runMarkSessionClosed(args, testHooks = null) {
   // branch, which left the success path with no way to see a hostTagWarning at
   // all: a close that survived a pasted host tag wrote its marker, unblocked
   // the Stop chain, and said nothing, on the one entry point a model reaches
-  // after closing by hand. Hoisting changes no gate decision: the decision
-  // below still reads the raw `isCloseGateOpen` boolean per this file's
-  // "runMarkSessionClosed stays on isCloseGateOpen" contract, and this result
-  // is only ever read for its two strings. `null` when there is no transcript
-  // to read either from.
+  // after closing by hand. The decision below reads this result's raw `open`
+  // (the same walkCloseGate boolean isCloseGateOpen returns, per this file's
+  // "runMarkSessionClosed stays on the raw open" contract), never its
+  // resolution-aware `ok`. `null` when there is no transcript to read either from.
   const gateStatus = closeTranscript ? closeGate : null;
   // This path writes one thing, the marker, and makes no commit, so the undo
   // it offers is the marker alone. A revert instruction here would point at
@@ -995,7 +998,11 @@ export function runMarkSessionClosed(args, testHooks = null) {
     args.hypoDir,
     args.sessionId,
   );
-  if (!closeTranscript || !isCloseGateOpen(closeTranscript)) {
+  // Reads `closeGate.open` (walkCloseGate's raw verdict, as isCloseGateOpen
+  // returns) and not a second transcript read: the bound settleCloseResolution
+  // stamps comes from this same read, so a phrase typed after it cannot
+  // authorize this mark and stays a new request.
+  if (!closeTranscript || !closeGate.open) {
     const reason = !closeTranscript
       ? `cannot resolve a transcript for session ${args.sessionId} — the session-closed marker requires a verifiable user close signal`
       : "no user close signal in this session's transcript — marker refused (the user did not signal session close)";
@@ -1484,6 +1491,10 @@ function pinCloseId(hypoDir, sessionId, { openedAtIndex, resolvedAtIndex }) {
 // transcript that now holds fewer records than the bound (shrunk or rewritten),
 // records nothing and fails the close like an unwritable record. It never falls
 // back to stamping the whole transcript, which is the race this closes.
+// `resolvedAtIndex` is null whenever the stored record's prefix hash no longer
+// matches the transcript, so the stored count is also read here without the hash
+// check (storedResolutionCount): a rewritten transcript must not let a re-mark
+// record a smaller count and reopen phrases an earlier close already spent.
 // `testHooks.beforeResolution` and `testHooks.afterResolutionBeforePin` are test-only.
 // @returns {{ok: true} | {ok: false, retractFailed?: string}}
 function settleCloseResolution(
@@ -1498,7 +1509,11 @@ function settleCloseResolution(
     // Outside the bound check so a test can append a record in this very gap.
     testHooks?.beforeResolution?.();
     if (Number.isSafeInteger(openedAtIndex) && openedAtIndex >= 0) {
-      const bound = Math.max(openedAtIndex + 1, resolvedAtIndex ?? 0);
+      const bound = Math.max(
+        openedAtIndex + 1,
+        resolvedAtIndex ?? 0,
+        storedResolutionCount(hypoDir, sessionId),
+      );
       const stamp = resolutionStamp(readFileSync(transcriptPath), bound);
       if (stamp?.index === bound) landed = recordGateClosed(hypoDir, sessionId, stamp);
     }
@@ -1513,6 +1528,25 @@ function settleCloseResolution(
   testHooks?.afterResolutionBeforePin?.();
   resolveClosePin(hypoDir, sessionId);
   return { ok: true };
+}
+
+// The record count of this session's stored close-gate resolution, whatever its
+// prefix hash says. 0 when the file is absent, unreadable, for another session
+// or not a positive safe integer, the same files readResolution treats as no
+// constraint. Only ever used to raise a bound, never to authorize anything.
+function storedResolutionCount(hypoDir, sessionId) {
+  try {
+    const stored = JSON.parse(readFileSync(closeGatePath(hypoDir, sessionId), 'utf-8'));
+    const n = stored?.closedAtIndex;
+    return stored?.v === 1 &&
+      stored.sessionId === String(sessionId) &&
+      Number.isSafeInteger(n) &&
+      n > 0
+      ? n
+      : 0;
+  } catch {
+    return 0;
+  }
 }
 
 // The close resolved (receipt and marker landed, gate resolution recorded):
