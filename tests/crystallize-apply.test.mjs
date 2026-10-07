@@ -3894,8 +3894,15 @@ function withUnwritableGateDir(dir, sessionId, fn) {
 
 // The second close request after a recovered close: a new id, a new entry, and the
 // first close's bytes untouched (the state a lent id would have broken).
-function assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, firstId, firstBytes) {
-  typeCloseAgain(sessionId);
+function assertSecondRequestGetsItsOwnEntry(
+  dir,
+  today,
+  sessionId,
+  firstId,
+  firstBytes,
+  { typeAgain = true } = {},
+) {
+  if (typeAgain) typeCloseAgain(sessionId);
   const gate = pinGate(dir, sessionId);
   assert.equal(gate.ok, true, 'the new request is open');
   const second = JSON.parse(
@@ -4001,6 +4008,116 @@ test('--mark-session-closed records the resolution too: one that cannot be writt
       assert.equal(readClosePin(dir, sessionId).lastResolved, id);
 
       assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Runs `--mark-session-closed` or `--apply-session-close` in a child whose
+// `beforeResolution` seam appends a genuine second close request to the transcript:
+// the user typing between this close's gate check and its resolution record.
+// `payload` is only for the apply mode.
+function runTypingBeforeResolution(dir, sessionId, mode, payload = null) {
+  const payloadPath = join(
+    tmpdir(),
+    `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+  );
+  const argv = [
+    'node',
+    'crystallize.mjs',
+    `--hypo-dir=${dir}`,
+    `--session-id=${sessionId}`,
+    '--json',
+    ...(mode === 'apply'
+      ? ['--apply-session-close', `--payload=${payloadPath}`]
+      : ['--mark-session-closed', '--project=test-project']),
+  ];
+  if (payload) writeFileSync(payloadPath, JSON.stringify(payload));
+  const entry = mode === 'apply' ? 'applySessionClose' : 'runMarkSessionClosed';
+  const script = `
+    import { appendFileSync } from 'node:fs';
+    import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
+    import { ${entry} } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
+    ${entry}(parseArgs(${JSON.stringify(argv)}), {
+      beforeResolution() {
+        appendFileSync(${JSON.stringify(pinTranscriptPath(sessionId))}, ${JSON.stringify(PIN_CLOSE_PHRASE + '\n')});
+      },
+    });
+  `;
+  try {
+    return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+  } finally {
+    rmSync(payloadPath, { force: true });
+  }
+}
+
+function recordedClosedAtIndex(dir, sessionId) {
+  return JSON.parse(readFileSync(closeGatePath(dir, sessionId), 'utf-8')).closedAtIndex;
+}
+
+// Disabling the check: in settleCloseResolution call `resolutionStamp` without the
+// bound (`resolutionStamp(readFileSync(transcriptPath))`), or in runMarkSessionClosed
+// pass `{ openedAtIndex: -1, ... }`. The first goes red on the closedAtIndex line,
+// the second on the mark's own ok.
+// The fixture puts a blank line, a `null` and a number before the first signal: they
+// are not records for either walkCloseGate or resolutionStamp, so position 0 and a
+// count of 1 must still line up.
+test('--mark-session-closed does not resolve a close request typed after its gate check: the signal stays open and the next apply succeeds under a new close id', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-race');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const tp = pinTranscriptPath(sessionId);
+      writeFileSync(tp, '\nnull\n42\n' + readFileSync(tp, 'utf-8'));
+      const unblock = blockReceipt(dir, sessionId);
+      const applied = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(applied.stage, 'receipt-write-failed', JSON.stringify(applied));
+      unblock();
+      const id = closeIdFor(sessionId, 0);
+      const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
+
+      const r = runTypingBeforeResolution(dir, sessionId, 'mark');
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.equal(JSON.parse(r.stdout).ok, true, r.stdout);
+      assert.equal(recordedClosedAtIndex(dir, sessionId), 1, 'only the first request is resolved');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+      const gate = pinGate(dir, sessionId);
+      assert.equal(gate.ok, true, 'the request typed in the gap is still open');
+      assert.equal(gate.openedAtIndex, 1);
+
+      assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes, { typeAgain: false });
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: pass `{ openedAtIndex: -1, ... }` at the settleCloseResolution
+// call in the apply marker phase, or drop the bound there as above. The first apply
+// then fails at close-resolution-failed, the second refuses
+// no-new-open-since-resolution.
+test('an apply does not resolve a close request typed between its gate check and its resolution record: the next apply succeeds under a new close id', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('apply-race');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const r = runTypingBeforeResolution(dir, sessionId, 'apply', payloadForCleanWiki(dir, today));
+      const first = JSON.parse(r.stdout);
+      assert.equal(first.ok, true, `${r.stdout}\n${r.stderr}`);
+      assert.equal(first.markerWritten, true, r.stdout);
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(recordedClosedAtIndex(dir, sessionId), 1, 'only the first request is resolved');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+      assert.equal(pinGate(dir, sessionId).ok, true, 'the request typed in the gap is still open');
+      const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
+
+      assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes, { typeAgain: false });
     } finally {
       cleanup();
     }

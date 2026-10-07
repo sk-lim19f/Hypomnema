@@ -800,7 +800,8 @@ function priorReceiptCommitRewritten(hypoDir, sessionId) {
 // checkpointMode (the git axis narrowed), is green. A failed gate exits 1 with no
 // marker — the next Stop hook re-blocks.
 
-export function runMarkSessionClosed(args) {
+// `testHooks` is test-only, see settleCloseResolution.
+export function runMarkSessionClosed(args, testHooks = null) {
   if (!args.sessionId) {
     const msg = '--session-id=<id> is required with --mark-session-closed';
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
@@ -1141,7 +1142,13 @@ export function runMarkSessionClosed(args) {
         if (args.logOnly) return { ok: true };
         // Same rule as the apply marker phase: a close whose signal cannot be
         // spent is not finished (settleCloseResolution).
-        const settled = settleCloseResolution(args.hypoDir, args.sessionId, closeTranscript);
+        const settled = settleCloseResolution(
+          args.hypoDir,
+          args.sessionId,
+          closeTranscript,
+          { openedAtIndex: closeGate.openedAtIndex, resolvedAtIndex },
+          testHooks,
+        );
         if (settled.ok) return { ok: true };
         return {
           ok: false,
@@ -1460,12 +1467,41 @@ function pinCloseId(hypoDir, sessionId, { openedAtIndex, resolvedAtIndex }) {
 // signal stays open, so a retry runs under the same id and adopts the entry this
 // close committed. Shared by the apply marker phase and a project
 // `--mark-session-closed` (a `--log-only` mark spends nothing).
-// `testHooks.afterResolutionBeforePin` is test-only.
+// The resolution covers the records up to the signal THIS close was authorized
+// by, never the whole transcript as it reads now: a close request typed between
+// the gate check and this record would otherwise be marked resolved unseen, and
+// the next apply would refuse it as `no-new-open-since-resolution`.
+// `openedAtIndex` is the 0-based position of that signal, read by the caller's
+// own gate check (both callers hold one: verifyCloseAuthority, or the mark's
+// closeGateStatus read), so the bound is the record COUNT `openedAtIndex + 1`
+// that `resolutionStamp` takes. It is the gate's signal and not the pin's
+// `pending.openedAtIndex` on purpose: a retry reuses `pending` from the first
+// request while the user's retyped phrase (the signal that authorized this retry)
+// sits later, and bounding at the first request would leave that phrase open
+// after the close it asked for. `resolvedAtIndex` (an earlier recorded
+// resolution, or null) keeps a re-mark of an already resolved close from
+// lowering the record. A position that is not a non-negative integer, or a
+// transcript that now holds fewer records than the bound (shrunk or rewritten),
+// records nothing and fails the close like an unwritable record. It never falls
+// back to stamping the whole transcript, which is the race this closes.
+// `testHooks.beforeResolution` and `testHooks.afterResolutionBeforePin` are test-only.
 // @returns {{ok: true} | {ok: false, retractFailed?: string}}
-function settleCloseResolution(hypoDir, sessionId, transcriptPath, testHooks = null) {
+function settleCloseResolution(
+  hypoDir,
+  sessionId,
+  transcriptPath,
+  { openedAtIndex, resolvedAtIndex = null },
+  testHooks = null,
+) {
   let landed = false;
   try {
-    landed = recordGateClosed(hypoDir, sessionId, resolutionStamp(readFileSync(transcriptPath)));
+    // Outside the bound check so a test can append a record in this very gap.
+    testHooks?.beforeResolution?.();
+    if (Number.isSafeInteger(openedAtIndex) && openedAtIndex >= 0) {
+      const bound = Math.max(openedAtIndex + 1, resolvedAtIndex ?? 0);
+      const stamp = resolutionStamp(readFileSync(transcriptPath), bound);
+      if (stamp?.index === bound) landed = recordGateClosed(hypoDir, sessionId, stamp);
+    }
   } catch {
     // an unreadable transcript records nothing, same as a failed write
   }
@@ -1684,6 +1720,10 @@ function refuseUnlessCloseRequested(args) {
     // marker phase's gate.
     closeOpen: closeAuth.ok === true,
     resolvedAtIndex: closeAuth.resolvedAtIndex ?? null,
+    // The position of the signal that authorized this apply: the bound its
+    // gate resolution is recorded at (settleCloseResolution). -1 (no position)
+    // fails that record closed.
+    openedAtIndex: closeAuth.openedAtIndex ?? -1,
   };
 }
 
@@ -3936,6 +3976,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     verify,
     closeOpen = false,
     resolvedAtIndex = null,
+    openedAtIndex = -1,
   } = receiptCtx;
   let markerWritten = false;
   let markerSkipReason = null;
@@ -4212,6 +4253,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
               args.hypoDir,
               args.sessionId,
               closeTranscript,
+              { openedAtIndex, resolvedAtIndex },
               testHooks,
             );
             if (!settled.ok) {
@@ -4737,7 +4779,9 @@ function printCloseReport({
   }
 }
 
-// `testHooks` is test-only. `afterResolutionBeforePin` runs once the gate
+// `testHooks` is test-only. `beforeResolution` runs after every gate check and
+// right before the close-gate resolution is recorded, so a test can append a
+// transcript record in that gap. `afterResolutionBeforePin` runs once the gate
 // resolution record has landed and before the close pin's `pending` moves, so a
 // test can crash a close in the one gap between those two writes. `beforePublish`,
 // `afterPublish` and `afterPinBeforeReplace` do the same for the entry write (see
@@ -4819,7 +4863,8 @@ export function applySessionClose(args, testHooks = null) {
     // "payload is required" with the same error shape as before.
   }
 
-  const { hostTagWarning, closeId, closeOpen, resolvedAtIndex } = refuseUnlessCloseRequested(args);
+  const { hostTagWarning, closeId, closeOpen, resolvedAtIndex, openedAtIndex } =
+    refuseUnlessCloseRequested(args);
   const { payload, legacyFormat } = loadValidatedPayload(args);
   // Computed off the payload as read, before any write phase can consume it.
   const obsoleteNotices = obsoleteFieldNotices(payload);
@@ -5036,6 +5081,7 @@ export function applySessionClose(args, testHooks = null) {
       sessionCloseFileStatus(args.hypoDir, { scope: 'session', closeId, projectOverride: project }),
     closeOpen,
     resolvedAtIndex,
+    openedAtIndex,
   });
   const verificationOk = !verificationCounts || verification.ok;
   // `let` (not const): the close-result invariant self-check below may flip this
