@@ -94,7 +94,6 @@ import {
   isValidSessionId,
 } from '../../hooks/proposal-store.mjs';
 import {
-  closeGatePath,
   recordGateClosed,
   resolutionStamp,
   closeGateStatus,
@@ -757,6 +756,17 @@ export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker) 
   };
 }
 
+// closeGateStatus starts its reason with this when a stored resolution exists but
+// this transcript no longer verifies it (hooks/close-gate-store.mjs, prefixMatches
+// false: rewritten, shortened or an implausible count).
+const CLOSE_GATE_UNVERIFIABLE_PREFIX = 'transcript-rewrite-detected';
+
+// What a mark that left such a record alone tells the operator.
+const LEFT_UNVERIFIABLE_NOTE =
+  "This session's recorded close resolution cannot be checked against the transcript as it " +
+  'reads now, so the mark left it untouched. The gate refuses a new close in this session: ' +
+  'close from a new session.';
+
 // One wording for both writers of `close-resolution-failed`.
 const CLOSE_RESOLUTION_FAILED_HELP = (retractFailed) =>
   'the close could not record its resolution under .cache/close-gate/ (likely a permission ' +
@@ -1147,6 +1157,12 @@ export function runMarkSessionClosed(args, testHooks = null) {
         // A log-only mark proves no project close, so it spends no close signal and
         // leaves the pin alone: a pending close of this session keeps its id.
         if (args.logOnly) return { ok: true };
+        // A stored resolution this transcript no longer verifies (rewritten, shortened,
+        // an implausible count) is left exactly as it is: any record settle wrote would
+        // either lower it or stamp a bound the mark never read. The receipt and marker
+        // stay, and the result says so.
+        if (closeGate.reason?.startsWith(CLOSE_GATE_UNVERIFIABLE_PREFIX))
+          return { ok: true, leftUnverifiable: true };
         // Same rule as the apply marker phase: a close whose signal cannot be
         // spent is not finished (settleCloseResolution).
         const settled = settleCloseResolution(
@@ -1236,6 +1252,11 @@ export function runMarkSessionClosed(args, testHooks = null) {
     // hook self-heals the projection (feedback-sync --write) at /compact. Surface
     // the deferral so the caller knows MEMORY/CLAUDE sync is pending, not lost.
     drift_deferred: gate.driftTargets,
+    // Present only when the stored close resolution could not be verified against
+    // this transcript and the mark left it alone.
+    ...(receiptResult.leftUnverifiable
+      ? { resolution: 'left-unverifiable', resolution_note: LEFT_UNVERIFIABLE_NOTE }
+      : {}),
   };
   if (args.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -1254,6 +1275,7 @@ export function runMarkSessionClosed(args, testHooks = null) {
     // prints the same string next to its own commit; both read one value
     // computed once per run, so neither repeats on a later gate read.
     if (hostTagWarning) console.log(`\n⚠ ${hostTagWarning}`);
+    if (receiptResult.leftUnverifiable) console.log(`  · ${LEFT_UNVERIFIABLE_NOTE}`);
   }
   process.exit(0);
 }
@@ -1492,9 +1514,9 @@ function pinCloseId(hypoDir, sessionId, { openedAtIndex, resolvedAtIndex }) {
 // records nothing and fails the close like an unwritable record. It never falls
 // back to stamping the whole transcript, which is the race this closes.
 // `resolvedAtIndex` is null whenever the stored record's prefix hash no longer
-// matches the transcript, so the stored count is also read here without the hash
-// check (storedResolutionCount): a rewritten transcript must not let a re-mark
-// record a smaller count and reopen phrases an earlier close already spent.
+// matches the transcript. A mark skips settle for such a record (see
+// CLOSE_GATE_UNVERIFIABLE_PREFIX), so a rewritten transcript never gets a smaller
+// count recorded over it.
 // `testHooks.beforeResolution` and `testHooks.afterResolutionBeforePin` are test-only.
 // @returns {{ok: true} | {ok: false, retractFailed?: string}}
 function settleCloseResolution(
@@ -1509,11 +1531,7 @@ function settleCloseResolution(
     // Outside the bound check so a test can append a record in this very gap.
     testHooks?.beforeResolution?.();
     if (Number.isSafeInteger(openedAtIndex) && openedAtIndex >= 0) {
-      const bound = Math.max(
-        openedAtIndex + 1,
-        resolvedAtIndex ?? 0,
-        storedResolutionCount(hypoDir, sessionId),
-      );
+      const bound = Math.max(openedAtIndex + 1, resolvedAtIndex ?? 0);
       const stamp = resolutionStamp(readFileSync(transcriptPath), bound);
       if (stamp?.index === bound) landed = recordGateClosed(hypoDir, sessionId, stamp);
     }
@@ -1528,25 +1546,6 @@ function settleCloseResolution(
   testHooks?.afterResolutionBeforePin?.();
   resolveClosePin(hypoDir, sessionId);
   return { ok: true };
-}
-
-// The record count of this session's stored close-gate resolution, whatever its
-// prefix hash says. 0 when the file is absent, unreadable, for another session
-// or not a positive safe integer, the same files readResolution treats as no
-// constraint. Only ever used to raise a bound, never to authorize anything.
-function storedResolutionCount(hypoDir, sessionId) {
-  try {
-    const stored = JSON.parse(readFileSync(closeGatePath(hypoDir, sessionId), 'utf-8'));
-    const n = stored?.closedAtIndex;
-    return stored?.v === 1 &&
-      stored.sessionId === String(sessionId) &&
-      Number.isSafeInteger(n) &&
-      n > 0
-      ? n
-      : 0;
-  } catch {
-    return 0;
-  }
 }
 
 // The close resolved (receipt and marker landed, gate resolution recorded):
