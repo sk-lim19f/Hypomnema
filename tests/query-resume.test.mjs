@@ -828,14 +828,32 @@ test('resume.mjs: a foreign lock artifact is not counted as a foreign change', (
   withTwoProjectResumeWiki((dir) => {
     const theirs = join(dir, 'projects', 'theirs');
     writeFileSync(join(theirs, 'draft.md'), 'uncommitted draft\n');
-    writeFileSync(join(theirs, 'draft.md.lock'), '');
-    writeFileSync(join(theirs, 'draft.md.lock.0123456789abcdef.tmp'), '');
+    // The two files a close locks inside the tracked tree live in a session-log shard.
+    mkdirSync(join(theirs, 'session-log'), { recursive: true });
+    writeFileSync(join(theirs, 'session-log', '2026-01-01.md.lock'), '');
+    writeFileSync(join(theirs, 'session-log', '2026-01-01.md.lock.0123456789abcdef.tmp'), '');
     const r = runResume(dir);
     assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
     assert.match(
       r.stdout,
       /^\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\./,
       `only the draft counts, got: ${r.stdout}`,
+    );
+  });
+});
+
+// Only the files a close locks are artifacts: a person's untracked `.lock` file counts.
+test("resume.mjs: a person's untracked .lock file is counted as a foreign change", () => {
+  withTwoProjectResumeWiki((dir) => {
+    const theirs = join(dir, 'projects', 'theirs');
+    writeFileSync(join(theirs, 'draft.md'), 'uncommitted draft\n');
+    writeFileSync(join(theirs, 'draft.md.lock'), 'mine\n');
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 2건이 있습니다\./,
+      `both files count, got: ${r.stdout}`,
     );
   });
 });

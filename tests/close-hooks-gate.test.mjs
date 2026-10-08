@@ -1064,7 +1064,22 @@ for (const parentName of ['parent ', ' parent']) {
 //    in the vault while a close runs, and neither is guaranteed to be gitignored. ────────────
 suite('hypoIsClean / gitDirtyFiles: lock artifacts');
 
-const STAGING_ARTIFACT = 'x.md.lock.0123456789abcdef.tmp';
+// The two files a close locks inside the tracked tree: the root log.md and a session-log shard.
+const SHARD_REL = join('projects', 'p', 'session-log', '2026-01-01.md');
+const STAGING_ARTIFACT = 'log.md.lock.0123456789abcdef.tmp';
+const SHARD_STAGING_ARTIFACT = `${SHARD_REL}.lock.0123456789abcdef.tmp`;
+
+function writeLockArtifacts(dir) {
+  mkdirSync(join(dir, 'projects', 'p', 'session-log'), { recursive: true });
+  for (const rel of [
+    'log.md.lock',
+    STAGING_ARTIFACT,
+    `${SHARD_REL}.lock`,
+    SHARD_STAGING_ARTIFACT,
+  ]) {
+    writeFileSync(join(dir, rel), '');
+  }
+}
 
 function pinnedGit(dir, args) {
   const r = spawnSync('git', args, {
@@ -1077,8 +1092,7 @@ function pinnedGit(dir, args) {
 
 test('hypoIsClean / gitDirtyFiles: lock artifacts next to a modified page leave only the page', () => {
   withCleanWiki((dir) => {
-    writeFileSync(join(dir, 'x.md.lock'), '');
-    writeFileSync(join(dir, STAGING_ARTIFACT), '');
+    writeLockArtifacts(dir);
     appendFileSync(join(dir, 'log.md'), '\nedited\n');
     assert.equal(hypoIsClean(dir).uncommitted, true);
     assert.deepEqual(gitDirtyFiles(dir), ['log.md']);
@@ -1087,14 +1101,33 @@ test('hypoIsClean / gitDirtyFiles: lock artifacts next to a modified page leave 
 
 test('hypoIsClean / gitDirtyFiles: lock artifacts alone are not uncommitted work', () => {
   withCleanWiki((dir) => {
-    writeFileSync(join(dir, 'x.md.lock'), '');
-    writeFileSync(join(dir, STAGING_ARTIFACT), '');
+    writeLockArtifacts(dir);
     const st = hypoIsClean(dir);
     assert.equal(st.uncommitted, false, JSON.stringify(st));
     assert.equal(st.clean, true, JSON.stringify(st));
     assert.deepEqual(gitDirtyFiles(dir), []);
   });
 });
+
+// A person's untracked file that merely ends in `.lock` is not something a close created.
+for (const rel of [
+  'notes.md.lock',
+  join('pages', 'x.lock'),
+  join('projects', 'p', 'draft.md.lock'),
+  join('projects', 'p', 'session-log', 'notes.txt.lock'),
+  `notes.md.lock.0123456789abcdef.tmp`,
+]) {
+  test(`hypoIsClean / gitDirtyFiles: a person's untracked ${rel} stays visible`, () => {
+    withCleanWiki((dir) => {
+      mkdirSync(join(dir, rel, '..'), { recursive: true });
+      writeFileSync(join(dir, rel), 'mine\n');
+      const st = hypoIsClean(dir);
+      assert.equal(st.uncommitted, true, JSON.stringify(st));
+      assert.equal(st.clean, false, JSON.stringify(st));
+      assert.deepEqual(gitDirtyFiles(dir), [rel]);
+    });
+  });
+}
 
 test('hypoIsClean / gitDirtyFiles: a staged rename whose source is a tracked .lock file reports both paths', () => {
   withCleanWiki((dir) => {

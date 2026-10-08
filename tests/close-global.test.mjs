@@ -6329,7 +6329,11 @@ function withProjectVault(migrated, fn) {
   withTmpDir((dir) => {
     writeFileSync(join(dir, '.gitignore'), migrated ? `.cache/\n${GITIGNORE_BLOCK}` : '.cache/\n');
     writeFileSync(join(dir, 'log.md'), '# log\n');
-    const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8' });
+    const git = (...a) =>
+      spawnSync('git', ['-C', dir, ...a], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
     git('init', '-q');
     git('config', 'user.email', 't@t.test');
     git('config', 'user.name', 'T');
@@ -7052,7 +7056,11 @@ function withMigratedLegacyVault(migrated, fn) {
     );
     writeDatedEntry(dir, 'mine', today, 's-t10-mine-0');
     appendFileSync(join(dir, 'log.md'), `## [${today}] session | mine\n`);
-    const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8' });
+    const git = (...a) =>
+      spawnSync('git', ['-C', dir, ...a], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
     git('init', '-q');
     git('config', 'user.email', 't@t.test');
     git('config', 'user.name', 'T');

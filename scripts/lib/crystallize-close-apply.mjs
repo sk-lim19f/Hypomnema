@@ -27,6 +27,7 @@ import {
   precompactGateStatus,
   writeSessionClosedMarker,
   sessionClosedMarkerPath,
+  sanitizeSessionId,
   partitionLintScope,
   isUnderProjectDirs,
   sessionLogReadCandidates,
@@ -80,6 +81,7 @@ import {
   CERT_CLOSE_FILES,
   RECEIPT_SCHEMA_VERSION,
   invalidateCloseArtifacts,
+  invalidateOne,
   receiptPath,
   verifyEntriesInCommit,
   writeReceiptAtomic,
@@ -849,8 +851,80 @@ export function withdrawOwnReceipt(hypoDir, sessionId, generation) {
   } catch {
     // Unreadable or unparseable: fall through and withdraw.
   }
-  const retracted = invalidateCloseArtifacts(hypoDir, sessionId);
+  // The receipt alone: a marker beside it names a generation of its own, and
+  // withdrawOwnMarker decides whether that one is ours.
+  const retracted = invalidateOne(path);
   return retracted.ok ? { ok: true, withdrawn: true } : { ok: false, reason: retracted.reason };
+}
+
+/**
+ * Take back the compat marker at this session's path, but only if it names the
+ * receipt generation this close filed (or names none readable, which no concurrent
+ * writer of this version produces). A marker of another generation belongs to another
+ * close of the same session and is left alone, like withdrawOwnReceipt does for the
+ * receipt. An absent marker is nothing of ours to take back.
+ * @returns {{ok: true, withdrawn: boolean} | {ok: false, reason: string}}
+ */
+export function withdrawOwnMarker(hypoDir, sessionId, generation) {
+  const path = sessionClosedMarkerPath(hypoDir, sessionId);
+  if (!existsSync(path)) return { ok: true, withdrawn: false };
+  try {
+    const onDisk = JSON.parse(readFileSync(path, 'utf-8'));
+    if (
+      typeof onDisk?.receipt_generation === 'string' &&
+      onDisk.receipt_generation !== generation
+    ) {
+      return { ok: true, withdrawn: false };
+    }
+  } catch {
+    // Unreadable or unparseable: fall through and withdraw.
+  }
+  const retracted = invalidateOne(path);
+  return retracted.ok ? { ok: true, withdrawn: true } : { ok: false, reason: retracted.reason };
+}
+
+// One lock per session id for everything that files or retracts that session's close
+// artifacts (receipt, marker, resolution). Both the apply path and --mark-session-closed
+// reach those writes after the append locks are gone, and the apply path after the vault
+// commit lock too, so two attempts for one session id could otherwise interleave and leave
+// a receipt of one generation beside a marker of another. The target sits under .cache
+// next to the per-session close records, which is gitignored, so its lock files never show
+// as vault changes. Lock order: the vault commit lock (when a path holds it) is taken
+// before this one, and nothing under this lock takes the vault commit lock.
+const SESSION_CLOSE_LOCK_TIMEOUT_MS = 5000;
+
+export function sessionCloseLockTarget(hypoDir, sessionId) {
+  return join(hypoDir, '.cache', 'close-phase', sanitizeSessionId(sessionId));
+}
+
+// Run `fn` under the session's close lock. A lock that is not free in time comes back as
+// `{locked: false}` instead of a throw, so each caller reports it in its own words.
+function withSessionCloseLock(hypoDir, sessionId, fn, timeoutMs = SESSION_CLOSE_LOCK_TIMEOUT_MS) {
+  try {
+    return {
+      locked: true,
+      value: withFileLock(sessionCloseLockTarget(hypoDir, sessionId), fn, { timeoutMs }),
+    };
+  } catch (err) {
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    return { locked: false };
+  }
+}
+
+/**
+ * Invalidate this session's prior receipt and marker when a new close is accepted, under
+ * the session close lock so it cannot cut into the middle of another attempt's
+ * receipt-then-marker landing.
+ * @returns {{ok: boolean, reason?: string}}
+ */
+export function invalidatePriorCloseArtifacts(hypoDir, sessionId, timeoutMs) {
+  const run = withSessionCloseLock(
+    hypoDir,
+    sessionId,
+    () => invalidateCloseArtifacts(hypoDir, sessionId),
+    timeoutMs,
+  );
+  return run.locked ? run.value : { ok: false, reason: 'session-close-lock-timeout' };
 }
 
 /**
@@ -877,13 +951,31 @@ export function withdrawOwnReceipt(hypoDir, sessionId, generation) {
  * transient re-read error would let it stand as valid with no marker. That
  * branch takes the receipt back too, through `withdrawOwnReceipt`.
  *
- * @returns {{ok: true} |
+ * The whole landing runs under the session's close lock (`sessionCloseLockTarget`), and so
+ * does `opts.afterLanded`, which runs once both artifacts have landed (the callers record
+ * the close resolution there). Two attempts for one session id therefore cannot leave a
+ * receipt of one generation beside a marker of the other, and a failed attempt takes back
+ * only the receipt and marker carrying its own generation. `opts.lockTimeoutMs` shortens
+ * the wait for the lock in tests.
+ *
+ * @returns {{ok: true, afterLanded?: any} |
  *   {ok: false, reason: 'receipt-write-failed', writeReason: string, retractFailed?: string} |
- *   {ok: false, reason: 'marker-did-not-land', retractFailed?: string}}
+ *   {ok: false, reason: 'marker-did-not-land', retractFailed?: string} |
+ *   {ok: false, reason: 'session-close-lock-timeout'}}
  *   `retractFailed` is set only when withdrawing the receipt failed too, which
  *   leaves a valid receipt behind a run that reports failure.
  */
-export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker) {
+export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker, opts = {}) {
+  const run = withSessionCloseLock(
+    hypoDir,
+    sessionId,
+    () => landReceiptThenMarkerLocked(hypoDir, sessionId, receipt, writeMarker, opts.afterLanded),
+    opts.lockTimeoutMs,
+  );
+  return run.locked ? run.value : { ok: false, reason: 'session-close-lock-timeout' };
+}
+
+function landReceiptThenMarkerLocked(hypoDir, sessionId, receipt, writeMarker, afterLanded) {
   const written = writeReceiptAtomic(hypoDir, sessionId, receipt);
   if (!written.ok) {
     // Only the re-read reasons mean the rename happened. 'write-failed' and
@@ -904,12 +996,19 @@ export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker) 
   } catch {
     // A writer that throws did not write. Same outcome as returning false.
   }
-  if (wrote && existsSync(sessionClosedMarkerPath(hypoDir, sessionId))) return { ok: true };
-  const retracted = invalidateCloseArtifacts(hypoDir, sessionId);
+  if (wrote && existsSync(sessionClosedMarkerPath(hypoDir, sessionId))) {
+    return afterLanded ? { ok: true, afterLanded: afterLanded() } : { ok: true };
+  }
+  // Only what this attempt wrote: another close of the session may have landed its own
+  // pair, and taking that back would undo a close that succeeded.
+  const retracted = [
+    withdrawOwnMarker(hypoDir, sessionId, receipt.generation),
+    withdrawOwnReceipt(hypoDir, sessionId, receipt.generation),
+  ].find((r) => !r.ok);
   return {
     ok: false,
     reason: 'marker-did-not-land',
-    ...(retracted.ok ? {} : { retractFailed: retracted.reason }),
+    ...(retracted ? { retractFailed: retracted.reason } : {}),
   };
 }
 
@@ -1073,7 +1172,7 @@ export function runMarkSessionClosed(args, testHooks = null) {
     );
     process.exit(1);
   }
-  const invalidated = invalidateCloseArtifacts(args.hypoDir, args.sessionId);
+  const invalidated = invalidatePriorCloseArtifacts(args.hypoDir, args.sessionId);
   if (!invalidated.ok) {
     const msg =
       `--mark-session-closed refused before the gate ran: could not invalidate this session's ` +
@@ -1298,47 +1397,59 @@ export function runMarkSessionClosed(args, testHooks = null) {
         skipped: gate.skipped || { lint: false, feedback: false },
         createdAt: new Date().toISOString(),
       };
-      const landed = landReceiptThenMarker(args.hypoDir, args.sessionId, receipt, () =>
-        writeSessionClosedMarker(args.hypoDir, args.sessionId, {
-          project: markerProject,
-          projects: args.logOnly ? [] : markerProjects,
-          ...(args.logOnly ? { scope: 'log-only' } : {}),
-          verifiedScope,
-          // Same residual the console line below reports, kept in the marker so a
-          // reader auditing this close later sees the same thing the operator saw
-          // at the time. The apply path stamps its own marker the same way.
-          ...(hostTagWarning ? { hostTagWarning } : {}),
-          // Names the receipt this marker projects. See writeSessionClosedMarker's
-          // own doc comment for what a new Stop does with this field.
-          receiptGeneration: generation,
-        }),
+      const landed = landReceiptThenMarker(
+        args.hypoDir,
+        args.sessionId,
+        receipt,
+        () =>
+          writeSessionClosedMarker(args.hypoDir, args.sessionId, {
+            project: markerProject,
+            projects: args.logOnly ? [] : markerProjects,
+            ...(args.logOnly ? { scope: 'log-only' } : {}),
+            verifiedScope,
+            // Same residual the console line below reports, kept in the marker so a
+            // reader auditing this close later sees the same thing the operator saw
+            // at the time. The apply path stamps its own marker the same way.
+            ...(hostTagWarning ? { hostTagWarning } : {}),
+            // Names the receipt this marker projects. See writeSessionClosedMarker's
+            // own doc comment for what a new Stop does with this field.
+            receiptGeneration: generation,
+          }),
+        {
+          // Runs under the same session lock as the receipt and marker above.
+          afterLanded: () => {
+            // A log-only mark proves no project close, so it spends no close signal and
+            // leaves the pin alone: a pending close of this session keeps its id.
+            if (args.logOnly) return { ok: true };
+            // A stored resolution this transcript no longer verifies (rewritten, shortened,
+            // an implausible count) is left exactly as it is: any record settle wrote would
+            // either lower it or stamp a bound the mark never read. The receipt and marker
+            // stay, and the result says so.
+            if (closeGate.reason?.startsWith(CLOSE_GATE_UNVERIFIABLE_PREFIX))
+              return { ok: true, leftUnverifiable: true };
+            // Same rule as the apply marker phase: a close whose signal cannot be
+            // spent is not finished (settleCloseResolution).
+            return settleCloseResolution(
+              args.hypoDir,
+              args.sessionId,
+              closeTranscript,
+              { openedAtIndex: closeGate.openedAtIndex, resolvedAtIndex },
+              testHooks,
+            );
+          },
+        },
       );
       if (landed.ok) {
-        // A log-only mark proves no project close, so it spends no close signal and
-        // leaves the pin alone: a pending close of this session keeps its id.
-        if (args.logOnly) return { ok: true };
-        // A stored resolution this transcript no longer verifies (rewritten, shortened,
-        // an implausible count) is left exactly as it is: any record settle wrote would
-        // either lower it or stamp a bound the mark never read. The receipt and marker
-        // stay, and the result says so.
-        if (closeGate.reason?.startsWith(CLOSE_GATE_UNVERIFIABLE_PREFIX))
-          return { ok: true, leftUnverifiable: true };
-        // Same rule as the apply marker phase: a close whose signal cannot be
-        // spent is not finished (settleCloseResolution).
-        const settled = settleCloseResolution(
-          args.hypoDir,
-          args.sessionId,
-          closeTranscript,
-          { openedAtIndex: closeGate.openedAtIndex, resolvedAtIndex },
-          testHooks,
-        );
-        if (settled.ok) return { ok: true };
+        const settled = landed.afterLanded;
+        if (settled.ok)
+          return settled.leftUnverifiable ? { ok: true, leftUnverifiable: true } : { ok: true };
         return {
           ok: false,
           reason: 'close-resolution-failed',
           ...(settled.retractFailed ? { retractFailed: settled.retractFailed } : {}),
         };
       }
+      if (landed.reason === 'session-close-lock-timeout') return landed;
       return landed.reason === 'receipt-write-failed'
         ? {
             ok: false,
@@ -1371,7 +1482,9 @@ export function runMarkSessionClosed(args, testHooks = null) {
                 : '')
             : receiptResult.reason === 'vault-commit-lock-timeout'
               ? 'another close or commit held the vault-commit lock past the timeout; re-run shortly'
-              : 'no commit identity (not a git repository, or no commit exists yet)';
+              : receiptResult.reason === 'session-close-lock-timeout'
+                ? 'another close of this session held its close lock past the timeout; re-run shortly'
+                : 'no commit identity (not a git repository, or no commit exists yet)';
     // A marker that did not land after a certified receipt keeps its own
     // wording: it is a disk problem under .cache/, not a proof problem, and the
     // receipt filed for it has already been withdrawn.
@@ -1533,6 +1646,7 @@ export function markerWriteGenuinelyFailed({ markerWritten, markerSkipReason }) 
     (markerSkipReason === 'marker-did-not-land' ||
       markerSkipReason === 'receipt-proof-mismatch' ||
       markerSkipReason === 'receipt-write-failed' ||
+      markerSkipReason === 'session-close-lock-timeout' ||
       markerSkipReason === 'close-resolution-failed')
   );
 }
@@ -1888,7 +2002,7 @@ function refuseUnlessCloseRequested(args) {
   // or not this particular attempt goes on to succeed. `--mark-session-closed`
   // invalidates at its own gate call instead (no payload/preflight to race).
   if (args.payload && args.sessionId) {
-    const invalidated = invalidateCloseArtifacts(args.hypoDir, args.sessionId);
+    const invalidated = invalidatePriorCloseArtifacts(args.hypoDir, args.sessionId);
     if (!invalidated.ok) {
       const msg =
         `session-close apply refused before any wiki write or commit: could not invalidate ` +
@@ -4424,22 +4538,38 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
           // check decides whether the close signal below gets spent, and
           // spending it on a marker this run did not write is the failure
           // this whole phase was reordered to avoid.
-          const landed = landReceiptThenMarker(args.hypoDir, args.sessionId, receipt, () =>
-            writeSessionClosedMarker(args.hypoDir, args.sessionId, {
-              project,
-              projects: [project],
-              verifiedScope: { kind: 'global', projects: gateEvaluatedProjects },
-              // Carried through from refuseUnlessCloseRequested's gate check,
-              // computed once before any write in this apply and unchanged since:
-              // this close survived a HOST_TAG_NAMES-shaped queue item reading as
-              // neutral, so the marker records the same residual the console
-              // output also warns about once.
-              ...(markerHostTagWarning ? { hostTagWarning: markerHostTagWarning } : {}),
-              // Names the receipt this marker is a compat projection
-              // of. A new Stop refuses to trust this marker alone once it sees
-              // this field: it must find the matching, valid receipt too.
-              receiptGeneration,
-            }),
+          const landed = landReceiptThenMarker(
+            args.hypoDir,
+            args.sessionId,
+            receipt,
+            () =>
+              writeSessionClosedMarker(args.hypoDir, args.sessionId, {
+                project,
+                projects: [project],
+                verifiedScope: { kind: 'global', projects: gateEvaluatedProjects },
+                // Carried through from refuseUnlessCloseRequested's gate check,
+                // computed once before any write in this apply and unchanged since:
+                // this close survived a HOST_TAG_NAMES-shaped queue item reading as
+                // neutral, so the marker records the same residual the console
+                // output also warns about once.
+                ...(markerHostTagWarning ? { hostTagWarning: markerHostTagWarning } : {}),
+                // Names the receipt this marker is a compat projection
+                // of. A new Stop refuses to trust this marker alone once it sees
+                // this field: it must find the matching, valid receipt too.
+                receiptGeneration,
+              }),
+            {
+              // Recorded under the session lock the receipt and marker land under
+              // (see the comment below on why only after they landed).
+              afterLanded: () =>
+                settleCloseResolution(
+                  args.hypoDir,
+                  args.sessionId,
+                  closeTranscript,
+                  { openedAtIndex, resolvedAtIndex },
+                  testHooks,
+                ),
+            },
           );
           if (landed.ok) {
             markerWritten = true;
@@ -4467,13 +4597,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
             // settleCloseResolution): the pin's `pending` would stay, and the
             // next close request would borrow this close's id and lose its own
             // summary to this close's committed entry.
-            const settled = settleCloseResolution(
-              args.hypoDir,
-              args.sessionId,
-              closeTranscript,
-              { openedAtIndex, resolvedAtIndex },
-              testHooks,
-            );
+            const settled = landed.afterLanded;
             if (!settled.ok) {
               markerWritten = false;
               markerSkipReason = 'close-resolution-failed';
@@ -4483,6 +4607,8 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
                 ];
               }
             }
+          } else if (landed.reason === 'session-close-lock-timeout') {
+            markerSkipReason = 'session-close-lock-timeout';
           } else if (landed.reason === 'receipt-write-failed') {
             markerSkipReason = 'receipt-write-failed';
             receiptMismatches = [
@@ -4923,9 +5049,15 @@ function printCloseReport({
               `    clear whichever other blocker the gate names), then re-run the same\n` +
               `    close. No fresh close phrase is needed: a close signal is spent only\n` +
               `    once the marker lands.\n`
-            : markerSkipReason === 'close-resolution-failed'
-              ? `    ${CLOSE_RESOLUTION_FAILED_HELP(null)}\n`
-              : null;
+            : markerSkipReason === 'session-close-lock-timeout'
+              ? `    The close files were applied and committed, but another close of this\n` +
+                `    session held its close lock past the timeout, so no receipt or marker\n` +
+                `    was filed. This run reports ok:false and exits 1. The session is NOT\n` +
+                `    closed. To fix: re-run the same close shortly. No fresh close phrase\n` +
+                `    is needed.\n`
+              : markerSkipReason === 'close-resolution-failed'
+                ? `    ${CLOSE_RESOLUTION_FAILED_HELP(null)}\n`
+                : null;
     process.stderr.write(
       `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
         // MAJOR FIX (codex cross-review round 5): only present when the reason
