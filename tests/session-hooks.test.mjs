@@ -5122,6 +5122,130 @@ test('ISSUE-198: a refused call on a path with an older failed-reset entry keeps
   });
 });
 
+// A post-commit hook of a person's own that stages other bytes for the path just committed. The
+// reset after the commit used to put HEAD over them without a trace. Disabling: in
+// `commitWikiChanges` change `(indexNow.get(p) ?? null) === (added.get(p) ?? null)` to `true`. The
+// index and notice assertions go red.
+function withPostCommitHook(dir, script, fn) {
+  const hooks = join(dir, '.git', 'x-test-hooks');
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, 'post-commit'), `#!/bin/sh\n${script}\n`);
+  chmodSync(join(hooks, 'post-commit'), 0o755);
+  spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+  try {
+    fn();
+  } finally {
+    spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+  }
+}
+
+test('ISSUE-198: a blob a post-commit hook staged is left in the index and named in a notice, not reset', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'hook-staged.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    withPostCommitHook(
+      dir,
+      `blob=$(printf 'bytes only in the index\\n' | git hash-object -w --stdin)\ngit update-index --cacheinfo "100644,$blob,${rel}"`,
+      () => {
+        const res = commitWikiChanges(dir, [rel]);
+        assert.equal(res.committed, true, JSON.stringify(res));
+        assert.deepEqual(res.committedPaths, [rel]);
+        assert.equal(res.indexWarning, undefined, JSON.stringify(res));
+      },
+    );
+    assert.equal(headText(dir, rel), 'committed\nthis close\n', 'the commit landed');
+    assert.equal(indexBlob(dir, rel), 'bytes only in the index\n', 'the hook staged bytes survive');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'committed\nthis close\n');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(rel) && notice.includes('git reset -q HEAD'), notice);
+  });
+});
+
+// The pair: with nothing staged after the commit the same call still brings the path to HEAD and
+// leaves no notice, so the check above is not "never reset".
+test('ISSUE-198: without a stage made after the commit the path is reset to HEAD and no notice is left', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'plain-reset.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.deepEqual(res.committedPaths, [rel]);
+    assert.equal(cachedNames(dir), '', 'index == HEAD');
+    assert.equal(consumeRootHotHealthNotice(dir), null);
+  });
+});
+
+// A landed commit whose reset failed, then a Stop with nothing new to commit (an empty scope).
+// Disabling: in `commitWikiChanges` move `const reconcileWarning = reconcileStaleIndex(hypoDir);`
+// below the `if (supplied.size === 0)` return. The index assertion goes red.
+test('ISSUE-198: an idle call with an empty scope finishes a reset that failed after a landed commit', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'idle-retry.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    withPreCommitHook(dir, `printf 'other close\\n' >> ${rel}\ngit add -- ${rel}`, () => {
+      withPostCommitLock(dir, () => {
+        const res = commitWikiChanges(dir, [rel]);
+        assert.equal(res.committed, true, JSON.stringify(res));
+        assert.match(res.indexWarning ?? '', /git reset -q HEAD/, JSON.stringify(res));
+      });
+    });
+    assert.equal(cachedNames(dir), `${rel}\n`, 'precondition: the index still differs from HEAD');
+    assert.ok(reconcileJournal(dir)[rel], 'precondition: the journal names the path');
+
+    const idle = commitWikiChanges(dir, []);
+    assert.equal(idle.committed, true, JSON.stringify(idle));
+    assert.equal(idle.scoped, 0, JSON.stringify(idle));
+    assert.equal(idle.indexWarning, undefined, JSON.stringify(idle));
+    assert.equal(cachedNames(dir), '', 'the index of the earlier path is HEAD again');
+    assert.equal(reconcileJournal(dir)[rel], undefined, 'entry dropped');
+    assert.equal(
+      headText(dir, rel),
+      'committed\nthis close\nother close\n',
+      'HEAD keeps the append',
+    );
+  });
+});
+
+// The backups hold a person's staged bytes, so none is written under a `.cache/` that a `git add -A`
+// would stage. Disabling: in `backUpStagedVersions` change `if (unignored.length > 0) {` to
+// `if (false) {`. The committed, backup and notice assertions go red.
+test('ISSUE-198: a staged version is not backed up while .cache/ is not ignored, and the commit is refused with the stage intact', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, '.gitignore'), 'unrelated/\n');
+    const rel = 'cache-not-ignored.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v1 staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v2 on disk\n');
+    const headBefore = gitOut(dir, 'rev-parse', 'HEAD');
+    const lsBefore = gitOut(dir, 'ls-files', '-s');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, false, JSON.stringify(res));
+    assert.match(res.reason, /could not save a version staged in the index/);
+    assert.match(res.reason, /\.cache\/ is not ignored/);
+    assert.equal(gitOut(dir, 'rev-parse', 'HEAD'), headBefore, 'HEAD did not move');
+    assert.equal(gitOut(dir, 'ls-files', '-s'), lsBefore, 'the index is what it was');
+    assert.equal(indexBlob(dir, rel), 'v1 staged by hand\n', 'their stage is still staged');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'v2 on disk\n');
+    assert.deepEqual(stagedBackupFiles(dir), [], 'no backup was written');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes('.gitignore') && notice.includes('/.cache/'), notice);
+    // The pair: once the ignore line is there the same call saves the version and commits.
+    writeFileSync(join(dir, '.gitignore'), 'unrelated/\n/.cache/\n');
+    const again = commitWikiChanges(dir, [rel]);
+    assert.equal(again.committed, true, JSON.stringify(again));
+    assert.equal(again.stagedBackups?.length, 1, JSON.stringify(again));
+    assert.equal(readFileSync(again.stagedBackups[0].backupPath, 'utf-8'), 'v1 staged by hand\n');
+  });
+});
+
 // A dangling symlink put where a staged deletion was gets staged by `git add -A`, and the file
 // check that announces the replaced deletion followed the link and saw nothing.
 // Disabling: in `backUpStagedVersions` change `!isFileOrLink(join(hypoDir, path))` back to
@@ -9506,6 +9630,42 @@ test('Stop does not push after a deferred pull: the last record names the deferr
       JSON.stringify(entries),
     );
     assert.match(entries[0].error, /\.gitignore/, 'the record names the deferral');
+    assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
+  });
+});
+
+// One .gitignore line staged and another only in the work tree. The catch-up used to put both
+// lines back into the work tree alone, delete the saved bytes, and leave the stage empty. Disabling:
+// in `clearBlockingPaths` (hooks/hypo-shared.mjs) change `if (staged.has('.gitignore') &&
+// blocked.includes('.gitignore')) {` to `if (false) {`. The stage, deferral and backup assertions go red.
+test('Stop defers a catch-up pull when .gitignore has a staged change, and leaves the stage and the work tree as they were', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    const remote = syRemoteHead(origin);
+    const base = syRead(b, '.gitignore');
+    syPut(b, '.gitignore', `${base}staged-line/\n`);
+    sgitOk(b, ['add', '.gitignore']);
+    syPut(b, '.gitignore', `${base}staged-line/\nunstaged-line/\n`);
+    syTouch(b, 'sess-split-gitignore', 'pages/note.md');
+    const r = syStop(b, 'sess-split-gitignore');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    const entries = readSyncEntries(b);
+    assert.deepEqual(
+      entries.map((e) => e.op),
+      ['pull'],
+      JSON.stringify(entries),
+    );
+    assert.match(entries.at(-1).error, /\.gitignore/, 'the last record is the deferral');
+    assert.equal(
+      sgitOk(b, ['show', ':.gitignore']),
+      `${base}staged-line/\n`,
+      'the stage is what it was',
+    );
+    assert.equal(syRead(b, '.gitignore'), `${base}staged-line/\nunstaged-line/\n`);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false, 'nothing is archived');
+    assert.equal(existsSync(join(b, '.cache', 'backups')), false, 'and no backup is made');
     assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
   });
 });

@@ -2363,7 +2363,18 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     return stop({ reason: 'other-dirty' });
   }
 
-  // 4. `.gitignore`: only a pure addition (stage and working tree alike) can be set aside.
+  // 4. `.gitignore`: only a pure addition (stage and working tree alike) can be set aside. A staged
+  // one is not set aside at all: the merge would take it out of the index and the lines come back
+  // to the working tree only, so a person's stage boundary would be gone and the backup the notice
+  // names deleted. It waits until they commit or unstage it.
+  if (staged.has('.gitignore') && blocked.includes('.gitignore')) {
+    return stop({
+      deferred: 'gitignore',
+      reason: 'gitignore-staged',
+      notice:
+        '스테이징해 둔 .gitignore 변경이 있어 이행 커밋을 받지 못했습니다. 그 변경을 커밋하거나 스테이징을 풀면 다음 동기화에서 받습니다',
+    });
+  }
   if (blocked.includes('.gitignore')) {
     const headText = gitShowText(hypoDir, 'HEAD', '.gitignore') ?? '';
     const targetText = gitShowText(hypoDir, target, '.gitignore') ?? '';
@@ -6077,15 +6088,31 @@ function backUpStagedVersions(hypoDir, commitScope, renamedFrom, lsStaged, toVau
   // The blob hypo-auto-stage itself staged for a path is Claude's own write, not a person's. With
   // no record, a stale one or one that cannot be read, nothing is skipped and the blob is saved.
   const autoStaged = readAutoStagedRecord(hypoDir);
+  const toSave = [...staged].filter(
+    ([path, blob]) =>
+      !(
+        blob === head.get(path) ||
+        blob === head.get(renamedFrom.get(path)) ||
+        blob === work.get(path) ||
+        isAutoStagedBlob(autoStaged, path, blob, head.get(path) ?? null)
+      ),
+  );
+  // The backups hold a person's own bytes: none is written while a `git add -A` would stage them.
+  // The commit is refused here, before anything is staged, and their stage stays where it is.
+  if (toSave.length > 0) {
+    const unignored = unignoredCachePaths(hypoDir);
+    if (unignored.length > 0) {
+      const noticed = writeRootHotHealthNotice(
+        hypoDir,
+        `${cacheNotIgnoredNotice(unignored)} 올려 둔 버전은 index 에 그대로 남고 커밋은 미뤄졌습니다.`,
+      );
+      throw new Error(
+        `.cache/ is not ignored (${unignored.join(', ')}), so no backup is written${noticed ? '' : ' and the notice could not be written'}`,
+      );
+    }
+  }
   const saved = [];
-  for (const [path, blob] of staged) {
-    if (
-      blob === head.get(path) ||
-      blob === head.get(renamedFrom.get(path)) ||
-      blob === work.get(path) ||
-      isAutoStagedBlob(autoStaged, path, blob, head.get(path) ?? null)
-    )
-      continue;
+  for (const [path, blob] of toSave) {
     const content = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', blob], {
       timeout: 30000,
       maxBuffer: 64 * 1024 * 1024,
@@ -6109,6 +6136,22 @@ function backUpStagedVersions(hypoDir, commitScope, renamedFrom, lsStaged, toVau
   return saved;
 }
 
+// The paths a commit just took whose index entry is another blob than the one journaled before it
+// and still differs from HEAD: staged after the commit by something else, and left staged. Names
+// them in a durable notice. Returns the message instead when the notice could not be written, so the
+// caller's warning carries it.
+function noticeStagedAfterCommit(hypoDir, git, kept) {
+  if (kept.length === 0) return undefined;
+  const differing = git('diff', '--cached', '--name-only', '--relative', '-z', '--', ...kept);
+  const paths =
+    differing.status === 0 ? (differing.stdout || '').split('\0').filter(Boolean) : kept;
+  if (paths.length === 0) return undefined;
+  const message =
+    `커밋 직후 ${paths.join(', ')} 의 index 에 다른 내용이 올라와 HEAD 로 되돌리지 않고 그대로 두었습니다(post-commit 훅 같은 것이 올렸을 수 있습니다). ` +
+    `필요 없으면 \`git reset -q HEAD -- ${paths.map(shellQuote).join(' ')}\` 로 되돌리세요.`;
+  return writeRootHotHealthNotice(hypoDir, message) ? undefined : message;
+}
+
 /**
  * Stage + commit ONLY the caller-supplied `paths`, intersected with what is
  * actually changed on disk right now. Does NOT pull/push; remote
@@ -6121,6 +6164,8 @@ function backUpStagedVersions(hypoDir, commitScope, renamedFrom, lsStaged, toVau
  * whole tree. `paths` absent/empty is a clean no-op (`scoped: 0`), not an
  * error and not a whole-tree fallback — this is how a caller with nothing to
  * contribute (e.g. no session_id, so nothing was accumulated) skips cleanly.
+ * It still finishes an earlier commit's failed index reset (`reconcileStaleIndex`) and reports a
+ * failure of that as `indexWarning`.
  *
  * The authoritative scope is INTERSECT(paths, currently-changed): a stale
  * entry (already committed elsewhere, or never actually changed) is dropped
@@ -6156,7 +6201,8 @@ function backUpStagedVersions(hypoDir, commitScope, renamedFrom, lsStaged, toVau
  *   is left unresolved. On a failed add or commit the index entries of this
  *   call's paths are put back as they were (the `reason` says so when that
  *   fails too). After a commit every committed path's index entry is the new
- *   HEAD. A version a person had staged for a committed path, when it differs
+ *   HEAD, except one that something staged after the commit (its blob is not the one journaled before
+ *   it): that stays staged and a health notice names it. A version a person had staged for a committed path, when it differs
  *   from HEAD's and from the bytes committed, is saved first under
  *   `.cache/backups/staged/`: `stagedBackups` names each `{path, backupPath}`
  *   and a health notice, written right after each backup, says so. When nothing ends up to commit
@@ -6180,12 +6226,17 @@ export function commitWikiChanges(hypoDir, paths) {
       (p) => typeof p === 'string' && p.length > 0 && !isGeneratedViewPath(p),
     ),
   );
-  if (supplied.size === 0)
-    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths: [] };
 
   // A reset that failed after an earlier commit is finished first, while the caller's vault lock is
-  // held, so this call's own scope starts from an index that matches HEAD.
+  // held, so this call's own scope starts from an index that matches HEAD. It runs before the
+  // empty-scope return too: an idle Stop is the retry for a reset that failed, and its warning
+  // comes back on every outcome that follows.
   const reconcileWarning = reconcileStaleIndex(hypoDir);
+  const withWarning = (outcome) =>
+    reconcileWarning ? { ...outcome, indexWarning: reconcileWarning } : outcome;
+
+  if (supplied.size === 0)
+    return withWarning({ committed: true, scoped: 0, committedPaths: [], ignoredPaths: [] });
 
   // `-z`: NUL-separated records with verbatim paths — no surrounding quotes and
   // no octal escaping, so non-ASCII paths (Korean page names are normal input
@@ -6261,7 +6312,7 @@ export function commitWikiChanges(hypoDir, paths) {
     }
   }
   if (scoped.length === 0 && commitScope.length === 0)
-    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
+    return withWarning({ committed: true, scoped: 0, committedPaths: [], ignoredPaths });
 
   // A held `index.lock` (another git process mid-operation, or a stale one) would fail the staging
   // below, and the restore after a failure needs the same lock. Stop here, before anything is saved
@@ -6367,7 +6418,7 @@ export function commitWikiChanges(hypoDir, paths) {
         committed: false,
         reason: `nothing to commit, and the index was not restored: ${(restored.stderr || '').trim() || 'unknown'}`,
       };
-    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
+    return withWarning({ committed: true, scoped: 0, committedPaths: [], ignoredPaths });
   }
 
   const projects = new Set(stagedFiles.map(projectOfPath));
@@ -6416,15 +6467,33 @@ export function commitWikiChanges(hypoDir, paths) {
   // index entries to HEAD while the caller still holds the vault lock. Every
   // committed path ends with index == HEAD, so a later write to it shows as an
   // unstaged change only, and a merge that touches it is not refused.
-  const sync = git('reset', '-q', 'HEAD', '--', ...commitScope);
+  //
+  // Only a path whose index blob is still the one journaled before the commit is reset. Any other
+  // blob was staged after that by something else (a person's post-commit hook, say) and is theirs:
+  // it stays, and a notice names it. An index that cannot be read resets everything, as before.
+  const after = git('ls-files', '-s', '-z', '--', ...commitScope);
+  const indexNow = new Map();
+  for (const rec of (after.stdout || '').split('\0')) {
+    const m = /^\d+ ([0-9a-f]+) 0\t([\s\S]*)$/.exec(rec);
+    if (m) indexNow.set(m[2], m[1]);
+  }
+  const resetScope =
+    after.status === 0
+      ? commitScope.filter((p) => (indexNow.get(p) ?? null) === (added.get(p) ?? null))
+      : commitScope;
+  const kept = commitScope.filter((p) => !resetScope.includes(p));
+  const sync =
+    resetScope.length > 0 ? git('reset', '-q', 'HEAD', '--', ...resetScope) : { status: 0 };
   dropAutoStagedBlobs(hypoDir, commitScope);
   // The reset brought these paths to HEAD, which also settles an older entry for the same path.
   if (sync.status === 0 && headKnown) dropIndexJournal(hypoDir, [...added.keys()]);
   const ownWarning =
     sync.status === 0
       ? undefined
-      : `the index of the committed paths was not brought to HEAD (${(sync.stderr || '').trim() || 'unknown'}); run \`git reset -q HEAD -- ${commitScope.map(shellQuote).join(' ')}\` before any plain git commit`;
-  const indexWarning = [reconcileWarning, ownWarning].filter(Boolean).join('\n') || undefined;
+      : `the index of the committed paths was not brought to HEAD (${(sync.stderr || '').trim() || 'unknown'}); run \`git reset -q HEAD -- ${resetScope.map(shellQuote).join(' ')}\` before any plain git commit`;
+  const keptWarning = noticeStagedAfterCommit(hypoDir, git, kept);
+  const indexWarning =
+    [reconcileWarning, ownWarning, keptWarning].filter(Boolean).join('\n') || undefined;
   // MAJOR fix: name the commit this call just created. A caller that has to
   // tell a user how to take it back (close-gate-store.mjs's
   // hostTagWarningWithUndo) cannot derive it afterwards: on a shared vault
